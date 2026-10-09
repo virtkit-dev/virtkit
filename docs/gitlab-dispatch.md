@@ -60,8 +60,9 @@ move to another runner. So the daemon holds capacity before it asks, never after
 
 - **Capacity first.** `POST /v1/capacity` is advisory: the hub's count, from heartbeats less
   the reservations and starting jobs they do not show yet, of how many envelopes of the
-  placement its ready nodes could take, each node at most what its concurrency ceiling leaves
-  past the reservations and jobs it holds.
+  placement its ready nodes could take, each node at most what its cap — the smaller of its
+  concurrency ceiling and its own `max_concurrency` — leaves past the reservations and jobs it
+  holds.
   The daemon does not poll GitLab for a runner while it is 0, so a fleet with no room leaves
   the job pending in GitLab for another runner.
 - **Then a reservation.** Before each job request the daemon holds a reservation. The node
@@ -111,9 +112,11 @@ own configuration and reports in its inventory's `labels`, absent from an older 
 policy on the hub decides the pools the daemon may use and the largest envelope it may ask
 for.
 
-A node's concurrency ceiling (`vk-hub nodes ceiling`) caps its placed work: the hub offers and
-starts nothing on a node whose reservations and jobs not finished reach it, and the node
-refuses `ceiling` past it by its own count. Running jobs above a lowered ceiling carry on.
+A node's concurrency ceiling (`vk-hub nodes ceiling`) and its own executor limit
+(`[executor.schedule] max_concurrency`, which the node reports) cap its placed work at the
+smaller limit. The hub offers and starts nothing on a node whose reservations and unfinished
+jobs reach the cap. The node enforces it independently, refusing `ceiling` or `concurrency`
+by its own count. Running jobs above a lowered ceiling carry on.
 
 A host runs its own gitlab-runner with the vk executor or takes placed jobs, never both. A node
 that finds such a runner on its host says so in its report and refuses with `runner` every new
@@ -230,9 +233,10 @@ one offering at most 2 is steered and never offered a job.
 
 Refusal reasons are `memory`, `disk`, `cpus`, `not_ready` (draining, drained, quarantined, in
 maintenance), `policy`, `no_reservation`, `invalid`, `ceiling` (the node's placed jobs not
-finished and reservations held reach the hub's ceiling, as the node last applied it) and
-`runner` (the host runs its own gitlab-runner with the vk executor); one the hub does not know
-reads as `other`, as `ceiling` and `runner` do on a hub older than them.
+finished and reservations held reach the hub's ceiling, as the node last applied it),
+`concurrency` (the same, at the node's own `max_concurrency`) and `runner` (the host runs its own
+gitlab-runner with the vk executor); one the hub does not know reads as `other`, as `ceiling`,
+`concurrency` and `runner` do on a hub older than them.
 
 **Reservations.** A node answers an offer at once from its ledger: granted, or refused with
 the resource that is short. It holds the entry in the ledger itself, with no job process

@@ -386,10 +386,12 @@ pub async fn run(
 
 /// A job message from the hub, answered from the node's ledger and job journal.
 async fn handle_job(node: &Node, msg: vk_hub_proto::dispatch::HubJobMsg) -> Result<Vec<NodeMsg>> {
+    let placed = node.core.placed();
     let intake = super::jobs::Intake {
         ready: super::jobs::ready(node.core.state(), *node.core.acquire().borrow()),
         ceiling: node.core.hub_ceiling(),
-        runner: node.core.placed().runner.is_some(),
+        runner: placed.runner.is_some(),
+        limit: placed.limit,
     };
     let jobs = node.jobs.clone();
     let replies =
@@ -1242,6 +1244,7 @@ mod tests {
         // An external runner of its own: it may go on taking jobs past a stop.
         f.node.core.set_placed(vk_hub_proto::PlacedIntake {
             runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+            ..vk_hub_proto::PlacedIntake::default()
         });
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();

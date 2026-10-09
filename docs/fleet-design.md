@@ -188,7 +188,9 @@ effective = min(local estimate, hub ceiling, local ceiling)
   saturated on a resource the estimate does not see, or whose capacity is kept for other work.
   On a node that takes placed jobs instead of running a gitlab-runner, it caps those, counted
   by both sides (see [placed jobs](fleet-prototype.md#placed-jobs)).
-- **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
+- **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit. It also
+  caps placed jobs. The node reports this limit to the hub and enforces the smaller of it and
+  the hub ceiling.
 
 `vk tune` and `vk node run` use one controller, with a single writer while the node is up.
 

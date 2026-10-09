@@ -783,7 +783,9 @@ passes the vCPU check is granted. Leases are cut to 600 seconds and run on the n
 clock; an offer of a reservation already held renews it. A node not `ready`, or with acquisition
 stopped, refuses offers and starts without a reservation; so does, as `ceiling`, a node whose
 placed jobs not finished and reservations held reach the hub's ceiling, as the node last
-applied it. A quarantined node releases every reservation. Reservations live in memory: a
+applied it, and as `concurrency` one whose same count reaches its own
+`[executor.schedule] max_concurrency` when that is the smaller. The node reports that limit as
+`placed.limit`. A quarantined node releases every reservation. Reservations live in memory: a
 restarted node holds none, and the hub releases what it thought held.
 
 **Starting a job.** Before answering `accepted`, the node journals the start under
@@ -968,20 +970,23 @@ request that got no reservation is tried afresh; for a job, the job.
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
 `held`, it is connected, in the pool, carries every label, reports itself ready and has at least
 the CPUs the envelope asks, does not report a gitlab-runner of its own ([one kind of
-host](#placed-jobs-on-the-node)), and while it holds less placed work than the ceiling the
-operator set it, if any. Its room is its last heartbeat's admission budget less committed memory
+host](#placed-jobs-on-the-node)), and while it holds less placed work than its cap: the smaller
+of the ceiling the operator set it and the node's own `max_concurrency`, if either is set —
+read, from a node older than reporting it, from its runner's concurrency report.
+Its room is its last heartbeat's admission budget less committed memory
 — or its memory available, with no budget — and the job filesystem's most free space, less what
 the hub asked of it since: offers not yet answered, reservations accepted after that heartbeat,
 and starts not yet answered that are not on a reservation. `fits` is the sum of each node's room
-in envelopes, at most 1024 a node, and at most what its ceiling leaves.
+in envelopes, at most 1024 a node, and at most what its cap leaves.
 
 **The ceiling.** The hub counts offered reservations that have not been refused, unfinished jobs
 sent to the node (including those recovered from its database after a restart), and jobs
 reported in `held` that the hub has ended or never knew, until their results arrive. A job on a
 reservation counts once: as the reservation until sent, then as the job. The node counts
-unfinished placed jobs and held reservations against its applied ceiling. It refuses excess
-offers or starts without a reservation as `ceiling`, preventing overshoot if the hub
-undercounts. Starts on held reservations and renewals still proceed. The hub uses its desired
+unfinished placed jobs and held reservations against its applied ceiling and its own limit. It
+refuses excess offers or starts without a reservation as `ceiling` or `concurrency`,
+preventing overshoot if the hub undercounts. Starts on held reservations and renewals still
+proceed. The hub uses its desired
 ceiling; the node uses its last applied ceiling, so it may refuse `ceiling` after a raise until
 it applies the change. Lowering the ceiling cancels nothing: running jobs continue, and new work
 resumes when the count falls below it. A node running its own gitlab-runner, whose `concurrent`
@@ -1083,7 +1088,8 @@ concurrency, drain progress and what it cannot carry out — and its 20 latest c
 outcomes. It opens with a steering panel describing the current state in plain language, grouped
 into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
 node's current effective limit, and on a hub that places jobs, for a node at protocol version 3
-or later, the jobs the hub has placed on it against that ceiling (`Placed by the hub: 3 of 4`),
+or later, the jobs the hub has placed on it against that ceiling or the node's own limit,
+whichever is smaller (`Placed by the hub: 3 of 4`),
 or why it takes none when it runs its own gitlab-runner; *Maintenance* — in service, draining,
 drained, under maintenance, checking itself or quarantined; and an operator-only *Danger zone*.
 Operators see applicable actions with short explanations: pause intake or resume it, set the

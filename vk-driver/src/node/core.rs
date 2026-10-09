@@ -692,6 +692,7 @@ mod tests {
         // An external runner goes on taking jobs, and the report says why.
         core.set_placed(PlacedIntake {
             runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+            ..PlacedIntake::default()
         });
         let report = core.report();
         assert_eq!(report.unsupported.len(), 1);

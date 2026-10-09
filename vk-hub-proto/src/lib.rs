@@ -866,6 +866,11 @@ pub struct PlacedIntake {
     /// in words. A host runs one or the other, never both. `None`: it takes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// The node's `[executor.schedule] max_concurrency` limit on unfinished placed jobs and
+    /// reservations. The hub's ceiling also applies; the smaller limit wins.
+    /// `None`: no limit of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 impl Report {
@@ -2259,6 +2264,7 @@ mod tests {
         let runner = Report {
             placed: Some(PlacedIntake {
                 runner: Some("[node] runner = \"managed\"".into()),
+                limit: None,
             }),
             ..steering_report()
         };
@@ -2266,6 +2272,13 @@ mod tests {
         wire["placed"] = json!({"runner": "[node] runner = \"managed\""});
         pinned(&NodeMsg::Report(runner), wire);
         pinned(&PlacedIntake::default(), json!({}));
+        pinned(
+            &PlacedIntake {
+                runner: None,
+                limit: Some(3),
+            },
+            json!({"limit": 3}),
+        );
         assert_eq!(steering_report().placed, None);
     }
 

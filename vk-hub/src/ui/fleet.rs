@@ -945,10 +945,15 @@ impl Panel {
         let placed = v
             .placed
             .filter(|_| v.protocol.is_some_and(|p| p >= vk_hub_proto::JOBS) && own_runner.is_none())
-            .map(|placed| match ceiling {
-                Some(n) => format!("Placed by the hub: {placed} of {n}"),
-                None => format!("Placed by the hub: {placed}"),
-            });
+            .map(
+                |placed| match crate::jobs::placed_cap(v.desired.as_ref(), report) {
+                    Some(n) if ceiling.is_some_and(|c| c <= n) => {
+                        format!("Placed by the hub: {placed} of {n}")
+                    }
+                    Some(n) => format!("Placed by the hub: {placed} of {n} (the node's own limit)"),
+                    None => format!("Placed by the hub: {placed}"),
+                },
+            );
 
         let maintenance = match state {
             None => "State not reported yet",
@@ -1975,10 +1980,31 @@ mod tests {
             Some("With [node] runner = \"external\", a reset is refused.")
         );
         assert_eq!(p.placed.as_deref(), Some("Placed by the hub: 2"));
+        // Its own limit caps them too, the smaller of the two binding.
+        if let Some(r) = v.report.as_mut() {
+            r.placed = Some(PlacedIntake {
+                limit: Some(2),
+                ..PlacedIntake::default()
+            });
+        }
+        assert_eq!(
+            Panel::of(&v).placed.as_deref(),
+            Some("Placed by the hub: 2 of 2 (the node's own limit)")
+        );
+        v.desired = Some(DesiredState {
+            generation: 4,
+            ceiling: Some(2),
+            acquisition: Acquisition::Stop,
+        });
+        assert_eq!(
+            Panel::of(&v).placed.as_deref(),
+            Some("Placed by the hub: 2 of 2")
+        );
         // One that runs its own takes none of them, and says why.
         if let Some(r) = v.report.as_mut() {
             r.placed = Some(PlacedIntake {
                 runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+                ..PlacedIntake::default()
             });
         }
         let p = Panel::of(&v);

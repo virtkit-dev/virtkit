@@ -2255,6 +2255,7 @@ fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
         report: Some(Report {
             placed: Some(PlacedIntake {
                 runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+                ..PlacedIntake::default()
             }),
             ..Report::default()
         }),

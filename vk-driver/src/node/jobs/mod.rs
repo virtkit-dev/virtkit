@@ -122,10 +122,10 @@ struct State {
 }
 
 impl State {
-    /// Whether new placed work is taken: never on a host running its own runner. At the hub's
-    /// ceiling, the node's placed jobs not finished and its reservations fill it: a job on a
-    /// reservation counts once, as the reservation until it starts. Jobs past a ceiling lowered
-    /// under them carry on.
+    /// Whether the node takes new placed work: never on a host running its own runner, or when
+    /// unfinished placed jobs and reservations reach the smaller of the hub's ceiling and the
+    /// node's own limit. A reserved job counts once, as the reservation until it starts.
+    /// Lowering the ceiling leaves running jobs alone.
     fn gate(&self, intake: Intake) -> Gate {
         if intake.runner {
             return Gate::Runner;
@@ -135,10 +135,13 @@ impl State {
         }
         let held = (self.jobs.values().filter(|t| t.result.is_none()).count())
             .saturating_add(self.ledger.count());
-        match intake.ceiling {
-            Some(ceiling) if held >= usize::try_from(ceiling).unwrap_or(usize::MAX) => {
+        let full = |n: u32| held >= usize::try_from(n).unwrap_or(usize::MAX);
+        // Report the hub's ceiling when it is at or below the node's own limit.
+        match (intake.ceiling, intake.limit) {
+            (Some(ceiling), limit) if full(ceiling) && limit.is_none_or(|l| ceiling <= l) => {
                 Gate::Ceiling { ceiling, held }
             }
+            (_, Some(limit)) if full(limit) => Gate::Concurrency { limit, held },
             _ => Gate::Open,
         }
     }
@@ -154,6 +157,8 @@ pub struct Intake {
     /// The host runs a gitlab-runner of its own with the vk executor
     /// ([`vk_hub_proto::PlacedIntake::runner`]).
     pub runner: bool,
+    /// The node's own limit ([`vk_hub_proto::PlacedIntake::limit`]).
+    pub limit: Option<u32>,
 }
 
 /// Every reservation and placed job this node holds, for the sessions of `vk node run`.
@@ -831,6 +836,7 @@ fn refusal_change(
         (Refusal::NoReservation, None) => "no such reservation",
         (Refusal::Ceiling, None) => "at the hub's ceiling",
         (Refusal::Runner, None) => "this host runs its own gitlab-runner",
+        (Refusal::Concurrency, None) => "at its own max_concurrency",
         (Refusal::Other, None) => "for another reason",
     };
     Some(format!("refusing the hub's offers: {why}"))
@@ -937,6 +943,7 @@ pub(crate) mod tests {
         ready: true,
         ceiling: None,
         runner: false,
+        limit: None,
     };
 
     const NOT_READY: Intake = Intake {
@@ -1271,6 +1278,94 @@ pub(crate) mod tests {
                 reply: OfferReply::Accepted { .. },
                 ..
             }]
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The smaller of the node's limit and the hub's ceiling caps placed work. Refusals name
+    /// that limit, with the hub's ceiling winning ties.
+    #[test]
+    fn the_nodes_own_limit_caps_placed_work_with_the_hubs_ceiling() {
+        let (jobs, dir) = jobs("limit", None);
+        let now = Instant::now();
+        let at = |ceiling, limit| Intake {
+            ceiling,
+            limit,
+            ..OPEN
+        };
+        let offer = |id: &str, intake| {
+            let msgs = jobs.handle(
+                HubJobMsg::Offer {
+                    reservation: hex(id),
+                    envelope: envelope(1),
+                    lease_secs: 90,
+                },
+                intake,
+                now,
+            );
+            match msgs.as_slice() {
+                [NodeJobMsg::OfferReply { reply, .. }] => reply.clone(),
+                _ => panic!("{msgs:?}"),
+            }
+        };
+        let refused = |reply: OfferReply| match reply {
+            OfferReply::Refused { reason, message } => (reason, message.unwrap_or_default()),
+            OfferReply::Accepted { .. } => panic!("granted"),
+        };
+        assert!(matches!(
+            offer("a", at(None, Some(1))),
+            OfferReply::Accepted { .. }
+        ));
+        let (reason, why) = refused(offer("c", at(None, Some(1))));
+        assert_eq!(reason, Refusal::Concurrency);
+        assert!(why.contains("max_concurrency = 1"), "{why}");
+        assert_eq!(
+            refused(offer("c", at(Some(3), Some(1)))).0,
+            Refusal::Concurrency
+        );
+        assert_eq!(
+            refused(offer("c", at(Some(1), Some(1)))).0,
+            Refusal::Ceiling
+        );
+        assert_eq!(
+            refused(offer("c", at(Some(1), Some(2)))).0,
+            Refusal::Ceiling
+        );
+        // At the limit, held reservations can still be renewed and started;
+        // starts without a reservation are refused.
+        assert!(matches!(
+            offer("a", at(None, Some(1))),
+            OfferReply::Accepted { .. }
+        ));
+        let msgs = jobs.handle(start(&hex("b"), None, 2), at(None, Some(1)), now);
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [NodeJobMsg::Job {
+                    state: RunState::Refused {
+                        reason: Refusal::Concurrency,
+                        ..
+                    },
+                    ..
+                }]
+            ),
+            "{msgs:?}"
+        );
+        let msgs = jobs.handle(start(&hex("d"), Some(hex("a")), 4), at(None, Some(1)), now);
+        assert!(
+            matches!(
+                msgs.first(),
+                Some(NodeJobMsg::Job {
+                    state: RunState::Accepted,
+                    ..
+                })
+            ),
+            "{msgs:?}"
+        );
+        // Below both, it takes more.
+        assert!(matches!(
+            offer("c", at(Some(3), Some(2))),
+            OfferReply::Accepted { .. }
         ));
         let _ = std::fs::remove_dir_all(dir);
     }

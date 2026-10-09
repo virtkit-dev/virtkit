@@ -2290,6 +2290,7 @@ async fn a_node_running_its_own_runner_is_offered_nothing() {
     assert_eq!(fits().await, 4);
     let runner = vk_hub_proto::PlacedIntake {
         runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+        ..vk_hub_proto::PlacedIntake::default()
     };
     report_placed(&hub, &node, runner).await;
     assert_eq!(fits().await, 0);
@@ -2303,6 +2304,69 @@ async fn a_node_running_its_own_runner_is_offered_nothing() {
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
     node.quiet(Duration::from_millis(300)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A node's own limit caps what the hub places on it with the operator's ceiling, the smaller
+/// binding; a node older than reporting it has it read from its runner's concurrency.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_s_own_limit_caps_what_it_is_placed_with_the_ceiling() {
+    let dir = scratch("own-limit");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    // Memory for four envelopes.
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    let limit = |n| vk_hub_proto::PlacedIntake {
+        limit: Some(n),
+        ..vk_hub_proto::PlacedIntake::default()
+    };
+    report_placed(&hub, &node, limit(2)).await;
+    assert_eq!(fits().await, 2);
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, Some(3)).unwrap();
+    assert_eq!(fits().await, 2);
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, Some(1)).unwrap();
+    assert_eq!(fits().await, 1);
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, None).unwrap();
+    report_placed(&hub, &node, limit(1)).await;
+    // Full at one: nothing more is offered.
+    reserve_on(addr, &key, &mut node, 1).await;
+    assert_eq!(fits().await, 0);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/reservations",
+        Some(&key),
+        Some(reservation_body(2, 1)),
+    )
+    .await;
+    assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
+    node.quiet(Duration::from_millis(300)).await;
+    // An older node's report has no such field: its runner's local ceiling stands in.
+    node.outbox
+        .send(NodeMsg::Report(Report {
+            state: Some(NodeState::Ready),
+            concurrency: Some(vk_hub_proto::Concurrency {
+                local_ceiling: Some(3),
+                ..vk_hub_proto::Concurrency::default()
+            }),
+            ..Report::default()
+        }))
+        .unwrap();
+    wait_until(|| {
+        hub.db
+            .node(&node.id)
+            .unwrap()
+            .and_then(|r| r.report)
+            .is_some_and(|r| r.placed.is_none() && r.concurrency.is_some())
+    })
+    .await;
+    assert_eq!(fits().await, 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -185,6 +185,10 @@ pub enum Refusal {
     /// work at all ([`crate::PlacedIntake::runner`]). Read as [`Refusal::Other`] by a hub older
     /// than this reason.
     Runner,
+    /// The node already runs or holds as many placed jobs and reservations as its own
+    /// `[executor.schedule] max_concurrency` allows ([`crate::PlacedIntake::limit`]). Read as
+    /// [`Refusal::Other`] by a hub older than this reason.
+    Concurrency,
     /// A reason from a later node.
     #[serde(other)]
     Other,
@@ -435,8 +439,8 @@ mod tests {
         assert_eq!(end, LeaseEnd::Other);
     }
 
-    /// `ceiling` and `runner` came after the first nodes: a hub that knows them reads them, and
-    /// one that does not reads them as any later reason, `other`.
+    /// `ceiling`, `runner` and `concurrency` came after the first nodes: a hub that knows them
+    /// reads them, and one that does not reads them as any later reason, `other`.
     #[test]
     fn later_refusals_read_as_themselves_and_as_other_before_them() {
         #[derive(Debug, PartialEq, Deserialize)]
@@ -446,7 +450,11 @@ mod tests {
             #[serde(other)]
             Other,
         }
-        for (reason, name) in [(Refusal::Ceiling, "ceiling"), (Refusal::Runner, "runner")] {
+        for (reason, name) in [
+            (Refusal::Ceiling, "ceiling"),
+            (Refusal::Runner, "runner"),
+            (Refusal::Concurrency, "concurrency"),
+        ] {
             let refused = OfferReply::Refused {
                 reason,
                 message: None,

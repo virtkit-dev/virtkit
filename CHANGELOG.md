@@ -10,7 +10,8 @@ All notable changes to virtkit will be documented in this file.
   and the web UI's *Max concurrent jobs* also cap placed jobs and reservations, letting operators
   bring a node in gradually or spare a shared service such as the registry. The capacity
   `vk-gitlab` sees shrinks to match, and the node also enforces the ceiling. Lowering it leaves
-  running jobs alone. A node's page shows placed jobs against the ceiling.
+  running jobs alone. The node's own `[executor.schedule] max_concurrency` caps them too, as it
+  caps its runner's jobs; a node's page shows placed jobs against whichever binds.
 - **`vk-hub`'s web UI shows virtkit's logo as its browser tab icon.**
 - **`vk-hub` keeps the end of a failed job's output.** When `vk-gitlab` settles a failed job
   — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its

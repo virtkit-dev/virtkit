@@ -59,8 +59,9 @@ pub struct NodeView {
     /// The CI tools it built from a definition of the hub's and made current.
     #[serde(default)]
     pub tools: Option<vk_hub_proto::ToolsInstalled>,
-    /// The reservations and jobs not finished the hub has placed on it, as counted against
-    /// its ceiling; `None` from a hub that places no jobs.
+    /// The reservations and jobs not finished the hub has placed on it, as counted against its
+    /// cap (the smaller of its ceiling and its own max_concurrency); `None` from a hub that
+    /// places no jobs.
     #[serde(default)]
     pub placed: Option<u64>,
 }

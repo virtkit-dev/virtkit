@@ -49,6 +49,12 @@ pub enum Gate {
         ceiling: u32,
         held: usize,
     },
+    /// The same, at the node's own limit (`[executor.schedule] max_concurrency`), below the
+    /// hub's ceiling if any.
+    Concurrency {
+        limit: u32,
+        held: usize,
+    },
 }
 
 impl Gate {
@@ -69,6 +75,13 @@ impl Gate {
                 Refusal::Ceiling,
                 Some(format!(
                     "{held} placed jobs and reservations reach the hub's ceiling of {ceiling}"
+                )),
+            )),
+            Gate::Concurrency { limit, held } => Some((
+                Refusal::Concurrency,
+                Some(format!(
+                    "{held} placed jobs and reservations reach [executor.schedule] \
+                     max_concurrency = {limit}"
                 )),
             )),
         }

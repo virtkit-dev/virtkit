@@ -16,9 +16,10 @@
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
 //! what the hub has asked of it since: reservations accepted after that heartbeat, offers
 //! and starts not yet answered. Offers and starts go to the node with the most room first.
-//! A node the operator gave a concurrency ceiling takes placed work only below it, counted by
-//! [`placed`]: the node refuses past it too ([`Refusal::Ceiling`]), should the hub's count
-//! fall short of the node's. A node that reports a gitlab-runner of its own takes none
+//! A node takes placed work only below its cap ([`placed_cap`]): the operator's ceiling or its
+//! own executor limit, whichever is smaller, counted by [`placed`]. The node refuses past
+//! either too ([`Refusal::Ceiling`], [`Refusal::Concurrency`]), should the hub's count fall
+//! short of the node's. A node that reports a gitlab-runner of its own takes none
 //! ([`Refusal::Runner`]).
 //! The hub places a job again only while no node can have started it: after a refused start,
 //! or a start that never went out; a start whose answer was lost waits for the node's `held`.
@@ -45,7 +46,7 @@ use vk_hub_proto::dispatch::{
     OfferReply, Refusal, RunState,
 };
 use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
-use vk_hub_proto::{JOBS, NodeState, StorageRole};
+use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 
 use crate::client::ApiError;
 use crate::server::{Hub, Reach};
@@ -482,6 +483,7 @@ fn refusal_name(r: Refusal) -> &'static str {
         Refusal::Invalid => "invalid",
         Refusal::Ceiling => "ceiling",
         Refusal::Runner => "runner",
+        Refusal::Concurrency => "concurrency",
         Refusal::Other => "other",
     }
 }
@@ -1043,8 +1045,8 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
     if env.cpus > inventory.hardware.cpus {
         return None;
     }
-    let below_ceiling = match row.desired.as_ref().and_then(|d| d.ceiling) {
-        Some(ceiling) => u64::from(ceiling).saturating_sub(placed(state, node)),
+    let below_cap = match placed_cap(row.desired.as_ref(), report) {
+        Some(cap) => u64::from(cap).saturating_sub(placed(state, node)),
         None => MAX_FITS,
     };
     let heartbeat = row.heartbeat.as_ref()?;
@@ -1078,7 +1080,7 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
         _ => heartbeat.mem_available_mib?,
     }
     .saturating_sub(pending.mem_mib);
-    let mut fits = below_ceiling.min(MAX_FITS);
+    let mut fits = below_cap.min(MAX_FITS);
     if let Some(n) = mem_free.checked_div(env.mem_mib) {
         fits = fits.min(n);
     }
@@ -1154,6 +1156,20 @@ pub fn subscribe_node_work(hub: &Arc<Hub>, node: &str) -> watch::Receiver<u64> {
         }
     });
     rx
+}
+
+/// The most placed work a node takes at once: the smaller of the operator's ceiling and the
+/// node's own limit, which the node enforces too. A node older than reporting that limit has
+/// it read from its runner's concurrency, the same `[executor.schedule] max_concurrency`.
+pub fn placed_cap(desired: Option<&DesiredState>, report: Option<&Report>) -> Option<u32> {
+    let own = report.and_then(|r| match &r.placed {
+        Some(p) => p.limit,
+        None => r.concurrency.and_then(|c| c.local_ceiling),
+    });
+    [desired.and_then(|d| d.ceiling), own]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 /// The nodes with room for `placement`, most room first, but those in `skip`.

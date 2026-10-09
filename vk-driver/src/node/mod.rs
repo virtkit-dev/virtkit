@@ -580,6 +580,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     core.set_release_policy(policy);
     core.set_placed(vk_hub_proto::PlacedIntake {
         runner: ci_user::local_runner(&cfg),
+        limit: (cfg.executor.schedule.max_concurrency).map(std::num::NonZeroU32::get),
     });
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {

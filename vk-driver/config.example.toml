@@ -342,4 +342,5 @@
 #                        # filesystem, such jobs fail at once
 # max_concurrency = 12   # the most jobs `vk tune` ever asks the runner to accept, whatever the
 #                        # budget would allow; at least 1. Unset: no ceiling. A fleet hub's
-#                        # ceiling can lower it on a node, never raise it
+#                        # ceiling can lower it on a node, never raise it. On a fleet node
+#                        # taking the hub's jobs, it also caps placed jobs and reservations

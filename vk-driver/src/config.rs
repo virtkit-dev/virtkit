@@ -222,8 +222,9 @@ pub struct Schedule {
     /// `false` turns it off.
     pub disk_admission: Option<bool>,
     /// The most jobs the runner is ever told to accept, whatever the host could take or a
-    /// fleet hub allows: the ceiling in `min(estimate, hub ceiling, ceiling)`. At least one.
-    /// Unset: no ceiling of the host's own.
+    /// fleet hub allows: the ceiling in `min(estimate, hub ceiling, ceiling)`. On a fleet node
+    /// taking the hub's jobs, it also caps placed jobs and reservations. At least one. Unset: no
+    /// ceiling of the host's own.
     pub max_concurrency: Option<std::num::NonZeroU32>,
     /// What a job with no history of its own is expected to write into its job dir, as
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
