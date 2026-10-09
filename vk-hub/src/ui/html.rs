@@ -122,6 +122,256 @@ pub fn terminal_safe(s: &str) -> String {
     out
 }
 
+/// How a run of a terminal's text is drawn, as its SGR sequences (`ESC [ … m`) set it.
+/// Colours are the 16 of the basic and bright palettes; a 256-colour or RGB one is taken as
+/// the nearest of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Style {
+    pub fg: Option<u8>,
+    pub bg: Option<u8>,
+    pub bold: bool,
+    pub faint: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl Style {
+    /// Apply the SGR parameters `params`: `;`-separated, each a number (empty for 0, one too
+    /// large for a `u16` ignored), or a group of `:`-separated sub-parameters (ITU T.416),
+    /// read as one.
+    fn apply(&mut self, params: &str) {
+        let mut ps = params.split(';');
+        while let Some(group) = ps.next() {
+            if group.contains(':') {
+                self.apply_group(group);
+                continue;
+            }
+            let Some(p) = sgr_number(group) else {
+                continue;
+            };
+            match p {
+                0 => *self = Style::default(),
+                1 => self.bold = true,
+                2 => self.faint = true,
+                3 => self.italic = true,
+                4 => self.underline = true,
+                22 => (self.bold, self.faint) = (false, false),
+                23 => self.italic = false,
+                24 => self.underline = false,
+                30..=37 => self.fg = u8::try_from(p - 30).ok(),
+                39 => self.fg = None,
+                40..=47 => self.bg = u8::try_from(p - 40).ok(),
+                49 => self.bg = None,
+                90..=97 => self.fg = u8::try_from(p - 90 + 8).ok(),
+                100..=107 => self.bg = u8::try_from(p - 100 + 8).ok(),
+                38 | 48 => {
+                    let mut next = || ps.next().and_then(sgr_number);
+                    let colour = match next() {
+                        Some(5) => next().map(palette_256),
+                        // All three channels, or no colour.
+                        Some(2) => match (next(), next(), next()) {
+                            (Some(r), Some(g), Some(b)) => Some(nearest((
+                                channel(Some(r)),
+                                channel(Some(g)),
+                                channel(Some(b)),
+                            ))),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    self.set_colour(p, colour);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply one `:`-separated group: `38`/`48` with `5:n` or `2:[colour space:]r:g:b`, and
+    /// `4:n`, underlined unless `n` is 0. Any other is ignored.
+    fn apply_group(&mut self, group: &str) {
+        let subs: Vec<Option<u16>> = group.split(':').map(sgr_number).collect();
+        match subs.as_slice() {
+            [Some(p @ (38 | 48)), Some(5), n, ..] => self.set_colour(*p, n.map(palette_256)),
+            [Some(p @ (38 | 48)), Some(2), .., r, g, b] if subs.len() >= 5 => {
+                self.set_colour(*p, Some(nearest((channel(*r), channel(*g), channel(*b)))));
+            }
+            [Some(4), n, ..] => self.underline = n.is_some_and(|n| n != 0),
+            _ => {}
+        }
+    }
+
+    /// Set the foreground (`38`) or background (`48`) to `colour`, if one was given.
+    fn set_colour(&mut self, p: u16, colour: Option<u8>) {
+        let Some(colour) = colour else {
+            return;
+        };
+        if p == 38 {
+            self.fg = Some(colour);
+        } else {
+            self.bg = Some(colour);
+        }
+    }
+
+    /// The classes `ui.css` draws this style with, space-separated; empty for the default.
+    pub fn classes(&self) -> String {
+        let mut c = Vec::new();
+        if let Some(fg) = self.fg {
+            c.push(format!("c-f{fg}"));
+        }
+        if let Some(bg) = self.bg {
+            // `c-on`: black text (`c-f0`) on a background is drawn true black to stay legible.
+            c.push(format!("c-b{bg} c-on"));
+        }
+        for (on, class) in [
+            (self.bold, "c-bold"),
+            (self.faint, "c-faint"),
+            (self.italic, "c-it"),
+            (self.underline, "c-ul"),
+        ] {
+            if on {
+                c.push(class.to_string());
+            }
+        }
+        c.join(" ")
+    }
+}
+
+/// An SGR parameter: empty for 0, `None` for one too large for a `u16` or not a number.
+fn sgr_number(p: &str) -> Option<u16> {
+    if p.is_empty() {
+        return Some(0);
+    }
+    p.parse().ok()
+}
+
+/// An RGB channel: `None`, missing, as 0; past 255 as 255.
+fn channel(n: Option<u16>) -> u8 {
+    u8::try_from(n.unwrap_or(0).min(255)).unwrap_or(u8::MAX)
+}
+
+/// xterm's 16 colours, which the nearest of a 256-colour or RGB one is picked from.
+const PALETTE: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// The nearest of the 16 colours to 256-colour `n`.
+fn palette_256(n: u16) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match n {
+        0..=15 => u8::try_from(n).unwrap_or(7),
+        16..=231 => {
+            let i = usize::from(n - 16);
+            nearest((LEVELS[i / 36], LEVELS[i / 6 % 6], LEVELS[i % 6]))
+        }
+        _ => {
+            let v = u8::try_from(8 + 10 * (n.min(255) - 232)).unwrap_or(u8::MAX);
+            nearest((v, v, v))
+        }
+    }
+}
+
+fn nearest((r, g, b): (u8, u8, u8)) -> u8 {
+    let d = |&(pr, pg, pb): &(u8, u8, u8)| {
+        let sq = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2);
+        sq(r, pr) + sq(g, pg) + sq(b, pb)
+    };
+    (0..16u8)
+        .min_by_key(|&i| d(&PALETTE[usize::from(i)]))
+        .unwrap_or(7)
+}
+
+/// A run of a terminal line's text drawn in one [`Style`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub style: Style,
+    pub text: String,
+}
+
+/// Filter a terminal line as [`terminal_safe`] does, retaining SGR styles in text runs.
+/// Start with `style` and update it to the line's final state. A carriage return clears
+/// the text accumulated so far without resetting the style.
+pub fn terminal_runs(line: &str, style: &mut Style) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    let mut chars = line.chars().peekable();
+    let push = |runs: &mut Vec<Run>, style: Style, c: char| match runs.last_mut() {
+        Some(r) if r.style == style => r.text.push(c),
+        _ => runs.push(Run {
+            style,
+            text: c.to_string(),
+        }),
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    csi(&mut chars, style);
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    skip_string(&mut chars);
+                }
+                _ => skip_escape(&mut chars),
+            },
+            '\u{9b}' => csi(&mut chars, style),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            '\r' => runs.clear(),
+            '\n' | '\t' => push(&mut runs, *style, c),
+            c if c.is_control() || vk_hub_proto::invisible(c) => {}
+            c => push(&mut runs, *style, c),
+        }
+    }
+    runs
+}
+
+/// The longest SGR parameters applied.
+const MAX_SGR: usize = 64;
+
+/// Read a CSI sequence as [`skip_csi`] skips it, applying it to `style` when it is an SGR.
+fn csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, style: &mut Style) {
+    let mut params = String::new();
+    // Past what any SGR needs, it is skipped unapplied, as half of it would be wrong.
+    let mut overflow = false;
+    while let Some(&c) = chars.peek() {
+        if ('\u{20}'..='\u{3f}').contains(&c) {
+            chars.next();
+            if params.len() < MAX_SGR {
+                params.push(c);
+            } else {
+                overflow = true;
+            }
+            continue;
+        }
+        if ('\u{40}'..='\u{7e}').contains(&c) {
+            chars.next();
+            if c == 'm'
+                && !overflow
+                && params
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b';' || b == b':')
+            {
+                style.apply(&params);
+            }
+        }
+        return;
+    }
+}
+
 /// Skip a CSI sequence's parameters and intermediates, then its final character. A character
 /// that can be none of them ends it unread.
 fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
@@ -171,6 +421,218 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_line_s_colours_make_runs() {
+        let mut style = Style::default();
+        let runs = terminal_runs(
+            "\u{1b}[32;1mok\u{1b}[0m plain \u{1b}[38;5;196mred\u{1b}[m\u{1b}]0;title\u{7}",
+            &mut style,
+        );
+        let shown: Vec<(String, &str)> = runs
+            .iter()
+            .map(|r| (r.style.classes(), r.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("c-f2 c-bold".to_string(), "ok"),
+                (String::new(), " plain "),
+                ("c-f9".to_string(), "red"),
+            ]
+        );
+        // A carriage return starts the line over, in the style then set.
+        let runs = terminal_runs("\u{1b}[31m10%\r20%", &mut style);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].style.fg, runs[0].text.as_str()), (Some(1), "20%"));
+        // The line leaves the style it set, which the next starts from.
+        assert_eq!(style.fg, Some(1));
+        let runs = terminal_runs("still red", &mut style);
+        assert_eq!(runs[0].style.fg, Some(1));
+    }
+
+    /// What each SGR sequence makes of a style set red and bold on a green background.
+    #[test]
+    fn sgr_sequences_set_the_style() {
+        let base = Style {
+            fg: Some(1),
+            bg: Some(2),
+            bold: true,
+            faint: true,
+            italic: true,
+            underline: true,
+        };
+        let long = format!("\u{1b}[{}1m", "0;".repeat(40));
+        let cases: Vec<(String, Style)> = vec![
+            (
+                "\u{1b}[22m".into(),
+                Style {
+                    bold: false,
+                    faint: false,
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[23m".into(),
+                Style {
+                    italic: false,
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[24m".into(),
+                Style {
+                    underline: false,
+                    ..base
+                },
+            ),
+            ("\u{1b}[39m".into(), Style { fg: None, ..base }),
+            ("\u{1b}[49m".into(), Style { bg: None, ..base }),
+            (
+                "\u{1b}[40m".into(),
+                Style {
+                    bg: Some(0),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[47m".into(),
+                Style {
+                    bg: Some(7),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[100m".into(),
+                Style {
+                    bg: Some(8),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[107m".into(),
+                Style {
+                    bg: Some(15),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[90m".into(),
+                Style {
+                    fg: Some(8),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[97m".into(),
+                Style {
+                    fg: Some(15),
+                    ..base
+                },
+            ),
+            // The 256 colours' greys, and a cube colour, as the nearest of the 16.
+            (
+                "\u{1b}[38;5;232m".into(),
+                Style {
+                    fg: Some(0),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[38;5;255m".into(),
+                Style {
+                    fg: Some(7),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[38;5;21m".into(),
+                Style {
+                    fg: Some(4),
+                    ..base
+                },
+            ),
+            // No colour given, none set.
+            ("\u{1b}[38;5m".into(), base),
+            (
+                "\u{1b}[48;2;0;0;0m".into(),
+                Style {
+                    bg: Some(0),
+                    ..base
+                },
+            ),
+            // An RGB colour without all three channels sets none.
+            ("\u{1b}[48;2m".into(), base),
+            ("\u{1b}[38;2;0;0m".into(), base),
+            // A parameter too large is ignored; an empty one is 0, a reset.
+            ("\u{1b}[99999;3m".into(), base),
+            (
+                "\u{1b}[;1m".into(),
+                Style {
+                    bold: true,
+                    ..Style::default()
+                },
+            ),
+            ("\u{1b}[m".into(), Style::default()),
+            // Past what any SGR needs, nothing is applied.
+            (long, base),
+            // Other sequences leave the style be.
+            ("\u{1b}[?25l\u{1b}[2K".into(), base),
+            // Sub-parameters, `:`-separated, as one group.
+            (
+                "\u{1b}[38:5:196m".into(),
+                Style {
+                    fg: Some(9),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[48:2::0:0:250m".into(),
+                Style {
+                    bg: Some(4),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[38:2:0:0:250m".into(),
+                Style {
+                    fg: Some(4),
+                    ..base
+                },
+            ),
+            (
+                "\u{1b}[4:0m".into(),
+                Style {
+                    underline: false,
+                    ..base
+                },
+            ),
+            ("\u{1b}[4:3m".into(), base),
+            ("\u{1b}[1:2m".into(), base),
+            ("\u{1b}[38:5m".into(), base),
+        ];
+        for (seq, want) in cases {
+            let mut style = base;
+            let runs = terminal_runs(&format!("{seq}x"), &mut style);
+            assert_eq!(style, want, "{seq:?}");
+            assert_eq!(runs.len(), 1, "{seq:?}");
+            assert_eq!(runs[0].text, "x", "{seq:?}");
+        }
+        // Invisible characters go, inside a run as anywhere.
+        let mut style = Style::default();
+        let runs = terminal_runs("a\u{200b}b\u{1b}[1mc\u{202e}d", &mut style);
+        let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["ab", "cd"]);
+        // On a background, text reads dark unless it has a colour of its own.
+        assert_eq!(
+            Style {
+                bg: Some(7),
+                ..Style::default()
+            }
+            .classes(),
+            "c-b7 c-on"
+        );
+    }
 
     #[test]
     fn interpolated_text_cannot_be_markup() {

@@ -185,6 +185,102 @@ pre {
 }
 pre time, pre .cut { color: var(--muted); }
 
+/* A job's page: its output to the left, its record beside it, as GitLab lays out a job. */
+.job-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22rem;
+  gap: var(--s4);
+  align-items: start;
+}
+.job-page > aside > section {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--s3) var(--s4);
+}
+.job-page aside table.kv th { width: auto; padding-right: var(--s3); }
+.job-page aside table.kv td { overflow-wrap: anywhere; }
+@media (max-width: 70rem) {
+  .job-page { grid-template-columns: minmax(0, 1fr); }
+  /* The record first, so the result stays above a long log. */
+  .job-page > aside { order: -1; }
+}
+
+/* A job's log: a terminal's, dark whatever the page's scheme, each line numbered. */
+pre.log {
+  --log-bg: #1f1f23;
+  --log-fg: #e8e8ec;
+  --log-muted: #8b8b94;
+  background: var(--log-bg);
+  color: var(--log-fg);
+  border-color: #2e2e34;
+  color-scheme: dark;
+  max-height: 80vh;
+  padding: var(--s3) var(--s3) var(--s3) 0;
+  white-space: normal;
+  counter-reset: line;
+  line-height: 1.6;
+}
+pre.log .l {
+  display: grid;
+  grid-template-columns: 4.5em 7.5ch minmax(0, 1fr);
+  column-gap: var(--s3);
+  counter-increment: line;
+}
+pre.log .l::before {
+  content: counter(line);
+  text-align: right;
+  color: var(--log-muted);
+  user-select: none;
+}
+pre.log .l:hover { background: #2a2a30; }
+pre.log time { color: var(--log-muted); }
+pre.log .t { grid-column: 3; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.log .cut { display: block; color: var(--log-muted); padding-left: calc(4.5em + var(--s3)); }
+/* The 16 colours of the terminal's palette, on the log's dark background. Text on one of
+   the light backgrounds reads dark, unless it sets a colour of its own (the rules after). */
+.c-b0 { background: #000000; }
+.c-b1 { background: #a8322c; }
+.c-b2 { background: #2b7a3f; }
+.c-b3 { background: #8a6d14; }
+.c-b4 { background: #2f5aa8; }
+.c-b5 { background: #7a3a96; }
+.c-b6 { background: #237a85; }
+.c-b7 { background: #8c8c94; }
+.c-b8 { background: #55555e; }
+.c-b9 { background: #d9453e; }
+.c-b10 { background: #3aa357; }
+.c-b11 { background: #b8951e; }
+.c-b12 { background: #4677d1; }
+.c-b13 { background: #a14fc4; }
+.c-b14 { background: #2fa3b0; }
+.c-b15 { background: #c8c8d0; }
+/* `--c` too, so faint text on them is mixed from it. */
+.c-b7, .c-b10, .c-b11, .c-b14, .c-b15 { --c: #000; color: var(--c); }
+/* `--c`: the colour set, which faint text is mixed from. */
+.c-f0 { --c: #7d7d88; color: var(--c); }
+.c-f1 { --c: #f0605a; color: var(--c); }
+.c-f2 { --c: #4fcf72; color: var(--c); }
+.c-f3 { --c: #e6c35c; color: var(--c); }
+.c-f4 { --c: #5f9cf5; color: var(--c); }
+.c-f5 { --c: #c97de6; color: var(--c); }
+.c-f6 { --c: #4fc8d6; color: var(--c); }
+.c-f7 { --c: #d4d4da; color: var(--c); }
+.c-f8 { --c: #9a9aa4; color: var(--c); }
+.c-f9 { --c: #ff8580; color: var(--c); }
+.c-f10 { --c: #7ae894; color: var(--c); }
+.c-f11 { --c: #ffe07a; color: var(--c); }
+.c-f12 { --c: #8ab8ff; color: var(--c); }
+.c-f13 { --c: #e5a3ff; color: var(--c); }
+.c-f14 { --c: #7ae6f0; color: var(--c); }
+.c-f15 { --c: #ffffff; color: var(--c); }
+/* Black on a background is black, not the grey that shows it on the log's own. */
+.c-on.c-f0 { --c: #000; color: var(--c); }
+.c-bold { font-weight: 700; }
+.c-faint { color: color-mix(in srgb, var(--c, currentColor) 70%, var(--log-bg)); }
+.c-it { font-style: italic; }
+.c-ul { text-decoration: underline; }
+
 /* Controls. */
 button, input, select { font: inherit; color: inherit; }
 button {

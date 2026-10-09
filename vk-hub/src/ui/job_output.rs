@@ -59,7 +59,7 @@ pub(super) fn section(h: &mut Html, j: &JobRow, output: &Output, live: bool) {
         Output::Kept(tail) => {
             h.raw("<section><h2>End of its output</h2><p class=\"sub\">The last ")
                 .text(bytes(tail.len() as u64))
-                .raw(", masked as the node streamed it.</p><pre>");
+                .raw(", masked as the node streamed it.</p><pre class=\"log\">");
             for line in crate::jobs::readable(tail) {
                 line_html(h, &line);
                 h.raw("\n");
@@ -101,7 +101,7 @@ fn held(h: &mut Html, stretch: &Stretch, live: bool) {
             .raw("\" hx-target=\"#job-lines\"></span>");
     }
     // `data-follow`: `follow.js` keeps it scrolled to its end while the reader is there.
-    h.raw("<pre data-follow><span id=\"job-lines\"");
+    h.raw("<pre class=\"log\" data-follow><span id=\"job-lines\"");
     if live {
         h.raw(" sse-swap=\"")
             .raw(LINES)
@@ -156,6 +156,8 @@ fn held_html(h: &mut Html, lines: &[TraceLine]) {
 /// One line of output, without its newline: its stamp as its time of day, the instant on
 /// hover, then its text.
 fn line_html(h: &mut Html, line: &TraceLine) {
+    // `ui.css` numbers each `.l`, as GitLab's log does.
+    h.raw("<span class=\"l\">");
     if let Some(at) = &line.at {
         // A plain `<time>`: `time.js` rewrites only those with a `datetime`.
         h.raw("<time title=\"")
@@ -164,7 +166,20 @@ fn line_html(h: &mut Html, line: &TraceLine) {
             .text(at.get(11..19).unwrap_or(at))
             .raw("</time> ");
     }
-    h.text(&line.text);
+    h.raw("<span class=\"t\">");
+    for run in &line.runs {
+        let classes = run.style.classes();
+        if classes.is_empty() {
+            h.text(&run.text);
+        } else {
+            h.raw("<span class=\"")
+                .text(&classes)
+                .raw("\">")
+                .text(&run.text)
+                .raw("</span>");
+        }
+    }
+    h.raw("</span></span>");
 }
 
 /// What `/events/job/<id>` streams: job `id`'s output and record as they change. Each stream

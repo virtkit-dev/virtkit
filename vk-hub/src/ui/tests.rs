@@ -3711,8 +3711,9 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
         "<tr><th>Message</th><td>the VM &lt;did&gt; not boot</td></tr>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
         "<h2>End of its output</h2>",
-        "<pre><time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> \
-         &lt;script&gt;alert(1)&lt;/script&gt;\n</pre>",
+        "<pre class=\"log\"><span class=\"l\"><time title=\"2026-10-09T12:10:43.123456Z\">\
+         12:10:43</time> <span class=\"t\"><span class=\"c-f1\">&lt;script&gt;alert(1)&lt;/script&gt;\
+         </span></span></span>\n</pre>",
     ] {
         assert!(page.contains(want), "{want}: {page}");
     }
@@ -3868,7 +3869,10 @@ async fn a_running_job_s_page_follows_its_output() {
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let first = format!("{}<b>first</b>\n{}10%\r\n", stamp(' '), stamp(' '));
     let id = running_with_output(&hub, dir, 1, first.as_bytes());
-    let time = "<time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> ";
+    // A line as the page draws it: numbered by `ui.css`, its time, then its text.
+    let time = "<span class=\"l\"><time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> \
+                <span class=\"t\">";
+    let end = "</span></span>";
 
     // The history links every job to its page.
     let page = get(addr, "/jobs", Some(&viewer)).await.body;
@@ -3882,14 +3886,14 @@ async fn a_running_job_s_page_follows_its_output() {
     assert_only_embedded_scripts(&page);
     for want in [
         format!(
-            "<div hx-ext=\"sse\" sse-connect=\"/events/job/{id}\" sse-close=\"close\">\
-             <div id=\"job-record\" sse-swap=\"job\">"
+            "<div class=\"job-page\" hx-ext=\"sse\" sse-connect=\"/events/job/{id}\" \
+             sse-close=\"close\"><div class=\"job-output\">"
         ),
         "<span hidden sse-swap=\"output-start\" hx-target=\"#job-lines\"></span>".to_string(),
         format!(
-            "<pre data-follow><span id=\"job-lines\" sse-swap=\"output\" hx-swap=\"beforeend\">\
-             {time}&lt;b&gt;first&lt;/b&gt;\n</span><span id=\"job-held\" sse-swap=\"held\">\
-             {time}10%</span></pre>"
+            "<pre class=\"log\" data-follow><span id=\"job-lines\" sse-swap=\"output\" hx-swap=\"beforeend\">\
+             {time}&lt;b&gt;first&lt;/b&gt;{end}\n</span><span id=\"job-held\" sse-swap=\"held\">\
+             {time}10%{end}</span></pre>"
         ),
     ] {
         assert!(page.contains(&want), "{want}: {page}");
@@ -3906,11 +3910,11 @@ async fn a_running_job_s_page_follows_its_output() {
     // What the page shows, replacing it: a stream opened again shows no line twice.
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: output-start\ndata: {time}&lt;b&gt;first&lt;/b&gt;\ndata: \n\n")
+        format!("event: output-start\ndata: {time}&lt;b&gt;first&lt;/b&gt;{end}\ndata: \n\n")
     );
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: held\ndata: {time}10%\n\n")
+        format!("event: held\ndata: {time}10%{end}\n\n")
     );
     let record = stream.next().await.unwrap();
     assert!(
@@ -3925,7 +3929,7 @@ async fn a_running_job_s_page_follows_its_output() {
     more_output(&hub, dir, &id, &cut);
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: held\ndata: {time}20%\n\n")
+        format!("event: held\ndata: {time}20%{end}\n\n")
     );
     // The record shows the output's length: it follows it.
     let record = stream.next().await.unwrap();
@@ -3935,11 +3939,11 @@ async fn a_running_job_s_page_follows_its_output() {
     more_output(&hub, dir, &id, &rest);
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: output\ndata: {time}20%\ndata: {time}déjà ✓\ndata: \n\n")
+        format!("event: output\ndata: {time}20%{end}\ndata: {time}déjà ✓{end}\ndata: \n\n")
     );
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: held\ndata: {time}last\n\n")
+        format!("event: held\ndata: {time}last{end}\n\n")
     );
     let record = stream.next().await.unwrap();
     assert!(record.starts_with("event: job\ndata: "), "{record}");
@@ -3961,7 +3965,7 @@ async fn a_running_job_s_page_follows_its_output() {
     hub.job_changed(&id);
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: output\ndata: {time}last\ndata: \n\n")
+        format!("event: output\ndata: {time}last{end}\ndata: \n\n")
     );
     assert_eq!(stream.next().await.unwrap(), "event: held\ndata: \n\n");
     let record = stream.next().await.unwrap();
@@ -3978,7 +3982,7 @@ async fn a_running_job_s_page_follows_its_output() {
     let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
     assert!(!page.contains("sse-connect"), "{page}");
     assert!(
-        page.contains(&format!("{time}déjà ✓\n{time}last\n</span>")),
+        page.contains(&format!("{time}déjà ✓{end}\n{time}last{end}\n</span>")),
         "{page}"
     );
 }
@@ -3991,7 +3995,9 @@ async fn a_job_s_stream_ends_once_its_output_went() {
     let dir = &scratch.0;
     let (addr, hub) = start_fleet_placing(dir).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let time = "<time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> ";
+    let time = "<span class=\"l\"><time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> \
+                <span class=\"t\">";
+    let end = "</span></span>";
     let settle = |id: &str| {
         let mut row = hub.db.job(id).unwrap().unwrap();
         row.settled_at = Some(crate::now_secs());
@@ -4022,13 +4028,13 @@ async fn a_job_s_stream_ends_once_its_output_went() {
     assert!(start.starts_with("event: output-start\n"), "{start}");
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: held\ndata: {time}line\n\n")
+        format!("event: held\ndata: {time}line{end}\n\n")
     );
     assert!(stream.next().await.unwrap().starts_with("event: job\n"));
     settle(&id);
     assert_eq!(
         stream.next().await.unwrap(),
-        format!("event: output\ndata: {time}line\ndata: \n\n")
+        format!("event: output\ndata: {time}line{end}\ndata: \n\n")
     );
     assert_eq!(stream.next().await.unwrap(), "event: held\ndata: \n\n");
     assert!(stream.next().await.unwrap().starts_with("event: job\n"));
@@ -4075,7 +4081,10 @@ async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
     assert!(start.contains(&format!("line {:07} ", last - 1)));
     assert!(!start.contains(&format!("line {last:07} ")));
     let held = stream.next().await.unwrap();
-    assert!(held.starts_with("event: held\ndata: <time "), "{held}");
+    assert!(
+        held.starts_with("event: held\ndata: <span class=\"l\"><time "),
+        "{held}"
+    );
     assert!(held.contains(&format!("line {last:07} ")), "{held}");
     // 600 KiB more: read a stretch at a time, in order.
     let more = lines(last + 1, last + 1 + 6000);

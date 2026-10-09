@@ -52,6 +52,7 @@ use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 use crate::client::ApiError;
 use crate::server::{Hub, Reach};
 use crate::store::{ApiPrincipal, JobFilter, JobOutcome, JobPage, JobRow, NodeRow};
+use crate::ui::html::Style;
 
 /// How long a node may be unreachable while it holds a job before the job is lost, by
 /// default.
@@ -2273,8 +2274,10 @@ pub fn output_stretch(
 pub struct TraceLine {
     /// When it came, from its stamp (`FF_TIMESTAMPS`): `2026-10-09T12:10:43.123456Z`.
     pub at: Option<String>,
-    /// Its text, [`crate::ui::html::terminal_safe`].
+    /// Its text as [`crate::ui::html::terminal_runs`] leaves it, styles aside.
     pub text: String,
+    /// The same text in runs of the style its SGR sequences set.
+    pub runs: Vec<crate::ui::html::Run>,
 }
 
 /// `output`, a job's trace, for reading: lines continued (`+` stamps) joined to the line they
@@ -2322,6 +2325,9 @@ pub struct Trace {
     next: u64,
     /// The held line the last stretch ended inside, before its newline.
     open: Option<u64>,
+    /// SGR state after the completed lines, carried into the next line. A trace read from
+    /// the middle of a log starts with the default style.
+    style: Style,
 }
 
 /// A line [`Trace`] holds back.
@@ -2345,8 +2351,8 @@ impl HeldLine {
         self.text.len().saturating_add(HELD_LINE_COST)
     }
 
-    fn shown(self) -> Option<TraceLine> {
-        shown((self.at, self.text))
+    fn shown(self, style: &mut Style) -> Option<TraceLine> {
+        shown((self.at, self.text), style)
     }
 }
 
@@ -2447,15 +2453,17 @@ impl Trace {
                 // What continues it is read as a line of its own.
                 self.open = None;
             }
-            done.extend(line.shown());
+            done.extend(line.shown(&mut self.style));
         }
     }
 
     /// The lines held back, as they read so far.
     pub fn held(&self) -> Vec<TraceLine> {
+        // Preview from a copy: only completed lines advance the saved style.
+        let mut style = self.style;
         self.held
             .iter()
-            .filter_map(|l| shown((l.at.clone(), l.text.clone())))
+            .filter_map(|l| shown((l.at.clone(), l.text.clone()), &mut style))
             .collect()
     }
 
@@ -2463,7 +2471,8 @@ impl Trace {
     pub fn finish(&mut self) -> Vec<TraceLine> {
         self.open = None;
         self.cost = 0;
-        self.held.drain(..).filter_map(HeldLine::shown).collect()
+        let style = &mut self.style;
+        self.held.drain(..).filter_map(|l| l.shown(style)).collect()
     }
 }
 
@@ -2526,17 +2535,15 @@ fn before_escape(line: &str, end: usize) -> usize {
 }
 
 /// Format a joined line with its timestamp: remove GitLab section markers, keep the final
-/// carriage-return update, and apply [`crate::ui::html::terminal_safe`]. Return `None`
-/// for a line containing only a section marker.
-fn shown((at, text): (Option<String>, String)) -> Option<TraceLine> {
+/// carriage-return update, and draw it with [`crate::ui::html::terminal_runs`] from `style`,
+/// the style the lines before it left, which it leaves as the line does. Return `None` for a
+/// line containing only a section marker.
+fn shown((at, text): (Option<String>, String), style: &mut Style) -> Option<TraceLine> {
     let (text, marked) = without_sections(&text);
-    let shown = text
-        .trim_end_matches('\r')
-        .rsplit('\r')
-        .next()
-        .unwrap_or_default();
-    let text = crate::ui::html::terminal_safe(shown);
-    (!marked || !text.trim().is_empty()).then_some(TraceLine { at, text })
+    // What the terminal was left showing: the text after the last carriage return.
+    let runs = crate::ui::html::terminal_runs(text.trim_end_matches('\r'), style);
+    let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+    (!marked || !text.trim().is_empty()).then_some(TraceLine { at, text, runs })
 }
 
 /// Whether `h` is a stamp's header: `2026-10-09T12:10:43.123456Z 01O ` or `+` at its end.
@@ -2693,6 +2700,42 @@ mod tests {
         assert!(held[0].text.ends_with(CUT_MARK), "{}", held[0].text.len());
         assert!(held[0].text.starts_with('z'));
         assert_eq!(held[0].text.len(), MAX_HELD_LINE + CUT_MARK.len());
+    }
+
+    /// Colours carry between lines and stream stretches. Previewing an open line uses
+    /// the saved style without advancing it.
+    #[test]
+    fn a_colour_carries_from_line_to_line() {
+        let stamp = |kind: char| format!("2026-10-09T12:10:43.123456Z 01O{kind}");
+        let fg = |l: &TraceLine| l.runs.first().and_then(|r| r.style.fg);
+        let output = format!(
+            "{}\x1b[31mred\n{}still red\x1b[0m\n{}plain\n",
+            stamp(' '),
+            stamp(' '),
+            stamp(' ')
+        );
+        let lines = readable(output.as_bytes());
+        assert_eq!(
+            lines.iter().map(fg).collect::<Vec<_>>(),
+            [Some(1), Some(1), None]
+        );
+        let mut trace = Trace::default();
+        assert!(
+            trace
+                .push(&format!("{}\x1b[32mgreen\n", stamp(' ')))
+                .is_empty()
+        );
+        let done = trace.push(&format!("{}open \x1b[34mblue", stamp(' ')));
+        assert_eq!(done.iter().map(fg).collect::<Vec<_>>(), [Some(2)]);
+        // Held, open: drawn from green, again and again, the style unmoved by it.
+        for _ in 0..2 {
+            assert_eq!(trace.held().iter().map(fg).collect::<Vec<_>>(), [Some(2)]);
+        }
+        assert!(trace.push("\n").is_empty());
+        // Done, it is drawn from green still, and leaves blue for the next.
+        let done = trace.push(&format!("{}next\n", stamp(' ')));
+        assert_eq!(done.iter().map(fg).collect::<Vec<_>>(), [Some(2)]);
+        assert_eq!(trace.held().iter().map(fg).collect::<Vec<_>>(), [Some(4)]);
     }
 
     /// A line left open while the other stream writes on holds back no more than

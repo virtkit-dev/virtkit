@@ -1211,9 +1211,13 @@ sessions, trigger a full page load. Each node's page links to its jobs.
 `/jobs/<id>`, for viewers and operators alike, shows a job's record: its result, failure class,
 exit code and the node's message, its GitLab page when the spec names a plain web URL, its
 project, node, pool and key, when it was submitted, started, finished and settled, how long it
-ran and what it used. Then its output, as the node masked it, in a `<pre>`, as text: lines
-continued after a cut joined back, a line rewritten by carriage returns as it was left,
-GitLab's section markers and the terminal's escape sequences and other controls dropped, and
+ran and what it used, in a column to the right of the output, as in GitLab (above it on narrow
+screens). The output is masked by the node and shown on a dark terminal background, with lines
+numbered from the first shown. Continued lines are rejoined, carriage returns keep the final
+update, and GitLab section markers are removed. SGR colours, bold, faint, italic and underline
+carry between lines; 256-colour and RGB values map to the nearest of 16 colours. Styles use
+`ui.css` classes because the policy forbids inline styles. Other terminal escapes and controls
+are dropped. The page shows
 each line's stamp as its time of day, the full instant on hover. A line is kept to 64 KiB: past it,
 what precedes its last carriage return goes, else its head is kept, ending `…`. Lines waiting for a
 `+` line to continue them are held to 256 KiB in all, past which the oldest is taken as complete;
@@ -1235,8 +1239,8 @@ shows no line twice. A stream opened once the output has gone sends the record a
 change to the record — a new stage, more output, the result — replaces the record. Once the job has
 finished and its output is read to its end, the stream sends its last line and its result, and
 closes. The output stays scrolled to its end as it grows, unless scrolled up to read, and keeps its
-last 2 MiB of text or so, saying earlier lines went; that takes the embedded `follow.js`, without
-which it grows unscrolled and whole.
+last 2 MiB of text or so, with a notice for omitted lines and the remaining line numbers intact.
+This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

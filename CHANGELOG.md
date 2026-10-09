@@ -32,7 +32,8 @@ All notable changes to virtkit will be documented in this file.
   links to the job's page. It shows the available log's tail, follows new lines while the job
   runs, and shows the final result. Output scrolls to the end unless you scroll up to read.
   Once its producer settles a job that did not fail, the page says the log is gone and links
-  to the job on GitLab when a web link is available.
+  to the job on GitLab when a web link is available. The log uses GitLab's style: a dark
+  background, numbered lines, the output's colours and bold text, and job details on the right.
 - **`vk-hub`'s Jobs page filters by job name, branch and pipeline.** The name and branch
   match any part, ignoring the case of ASCII letters; each row shows its branch and pipeline,
   the pipeline linked to GitLab, and clicking a job's name, branch or pipeline narrows the page

@@ -740,23 +740,25 @@ fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], n
             .external_link(j.job_url.as_deref(), "On GitLab");
     }
     h.raw(" · <a href=\"").raw(PATH).raw("\">All jobs</a></p>");
+    // The output to the left, the record beside it, as GitLab lays out a job.
     // The router takes only hex for a job's ID.
     if live && vk_hub_proto::valid_id(id) {
-        h.raw("<div hx-ext=\"sse\" sse-connect=\"")
+        h.raw("<div class=\"job-page\" hx-ext=\"sse\" sse-connect=\"")
             .raw(job_output::EVENTS)
             .text(id)
-            .raw("\" sse-close=\"close\"><div id=\"job-record\" sse-swap=\"")
+            .raw("\" sse-close=\"close\"><div class=\"job-output\">");
+        job_output::section(&mut h, j, output, true);
+        h.raw("</div><aside id=\"job-record\" sse-swap=\"")
             .raw(job_output::RECORD)
             .raw("\">");
         record(&mut h, j, &names, now);
-        h.raw("</div>");
-        job_output::section(&mut h, j, output, true);
-        h.raw("</div>");
+        h.raw("</aside></div>");
     } else {
-        h.raw("<div id=\"job-record\">");
-        record(&mut h, j, &names, now);
-        h.raw("</div>");
+        h.raw("<div class=\"job-page\"><div class=\"job-output\">");
         job_output::section(&mut h, j, output, false);
+        h.raw("</div><aside id=\"job-record\">");
+        record(&mut h, j, &names, now);
+        h.raw("</aside></div>");
     }
     h
 }
