@@ -111,6 +111,36 @@ pub fn live_driver(dir: &Path) -> Option<i32> {
         .then_some(pid)
 }
 
+/// GitLab IDs of accepted jobs without results in `jobs_dir` (`<state_dir>/node/jobs`),
+/// including jobs still running or awaiting cleanup.
+pub fn unfinished(jobs_dir: &Path) -> Result<Vec<u64>> {
+    let entries = match std::fs::read_dir(jobs_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", jobs_dir.display())),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", jobs_dir.display()))?;
+        // As `Jobs::open_with` reads it: anything not named by a hub job ID is not a job.
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(vk_hub_proto::valid_id)
+        {
+            continue;
+        }
+        let dir = entry.path();
+        // No meta: taken down before it was accepted, and removed at the next start.
+        if let Ok(meta) = read_meta(&dir)
+            && !dir.join(RESULT).exists()
+        {
+            ids.push(meta.gitlab_id);
+        }
+    }
+    Ok(ids)
+}
+
 pub fn scripts_dir(dir: &Path) -> PathBuf {
     dir.join("scripts")
 }

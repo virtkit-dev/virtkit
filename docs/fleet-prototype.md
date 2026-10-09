@@ -357,16 +357,17 @@ follows the runner it finds there rather than start a second.
 
 A drain completes on what the node can observe. gitlab-runner, sent `SIGQUIT`, exits only
 once its jobs are over, cleanup stage included; the admission ledger holds and awaits
-nothing; and no job supervisor is still alive — a job dir alone proves nothing, since a
-failed cleanup leaves one behind, but its supervisor's pid, checked against the job dir, says
-whether its VM is still up. The report carries which of the three hold (`drain`) while the
-node drains. These are the node's own state dir's ledger and job dirs, so the executor its
-runner runs must use the same vk configuration; the node warns at start when the runner's
-config names another. `undrain` returns a drained or draining node to `ready`; a quarantine
-stops acquisition from any state and only `release` lifts it, returning the node to `drained`
-if that is where it was quarantined and to `ready` otherwise. A quarantined node refuses
-`drain` and `undrain`. All of it is persisted on the node, and a restart or a lost hub leaves
-it where it was.
+nothing; and no job is left: no job the hub placed is without its result, and no job
+supervisor is still alive — a job dir alone proves nothing, since a failed cleanup leaves one
+behind, but its supervisor's pid, checked against the job dir, says whether its VM is still
+up. The report carries which of the three hold (`drain`) while the node drains, its job count
+including placed jobs without a supervisor yet or still being cleaned up after. These are the
+node's own state dir's ledger and job dirs, so the executor its runner runs must use the same
+vk configuration; the node warns at start when the runner's config names another. `undrain`
+returns a drained or draining node to `ready`; a quarantine stops acquisition from any state
+and only `release` lifts it, returning the node to `drained` if that is where it was
+quarantined and to `ready` otherwise. A quarantined node refuses `drain` and `undrain`. All of
+it is persisted on the node, and a restart or a lost hub leaves it where it was.
 
 ## Releases
 

@@ -399,10 +399,25 @@ impl Core {
             .context("reading the admission ledger for the drain")?;
         let jobs = crate::vm::live_job_supervisors(&cfg.state_dir().join("jobs"))
             .context("counting the jobs left for the drain")?;
+        // Count placed jobs from acceptance to result, including before supervisor startup
+        // and during cleanup after driver exit. Match supervisors by GitLab job ID alone:
+        // an external runner's job from another GitLab instance with the same ID hides the
+        // placed job, leaving the count one short until either ends.
+        let placed = super::jobs::journal::unfinished(&self.dir.join("jobs"))
+            .context("counting the placed jobs left for the drain")?;
+        let unsupervised = placed
+            .iter()
+            .filter(|id| {
+                let name = id.to_string();
+                !jobs
+                    .iter()
+                    .any(|(dir, _)| dir.file_name() == Some(name.as_ref()))
+            })
+            .count();
         let progress = DrainProgress {
             runner_stopped: self.runner.as_ref().map(|r| *r.borrow()) == Some(RunnerState::Stopped),
             ledger_empty: held.granted == 0 && held.ahead == 0,
-            active_jobs: u32::try_from(jobs.len()).unwrap_or(u32::MAX),
+            active_jobs: u32::try_from(jobs.len().saturating_add(unsupervised)).unwrap_or(u32::MAX),
         };
         self.set(&self.drain, Some(progress));
         // Reset stops supervisors left by failed cleanup; waiting for them or the admission
@@ -465,7 +480,8 @@ const PREPARE_WAIT: Duration = Duration::from_secs(600);
 
 /// Whether a drain is complete: the runner has exited — which it does on `SIGQUIT` only once
 /// its jobs, their cleanup stage included, are over — the ledger holds and awaits nothing,
-/// and no job supervisor is left, which catches a job whose cleanup failed and left its VM up.
+/// and no job is left: no placed job without its result, and no job supervisor, which catches
+/// a job whose cleanup failed and left its VM up.
 fn drained(p: &DrainProgress) -> bool {
     p.runner_stopped && p.ledger_empty && p.active_jobs == 0
 }
@@ -515,6 +531,9 @@ mod tests {
             .unwrap(),
         )
     }
+
+    /// A hub job ID, naming a placed job's journal.
+    const PLACED: &str = "0123456789abcdef0123456789abcdef";
 
     fn drain() -> Command {
         Command {
@@ -571,7 +590,19 @@ mod tests {
         core.step(&cfg, true).unwrap();
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().acquisition, Some(Acquisition::Run));
+        // A placed job accepted, with no supervisor: it holds the drain past the runner.
+        let placed = dir.join("jobs").join(PLACED);
+        std::fs::create_dir_all(&placed).unwrap();
+        std::fs::write(
+            placed.join(crate::node::jobs::journal::META),
+            r#"{"gitlab_id":41,"slot":0,"project_slot":0,"project_id":7}"#,
+        )
+        .unwrap();
         runner_tx.send(RunnerState::Stopped).unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        assert_eq!(core.report().drain.unwrap().active_jobs, 1);
+        std::fs::write(placed.join(crate::node::jobs::journal::RESULT), "{}").unwrap();
         core.step(&cfg, true).unwrap();
         assert_eq!(core.state(), NodeState::Drained);
         assert_eq!(core.unrecorded()[0].outcome, Outcome::Done);
