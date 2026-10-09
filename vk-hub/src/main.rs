@@ -1331,11 +1331,13 @@ fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
     )
 }
 
-/// `vk-hub jobs`' table.
+/// `vk-hub jobs`' table: how long each job ran, or has been running, and the most memory
+/// its VM held, rounded up to a MiB, where its node reported it.
 fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
-    let rows: Vec<[String; 8]> = jobs
+    let rows: Vec<[String; 10]> = jobs
         .iter()
         .map(|(id, j)| {
+            let usage = j.result.as_ref().and_then(|r| r.usage);
             [
                 id.clone(),
                 j.key_name.clone(),
@@ -1344,6 +1346,12 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
                 j.node.clone().unwrap_or_else(|| "-".to_string()),
                 j.output_len.to_string(),
                 format!("{} ago", human_duration(ago(now, j.created_at))),
+                j.ran_ms(now)
+                    .map_or_else(|| "-".to_string(), jobs::run_text),
+                usage.and_then(|u| u.peak_mem_bytes).map_or_else(
+                    || "-".to_string(),
+                    |b| workloads::size_mib(b.div_ceil(1 << 20)),
+                ),
                 j.title.clone(),
             ]
         })
@@ -1357,6 +1365,8 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
             "NODE",
             "OUTPUT",
             "SUBMITTED",
+            "RAN",
+            "PEAK",
             "JOB",
         ],
         &rows,

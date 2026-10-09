@@ -1067,14 +1067,24 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     let resp = read.await.unwrap();
     assert_eq!(resp.body, b"done\n");
 
-    // The result, recorded; the output complete.
+    // The result, recorded with what the job used; the output complete.
+    let mut ended = result(Some(FailureClass::Script), 17);
+    ended.usage = Some(vk_hub_proto::job::JobUsage {
+        wall_ms: 4200,
+        cpu_ms: Some(1500),
+        peak_mem_bytes: Some(1 << 30),
+        cpus: Some(2),
+        mem_mib: Some(4096),
+    });
     node.send(NodeJobMsg::Result {
         job: id.clone(),
-        result: result(Some(FailureClass::Script), 17),
+        result: ended.clone(),
     });
     assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
     let done = view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
-    assert_eq!(done.result.unwrap().failure, Some(FailureClass::Script));
+    let done_result = done.result.unwrap();
+    assert_eq!(done_result.failure, Some(FailureClass::Script));
+    assert_eq!(done_result.usage, ended.usage);
     assert_eq!(done.output_len, 17);
     let resp = api(
         addr,
@@ -1163,11 +1173,19 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     ] {
         assert!(events.contains(&want), "{want} not in {events:?}");
     }
-    // The UI links the job to its page on GitLab.
+    // The UI links the job to its page on GitLab, and its history shows where it ran, when,
+    // and what it used.
+    let row = hub.db.job(&id).unwrap().unwrap();
     assert_eq!(
-        hub.db.job(&id).unwrap().unwrap().job_url.as_deref(),
+        row.job_url.as_deref(),
         Some("https://gitlab.example.com/group/project/-/jobs/2")
     );
+    assert_eq!(
+        (row.project.as_deref(), row.name.as_deref()),
+        (Some("group/project"), Some("test"))
+    );
+    assert!(row.started_at.is_some() && row.started_at <= row.finished_at);
+    assert_eq!(row.ran_ms(crate::now_secs()), Some(4200));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2189,6 +2207,8 @@ fn the_jobs_table_says_how_each_job_stands() {
         placement: placement(),
         title: "GitLab job 7 of g/p (test)".into(),
         job_url: None,
+        project: None,
+        name: None,
         created_at: 1000,
         state,
         revision: 1,
@@ -2197,12 +2217,27 @@ fn the_jobs_table_says_how_each_job_stands() {
         cancel: None,
         result,
         output_len: 42,
+        started_at: None,
         finished_at: None,
         settled_at: None,
     };
+    let mut running = row(JobState::Running, None);
+    running.started_at = Some(1010);
+    let mut measured = row(JobState::Finished, Some(result(None, 0)));
+    measured.result.as_mut().unwrap().usage = Some(vk_hub_proto::job::JobUsage {
+        wall_ms: 185_000,
+        peak_mem_bytes: Some(3 << 30),
+        ..Default::default()
+    });
+    let mut small = row(JobState::Finished, Some(result(None, 0)));
+    small.result.as_mut().unwrap().usage = Some(vk_hub_proto::job::JobUsage {
+        wall_ms: 400,
+        peak_mem_bytes: Some(300 << 10),
+        ..Default::default()
+    });
     let out = render_jobs(
         &[
-            ("aa".repeat(16), row(JobState::Running, None)),
+            ("aa".repeat(16), running),
             (
                 "bb".repeat(16),
                 row(
@@ -2210,14 +2245,31 @@ fn the_jobs_table_says_how_each_job_stands() {
                     Some(result(Some(FailureClass::Lost), 0)),
                 ),
             ),
+            ("cc".repeat(16), measured),
+            ("dd".repeat(16), small),
         ],
         1060,
     );
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].starts_with("ID"), "{out}");
     assert!(
-        lines[1].contains("running: step_script") && lines[1].contains("1m ago"),
+        lines[0].starts_with("ID") && lines[0].contains("RAN") && lines[0].contains("PEAK"),
+        "{out}"
+    );
+    // Running for 50 seconds; nothing measured yet.
+    assert!(
+        lines[1].contains("running: step_script")
+            && lines[1].contains("1m ago")
+            && lines[1].contains("50s"),
         "{out}"
     );
     assert!(lines[2].contains("failed: lost"), "{out}");
+    assert!(
+        lines[3].contains("succeeded") && lines[3].contains("3m05s") && lines[3].contains("3G"),
+        "{out}"
+    );
+    // Under a second and a MiB: neither reads as nothing.
+    assert!(
+        lines[4].contains("<1s") && lines[4].contains(" 1M "),
+        "{out}"
+    );
 }

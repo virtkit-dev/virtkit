@@ -486,6 +486,12 @@ async fn submit(
         job_url: match &ask.spec {
             JobSpec::GitlabCi(ci) => ci.job_url(),
         },
+        project: match &ask.spec {
+            JobSpec::GitlabCi(ci) => Some(vk_hub_proto::display_safe(&ci.job.project_path)),
+        },
+        name: match &ask.spec {
+            JobSpec::GitlabCi(ci) => Some(vk_hub_proto::display_safe(&ci.job.name)),
+        },
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,
@@ -494,6 +500,7 @@ async fn submit(
         cancel: None,
         result: None,
         output_len: 0,
+        started_at: None,
         finished_at: None,
         settled_at: None,
     };

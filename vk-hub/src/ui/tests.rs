@@ -3292,6 +3292,8 @@ async fn placed_jobs_are_shown_live() {
         },
         title: "GitLab job 7 of g/<b>p</b> (test)".into(),
         job_url: Some("https://gitlab.example.com/g/p/-/jobs/7".into()),
+        project: None,
+        name: None,
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,
@@ -3300,6 +3302,7 @@ async fn placed_jobs_are_shown_live() {
         cancel: None,
         result: None,
         output_len: 0,
+        started_at: None,
         finished_at: None,
         settled_at: None,
     };

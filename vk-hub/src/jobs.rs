@@ -620,6 +620,7 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
             // Journaled: accepted, whatever answer was lost.
             if job.row.state != JobState::Running {
                 job.row.state = JobState::Running;
+                job.row.started_at.get_or_insert_with(crate::now_secs);
                 job.row.revision = job.row.revision.saturating_add(1);
                 job.spec = None;
                 writes.push((j.job.clone(), job.row.clone(), Vec::new()));
@@ -794,6 +795,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                     return Ok(Vec::new());
                 }
                 row.state = JobState::Running;
+                row.started_at.get_or_insert_with(crate::now_secs);
                 job.spec = None;
                 job.reservation = None;
                 events.push((
@@ -826,6 +828,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
             }
             RunState::Running { stage } => {
                 row.state = JobState::Running;
+                row.started_at.get_or_insert_with(crate::now_secs);
                 job.spec = None;
                 job.reservation = None;
                 row.stage = Some(vk_hub_proto::display_safe(&stage));
@@ -1867,6 +1870,17 @@ pub fn listing(hub: &Hub, limit: usize) -> Result<Vec<(String, JobRow)>> {
         }
     }
     Ok(rows)
+}
+
+/// A job's run or CPU time, `ms` milliseconds, to the second: `42s`, `3m05s`, `1h02m`.
+pub(crate) fn run_text(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0 => "<1s".to_string(),
+        1..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 #[cfg(test)]

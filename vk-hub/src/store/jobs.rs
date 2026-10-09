@@ -41,6 +41,12 @@ pub struct JobRow {
     /// What the job is, for display: GitLab's job ID, project and name.
     #[serde(default)]
     pub title: String,
+    /// Display-safe GitLab project (`group/project`); `None` for an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The job's name in its pipeline, display-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The job's GitLab page from its spec; `None` for an invalid URL or an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>,
@@ -58,6 +64,9 @@ pub struct JobRow {
     /// The output's length: as stored while the job runs, final once it has finished.
     #[serde(default)]
     pub output_len: u64,
+    /// When a node accepted it, on the hub's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
     #[serde(default)]
     pub finished_at: Option<u64>,
     /// When its producer settled it and its output was dropped.
@@ -78,6 +87,20 @@ impl JobRow {
             cancel: self.cancel,
             result: self.result.clone(),
         }
+    }
+
+    /// Runtime in milliseconds, using the node's measurement when available. Otherwise,
+    /// use the hub's time from acceptance to completion, or to `now` while running.
+    /// `None` for a job no node accepted.
+    pub fn ran_ms(&self, now: u64) -> Option<u64> {
+        if let Some(usage) = self.result.as_ref().and_then(|r| r.usage) {
+            return Some(usage.wall_ms);
+        }
+        let end = match self.state {
+            JobState::Finished => self.finished_at?,
+            _ => now,
+        };
+        Some(end.saturating_sub(self.started_at?).saturating_mul(1000))
     }
 }
 
@@ -311,7 +334,7 @@ fn sweep_requests(db: &Db, requests: &mut redb::Table<'_, &str, &[u8]>, now: u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vk_hub_proto::job::Envelope;
+    use vk_hub_proto::job::{Envelope, FailureClass};
 
     fn row(revision: u64) -> JobRow {
         JobRow {
@@ -325,6 +348,8 @@ mod tests {
             },
             title: "gitlab job 7".into(),
             job_url: None,
+            project: None,
+            name: None,
             created_at: 10,
             state: JobState::Queued,
             revision,
@@ -333,6 +358,7 @@ mod tests {
             cancel: None,
             result: None,
             output_len: 0,
+            started_at: None,
             finished_at: None,
             settled_at: None,
         }
@@ -396,5 +422,48 @@ mod tests {
         );
         assert!(db.job(&id).unwrap().is_none());
         assert!(db.job_spec(&id).unwrap().is_none());
+    }
+
+    /// Job `n` of a history in `state`: submitted at `n`, on node `a…` or `b…` by parity, of
+    /// project `p<n % 3>`, started at once and, finished, ended by `failure` `n` seconds on.
+    fn job(n: u64, state: JobState, failure: Option<FailureClass>) -> JobRow {
+        let mut row = row(1);
+        row.request_id = format!("{n:032}");
+        row.created_at = n;
+        row.project = Some(format!("p{}", n % 3));
+        row.node = Some(if n.is_multiple_of(2) { "a" } else { "b" }.repeat(32));
+        row.state = state;
+        if state == JobState::Queued {
+            return row;
+        }
+        row.started_at = Some(n);
+        if state != JobState::Finished {
+            return row;
+        }
+        row.finished_at = Some(n + n);
+        row.result = Some(JobResult {
+            failure,
+            exit_code: None,
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: None,
+        });
+        row
+    }
+
+    /// The node's own measure of a job's run wins over the hub's timestamps.
+    #[test]
+    fn a_jobs_run_is_the_nodes_measure_when_it_sent_one() {
+        let mut row = job(5, JobState::Finished, None);
+        assert_eq!(row.ran_ms(100), Some(5000));
+        if let Some(r) = row.result.as_mut() {
+            r.usage = Some(vk_hub_proto::job::JobUsage {
+                wall_ms: 4321,
+                ..Default::default()
+            });
+        }
+        assert_eq!(row.ran_ms(100), Some(4321));
+        assert_eq!(job(5, JobState::Queued, None).ran_ms(100), None);
     }
 }

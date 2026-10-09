@@ -885,7 +885,8 @@ answers its result with `recorded` without changing the job's.
 continue, with nodes resending output from the end of the stored file.
 
 `vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
-output length, age and what the job is. The web UI's operations page lists the latest 20, live,
+output length, age, how long it ran (or has been running), its VM's peak memory, and what the
+job is. The web UI's operations page lists the latest 20, live,
 to viewers and operators alike, each leading to its page on GitLab.
 
 ## Web UI
