@@ -173,10 +173,11 @@ pub struct Trial {
 
 /// What a node can do, which decides what commands it takes.
 pub struct Abilities {
-    /// The node runs and can stop its runner, as reset and update without `force` require.
-    /// Drain and quarantine also work without a managed runner: they stop the hub-placed jobs
+    /// The node can stop everything that takes jobs on the host — the runner it manages, or,
+    /// with no runner, the hub's placed jobs — as reset and update without `force` require.
+    /// Drain and quarantine also work with an external runner: they stop the hub-placed jobs
     /// the node runs itself.
-    pub managed: bool,
+    pub drainable: bool,
     /// Whether it can install the update a command names, or why not. Looked at only for an
     /// update.
     pub update: Result<(), String>,
@@ -287,9 +288,9 @@ impl Persisted {
 
     /// [`Persisted::command_as`] for a node that can install any update.
     #[cfg(test)]
-    pub fn command(&mut self, command: Command, now: u64, managed: bool) -> CommandAck {
+    pub fn command(&mut self, command: Command, now: u64, drainable: bool) -> CommandAck {
         let can = Abilities {
-            managed,
+            drainable,
             update: Ok(()),
         };
         self.command_as(command, now, &can)
@@ -330,7 +331,7 @@ impl Persisted {
         let refused = |reason: &str| Outcome::Refused {
             reason: reason.to_string(),
         };
-        let (op, managed) = (&command.op, can.managed);
+        let (op, drainable) = (&command.op, can.drainable);
         if let Some(outcome) = self.during_job(op) {
             return outcome;
         }
@@ -393,7 +394,7 @@ impl Persisted {
             (Operation::Update { .. }, NodeState::Quarantined) => {
                 refused("the node is quarantined; release it first")
             }
-            (Operation::Update { force: false, .. }, _) if !managed => refused(
+            (Operation::Update { force: false, .. }, _) if !drainable => refused(
                 "the runner is external, so vk node cannot drain it, and jobs running across the \
                  switch would run their stages with two vk versions; update with --force to \
                  accept that",
@@ -420,7 +421,7 @@ impl Persisted {
                 };
                 let (resume, next) = match state {
                     // vk node cannot drain an external runner: straight to the download.
-                    NodeState::Ready if !managed => (NodeState::Ready, NodeState::Maintenance),
+                    NodeState::Ready if !drainable => (NodeState::Ready, NodeState::Maintenance),
                     NodeState::Ready => (NodeState::Ready, NodeState::Draining),
                     NodeState::Draining => (NodeState::Drained, NodeState::Draining),
                     _ => (NodeState::Drained, NodeState::Maintenance),
@@ -455,7 +456,7 @@ impl Persisted {
             (Operation::Reset { .. }, NodeState::Quarantined) => {
                 refused("the node is quarantined; release it first")
             }
-            (Operation::Reset { .. }, _) if !managed => refused(
+            (Operation::Reset { .. }, _) if !drainable => refused(
                 "a reset drains the runner first, which vk node cannot do to a runner it does \
                  not run ([node] runner = \"external\")",
             ),
@@ -1163,7 +1164,7 @@ mod tests {
 
         let mut p = Persisted::default();
         let stuck = Abilities {
-            managed: true,
+            drainable: true,
             update: Err("/usr/bin is not writable".into()),
         };
         let ack = p.command_as(update("u"), 1, &stuck);

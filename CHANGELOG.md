@@ -19,6 +19,15 @@ All notable changes to virtkit will be documented in this file.
   `hub.toml`, `"0"` to keep none). Unsettled jobs retain no log beyond 30 days after finishing.
   A failed job's page shows that log, readable without GitLab by every signed-in session,
   including viewers. `vk-hub jobs show <id>` prints the same.
+- **Set `[node] runner = "none"` for fleet hosts running only the hub's jobs.** Such a node
+  drains, resets and updates like one whose gitlab-runner it supervises — no `--force`, no
+  refused resets, no "the runner may still take jobs" notes — and is included in rollouts.
+  Left unset, the mode is `"none"` on a host that shows no gitlab-runner and `"external"`
+  otherwise, so runner hosts `vk node` can see keep their behaviour. `vk node run`,
+  `vk node join` and `vk node service install` refuse `"none"` on a host that runs a
+  gitlab-runner with the vk executor. `vk check` on a node and the node's page show the mode,
+  and `vk-hub nodes` notes a node that runs none. A hub older than this release sees such a
+  node as having an external runner.
 - **`vk-hub`'s web UI shows each job's log, live while it runs.** Every result on the Jobs page
   links to the job's page. It shows the available log's tail, follows new lines while the job
   runs, and shows the final result. Output scrolls to the end unless you scroll up to read.
@@ -108,6 +117,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **An unset `[node] runner` follows what the host shows.** It is `"external"` where a
+  gitlab-runner shows — its systemd unit, unmasked, or a `gitlab-runner` on systemd's `PATH` —
+  and `"none"` otherwise. A host whose runner `vk node` cannot see, such as one in a container,
+  must set `[node] runner = "external"`.
 - **`vk check --feature gitlab` requires a `gitlab-runner` in `[executor] tools_dir` only where
   one runs on the host** — one `vk node` manages, or one on systemd's `PATH`. Jobs a hub places
   need only `git` there.

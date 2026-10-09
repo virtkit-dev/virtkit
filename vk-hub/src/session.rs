@@ -1,7 +1,8 @@
 //! One node's WebSocket session: authenticate against the key pinned at enrollment with
 //! hello/challenge/auth, then store inventory, heartbeats and reports until it disconnects.
 //! From version [`STEERING`], also send desired state and commands; from version [`JOBS`],
-//! reservations and jobs ([`crate::jobs`]); from version [`vk_hub_proto::TOOLS`], tools builds.
+//! reservations and jobs ([`crate::jobs`]); from version [`vk_hub_proto::TOOLS`], tools builds;
+//! from version [`vk_hub_proto::RUNNER_NONE`], reports of nodes that run no gitlab-runner.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -35,11 +36,12 @@ const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 #[cfg(test)]
 const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
-/// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`] and
-/// [`vk_hub_proto::TOOLS`]. A node offering less negotiates the highest version both speak.
+/// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`],
+/// [`vk_hub_proto::TOOLS`] and [`vk_hub_proto::RUNNER_NONE`]. A node offering less negotiates
+/// the highest version both speak.
 pub const PROTOCOL: VersionRange = VersionRange {
     min: vk_hub_proto::PROTOCOL.min,
-    max: vk_hub_proto::TOOLS,
+    max: vk_hub_proto::RUNNER_NONE,
 };
 
 /// What a node removed from the hub is told.

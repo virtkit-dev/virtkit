@@ -1262,6 +1262,7 @@ fn prune(dir: &Path, keep: &[Option<String>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::core::Runner;
     use crate::node::state::{Issuer, Release};
     use std::sync::Mutex;
     use vk_hub_proto::{Command, Operation, RunnerState};
@@ -1562,8 +1563,12 @@ mod tests {
 
     fn core_on_trial(dir: &Path, deadline: u64) -> (Arc<Core>, Job, Trial) {
         let trial = on_trial(dir, 1, deadline, false);
-        let mut core =
-            Core::open(dir, issuer(), Some(watch::channel(RunnerState::Stopped).1)).unwrap();
+        let mut core = Core::open(
+            dir,
+            issuer(),
+            Runner::Managed(watch::channel(RunnerState::Stopped).1),
+        )
+        .unwrap();
         Arc::get_mut(&mut core).unwrap().set_exec(fake_exec);
         let job = core.persisted().job.unwrap();
         (core, job, trial)
@@ -1700,7 +1705,7 @@ mod tests {
             identity: crate::node::identity::Identity::load_or_create(dir).unwrap(),
             incarnation: "cd".repeat(16),
             tls: Arc::new(tls),
-            core: Core::open(dir, Issuer { hub, ..issuer() }, None).unwrap(),
+            core: Core::open(dir, Issuer { hub, ..issuer() }, Runner::External).unwrap(),
             jobs: crate::node::jobs::for_test(dir, crate::config::Config::default(), None),
         }
     }
@@ -1902,7 +1907,7 @@ mod tests {
         let mut core = Core::open(
             &node,
             issuer(),
-            Some(watch::channel(RunnerState::Stopped).1),
+            Runner::Managed(watch::channel(RunnerState::Stopped).1),
         )
         .unwrap();
         Arc::get_mut(&mut core).unwrap().set_exec(fake_exec);

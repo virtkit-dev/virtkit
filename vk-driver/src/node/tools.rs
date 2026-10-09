@@ -1348,7 +1348,7 @@ mod tests {
             hub: "https://hub".into(),
             node_id: "ab".repeat(16),
         };
-        Core::open(&state, issuer, None).unwrap()
+        Core::open(&state, issuer, crate::node::core::Runner::External).unwrap()
     }
 
     /// Give `core` the tools build of `sha256` to carry out, its phase `phase` as saved.

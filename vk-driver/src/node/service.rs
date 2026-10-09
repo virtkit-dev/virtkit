@@ -225,7 +225,8 @@ pub enum CiUser {
 }
 
 /// `vk node service install`, for the node to run as `user` when given; only root may name
-/// one.
+/// one. Refused where `[node] runner = "none"` but a runner is found, as `vk node run` would
+/// refuse to start.
 pub fn install(
     cfg: &Config,
     start: bool,
@@ -233,6 +234,7 @@ pub fn install(
     user: Option<&str>,
     ci_user: CiUser,
 ) -> Result<()> {
+    super::runner_mode(cfg).map_err(anyhow::Error::msg)?;
     let scope = Scope::current();
     let dir = super::dir(cfg);
     let account = match (scope, user) {
@@ -278,7 +280,7 @@ pub fn install(
         };
         ci_user_matches(cfg, Some(uid), &name, ci_user == CiUser::Warn)?;
     }
-    if cfg.node.runner == vk_hub_proto::RunnerMode::Managed
+    if cfg.node.runner == Some(vk_hub_proto::RunnerMode::Managed)
         && cfg.node.gitlab_runner.is_none()
         && on_path("gitlab-runner", SYSTEMD_PATH).is_none()
     {

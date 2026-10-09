@@ -179,10 +179,10 @@ pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
 pub fn runner_config_in(cfg: &Config, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     match (&cfg.node.runner_config, cfg.node.runner) {
         (Some(path), _) => Some(path.clone()),
-        (None, vk_hub_proto::RunnerMode::Managed) => home
+        (None, Some(vk_hub_proto::RunnerMode::Managed)) => home
             .filter(|h| !h.is_empty())
             .map(|h| Path::new(h).join(".gitlab-runner/config.toml")),
-        (None, vk_hub_proto::RunnerMode::External) => None,
+        (None, _) => None,
     }
 }
 

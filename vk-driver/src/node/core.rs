@@ -22,9 +22,20 @@ use super::state::{Abilities, Issuer, Persisted, Work};
 use super::update::Binary;
 use crate::config::Config;
 
+/// The node's gitlab-runner, as `[node] runner` says.
+pub enum Runner {
+    /// Run by the node: its process, as its supervisor reports it.
+    Managed(watch::Receiver<RunnerState>),
+    /// Run by something else, which may take jobs whatever the node is told.
+    External,
+    /// None: the node runs only the hub's placed jobs, all of which it can stop.
+    None,
+}
+
 pub struct Core {
     dir: PathBuf,
-    /// A managed runner's process, as its supervisor reports it; `None` for an external runner.
+    mode: RunnerMode,
+    /// A managed runner's process, as its supervisor reports it; `None` otherwise.
     runner: Option<watch::Receiver<RunnerState>>,
     persisted: Mutex<Persisted>,
     concurrency: Mutex<Option<Concurrency>>,
@@ -56,14 +67,14 @@ pub struct Core {
 }
 
 impl Core {
-    /// Load the state in `dir`, for `issuer` — the hub and node ID the node is enrolled as.
-    /// `runner` is a managed runner's state as its supervisor reports it, `None` for an
-    /// external runner.
-    pub fn open(
-        dir: &Path,
-        issuer: Issuer,
-        runner: Option<watch::Receiver<RunnerState>>,
-    ) -> Result<Arc<Core>> {
+    /// Load the state in `dir`, for `issuer` — the hub and node ID the node is enrolled as —
+    /// for a node with `runner`.
+    pub fn open(dir: &Path, issuer: Issuer, runner: Runner) -> Result<Arc<Core>> {
+        let (mode, runner) = match runner {
+            Runner::Managed(state) => (RunnerMode::Managed, Some(state)),
+            Runner::External => (RunnerMode::External, None),
+            Runner::None => (RunnerMode::None, None),
+        };
         let mut persisted = Persisted::load(dir)?;
         let before = persisted.clone();
         if persisted.adopt_issuer(issuer) {
@@ -76,13 +87,14 @@ impl Core {
         if persisted != before {
             persisted.save(dir)?;
         }
-        if runner.is_none() && persisted.state == NodeState::Draining {
+        if mode == RunnerMode::External && persisted.state == NodeState::Draining {
             say!("the node is draining with an external runner, which may still take jobs");
         }
         let (acquire, _) = watch::channel(!persisted.acquisition_stopped());
         let (changed, _) = watch::channel(0);
         Ok(Arc::new(Core {
             dir: dir.to_path_buf(),
+            mode,
             runner,
             persisted: Mutex::new(persisted),
             concurrency: Mutex::new(None),
@@ -138,7 +150,7 @@ impl Core {
 
     /// Journal `command` and carry it out. An external runner cannot be stopped, so a reset is
     /// refused, and a drain or a quarantine leaves it running; an update is refused when the
-    /// node could not install it, or may not.
+    /// node could not install it, or may not. A node with no runner stops all it runs.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
         let update = match &command.op {
             // Looked at only for an update: it reads the filesystem.
@@ -165,7 +177,7 @@ impl Core {
             _ => Ok(()),
         };
         let can = Abilities {
-            managed: self.runner.is_some(),
+            drainable: self.mode != RunnerMode::External,
             update,
         };
         self.update(|p| p.command_as(command, now, &can))
@@ -297,7 +309,7 @@ impl Core {
         let placed = self.placed();
         let mut unsupported = Vec::new();
         // A host with no runner of its own runs only the hub's jobs, which a stop stops.
-        if stopped && runner.is_none() && placed.runner.is_some() {
+        if stopped && self.mode == RunnerMode::External && placed.runner.is_some() {
             unsupported.push(
                 "stopping acquisition: the runner is external ([node] runner = \"external\"), \
                  so it may still take jobs"
@@ -309,16 +321,17 @@ impl Core {
             unsupported,
             state: Some(persisted.state),
             // Stopped only once a managed runner has exited: until then it may be one that
-            // never heard its signal.
-            acquisition: Some(if stopped && runner == Some(RunnerState::Stopped) {
-                Acquisition::Stop
-            } else {
-                Acquisition::Run
-            }),
-            runner: Some(match runner {
-                Some(_) => RunnerMode::Managed,
-                None => RunnerMode::External,
-            }),
+            // never heard its signal. With no runner, the node takes no placed job at once.
+            acquisition: Some(
+                if stopped
+                    && (self.mode == RunnerMode::None || runner == Some(RunnerState::Stopped))
+                {
+                    Acquisition::Stop
+                } else {
+                    Acquisition::Run
+                },
+            ),
+            runner: Some(self.mode),
             runner_state: runner,
             concurrency: *lock(&self.concurrency),
             concurrency_error: lock(&self.concurrency_error).clone(),
@@ -442,7 +455,16 @@ impl Core {
             })
             .count();
         let progress = DrainProgress {
-            runner_stopped: self.runner.as_ref().map(|r| *r.borrow()) == Some(RunnerState::Stopped),
+            // With no runner, the placed jobs stand in for it: a reset, which waits for the
+            // runner alone, then waits for each to have its result. A supervisor left past
+            // its result, by a failed cleanup, is what the reset is for.
+            runner_stopped: match self.mode {
+                RunnerMode::Managed => {
+                    self.runner.as_ref().map(|r| *r.borrow()) == Some(RunnerState::Stopped)
+                }
+                RunnerMode::External => false,
+                RunnerMode::None => placed.is_empty(),
+            },
             ledger_empty: held.granted == 0 && held.ahead == 0,
             active_jobs: u32::try_from(jobs.len().saturating_add(unsupervised)).unwrap_or(u32::MAX),
         };
@@ -492,7 +514,7 @@ impl Core {
             }
             progress.runner_stopped && held.ahead == 0 && preparing.is_empty()
         } else {
-            drained(&progress, self.runner.is_some())
+            drained(&progress, self.mode == RunnerMode::Managed)
         };
         if done && self.update(|p| p.finish_drain(now))? {
             say!("drained");
@@ -524,7 +546,7 @@ const PREPARE_WAIT: Duration = Duration::from_secs(600);
 /// nothing, and no job is left: no placed job without its result, and no job supervisor,
 /// which catches a job whose cleanup failed and left its VM up. An external runner is not
 /// waited for: it does not stop, and its jobs show in the ledger and as supervisors while they
-/// run.
+/// run. Nor is there one to wait for on a node with none.
 fn drained(p: &DrainProgress, managed: bool) -> bool {
     (p.runner_stopped || !managed) && p.ledger_empty && p.active_jobs == 0
 }
@@ -630,7 +652,7 @@ mod tests {
     fn a_drain_waits_for_the_runner_then_finishes() {
         let dir = scratch("drain");
         let (runner_tx, runner) = watch::channel(RunnerState::Running);
-        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::Managed(runner)).unwrap();
         let allowed = core.acquire();
         let cfg = cfg(&dir);
         assert!(*allowed.borrow());
@@ -657,8 +679,12 @@ mod tests {
         assert_eq!(report.runner, Some(RunnerMode::Managed));
         assert_eq!(report.concurrency.unwrap().effective, Some(3));
         // Persisted: a restarted node is still drained and still not taking jobs.
-        let again =
-            Core::open(&dir, issuer(), Some(watch::channel(RunnerState::Stopped).1)).unwrap();
+        let again = Core::open(
+            &dir,
+            issuer(),
+            Runner::Managed(watch::channel(RunnerState::Stopped).1),
+        )
+        .unwrap();
         assert_eq!(again.state(), NodeState::Drained);
         assert!(!*again.acquire().borrow());
         let _ = std::fs::remove_dir_all(&dir);
@@ -667,7 +693,7 @@ mod tests {
     #[test]
     fn the_hub_ceiling_binds_and_an_external_runner_says_what_it_cannot_do() {
         let dir = scratch("ceiling");
-        let core = Core::open(&dir, issuer(), None).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::External).unwrap();
         let cfg = cfg(&dir);
         core.apply_desired(DesiredState {
             generation: 1,
@@ -710,7 +736,7 @@ mod tests {
     fn a_node_without_a_managed_runner_drains_once_its_jobs_and_the_ledger_are_done() {
         use crate::node::jobs::journal;
         let dir = scratch("external-drain");
-        let core = Core::open(&dir, issuer(), None).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::External).unwrap();
         let cfg = cfg(&dir);
         // A placed job accepted, its supervisor not started yet.
         let placed = dir.join("jobs").join(PLACED);
@@ -756,6 +782,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With no runner, everything that takes jobs on the host is the node's: a stop and a
+    /// drain stop it with no runner to wait for, and a reset and an update without `--force`
+    /// go through, where an external runner refuses them.
+    #[test]
+    fn a_node_with_no_runner_stops_what_it_runs_and_takes_resets_and_updates() {
+        let dir = scratch("no-runner");
+        let bin = scratch("no-runner-bin");
+        let exe = bin.join("vk");
+        std::fs::write(&exe, "").unwrap();
+        let cfg = cfg(&dir);
+        let command = |id: &str, op| Command {
+            id: id.into(),
+            expires_at: u64::MAX,
+            op,
+        };
+        let update = || Operation::Update {
+            version: "999.0.0".into(),
+            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+            size: 1,
+            signature: None,
+            within_secs: None,
+            force: false,
+        };
+        let external = Core::open(&dir, issuer(), Runner::External).unwrap();
+        external
+            .change(|p| p.installed = Some(exe.clone()))
+            .unwrap();
+        for (id, op) in [("r0", Operation::Reset { images: false }), ("u0", update())] {
+            let ack = external.command(command(id, op), 1).unwrap();
+            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+        }
+        drop(external);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+
+        let core = Core::open(&dir, issuer(), Runner::None).unwrap();
+        core.change(|p| p.installed = Some(exe.clone())).unwrap();
+        core.apply_desired(DesiredState {
+            generation: 1,
+            ceiling: None,
+            acquisition: Acquisition::Stop,
+        })
+        .unwrap();
+        let report = core.report();
+        assert_eq!(report.runner, Some(RunnerMode::None));
+        assert_eq!(report.runner_state, None);
+        assert_eq!(report.acquisition, Some(Acquisition::Stop));
+        assert_eq!(report.unsupported, Vec::<String>::new());
+        core.command(drain(), 1).unwrap();
+        step(&core, &cfg);
+        assert_eq!(core.state(), NodeState::Drained);
+        core.command(command("u", Operation::Undrain), 1).unwrap();
+        let ack = core
+            .command(command("r", Operation::Reset { images: false }), 1)
+            .unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        step(&core, &cfg);
+        assert_eq!(core.state(), NodeState::Maintenance);
+        core.change(|p| {
+            p.end_job(Outcome::Done, vk_hub_proto::UpdatePhase::Done);
+        })
+        .unwrap();
+        assert_eq!(core.state(), NodeState::Ready);
+        // An update drains first, as with a managed runner.
+        let ack = core.command(command("u1", update()), 1).unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        assert_eq!(core.state(), NodeState::Draining);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
     #[test]
     fn a_drain_completes_while_the_concurrency_cannot_be_set() {
         let dir = scratch("broken");
@@ -765,8 +862,12 @@ mod tests {
             dir.join("state").display().to_string()
         ))
         .unwrap();
-        let core =
-            Core::open(&dir, issuer(), Some(watch::channel(RunnerState::Stopped).1)).unwrap();
+        let core = Core::open(
+            &dir,
+            issuer(),
+            Runner::Managed(watch::channel(RunnerState::Stopped).1),
+        )
+        .unwrap();
         core.command(drain(), 1).unwrap();
         step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Drained);
@@ -787,7 +888,7 @@ mod tests {
     async fn every_runner_transition_changes_the_report() {
         let dir = scratch("transitions");
         let (runner_tx, runner) = watch::channel(RunnerState::Running);
-        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::Managed(runner)).unwrap();
         let (halt, stop) = watch::channel(false);
         let task = tokio::spawn(
             core.clone()
@@ -850,7 +951,7 @@ mod tests {
                 .parse()
                 .unwrap()
         };
-        let core = Core::open(&dir, issuer(), None).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::External).unwrap();
         let (halt, stop) = watch::channel(false);
         let task = tokio::spawn(
             core.clone()
@@ -902,7 +1003,7 @@ mod tests {
         std::fs::write(admit.join("79"), "1024 3 granted\n").unwrap();
         let preparing = crate::admit::hold(&admit, "79").unwrap();
         let (_runner, runner) = watch::channel(RunnerState::Stopped);
-        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::Managed(runner)).unwrap();
         let cfg = cfg(&dir);
         let command = |id: &str, op| Command {
             id: id.into(),
@@ -943,6 +1044,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With no runner, a reset waits for every placed job's result, a live supervisor or not,
+    /// and then goes past a supervisor left behind.
+    #[test]
+    fn a_reset_with_no_runner_waits_for_the_placed_jobs() {
+        use crate::node::jobs::journal;
+        let dir = scratch("reset-none");
+        let placed = dir.join("jobs").join(PLACED);
+        std::fs::create_dir_all(&placed).unwrap();
+        std::fs::write(
+            placed.join(journal::META),
+            r#"{"gitlab_id":41,"slot":0,"project_slot":0,"project_id":7}"#,
+        )
+        .unwrap();
+        let job = dir.join("state").join("jobs").join("41");
+        std::fs::create_dir_all(&job).unwrap();
+        /// The supervisor's stand-in, killed however the test ends.
+        struct Killed(std::process::Child);
+        impl Drop for Killed {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Killed(
+            std::process::Command::new("sh")
+                .args(["-c", "while :; do sleep 1; done", job.to_str().unwrap()])
+                .spawn()
+                .unwrap(),
+        );
+        std::fs::write(job.join("supervisor.pid"), child.0.id().to_string()).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::None).unwrap();
+        let cfg = cfg(&dir);
+        let ack = core
+            .command(
+                Command {
+                    id: "r".into(),
+                    expires_at: u64::MAX,
+                    op: Operation::Reset { images: false },
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        step(&core, &cfg);
+        assert_eq!(core.state(), NodeState::Draining);
+        // Its result in, the supervisor still up: the reset goes on.
+        std::fs::write(placed.join(journal::RESULT), "{}").unwrap();
+        step(&core, &cfg);
+        assert_eq!(core.state(), NodeState::Maintenance);
+        drop(child);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_reset_waiting_too_long_on_a_job_being_prepared_fails_and_stays_drained() {
         let dir = scratch("reset-prepare");
@@ -952,7 +1106,7 @@ mod tests {
         std::fs::write(admit.join("79"), "1024 1 granted\n").unwrap();
         let _preparing = crate::admit::hold(&admit, "79").unwrap();
         let (_runner, runner) = watch::channel(RunnerState::Stopped);
-        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let core = Core::open(&dir, issuer(), Runner::Managed(runner)).unwrap();
         let cfg = cfg(&dir);
         let reset = Command {
             id: "r".into(),

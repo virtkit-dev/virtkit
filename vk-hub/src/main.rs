@@ -1900,6 +1900,12 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
             n.hostname
         ));
     }
+    if n.report.as_ref().and_then(|r| r.runner) == Some(vk_hub_proto::RunnerMode::None) {
+        placement.push(format!(
+            "{}: no gitlab-runner, placed jobs only",
+            n.hostname
+        ));
+    }
     let Some(report) = &n.report else {
         return placement;
     };

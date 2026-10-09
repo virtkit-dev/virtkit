@@ -222,8 +222,9 @@ pub struct Facts {
     pub outcome: Option<Outcome>,
     /// The phase the node reports its rollout update in, if it reports that one.
     pub phase: Option<vk_hub_proto::UpdatePhase>,
-    /// Whether it runs its gitlab-runner itself, so it can be drained.
-    pub managed: bool,
+    /// Whether it can stop everything that takes jobs on it, so it can be drained: it runs its
+    /// gitlab-runner itself, or runs none.
+    pub drainable: bool,
     /// The protocol version of its latest session.
     pub protocol: Option<u32>,
     /// Whether it has an update of its own under way, not the rollout's: an operator's,
@@ -240,7 +241,10 @@ impl Facts {
             state: report.and_then(|r| r.state),
             vk: versions.map(|v| v.vk.clone()),
             vk_sha256: versions.and_then(|v| v.vk_sha256.clone()),
-            managed: report.and_then(|r| r.runner) == Some(vk_hub_proto::RunnerMode::Managed),
+            drainable: matches!(
+                report.and_then(|r| r.runner),
+                Some(vk_hub_proto::RunnerMode::Managed | vk_hub_proto::RunnerMode::None)
+            ),
             protocol: node.protocol,
             ..Facts::default()
         }
@@ -263,7 +267,7 @@ pub fn ineligible(f: &Facts, force: bool) -> Option<&'static str> {
     match f.state {
         None => Some("it has not reported its state"),
         Some(NodeState::Quarantined) => Some("quarantined"),
-        Some(_) if !f.managed && !force => {
+        Some(_) if !f.drainable && !force => {
             Some("vk node cannot drain its external runner; --force includes it")
         }
         Some(_) => None,
@@ -674,7 +678,7 @@ mod tests {
             vk_sha256: Some(if on { SHA.into() } else { "cd".repeat(32) }),
             outcome: None,
             phase: None,
-            managed: true,
+            drainable: true,
             protocol: Some(vk_hub_proto::STEERING),
             own_update: false,
         }
@@ -913,13 +917,34 @@ mod tests {
         );
     }
 
+    /// A node drains when it runs its runner or runs none; one that reports no mode, or an
+    /// external runner, does not.
+    #[test]
+    fn a_node_with_a_managed_runner_or_none_is_drainable() {
+        use vk_hub_proto::RunnerMode;
+        let of = |runner| {
+            Facts::of(&NodeRow {
+                report: Some(vk_hub_proto::Report {
+                    runner,
+                    ..vk_hub_proto::Report::default()
+                }),
+                ..NodeRow::default()
+            })
+            .drainable
+        };
+        assert!(of(Some(RunnerMode::Managed)));
+        assert!(of(Some(RunnerMode::None)));
+        assert!(!of(Some(RunnerMode::External)));
+        assert!(!of(None));
+    }
+
     #[test]
     fn busy_unreported_and_unmanaged_nodes_are_skipped_unless_forced() {
         let mut facts: HashMap<String, Facts> = ["n1", "n2", "n3", "n4"]
             .iter()
             .map(|n| (n.to_string(), ready(false)))
             .collect();
-        facts.get_mut("n1").unwrap().managed = false;
+        facts.get_mut("n1").unwrap().drainable = false;
         facts.get_mut("n2").unwrap().state = None;
         facts.get_mut("n3").unwrap().state = Some(NodeState::Maintenance);
         let mut r = row(plan(nodes(), 4, false), 5);

@@ -137,6 +137,17 @@ sudo vk node service install --user gitlab-runner
 
 `sudo vk node join … --user gitlab-runner --service` does both, and sets the user up first.
 
+Set `[node] runner = "none"` for a host running only hub-placed jobs, `"managed"` when the node
+supervises its gitlab-runner, or `"external"` for any other runner host
+([Drain and runner lifecycle](#drain-and-runner-lifecycle)). An unset mode is `external` if the
+host has an unmasked `gitlab-runner.service` with its program present, regardless of its config,
+or a `gitlab-runner` on systemd's `PATH`; otherwise it is `none`
+([one kind of host](#placed-jobs-on-the-node)). Detectable runner hosts keep their mode. Set it
+explicitly for a runner the node cannot see, such as one in a container: otherwise the mode is
+`none`. `vk node join`, `vk node service install` and `vk node run` refuse `none` when they find
+a runner with the vk executor. On a node or where the mode is set, `vk check` reports the mode
+and why it applies.
+
 The unit's own `--user gitlab-runner` stays harmless for the vk custom executor, but a
 shell-executor runner on the same host then fails: it switches to that user with `su`, which
 takes root.
@@ -230,10 +241,12 @@ updates and serves releases (see [Releases](#releases)), and a node applies them
 placed jobs (see [Placed jobs](#placed-jobs)). Version 4 adds CI tools builds: the `tools`
 operation, which names a tools definition by sha256 and size; the build's progress on the
 report; and the definition's download, `GET /v1/tools/<sha256>`, signed as a release download is
-but under the label `vk-fleet tools-download v1` (see [CI tools](#ci-tools)). The hub speaks
-versions 1 to 4, and so does `vk node`, from ranges of their own; `vk_hub_proto::PROTOCOL`
-stays 1 to 2.
-A session negotiates version 3 or 4 only with a node that implements it.
+but under the label `vk-fleet tools-download v1` (see [CI tools](#ci-tools)). Version 5 adds
+the `none` runner mode on the report ([Drain and runner lifecycle](#drain-and-runner-lifecycle));
+in a session below it a node with no runner reports `external`, which an older hub reads and
+steers the more cautious way. The hub speaks versions 1 to 5, and so does `vk node`, from ranges
+of their own; `vk_hub_proto::PROTOCOL` stays 1 to 2.
+A session negotiates version 3 or later only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -358,9 +371,10 @@ A drain is `accepted`, and its ack moves to `done` once the node is drained, or 
 an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once. An
 update and a reset are `accepted` too, and end `done` or `failed` ([Update trial and
 rollback](#update-trial-and-rollback), [Resets](#resets)). Any other command the node can carry
-out is `done` when received. A reset needs a runner the node runs itself, and the node refuses
-it with an external runner. Drain, quarantine and a stop of acquisition in the desired state
-apply with either runner to the jobs the hub places on the node; with an external runner the
+out is `done` when received. A reset needs a node that can stop everything taking jobs on the
+host — a runner it runs itself, or no runner at all (`[node] runner = "none"`) — and the node
+refuses it with an external runner. Drain, quarantine and a stop of acquisition in the desired
+state apply in every mode to the jobs the hub places on the node; with an external runner the
 node also reports that its runner may still take jobs (`unsupported`), and still sets the
 runner's concurrency ([Drain and runner lifecycle](#drain-and-runner-lifecycle)). Each change
 is written, and its directory fsynced, before the ack goes out: the hub does not send a command
@@ -417,18 +431,28 @@ offers and starts without a reservation ([Placed jobs on the node](#placed-jobs-
 so the hub stops placing work on it. A start on a reservation granted before the drain is
 still accepted, as the hub may already hold its GitLab job, and the drain waits for that job.
 
-With `[node] runner = "external"`, the node does not run gitlab-runner. On a host that takes
-placed jobs, which runs none ([one kind of host](#placed-jobs-on-the-node)), those are all there
-is to stop. On a host whose own gitlab-runner the node found, drain and quarantine are accepted
-all the same, and the report says that the runner may still take jobs (`unsupported`, shown as
-`cannot comply`) for as long as acquisition is stopped. The drain does not wait for the runner
-to exit; it completes once the admission ledger holds nothing and no job supervisor is left, at
-a moment the external runner runs no vk job. A runner that keeps the ledger busy keeps the node
-`draining` until it is undrained or the runner is stopped by other means; a job the runner takes
-after `drained` is not noticed. A reset, which clears job dirs a running job may use, stays
-refused. An update needs `--force` ([Update trial and rollback](#update-trial-and-rollback)): a
-forced update from `ready` goes straight to maintenance, waiting for neither the runner's jobs
-nor placed jobs; on a node already draining it waits for that drain.
+With `[node] runner = "none"`, the host runs no gitlab-runner and takes only hub-placed jobs
+([one kind of host](#placed-jobs-on-the-node)). It reports stopped acquisition as `stop`
+immediately. A drain completes once every placed job has its result, the admission ledger holds
+and awaits nothing, and no job supervisor is alive. There is no runner to wait for or count in
+the report's drain progress. A reset waits for every placed job's result, then proceeds past
+supervisors left running by failed cleanup. Resets and updates without `--force` work as with a
+managed runner. `vk node run` refuses to start if it finds a gitlab-runner with the vk executor:
+mixing placed jobs with runner jobs would let a reset clear the runner's job dirs.
+
+With `[node] runner = "external"`, the node does not run gitlab-runner. On a host that runs
+none, the placed jobs are all there is to stop, but the node still refuses a reset and needs
+`--force` for an update: set `"none"` there. On a host whose own gitlab-runner the node found,
+drain and quarantine are accepted all the same, and the report says that the runner may still
+take jobs (`unsupported`, shown as `cannot comply`) for as long as acquisition is stopped. The
+drain does not wait for the runner to exit; it completes once the admission ledger holds nothing
+and no job supervisor is left, at a moment the external runner runs no vk job. A runner that
+keeps the ledger busy keeps the node `draining` until it is undrained or the runner is stopped
+by other means; a job the runner takes after `drained` is not noticed. A reset, which clears job
+dirs a running job may use, stays refused. An update needs `--force` ([Update trial and
+rollback](#update-trial-and-rollback)): a forced update from `ready` goes straight to
+maintenance, waiting for neither the runner's jobs nor placed jobs; on a node already draining
+it waits for that drain.
 
 ## Releases
 
@@ -554,9 +578,10 @@ previous binary downloaded the release from the hub just before the switch, so t
 treats lost connectivity as a release failure: keeping it could leave the node unreachable
 by its hub. If the hub went down meanwhile, the update must be retried.
 
-An update is refused on a node whose runner is external unless issued with `--force`: vk node
-cannot drain such a runner, so jobs running across the switch run their later stages with the
-new `vk` — the one thing draining exists to prevent. A forced update from `ready` goes straight
+An update is refused on a node whose runner is external unless issued with `--force`; one with
+a managed runner or none drains first. vk node cannot drain an external runner, so jobs running
+across the switch run their later stages with the new `vk` — the one thing draining exists to
+prevent. A forced update from `ready` goes straight
 to maintenance without waiting for the jobs the hub placed on the node either; on a node
 already draining it waits for that drain. It is refused, too, for an older version than the
 node runs unless the node's own `[node] allow_downgrade = true` allows it, and even then for
@@ -726,14 +751,15 @@ VM, which a node that requires signed releases would need to report versions.
 
 `vk-hub nodes reset <id> [--images]`, or the reset button on an operator's node page — which
 asks again, on a form of its own, before the reset is issued — drains the node like an update
-does, from `ready`, `draining` or `drained` and only with a managed runner, except that the
-drain is over once the runner has exited and no job is waiting for admission or being admitted:
-a job supervisor a failed cleanup left running, and the admission it holds, are what a reset is
-for, not something it waits on. A job admitted with no supervisor yet is a `prepare` under way,
-which the reset does not stop; it waits for that one to exit or hand its job to a supervisor,
-and fails, the node left `drained`, if it has done neither within ten minutes. In `maintenance`
-the node stops the processes past jobs left: those of its user whose binary is a `vk` (the
-running one, the installed one, a release under the node dir, or any file so named), a
+does, from `ready`, `draining` or `drained` and only with a managed runner or none (`[node]
+runner = "none"`), except that the drain is over once the runner has exited — with none, once
+every placed job has its result — and no job is waiting for admission or being admitted: a job
+supervisor a failed cleanup left running, and the admission it holds, are what a reset is for,
+not something it waits on. A job admitted with no supervisor yet is a `prepare` under way, which
+the reset does not stop; it waits for that one to exit or hand its job to a supervisor, and
+fails, the node left `drained`, if it has done neither within ten minutes. In `maintenance` the
+node stops the processes past jobs left: those of its user whose binary is a `vk` (the running
+one, the installed one, a release under the node dir, or any file so named), a
 `cloud-hypervisor` or a `virtiofsd`, and whose arguments name a path inside one of its job dirs,
 whole or as a `--flag=` value — a shell or a `tail` of a job's log is not one of them. Each is
 held by a pidfd opened before its `/proc` entry is read and kept only if still alive after, sent
@@ -742,15 +768,15 @@ seconds after that, or a `/proc` the node cannot list, fails the reset before an
 removed. The node then gives back each job dir's network lease, removes the job dirs under
 `<state_dir>/jobs` and anything else there but its dot-entries, a symlink removed as itself and
 never followed, sweeps the host checkouts no job uses and the dead builds' staging dirs (see
-*Dead builds* below), and with `--images` evicts the
-materialized images under `<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does.
-The build cache's registry store is never touched. `validating` then runs what an update's trial
-does — `vk check`'s gate, `[node] validate`, and a session with the hub within ten minutes — and
-the node returns to the state it was in; a node that fails stays `drained`, with the reset
-`failed` and the reason, rather than take jobs on a host that does not pass. A reset clears the
-last update's progress from the node's report, and a reset and an update exclude each other; a
-`vk node run` stopped during either takes it up again at its next start. The command's audit
-lines name it `reset`, or `reset, images included`.
+*Dead builds* below), and with `--images` evicts the materialized images under
+`<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does. The build cache's registry
+store is never touched. `validating` then runs what an update's trial does — `vk check`'s gate,
+`[node] validate`, and a session with the hub within ten minutes — and the node returns to the
+state it was in; a node that fails stays `drained`, with the reset `failed` and the reason,
+rather than take jobs on a host that does not pass. A reset clears the last update's progress
+from the node's report, and a reset and an update exclude each other; a `vk node run` stopped
+during either takes it up again at its next start. The command's audit lines name it `reset`, or
+`reset, images included`.
 
 ## Placed jobs on the node
 
@@ -766,14 +792,18 @@ reads it) running a config that runs the vk custom executor, or such a config na
 runner_config`. A runner it cannot find that way — a unit running as a user of its own without
 `--config`, or a user unit — is named by its config in `[node] runner_config`. Finding one, it
 logs it once, reports what it found in its report's `placed.runner`, and refuses with `runner`
-every new offer and every start without a reservation; a hub that places jobs offers it nothing and
-shows why on the node's page and under `vk-hub nodes`. A reservation it held before is renewed
-and started on as usual. The check reads unit files and configs, not whether a runner runs: to
-move a host over to placed jobs, drain it, remove or mask `gitlab-runner.service`, unset `[node]
-runner_config` (and `runner = "managed"`), then restart `vk node`. The other way, drain it
-before installing a runner, so that no placed job runs beside the runner's until `vk node`
-restarts and finds it. A node older than this check reports nothing of it, and the hub places
-work on it as before.
+every new offer and every start without a reservation; a hub that places jobs offers it nothing
+and shows why on the node's page and under `vk-hub nodes`. A reservation it held before is
+renewed and started on as usual. The check reads unit files and configs, not whether a runner
+runs: to move a host over to placed jobs, drain it, remove or mask `gitlab-runner.service`,
+unset `[node] runner_config`, set `[node] runner = "none"`, then restart `vk node`; left unset,
+the mode is `none` only once no `gitlab-runner` unit or binary is left on the host. A node with
+`runner = "none"` refuses to start on a host where it finds one ([Running the
+node](#running-the-node)); `vk-hub nodes` notes it `no gitlab-runner, placed jobs only`. The
+other way, drain it before installing a runner, so that no placed job runs beside the runner's
+until `vk node` restarts and finds it, and set `[node] runner` to `"external"` or `"managed"`:
+with `"none"` it refuses to start. A node older than this check reports nothing of it, and the
+hub places work on it as before.
 
 **Reservations.** An offer is decided at once against the same admission ledger
 (`<state_dir>/admit/`) as executor jobs: memory against `[executor.schedule] mem_budget`, job-dir
@@ -1118,21 +1148,21 @@ provider (see [Signing in](#signing-in)).
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); and the audit log (`/audit`,
 filterable by node, 100 lines a page; the hub keeps the newest 100,000 rows). A node's page
-shows what the hub asks of it beside what it reports — its state, acquisition, runner,
-concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
-outcomes. It opens with a steering panel describing the current state in plain language, grouped
-into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
-node's current effective limit, and on a hub that places jobs, for a node at protocol version 3
-or later, the jobs the hub has placed on it against that ceiling or the node's own limit,
-whichever is smaller (`Placed by the hub: 3 of 4`),
-or why it takes none when it runs its own gitlab-runner; *Maintenance* — in service, draining,
-drained, under maintenance, checking itself or quarantined; and an operator-only *Danger zone*.
-Operators see applicable actions with short explanations: pause intake or resume it, set the
-limit or remove it, drain from ready or during maintenance (the node stays drained once it
-ends), undrain while draining or drained, quarantine unless quarantined, release only then,
-reset from ready, draining or drained; no reset when the runner is external; everything while
-the node has reported nothing. They are the admin socket's operations — ceiling set or lifted,
-acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
+shows what the hub asks of it beside what it reports — its state, acquisition, runner (`none:
+placed jobs only` for a node with none), concurrency, drain progress and what it cannot carry
+out — and its 20 latest commands with their outcomes. It opens with a steering panel describing
+the current state in plain language, grouped into *Job intake* — whether the node takes new
+jobs, the hub's concurrency ceiling and the node's current effective limit, and on a hub that
+places jobs, for a node at protocol version 3 or later, the jobs the hub has placed on it
+against that ceiling or the node's own limit, whichever is smaller (`Placed by the hub: 3 of
+4`), or why it takes none when it runs its own gitlab-runner; *Maintenance* — in service,
+draining, drained, under maintenance, checking itself or quarantined; and an operator-only
+*Danger zone*. Operators see applicable actions with short explanations: pause intake or resume
+it, set the limit or remove it, drain from ready or during maintenance (the node stays drained
+once it ends), undrain while draining or drained, quarantine unless quarantined, release only
+then, reset from ready, draining or drained; no reset when the runner is external; everything
+while the node has reported nothing. They are the admin socket's operations — ceiling set or
+lifted, acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
 `/node/<id>/action` as before, which still refuses what does not apply. A reset requires
 confirmation from the same session, once and within ten minutes, as local mode's stops do. The
 panel is part of the node's live fragment, rendered for an operator's stream with that session's

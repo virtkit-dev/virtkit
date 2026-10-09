@@ -2348,6 +2348,19 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         "ci-1: cannot comply: stopping acquisition: external"
     );
     assert_eq!(lines[5], "ci-1: cannot set its concurrency: bad mem");
+    let placed_only = ops::NodeView {
+        hostname: "ci-4".into(),
+        report: Some(Report {
+            runner: Some(vk_hub_proto::RunnerMode::None),
+            ..Report::default()
+        }),
+        ..ops::NodeView::default()
+    };
+    let shown = render_nodes(&[placed_only], 1000);
+    assert!(
+        shown.ends_with("\nci-4: no gitlab-runner, placed jobs only\n"),
+        "{shown}"
+    );
     let (header, a, b, c) = (lines[0], lines[1], lines[2], lines[3]);
     assert!(header.starts_with("ID "));
     for (column, want) in [

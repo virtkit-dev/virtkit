@@ -1017,7 +1017,10 @@ impl Panel {
                 "Its runner is external: pausing intake, draining and quarantining do not stop \
                  it, and it may still take jobs. A reset is refused.",
             ),
-            (true, false) => Some("With [node] runner = \"external\", a reset is refused."),
+            (true, false) => Some(
+                "With [node] runner = \"external\", a reset is refused; a host with no runner \
+                 says so with runner = \"none\".",
+            ),
             (false, _) => None,
         };
         Panel {
@@ -1430,6 +1433,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
                 &or_dash(r.runner.map(|m| match m {
                     RunnerMode::Managed => "managed",
                     RunnerMode::External => "external",
+                    RunnerMode::None => "none: placed jobs only",
                 })),
             );
             if let Some(state) = r.runner_state {
@@ -1458,16 +1462,17 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
                 );
             }
             if let Some(p) = r.drain {
+                // A node with no runner has none to wait for.
+                let runner = match (r.runner, p.runner_stopped) {
+                    (Some(RunnerMode::None), _) => "",
+                    (_, true) => "runner stopped, ",
+                    (_, false) => "runner still running, ",
+                };
                 kv(
                     h,
                     "Drain",
                     &format!(
-                        "runner {}, admission ledger {}, {} job(s) running",
-                        if p.runner_stopped {
-                            "stopped"
-                        } else {
-                            "still running"
-                        },
+                        "{runner}admission ledger {}, {} job(s) running",
                         if p.ledger_empty { "empty" } else { "in use" },
                         p.active_jobs
                     ),
@@ -1887,6 +1892,10 @@ mod tests {
             ops(&view(Ready, External, None)),
             ["ceiling", "stop", "drain", "quarantine"]
         );
+        assert_eq!(
+            ops(&view(Ready, RunnerMode::None, None)),
+            ["ceiling", "stop", "drain", "quarantine", "reset"]
+        );
         let mut unreported = view(Ready, External, None);
         if let Some(r) = unreported.report.as_mut() {
             r.state = None;
@@ -1997,8 +2006,22 @@ mod tests {
         assert_eq!(p.intake, "Not taking new jobs: intake paused");
         assert_eq!(
             p.note,
-            Some("With [node] runner = \"external\", a reset is refused.")
+            Some(
+                "With [node] runner = \"external\", a reset is refused; a host with no runner \
+                 says so with runner = \"none\"."
+            )
         );
+        // One that runs none says so, and is steered like a managed one.
+        if let Some(r) = v.report.as_mut() {
+            r.runner = Some(RunnerMode::None);
+        }
+        let p = Panel::of(&v);
+        assert_eq!(p.intake, "Not taking new jobs: intake paused");
+        assert_eq!(p.note, None);
+        assert_eq!(p.maintenance, "Drained: no jobs running, none taken");
+        if let Some(r) = v.report.as_mut() {
+            r.runner = Some(RunnerMode::External);
+        }
         assert_eq!(p.placed.as_deref(), Some("Placed by the hub: 2"));
         // Its own limit caps them too, the smaller of the two binding.
         if let Some(r) = v.report.as_mut() {

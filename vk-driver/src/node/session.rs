@@ -61,11 +61,11 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 
-/// The protocol versions this node speaks: placed jobs and tools builds on top of what every
-/// peer shares.
+/// The protocol versions this node speaks: placed jobs, tools builds and `[node] runner =
+/// "none"` on top of what every peer shares.
 pub const NODE_PROTOCOL: VersionRange = VersionRange {
     min: PROTOCOL.min,
-    max: vk_hub_proto::TOOLS,
+    max: vk_hub_proto::RUNNER_NONE,
 };
 
 /// How often the node looks at its placed jobs for news: output, stages, results, leases.
@@ -461,7 +461,8 @@ struct Told {
 impl Told {
     /// Return and mark as sent a changed report (`workloads` and steering state), followed
     /// by unrecorded acks whose current outcomes this session has not sent. Below [`STEERING`],
-    /// include only workloads and no acks. Omit empty reports.
+    /// include only workloads and no acks; below the later versions, leave out what their hubs
+    /// cannot read. Omit empty reports.
     fn news(&mut self, core: &Core, workloads: Option<&Listed>, version: u32) -> Vec<NodeMsg> {
         let mut report = Report {
             workloads: workloads.map(|w| w.workloads.clone()),
@@ -470,8 +471,13 @@ impl Told {
         };
         if version < STEERING {
             report = report.without_steering();
-        } else if version < vk_hub_proto::TOOLS {
-            report = report.without_tools();
+        } else {
+            if version < vk_hub_proto::TOOLS {
+                report = report.without_tools();
+            }
+            if version < vk_hub_proto::RUNNER_NONE {
+                report = report.without_runner_none();
+            }
         }
         let mut msgs = Vec::new();
         if report != Report::default() && self.report.as_ref() != Some(&report) {
@@ -883,7 +889,7 @@ mod tests {
                         hub: format!("http://{addr}"),
                         node_id: "ab".repeat(16),
                     },
-                    None,
+                    super::super::core::Runner::External,
                 )
                 .unwrap(),
                 jobs: super::super::jobs::for_test(
@@ -964,6 +970,33 @@ mod tests {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
             .verify(&message, &vk_hub_proto::from_hex(&signature).unwrap())
             .is_ok()
+    }
+
+    /// A node with no runner says so to a hub from [`vk_hub_proto::RUNNER_NONE`], and to an
+    /// older one, which could not read that, says its runner is external.
+    #[test]
+    fn a_node_with_no_runner_tells_an_older_hub_its_runner_is_external() {
+        let dir = std::env::temp_dir().join(format!("vk-node-told-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let issuer = super::super::state::Issuer {
+            hub: "https://hub".into(),
+            node_id: "ab".repeat(16),
+        };
+        let core = Core::open(&dir, issuer, super::super::core::Runner::None).unwrap();
+        let told = |version| match Told::default().news(&core, None, version).as_slice() {
+            [NodeMsg::Report(r)] => r.runner,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(NODE_PROTOCOL.max, vk_hub_proto::RUNNER_NONE);
+        assert_eq!(
+            told(vk_hub_proto::RUNNER_NONE),
+            Some(vk_hub_proto::RunnerMode::None)
+        );
+        for older in [STEERING, JOBS, vk_hub_proto::TOOLS] {
+            assert_eq!(told(older), Some(vk_hub_proto::RunnerMode::External));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1411,7 +1444,7 @@ mod tests {
                 hub: f.node.enrollment.hub.clone(),
                 node_id: f.node.enrollment.node_id.clone(),
             },
-            Some(runner),
+            super::super::core::Runner::Managed(runner),
         )
         .unwrap();
         let (halt, halted) = watch::channel(false);

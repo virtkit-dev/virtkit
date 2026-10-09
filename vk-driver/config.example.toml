@@ -134,14 +134,20 @@
 #                           # `vk tune` — or `vk node run`, on a fleet node — sets its
 #                           # `concurrent` directly instead of leaving the number for the
 #                           # root-side vk-runnerctl
-# runner = "external"       # who runs gitlab-runner: "external" (default) — its own service,
-#                           # of which a fleet hub steers only `concurrent` — or "managed":
-#                           # `vk node run` runs `gitlab-runner run --config <runner_config>`
-#                           # as a child, restarts it if it dies, and stops it with SIGQUIT
-#                           # (running jobs finish, no new ones are taken) to stop acquisition,
-#                           # as a drain or a quarantine does. Managed, runner_config defaults
-#                           # to ~/.gitlab-runner/config.toml, and its vk executor must use
-#                           # this same config: drains are judged from this state dir
+# runner = "none"           # who runs gitlab-runner: "external" — its own service, of which
+#                           # a fleet hub steers only `concurrent`, so the node refuses a reset
+#                           # and updates only with --force — or "managed": `vk node run` runs
+#                           # `gitlab-runner run --config <runner_config>` as a child, restarts
+#                           # it if it dies, and stops it with SIGQUIT (running jobs finish, no
+#                           # new ones are taken) to stop acquisition, as a drain or a
+#                           # quarantine does. Managed, runner_config defaults to
+#                           # ~/.gitlab-runner/config.toml, and its vk executor must use this
+#                           # same config: drains are judged from this state dir. Or "none":
+#                           # no gitlab-runner, only the jobs the hub places; `vk node run`
+#                           # refuses to start where it finds one running the vk executor.
+#                           # Unset: "none" where no gitlab-runner shows (no unit, none on
+#                           # systemd's PATH), else "external"; set it explicitly where the
+#                           # runner runs outside systemd, in a container say.
 # gitlab_runner = "/usr/local/bin/gitlab-runner"  # the binary a managed runner runs;
 #                           # default: gitlab-runner on PATH
 # validate = ["sh", "-c", "$VK_BINARY run alpine true"]  # what an update runs, after

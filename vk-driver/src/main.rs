@@ -327,7 +327,8 @@ enum NodeCmd {
         ///
         /// A vk-node.service already running is stopped first, which waits for a managed
         /// runner's jobs, and started again on the new enrollment, or on the old one if the
-        /// join fails with it still in place.
+        /// join fails with it still in place. Like `vk node run`, the join is refused where
+        /// `[node] runner = "none"` but the host runs a gitlab-runner with the vk executor.
         #[arg(long)]
         service: bool,
         /// Join with --user although the host's CI jobs run as another user
@@ -346,8 +347,11 @@ enum NodeCmd {
     /// concurrency every half minute, as `vk tune` would, within the hub's ceiling, and keeps
     /// what the hub asked across restarts. With `[node] runner = "managed"` it runs
     /// gitlab-runner too, and stops it taking jobs when the hub stops acquisition, drains or
-    /// quarantines the node. SIGTERM or SIGINT stops it, after a managed runner has finished
-    /// its jobs; a second one abandons them. Under systemd, use `KillMode=mixed`, so the stop
+    /// quarantines the node. With `[node] runner = "none"` the host runs no gitlab-runner and
+    /// takes only the jobs the hub places; it refuses to start on a host that runs one with
+    /// the vk executor. Unset, the mode is `"none"` where no gitlab-runner shows on the host,
+    /// else `"external"`. SIGTERM or SIGINT stops it, after a managed runner has finished its
+    /// jobs; a second one abandons them. Under systemd, use `KillMode=mixed`, so the stop
     /// reaches the node and not the runner. Exits 75 while another `vk node` holds the state
     /// dir.
     Run,
@@ -379,8 +383,9 @@ enum NodeServiceCmd {
     /// Write vk-node.service, enable it and start it
     ///
     /// The unit runs this vk, resolved, as the installed binary updates replace, with the
-    /// config this command reads. Refuses on a host not enrolled. Run again, it rewrites the
-    /// unit and restarts the node if it is running.
+    /// config this command reads. Refuses on a host not enrolled, and where `[node] runner =
+    /// "none"` but the host runs a gitlab-runner with the vk executor. Run again, it rewrites
+    /// the unit and restarts the node if it is running.
     Install {
         /// Enable the unit without starting it
         #[arg(long)]

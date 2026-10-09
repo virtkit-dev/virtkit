@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Steering, end to end: a hub and two node services (tests/fleet/lib.sh), one running a
-# managed runner — the gitlab-runner stand-in in tests/fleet/node — and one leaving its
-# runner external, as a node does by default.
+# managed runner — the gitlab-runner stand-in in tests/fleet/node — and one whose runner is
+# external: its runner config runs the vk executor, which the node finds.
 #
 # 1. A ceiling reaches both nodes: each reports it applied, and the managed one's runner
 #    config carries it.
@@ -36,7 +36,16 @@ EOF
 node_start managed
 in_node managed sh -c 'mkdir -p /etc/gitlab-runner && echo "concurrent = 1" >/etc/gitlab-runner/config.toml'
 node_join managed >/dev/null || fail "managed could not join"
-node_up external
+node_config external <<'EOF'
+[node]
+runner = "external"
+runner_config = "/etc/gitlab-runner/config.toml"
+EOF
+node_start external
+in_node external sh -c 'mkdir -p /etc/gitlab-runner && printf "%s\n" "concurrent = 1" \
+  "[[runners]]" "executor = \"custom\"" "[runners.custom]" "run_exec = \"/usr/local/bin/vk\"" \
+  >/etc/gitlab-runner/config.toml'
+node_join external >/dev/null || fail "external could not join"
 m=$(node_id managed)
 x=$(node_id external)
 wait_for 60 node_reported "$m" || fail "managed ($m) did not report in"

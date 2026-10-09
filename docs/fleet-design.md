@@ -578,11 +578,12 @@ Experimental; the wire contract is [GitLab dispatch](gitlab-dispatch.md), and
 
 `vk-gitlab` is gitlab-runner's GitLab-facing side, reimplemented: it registers as one or more
 runners, asks GitLab for jobs, and has the hub run each on a node. The node runs the job's
-stages itself — no gitlab-runner binary on the node or in the guest — reusing the executor's
-VM, exec, checkout and cleanup code. The local gitlab-runner with the vk executor is the
-transition state: it keeps working on the nodes still configured for it, and a node moves
-over by draining, removing or masking `gitlab-runner.service`, unsetting `[node] runner_config`
-(and `runner = "managed"`) and restarting `vk node`, which then takes placed jobs instead.
+stages itself — no gitlab-runner binary on the node or in the guest — reusing the executor's VM,
+exec, checkout and cleanup code. The local gitlab-runner with the vk executor is the transition
+state: it keeps working on the nodes still configured for it, and a node moves over by draining,
+removing or masking `gitlab-runner.service`, unsetting `[node] runner_config`, setting `[node]
+runner = "none"` — unset gives `none` only once no `gitlab-runner` unit or binary is left — and
+restarting `vk node`, which then takes placed jobs instead.
 
 ```
 GitLab ◀──runner API──▶ vk-gitlab ──client API──▶ vk-hub ◀──session──▶ vk node ──▶ microVMs

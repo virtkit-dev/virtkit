@@ -1095,7 +1095,7 @@ fn registry(cfg: &Config) -> Outcome {
 }
 
 fn gitlab(cfg: &Config) -> Outcome {
-    gitlab_with(cfg, &SYSTEMD_PATH)
+    gitlab_with(cfg, &crate::node::ci_user::SYSTEMD_PATH)
 }
 
 /// [`gitlab`], looking for a gitlab-runner of the host's own in `path`.
@@ -1111,8 +1111,18 @@ fn gitlab_with(cfg: &Config, path: &[&str]) -> Outcome {
     if let Err(e) = dir_writable(&jobs) {
         return fail(format!("{e} (per-job state lives there; see state_dir)"));
     }
+    let mode = match crate::node::runner_mode_in(cfg, path) {
+        Ok(mode) => mode,
+        Err(e) => return fail(e),
+    };
+    // Said where it matters: a node, or a mode set for one.
+    let runner = if cfg.node.runner.is_some() || crate::node::enrolled(cfg) {
+        format!(", {}", runner_note(cfg.node.runner.is_some(), mode))
+    } else {
+        String::new()
+    };
     if let Some(dir) = &cfg.executor.tools_dir
-        && let Err(e) = check_tools_dir(cfg, dir, host_gitlab_runner(cfg, path).as_deref())
+        && let Err(e) = check_tools_dir(cfg, dir, host_gitlab_runner(mode, path).as_deref())
     {
         return fail(format!("[executor] tools_dir {e}"));
     }
@@ -1152,9 +1162,24 @@ fn gitlab_with(cfg: &Config, path: &[&str]) -> Outcome {
     let tools = crate::node::tools::unused_warning(cfg)
         .map_or_else(String::new, |why| format!("; note: {why}"));
     ok(format!(
-        "jobs dir {} writable, {stats}, {nesting}{tools}",
+        "jobs dir {} writable, {stats}, {nesting}{runner}{tools}",
         jobs.display()
     ))
+}
+
+/// `[node] runner` for `vk check`: `mode`, set explicitly when `set`, else implied by the host.
+fn runner_note(set: bool, mode: vk_hub_proto::RunnerMode) -> String {
+    use vk_hub_proto::RunnerMode;
+    let mode = match mode {
+        RunnerMode::Managed => "managed",
+        RunnerMode::External => "external",
+        RunnerMode::None => "none (placed jobs only)",
+    };
+    if set {
+        format!("node runner {mode}")
+    } else {
+        format!("node runner {mode}, by what is found (`[node] runner` unset)")
+    }
 }
 
 /// Resolve a share root as the executor does, refusing the links and trees it refuses, and
@@ -1175,27 +1200,17 @@ fn readable_root(
     Ok((root, shown))
 }
 
-/// systemd's default `PATH`, where a runner service finds its binary.
-const SYSTEMD_PATH: [&str; 6] = [
-    "/usr/local/sbin",
-    "/usr/local/bin",
-    "/usr/sbin",
-    "/usr/bin",
-    "/sbin",
-    "/bin",
-];
-
-/// Why this host runs a gitlab-runner of its own, or `None`: `vk node` manages one, or one is
-/// in a directory of `path`. Only these are seen: a runner started from another directory or
-/// in a container goes unnoticed, and its jobs pass this check with no gitlab-runner.
-fn host_gitlab_runner(cfg: &Config, path: &[&str]) -> Option<String> {
-    if cfg.node.runner == vk_hub_proto::RunnerMode::Managed {
-        return Some("vk node manages a gitlab-runner here".into());
+/// Why this host runs a gitlab-runner of its own, or `None`, by the runner `mode`: `vk node`
+/// manages one, or, unless it runs none, one is in a directory of `path`. Only these are seen:
+/// a runner started from another directory or in a container goes unnoticed, and its jobs pass
+/// this check with no gitlab-runner.
+fn host_gitlab_runner(mode: vk_hub_proto::RunnerMode, path: &[&str]) -> Option<String> {
+    match mode {
+        vk_hub_proto::RunnerMode::Managed => Some("vk node manages a gitlab-runner here".into()),
+        vk_hub_proto::RunnerMode::None => None,
+        vk_hub_proto::RunnerMode::External => crate::node::ci_user::runner_on_path(path)
+            .map(|p| format!("this host runs gitlab-runner at {}", p.display())),
     }
-    path.iter()
-        .map(|dir| Path::new(dir).join("gitlab-runner"))
-        .find(|p| p.is_file())
-        .map(|p| format!("this host runs gitlab-runner at {}", p.display()))
 }
 
 /// Fails unless `[executor] tools_dir` is readable and, when `runner_here` says why the host
@@ -1662,6 +1677,20 @@ mod tests {
         // The default config grants no nesting, and the check says so rather than leaving
         // an operator to guess whether the grant took.
         assert!(out.detail.contains("no nesting"), "{}", out.detail);
+        // And how a fleet node runs gitlab-runner, if it does.
+        let mut managed = with(Executor::default());
+        managed.node.runner = Some(vk_hub_proto::RunnerMode::Managed);
+        let out = gitlab(&managed);
+        assert!(
+            out.detail.contains("no nesting, node runner managed"),
+            "{}",
+            out.detail
+        );
+        assert_eq!(
+            runner_note(true, vk_hub_proto::RunnerMode::None),
+            "node runner none (placed jobs only)"
+        );
+        assert!(runner_note(false, vk_hub_proto::RunnerMode::External).contains("unset"));
 
         // Turned off, the check says so rather than going quiet about it.
         let out = gitlab(&with(Executor {
@@ -1704,14 +1733,14 @@ mod tests {
                 },
                 ..Default::default()
             };
-            cfg.node.runner = vk_hub_proto::RunnerMode::Managed;
+            cfg.node.runner = Some(vk_hub_proto::RunnerMode::Managed);
             cfg
         };
         // A host with no runner of its own needs none in tools_dir; one with a runner on
         // systemd's PATH does, and so does a node that manages one.
         let external = || {
             let mut cfg = with(&link);
-            cfg.node.runner = vk_hub_proto::RunnerMode::External;
+            cfg.node.runner = Some(vk_hub_proto::RunnerMode::External);
             cfg
         };
         let out = gitlab_with(&external(), &[]);

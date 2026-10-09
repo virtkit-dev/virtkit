@@ -59,6 +59,10 @@
 //! it, and a node leaves the report's tools progress out there. [`Versions::tools`] is an
 //! optional inventory field, which a hub of any version reads or ignores.
 //!
+//! Version 5 ([`RUNNER_NONE`]) adds [`RunnerMode::None`], a node that runs no gitlab-runner. In
+//! a session below it a node reports that mode as [`RunnerMode::External`], which an older hub
+//! reads and steers more cautiously: it leaves the node out of an unforced rollout.
+//!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
 //! concurrency, drain and update progress — and the node acks every command whose
@@ -145,6 +149,10 @@ pub const JOBS: u32 = 3;
 /// The first protocol version carrying tools definitions: [`Operation::Tools`],
 /// [`Report::tools`] and the tools download. Not in [`PROTOCOL`] either.
 pub const TOOLS: u32 = 4;
+
+/// The first protocol version whose [`Report::runner`] may be [`RunnerMode::None`]. Not in
+/// [`PROTOCOL`] either.
+pub const RUNNER_NONE: u32 = 5;
 
 /// The largest tools definition — a build context packed as a tar — a hub holds and a node
 /// takes: a Dockerfile and the few files it copies, not the tools themselves.
@@ -898,6 +906,18 @@ impl Report {
             ..self
         }
     }
+
+    /// Replace [`RunnerMode::None`] with [`RunnerMode::External`] for sessions below
+    /// [`RUNNER_NONE`], whose hub cannot read the new mode.
+    pub fn without_runner_none(self) -> Report {
+        Report {
+            runner: match self.runner {
+                Some(RunnerMode::None) => Some(RunnerMode::External),
+                runner => runner,
+            },
+            ..self
+        }
+    }
 }
 
 /// Progress of an [`Operation::Update`].
@@ -1000,7 +1020,7 @@ pub enum NodeState {
     Quarantined,
 }
 
-/// How the node's gitlab-runner is run.
+/// How the node's gitlab-runner is run, if it runs one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerMode {
@@ -1009,6 +1029,9 @@ pub enum RunnerMode {
     /// Something else runs it; only its concurrency can be steered.
     #[default]
     External,
+    /// The host runs none: it takes only the jobs the hub places, which a drain, a quarantine
+    /// and a stop of acquisition stop. From version [`RUNNER_NONE`].
+    None,
 }
 
 /// `effective = min(estimate, hub_ceiling, local_ceiling)`, as the node last worked it out.
@@ -2228,6 +2251,58 @@ mod tests {
             .tools,
             BTreeMap::new()
         );
+    }
+
+    /// Version 5 adds the `none` runner mode. Older hubs cannot read it, so reports sent to
+    /// them use `external` instead.
+    #[test]
+    fn version_5_keeps_its_wire_shape() {
+        /// [`RunnerMode`] as a hub before version 5 has it.
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldMode {
+            Managed,
+            External,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OldReport {
+            runner: Option<OldMode>,
+        }
+        let old =
+            |r: &Report| serde_json::from_value::<OldReport>(serde_json::to_value(r).unwrap());
+
+        assert_eq!(RUNNER_NONE, 5);
+        pinned(&RunnerMode::Managed, json!("managed"));
+        pinned(&RunnerMode::None, json!("none"));
+        let placed_only = Report {
+            runner: Some(RunnerMode::None),
+            ..steering_report()
+        };
+        let mut wire = serde_json::to_value(NodeMsg::Report(steering_report())).unwrap();
+        wire["runner"] = json!("none");
+        pinned(&NodeMsg::Report(placed_only.clone()), wire);
+        assert!(old(&placed_only).is_err());
+        let told = placed_only.clone().without_runner_none();
+        assert!(matches!(
+            old(&told).unwrap().runner,
+            Some(OldMode::External)
+        ));
+        assert_eq!(
+            told,
+            Report {
+                runner: Some(RunnerMode::External),
+                ..placed_only
+            }
+        );
+        // Every other mode goes through as it is, read by hubs old and new alike.
+        for mode in [RunnerMode::Managed, RunnerMode::External] {
+            let r = Report {
+                runner: Some(mode),
+                ..steering_report()
+            };
+            assert_eq!(r.clone().without_runner_none(), r);
+            assert!(old(&r).is_ok());
+        }
     }
 
     /// A report as 0.83.0 and 0.84.0 write it reads with every steering field absent, and goes

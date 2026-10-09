@@ -279,12 +279,16 @@ pub struct Node {
     /// than leaving the number for `vk-runnerctl`. Unset: the runner is root's — or, with
     /// `runner = "managed"`, `~/.gitlab-runner/config.toml`.
     pub runner_config: Option<PathBuf>,
-    /// Who runs gitlab-runner: `"external"` (the default) — a service of its own, whose
-    /// concurrency is all a hub can steer — or `"managed"`: `vk node run` runs it as a child,
-    /// `gitlab-runner run --config <runner_config>`, restarts it when it dies, and stops it
-    /// with `SIGQUIT` (finish the running jobs, take no new ones) when acquisition is to stop.
-    /// A drain or a quarantine needs that, so an external runner refuses them.
-    pub runner: vk_hub_proto::RunnerMode,
+    /// Who runs gitlab-runner: `"external"` — a service of its own, whose concurrency is all a
+    /// hub can steer, so a node refuses a reset and updates only with `--force` — or
+    /// `"managed"`: `vk node run` runs it as a child, `gitlab-runner run --config
+    /// <runner_config>`, restarts it when it dies, and stops it with `SIGQUIT` (finish the
+    /// running jobs, take no new ones) when acquisition is to stop. Or `"none"`: the host runs
+    /// no gitlab-runner and takes only the jobs the hub places, which the node stops itself;
+    /// `vk node run` refuses to start where it finds a runner with the vk executor. Unset:
+    /// `"none"` where no gitlab-runner shows on the host, else `"external"`
+    /// ([`crate::node::runner_mode`]).
+    pub runner: Option<vk_hub_proto::RunnerMode>,
     /// The gitlab-runner binary a managed runner runs. Unset: `gitlab-runner`, on `PATH`.
     pub gitlab_runner: Option<PathBuf>,
     /// Validation argv run after `vk check`, before accepting the new `vk`. For example,
@@ -1222,6 +1226,27 @@ mod tests {
         assert!(toml::from_str::<Config>("[node]\nspeed = \"fast\"\n").is_err());
         let bare: Config = toml::from_str("").unwrap();
         assert!(!toml::to_string(&bare).unwrap().contains("[node]"));
+    }
+
+    #[test]
+    fn node_runner_modes_parse_and_unset_is_left_to_the_host() {
+        use vk_hub_proto::RunnerMode;
+        for (text, mode) in [
+            ("managed", RunnerMode::Managed),
+            ("external", RunnerMode::External),
+            ("none", RunnerMode::None),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[node]\nrunner = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.node.runner, Some(mode));
+            assert!(
+                toml::to_string(&cfg)
+                    .unwrap()
+                    .contains(&format!("runner = \"{text}\""))
+            );
+        }
+        let bare: Config = toml::from_str("[node]\n").unwrap();
+        assert_eq!(bare.node.runner, None);
+        assert!(toml::from_str::<Config>("[node]\nrunner = \"auto\"\n").is_err());
     }
 
     #[test]

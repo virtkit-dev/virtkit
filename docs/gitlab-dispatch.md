@@ -122,6 +122,9 @@ A host runs its own gitlab-runner with the vk executor or takes placed jobs, nev
 that finds such a runner on its host says so in its report and refuses with `runner` every new
 offer and every start without a reservation (a reservation it already holds is renewed and
 started on); the hub places nothing on it and counts it in no capacity.
+A host that takes placed jobs sets `[node] runner = "none"` (unset gives `none` only where no
+`gitlab-runner` unit or binary shows), so the node drains, resets and updates it as one whose
+runner it supervises.
 
 Among the nodes with room, the hub offers a reservation, or starts a job without one, on the
 least loaded first, then the one with the most room, then by node ID. A node's load is the

@@ -3,9 +3,9 @@
 //! vk executor writes, `0600` and `0700`; when the executor runs as another user, the node
 //! cannot read them, under-counts admission and cannot tell when a drain is done.
 //!
-//! Two signs are read: who owns the jobs' entries under the state dir, and, with an external
-//! runner, the user gitlab-runner's systemd unit runs as when its config runs the vk custom
-//! executor: gitlab-runner runs a custom executor as itself. Handing the state dir to the
+//! Two signs are read: who owns the jobs' entries under the state dir, and, unless the node
+//! runs its runner, the user gitlab-runner's systemd unit runs as when its config runs the vk
+//! custom executor: gitlab-runner runs a custom executor as itself. Handing the state dir to the
 //! node's user (`vk node join --user`) erases the first sign once, not the cause, so it is
 //! read before.
 
@@ -14,6 +14,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+use vk_hub_proto::RunnerMode;
 
 use crate::config::Config;
 
@@ -68,7 +70,7 @@ fn others_by(
             at: path.display().to_string(),
         })
         .collect();
-    if cfg.node.runner == vk_hub_proto::RunnerMode::External
+    if cfg.node.runner != Some(RunnerMode::Managed)
         && let Some((user, unit)) = runner_unit_user(UNIT_DIRS)
     {
         let uid = uid_of_user(&user);
@@ -105,9 +107,77 @@ pub fn local_runner(cfg: &Config) -> Option<String> {
     local_runner_in(cfg, UNIT_DIRS)
 }
 
+/// systemd's default `PATH`, where a runner service finds its binary.
+pub(crate) const SYSTEMD_PATH: [&str; 6] = [
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// The runner mode `[node] runner` sets or, unset, the one this host implies: `none` only where
+/// no gitlab-runner shows at all ([`visible_runner`]), else `external`. Fails for `none` where
+/// [`local_runner`] finds one: the host would take the hub's jobs beside its runner's, and a
+/// reset clear that runner's jobs under it.
+pub fn runner_mode(cfg: &Config) -> Result<RunnerMode, String> {
+    runner_mode_in(cfg, &SYSTEMD_PATH)
+}
+
+/// [`runner_mode`], looking for a `gitlab-runner` binary in `path`.
+pub fn runner_mode_in(cfg: &Config, path: &[&str]) -> Result<RunnerMode, String> {
+    let found = local_runner(cfg);
+    let visible = found.is_some() || runner_visible(path);
+    runner_mode_of(cfg.node.runner, found.as_deref(), visible)
+}
+
+/// [`runner_mode`] with [`local_runner`]'s result in `found` and host runner visibility in
+/// `visible`.
+pub fn runner_mode_of(
+    set: Option<RunnerMode>,
+    found: Option<&str>,
+    visible: bool,
+) -> Result<RunnerMode, String> {
+    match (set, found) {
+        (Some(RunnerMode::None), Some(why)) => Err(format!(
+            "[node] runner = \"none\", but this host runs a gitlab-runner with the vk executor \
+             ({why}); set [node] runner = \"external\", or remove that runner"
+        )),
+        (Some(mode), _) => Ok(mode),
+        // Unset, a runner the node cannot tell runs vk — its config unreadable, say — is
+        // taken for one that does.
+        (None, _) if visible => Ok(RunnerMode::External),
+        (None, _) => Ok(RunnerMode::None),
+    }
+}
+
+/// Whether a gitlab-runner shows on this host ([`visible_runner`]), looking for its binary in
+/// `path`.
+pub fn runner_visible(path: &[&str]) -> bool {
+    visible_runner(UNIT_DIRS, path).is_some()
+}
+
+/// What shows a gitlab-runner on this host, whatever it runs: gitlab-runner's unit in
+/// `unit_dirs`, not masked and with its program there, or a `gitlab-runner` in `path`. A
+/// runner in a container or started by hand shows nowhere.
+fn visible_runner(unit_dirs: &[&str], path: &[&str]) -> Option<String> {
+    if let Some((unit, _)) = runner_unit(unit_dirs) {
+        return Some(format!("{} is installed", unit.display()));
+    }
+    runner_on_path(path).map(|p| format!("{} is installed", p.display()))
+}
+
+/// The first `gitlab-runner` file in a directory of `path`.
+pub(crate) fn runner_on_path(path: &[&str]) -> Option<PathBuf> {
+    path.iter()
+        .map(|dir| Path::new(dir).join("gitlab-runner"))
+        .find(|p| p.is_file())
+}
+
 /// [`local_runner`], reading gitlab-runner's unit from `unit_dirs`.
 fn local_runner_in(cfg: &Config, unit_dirs: &[&str]) -> Option<String> {
-    if cfg.node.runner == vk_hub_proto::RunnerMode::Managed {
+    if cfg.node.runner == Some(RunnerMode::Managed) {
         return Some("the node runs gitlab-runner itself ([node] runner = \"managed\")".into());
     }
     if let Some((_, unit)) = runner_unit_user(unit_dirs) {
@@ -180,9 +250,30 @@ fn uid_of_user(user: &str) -> Option<u32> {
 }
 
 /// The user gitlab-runner's unit runs as, and the unit, when the config it runs with runs the
-/// vk custom executor; `None` when there is no such unit, it is masked, or its config cannot be
-/// read.
+/// vk custom executor; `None` when there is no such unit ([`runner_unit`]), or its config
+/// cannot be read.
 fn runner_unit_user(unit_dirs: &[&str]) -> Option<(String, PathBuf)> {
+    let (unit, service) = runner_unit(unit_dirs)?;
+    let user = service.user.unwrap_or_else(|| "root".to_string());
+    let config = match service.config {
+        Some(config) => config,
+        None if uid_of_user(&user) == Some(0) => PathBuf::from(ROOT_RUNNER_CONFIG),
+        // Its home's `.gitlab-runner/config.toml`, a guess not worth making.
+        None => return None,
+    };
+    let mut text = String::new();
+    std::fs::File::open(config)
+        .and_then(|f| {
+            f.take(super::inventory::MAX_RUNNER_CONFIG)
+                .read_to_string(&mut text)
+        })
+        .ok()?;
+    runs_vk(&text).then_some((user, unit))
+}
+
+/// gitlab-runner's unit and what it says, its drop-ins read; `None` when there is none, it is
+/// masked, or the program it runs is gone.
+fn runner_unit(unit_dirs: &[&str]) -> Option<(PathBuf, RunnerService)> {
     let (unit, text) = unit_dirs.iter().find_map(|dir| {
         let path = Path::new(dir).join(RUNNER_UNIT);
         std::fs::read_to_string(&path).ok().map(|t| (path, t))
@@ -221,21 +312,7 @@ fn runner_unit_user(unit_dirs: &[&str]) -> Option<(String, PathBuf)> {
     }) {
         return None;
     }
-    let user = service.user.unwrap_or_else(|| "root".to_string());
-    let config = match service.config {
-        Some(config) => config,
-        None if uid_of_user(&user) == Some(0) => PathBuf::from(ROOT_RUNNER_CONFIG),
-        // Its home's `.gitlab-runner/config.toml`, a guess not worth making.
-        None => return None,
-    };
-    let mut text = String::new();
-    std::fs::File::open(config)
-        .and_then(|f| {
-            f.take(super::inventory::MAX_RUNNER_CONFIG)
-                .read_to_string(&mut text)
-        })
-        .ok()?;
-    runs_vk(&text).then_some((user, unit))
+    Some((unit, service))
 }
 
 /// What a unit's `[Service]` section says of gitlab-runner, the unit then its drop-ins.
@@ -652,6 +729,63 @@ ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.tom
                 units.join(RUNNER_UNIT).display()
             ))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unset, the mode is `none` only where no gitlab-runner shows; set, it stands, except
+    /// `none` on a host found running a runner of its own.
+    #[test]
+    fn the_runner_mode_is_the_one_set_or_the_one_the_host_implies() {
+        use RunnerMode::{External, Managed};
+        let found = Some("gitlab-runner.service runs the vk custom executor");
+        assert_eq!(runner_mode_of(None, None, false), Ok(RunnerMode::None));
+        assert_eq!(runner_mode_of(None, found, true), Ok(External));
+        // A runner shows whose config the node cannot read: taken for one running vk.
+        assert_eq!(runner_mode_of(None, None, true), Ok(External));
+        for mode in [Managed, External] {
+            assert_eq!(runner_mode_of(Some(mode), None, false), Ok(mode));
+            assert_eq!(runner_mode_of(Some(mode), found, true), Ok(mode));
+        }
+        assert_eq!(
+            runner_mode_of(Some(RunnerMode::None), None, true),
+            Ok(RunnerMode::None)
+        );
+        let lie = runner_mode_of(Some(RunnerMode::None), found, true).unwrap_err();
+        assert!(lie.contains("gitlab-runner.service"), "{lie}");
+        assert!(lie.contains("runner = \"external\""), "{lie}");
+    }
+
+    /// A gitlab-runner shows by its unit, whatever its config, or by its binary on the path;
+    /// not by a masked unit, nor one whose program is gone.
+    #[test]
+    fn a_runner_shows_by_its_unit_or_its_binary() {
+        let dir = scratch("visible-runner");
+        let units = dir.join("units");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let dirs = [units.to_str().unwrap()];
+        let path = [bin.to_str().unwrap()];
+        assert_eq!(visible_runner(&dirs, &path), None);
+        // On the path.
+        std::fs::write(bin.join("gitlab-runner"), "").unwrap();
+        assert!(visible_runner(&dirs, &path).is_some());
+        std::fs::remove_file(bin.join("gitlab-runner")).unwrap();
+        // Masked.
+        std::fs::write(units.join(RUNNER_UNIT), "").unwrap();
+        assert_eq!(visible_runner(&dirs, &path), None);
+        // Its program gone.
+        let program = dir.join("gitlab-runner");
+        let unit = format!(
+            "[Service]\nExecStart={} run --config /nonexistent/config.toml\n",
+            program.display()
+        );
+        std::fs::write(units.join(RUNNER_UNIT), &unit).unwrap();
+        assert_eq!(visible_runner(&dirs, &path), None);
+        // There, its config unreadable: it shows all the same, though not as running vk.
+        std::fs::write(&program, "").unwrap();
+        assert!(visible_runner(&dirs, &path).is_some());
+        assert_eq!(runner_unit_user(&dirs), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

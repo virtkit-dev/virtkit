@@ -38,7 +38,7 @@ macro_rules! say {
     }};
 }
 
-mod ci_user;
+pub(crate) mod ci_user;
 mod core;
 mod identity;
 mod inventory;
@@ -50,6 +50,8 @@ mod session;
 mod state;
 pub(crate) mod tools;
 mod update;
+
+pub use ci_user::{runner_mode, runner_mode_in};
 
 use std::io::{BufRead, Read};
 use std::os::fd::AsRawFd;
@@ -170,6 +172,11 @@ fn dir(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("node")
 }
 
+/// Whether this host is enrolled as a node.
+pub fn enrolled(cfg: &Config) -> bool {
+    dir(cfg).join(ENROLLMENT_FILE).exists()
+}
+
 /// Add enrollment instructions to `e` when an enrollment file is missing.
 fn not_enrolled(e: anyhow::Error) -> anyhow::Error {
     if is_not_found(&e) {
@@ -203,6 +210,7 @@ pub async fn join(
     // The hub URL is checked, an enrolled host refused and the token read before anything
     // changes on the host.
     let hub = normalize_hub_url(hub)?;
+    ci_user::runner_mode(cfg).map_err(anyhow::Error::msg)?;
     if !opts.replace {
         match read_enrollment(&dir(cfg)) {
             Ok(existing) => return Err(already_enrolled(&existing)),
@@ -217,7 +225,7 @@ pub async fn join(
         host_checks(cfg)?;
         // Check before transferring state ownership hides the executor's user. A managed
         // runner runs as the node, so the transfer also fixes ownership of a former user's state.
-        if cfg.node.runner == vk_hub_proto::RunnerMode::External {
+        if cfg.node.runner != Some(vk_hub_proto::RunnerMode::Managed) {
             let uid = service::Account::lookup(name)?.map(|a| a.uid);
             service::ci_user_matches(cfg, uid, name, opts.ignore_ci_user)?;
         }
@@ -531,6 +539,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     update::note_installed(&dir)?;
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
     inventory::labels(&cfg)?;
+    let local_runner = ci_user::local_runner(&cfg);
+    // A host that says it runs no runner but does would take the hub's jobs beside its own
+    // and let a reset clear that runner's jobs: refused outright rather than half-trusted.
+    let visible = local_runner.is_some() || ci_user::runner_visible(&ci_user::SYSTEMD_PATH);
+    let mode = ci_user::runner_mode_of(cfg.node.runner, local_runner.as_deref(), visible)
+        .map_err(anyhow::Error::msg)?;
     if let Some(why) = ci_user::this_node(&cfg) {
         say!("warning: {why}");
     }
@@ -552,7 +566,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         enrollment.node_id,
         enrollment.hub
     );
-    let spec = match cfg.node.runner {
+    let spec = match mode {
         vk_hub_proto::RunnerMode::Managed => {
             let config = crate::schedule::runner_config(&cfg).context(
                 "[node] runner = \"managed\" needs [node] runner_config, or HOME for the default",
@@ -568,7 +582,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 dir: dir.clone(),
             })
         }
-        vk_hub_proto::RunnerMode::External => None,
+        vk_hub_proto::RunnerMode::External | vk_hub_proto::RunnerMode::None => None,
     };
     let (mut stop, abort) = stop_on_signal(spec.is_some())?;
     let issuer = state::Issuer {
@@ -578,11 +592,16 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (runner_tx, runner_state) = tokio::sync::watch::channel(vk_hub_proto::RunnerState::Stopped);
     let policy =
         crate::release_key::Policy::from_config(&cfg.node.release_keys, cfg.node.require_signed)?;
-    let core = core::Core::open(&dir, issuer, spec.is_some().then_some(runner_state))?;
+    let runner = match mode {
+        vk_hub_proto::RunnerMode::Managed => core::Runner::Managed(runner_state),
+        vk_hub_proto::RunnerMode::External => core::Runner::External,
+        vk_hub_proto::RunnerMode::None => core::Runner::None,
+    };
+    let core = core::Core::open(&dir, issuer, runner)?;
     core.set_allow_downgrade(cfg.node.allow_downgrade);
     core.set_release_policy(policy);
     core.set_placed(vk_hub_proto::PlacedIntake {
-        runner: ci_user::local_runner(&cfg),
+        runner: local_runner,
         limit: (cfg.executor.schedule.max_concurrency).map(std::num::NonZeroU32::get),
     });
     let (halt, halted) = tokio::sync::watch::channel(false);
