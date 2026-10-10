@@ -1077,7 +1077,9 @@ hold the image starts on such a node instead, without a reservation, and its res
 released at once; on a refusal it is placed as any job without one. Busier nodes, or none
 holding the image, leave the order above unchanged. Reservations are offered before the job is
 known, so they follow the order above alone. The audit says `where its image is warm`, and
-names the reservation given back. A restarted hub has forgotten which node holds what.
+names the reservation given back. On restart, the hub restores image usage from the newest
+`job_history` records whose specs remain: jobs finished within a day and jobs still running.
+Running jobs count as using their image at the restart.
 
 An offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
 every node with room has refused, the hub pauses 2 seconds and asks again until the request's

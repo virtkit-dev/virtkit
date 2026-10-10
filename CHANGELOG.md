@@ -20,9 +20,10 @@ All notable changes to virtkit will be documented in this file.
   seconds rather than spending a minute or two rebuilding it — but only while that node's load,
   with the job, stays below 0.7 per CPU (`image_affinity_max_load` in `hub.toml`, `0` to turn
   it off) and is at most 0.25 per CPU above the least loaded node's
-  (`image_affinity_max_extra_load`). Busier, jobs keep going to the least loaded node. Nodes
-  now tell the hub their image idle time; with an older `vk` the hub assumes 30 minutes, and
-  never prefers a node that reports no load average.
+  (`image_affinity_max_extra_load`). Busier, jobs keep going to the least loaded node. The hub
+  remembers which node built what across a restart. Nodes now tell the hub their image idle
+  time; with an older `vk` the hub assumes 30 minutes, and never prefers a node that reports
+  no load average.
 - **`vk-hub` keeps the end of a failed job's output.** When `vk-gitlab` settles a failed job
   — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its
   log, masked on the node, for as long as it keeps the job (`kept_failure_output` in

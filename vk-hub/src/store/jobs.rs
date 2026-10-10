@@ -488,6 +488,38 @@ impl Db {
         Ok(out)
     }
 
+    /// Visit the latest `limit` jobs, newest first, retaining only jobs a node accepted
+    /// that finished at or after `since` or remain unfinished. Pass each redacted spec to
+    /// `visit`, holding one spec at a time. Skip jobs whose specs expired.
+    pub fn recent_job_specs(
+        &self,
+        since: u64,
+        limit: usize,
+        mut visit: impl FnMut(String, JobRow, &[u8]),
+    ) -> Result<()> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(JOBS)?;
+        let specs = txn.open_table(JOB_SPECS)?;
+        let order = txn.open_table(JOB_ORDER)?;
+        for entry in order.iter()?.rev().take(limit) {
+            let id = entry?.1.value().to_string();
+            let Some(row) = table.get(id.as_str())? else {
+                continue;
+            };
+            let row = decode::<JobRow>(row.value())?;
+            if row.node.is_none()
+                || row.started_at.is_none()
+                || row.finished_at.is_some_and(|t| t < since)
+            {
+                continue;
+            }
+            if let Some(spec) = specs.get(id.as_str())? {
+                visit(id, row, spec.value());
+            }
+        }
+        Ok(())
+    }
+
     /// Up to `limit` matching jobs, newest first, submitted before the job at `before`.
     /// Includes a summary of the newest [`SUMMARY_JOBS`] jobs matching `filter`.
     pub fn job_page(

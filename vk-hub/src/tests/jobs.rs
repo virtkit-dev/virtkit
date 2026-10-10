@@ -2554,6 +2554,158 @@ async fn a_job_goes_to_a_lightly_loaded_node_holding_its_image() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Which node holds which image survives a restart: read back from the job history.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_hub_still_knows_which_node_holds_a_job_s_image() {
+    let dir = scratch("affinity-restart");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let warm_key = keypair();
+    let warm_id = new_node(addr, &hub, &warm_key).await;
+    let connect_warm = |addr| {
+        connect_beating(
+            addr,
+            &warm_id,
+            &warm_key,
+            V3,
+            heartbeat(16384, Some(100)),
+            Some(Held::default()),
+            Duration::from_millis(300),
+        )
+    };
+    let mut warm = connect_warm(addr).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &warm_id) && heard(&hub, &warm_id)).await;
+    let image = "dockerfile:ci/Dockerfile";
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(1, None, image)),
+    )
+    .await;
+    let first: JobView = resp.json();
+    assert_eq!(next_start(&mut warm).await.job, first.id);
+    warm.send(NodeJobMsg::Job {
+        job: first.id.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &first.id, |v| v.state == JobState::Running).await;
+    warm.send(NodeJobMsg::Result {
+        job: first.id.clone(),
+        result: result(None, 0),
+    });
+    wait_until(|| {
+        db.job(&first.id)
+            .unwrap()
+            .is_some_and(|r| r.finished_at.is_some())
+    })
+    .await;
+    drop(warm);
+    // Restarted over the same database: `warm` comes back, `cold` is new and less loaded.
+    let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    let mut warm = connect_warm(addr).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &warm_id) && heard(&hub, &warm_id)).await;
+    let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
+    let grant = reserve_on(addr, &key, &mut cold, 2).await;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(3, Some(&grant.reservation), image)),
+    )
+    .await;
+    let second: JobView = resp.json();
+    let start = next_start(&mut warm).await;
+    assert_eq!(
+        (start.job.as_str(), start.reservation),
+        (second.id.as_str(), None)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A job still running when the hub restarts gets its image key back from its spec, and its
+/// end, after the restart, counts as its node's latest use of the image.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_running_across_a_restart_keeps_its_image() {
+    let dir = scratch("affinity-running");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let node_key = keypair();
+    let node_id = new_node(addr, &hub, &node_key).await;
+    let connect_node = |addr, held| {
+        connect_beating(
+            addr,
+            &node_id,
+            &node_key,
+            V3,
+            heartbeat(16384, Some(100)),
+            Some(held),
+            Duration::from_millis(300),
+        )
+    };
+    let mut node = connect_node(addr, Held::default()).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &node_id) && heard(&hub, &node_id)).await;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(1, None, "dockerfile:ci/Dockerfile")),
+    )
+    .await;
+    let job: JobView = resp.json();
+    assert_eq!(next_start(&mut node).await.job, job.id);
+    node.send(NodeJobMsg::Job {
+        job: job.id.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &job.id, |v| v.state == JobState::Running).await;
+    let image = crate::jobs::testing::image_key(&hub, &job.id).unwrap();
+    // Wait for the start to be persisted so recovery can read it.
+    wait_until(|| {
+        db.job(&job.id)
+            .unwrap()
+            .is_some_and(|r| r.started_at.is_some())
+    })
+    .await;
+    drop(node);
+    // Restarted over the same database, the job still running on its node.
+    let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    assert_eq!(
+        crate::jobs::testing::image_key(&hub, &job.id).as_deref(),
+        Some(image.as_str())
+    );
+    let recalled = crate::jobs::testing::warm_at(&hub, &image, &node_id).unwrap();
+    let held = Held {
+        reservations: vec![],
+        jobs: vec![HeldJob {
+            job: job.id.clone(),
+            state: RunState::Running {
+                stage: "step_script".into(),
+            },
+            output_len: 0,
+            finished: false,
+        }],
+    };
+    let node = connect_node(addr, held).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &node_id)).await;
+    // Its end is a later use.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    node.send(NodeJobMsg::Result {
+        job: job.id.clone(),
+        result: result(None, 0),
+    });
+    wait_until(|| {
+        crate::jobs::testing::warm_at(&hub, &image, &node_id).is_some_and(|at| at > recalled)
+    })
+    .await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
     let dir = scratch("ceiling-disowned");

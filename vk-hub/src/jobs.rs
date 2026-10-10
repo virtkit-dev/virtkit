@@ -27,7 +27,8 @@
 //! the job in seconds where another spends a minute or two building it. A job submitted on a
 //! reservation on a node without the image starts on the warm node instead, without its
 //! reservation, which is released. Busier, the job goes least loaded first as above; a node
-//! that sends no load average is never preferred. What each node ran is kept in memory only.
+//! that sends no load average is never preferred. Which node ran what is kept in memory and
+//! read back from the job history after a restart.
 //!
 //! A node takes placed work only below its cap ([`placed_cap`]): the operator's ceiling or its
 //! own executor limit, whichever is smaller, counted by [`placed`]. The node refuses past
@@ -256,7 +257,8 @@ struct LiveJob {
     /// When the node accepted the reservation it was sent on, as [`Resv::accepted_at`]: until
     /// a heartbeat from after that, its start is counted against the node's room.
     reservation_accepted_at: u64,
-    /// Its [`image_key`], from its spec; `None` for a job recovered after a restart.
+    /// Its [`image_key`], from its spec; `None` for a job recovered after a restart whose
+    /// spec expired.
     image_key: Option<String>,
 }
 
@@ -1376,13 +1378,38 @@ fn image_key(spec: &JobSpec) -> Option<String> {
 fn warm_touch(state: &mut State, key: String, node: &str, now: u64) {
     let nodes = state.warm.entry(key).or_default();
     nodes.retain(|_, at| now.saturating_sub(*at) < MAX_IMAGE_IDLE_SECS);
-    nodes.insert(node.to_string(), now);
+    warm_note(nodes, node, now);
     if state.warm.len() > MAX_IMAGE_KEYS
         && let Some(oldest) = (state.warm.iter())
             .min_by_key(|(_, nodes)| nodes.values().max().copied().unwrap_or(0))
             .map(|(k, _)| k.clone())
     {
         state.warm.remove(&oldest);
+    }
+}
+
+/// Record `node`'s use of an image at `at` in `nodes`, preserving any later use.
+fn warm_note(nodes: &mut HashMap<String, u64>, node: &str, at: u64) {
+    let used = nodes.entry(node.to_string()).or_insert(at);
+    *used = (*used).max(at);
+}
+
+/// Forget, as of `now`, uses past [`MAX_IMAGE_IDLE_SECS`] and, past [`MAX_IMAGE_KEYS`], the
+/// keys used least recently: what [`warm_touch`] does for one key, for every key at once.
+fn warm_prune(state: &mut State, now: u64) {
+    state.warm.retain(|_, nodes| {
+        nodes.retain(|_, at| now.saturating_sub(*at) < MAX_IMAGE_IDLE_SECS);
+        !nodes.is_empty()
+    });
+    let excess = state.warm.len().saturating_sub(MAX_IMAGE_KEYS);
+    if excess > 0 {
+        let mut latest: Vec<(u64, String)> = (state.warm.iter())
+            .map(|(k, nodes)| (nodes.values().max().copied().unwrap_or(0), k.clone()))
+            .collect();
+        latest.sort_unstable();
+        for (_, key) in latest.into_iter().take(excess) {
+            state.warm.remove(&key);
+        }
     }
 }
 
@@ -2107,6 +2134,45 @@ pub async fn recover(hub: &Hub) -> Result<()> {
             persist(hub, &id, row, events).await?;
         }
     }
+    recall_warm(hub).await
+}
+
+/// Rebuild which node last used each image key from the job history: the newest jobs, up to
+/// the history's count, sent to a node and finished within [`MAX_IMAGE_IDLE_SECS`] or not
+/// finished, whose spec is still kept. A job running carries its key, for its end to count.
+/// Each node's own idle window applies when placing, once it has said it.
+async fn recall_warm(hub: &Hub) -> Result<()> {
+    let now = crate::now_secs();
+    let since = now.saturating_sub(MAX_IMAGE_IDLE_SECS);
+    let limit = hub.dispatch.history;
+    // Each spec's key alone is kept, not the spec.
+    let jobs = blocking(hub, move |db| {
+        let mut jobs = Vec::new();
+        db.recent_job_specs(since, limit, |id, row, spec| {
+            // A spec that no longer parses, from another version of the hub, has no key: its
+            // job is not recalled, which costs no more than a node passed over once.
+            let key = serde_json::from_slice::<JobSpec>(spec)
+                .ok()
+                .as_ref()
+                .and_then(image_key);
+            // One running holds its image now.
+            if let (Some(key), Some(node)) = (key, row.node) {
+                jobs.push((id, node, key, row.finished_at.unwrap_or(now)));
+            }
+        })?;
+        Ok(jobs)
+    })
+    .await?;
+    // Before the hub serves anyone: holding the lock over the replay delays nothing.
+    let mut state = hub.dispatch.lock();
+    // In any order: a node keeps its latest use.
+    for (id, node, key, at) in jobs {
+        warm_note(state.warm.entry(key.clone()).or_default(), &node, at);
+        if let Some(job) = state.jobs.get_mut(&id) {
+            job.image_key = Some(key);
+        }
+    }
+    warm_prune(&mut state, now);
     Ok(())
 }
 
@@ -3122,6 +3188,27 @@ mod tests {
         warm_first(found, &light).remove(0).0
     }
 
+    /// A node keeps its latest use of an image, in whatever order uses are noted: replayed in
+    /// submission order, a job still running is followed by one submitted later and finished
+    /// earlier. Pruned, a use past a day goes, and its key with it once no node holds it.
+    #[test]
+    fn a_node_keeps_its_latest_use_of_an_image() {
+        let mut state = State::default();
+        for at in [NOW, NOW - 600] {
+            warm_note(state.warm.entry("key".into()).or_default(), "n", at);
+        }
+        warm_note(
+            state.warm.entry("old".into()).or_default(),
+            "n",
+            NOW - MAX_IMAGE_IDLE_SECS,
+        );
+        warm_prune(&mut state, NOW);
+        assert_eq!(state.warm.get("key").and_then(|n| n.get("n")), Some(&NOW));
+        assert!(!state.warm.contains_key("old"));
+        warm_touch(&mut state, "key".into(), "n", NOW - 60);
+        assert_eq!(state.warm.get("key").and_then(|n| n.get("n")), Some(&NOW));
+    }
+
     #[test]
     fn a_lightly_loaded_node_holding_the_image_goes_first() {
         // 8 CPUs each; the job's 2 vCPUs add 0.25 per CPU.
@@ -3267,6 +3354,16 @@ mod tests {
 pub(crate) mod testing {
     //! What tests see of the dispatch state.
     use super::*;
+
+    /// Live job `id`'s [`image_key`], as the hub holds it.
+    pub fn image_key(hub: &Hub, id: &str) -> Option<String> {
+        (hub.dispatch.lock().jobs.get(id)).and_then(|j| j.image_key.clone())
+    }
+
+    /// When `node` last used image `key`, as the hub remembers it.
+    pub fn warm_at(hub: &Hub, key: &str, node: &str) -> Option<u64> {
+        (hub.dispatch.lock().warm.get(key)).and_then(|nodes| nodes.get(node).copied())
+    }
 
     /// How many reservations the hub holds.
     pub fn reservations(hub: &Hub) -> usize {
