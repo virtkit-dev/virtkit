@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-10-10
+
 ### Added
 
 - **A node's concurrency ceiling caps the jobs the hub places on it.** `vk-hub nodes ceiling`
@@ -4052,7 +4054,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.86.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.87.0...HEAD
+[0.87.0]: https://github.com/virtkit-dev/virtkit/compare/v0.86.1...v0.87.0
 [0.86.1]: https://github.com/virtkit-dev/virtkit/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/virtkit-dev/virtkit/compare/v0.85.0...v0.86.0
 [0.85.0]: https://github.com/virtkit-dev/virtkit/compare/v0.84.0...v0.85.0
