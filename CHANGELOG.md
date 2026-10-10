@@ -137,6 +137,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk-registry`'s pages use `vk-hub`'s theme.** The browse, upload and API-key pages, and
+  its error pages, get the hub's top bar, light and dark colours, tables and controls. Their
+  tab icon is the registry's own, so its tabs stand apart from the hub's.
 - **An unset `[node] runner` follows what the host shows.** It is `"external"` where a
   gitlab-runner shows — its systemd unit, unmasked, or a `gitlab-runner` on systemd's `PATH` —
   and `"none"` otherwise. A host whose runner `vk node` cannot see, such as one in a container,

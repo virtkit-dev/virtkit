@@ -20,7 +20,7 @@ use crate::accounts::{self, Action, ApiKey, Db, Principal, Scope, User};
 use crate::forms::{
     csrf_of, csrf_ok, csrf_rejected, form_body, see_other, server_error, too_large,
 };
-use crate::html::{self, page, respond};
+use crate::html::{self, Section, page, respond};
 use crate::{html_escape, query_param};
 
 /// The longest life a key may be given. Ten years is past any sensible CI credential's
@@ -175,7 +175,8 @@ async fn create(
     Ok(respond(
         StatusCode::OK,
         &page(
-            "vk-registry: new API key",
+            "New API key",
+            Some(Section::Keys),
             &Principal::Session(user.clone()),
             csrf_of(db, session_id.as_deref()).as_deref(),
             &format!(
@@ -269,7 +270,7 @@ fn list_page(
              <label>Repo pattern <input name=\"repo_pattern\" placeholder=\"team-a/*\" required></label>\n\
              {action}\n\
              <label>Expires in days (blank = never, max {MAX_EXPIRY_DAYS}) <input name=\"expires_days\" type=\"number\" min=\"1\" max=\"{MAX_EXPIRY_DAYS}\"></label>\n\
-             <button type=\"submit\">Create</button>\n\
+             <button type=\"submit\" class=\"primary\">Create</button>\n\
              </form>",
             csrf = html_escape(token),
             action = action_field(user.is_admin),
@@ -279,7 +280,8 @@ fn list_page(
     Ok(respond(
         status,
         &page(
-            "vk-registry: API keys",
+            "API keys",
+            Some(Section::Keys),
             &Principal::Session(user.clone()),
             csrf.as_deref(),
             &format!("<h1>API keys</h1>\n{notice_html}{table}{new_key_form}"),
@@ -331,7 +333,7 @@ fn key_row(k: &ApiKey, csrf: Option<&str>) -> String {
         format!(
             "<form method=\"post\" action=\"/settings/keys/{id}/revoke\">\
              <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-             <button type=\"submit\">Revoke</button></form>",
+             <button type=\"submit\" class=\"danger\">Revoke</button></form>",
             id = html_escape(&k.id),
             csrf = html_escape(csrf),
         )

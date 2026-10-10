@@ -29,7 +29,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::accounts::{self, Db, Principal};
-use crate::html::{self, page, respond};
+use crate::html::{self, Section, page, respond};
 use crate::{Body, body_of};
 use crate::{Store, html_escape, valid_name, valid_tag};
 
@@ -629,7 +629,8 @@ fn form_page(
     Ok(respond(
         status,
         &page(
-            "vk-registry: upload",
+            "Upload",
+            Some(Section::Upload),
             &Principal::Session(user.clone()),
             Some(&csrf),
             &format!(
@@ -640,7 +641,7 @@ fn form_page(
                  <label>Repository <input name=\"name\" placeholder=\"team-a/myfile\" required></label>\n\
                  <label>Tag <input name=\"tag\" value=\"latest\" required></label>\n\
                  <label>File <input type=\"file\" name=\"file\" required></label>\n\
-                 <button type=\"submit\">Upload</button>\n\
+                 <button type=\"submit\" class=\"primary\">Upload</button>\n\
                  </form>",
                 mib = MAX_UPLOAD_BYTES / (1024 * 1024),
                 csrf = html_escape(&csrf),

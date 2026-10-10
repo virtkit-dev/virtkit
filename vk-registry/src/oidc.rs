@@ -403,7 +403,13 @@ fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Body> {
 /// An error page for a caller who is, by definition, not signed in yet — so it renders
 /// without the signed-in chrome, but with the same headers every other page here sets.
 fn html_error(status: StatusCode, message: &str) -> Response<Body> {
-    html::error(status, None, None, status.as_str(), message)
+    html::error(
+        status,
+        None,
+        None,
+        status.canonical_reason().unwrap_or(status.as_str()),
+        message,
+    )
 }
 
 /// The provider, or the network to it, failed us — log the detail, tell the caller only

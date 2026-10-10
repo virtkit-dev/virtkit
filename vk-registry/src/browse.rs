@@ -21,7 +21,7 @@ use anyhow::Result;
 use hyper::{Response, StatusCode};
 
 use crate::accounts::{Action, Db, MAX_CAPTION_LEN, authorize};
-use crate::html::{self, page, respond};
+use crate::html::{self, Section, page, respond};
 use crate::{
     Authz, Body, Store, accounts, html_escape, human_bytes, is_blob_hex, manifest_descriptors,
     valid_digest, valid_name, valid_reference,
@@ -112,7 +112,8 @@ fn repo_list(
     Ok(respond(
         StatusCode::OK,
         &page(
-            "vk-registry",
+            "Repositories",
+            Some(Section::Browse),
             principal,
             csrf,
             &format!(
@@ -231,7 +232,7 @@ fn tag_list(
                  <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
                  <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\
                  <input type=\"hidden\" name=\"tag\" value=\"{tag}\">\
-                 <button type=\"submit\">Delete</button></form></td>",
+                 <button type=\"submit\" class=\"danger\">Delete</button></form></td>",
                 csrf = html_escape(token),
                 repo = html_escape(name),
                 tag = html_escape(t),
@@ -299,7 +300,7 @@ fn tag_list(
              <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\n\
              <label>Caption <input name=\"caption\" maxlength=\"{MAX_CAPTION_LEN}\" \
              value=\"{current}\" placeholder=\"what this repository holds\"></label>\n\
-             <button type=\"submit\">Save</button>\n\
+             <button type=\"submit\" class=\"primary\">Save</button>\n\
              <p>Shown to everyone who can read this repository. \
              Empty restores the default.</p>\n\
              </form>\n",
@@ -323,7 +324,8 @@ fn tag_list(
     Ok(respond(
         StatusCode::OK,
         &page(
-            &format!("vk-registry: {name}"),
+            name,
+            Some(Section::Browse),
             principal,
             csrf,
             &format!(
@@ -447,7 +449,8 @@ fn manifest_detail(
     Ok(respond(
         StatusCode::OK,
         &page(
-            &format!("vk-registry: {name}@{reference}"),
+            &format!("{name}@{reference}"),
+            Some(Section::Browse),
             principal,
             csrf,
             &format!(
@@ -1223,6 +1226,10 @@ mod tests {
 
         let admin = page(&admin_p, Some("tok")).await;
         assert!(
+            admin.contains("<a href=\"/browse\" aria-current=\"page\">"),
+            "a repository's page sits under Browse: {admin}"
+        );
+        assert!(
             admin.contains("action=\"/settings/tags/delete\""),
             "{admin}"
         );
@@ -1232,7 +1239,7 @@ mod tests {
             "{admin}"
         );
         assert!(
-            admin.contains("<button type=\"submit\">Delete</button>"),
+            admin.contains("<button type=\"submit\" class=\"danger\">Delete</button>"),
             "{admin}"
         );
 
