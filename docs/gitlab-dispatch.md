@@ -138,11 +138,13 @@ bound each node, and capacity (`fits`) is the sum of every node's room.
 
 A job whose image its node builds from the checkout (`dockerfile:` or `compose:`, its own or a
 service's) goes first to a node that ran a job of the same project with the same such images
-within that node's `image_cache_idle_secs`, while that node is lightly loaded: 1-minute load
-average and placed vCPUs, each per CPU, below the hub's `image_affinity_max_load` (default
-`0.5`). That node boots it in seconds where another spends a minute or two building the image.
-A job submitted on a reservation on a node without the image then starts on the warm node
-without it, and the hub releases the reservation. Under heavier load the order above holds.
+within that node's `image_cache_idle_secs`, while that node is lightly loaded: its 1-minute
+load average, plus the vCPUs of jobs sent to it in the last minute and of this job, per CPU,
+below the hub's `image_affinity_max_load` (default `0.7`), and without this job no more than
+`image_affinity_max_extra_load` (default `0.25`) above the lowest such load among candidates.
+That node boots it in seconds where another spends a minute or two building the image. A job
+submitted on a reservation on a node without the image then starts on the warm node without it,
+and the hub releases the reservation. Under heavier load the order above holds.
 
 ## Daemon ↔ hub: the client API
 

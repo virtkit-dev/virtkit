@@ -20,8 +20,11 @@
 //! # settles it; "0" keeps none.
 //! kept_failure_output = "256K"
 //! # A job whose image its node builds goes first to a node that still holds that image while
-//! # that node's CPU load, per CPU, is below this; "0" turns the preference off.
-//! image_affinity_max_load = 0.5
+//! # that node's load per CPU, the job's vCPUs added, stays below this ("0" turns the preference
+//! # off) and, without the job, is at most image_affinity_max_extra_load above the least loaded
+//! # node's.
+//! image_affinity_max_load = 0.7
+//! image_affinity_max_extra_load = 0.25
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -82,9 +85,8 @@ pub struct HubConfig {
     pub job_history: usize,
     /// How many bytes from the end of a failed job's output are kept once it is settled.
     pub kept_failure_output: u64,
-    /// The CPU load per CPU, in millionths, under which a node holding a job's image is
-    /// preferred; 0 turns the preference off.
-    pub image_affinity_max_load: u64,
+    /// When a node holding a job's image is preferred.
+    pub image_affinity: crate::jobs::Affinity,
 }
 
 /// The web UI's listener.
@@ -131,6 +133,7 @@ struct FileConfig {
     job_history: Option<u64>,
     kept_failure_output: Option<String>,
     image_affinity_max_load: Option<f64>,
+    image_affinity_max_extra_load: Option<f64>,
     oidc: Option<FileOidc>,
 }
 
@@ -287,10 +290,20 @@ impl HubConfig {
                 _ => bail!("kept_failure_output {size:?}: expected a size from 0 to 4M"),
             },
         };
-        let image_affinity_max_load = match f.image_affinity_max_load {
-            None => crate::jobs::DEFAULT_AFFINITY_MAX_LOAD,
-            Some(load) if (0.0..=1.0).contains(&load) => (load * 1e6).round() as u64,
-            Some(load) => bail!("image_affinity_max_load {load}: expected 0 to 1"),
+        let default = crate::jobs::Affinity::default();
+        let image_affinity = crate::jobs::Affinity {
+            max_load: millionths(
+                "image_affinity_max_load",
+                f.image_affinity_max_load,
+                2.0,
+                default.max_load,
+            )?,
+            max_extra_load: millionths(
+                "image_affinity_max_extra_load",
+                f.image_affinity_max_extra_load,
+                1.0,
+                default.max_extra_load,
+            )?,
         };
         Ok(HubConfig {
             addr,
@@ -302,7 +315,7 @@ impl HubConfig {
             job_lost_after,
             job_history,
             kept_failure_output,
-            image_affinity_max_load,
+            image_affinity,
         })
     }
 
@@ -349,6 +362,15 @@ impl UiConfig {
             self.tls_key.as_deref(),
             "ui_tls_cert and ui_tls_key",
         )
+    }
+}
+
+/// `key`'s `value`, 0 to `max`, in millionths; `default` when unset.
+fn millionths(key: &str, value: Option<f64>, max: f64, default: u64) -> Result<u64> {
+    match value {
+        None => Ok(default),
+        Some(v) if (0.0..=max).contains(&v) => Ok((v * 1e6).round() as u64),
+        Some(v) => bail!("{key} {v}: expected 0 to {max}"),
     }
 }
 
@@ -692,23 +714,32 @@ mod tests {
     }
 
     #[test]
-    fn image_affinity_holds_below_a_load_of_0_to_1_per_cpu() {
-        let max = |extra: &str| {
-            parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.image_affinity_max_load)
+    fn image_affinity_takes_loads_per_cpu_of_0_to_2_and_0_to_1() {
+        use crate::jobs::Affinity;
+        let affinity =
+            |extra: &str| parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.image_affinity);
+        assert_eq!(affinity("").unwrap(), Affinity::default());
+        let both = affinity("image_affinity_max_load = 2\nimage_affinity_max_extra_load = 1\n");
+        let want = Affinity {
+            max_load: 2_000_000,
+            max_extra_load: 1_000_000,
         };
-        assert_eq!(max("").unwrap(), crate::jobs::DEFAULT_AFFINITY_MAX_LOAD);
-        for (load, millionths) in [("0", 0), ("0.25", 250_000), ("1", 1_000_000)] {
-            assert_eq!(
-                max(&format!("image_affinity_max_load = {load}\n")).unwrap(),
-                millionths,
-                "{load}"
-            );
-        }
-        for bad in ["-0.1", "1.5", "nan", "\"0.5\""] {
-            assert!(
-                max(&format!("image_affinity_max_load = {bad}\n")).is_err(),
-                "{bad}"
-            );
+        assert_eq!(both.unwrap(), want);
+        let off = affinity("image_affinity_max_load = 0\nimage_affinity_max_extra_load = 0.25\n");
+        let want = Affinity {
+            max_load: 0,
+            max_extra_load: 250_000,
+        };
+        assert_eq!(off.unwrap(), want);
+        for bad in [
+            "image_affinity_max_load = 2.5",
+            "image_affinity_max_load = -0.1",
+            "image_affinity_max_load = nan",
+            "image_affinity_max_load = \"0.5\"",
+            "image_affinity_max_extra_load = 1.5",
+            "image_affinity_max_extra_load = -1",
+        ] {
+            assert!(affinity(&format!("{bad}\n")).is_err(), "{bad}");
         }
     }
 

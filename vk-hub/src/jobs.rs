@@ -21,8 +21,9 @@
 //! **Image affinity.** A job whose image a node builds from the job's checkout (`dockerfile:`
 //! or `compose:`, as its own image or a service's) goes first to a node that ran a job of the
 //! same project with the same such images within that node's image idle window, while that
-//! node is lightly loaded: its 1-minute load average, and the vCPUs of its placed work, each
-//! per CPU below [`Dispatch::affinity_max_load`]. Such a node has the image built and boots
+//! node is lightly loaded ([`Affinity`]): its 1-minute load average, plus the vCPUs of the jobs
+//! it was sent in the last minute and of this job, per CPU, below a maximum, and no more than
+//! a margin above the least loaded candidate's. Such a node has the image built and boots
 //! the job in seconds where another spends a minute or two building it. A job submitted on a
 //! reservation on a node without the image starts on the warm node instead, without its
 //! reservation, which is released. Busier, the job goes least loaded first as above; a node
@@ -128,9 +129,30 @@ const MAX_IMAGE_IDLE_SECS: u64 = 86_400;
 /// The most image keys the hub remembers nodes for; the least recently used goes.
 const MAX_IMAGE_KEYS: usize = 4096;
 
-/// The CPU load under which a node holding a job's image is preferred, in millionths per
-/// CPU, by default (`image_affinity_max_load` in `hub.toml`): 0.5.
-pub const DEFAULT_AFFINITY_MAX_LOAD: u64 = 500_000;
+/// How long a job started on a node may not show in its 1-minute load average. A heuristic:
+/// the average, an exponential one, shows about 63% of a step in load 60 seconds on.
+const RECENT_START_SECS: u64 = 60;
+
+/// When a node holding a job's image is preferred ([`prefer_warm`]): loads per CPU, in
+/// millionths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Affinity {
+    /// The node's load with the job must stay below it; 0 turns image affinity off
+    /// (`image_affinity_max_load` in `hub.toml`).
+    pub max_load: u64,
+    /// The most the node's load may be above the least loaded candidate's
+    /// (`image_affinity_max_extra_load`).
+    pub max_extra_load: u64,
+}
+
+impl Default for Affinity {
+    fn default() -> Self {
+        Affinity {
+            max_load: 700_000,
+            max_extra_load: 250_000,
+        }
+    }
+}
 
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
@@ -149,9 +171,8 @@ pub struct Dispatch {
     /// How many bytes from the end of a failed job's output are kept when it is settled; 0
     /// keeps none.
     pub kept_failure_output: u64,
-    /// The CPU load, in millionths per CPU, under which a node holding a job's image is
-    /// preferred ([`DEFAULT_AFFINITY_MAX_LOAD`]); 0 turns image affinity off.
-    pub affinity_max_load: u64,
+    /// When a node holding a job's image is preferred.
+    pub affinity: Affinity,
 }
 
 #[derive(Default)]
@@ -262,7 +283,7 @@ impl Dispatch {
             lost_after,
             history,
             kept_failure_output: DEFAULT_KEPT_FAILURE_OUTPUT,
-            affinity_max_load: DEFAULT_AFFINITY_MAX_LOAD,
+            affinity: Affinity::default(),
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -1371,44 +1392,91 @@ fn still_warm(used_at: u64, idle_secs: u64, now: u64) -> bool {
     now.saturating_sub(used_at) < idle_secs.min(MAX_IMAGE_IDLE_SECS)
 }
 
-/// A node's CPU pressure in millionths, for image affinity: the larger of its 1-minute load
-/// average and the vCPUs of its placed work, each per CPU. `None` without a load average or a
-/// CPU count: such a node is not known to be lightly loaded.
-fn cpu_pressure(placed_cpus: u64, cpus: u32, load1_hundredths: Option<u32>) -> Option<u64> {
-    let load1 = load1_hundredths?;
-    (cpus > 0).then(|| load(0, 0, placed_cpus, cpus, Some(load1)))
+/// Sum vCPUs by node in one pass for jobs its 1-minute load average may not show yet:
+/// those awaiting acceptance or accepted within [`RECENT_START_SECS`] of `now`.
+fn recent_cpus(state: &State, now: u64) -> HashMap<&str, u64> {
+    let mut by_node: HashMap<&str, u64> = HashMap::new();
+    for j in state.jobs.values() {
+        let recent = match j.row.state {
+            JobState::Starting => true,
+            JobState::Running => {
+                (j.row.started_at).is_some_and(|t| now.saturating_sub(t) < RECENT_START_SECS)
+            }
+            _ => false,
+        };
+        if let Some(node) = j.node().filter(|_| recent) {
+            let cpus = by_node.entry(node).or_default();
+            *cpus = cpus.saturating_add(u64::from(j.row.placement.envelope.cpus));
+        }
+    }
+    by_node
 }
 
-/// The nodes that still hold image `key`, by [`still_warm`] and their own idle window, each
-/// with whether its [`cpu_pressure`] is below `max_load`.
-fn warm_nodes(
-    state: &State,
-    nodes: &[(String, NodeRow)],
-    key: &str,
-    max_load: u64,
-    now: u64,
-) -> HashMap<String, bool> {
+/// Load per CPU in millionths: the 1-minute load average plus `extra_cpus` busy CPUs,
+/// divided by the node's CPU count. `None` without a load average or a CPU count.
+fn load_per_cpu(load1_hundredths: Option<u32>, extra_cpus: u64, cpus: u32) -> Option<u64> {
+    let load1 = u64::from(load1_hundredths?).saturating_mul(10_000);
+    load1
+        .saturating_add(extra_cpus.saturating_mul(1_000_000))
+        .checked_div(u64::from(cpus))
+}
+
+/// Whether a node holding the image, at load `warm` per CPU (millionths, without the job), is
+/// preferred for a job adding `job` per CPU, the least loaded candidate being at `least`.
+fn prefer_warm(warm: u64, job: u64, least: u64, affinity: Affinity) -> bool {
+    warm.saturating_add(job) < affinity.max_load
+        && warm <= least.saturating_add(affinity.max_extra_load)
+}
+
+/// The nodes that still hold image `key` at `now`, by [`still_warm`] and their own idle
+/// window.
+fn warm_nodes(state: &State, nodes: &[(String, NodeRow)], key: &str, now: u64) -> HashSet<String> {
     let Some(used) = state.warm.get(key) else {
-        return HashMap::new();
+        return HashSet::new();
     };
-    nodes
-        .iter()
-        .filter_map(|(id, row)| {
-            let at = *used.get(id)?;
+    (nodes.iter())
+        .filter(|(id, row)| {
             let idle = (row.report.as_ref())
                 .and_then(|r| r.placed.as_ref())
                 .and_then(|p| p.image_cache_idle_secs)
                 .unwrap_or(DEFAULT_IMAGE_IDLE_SECS);
-            if !still_warm(at, idle, now) {
-                return None;
-            }
-            let pressure = cpu_pressure(
-                tallies(state).get(id.as_str()).map_or(0, |t| t.cpus),
-                row.inventory.as_ref().map_or(0, |i| i.hardware.cpus),
-                row.heartbeat.as_ref().and_then(|h| h.load1_hundredths),
-            );
-            Some((id.clone(), pressure.is_some_and(|p| p < max_load)))
+            used.get(id).is_some_and(|at| still_warm(*at, idle, now))
         })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Of `warm`, the candidates in `found` preferred for a job of `cpus` vCPUs ([`prefer_warm`]):
+/// each node's load being its load average plus [`recent_cpus`], per CPU; a node without a
+/// load average is neither preferred nor counted as the least loaded.
+fn preferred(
+    state: &State,
+    nodes: &[(String, NodeRow)],
+    found: &[(String, u64)],
+    warm: &HashSet<String>,
+    cpus: u32,
+    affinity: Affinity,
+    now: u64,
+) -> HashSet<String> {
+    let rows: HashMap<&str, &NodeRow> = nodes.iter().map(|(id, r)| (id.as_str(), r)).collect();
+    let recent = recent_cpus(state, now);
+    let loads: Vec<(&str, u64, u64)> = (found.iter())
+        .filter_map(|(id, _)| {
+            let row = rows.get(id.as_str())?;
+            let node_cpus = row.inventory.as_ref().map_or(0, |i| i.hardware.cpus);
+            let load1 = row.heartbeat.as_ref().and_then(|h| h.load1_hundredths);
+            let extra = recent.get(id.as_str()).copied().unwrap_or(0);
+            let load = load_per_cpu(load1, extra, node_cpus)?;
+            let job = load_per_cpu(Some(0), u64::from(cpus), node_cpus)?;
+            Some((id.as_str(), load, job))
+        })
+        .collect();
+    let Some(least) = loads.iter().map(|(_, load, _)| *load).min() else {
+        return HashSet::new();
+    };
+    (loads.into_iter())
+        .filter(|(id, load, job)| warm.contains(*id) && prefer_warm(*load, *job, least, affinity))
+        .map(|(id, _, _)| id.to_string())
         .collect()
 }
 
@@ -2237,14 +2305,19 @@ fn place(
     let spec = job.spec.clone()?;
     let placement = job.row.placement.clone();
     let mut tried = job.tried.clone();
-    let warm = match (&job.image_key, hub.dispatch.affinity_max_load) {
-        (Some(key), max_load @ 1..) => warm_nodes(state, nodes, key, max_load, crate::now_secs()),
-        _ => HashMap::new(),
+    let affinity = hub.dispatch.affinity;
+    let clock = crate::now_secs();
+    let warm = match &job.image_key {
+        Some(key) if affinity.max_load > 0 => warm_nodes(state, nodes, key, clock),
+        _ => HashSet::new(),
     };
-    let light: HashSet<String> = (warm.iter())
-        .filter(|(_, light)| **light)
-        .map(|(id, _)| id.clone())
-        .collect();
+    let preferred_among = |state: &State, found: &[(String, u64)]| {
+        if warm.is_empty() {
+            return HashSet::new();
+        }
+        let cpus = placement.envelope.cpus;
+        preferred(state, nodes, found, &warm, cpus, affinity, clock)
+    };
     let reserved = job.reservation.as_ref().and_then(|r| {
         let x = state.reservations.get(r)?;
         let ok = matches!(x.phase, ResvPhase::Held { .. })
@@ -2255,10 +2328,11 @@ fn place(
     let given_up = reserved
         .as_ref()
         .filter(|(_, node, _, _)| {
-            !warm.contains_key(node)
-                && !light.is_empty()
-                && (candidates(hub, state, nodes, &placement, &tried).iter())
-                    .any(|(id, _)| light.contains(id))
+            if warm.contains(node) || warm.is_empty() {
+                return false;
+            }
+            let found = candidates(hub, state, nodes, &placement, &tried);
+            !preferred_among(state, &found).is_empty()
         })
         .map(|(r, _, _, _)| r.clone());
     let reserved = reserved.filter(|_| given_up.is_none());
@@ -2282,6 +2356,7 @@ fn place(
                 tried.clear();
                 found = candidates(hub, state, nodes, &placement, &tried);
             }
+            let light = preferred_among(state, &found);
             let (node, _) = warm_first(found, &light).into_iter().next()?;
             (node, None, placement.envelope)
         }
@@ -2311,7 +2386,7 @@ fn place(
         Some(r) => format!("on reservation {r}"),
         None => "without a reservation".to_string(),
     };
-    if light.contains(&node) {
+    if warm.contains(&node) {
         how.push_str(", where its image is warm");
     }
     if let Some(r) = given_up
@@ -2996,76 +3071,132 @@ mod tests {
         }
     }
 
-    /// First node for image `key` among `found`, supplied least loaded first.
-    /// `warm` names the node that last ran it and how many seconds ago.
-    fn first(warm: (&str, u64), nodes: &[(String, NodeRow)], found: &[&str]) -> String {
-        const NOW: u64 = 1_000_000;
+    const NOW: u64 = 1_000_000;
+
+    /// A job of `cpus` vCPUs sent to `node`, accepted `started` seconds before [`NOW`] or not
+    /// yet.
+    fn sent(node: &str, cpus: u32, started: Option<u64>) -> LiveJob {
+        let placement = Placement {
+            envelope: Envelope {
+                cpus,
+                ..Envelope::default()
+            },
+            ..Placement::default()
+        };
+        let row = serde_json::json!({
+            "key": "k", "key_name": "k", "request_id": "r", "created_at": 0, "revision": 1,
+            "placement": placement, "node": node,
+            "state": if started.is_some() { "running" } else { "starting" },
+            "started_at": started.map(|ago| NOW - ago),
+        });
+        LiveJob {
+            row: serde_json::from_value(row).unwrap(),
+            spec: None,
+            reservation: None,
+            deadline: Instant::now(),
+            tried: HashSet::new(),
+            round_ended: None,
+            output_cap: 0,
+            reservation_accepted_at: 0,
+            image_key: None,
+        }
+    }
+
+    /// The node a job of 2 vCPUs goes to first among `found`, least loaded first, with `warm`
+    /// the node that last ran its image `ago` seconds before, and `jobs` sent to nodes.
+    fn first(
+        warm: (&str, u64),
+        nodes: &[(String, NodeRow)],
+        found: &[&str],
+        jobs: Vec<LiveJob>,
+    ) -> String {
         let mut state = State::default();
+        for (n, job) in jobs.into_iter().enumerate() {
+            state.jobs.insert(n.to_string(), job);
+        }
         let (node, ago) = warm;
         warm_touch(&mut state, "key".into(), node, NOW - ago);
-        let light: HashSet<String> = warm_nodes(&state, nodes, "key", 500_000, NOW)
-            .into_iter()
-            .filter_map(|(id, light)| light.then_some(id))
-            .collect();
-        let found = found.iter().map(|id| (id.to_string(), 1)).collect();
+        let warm = warm_nodes(&state, nodes, "key", NOW);
+        let found: Vec<(String, u64)> = found.iter().map(|id| (id.to_string(), 1)).collect();
+        let light = preferred(&state, nodes, &found, &warm, 2, Affinity::default(), NOW);
         warm_first(found, &light).remove(0).0
     }
 
     #[test]
     fn a_lightly_loaded_node_holding_the_image_goes_first() {
-        let nodes = |warm_load, idle| {
+        // 8 CPUs each; the job's 2 vCPUs add 0.25 per CPU.
+        let nodes = |cold_load, warm_load, idle| {
             vec![
-                ("cold".to_string(), node_row(Some(0), None)),
+                ("cold".to_string(), node_row(cold_load, None)),
                 ("warm".to_string(), node_row(warm_load, idle)),
             ]
         };
         let found = ["cold", "warm"];
-        // A load of 2 on 8 CPUs, under half: the warm node, though the other is less loaded.
-        assert_eq!(first(("warm", 60), &nodes(Some(200), None), &found), "warm");
-        // Loaded to half its CPUs or past: least loaded first.
-        assert_eq!(first(("warm", 60), &nodes(Some(400), None), &found), "cold");
-        assert_eq!(
-            first(("warm", 60), &nodes(Some(1200), None), &found),
-            "cold"
-        );
+        let pick = |cold, warm, ago| first(("warm", ago), &nodes(cold, warm, None), &found, vec![]);
+        // 0.25 per CPU, 0.5 with the job, 0.25 above the other: the warm node.
+        assert_eq!(pick(Some(0), Some(200), 60), "warm");
+        // 0.375 above the other: least loaded first; 0.25 above it, the warm node again.
+        assert_eq!(pick(Some(0), Some(300), 60), "cold");
+        assert_eq!(pick(Some(100), Some(300), 60), "warm");
+        // 0.5, 0.75 with the job, though only 0.125 above the other: least loaded first.
+        assert_eq!(pick(Some(300), Some(400), 60), "cold");
+        assert_eq!(pick(Some(300), Some(1200), 60), "cold");
         // No load average: not known to be lightly loaded.
-        assert_eq!(first(("warm", 60), &nodes(None, None), &found), "cold");
+        assert_eq!(pick(Some(0), None, 60), "cold");
+        // The least loaded is one with a load average.
+        assert_eq!(pick(None, Some(200), 60), "warm");
+        // Jobs it was just sent, not in its load average yet, count: 2 vCPUs not yet accepted
+        // put it 0.375 above the other, as do 2 accepted 30 seconds ago; not 2 accepted 90
+        // seconds ago, nor 2 just sent to the other too.
+        let run = |jobs| first(("warm", 60), &nodes(Some(0), Some(100), None), &found, jobs);
+        assert_eq!(run(vec![]), "warm");
+        assert_eq!(run(vec![sent("warm", 2, None)]), "cold");
+        assert_eq!(run(vec![sent("warm", 2, Some(30))]), "cold");
+        assert_eq!(run(vec![sent("warm", 2, Some(90))]), "warm");
+        assert_eq!(
+            run(vec![sent("warm", 2, None), sent("cold", 2, Some(10))]),
+            "warm"
+        );
         // Past the node's idle window, 30 minutes when it does not say: it evicted the image.
-        assert_eq!(
-            first(("warm", 1800), &nodes(Some(200), None), &found),
-            "cold"
-        );
-        assert_eq!(
-            first(("warm", 1799), &nodes(Some(200), None), &found),
-            "warm"
-        );
-        assert_eq!(
-            first(("warm", 1800), &nodes(Some(200), Some(3600)), &found),
-            "warm"
-        );
-        assert_eq!(
-            first(("warm", 600), &nodes(Some(200), Some(300)), &found),
-            "cold"
-        );
+        assert_eq!(pick(Some(0), Some(200), 1800), "cold");
+        assert_eq!(pick(Some(0), Some(200), 1799), "warm");
+        let idle = |idle, ago| {
+            first(
+                ("warm", ago),
+                &nodes(Some(0), Some(200), idle),
+                &found,
+                vec![],
+            )
+        };
+        assert_eq!(idle(Some(3600), 1800), "warm");
+        assert_eq!(idle(Some(300), 600), "cold");
         // Not a candidate, for room or caps: never placed on.
-        assert_eq!(
-            first(("warm", 60), &nodes(Some(200), None), &["cold"]),
-            "cold"
+        let only_cold = first(
+            ("warm", 60),
+            &nodes(Some(0), Some(200), None),
+            &["cold"],
+            vec![],
         );
+        assert_eq!(only_cold, "cold");
         // Already first, or no node holds it: unchanged.
-        assert_eq!(
-            first(("warm", 60), &nodes(Some(0), None), &["warm", "cold"]),
-            "warm"
+        let order = ["warm", "cold"];
+        let warm_first = first(("warm", 60), &nodes(Some(0), Some(0), None), &order, vec![]);
+        assert_eq!(warm_first, "warm");
+        let gone = first(
+            ("gone", 60),
+            &nodes(Some(0), Some(200), None),
+            &found,
+            vec![],
         );
-        assert_eq!(first(("gone", 60), &nodes(Some(200), None), &found), "cold");
+        assert_eq!(gone, "cold");
     }
 
     #[test]
-    fn a_node_s_cpu_pressure_counts_its_placed_vcpus_and_load_average() {
-        assert_eq!(cpu_pressure(0, 8, Some(200)), Some(250_000));
-        assert_eq!(cpu_pressure(6, 8, Some(200)), Some(750_000));
-        assert_eq!(cpu_pressure(0, 8, None), None);
-        assert_eq!(cpu_pressure(0, 0, Some(0)), None);
+    fn a_node_s_load_per_cpu_adds_cpus_to_its_load_average() {
+        assert_eq!(load_per_cpu(Some(200), 0, 8), Some(250_000));
+        assert_eq!(load_per_cpu(Some(200), 4, 8), Some(750_000));
+        assert_eq!(load_per_cpu(None, 4, 8), None);
+        assert_eq!(load_per_cpu(Some(0), 4, 0), None);
     }
 
     #[test]
