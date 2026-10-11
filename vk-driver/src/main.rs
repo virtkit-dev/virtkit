@@ -99,6 +99,7 @@ mod vmm;
 mod vmmctl;
 mod vms;
 mod winbuild;
+mod wincache;
 mod wineval;
 mod winexec;
 mod winiso;
@@ -3966,7 +3967,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         if windows {
-            return windows_build(&cli.cmd).await;
+            return windows_build(&cli.cmd, &cfg).await;
         }
         if *reinstall {
             return fail(
@@ -5188,7 +5189,7 @@ fn windows_context(context: &[PathBuf], dockerfile: &Path) -> PathBuf {
 
 /// `vk build` of a Windows Dockerfile: a bundle of qcow2 layers made through qemu-ga
 /// ([`winbuild`]) instead of an ext4, refusing the flags only the Linux build reads.
-async fn windows_build(cmd: &Cmd) -> ExitCode {
+async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
     let Cmd::Build {
         file,
         target,
@@ -5232,8 +5233,6 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         (*print_plan, "--print-plan"),
         (kernel.is_some(), "--kernel"),
         (agent.is_some(), "--agent"),
-        (cache_registry.is_some(), "--cache-registry"),
-        (*cache_insecure, "--cache-insecure"),
         (build_cache.is_some(), "--build-cache"),
         (*no_journal, "--no-journal"),
         (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
@@ -5265,6 +5264,13 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
             2,
         );
     };
+    // Layers are shared through a cache registry other hosts reach; the default in-process
+    // store would only hold a second copy of what this host's layer cache already has.
+    let cache = build::CacheOpts::resolve(cache_registry.as_deref(), *cache_insecure, &cfg.build);
+    let registry = match build::shared_cache_registry(&cache) {
+        Ok(r) => r,
+        Err(e) => return fail(&e, 2),
+    };
     let context = windows_context(context, dockerfile);
     let context = match context.canonicalize() {
         Ok(c) => c,
@@ -5284,6 +5290,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
         no_network,
         reinstall: *reinstall,
+        registry,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
         Ok(Ok(())) => ExitCode::SUCCESS,

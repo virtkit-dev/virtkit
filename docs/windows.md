@@ -103,6 +103,34 @@ running 10 seconds later. `vk stop` waits 210 seconds by default before it repor
 stuck; a VM left behind by a vk that crashed ends itself the same way 11 minutes after the
 button.
 
+## Sharing builds between hosts
+
+With a build cache registry server (`[build] cache_registry`, or `--cache-registry`), a Windows
+build shares its layers as Linux build steps do (`wincache`):
+
+- **Push.** The install, once settled, and each `RUN`/`COPY` layer go to
+  `build-cache:win-<key>`, chunked by content (FastCDC, zstd), each chunk stored once registry
+  wide. A layer whose parent is in the registry as this host has it is pushed as a diff: the
+  parent's chunks are reused and only the ranges the step wrote are chunked again. The install
+  is pushed whole.
+- **Pull.** A host missing a layer pulls it lazily: a `.vk_ro_img` view over its chunks,
+  decompressed as Windows reads them, which the next step's overlay or a bundle builds on. A
+  pulled layer stands alone; it needs none of the layers under it.
+- **Once.** While a host makes a layer it holds the registry's build lock on its key; the others
+  wait for its push rather than install Windows again (up to an hour, then they build too).
+- **Passwords.** Each layer records the Administrator password of its install in its entry:
+  two hosts installing the same key at once give it different ones, and a pulled layer must
+  come with its own.
+- **Media.** `vk registry put <iso>...` stores install media in the registry's `files/` area,
+  by digest (`files/sha256:<hex>`). A `winiso:` stage whose file is not in its build context
+  fetches the one it pins from there (into the host's Windows cache), so neither the
+  repository nor every host holds the ISOs. Each build that uses an install marks its media as
+  used, so the registry's retention keeps them as long as the install is in use; `--keep`
+  keeps them regardless.
+
+The in-process store (no `cache_registry`) is not used: it would only hold a second copy of the
+host's own layer cache.
+
 ## Tests
 
 - `tests/windows-ad-e2e.sh`: the AD lab (a DC, a Linux job creating its users, two members,

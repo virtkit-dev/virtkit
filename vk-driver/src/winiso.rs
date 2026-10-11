@@ -116,6 +116,51 @@ impl Pinned {
         Ok(())
     }
 
+    /// This medium, or, when the Dockerfile's path does not hold it, the copy `registry` keeps
+    /// under its digest ([`crate::files`]), fetched once into `cache`. Under its own file name:
+    /// the install medium's script names the ISO by it.
+    fn fetched(&self, cache: &Path, registry: Option<&crate::config::Registry>) -> Result<Pinned> {
+        if self.path.exists() {
+            return Ok(self.clone());
+        }
+        let name = self
+            .path
+            .file_name()
+            .with_context(|| format!("{}: no file name", self.path.display()))?;
+        let dir = cache.join("iso").join(&self.sha256);
+        let local = Pinned {
+            path: dir.join(name),
+            sha256: self.sha256.clone(),
+        };
+        if local.path.exists() {
+            return Ok(local);
+        }
+        let Some(rg) = registry else {
+            bail!(
+                "{}: no such file, and no build cache registry to fetch it from",
+                self.path.display()
+            );
+        };
+        eprintln!(
+            "virtkit: winiso: fetching {} from the build cache ({}:{})",
+            self.path.display(),
+            crate::files::BY_DIGEST,
+            self.sha256
+        );
+        std::fs::create_dir_all(&dir)?;
+        let result = match crate::files::fetch(rg, &self.sha256, &local.path) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(anyhow::anyhow!(
+                "no such file, nor in the build cache: put it there with \
+                 `vk registry put {}`",
+                self.path.display()
+            )),
+            Err(e) => Err(e),
+        };
+        result.with_context(|| format!("{}", self.path.display()))?;
+        Ok(local)
+    }
+
     /// The file itself, past any symlink: the helper VM sees only the directory mounted for it.
     fn real_path(&self) -> Result<PathBuf> {
         std::fs::canonicalize(&self.path).with_context(|| format!("{}", self.path.display()))
@@ -344,7 +389,35 @@ pub(crate) fn cached_base(cache: &Path, key: &str) -> Option<PathBuf> {
     let dir = cache.join("settled").join(key);
     dir.join("base.json")
         .is_file()
-        .then(|| dir.join("disk.qcow2"))
+        .then(|| crate::wincache::layer_disk(&dir))
+}
+
+/// The base layer `key` recorded in its directory `dir`, if `dir` holds one.
+fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
+    let Ok(text) = std::fs::read_to_string(dir.join("base.json")) else {
+        return Ok(None);
+    };
+    let password = serde_json::from_str::<serde_json::Value>(&text)?["password"]
+        .as_str()
+        .context("base.json without a password")?
+        .to_string();
+    Ok(Some(Base {
+        disk: crate::wincache::layer_disk(dir),
+        password,
+        key: key.to_string(),
+    }))
+}
+
+/// Write `record`, a base layer's `base.json`, into its unpublished directory `tmp`, readable
+/// by its owner only: it holds the Administrator password.
+fn write_base_record(tmp: &Path, record: &serde_json::Value) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp.join("base.json"))?;
+    std::io::Write::write_all(&mut file, serde_json::to_string_pretty(record)?.as_bytes())?;
+    Ok(())
 }
 
 /// The virtio-win directory of the Windows `edition` names, if vk knows it.
@@ -403,7 +476,9 @@ fn count_reinstall(path: &Path) -> Result<()> {
 
 /// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`; with `reinstall`,
 /// a new one under new keys. Cache the install by its medium and disk size, and the settle
-/// overlay by the install and settle step, so changing the settle does not reinstall.
+/// overlay by the install and settle step, so changing the settle does not reinstall. With a
+/// `registry`, a base another host made is pulled from it, and one made here is pushed to it
+/// ([`crate::wincache`]).
 pub(crate) fn base(
     source: &Source,
     disk_size: u64,
@@ -411,6 +486,7 @@ pub(crate) fn base(
     mem: &str,
     cache: &Path,
     reinstall: bool,
+    registry: Option<&crate::config::Registry>,
 ) -> Result<Base> {
     let first = install_key(&source.media_key(), disk_size);
     let count = cache.join("reinstalls").join(&first);
@@ -421,23 +497,102 @@ pub(crate) fn base(
     }
     let (install_key, key) = keys(&first, reinstalls(&count));
     let dir = cache.join("settled").join(&key);
-    let record = dir.join("base.json");
-    if let Ok(text) = std::fs::read_to_string(&record) {
-        let password = serde_json::from_str::<serde_json::Value>(&text)?["password"]
-            .as_str()
-            .context("base.json without a password")?
-            .to_string();
+    if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
-        return Ok(Base {
-            disk: dir.join("disk.qcow2"),
-            password,
-            key,
-        });
+        if let Some(rg) = registry {
+            keep_media(rg, source);
+        }
+        return Ok(base);
     }
+    let Some(rg) = registry else {
+        return make_base(
+            source,
+            disk_size,
+            cpus,
+            mem,
+            cache,
+            &install_key,
+            &key,
+            None,
+        );
+    };
+    keep_media(rg, source);
+    // Held while this host installs, so the others wait for its push.
+    let _lock = crate::wincache::lock(rg, &key, "Windows install");
+    if let Some(base) = read_base(&dir, &key)? {
+        return Ok(base);
+    }
+    let root = cache.parent().unwrap_or(cache);
+    let tmp = scratch_beside(&dir)?;
+    match crate::wincache::pull(rg, root, &key, &tmp)? {
+        Some(record) if record["password"].is_string() => {
+            write_base_record(&tmp, &record)?;
+            publish(&tmp, &dir)?;
+            eprintln!(
+                "virtkit: winiso: base {} (from the build cache)",
+                &key[..12]
+            );
+            return read_base(&dir, &key)?.context("a pulled base without its record");
+        }
+        Some(_) => eprintln!(
+            "virtkit: warning: the build cache's base {} has no password; installing again",
+            &key[..12]
+        ),
+        None => {}
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    let base = make_base(
+        source,
+        disk_size,
+        cpus,
+        mem,
+        cache,
+        &install_key,
+        &key,
+        Some(rg),
+    )?;
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("base.json"))?)?;
+    if let Err(e) = crate::wincache::push(rg, &key, &base.disk, None, record) {
+        eprintln!(
+            "virtkit: warning: pushing base {} failed: {e:#}",
+            &key[..12]
+        );
+    }
+    Ok(base)
+}
 
-    let install_dir = cache.join("install").join(&install_key);
+/// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
+/// as long as builds use what was installed from them. Best effort.
+fn keep_media(rg: &crate::config::Registry, source: &Source) {
+    for pinned in [&source.iso, &source.drivers] {
+        let _ = crate::files::exists(rg, &pinned.sha256);
+    }
+}
+
+/// Install `source` on a `disk_size`-byte disk, or take the install `install_key` from `cache`,
+/// and settle it into the base layer `key`. Media missing here are fetched from `registry`.
+#[allow(clippy::too_many_arguments)]
+fn make_base(
+    source: &Source,
+    disk_size: u64,
+    cpus: u32,
+    mem: &str,
+    cache: &Path,
+    install_key: &str,
+    key: &str,
+    registry: Option<&crate::config::Registry>,
+) -> Result<Base> {
+    let dir = cache.join("settled").join(key);
+
+    let install_dir = cache.join("install").join(install_key);
     let installed_disk = install_dir.join("disk.qcow2");
     if !install_dir.join("installed").exists() {
+        let source = &Source {
+            iso: source.iso.fetched(cache, registry)?,
+            drivers: source.drivers.fetched(cache, registry)?,
+            edition: source.edition.clone(),
+        };
         source.iso.verify(cache)?;
         source.drivers.verify(cache)?;
         let media = media(source, cache)?;
@@ -466,27 +621,21 @@ pub(crate) fn base(
             return Err(e);
         }
     };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(tmp.join("base.json"))?;
-    std::io::Write::write_all(
-        &mut file,
-        serde_json::to_string_pretty(&serde_json::json!({
+    write_base_record(
+        &tmp,
+        &serde_json::json!({
             "password": password,
             "edition": source.edition,
             "iso": source.iso.sha256,
             "drivers": source.drivers.sha256,
-        }))?
-        .as_bytes(),
+        }),
     )?;
     let _ = std::fs::remove_dir_all(tmp.join("settle"));
     publish(&tmp, &dir)?;
     Ok(Base {
         disk: dir.join("disk.qcow2"),
         password,
-        key,
+        key: key.to_string(),
     })
 }
 

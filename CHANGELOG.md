@@ -6,11 +6,19 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **Hosts sharing a build cache registry install Windows once between them.** A Windows build's
+  install and each `RUN`/`COPY` layer go to the build cache registry (`[build]
+  cache_registry`) as Linux build steps do: chunked by content, each chunk stored once, a layer
+  pushed as a diff over the layer under it. Another host pulls a layer it lacks lazily instead
+  of installing Windows again, and while one host makes a layer the others wait for it. Builds
+  without a registry server keep their layers on the host, as before.
 - **`vk registry put` and `vk registry get` keep plain files in the build cache registry**, in
   `vk-registry`'s `files/` area: each file is stored once, by digest (`sha256:<hex>`, served
   over WebDAV at `/dav/files/sha256/<hex>`) and, with `--dir`, by name (`<dir>/<name>`).
-  `--keep` keeps a file however long it goes unused, `--ttl <duration>` drops it that long
-  after the put, used or not.
+  A `FROM winiso:<file>@sha256:<hex>` stage whose ISO is not on the building host fetches it
+  by digest, so install media need not be on every host, nor in the repository. `--keep`
+  keeps a file however long it goes unused, `--ttl <duration>` drops it that long after the
+  put, used or not.
 - **A pushed manifest can set how long `vk-registry gc` keeps its tags**: annotated
   `org.virtkit.retention=keep` they stay however long they go unused, annotated
   `org.virtkit.expires=<unix seconds>` they go at that time, used or not.

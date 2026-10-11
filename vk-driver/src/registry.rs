@@ -166,6 +166,10 @@ struct BundleConfig {
     /// not baked). Absent for older bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_config: Option<vk_core::runcfg::RunConfig>,
+    /// What a build-cache entry carries beside its disk for the build that restores it: a
+    /// Windows layer's Administrator password and licensing (`winbuild`). Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
 }
 
 /// The bundle config a bundle-dir push records, HTTP and local alike: the boot flavour
@@ -211,6 +215,7 @@ fn bundle_config_from_dir(
         has_kernel,
         has_initrd,
         run_config,
+        meta: None,
     })
 }
 
@@ -720,17 +725,26 @@ pub fn fetch_chunks(
     name: &str,
     tag: &str,
 ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
-    if let Some(root) = rg.local_root() {
-        return local::fetch_chunks(&root, name, tag);
-    }
-    block_on(fetch_chunks_async(rg, name, tag))
+    Ok(fetch_bundle(rg, name, tag)?.map(|b| (b.chunks, b.total_size)))
 }
 
-async fn fetch_chunks_async(
-    rg: &Registry,
-    name: &str,
-    tag: &str,
-) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+/// A cached bundle as [`fetch_bundle`] reads it.
+pub struct FetchedBundle {
+    pub chunks: Vec<OciDescriptor>,
+    pub total_size: u64,
+    /// What [`push_disk_diff`] recorded with it.
+    pub meta: Option<serde_json::Value>,
+}
+
+/// [`fetch_chunks`], with the `meta` the bundle was pushed with.
+pub fn fetch_bundle(rg: &Registry, name: &str, tag: &str) -> Result<Option<FetchedBundle>> {
+    if let Some(root) = rg.local_root() {
+        return local::fetch_bundle(&root, name, tag);
+    }
+    block_on(fetch_bundle_async(rg, name, tag))
+}
+
+async fn fetch_bundle_async(rg: &Registry, name: &str, tag: &str) -> Result<Option<FetchedBundle>> {
     let (client, auth) = client(rg)?;
     // A pinned parent is passed by immutable digest (`sha256:…`), which must be resolved
     // as a digest reference — `make_ref` would build an unparseable `:sha256:…` tag. A
@@ -767,7 +781,11 @@ async fn fetch_chunks_async(
             )
         })
         .collect();
-    Ok(Some((chunks, config.total_size)))
+    Ok(Some(FetchedBundle {
+        chunks,
+        total_size: config.total_size,
+        meta: config.meta,
+    }))
 }
 
 /// A plain file the registry holds: one blob under a single-layer manifest whose layer is a
@@ -1006,17 +1024,47 @@ pub fn push_ext4_diff(
     holes: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
+    push_disk_diff(
+        rg,
+        name,
+        tag,
+        ext4,
+        boot_kind,
+        total_size,
+        dirty,
+        holes,
+        parent_layers,
+        None,
+    )
+}
+
+/// [`push_ext4_diff`] of any disk image, with `meta` recorded in the bundle config for
+/// [`fetch_bundle`] to hand back.
+#[allow(clippy::too_many_arguments)]
+pub fn push_disk_diff(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    disk: &Path,
+    boot_kind: &str,
+    total_size: u64,
+    dirty: &[(u64, u64)],
+    holes: &[(u64, u64)],
+    parent_layers: &[OciDescriptor],
+    meta: Option<serde_json::Value>,
+) -> Result<(Vec<OciDescriptor>, u64, String)> {
     if let Some(root) = rg.local_root() {
         return local::push_ext4_diff(
             &root,
             name,
             tag,
-            ext4,
+            disk,
             boot_kind,
             total_size,
             dirty,
             holes,
             parent_layers,
+            meta,
         );
     }
     block_on(with_upload_retry("diff push", |force| {
@@ -1024,12 +1072,13 @@ pub fn push_ext4_diff(
             rg,
             name,
             tag,
-            ext4,
+            disk,
             boot_kind,
             total_size,
             dirty,
             holes,
             parent_layers,
+            meta.clone(),
             force,
         )
     }))
@@ -1046,6 +1095,7 @@ async fn push_ext4_diff_async(
     dirty: &[(u64, u64)],
     holes: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
+    meta: Option<serde_json::Value>,
     force: bool,
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
     let (client, auth) = client(rg)?;
@@ -1183,6 +1233,7 @@ async fn push_ext4_diff_async(
         has_initrd: false,
         // The build-sharing path pushes an ext4 by fingerprint; no runtime config rides it.
         run_config: None,
+        meta,
     };
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
     let config_digest = sha256_hex(&config_json);
@@ -3143,11 +3194,11 @@ mod local {
             .unwrap_or_else(|_| vec![false; tags.len()])
     }
 
-    pub(super) fn fetch_chunks(
+    pub(super) fn fetch_bundle(
         root: &Path,
         name: &str,
         tag: &str,
-    ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+    ) -> Result<Option<FetchedBundle>> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
         let Some((_digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
@@ -3163,7 +3214,11 @@ mod local {
                 )
             })
             .collect();
-        Ok(Some((chunks, config.total_size)))
+        Ok(Some(FetchedBundle {
+            chunks,
+            total_size: config.total_size,
+            meta: config.meta,
+        }))
     }
 
     pub(super) fn try_pull_ext4(
@@ -3309,7 +3364,7 @@ mod local {
             |start, len| file_region(ext4, start, len),
             &mut layers,
         )?;
-        let config = cache_config(&layers, total_size, boot_kind);
+        let config = cache_config(&layers, total_size, boot_kind, None);
         put_bundle_manifest(&store, name, tag, layers, config)
     }
 
@@ -3324,6 +3379,7 @@ mod local {
         dirty: &[(u64, u64)],
         holes: &[(u64, u64)],
         parent_layers: &[OciDescriptor],
+        meta: Option<serde_json::Value>,
     ) -> Result<(Vec<OciDescriptor>, u64, String)> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
@@ -3391,7 +3447,7 @@ mod local {
             &mut layers,
         )?;
         let ret = layers.clone();
-        let config = cache_config(&layers, total_size, boot_kind);
+        let config = cache_config(&layers, total_size, boot_kind, meta);
         let digest = put_bundle_manifest(&store, name, tag, layers, config)?;
         Ok((ret, total_size, digest))
     }
@@ -3665,7 +3721,12 @@ mod local {
 
     /// The bundle config a build-cache snapshot carries: chunk layers only, and none of
     /// the bundle extras (`push_bundle` fills those in from the bundle dir).
-    fn cache_config(layers: &[OciDescriptor], total_size: u64, boot_kind: &str) -> BundleConfig {
+    fn cache_config(
+        layers: &[OciDescriptor],
+        total_size: u64,
+        boot_kind: &str,
+        meta: Option<serde_json::Value>,
+    ) -> BundleConfig {
         BundleConfig {
             total_size,
             chunk_count: layers.len(),
@@ -3674,6 +3735,7 @@ mod local {
             has_kernel: false,
             has_initrd: false,
             run_config: None,
+            meta,
         }
     }
 
@@ -4994,6 +5056,7 @@ mod tests {
             has_kernel: false,
             has_initrd: false,
             run_config: Some(rc.clone()),
+            meta: None,
         };
         // the config blob push writes and pull reads must preserve run_config verbatim.
         let json = serde_json::to_vec(&cfg).unwrap();

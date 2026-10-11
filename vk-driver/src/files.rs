@@ -1,7 +1,8 @@
-//! Plain files in the build cache registry: `vk registry put|get`. They live in the
-//! registry's `files/` area, the one its WebDAV view serves under `/dav/files/`:
-//! `files/<dir>:<name>` is `/dav/files/<dir>/<name>`. Every file put is also tagged by its
-//! digest in [`BY_DIGEST`], so whatever names it carries it can be fetched by content alone.
+//! Plain files in the build cache registry: `vk registry put|get`, and the install media a
+//! `winiso:` stage pins. They live in the registry's `files/` area, the one its WebDAV view
+//! serves under `/dav/files/`: `files/<dir>:<name>` is `/dav/files/<dir>/<name>`. Every file
+//! put is also tagged by its digest in [`BY_DIGEST`], so whatever names it carries it can be
+//! fetched by content alone, as a Dockerfile pinning `<file>@sha256:<hex>` does.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -139,6 +140,17 @@ pub(crate) fn get(
     Ok(crate::registry::pull_raw_file(rg, &repo, &tag, &dest)?.map(|f| (f, dest)))
 }
 
+/// Fetch the file whose sha256 is `sha256` to `dest`: `false` when the registry has none.
+pub(crate) fn fetch(rg: &Registry, sha256: &str, dest: &Path) -> Result<bool> {
+    Ok(crate::registry::pull_raw_file(rg, BY_DIGEST, sha256, dest)?.is_some())
+}
+
+/// Whether the registry holds the file whose sha256 is `sha256`. Asking counts as a use,
+/// so it keeps an idle file from expiring.
+pub(crate) fn exists(rg: &Registry, sha256: &str) -> bool {
+    crate::registry::exists(rg, BY_DIGEST, sha256)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +202,8 @@ mod tests {
         );
     }
 
-    /// Through a store on disk: put under a digest and a name, read back by either.
+    /// Through a store on disk: put under a digest and a name, read back by either, and
+    /// the digest is what a `winiso:` stage fetches by.
     #[test]
     fn a_file_round_trips_through_a_local_store() {
         let dir = std::env::temp_dir().join(format!("vk-files-{}", std::process::id()));
@@ -212,12 +225,16 @@ mod tests {
             refs,
             [format!("sha256:{sha256}"), "iso/medium.iso".to_string()]
         );
+        assert!(exists(&rg, &sha256));
         for r in &refs {
             let out = dir.join("out");
             let (file, _) = get(&rg, r, Some(&out)).unwrap().unwrap();
             assert_eq!(file.title.as_deref(), Some("medium.iso"));
             assert_eq!(std::fs::read(&out).unwrap(), b"an install medium");
         }
+        let fetched = dir.join("fetched");
+        assert!(fetch(&rg, &sha256, &fetched).unwrap());
+        assert!(!fetch(&rg, &"0".repeat(64), &dir.join("none")).unwrap());
         assert!(
             get(&rg, "iso/absent", Some(&dir.join("none")))
                 .unwrap()
