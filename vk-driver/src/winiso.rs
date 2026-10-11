@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::build::hex;
 use crate::qga::Client;
 use crate::vmm::Disk;
+use crate::wincache::Lookup;
 
 /// The image scheme of a Windows install stage.
 pub(crate) const SCHEME: &str = "winiso:";
@@ -445,6 +446,8 @@ pub(crate) struct Base {
     pub disk: PathBuf,
     pub password: String,
     pub key: String,
+    /// A registry-only base's manifest digest; [`pull_base`] puts its disk at `disk` when needed.
+    pub pending: Option<String>,
 }
 
 /// The base layer `key` recorded in its directory `dir`, if `dir` holds one.
@@ -464,6 +467,7 @@ pub(crate) fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
         disk: crate::wincache::layer_disk(dir),
         password,
         key: key.to_string(),
+        pending: None,
     }))
 }
 
@@ -559,6 +563,7 @@ fn keep_media(rg: &crate::config::Registry, source: &Source) {
 /// missing here are fetched from `registry`, which every build keeps them alive in; a base
 /// another host made is pulled from it, and one made here is pushed to it
 /// ([`crate::wincache`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn base(
     source: &Source,
     disk_size: u64,
@@ -567,6 +572,7 @@ pub(crate) fn base(
     cache: &Path,
     reinstall: bool,
     registry: Option<&crate::config::Registry>,
+    pull: bool,
 ) -> Result<Base> {
     let first = install_key(&source.media_key(), disk_size);
     let count = cache.join("reinstalls").join(&first);
@@ -597,52 +603,30 @@ pub(crate) fn base(
         );
     };
     keep_media(rg, source);
+    // Reinstall counts are host-local: another host may have the same key, but pulling its
+    // install would skip the requested reinstall.
+    let first = if reinstall || !pull {
+        Lookup::Missing
+    } else {
+        remote_base(rg, &dir, &key)
+    };
+    let failed = matches!(first, Lookup::Failed);
+    if let Lookup::Found(base) = first {
+        return Ok(base);
+    }
     // Held while this host installs, so the others wait for its push.
     let _lock = crate::wincache::lock(rg, &key, "Windows install");
     if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
         return Ok(base);
     }
-    // Reinstall counts are host-local: another host may have the same key, but pulling its
-    // install would skip the requested reinstall.
-    if !reinstall {
-        let root = cache.parent().unwrap_or(cache);
-        let tmp = scratch_beside(&dir)?;
-        let placed = (|| {
-            let Some(record) = crate::wincache::pull(rg, root, &key, &tmp)? else {
-                return Ok(false);
-            };
-            if !record["password"].is_string() {
-                eprintln!(
-                    "virtkit: warning: the build cache's base {} has no password; \
-                     installing again",
-                    &key[..12]
-                );
-                return Ok(false);
-            }
-            write_base_record(&tmp, &record)?;
-            publish(&tmp, &dir)?;
-            Ok::<_, anyhow::Error>(true)
-        })();
-        if !matches!(placed, Ok(true)) {
-            // Best effort: a leftover is cleared by the next build of the key (`scratch_beside`).
-            let _ = std::fs::remove_dir_all(&tmp);
-        }
-        // Best effort, like the push: a failed pull triggers a local install.
-        let placed = placed.unwrap_or_else(|e| {
-            eprintln!(
-                "virtkit: warning: pulling base {} failed, installing here: {e:#}",
-                &key[..12]
-            );
-            false
-        });
-        if placed {
-            eprintln!(
-                "virtkit: winiso: base {} (from the build cache)",
-                &key[..12]
-            );
-            return read_base(&dir, &key)?.context("a pulled base without its record");
-        }
+    // Check for a push during the lock wait, unless the first lookup failed.
+    if !reinstall
+        && pull
+        && !failed
+        && let Lookup::Found(base) = remote_base(rg, &dir, &key)
+    {
+        return Ok(base);
     }
     let base = make_base(
         source,
@@ -671,6 +655,71 @@ pub(crate) fn base(
         }
     }
     Ok(base)
+}
+
+/// The base layer `key` the build cache `rg` holds, to be pulled into its directory `dir` when
+/// something needs its disk ([`pull_base`]). `Missing` when the registry does not have it, or
+/// has it without the password a base must record; a failed lookup costs an install here.
+fn remote_base(rg: &crate::config::Registry, dir: &Path, key: &str) -> Lookup<Base> {
+    let (digest, record) = match crate::wincache::remote(rg, key) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Lookup::Missing,
+        Err(e) => {
+            eprintln!(
+                "virtkit: warning: looking up base {} in the build cache failed, installing \
+                 here: {e:#}",
+                &key[..12]
+            );
+            return Lookup::Failed;
+        }
+    };
+    let Some(password) = record["password"].as_str() else {
+        eprintln!(
+            "virtkit: warning: the build cache's base {} has no password; installing again",
+            &key[..12]
+        );
+        return Lookup::Missing;
+    };
+    eprintln!("virtkit: winiso: base {} (in the build cache)", &key[..12]);
+    Lookup::Found(Base {
+        disk: dir.join(crate::wincache::PULLED_DISK),
+        password: password.to_string(),
+        key: key.to_string(),
+        pending: Some(digest),
+    })
+}
+
+/// Pull the base layer `key`, the build cache's manifest `digest`, into its directory under
+/// `cache`, with its record.
+pub(crate) fn pull_base(
+    rg: &crate::config::Registry,
+    cache: &Path,
+    key: &str,
+    digest: &str,
+) -> Result<()> {
+    let dir = cache.join("settled").join(key);
+    if dir.join("base.json").is_file() {
+        return Ok(());
+    }
+    let tmp = scratch_beside(&dir)?;
+    let root = cache.parent().unwrap_or(cache);
+    let placed = (|| {
+        let record =
+            crate::wincache::pull(rg, root, key, Some(digest), &tmp)?.with_context(|| {
+                format!(
+                    "base {}: gone from the build cache since this build found it there; build \
+                     again",
+                    &key[..12]
+                )
+            })?;
+        write_base_record(&tmp, &record)?;
+        publish(&tmp, &dir)
+    })();
+    if placed.is_err() {
+        // Best effort: a leftover is cleared by the next build of the key (`scratch_beside`).
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    placed
 }
 
 /// Install `source` on a `disk_size`-byte disk, or take the install `install_key` from `cache`,
@@ -1013,6 +1062,33 @@ fn humantime(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A base the registry lacks, or holds without a password, is not taken from it.
+    #[test]
+    fn a_base_without_a_password_is_not_taken() {
+        let root = std::env::temp_dir().join(format!("vk-winiso-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let rg = crate::config::Registry::for_share(
+            root.join("store").display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let dir = root.join("settled");
+        assert!(remote_base(&rg, &dir, &"a".repeat(64)).found().is_none());
+        let bare = "b".repeat(64);
+        let raw = root.join("disk.raw");
+        std::fs::write(&raw, vec![1u8; 4 << 20]).unwrap();
+        let disk = root.join(crate::wincache::BUILT_DISK);
+        crate::qcow2::create_overlay(&disk, &raw).unwrap();
+        crate::wincache::push(&rg, &bare, &disk, None, serde_json::json!({})).unwrap();
+        assert!(remote_base(&rg, &dir, &bare).found().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A base placed after another build placed its own first reads back as that build's:
     /// its record, password included, is what stays in place.
@@ -1582,7 +1658,7 @@ mod tests {
             .unwrap();
         }
 
-        let base = base(&source, size, 1, "1G", &cache, false, Some(&rg)).unwrap();
+        let base = base(&source, size, 1, "1G", &cache, false, Some(&rg), true).unwrap();
         assert_eq!(base.password, "theirs-0");
         assert_eq!(base.key, keys(&first, 0).1);
         assert!(!base.disk.ends_with(crate::wincache::BUILT_DISK));
@@ -1590,7 +1666,7 @@ mod tests {
         // Reinstalling installs, which here fails on the absent media, instead of pulling.
         let err = format!(
             "{:#}",
-            super::base(&source, size, 1, "1G", &cache, true, Some(&rg)).unwrap_err()
+            super::base(&source, size, 1, "1G", &cache, true, Some(&rg), true).unwrap_err()
         );
         assert!(err.contains("vk registry put"), "{err}");
         assert!(!cache.join("settled").join(keys(&first, 1).1).exists());

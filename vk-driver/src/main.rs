@@ -5391,6 +5391,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         net,
         reinstall: *reinstall,
         registry,
+        pull_layers: true,
         ceiling: None,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {

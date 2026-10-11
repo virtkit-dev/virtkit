@@ -27,12 +27,31 @@ const CACHE_REPO: &str = vk_registry::BUILD_CACHE_REPO;
 /// The disk of a layer this host made: a qcow2 overlay over its parent's.
 pub(crate) const BUILT_DISK: &str = "disk.qcow2";
 /// The disk of a layer pulled from the registry: a lazy view over its chunks.
-const PULLED_DISK: &str = "disk.vk_ro_img";
+pub(crate) const PULLED_DISK: &str = "disk.vk_ro_img";
 /// In a layer's directory: the registry manifest the layer's disk is, byte for byte, when it
 /// was pulled from or pushed to the registry. Only then can a child's push reuse its chunks.
 const DIGEST: &str = "registry-digest";
 /// In a layer's directory: the Administrator password of a layer that recorded one.
 const PASSWORD: &str = "admin-password";
+
+/// What looking a layer up in the build cache found. `Failed` has been warned of: the build
+/// goes on as if the registry lacked the layer, best effort as a push is.
+pub(crate) enum Lookup<T> {
+    Found(T),
+    Missing,
+    Failed,
+}
+
+#[cfg(test)]
+impl<T> Lookup<T> {
+    /// What was found, missing and failed alike `None`.
+    pub(crate) fn found(self) -> Option<T> {
+        match self {
+            Lookup::Found(t) => Some(t),
+            Lookup::Missing | Lookup::Failed => None,
+        }
+    }
+}
 
 /// The registry tag of layer `key`.
 fn tag(key: &str) -> String {
@@ -105,13 +124,22 @@ pub(crate) fn lock(rg: &Registry, key: &str, what: &str) -> Option<crate::regist
     lock
 }
 
-/// Pull layer `key` into the unpublished layer directory `tmp`, the chunks into the shared
-/// chunk cache under `root`. Returns what the layer was pushed with, or `None` when the
-/// registry does not have it.
+/// Whether the registry has layer `key`, without pulling it: the manifest digest that names it,
+/// and what it was pushed with. A build takes a layer's password and licensing from here, and
+/// pulls the layer only once something builds on it or boots it ([`pull`] with the digest).
+pub(crate) fn remote(rg: &Registry, key: &str) -> Result<Option<(String, serde_json::Value)>> {
+    Ok(crate::registry::fetch_bundle(rg, CACHE_REPO, &tag(key))?
+        .map(|b| (b.digest, b.meta.unwrap_or_default())))
+}
+
+/// Pull layer `key` — the manifest `digest` names when given, else what its tag names now —
+/// into the unpublished layer directory `tmp`, the chunks into the shared chunk cache under
+/// `root`. Returns what the layer was pushed with, or `None` when the registry does not have it.
 pub(crate) fn pull(
     rg: &Registry,
     root: &Path,
     key: &str,
+    digest: Option<&str>,
     tmp: &Path,
 ) -> Result<Option<serde_json::Value>> {
     // The chunk cache is `<staging>/../chunks` (see `registry::chunks_cache_dir`): one cache for
@@ -125,8 +153,9 @@ pub(crate) fn pull(
     let result = (|| -> Result<Option<serde_json::Value>> {
         let view = staging.join(PULLED_DISK);
         let label = format!("Windows layer {}", &key[..12]);
+        let reference = digest.map_or_else(|| tag(key), str::to_string);
         let Some(digest) =
-            crate::registry::try_pull_ext4_lazy(rg, CACHE_REPO, &tag(key), &view, &label, None)?
+            crate::registry::try_pull_ext4_lazy(rg, CACHE_REPO, &reference, &view, &label, None)?
         else {
             return Ok(None);
         };
@@ -341,7 +370,7 @@ mod tests {
         // Host B pulls the step alone, and gets every byte of it.
         let pulled = host_b.join("layers").join(key(2));
         std::fs::create_dir_all(&pulled).unwrap();
-        let meta = pull(rg, &host_b, &key(2), &pulled).unwrap().unwrap();
+        let meta = pull(rg, &host_b, &key(2), None, &pulled).unwrap().unwrap();
         assert_eq!(meta["password"], "pa");
         assert_eq!(password(&pulled).unwrap().as_deref(), Some("pa"));
         assert!(layer_disk(&pulled).ends_with(PULLED_DISK));
@@ -372,14 +401,16 @@ mod tests {
         .unwrap();
         let again = tmp.join("c").join(key(3));
         std::fs::create_dir_all(&again).unwrap();
-        let meta = pull(rg, &tmp.join("c"), &key(3), &again).unwrap().unwrap();
+        let meta = pull(rg, &tmp.join("c"), &key(3), None, &again)
+            .unwrap()
+            .unwrap();
         assert_eq!(meta["password"], "pb");
         assert_eq!(contents(&layer_disk(&again), tmp), contents(&next, tmp));
 
         // A layer the registry does not have.
         let none = tmp.join("none");
         std::fs::create_dir_all(&none).unwrap();
-        assert!(pull(rg, &host_b, &key(9), &none).unwrap().is_none());
+        assert!(pull(rg, &host_b, &key(9), None, &none).unwrap().is_none());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

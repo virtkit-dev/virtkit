@@ -26,10 +26,11 @@ All notable changes to virtkit will be documented in this file.
 - **Hosts sharing a build cache registry install Windows once between them.** A Windows
   build's install and each `RUN`/`COPY` layer go to the build cache registry server
   (`[build] cache_registry`), and another host takes a layer it lacks from there instead of
-  installing Windows again; while one host makes a layer, the others wait for it, for up to
-  three hours. Builds without a registry server keep their layers on the host, as before.
-  The registry holds each install's Administrator password in clear: restrict pull access
-  to `build-cache`.
+  installing Windows again. It downloads only the layers it builds on or boots; if one has
+  left the registry, the build restarts without registry layers. While one host makes a
+  layer, the others wait for up to three hours. Builds without a
+  registry server keep their layers on the host, as before. The registry holds each
+  install's Administrator password in clear: restrict pull access to `build-cache`.
 - **CI jobs run Windows services.** A `compose:` service with a Windows `build:` Dockerfile
   builds during prepare, reusing cached layers shared between hosts when a build cache
   registry is configured. It boots beside the Linux job VM on the job's LAN and runs its

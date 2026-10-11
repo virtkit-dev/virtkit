@@ -1229,6 +1229,7 @@ fn build_windows_unit(
         net,
         reinstall: false,
         registry,
+        pull_layers: true,
         // A job's Dockerfile sizes its build guests no larger than its services.
         ceiling: Some(service_ceiling(cfg)?),
     };

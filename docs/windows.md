@@ -116,8 +116,13 @@ build shares its layers as Linux build steps do (`wincache`):
   is pushed whole.
 - **Pull.** A host missing a layer pulls it as a `.vk_ro_img` view: its chunks are fetched,
   then decompressed as Windows reads them, and the next step's overlay or a bundle builds on
-  it. A pulled layer stands alone; it needs none of the layers under it. A failed pull builds
-  the layer locally; a failed push leaves it local.
+  it. A pulled layer stands alone; it needs none of the layers under it, so a build takes only
+  the registry's record of each layer it finds there (its password, its licensing) and pulls
+  the one a step builds on or the bundle boots: a host whose target is cached downloads that
+  layer only, never the install under it. The record's manifest digest pins what is pulled
+  later. A failed lookup makes the layer here; a layer found but then not pulled (its
+  manifest gone since) starts the build over taking no layer from the registry; a failed push
+  leaves it local.
 - **Once.** While a host makes a layer it holds the registry's build lock on its key; the others
   wait for its push rather than install Windows again (up to three hours, longer than a
   Windows 11 install; then they build too, and say so).
