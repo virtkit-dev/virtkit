@@ -79,6 +79,7 @@ its rationale and test. For Windows they add:
 | --- | --- |
 | `winiso` | The unattended install: the FAT32 install disk (made in a Linux helper VM), Setup, the first boots' servicing, the settle step. |
 | `winbuild` | Windows Dockerfile stages: the `RUN`/`COPY` layers through qemu-ga, sysprep, the bundle. |
+| `wincache` | Layers shared through the build cache registry, and the host's Windows cache sweep. |
 | `uefi` | Booting a UEFI guest: its spec, the firmware, its run directory, waiting for Windows to finish starting, stopping it. |
 | `qga` | The qemu-ga client: one connection at a time, resynchronized after a guest reboot. |
 | `relay` | The boot child's sockets: qemu-ga shared among its clients, COM1's input. |
@@ -115,7 +116,10 @@ build shares its layers as Linux build steps do (`wincache`):
   is pushed whole.
 - **Pull.** A host missing a layer pulls it lazily: a `.vk_ro_img` view over its chunks,
   decompressed as Windows reads them, which the next step's overlay or a bundle builds on. A
-  pulled layer stands alone; it needs none of the layers under it.
+  pulled layer stands alone; it needs none of the layers under it, so a build takes only the
+  registry's record of each layer it finds there (its password, its licensing) and pulls the
+  one a step builds on or the bundle boots: a host whose target is cached downloads that layer
+  only, never the install under it. The record's manifest digest pins what is pulled later.
 - **Once.** While a host makes a layer it holds the registry's build lock on its key; the others
   wait for its push rather than install Windows again (up to an hour, then they build too).
 - **Passwords.** Each layer records the Administrator password of its install in its entry:
@@ -130,6 +134,13 @@ build shares its layers as Linux build steps do (`wincache`):
 
 The in-process store (no `cache_registry`) is not used: it would only hold a second copy of the
 host's own layer cache.
+
+**Reclaiming.** Every build references the cache entries it uses (`wincache::reference`, on the
+`cachelock` protocol the image caches share), a CI job references its service's whole chain for
+as long as it runs, and a CI host sweeps its Windows cache after each Windows build: an entry
+nobody references and nobody used for `image_cache_idle_secs` goes (layers, installs, media,
+fetched ISOs), then the chunks no remaining pulled layer reads. A layer is used whenever one
+built on it is, so the sweep never takes a layer from under a kept one.
 
 ## Tests
 

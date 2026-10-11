@@ -1,4 +1,5 @@
-//! `FROM winiso:<iso>@sha256:<hex> --drivers=<iso>@sha256:<hex> [--edition=<name>]`: a Windows
+//! `FROM winiso:<iso>@sha256:<hex> --drivers=<iso>@sha256:<hex> [--edition=<name>]
+//! [--product-key=<key>]`: a Windows
 //! base layer installed from Microsoft's ISO under vk, with no AHCI or ATAPI and no other VMM.
 //!
 //! The install medium is a GPT disk whose FAT32 partition holds the ISO's files (built in a Linux
@@ -251,6 +252,9 @@ pub(crate) struct Source {
     pub iso: Pinned,
     pub drivers: Pinned,
     pub edition: Option<String>,
+    /// The key Setup installs with, for media that ask for one (retail, volume): a KMS client
+    /// setup key of the edition does for a build that is not activated.
+    pub product_key: Option<String>,
 }
 
 impl Source {
@@ -266,11 +270,13 @@ impl Source {
         };
         if let Some((name, _)) = flags
             .iter()
-            .find(|(k, _)| !matches!(k.as_str(), "edition" | "drivers"))
+            .find(|(k, _)| !matches!(k.as_str(), "edition" | "drivers" | "product-key"))
         {
-            bail!("FROM {image}: unknown flag --{name} (expected --drivers, --edition)");
+            bail!(
+                "FROM {image}: unknown flag --{name} (expected --drivers, --edition, --product-key)"
+            );
         }
-        for name in ["drivers", "edition"] {
+        for name in ["drivers", "edition", "product-key"] {
             if flags.iter().filter(|(k, _)| k == name).count() > 1 {
                 bail!("FROM {image}: --{name} given twice");
             }
@@ -287,10 +293,17 @@ impl Source {
                  such as \"Windows Server 2025 Standard\": Server 2016 to 2025, Windows 10 or 11)"
             );
         }
+        let product_key = flag(flags, "product-key").filter(|k| !k.is_empty());
+        if let Some(key) = product_key
+            && !is_product_key(key)
+        {
+            bail!("FROM {image}: --product-key: expected five groups of five letters and digits");
+        }
         Ok(Some(Source {
             iso: Pinned::parse(iso, context)?,
             drivers: Pinned::parse(drivers, context)?,
             edition: edition.map(str::to_string),
+            product_key: product_key.map(str::to_ascii_uppercase),
         }))
     }
 
@@ -366,6 +379,10 @@ impl Source {
         } else {
             (VIRTIO_WIN_MSI, QEMU_GA_MSI)
         };
+        // Absent, the answer file is the one installs without a key always had.
+        let product_key = self.product_key.as_deref().map_or(String::new(), |key| {
+            format!("<ProductKey><Key>{key}</Key><WillShowUI>OnError</WillShowUI></ProductKey>")
+        });
         ANSWER_TEMPLATE
             .replace("@FIRST_MSI@", first)
             .replace("@SECOND_MSI@", second)
@@ -373,7 +390,17 @@ impl Source {
             .replace("@IMAGE_KEY@", key)
             .replace("@IMAGE_VALUE@", &value)
             .replace("@INSTALL_PASSWORD@", INSTALL_PASSWORD)
+            .replace("@PRODUCT_KEY@", &product_key)
     }
+}
+
+/// Whether `key` has a Windows product key's shape: `XXXXX-XXXXX-XXXXX-XXXXX-XXXXX`.
+fn is_product_key(key: &str) -> bool {
+    let groups: Vec<&str> = key.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// A base layer: its disk, the Administrator password the settle boot gave it, and its key.
@@ -382,6 +409,9 @@ pub(crate) struct Base {
     pub disk: PathBuf,
     pub password: String,
     pub key: String,
+    /// The build cache's manifest of this base when it is still there only: `disk` is where
+    /// [`pull_base`] puts it once something needs it.
+    pub pending: Option<String>,
 }
 
 /// The disk of the base layer `key` if `cache` holds it.
@@ -405,6 +435,7 @@ fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
         disk: crate::wincache::layer_disk(dir),
         password,
         key: key.to_string(),
+        pending: None,
     }))
 }
 
@@ -517,30 +548,17 @@ pub(crate) fn base(
         );
     };
     keep_media(rg, source);
+    if let Some(base) = remote_base(rg, &dir, &key)? {
+        return Ok(base);
+    }
     // Held while this host installs, so the others wait for its push.
     let _lock = crate::wincache::lock(rg, &key, "Windows install");
     if let Some(base) = read_base(&dir, &key)? {
         return Ok(base);
     }
-    let root = cache.parent().unwrap_or(cache);
-    let tmp = scratch_beside(&dir)?;
-    match crate::wincache::pull(rg, root, &key, &tmp)? {
-        Some(record) if record["password"].is_string() => {
-            write_base_record(&tmp, &record)?;
-            publish(&tmp, &dir)?;
-            eprintln!(
-                "virtkit: winiso: base {} (from the build cache)",
-                &key[..12]
-            );
-            return read_base(&dir, &key)?.context("a pulled base without its record");
-        }
-        Some(_) => eprintln!(
-            "virtkit: warning: the build cache's base {} has no password; installing again",
-            &key[..12]
-        ),
-        None => {}
+    if let Some(base) = remote_base(rg, &dir, &key)? {
+        return Ok(base);
     }
-    let _ = std::fs::remove_dir_all(&tmp);
     let base = make_base(
         source,
         disk_size,
@@ -560,6 +578,49 @@ pub(crate) fn base(
         );
     }
     Ok(base)
+}
+
+/// The base layer `key` the build cache `rg` holds, to be pulled into its directory `dir` when
+/// something needs its disk ([`pull_base`]); `None` when the registry does not have it, or has
+/// it without the password a base must record.
+fn remote_base(rg: &crate::config::Registry, dir: &Path, key: &str) -> Result<Option<Base>> {
+    let Some((digest, record)) = crate::wincache::remote(rg, key)? else {
+        return Ok(None);
+    };
+    let Some(password) = record["password"].as_str() else {
+        eprintln!(
+            "virtkit: warning: the build cache's base {} has no password; installing again",
+            &key[..12]
+        );
+        return Ok(None);
+    };
+    eprintln!("virtkit: winiso: base {} (in the build cache)", &key[..12]);
+    Ok(Some(Base {
+        disk: dir.join(crate::wincache::PULLED_DISK),
+        password: password.to_string(),
+        key: key.to_string(),
+        pending: Some(digest),
+    }))
+}
+
+/// Pull the base layer `key`, the build cache's manifest `digest`, into its directory under
+/// `cache`, with its record.
+pub(crate) fn pull_base(
+    rg: &crate::config::Registry,
+    cache: &Path,
+    key: &str,
+    digest: &str,
+) -> Result<()> {
+    let dir = cache.join("settled").join(key);
+    if dir.join("base.json").is_file() {
+        return Ok(());
+    }
+    let tmp = scratch_beside(&dir)?;
+    let root = cache.parent().unwrap_or(cache);
+    let record = crate::wincache::pull(rg, root, key, Some(digest), &tmp)?
+        .with_context(|| format!("base {}: gone from the build cache", &key[..12]))?;
+    write_base_record(&tmp, &record)?;
+    publish(&tmp, &dir)
 }
 
 /// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
@@ -587,14 +648,27 @@ fn make_base(
 
     let install_dir = cache.join("install").join(install_key);
     let installed_disk = install_dir.join("disk.qcow2");
+    // What this install uses, referenced against `wincache::gc` while it runs.
+    let mut refs = vec![crate::wincache::reference(&install_dir)?];
     if !install_dir.join("installed").exists() {
         let source = &Source {
             iso: source.iso.fetched(cache, registry)?,
             drivers: source.drivers.fetched(cache, registry)?,
             edition: source.edition.clone(),
+            product_key: source.product_key.clone(),
         };
+        for pinned in [&source.iso, &source.drivers] {
+            if let Some(dir) = pinned.path.parent()
+                && dir.starts_with(cache.join("iso"))
+            {
+                refs.push(crate::wincache::reference(dir)?);
+            }
+        }
         source.iso.verify(cache)?;
         source.drivers.verify(cache)?;
+        refs.push(crate::wincache::reference(
+            &cache.join("media").join(source.media_key()),
+        )?);
         let media = media(source, cache)?;
         let tmp = scratch_beside(&install_dir)?;
         let disk = tmp.join("disk.qcow2");
@@ -636,6 +710,7 @@ fn make_base(
         disk: dir.join("disk.qcow2"),
         password,
         key: key.to_string(),
+        pending: None,
     })
 }
 
@@ -837,8 +912,11 @@ while ((Get-Process TiWorker -ErrorAction SilentlyContinue) -and ((Get-Date) -lt
 $cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
 $wu = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
 if ((Test-Path $cbs) -or (Test-Path $wu)) { exit 3010 }
-net user Administrator '@PASSWORD@' | Out-Null
-if ($LASTEXITCODE -ne 0) { 'setting the Administrator password failed'; exit 1 }
+# The built-in Administrator by its well-known RID, 500: localized Windows names it otherwise
+# (Administrateur, Administrador).
+$admin = (Get-CimInstance Win32_UserAccount -Filter 'LocalAccount = TRUE' | Where-Object SID -like 'S-1-5-21-*-500').Name
+net user $admin '@PASSWORD@' | Out-Null
+if ($LASTEXITCODE -ne 0) { "setting the password of $admin failed"; exit 1 }
 $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 Set-ItemProperty $wl AutoAdminLogon '0'
 Remove-ItemProperty $wl -Name DefaultPassword -ErrorAction SilentlyContinue
@@ -977,6 +1055,7 @@ mod tests {
             iso: pinned("a.iso"),
             drivers: pinned("b.iso"),
             edition: Some(edition.into()),
+            product_key: None,
         };
         // Server scripts match the file before the placeholder was added.
         let server = source("Windows Server 2025 Standard Evaluation").setup_cmd();
@@ -1036,12 +1115,49 @@ mod tests {
         assert!(SETTLE_PS1.contains("-eq ''Stopped'' -and $s.ExitCode -ne 0"));
     }
 
+    /// A product key goes into the answer file's UserData, checked for shape; without one the
+    /// answer file is the one keyless installs always had, so their cache keys hold.
+    #[test]
+    fn a_product_key_reaches_setup() {
+        let flags = |key: &str| {
+            vec![
+                ("drivers".to_string(), format!("v.iso@sha256:{DIGEST}")),
+                ("edition".to_string(), "Windows 10 Pro".to_string()),
+                ("product-key".to_string(), key.to_string()),
+            ]
+        };
+        let image = format!("winiso:w.iso@sha256:{DIGEST}");
+        let src = Source::of_stage(
+            &image,
+            &flags("w269n-WFGWX-YVC9B-4J6C9-T83GX"),
+            Path::new("/"),
+        )
+        .unwrap()
+        .unwrap();
+        let answer = src.answer_file();
+        assert!(answer.contains(
+            "<Organization>vk</Organization><ProductKey><Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key>"
+        ));
+        let keyless = Source {
+            product_key: None,
+            ..src
+        }
+        .answer_file();
+        assert!(keyless.contains("<Organization>vk</Organization></UserData>"));
+        assert!(!keyless.contains("@PRODUCT_KEY@"));
+        for bad in ["W269N-WFGWX", "W269N-WFGWX-YVC9B-4J6C9-T83G!", "<x>"] {
+            let err = Source::of_stage(&image, &flags(bad), Path::new("/")).unwrap_err();
+            assert!(format!("{err:#}").contains("--product-key"), "{bad}");
+        }
+    }
+
     #[test]
     fn without_an_edition_the_first_image_is_installed() {
         let src = Source {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: None,
+            product_key: None,
         };
         assert!(
             src.answer_file()
@@ -1103,6 +1219,7 @@ mod tests {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: edition.map(str::to_string),
+            product_key: None,
         };
         assert_ne!(
             src(None).media_key(),
@@ -1136,6 +1253,7 @@ mod tests {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: Some("Windows Server 2025 R&D <\"x\">".to_string()),
+            product_key: None,
         };
         let answer = src.answer_file();
         assert!(

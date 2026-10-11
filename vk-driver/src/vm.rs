@@ -355,12 +355,54 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         .with_context(|| format!("creating {}", ctx.job_dir.display()))
         .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
 
-    // Admission (`[executor.schedule]`): claim the guest RAM this job is about to boot and the
-    // room its job dir will grow into before booting it, waiting for both on a full host. Held
-    // for the rest of prepare; the supervisor takes its own hold on the same reservation, so it
-    // never lapses between the two. After the stale-job teardown above, which frees a
-    // predecessor's claim, and before anything is written into the job dir.
-    let _reservation = admit(ctx, &mem)?;
+    // [executor] host_checkout: check the sources out on the host NOW — before resolving the
+    // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
+    // guest boots — so supervise can share the tree in and the git token never enters the
+    // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
+    // beat a supervisor-log pointer; like any prepare failure a checkout error exits
+    // system_failure.
+    // Held to the end of prepare, which outlasts the supervisor taking its own hold below, so the
+    // tree is referenced continuously from the clone until the job's VM is gone.
+    let _checkout_use = if cfg.executor.host_checkout {
+        let url = ctx
+            .ci_repo_url
+            .as_deref()
+            .context("host_checkout is set but CI_REPOSITORY_URL is unset")?;
+        let sha = ctx
+            .ci_commit_sha
+            .as_deref()
+            .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
+        let dest = ctx.host_checkout_dir();
+        let guard = crate::checkout::acquire_use_lock(&dest)
+            .with_context(|| format!("locking host checkout {}", dest.display()))?;
+        // Bound what abandoned checkouts cost the host before adding one more — on a tmpfs
+        // `checkout_dir` they hold RAM that `vk tune` charges against this runner's concurrency.
+        // Swept while already holding our own reference, so an idle window that has just
+        // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
+        // re-clone.
+        crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
+        println!("virtkit: host checkout of {sha} -> {}", dest.display());
+        crate::checkout::discard_if_untrusted(&dest, url)
+            .with_context(|| format!("checking host checkout {}", dest.display()))?;
+        // Bind the external bookkeeping to the destination before the clone fills it, so a
+        // prepare killed part-way through leaves a partial tree the idle sweep can still find.
+        crate::checkout::claim(&dest)
+            .with_context(|| format!("claiming host checkout {}", dest.display()))?;
+        crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
+            .context("host checkout")?;
+        Some(guard)
+    } else {
+        None
+    };
+
+    // Admission (`[executor.schedule]`): claim the guest RAM this job is about to boot, its
+    // services' included, and the room its job dir will grow into before booting it, waiting for
+    // both on a full host. Held for the rest of prepare; the supervisor takes its own hold on the
+    // same reservation, so it never lapses between the two. After the stale-job teardown above,
+    // which frees a predecessor's claim, and the checkout, which holds a `compose:` job's
+    // services; before anything is written into the job dir.
+    let services_mib = services_mem_mib(ctx)?;
+    let _reservation = admit(ctx, &mem, services_mib)?;
     // Record job metadata beside the VM for `vk workloads`. Like the VM registry, this is
     // best-effort: failure to record metadata must not prevent the job from running.
     if let Err(e) = ctx.record(cpus, &mem) {
@@ -403,46 +445,6 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     }
 
-    // [executor] host_checkout: check the sources out on the host NOW — before resolving the
-    // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
-    // guest boots — so supervise can share the tree in and the git token never enters the
-    // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
-    // beat a supervisor-log pointer; like any prepare failure a checkout error exits
-    // system_failure.
-    // Held to the end of prepare, which outlasts the supervisor taking its own hold below, so the
-    // tree is referenced continuously from the clone until the job's VM is gone.
-    let _checkout_use = if cfg.executor.host_checkout {
-        let url = ctx
-            .ci_repo_url
-            .as_deref()
-            .context("host_checkout is set but CI_REPOSITORY_URL is unset")?;
-        let sha = ctx
-            .ci_commit_sha
-            .as_deref()
-            .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
-        let dest = ctx.host_checkout_dir();
-        let guard = crate::checkout::acquire_use_lock(&dest)
-            .with_context(|| format!("locking host checkout {}", dest.display()))?;
-        // Bound what abandoned checkouts cost the host before adding one more — on a tmpfs
-        // `checkout_dir` they hold RAM that `vk tune` charges against this runner's concurrency.
-        // Swept while already holding our own reference, so an idle window that has just
-        // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
-        // re-clone.
-        crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
-        println!("virtkit: host checkout of {sha} -> {}", dest.display());
-        crate::checkout::discard_if_untrusted(&dest, url)
-            .with_context(|| format!("checking host checkout {}", dest.display()))?;
-        // Bind the external bookkeeping to the destination before the clone fills it, so a
-        // prepare killed part-way through leaves a partial tree the idle sweep can still find.
-        crate::checkout::claim(&dest)
-            .with_context(|| format!("claiming host checkout {}", dest.display()))?;
-        crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
-            .context("host checkout")?;
-        Some(guard)
-    } else {
-        None
-    };
-
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build).
     let mut plan = resolve_media(ctx)?;
@@ -478,7 +480,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
             validate_service_egress(cfg, &unit)?;
             if let Some(build) = windows_build(&unit)? {
-                build_windows_unit(ctx, &unit, &build)?;
+                warm_guards.extend(build_windows_unit(ctx, &unit, &build)?.1);
             } else if matches!(unit.source, crate::compose::Source::Build { .. }) {
                 let (_, _, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
@@ -1177,16 +1179,17 @@ fn windows_bundle_dir(ctx: &JobCtx, name: &str) -> PathBuf {
 }
 
 /// Build the Windows service `unit` into its bundle ([`windows_bundle_dir`]), unless prepare's
-/// warm pass did already. Steps reach the network (`RUN --network=default`) only when the
-/// `[egress.build]` policy is unrestricted: a Windows step's switch applies no allowlist.
+/// warm pass did already. A step's network (`RUN --network=default`) follows the
+/// `[egress.build]` policy, as a Linux build step's does.
 fn build_windows_unit(
     ctx: &JobCtx,
     unit: &crate::compose::Unit,
     build: &WindowsBuild,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Vec<crate::cachelock::Guard>)> {
     let out = windows_bundle_dir(ctx, &unit.name);
+    let disk = out.join("disk.qcow2");
     if out.join(crate::uefi::MANIFEST).is_file() && out.join("layer.json").is_file() {
-        return Ok(out);
+        return Ok((out, crate::wincache::reference_chain(&disk)?));
     }
     let cfg = &ctx.cfg;
     let (net, _audit) = effective_build_egress(cfg, ctx)?;
@@ -1199,18 +1202,23 @@ fn build_windows_unit(
         out: out.clone(),
         cpus: crate::build::configured_build_cpus().unwrap_or(4),
         mem: crate::build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
-        no_network: !matches!(net, crate::build::BuildNet::All),
+        net,
         reinstall: false,
         registry,
     };
     println!("virtkit: service {}: building its Windows image", unit.name);
     // On a thread of its own: a step's guest starts a runtime for its switch, which it cannot
     // from inside this phase's.
-    std::thread::spawn(move || crate::winbuild::build(&opts))
+    let refs = std::thread::spawn(move || crate::winbuild::build(&opts))
         .join()
         .map_err(|_| anyhow!("the Windows build panicked"))?
         .with_context(|| format!("service {}: building its Windows image", unit.name))?;
-    Ok(out)
+    // Bound what the host's Windows cache costs, holding this job's own chain.
+    crate::wincache::gc(
+        &crate::run::default_data_base()?.join("windows"),
+        cfg.image_cache_idle(),
+    );
+    Ok((out, refs))
 }
 
 /// In a Windows service's runtime dir: written by the supervisor once the service's
@@ -2098,7 +2106,9 @@ fn plan_services(
             extra_ips,
         };
         if let Some(build) = windows_build(&unit)? {
-            let bundle = build_windows_unit(ctx, &unit, &build)?;
+            let (bundle, refs) = build_windows_unit(ctx, &unit, &build)?;
+            // Held for the job's life: its machine's overlays stand on these layers.
+            guards.extend(refs);
             let config = crate::compose::merged_config(&Default::default(), &unit);
             let prov = crate::units::provisioned(&unit, bundle, config, siting(slot, extra_ips))?;
             let dir = ctx.job_dir.join(format!("svc-{}", unit.name));
@@ -2641,13 +2651,18 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
 /// both (see admit). `None` when both are off — the host then admits every job the runner hands
 /// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
 /// system failure, not the job's fault.
-fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
-    let declared_mib = parse_gib(mem)
-        .context("invalid guest memory size")?
-        .checked_mul(1024)
-        .context("guest memory size is absurdly large")?;
+fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::admit::Reservation>> {
+    let declared_mib = mem_mib(mem)?;
+    let mut mem_ask = admit_memory(ctx, declared_mib)?;
+    // The job's history is its own guest's; its services boot what they declare beside it.
+    if let Some(ask) = &mut mem_ask
+        && services_mib > 0
+    {
+        println!("virtkit: reserving {services_mib} MiB for the job's services");
+        ask.want_mib = ask.want_mib.saturating_add(services_mib);
+    }
     let ask = crate::admit::Ask {
-        mem: admit_memory(ctx, declared_mib)?,
+        mem: mem_ask,
         disk: admit_disk(ctx, declared_mib)?,
     };
     if ask.mem.is_none() && ask.disk.is_none() {
@@ -2656,6 +2671,40 @@ fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
     let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
     let reservation = crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, &ask, timeout)?;
     Ok(Some(reservation))
+}
+
+/// `mem` (`4G`, `512M`) in MiB.
+fn mem_mib(mem: &str) -> Result<u64> {
+    parse_gib(mem)
+        .context("invalid guest memory size")?
+        .checked_mul(1024)
+        .context("guest memory size is absurdly large")
+}
+
+/// The guest RAM the job's services boot with, in MiB: each one's `x-virtkit.mem`, else what
+/// its image says (a Windows bundle's `# vk: mem=`), else the default of its kind.
+fn services_mem_mib(ctx: &JobCtx) -> Result<u64> {
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    let units = match image_ref.strip_prefix("compose:") {
+        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?)?,
+        None => crate::services::to_units(crate::services::from_env()?),
+    };
+    let mut total: u64 = 0;
+    for unit in &units {
+        let mem = match (&unit.mem, windows_build(unit)?) {
+            (Some(mem), _) => mem.clone(),
+            (None, Some(build)) => crate::winbuild::target_mem(
+                &build.dockerfile,
+                build.target.as_deref(),
+                &crate::build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
+            )?,
+            (None, None) => crate::units::DEFAULT_MEM.to_string(),
+        };
+        let mib = crate::run::parse_mem_mib(&mem)
+            .with_context(|| format!("service {}: memory size {mem:?}", unit.name))?;
+        total = total.saturating_add(mib);
+    }
+    Ok(total)
 }
 
 /// This job's share of `[executor.schedule] mem_budget`, or `None` when no budget is configured.
@@ -3514,6 +3563,39 @@ fn log_tail(path: &Path, lines: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `compose:` job's services count in its admission: each one's `x-virtkit.mem`, else a
+    /// Windows build's `# vk: mem=`, else the Linux default; the primary is the job's own.
+    #[test]
+    fn a_compose_jobs_services_count_in_its_memory() {
+        let dir = std::env::temp_dir().join(format!("vk-svc-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        cfg.executor.host_checkout = true;
+        let mut ctx = JobCtx::new_for_job(cfg, "9".into()).unwrap();
+        ctx.image_ref = Some("compose:ci/c.yaml#job".into());
+        let checkout = ctx.host_checkout_dir();
+        std::fs::create_dir_all(checkout.join("ci")).unwrap();
+        std::fs::write(
+            checkout.join("ci/win.Dockerfile"),
+            "# vk: mem=3G\nFROM winiso:ws.iso@sha256:aa --drivers=v.iso@sha256:bb AS base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("ci/c.yaml"),
+            "services:\n\
+             \x20 job:\n    image: alpine:3.21\n\
+             \x20 win:\n    build: { context: ., dockerfile: win.Dockerfile }\n\
+             \x20 db:\n    image: postgres:17\n\
+             \x20 cache:\n    image: redis:7\n    x-virtkit: { mem: 512M }\n",
+        )
+        .unwrap();
+        assert_eq!(services_mem_mib(&ctx).unwrap(), 3 * 1024 + 1024 + 512);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A compose `build:` service whose Dockerfile installs Windows is a Windows build, with its
     /// one Dockerfile; a Linux one is not, and a Windows one with Linux-only build keys is
@@ -4734,7 +4816,7 @@ mod tests {
         cfg.executor.schedule.disk_admission = Some(false);
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
-        assert!(admit(&ctx, "8G").unwrap().is_none());
+        assert!(admit(&ctx, "8G", 0).unwrap().is_none());
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
 
         let schedule = &mut ctx.cfg.executor.schedule;
@@ -4742,7 +4824,7 @@ mod tests {
         schedule.disk_default = Some("1G".into());
         schedule.wait_timeout_secs = Some(0);
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
-        let held = admit(&ctx, "8G").unwrap();
+        let held = admit(&ctx, "8G", 0).unwrap();
         assert!(held.is_some(), "disk admission is on by default");
         let entry = std::fs::read_to_string(ctx.admit_dir().join("42")).unwrap();
         assert!(
@@ -4753,7 +4835,7 @@ mod tests {
 
         // Not a size at all (only `G` is): refused before any history is consulted.
         ctx.cfg.executor.schedule.disk_default = Some("1T".into());
-        let err = admit(&ctx, "8G").unwrap_err();
+        let err = admit(&ctx, "8G", 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("disk_default \"1T\""),
             "{err:#}"

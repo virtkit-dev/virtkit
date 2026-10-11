@@ -1422,8 +1422,10 @@ ad-tests:
 - The supervisor boots it on the job's LAN under its service name and runs its provisioning
   (`CMD`, compose `environment`, `secrets`); prepare waits for that, up to 30 minutes, before
   the script starts.
-- A step reaches the network (`RUN --network=default`) only when `[egress.build]` is
-  unrestricted: a Windows step's switch applies no allowlist.
+- A step's network (`RUN --network=default`) follows `[egress.build]` as a Linux step's does.
+- Its memory (`x-virtkit.mem`, else the Dockerfile's `# vk: mem=`) counts in the job's
+  [admission](#keeping-the-host-inside-its-memory), as every service's does.
+- Its layers are reclaimed once no job used them for `image_cache_idle_secs`.
 - One Dockerfile per service, no build args and no additional contexts; a bundle `image:` path
   is refused, and the job VM cannot be Windows.
 

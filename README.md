@@ -669,13 +669,18 @@ vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-pass
 - The ISOs are local files pinned by digest; `--drivers` is virtio-win's ISO (drivers and
   qemu-ga). Without `--edition` the ISO's first image installs. For Windows 11, `--edition`
   must name a Windows 11 edition: otherwise it installs as a server would and Setup stops at
-  its TPM check. The install takes about 20 minutes (70 for Windows 11) and is cached; so is
-  every later step.
+  its TPM check. Retail and volume media install too: Setup runs in the medium's own language,
+  an `install.esd` is converted, and `--product-key=<key>` gives Setup the key such media ask
+  for (a KMS client setup key of the edition installs without activating). The install takes
+  about 20 minutes (70 for Windows 11) and is cached; so is every later step. With a build
+  cache registry server, hosts share both ([how](docs/windows.md#sharing-builds-between-hosts)),
+  and `vk registry put` keeps the ISOs there for hosts that lack them.
 - `# vk:` directives: `disk=<size>` sizes the install (default 40G), `generalize=on` ends
   the stage with sysprep (each copy gets its own name and SID), `firmware=uefi-secboot`
   enrolls Microsoft's Secure Boot keys, `tpm=on` gives each machine a TPM 2.0, and
   `cpus`/`mem` size the build's guests and the bundle's machine.
-- `RUN` has no network unless it says `--network=default`; exit code 3010 or 1641 restarts
+- `RUN` has no network unless it says `--network=default`, and then the build's own
+  (`--build-net`, `--build-allow-ip`, `--build-allow-name`); exit code 3010 or 1641 restarts
   Windows (`--reboot=auto|always|never`). Steps run as SYSTEM. `ENV`, `WORKDIR`, `SHELL` and
   `COPY` apply; `USER`, `ARG`, `ADD`, `ONBUILD`, `ENTRYPOINT`, `COPY --from` and `$VAR`
   substitution in `ENV`, `WORKDIR` or `COPY` are refused.
@@ -697,7 +702,8 @@ sharing images built from it.
   warn from 30 days before an evaluation ends, or 3 days before that grace does.
 - `vk build --reinstall` installs each `FROM winiso:` stage again under new cache keys and
   rebuilds every step on it. The old install and its layers stay cached (tens of GB): bundles
-  built on them keep working until they are rebuilt. Nothing removes them: once no bundle
+  built on them keep working until they are rebuilt. On a CI host they are reclaimed once no
+  job has used them for `image_cache_idle_secs`; elsewhere nothing removes them: once no bundle
   uses the Windows build cache, `rm -rf ~/.local/share/virtkit/windows`
   (`$XDG_DATA_HOME/virtkit/windows` when that is set) frees it all, and the next build
   installs from the ISO again.

@@ -27,7 +27,7 @@ const CACHE_REPO: &str = vk_registry::BUILD_CACHE_REPO;
 /// The disk of a layer this host made: a qcow2 overlay over its parent's.
 pub(crate) const BUILT_DISK: &str = "disk.qcow2";
 /// The disk of a layer pulled from the registry: a lazy view over its chunks.
-const PULLED_DISK: &str = "disk.vk_ro_img";
+pub(crate) const PULLED_DISK: &str = "disk.vk_ro_img";
 /// In a layer's directory: the registry manifest the layer's disk is, byte for byte, when it
 /// was pulled from or pushed to the registry. Only then can a child's push reuse its chunks.
 const DIGEST: &str = "registry-digest";
@@ -84,13 +84,22 @@ pub(crate) fn lock(rg: &Registry, key: &str, what: &str) -> Option<crate::regist
     })
 }
 
-/// Pull layer `key` into the unpublished layer directory `tmp`, the chunks into the shared
-/// chunk cache under `root`. Returns what the layer was pushed with, or `None` when the
-/// registry does not have it.
+/// Whether the registry has layer `key`, without pulling it: the manifest digest that names it,
+/// and what it was pushed with. A build takes a layer's password and licensing from here, and
+/// pulls the layer only once something builds on it or boots it ([`pull`] with the digest).
+pub(crate) fn remote(rg: &Registry, key: &str) -> Result<Option<(String, serde_json::Value)>> {
+    Ok(crate::registry::fetch_bundle(rg, CACHE_REPO, &tag(key))?
+        .map(|b| (b.digest, b.meta.unwrap_or_default())))
+}
+
+/// Pull layer `key` — the manifest `digest` names when given, else what its tag names now —
+/// into the unpublished layer directory `tmp`, the chunks into the shared chunk cache under
+/// `root`. Returns what the layer was pushed with, or `None` when the registry does not have it.
 pub(crate) fn pull(
     rg: &Registry,
     root: &Path,
     key: &str,
+    digest: Option<&str>,
     tmp: &Path,
 ) -> Result<Option<serde_json::Value>> {
     // The chunk cache is `<staging>/../chunks` (see `registry::chunks_cache_dir`): one cache for
@@ -103,8 +112,9 @@ pub(crate) fn pull(
     let result = (|| -> Result<Option<serde_json::Value>> {
         let view = staging.join(PULLED_DISK);
         let label = format!("Windows layer {}", &key[..12]);
+        let reference = digest.map_or_else(|| tag(key), str::to_string);
         let Some(digest) =
-            crate::registry::try_pull_ext4_lazy(rg, CACHE_REPO, &tag(key), &view, &label, None)?
+            crate::registry::try_pull_ext4_lazy(rg, CACHE_REPO, &reference, &view, &label, None)?
         else {
             return Ok(None);
         };
@@ -177,6 +187,164 @@ pub(crate) fn push(
         std::fs::rename(&tmp, dir.join(DIGEST))?;
     }
     Ok(digest)
+}
+
+/// The directories of the Windows cache rooted at `root` that hold one entry each, by key: a
+/// layer, an install's settled base and the install itself, its medium, a fetched ISO.
+fn entry_dirs(root: &Path) -> [PathBuf; 5] {
+    let winiso = root.join("winiso");
+    [
+        root.join("layers"),
+        winiso.join("settled"),
+        winiso.join("install"),
+        winiso.join("media"),
+        winiso.join("iso"),
+    ]
+}
+
+/// The [`crate::cachelock`] sidecars of the cache entry `dir`, beside it.
+fn sidecars(dir: &Path) -> (PathBuf, PathBuf) {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    (
+        dir.with_file_name(format!("{name}.inuse")),
+        dir.with_file_name(format!("{name}.used")),
+    )
+}
+
+/// Reference the cache entry `dir` for as long as the guard lives, so [`gc`] leaves it.
+pub(crate) fn reference(dir: &Path) -> Result<crate::cachelock::Guard> {
+    // A first install references its entry before anything has made the directory holding it.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let (lock, used) = sidecars(dir);
+    crate::cachelock::acquire_shared(&lock, &used)
+}
+
+/// Reference every entry of the Windows cache a disk stands on: `disk` itself when it is a
+/// layer's, and each image down its backing chain, which ends at a pulled layer (it needs only
+/// its chunks) or the install. For a bundle a job boots.
+pub(crate) fn reference_chain(disk: &Path) -> Result<Vec<crate::cachelock::Guard>> {
+    let mut guards = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut next = Some(disk.to_path_buf());
+    while let Some(disk) = next.take() {
+        let dir = disk.parent().context("a disk with no directory")?;
+        let entry = dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str());
+        if matches!(entry, Some("layers" | "settled" | "install")) && seen.insert(dir.to_path_buf())
+        {
+            guards.push(reference(dir)?);
+        }
+        if disk
+            .extension()
+            .is_some_and(|e| e == crate::registry::VK_RO_IMG_EXT)
+        {
+            break;
+        }
+        // A disk that is not a qcow2 (a raw image) stands on nothing.
+        next = crate::qcow2::Qcow2::open(&disk)
+            .ok()
+            .and_then(|q| q.backing_path().map(Path::to_path_buf));
+    }
+    Ok(guards)
+}
+
+/// Reclaim what the Windows cache rooted at `root` has not used for `idle`: entries nobody
+/// references ([`reference`]), then the chunks no pulled layer still reads. An entry is used
+/// whenever a layer built on it is, as builds and jobs reference whole chains, so a layer is
+/// never reclaimed from under one kept. Entries made before this sweep existed are dated now.
+/// Best effort.
+pub(crate) fn gc(root: &Path, idle: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    let mut freed = 0usize;
+    for kind in entry_dirs(root) {
+        let Ok(entries) = std::fs::read_dir(&kind) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let name = entry.file_name();
+            // Keys only: no sidecar, no unpublished `<key>.tmp-<pid>`.
+            if name.to_string_lossy().contains('.') || !dir.is_dir() {
+                continue;
+            }
+            let (lock, used) = sidecars(&dir);
+            if !used.exists() {
+                crate::cachelock::stamp(&lock, &used);
+                continue;
+            }
+            if crate::cachelock::try_reclaim(&lock, &used, idle, now, || {
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_file(&used);
+            }) {
+                freed += 1;
+            }
+        }
+    }
+    let chunks = sweep_chunks(root, idle, now);
+    if freed > 0 || chunks > 0 {
+        eprintln!(
+            "virtkit: Windows cache: reclaimed {freed} entries and {chunks} chunks idle for {}s",
+            idle.as_secs()
+        );
+    }
+}
+
+/// Remove the chunks under `root`'s chunk cache that no pulled layer reads and nothing wrote
+/// for `idle` (a pull in progress writes its chunks before its view). Returns how many went.
+fn sweep_chunks(root: &Path, idle: std::time::Duration, now: std::time::SystemTime) -> usize {
+    let mut live = std::collections::HashSet::new();
+    for kind in entry_dirs(root) {
+        for entry in std::fs::read_dir(&kind).into_iter().flatten().flatten() {
+            if let Ok(view) = std::fs::read(entry.path().join(PULLED_DISK)) {
+                live.extend(view_chunks(&view));
+            }
+        }
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(root.join("registry").join("chunks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| now.duration_since(t).unwrap_or_default() >= idle);
+        if old && !live.contains(&name) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The chunk file names (hex digests) the `.vk_ro_img` view `bytes` reads, as
+/// `registry::write_vk_ro_img` lays it out; none for anything else.
+fn view_chunks(bytes: &[u8]) -> Vec<String> {
+    let parse = || -> Option<Vec<String>> {
+        let magic = bytes.get(..8)?;
+        if magic != crate::registry::VK_RO_IMG_MAGIC.as_slice() {
+            return None;
+        }
+        let dir_len = u32::from_le_bytes(bytes.get(17..21)?.try_into().ok()?) as usize;
+        let mut at = 21 + dir_len;
+        let count = u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
+        at += 8;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            // offset (8), length (4), codec (1), sha256 (32)
+            let digest = bytes.get(at + 13..at + 45)?;
+            out.push(digest.iter().map(|b| format!("{b:02x}")).collect());
+            at += 45;
+        }
+        Some(out)
+    };
+    parse().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -295,7 +463,7 @@ mod tests {
         // Host B pulls the step alone, and gets every byte of it.
         let pulled = host_b.join("layers").join(key(2));
         std::fs::create_dir_all(&pulled).unwrap();
-        let meta = pull(&rg, &host_b, &key(2), &pulled).unwrap().unwrap();
+        let meta = pull(&rg, &host_b, &key(2), None, &pulled).unwrap().unwrap();
         assert_eq!(meta["password"], "pa");
         assert_eq!(password(&pulled).as_deref(), Some("pa"));
         assert!(layer_disk(&pulled).ends_with(PULLED_DISK));
@@ -318,14 +486,110 @@ mod tests {
         .unwrap();
         let again = tmp.join("c").join(key(3));
         std::fs::create_dir_all(&again).unwrap();
-        let meta = pull(&rg, &tmp.join("c"), &key(3), &again).unwrap().unwrap();
+        let meta = pull(&rg, &tmp.join("c"), &key(3), None, &again)
+            .unwrap()
+            .unwrap();
         assert_eq!(meta["password"], "pb");
         assert_eq!(contents(&layer_disk(&again), &tmp), contents(&next, &tmp));
 
         // A layer the registry does not have.
         let none = tmp.join("none");
         std::fs::create_dir_all(&none).unwrap();
-        assert!(pull(&rg, &host_b, &key(9), &none).unwrap().is_none());
+        assert!(pull(&rg, &host_b, &key(9), None, &none).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A sweep dates what it finds undated, then reclaims what nobody references, keeps what a
+    /// build or job references, and drops the chunks no pulled layer reads.
+    #[test]
+    fn a_sweep_keeps_what_is_referenced() {
+        let root = std::env::temp_dir().join(format!("vk-wincache-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let layers = root.join("layers");
+        for dir in [
+            layers.join(key(1)),
+            layers.join(key(2)),
+            root.join("winiso/settled").join(key(3)),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        // A pulled layer reading one of two cached chunks.
+        let chunks = root.join("registry/chunks");
+        std::fs::create_dir_all(&chunks).unwrap();
+        for c in [key(7), key(8)] {
+            std::fs::write(chunks.join(c), b"chunk").unwrap();
+        }
+        let pulled = layers.join(key(4));
+        crate::registry::write_vk_ro_img(
+            &pulled.join(PULLED_DISK),
+            4096,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &chunks,
+            &[crate::registry::LazyChunk {
+                offset: 0,
+                length: 4096,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest: [0x07; 32],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            view_chunks(&std::fs::read(pulled.join(PULLED_DISK)).unwrap()),
+            [key(7)]
+        );
+
+        // Referenced before anything made its kind's directory, as a first install is.
+        drop(reference(&root.join("winiso/media").join(key(5))).unwrap());
+
+        let idle = std::time::Duration::ZERO;
+        gc(&root, idle);
+        assert!(
+            layers.join(key(2)).exists(),
+            "an undated entry is dated, not reclaimed"
+        );
+
+        let held = [
+            reference(&layers.join(key(1))).unwrap(),
+            reference(&pulled).unwrap(),
+        ];
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            gc(&root, idle);
+            !layers.join(key(2)).exists() && !root.join("winiso/settled").join(key(3)).exists()
+        }));
+        assert!(layers.join(key(1)).exists() && pulled.exists());
+        assert!(chunks.join(key(7)).exists(), "a pulled layer's chunk stays");
+        assert!(!chunks.join(key(8)).exists(), "an unread chunk goes");
+
+        drop(held);
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            gc(&root, idle);
+            !layers.join(key(1)).exists() && !pulled.exists()
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bundle's chain references each layer it stands on, down to the install, and stops at a
+    /// pulled layer, which needs nothing under it.
+    #[test]
+    fn a_chain_references_every_layer_under_a_disk() {
+        let root = std::env::temp_dir().join(format!("vk-wincache-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let install = root.join("winiso/install").join(key(1));
+        let step = root.join("layers").join(key(2));
+        let bundle = root.join("job/win-dc");
+        for dir in [&install, &step, &bundle] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let raw = install.join("disk.raw");
+        std::fs::write(&raw, vec![0u8; 1 << 20]).unwrap();
+        crate::qcow2::create_overlay(&install.join(BUILT_DISK), &raw).unwrap();
+        crate::qcow2::create_overlay(&step.join(BUILT_DISK), &install.join(BUILT_DISK)).unwrap();
+        crate::qcow2::create_overlay(&bundle.join("disk.qcow2"), &step.join(BUILT_DISK)).unwrap();
+        // The bundle's own dir is the job's, not the cache's: two references, step and install.
+        assert_eq!(
+            reference_chain(&bundle.join("disk.qcow2")).unwrap().len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

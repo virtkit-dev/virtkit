@@ -579,7 +579,12 @@ async fn try_pull_ext4_lazy_async(
     meter: Option<&TransferMeter>,
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
-    let image = make_ref(rg, name, tag)?;
+    // A digest (`sha256:…`) pins content a tag may since have moved off, as in `fetch_bundle`.
+    let image = if tag.starts_with("sha256:") {
+        make_digest_ref(rg, name, tag)?
+    } else {
+        make_ref(rg, name, tag)?
+    };
     let Ok(digest) = resolve_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
@@ -730,6 +735,8 @@ pub fn fetch_chunks(
 
 /// A cached bundle as [`fetch_bundle`] reads it.
 pub struct FetchedBundle {
+    /// The manifest's digest, which names this content whatever the tag says later.
+    pub digest: String,
     pub chunks: Vec<OciDescriptor>,
     pub total_size: u64,
     /// What [`push_disk_diff`] recorded with it.
@@ -782,6 +789,7 @@ async fn fetch_bundle_async(rg: &Registry, name: &str, tag: &str) -> Result<Opti
         })
         .collect();
     Ok(Some(FetchedBundle {
+        digest,
         chunks,
         total_size: config.total_size,
         meta: config.meta,
@@ -3201,7 +3209,7 @@ mod local {
     ) -> Result<Option<FetchedBundle>> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
-        let Some((_digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
+        let Some((digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
             return Ok(None);
         };
         let chunks: Vec<OciDescriptor> = manifest
@@ -3215,6 +3223,7 @@ mod local {
             })
             .collect();
         Ok(Some(FetchedBundle {
+            digest,
             chunks,
             total_size: config.total_size,
             meta: config.meta,

@@ -79,8 +79,9 @@ pub(crate) struct Options {
     pub out: PathBuf,
     pub cpus: u32,
     pub mem: String,
-    /// `--build-net none`: refuse `RUN --network=default`.
-    pub no_network: bool,
+    /// What a `RUN --network=default` step reaches: refused with `None`, everything with `All`,
+    /// the allowlist with `Allow`, which the step's switch enforces as a Linux step's does.
+    pub net: crate::build::BuildNet,
     /// `--reinstall`: install each `winiso:` stage again, under new cache keys.
     pub reinstall: bool,
     /// The build cache registry the hosts share layers through ([`crate::wincache`]); `None`
@@ -129,6 +130,48 @@ struct Layer {
     /// Sysprep made this layer: its next step deletes the answer file the generalize step left.
     #[serde(default)]
     generalized: bool,
+    /// The layer is in the build cache registry only, for now: `disk` is where [`ensure`]
+    /// pulls it once a step builds on it or a bundle boots it.
+    #[serde(skip)]
+    pending: Option<Pending>,
+}
+
+/// A layer the build cache registry holds and this host has not pulled yet.
+#[derive(Clone, Debug)]
+struct Pending {
+    /// The manifest the layer was looked up as: what a later push to its tag cannot change.
+    digest: String,
+    /// A Windows install's base layer, pulled with its record, or a step's.
+    base: bool,
+}
+
+/// Pull `layer` if it is still only in the registry ([`Pending`]), so its disk is here.
+fn ensure(
+    layer: &mut Layer,
+    cache: &Path,
+    registry: Option<&crate::config::Registry>,
+    refs: &Refs,
+) -> Result<()> {
+    let Some(pending) = layer.pending.take() else {
+        return Ok(());
+    };
+    let rg = registry.context("a layer pending from the registry with no registry")?;
+    if pending.base {
+        crate::winiso::pull_base(rg, &cache.join("winiso"), &layer.key, &pending.digest)?;
+        layer.disk = crate::winiso::cached_base(&cache.join("winiso"), &layer.key)
+            .context("a pulled base without its record")?;
+    } else {
+        let dir = cache.join("layers").join(&layer.key);
+        if !dir.join("complete").exists()
+            && !pull_step(rg, cache, &layer.key, &pending.digest, &dir)?
+        {
+            bail!("layer {}: gone from the build cache", &layer.key[..12]);
+        }
+        layer.disk = crate::wincache::layer_disk(&dir);
+    }
+    refs.borrow_mut()
+        .extend(crate::wincache::reference_chain(&layer.disk)?);
+    Ok(())
 }
 
 struct Stage {
@@ -191,8 +234,24 @@ fn guest_size(stage: &Stage, opts: &Options) -> (u32, String) {
     )
 }
 
-/// Build `opts` and write its bundle.
-pub(crate) fn build(opts: &Options) -> Result<()> {
+/// The memory the bundle `dockerfile`'s stage `target` builds boots with: its `# vk: mem=`,
+/// else `mem`, as [`build`] writes it into the bundle.
+pub(crate) fn target_mem(dockerfile: &Path, target: Option<&str>, mem: &str) -> Result<String> {
+    let text = std::fs::read_to_string(dockerfile)
+        .with_context(|| format!("reading {}", dockerfile.display()))?;
+    let stages = stages(parser::parse(&text)?)?;
+    let stage = &stages[target_index(&stages, target)?];
+    Ok(stage
+        .from
+        .guest
+        .mem
+        .clone()
+        .unwrap_or_else(|| mem.to_string()))
+}
+
+/// Build `opts` and write its bundle. Returns the references on the cache entries the bundle
+/// stands on, for a caller that must keep them past the build ([`crate::wincache::gc`]).
+pub(crate) fn build(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let text = std::fs::read_to_string(&opts.dockerfile)
         .with_context(|| format!("reading {}", opts.dockerfile.display()))?;
     let stages =
@@ -201,13 +260,16 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
     let cache = crate::run::default_data_base()?.join("windows");
     let started = Instant::now();
+    let refs = Refs::default();
     let mut build = Build {
         opts,
         cache: &cache,
         built: HashMap::new(),
         reinstalled: Vec::new(),
+        refs: &refs,
     };
-    let layer = build_stage(&mut build, &stages, target, true)?;
+    let mut layer = build_stage(&mut build, &stages, target, true)?;
+    ensure(&mut layer, &cache, opts.registry.as_ref(), &refs)?;
     if opts.reinstall && build.reinstalled.is_empty() {
         eprintln!(
             "virtkit: warning: --reinstall: the target builds on no `FROM winiso:` stage; \
@@ -222,7 +284,7 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
         opts.out.display(),
         started.elapsed().as_secs()
     );
-    Ok(())
+    Ok(refs.into_inner())
 }
 
 /// Refuse what `stage` asks for that a Windows build does not do, before anything boots.
@@ -378,7 +440,12 @@ struct Build<'a> {
     built: HashMap<usize, Layer>,
     /// The installs (medium and disk size) `--reinstall` has made again in this build.
     reinstalled: Vec<(crate::winiso::Source, u64)>,
+    /// The cache entries this build uses, referenced against [`crate::wincache::gc`].
+    refs: &'a Refs,
 }
+
+/// The cache entries a build references, held until it ends or its caller lets them go.
+type Refs = std::cell::RefCell<Vec<crate::cachelock::Guard>>;
 
 /// Build stage `index` of `stages`, and the stages it builds on, into a layer. The `target`
 /// stage's last step also asks Windows how long it keeps working (see [`crate::wineval`]).
@@ -389,7 +456,8 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     let (opts, cache) = (b.opts, b.cache);
     let stage = &stages[index];
     let label = stage.label(index);
-    check_stage(stage, &opts.context, opts.no_network).with_context(|| format!("stage {label}"))?;
+    let no_network = matches!(opts.net, crate::build::BuildNet::None);
+    check_stage(stage, &opts.context, no_network).with_context(|| format!("stage {label}"))?;
     let (cpus, mem) = guest_size(stage, opts);
     let bundle = opts.context.join(&stage.from.image);
     let mut layer = if let Some(source) =
@@ -417,6 +485,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             disk: base.disk,
             key: base.key,
             password: base.password,
+            pending: base.pending.map(|digest| Pending { digest, base: true }),
             shell: DEFAULT_SHELL.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
             workdir: None,
@@ -443,12 +512,19 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             stage.from.image
         );
     };
+    if layer.pending.is_none() {
+        b.refs
+            .borrow_mut()
+            .extend(crate::wincache::reference_chain(&layer.disk)?);
+    }
     machine_directives(stage, &mut layer);
     let steps = Steps {
         cpus,
         mem: &mem,
         cache,
         registry: opts.registry.as_ref(),
+        net: &opts.net,
+        refs: b.refs,
         evaluation: false,
     };
     // A generalized image carries no clock of its own: each machine starts a new grace.
@@ -559,7 +635,8 @@ fn bundle_layer(
     } else if let Some(disk) = crate::winiso::cached_base(&cache.join("winiso"), &layer.key) {
         disk
     } else if let Some(rg) = registry
-        && pull_step(rg, cache, &layer.key, &step)?
+        && let Some((digest, _)) = crate::wincache::remote(rg, &layer.key)?
+        && pull_step(rg, cache, &layer.key, &digest, &step)?
     {
         crate::wincache::layer_disk(&step)
     } else {
@@ -716,6 +793,9 @@ struct Steps<'a> {
     cache: &'a Path,
     /// Where the hosts share layers, if they do.
     registry: Option<&'a crate::config::Registry>,
+    /// What a step with a network reaches.
+    net: &'a crate::build::BuildNet,
+    refs: &'a Refs,
     evaluation: bool,
 }
 
@@ -1034,15 +1114,26 @@ fn step(
     let key = step_key(layer, material);
     let dir = steps.cache.join("layers").join(&key);
     let mut cached = dir.join("complete").exists();
+    // In the registry only: pulled when a step builds on it or a bundle boots it.
+    let mut remote = None;
     // Held while this host makes the layer, so the others wait for its push.
     let mut _lock = None;
     if !cached && let Some(rg) = steps.registry {
-        _lock = crate::wincache::lock(rg, &key, "layer");
-        cached = dir.join("complete").exists() || pull_step(rg, steps.cache, &key, &dir)?;
+        remote = crate::wincache::remote(rg, &key)?;
+        if remote.is_none() {
+            _lock = crate::wincache::lock(rg, &key, "layer");
+            cached = dir.join("complete").exists();
+            if !cached {
+                remote = crate::wincache::remote(rg, &key)?;
+            }
+        }
     }
     if cached {
         eprintln!("virtkit:   CACHED {}", &key[..12]);
+    } else if remote.is_some() {
+        eprintln!("virtkit:   CACHED {} (build cache)", &key[..12]);
     } else {
+        ensure(layer, steps.cache, steps.registry, steps.refs)?;
         clear_attempts(&steps.cache.join("layers"), &key);
         let tmp = crate::winiso::scratch_beside(&dir)?;
         let work = tmp.join("run");
@@ -1070,21 +1161,40 @@ fn step(
             push_step(rg, &key, &dir, layer);
         }
     }
-    layer.disk = crate::wincache::layer_disk(&dir);
     // A layer records the password its install was given, which need not be the one of the
     // layer this host has under it: either may have come from another host.
-    if let Some(password) = crate::wincache::password(&dir) {
-        layer.password = password;
+    let mut evaluated = dir.join(EVALUATION).exists();
+    if let Some((digest, meta)) = remote {
+        layer.disk = dir.join(crate::wincache::PULLED_DISK);
+        layer.pending = Some(Pending {
+            digest,
+            base: false,
+        });
+        if let Some(password) = meta["password"].as_str() {
+            layer.password = password.to_string();
+        }
+        evaluated |= !meta["evaluation"].is_null();
+    } else {
+        layer.disk = crate::wincache::layer_disk(&dir);
+        layer.pending = None;
+        steps
+            .refs
+            .borrow_mut()
+            .push(crate::wincache::reference(&dir)?);
+        if let Some(password) = crate::wincache::password(&dir) {
+            layer.password = password;
+        }
     }
     layer.key = key;
     layer.unsaved_env.clear();
     layer.unmade_workdir = false;
     layer.generalized = false;
     // Made by a build that did not ask Windows, or could not.
-    if cached
+    if (cached || layer.pending.is_some())
         && steps.evaluation
-        && !dir.join(EVALUATION).exists()
-        && let Err(e) = evaluate_cached(layer, &dir, steps)
+        && !evaluated
+        && let Err(e) = ensure(layer, steps.cache, steps.registry, steps.refs)
+            .and_then(|()| evaluate_cached(layer, &dir, steps))
     {
         crate::wineval::warn_unread(&e);
     }
@@ -1129,11 +1239,17 @@ fn clear_attempts(layers: &Path, key: &str) {
     }
 }
 
-/// Pull layer `key` from `rg` into its directory `dir` under `cache`; false when the registry
-/// does not have it.
-fn pull_step(rg: &crate::config::Registry, cache: &Path, key: &str, dir: &Path) -> Result<bool> {
+/// Pull layer `key`, the manifest `digest` in `rg`, into its directory `dir` under `cache`;
+/// false when the registry does not have it.
+fn pull_step(
+    rg: &crate::config::Registry,
+    cache: &Path,
+    key: &str,
+    digest: &str,
+    dir: &Path,
+) -> Result<bool> {
     let tmp = crate::winiso::scratch_beside(dir)?;
-    let Some(meta) = crate::wincache::pull(rg, cache, key, &tmp)? else {
+    let Some(meta) = crate::wincache::pull(rg, cache, key, Some(digest), &tmp)? else {
         let _ = std::fs::remove_dir_all(&tmp);
         return Ok(false);
     };
@@ -1186,12 +1302,18 @@ fn make_step(
     let mut nics = Vec::new();
     if network {
         let vsock = work.join("vsock.sock");
+        let (allow_ip, allow_name, restrict) = match steps.net {
+            crate::build::BuildNet::Allow { ips, names } => {
+                (ips.as_slice(), names.as_slice(), true)
+            }
+            _ => (&[][..], &[][..], false),
+        };
         let spawn = crate::run::spawn_vm_switch(
             &vsock,
             work,
             crate::run::NET_VSOCK_PORT,
-            &[],
-            &[],
+            allow_ip,
+            allow_name,
             &[],
             &[],
             &[],
@@ -1200,7 +1322,7 @@ fn make_step(
             None,
             None,
             None,
-            false,
+            restrict,
             None,
             crate::prio::Prio::Normal,
         );
@@ -1374,6 +1496,7 @@ mod tests {
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
+            pending: None,
         }
     }
 
@@ -1835,15 +1958,17 @@ mod tests {
             out: out.clone(),
             cpus: 2,
             mem: "4G".into(),
-            no_network: false,
+            net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
         };
+        let refs = Refs::default();
         let mut build = Build {
             opts: &opts,
             cache: &cache,
             built: HashMap::new(),
             reinstalled: Vec::new(),
+            refs: &refs,
         };
         let stages = parsed("FROM ./base\nENV A=1\n");
         let built = build_stage(&mut build, &stages, 0, true).unwrap();

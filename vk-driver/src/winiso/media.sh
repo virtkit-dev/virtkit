@@ -4,7 +4,9 @@
 # holds the ISO's files with install.wim split for FAT32. boot.wim's Setup image carries the
 # virtio drivers and a script, started by winpeshl.ini, that loads viostor and starts Setup on
 # the answer file; sources\$OEM$\$1\vk holds the virtio-win and qemu-ga installers, which Setup
-# copies to C:\vk for the first logon.
+# copies to C:\vk for the first logon. Retail media carry install.esd, which is converted to
+# install.wim (an ESD's solid compression does not split); the answer file's languages become
+# the medium's own, which Setup requires of its windowsPE pass.
 #
 # In: /in/iso/$ISO, /in/drivers/$DRIVERS, /assets/{autounattend.xml,setup.cmd,winpeshl.ini},
 #     $DRIVERDIR (virtio-win's directory for this Windows, e.g. 2k25). Out: /out/media.img.
@@ -12,7 +14,15 @@ set -eu
 T=/out/tmp; rm -rf "$T"; mkdir -p "$T/iso" "$T/drv" "$T/vw"
 echo "vk-media: extracting the ISO"
 (cd "$T/iso" && 7z x -y "/in/iso/$ISO" >/dev/null)
-[ -f "$T/iso/sources/install.wim" ] || { echo "vk-media: no sources/install.wim in the ISO" >&2; exit 1; }
+if [ ! -f "$T/iso/sources/install.wim" ]; then
+  [ -f "$T/iso/sources/install.esd" ] || { echo "vk-media: no sources/install.wim or install.esd in the ISO" >&2; exit 1; }
+  echo "vk-media: converting install.esd"
+  wimlib-imagex export "$T/iso/sources/install.esd" all "$T/iso/sources/install.wim" --compress=LZX >/dev/null
+  rm "$T/iso/sources/install.esd"
+fi
+lang=$(wimlib-imagex info "$T/iso/sources/boot.wim" 2 | sed -n 's/^Default Language: *\([A-Za-z-]*\).*/\1/p' | head -n 1)
+echo "vk-media: language ${lang:=en-US}"
+sed "s/en-US/$lang/g" /assets/autounattend.xml >"$T/autounattend.xml"
 echo "vk-media: splitting install.wim"
 wimlib-imagex split "$T/iso/sources/install.wim" "$T/iso/sources/install.swm" 3800 >/dev/null
 rm "$T/iso/sources/install.wim"
@@ -29,7 +39,7 @@ echo "vk-media: boot.wim"
 wimlib-imagex update "$T/iso/sources/boot.wim" 2 >/dev/null <<EOC
 add $T/drv /vk/drivers
 add /assets/setup.cmd /vk/setup.cmd
-add /assets/autounattend.xml /vk/autounattend.xml
+add $T/autounattend.xml /vk/autounattend.xml
 add /assets/winpeshl.ini /Windows/System32/winpeshl.ini
 EOC
 echo "vk-media: FAT32 disk"

@@ -5237,8 +5237,6 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         (*no_journal, "--no-journal"),
         (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
         (!build_arg.is_empty(), "--build-arg"),
-        (!build_allow_ip.is_empty(), "--build-allow-ip"),
-        (!build_allow_name.is_empty(), "--build-allow-name"),
         (*build_audit_egress, "--build-audit-egress"),
         (*require_cached, "--require-cached"),
         (build_jobs.is_some(), "--build-jobs"),
@@ -5252,9 +5250,9 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
             2,
         );
     }
-    // Allow lists are refused above; --build-net controls whether a step may request a network.
-    let no_network = match build::BuildNet::from_flags(build_net, &[], &[]) {
-        Ok(net) => matches!(net, build::BuildNet::None),
+    // What a `RUN --network=default` step reaches, as for a Linux build.
+    let net = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
+        Ok(net) => net,
         Err(e) => return fail(&e, 2),
     };
     let dockerfile = &file[0];
@@ -5288,12 +5286,12 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         out,
         cpus: build::configured_build_cpus().unwrap_or(4),
         mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
-        no_network,
+        net,
         reinstall: *reinstall,
         registry,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
-        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Ok(_refs)) => ExitCode::SUCCESS,
         Ok(Err(e)) => fail(&e, 1),
         Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
     }

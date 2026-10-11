@@ -41,7 +41,7 @@
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>
-      <UserData><AcceptEula>true</AcceptEula><FullName>vk</FullName><Organization>vk</Organization></UserData>
+      <UserData><AcceptEula>true</AcceptEula><FullName>vk</FullName><Organization>vk</Organization>@PRODUCT_KEY@</UserData>
     </component>
   </settings>
   <settings pass="specialize">

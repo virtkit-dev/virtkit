@@ -26,6 +26,21 @@ All notable changes to virtkit will be documented in this file.
   installs Windows is built during prepare, over layers shared through the build cache
   registry, booted beside the job VM on the job's LAN, and provisioned (its `CMD`) before the
   script starts. The job VM itself stays Linux.
+- **Retail and volume Windows media install.** Setup runs in the medium's own language instead
+  of en-US, an `install.esd` is converted, and `FROM winiso:` takes `--product-key=<key>` for
+  media that ask for one. Hosts install Windows again once, as the install medium changed.
+- **A Windows build's `RUN --network=default` follows `--build-allow-ip`/`--build-allow-name`**
+  (`[egress.build]` in CI), enforced by the step's switch as for a Linux step.
+
+### Changed
+
+- **A CI job's memory admission counts its services**, Linux and Windows: each one's
+  `x-virtkit.mem`, else its image's, else the default. Admission now runs after the host
+  checkout, which holds a `compose:` job's services.
+- **A host pulls only the Windows layers it builds on or boots.** It takes the registry's
+  record of the others, so a build whose target is cached downloads that layer alone.
+- **CI hosts reclaim their Windows build cache**: layers, installs, media and fetched ISOs no
+  job used for `image_cache_idle_secs`, and the chunks no remaining layer reads.
 
 ## [0.88.0] - 2026-10-11
 
