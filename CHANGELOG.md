@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-10-11
+
 ### Added
 
 - **Windows guests get a hardware random-number generator, as Linux guests do.** A Windows
@@ -4110,7 +4112,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.87.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.88.0...HEAD
+[0.88.0]: https://github.com/virtkit-dev/virtkit/compare/v0.87.0...v0.88.0
 [0.87.0]: https://github.com/virtkit-dev/virtkit/compare/v0.86.1...v0.87.0
 [0.86.1]: https://github.com/virtkit-dev/virtkit/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/virtkit-dev/virtkit/compare/v0.85.0...v0.86.0
