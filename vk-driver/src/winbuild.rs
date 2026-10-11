@@ -265,6 +265,7 @@ fn ensure(
     layer: &mut Layer,
     cache: &Path,
     registry: Option<&crate::config::Registry>,
+    refs: &Refs,
 ) -> Result<()> {
     // Kept until pulled: a failed pull leaves the layer pending, so it fails as one again.
     let Some(pending) = layer.pending.clone() else {
@@ -293,6 +294,7 @@ fn ensure(
         }
         layer.disk = crate::wincache::layer_disk(&dir);
     }
+    refs.reference_chain(cache, &layer.disk)?;
     layer.pending = None;
     Ok(())
 }
@@ -399,7 +401,9 @@ fn stage_mem(stage: &Stage, mem: &str) -> String {
 }
 
 /// Build `opts` and write its bundle.
-pub(crate) fn build(opts: &Options) -> Result<()> {
+/// Returns the references on the cache entries the bundle stands on, and only those, for a
+/// caller that must keep them past the build ([`crate::wincache::gc`]).
+pub(crate) fn build(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     match build_with(opts) {
         Err(e) if opts.pull_layers && e.chain().any(|c| c.is::<PullFailed>()) => {
             eprintln!(
@@ -417,7 +421,7 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
 }
 
 /// [`build`], once.
-fn build_with(opts: &Options) -> Result<()> {
+fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let text = std::fs::read_to_string(&opts.dockerfile)
         .with_context(|| format!("reading {}", opts.dockerfile.display()))?;
     let stages =
@@ -426,14 +430,16 @@ fn build_with(opts: &Options) -> Result<()> {
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
     let cache = crate::run::default_data_base()?.join("windows");
     let started = Instant::now();
+    let refs = Refs::default();
     let mut build = Build {
         opts,
         cache: &cache,
         built: HashMap::new(),
         reinstalled: Vec::new(),
+        refs: &refs,
     };
     let mut layer = build_stage(&mut build, &stages, target, true)?;
-    ensure(&mut layer, &cache, opts.registry.as_ref())?;
+    ensure(&mut layer, &cache, opts.registry.as_ref(), &refs)?;
     if opts.reinstall && build.reinstalled.is_empty() {
         eprintln!(
             "virtkit: warning: --reinstall: the target builds on no `FROM winiso:` stage; \
@@ -448,7 +454,10 @@ fn build_with(opts: &Options) -> Result<()> {
         opts.out.display(),
         started.elapsed().as_secs()
     );
-    Ok(())
+    // Taken while the build's own are still held, so the bundle's chain is never unreferenced.
+    let bundle = Refs::default();
+    bundle.reference_chain(&cache, &layer.disk)?;
+    Ok(bundle.into_guards())
 }
 
 /// Refuse what `stage` asks for that a Windows build does not do, before anything boots.
@@ -604,7 +613,12 @@ struct Build<'a> {
     built: HashMap<usize, Layer>,
     /// The installs (medium and disk size) `--reinstall` has made again in this build.
     reinstalled: Vec<(crate::winiso::Source, u64)>,
+    /// The cache entries this build uses, referenced against [`crate::wincache::gc`].
+    refs: &'a Refs,
 }
+
+/// The cache entries a build references, held until it ends or its caller lets them go.
+type Refs = crate::wincache::Refs;
 
 /// Build stage `index` of `stages`, and the stages it builds on, into a layer. The `target`
 /// stage's last step also asks Windows how long it keeps working (see [`crate::wineval`]).
@@ -644,6 +658,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             reinstall,
             opts.registry.as_ref(),
             opts.pull_layers,
+            b.refs,
         )?;
         Layer {
             disk: base.disk,
@@ -671,6 +686,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             &bundle,
             cache,
             opts.registry.as_ref().filter(|_| opts.pull_layers),
+            b.refs,
         )
         .with_context(|| format!("FROM {}", stage.from.image))?
     } else {
@@ -680,6 +696,9 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             stage.from.image
         );
     };
+    if layer.pending.is_none() {
+        b.refs.reference_chain(cache, &layer.disk)?;
+    }
     machine_directives(stage, &mut layer);
     let steps = Steps {
         cpus,
@@ -688,6 +707,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
         registry: opts.registry.as_ref(),
         pull: opts.pull_layers,
         net: &opts.net,
+        refs: b.refs,
         evaluation: false,
     };
     // A generalized image carries no clock of its own: each machine starts a new grace.
@@ -790,12 +810,21 @@ fn bundle_layer(
     dir: &Path,
     cache: &Path,
     registry: Option<&crate::config::Registry>,
+    refs: &Refs,
 ) -> Result<Layer> {
     let mut layer = read_layer(dir)?;
     let step = cache.join("layers").join(&layer.key);
-    layer.disk = if step.join("complete").exists() {
+    let settled = cache.join("winiso").join("settled").join(&layer.key);
+    // Each referenced before it is looked at, so a sweep cannot take it between the two.
+    layer.disk = if refs
+        .reference(&step)
+        .map(|()| step.join("complete").exists())?
+    {
         crate::wincache::layer_disk(&step)
-    } else if let Some(disk) = crate::winiso::cached_base(&cache.join("winiso"), &layer.key) {
+    } else if let Some(disk) = refs
+        .reference(&settled)
+        .map(|()| crate::winiso::cached_base(&cache.join("winiso"), &layer.key))?
+    {
         disk
     } else if let Some(rg) = registry
         && let Some(remote) = match remote_step(rg, &layer.key) {
@@ -974,6 +1003,7 @@ struct Steps<'a> {
     /// Whether a step takes a layer the registry holds ([`Options::pull_layers`]).
     pull: bool,
     net: &'a crate::build::BuildNet,
+    refs: &'a Refs,
     evaluation: bool,
 }
 
@@ -1291,6 +1321,8 @@ fn step(
 ) -> Result<()> {
     let key = step_key(layer, material);
     let dir = steps.cache.join("layers").join(&key);
+    // Referenced before it is looked at, so a sweep cannot take it between the two.
+    steps.refs.reference(&dir)?;
     let mut cached = dir.join("complete").exists();
     // In the registry only: pulled when a step builds on it or a bundle boots it.
     let mut remote = None;
@@ -1323,7 +1355,7 @@ fn step(
     } else if remote.is_some() {
         eprintln!("virtkit:   CACHED {} (build cache)", &key[..12]);
     } else {
-        ensure(layer, steps.cache, steps.registry)?;
+        ensure(layer, steps.cache, steps.registry, steps.refs)?;
         clear_attempts(&steps.cache.join("layers"), &key);
         let tmp = crate::winiso::scratch_beside(&dir)?;
         let work = tmp.join("run");
@@ -1368,6 +1400,8 @@ fn step(
         evaluated |= !remote.meta["evaluation"].is_null();
     } else {
         layer.disk = crate::wincache::layer_disk(&dir);
+        // A cached layer's disk may stand on entries this build has not referenced yet.
+        steps.refs.reference_chain(steps.cache, &layer.disk)?;
         layer.pending = None;
         if let Some(password) = crate::wincache::password(&dir)? {
             layer.password = password;
@@ -1380,7 +1414,7 @@ fn step(
     // Made by a build that did not ask Windows, or could not. Its pull is no best effort: a
     // layer that cannot be pulled fails the build as a [`PullFailed`].
     if (cached || layer.pending.is_some()) && steps.evaluation && !evaluated {
-        ensure(layer, steps.cache, steps.registry)?;
+        ensure(layer, steps.cache, steps.registry, steps.refs)?;
         if let Err(e) = evaluate_cached(layer, &dir, steps) {
             crate::wineval::warn_unread(&e);
         }
@@ -1409,21 +1443,15 @@ fn evaluate_cached(layer: &Layer, dir: &Path, steps: &Steps) -> Result<()> {
 
 /// Remove what earlier attempts at the layer `key` left in `layers`: a failed step keeps its
 /// logs (see [`step`]), and a killed build its whole directory. An attempt whose process is
-/// still running is left alone.
+/// still running is left alone; the new attempt replaces the logs of the others, however
+/// recent.
 fn clear_attempts(layers: &Path, key: &str) {
-    let Ok(entries) = std::fs::read_dir(layers) else {
-        return;
-    };
-    let prefix = format!("{key}.tmp-");
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
-            continue;
-        };
-        if !Path::new("/proc").join(pid).exists() {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
+    crate::wincache::clear_dead_scratch(
+        layers,
+        Some(key),
+        std::time::Duration::ZERO,
+        std::time::SystemTime::now(),
+    );
 }
 
 /// A layer the build cache holds, to be pulled when something needs its disk.
@@ -1473,6 +1501,7 @@ fn pull_step(
     digest: &str,
     dir: &Path,
 ) -> Result<bool> {
+    let _chunks = crate::wincache::hold_chunks(cache)?;
     let tmp = crate::winiso::scratch_beside(dir)?;
     let pulled = (|| -> Result<bool> {
         let Some(meta) = crate::wincache::pull(rg, cache, key, Some(digest), &tmp)? else {
@@ -2259,7 +2288,7 @@ mod tests {
         std::fs::write(parent_dir.join("complete"), "").unwrap();
         write_bundle(&parent, 2, "4G", Default::default(), &base).unwrap();
         // The target's last step (saving its ENV), cached with what Windows said then.
-        let mut saving = bundle_layer(&base, &cache, None).unwrap();
+        let mut saving = bundle_layer(&base, &cache, None, &Refs::default()).unwrap();
         saving.unsaved_env.push(("A".into(), "1".into()));
         let key = step_key(&saving, "SAVE");
         let step = cache.join("layers").join(&key);
@@ -2289,11 +2318,13 @@ mod tests {
             pull_layers: true,
             ceiling: None,
         };
+        let refs = Refs::default();
         let mut build = Build {
             opts: &opts,
             cache: &cache,
             built: HashMap::new(),
             reinstalled: Vec::new(),
+            refs: &refs,
         };
         let stages = parsed("FROM ./base\nENV A=1\n");
         let built = build_stage(&mut build, &stages, 0, true).unwrap();
@@ -2335,11 +2366,14 @@ mod tests {
             "{record}"
         );
         assert!(!bundle.join(format!("{LAYER_RECORD}.tmp")).exists());
-        let err = format!("{:#}", bundle_layer(&bundle, &cache, None).unwrap_err());
+        let err = format!(
+            "{:#}",
+            bundle_layer(&bundle, &cache, None, &Refs::default()).unwrap_err()
+        );
         assert!(err.contains("gone from the build cache"), "{err}");
         let step = cache.join("layers").join(&key);
         std::fs::write(step.join("complete"), "").unwrap();
-        let loaded = bundle_layer(&bundle, &cache, None).unwrap();
+        let loaded = bundle_layer(&bundle, &cache, None, &Refs::default()).unwrap();
         assert_eq!(loaded.disk, step.join("disk.qcow2"));
         assert_eq!(loaded.password, "secret");
         assert!(loaded.generalized);
@@ -2348,7 +2382,9 @@ mod tests {
         // the bundle's.
         std::fs::write(step.join("admin-password"), "theirs\n").unwrap();
         assert_eq!(
-            bundle_layer(&bundle, &cache, None).unwrap().password,
+            bundle_layer(&bundle, &cache, None, &Refs::default())
+                .unwrap()
+                .password,
             "theirs"
         );
         std::fs::remove_file(step.join("admin-password")).unwrap();
@@ -2370,7 +2406,10 @@ mod tests {
         for (forged, want) in refused {
             assert_ne!(forged, record, "{want}");
             std::fs::write(bundle.join(LAYER_RECORD), forged).unwrap();
-            let err = format!("{:#}", bundle_layer(&bundle, &cache, None).unwrap_err());
+            let err = format!(
+                "{:#}",
+                bundle_layer(&bundle, &cache, None, &Refs::default()).unwrap_err()
+            );
             assert!(err.contains(want), "{want}: {err}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -2386,18 +2425,26 @@ mod tests {
         std::fs::write(settled.join("base.json"), r#"{"password": "the base's"}"#).unwrap();
         std::fs::create_dir_all(&bundle).unwrap();
         let mut record = serde_json::to_value(layer()).unwrap();
-        record["key"] = key.into();
+        record["key"] = key.clone().into();
         record["version"] = LAYER_RECORD_VERSION.into();
         std::fs::write(bundle.join(LAYER_RECORD), record.to_string()).unwrap();
         std::fs::write(bundle.join("admin-password"), "pw\n").unwrap();
-        let loaded = bundle_layer(&bundle, &cache, None).unwrap();
+        let refs = Refs::default();
+        let loaded = bundle_layer(&bundle, &cache, None, &refs).unwrap();
         assert_eq!(loaded.disk, settled.join("disk.qcow2"));
+        // Both places its layer may be were referenced before they were looked at.
+        assert!(refs.holds(&cache.join("layers").join(&key)) && refs.holds(&settled));
         // The base this host has records the password of its own install, which wins.
         assert_eq!(loaded.password, "the base's");
         // Records predating CMD have no provisioning.
         record.as_object_mut().unwrap().remove("provision");
         std::fs::write(bundle.join(LAYER_RECORD), record.to_string()).unwrap();
-        assert_eq!(bundle_layer(&bundle, &cache, None).unwrap().provision, None);
+        assert_eq!(
+            bundle_layer(&bundle, &cache, None, &Refs::default())
+                .unwrap()
+                .provision,
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2470,6 +2517,7 @@ mod tests {
     #[test]
     fn a_pending_layer_is_pulled_as_it_was_found() {
         let root = scratch("pending");
+        let refs = Refs::default();
         let cache = root.join("cache");
         let rg = crate::config::Registry::for_share(
             root.join("store").display().to_string(),
@@ -2508,7 +2556,7 @@ mod tests {
         push(&step, 2, serde_json::json!({"password": "two"}));
         let mut layer = pending(&step, found.digest, false);
         layer.password = found.password;
-        ensure(&mut layer, &cache, Some(&rg)).unwrap();
+        ensure(&mut layer, &cache, Some(&rg), &refs).unwrap();
         assert!(layer.pending.is_none());
         assert!(layer.disk.ends_with(crate::wincache::PULLED_DISK));
         let dir = cache.join("layers").join(&step);
@@ -2524,7 +2572,7 @@ mod tests {
         let digest = crate::wincache::remote(&rg, &base).unwrap().unwrap().0;
         let mut layer = pending(&base, digest, true);
         layer.password = "pb".into();
-        ensure(&mut layer, &cache, Some(&rg)).unwrap();
+        ensure(&mut layer, &cache, Some(&rg), &refs).unwrap();
         let settled = cache.join("winiso").join("settled").join(&base);
         assert!(settled.join("base.json").is_file());
         assert_eq!(layer.disk, crate::wincache::layer_disk(&settled));
@@ -2536,22 +2584,25 @@ mod tests {
         std::fs::create_dir_all(&here).unwrap();
         std::fs::write(here.join("complete"), "").unwrap();
         crate::wincache::write_password(&here, "this host's").unwrap();
+        let raw = root.join("local.raw");
+        std::fs::write(&raw, vec![9u8; 4 << 20]).unwrap();
+        crate::qcow2::create_overlay(&here.join(crate::wincache::BUILT_DISK), &raw).unwrap();
         let mut layer = pending(&local, format!("sha256:{}", "f".repeat(64)), false);
-        let err = ensure(&mut layer, &cache, Some(&rg)).unwrap_err();
+        let err = ensure(&mut layer, &cache, Some(&rg), &refs).unwrap_err();
         assert!(err.chain().any(|c| c.is::<PullFailed>()), "{err:#}");
         // With the same password, it is taken as it is.
         layer.password = "this host's".into();
-        ensure(&mut layer, &cache, Some(&rg)).unwrap();
+        ensure(&mut layer, &cache, Some(&rg), &refs).unwrap();
         assert!(layer.pending.is_none());
 
         // Gone since it was found.
         let gone = "4".repeat(64);
         let mut layer = pending(&gone, format!("sha256:{}", "e".repeat(64)), false);
-        let err = ensure(&mut layer, &cache, Some(&rg)).unwrap_err();
+        let err = ensure(&mut layer, &cache, Some(&rg), &refs).unwrap_err();
         assert!(err.chain().any(|c| c.is::<PullFailed>()), "{err:#}");
         // Still pending: what builds on it next fails as one too, not on a missing disk.
         assert!(layer.pending.is_some());
-        assert!(ensure(&mut layer, &cache, Some(&rg)).is_err());
+        assert!(ensure(&mut layer, &cache, Some(&rg), &refs).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2595,7 +2646,7 @@ mod tests {
             serde_json::json!({"password": "theirs", "evaluation": evaluation}),
         );
         record_for(&key);
-        let loaded = bundle_layer(&bundle, &cache, Some(&rg)).unwrap();
+        let loaded = bundle_layer(&bundle, &cache, Some(&rg), &Refs::default()).unwrap();
         let step = cache.join("layers").join(&key);
         assert_eq!(loaded.disk, crate::wincache::layer_disk(&step));
         assert!(!loaded.disk.ends_with(crate::wincache::BUILT_DISK));
@@ -2609,7 +2660,7 @@ mod tests {
         record_for(&bare);
         let err = format!(
             "{:#}",
-            bundle_layer(&bundle, &cache, Some(&rg)).unwrap_err()
+            bundle_layer(&bundle, &cache, Some(&rg), &Refs::default()).unwrap_err()
         );
         assert!(err.contains("gone from the build cache"), "{err}");
         assert!(!cache.join("layers").join(&bare).exists());

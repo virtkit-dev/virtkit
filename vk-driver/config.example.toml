@@ -250,6 +250,11 @@
 #                        # job's writes in RAM instead of on the state disk
 # checkout_cache_idle_secs = 1800  # unused clones are reclaimed before a checkout and by
 #                        # `vk gc`; unset inherits image_cache_idle_secs
+# windows_cache_idle_secs = 604800  # an entry of the Windows build cache (layer, install,
+#                        # medium, fetched ISO) no build or job used this long is reclaimed
+#                        # after the next Windows build of a CI job; one a kept layer stands
+#                        # on stays. 7 days; 0 is refused, as it would let a sweep take the
+#                        # install under a layer a build is publishing
 # checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
 #                        # so writes run at guest speed and the guest cannot touch the host
 #                        # tree; false shares it read-write, and the checkout is re-cloned

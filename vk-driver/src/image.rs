@@ -1090,7 +1090,7 @@ pub(crate) fn staging_chunk_name(hex: &str) -> String {
 /// file will never be renamed into place. A name that does not carry a pid is from an older
 /// `vk` (or is not ours at all) and is reported as still live — never reclaiming someone
 /// else's in-flight write is worth leaving the odd stale file behind.
-fn staging_writer_is_gone(name: &str) -> bool {
+pub(crate) fn staging_writer_is_gone(name: &str) -> bool {
     name.strip_suffix(".tmp")
         .and_then(|rest| rest.rsplit_once('.'))
         .and_then(|(_hex, owner)| owner.split_once('-'))

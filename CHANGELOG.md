@@ -35,7 +35,10 @@ All notable changes to virtkit will be documented in this file.
   builds during prepare, reusing cached layers shared between hosts when a build cache
   registry is configured. It boots beside the Linux job VM on the job's LAN and runs its
   provisioning (`CMD`) before the script starts. Raise gitlab-runner's `prepare_exec_timeout`
-  to cover a first install.
+  to cover a first install. After each Windows build a CI host reclaims the entries of its
+  Windows build cache no build or job used for `[executor] windows_cache_idle_secs` (7 days
+  by default): an install reclaimed means installing Windows again, and a bundle `vk build`
+  wrote on that host stops booting once its layers are reclaimed.
 - **Localized Windows media install.** Setup runs in the medium's own language instead of
   en-US, and a generalized image keeps it. Hosts install Windows again once, as the install
   medium changed.

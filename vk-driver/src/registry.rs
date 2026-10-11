@@ -2113,6 +2113,9 @@ async fn pull_chunk(
     use std::sync::atomic::Ordering;
     let hex = layer.digest.trim_start_matches("sha256:");
     let cached = cache.join(hex);
+    // Hits are not re-dated: neither chunk sweep uses age alone. Windows sweeps only while no
+    // pull holds the store (`wincache::sweep_chunks`); callers hold `wincache::hold_chunks` until
+    // the view is published. Linux keeps chunks named in `chunks.list`, written before fetching.
     if let Ok(bytes) = std::fs::read(&cached) {
         reused.fetch_add(1, Ordering::Relaxed);
         return Ok(bytes);

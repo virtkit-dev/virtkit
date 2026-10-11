@@ -982,7 +982,8 @@ fn open_backing(path: &Path) -> Result<Backing> {
 /// `third_party/libkrun`'s `LazyChunkStorage`, which the guest's virtio-blk uses instead).
 /// This one exists so a stage that never boots (or a diff-push instruction snapshot) can be
 /// exported/diffed straight from the host, without booting a guest just to decompress a
-/// chunk cache this process can read directly.
+/// chunk cache this process can read directly, and so the Windows cache sweep knows which
+/// chunks a view reads ([`VkRoImg::digests`]).
 pub struct VkRoImg {
     total_size: u64,
     layout: u8,
@@ -1003,7 +1004,7 @@ struct VkRoChunk {
 }
 
 impl VkRoImg {
-    fn open(path: &Path) -> Result<VkRoImg> {
+    pub(crate) fn open(path: &Path) -> Result<VkRoImg> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let mut p = 0usize;
         let mut take = |n: usize| -> Result<&[u8]> {
@@ -1067,6 +1068,11 @@ impl VkRoImg {
             chunks,
             last: None,
         })
+    }
+
+    /// The digests of the chunks this view reads, in offset order.
+    pub(crate) fn digests(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.chunks.iter().map(|c| &c.digest)
     }
 
     /// Returns the sorted, non-overlapping, non-empty ranges this backing contributes to
@@ -1290,6 +1296,21 @@ fn read_backing_name(file: &File, h: &[u8], path: &Path) -> Result<Option<PathBu
         .context("reading backing file name")?;
     let name = String::from_utf8(name).context("backing file name not utf-8")?;
     Ok(Some(resolve_backing(path, &name)))
+}
+
+/// The image `path` is an overlay over, from its header alone: `None` for one that stands on
+/// nothing (a raw image, a `.vk_ro_img`, or a qcow2 without a backing file). Unlike
+/// [`Qcow2::open`] it opens nothing down the chain, so a caller walks it one link at a time.
+pub(crate) fn backing_name(path: &Path) -> Result<Option<PathBuf>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    if sniff_kind(&file) != ImageKind::Qcow2 {
+        return Ok(None);
+    }
+    // Up to the backing file name's length: magic, version, its offset, its length.
+    let mut h = [0u8; 20];
+    file.read_exact_at(&mut h, 0)
+        .with_context(|| format!("reading qcow2 header of {}", path.display()))?;
+    read_backing_name(&file, &h, path)
 }
 
 /// Resolve a backing-file name (often absolute, as this tool writes it) relative to the

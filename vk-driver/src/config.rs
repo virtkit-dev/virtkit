@@ -387,6 +387,13 @@ pub struct Executor {
     /// is removed. Reclamation runs before each host checkout and from `vk gc`; unset inherits
     /// the top-level `image_cache_idle_secs` (30 minutes by default).
     pub checkout_cache_idle_secs: Option<u64>,
+    /// How long an entry of the host's Windows build cache (a layer, an install, a medium, a
+    /// fetched ISO: tens of GB each, hours to make again) may go unused before the sweep a CI
+    /// host runs after each Windows build removes it; one a kept layer stands on stays. Unset
+    /// = 7 days. `0` is refused when the config loads: a build drops its reference to the
+    /// install under a layer it just published, and a sweep that scanned the layers before the
+    /// publish would then take that install at once.
+    pub windows_cache_idle_secs: Option<std::num::NonZeroU64>,
     /// Mount the `host_checkout` tree in the guest behind a tmpfs-backed overlayfs (default
     /// on). The share is then exported read-only — the guest can never touch the host tree —
     /// and every in-job write runs at guest-native speed instead of a 50–90µs synchronous
@@ -496,6 +503,7 @@ impl Default for Executor {
             host_checkout: false,
             checkout_dir: None,
             checkout_cache_idle_secs: None,
+            windows_cache_idle_secs: None,
             checkout_overlay: true,
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
             checkout_tmpfs: true,
@@ -1037,7 +1045,20 @@ impl Config {
                 .unwrap_or_else(|| self.image_cache_idle().as_secs()),
         )
     }
+
+    /// How long an unused entry of a CI host's Windows build cache stays. Not the image
+    /// cache's lifetime: an entry costs hours to make again, not a decompression.
+    pub fn windows_cache_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.executor
+                .windows_cache_idle_secs
+                .map_or(DEFAULT_WINDOWS_CACHE_IDLE_SECS, std::num::NonZeroU64::get),
+        )
+    }
 }
+
+/// [`Config::windows_cache_idle`] when the config sets none: a week.
+const DEFAULT_WINDOWS_CACHE_IDLE_SECS: u64 = 7 * 24 * 3600;
 
 #[cfg(test)]
 mod tests {
@@ -1287,6 +1308,10 @@ mod tests {
             "the default root is the executor's state dir, which is what `vk gc` must sweep"
         );
         assert_eq!(bare.checkout_cache_idle(), bare.image_cache_idle());
+        // The Windows cache keeps its own, far longer lifetime, which a config can set.
+        assert_eq!(bare.windows_cache_idle().as_secs(), 7 * 24 * 3600);
+        let set: Config = toml::from_str("[executor]\nwindows_cache_idle_secs = 3600\n").unwrap();
+        assert_eq!(set.windows_cache_idle().as_secs(), 3600);
         // No `[executor]` table at all still resolves a root, and a configured state dir moves it.
         assert_eq!(
             Config::default().checkout_root(),
@@ -1570,5 +1595,15 @@ mod tests {
             std::num::NonZeroU32::new(3)
         );
         assert!(toml::from_str::<Config>("[executor.schedule]\nmax_concurrency = 0\n").is_err());
+    }
+
+    /// A Windows cache lifetime of zero is refused at load time: it would let a sweep take the
+    /// install under a layer a build is publishing.
+    #[test]
+    fn windows_cache_idle_refuses_zero() {
+        let err = toml::from_str::<Config>("[executor]\nwindows_cache_idle_secs = 0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("windows_cache_idle_secs"), "{err}");
     }
 }

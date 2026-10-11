@@ -459,7 +459,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             validate_service_egress(cfg, &unit)?;
             let windows = windows_build(&unit)?;
             if let Some(build) = &windows {
-                build_windows_unit(ctx, &unit, build)?;
+                warm_guards.extend(build_windows_unit(ctx, &unit, build)?.1);
             } else if matches!(unit.source, crate::compose::Source::Build { .. }) {
                 let (_, _, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
@@ -1201,12 +1201,16 @@ fn build_windows_unit(
     ctx: &JobCtx,
     unit: &crate::compose::Unit,
     build: &WindowsBuild,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Vec<crate::cachelock::Guard>)> {
     let out = windows_bundle_dir(ctx, &unit.name);
+    let disk = out.join("disk.qcow2");
     if out.join(crate::uefi::MANIFEST).is_file()
         && out.join(crate::winbuild::LAYER_RECORD).is_file()
     {
-        return Ok(out);
+        let root = crate::run::default_data_base()?.join("windows");
+        let refs = crate::wincache::Refs::default();
+        refs.reference_chain(&root, &disk)?;
+        return Ok((out, refs.into_guards()));
     }
     let cfg = &ctx.cfg;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
@@ -1235,11 +1239,16 @@ fn build_windows_unit(
     };
     println!("virtkit: service {}: building its Windows image", unit.name);
     // A step's switch needs a runtime outside prepare's runtime.
-    std::thread::spawn(move || crate::winbuild::build(&opts))
+    let refs = std::thread::spawn(move || crate::winbuild::build(&opts))
         .join()
         .map_err(|_| anyhow!("the Windows build panicked"))?
         .with_context(|| format!("service {}: building its Windows image", unit.name))?;
-    Ok(out)
+    // Bound what the host's Windows cache costs, holding this job's own chain.
+    crate::wincache::gc(
+        &crate::run::default_data_base()?.join("windows"),
+        cfg.windows_cache_idle(),
+    );
+    Ok((out, refs))
 }
 
 /// In a Windows service's runtime dir: written by the supervisor once the service's
@@ -2430,7 +2439,9 @@ fn plan_services(
             extra_ips,
         };
         if let Some(build) = windows_build(&unit)? {
-            let bundle = build_windows_unit(ctx, &unit, &build)?;
+            let (bundle, refs) = build_windows_unit(ctx, &unit, &build)?;
+            // Held for the job's life: its machine's overlays stand on these layers.
+            guards.extend(refs);
             let manifest = crate::uefi::Bundle::open(&bundle)?.manifest;
             size_windows_service(&ctx.cfg, &mut unit, manifest.cpus, manifest.mem)?;
             let config = crate::compose::merged_config(&Default::default(), &unit);

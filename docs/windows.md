@@ -79,7 +79,7 @@ its rationale and test. For Windows they add:
 | --- | --- |
 | `winiso` | The unattended install: the FAT32 install disk (made in a Linux helper VM), Setup, the first boots' servicing, the settle step. |
 | `winbuild` | Windows Dockerfile stages: the `RUN`/`COPY` layers through qemu-ga, sysprep, the bundle. |
-| `wincache` | Layers shared through the build cache registry. |
+| `wincache` | Layers shared through the build cache registry, and the host's Windows cache sweep. |
 | `uefi` | Booting a UEFI guest: its spec, the firmware, its run directory, waiting for Windows to finish starting, stopping it. |
 | `qga` | The qemu-ga client: one connection at a time, resynchronized after a guest reboot. |
 | `relay` | The boot child's sockets: qemu-ga shared among its clients, COM1's input. |
@@ -145,6 +145,19 @@ A store on disk — the builtin one, or a `cache_registry` naming a path — is 
 only hold a second copy of the host's own layer cache, and `--cache-registry` naming one is
 refused. A `--reinstall` never pulls the install: its keys count this host's reinstalls, which
 another host's count may match, so it installs again and pushes over what that host pushed.
+
+**Reclaiming.** A CI host sweeps its Windows cache after each Windows build: an entry nobody
+references and nobody used for `[executor] windows_cache_idle_secs` (7 days by default; `0` is
+refused, as a build drops its reference to the install under a layer it is publishing) goes
+(layers, installs, media, fetched ISOs), never one a kept layer stands on, then the chunks no
+remaining pulled layer reads, and what a process that is gone left half made and has not
+touched for as long. The sweep first locks every idle entry nobody references, and keeps the
+chain of every other one. A build references each entry before it reads it, waiting behind
+the sweep's lock, and fails with "gone from the Windows build cache; build again" when the
+sweep took it; it holds its references to the end, and a CI job holds its service's whole
+chain for as long as it runs. A pull holds the chunk store until its layer is in place, and
+the sweep leaves the chunks alone while one does. A bundle `vk build` wrote holds nothing once
+the build ends: on a CI host it stops booting once its layers are reclaimed.
 
 ## Tests
 

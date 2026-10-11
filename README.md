@@ -716,7 +716,10 @@ sharing images built from it.
   warn from 30 days before an evaluation ends, or 3 days before that grace does.
 - `vk build --reinstall` installs each `FROM winiso:` stage again under new cache keys and
   rebuilds every step on it. The old install and its layers stay cached (tens of GB): bundles
-  built on them keep working until they are rebuilt. Nothing removes them: once no bundle
+  built on them keep working until they are rebuilt, except on a CI host: there they are
+  reclaimed once no build or job has used them for `[executor] windows_cache_idle_secs` (7
+  days by default), and a bundle built on them, which holds no reference once its build ends,
+  stops booting once its layers are reclaimed. Elsewhere nothing removes them: once no bundle
   uses the Windows build cache, `rm -rf ~/.local/share/virtkit/windows`
   (`$XDG_DATA_HOME/virtkit/windows` when that is set) frees it all, and the next build
   installs from the ISO again.

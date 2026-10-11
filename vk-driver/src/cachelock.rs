@@ -145,7 +145,7 @@ fn reclaim_opened(
 
 /// Whether the entry dated by `used` has been idle at least `idle` at `now`. A missing or
 /// unreadable marker is an entry mid-setup, never idle.
-fn is_idle(used: &Path, idle: Duration, now: SystemTime) -> bool {
+pub(crate) fn is_idle(used: &Path, idle: Duration, now: SystemTime) -> bool {
     match std::fs::metadata(used).and_then(|m| m.modified()) {
         // A `.used` timestamp can read microseconds *ahead* of `now`: the filesystem stamps
         // mtime from a coarse clock while `now` is precise, so under load the marker can appear
@@ -168,6 +168,20 @@ fn lock_exclusive(file: &std::fs::File, lock: &Path) -> bool {
     // As in `acquire_shared`, a lock on an unlinked file does not exclude users of an entry
     // rebuilt at the same path after reclamation.
     same_file(file, lock).unwrap_or(false)
+}
+
+/// A sweep's exclusive lock on an entry, held for as long as this lives: every would-be user
+/// waits behind it in [`acquire_shared`], then finds the entry as the sweep left it.
+#[derive(Debug)]
+pub(crate) struct Exclusive {
+    _file: std::fs::File,
+}
+
+/// Lock the entry whose sidecar is `lock` exclusively, without waiting. Returns `None` if held,
+/// unopenable or replaced. Unlike [`try_reclaim`], keeps new references blocked across steps.
+pub(crate) fn try_exclusive(lock: &Path) -> Option<Exclusive> {
+    let file = open_lock(lock).ok()?;
+    lock_exclusive(&file, lock).then_some(Exclusive { _file: file })
 }
 
 fn open_lock(lock: &Path) -> Result<std::fs::File> {

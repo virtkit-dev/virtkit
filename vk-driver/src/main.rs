@@ -5395,7 +5395,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         ceiling: None,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
-        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Ok(_refs)) => ExitCode::SUCCESS,
         Ok(Err(e)) => fail(&e, 1),
         Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
     }

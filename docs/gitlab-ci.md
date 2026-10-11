@@ -1456,6 +1456,9 @@ ad-tests:
   step's does; its audit does not cover a Windows step. Under an allowlist Windows reports no
   Internet, so BITS or winget may refuse to run unless the allowlist lets its connectivity
   check through.
+- Its layers, installs and media are reclaimed once no build or job used them for
+  `[executor] windows_cache_idle_secs` (7 days by default, at least 1; reclaiming an install
+  means installing Windows again).
 - The Dockerfile's `winiso:` paths (the medium, its `--drivers`) must stay inside the build
   context: an absolute path, a `..` or a symlink out is refused. A stage builds on a
   `winiso:` medium or an earlier stage, never on a bundle: a bundle names its layer by key
