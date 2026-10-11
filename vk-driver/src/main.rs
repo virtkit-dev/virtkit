@@ -5342,8 +5342,6 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         (*no_journal, "--no-journal"),
         (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
         (!build_arg.is_empty(), "--build-arg"),
-        (!build_allow_ip.is_empty(), "--build-allow-ip"),
-        (!build_allow_name.is_empty(), "--build-allow-name"),
         (*build_audit_egress, "--build-audit-egress"),
         (*require_cached, "--require-cached"),
         (build_jobs.is_some(), "--build-jobs"),
@@ -5357,9 +5355,8 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
             2,
         );
     }
-    // Allow lists are refused above; --build-net controls whether a step may request a network.
-    let no_network = match build::BuildNet::from_flags(build_net, &[], &[]) {
-        Ok(net) => matches!(net, build::BuildNet::None),
+    let net = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
+        Ok(net) => net,
         Err(e) => return fail(&e, 2),
     };
     let dockerfile = &file[0];
@@ -5391,7 +5388,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         out,
         cpus,
         mem,
-        no_network,
+        net,
         reinstall: *reinstall,
         registry,
         ceiling: None,

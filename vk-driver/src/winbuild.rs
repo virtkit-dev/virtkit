@@ -151,8 +151,9 @@ pub(crate) struct Options {
     pub out: PathBuf,
     pub cpus: u32,
     pub mem: String,
-    /// `--build-net none`: refuse `RUN --network=default`.
-    pub no_network: bool,
+    /// `RUN --network=default`: `None` refuses it, `All` allows everything, and `Allow`
+    /// enforces the allowlist through the step's switch, as for Linux steps.
+    pub net: crate::build::BuildNet,
     /// `--reinstall`: install each `winiso:` stage again, under new cache keys.
     pub reinstall: bool,
     /// The build cache registry the hosts share layers through ([`crate::wincache`]); `None`
@@ -484,7 +485,12 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     let (opts, cache) = (b.opts, b.cache);
     let stage = &stages[index];
     let label = stage.label(index);
-    check_stage(stage, &opts.context, opts.no_network).with_context(|| format!("stage {label}"))?;
+    check_stage(
+        stage,
+        &opts.context,
+        matches!(opts.net, crate::build::BuildNet::None),
+    )
+    .with_context(|| format!("stage {label}"))?;
     let (cpus, mem) = guest_size(stage, opts)?;
     let bundle = opts.context.join(&stage.from.image);
     let mut layer = if let Some(source) =
@@ -544,6 +550,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
         mem: &mem,
         cache,
         registry: opts.registry.as_ref(),
+        net: &opts.net,
         evaluation: false,
     };
     // A generalized image carries no clock of its own: each machine starts a new grace.
@@ -819,6 +826,7 @@ struct Steps<'a> {
     cache: &'a Path,
     /// Where the hosts share layers, if they do.
     registry: Option<&'a crate::config::Registry>,
+    net: &'a crate::build::BuildNet,
     evaluation: bool,
 }
 
@@ -1315,12 +1323,13 @@ fn make_step(
     let mut nics = Vec::new();
     if network {
         let vsock = work.join("vsock.sock");
+        let (allow_ip, allow_name, restrict) = steps.net.switch_policy();
         let spawn = crate::run::spawn_vm_switch(
             &vsock,
             work,
             crate::run::NET_VSOCK_PORT,
-            &[],
-            &[],
+            allow_ip,
+            allow_name,
             &[],
             &[],
             &[],
@@ -1329,7 +1338,7 @@ fn make_step(
             None,
             None,
             None,
-            false,
+            restrict,
             None,
             crate::prio::Prio::Normal,
         );
@@ -1488,7 +1497,7 @@ mod tests {
             out: PathBuf::new(),
             cpus: 2,
             mem: "2G".into(),
-            no_network: false,
+            net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
             ceiling,
@@ -2046,7 +2055,7 @@ mod tests {
             out: out.clone(),
             cpus: 2,
             mem: "4G".into(),
-            no_network: false,
+            net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
             ceiling: None,

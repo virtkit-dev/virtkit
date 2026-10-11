@@ -1216,8 +1216,8 @@ fn windows_bundle_dir(ctx: &JobCtx, name: &str) -> PathBuf {
 }
 
 /// Build the Windows service `unit` into its bundle ([`windows_bundle_dir`]), unless prepare's
-/// warm pass did already. Steps reach the network (`RUN --network=default`) only when the
-/// `[egress.build]` policy is unrestricted: a Windows step's switch applies no allowlist.
+/// warm pass did already. A step's network (`RUN --network=default`) follows the
+/// `[egress.build]` policy, as a Linux build step's does.
 fn build_windows_unit(
     ctx: &JobCtx,
     unit: &crate::compose::Unit,
@@ -1247,7 +1247,7 @@ fn build_windows_unit(
         out: out.clone(),
         cpus,
         mem,
-        no_network: !matches!(net, crate::build::BuildNet::All),
+        net,
         reinstall: false,
         registry,
         // A job's Dockerfile sizes its build guests no larger than its services.

@@ -43,6 +43,8 @@ All notable changes to virtkit will be documented in this file.
 - **`FROM winiso:` accepts `--product-key=<key>`** for retail and volume media that require one.
   Windows retains the key in every layer and bundle built on the install, including those in
   the build cache registry.
+- **A Windows build's `RUN --network=default` follows `--build-allow-ip`/`--build-allow-name`**
+  (`[egress.build]` in CI), as a Linux build's does.
 
 ### Changed
 

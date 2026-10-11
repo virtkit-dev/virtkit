@@ -690,8 +690,12 @@ vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-pass
   the stage with sysprep (each copy gets its own name and SID), `firmware=uefi-secboot`
   enrolls Microsoft's Secure Boot keys, `tpm=on` gives each machine a TPM 2.0, and
   `cpus`/`mem` size the build's guests and the bundle's machine.
-- `RUN` has no network unless it says `--network=default`; exit code 3010 or 1641 restarts
-  Windows (`--reboot=auto|always|never`). Steps run as SYSTEM. `ENV`, `WORKDIR`, `SHELL` and
+- `RUN` has no network unless it says `--network=default`, and then reaches what
+  `--build-allow-ip`/`--build-allow-name` allow (everything without them; `--build-net none`
+  refuses it). Under an allowlist Windows' own connectivity check fails, so it reports no
+  Internet, and a downloader that asks it first (BITS, winget) may refuse to run unless the
+  allowlist lets that check through. Exit code 3010 or 1641 restarts Windows
+  (`--reboot=auto|always|never`). Steps run as SYSTEM. `ENV`, `WORKDIR`, `SHELL` and
   `COPY` apply; `USER`, `ARG`, `ADD`, `ONBUILD`, `ENTRYPOINT`, `COPY --from` and `$VAR`
   substitution in `ENV`, `WORKDIR` or `COPY` are refused.
 - `CMD` is the image's provisioning command, run at each compose service start.

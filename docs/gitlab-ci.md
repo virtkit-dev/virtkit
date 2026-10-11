@@ -1443,11 +1443,13 @@ ad-tests:
 - Its size is the compose `x-virtkit` one, else its Dockerfile's `# vk:` line, else the
   runner's `[build]` guest size, held under the runner's `vm.max_cpus`/`vm.max_mem` and
   `mem_budget` like any service; its build guests are held under them too, and less than
-  the 2G Windows needs, asked for or left by a ceiling, fails the build up front. Admission does
-  not count it yet: not its memory (as for any service), its build guests, or its disk growth.
-- A step reaches the network (`RUN --network=default`) only when `[egress.build]` is
-  unrestricted: a Windows step's switch applies no allowlist, and `[egress.build]` audit does
-  not cover it.
+  the 2G Windows needs, asked for or left by a ceiling, fails the build up front. Admission
+  does not count it yet: not its memory (as for any service), its build guests, or its disk
+  growth.
+- A step's network (`RUN --network=default`) follows `[egress.build]`'s allowlist as a Linux
+  step's does; its audit does not cover a Windows step. Under an allowlist Windows reports no
+  Internet, so BITS or winget may refuse to run unless the allowlist lets its connectivity
+  check through.
 - The Dockerfile's `winiso:` paths (the medium, its `--drivers`) must stay inside the build
   context: an absolute path, a `..` or a symlink out is refused. A stage builds on a
   `winiso:` medium or an earlier stage, never on a bundle: a bundle names its layer by key
