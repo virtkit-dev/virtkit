@@ -265,6 +265,12 @@ pub(crate) fn cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::
     }))
 }
 
+/// [`cache_registry`] when other hosts can reach it: a registry server, not an in-process
+/// store. What a Windows build shares through.
+pub(crate) fn shared_cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::Registry>> {
+    Ok(cache_registry(cache)?.filter(|rg| rg.local_root().is_none()))
+}
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).

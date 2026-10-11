@@ -19,6 +19,10 @@ All notable changes to virtkit will be documented in this file.
   checks each file against its digest. The registry is `--cache-registry`, else
   `[build] cache_registry`, else this host's builtin store: a `vk-registry` server or a store
   on disk.
+- **A `FROM winiso:<file>@sha256:<hex>` stage fetches missing install and driver ISOs from
+  the build cache registry.** Upload them once with `vk registry put` instead of keeping
+  copies on every build host or in the repository. Windows builds accept `--cache-registry`
+  and `--cache-insecure`, but reject `--cache-registry` naming a store on disk.
 
 ### Changed
 

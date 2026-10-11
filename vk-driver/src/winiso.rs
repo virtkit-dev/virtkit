@@ -86,19 +86,7 @@ impl Pinned {
     /// Check the file's digest, remembering a match (by path, size and mtime) under `cache` so
     /// an 8 GB ISO is hashed once.
     fn verify(&self, cache: &Path) -> Result<()> {
-        let meta =
-            std::fs::metadata(&self.path).with_context(|| format!("{}", self.path.display()))?;
-        let stamp_dir = cache.join("verified");
-        let stamp = stamp_dir.join(hex(&Sha256::digest(
-            format!(
-                "{}\0{}\0{}\0{}",
-                self.path.display(),
-                meta.len(),
-                meta.mtime(),
-                self.sha256
-            )
-            .as_bytes(),
-        )));
+        let stamp = self.stamp(cache)?;
         if stamp.exists() {
             return Ok(());
         }
@@ -111,9 +99,100 @@ impl Pinned {
                 self.sha256
             );
         }
-        std::fs::create_dir_all(&stamp_dir)?;
-        std::fs::write(&stamp, &got)?;
+        self.remember_verified(cache)
+    }
+
+    /// [`Pinned::verify`]'s digest stamp for the file's current metadata.
+    fn stamp(&self, cache: &Path) -> Result<PathBuf> {
+        let meta =
+            std::fs::metadata(&self.path).with_context(|| format!("{}", self.path.display()))?;
+        Ok(cache.join("verified").join(hex(&Sha256::digest(
+            format!(
+                "{}\0{}\0{}\0{}",
+                self.path.display(),
+                meta.len(),
+                meta.mtime(),
+                self.sha256
+            )
+            .as_bytes(),
+        ))))
+    }
+
+    /// Record a digest match checked by the caller.
+    fn remember_verified(&self, cache: &Path) -> Result<()> {
+        let stamp = self.stamp(cache)?;
+        if let Some(dir) = stamp.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&stamp, &self.sha256)?;
         Ok(())
+    }
+
+    /// Use the medium at the Dockerfile's path, or fetch it once by digest from `registry`
+    /// into `cache` ([`crate::files`]). Preserve its file name: the install script uses it.
+    fn local_or_fetched(
+        &self,
+        cache: &Path,
+        registry: Option<&crate::config::Registry>,
+    ) -> Result<Pinned> {
+        if self.path.exists() {
+            return Ok(self.clone());
+        }
+        let name = self
+            .path
+            .file_name()
+            .with_context(|| format!("{}: no file name", self.path.display()))?;
+        let dir = cache.join("iso").join(&self.sha256);
+        let local = Pinned {
+            path: dir.join(name),
+            sha256: self.sha256.clone(),
+        };
+        if local.path.exists() {
+            return Ok(local);
+        }
+        // The same bytes, fetched under another name: linked rather than fetched again. Only
+        // a fetch, which checks the digest, publishes a file there; its staging files are
+        // dotfiles. A link that fails (another filesystem, or a concurrent build's link
+        // already there) falls back to a fetch.
+        let fetched = std::fs::read_dir(&dir).ok().and_then(|entries| {
+            entries.filter_map(|e| e.ok()).find_map(|e| {
+                let path = e.path();
+                (!e.file_name().as_encoded_bytes().starts_with(b".") && path.is_file())
+                    .then_some(path)
+            })
+        });
+        if let Some(other) = fetched
+            && std::fs::hard_link(&other, &local.path).is_ok()
+        {
+            local.remember_verified(cache)?;
+            return Ok(local);
+        }
+        let Some(rg) = registry else {
+            bail!(
+                "{}: no such file, and no build cache registry to fetch it from",
+                self.path.display()
+            );
+        };
+        eprintln!(
+            "virtkit: winiso: fetching {} from the build cache ({}:{})",
+            self.path.display(),
+            crate::files::BY_DIGEST,
+            self.sha256
+        );
+        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        if !crate::files::fetch(rg, &self.sha256, &local.path)
+            .with_context(|| self.path.display().to_string())?
+        {
+            bail!(
+                "{}: no such file, nor in the build cache: put it there with \
+                 `vk registry put {}`",
+                self.path.display(),
+                self.path.display()
+            );
+        }
+        // The fetch checked the digest as the bytes came in.
+        local.remember_verified(cache)?;
+        Ok(local)
     }
 
     /// The file itself, past any symlink: the helper VM sees only the directory mounted for it.
@@ -401,9 +480,20 @@ fn count_reinstall(path: &Path) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
+/// as long as builds use what was installed from them. Best effort: only the asking matters,
+/// not the answer, and an unreachable registry costs each build the client's timeout per
+/// medium, not the build.
+fn keep_media(rg: &crate::config::Registry, source: &Source) {
+    for pinned in [&source.iso, &source.drivers] {
+        crate::files::exists(rg, &pinned.sha256);
+    }
+}
+
 /// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`; with `reinstall`,
 /// a new one under new keys. Cache the install by its medium and disk size, and the settle
-/// overlay by the install and settle step, so changing the settle does not reinstall.
+/// overlay by the install and settle step, so changing the settle does not reinstall. Media
+/// missing here are fetched from `registry`, which every build keeps them alive in.
 pub(crate) fn base(
     source: &Source,
     disk_size: u64,
@@ -411,6 +501,7 @@ pub(crate) fn base(
     mem: &str,
     cache: &Path,
     reinstall: bool,
+    registry: Option<&crate::config::Registry>,
 ) -> Result<Base> {
     let first = install_key(&source.media_key(), disk_size);
     let count = cache.join("reinstalls").join(&first);
@@ -420,6 +511,9 @@ pub(crate) fn base(
         count_reinstall(&count)?;
     }
     let (install_key, key) = keys(&first, reinstalls(&count));
+    if let Some(rg) = registry {
+        keep_media(rg, source);
+    }
     let dir = cache.join("settled").join(&key);
     let record = dir.join("base.json");
     if let Ok(text) = std::fs::read_to_string(&record) {
@@ -438,9 +532,7 @@ pub(crate) fn base(
     let install_dir = cache.join("install").join(&install_key);
     let installed_disk = install_dir.join("disk.qcow2");
     if !install_dir.join("installed").exists() {
-        source.iso.verify(cache)?;
-        source.drivers.verify(cache)?;
-        let media = media(source, cache)?;
+        let media = media(source, cache, registry)?;
         let tmp = scratch_beside(&install_dir)?;
         let disk = tmp.join("disk.qcow2");
         if let Err(e) = install(&tmp, &disk, &media, disk_size, cpus, mem) {
@@ -490,14 +582,26 @@ pub(crate) fn base(
     })
 }
 
-/// The install medium of `source`, from `cache` or built there in a helper VM.
-fn media(source: &Source, cache: &Path) -> Result<PathBuf> {
-    let answer = source.answer_file();
-    let setup_cmd = source.setup_cmd();
+/// The install medium of `source`, cached or built in a helper VM. Only building the medium
+/// reads and verifies the ISOs, fetching missing ones from `registry`.
+fn media(
+    source: &Source,
+    cache: &Path,
+    registry: Option<&crate::config::Registry>,
+) -> Result<PathBuf> {
     let dir = cache.join("media").join(source.media_key());
     if dir.join("complete").exists() {
         return Ok(dir.join("media.img"));
     }
+    let source = &Source {
+        iso: source.iso.local_or_fetched(cache, registry)?,
+        drivers: source.drivers.local_or_fetched(cache, registry)?,
+        ..source.clone()
+    };
+    source.iso.verify(cache)?;
+    source.drivers.verify(cache)?;
+    let answer = source.answer_file();
+    let setup_cmd = source.setup_cmd();
     let out = scratch_beside(&dir)?;
     let img = out.join("media.img");
     let assets = out.join("assets");
@@ -1087,6 +1191,92 @@ mod tests {
         count_reinstall(&count).unwrap();
         count_reinstall(&count).unwrap();
         assert_eq!(reinstalls(&count), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A registry on a store under `dir`.
+    fn local_registry(dir: &Path) -> crate::config::Registry {
+        crate::config::Registry::for_share(
+            dir.join("store").display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A medium missing from its path is fetched by digest into the cache, once and already
+    /// verified; without a registry, or one that lacks it, it is an error naming the fix.
+    #[test]
+    fn a_missing_medium_is_fetched_by_its_digest() {
+        let dir = std::env::temp_dir().join(format!("vk-winiso-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rg = local_registry(&dir);
+        let src = dir.join("ws2025.iso");
+        std::fs::write(&src, b"an install medium").unwrap();
+        let (sha256, _) =
+            crate::files::put(&rg, &src, None, crate::files::PutRetention::Idle).unwrap();
+        let cache = dir.join("cache");
+        let missing = Pinned {
+            path: dir.join("context/ws2025.iso"),
+            sha256: sha256.clone(),
+        };
+        let err = format!("{:#}", missing.local_or_fetched(&cache, None).unwrap_err());
+        assert!(err.contains("no build cache registry"), "{err}");
+
+        let local = missing.local_or_fetched(&cache, Some(&rg)).unwrap();
+        assert_eq!(
+            local.path,
+            cache.join("iso").join(&sha256).join("ws2025.iso")
+        );
+        assert_eq!(std::fs::read(&local.path).unwrap(), b"an install medium");
+        assert!(
+            local.stamp(&cache).unwrap().exists(),
+            "not remembered as verified"
+        );
+        // Fetched once: the registry is not asked again.
+        let _ = std::fs::remove_dir_all(dir.join("store"));
+        assert_eq!(
+            missing.local_or_fetched(&cache, Some(&rg)).unwrap().path,
+            local.path
+        );
+        // Nor for the same bytes pinned under another name.
+        let renamed = Pinned {
+            path: dir.join("context/renamed.iso"),
+            sha256: sha256.clone(),
+        }
+        .local_or_fetched(&cache, Some(&rg))
+        .unwrap();
+        assert_eq!(
+            renamed.path,
+            cache.join("iso").join(&sha256).join("renamed.iso")
+        );
+        assert_eq!(std::fs::read(&renamed.path).unwrap(), b"an install medium");
+        assert!(renamed.stamp(&cache).unwrap().exists());
+        // A file in its place is used as it is.
+        assert_eq!(
+            Pinned {
+                path: src.clone(),
+                sha256: sha256.clone()
+            }
+            .local_or_fetched(&cache, Some(&rg))
+            .unwrap()
+            .path,
+            src
+        );
+
+        let absent = Pinned {
+            path: dir.join("context/other.iso"),
+            sha256: "ab".repeat(32),
+        };
+        let err = format!(
+            "{:#}",
+            absent.local_or_fetched(&cache, Some(&rg)).unwrap_err()
+        );
+        assert!(err.contains("vk registry put"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -496,7 +496,9 @@ enum RegistryCmd {
     ///
     /// Each file is stored once, tagged by its digest (`sha256:<hex>`) and, with --dir, as
     /// `<dir>/<its name>`: the registry's WebDAV view serves it at `/dav/files/sha256/<hex>`
-    /// and `/dav/files/<dir>/<name>`. A file is kept while it gets used, unless --ttl or
+    /// and `/dav/files/<dir>/<name>`. A `FROM winiso:<file>@sha256:<hex>` stage whose ISO is
+    /// not on the building host fetches it by digest, so install media need only be put once,
+    /// by whoever holds them. A file is kept while it gets used, unless --ttl or
     /// --keep say otherwise; putting it again sets its retention anew, under its digest too.
     /// The build cache registry is --cache-registry, else `[build] cache_registry`, else this
     /// host's builtin store: a registry server, or a store on disk.
@@ -4011,7 +4013,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         if windows {
-            return windows_build(&cli.cmd).await;
+            return windows_build(&cli.cmd, &cfg).await;
         }
         if *reinstall {
             return fail(
@@ -5291,7 +5293,7 @@ fn windows_context(context: &[PathBuf], dockerfile: &Path) -> PathBuf {
 
 /// `vk build` of a Windows Dockerfile: a bundle of qcow2 layers made through qemu-ga
 /// ([`winbuild`]) instead of an ext4, refusing the flags only the Linux build reads.
-async fn windows_build(cmd: &Cmd) -> ExitCode {
+async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
     let Cmd::Build {
         file,
         target,
@@ -5335,8 +5337,6 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         (*print_plan, "--print-plan"),
         (kernel.is_some(), "--kernel"),
         (agent.is_some(), "--agent"),
-        (cache_registry.is_some(), "--cache-registry"),
-        (*cache_insecure, "--cache-insecure"),
         (build_cache.is_some(), "--build-cache"),
         (*no_journal, "--no-journal"),
         (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
@@ -5368,6 +5368,10 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
             2,
         );
     };
+    let registry = match windows_registry(cache_registry.as_deref(), *cache_insecure, &cfg.build) {
+        Ok(r) => r,
+        Err(e) => return fail(&e, 2),
+    };
     let context = windows_context(context, dockerfile);
     let context = match context.canonicalize() {
         Ok(c) => c,
@@ -5387,6 +5391,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
         no_network,
         reinstall: *reinstall,
+        registry,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
         Ok(Ok(())) => ExitCode::SUCCESS,
@@ -5415,6 +5420,36 @@ fn act_on_vms(
         },
         Err(e) => fail(&e, 2),
     }
+}
+
+/// Resolve a Windows build's shared registry: `--cache-registry` and `--cache-insecure`
+/// override `[build]`. Only registry servers can be shared across hosts. Reject a store on
+/// disk named on the command line; ignore one named in config. With nothing configured,
+/// use no registry and skip resolving the on-disk builtin store that Linux builds default to.
+fn windows_registry(
+    cli: Option<&str>,
+    insecure: bool,
+    b: &config::Build,
+) -> anyhow::Result<Option<config::Registry>> {
+    let cache = build::CacheOpts::resolve(cli, insecure, b);
+    let registry = if cache.registry.is_some() {
+        build::shared_cache_registry(&cache)?
+    } else {
+        None
+    };
+    if let Some(named) = cli
+        && named != "none"
+        && registry.is_none()
+    {
+        anyhow::bail!(
+            "--cache-registry {named}: a Windows build shares only through a registry server, \
+             not a store on disk"
+        );
+    }
+    if insecure && registry.is_none() {
+        anyhow::bail!("--cache-insecure: this Windows build uses no registry server");
+    }
+    Ok(registry)
 }
 
 /// The build cache registry `vk registry put|get` use: `--cache-registry`, else
@@ -6315,6 +6350,39 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_windows_build_shares_only_through_a_registry_server() {
+        let none = config::Build::default();
+        let on_disk = config::Build {
+            cache_registry: Some("/var/cache/vk".to_string()),
+            ..Default::default()
+        };
+        assert!(windows_registry(None, false, &none).unwrap().is_none());
+        assert!(
+            windows_registry(Some("none"), false, &on_disk)
+                .unwrap()
+                .is_none()
+        );
+        // A store the config names is not shared, and not an error either.
+        assert!(windows_registry(None, false, &on_disk).unwrap().is_none());
+        let configured = config::Build {
+            cache_registry: Some("127.0.0.1:5000".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            windows_registry(None, false, &configured)
+                .unwrap()
+                .is_some()
+        );
+        assert!(windows_registry(Some("/var/cache/vk"), false, &none).is_err());
+        assert!(windows_registry(None, true, &none).is_err());
+        assert!(windows_registry(Some("none"), true, &none).is_err());
+        let server = windows_registry(Some("127.0.0.1:5000"), true, &none)
+            .unwrap()
+            .unwrap();
+        assert!(server.local_root().is_none());
+    }
 
     #[test]
     fn a_failing_scripts_exit_code_goes_to_build_exit_code_file() {

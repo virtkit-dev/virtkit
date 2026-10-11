@@ -103,6 +103,22 @@ running 10 seconds later. `vk stop` waits 210 seconds by default before it repor
 stuck; a VM left behind by a vk that crashed ends itself the same way 11 minutes after the
 button.
 
+## Sharing builds between hosts
+
+With a build cache registry server (`[build] cache_registry`, or `--cache-registry`), a Windows
+build shares through it:
+
+- **Media.** `vk registry put <iso>...` stores install media in the registry's `files/` area,
+  by digest (`files/sha256:<hex>`). A `winiso:` stage whose file is not in its build context
+  fetches the one it pins from there (into the host's Windows cache), so neither the
+  repository nor every host holds the ISOs. Each build that uses an install marks its media as
+  used, so the registry's retention keeps them as long as the install is in use, unless they
+  were put with `--ttl`, which drops them on time. `vk registry put --keep` keeps them
+  regardless.
+
+A store on disk — the builtin one, or a `cache_registry` naming a path — is not used, and
+`--cache-registry` naming one is refused.
+
 ## Tests
 
 - `tests/windows-ad-e2e.sh`: the AD lab (a DC, a Linux job creating its users, two members,

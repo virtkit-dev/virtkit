@@ -83,6 +83,8 @@ pub(crate) struct Options {
     pub no_network: bool,
     /// `--reinstall`: install each `winiso:` stage again, under new cache keys.
     pub reinstall: bool,
+    /// The shared build cache registry; `None` keeps everything on this host.
+    pub registry: Option<crate::config::Registry>,
 }
 
 /// A stage as it builds: its current layer and what its later `RUN`s inherit. A bundle
@@ -401,8 +403,15 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
         if reinstall {
             b.reinstalled.push((source.clone(), disk));
         }
-        let base =
-            crate::winiso::base(&source, disk, cpus, &mem, &cache.join("winiso"), reinstall)?;
+        let base = crate::winiso::base(
+            &source,
+            disk,
+            cpus,
+            &mem,
+            &cache.join("winiso"),
+            reinstall,
+            opts.registry.as_ref(),
+        )?;
         Layer {
             disk: base.disk,
             key: base.key,
@@ -1760,6 +1769,7 @@ mod tests {
             mem: "4G".into(),
             no_network: false,
             reinstall: false,
+            registry: None,
         };
         let mut build = Build {
             opts: &opts,
