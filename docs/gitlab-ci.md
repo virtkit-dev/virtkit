@@ -1391,6 +1391,42 @@ A service reaches the job VM back as `build`, the alias GitLab's docker executor
 job container on a per-build network, or by `[executor.vm] hostname`; a service aliased
 either name keeps that name.
 
+### Windows services
+
+A `compose:` job's service whose `build:` Dockerfile installs Windows (`FROM winiso:`, see
+[Windows guests](windows.md)) runs beside the job VM, which stays Linux:
+
+```yaml
+# ci/lab.compose.yaml
+services:
+  job:
+    build: { context: ., dockerfile: job.Dockerfile }
+  dc:
+    build: { context: windows, dockerfile: lab.Dockerfile, target: dc }
+    x-virtkit: { cpus: 2, mem: 3G }
+```
+
+```yaml
+ad-tests:
+  variables:
+    MICROVM_IMAGE: compose:ci/lab.compose.yaml#job
+  script:
+    - ./tests/ad.sh dc            # the DC by its service name
+```
+
+- Prepare builds it with `vk build`'s Windows path into the job dir. Its layers come from the
+  host's Windows cache or, with `[build] cache_registry` on a registry server, from the hosts
+  that built them ([sharing builds](windows.md#sharing-builds-between-hosts)); the ISOs a
+  `winiso:` stage pins come from that registry too (`vk registry put`), so they need not
+  be in the repository. A first install takes 20 minutes or more, once for the fleet.
+- The supervisor boots it on the job's LAN under its service name and runs its provisioning
+  (`CMD`, compose `environment`, `secrets`); prepare waits for that, up to 30 minutes, before
+  the script starts.
+- A step reaches the network (`RUN --network=default`) only when `[egress.build]` is
+  unrestricted: a Windows step's switch applies no allowlist.
+- One Dockerfile per service, no build args and no additional contexts; a bundle `image:` path
+  is refused, and the job VM cannot be Windows.
+
 ### Per-service networking
 
 Each service is a real VM with its own address on the shared switch, so a service

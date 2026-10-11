@@ -22,6 +22,10 @@ All notable changes to virtkit will be documented in this file.
 - **A pushed manifest can set how long `vk-registry gc` keeps its tags**: annotated
   `org.virtkit.retention=keep` they stay however long they go unused, annotated
   `org.virtkit.expires=<unix seconds>` they go at that time, used or not.
+- **CI jobs run Windows services.** A `compose:` job's service whose `build:` Dockerfile
+  installs Windows is built during prepare, over layers shared through the build cache
+  registry, booted beside the job VM on the job's LAN, and provisioned (its `CMD`) before the
+  script starts. The job VM itself stays Linux.
 
 ## [0.88.0] - 2026-10-11
 
