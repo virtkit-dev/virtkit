@@ -40,6 +40,7 @@ use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, Rollo
 
 mod jobs;
 mod keys;
+mod registries;
 mod tools;
 
 pub use jobs::{
@@ -47,6 +48,10 @@ pub use jobs::{
     Submitted,
 };
 pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
+pub use registries::{
+    RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
+    operation_name as registry_operation_name,
+};
 pub use tools::{Tools, ToolsRow};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
@@ -85,7 +90,7 @@ const AUDIT_PRUNE: u64 = 1000;
 
 /// How long a command is kept once it is settled — finished, refused, expired, or never
 /// taken by its expiry — for `vk-hub nodes` and a look back. The audit log keeps the record.
-const COMMAND_KEEP: u64 = 30 * 86_400;
+pub(super) const COMMAND_KEEP: u64 = 30 * 86_400;
 
 /// At least this often, in seconds, a heartbeat's write is made durable. redb keeps every
 /// non-durable commit's bookkeeping in memory, and the pages it frees unreusable, until the
@@ -398,8 +403,21 @@ pub struct ReleaseRow {
     /// A release key's ed25519 signature over [`vk_hub_proto::release_message`], base64.
     #[serde(default)]
     pub signature: Option<String>,
+    /// The program it is: `vk` for nodes when absent, or [`REGISTRY_PROGRAM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
     pub added_at: u64,
     pub added_by: String,
+}
+
+/// The program of a `vk-registry` release.
+pub const REGISTRY_PROGRAM: &str = "vk-registry";
+
+impl ReleaseRow {
+    /// The program it is: `vk` or [`REGISTRY_PROGRAM`].
+    pub fn program(&self) -> &str {
+        self.program.as_deref().unwrap_or("vk")
+    }
 }
 
 /// A release as `vk-hub release list` shows it.
@@ -428,6 +446,27 @@ pub struct AuditRow {
 struct TokenRow {
     created_at: u64,
     expires_at: u64,
+    /// What it enrolls; tokens from before registries enroll nodes.
+    #[serde(default)]
+    kind: TokenKind,
+}
+
+/// What an enrollment token enrolls: a node or a registry, never either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    #[default]
+    Node,
+    Registry,
+}
+
+impl TokenKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenKind::Node => "node",
+            TokenKind::Registry => "registry",
+        }
+    }
 }
 
 /// A node's row is gone: it was never enrolled, or has been removed.
@@ -641,6 +680,10 @@ impl Db {
             .context("starting the hub db's first write")?;
         txn.open_table(NODES).context("opening the nodes table")?;
         txn.open_table(TOKENS).context("opening the tokens table")?;
+        txn.open_table(registries::REGISTRIES)
+            .context("opening the registries table")?;
+        txn.open_table(registries::REGISTRY_COMMANDS)
+            .context("opening the registry commands table")?;
         txn.open_table(COMMANDS)
             .context("opening the commands table")?;
         txn.open_table(AUDIT).context("opening the audit table")?;
@@ -687,10 +730,22 @@ impl Db {
         })
     }
 
-    /// Issue a single-use enrollment token valid for `ttl`, audited as `actor`'s. Returns the
-    /// token — shown once, never stored — and when it expires. Expired tokens are swept in the
-    /// same write.
+    /// [`Db::create_token_for`] a node.
+    #[cfg(test)]
     pub fn create_token(&self, ttl: Duration, actor: &str, now: u64) -> Result<(String, u64)> {
+        self.create_token_for(TokenKind::Node, ttl, actor, now)
+    }
+
+    /// Issue a single-use token enrolling `kind`, valid for `ttl`, audited as `actor`'s.
+    /// Returns the token — shown once, never stored — and when it expires. Expired tokens are
+    /// swept in the same write.
+    pub fn create_token_for(
+        &self,
+        kind: TokenKind,
+        ttl: Duration,
+        actor: &str,
+        now: u64,
+    ) -> Result<(String, u64)> {
         if ttl.is_zero() || ttl > MAX_TOKEN_TTL {
             bail!(
                 "a token's lifetime must be between 1s and {} days",
@@ -715,13 +770,21 @@ impl Db {
             let row = TokenRow {
                 created_at: now,
                 expires_at,
+                kind,
             };
             table.insert(token_key(&token).as_str(), encode(&row)?.as_slice())?;
         }
-        let event = format!(
-            "{actor} issued an enrollment token valid for {}s",
-            ttl.as_secs()
-        );
+        let event = match kind {
+            TokenKind::Node => format!(
+                "{actor} issued an enrollment token valid for {}s",
+                ttl.as_secs()
+            ),
+            kind => format!(
+                "{actor} issued a {} enrollment token valid for {}s",
+                kind.name(),
+                ttl.as_secs()
+            ),
+        };
         append_audit(&txn, None, actor, &event, now)?;
         txn.commit().context("storing an enrollment token")?;
         Ok((token, expires_at))
@@ -745,7 +808,7 @@ impl Db {
                 .get(key.as_str())?
                 .map(|g| decode::<TokenRow>(g.value()))
                 .transpose()?
-                .is_some_and(|row| row.expires_at > now);
+                .is_some_and(|row| row.expires_at > now && row.kind == TokenKind::Node);
             // Expired tokens are left for `create_token`'s sweep: removing one here would be
             // the write this read exists to avoid.
             if !live {
@@ -761,9 +824,10 @@ impl Db {
                 .map(|g| decode::<TokenRow>(g.value()))
                 .transpose()?;
             // Removed whether or not it is still valid: an expired token is no use to anyone
-            // and a spent one is removed by definition.
+            // and a spent one is removed by definition. One for a registry was refused by the
+            // read above, unless a registry spent it meanwhile.
             match row {
-                Some(row) if row.expires_at > now => {
+                Some(row) if row.expires_at > now && row.kind == TokenKind::Node => {
                     let mut nodes = txn.open_table(NODES)?;
                     let mut pinned = None;
                     for entry in nodes.iter()? {
@@ -1346,6 +1410,18 @@ impl Db {
                     bail!(
                         "node {} is still being updated to this release (command {})",
                         key.split_once('/').map_or(key, |(node, _)| node),
+                        row.command.id
+                    );
+                }
+            }
+            for entry in txn.open_table(registries::REGISTRY_COMMANDS)?.iter()? {
+                let (key, value) = entry?;
+                let row = decode::<RegistryCommandRow>(value.value())?;
+                if row.updates_to(sha256, now) {
+                    let key = key.value();
+                    bail!(
+                        "registry {} is still being updated to this release (command {})",
+                        key.split_once('/').map_or(key, |(id, _)| id),
                         row.command.id
                     );
                 }
@@ -2530,7 +2606,7 @@ pub(crate) fn short(sha256: &str) -> &str {
     sha256.get(..12).unwrap_or(sha256)
 }
 
-fn outcome_text(outcome: &Outcome) -> String {
+pub(crate) fn outcome_text(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Accepted => "accepted".into(),
         Outcome::Done => "done".into(),
@@ -3552,6 +3628,7 @@ mod tests {
             version: "0.84.0".into(),
             size: 10,
             signature: None,
+            program: None,
             added_at: 5,
             added_by: "uid 0".into(),
         };

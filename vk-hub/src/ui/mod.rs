@@ -73,6 +73,7 @@ mod multipart;
 mod oidc;
 mod operations;
 mod pages;
+mod registries;
 mod sse;
 mod users;
 
@@ -378,6 +379,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     fleet::node_action(req, ui, site, id).await
                 } else if let Some(id) = fleet::action_rollout(&path) {
                     fleet::rollout_action(req, ui, id).await
+                } else if let Some(id) = registries::action_target(&path) {
+                    registries::action(req, ui, id).await
                 } else {
                     Ok(message(StatusCode::NOT_FOUND, "No such action."))
                 }

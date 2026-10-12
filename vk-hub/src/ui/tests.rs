@@ -3179,6 +3179,7 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
         version: version.into(),
         size: 3 << 20,
         signature,
+        program: None,
         added_at: 1,
         added_by: "uid 0".into(),
     };
@@ -3308,7 +3309,8 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         let page = get(addr, "/operations", Some(&cookie)).await.body;
         assert!(
             page.contains(
-                "<nav><a href=\"/\">Nodes</a><a href=\"/jobs\">Jobs</a>\
+                "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
+                 <a href=\"/jobs\">Jobs</a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -5928,6 +5930,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
         version: "0.85.0".into(),
         size: 3 << 20,
         signature: None,
+        program: None,
         added_at: 1,
         added_by: "uid 0".into(),
     };

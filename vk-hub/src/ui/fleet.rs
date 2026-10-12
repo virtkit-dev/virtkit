@@ -225,6 +225,12 @@ pub(super) async fn get(
     if path == super::users::PATH {
         return super::users::get(auth, ui).await.map(Some);
     }
+    if path == super::registries::PATH {
+        return super::registries::list(auth, ui).await.map(Some);
+    }
+    if let Some(id) = super::registries::detail_target(path) {
+        return super::registries::detail(id, auth, ui).await.map(Some);
+    }
     if path == super::jobs::PATH {
         return super::jobs::get(query, auth, &site.jobs, ui, swap)
             .await
@@ -578,6 +584,7 @@ fn nav(auth: &Auth) -> pages::Nav {
 
 const NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
@@ -585,6 +592,7 @@ const NAV: pages::Nav = &[
 
 const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
@@ -641,9 +649,20 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
             "Refused: not one of the form's lifetimes.",
         ));
     };
+    let kind = match field(&form, "kind") {
+        None | Some("node") => crate::store::TokenKind::Node,
+        Some("registry") => crate::store::TokenKind::Registry,
+        Some(_) => {
+            return Ok(message(
+                StatusCode::BAD_REQUEST,
+                "Refused: a token enrolls a node or a registry.",
+            ));
+        }
+    };
     let (hub, principal) = (ui.hub.clone(), auth.session.principal());
     let (token, expires_at) = blocking(move || {
-        hub.db.create_token(
+        hub.db.create_token_for(
+            kind,
             std::time::Duration::from_secs(ttl),
             &principal,
             crate::now_secs(),
@@ -651,9 +670,13 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     })
     .await?;
     eprintln!(
-        "vk-hub: ui: {} issued an enrollment token valid for {ttl}s",
-        auth.session.principal()
+        "vk-hub: ui: {} issued a {} enrollment token valid for {ttl}s",
+        auth.session.principal(),
+        kind.name()
     );
+    if kind == crate::store::TokenKind::Registry {
+        return Ok(page(registry_token(ui, &auth, &token, expires_at)));
+    }
     let mut main = Html::new();
     main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ");
     pages::at(&mut main, expires_at)
@@ -682,6 +705,26 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
         .raw("the token stays out of the shell's history and the process list.</p>")
         .raw("<p><a href=\"/\">Back to the nodes</a></p>");
     Ok(page(layout("Enrollment token", "/", &auth, &main)))
+}
+
+/// The page showing a registry's enrollment token once, with how to redeem it.
+fn registry_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
+    let mut main = Html::new();
+    main.raw("<h1>Registry enrollment token</h1><p>Single-use, valid until ");
+    pages::at(&mut main, expires_at)
+        .raw(". It is shown this once: copy it now.</p><pre>")
+        .text(token)
+        .raw("</pre><p>On the registry's host, as the user <code>vk-registry serve</code> runs ")
+        .raw("as, run this, then paste the token and press Enter:</p><pre>vk-registry join ");
+    match &ui.hub.node_url {
+        Some(url) => main.text(url),
+        None => main.raw("&lt;hub-url&gt;"),
+    };
+    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as for ")
+        .raw("<code>serve</code>. A running <code>serve</code> connects within a minute. ")
+        .raw("<code>vk-registry leave</code> undoes it.</p>")
+        .raw("<p><a href=\"/registries\">Back to the registries</a></p>");
+    layout("Registry enrollment token", "/registries", auth, &main)
 }
 
 // Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs

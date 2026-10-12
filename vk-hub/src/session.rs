@@ -26,15 +26,15 @@ use vk_hub_proto::{
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
 use crate::store::NotEnrolled;
 
-type Ws = WebSocketStream<TokioIo<Upgraded>>;
+pub(crate) type Ws = WebSocketStream<TokioIo<Upgraded>>;
 
 /// How long a node has for each handshake step. Signing a nonce takes microseconds; a peer
 /// this slow is not a node doing its job, and holding the socket for it costs a descriptor.
 /// Short under test, so the timeout itself can be tested.
 #[cfg(not(test))]
-const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
+pub(crate) const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 #[cfg(test)]
-const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
+pub(crate) const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
 /// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`],
 /// [`vk_hub_proto::TOOLS`] and [`vk_hub_proto::RUNNER_NONE`]. A node offering less negotiates
@@ -56,7 +56,7 @@ pub async fn run(
     exported: Exported,
     permit: OwnedSemaphorePermit,
 ) {
-    let node = match handshake(&mut ws, &hub, exported).await {
+    let node = match handshake(&mut ws, &hub, exported, PeerKind::Node).await {
         Ok(node) => node,
         Err(r) => return turn_away(&mut ws, peer, r).await,
     };
@@ -96,7 +96,7 @@ pub async fn run(
 }
 
 /// Log why a handshake ended and, unless the peer is gone, tell it.
-async fn turn_away(ws: &mut Ws, peer: SocketAddr, r: Refusal) {
+pub(crate) async fn turn_away(ws: &mut Ws, peer: SocketAddr, r: Refusal) {
     let why = r.detail.as_deref().unwrap_or(&r.reason);
     if r.gone {
         eprintln!("vk-hub: {peer}: handshake ended: {why}");
@@ -108,7 +108,7 @@ async fn turn_away(ws: &mut Ws, peer: SocketAddr, r: Refusal) {
 
 /// Tell the peer why and close. Best effort: the peer is being turned away, and a failure to
 /// tell it so leaves nothing to clean up.
-async fn refuse(ws: &mut Ws, code: RefusalCode, reason: &str) {
+pub(crate) async fn refuse(ws: &mut Ws, code: RefusalCode, reason: &str) {
     let msg = HubMsg::Refused {
         code,
         reason: reason.to_string(),
@@ -120,19 +120,47 @@ async fn refuse(ws: &mut Ws, code: RefusalCode, reason: &str) {
     .await;
 }
 
-/// An authenticated node.
-struct Node {
-    id: String,
-    incarnation: String,
-    hostname: String,
+/// An authenticated peer: a node, or a registry ([`crate::registries`]).
+pub(crate) struct Peer {
+    pub(crate) id: String,
+    pub(crate) incarnation: String,
+    pub(crate) hostname: String,
     /// The incarnation of its previous session, to tell a reconnect from a restart.
-    previous_incarnation: Option<String>,
-    /// The protocol version of the session: below [`STEERING`], it is monitored only.
-    version: u32,
+    pub(crate) previous_incarnation: Option<String>,
+    /// The protocol version of the session: for a node, below [`STEERING`], it is monitored
+    /// only.
+    pub(crate) version: u32,
 }
 
+/// Which kind of peer a session is for: each has its own endpoint, protocol versions and
+/// table of pinned keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerKind {
+    Node,
+    Registry,
+}
+
+impl PeerKind {
+    fn protocol(self) -> VersionRange {
+        match self {
+            PeerKind::Node => PROTOCOL,
+            PeerKind::Registry => vk_hub_proto::registry::PROTOCOL,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            PeerKind::Node => "node",
+            PeerKind::Registry => "registry",
+        }
+    }
+}
+
+/// A peer's pinned key, hostname and last incarnation, `None` when it is not enrolled.
+type Pinned = Option<(String, String, Option<String>)>;
+
 /// A handshake refusal, with a public reason and private log detail.
-struct Refusal {
+pub(crate) struct Refusal {
     code: RefusalCode,
     reason: String,
     detail: Option<String>,
@@ -141,7 +169,7 @@ struct Refusal {
 }
 
 impl Refusal {
-    fn new(code: RefusalCode, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(code: RefusalCode, reason: impl Into<String>) -> Self {
         Refusal {
             code,
             reason: reason.into(),
@@ -151,7 +179,7 @@ impl Refusal {
     }
 
     /// A send to the peer failed with `e`.
-    fn gone(e: anyhow::Error) -> Self {
+    pub(crate) fn gone(e: anyhow::Error) -> Self {
         Refusal {
             gone: true,
             ..Refusal::from(e)
@@ -172,7 +200,14 @@ impl<E: std::fmt::Display> From<E> for Refusal {
     }
 }
 
-async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, Refusal> {
+pub(crate) async fn handshake(
+    ws: &mut Ws,
+    hub: &Hub,
+    exported: Exported,
+    kind: PeerKind,
+) -> Result<Peer, Refusal> {
+    let protocol_range = kind.protocol();
+    let noun = kind.noun();
     let protocol = |e: anyhow::Error| Refusal {
         code: RefusalCode::Protocol,
         reason: format!("{e:#}"),
@@ -191,13 +226,13 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
             "a session opens with a hello",
         ));
     };
-    let Some(version) = PROTOCOL.negotiate(versions) else {
+    let Some(version) = protocol_range.negotiate(versions) else {
         return Err(Refusal::new(
             RefusalCode::Version,
             format!(
-                "no common protocol version: this hub speaks {}–{}, vk {} speaks {}–{}",
-                PROTOCOL.min,
-                PROTOCOL.max,
+                "no common protocol version: this hub speaks {}–{}, version {} speaks {}–{}",
+                protocol_range.min,
+                protocol_range.max,
                 vk_hub_proto::display_safe(&vk_version),
                 versions.min,
                 versions.max
@@ -207,15 +242,26 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
     if !vk_hub_proto::valid_id(&node_id) || !vk_hub_proto::valid_id(&incarnation) {
         return Err(Refusal::new(
             RefusalCode::Protocol,
-            "malformed node or incarnation ID",
+            format!("malformed {noun} or incarnation ID"),
         ));
     }
     let db = hub.db.clone();
     let id = node_id.clone();
-    let Some(row) = tokio::task::spawn_blocking(move || db.node(&id)).await?? else {
+    let pinned: Pinned = tokio::task::spawn_blocking(move || {
+        anyhow::Ok(match kind {
+            PeerKind::Node => db
+                .node(&id)?
+                .map(|r| (r.public_key, r.hostname, r.incarnation)),
+            PeerKind::Registry => db
+                .registry(&id)?
+                .map(|r| (r.public_key, r.hostname, r.incarnation)),
+        })
+    })
+    .await??;
+    let Some((pinned_key, hostname, previous_incarnation)) = pinned else {
         return Err(Refusal::new(
             RefusalCode::NotEnrolled,
-            format!("node {node_id} is not enrolled"),
+            format!("{noun} {node_id} is not enrolled"),
         ));
     };
     let nonce = crate::random_bytes(CHALLENGE_LEN)?;
@@ -223,7 +269,7 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
         ws,
         &HubMsg::Challenge {
             version,
-            versions: PROTOCOL,
+            versions: protocol_range,
             nonce: vk_hub_proto::to_hex(&nonce),
         },
     )
@@ -238,8 +284,8 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
     let Some(signature) = from_hex_lower::<SIGNATURE_LEN>(&signature) else {
         return Err(Refusal::new(RefusalCode::Protocol, "malformed signature"));
     };
-    let Some(public_key) = from_hex_lower::<PUBLIC_KEY_LEN>(&row.public_key) else {
-        return Err(anyhow!("node {node_id} has a corrupt pinned key").into());
+    let Some(public_key) = from_hex_lower::<PUBLIC_KEY_LEN>(&pinned_key) else {
+        return Err(anyhow!("{noun} {node_id} has a corrupt pinned key").into());
     };
     let channel = match &exported {
         Some(exported) => Channel::Tls(exported),
@@ -250,7 +296,7 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
         &node_id,
         &incarnation,
         versions,
-        PROTOCOL,
+        protocol_range,
         version,
         channel,
     );
@@ -258,24 +304,24 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
         return Err(Refusal::new(
             RefusalCode::BadSignature,
             format!(
-                "node {node_id}: the signature does not match its pinned key; a proxy \
+                "{noun} {node_id}: the signature does not match its pinned key; a proxy \
                  terminating TLS in front of the hub breaks the session's binding to the \
                  connection: pass TLS through"
             ),
         ));
     }
-    Ok(Node {
+    Ok(Peer {
         id: node_id,
         incarnation,
-        hostname: row.hostname,
-        previous_incarnation: row.incarnation,
+        hostname,
+        previous_incarnation,
         version,
     })
 }
 
 /// Record `session` of the authenticated `node` and welcome it, unless the node was removed
 /// or a newer session took over meanwhile.
-async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, node: &Node, session: u64) -> Result<(), Refusal> {
+async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, node: &Peer, session: u64) -> Result<(), Refusal> {
     let (db, live) = (hub.db.clone(), hub.clone());
     let (id, incarnation, version) = (node.id.clone(), node.incarnation.clone(), node.version);
     let recorded = tokio::task::spawn_blocking(move || {
@@ -311,7 +357,7 @@ async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, node: &Node, session: u64) -> Resu
 async fn serve(
     ws: &mut Ws,
     hub: &Hub,
-    node: &Node,
+    node: &Peer,
     session: u64,
     ending: &Ending,
     mut jobs: Option<tokio::sync::mpsc::Receiver<vk_hub_proto::dispatch::HubJobMsg>>,
@@ -470,7 +516,7 @@ struct Steer {
 
 impl Steer {
     /// Send what the node lacks and this session has not sent it yet.
-    async fn sync(&mut self, ws: &mut Ws, hub: &Hub, node: &Node) -> Result<()> {
+    async fn sync(&mut self, ws: &mut Ws, hub: &Hub, node: &Peer) -> Result<()> {
         let Some(applied) = self.applied else {
             return Ok(());
         };
@@ -507,7 +553,7 @@ impl Steer {
 async fn acknowledge(
     ws: &mut Ws,
     hub: &Hub,
-    node: &Node,
+    node: &Peer,
     ack: vk_hub_proto::CommandAck,
 ) -> Result<()> {
     let db = hub.db.clone();
@@ -617,7 +663,7 @@ enum Write {
 
 /// Write `write` for `node`. `Some` carries why the session ends: the node was removed since
 /// its last message, before its revocation reached the session loop, and has been told.
-async fn store(ws: &mut Ws, hub: &Hub, node: &Node, write: Write) -> Result<Option<&'static str>> {
+async fn store(ws: &mut Ws, hub: &Hub, node: &Peer, write: Write) -> Result<Option<&'static str>> {
     let db = hub.db.clone();
     let id = node.id.clone();
     let now = crate::now_secs();

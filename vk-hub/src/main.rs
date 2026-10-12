@@ -32,6 +32,7 @@ mod fetch;
 mod jobs;
 mod local;
 mod ops;
+mod registries;
 mod releases;
 mod rollout;
 mod server;
@@ -88,6 +89,13 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: Option<NodesCmd>,
+    },
+    /// List the registries the hub manages, or steer, update or remove one
+    Registries {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<RegistriesCmd>,
     },
     /// Keep vk binaries for nodes to update to
     Release {
@@ -208,6 +216,9 @@ enum ReleaseCmd {
         /// one
         #[arg(long, value_name = "FILE")]
         signature: Option<PathBuf>,
+        /// The program it is: vk, for nodes, or vk-registry, for registries
+        #[arg(long, default_value = "vk", value_parser = ["vk", "vk-registry"])]
+        program: String,
     },
     /// Download a release's vk from the hub's release_repository and hold it
     ///
@@ -612,7 +623,89 @@ enum TokenCmd {
         /// How long the token stays valid: <n>s, <n>m, <n>h or <n>d (at most 30d)
         #[arg(long, default_value = "1h", value_parser = parse_token_ttl)]
         ttl: Duration,
+        /// What it enrolls: a node (`vk node join`) or a registry (`vk-registry join`)
+        #[arg(long, default_value = "node", value_parser = parse_token_kind)]
+        kind: store::TokenKind,
     },
+}
+
+fn parse_token_kind(s: &str) -> Result<store::TokenKind, String> {
+    match s {
+        "node" => Ok(store::TokenKind::Node),
+        "registry" => Ok(store::TokenKind::Registry),
+        _ => Err(format!("{s:?}: expected node or registry")),
+    }
+}
+
+#[derive(Subcommand)]
+enum RegistriesCmd {
+    /// Show a registry: what it reports, what the hub wants of it, its commands
+    Show {
+        /// The registry's ID, as `vk-hub registries` lists it
+        id: String,
+    },
+    /// Remove a registry: unpin its key and end its session
+    ///
+    /// The registry serves on as before; it can join again only with a new token.
+    Remove { id: String },
+    /// Make the registry refuse writes (`on`), take them again (`off`), or do as its config says
+    ///
+    /// Needs `read-only` in the registry's `[hub] allow`.
+    ReadOnly {
+        id: String,
+        #[arg(value_parser = ["on", "off", "default"])]
+        state: String,
+    },
+    /// Have the registry run gc on a schedule, or stop scheduling it
+    ///
+    /// Needs `gc` in the registry's `[hub] allow`.
+    GcSchedule {
+        id: String,
+        /// How often: <n>m, <n>h or <n>d (at least 10m)
+        #[arg(long, value_parser = parse_gc_every, required_unless_present = "off")]
+        every: Option<Duration>,
+        /// Drop tags unused for more than this many days
+        #[arg(long, default_value_t = 30)]
+        retention_days: u64,
+        /// Keep unreferenced blobs this many days past their last use
+        #[arg(long, default_value_t = 1)]
+        grace_days: u64,
+        /// Stop the scheduled gc
+        #[arg(long, conflicts_with = "every")]
+        off: bool,
+    },
+    /// Run gc on the registry now
+    ///
+    /// Needs `gc` in the registry's `[hub] allow`.
+    Gc {
+        id: String,
+        #[arg(long, default_value_t = 30)]
+        retention_days: u64,
+        #[arg(long, default_value_t = 1)]
+        grace_days: u64,
+        /// Report what would go without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update the registry to a vk-registry release the hub holds
+    ///
+    /// Needs `update` in the registry's `[hub] allow`. The registry checks the release's
+    /// signature against its own `[hub] release_keys`, runs it, and keeps it only once it is
+    /// back in session with the hub.
+    Update {
+        id: String,
+        /// The release's sha256, or at least the first 8 hex digits
+        #[arg(long)]
+        release: String,
+    },
+}
+
+fn parse_gc_every(s: &str) -> Result<Duration, String> {
+    let every = parse_ttl(s, Duration::from_secs(365 * 86_400), "a gc interval")?;
+    if every < Duration::from_secs(600) {
+        return Err(format!("{s:?}: a gc runs at most every 10 minutes"));
+    }
+    Ok(every)
 }
 
 fn parse_role(s: &str) -> Result<store::Role, String> {
@@ -638,18 +731,27 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Serve { config } => serve(HubConfig::load(config.config.as_deref())?).await,
         Cmd::Token {
-            cmd: TokenCmd::Create { config, ttl },
+            cmd: TokenCmd::Create { config, ttl, kind },
         } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
-            let created = tokio::task::spawn_blocking(move || client.create_token(ttl)).await??;
+            let created =
+                tokio::task::spawn_blocking(move || client.create_token_for(kind, ttl)).await??;
             // The token alone on stdout, so `$(vk-hub token create)` captures just it.
             println!("{}", created.token);
             eprintln!(
-                "vk-hub: single-use, valid for {}; enroll with `vk node join <hub-url> --token -` \
+                "vk-hub: single-use, valid for {}; enroll with `{} join <hub-url> --token -` \
                  reading it on stdin",
-                human_duration(ttl)
+                human_duration(ttl),
+                match kind {
+                    store::TokenKind::Node => "vk node",
+                    store::TokenKind::Registry => "vk-registry",
+                }
             );
             Ok(())
+        }
+        Cmd::Registries { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            registries_cmd(client, cmd).await
         }
         Cmd::Nodes { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
@@ -748,22 +850,29 @@ async fn run(cli: Cli) -> Result<()> {
                     file,
                     version,
                     signature,
+                    program,
                 } => {
                     let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
                         .with_context(|| format!("resolving {}", file.display()))?;
                     let added = tokio::task::spawn_blocking(move || {
-                        client.add_release(&file, &version, signature)
+                        client.add_release(&file, &version, signature, Some(&program))
                     })
                     .await??;
                     // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
                     println!("{}", added.sha256);
                     eprintln!(
-                        "vk-hub: holding vk {} ({} bytes); `vk-hub nodes update <id> --release \
-                         {}` updates a node to it",
+                        "vk-hub: holding {} {} ({} bytes); `vk-hub {} update <id> --release {}` \
+                         updates one to it",
+                        added.row.program(),
                         added.row.version,
                         added.row.size,
+                        if added.row.program() == store::REGISTRY_PROGRAM {
+                            "registries"
+                        } else {
+                            "nodes"
+                        },
                         store::short(&added.sha256)
                     );
                 }
@@ -1973,6 +2082,190 @@ fn tools_notes(n: &ops::NodeView) -> Vec<String> {
     ));
     notes.extend(b.log.iter().map(|line| format!("    {line}")));
     notes
+}
+
+/// `vk-hub registries` and its subcommands.
+async fn registries_cmd(client: admin::Client, cmd: Option<RegistriesCmd>) -> Result<()> {
+    let blocking = |f: Box<dyn FnOnce(admin::Client) -> Result<()> + Send>| async move {
+        tokio::task::spawn_blocking(move || f(client)).await?
+    };
+    match cmd {
+        None => {
+            blocking(Box::new(|client| {
+                let views = client.list_registries()?;
+                print!("{}", render_registries(&views, now_secs()));
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::Show { id }) => {
+            blocking(Box::new(move |client| {
+                let Some((view, commands)) = client.show_registry(&id)? else {
+                    bail!("there is no registry {id}");
+                };
+                print!("{}", render_registry(&view, &commands, now_secs()));
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::Remove { id }) => {
+            blocking(Box::new(move |client| {
+                if !client.remove_registry(&id)? {
+                    bail!("there is no registry {id}");
+                }
+                eprintln!("vk-hub: removed registry {id}");
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::ReadOnly { id, state }) => {
+            let read_only = match state.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            blocking(Box::new(move |client| {
+                let desired = client.set_registry_read_only(&id, read_only)?;
+                eprintln!(
+                    "vk-hub: registry {id}: desired state generation {}",
+                    desired.generation
+                );
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::GcSchedule {
+            id,
+            every,
+            retention_days,
+            grace_days,
+            off,
+        }) => {
+            let gc =
+                (!off)
+                    .then_some(())
+                    .and(every)
+                    .map(|every| vk_hub_proto::registry::GcPolicy {
+                        every_secs: every.as_secs(),
+                        retention_days,
+                        grace_days,
+                    });
+            blocking(Box::new(move |client| {
+                let desired = client.set_registry_gc(&id, gc)?;
+                eprintln!(
+                    "vk-hub: registry {id}: desired state generation {}",
+                    desired.generation
+                );
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::Gc {
+            id,
+            retention_days,
+            grace_days,
+            dry_run,
+        }) => {
+            blocking(Box::new(move |client| {
+                let command = client.registry_gc(&id, retention_days, grace_days, dry_run)?;
+                eprintln!("vk-hub: registry {id}: issued command {}", command.id);
+                Ok(())
+            }))
+            .await
+        }
+        Some(RegistriesCmd::Update { id, release }) => {
+            blocking(Box::new(move |client| {
+                let command = client.update_registry(&id, &release)?;
+                eprintln!("vk-hub: registry {id}: issued command {}", command.id);
+                Ok(())
+            }))
+            .await
+        }
+    }
+}
+
+/// `vk-hub registries`' table, with each registry's notes under it.
+fn render_registries(views: &[registries::RegistryView], now: u64) -> String {
+    let rows: Vec<[String; 9]> = views.iter().map(|r| registries::cells(r, now)).collect();
+    let mut out = table(&registries::COLUMNS, &rows);
+    for r in views {
+        for note in registries::notes(r) {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `vk-hub registries show`.
+fn render_registry(
+    r: &registries::RegistryView,
+    commands: &[store::RegistryCommandRow],
+    now: u64,
+) -> String {
+    let mut out = render_registries(std::slice::from_ref(r), now);
+    let mut field = |name: &str, value: String| out.push_str(&format!("{name}: {value}\n"));
+    if let Some(i) = &r.row.inventory {
+        field(
+            "listen",
+            format!("{}{}", i.listen, if i.tls { " (TLS)" } else { "" }),
+        );
+        field("store", i.store.clone());
+        field("webdav", i.webdav.to_string());
+        field(
+            "the hub may",
+            if i.allow.is_empty() {
+                "nothing ([hub] allow is empty)".to_string()
+            } else {
+                i.allow.join(", ")
+            },
+        );
+        field("signed updates only", i.requires_signed.to_string());
+    }
+    if let Some(u) = &r.row.usage {
+        field(
+            "usage",
+            format!(
+                "{} stored, {} referenced, {} tags, {} blobs (at {})",
+                registries::gib(u.stored_bytes),
+                registries::gib(u.referenced_bytes),
+                u.tags,
+                u.blobs,
+                utc(u.at)
+            ),
+        );
+    }
+    match &r.row.desired {
+        Some(d) => field(
+            "desired",
+            format!(
+                "generation {}, read-only {}, gc {}",
+                d.generation,
+                d.read_only
+                    .map_or("as configured".to_string(), |b| b.to_string()),
+                d.gc.map_or("not scheduled".to_string(), |gc| format!(
+                    "every {}",
+                    human_duration(Duration::from_secs(gc.every_secs))
+                ))
+            ),
+        ),
+        None => field("desired", "nothing asked".to_string()),
+    }
+    if let Some(applied) = r.row.report.as_ref().and_then(|rep| rep.applied) {
+        field("applied", format!("generation {applied}"));
+    }
+    for c in commands {
+        out.push_str(&format!(
+            "command {} {} at {}: {}\n",
+            c.command.id,
+            store::registry_operation_name(&c.command.op),
+            utc(c.issued_at),
+            c.outcome
+                .as_ref()
+                .map_or("not taken yet".to_string(), store::outcome_text)
+        ));
+    }
+    out
 }
 
 /// `vk-hub nodes`' table, with each node's notes under it.

@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::server::Hub;
-use crate::store::{Release, ReleaseRow};
+use crate::store::{REGISTRY_PROGRAM, Release, ReleaseRow};
 
 /// The largest binary the hub takes: a `vk` is a few hundred megabytes at most, even
 /// unstripped.
@@ -138,16 +138,27 @@ fn create_private(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
-/// Copy the binary at `from` into the hub as `version`, with `signature`, audited as
-/// `actor`'s. Its sha256 names it; the file is published whole, by rename, before the row
-/// that points at it is written.
+/// Copy the binary at `from` into the hub as `version` of `program` (`None` for `vk`, or
+/// [`REGISTRY_PROGRAM`] for a `vk-registry` release, which only registries update to), with
+/// `signature`, audited as `actor`'s. Its sha256 names it; the file is published whole, by
+/// rename, before the row that points at it is written.
 pub fn add(
     hub: &Hub,
     actor: &str,
     from: &Path,
+    program: Option<&str>,
     version: &str,
     signature: Option<String>,
 ) -> Result<Release> {
+    let program = match program {
+        None | Some("vk") => None,
+        Some(REGISTRY_PROGRAM) => Some(REGISTRY_PROGRAM.to_string()),
+        Some(other) => bail!(
+            "{:?} is not a program the hub holds releases of: vk or {REGISTRY_PROGRAM}",
+            vk_hub_proto::display_safe(other)
+        ),
+    };
+    let named = program.as_deref().unwrap_or("vk");
     check_version(version)?;
     let signature = signature.map(|s| check_signature(&s)).transpose()?;
     releases_dir(hub)?;
@@ -173,9 +184,11 @@ pub fn add(
     }
     let (staged, mut out) = Staged::create(hub, "add")?;
     let (sha256, size) = copy_checked(&mut source, Some((&mut out, staged.path())), version)
-        .with_context(|| format!("reading {} as vk {version}", from.display()))?;
+        .with_context(|| format!("reading {} as {named} {version}", from.display()))?;
     drop(out);
-    publish(hub, actor, staged, &sha256, size, version, signature)
+    publish(
+        hub, actor, staged, &sha256, size, version, signature, program,
+    )
 }
 
 /// Take the binary `staged` holds — uploaded or downloaded into it, and closed — into the hub
@@ -199,11 +212,12 @@ pub fn adopt(
     let (sha256, size) = copy_checked(&mut source, None, version)
         .with_context(|| format!("reading the binary as vk {version}"))?;
     drop(source);
-    publish(hub, actor, staged, &sha256, size, version, signature)
+    publish(hub, actor, staged, &sha256, size, version, signature, None)
 }
 
-/// Rename `staged`, checked to hash to `sha256`, into place as release `sha256`, and record
-/// it.
+/// Rename `staged`, checked to hash to `sha256`, into place as release `sha256` of `program`
+/// (`None` for `vk`), and record it.
+#[allow(clippy::too_many_arguments)]
 fn publish(
     hub: &Hub,
     actor: &str,
@@ -212,6 +226,7 @@ fn publish(
     size: u64,
     version: &str,
     signature: Option<String>,
+    program: Option<String>,
 ) -> Result<Release> {
     let dir = hub.releases_dir()?;
     let sha256 = sha256.to_string();
@@ -219,6 +234,7 @@ fn publish(
         version: version.to_string(),
         size,
         signature,
+        program,
         added_at: crate::now_secs(),
         added_by: actor.to_string(),
     };
@@ -228,9 +244,13 @@ fn publish(
     let dest = path(dir, &sha256);
     let existing = hub.db.release(&sha256)?;
     if let Some(existing) = &existing {
-        if existing.version != row.version || existing.signature != row.signature {
+        if existing.version != row.version
+            || existing.signature != row.signature
+            || existing.program != row.program
+        {
             bail!(
-                "release {sha256} is already held, as vk {}{}",
+                "release {sha256} is already held, as {} {}{}",
+                existing.program(),
                 existing.version,
                 if existing.signature == row.signature {
                     ""
