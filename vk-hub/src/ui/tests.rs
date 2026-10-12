@@ -3179,6 +3179,7 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
         version: version.into(),
         size: 3 << 20,
         signature,
+        program: None,
         added_at: 1,
         added_by: "uid 0".into(),
     };
@@ -3308,7 +3309,8 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         let page = get(addr, "/operations", Some(&cookie)).await.body;
         assert!(
             page.contains(
-                "<nav><a href=\"/\">Nodes</a><a href=\"/jobs\">Jobs</a>\
+                "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
+                 <a href=\"/jobs\">Jobs</a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -5972,6 +5974,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
         version: "0.85.0".into(),
         size: 3 << 20,
         signature: None,
+        program: None,
         added_at: 1,
         added_by: "uid 0".into(),
     };
@@ -6261,4 +6264,133 @@ async fn an_operator_fetches_a_release_from_github() {
     assert!(page.body.contains("does not match"), "{}", page.body);
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Viewers see registries with nothing to steer them; operators steer them with the session's
+/// CSRF token, and issue registry tokens.
+#[tokio::test(flavor = "multi_thread")]
+async fn registries_are_shown_to_all_and_steered_by_operators() {
+    use crate::store::{RegistryEnrollment, TokenKind};
+    let (addr, hub, origin) = start_fleet().await;
+    let (token, _) = hub
+        .db
+        .create_token_for(
+            TokenKind::Registry,
+            Duration::from_secs(60),
+            "uid 0",
+            crate::now_secs(),
+        )
+        .unwrap();
+    let RegistryEnrollment::Enrolled { id } = hub
+        .db
+        .enroll_registry(&token, "aa", "reg-1", "peer p", 1)
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    let detail = format!("/registry/{id}");
+    let action = format!("{detail}/action");
+    let forms = ["action=\"/tokens\"", &format!("action=\"{action}\"")];
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    for path in ["/registries", detail.as_str()] {
+        let page = get(addr, path, Some(&viewer)).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        assert!(page.body.contains("reg-1"), "{path}: {}", page.body);
+        assert!(
+            forms.iter().all(|f| !page.body.contains(f)),
+            "{path}: {}",
+            page.body
+        );
+    }
+    let form = format!("_csrf={viewer_csrf}&op=read-only");
+    let reply = post_action(addr, &origin, &viewer, &action, &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let form = format!("_csrf={viewer_csrf}&ttl=3600&kind=registry");
+    let reply = post_action(addr, &origin, &viewer, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    assert!(
+        get(addr, "/registries", Some(&operator))
+            .await
+            .body
+            .contains(forms[0])
+    );
+    assert!(
+        get(addr, &detail, Some(&operator))
+            .await
+            .body
+            .contains(forms[1])
+    );
+    for (form, status) in [
+        ("op=read-only".to_string(), 403),
+        (
+            format!("_csrf={csrf}&op=gc-now&retention_days=0&grace_days=1"),
+            400,
+        ),
+        (format!("_csrf={csrf}&op=read-only"), 303),
+        (
+            format!("_csrf={csrf}&op=gc-now&retention_days=7&grace_days=2"),
+            303,
+        ),
+    ] {
+        let reply = post_action(addr, &origin, &operator, &action, &form, false).await;
+        assert_eq!(reply.status, status, "{form}: {}", reply.body);
+    }
+    let row = hub.db.registry(&id).unwrap().unwrap();
+    assert_eq!(row.desired.unwrap().read_only, Some(true));
+    let commands = hub.db.registry_commands(&id).unwrap();
+    assert!(
+        matches!(
+            commands[..],
+            [crate::store::RegistryCommandRow {
+                command: vk_hub_proto::registry::Command {
+                    op: vk_hub_proto::registry::Operation::Gc {
+                        retention_days: 7,
+                        grace_days: 2,
+                        dry_run: false,
+                    },
+                    ..
+                },
+                ..
+            }]
+        ),
+        "{commands:?}"
+    );
+
+    // A registry token, from the Registries page's form.
+    let form = format!("_csrf={csrf}&ttl=3600&kind=registry");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("vk-registry join"), "{}", reply.body);
+    let at = reply.body.find("vkh_").expect("the token");
+    let token: String = reply.body[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    assert!(matches!(
+        hub.db.enroll(&token, "bb", "node", "peer p", 1).unwrap(),
+        crate::store::Enrollment::BadToken
+    ));
+    assert!(matches!(
+        hub.db
+            .enroll_registry(&token, "bb", "reg-2", "peer p", 1)
+            .unwrap(),
+        RegistryEnrollment::Enrolled { .. }
+    ));
+    let form = format!("_csrf={csrf}&ttl=3600&kind=vm");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+
+    // The audit log links each to its own page.
+    let audit = get(addr, "/audit", Some(&operator)).await.body;
+    assert!(
+        audit.contains(&format!("<a href=\"/registry/{id}\">reg-1</a>")),
+        "{audit}"
+    );
+    assert!(
+        audit.contains(&format!("<option value=\"{id}\"")),
+        "{audit}"
+    );
 }

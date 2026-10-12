@@ -271,7 +271,21 @@ pub fn update(hub: &Hub, actor: &str, id: &str, release: &str, force: bool) -> R
     // Held from the lookup to the command, so the release cannot be removed between them.
     let _held = hub.releases_lock();
     let release = hub.db.resolve_release(release)?;
+    nodes_release(&release)?;
     issue(hub, actor, id, update_operation(&release, force, None))
+}
+
+/// Refuse a release of another program than `vk`: a node runs nothing else.
+fn nodes_release(release: &Release) -> Result<()> {
+    if release.row.program() != "vk" {
+        bail!(
+            "release {} is {} {}, not a vk a node updates to",
+            crate::store::short(&release.sha256),
+            release.row.program(),
+            release.row.version
+        );
+    }
+    Ok(())
 }
 
 /// The command that updates a node to `release`, to be over within `within_secs` of its drain.
@@ -362,6 +376,7 @@ pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<Rollo
         bail!("a node's drain and its update need at least a minute each");
     }
     let release = hub.db.resolve_release(&plan.release)?;
+    nodes_release(&release)?;
     let nodes = hub.db.nodes()?;
     let chosen: Vec<(String, NodeRow)> = match &plan.nodes {
         Selection::All => nodes,

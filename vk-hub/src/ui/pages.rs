@@ -196,21 +196,29 @@ pub fn signed_out_fragment(sign_in: &'static str) -> Html {
     h
 }
 
-/// `/audit`: the paginated log, newest first, optionally filtered by node.
+/// A node or a registry, as the audit log's filter and column name it.
+pub struct Subject {
+    pub id: String,
+    pub name: String,
+    /// Its page, before its ID: `/node/` or `/registry/`.
+    pub page: &'static str,
+}
+
+/// `/audit`: the paginated log, newest first, optionally filtered by node or registry.
 ///
-/// `names` maps node IDs to names for the filter and node column; local mode has no nodes
-/// and passes `None`. `nav` is the site's navigation.
-pub fn audit(auth: &Auth, page: &AuditPage, names: Option<&[(String, String)]>, nav: Nav) -> Html {
-    let with_node = names.is_some();
-    let names = names.unwrap_or_default();
+/// `subjects` names the nodes and registries for the filter and their column; local mode has
+/// none and passes `None`. `nav` is the site's navigation.
+pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: Nav) -> Html {
+    let with_node = subjects.is_some();
+    let subjects = subjects.unwrap_or_default();
     let mut main = Html::new();
     main.raw("<h1>Audit</h1>");
     if with_node {
         main.raw("<form class=\"filter\" method=\"get\" action=\"/audit\">")
-            .raw("<select name=\"node\"><option value=\"\">Every node</option>");
-        let mut sorted: Vec<(&str, &str)> = names
+            .raw("<select name=\"node\"><option value=\"\">Every node and registry</option>");
+        let mut sorted: Vec<(&str, &str)> = subjects
             .iter()
-            .map(|(id, name)| (id.as_str(), name.as_str()))
+            .map(|s| (s.id.as_str(), s.name.as_str()))
             .collect();
         sorted.sort_by_key(|&(id, name)| (name, id));
         for (id, name) in sorted {
@@ -226,11 +234,8 @@ pub fn audit(auth: &Auth, page: &AuditPage, names: Option<&[(String, String)]>, 
         }
         main.raw("</select> <button>Show</button></form>");
     }
-    let names: HashMap<&str, &str> = names
-        .iter()
-        .map(|(id, name)| (id.as_str(), name.as_str()))
-        .collect();
-    audit_table(&mut main, &page.rows, &names, with_node);
+    let subjects: HashMap<&str, &Subject> = subjects.iter().map(|s| (s.id.as_str(), s)).collect();
+    audit_table(&mut main, &page.rows, &subjects, with_node);
     if page.rows.len() == AUDIT_PAGE
         && let Some((oldest, _)) = page.rows.last()
     {
@@ -246,7 +251,7 @@ pub fn audit(auth: &Auth, page: &AuditPage, names: Option<&[(String, String)]>, 
 fn audit_table(
     h: &mut Html,
     rows: &[(u64, AuditRow)],
-    names: &HashMap<&str, &str>,
+    subjects: &HashMap<&str, &Subject>,
     with_node: bool,
 ) {
     if rows.is_empty() {
@@ -255,7 +260,7 @@ fn audit_table(
     }
     h.raw("<table class=\"grid\"><thead><tr><th>when</th>");
     if with_node {
-        h.raw("<th>node</th>");
+        h.raw("<th>node or registry</th>");
     }
     h.raw("<th>who</th><th>what</th></tr></thead><tbody>");
     for (_, row) in rows {
@@ -264,14 +269,20 @@ fn audit_table(
         if with_node {
             h.raw("<td>");
             match row.node.as_deref() {
-                Some(id) if vk_hub_proto::valid_id(id) => {
-                    h.raw("<a href=\"/node/").text(id).raw("\">");
-                    match names.get(id) {
-                        Some(name) => h.node(name),
-                        None => h.text(id.get(..8).unwrap_or(id)),
-                    };
-                    h.raw("</a>");
-                }
+                Some(id) if vk_hub_proto::valid_id(id) => match subjects.get(id) {
+                    Some(s) => {
+                        h.raw("<a href=\"")
+                            .raw(s.page)
+                            .text(id)
+                            .raw("\">")
+                            .node(&s.name)
+                            .raw("</a>");
+                    }
+                    // Removed since: no page to link to.
+                    None => {
+                        h.text(id.get(..8).unwrap_or(id));
+                    }
+                },
                 Some(id) => {
                     h.node(id);
                 }

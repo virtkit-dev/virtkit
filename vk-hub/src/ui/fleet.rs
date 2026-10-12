@@ -207,23 +207,47 @@ pub(super) async fn get(
             .filter(|n| vk_hub_proto::valid_id(n))
             .map(str::to_string);
         let before = field(&query, "before").and_then(|b| b.parse().ok());
-        let (audit, names) = blocking(move || {
+        let (audit, subjects) = blocking(move || {
             let rows = hub
                 .db
                 .audit_page(node.as_deref(), before, pages::AUDIT_PAGE)?;
-            let names = hub.db.node_names()?;
-            anyhow::Ok((pages::AuditPage { node, rows }, names))
+            let nodes = hub
+                .db
+                .node_names()?
+                .into_iter()
+                .map(|(id, name)| pages::Subject {
+                    id,
+                    name,
+                    page: "/node/",
+                });
+            let registries = hub
+                .db
+                .registries()?
+                .into_iter()
+                .map(|(id, row)| pages::Subject {
+                    id,
+                    name: row.hostname,
+                    page: super::registries::DETAIL_PREFIX,
+                });
+            let subjects: Vec<pages::Subject> = nodes.chain(registries).collect();
+            anyhow::Ok((pages::AuditPage { node, rows }, subjects))
         })
         .await?;
         return Ok(Some(page(pages::audit(
             auth,
             &audit,
-            Some(&names),
+            Some(&subjects),
             nav(auth),
         ))));
     }
     if path == super::users::PATH {
         return super::users::get(auth, ui).await.map(Some);
+    }
+    if path == super::registries::PATH {
+        return super::registries::list(auth, ui).await.map(Some);
+    }
+    if let Some(id) = super::registries::detail_target(path) {
+        return super::registries::detail(id, auth, ui).await.map(Some);
     }
     if path == super::jobs::PATH {
         return super::jobs::get(query, auth, &site.jobs, ui, swap)
@@ -578,6 +602,7 @@ fn nav(auth: &Auth) -> pages::Nav {
 
 const NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
@@ -585,6 +610,7 @@ const NAV: pages::Nav = &[
 
 const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
@@ -641,9 +667,20 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
             "Refused: not one of the form's lifetimes.",
         ));
     };
+    let kind = match field(&form, "kind") {
+        None | Some("node") => crate::store::TokenKind::Node,
+        Some("registry") => crate::store::TokenKind::Registry,
+        Some(_) => {
+            return Ok(message(
+                StatusCode::BAD_REQUEST,
+                "Refused: a token enrolls a node or a registry.",
+            ));
+        }
+    };
     let (hub, principal) = (ui.hub.clone(), auth.session.principal());
     let (token, expires_at) = blocking(move || {
-        hub.db.create_token(
+        hub.db.create_token_for(
+            kind,
             std::time::Duration::from_secs(ttl),
             &principal,
             crate::now_secs(),
@@ -651,9 +688,13 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     })
     .await?;
     eprintln!(
-        "vk-hub: ui: {} issued an enrollment token valid for {ttl}s",
-        auth.session.principal()
+        "vk-hub: ui: {} issued a {} enrollment token valid for {ttl}s",
+        auth.session.principal(),
+        kind.name()
     );
+    if kind == crate::store::TokenKind::Registry {
+        return Ok(page(registry_token(ui, &auth, &token, expires_at)));
+    }
     let mut main = Html::new();
     main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ");
     pages::at(&mut main, expires_at)
@@ -682,6 +723,26 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
         .raw("the token stays out of the shell's history and the process list.</p>")
         .raw("<p><a href=\"/\">Back to the nodes</a></p>");
     Ok(page(layout("Enrollment token", "/", &auth, &main)))
+}
+
+/// The page showing a registry's enrollment token once, with how to redeem it.
+fn registry_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
+    let mut main = Html::new();
+    main.raw("<h1>Registry enrollment token</h1><p>Single-use, valid until ");
+    pages::at(&mut main, expires_at)
+        .raw(". It is shown this once: copy it now.</p><pre>")
+        .text(token)
+        .raw("</pre><p>On the registry's host, as the user <code>vk-registry serve</code> runs ")
+        .raw("as, run this, then paste the token and press Enter:</p><pre>vk-registry join ");
+    match &ui.hub.node_url {
+        Some(url) => main.text(url),
+        None => main.raw("&lt;hub-url&gt;"),
+    };
+    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as for ")
+        .raw("<code>serve</code>. A running <code>serve</code> connects within a minute. ")
+        .raw("<code>vk-registry leave</code> undoes it.</p>")
+        .raw("<p><a href=\"/registries\">Back to the registries</a></p>");
+    layout("Registry enrollment token", "/registries", auth, &main)
 }
 
 // Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs
@@ -1132,7 +1193,7 @@ fn form_open(h: &mut Html, path: &str, csrf: &str) {
 
 /// How long before `now` the instant `then` was, in steps of a heartbeat under a minute:
 /// what a page shows moves only when it has something to say, not every second.
-fn age(now: u64, then: u64) -> String {
+pub(super) fn age(now: u64, then: u64) -> String {
     let step = HEARTBEAT.as_secs().max(1);
     let secs = now.saturating_sub(then);
     match secs {
@@ -1651,17 +1712,19 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     h.raw("<section><h2>Releases</h2>");
     operations::fetch_line(&mut h, ops.fetch.as_ref(), ops.latest.as_ref());
     if ops.releases.is_empty() {
-        h.raw("<p class=\"empty\">none: <code>vk-hub release add</code> copies a vk binary ")
-            .raw("into the hub</p>");
+        h.raw("<p class=\"empty\">none: <code>vk-hub release add</code> copies a vk or ")
+            .raw("vk-registry binary into the hub</p>");
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
-            .raw("<th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
+        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>program</th>")
+            .raw("<th>version</th><th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
         for r in &ops.releases {
             h.raw("<tr><td><code title=\"")
                 .text(&r.sha256)
                 .raw("\">")
                 .text(crate::store::short(&r.sha256))
                 .raw("</code></td><td>")
+                .text(r.row.program())
+                .raw("</td><td>")
                 .text(&r.row.version)
                 .raw("</td><td>")
                 .text(bytes(r.row.size))

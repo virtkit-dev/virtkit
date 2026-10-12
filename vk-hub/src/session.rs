@@ -120,7 +120,7 @@ async fn refuse(ws: &mut Ws, code: RefusalCode, reason: &str) {
     .await;
 }
 
-/// An authenticated peer, of a [`PeerKind`].
+/// An authenticated peer: a node, or a registry ([`crate::registries`]).
 pub(crate) struct Peer {
     pub(crate) id: String,
     pub(crate) incarnation: String,
@@ -136,18 +136,21 @@ pub(crate) struct Peer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PeerKind {
     Node,
+    Registry,
 }
 
 impl PeerKind {
     fn protocol(self) -> VersionRange {
         match self {
             PeerKind::Node => PROTOCOL,
+            PeerKind::Registry => vk_hub_proto::registry::PROTOCOL,
         }
     }
 
     fn noun(self) -> &'static str {
         match self {
             PeerKind::Node => "node",
+            PeerKind::Registry => "registry",
         }
     }
 }
@@ -226,7 +229,7 @@ pub(crate) async fn handshake(
         return Err(Refusal::new(
             RefusalCode::Version,
             format!(
-                "no common protocol version: this hub speaks {}–{}, vk {} speaks {}–{}",
+                "no common protocol version: this hub speaks {}–{}, version {} speaks {}–{}",
                 protocol_range.min,
                 protocol_range.max,
                 vk_hub_proto::display_safe(&vk_version),
@@ -247,6 +250,9 @@ pub(crate) async fn handshake(
         anyhow::Ok(match kind {
             PeerKind::Node => db
                 .node(&id)?
+                .map(|r| (r.public_key, r.hostname, r.incarnation)),
+            PeerKind::Registry => db
+                .registry(&id)?
                 .map(|r| (r.public_key, r.hostname, r.incarnation)),
         })
     })

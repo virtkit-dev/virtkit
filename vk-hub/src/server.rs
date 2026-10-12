@@ -30,7 +30,8 @@ use vk_hub_proto::{
 };
 
 use crate::session::PeerKind;
-use crate::store::{Db, Enrollment};
+use crate::store::{Db, Enrollment, RegistryEnrollment};
+use vk_hub_proto::registry;
 
 /// A response body: whole, or a release binary streamed from its file.
 pub(crate) type Body = BoxBody<Bytes, std::io::Error>;
@@ -698,8 +699,23 @@ async fn handle(
     state: ConnState,
 ) -> Result<Response<Body>, Infallible> {
     let resp = match (req.method(), req.uri().path()) {
-        (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer).await,
+        (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Node).await,
+        (&Method::POST, registry::ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Registry).await,
         (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported, PeerKind::Node)),
+        (&Method::GET, registry::SESSION_PATH) => {
+            Ok(upgrade(req, hub, peer, exported, PeerKind::Registry))
+        }
+        (&Method::GET, path) if path.starts_with(registry::RELEASE_PATH) => {
+            download(
+                &req,
+                &hub,
+                peer,
+                exported,
+                &state,
+                Download::RegistryRelease,
+            )
+            .await
+        }
         (&Method::GET, path) if path.starts_with(RELEASE_PATH) => {
             download(&req, &hub, peer, exported, &state, Download::Release).await
         }
@@ -734,7 +750,13 @@ async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Re
 }
 
 /// `POST /v1/enroll`: check the node's proof of its key, then spend the token on it.
-async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<Response<Body>> {
+/// `POST /v1/registry/enroll` does the same for a registry, with a token issued for one.
+async fn enroll(
+    req: Request<Incoming>,
+    hub: &Hub,
+    peer: SocketAddr,
+    kind: PeerKind,
+) -> Result<Response<Body>> {
     // Capped while reading: a chunked body declares no length to check up front. Timed,
     // since the header timeout ends with the headers.
     let body = match tokio::time::timeout(
@@ -767,6 +789,9 @@ async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<R
             "the signature does not match the key",
         ));
     }
+    if kind == PeerKind::Registry {
+        return enroll_registry(hub, peer, ask).await;
+    }
     let db = hub.db.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let actor = format!("peer {peer}");
@@ -796,6 +821,48 @@ async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<R
     })
 }
 
+/// A registry's enrollment, its proof of its key already checked.
+async fn enroll_registry(
+    hub: &Hub,
+    peer: SocketAddr,
+    ask: EnrollRequest,
+) -> Result<Response<Body>> {
+    let db = hub.db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let actor = format!("peer {peer}");
+        db.enroll_registry(
+            &ask.token,
+            &ask.public_key,
+            &ask.hostname,
+            &actor,
+            crate::now_secs(),
+        )
+    })
+    .await
+    .context("running an enrollment")??;
+    Ok(match outcome {
+        RegistryEnrollment::Enrolled { id } => {
+            eprintln!("vk-hub: {peer}: enrolled registry {id}");
+            hub.touch();
+            json(
+                StatusCode::OK,
+                &registry::EnrollResponse { registry_id: id },
+            )
+        }
+        RegistryEnrollment::Reenrolled { id } => {
+            eprintln!("vk-hub: {peer}: registry {id} enrolled again with its pinned key");
+            json(
+                StatusCode::OK,
+                &registry::EnrollResponse { registry_id: id },
+            )
+        }
+        RegistryEnrollment::BadToken => error(
+            StatusCode::FORBIDDEN,
+            "the enrollment token is unknown, used, expired, or not issued for a registry",
+        ),
+    })
+}
+
 /// What a peer downloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Download {
@@ -803,6 +870,8 @@ enum Download {
     Release,
     /// The tools definition a tools build names.
     Tools,
+    /// The `vk-registry` binary a registry's update names.
+    RegistryRelease,
 }
 
 impl Download {
@@ -810,12 +879,13 @@ impl Download {
         match self {
             Download::Release => RELEASE_PATH,
             Download::Tools => TOOLS_PATH,
+            Download::RegistryRelease => registry::RELEASE_PATH,
         }
     }
 
     fn what(self) -> &'static str {
         match self {
-            Download::Release => "release",
+            Download::Release | Download::RegistryRelease => "release",
             Download::Tools => "tools definition",
         }
     }
@@ -824,6 +894,7 @@ impl Download {
     fn peer(self) -> (&'static str, &'static str) {
         match self {
             Download::Release | Download::Tools => (vk_hub_proto::NODE_HEADER, "node"),
+            Download::RegistryRelease => (registry::REGISTRY_HEADER, "registry"),
         }
     }
 
@@ -835,7 +906,9 @@ impl Download {
         channel: vk_hub_proto::Channel<'_>,
     ) -> Vec<u8> {
         match self {
-            Download::Release => vk_hub_proto::download_message(node_id, digest, at, channel),
+            Download::Release | Download::RegistryRelease => {
+                vk_hub_proto::download_message(node_id, digest, at, channel)
+            }
             Download::Tools => vk_hub_proto::tools_download_message(node_id, digest, at, channel),
         }
     }
@@ -897,12 +970,21 @@ async fn download(
         Download::Release => anyhow::Ok((
             db.node(&id)?.map(|r| r.public_key),
             db.updating_to(&id, &sha, now)?,
-            db.release(&sha)?.map(|r| r.size),
+            db.release(&sha)?
+                .filter(|r| r.program() == "vk")
+                .map(|r| r.size),
         )),
         Download::Tools => anyhow::Ok((
             db.node(&id)?.map(|r| r.public_key),
             db.building_tools(&id, &sha, now)?,
             db.tools(&sha)?.map(|t| t.size),
+        )),
+        Download::RegistryRelease => anyhow::Ok((
+            db.registry(&id)?.map(|r| r.public_key),
+            db.registry_updating_to(&id, &sha, now)?,
+            db.release(&sha)?
+                .filter(|r| r.program() == crate::store::REGISTRY_PROGRAM)
+                .map(|r| r.size),
         )),
     })
     .await
@@ -933,11 +1015,16 @@ async fn download(
             match kind {
                 Download::Release => "this node has no update to that release under way",
                 Download::Tools => "this node has no tools build of that definition under way",
+                Download::RegistryRelease => {
+                    "this registry has no update to that release under way"
+                }
             },
         ));
     };
     let path = match kind {
-        Download::Release => crate::releases::path(hub.releases_dir()?, &sha256),
+        Download::Release | Download::RegistryRelease => {
+            crate::releases::path(hub.releases_dir()?, &sha256)
+        }
         Download::Tools => crate::tools::path(hub.tools_dir()?, &sha256),
     };
     let file = match tokio::fs::File::open(&path).await {
@@ -1017,8 +1104,9 @@ async fn download(
     Ok(resp)
 }
 
-/// `GET /v1/node`: answer the WebSocket handshake and run the `kind` of session on the
-/// upgraded connection, or 503 with every handshake permit taken.
+/// `GET /v1/node`, or a registry's `GET /v1/registry/session`: answer the WebSocket
+/// handshake and run the `kind` of session on the upgraded connection, or 503 with every
+/// handshake permit taken.
 fn upgrade(
     mut req: Request<Incoming>,
     hub: Arc<Hub>,
@@ -1080,6 +1168,7 @@ fn upgrade(
                 .await;
         match kind {
             PeerKind::Node => crate::session::run(ws, hub, peer, exported, permit).await,
+            PeerKind::Registry => crate::registries::run(ws, hub, peer, exported, permit).await,
         }
     });
     let mut resp = Response::new(full(Bytes::new()));

@@ -638,10 +638,15 @@ pub(super) fn forms(
             );
     }
     h.raw("</section><section><h2>Start a rollout</h2>");
+    // A rollout updates nodes, so only to a vk release.
+    let releases: Vec<&Release> = releases
+        .iter()
+        .filter(|r| r.row.program() == "vk")
+        .collect();
     if releases.is_empty() || nodes.is_empty() {
         h.raw("<p class=\"empty\">")
             .raw(if releases.is_empty() {
-                "Add a release first."
+                "Add a vk release first."
             } else {
                 "No node has enrolled yet."
             })

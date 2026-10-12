@@ -27,10 +27,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops::{self, AccountOutcome, NodeView};
+use crate::registries::RegistryView;
 use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
 use crate::store::{
-    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, Tools, UiSession,
+    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, TokenKind, Tools, UiSession,
+};
+use vk_hub_proto::registry::{
+    Command as RegistryCommand, DesiredState as RegistryDesired, GcPolicy,
 };
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
@@ -69,6 +73,9 @@ const CHECK_WAIT: Duration = Duration::from_secs(2 * crate::fetch::CHECK_TIMEOUT
 enum Call {
     CreateToken {
         ttl_secs: u64,
+        /// What it enrolls; a node when absent, as before registries.
+        #[serde(default)]
+        kind: TokenKind,
     },
     ListNodes,
     /// Every node's workloads, or one node's: by ID, or by a hostname only it has.
@@ -104,6 +111,36 @@ enum Call {
         /// A release key's signature, base64.
         #[serde(default)]
         signature: Option<String>,
+        /// `vk-registry` for a registry's release; `vk` when absent.
+        #[serde(default)]
+        program: Option<String>,
+    },
+    ListRegistries,
+    ShowRegistry {
+        id: String,
+    },
+    RemoveRegistry {
+        id: String,
+    },
+    /// `None` gives it back to the registry's config.
+    SetRegistryReadOnly {
+        id: String,
+        read_only: Option<bool>,
+    },
+    /// `None` stops scheduled gc.
+    SetRegistryGc {
+        id: String,
+        gc: Option<GcPolicy>,
+    },
+    RegistryGc {
+        id: String,
+        retention_days: u64,
+        grace_days: u64,
+        dry_run: bool,
+    },
+    UpdateRegistry {
+        id: String,
+        release: String,
     },
     /// Download a release's `vk` from the configured repository: `None` for the latest.
     FetchRelease {
@@ -408,12 +445,18 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     )?;
     let actor = format!("uid {uid}");
     let value = match envelope.call {
-        Call::CreateToken { ttl_secs } => {
-            let (token, expires_at) =
-                hub.db
-                    .create_token(Duration::from_secs(ttl_secs), &actor, crate::now_secs())?;
+        Call::CreateToken { ttl_secs, kind } => {
+            let (token, expires_at) = hub.db.create_token_for(
+                kind,
+                Duration::from_secs(ttl_secs),
+                &actor,
+                crate::now_secs(),
+            )?;
             // The token itself is never logged: it is the credential.
-            eprintln!("vk-hub: admin: uid {uid} issued an enrollment token valid for {ttl_secs}s");
+            eprintln!(
+                "vk-hub: admin: uid {uid} issued a {} enrollment token valid for {ttl_secs}s",
+                kind.name()
+            );
             serde_json::to_value(CreatedToken { token, expires_at })?
         }
         Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
@@ -436,9 +479,52 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             path,
             version,
             signature,
+            program,
         } => serde_json::to_value(crate::releases::add(
-            hub, &actor, &path, &version, signature,
+            hub,
+            &actor,
+            &path,
+            program.as_deref(),
+            &version,
+            signature,
         )?)?,
+        Call::ListRegistries => serde_json::to_value(crate::registries::views(hub)?)?,
+        Call::ShowRegistry { id } => serde_json::to_value(crate::registries::detail(hub, &id)?)?,
+        Call::RemoveRegistry { id } => {
+            let removed = crate::registries::remove(hub, &actor, &id)?;
+            eprintln!(
+                "vk-hub: admin: uid {uid} removed registry {} ({})",
+                vk_hub_proto::display_safe(&id),
+                if removed {
+                    "applied"
+                } else {
+                    "no such registry"
+                }
+            );
+            serde_json::to_value(removed)?
+        }
+        Call::SetRegistryReadOnly { id, read_only } => {
+            serde_json::to_value(crate::registries::read_only(hub, &actor, &id, read_only)?)?
+        }
+        Call::SetRegistryGc { id, gc } => {
+            serde_json::to_value(crate::registries::gc_schedule(hub, &actor, &id, gc)?)?
+        }
+        Call::RegistryGc {
+            id,
+            retention_days,
+            grace_days,
+            dry_run,
+        } => serde_json::to_value(crate::registries::gc(
+            hub,
+            &actor,
+            &id,
+            retention_days,
+            grace_days,
+            dry_run,
+        )?)?,
+        Call::UpdateRegistry { id, release } => {
+            serde_json::to_value(crate::registries::update(hub, &actor, &id, &release)?)?
+        }
         Call::FetchRelease { .. } | Call::LatestRelease => {
             bail!("a fetch is served on its own path")
         }
@@ -610,9 +696,70 @@ impl Client {
         })
     }
 
-    pub fn create_token(&self, ttl: Duration) -> Result<CreatedToken> {
+    pub fn create_token_for(&self, kind: TokenKind, ttl: Duration) -> Result<CreatedToken> {
         self.call(Call::CreateToken {
             ttl_secs: ttl.as_secs(),
+            kind,
+        })
+    }
+
+    pub fn list_registries(&self) -> Result<Vec<RegistryView>> {
+        self.call(Call::ListRegistries)
+    }
+
+    pub fn show_registry(
+        &self,
+        id: &str,
+    ) -> Result<Option<(RegistryView, Vec<crate::store::RegistryCommandRow>)>> {
+        self.call(Call::ShowRegistry { id: id.to_string() })
+    }
+
+    /// Whether there was such a registry to remove.
+    pub fn remove_registry(&self, id: &str) -> Result<bool> {
+        self.call(Call::RemoveRegistry { id: id.to_string() })
+    }
+
+    pub fn set_registry_read_only(
+        &self,
+        id: &str,
+        read_only: Option<bool>,
+    ) -> Result<Option<RegistryDesired>> {
+        self.call(Call::SetRegistryReadOnly {
+            id: id.to_string(),
+            read_only,
+        })
+    }
+
+    pub fn set_registry_gc(
+        &self,
+        id: &str,
+        gc: Option<GcPolicy>,
+    ) -> Result<Option<RegistryDesired>> {
+        self.call(Call::SetRegistryGc {
+            id: id.to_string(),
+            gc,
+        })
+    }
+
+    pub fn registry_gc(
+        &self,
+        id: &str,
+        retention_days: u64,
+        grace_days: u64,
+        dry_run: bool,
+    ) -> Result<RegistryCommand> {
+        self.call(Call::RegistryGc {
+            id: id.to_string(),
+            retention_days,
+            grace_days,
+            dry_run,
+        })
+    }
+
+    pub fn update_registry(&self, id: &str, release: &str) -> Result<RegistryCommand> {
+        self.call(Call::UpdateRegistry {
+            id: id.to_string(),
+            release: release.to_string(),
         })
     }
 
@@ -671,11 +818,13 @@ impl Client {
         path: &Path,
         version: &str,
         signature: Option<String>,
+        program: Option<&str>,
     ) -> Result<Release> {
         self.call(Call::AddRelease {
             path: path.to_path_buf(),
             version: version.to_string(),
             signature,
+            program: program.map(str::to_string),
         })
     }
 
@@ -896,7 +1045,9 @@ mod tests {
         tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
         let client = Client::connect(&path).unwrap();
         let created = tokio::task::spawn_blocking(move || {
-            client.create_token(Duration::from_secs(60)).unwrap()
+            client
+                .create_token_for(TokenKind::Node, Duration::from_secs(60))
+                .unwrap()
         })
         .await
         .unwrap();
@@ -907,7 +1058,9 @@ mod tests {
         let client = Client::connect(&path).unwrap();
         let (nodes, refused, removed) = tokio::task::spawn_blocking(move || {
             let nodes = client.list_nodes().unwrap();
-            let refused = client.create_token(Duration::ZERO).unwrap_err();
+            let refused = client
+                .create_token_for(TokenKind::Node, Duration::ZERO)
+                .unwrap_err();
             let id = nodes[0].id.clone();
             let removed = (
                 client.remove_node(&id).unwrap(),
@@ -1297,5 +1450,81 @@ mod tests {
         );
         let ended = dispatch(br#"{"v":1,"call":{"op":"ui-logout","id":null}}"#, &hub, 0).unwrap();
         assert_eq!(ended, 1);
+    }
+
+    /// Tokens requested without a kind by older CLIs enroll nodes.
+    #[test]
+    fn a_token_without_a_kind_enrolls_a_node() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let created: CreatedToken = serde_json::from_value(
+            dispatch(
+                br#"{"v":1,"call":{"op":"create-token","ttl_secs":60}}"#,
+                &hub,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            hub.db
+                .enroll(&created.token, "aa", "h", "peer p", crate::now_secs())
+                .unwrap(),
+            crate::store::Enrollment::Enrolled { .. }
+        ));
+    }
+
+    /// The registries calls, as the CLI sends them over the socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registries_are_served_over_the_socket() {
+        let dir = scratch("admin-registries");
+        let path = dir.join("admin.sock");
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+        tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
+        let client = Client::connect(&path).unwrap();
+        let hub2 = hub.clone();
+        tokio::task::spawn_blocking(move || {
+            let created = client
+                .create_token_for(TokenKind::Registry, Duration::from_secs(60))
+                .unwrap();
+            let crate::store::RegistryEnrollment::Enrolled { id } = hub2
+                .db
+                .enroll_registry(&created.token, "aa", "reg-1", "peer p", 1)
+                .unwrap()
+            else {
+                panic!("expected an enrollment");
+            };
+            let listed = client.list_registries().unwrap();
+            assert_eq!(
+                (listed.len(), listed[0].row.hostname.as_str()),
+                (1, "reg-1")
+            );
+            let desired = client.set_registry_read_only(&id, Some(true)).unwrap();
+            assert_eq!(desired.unwrap().read_only, Some(true));
+            assert_eq!(
+                client.set_registry_read_only(&id, Some(true)).unwrap(),
+                None
+            );
+            let gc = GcPolicy {
+                every_secs: 86_400,
+                retention_days: 30,
+                grace_days: 1,
+            };
+            assert_eq!(
+                client.set_registry_gc(&id, Some(gc)).unwrap().unwrap().gc,
+                Some(gc)
+            );
+            let command = client.registry_gc(&id, 7, 2, true).unwrap();
+            assert!(client.update_registry(&id, "abcdabcd").is_err());
+            let (view, commands) = client.show_registry(&id).unwrap().unwrap();
+            assert_eq!(view.row.desired.unwrap().gc, Some(gc));
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].command, command);
+            assert!(client.remove_registry(&id).unwrap());
+            assert!(!client.remove_registry(&id).unwrap());
+            assert!(client.show_registry(&id).unwrap().is_none());
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
