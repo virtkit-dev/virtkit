@@ -500,6 +500,12 @@ async fn submit(
         pipeline: match &ask.spec {
             JobSpec::GitlabCi(ci) => Some(ci.job.pipeline_id).filter(|&p| p > 0),
         },
+        // Hex only: it goes into a tooltip, and a commit is nothing else.
+        commit: match &ask.spec {
+            JobSpec::GitlabCi(ci) => Some(ci.sources.sha.to_ascii_lowercase()).filter(|s| {
+                !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+            }),
+        },
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,

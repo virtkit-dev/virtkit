@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A job's branch shows the commit it ran: on hover in the jobs table, and on its page.**
+
 ### Fixed
 
 - **vk-hub's jobs table no longer reflows on every live update.** Its columns have fixed

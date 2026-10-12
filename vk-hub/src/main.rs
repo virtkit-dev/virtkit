@@ -1576,6 +1576,7 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
         ("started", at(j.started_at)),
         ("finished", at(j.finished_at)),
         ("settled", at(j.settled_at)),
+        ("commit", j.commit.clone().unwrap_or_else(dash)),
         ("ran", j.ran_ms(now).map_or_else(dash, jobs::run_text)),
         (
             "peak memory",

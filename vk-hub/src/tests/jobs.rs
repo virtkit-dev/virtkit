@@ -2982,6 +2982,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3065,6 +3066,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3423,6 +3425,7 @@ fn a_job_is_shown_on_the_command_line() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);

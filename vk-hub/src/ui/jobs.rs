@@ -598,7 +598,7 @@ fn job_row(
         .raw("\"><div class=\"fit\">");
     cut_middle(h, project, PROJECT_TAIL);
     h.raw("</div></td><td title=\"")
-        .node(j.git_ref.as_deref().unwrap_or(""))
+        .node(&branch_title(j))
         .raw("\"><div class=\"fit\">");
     match &j.git_ref {
         Some(git_ref) => narrowing_cut(
@@ -835,6 +835,16 @@ fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], n
 
 /// Job `j`'s elapsed run time. While running, `data-since` holds its start time so
 /// `time.js` advances the duration each second between page updates.
+/// The branch's cell's tooltip: the branch whole, and the commit the job ran.
+fn branch_title(j: &JobRow) -> String {
+    match (j.git_ref.as_deref(), j.commit.as_deref()) {
+        (Some(git_ref), Some(commit)) => format!("{git_ref} @ {commit}"),
+        (Some(git_ref), None) => git_ref.to_string(),
+        (None, Some(commit)) => commit.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
 fn ran(h: &mut Html, j: &JobRow, now: u64) {
     let text = dash_or(j.ran_ms(now).map(crate::jobs::run_text));
     match j.running_since() {
@@ -867,6 +877,19 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
     }
     pages::kv_node(h, "Title", &j.title);
     pages::kv_node(h, "Project", j.project.as_deref().unwrap_or("-"));
+    if j.git_ref.is_some() || j.commit.is_some() {
+        // The branch, and the commit it ran: short, whole on hover.
+        let mut cell = Html::new();
+        cell.node(j.git_ref.as_deref().unwrap_or("-"));
+        if let Some(commit) = &j.commit {
+            cell.raw(" @ <code title=\"")
+                .text(commit)
+                .raw("\">")
+                .text(commit.get(..12).unwrap_or(commit))
+                .raw("</code>");
+        }
+        pages::kv_html(h, "Branch", &cell);
+    }
     let mut cell = Html::new();
     node_link(&mut cell, j, names);
     pages::kv_html(h, "Node", &cell);
