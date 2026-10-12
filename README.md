@@ -812,7 +812,8 @@ repository's tags, manifests and blobs, and `/dav/files/` is a plain-file area w
 `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway microVMs reuse each other's
 compiled units. In accounts mode, a key with `write:files/<dir>/*` fills the cache and one
 with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry gc`'s tag
-retention like any other tag. Set `webdav = false` in the server config to disable WebDAV.
+retention like any other tag, unless their manifest keeps or expires them. Set
+`webdav = false` in the server config to disable WebDAV.
 
 A registry that turns requests away, as a busy `vk-registry` does past its per-host
 connection cap, is waited out: `vk` retries a 503 or 429, or a connection closed before any

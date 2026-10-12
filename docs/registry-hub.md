@@ -113,7 +113,8 @@ else is refused. gc deletes
 too, since retention decides when an idle tag stops being a root: the hub refuses a retention
 or grace of 0 days, and the registry keeps floors of its own (`[hub] min_retention_days`,
 default 7, and `min_grace_days`, default 1) that the hub's windows may lengthen, never
-shorten.
+shorten. These floors bound the store-wide window only: a manifest annotated with its own
+retention or expiry is outside them, since any account with push rights sets those.
 
 **Losing the hub does not stop the registry.** It keeps serving content, checking tokens
 against the keys it pinned and the key table and revocation list it last received, and runs gc

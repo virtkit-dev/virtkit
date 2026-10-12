@@ -508,8 +508,10 @@ enum RegistryCmd {
     /// Garbage-collect a registry store
     ///
     /// It drops tags idle past the retention window, then sweeps the blobs no surviving
-    /// manifest references and the stale uploads (both after a grace window). It holds
-    /// the store lock exclusive, briefly blocking concurrent pushers.
+    /// manifest references and the stale uploads (both after a grace window). A tag whose
+    /// manifest is annotated `org.virtkit.retention=keep` is never dropped, and one
+    /// annotated `org.virtkit.expires=<unix seconds>` is dropped once that time passes,
+    /// used or not. It holds the store lock exclusive, briefly blocking concurrent pushers.
     Gc {
         /// store directory [default: the store the build cache uses]
         ///
@@ -518,6 +520,9 @@ enum RegistryCmd {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// drop tags unused for more than this many days
+        ///
+        /// A tag whose manifest keeps or expires it (`org.virtkit.retention`,
+        /// `org.virtkit.expires`) follows that instead.
         #[arg(long, default_value_t = 30, value_name = "DAYS")]
         retention_days: u64,
         /// keep unreferenced blobs and stale uploads this many days past their last use

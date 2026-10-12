@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Pushed manifests can control tag retention.** `org.virtkit.retention=keep` keeps
+  their tags indefinitely; `org.virtkit.expires=<unix seconds>` expires them at that
+  time, even if still in use. Both `vk-registry gc` and `vk registry gc` honour these
+  annotations.
+
 ### Changed
 
 - **Compose files accept YAML merge keys.** `<<: *base` merges an anchor defined elsewhere
