@@ -3448,17 +3448,22 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     for want in [
         // 61 and 10 seconds.
         "104 jobs · 50% of 2 finished succeeded · median run of finished jobs 35s",
-        "<a href=\"/jobs?name=build-102\">build-102</a> \
-         <a href=\"https://gitlab.example.com/acme/web/-/jobs/102\" target=\"_blank\" \
-         rel=\"noopener noreferrer\">↗</a></td><td>acme/web</td>\
-         <td><a href=\"/jobs?ref=main\">main</a></td><td>-</td>",
+        "<a href=\"/jobs?name=build-102\"><span class=\"mid\"><span class=\"head\">build-102\
+         </span></span></a> <a href=\"https://gitlab.example.com/acme/web/-/jobs/102\" \
+         target=\"_blank\" rel=\"noopener noreferrer\">↗</a></div></td><td title=\"acme/web\">\
+         <div class=\"fit\"><span class=\"mid\"><span class=\"head\">acme/web</span></span>\
+         </div></td><td title=\"main\"><div class=\"fit\"><a href=\"/jobs?ref=main\">\
+         <span class=\"mid\"><span class=\"head\">main</span></span></a></div></td><td>-</td>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
         "<span class=\"badge ok\">success</span>",
         "<td class=\"num\">1m01s</td><td class=\"num\">3.0 GiB</td>\
          <td class=\"num\">2m00s</td><td class=\"num\">4 vCPUs, 8.0 GiB</td>",
         // Not a web link: no link to GitLab, for the job or its pipeline.
-        "<a href=\"/jobs?name=build-103\">build-103</a></td><td>acme/api</td>\
-         <td><a href=\"/jobs?ref=fix%2F%3Cx%3E\">fix/&lt;x&gt;</a></td>\
+        "<a href=\"/jobs?name=build-103\"><span class=\"mid\"><span class=\"head\">build-103\
+         </span></span></a></div></td><td title=\"acme/api\"><div class=\"fit\">\
+         <span class=\"mid\"><span class=\"head\">acme/api</span></span></div></td>\
+         <td title=\"fix/&lt;x&gt;\"><div class=\"fit\"><a href=\"/jobs?ref=fix%2F%3Cx%3E\">\
+         <span class=\"mid\"><span class=\"head\">fix/&lt;x&gt;</span></span></a></div></td>\
          <td><a href=\"/jobs?pipeline=77\">77</a></td>\
          <td><a href=\"/node/efefefefefefefefefefefefefefefef\"><code>efefefef</code></a></td>",
         // The job's pipeline, and its page on GitLab.
@@ -3572,7 +3577,10 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     );
     // A row narrows the page it is on.
     assert!(
-        page.contains("<a href=\"/jobs?name=build-104&amp;pipeline=77\">build-104</a>"),
+        page.contains(
+            "<a href=\"/jobs?name=build-104&amp;pipeline=77\"><span class=\"mid\">\
+             <span class=\"head\">build-104</span></span></a>"
+        ),
         "{page}"
     );
     let page = get(addr, "/jobs?name=build-1&ref=fix%2F%3C", Some(&viewer))

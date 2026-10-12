@@ -171,6 +171,33 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 table.grid tbody tr:hover td { background: var(--raised); }
 table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
 table.grid tr.down td, .rollout tr.failed td { color: var(--bad); }
+/* The jobs table keeps its columns where they are across live updates: fixed widths, sized for
+   the longest values the other columns show, the job, its project and its branch sharing what
+   is left, and text cut short (whole on hover) rather than widening a column. */
+section.jobs-table { overflow-x: auto; }
+table.grid.jobs { table-layout: fixed; min-width: 84rem; }
+/* What the fixed columns leave (74rem of them) goes to the branch, often long, and the job. */
+table.grid.jobs col.job { width: calc((100% - 74rem) * 0.4); }
+table.grid.jobs col.project { width: 8rem; }        /* git/proxies-rs */
+table.grid.jobs col.branch { width: calc((100% - 74rem) * 0.6); }
+table.grid.jobs td { overflow: hidden; text-overflow: ellipsis; }
+/* A long name loses its middle (`.mid`): its head is cut short, its tail stays. */
+table.grid.jobs .fit { display: flex; align-items: baseline; gap: 0.3em; min-width: 0; }
+table.grid.jobs .fit > a { display: flex; min-width: 0; }
+table.grid.jobs .fit > a + a { flex-shrink: 0; }
+.mid { display: inline-flex; min-width: 0; max-width: 100%; }
+/* The head keeps a few letters and its "…" before the tail gives way too, so a cut never
+   reads as a whole name. */
+.mid .head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 2.2em; }
+.mid .tail { flex-shrink: 0.001; overflow: hidden; white-space: pre; min-width: 0; }
+table.grid.jobs col.pipeline { width: 6.5rem; }   /* 509098 ↗ */
+table.grid.jobs col.node { width: 9rem; }         /* hq-srv41-rd-hv05 */
+table.grid.jobs col.result { width: 10rem; }      /* running: step_script */
+table.grid.jobs col.started { width: 11rem; }     /* 01:40 PM · 11 min ago */
+table.grid.jobs col.ran { width: 5.5rem; }
+table.grid.jobs col.mem { width: 7.5rem; }
+table.grid.jobs col.cpu { width: 6.5rem; }
+table.grid.jobs col.size { width: 9.5rem; }       /* 16 vCPUs, 32.0 GiB */
 table.kv { width: 100%; }
 table.kv th, table.kv td { text-align: left; padding: var(--s1) var(--s4) var(--s1) 0; vertical-align: top; }
 table.kv th { color: var(--muted); font-weight: 500; white-space: nowrap; width: 16rem; }

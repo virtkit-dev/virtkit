@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **vk-hub's jobs table no longer reflows on every live update.** Its columns have fixed
+  widths, sized for the longest values they show; the job and its branch share what is left,
+  and a name too long for its column loses its middle, keeping its start and its end, and is
+  shown whole on hover.
+
 ## [0.88.0] - 2026-10-11
 
 ### Added
