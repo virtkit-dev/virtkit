@@ -812,6 +812,11 @@ Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc
 local store. The central server and storage model are documented in
 [`vk-registry/DESIGN.md`](vk-registry/DESIGN.md).
 
+A `vk-hub` can manage registries (experimental): `vk-registry join` enrolls one, whose mode,
+database, keys and UI stay as they are; the hub then shows its health and usage and, within
+what the registry's `[hub] allow` lists, makes it read-only, schedules or runs its gc, and
+updates it on trial. See [`docs/registry-hub.md`](docs/registry-hub.md).
+
 ## Binaries
 
 | Binary | Purpose |

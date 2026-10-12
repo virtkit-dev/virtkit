@@ -131,8 +131,8 @@ generation: nothing the registry writes, nothing to back up.
 
 ### People in the browser
 
-`/browse`, `/upload` and `/settings/keys` stay on the registry, which serves the bytes;
-signing in moves to the hub:
+The registry keeps its UI — `/browse`, `/upload`, `/settings/keys` — and serves it itself.
+In `accounts` mode nothing changes. In `managed` mode only signing in moves to the hub:
 
 1. an unauthenticated browser request redirects to the hub's `/registry/login?registry=reg-1`;
 2. the hub signs the person in with its own OIDC session, and redirects back with a one-time,
@@ -141,8 +141,8 @@ signing in moves to the hub:
    expiry, under a key held in memory and regenerated at each start.
 
 Sessions need no table: a restart signs everyone out, logout clears the cookie, and the
-revocation list carries users to cut off before their cookie expires. `/settings/keys` becomes
-a link to the hub's key page.
+revocation list carries users to cut off before their cookie expires. `/settings/keys` lists
+the person's hub keys for this registry and links to the hub to create or revoke one.
 
 ### Scopes
 
@@ -164,7 +164,7 @@ means something.
 | admins, on the Unix socket | hub roles: operator for gc and captions, admin for deletions, updates and enrollment |
 | `repo_captions` | a file per repository in the store (`repos/<name>/caption`), set by command |
 | `vk-registry gc` by cron | gc scheduled in desired state, its reports on the hub |
-| failure memos and locks | unchanged: in memory, domain-scoped per the domains design |
+| failure memos and locks | unchanged for now: in memory on the registry, domain-scoped per the domains design. They are to move to the hub later, as a step of their own after managed mode |
 
 The admin socket stays, for an operator on the host: `status`, `gc`, and, when the hub is
 gone for good, leaving managed mode.
@@ -211,28 +211,98 @@ so an hour's outage costs nothing.
 
 ## Migration
 
-1. **Monitoring.** Enrollment and the session with inventory, heartbeat, usage and gc
-   reports, in any mode. Nothing about authentication changes; useful on its own.
-2. **Steering.** Desired state (gc schedule and windows, WebDAV, read-only) and commands, still
-   in any mode.
-3. **Hub tokens.** The hub's token endpoint and the registry's checks, in `accounts` mode next
-   to `vkr_` keys: this is step 1 of the domains design's migration.
-4. **Managed mode.** `vk-hub registries import reg-1 accounts.db` turns users into hub users
-   (matched on OIDC issuer and subject), keeps API keys working by importing their hashes and
-   scopes as hub keys, and moves captions into the store; then the registry restarts in
-   `managed` and `accounts.db` is archived.
-5. **Updates** of `vk-registry` through rollouts.
+The path is a series of releases. Each one is opt-in on the registry, changes nothing for
+clients unless its row says so, and can be undone by the operator on the registry host
+alone.
 
-Each step ships on its own and leaves the registry working without the next.
+| Step | What the operator does | What changes for clients | Undo |
+|---|---|---|---|
+| 1. Registration and monitoring | `vk-hub token create --kind registry`, then `vk-registry join` on the registry host | nothing: same URL, same mode, same keys, same UI | `vk-registry leave`, or delete `<root>/hub/`; the registry runs as before |
+| 2. Steering | allow commands in `[hub] allow`; set a gc schedule on the hub | nothing; gc may run from the hub's schedule instead of cron | empty `[hub] allow`; the last applied policy is dropped with it |
+| 3. Updates | add `release_keys` to `[hub]`; upload `vk-registry` releases to the hub | the registry restarts on the new version, as after a manual upgrade | the registry rolls back on its own when the new binary fails its trial; a downgrade needs `allow_downgrade` |
+| 4. Hub tokens | `[hub] tokens = true` | clients may also get tokens from the hub; `vkr_` keys and sessions keep working | `tokens = false` |
+| 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; `vkr_` keys keep working, now issued by the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted |
+| 6. Locks on the hub | to be designed | — | — |
+
+Steps 1 to 3 are implemented; their reference is below. Steps 4 and 5 follow the domains
+design; nothing in steps 1 to 3 depends on them, and a registry may stay at step 3.
+
+## Steps 1 to 3: reference
+
+A registry in any mode — `shared-secret` or `accounts` — can be enrolled; its database, its
+keys and its UI are untouched, and it serves exactly as before whether the hub is reachable
+or not. The hub sees it on its **Registries** page and through `vk-hub registries`.
+
+**Enrolling.**
+
+```sh
+vk-hub token create --kind registry | ssh reg-1 vk-registry join https://hub.example.com --token - [--ca FILE] [--config FILE]
+```
+
+A token is issued for a node or for a registry (`--kind`, a node by default), and enrolls
+nothing else: the registry has `POST /v1/registry/enroll`, a table of pinned keys of its own,
+and its session at `GET /v1/registry/session`, so neither kind of peer is ever taken for the
+other. `join` resolves the store root as `status` does (`--root`, `VK_REGISTRY_ROOT`, the
+`root` in `--config`, the shared store) and creates `<root>/hub/` (mode `0700`) with the
+registry's ed25519 key, the hub's URL, its CA bundle when given, and the registry ID the hub
+assigns; it prints the ID. A `serve` running at the time picks the enrollment up within a
+minute; one started later connects at start. `vk-registry leave` deletes `<root>/hub/`; a
+running `serve` reports until it restarts, and the hub keeps the registry, disconnected, until
+`vk-hub registries remove <id>`. The web UI's Registries page issues a registry token too.
+
+The session opens with the handshake every peer shares (hello, challenge, auth bound to the
+TLS connection), then speaks `vk_hub_proto::registry`'s messages, version 1. `vk node` and
+`vk-registry` share the client side in the `vk-peer` crate.
+
+**Monitoring.** The registry sends its inventory (version and binary sha256, listen address
+and TLS, mode, WebDAV, upstream prefixes, store filesystem size and free space, a hash of its
+config, what `[hub] allow` lists and whether updates must be signed) on connect and when it
+changes, a heartbeat at the interval the hub asks (connections open and the limit, uploads
+in flight, build-once locks held, free space), its store usage after each gc and every 10
+minutes (`status`'s figures, and its 256 largest repositories), and a report of what it
+applied and is doing. The hub keeps the latest of each: `vk-hub registries`, `vk-hub
+registries show <id>`, `/registries`, `/registry/<id>`.
+
+**Steering.** Desired state carries, each optional, with a generation applied at most once:
+
+- `read_only` (`vk-hub registries read-only <id> on|off|default`): refuse writes — pushes,
+  uploads, WebDAV writes, deletions — with 503 and `Retry-After`, while reads, sign-ins, key
+  management and the lock service go on. It holds across a restart of `serve`;
+- `gc` (`vk-hub registries gc-schedule <id> --every 1d [--retention-days 30] [--grace-days 1]
+  | --off`): the registry runs gc itself on that schedule, as `vk-registry gc` does.
+
+Commands are `gc` (`vk-hub registries gc <id> [--dry-run]`) and `update`, each journaled by the
+registry so one redelivered after a reconnect is answered with its outcome rather than run
+again. The registry applies a desired-state field or runs a command only when `[hub] allow`
+lists it (`read-only`, `gc`, `update`); anything else is refused, and reported as refused. An
+enrolled registry with no `[hub]` table is watched and nothing more.
+
+**Updates.** `vk-hub release add <file> --version V --program vk-registry` holds a
+`vk-registry` binary as `vk-hub` holds `vk` ones; nodes never update to it, nor registries to
+a `vk`. `vk-hub registries update <id> --release <sha256 prefix>` sends it. The registry:
+
+1. refuses it unless its version is not older than its own (or `[hub] allow_downgrade`), its
+   signature verifies against `[hub] release_keys` when signatures are required (by default,
+   once keys are listed), and the directory of the running binary is writable by its user;
+2. downloads it from `/v1/registry/releases/<sha256>` under its own signature, checks its
+   digest and size, and its `--version`;
+3. keeps the running binary under `<root>/hub/releases/`, records a trial, and executes the
+   release in its place, `alarm(2)` armed past a two-minute deadline. Open connections are
+   dropped, as by a restart;
+4. the release, once in session with the hub, installs itself over the running binary's path
+   by rename and reports the update done.
+
+Until then the installed binary is left as it is. Run `serve` under a supervisor that restarts
+it (`vk-registry install-service`): a release that crashes or hangs is restarted as the
+previous binary, which hands over again up to three starts, then takes the registry back and
+reports the update rolled back.
 
 ## Open questions
 
-- **Browse on the hub instead?** The hub could serve the catalog and manifests over the
-  session and leave only blob downloads to the registry, ending browser sessions on the
-  registry altogether. Costs a proxy of every page through the session.
 - **Key table size.** Fine for hundreds of keys; a fleet with per-project keys in the
   thousands would rather have the registry ask the hub per unknown key and cache the answer.
 - **Several registries.** A pull-through cache per site would want the same management; does
   one hub token name several registries (`aud` a list), or one per registry as proposed?
-- **Locks on the hub?** The build-once lock service lives in the registry today; with a hub in
-  every fleet it could move there, which would let a lock span registries.
+- **Locks on the hub.** Decided in principle, not designed: the build-once lock service moves to
+  the hub after managed mode, which would let a lock span registries. The open part is how a
+  lock outlives a hub restart.

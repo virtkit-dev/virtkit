@@ -35,8 +35,9 @@ embedded database, no replication.
   prints for the programs on its host, the hub's client API and the job spec. A node and the
   hub negotiate the protocol version on connect; a rolling update runs mixed versions by
   definition.
-- **`vk-registry`** — unchanged and operated separately. Nodes pull from it directly; the hub
-  is one of its clients.
+- **`vk-registry`** — operated separately. Nodes pull from it directly; the hub is one of its
+  clients. A registry may also enroll with the hub, which then watches it and, within what its
+  config allows, steers and updates it ([a registry the hub manages](registry-hub.md)).
 
 Where state lives:
 
