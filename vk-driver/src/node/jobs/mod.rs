@@ -91,6 +91,26 @@ const RESULT_REPEAT: Duration = Duration::from_secs(15);
 /// How long a driver may take to write its pid before a missing one means it is gone.
 const DRIVER_START: Duration = Duration::from_secs(10);
 
+/// A job's stage as last told the hub.
+#[derive(Clone, PartialEq)]
+struct Told {
+    stage: String,
+    /// What the stage was doing.
+    activity: Option<vk_hub_proto::dispatch::Activity>,
+    /// The VM's size, once prepare sized it.
+    guest: Option<vk_hub_proto::dispatch::GuestSize>,
+}
+
+impl Told {
+    fn running(self) -> RunState {
+        RunState::Running {
+            stage: self.stage,
+            activity: self.activity,
+            guest: self.guest,
+        }
+    }
+}
+
 /// A job the node holds, as the session follows it.
 struct Track {
     dir: PathBuf,
@@ -107,8 +127,8 @@ struct Track {
     /// Raised once the node's cleanup after the job's lost driver has ended, when one was
     /// started: the result is written then.
     cleaning: Option<Arc<AtomicBool>>,
-    /// The stage last told, and what it was doing.
-    told: Option<(String, Option<vk_hub_proto::dispatch::Activity>)>,
+    /// The stage last told, what it was doing, and the VM's size.
+    told: Option<Told>,
     result: Option<JobResult>,
     result_told: Option<Instant>,
     started: Instant,
@@ -275,13 +295,17 @@ impl Jobs {
             t.result_told = None;
             let stage = journal::read_stage(&t.dir);
             let activity = stage.as_deref().and_then(|s| stage_activity(&t.dir, s));
-            t.told = stage.clone().map(|s| (s, activity.clone()));
+            t.told = stage.map(|stage| Told {
+                stage,
+                activity,
+                guest: journal::read_guest(&t.dir),
+            });
             let finished = t.result.is_some();
             jobs.push(HeldJob {
                 job: id.clone(),
-                state: match (finished, stage) {
+                state: match (finished, &t.told) {
                     (true, _) => RunState::Finished,
-                    (false, Some(stage)) => RunState::Running { stage, activity },
+                    (false, Some(told)) => told.clone().running(),
                     (false, None) => RunState::Accepted,
                 },
                 output_len: journal::output_len(&t.dir),
@@ -391,6 +415,7 @@ impl Jobs {
                 (None, Some(stage)) => RunState::Running {
                     activity: stage_activity(&t.dir, &stage),
                     stage,
+                    guest: journal::read_guest(&t.dir),
                 },
                 (None, None) => RunState::Accepted,
             };
@@ -666,14 +691,21 @@ impl Jobs {
                 if let Some(stage) = journal::read_stage(&t.dir)
                     && t.result.is_none()
                 {
-                    let activity = stage_activity(&t.dir, &stage);
-                    let told = (stage, activity);
+                    let told = Told {
+                        activity: stage_activity(&t.dir, &stage),
+                        stage,
+                        // Once sized, the VM keeps its size: read it until it is known.
+                        guest: t
+                            .told
+                            .as_ref()
+                            .and_then(|told| told.guest)
+                            .or_else(|| journal::read_guest(&t.dir)),
+                    };
                     if t.told.as_ref() != Some(&told) {
                         t.told = Some(told.clone());
-                        let (stage, activity) = told;
                         msgs.push(NodeJobMsg::Job {
                             job: id.clone(),
-                            state: RunState::Running { stage, activity },
+                            state: told.running(),
                         });
                     }
                 }
@@ -1146,6 +1178,7 @@ pub(crate) mod tests {
         let preparing = |activity| RunState::Running {
             stage: "prepare_executor".into(),
             activity,
+            guest: None,
         };
         std::fs::write(job_dir.join(journal::STAGE), "prepare_executor").unwrap();
         assert_eq!(told(), [preparing(None)]);
@@ -1160,11 +1193,23 @@ pub(crate) mod tests {
         // Past preparing, what the job's supervisor says, starting a service, is not the stage's.
         std::fs::write(job_dir.join(journal::STAGE), "step_script").unwrap();
         journal::write_json(&job_dir.join(journal::ACTIVITY), &building).unwrap();
-        let scripting = RunState::Running {
+        let mut scripting = RunState::Running {
             stage: "step_script".into(),
             activity: None,
+            guest: None,
         };
         assert_eq!(told(), std::slice::from_ref(&scripting));
+        // Report the prepared VM's size once, and include it in held stages.
+        let size = vk_hub_proto::dispatch::GuestSize {
+            cpus: 4,
+            mem_mib: 8192,
+        };
+        journal::write_json(&job_dir.join(journal::GUEST), &size).unwrap();
+        if let RunState::Running { guest, .. } = &mut scripting {
+            *guest = Some(size);
+        }
+        assert_eq!(told(), std::slice::from_ref(&scripting));
+        assert_eq!(told(), []);
         let NodeJobMsg::Held(held) = jobs.held(now) else {
             panic!("not held");
         };

@@ -301,11 +301,7 @@ impl Driver {
         self.set_stage("prepare_executor");
         self.trace.section_start("prepare_executor");
         self.header("Preparing the \"vk\" executor");
-        let preparing = Instant::now();
-        let prepared = self
-            .executor("prepare", &[], Some((Phase::Before, None)))
-            .await;
-        self.prepared_in = Some(preparing.elapsed());
+        let prepared = self.prepare().await;
         self.trace.section_end("prepare_executor");
         match prepared {
             Ok(End::Ok) => {}
@@ -578,6 +574,31 @@ impl Driver {
             trace: &self.trace,
             scratch,
             cancel: &self.stopped,
+        }
+    }
+
+    /// Time the executor's prepare and record the VM size on success.
+    async fn prepare(&mut self) -> Result<End> {
+        let preparing = Instant::now();
+        let prepared = self
+            .executor("prepare", &[], Some((Phase::Before, None)))
+            .await;
+        self.prepared_in = Some(preparing.elapsed());
+        if matches!(prepared, Ok(End::Ok)) {
+            self.note_guest_size();
+        }
+        prepared
+    }
+
+    /// Record the prepared VM's size for the node to report with the job's stages.
+    fn note_guest_size(&self) {
+        if let Ok((cpus, mem_mib)) = crate::vm::declared_size(&self.ctx) {
+            // A failure only leaves the size unknown while the job runs: its result's usage
+            // carries it too.
+            let _ = journal::write_json(
+                &self.dir.join(journal::GUEST),
+                &vk_hub_proto::dispatch::GuestSize { cpus, mem_mib },
+            );
         }
     }
 
@@ -963,19 +984,7 @@ mod tests {
         let f = Fixture::stamped("driver-run", "https://gitlab.example");
         // Stands in for `vk gitlab run`.
         let exe = fake_vk(&f, "#!/bin/sh\necho out\necho err >&2\n");
-        let timeout = Duration::from_secs(60);
-        let driver = Driver {
-            ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
-            env: Vec::new(),
-            dir: f.dir.clone(),
-            job: f.job.clone(),
-            trace: f.trace.clone(),
-            exe,
-            deadline: Instant::now() + timeout,
-            timeout,
-            stopped: CancellationToken::new(),
-            prepared_in: None,
-        };
+        let driver = driver(&f, exe);
         let end = driver
             .executor("run", &[], Some((Phase::Steps, None)))
             .await;
@@ -988,6 +997,23 @@ mod tests {
             .collect();
         lines.sort_unstable();
         assert_eq!(lines, ["01E err", "01O out"], "{output:?}");
+    }
+
+    /// A driver of `f`'s job with the default config, running `exe` as its `vk`.
+    fn driver(f: &Fixture, exe: PathBuf) -> Driver {
+        let timeout = Duration::from_secs(60);
+        Driver {
+            ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
+            env: Vec::new(),
+            dir: f.dir.clone(),
+            job: f.job.clone(),
+            trace: f.trace.clone(),
+            exe,
+            deadline: Instant::now() + timeout,
+            timeout,
+            stopped: CancellationToken::new(),
+            prepared_in: None,
+        }
     }
 
     /// `script`, as the `vk` a driver of `f` runs. Written by `cp`, not here: a file this
@@ -1024,19 +1050,7 @@ mod tests {
             "#!/bin/sh\n[ -z \"$VK_JOB_ACTIVITY\" ] || \
              echo '{\"kind\":\"building\",\"image\":\"img\"}' > \"$VK_JOB_ACTIVITY\"\n",
         );
-        let timeout = Duration::from_secs(60);
-        let driver = Driver {
-            ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
-            env: Vec::new(),
-            dir: f.dir.clone(),
-            job: f.job.clone(),
-            trace: f.trace.clone(),
-            exe,
-            deadline: Instant::now() + timeout,
-            timeout,
-            stopped: CancellationToken::new(),
-            prepared_in: None,
-        };
+        let driver = driver(&f, exe);
         let run = |cmd| driver.executor(cmd, &[], Some((Phase::Before, None)));
         assert_eq!(run("run").await.unwrap(), End::Ok);
         assert_eq!(journal::read_activity(&f.dir), None);
@@ -1049,6 +1063,29 @@ mod tests {
         );
         driver.set_stage("get_sources");
         assert_eq!(journal::read_activity(&f.dir), None);
+    }
+
+    /// The VM's size is recorded once prepare has sized it, and not when prepare fails.
+    #[tokio::test]
+    async fn a_prepared_job_records_its_vm_s_size() {
+        for (name, script, sized) in [
+            ("driver-sized", "#!/bin/sh\n", true),
+            ("driver-unsized", "#!/bin/sh\nexit 1\n", false),
+        ] {
+            let f = Fixture::stamped(name, "https://gitlab.example");
+            let exe = fake_vk(&f, script);
+            let mut driver = driver(&f, exe);
+            let size = crate::vm::declared_size(&driver.ctx).unwrap();
+            assert_eq!(driver.prepare().await.unwrap() == End::Ok, sized, "{name}");
+            assert_eq!(
+                journal::read_guest(&f.dir),
+                sized.then_some(vk_hub_proto::dispatch::GuestSize {
+                    cpus: size.0,
+                    mem_mib: size.1,
+                }),
+                "{name}"
+            );
+        }
     }
 
     #[test]

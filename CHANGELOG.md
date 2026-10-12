@@ -38,6 +38,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A running job's size is its VM's, once its node has sized it.** The jobs table and job
+  page showed the reservation vk-gitlab asked for, which is not the VM the job gets; they now
+  show "-" until the job's preparation sizes the VM, and the size the node gave it from then
+  on, in `vk-hub jobs show` too.
 - **A host checkout no longer fails on a branch named under a deleted one** (`a/b` after `a`
   was deleted, or the reverse) when a runner reuses its checkout.
 - **vk-hub's jobs table no longer jumps around on live updates.** A job, project or branch

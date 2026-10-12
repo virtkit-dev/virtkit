@@ -26,6 +26,8 @@ pub const OUTPUT: &str = "output";
 pub const STAGE: &str = "stage";
 /// What the stage does, when prepare says ([`crate::activity`]): JSON.
 pub const ACTIVITY: &str = "activity.json";
+/// The size of the job's VM, once prepare sized it: JSON.
+pub const GUEST: &str = "guest.json";
 pub const CANCEL: &str = "cancel";
 pub const RESULT: &str = "result.json";
 pub const DRIVER_LOG: &str = "driver.log";
@@ -74,9 +76,20 @@ pub fn read_stage(dir: &Path) -> Option<String> {
 /// What the job's stage does, as its prepare last said; `None` when it said nothing, or
 /// nothing this node can read.
 pub fn read_activity(dir: &Path) -> Option<vk_hub_proto::dispatch::Activity> {
+    read_small(&dir.join(ACTIVITY))
+}
+
+/// The size of the job's VM, once its prepare has sized it.
+pub fn read_guest(dir: &Path) -> Option<vk_hub_proto::dispatch::GuestSize> {
+    read_small(&dir.join(GUEST))
+}
+
+/// The JSON at `path`, which the job's driver, or its prepare, writes; `None` when absent,
+/// unreadable, or larger than any it writes.
+fn read_small<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    std::fs::File::open(dir.join(ACTIVITY))
+    std::fs::File::open(path)
         .ok()?
         .take(4097)
         .read_to_end(&mut bytes)

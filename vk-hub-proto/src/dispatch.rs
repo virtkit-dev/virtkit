@@ -234,9 +234,20 @@ pub enum RunState {
         stage: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<Activity>,
+        /// The size of the job's VM, once its preparation has sized it. A hub older than it
+        /// reads the stage alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest: Option<GuestSize>,
     },
     /// Ended; the result follows in [`NodeJobMsg::Result`].
     Finished,
+}
+
+/// The size a node gave a job's VM: what the job asked for, within the node's ceilings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestSize {
+    pub cpus: u32,
+    pub mem_mib: u64,
 }
 
 /// What a job's stage is doing, as far as the node can tell: preparing, building or pulling an
@@ -326,6 +337,7 @@ mod tests {
                     state: RunState::Running {
                         stage: "step_script".into(),
                         activity: None,
+                        guest: None,
                     },
                     output_len: 8192,
                     finished: false,
@@ -524,6 +536,10 @@ mod tests {
                 building: true,
                 holder: Some("https://gitlab.example.com/g/p/-/jobs/1".into()),
             }),
+            guest: Some(GuestSize {
+                cpus: 8,
+                mem_mib: 16384,
+            }),
         };
         let value = serde_json::to_value(&state).unwrap();
         assert_eq!(
@@ -537,6 +553,7 @@ mod tests {
                     "building": true,
                     "holder": "https://gitlab.example.com/g/p/-/jobs/1",
                 },
+                "guest": {"cpus": 8, "mem_mib": 16384},
             })
         );
         assert_eq!(serde_json::from_value::<RunState>(value).unwrap(), state);
@@ -547,7 +564,8 @@ mod tests {
             bare,
             RunState::Running {
                 stage: "step_script".into(),
-                activity: None
+                activity: None,
+                guest: None
             }
         );
         let later: Activity = serde_json::from_value(json!({"kind": "compiling"})).unwrap();

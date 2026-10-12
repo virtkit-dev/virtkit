@@ -251,9 +251,12 @@ one offering at most 2 is steered and never offered a job.
 | `held {reservations, jobs}` | everything the node holds, once per session after its report |
 | `offer_reply {reservation, reply}` | `accepted {lease_secs}` or `refused {reason, message?}` |
 | `lease {reservation, state}` | `held {remaining_secs}` or `gone {why}`: `expired`, `released`, `started`, `unknown` |
-| `job {job, state}` | `accepted`, `refused {reason, message?}`, `running {stage}`, `finished` |
+| `job {job, state}` | `accepted`, `refused {reason, message?}`, `running {stage, activity?, guest? {cpus, mem_mib}}`, `finished` |
 | `output {job, offset, data}` | output bytes from `offset`, base64, at most 256 KiB |
 | `result {job, result}` | how the job ended; repeated until `recorded` |
+
+A `running` state's `guest` is the size of the job's VM, once its prepare has sized it; a hub
+older than it ignores it.
 
 Refusal reasons are `memory`, `disk`, `cpus`, `not_ready` (draining, drained, quarantined, in
 maintenance), `policy`, `no_reservation`, `invalid`, `ceiling` (the node's placed jobs not

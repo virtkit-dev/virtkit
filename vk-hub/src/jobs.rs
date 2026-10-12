@@ -55,7 +55,7 @@ use tokio::time::Instant;
 use vk_hub_proto::client::{
     CancelMode, Capacity, ErrorCode, JobState, JobView, Placement, ReservationGrant,
 };
-use vk_hub_proto::dispatch::Activity;
+use vk_hub_proto::dispatch::{Activity, GuestSize};
 use vk_hub_proto::dispatch::{
     Held, HubJobMsg, JobStart, LeaseEnd, LeaseState, MAX_LEASE_SECS, MAX_OUTPUT_CHUNK, NodeJobMsg,
     OfferReply, Refusal, RunState,
@@ -545,7 +545,14 @@ fn display_safe_activity(activity: Activity) -> Activity {
 }
 
 /// Record the node's `stage` and `activity` at `now`; retain activity only during preparation.
-fn note_stage(row: &mut JobRow, stage: &str, activity: Option<Activity>, now: u64) {
+/// Retain the VM size, `guest`, once reported by the node.
+fn note_stage(
+    row: &mut JobRow,
+    stage: &str,
+    activity: Option<Activity>,
+    guest: Option<GuestSize>,
+    now: u64,
+) {
     use crate::store::PREPARE_STAGE;
     // A job's runtime starts after preparation. Exclude cleanup after failed preparation
     // and jobs already past preparation when the hub started recording this boundary.
@@ -559,6 +566,8 @@ fn note_stage(row: &mut JobRow, stage: &str, activity: Option<Activity>, now: u6
     row.activity = activity
         .filter(|_| stage == PREPARE_STAGE)
         .map(display_safe_activity);
+    // Known once preparation sizes the VM; a node that has not yet says nothing.
+    row.guest = guest.or(row.guest);
 }
 
 /// What `activity` is, in a few words, for a badge: the image it names is on the job's page.
@@ -812,8 +821,13 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
                 job.spec = None;
             }
             // Where it is now: the node tells only what changes from here.
-            if let RunState::Running { stage, activity } = j.state {
-                note_stage(&mut job.row, &stage, activity, now);
+            if let RunState::Running {
+                stage,
+                activity,
+                guest,
+            } = j.state
+            {
+                note_stage(&mut job.row, &stage, activity, guest, now);
             }
             if job.row != before {
                 job.row.revision = job.row.revision.saturating_add(1);
@@ -1029,13 +1043,17 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                     ),
                 ));
             }
-            RunState::Running { stage, activity } => {
+            RunState::Running {
+                stage,
+                activity,
+                guest,
+            } => {
                 row.state = JobState::Running;
                 let now = crate::now_secs();
                 row.started_at.get_or_insert(now);
                 job.spec = None;
                 job.reservation = None;
-                note_stage(row, &stage, activity, now);
+                note_stage(row, &stage, activity, guest, now);
             }
             RunState::Finished => return Ok(Vec::new()),
         }
@@ -3022,6 +3040,15 @@ fn live_row<'s>(state: &'s State, id: &str) -> Option<&'s JobRow> {
     (state.jobs.get(id).map(|j| &j.row)).or_else(|| state.finished.get(id))
 }
 
+/// The size of job `j`'s VM ([`JobRow::vm_size`]), its memory written by `mem` from MiB:
+/// `4 vCPUs, 8.0 GiB`.
+pub(crate) fn size_text(j: &JobRow, mem: impl FnOnce(u64) -> String) -> Option<String> {
+    j.vm_size().map(|(cpus, mib)| {
+        let unit = if cpus == 1 { "vCPU" } else { "vCPUs" };
+        format!("{cpus} {unit}, {}", mem(mib))
+    })
+}
+
 /// A job's run or CPU time, `ms` milliseconds, to the second: `42s`, `3m05s`, `1h02m`.
 pub(crate) fn run_text(ms: u64) -> String {
     let s = ms / 1000;
@@ -3226,6 +3253,7 @@ mod tests {
             &mut row,
             "prepare_executor",
             Some(waiting.clone()),
+            None,
             NOW - 50,
         );
         assert_eq!(
@@ -3233,27 +3261,56 @@ mod tests {
             (None, "waiting for build")
         );
         // What a stage of its own does is not said: the job's supervisor starting a service.
-        note_stage(&mut row, "step_script", Some(waiting.clone()), NOW - 20);
+        note_stage(
+            &mut row,
+            "step_script",
+            Some(waiting.clone()),
+            None,
+            NOW - 20,
+        );
         assert_eq!(
             (&row.activity, state_text(&row).as_str()),
             (&None, "running: step_script")
         );
-        note_stage(&mut row, "after_script", None, NOW);
+        note_stage(&mut row, "after_script", None, None, NOW);
         assert_eq!(row.prepared_at, Some(NOW - 20));
         // Accepted, then straight past it.
         let mut row = sent("n", 2, Some(60)).row;
-        note_stage(&mut row, "get_sources", None, NOW);
+        note_stage(&mut row, "get_sources", None, None, NOW);
         assert_eq!(row.prepared_at, Some(NOW));
         // Past it before: the next stage is not where its preparation ended.
         let mut row = sent("n", 2, Some(60)).row;
         row.stage = Some("step_script".into());
-        note_stage(&mut row, "after_script", None, NOW);
+        note_stage(&mut row, "after_script", None, None, NOW);
         assert_eq!(row.prepared_at, None);
         // Nor is the cleanup after a failed prepare.
         let mut row = sent("n", 2, Some(60)).row;
-        note_stage(&mut row, "prepare_executor", Some(waiting), NOW - 20);
-        note_stage(&mut row, "cleanup", None, NOW);
+        note_stage(&mut row, "prepare_executor", Some(waiting), None, NOW - 20);
+        note_stage(&mut row, "cleanup", None, None, NOW);
         assert_eq!(row.prepared_at, None);
+    }
+
+    /// Retain the reported VM size and display it only when both dimensions are nonzero.
+    #[test]
+    fn a_job_keeps_its_vm_s_size_once_told() {
+        let mut row = sent("n", 2, Some(60)).row;
+        note_stage(&mut row, "prepare_executor", None, None, NOW - 50);
+        assert_eq!(row.vm_size(), None);
+        let size = GuestSize {
+            cpus: 4,
+            mem_mib: 8192,
+        };
+        note_stage(&mut row, "get_sources", None, Some(size), NOW - 20);
+        assert_eq!(row.guest, Some(size));
+        // A later stage that omits the size does not clear it.
+        note_stage(&mut row, "step_script", None, None, NOW);
+        assert_eq!(row.vm_size(), Some((4, 8192)));
+        // A zero dimension makes the size unknown.
+        row.guest = Some(GuestSize {
+            cpus: 0,
+            mem_mib: 8192,
+        });
+        assert_eq!(row.vm_size(), None);
     }
 
     /// A job lost while it prepares keeps that stage: all of its time was preparing.
@@ -3262,7 +3319,7 @@ mod tests {
         let mut state = State::default();
         for (id, stage) in [("p", "prepare_executor"), ("s", "step_script")] {
             let mut job = sent("n", 2, Some(60));
-            note_stage(&mut job.row, stage, None, NOW);
+            note_stage(&mut job.row, stage, None, None, NOW);
             state.jobs.insert(id.into(), job);
         }
         let mut lost = |id| {

@@ -1029,6 +1029,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
                 building: true,
                 holder: Some("https://gitlab.example.com/g/p/-/jobs/1".into()),
             }),
+            guest: None,
         },
     });
     view_until(addr, &key, &id, |v| {
@@ -1048,6 +1049,10 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         state: RunState::Running {
             stage: "step_script".into(),
             activity: None,
+            guest: Some(vk_hub_proto::dispatch::GuestSize {
+                cpus: 8,
+                mem_mib: 16384,
+            }),
         },
     });
     view_until(addr, &key, &id, |v| {
@@ -1056,7 +1061,12 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     .await;
     eventually(|| {
         hub.db.job(&id).unwrap().is_some_and(|row| {
-            row.activity.is_none()
+            row.guest
+                == Some(vk_hub_proto::dispatch::GuestSize {
+                    cpus: 8,
+                    mem_mib: 16384,
+                })
+                && row.activity.is_none()
                 && row.prepared_at.is_some()
                 && !row.preparing()
                 && crate::jobs::state_text(&row) == "running: step_script"
@@ -1331,6 +1341,7 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
             activity: Some(vk_hub_proto::dispatch::Activity::Building {
                 image: "img".into(),
             }),
+            guest: None,
         },
     });
     eventually(|| {
@@ -1391,6 +1402,10 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
                 state: RunState::Running {
                     stage: "step_script".into(),
                     activity: None,
+                    guest: Some(vk_hub_proto::dispatch::GuestSize {
+                        cpus: 2,
+                        mem_mib: 4096,
+                    }),
                 },
                 output_len: 40,
                 finished: false,
@@ -1428,12 +1443,14 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
             "{want:?} not in {answers:?}"
         );
     }
-    // Past preparing while the hub was away: its `held` says so, and the node tells no more.
+    // Preparation finished while the hub was away: `held` reports the stage and VM size
+    // without another stage update.
     let row = hub.db.job(&job).unwrap().unwrap();
     assert_eq!(
         (row.stage.as_deref(), &row.activity, row.preparing()),
         (Some("step_script"), &None, false)
     );
+    assert_eq!(row.vm_size(), Some((2, 4096)));
     assert!(row.prepared_at.is_some());
     node.send(output(&job, 15, b"after restart\n"));
     assert_eq!(
@@ -1568,6 +1585,7 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -2760,6 +2778,7 @@ async fn a_job_running_across_a_restart_keeps_its_image() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -2795,6 +2814,7 @@ async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -3060,6 +3080,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3160,6 +3181,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3239,6 +3261,7 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
         state: RunState::Running {
             stage: "step_script".into(),
             activity: None,
+            guest: None,
         },
     });
     wait_until(|| jobs.has_changed().unwrap()).await;
@@ -3522,6 +3545,10 @@ fn a_job_is_shown_on_the_command_line() {
         commit: Some("ab12".into()),
         activity: None,
         prepared_at: Some(1030),
+        guest: Some(vk_hub_proto::dispatch::GuestSize {
+            cpus: 2,
+            mem_mib: 4096,
+        }),
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);
@@ -3538,7 +3565,7 @@ fn a_job_is_shown_on_the_command_line() {
         "message      the VM did not boot\n".to_string(),
         "gitlab       https://gitlab.example.com/g/p/-/jobs/7\n".to_string(),
         "finished     1970-01-01T00:17:50Z\n".to_string(),
-        "prepared in  20s\nran          40s\n".to_string(),
+        "prepared in  20s\nran          40s\nsize         2 vCPUs, 4G\n".to_string(),
         "\nThe last 51 bytes of its output, masked as the node streamed it:\n\
          12:10:43 no kernel\n"
             .to_string(),
@@ -3549,6 +3576,9 @@ fn a_job_is_shown_on_the_command_line() {
     // A link that is not a plain web one is left out.
     row.job_url = Some("javascript:alert(1)".into());
     assert!(!render_job(&id, &row, None, 2000).contains("gitlab "));
+    // An unreported size is unknown.
+    row.guest = None;
+    assert!(render_job(&id, &row, None, 2000).contains("size         -\n"));
 }
 
 /// A spec's commit is kept lowercased, and only as hex no longer than a SHA-256.

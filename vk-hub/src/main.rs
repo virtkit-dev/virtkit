@@ -1697,6 +1697,10 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
         ),
         ("ran", j.ran_ms(now).map_or_else(dash, jobs::run_text)),
         (
+            "size",
+            jobs::size_text(j, workloads::size_mib).unwrap_or_else(dash),
+        ),
+        (
             "peak memory",
             usage
                 .and_then(|u| u.peak_mem_bytes)

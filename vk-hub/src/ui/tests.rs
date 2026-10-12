@@ -3384,6 +3384,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3433,6 +3434,12 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     failed.pipeline = Some(77);
     failed.started_at = Some(now - 20);
     failed.finished_at = Some(now - 10);
+    // What its reservation held is not the size of its VM, which its node did not say.
+    failed.placement.envelope = Envelope {
+        cpus: 8,
+        mem_mib: 16384,
+        disk_bytes: 0,
+    };
     submit(103, &failed);
     let mut running = job(
         104,
@@ -3446,6 +3453,10 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     running.pipeline = Some(77);
     running.stage = Some("step_script".into());
     running.started_at = Some(now - 90);
+    running.guest = Some(vk_hub_proto::dispatch::GuestSize {
+        cpus: 2,
+        mem_mib: 4096,
+    });
     submit(104, &running);
 
     let rows = |body: &str| body.matches("<tr><td title=").count();
@@ -3498,6 +3509,19 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         assert!(page.contains(want), "{want}: {page}");
     }
     assert!(!page.contains("href=\"javascript"), "{page}");
+    // The running job's size is its VM's, as its node said; the failed one's is not known.
+    let row_of = |name: &str| {
+        let row = page.split("<tr>").find(|r| r.contains(name)).unwrap();
+        row.split("</tr>").next().unwrap()
+    };
+    assert!(
+        row_of(">build-104<").ends_with("<td class=\"num\">2 vCPUs, 4.0 GiB</td>"),
+        "{page}"
+    );
+    assert!(
+        row_of(">build-103<").ends_with("<td class=\"num\">-</td>"),
+        "{page}"
+    );
     // Only the running job's duration advances.
     assert_eq!(page.matches("data-since=").count(), 1, "{page}");
     // Newest first.
@@ -3657,6 +3681,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     }
 }
 

@@ -524,6 +524,7 @@ async fn submit(
         expired_at: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     let redacted = match &ask.spec {
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),

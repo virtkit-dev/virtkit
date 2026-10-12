@@ -1165,9 +1165,9 @@ nodes resending output from the end of the stored file.
 output length, age, how long it ran (or has been running), its VM's peak memory, and what the
 job is. `vk-hub jobs show <id>` prints one job's record, one field per line: outcome, exit
 code, node message, GitLab page, node, pool, key, submission/start/finish/settlement times,
-run time and resource usage. It also prints the end of a finished job's output the hub kept,
-or before it is settled as much as settling would keep, made readable as in the web UI (below),
-so the job's escape sequences never reach the terminal.
+run time, VM size and resource usage. It also prints the end of a finished job's output the
+hub kept, or before it is settled as much as settling would keep, made readable as in the web
+UI (below), so the job's escape sequences never reach the terminal.
 The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 

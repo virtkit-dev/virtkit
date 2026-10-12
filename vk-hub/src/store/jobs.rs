@@ -128,6 +128,10 @@ pub struct JobRow {
     /// `None` during preparation or for an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_at: Option<u64>,
+    /// The size its node gave its VM, once its preparation sized it; `None` before, or from a
+    /// node that does not say. A finished job's usage says it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<vk_hub_proto::dispatch::GuestSize>,
     #[serde(default)]
     pub finished_at: Option<u64>,
     /// When its producer settled it and its output was dropped.
@@ -220,6 +224,19 @@ impl JobRow {
             .or(self.started_at)
             .filter(|_| self.state != JobState::Finished && self.result.is_none())
             .filter(|_| !self.preparing())
+    }
+
+    /// The size its node gave its VM, in vCPUs and MiB: from its usage once it ended, from its
+    /// stages once its preparation sized it, and unknown before or from a node that does not
+    /// say. Not the reservation's envelope: what the producer asked to hold, not what the job
+    /// got.
+    pub fn vm_size(&self) -> Option<(u32, u64)> {
+        let usage = self.result.as_ref().and_then(|r| r.usage);
+        let size = match usage.map(|u| (u.cpus, u.mem_mib)) {
+            Some((Some(cpus), Some(mem))) => Some((cpus, mem)),
+            _ => self.guest.map(|g| (g.cpus, g.mem_mib)),
+        };
+        size.filter(|&(cpus, mem)| cpus > 0 && mem > 0)
     }
 
     /// When its preparation started, while it goes on.
@@ -1088,6 +1105,7 @@ mod tests {
             commit: None,
             activity: None,
             prepared_at: None,
+            guest: None,
         }
     }
 
