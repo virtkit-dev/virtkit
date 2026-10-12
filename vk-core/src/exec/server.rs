@@ -817,9 +817,7 @@ async fn srv_run_cmd_tty(
 
     let (tx, rx) = mpsc::channel(super::DATA_CHANNEL_CAPACITY);
 
-    let writer = tokio::spawn(async move {
-        writer_task(rx, sink, req_id).await;
-    });
+    let writer = tokio::spawn(async move { writer_task(rx, sink, req_id).await });
 
     let tx_out = tx.clone();
     let mut copy_out = tokio::spawn(async move {
@@ -829,9 +827,14 @@ async fn srv_run_cmd_tty(
     // The reader reports a client that went away; the hang-up is this task's, which
     // reaps the command, so no signal can reach a group whose leader was reaped.
     let (gone_tx, mut gone) = oneshot::channel();
+    let (stop_reader, mut stop) = oneshot::channel::<()>();
     let client_stream_reader = tokio::spawn(async move {
         let disconnected = loop {
-            match stream.next().await {
+            let next = select! {
+                _ = &mut stop => break false,
+                next = stream.next() => next,
+            };
+            match next {
                 Some(Ok(Message::Data {
                     fd: messages::Fd::Stdin,
                     msg,
@@ -855,6 +858,7 @@ async fn srv_run_cmd_tty(
         if disconnected {
             let _ = gone_tx.send(());
         }
+        stream
     });
 
     let mut hung_up = false;
@@ -872,10 +876,9 @@ async fn srv_run_cmd_tty(
     };
 
     debug!("command [{req_id}] exit status: {status}");
-    // Await cancellation to drop the reader's half of the master; the task's
-    // cancellation error is expected.
-    client_stream_reader.abort();
-    let _ = client_stream_reader.await;
+    // Await the reader's end, which drops its half of the master.
+    let _ = stop_reader.send(());
+    let stream = client_stream_reader.await?;
     if hung_up {
         // the output copy is gone already
     } else if status.signal().is_some() {
@@ -895,7 +898,8 @@ async fn srv_run_cmd_tty(
         }))
         .await;
     drop(tx);
-    writer.await?;
+    let sink = writer.await?;
+    linger(req_id, stream, sink).await;
     info!("command [{req_id}] done ({status})");
 
     Ok(())
@@ -951,9 +955,7 @@ async fn srv_run_cmd(
 
     // async task to send messages using the unix socket
     // other tasks can use tx clones to send messages
-    let writer = tokio::spawn(async move {
-        writer_task(rx, sink, req_id).await;
-    });
+    let writer = tokio::spawn(async move { writer_task(rx, sink, req_id).await });
 
     // async task to read from stdout
     let tx_out = tx.clone();
@@ -992,9 +994,14 @@ async fn srv_run_cmd(
     // The reader reports a client that went away; the kill is this task's, which reaps
     // the command, so no signal can reach a group whose leader was reaped.
     let (gone_tx, mut gone) = oneshot::channel();
+    let (stop_reader, mut stop) = oneshot::channel::<()>();
     let client_stream_reader = tokio::spawn(async move {
         let disconnected = loop {
-            let client_msg = match stream.next().await {
+            let next = select! {
+                _ = &mut stop => break false,
+                next = stream.next() => next,
+            };
+            let client_msg = match next {
                 Some(Ok(msg)) => msg,
                 // EOF or framing error: the client is gone — it never closes the
                 // connection while the command runs (stdin end-of-input is signaled
@@ -1030,6 +1037,7 @@ async fn srv_run_cmd(
         if disconnected {
             let _ = gone_tx.send(());
         }
+        stream
     });
 
     let status = select! {
@@ -1052,9 +1060,9 @@ async fn srv_run_cmd(
             error: None,
         })
         .await;
-    // Await the reader's cancellation to drop the stdin channel and end write_stdin.
-    client_stream_reader.abort();
-    let _ = client_stream_reader.await;
+    // Await the reader's end, which drops the stdin channel and ends write_stdin.
+    let _ = stop_reader.send(());
+    let stream = client_stream_reader.await?;
     if status.signal().is_some() {
         copy_out.abort();
         copy_err.abort();
@@ -1077,7 +1085,8 @@ async fn srv_run_cmd(
         .await;
     debug!("command [{req_id}] execDone sent");
     drop(tx);
-    writer.await?;
+    let sink = writer.await?;
+    linger(req_id, stream, sink).await;
     info!("command [{req_id}] done ({status})");
 
     Ok(())
@@ -1212,11 +1221,32 @@ async fn reader_task<T: AsyncRead + Unpin>(
     debug!("command [{req_id}] done reading from {fd_kind} ({read_count} bytes)");
 }
 
-async fn writer_task(
-    mut rx: mpsc::Receiver<Message>,
-    mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
+/// How long a session waits, its last message sent, for the client to close the connection.
+const CLIENT_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// Keep the connection open, the session's last message sent, until the client closes it
+/// (within [`CLIENT_CLOSE_GRACE`]). Closing first may lose that message: libkrun's
+/// guest→host vsock bridge resets the guest's end of the stream when the host end closes,
+/// dropping what it has not delivered yet — the exit status of a command a guest runs over
+/// the host command channel.
+async fn linger(
     req_id: usize,
+    mut stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
+    sink: impl Sink<Message, Error = std::io::Error>,
 ) {
+    let closed = async { while let Some(Ok(_)) = stream.next().await {} };
+    if time::timeout(CLIENT_CLOSE_GRACE, closed).await.is_err() {
+        debug!("command [{req_id}] client still connected after its exit status, closing");
+    }
+    drop(sink);
+}
+
+/// Send what `rx` yields on `sink` until it ends or `sink` fails; give `sink` back.
+async fn writer_task<S: Sink<Message, Error = std::io::Error> + Unpin + Send + 'static>(
+    mut rx: mpsc::Receiver<Message>,
+    mut sink: S,
+    req_id: usize,
+) -> S {
     let (mut written_stdout, mut written_stderr) = (0, 0);
     while let Some(msg) = rx.recv().await {
         match &msg {
@@ -1239,6 +1269,7 @@ async fn writer_task(
     debug!(
         "command [{req_id}] network writer done (stdout:{written_stdout}, stderr:{written_stderr})"
     );
+    sink
 }
 
 #[cfg(test)]
