@@ -38,6 +38,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A command a guest runs on its host (`vk run --host-exec`) no longer occasionally loses
+  its exit status ("stream interrupted unexpectedly").**
 - **A running job's size is its VM's, once its node has sized it.** The jobs table and job
   page showed the reservation vk-gitlab asked for, which is not the VM the job gets; they now
   show "-" until the job's preparation sizes the VM, and the size the node gave it from then

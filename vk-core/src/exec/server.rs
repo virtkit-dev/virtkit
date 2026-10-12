@@ -284,7 +284,7 @@ fn wrap_cmd(mut cmd: CmdExec, wrapper: &ExecWrapper) -> CmdExec {
 async fn do_handle_conn(
     status: &Status,
     mut stream: SerStream,
-    mut sink: DeSink,
+    sink: DeSink,
     exec_wrapper: Option<&ExecWrapper>,
 ) -> Result<bool, anyhow::Error> {
     let client_request = stream.next().await.ok_or(anyhow!("no data"))??;
@@ -305,12 +305,9 @@ async fn do_handle_conn(
             }
         }
         Message::CmdStatus => {
-            let resp = sink
-                .send(Message::RespStatus {
-                    status: status.clone(),
-                })
-                .await;
-            resp.map_err(std::convert::Into::into).and(Ok(true))
+            let status = status.clone();
+            send_last(stream, sink, Message::RespStatus { status }).await?;
+            Ok(true)
         }
         Message::CmdConnect { target } => {
             // A wrapped channel is a restricted one (the host-exec allowlist a guest's
@@ -321,7 +318,7 @@ async fn do_handle_conn(
             // (the guest's own control port, as `vk exec`/`vk status` already use).
             if exec_wrapper.is_some() {
                 let msg = "connect is refused on a wrapped (host-exec) channel".to_string();
-                let _ = sink.send(Message::StartErr { msg: msg.clone() }).await;
+                let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                 return Err(anyhow!(msg));
             }
             let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -329,7 +326,7 @@ async fn do_handle_conn(
                 Ok(a) => a,
                 Err(e) => {
                     let msg = format!("invalid connect target {target:?}: {e:#}");
-                    let _ = sink.send(Message::StartErr { msg: msg.clone() }).await;
+                    let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                     return Err(anyhow!("connect [{req_id}] {msg}"));
                 }
             };
@@ -747,17 +744,15 @@ async fn srv_run_cmd_tty(
     let Some(tty) = &cmd.tty else { unreachable!() };
     if cmd.mode == RunMode::Background {
         let msg = "--tty is incompatible with --background".to_string();
-        sink.send(Message::StartErr { msg: msg.clone() }).await?;
+        send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await?;
         return Err(anyhow!("command [{req_id}] {msg}"));
     }
 
     let (master, slave) = match pty::openpty(tty.rows, tty.cols) {
         Ok(pair) => pair,
         Err(e) => {
-            sink.send(Message::StartErr {
-                msg: format!("openpty: {e}"),
-            })
-            .await?;
+            let msg = format!("openpty: {e}");
+            send_last(stream, sink, Message::StartErr { msg }).await?;
             return Err(anyhow!("command [{req_id}] openpty: {e}"));
         }
     };
@@ -802,7 +797,7 @@ async fn srv_run_cmd_tty(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            sink.send(Message::StartErr { msg: e.to_string() }).await?;
+            send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("command [{req_id}] error starting process: {e}"));
         }
     };
@@ -817,9 +812,7 @@ async fn srv_run_cmd_tty(
 
     let (tx, rx) = mpsc::channel(super::DATA_CHANNEL_CAPACITY);
 
-    let writer = tokio::spawn(async move {
-        writer_task(rx, sink, req_id).await;
-    });
+    let writer = tokio::spawn(writer_task(rx, sink, req_id));
 
     let tx_out = tx.clone();
     let mut copy_out = tokio::spawn(async move {
@@ -829,32 +822,41 @@ async fn srv_run_cmd_tty(
     // The reader reports a client that went away; the hang-up is this task's, which
     // reaps the command, so no signal can reach a group whose leader was reaped.
     let (gone_tx, mut gone) = oneshot::channel();
+    // `stop` cancels the reader wherever it waits, a write to a full pty included.
+    let (stop_reader, stop) = oneshot::channel::<()>();
     let client_stream_reader = tokio::spawn(async move {
-        let disconnected = loop {
-            match stream.next().await {
-                Some(Ok(Message::Data {
-                    fd: messages::Fd::Stdin,
-                    msg,
-                })) => {
-                    if master_write.write_all(&msg).await.is_err() {
-                        break false;
+        let read = async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(Message::Data {
+                        fd: messages::Fd::Stdin,
+                        msg,
+                    })) => {
+                        if master_write.write_all(&msg).await.is_err() {
+                            break false;
+                        }
                     }
+                    Some(Ok(Message::Resize { rows, cols })) => {
+                        // master_write (same underlying fd) outlives this task: the fd
+                        // stays valid for the ioctl
+                        let _ = pty::set_winsize(master_fd, rows, cols);
+                    }
+                    // no tty equivalent of half-closing stdin: ignore Close
+                    Some(Ok(_)) => {}
+                    None | Some(Err(_)) => break true,
                 }
-                Some(Ok(Message::Resize { rows, cols })) => {
-                    // master_write (same underlying fd) outlives this task: the fd
-                    // stays valid for the ioctl
-                    let _ = pty::set_winsize(master_fd, rows, cols);
-                }
-                // no tty equivalent of half-closing stdin: ignore Close
-                Some(Ok(_)) => {}
-                None | Some(Err(_)) => break true,
             }
+        };
+        let disconnected = select! {
+            _ = stop => false,
+            disconnected = read => disconnected,
         };
         // Its half of the master goes before the hang-up that follows.
         drop(master_write);
         if disconnected {
             let _ = gone_tx.send(());
         }
+        stream
     });
 
     let mut hung_up = false;
@@ -872,10 +874,13 @@ async fn srv_run_cmd_tty(
     };
 
     debug!("command [{req_id}] exit status: {status}");
-    // Await cancellation to drop the reader's half of the master; the task's
-    // cancellation error is expected.
-    client_stream_reader.abort();
-    let _ = client_stream_reader.await;
+    // Await the reader's end, which drops its half of the master.
+    let _ = stop_reader.send(());
+    // A panicked reader drops the stream: still report the exit without lingering.
+    let stream = client_stream_reader
+        .await
+        .inspect_err(|e| error!("command [{req_id}] client stream reader: {e}"))
+        .ok();
     if hung_up {
         // the output copy is gone already
     } else if status.signal().is_some() {
@@ -895,7 +900,10 @@ async fn srv_run_cmd_tty(
         }))
         .await;
     drop(tx);
-    writer.await?;
+    let sink = writer.await?;
+    if let Some(stream) = stream {
+        linger(stream, sink).await;
+    }
     info!("command [{req_id}] done ({status})");
 
     Ok(())
@@ -935,25 +943,23 @@ async fn srv_run_cmd(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            sink.send(Message::StartErr { msg: e.to_string() }).await?;
+            send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("command [{req_id}] error starting process: {e}",));
         }
     };
 
-    sink.send(Message::StartOK).await?;
-
     if cmd.mode == RunMode::Background {
         info!("command [{req_id}] background task started");
+        send_last(stream, sink, Message::StartOK).await?;
         return Ok(());
     }
+    sink.send(Message::StartOK).await?;
 
     let (tx, rx) = mpsc::channel(super::DATA_CHANNEL_CAPACITY);
 
     // async task to send messages using the unix socket
     // other tasks can use tx clones to send messages
-    let writer = tokio::spawn(async move {
-        writer_task(rx, sink, req_id).await;
-    });
+    let writer = tokio::spawn(writer_task(rx, sink, req_id));
 
     // async task to read from stdout
     let tx_out = tx.clone();
@@ -992,44 +998,53 @@ async fn srv_run_cmd(
     // The reader reports a client that went away; the kill is this task's, which reaps
     // the command, so no signal can reach a group whose leader was reaped.
     let (gone_tx, mut gone) = oneshot::channel();
+    // `stop` cancels the reader wherever it waits, a send to a full stdin channel included.
+    let (stop_reader, stop) = oneshot::channel::<()>();
     let client_stream_reader = tokio::spawn(async move {
-        let disconnected = loop {
-            let client_msg = match stream.next().await {
-                Some(Ok(msg)) => msg,
-                // EOF or framing error: the client is gone — it never closes the
-                // connection while the command runs (stdin end-of-input is signaled
-                // with a Close message, not by closing the socket)
-                None | Some(Err(_)) => break true,
-            };
-            match client_msg {
-                Message::Data {
-                    fd: messages::Fd::Stdin,
-                    msg,
-                } => {
-                    debug!("writing to stdin {} bytes", msg.len());
-                    if let Some(ref tx) = stdin_tx {
-                        let _ = tx.send(msg).await;
-                    } else {
-                        error!("attempt to write to stdin after it is closed");
-                        break false;
+        let read = async {
+            loop {
+                let client_msg = match stream.next().await {
+                    Some(Ok(msg)) => msg,
+                    // EOF or framing error: the client is gone — it never closes the
+                    // connection while the command runs (stdin end-of-input is signaled
+                    // with a Close message, not by closing the socket)
+                    None | Some(Err(_)) => break true,
+                };
+                match client_msg {
+                    Message::Data {
+                        fd: messages::Fd::Stdin,
+                        msg,
+                    } => {
+                        debug!("writing to stdin {} bytes", msg.len());
+                        if let Some(ref tx) = stdin_tx {
+                            let _ = tx.send(msg).await;
+                        } else {
+                            error!("attempt to write to stdin after it is closed");
+                            break false;
+                        }
                     }
-                }
-                Message::Close {
-                    fd: messages::Fd::Stdin,
-                    error,
-                } => {
-                    if let Some(err) = error {
-                        debug!("got close message on stdin with error {err}");
+                    Message::Close {
+                        fd: messages::Fd::Stdin,
+                        error,
+                    } => {
+                        if let Some(err) = error {
+                            debug!("got close message on stdin with error {err}");
+                        }
+                        debug!("closing stdin from msg");
+                        stdin_tx = None;
                     }
-                    debug!("closing stdin from msg");
-                    stdin_tx = None;
+                    _ => {}
                 }
-                _ => {}
             }
+        };
+        let disconnected = select! {
+            _ = stop => false,
+            disconnected = read => disconnected,
         };
         if disconnected {
             let _ = gone_tx.send(());
         }
+        stream
     });
 
     let status = select! {
@@ -1052,9 +1067,13 @@ async fn srv_run_cmd(
             error: None,
         })
         .await;
-    // Await the reader's cancellation to drop the stdin channel and end write_stdin.
-    client_stream_reader.abort();
-    let _ = client_stream_reader.await;
+    // Await the reader's end, which drops the stdin channel and ends write_stdin.
+    let _ = stop_reader.send(());
+    // A panicked reader drops the stream: still report the exit without lingering.
+    let stream = client_stream_reader
+        .await
+        .inspect_err(|e| error!("command [{req_id}] client stream reader: {e}"))
+        .ok();
     if status.signal().is_some() {
         copy_out.abort();
         copy_err.abort();
@@ -1077,7 +1096,10 @@ async fn srv_run_cmd(
         .await;
     debug!("command [{req_id}] execDone sent");
     drop(tx);
-    writer.await?;
+    let sink = writer.await?;
+    if let Some(stream) = stream {
+        linger(stream, sink).await;
+    }
     info!("command [{req_id}] done ({status})");
 
     Ok(())
@@ -1104,7 +1126,7 @@ async fn srv_run_connect(
             conn
         }
         Err(e) => {
-            sink.send(Message::StartErr { msg: e.to_string() }).await?;
+            send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("connect [{req_id}] {e:#}"));
         }
     };
@@ -1113,9 +1135,7 @@ async fn srv_run_connect(
     let (read_half, mut write_half) = tokio::io::split(conn);
     let (tx, rx) = mpsc::channel(super::DATA_CHANNEL_CAPACITY);
 
-    let writer = tokio::spawn(async move {
-        writer_task(rx, sink, req_id).await;
-    });
+    let writer = tokio::spawn(writer_task(rx, sink, req_id));
 
     let copy_out = tokio::spawn(async move {
         reader_task(req_id, messages::Fd::Stdout, read_half, tx).await;
@@ -1146,7 +1166,8 @@ async fn srv_run_connect(
 
     // The target closing (EOF on read_half) ends the session: reader_task has queued
     // Close{Stdout} and dropped its tx by the time this returns, so the writer below
-    // sees the channel close on its own.
+    // sees the channel close on its own. No linger after that Close: CmdConnect is only
+    // served host→guest, not over the guest→host bridge [`linger`] works around.
     copy_out.await?;
     client_stream_reader.abort();
     drop(client_stream_reader);
@@ -1212,11 +1233,43 @@ async fn reader_task<T: AsyncRead + Unpin>(
     debug!("command [{req_id}] done reading from {fd_kind} ({read_count} bytes)");
 }
 
-async fn writer_task(
-    mut rx: mpsc::Receiver<Message>,
-    mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
-    req_id: usize,
+/// Maximum wait for the client to close after the session's last message.
+const CLIENT_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// Wait up to [`CLIENT_CLOSE_GRACE`] for the client to close after the last message.
+/// Closing first can lose undelivered data, including a guest's host-command exit status:
+/// libkrun's guest→host vsock bridge can reset the guest's stream when the host end closes.
+/// On hang-up, `process_event` in
+/// third_party/libkrun/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+/// pushes a reset before reading the socket's remaining data.
+async fn linger(
+    mut stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
+    sink: impl Sink<Message, Error = std::io::Error>,
 ) {
+    let closed = async { while let Some(Ok(_)) = stream.next().await {} };
+    if time::timeout(CLIENT_CLOSE_GRACE, closed).await.is_err() {
+        debug!("client still connected after the session's last message, closing");
+    }
+    drop(sink);
+}
+
+/// Send `msg` as the session's last message, then [`linger`].
+async fn send_last(
+    stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
+    mut sink: impl Sink<Message, Error = std::io::Error> + Unpin,
+    msg: Message,
+) -> Result<(), std::io::Error> {
+    sink.send(msg).await?;
+    linger(stream, sink).await;
+    Ok(())
+}
+
+/// Send what `rx` yields on `sink` until it ends or `sink` fails; give `sink` back.
+async fn writer_task<S: Sink<Message, Error = std::io::Error> + Unpin + Send + 'static>(
+    mut rx: mpsc::Receiver<Message>,
+    mut sink: S,
+    req_id: usize,
+) -> S {
     let (mut written_stdout, mut written_stderr) = (0, 0);
     while let Some(msg) = rx.recv().await {
         match &msg {
@@ -1239,6 +1292,7 @@ async fn writer_task(
     debug!(
         "command [{req_id}] network writer done (stdout:{written_stdout}, stderr:{written_stderr})"
     );
+    sink
 }
 
 #[cfg(test)]

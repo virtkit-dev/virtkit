@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::{Stdin, client_run_connect};
 use vk_core::exec::server::run_server;
+use vk_core::framing::{DeSink, SerStream};
 use vk_core::messages::{CmdExec, Fd, Message, RunMode, Tty};
 use vk_core::net::connect;
 use vk_core::status::get_status;
@@ -746,4 +747,189 @@ async fn commands_run_back_to_back_without_forwarding_stdin() {
     assert_ne!(opened.as_raw_fd(), 0, "a run freed fd 0");
     drop(opened);
     assert_eq!(run("exit 0").await.code, Some(0));
+}
+
+/// Start `script` as an interactive exec on `tty` (or pipes) and wait for its StartOK.
+async fn start_exec(addr: &SocketAddr, script: &str, tty: Option<Tty>) -> (SerStream, DeSink) {
+    let (mut stream, mut sink) = connect(addr).await.unwrap();
+    sink.send(Message::CmdExec(CmdExec {
+        name: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        clear_env: false,
+        mode: RunMode::Interactive,
+        tty,
+        dir: None,
+        user: AMBIENT_USER,
+    }))
+    .await
+    .unwrap();
+    let first = timeout(Duration::from_secs(10), stream.next())
+        .await
+        .unwrap();
+    assert!(matches!(first.unwrap().unwrap(), Message::StartOK));
+    (stream, sink)
+}
+
+/// Read the session up to its ExecDone; return its exit code.
+async fn exec_done(stream: &mut SerStream) -> Option<i32> {
+    loop {
+        if let Message::ExecDone(result) = stream.next().await.unwrap().unwrap() {
+            return result.code;
+        }
+    }
+}
+
+/// The server waits for the client to close after its last message.
+async fn assert_lingers_until_client_closes(mut stream: SerStream, mut sink: DeSink) {
+    let early = timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(
+        early.is_err(),
+        "the server did not wait for the client: {early:?}"
+    );
+    sink.close().await.unwrap();
+    // well under the 2s grace: the server closed because the client did, not on its own
+    let end = timeout(Duration::from_secs(1), stream.next()).await;
+    assert!(
+        matches!(end, Ok(None)),
+        "the server kept the connection: {end:?}"
+    );
+}
+
+#[tokio::test]
+async fn exec_holds_the_connection_until_the_client_closes_it() {
+    let addr = start_server("exec-linger").await;
+    let (mut stream, sink) = start_exec(&addr, "exit 3", None).await;
+    let code = timeout(Duration::from_secs(10), exec_done(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(3));
+    assert_lingers_until_client_closes(stream, sink).await;
+}
+
+#[tokio::test]
+async fn tty_exec_holds_the_connection_until_the_client_closes_it() {
+    let addr = start_server("tty-linger").await;
+    let tty = Tty {
+        term: Some("xterm".into()),
+        rows: 24,
+        cols: 80,
+        modes: vec![],
+    };
+    let (mut stream, sink) = start_exec(&addr, "exit 3", Some(tty)).await;
+    let code = timeout(Duration::from_secs(10), exec_done(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(3));
+    assert_lingers_until_client_closes(stream, sink).await;
+}
+
+#[tokio::test]
+async fn background_start_ok_holds_the_connection_until_the_client_closes_it() {
+    let addr = start_server("background-linger").await;
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdExec(CmdExec {
+        name: "true".into(),
+        args: vec![],
+        env: vec![],
+        clear_env: false,
+        mode: RunMode::Background,
+        tty: None,
+        dir: None,
+        user: AMBIENT_USER,
+    }))
+    .await
+    .unwrap();
+    let reply = timeout(Duration::from_secs(10), stream.next())
+        .await
+        .unwrap();
+    assert!(matches!(reply.unwrap().unwrap(), Message::StartOK));
+    assert_lingers_until_client_closes(stream, sink).await;
+}
+
+#[tokio::test]
+async fn start_err_holds_the_connection_until_the_client_closes_it() {
+    let addr = start_server("connect-badaddr-linger").await;
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdConnect {
+        target: "vsock://not-a-port".into(),
+    })
+    .await
+    .unwrap();
+    let reply = timeout(Duration::from_secs(10), stream.next())
+        .await
+        .unwrap();
+    assert!(matches!(reply.unwrap().unwrap(), Message::StartErr { .. }));
+    assert_lingers_until_client_closes(stream, sink).await;
+}
+
+/// A client that never closes the connection does not hold the session past the 2s grace.
+#[tokio::test]
+async fn exec_closes_a_connection_the_client_never_closes() {
+    let addr = start_server("exec-linger-cut").await;
+    let (mut stream, _sink) = start_exec(&addr, "exit 0", None).await;
+    let code = timeout(Duration::from_secs(10), exec_done(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(0));
+    let started = Instant::now();
+    let end = timeout(Duration::from_secs(4), stream.next()).await;
+    assert!(
+        matches!(end, Ok(None)),
+        "the server kept the connection: {end:?}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "closed after {elapsed:?}"
+    );
+}
+
+/// A leftover process holds stdin unread while the client floods the pipe or pty
+/// and the session's stdin buffer. The session must still report the exit after
+/// the drain grace period.
+async fn exec_done_despite_unread_stdin(tag: &str, script: &str, tty: Option<Tty>) {
+    let addr = start_server(tag).await;
+    let (mut stream, mut sink) = start_exec(&addr, script, tty).await;
+    let flood = tokio::spawn(async move {
+        // short lines, so a canonical-mode pty queues them rather than discarding
+        let chunk = b"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n".repeat(64);
+        while sink
+            .send(Message::Data {
+                fd: Fd::Stdin,
+                msg: chunk.clone(),
+            })
+            .await
+            .is_ok()
+        {}
+    });
+    // the command runs 1s, then 500ms of drain grace
+    let code = timeout(Duration::from_secs(6), exec_done(&mut stream))
+        .await
+        .expect("no exit status while the client floods stdin");
+    assert_eq!(code, Some(0));
+    flood.abort();
+}
+
+/// Guards the reader's stop cancelling it mid-send, not only between messages.
+#[tokio::test]
+async fn exec_ends_when_a_leftover_process_holds_stdin_unread() {
+    exec_done_despite_unread_stdin("exec-stdin-flood", "exec 3<&0; sleep 5 <&3 & sleep 1", None)
+        .await;
+}
+
+/// Guards the reader's stop cancelling it mid-write, not only between messages.
+#[tokio::test]
+async fn tty_exec_ends_when_a_leftover_process_holds_the_pty_unread() {
+    exec_done_despite_unread_stdin(
+        "tty-stdin-flood",
+        "trap '' HUP; sleep 5 & sleep 1",
+        Some(Tty {
+            term: Some("xterm".into()),
+            rows: 24,
+            cols: 80,
+            modes: vec![],
+        }),
+    )
+    .await;
 }
