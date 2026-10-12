@@ -439,6 +439,12 @@ pub struct Executor {
     /// `[executor.vm] reclaim` is `"off"` (or `[executor.vm] balloon` is, which stops the
     /// trimming too).
     pub atop: bool,
+    /// Give a job VM with compose services a `vk` command that runs commands in them:
+    /// `vk exec --service NAME [-t] [--user U] [--dir D] [--env K=V] -- CMD…`, the host's `vk
+    /// exec` reached over the guest's host command channel and confined to that one form and
+    /// the job's own services — no host command, no other job. The job already reaches its
+    /// services over its network, so it grants nothing new. Default true.
+    pub guest_service_exec: bool,
     /// Seconds between samples. Must be at least 1. Default 10.
     pub atop_interval_secs: u64,
     /// How many days back the archive keeps beside today's, counted in whole UTC days rather
@@ -492,6 +498,7 @@ impl Default for Executor {
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
             checkout_tmpfs: true,
             atop: true,
+            guest_service_exec: true,
             atop_interval_secs: 10,
             atop_retention_days: 14,
             vm: Vm::default(),

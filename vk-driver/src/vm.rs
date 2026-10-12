@@ -1465,6 +1465,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let mut net_info: Option<(String, u32, String, String)> = None;
     // The job VM's switch attach (`net.mode = switch`): its NICs or vsock bridge.
     let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
+    // The job's services, by name, for its `vk exec --service` ([`service_exec`]).
+    let mut service_names: Vec<String> = Vec::new();
     match cfg.net.mode.as_str() {
         "none" => {}
         "tap" => {
@@ -1499,6 +1501,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // git-defined/`build:` service's the moment its build promotes it, an `image:`
             // service's fresh off `image::resolve_ref` — no gap either way.
             let services = plan_services(ctx, gateway, prefix, &mut use_guards)?;
+            service_names = services.iter().map(|s| s.name.clone()).collect();
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -1585,6 +1588,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
 
+    // The guest's `vk exec --service`: its host command channel, served below.
+    let service_exec = cfg.executor.guest_service_exec && !service_names.is_empty();
+    if service_exec {
+        cmdline.push_str(&format!(
+            " VIRTKIT_HOST_EXEC_PORT={} VIRTKIT_VK_CMD=1",
+            crate::run::HOST_EXEC_PORT
+        ));
+    }
+
     if !cfg.executor.vm.cmdline_extra.is_empty() {
         cmdline.push(' ');
         cmdline.push_str(&cfg.executor.vm.cmdline_extra);
@@ -1608,6 +1620,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),
             crate::run::SSH_AGENT_VSOCK_PORT,
+        ));
+    }
+    if service_exec {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(
+            &ctx.vsock_sock(),
+            crate::run::HOST_EXEC_PORT,
         ));
     }
 
@@ -1659,6 +1677,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             spawn_tied_logged(fwd, &ctx.ssh_agent_forward_log())
                 .context("spawning the ssh-agent forward")?,
         );
+    }
+    if service_exec {
+        children.push(spawn_service_exec_serve(ctx, &agent.path)?);
     }
     let vmm = crate::vmm::selected();
     // The one VMM spawn shared with `vk run`/`vk build`: it clears CLOEXEC on the
@@ -1745,6 +1766,177 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
         .arg("--max-conns")
         .arg(crate::run::SSH_AGENT_MAX_CONNS.to_string());
     Ok(Some(fwd))
+}
+
+/// The wrapper every command of the job VM's host command channel goes through, in the job dir.
+const SERVICE_EXEC_WRAPPER: &str = "service-exec";
+
+/// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk` dials — for
+/// its services' `vk exec` ([`spawn_service_exec_serve_at`]).
+fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
+    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent)
+}
+
+/// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
+/// serve`, every command forced through a wrapper that runs `vk gitlab service-exec <dir>`,
+/// which allows `vk exec --service` into the `svc-<name>` services under `dir` — a CI job's
+/// dir, or a `vk run --compose`'s — and nothing else. Its log is `dir/service-exec.log`.
+pub(crate) fn spawn_service_exec_serve_at(
+    vsock: &Path,
+    dir: &Path,
+    agent: &Path,
+) -> Result<std::process::Child> {
+    use std::os::unix::ffi::OsStrExt;
+    let quote = |p: &Path| {
+        let mut q = b"'".to_vec();
+        for &b in p.as_os_str().as_bytes() {
+            if b == b'\'' {
+                q.extend_from_slice(b"'\\''");
+            } else {
+                q.push(b);
+            }
+        }
+        q.push(b'\'');
+        q
+    };
+    // The binary by its path: `/proc/self/exe` would name the script's own shell.
+    let exe = std::env::current_exe().context("finding the vk binary")?;
+    let mut script = b"#!/bin/sh\nexec ".to_vec();
+    script.extend(quote(&exe));
+    script.extend_from_slice(b" gitlab service-exec ");
+    script.extend(quote(dir));
+    script.extend_from_slice(b" \"$@\"\n");
+    let wrapper = dir.join(SERVICE_EXEC_WRAPPER);
+    vk_fs::write_atomic(&wrapper, &script, 0o700)
+        .with_context(|| format!("writing {}", wrapper.display()))?;
+    let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
+    let mut cmd = Command::new(agent);
+    cmd.arg("-s")
+        .arg(&listen)
+        .arg("serve")
+        .arg("--exec-wrapper")
+        .arg(&wrapper)
+        .current_dir(dir);
+    spawn_tied_logged(cmd, &dir.join("service-exec.log"))
+        .context("spawning the service exec channel")
+}
+
+/// The command a job VM's `vk` may run on the host: `vk exec --service`.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "vk",
+    about = "vk inside a CI job: run commands in the job's services"
+)]
+struct GuestVk {
+    #[command(subcommand)]
+    cmd: GuestVkCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GuestVkCmd {
+    /// Run a command in one of the job's compose services
+    Exec {
+        /// The service, as the job's compose file names it
+        #[arg(long)]
+        service: String,
+        /// Allocate a pty: stdin and stdout must be a terminal
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Run as this user of the service
+        #[arg(long)]
+        user: Option<String>,
+        /// Working directory in the service
+        #[arg(long)]
+        dir: Option<String>,
+        /// Add an environment variable, KEY=value (repeatable)
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// The command and its arguments
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+}
+
+/// `vk gitlab service-exec <job dir> vk exec --service NAME … -- CMD…`: what a job VM's `vk`
+/// asked, run when it is an exec into one of the job's services and refused otherwise.
+pub async fn service_exec(job_dir: &Path, argv: &[String]) -> std::process::ExitCode {
+    use clap::Parser;
+    let refuse = |why: String| {
+        eprintln!("vk: {why}");
+        std::process::ExitCode::from(2)
+    };
+    // The guest's own `vk` names itself first; anything else is not that `vk`.
+    if argv.first().map(String::as_str) != Some("vk") {
+        return refuse(
+            "a CI job runs only `vk exec --service NAME -- CMD` on its host".to_string(),
+        );
+    }
+    let parsed = match GuestVk::try_parse_from(argv) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = e.print();
+            return std::process::ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2));
+        }
+    };
+    let GuestVkCmd::Exec {
+        service,
+        tty,
+        user,
+        dir,
+        env,
+        cmd,
+    } = parsed.cmd;
+    let valid = !service.is_empty()
+        && service
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !service.starts_with('.');
+    let svc_dir = job_dir.join(format!("svc-{service}"));
+    if !valid || !svc_dir.is_dir() {
+        let mut known: Vec<String> = std::fs::read_dir(job_dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|n| n.strip_prefix("svc-"))
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        known.sort();
+        return refuse(format!(
+            "no service {service:?} here; the services: {}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    }
+    let addr = crate::vmm::exec_addr(&svc_dir.join("vsock.sock"), crate::units::VSOCK_PORT);
+    let mut cmd = cmd.into_iter();
+    let Some(program) = cmd.next() else {
+        return refuse("no command to run".to_string());
+    };
+    match crate::exec::run(
+        addr,
+        false,
+        false,
+        env,
+        dir,
+        tty,
+        user,
+        program,
+        cmd.collect(),
+        vk_core::exec::client::Stdin::Forward,
+    )
+    .await
+    {
+        Ok(result) => crate::exec::exit(result),
+        Err(e) => refuse(format!("{e:#}")),
+    }
 }
 
 /// Probe the booted guest for bash and record the result for the run stage (a
@@ -3335,6 +3527,31 @@ fn log_tail(path: &Path, lines: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a job VM's `vk` may ask of its host: an exec into one of the job's own services.
+    /// Any other `vk` command, a service the job does not have, a name that would leave the
+    /// job dir, and a caller that is not the guest's `vk` are refused, before anything is
+    /// dialed.
+    #[tokio::test]
+    async fn a_job_vms_vk_reaches_only_its_own_services() {
+        let job = std::env::temp_dir().join(format!("vk-service-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&job);
+        std::fs::create_dir_all(job.join("svc-db")).unwrap();
+        std::fs::create_dir_all(job.join("other")).unwrap();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let refused = std::process::ExitCode::from(2);
+        for asked in [
+            argv(&["sh", "-c", "id"]),
+            argv(&["vk", "run", "alpine"]),
+            argv(&["vk", "exec", "--service", "web", "--", "true"]),
+            argv(&["vk", "exec", "--service", "../other", "--", "true"]),
+            argv(&["vk", "exec", "--service", "..", "--", "true"]),
+            argv(&["vk", "exec", "--", "true"]),
+        ] {
+            assert_eq!(service_exec(&job, &asked).await, refused, "{asked:?}");
+        }
+        let _ = std::fs::remove_dir_all(&job);
+    }
     use crate::config::Config;
     use crate::jobctx::JobCtx;
 

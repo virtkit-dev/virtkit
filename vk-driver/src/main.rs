@@ -450,6 +450,18 @@ enum GitlabCmd {
         /// the job dir (pid-reuse guard on the cmdline; must match the environment)
         job_dir: PathBuf,
     },
+    /// internal: what a guest's `vk` asks of its host, over the VM's host command channel
+    ///
+    /// Runs `vk exec --service NAME … -- CMD` in one of the VM's services; refuses anything
+    /// else.
+    #[command(hide = true)]
+    ServiceExec {
+        /// the job dir, whose `svc-<name>` dirs are the job's services
+        job_dir: PathBuf,
+        /// what the guest's `vk` was given, `vk` first
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4380,6 +4392,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
+    // What a job VM's `vk` asks: it needs the job dir alone, not a job context.
+    if let Cmd::Gitlab {
+        cmd: GitlabCmd::ServiceExec { job_dir, argv },
+    } = &cli.cmd
+    {
+        return vm::service_exec(job_dir, argv).await;
+    }
     let ctx = match JobCtx::new(cfg) {
         Ok(ctx) => ctx,
         Err(e) => return fail(&e, 2),
@@ -4515,6 +4534,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
+            GitlabCmd::ServiceExec { .. } => unreachable!("handled before the job context"),
             GitlabCmd::Supervise { job_dir } => {
                 // Its stdout and stderr are a log in the job dir, so a full filesystem must
                 // not make its every line a panic. Held past `fail`, whose line it drains.
@@ -4749,6 +4769,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
             user,
             command,
         } => {
+            // Inside a VM whose host serves its services' `vk exec` (a CI job, a compose
+            // run's primary): this VM's services, through that channel's own `vk`.
+            const GUEST_VK: &str = "/run/vk/bin/vk";
+            if target.is_none() && service.is_some() && Path::new(GUEST_VK).exists() {
+                use std::os::unix::process::CommandExt;
+                let e = std::process::Command::new(GUEST_VK)
+                    .args(std::env::args_os().skip(1))
+                    .exec();
+                return fail(&anyhow::anyhow!("running {GUEST_VK}: {e}"), 1);
+            }
             // A Windows (UEFI) guest has no vk-agent: its qemu-ga runs the command instead.
             let socket = match windows_exec_socket(target.as_deref(), service.as_deref()) {
                 Ok(socket) => socket,

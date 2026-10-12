@@ -148,6 +148,20 @@ enum Commands {
 }
 
 fn main() {
+    // Invoked as `vk` (init links it so in a CI job VM with services): the host's `vk`, over the
+    // host command channel, which runs `vk exec --service` into the job's services and nothing
+    // else. Everything given goes to the host as is; a terminal on both ends gets a pty.
+    if std::env::args_os()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|n| n == std::ffi::OsStr::new("vk"))
+        })
+        .unwrap_or(false)
+    {
+        std::process::exit(guest_vk());
+    }
     // The compose control filesystem (no --socket: it dials the manager over
     // vsock itself); handled before clap since init forks it with plain args.
     let args: Vec<String> = std::env::args().collect();
@@ -294,6 +308,57 @@ fn main() {
         .build()
         .expect("building the tokio runtime")
         .block_on(async_main(socket, cli_args.command));
+}
+
+/// The guest's `vk`: what it was given, run as `vk …` by the host through the host command
+/// channel at `/run/vk/host.sock`. Its exit status, or 1 when the host cannot be reached.
+fn guest_vk() -> i32 {
+    const HOST_SOCK: &str = "/run/vk/host.sock";
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Ok(socket) = HOST_SOCK.parse::<SocketAddr>() else {
+        return 1;
+    };
+    if !std::path::Path::new(HOST_SOCK).exists() {
+        eprintln!(
+            "vk: this VM has no host command channel: `vk exec --service` is for CI jobs with \
+             compose services"
+        );
+        return 1;
+    }
+    // SAFETY: isatty on the inherited stdio fds.
+    let tty = (unsafe { libc::isatty(0) } == 1 && unsafe { libc::isatty(1) } == 1).then(Tty::local);
+    let ran = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(execute(
+            socket,
+            "vk".into(),
+            args,
+            false,
+            Vec::new(),
+            RunMode::Interactive,
+            None,
+            tty,
+            None,
+        ));
+    match ran {
+        Ok(result) => {
+            if let Some(code) = result.code {
+                return code;
+            }
+            if let Some(signal) = result.signal {
+                // SAFETY: re-raise the command's terminating signal on this process.
+                unsafe { libc::kill(std::process::id() as i32, signal) };
+                return 128 + signal;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            1
+        }
+    }
 }
 
 /// Configure logging for PID 1 and the long-running `serve`, `forward` and `ssh-serve`

@@ -129,7 +129,7 @@ const PRIMARY_VM: u32 = 0;
 /// vsock port the guest's host-exec forwarder dials (`--host-exec`); the host side
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
-const HOST_EXEC_PORT: u32 = 1100;
+pub(crate) const HOST_EXEC_PORT: u32 = 1100;
 /// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
 /// the guest agent's forwarder for that guest path and spliced host-side to the host socket
 /// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and
@@ -1840,6 +1840,15 @@ async fn build_and_boot(
     if args.host_exec {
         cmdline.push_str(&format!(" VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT}"));
     }
+    // A compose run's primary gets a `vk` that runs `vk exec --service` into the run's
+    // services, over the same channel confined to that form — unless --host-exec opened it
+    // whole.
+    let service_exec = !args.host_exec && !planned.units.is_empty();
+    if service_exec {
+        cmdline.push_str(&format!(
+            " VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT} VIRTKIT_VK_CMD=1"
+        ));
+    }
 
     // Networking: a userspace `vk switch` gives the guest egress — attached as virtio-net
     // NICs; the agent takes the static address from the cmdline fragment.
@@ -2270,7 +2279,7 @@ async fn build_and_boot(
     }
     // Host-exec (guest->host): the guest's /run/vk/host.sock forwarder dials
     // HOST_EXEC_PORT, bridged to the `vk-agent serve` spawned below.
-    if args.host_exec {
+    if args.host_exec || service_exec {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, HOST_EXEC_PORT));
     }
     // The VM's process name follows the boot target: a --primary compose service, a -f
@@ -2544,8 +2553,15 @@ async fn build_and_boot(
     // per-port socket the guest's /run/vk/host.sock forwarder dials. cwd is the
     // --workdir (else our own), so a relative `exec --dir` resolves against the
     // shared tree; the wrapper (if any) enforces what may run.
-    if args.host_exec {
-        match spawn_host_exec_serve(&vsock, agent, args, work) {
+    let served = if args.host_exec {
+        Some(spawn_host_exec_serve(&vsock, agent, args, work))
+    } else if service_exec {
+        Some(crate::vm::spawn_service_exec_serve_at(&vsock, work, agent))
+    } else {
+        None
+    };
+    if let Some(served) = served {
+        match served {
             Ok(fwd) => host_exec_serve = Some(fwd),
             Err(e) => {
                 teardown_run(

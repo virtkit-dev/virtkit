@@ -179,6 +179,12 @@ job's plain GitLab `image:` is read the same way):
   the compose file, inside the checkout that every job starts by cleaning: it lasts
   for the job, across a service being stopped and started within it, and never from
   one job to the next.
+  The job's script runs commands in its services with `vk exec --service NAME [-t]
+  [--user U] [--dir D] [--env K=V] -- CMD…`, as on a host: the job VM's `vk` hands it to
+  the host over the VM's host command channel, which runs that one form, into the job's
+  own services, and refuses anything else — no host command, no other job. The job reaches
+  its services over its network anyway, so this grants it nothing new; `[executor]
+  guest_service_exec = false` turns it off.
 
 ```yaml
 my-job:

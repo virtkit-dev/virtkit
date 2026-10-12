@@ -4,6 +4,23 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A CI job, or a `vk run --compose` primary, runs commands in its compose services with
+  `vk exec --service`**, from inside its own VM: `vk exec --service db -- psql -c 'select 1'`
+  runs in the `db` service, its output and exit status back in the caller. The VM's `vk` —
+  the guest agent under that name, so the image needs none, or the image's own `vk`, which
+  hands off to it — passes the command to the host, which runs only that form, into the VM's
+  own services. On by default; `[executor] guest_service_exec = false` turns it off for CI
+  jobs, and `vk run --host-exec` opens the channel whole instead.
+
+### Fixed
+
+- **A command a guest ran on its host (`vk run --host-exec`) sometimes lost its exit status**
+  (`stream interrupted unexpectedly`, about one call in four): the host closed the connection
+  right after the status, and libkrun's guest→host vsock bridge could reset the guest's end
+  before delivering it. The host now waits for the guest to close first.
+
 ## [0.88.0] - 2026-10-11
 
 ### Added

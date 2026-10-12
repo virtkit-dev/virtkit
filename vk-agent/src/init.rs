@@ -2723,6 +2723,40 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
     if let Err(e) = fork_agent(&host_exec_forward_args(port, run_user.as_deref())) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
+    if cmdline.contains_key("VIRTKIT_VK_CMD") {
+        link_vk_cmd();
+    }
+}
+
+/// Where the guest's `vk` is: the agent under the name it answers to as the host's `vk`.
+const VK_CMD: &str = "/run/vk/bin/vk";
+
+/// Where a job's shell finds `vk` on its `PATH`.
+const VK_CMD_ON_PATH: &str = "/usr/local/bin/vk";
+
+/// Give the guest a `vk` command (`VIRTKIT_VK_CMD`, a CI job with services): the agent, linked
+/// as `vk`, which hands what it is given to the host's `vk` over the host command channel —
+/// `vk exec --service NAME -- CMD`, the one form the host allows. On the `PATH` unless the image
+/// has a `vk` of its own there.
+fn link_vk_cmd() {
+    let _ = std::fs::remove_file(VK_CMD);
+    if let Err(e) = std::os::unix::fs::symlink("vk-agent", VK_CMD) {
+        warn!("vk-agent init: linking {VK_CMD} failed: {e}");
+        return;
+    }
+    let on_path = Path::new(VK_CMD_ON_PATH);
+    if std::fs::symlink_metadata(on_path).is_ok() {
+        return;
+    }
+    if let Some(dir) = on_path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        warn!("vk-agent init: creating {} failed: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = std::os::unix::fs::symlink(VK_CMD, on_path) {
+        warn!("vk-agent init: linking {VK_CMD_ON_PATH} failed: {e}");
+    }
 }
 
 /// Make the running agent reachable at [`crate::runenv::AGENT_BIN`] for guest processes — the
