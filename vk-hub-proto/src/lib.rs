@@ -2,7 +2,7 @@
 //! `vk-hub` in fleet mode. Shared message types and signing payloads prevent format drift;
 //! each side handles its own transport, storage and crypto.
 //!
-//! Five exchanges exist:
+//! Five exchanges exist, and [`registry`] adds a sixth for a registry the hub manages:
 //!
 //! - **Workloads**: `vk workloads` prints the VMs running on its host for its user as a
 //!   [`WorkloadList`], one JSON document per line, for a local UI or any other reader on the
@@ -90,6 +90,7 @@ use serde::{Deserialize, Serialize};
 pub mod client;
 pub mod dispatch;
 pub mod job;
+pub mod registry;
 pub mod stamp;
 
 /// Where a node enrolls.
