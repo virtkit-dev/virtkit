@@ -601,6 +601,14 @@ tags in an existing cache, status reports the stage data size as unknown.
 - retention controls when idle tags stop being roots; and
 - grace protects recent unreferenced blobs, digest-pinned manifests, and uploads.
 
+A manifest can set its own tags' retention through annotations, which the pusher chooses:
+`org.virtkit.retention=keep` keeps a tag however long it sits idle, and
+`org.virtkit.expires=<seconds since the epoch>` drops it once that time passes, used or not.
+A manifest without either, or with one that does not parse, takes the window. The policy
+follows the manifest, so every tag on it shares it, and re-tagging a manifest whose
+annotations differ is how a pusher changes it (`vk registry put` does). An expired tag's
+blobs go as any unreferenced blob does, after the grace window.
+
 Membership markers are not roots. After sweeping blobs, `gc` removes markers and manifest
 sidecars whose content no longer exists. Repository traversal does not follow symlinks and
 is bounded by the same repository-depth limit enforced on writes.
@@ -671,8 +679,8 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
 - The lock manager and accounts database assume one server process. Multi-replica operation
   requires a distributed lock implementation and a replicated account store.
 - Pull-through cache eviction is retention-based; there is no size-capped LRU policy.
-- `files/` entries expire only through `gc`'s store-wide retention; there is no per-directory
-  policy and no size cap (see "Lifecycle").
+- `files/` entries expire through `gc`'s store-wide retention unless their manifest keeps or
+  expires them; there is no per-directory policy and no size cap (see "Lifecycle").
 - Every `files/` directory is a repository. `sccache` shards keys as `a/b/c/<key>`, so one
   cache directory grows to up to 4096 repositories and the path components above them, and
   each entry costs about five files — the tag, the manifest sidecar, the layer's membership

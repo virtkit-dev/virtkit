@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A pushed manifest can set how long `vk-registry gc` keeps its tags**: annotated
+  `org.virtkit.retention=keep` they stay however long they go unused, annotated
+  `org.virtkit.expires=<unix seconds>` they go at that time, used or not.
+
 ## [0.88.0] - 2026-10-11
 
 ### Added

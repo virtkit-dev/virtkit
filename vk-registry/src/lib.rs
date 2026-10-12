@@ -1326,7 +1326,7 @@ impl Store {
 
     /// Garbage-collect the store, holding the lock exclusive (pushers briefly
     /// block; see [`Store::lock_shared`]). Tags idle past `retention` are dropped
-    /// (tag mtime = last use). The surviving tags' manifests — plus digest-pinned
+    /// (tag mtime = last use), unless their manifest sets a [`Retention`] of its own. The surviving tags' manifests — plus digest-pinned
     /// manifests (a sidecar with no tag) whose blob is younger than `grace` —
     /// root the mark: their manifest, config and layer blobs are live. Everything
     /// else idle past `grace` is swept: unmarked blobs (the grace window protects
@@ -1371,22 +1371,35 @@ impl Store {
             );
         }
 
-        // drop idle tags; the survivors' manifest hexes root the mark phase.
+        // drop the tags their retention is over for (`Retention`: idle past the window
+        // unless the manifest keeps or expires them); the survivors' manifest hexes root the
+        // mark phase.
         let mut roots: HashSet<String> = HashSet::new();
         for tags_dir in tags_dirs {
             for tag in root_dir_files(&tags_dir)? {
-                if idle(&tag, retention) {
+                // A tag being kept has to be readable: leaving it unrooted would mean
+                // sweeping the blobs it still references.
+                let d = std::fs::read_to_string(&tag)
+                    .with_context(|| format!("reading the tag {}", tag.display()))?;
+                let hex = d.trim().trim_start_matches("sha256:");
+                let kept = if !is_blob_hex(hex) {
+                    !idle(&tag, retention)
+                } else {
+                    let manifest = self
+                        .read_blob_capped(hex, MAX_MANIFEST_BYTES)
+                        .ok()
+                        .flatten();
+                    match manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m)) {
+                        Retention::Keep => true,
+                        Retention::Until(t) => now < t,
+                        Retention::Idle => !idle(&tag, retention),
+                    }
+                };
+                if !kept {
                     remove(&tag)?;
                     report.tags_dropped += 1;
-                } else {
-                    // A tag being kept has to be readable: leaving it unrooted would mean
-                    // sweeping the blobs it still references.
-                    let d = std::fs::read_to_string(&tag)
-                        .with_context(|| format!("reading the tag {}", tag.display()))?;
-                    let hex = d.trim().trim_start_matches("sha256:");
-                    if is_blob_hex(hex) {
-                        roots.insert(hex.to_string());
-                    }
+                } else if is_blob_hex(hex) {
+                    roots.insert(hex.to_string());
                 }
             }
         }
@@ -1851,6 +1864,51 @@ pub const DEFAULT_GC_GRACE_DAYS: u64 = 1;
 
 /// [`DEFAULT_GC_GRACE_DAYS`] as a duration.
 pub(crate) const DEFAULT_GC_GRACE: Duration = Duration::from_secs(DEFAULT_GC_GRACE_DAYS * 86_400);
+
+/// The manifest annotation that exempts a tag from [`Store::gc`]'s retention window:
+/// value [`RETENTION_KEEP`].
+pub const RETENTION_ANNOTATION: &str = "org.virtkit.retention";
+
+/// [`RETENTION_ANNOTATION`]'s one value.
+pub const RETENTION_KEEP: &str = "keep";
+
+/// The manifest annotation that gives a tag a fixed expiry, in seconds since the Unix
+/// epoch: [`Store::gc`] drops the tag past it, used or not, and never before it.
+pub const EXPIRES_ANNOTATION: &str = "org.virtkit.expires";
+
+/// How long [`Store::gc`] keeps a tag, as its manifest's annotations say.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// Until it sits unused past the gc's retention window: no annotation.
+    Idle,
+    /// For good: [`RETENTION_ANNOTATION`].
+    Keep,
+    /// Until this moment, used or not: [`EXPIRES_ANNOTATION`].
+    Until(SystemTime),
+}
+
+impl Retention {
+    /// The retention a manifest's bytes ask for. A manifest that does not parse, or an
+    /// annotation that does not, asks for none: the window applies, as it always has.
+    pub fn of_manifest(bytes: &[u8]) -> Retention {
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return Retention::Idle;
+        };
+        let annotation = |key: &str| {
+            manifest
+                .get("annotations")
+                .and_then(|a| a.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+        if annotation(RETENTION_ANNOTATION) == Some(RETENTION_KEEP) {
+            return Retention::Keep;
+        }
+        match annotation(EXPIRES_ANNOTATION).and_then(|s| s.parse::<u64>().ok()) {
+            Some(secs) => Retention::Until(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            None => Retention::Idle,
+        }
+    }
+}
 
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
@@ -5926,6 +5984,63 @@ mod tests {
         assert_eq!(report.manifests_dropped, 1);
         assert_eq!(report.blobs_dropped, 3);
         assert_eq!(report.uploads_dropped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest's annotations override the window: a kept tag survives any idleness, an
+    /// expired one goes however recently it was used, and one expiring later stays.
+    #[test]
+    fn gc_honours_a_manifests_retention() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let annotated = |byte: u8, key: &str, value: String| {
+            let chunk = store.put_blob(&[byte; 4096]).unwrap();
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&manifest_body(&chunk, &[&chunk])).unwrap();
+            body["annotations"] = serde_json::json!({ key: value });
+            serde_json::to_vec(&body).unwrap()
+        };
+        for (tag, body) in [
+            (
+                "kept",
+                annotated(1, RETENTION_ANNOTATION, RETENTION_KEEP.into()),
+            ),
+            (
+                "expired",
+                annotated(2, EXPIRES_ANNOTATION, (now - 60).to_string()),
+            ),
+            (
+                "later",
+                annotated(3, EXPIRES_ANNOTATION, (now + 3600).to_string()),
+            ),
+            ("idle", annotated(4, "other", "x".into())),
+        ] {
+            store
+                .put_manifest("repo", tag, DEFAULT_MANIFEST_TYPE, &body)
+                .unwrap();
+        }
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "expired"));
+
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.tags_dropped, 2);
+        for (tag, present) in [
+            ("kept", true),
+            ("expired", false),
+            ("later", true),
+            ("idle", false),
+        ] {
+            assert_eq!(
+                store.get_manifest("repo", tag).unwrap().is_some(),
+                present,
+                "{tag}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
