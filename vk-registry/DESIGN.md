@@ -523,7 +523,8 @@ which is what opendal's parent walk asks, always answers.
 
 An object is a tag, so `gc` expires it as it expires every tag: dropped once idle past the
 retention window, its blobs swept once unreferenced and past the grace window, both windows
-store-wide. Idleness is the tag's mtime, which a `PUT` sets and a `GET` refreshes once it is an
+store-wide, unless its manifest keeps or expires it ("Garbage collection and reporting"). A
+WebDAV `PUT` writes none of those annotations; `vk registry put --keep|--ttl` does. Idleness is the tag's mtime, which a `PUT` sets and a `GET` refreshes once it is an
 hour old, so a read-only pipeline's hits keep an entry alive as a writer's do. There is no
 per-directory policy and no size cap; a replaced or deleted object frees no disk until the
 next `gc`. A staging file a crashed `PUT` left in `uploads/` goes with the idle uploads.

@@ -804,6 +804,12 @@ compiled units. In accounts mode, a key with `write:files/<dir>/*` fills the cac
 with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry gc`'s tag
 retention like any other tag. Set `webdav = false` in the server config to disable WebDAV.
 
+`vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
+digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and
+`vk registry get <sha256:hex | dir/name>` fetches one back, checked against its digest. A put
+file is kept while it is used, for `--ttl` after the put whether used or not, or with `--keep`
+until a later put changes that.
+
 A registry that turns requests away, as a busy `vk-registry` does past its per-host
 connection cap, is waited out: `vk` retries a 503 or 429, or a connection closed before any
 answer, with growing randomized delays for up to three minutes before a pull or push fails.

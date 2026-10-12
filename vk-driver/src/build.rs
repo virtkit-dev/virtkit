@@ -249,6 +249,24 @@ impl CacheOpts {
     }
 }
 
+/// The registry `cache` names when other hosts can reach it: a registry server, not an
+/// in-process store. What plain files are put in.
+pub(crate) fn shared_cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::Registry>> {
+    Ok(cache_repo(cache.registry.as_deref())?
+        .map(|repo| {
+            crate::config::Registry::for_share(
+                repo,
+                cache.insecure,
+                cache.auth.ca_file.clone(),
+                cache.auth.username.clone(),
+                cache.auth.password_file.clone(),
+                cache.auth.token_file.clone(),
+                None,
+            )
+        })
+        .filter(|rg| rg.local_root().is_none()))
+}
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).

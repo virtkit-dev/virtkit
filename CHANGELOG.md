@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk registry put` and `vk registry get` keep plain files in the build cache registry**, in
+  `vk-registry`'s `files/` area: each file is stored once, by digest (`sha256:<hex>`, served
+  over WebDAV at `/dav/files/sha256/<hex>`) and, with `--dir`, by name (`<dir>/<name>`).
+  `--keep` keeps a file however long it goes unused, `--ttl <duration>` drops it that long
+  after the put, used or not.
 - **A pushed manifest can set how long `vk-registry gc` keeps its tags**: annotated
   `org.virtkit.retention=keep` they stay however long they go unused, annotated
   `org.virtkit.expires=<unix seconds>` they go at that time, used or not.

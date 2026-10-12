@@ -770,6 +770,218 @@ async fn fetch_chunks_async(
     Ok(Some((chunks, config.total_size)))
 }
 
+/// A plain file the registry holds: one blob under a single-layer manifest whose layer is a
+/// `vk_registry::RAW_FILE_MEDIA_TYPE` — what [`put_raw_file`], the registry's `/upload` form
+/// and its WebDAV `files/` area all write.
+pub struct RawFile {
+    /// The file's sha256 hex, which is its blob's digest.
+    pub sha256: String,
+    pub size: u64,
+    /// The file's name, when its writer gave one.
+    pub title: Option<String>,
+}
+
+impl RawFile {
+    /// The raw file `manifest` describes, `None` for a manifest of any other shape.
+    fn of_manifest(manifest: &[u8]) -> Option<RawFile> {
+        let (sha256, size) = vk_registry::raw_file_layer(manifest)?;
+        Some(RawFile {
+            sha256,
+            size,
+            title: vk_registry::raw_file_title(manifest),
+        })
+    }
+}
+
+/// Put the file at `path`, whose sha256 hex is `sha256`, in `rg` as a raw file tagged under
+/// each `(name, tag)` of `tags`, `annotations` on its manifest and `title` on its layer. The
+/// bytes go up once, streamed, and not at all when the registry already holds them.
+pub fn put_raw_file(
+    rg: &Registry,
+    tags: &[(&str, &str)],
+    path: &Path,
+    sha256: &str,
+    title: Option<&str>,
+    annotations: &BTreeMap<String, String>,
+) -> Result<()> {
+    if let Some(root) = rg.local_root() {
+        let got = vk_registry::Store::new(root)?.put_file(tags, path, title, annotations)?;
+        if got != sha256 {
+            bail!("{} changed while it was put", path.display());
+        }
+        return Ok(());
+    }
+    block_on(put_raw_file_async(
+        rg,
+        tags,
+        path,
+        sha256,
+        title,
+        annotations,
+    ))
+}
+
+async fn put_raw_file_async(
+    rg: &Registry,
+    tags: &[(&str, &str)],
+    path: &Path,
+    sha256: &str,
+    title: Option<&str>,
+    annotations: &BTreeMap<String, String>,
+) -> Result<()> {
+    let (client, auth) = client(rg)?;
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let digest = format!("sha256:{sha256}");
+    let config_digest = sha256_hex(vk_registry::RAW_FILE_EMPTY_CONFIG);
+    let layer = OciDescriptor {
+        media_type: vk_registry::RAW_FILE_MEDIA_TYPE.to_string(),
+        digest: digest.clone(),
+        size: size as i64,
+        annotations: title.map(|t| {
+            BTreeMap::from([("org.opencontainers.image.title".to_string(), t.to_string())])
+        }),
+        ..Default::default()
+    };
+    for (name, tag) in tags {
+        let image = make_ref(rg, name, tag)?;
+        client
+            .store_auth_if_needed(image.resolve_registry(), &auth)
+            .await;
+        let ops = [RegistryOperation::Pull, RegistryOperation::Push];
+        authenticate(&client, &image, &auth, &ops)
+            .await
+            .with_context(|| format!("authenticating to {}", rg.repo))?;
+        // A registry that already holds the bytes, under this repository or another the
+        // caller reads (vk-registry answers for both), mounts them with the manifest.
+        if !blob_exists(&client, &image, &digest).await? {
+            println!(
+                "virtkit: registry: uploading {} ({} MiB)",
+                path.display(),
+                size >> 20
+            );
+            with_transfer_retry(&format!("pushing {}", path.display()), || async {
+                let file = tokio::fs::File::open(path).await?;
+                let stream = futures::StreamExt::map(
+                    tokio_util::io::ReaderStream::with_capacity(file, 1 << 22),
+                    |r| r.map_err(OciDistributionError::from),
+                );
+                client
+                    .push_blob_stream(&image, stream, &digest, Some(size))
+                    .await
+            })
+            .await
+            .with_context(|| format!("pushing {}", path.display()))?;
+        }
+        if !blob_exists(&client, &image, &config_digest).await? {
+            push_blob(
+                &client,
+                &image,
+                bytes::Bytes::from_static(vk_registry::RAW_FILE_EMPTY_CONFIG),
+                &config_digest,
+            )
+            .await
+            .context("pushing the raw file config blob")?;
+        }
+        let manifest = OciManifest::Image(OciImageManifest {
+            schema_version: 2,
+            media_type: Some(OCI_IMAGE_MEDIA_TYPE.to_string()),
+            artifact_type: None,
+            config: OciDescriptor {
+                media_type: vk_registry::RAW_FILE_CONFIG_MEDIA_TYPE.to_string(),
+                digest: config_digest.clone(),
+                size: vk_registry::RAW_FILE_EMPTY_CONFIG.len() as i64,
+                ..Default::default()
+            },
+            layers: vec![layer.clone()],
+            subject: None,
+            annotations: (!annotations.is_empty()).then(|| annotations.clone()),
+        });
+        push_manifest(&client, &image, &manifest).await?;
+    }
+    Ok(())
+}
+
+/// The raw file tagged `<name>:<tag>`, without its bytes: `None` when the tag is absent,
+/// an error when it names something else. Bumps the tag, as a pull does.
+pub fn raw_file(rg: &Registry, name: &str, tag: &str) -> Result<Option<RawFile>> {
+    let manifest = if let Some(root) = rg.local_root() {
+        let store = vk_registry::Store::new(root)?;
+        let _lock = store.lock_shared()?;
+        store.get_manifest(name, tag)?.map(|(_, bytes, _)| bytes)
+    } else {
+        block_on(raw_manifest_async(rg, name, tag))?
+    };
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    RawFile::of_manifest(&manifest)
+        .map(Some)
+        .with_context(|| format!("{name}:{tag} is not a plain file"))
+}
+
+async fn raw_manifest_async(rg: &Registry, name: &str, tag: &str) -> Result<Option<Vec<u8>>> {
+    let (client, auth) = client(rg)?;
+    let image = make_ref(rg, name, tag)?;
+    if resolve_digest(&client, &image, &auth).await.is_err() {
+        return Ok(None);
+    }
+    let (bytes, _) = with_transfer_retry(&format!("pulling the manifest of {name}:{tag}"), || {
+        client.pull_manifest_raw(&image, &auth, &[OCI_IMAGE_MEDIA_TYPE])
+    })
+    .await
+    .with_context(|| format!("pulling the manifest of {name}:{tag}"))?;
+    Ok(Some(bytes.to_vec()))
+}
+
+/// Fetch the raw file tagged `<name>:<tag>` to `dest`, checked against its digest: `None`
+/// when the tag is absent. Written beside `dest` and renamed into place.
+pub fn pull_raw_file(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<Option<RawFile>> {
+    let Some(file) = raw_file(rg, name, tag)? else {
+        return Ok(None);
+    };
+    let tmp = staging_bundle(dest, ".vkget-");
+    let fetched = (|| {
+        if let Some(root) = rg.local_root() {
+            let store = vk_registry::Store::new(root)?;
+            let _lock = store.lock_shared()?;
+            let mut opened = store
+                .open_file(name, tag)?
+                .with_context(|| format!("{name}:{tag} went away"))?;
+            let mut out = std::fs::File::create(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            std::io::copy(&mut opened.reader, &mut out)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+        } else {
+            let image = make_ref(rg, name, tag)?;
+            let layer = OciDescriptor {
+                media_type: vk_registry::RAW_FILE_MEDIA_TYPE.to_string(),
+                digest: format!("sha256:{}", file.sha256),
+                size: file.size as i64,
+                ..Default::default()
+            };
+            block_on(async {
+                let (client, auth) = client(rg)?;
+                authenticate(&client, &image, &auth, &[RegistryOperation::Pull]).await?;
+                pull_blob_to_file(&client, &image, &layer, &tmp, file.size).await
+            })?;
+        }
+        let got = crate::winiso::sha256_file(&tmp)?;
+        if got != file.sha256 {
+            bail!(
+                "{name}:{tag}: fetched sha256 {got}, expected {}",
+                file.sha256
+            );
+        }
+        std::fs::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))
+    })();
+    if fetched.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    fetched.map(|()| Some(file))
+}
+
 /// Push `ext4` as a new bundle tagged `<name>:<tag>`, reusing `parent_layers` for every
 /// chunk whose byte range is untouched by `dirty` and re-chunking only the dirty ranges.
 /// A parent chunk that overlaps a dirty extent is regenerated whole (one chunk, same
@@ -4556,6 +4768,58 @@ mod tests {
         );
         // an empty batch is answered without a request.
         assert_eq!(exists_many(&rg, "build-cache", &[]), Vec::<bool>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A raw file put over HTTP: streamed up once in several chunks, tagged in two
+    /// repositories (the second mounting the first's blob), read back whole from either, and
+    /// stored as the raw file the registry's WebDAV view serves, with its retention.
+    #[test]
+    fn a_raw_file_round_trips_through_a_real_registry() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("raw-file");
+        let store = std::sync::Arc::new(vk_registry::Store::new(dir.join("store")).unwrap());
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: std::sync::Arc::clone(&store),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+            webdav: true,
+        }));
+        let rg = Registry::for_share(url, true, None, String::new(), None, None, None);
+        // Over the client's 4 MiB PATCH size, so the upload takes several.
+        let bytes: Vec<u8> = (0..9u32 << 20).map(|i| (i % 253) as u8).collect();
+        let src = dir.join("medium.iso");
+        std::fs::write(&src, &bytes).unwrap();
+        let sha256 = crate::winiso::sha256_file(&src).unwrap();
+        let keep = BTreeMap::from([(
+            vk_registry::RETENTION_ANNOTATION.to_string(),
+            vk_registry::RETENTION_KEEP.to_string(),
+        )]);
+        let tags = [
+            ("files/sha256", sha256.as_str()),
+            ("files/iso", "medium.iso"),
+        ];
+        put_raw_file(&rg, &tags, &src, &sha256, Some("medium.iso"), &keep).unwrap();
+        for (name, tag) in tags {
+            let out = dir.join(format!("out-{}", name.replace('/', "-")));
+            let file = pull_raw_file(&rg, name, tag, &out).unwrap().unwrap();
+            assert_eq!(file.sha256, sha256);
+            assert_eq!(file.size, bytes.len() as u64);
+            assert_eq!(file.title.as_deref(), Some("medium.iso"));
+            assert_eq!(std::fs::read(&out).unwrap(), bytes);
+            let (_, manifest, _) = store.get_manifest(name, tag).unwrap().unwrap();
+            assert_eq!(
+                vk_registry::raw_file_layer(&manifest),
+                Some((sha256.clone(), bytes.len() as u64))
+            );
+            assert_eq!(
+                vk_registry::Retention::of_manifest(&manifest),
+                vk_registry::Retention::Keep
+            );
+        }
+        assert!(raw_file(&rg, "files/iso", "absent").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
