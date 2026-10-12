@@ -13,6 +13,8 @@ All notable changes to virtkit will be documented in this file.
   hands off to it — passes the command to the host, which runs only that form, into the VM's
   own services. On by default; `[executor] guest_service_exec = false` turns it off for CI
   jobs, and `vk run --host-exec` opens the channel whole instead.
+- **`vk service up|down|reboot|status` in a `vk run --compose` primary needs no `vk` in the
+  image**: the guest's `vk` asks the service manager itself, as the `/run/vk/services` files do.
 
 ### Fixed
 

@@ -148,9 +148,10 @@ enum Commands {
 }
 
 fn main() {
-    // Invoked as `vk` (init links it so in a CI job VM with services): the host's `vk`, over the
-    // host command channel, which runs `vk exec --service` into the job's services and nothing
-    // else. Everything given goes to the host as is; a terminal on both ends gets a pty.
+    // Invoked as `vk` (init links it so in a VM with services): `vk service` goes to the service
+    // manager; anything else, as is, to the host's `vk` over the host command channel, which
+    // runs `vk exec --service` into the VM's services and nothing else. A terminal on both ends
+    // gets a pty.
     if std::env::args_os()
         .next()
         .and_then(|a| {
@@ -315,6 +316,9 @@ fn main() {
 fn guest_vk() -> i32 {
     const HOST_SOCK: &str = "/run/vk/host.sock";
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("service") {
+        return guest_vk_service(&args[1..]);
+    }
     let Ok(socket) = HOST_SOCK.parse::<SocketAddr>() else {
         return 1;
     };
@@ -356,6 +360,35 @@ fn guest_vk() -> i32 {
         }
         Err(e) => {
             eprintln!("vk: {e:#}");
+            1
+        }
+    }
+}
+
+/// `vk service up|down|reboot|status` from inside a compose run's primary: the host's service
+/// manager answers it over the VM's control plane, as it does the `/run/vk/services` files, so
+/// it needs no host command.
+fn guest_vk_service(args: &[String]) -> i32 {
+    use vk_core::fleetctl::{Client, SERVICE_USAGE, ServiceOp};
+    let Some(op) = ServiceOp::parse(args) else {
+        eprintln!("{SERVICE_USAGE}");
+        return 2;
+    };
+    let reply = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(op.run(&mut Client::new()));
+    match reply {
+        Ok(reply) => {
+            reply.print();
+            if reply.ok { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!(
+                "vk: {e:#}\nvk: `vk service` needs a service manager, which a `vk run --compose` \
+                 primary has; a CI job's services are fixed for the job"
+            );
             1
         }
     }

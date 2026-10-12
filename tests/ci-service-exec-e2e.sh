@@ -7,7 +7,7 @@
 #   1. the job's script runs `vk exec --service db -- …`: the command runs in the service, its
 #      output and exit status come back;
 #   2. what the host does not allow is refused: another `vk` command, a service the job does
-#      not have;
+#      not have, `vk service` (a job's services are fixed for it);
 #   3. with `[executor] guest_service_exec = false`, the job VM has no such channel.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
@@ -123,7 +123,10 @@ if vk exec --service nope -- true 2>err; then exit 1; fi
 cat err
 grep -q "no service" err
 if vk version 2>err; then exit 1; fi
-cat err' || fail "a command the host does not allow ran"
+cat err
+if vk service down db 2>err; then exit 1; fi
+cat err
+grep -q "fixed for the job" err' || fail "a command the host does not allow ran"
 grep -q "the services: db" "$root/stage.log" || fail "the refusal does not name the job's services"
 echo "ok"
 

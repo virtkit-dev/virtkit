@@ -465,9 +465,10 @@ state, control, and logs through ordinary files. `vk service up|down|reboot|stat
 corresponding command interface: `up` starts a declared (or profiled-down) service, building
 it on first use, and returns once it answers; `down` powers it off; `reboot` restarts its
 guest in place on the same disks; `status` reports one or all. `vk exec --service NAME --
-CMD` runs a command in one of them, as it does from the host; the primary needs no `vk` of
-its own for it, as its host serves it — that one form, into this run's services — over the
-primary's host command channel. A run with `--host-exec` has that channel open whole instead. `vk run --ssh` enables SSH
+CMD` runs a command in one of them, as it does from the host. The primary needs no `vk` of
+its own for either: the guest's `vk` asks the service manager for `vk service`, and its host
+for `vk exec --service` — that one form, into this run's services — over the primary's host
+command channel. A run with `--host-exec` has that channel open whole instead. `vk run --ssh` enables SSH
 access for development VMs, including VS Code Remote-SSH workflows. In a CI fleet a
 service's `environment:` may also carry its own egress allowlist — see
 [Per-service egress](docs/gitlab-ci.md#per-service-egress).
