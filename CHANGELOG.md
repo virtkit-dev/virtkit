@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A host checkout no longer fails on a branch named under a deleted one** (`a/b` after `a`
+  was deleted, or the reverse) when a runner reuses its checkout.
+
 ## [0.88.0] - 2026-10-11
 
 ### Added

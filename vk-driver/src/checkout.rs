@@ -530,18 +530,14 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     // to the runner user so a co-tenant on the host cannot read the credential at rest.
     std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("securing {}", dest.display()))?;
-    // Fetch the ref tip so `sha` is reachable, then detach onto exactly that commit. `--`
-    // guards a ref that begins with '-'; `sha` is validated hex above. `--quiet` drops git's
-    // transfer summary (the "From <url>" / "forced update" block) from the job trace —
-    // virtkit already prints its own `host checkout of <sha>` line.
+    // Fetch the ref tip so `sha` is reachable, then detach onto exactly that commit. `sha` is
+    // validated hex above. `--quiet` drops git's transfer summary (the "From <url>" /
+    // "forced update" block) from the job trace — virtkit already prints its own
+    // `host checkout of <sha>` line.
     if ref_name.is_empty() {
         git(dest, &["fetch", "--quiet", "--prune", "origin"], "fetch")?;
     } else {
-        git(
-            dest,
-            &["fetch", "--quiet", "--prune", "origin", "--", ref_name],
-            "fetch",
-        )?;
+        fetch_ref(dest, ref_name)?;
     }
     // Detach onto exactly `sha`. HEAD is moved with `update-ref` rather than
     // `git checkout --detach`: this per-slot repo is always on a detached HEAD, and after a
@@ -600,6 +596,68 @@ fn settle_index(dest: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1) - age);
     }
     git(dest, &["update-index", "-q", "--refresh"], "refresh")
+}
+
+/// Fetch the job's `ref_name` from `origin` into slot repository `dest`, clearing stale
+/// tracking refs first ([`drop_conflicting_tracking_refs`]). With an explicit refspec,
+/// `--prune` only removes matching refs, leaving these conflicts.
+fn fetch_ref(dest: &Path, ref_name: &str) -> Result<()> {
+    drop_conflicting_tracking_refs(dest, ref_name)?;
+    // `--` guards a ref that begins with '-'.
+    git(
+        dest,
+        &["fetch", "--quiet", "--prune", "origin", "--", ref_name],
+        "fetch",
+    )
+}
+
+/// Delete tracking refs that conflict with branch `ref_name`: `origin/<p>` for an ancestor
+/// path `p`, or anything under `origin/<ref_name>/`. Git cannot hold both `origin/a` and
+/// `origin/a/b`, whether loose, packed or reftable. The remote cannot hold both branches
+/// either, so a conflicting tracking ref is stale. Tags occupy a separate namespace:
+/// fetching one may delete tracking refs that the next fetch of their branches restores.
+/// Names with empty path components are invalid for fetch and leave tracking refs untouched.
+fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if ref_name.split('/').any(str::is_empty) {
+        return Ok(());
+    }
+    // `for-each-ref` matches a pattern and every ref under it, so the name's first component
+    // lists every ref that can be in the way; the check below keeps those that are.
+    let first = ref_name.split_once('/').map_or(ref_name, |(f, _)| f);
+    let out = git_command()
+        .arg("-C")
+        .arg(dest)
+        .args(["for-each-ref", "--format=%(refname)"])
+        .arg(format!("refs/remotes/origin/{first}"))
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("spawning git for-each-ref")?;
+    if !out.status.success() {
+        bail!("git for-each-ref failed ({})", out.status);
+    }
+    let target = format!("refs/remotes/origin/{ref_name}");
+    let target = target.as_bytes();
+    for r in out.stdout.split(|&b| b == b'\n').filter(|r| !r.is_empty()) {
+        let above = target
+            .strip_prefix(r)
+            .is_some_and(|rest| rest.starts_with(b"/"));
+        let below = r
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with(b"/"));
+        if above || below {
+            // `--no-deref`: `origin/HEAD` is a symref, whose own name is what is in the way.
+            run(
+                git_command()
+                    .arg("-C")
+                    .arg(dest)
+                    .args(["update-ref", "--no-deref", "-d"])
+                    .arg(std::ffi::OsStr::from_bytes(r)),
+                "update-ref -d",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// A git ref name safe to pass as a fetch argument: git's own rules already forbid these in a
@@ -800,6 +858,93 @@ mod tests {
         assert!(ensure("https://h/p.git", "main", "deadbeefZZ", dest).is_err());
         // An option-injection ref is refused before any git runs.
         assert!(ensure("https://h/p.git", "-x", "deadbeef", dest).is_err());
+    }
+
+    /// Fetch past stale tracking refs in a reused slot: ancestor and descendant conflicts,
+    /// including deeper paths and multiple refs. Preserve names that only share a prefix.
+    #[test]
+    fn a_fetch_gets_past_a_deleted_branchs_tracking_ref() {
+        let root = root("df-conflict");
+        let remote = root.join("remote");
+        let dest = root.join("dest");
+        let git_in = |dir: &Path, args: &[&str]| git(dir, args, "test").unwrap();
+        run(
+            git_command()
+                .args(["init", "--quiet", "-b", "main"])
+                .arg(&remote),
+            "init",
+        )
+        .unwrap();
+        git_in(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "c",
+            ],
+        );
+        git_in(&remote, &["branch", "a"]);
+        // A clone packs its refs, so `origin/a` starts in packed-refs, not as a file.
+        run(
+            git_command()
+                .args(["clone", "--quiet"])
+                .arg(&remote)
+                .arg(&dest),
+            "clone",
+        )
+        .unwrap();
+        let has = |name: &str| {
+            git_command()
+                .arg("-C")
+                .arg(&dest)
+                .args(["rev-parse", "--verify", "--quiet"])
+                .arg(format!("refs/remotes/origin/{name}"))
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let swap = |gone: &[&str], new: &str| {
+            for b in gone {
+                git_in(&remote, &["branch", "-q", "-D", b]);
+            }
+            git_in(&remote, &["branch", new]);
+            fetch_ref(&dest, new).unwrap();
+            assert!(has(new), "{new}");
+            for b in gone {
+                assert!(!has(b), "{b}");
+            }
+        };
+
+        // `a` goes, `a/b` comes: `origin/a` is in the way of `origin/a/b`; and back.
+        swap(&["a"], "a/b");
+        swap(&["a/b"], "a");
+        // Deeper: `origin/a` is in the way of `origin/a/b/c`.
+        swap(&["a"], "a/b/c");
+        // Several below at once.
+        git_in(&remote, &["branch", "a/d"]);
+        fetch_ref(&dest, "a/d").unwrap();
+        swap(&["a/b/c", "a/d"], "a");
+
+        // A name merely sharing a prefix is not in the way.
+        git_in(&remote, &["branch", "ab"]);
+        fetch_ref(&dest, "ab").unwrap();
+        fetch_ref(&dest, "a").unwrap();
+        assert!(has("ab") && has("a"));
+
+        // A tag named under a branch costs that branch's tracking ref, until it is fetched again.
+        git_in(&remote, &["tag", "a/t"]);
+        fetch_ref(&dest, "a/t").unwrap();
+        assert!(!has("a"));
+        fetch_ref(&dest, "a").unwrap();
+        assert!(has("a"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A checkout root with two slot/project trees in it, one of them ours to reclaim.
