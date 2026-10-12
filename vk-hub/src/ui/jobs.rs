@@ -756,11 +756,12 @@ fn node_link(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>) {
 /// The guest job `j` ran in: `4 vCPUs, 8.0 GiB`.
 fn size_text(j: &JobRow) -> Option<String> {
     let usage = j.result.as_ref().and_then(|r| r.usage);
+    // The VM's size as its node gave it: from its usage once it ended, from its stages once
+    // its preparation sized it, and unknown before. Not the reservation's envelope, which is
+    // what the producer asked to hold, not what the job got.
     let size = match usage.map(|u| (u.cpus, u.mem_mib)) {
         Some((Some(cpus), Some(mem))) => Some((cpus, mem)),
-        // Fall back to the placement envelope when the node did not report the guest size.
-        _ => Some((j.placement.envelope.cpus, j.placement.envelope.mem_mib))
-            .filter(|&(cpus, mem)| cpus > 0 && mem > 0),
+        _ => j.guest.map(|g| (g.cpus, g.mem_mib)),
     };
     size.map(|(cpus, mem)| {
         let unit = if cpus == 1 { "vCPU" } else { "vCPUs" };

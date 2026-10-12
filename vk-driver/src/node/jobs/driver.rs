@@ -306,6 +306,9 @@ impl Driver {
             .executor("prepare", &[], Some((Phase::Before, None)))
             .await;
         self.prepared_in = Some(preparing.elapsed());
+        if matches!(prepared, Ok(End::Ok)) {
+            self.note_guest_size();
+        }
         self.trace.section_end("prepare_executor");
         match prepared {
             Ok(End::Ok) => {}
@@ -578,6 +581,17 @@ impl Driver {
             trace: &self.trace,
             scratch,
             cancel: &self.stopped,
+        }
+    }
+
+    /// Record the size of the job's VM, which its prepare has just sized, for the node to
+    /// report with the job's stages. Best effort: the result carries it too.
+    fn note_guest_size(&self) {
+        if let Ok((cpus, mem_mib)) = crate::vm::declared_size(&self.ctx)
+            && let Ok(json) =
+                serde_json::to_vec(&vk_hub_proto::dispatch::GuestSize { cpus, mem_mib })
+        {
+            let _ = vk_fs::write_atomic(&self.dir.join(journal::GUEST), &json, 0o600);
         }
     }
 

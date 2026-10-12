@@ -91,6 +91,13 @@ const RESULT_REPEAT: Duration = Duration::from_secs(15);
 /// How long a driver may take to write its pid before a missing one means it is gone.
 const DRIVER_START: Duration = Duration::from_secs(10);
 
+/// A job's stage as last told the hub: the stage, what it was doing, the VM's size.
+type Told = (
+    String,
+    Option<vk_hub_proto::dispatch::Activity>,
+    Option<vk_hub_proto::dispatch::GuestSize>,
+);
+
 /// A job the node holds, as the session follows it.
 struct Track {
     dir: PathBuf,
@@ -107,8 +114,8 @@ struct Track {
     /// Raised once the node's cleanup after the job's lost driver has ended, when one was
     /// started: the result is written then.
     cleaning: Option<Arc<AtomicBool>>,
-    /// The stage last told, and what it was doing.
-    told: Option<(String, Option<vk_hub_proto::dispatch::Activity>)>,
+    /// The stage last told, what it was doing, and the VM's size.
+    told: Option<Told>,
     result: Option<JobResult>,
     result_told: Option<Instant>,
     started: Instant,
@@ -275,13 +282,18 @@ impl Jobs {
             t.result_told = None;
             let stage = journal::read_stage(&t.dir);
             let activity = journal::read_activity(&t.dir);
-            t.told = stage.clone().map(|s| (s, activity.clone()));
+            let guest = journal::read_guest(&t.dir);
+            t.told = stage.clone().map(|s| (s, activity.clone(), guest));
             let finished = t.result.is_some();
             jobs.push(HeldJob {
                 job: id.clone(),
                 state: match (finished, stage) {
                     (true, _) => RunState::Finished,
-                    (false, Some(stage)) => RunState::Running { stage, activity },
+                    (false, Some(stage)) => RunState::Running {
+                        stage,
+                        activity,
+                        guest,
+                    },
                     (false, None) => RunState::Accepted,
                 },
                 output_len: journal::output_len(&t.dir),
@@ -391,6 +403,7 @@ impl Jobs {
                 (None, Some(stage)) => RunState::Running {
                     stage,
                     activity: journal::read_activity(&t.dir),
+                    guest: journal::read_guest(&t.dir),
                 },
                 (None, None) => RunState::Accepted,
             };
@@ -666,13 +679,21 @@ impl Jobs {
                 if let Some(stage) = journal::read_stage(&t.dir)
                     && t.result.is_none()
                 {
-                    let told = (stage, journal::read_activity(&t.dir));
+                    let told = (
+                        stage,
+                        journal::read_activity(&t.dir),
+                        journal::read_guest(&t.dir),
+                    );
                     if t.told.as_ref() != Some(&told) {
                         t.told = Some(told.clone());
-                        let (stage, activity) = told;
+                        let (stage, activity, guest) = told;
                         msgs.push(NodeJobMsg::Job {
                             job: id.clone(),
-                            state: RunState::Running { stage, activity },
+                            state: RunState::Running {
+                                stage,
+                                activity,
+                                guest,
+                            },
                         });
                     }
                 }

@@ -26,6 +26,8 @@ pub const OUTPUT: &str = "output";
 pub const STAGE: &str = "stage";
 /// What the stage does, when prepare says ([`crate::activity`]): JSON.
 pub const ACTIVITY: &str = "activity.json";
+/// The size of the job's VM, once prepare sized it: JSON.
+pub const GUEST: &str = "guest.json";
 pub const CANCEL: &str = "cancel";
 pub const RESULT: &str = "result.json";
 pub const DRIVER_LOG: &str = "driver.log";
@@ -75,6 +77,15 @@ pub fn read_stage(dir: &Path) -> Option<String> {
 /// nothing this node can read.
 pub fn read_activity(dir: &Path) -> Option<vk_hub_proto::dispatch::Activity> {
     let bytes = std::fs::read(dir.join(ACTIVITY)).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The size of the job's VM, once its prepare has sized it.
+pub fn read_guest(dir: &Path) -> Option<vk_hub_proto::dispatch::GuestSize> {
+    let bytes = std::fs::read(dir.join(GUEST)).ok()?;
     if bytes.len() > 4096 {
         return None;
     }

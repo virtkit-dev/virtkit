@@ -16,6 +16,9 @@ All notable changes to virtkit will be documented in this file.
   time, which no longer includes it; so does the median run time. Jobs from older nodes keep
   one time.
 - **A job's branch shows the commit it ran: on hover in the jobs table, and on its page.**
+- **A running job's size is its VM's, once its node has sized it.** It showed the reservation
+  vk-gitlab asked for, which is not the VM the job gets; it is now "-" until the job's
+  preparation sizes the VM, and the size the node gave it from then on.
 
 ### Fixed
 

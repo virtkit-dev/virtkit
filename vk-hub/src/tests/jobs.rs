@@ -1029,6 +1029,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
                 building: true,
                 holder: Some("https://gitlab.example.com/g/p/-/jobs/1".into()),
             }),
+            guest: None,
         },
     });
     view_until(addr, &key, &id, |v| {
@@ -1048,6 +1049,10 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         state: RunState::Running {
             stage: "step_script".into(),
             activity: None,
+            guest: Some(vk_hub_proto::dispatch::GuestSize {
+                cpus: 8,
+                mem_mib: 16384,
+            }),
         },
     });
     view_until(addr, &key, &id, |v| {
@@ -1056,7 +1061,12 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     .await;
     eventually(|| {
         hub.db.job(&id).unwrap().is_some_and(|row| {
-            row.activity.is_none()
+            row.guest
+                == Some(vk_hub_proto::dispatch::GuestSize {
+                    cpus: 8,
+                    mem_mib: 16384,
+                })
+                && row.activity.is_none()
                 && row.prepared_at.is_some()
                 && !row.preparing()
                 && crate::jobs::state_text(&row) == "running: step_script"
@@ -1363,6 +1373,7 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
                 state: RunState::Running {
                     stage: "step_script".into(),
                     activity: None,
+                    guest: None,
                 },
                 output_len: 40,
                 finished: false,
@@ -1533,6 +1544,7 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -2725,6 +2737,7 @@ async fn a_job_running_across_a_restart_keeps_its_image() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -2760,6 +2773,7 @@ async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
             state: RunState::Running {
                 stage: "step_script".into(),
                 activity: None,
+                guest: None,
             },
             output_len: 0,
             finished: false,
@@ -3025,6 +3039,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3111,6 +3126,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3190,6 +3206,7 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
         state: RunState::Running {
             stage: "step_script".into(),
             activity: None,
+            guest: None,
         },
     });
     wait_until(|| jobs.has_changed().unwrap()).await;
@@ -3473,6 +3490,7 @@ fn a_job_is_shown_on_the_command_line() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);

@@ -127,6 +127,10 @@ pub struct JobRow {
     /// hub's clock; `None` while it prepares, or for an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_at: Option<u64>,
+    /// The size its node gave its VM, once its preparation sized it; `None` before, or from a
+    /// node that does not say. A finished job's usage says it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<vk_hub_proto::dispatch::GuestSize>,
     #[serde(default)]
     pub finished_at: Option<u64>,
     /// When its producer settled it and its output was dropped.
@@ -1074,6 +1078,7 @@ mod tests {
             commit: None,
             activity: None,
             prepared_at: None,
+            guest: None,
         }
     }
 

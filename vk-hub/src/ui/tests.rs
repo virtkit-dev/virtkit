@@ -3382,6 +3382,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3642,6 +3643,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         commit: None,
         activity: None,
         prepared_at: None,
+        guest: None,
     }
 }
 

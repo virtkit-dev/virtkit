@@ -1000,7 +1000,11 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                     ),
                 ));
             }
-            RunState::Running { stage, activity } => {
+            RunState::Running {
+                stage,
+                activity,
+                guest,
+            } => {
                 row.state = JobState::Running;
                 let now = crate::now_secs();
                 row.started_at.get_or_insert(now);
@@ -1012,6 +1016,9 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 }
                 row.stage = Some(vk_hub_proto::display_safe(&stage));
                 row.activity = activity.map(display_safe_activity);
+                if guest.is_some() {
+                    row.guest = guest;
+                }
             }
             RunState::Finished => return Ok(Vec::new()),
         }
