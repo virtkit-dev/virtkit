@@ -3,8 +3,9 @@
 //! creates a key; `vk release-key sign` signs a binary on the machine holding it. Keep the
 //! key off the hub so a compromised hub can send arbitrary bytes but cannot sign them.
 //!
-//! A signature covers [`vk_hub_proto::release_message`] — the binary's sha256 and the version
-//! it is released as — and is written as base64, as the public keys are.
+//! A signature covers the binary's sha256 and the version it is released as, under a label
+//! naming its [`Program`] — so a `vk` release never verifies as a `vk-registry` one, nor the
+//! reverse — and is written as base64, as the public keys are.
 
 use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -35,12 +36,31 @@ pub fn generate(path: &Path) -> Result<String> {
     Ok(vk_hub_proto::to_base64(key.public_key().as_ref()))
 }
 
-/// `vk release-key sign`: the signature of `binary` as `version` under the key at `key`,
-/// base64.
-pub fn sign(key: &Path, binary: &Path, version: &str) -> Result<String> {
+/// The release's program determines the signed message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Program {
+    /// `vk`, which nodes run: [`vk_hub_proto::release_message`].
+    #[default]
+    Vk,
+    /// `vk-registry`: [`vk_hub_proto::registry::release_message`].
+    Registry,
+}
+
+impl Program {
+    fn release_message(self, sha256: &[u8; vk_hub_proto::SHA256_LEN], version: &str) -> Vec<u8> {
+        match self {
+            Program::Vk => vk_hub_proto::release_message(sha256, version),
+            Program::Registry => vk_hub_proto::registry::release_message(sha256, version),
+        }
+    }
+}
+
+/// `vk release-key sign`: the signature of `binary` as `version` of `program` under the key
+/// at `key`, base64.
+pub fn sign(key: &Path, binary: &Path, version: &str, program: Program) -> Result<String> {
     let key = load(key)?;
     let sha256 = sha256_of(binary)?;
-    let signature = key.sign(&vk_hub_proto::release_message(&sha256, version));
+    let signature = key.sign(&program.release_message(&sha256, version));
     Ok(vk_hub_proto::to_base64(signature.as_ref()))
 }
 
@@ -104,19 +124,23 @@ pub struct Policy {
     required: bool,
     /// The config table the keys come from, `[node]` or `[hub]`, to say so.
     section: &'static str,
+    /// The program of the releases it checks.
+    program: Program,
 }
 
 impl Policy {
-    /// The policy `[node]` sets. A signature is required when any key is configured, unless
-    /// `require_signed = false`; requiring one with no key to check it against is an error,
-    /// as is a key that is not 32 bytes of base64.
+    /// The policy `[node]` sets for `vk` releases. A signature is required when any key is
+    /// configured, unless `require_signed = false`; requiring one with no key to check it
+    /// against is an error, as is a key that is not 32 bytes of base64.
     pub fn from_config(keys: &[String], require_signed: Option<bool>) -> Result<Self> {
-        Self::from_config_in("[node]", keys, require_signed)
+        Self::from_config_in("[node]", Program::Vk, keys, require_signed)
     }
 
-    /// [`Policy::from_config`] for the keys of the config table `section`.
+    /// [`Policy::from_config`] for the keys of the config table `section`, checking releases
+    /// of `program`.
     pub fn from_config_in(
         section: &'static str,
+        program: Program,
         keys: &[String],
         require_signed: Option<bool>,
     ) -> Result<Self> {
@@ -141,6 +165,7 @@ impl Policy {
             keys,
             required,
             section,
+            program,
         })
     }
 
@@ -178,7 +203,7 @@ impl Policy {
         let signature = vk_hub_proto::from_base64(signature)
             .filter(|s| s.len() == vk_hub_proto::SIGNATURE_LEN)
             .ok_or_else(|| "the release's signature is not an ed25519 signature".to_string())?;
-        let message = vk_hub_proto::release_message(&digest, version);
+        let message = self.program.release_message(&digest, version);
         if self.keys.iter().any(|k| {
             UnparsedPublicKey::new(&ED25519, k)
                 .verify(&message, &signature)
@@ -216,7 +241,7 @@ mod tests {
         assert_eq!(std::fs::read(&key).unwrap(), before);
         let binary = dir.join("vk");
         std::fs::write(&binary, b"a vk").unwrap();
-        let signature = sign(&key, &binary, "0.84.0").unwrap();
+        let signature = sign(&key, &binary, "0.84.0", Program::Vk).unwrap();
         let sha = vk_hub_proto::to_hex(&sha256_of(&binary).unwrap());
 
         let policy = Policy::from_config(std::slice::from_ref(&public), None).unwrap();
@@ -256,17 +281,39 @@ mod tests {
         // A key others can read, or a link to one, is refused.
         let link = dir.join("link.pk8");
         std::os::unix::fs::symlink(&key, &link).unwrap();
-        assert!(sign(&link, &binary, "0.84.0").is_err());
+        assert!(sign(&link, &binary, "0.84.0", Program::Vk).is_err());
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = sign(&key, &binary, "0.84.0").unwrap_err();
+        let err = sign(&key, &binary, "0.84.0", Program::Vk).unwrap_err();
         assert!(format!("{err:#}").contains("chmod 600"), "{err:#}");
         // A FIFO is refused, not waited on.
         let fifo = dir.join("fifo.pk8");
         let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and outlives the call.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
-        let err = sign(&fifo, &binary, "0.84.0").unwrap_err();
+        let err = sign(&fifo, &binary, "0.84.0", Program::Vk).unwrap_err();
         assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_registry_release_verifies_only_as_a_registrys() {
+        let dir = std::env::temp_dir().join(format!("vk-release-key-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("release.pk8");
+        let public = generate(&key).unwrap();
+        let binary = dir.join("vk-registry");
+        std::fs::write(&binary, b"a vk-registry").unwrap();
+        let sha = vk_hub_proto::to_hex(&sha256_of(&binary).unwrap());
+        let keys = std::slice::from_ref(&public);
+        let registry = Policy::from_config_in("[hub]", Program::Registry, keys, None).unwrap();
+        let node = Policy::from_config(keys, None).unwrap();
+
+        let signed = sign(&key, &binary, "0.89.0", Program::Registry).unwrap();
+        registry.check(&sha, "0.89.0", Some(&signed)).unwrap();
+        assert!(node.check(&sha, "0.89.0", Some(&signed)).is_err());
+        let as_vk = sign(&key, &binary, "0.89.0", Program::Vk).unwrap();
+        assert!(registry.check(&sha, "0.89.0", Some(&as_vk)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

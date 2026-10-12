@@ -1587,8 +1587,15 @@ mod tests {
         );
         std::fs::write(dir.join("new"), b"new").unwrap();
         let key = dir.join("release.pk8");
-        let signed =
-            |version: &str| crate::release_key::sign(&key, &dir.join("new"), version).unwrap();
+        let signed = |version: &str| {
+            crate::release_key::sign(
+                &key,
+                &dir.join("new"),
+                version,
+                crate::release_key::Program::Vk,
+            )
+            .unwrap()
+        };
         let version = next_version(0);
         let reason = refusal(&core, update_to("a", &dir, &version, None));
         assert!(reason.contains("unsigned"), "{reason}");
@@ -1604,7 +1611,13 @@ mod tests {
         // Signed by a key the node does not hold.
         let other = dir.join("other.pk8");
         crate::release_key::generate(&other).unwrap();
-        let foreign = crate::release_key::sign(&other, &dir.join("new"), &version).unwrap();
+        let foreign = crate::release_key::sign(
+            &other,
+            &dir.join("new"),
+            &version,
+            crate::release_key::Program::Vk,
+        )
+        .unwrap();
         let reason = refusal(&core, update_to("c", &dir, &version, Some(foreign)));
         assert!(reason.contains("does not verify"), "{reason}");
         assert_eq!(core.persisted().job, None);

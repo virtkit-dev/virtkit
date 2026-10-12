@@ -19,6 +19,8 @@ All notable changes to virtkit will be documented in this file.
   combined time.
 - **A job's branch shows the commit it ran: on hover in the jobs table, on its page, and in
   `vk-hub jobs show`.**
+- **`vk release-key sign --program vk-registry`** signs a `vk-registry` release, for
+  `vk-hub release add --program vk-registry --signature`.
 
 ### Fixed
 

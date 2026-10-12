@@ -148,6 +148,16 @@ fn parse_build_jobs(s: &str) -> Result<NonZeroUsize, String> {
         .map_err(|_| format!("expected a positive stage count, got {s:?}"))
 }
 
+/// Which program `vk release-key sign` signs a release of; the names `vk-hub release add
+/// --program` takes.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum ReleaseProgram {
+    /// vk, which nodes run
+    Vk,
+    /// vk-registry, which registries run
+    VkRegistry,
+}
+
 /// What `vk export` can package a raw disk image as.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum ExportFormat {
@@ -268,15 +278,18 @@ enum ReleaseKeyCmd {
         #[arg(long, value_name = "FILE")]
         key: PathBuf,
     },
-    /// Sign a vk binary as a version, and print the signature
+    /// Sign a vk or vk-registry binary as a version, and print the signature
     Sign {
         /// The private key `generate` wrote
         #[arg(long, value_name = "FILE")]
         key: PathBuf,
-        /// The version the binary's `vk --version` prints
+        /// The version the binary's `--version` prints
         #[arg(long)]
         version: String,
-        /// The vk binary
+        /// The program it is: vk, for nodes, or vk-registry, for registries
+        #[arg(long, value_enum, default_value_t = ReleaseProgram::Vk)]
+        program: ReleaseProgram,
+        /// The binary
         binary: PathBuf,
     },
 }
@@ -827,11 +840,12 @@ enum Cmd {
               value_parser = clap::value_parser!(u64).range(1..))]
         mem_secs: u64,
     },
-    /// Keys that sign vk releases for a fleet's nodes (experimental)
+    /// Keys that sign vk and vk-registry releases for a fleet (experimental)
     ///
-    /// `generate` makes a key and prints the public half for `[node] release_keys`; `sign`
-    /// signs a vk binary as a version, for `vk-hub release add --signature`. Keep the key
-    /// off the hub: a signature is what a node trusts when the hub itself might not be.
+    /// `generate` makes a key and prints the public half for `[node] release_keys` (or a
+    /// vk-registry's `[hub] release_keys`); `sign` signs a binary as a version, for `vk-hub
+    /// release add --signature`. Keep the key off the hub: a signature is what a node or
+    /// registry trusts when the hub itself might not be.
     #[command(hide = true)]
     ReleaseKey {
         #[command(subcommand)]
@@ -3147,8 +3161,15 @@ async fn cli_main(cli: Cli) -> ExitCode {
             ReleaseKeyCmd::Sign {
                 key,
                 version,
+                program,
                 binary,
-            } => release_key::sign(key, binary, version),
+            } => {
+                let program = match program {
+                    ReleaseProgram::Vk => release_key::Program::Vk,
+                    ReleaseProgram::VkRegistry => release_key::Program::Registry,
+                };
+                release_key::sign(key, binary, version, program)
+            }
         };
         return match printed {
             Ok(line) => {

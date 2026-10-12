@@ -594,9 +594,11 @@ one older than 0.85.0, the first release that takes part in a trial; versions ar
 Signatures are made offline: `vk release-key generate --key <file>` writes an ed25519 key
 (`0600`, published whole and never over an existing file) and prints its public half in
 base64, and `vk release-key sign --key <file> --version <v> <binary>` prints the signature of
-the binary's sha256 and version under the label `vk-fleet release v1`. The tool is in `vk`,
-which every node and workstation has and which already links ring, rather than in `vk-hub`:
-keep the key off the hub so a compromised hub cannot sign releases.
+the binary's sha256 and version under the label `vk-fleet release v1`; with `--program
+vk-registry` it signs a `vk-registry` release instead, under `vk-fleet registry-release v1`,
+for `vk-hub release add --program vk-registry --signature`. The tool is in `vk`, which every
+node and workstation has and which already links ring, rather than in `vk-hub`: keep the key
+off the hub so a compromised hub cannot sign releases.
 
 A node's `[node] release_keys` lists its trusted keys. `require_signed` defaults to true when
 any key is set, requiring a signature by one of them. The node checks it on receipt, before
