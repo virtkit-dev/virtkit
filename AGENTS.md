@@ -69,6 +69,11 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with thirteen crates:
   payloads each side signs or verifies; and the hub's client API and the job spec a producer
   such as `vk-gitlab` submits through it. Types and pure functions only — no runtime,
   transport or crypto.
+- **`vk-peer/`** — what a peer of `vk-hub` needs to join it and hold a session: its ed25519
+  identity, enrollment, TLS and the session's opening handshake, release keys, and the
+  pieces of a self-update on trial (download under the peer's signature, publish by rename,
+  `fexecve` with `alarm(2)` armed). `vk node` uses it; each peer keeps its own messages and
+  state.
 - **`vk-oidc/`** — the OIDC relying party `vk-registry` and `vk-hub` sign people in with:
   discovery checked against the configured issuer, the authorization URL with `state` and
   PKCE, the code exchange and UserInfo, and the checks on an `[oidc]` table's issuer and

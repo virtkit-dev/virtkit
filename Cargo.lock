@@ -4088,6 +4088,7 @@ dependencies = [
  "vk-core",
  "vk-fs",
  "vk-hub-proto",
+ "vk-peer",
  "vk-registry",
  "vk-runnerctl",
  "vk-selfupdate",
@@ -4180,6 +4181,32 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "vk-peer"
+version = "0.88.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "vk-fs",
+ "vk-hub-proto",
+ "vk-selfupdate",
 ]
 
 [[package]]

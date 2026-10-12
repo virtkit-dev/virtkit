@@ -67,7 +67,7 @@ mod qga;
 mod registry;
 mod regproxy;
 mod relay;
-mod release_key;
+use vk_peer::release_key;
 mod run;
 mod schedule;
 mod scratch;

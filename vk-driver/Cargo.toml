@@ -23,6 +23,7 @@ vk-fs = { path = "../vk-fs" }
 # daemon; vk links it for its in-process build cache (registry.rs `mod local`).
 vk-registry = { path = "../vk-registry" }
 # `vk update`: the release-install path, shared with the vk-registry binary.
+vk-peer = { path = "../vk-peer" }
 vk-selfupdate = { path = "../vk-selfupdate" }
 # Share the root-side `concurrent` editor and its check that nothing else changed
 # when editing a runner config this user owns.

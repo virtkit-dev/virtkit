@@ -1,0 +1,30 @@
+[package]
+name = "vk-peer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# A peer of vk-hub — `vk node`, `vk-registry` — joining it and holding a session with it: the
+# identity, enrollment, transport and handshake, release keys and self-update pieces they share.
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+tokio-tungstenite.workspace = true
+vk-fs = { path = "../vk-fs" }
+vk-hub-proto = { path = "../vk-hub-proto" }
+vk-selfupdate = { path = "../vk-selfupdate" }

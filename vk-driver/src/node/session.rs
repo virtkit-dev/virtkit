@@ -11,7 +11,6 @@
 //! the session rather than wedging it.
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,14 +18,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use vk_hub_proto::{
-    Channel, CommandAck, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, Outcome, PROTOCOL, Report,
-    STEERING, TLS_EXPORTER_LEN, VersionRange,
+    CommandAck, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, Outcome, PROTOCOL, Report, STEERING,
+    TLS_EXPORTER_LEN, VersionRange,
 };
 
 use super::Enrollment;
@@ -55,12 +51,6 @@ const MISSED_HEARTBEATS: u32 = 3;
 /// How long a stopping node waits for the hub to take its close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long unacknowledged data may sit on the socket before the kernel gives the
-/// connection up, and when an idle one starts being probed. At the hub's 5s heartbeat both
-/// fall well inside the silence that ends a session, so the socket fails first and says why.
-const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
-
 /// The protocol versions this node speaks: placed jobs, tools builds and `[node] runner =
 /// "none"` on top of what every peer shares.
 pub const NODE_PROTOCOL: VersionRange = VersionRange {
@@ -71,35 +61,9 @@ pub const NODE_PROTOCOL: VersionRange = VersionRange {
 /// How often the node looks at its placed jobs for news: output, stages, results, leases.
 const JOBS_EVERY: Duration = Duration::from_millis(250);
 
-/// The transport under the WebSocket: TCP, or TLS over it.
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-
-type Ws = WebSocketStream<Box<dyn Io>>;
-
-/// A refusal no redial can fix: the node's enrollment is gone or not its own.
-#[derive(Debug)]
-pub struct Permanent(pub String);
-
-impl std::fmt::Display for Permanent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Permanent {}
-
-/// A newer session of this node took over at the hub.
-#[derive(Debug)]
-pub struct Superseded(pub String);
-
-impl std::fmt::Display for Superseded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Superseded {}
+pub use vk_peer::now_secs;
+use vk_peer::session::Ws;
+pub use vk_peer::session::{Permanent, Superseded};
 
 /// What a session needs and keeps across reconnects.
 pub struct Node {
@@ -534,13 +498,6 @@ async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<Command
     }
 }
 
-/// Seconds since the Unix epoch, which command expiries count in.
-pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Run `f` on the core off the runtime: it writes the node's state file.
 async fn persist<T: Send + 'static>(
     core: &Arc<Core>,
@@ -611,177 +568,25 @@ async fn handshake(
     node: &Node,
     exported: Option<&[u8; TLS_EXPORTER_LEN]>,
 ) -> Result<(u32, u32)> {
-    let node_id = &node.enrollment.node_id;
-    send(
-        ws,
-        &NodeMsg::Hello {
-            versions: NODE_PROTOCOL,
-            node_id: node_id.clone(),
-            incarnation: node.incarnation.clone(),
-            vk_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-        CONNECT_TIMEOUT,
-    )
-    .await?;
-    let (version, hub_versions, nonce) = match receive(ws).await? {
-        HubMsg::Challenge {
-            version,
-            versions,
-            nonce,
-        } => {
-            // The highest version both sides speak, and nothing else: a hub — or something
-            // between the two — picking a lower one is refused, not followed.
-            if !NODE_PROTOCOL.accepts_pick(versions, version) {
-                bail!(
-                    "the hub chose protocol version {version} of {}–{}, not the highest this vk \
-                     ({}–{}) shares with it",
-                    versions.min,
-                    versions.max,
-                    NODE_PROTOCOL.min,
-                    NODE_PROTOCOL.max
-                );
-            }
-            let nonce = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::CHALLENGE_LEN }>(&nonce)
-                .context("the hub's challenge is malformed")?;
-            (version, versions, nonce)
-        }
-        HubMsg::Refused { code, reason } => return Err(refusal(code, &reason, &node.dir)),
-        other => bail!("the hub answered the hello with {}", kind(&other)),
+    let hello = vk_peer::session::Hello {
+        versions: NODE_PROTOCOL,
+        id: &node.enrollment.node_id,
+        identity: &node.identity,
+        incarnation: &node.incarnation,
+        version: env!("CARGO_PKG_VERSION"),
     };
-    let channel = match exported {
-        Some(exported) => Channel::Tls(exported),
-        None => Channel::Plaintext,
-    };
-    let signature = node.identity.sign(&vk_hub_proto::auth_message(
-        &nonce,
-        node_id,
-        &node.incarnation,
-        NODE_PROTOCOL,
-        hub_versions,
-        version,
-        channel,
-    ));
-    send(ws, &NodeMsg::Auth { signature }, CONNECT_TIMEOUT).await?;
-    match receive(ws).await? {
-        HubMsg::Welcome { heartbeat_secs } => Ok((heartbeat_secs, version)),
-        HubMsg::Refused { code, reason } => Err(refusal(code, &reason, &node.dir)),
-        other => bail!("the hub answered the auth with {}", kind(&other)),
-    }
+    vk_peer::session::handshake(ws, &hello, exported, CONNECT_TIMEOUT, |code, reason| {
+        refusal(code, reason, &node.dir)
+    })
+    .await
 }
 
-/// Dial the hub's node endpoint: TCP, TLS for an `https` hub, then the WebSocket upgrade.
-/// Returns the TLS keying material the auth is bound to, `None` on plain TCP.
+/// Dial the hub's node endpoint.
 async fn connect(
     hub: &str,
     tls: &Arc<rustls::ClientConfig>,
 ) -> Result<(Ws, Option<[u8; TLS_EXPORTER_LEN]>)> {
-    let (io, exported, authority) = dial(hub, tls).await?;
-    let scheme = if exported.is_some() { "wss" } else { "ws" };
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(vk_hub_proto::MAX_MESSAGE))
-        .max_frame_size(Some(vk_hub_proto::MAX_MESSAGE));
-    let ws_url = format!("{scheme}://{authority}{}", vk_hub_proto::NODE_PATH);
-    let (ws, _) = tokio_tungstenite::client_async_with_config(ws_url, io, Some(config))
-        .await
-        .map_err(|e| match e {
-            // The hub's bound on handshakes in flight: transient by design.
-            tokio_tungstenite::tungstenite::Error::Http(resp)
-                if resp.status()
-                    == tokio_tungstenite::tungstenite::http::StatusCode::SERVICE_UNAVAILABLE =>
-            {
-                anyhow!("{hub} is busy with other nodes' handshakes (HTTP 503)")
-            }
-            e => anyhow!("opening the WebSocket to {hub}: {e}"),
-        })?;
-    Ok((ws, exported))
-}
-
-/// A connection to the hub's node listener: TCP, and TLS for an `https` hub. Returns it
-/// with the TLS keying material a signature on it is bound to — `None` on plain TCP — and
-/// the `host:port` it reached.
-pub async fn dial(
-    hub: &str,
-    tls: &Arc<rustls::ClientConfig>,
-) -> Result<(Box<dyn Io>, Option<[u8; TLS_EXPORTER_LEN]>, String)> {
-    let url = reqwest::Url::parse(hub).with_context(|| format!("parsing the hub URL {hub:?}"))?;
-    // Bracketed for an IPv6 literal, which is the form both the socket address and the
-    // WebSocket URL want.
-    let host = url.host_str().context("the hub URL has no host")?;
-    let port = url
-        .port_or_known_default()
-        .context("the hub URL has no port")?;
-    let authority = format!("{host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&authority)
-        .await
-        .with_context(|| format!("connecting to {authority}"))?;
-    // Heartbeats are small and latency is what a session is judged on.
-    tcp.set_nodelay(true).context("setting TCP_NODELAY")?;
-    keepalive(&tcp).context("setting TCP keepalives")?;
-    let (io, exported): (Box<dyn Io>, _) = match url.scheme() {
-        "https" => {
-            // An IP literal is verified against the certificate's IP addresses, a name
-            // against its DNS names.
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            let name = match bare.parse::<std::net::IpAddr>() {
-                Ok(ip) => ip.into(),
-                Err(_) => rustls::pki_types::ServerName::try_from(bare.to_string())
-                    .with_context(|| format!("{bare:?} is not a valid TLS server name"))?,
-            };
-            let stream = tokio_rustls::TlsConnector::from(tls.clone())
-                .connect(name, tcp)
-                .await
-                .with_context(|| format!("TLS handshake with {authority}"))?;
-            let mut exported = [0u8; TLS_EXPORTER_LEN];
-            stream
-                .get_ref()
-                .1
-                .export_keying_material(&mut exported, vk_hub_proto::TLS_EXPORTER_LABEL, None)
-                .context("exporting TLS keying material")?;
-            (Box::new(stream), Some(exported))
-        }
-        "http" => (Box::new(tcp), None),
-        other => bail!("the hub URL has scheme {other:?}; expected https (or http on loopback)"),
-    };
-    Ok((io, exported, authority))
-}
-
-/// Keepalives on an idle socket and a bound on unacknowledged data on a busy one, so a hub
-/// that disappeared behind a dead route is noticed by the kernel too.
-fn keepalive(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
-    let fd = tcp.as_raw_fd();
-    let secs = |d: Duration| libc::c_int::try_from(d.as_secs()).unwrap_or(libc::c_int::MAX);
-    let millis = libc::c_int::try_from(TCP_USER_TIMEOUT.as_millis()).unwrap_or(libc::c_int::MAX);
-    for (level, name, value) in [
-        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
-        (
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPIDLE,
-            secs(TCP_KEEPALIVE_IDLE),
-        ),
-        (
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPINTVL,
-            secs(TCP_KEEPALIVE_IDLE),
-        ),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 2),
-        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, millis),
-    ] {
-        // SAFETY: `fd` is the live socket `tcp` owns; the option value is a c_int that outlives
-        // the call, and its size is passed with it.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&raw const value).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    vk_peer::session::connect(hub, tls, vk_hub_proto::NODE_PATH).await
 }
 
 async fn send(ws: &mut Ws, msg: &NodeMsg, within: Duration) -> Result<()> {
@@ -792,27 +597,11 @@ async fn send(ws: &mut Ws, msg: &NodeMsg, within: Duration) -> Result<()> {
         .map_err(|e| anyhow!("sending to the hub: {e}"))
 }
 
-/// The next message of the handshake, within [`CONNECT_TIMEOUT`].
-async fn receive(ws: &mut Ws) -> Result<HubMsg> {
-    tokio::time::timeout(CONNECT_TIMEOUT, async {
-        loop {
-            match ws.next().await {
-                None => bail!("the hub closed the connection"),
-                Some(Err(e)) => bail!("reading from the hub: {e}"),
-                Some(Ok(Message::Text(text))) => return parse(text.as_str()),
-                Some(Ok(Message::Close(_))) => bail!("the hub closed the session"),
-                Some(Ok(_)) => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("the hub sent nothing for {CONNECT_TIMEOUT:?}"))?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio_tungstenite::WebSocketStream;
+    use vk_hub_proto::Channel;
     use vk_hub_proto::{Operation, RefusalCode, VersionRange};
 
     type HubSide = WebSocketStream<tokio::net::TcpStream>;
