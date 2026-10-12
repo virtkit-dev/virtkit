@@ -537,6 +537,7 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     if ref_name.is_empty() {
         git(dest, &["fetch", "--quiet", "--prune", "origin"], "fetch")?;
     } else {
+        drop_conflicting_tracking_refs(dest, ref_name)?;
         git(
             dest,
             &["fetch", "--quiet", "--prune", "origin", "--", ref_name],
@@ -605,6 +606,40 @@ fn settle_index(dest: &Path) -> Result<()> {
 /// A git ref name safe to pass as a fetch argument: git's own rules already forbid these in a
 /// branch/tag, so rejecting them cannot turn away a legitimate ref. `/` stays allowed
 /// (`feature/x`); a leading `-`/`+` and refspec/glob metacharacters are refused.
+/// Delete the remote-tracking refs a fetch of `ref_name` would collide with: `origin/<p>` for a
+/// leading path `p` of it, or anything under `origin/<ref_name>/`. Git stores refs as files, so
+/// `origin/a` left over from a deleted branch `a` makes `origin/a/b` impossible to create, and
+/// `--prune` does not reach it: with a refspec on the command line it prunes only what that
+/// refspec matches. The remote cannot hold both names, so a ref in the way is always stale.
+fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str) -> Result<()> {
+    let out = git_command()
+        .arg("-C")
+        .arg(dest)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remotes/origin/",
+        ])
+        .output()
+        .context("spawning git for-each-ref")?;
+    if !out.status.success() {
+        bail!("git for-each-ref failed ({})", out.status);
+    }
+    let target = format!("refs/remotes/origin/{ref_name}");
+    for r in String::from_utf8_lossy(&out.stdout).lines() {
+        let above = target
+            .strip_prefix(r)
+            .is_some_and(|rest| rest.starts_with('/'));
+        let below = r
+            .strip_prefix(&target)
+            .is_some_and(|rest| rest.starts_with('/'));
+        if above || below {
+            git(dest, &["update-ref", "-d", r], "update-ref -d")?;
+        }
+    }
+    Ok(())
+}
+
 fn ref_name_ok(r: &str) -> bool {
     !r.starts_with('-')
         && !r.starts_with('+')
@@ -803,6 +838,74 @@ mod tests {
     }
 
     /// A checkout root with two slot/project trees in it, one of them ours to reclaim.
+    /// A branch replaced by branches under its name, and the reverse: the fetch of the new
+    /// name succeeds over the tracking ref the old one left in the slot's repository.
+    #[test]
+    fn a_fetch_gets_past_a_deleted_branchs_tracking_ref() {
+        let root = root("df-conflict");
+        let remote = root.join("remote");
+        let dest = root.join("dest");
+        let sh = |dir: &Path, args: &[&str]| git(dir, args, "test").unwrap();
+        run(
+            git_command()
+                .args(["init", "--quiet", "-b", "main"])
+                .arg(&remote),
+            "init",
+        )
+        .unwrap();
+        sh(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "c",
+            ],
+        );
+        sh(&remote, &["branch", "a"]);
+        run(
+            git_command()
+                .args(["clone", "--quiet"])
+                .arg(&remote)
+                .arg(&dest),
+            "clone",
+        )
+        .unwrap();
+        let fetch = |name: &str| {
+            drop_conflicting_tracking_refs(&dest, name).unwrap();
+            git(
+                &dest,
+                &["fetch", "--quiet", "--prune", "origin", "--", name],
+                "fetch",
+            )
+        };
+        sh(&dest, &["fetch", "--quiet", "origin"]);
+
+        // `a` goes, `a/b` comes: `origin/a` is in the way of `origin/a/b`.
+        sh(&remote, &["branch", "-D", "a"]);
+        sh(&remote, &["branch", "a/b"]);
+        fetch("a/b").unwrap();
+        assert!(dest.join(".git/refs/remotes/origin/a/b").exists());
+
+        // And back: `origin/a/b` is in the way of `origin/a`.
+        sh(&remote, &["branch", "-D", "a/b"]);
+        sh(&remote, &["branch", "a"]);
+        fetch("a").unwrap();
+        assert!(dest.join(".git/refs/remotes/origin/a").is_file());
+
+        // A name merely sharing a prefix is not in the way.
+        sh(&remote, &["branch", "ab"]);
+        sh(&dest, &["fetch", "--quiet", "origin"]);
+        fetch("a").unwrap();
+        assert!(dest.join(".git/refs/remotes/origin/ab").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("vk-checkout-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
