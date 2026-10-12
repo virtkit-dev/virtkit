@@ -68,7 +68,6 @@ mod qga;
 mod registry;
 mod regproxy;
 mod relay;
-mod release_key;
 mod run;
 mod schedule;
 mod scratch;
@@ -114,6 +113,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use vk_core::addr::SocketAddr;
+use vk_peer::release_key;
 
 use crate::config::Config;
 use crate::jobctx::JobCtx;

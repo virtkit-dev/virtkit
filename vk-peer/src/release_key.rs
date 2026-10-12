@@ -1,4 +1,5 @@
-//! Ed25519 release keys for fleet nodes (`[node] release_keys`). `vk release-key generate`
+//! Ed25519 release keys for the hub's peers (`[node] release_keys` for `vk node`, `[hub]
+//! release_keys` for `vk-registry`). `vk release-key generate`
 //! creates a key; `vk release-key sign` signs a binary on the machine holding it. Keep the
 //! key off the hub so a compromised hub can send arbitrary bytes but cannot sign them.
 //!
@@ -17,8 +18,8 @@ use sha2::{Digest, Sha256};
 const MAX_KEY_FILE: u64 = 4096;
 
 /// `vk release-key generate`: a new key at `path`, `0600` from the moment it exists, published
-/// whole and never over an existing file. Returns its public half, base64, for `[node]
-/// release_keys`.
+/// whole and never over an existing file. Returns its public half, base64, for a peer's
+/// `release_keys`.
 pub fn generate(path: &Path) -> Result<String> {
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 =
@@ -44,7 +45,7 @@ pub fn sign(key: &Path, binary: &Path, version: &str) -> Result<String> {
 }
 
 fn load(path: &Path) -> Result<Ed25519KeyPair> {
-    // `O_NOFOLLOW` and the mode judged off the descriptor, as for the node's own key;
+    // `O_NOFOLLOW` and the mode judged off the descriptor, as for the peer's own key;
     // `O_NONBLOCK` so a FIFO there is refused rather than waited on.
     let mut file = std::fs::File::options()
         .read(true)
@@ -95,11 +96,14 @@ fn sha256_of(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-/// The node's signature policy, read once from `[node] release_keys` and `require_signed`.
+/// A peer's signature policy, read once from its config's `release_keys` and
+/// `require_signed`.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     keys: Vec<Vec<u8>>,
     required: bool,
+    /// The config table the keys come from, `[node]` or `[hub]`, to say so.
+    section: &'static str,
 }
 
 impl Policy {
@@ -107,6 +111,15 @@ impl Policy {
     /// `require_signed = false`; requiring one with no key to check it against is an error,
     /// as is a key that is not 32 bytes of base64.
     pub fn from_config(keys: &[String], require_signed: Option<bool>) -> Result<Self> {
+        Self::from_config_in("[node]", keys, require_signed)
+    }
+
+    /// [`Policy::from_config`] for the keys of the config table `section`.
+    pub fn from_config_in(
+        section: &'static str,
+        keys: &[String],
+        require_signed: Option<bool>,
+    ) -> Result<Self> {
         let keys = keys
             .iter()
             .map(|k| {
@@ -114,20 +127,24 @@ impl Policy {
                     .filter(|k| k.len() == vk_hub_proto::PUBLIC_KEY_LEN)
                     .ok_or_else(|| {
                         anyhow!(
-                            "[node] release_keys: {k:?} is not an ed25519 public key in base64, \
-                             as `vk release-key generate` prints one"
+                            "{section} release_keys: {k:?} is not an ed25519 public key in \
+                             base64, as `vk release-key generate` prints one"
                         )
                     })
             })
             .collect::<Result<Vec<_>>>()?;
         let required = require_signed.unwrap_or(!keys.is_empty());
         if required && keys.is_empty() {
-            bail!("[node] require_signed = true needs release_keys to check signatures against");
+            bail!("{section} require_signed = true needs release_keys to check signatures against");
         }
-        Ok(Policy { keys, required })
+        Ok(Policy {
+            keys,
+            required,
+            section,
+        })
     }
 
-    /// Whether every release must carry a signature by one of the node's keys: the node does
+    /// Whether every release must carry a signature by one of the peer's keys: the peer does
     /// not take its hub's word for what runs on it.
     pub fn required(&self) -> bool {
         self.required
@@ -144,11 +161,11 @@ impl Policy {
     ) -> Result<(), String> {
         let Some(signature) = signature else {
             return if self.required {
-                Err(
-                    "the release is unsigned, and this node requires a signature by one of its \
-                     [node] release_keys"
-                        .to_string(),
-                )
+                Err(format!(
+                    "the release is unsigned, and this host requires a signature by one of its \
+                     {} release_keys",
+                    self.section
+                ))
             } else {
                 Ok(())
             };
@@ -170,8 +187,9 @@ impl Policy {
             Ok(())
         } else {
             Err(format!(
-                "the release's signature does not verify as vk {version} against any of this \
-                 node's [node] release_keys"
+                "the release's signature does not verify as {version} against any of this \
+                 host's {} release_keys",
+                self.section
             ))
         }
     }

@@ -1,6 +1,6 @@
-//! The node's ed25519 identity: a PKCS#8 key under `<state_dir>/node/`, created `0600` and
-//! never replaced. The hub pins its public half at enrollment, so losing or replacing the
-//! file means enrolling again as a new node.
+//! A peer's ed25519 identity: a PKCS#8 key in its state directory, created `0600` and never
+//! replaced. The hub pins its public half at enrollment, so losing or replacing the file means
+//! enrolling again as a new peer.
 
 use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -31,7 +31,7 @@ impl Identity {
         }
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|_| anyhow!("generating the node's ed25519 key"))?;
+            .map_err(|_| anyhow!("generating the peer's ed25519 key"))?;
         // Private from the moment it exists, and published whole by `rename`.
         vk_fs::write_atomic(&path, pkcs8.as_ref(), 0o600)
             .with_context(|| format!("writing {}", path.display()))?;
@@ -43,8 +43,8 @@ impl Identity {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(KEY_FILE);
         // `O_NOFOLLOW` and the mode judged off the descriptor: a key file swapped for a link,
-        // or one others can read, is not this node's secret any more. Its owner is left to
-        // the directory, which `vk node` requires be this user's alone.
+        // or one others can read, is not this peer's secret any more. Its owner is left to
+        // the directory, which the peer requires be this user's alone.
         let mut file = std::fs::File::options()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -57,7 +57,7 @@ impl Identity {
             .mode();
         if mode & 0o077 != 0 {
             bail!(
-                "{} has mode {:o}: the node's private key must be readable by its owner only \
+                "{} has mode {:o}: the peer's private key must be readable by its owner only \
                  (chmod 600)",
                 path.display(),
                 mode & 0o7777
@@ -93,7 +93,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-node-id-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vk-peer-id-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
