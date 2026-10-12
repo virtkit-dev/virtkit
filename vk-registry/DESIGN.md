@@ -615,6 +615,16 @@ so no push can stop collection.
 The `/dav/files/` objects are tags and blobs under `files/` and need no pass of their own:
 `gc` and `status` treat them as the repositories they are.
 
+## Management by a hub
+
+A registry may enroll with a `vk-hub` (`vk-registry join`), which then sees its inventory,
+load and usage and, within what `[hub] allow` lists, makes it read-only, schedules and runs
+its gc, and updates it on trial. The registry's authentication and its accounts database are
+not involved: the session is an outbound WebSocket to the hub, authenticated with the
+registry's own ed25519 key, and everything kept for it is under `<root>/hub/`. Read-only is
+enforced after authentication, on every route that writes the store. See
+[`docs/registry-hub.md`](../docs/registry-hub.md).
+
 ## Guest credential proxy
 
 With `vk run --registry-proxy` or `[registry] proxy_guests = true`, the host starts a

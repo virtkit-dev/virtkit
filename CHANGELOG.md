@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A vk-hub can manage registries** (experimental). `vk-registry join <hub> --token -`
+  enrolls a registry with a token from `vk-hub token create --kind registry`; its mode,
+  database, keys and UI stay as they are, and it serves whether the hub is reachable or not.
+  The hub lists each registry's version, store space and usage, connections and last gc
+  (`vk-hub registries`, the web UI's Registries page), and may make it read-only, schedule
+  or run its gc, or update it to a `vk-registry` release it holds, on trial and rolled back
+  when the release does not reach the hub — only what the registry's `[hub] allow` lists.
+  `vk-registry leave` undoes it. See `docs/registry-hub.md`.
+- **`vk-hub release add --program vk-registry`** holds `vk-registry` releases beside `vk` ones.
+
 ## [0.88.0] - 2026-10-11
 
 ### Added

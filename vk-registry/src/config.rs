@@ -91,6 +91,30 @@ pub struct ServerConfig {
     /// Connections served at once from one client address (an IPv6 /64); past it, new ones
     /// are answered 503 and closed, so one host cannot take every slot of `max_connections`.
     pub max_connections_per_client: usize,
+    /// `[hub]`: what a hub this registry is enrolled with may do to it.
+    pub hub: HubSettings,
+}
+
+/// The `[hub]` table: what the hub may do to a registry enrolled with it. Nothing, by
+/// default: an enrolled registry is watched, not steered, until its operator says so here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HubSettings {
+    /// The hub's desired state and commands this registry takes: `read-only`, `gc`,
+    /// `update`.
+    pub allow: Vec<String>,
+    /// Ed25519 public keys, base64, an update must be signed by one of.
+    pub release_keys: Vec<String>,
+    /// Whether an update must be signed; by default, when `release_keys` names any.
+    pub require_signed: Option<bool>,
+    /// Whether an update may install an older version.
+    pub allow_downgrade: bool,
+}
+
+impl HubSettings {
+    /// Whether the hub may do what [`vk_hub_proto::registry`]'s `ALLOW_*` value `what` names.
+    pub fn allows(&self, what: &str) -> bool {
+        self.allow.iter().any(|a| a == what)
+    }
 }
 
 /// The `[oidc]` config table, as declared (before its client secret is read and checked
@@ -149,6 +173,21 @@ struct FileConfig {
     oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
+    hub: Option<FileHub>,
+}
+
+/// `deny_unknown_fields`: a misspelt `allow` would leave the hub steering nothing, or a
+/// misspelt `release_keys` updates unchecked, without a word.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileHub {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    release_keys: Vec<String>,
+    require_signed: Option<bool>,
+    #[serde(default)]
+    allow_downgrade: bool,
 }
 
 /// What `admin_socket` accepts: a bool (`false` = bind none, `true` = the default path)
@@ -237,7 +276,54 @@ impl ServerConfig {
             webdav: true,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
+            hub: HubSettings::default(),
         }
+    }
+
+    /// What a hub managing the registry is told it is, and may do to it.
+    pub fn hub_facts(&self) -> crate::hub::Facts {
+        use sha2::{Digest, Sha256};
+        let mode = match self.mode {
+            AuthMode::SharedSecret => "shared-secret",
+            AuthMode::Accounts => "accounts",
+        };
+        let upstreams: Vec<String> = self.upstreams.iter().map(|u| u.prefix.clone()).collect();
+        let tls = self.tls_cert.is_some() && self.tls_key.is_some();
+        // What would make two registries that should match differ: not paths or secrets.
+        let described = format!(
+            "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub={:?}",
+            self.webdav, self.max_connections, self.max_connections_per_client, self.hub
+        );
+        crate::hub::Facts {
+            listen: self.addr.to_string(),
+            tls,
+            mode,
+            webdav: self.webdav,
+            upstreams,
+            max_connections: self.max_connections,
+            settings: self.hub.clone(),
+            config_hash: vk_hub_proto::to_hex(&Sha256::digest(described.as_bytes()))[..16]
+                .to_string(),
+        }
+    }
+
+    /// `[hub] allow` names only what a hub can ask, and its release keys parse.
+    fn check_hub(&self) -> Result<()> {
+        use vk_hub_proto::registry::{ALLOW_GC, ALLOW_READ_ONLY, ALLOW_UPDATE};
+        for what in &self.hub.allow {
+            if ![ALLOW_READ_ONLY, ALLOW_GC, ALLOW_UPDATE].contains(&what.as_str()) {
+                bail!(
+                    "[hub] allow: {what:?} is not something the hub asks; expected \
+                     {ALLOW_READ_ONLY}, {ALLOW_GC} or {ALLOW_UPDATE}"
+                );
+            }
+        }
+        vk_peer::release_key::Policy::from_config_in(
+            "[hub]",
+            &self.hub.release_keys,
+            self.hub.require_signed,
+        )?;
+        Ok(())
     }
 
     /// The store root alone, for the commands that operate on a store without serving it
@@ -418,8 +504,15 @@ impl ServerConfig {
             max_connections_per_client: f
                 .max_connections_per_client
                 .unwrap_or(crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT),
+            hub: f.hub.map_or_else(HubSettings::default, |h| HubSettings {
+                allow: h.allow,
+                release_keys: h.release_keys,
+                require_signed: h.require_signed,
+                allow_downgrade: h.allow_downgrade,
+            }),
         };
         cfg.check_connection_limits()?;
+        cfg.check_hub()?;
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
         // a contradictory file is refused by parsing it at all, not only by the path that
         // goes on to build the auth scheme. The serve path does both, so no message an

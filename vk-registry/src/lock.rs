@@ -103,6 +103,11 @@ impl Default for LockManager {
 }
 
 impl LockManager {
+    /// How many locks are held now.
+    pub fn held_count(&self) -> usize {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     pub fn new() -> Self {
         LockManager {
             held: Mutex::new(HashMap::new()),

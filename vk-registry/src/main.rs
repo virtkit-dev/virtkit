@@ -107,6 +107,47 @@ enum Cmd {
         )]
         service_user: String,
     },
+    /// Enroll this registry with a vk-hub, which then watches it and may steer it
+    ///
+    /// Generates the registry's key under <store>/hub/ and enrolls it with a single-use token
+    /// from `vk-hub token create --kind registry`. Nothing about how the registry serves
+    /// changes: its mode, database, keys and UI stay as they are, and it serves whether the hub
+    /// is reachable or not. A running `serve` connects within a minute. The hub may only do
+    /// what the config's `[hub] allow` lists. `vk-registry leave` undoes it.
+    Join {
+        /// The hub's URL: https, or http to a hub on loopback
+        hub: String,
+        /// The token; prefer --token - (read on stdin) or --token-file
+        #[arg(long, conflicts_with = "token_file")]
+        token: Option<String>,
+        /// A file holding the token
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<PathBuf>,
+        /// Verify the hub against this CA bundle alone, not the system's roots
+        #[arg(long, value_name = "FILE")]
+        ca: Option<PathBuf>,
+        /// Enroll again, as a new registry, though this one is enrolled
+        #[arg(long)]
+        replace: bool,
+        /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// The `serve` config file to take the store root from
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+    /// Forget the hub this registry is enrolled with
+    ///
+    /// Deletes <store>/hub/. A running `serve` reports to the hub until it restarts; the hub
+    /// keeps the registry, disconnected, until `vk-hub registries remove`.
+    Leave {
+        /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// The `serve` config file to take the store root from
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
     /// Report the store's usage and content
     ///
     /// Stored bytes, space referenced by tags, uncompressed data in recorded completed
@@ -544,6 +585,26 @@ const TOOL: Tool = Tool {
     version: env!("CARGO_PKG_VERSION"),
 };
 
+/// The version as a string of its own in the binary, NUL on both sides: what `vk-hub release
+/// add --program vk-registry` checks a binary against the version it is told, as it finds a
+/// `vk`'s. The compiler would otherwise only store it run together with other literals.
+#[used]
+static VERSION_MARK: [u8; VERSION_MARK_LEN] = version_mark();
+
+const VERSION_MARK_TEXT: &str = concat!("\0vk-registry ", env!("CARGO_PKG_VERSION"), "\0");
+const VERSION_MARK_LEN: usize = VERSION_MARK_TEXT.len();
+
+const fn version_mark() -> [u8; VERSION_MARK_LEN] {
+    let bytes = VERSION_MARK_TEXT.as_bytes();
+    let mut out = [0u8; VERSION_MARK_LEN];
+    let mut i = 0;
+    while i < VERSION_MARK_LEN {
+        out[i] = bytes[i];
+        i += 1;
+    }
+    out
+}
+
 /// Resolve an optional `--root` to a store directory, defaulting to the shared
 /// virtkit store location.
 fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
@@ -629,6 +690,45 @@ async fn run(cli: Cli) -> Result<()> {
         // Both resolve their store through `store_root`, which is where the order is: it
         // reaches the one the server uses, and it is `accounts`' order too, so an operator
         // who exported a `VK_REGISTRY_*` once does not have to know which subcommand this is.
+        Cmd::Join {
+            hub,
+            token,
+            token_file,
+            ca,
+            replace,
+            root,
+            config,
+        } => {
+            let root = store_root(root, config, |name| std::env::var_os(name))?;
+            let token = match (token, token_file) {
+                (Some(t), _) if t == "-" => vk_peer::net::TokenSource::Stdin,
+                (Some(t), _) => vk_peer::net::TokenSource::Literal(t),
+                (None, Some(f)) => vk_peer::net::TokenSource::File(f),
+                (None, None) => {
+                    anyhow::bail!("pass the token: --token - to read it on stdin, or --token-file")
+                }
+            };
+            let id = vk_registry::hub::join(&root, &hub, &token, ca.as_deref(), replace).await?;
+            println!("{id}");
+            eprintln!(
+                "vk-registry: enrolled as registry {id}; `serve` on {} reports to the hub \
+                 within a minute. The hub may do only what [hub] allow lists.",
+                root.display()
+            );
+            Ok(())
+        }
+        Cmd::Leave { root, config } => {
+            let root = store_root(root, config, |name| std::env::var_os(name))?;
+            if vk_registry::hub::leave(&root)? {
+                eprintln!(
+                    "vk-registry: left the hub; restart `serve` to stop reporting to it, and \
+                     `vk-hub registries remove` the registry there"
+                );
+            } else {
+                eprintln!("vk-registry: {} is not enrolled with a hub", root.display());
+            }
+            Ok(())
+        }
         Cmd::Status { root, config } => vk_registry::status(
             "vk-registry",
             store_root(root, config, |name| std::env::var_os(name))?,
