@@ -1,6 +1,9 @@
 # A registry the hub manages (design)
 
-Status: **proposed**. Builds on [the fleet design](fleet-design.md).
+Status: **in progress**. Implemented: migration steps 1 (monitoring), 2 in part (gc schedule
+and windows, read-only, the `gc` command) and 5 in part (an update on trial to a release the
+hub holds, one registry at a time; rollouts do not cover registries yet). The rest is
+proposed. Builds on [the fleet design](fleet-design.md).
 
 A `vk-registry` enrolls with the hub as a node does and keeps a session open for monitoring
 and control. In **managed** mode it keeps no database: besides content it stores only its enrollment and a
@@ -88,12 +91,17 @@ has no jobs, runner or admission.
 - desired state, with a generation: the registry applies the newest one, and again after a
   restart, as nodes do:
   - retention and grace windows, and when gc runs (a schedule, or never);
-  - whether writes are accepted (read-only for maintenance); later, whether WebDAV is on;
+  - whether writes are accepted (read-only for maintenance: a client's pushes, uploads and
+    deletions are refused, but the pull-through relay still caches what a read fetches);
+    later, whether WebDAV is on;
   - the token-signing keys, the revocation list, and the key table (see below);
   - each repository's caption;
 - commands, journaled before they run so each runs at most once, with an ID and an expiry:
   - `gc [--dry-run]`, `delete-tag`, `delete-repo`;
-  - `update` to a release, run on trial and rolled back as a node's is.
+  - `update` to a release, run on trial and rolled back as a node's is. As for a node, that
+    needs `vk-registry serve` under a supervisor that restarts it (systemd, say): a release
+    that cannot reach the hub in time is ended by its alarm, and only a restart brings the
+    previous binary back to roll it back.
 
 The registry's config controls the listener, TLS, store root, upstreams and connection
 limits. The hub only narrows what the config allows. The config lists what the hub may set
@@ -217,9 +225,10 @@ db is as of the import: users, keys and captions created on the hub since are no
 - `vk-hub registries` (the list), `vk-hub registries show|remove`, `vk-hub registries
   read-only|gc-schedule|gc|update`.
 - Rollouts cover registries: `vk-hub release` holds `vk-registry` binaries as it holds `vk`,
-  signed by the same off-hub key. A registry whose `[hub] release_keys` names any key
-  requires a signature by one of them (unless `require_signed = false`); one that names none
-  takes unsigned releases. It refuses a downgrade unless its config allows it.
+  signed by the same off-hub key (`vk release-key sign --program vk-registry`). A registry
+  whose `[hub] release_keys` names any key requires a signature by one of them (unless
+  `require_signed = false`); one that names none takes unsigned releases. It
+  refuses a downgrade unless its config allows it.
 - Nodes' `[build] cache_registry` can name a registry by ID; the hub turns it into the URL
   bound at enrollment, and the node's tokens name that ID as `aud`.
 - The audit log records enrollment, every command and every desired-state change, as for

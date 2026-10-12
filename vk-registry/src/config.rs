@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
+use vk_hub_proto::registry::GcPolicy;
 
 use crate::accounts;
 use crate::auth::Auth;
@@ -91,6 +92,89 @@ pub struct ServerConfig {
     /// Connections served at once from one client address (an IPv6 /64); past it, new ones
     /// are answered 503 and closed, so one host cannot take every slot of `max_connections`.
     pub max_connections_per_client: usize,
+    /// `[hub]`: what a hub this registry is enrolled with may do to it.
+    pub hub: HubSettings,
+}
+
+/// The `[hub]` table: what the hub may do to a registry enrolled with it. Nothing, by
+/// default: an enrolled registry is watched, not steered, until its operator says so here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubSettings {
+    /// The hub's desired state and commands this registry takes: `read-only`, `gc`,
+    /// `update`.
+    pub allow: Vec<String>,
+    /// Ed25519 public keys, base64, an update must be signed by one of.
+    pub release_keys: Vec<String>,
+    /// Whether an update must be signed; by default, when `release_keys` names any.
+    pub require_signed: Option<bool>,
+    /// Whether an update may install an older version.
+    pub allow_downgrade: bool,
+    /// The shortest gc windows, in days, the hub may set or run gc with: it may lengthen
+    /// them, never shorten them.
+    pub min_retention_days: u64,
+    pub min_grace_days: u64,
+}
+
+/// `[hub] min_retention_days`'s default.
+const DEFAULT_MIN_RETENTION_DAYS: u64 = 7;
+
+impl Default for HubSettings {
+    fn default() -> Self {
+        HubSettings {
+            allow: Vec::new(),
+            release_keys: Vec::new(),
+            require_signed: None,
+            allow_downgrade: false,
+            min_retention_days: DEFAULT_MIN_RETENTION_DAYS,
+            min_grace_days: crate::DEFAULT_GC_GRACE_DAYS,
+        }
+    }
+}
+
+impl HubSettings {
+    /// Whether the hub may do what [`vk_hub_proto::registry`]'s `ALLOW_*` value `what` names.
+    pub fn allows(&self, what: &str) -> bool {
+        self.allow.iter().any(|a| a == what)
+    }
+
+    /// Whether the hub may run gc with these windows: `Err` with why not, when either is
+    /// below its floor.
+    pub fn check_gc(&self, retention_days: u64, grace_days: u64) -> Result<(), String> {
+        if retention_days < self.min_retention_days {
+            return Err(format!(
+                "a retention of {retention_days} days is below this registry's [hub] \
+                 min_retention_days = {}",
+                self.min_retention_days
+            ));
+        }
+        if grace_days < self.min_grace_days {
+            return Err(format!(
+                "a grace of {grace_days} days is below this registry's [hub] min_grace_days = {}",
+                self.min_grace_days
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the hub may schedule gc as `policy`: [`HubSettings::check_gc`]'s windows, and
+    /// an interval that is not 0.
+    pub fn check_gc_policy(&self, policy: &GcPolicy) -> Result<(), String> {
+        if policy.every_secs == 0 {
+            return Err("a gc schedule of every 0 seconds".to_string());
+        }
+        self.check_gc(policy.retention_days, policy.grace_days)
+    }
+
+    /// The signature policy `release_keys` and `require_signed` set for `vk-registry`
+    /// releases.
+    pub fn release_policy(&self) -> Result<vk_peer::release_key::Policy> {
+        vk_peer::release_key::Policy::from_config_in(
+            "[hub]",
+            vk_peer::release_key::Program::Registry,
+            &self.release_keys,
+            self.require_signed,
+        )
+    }
 }
 
 /// The `[oidc]` config table, as declared (before its client secret is read and checked
@@ -149,6 +233,23 @@ struct FileConfig {
     oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
+    hub: Option<FileHub>,
+}
+
+/// `deny_unknown_fields`: a misspelt `allow` would leave the hub steering nothing, or a
+/// misspelt `release_keys` updates unchecked, without a word.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileHub {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    release_keys: Vec<String>,
+    require_signed: Option<bool>,
+    #[serde(default)]
+    allow_downgrade: bool,
+    min_retention_days: Option<u64>,
+    min_grace_days: Option<u64>,
 }
 
 /// What `admin_socket` accepts: a bool (`false` = bind none, `true` = the default path)
@@ -237,7 +338,50 @@ impl ServerConfig {
             webdav: true,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
+            hub: HubSettings::default(),
         }
+    }
+
+    /// What a hub managing the registry is told it is, and may do to it.
+    pub fn hub_facts(&self) -> crate::hub::Facts {
+        use sha2::{Digest, Sha256};
+        let mode = match self.mode {
+            AuthMode::SharedSecret => "shared-secret",
+            AuthMode::Accounts => "accounts",
+        };
+        let upstreams: Vec<String> = self.upstreams.iter().map(|u| u.prefix.clone()).collect();
+        let tls = self.tls_cert.is_some() && self.tls_key.is_some();
+        // What would make two registries that should match differ: not paths or secrets.
+        let described = format!(
+            "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub={:?}",
+            self.webdav, self.max_connections, self.max_connections_per_client, self.hub
+        );
+        crate::hub::Facts {
+            listen: self.addr.to_string(),
+            tls,
+            mode,
+            webdav: self.webdav,
+            upstreams,
+            max_connections: self.max_connections,
+            settings: self.hub.clone(),
+            config_hash: vk_hub_proto::to_hex(&Sha256::digest(described.as_bytes()))[..16]
+                .to_string(),
+        }
+    }
+
+    /// `[hub] allow` names only what a hub can ask, and its release keys parse.
+    fn check_hub(&self) -> Result<()> {
+        use vk_hub_proto::registry::{ALLOW_GC, ALLOW_READ_ONLY, ALLOW_UPDATE};
+        for what in &self.hub.allow {
+            if ![ALLOW_READ_ONLY, ALLOW_GC, ALLOW_UPDATE].contains(&what.as_str()) {
+                bail!(
+                    "[hub] allow: {what:?} is not something the hub asks; expected \
+                     {ALLOW_READ_ONLY}, {ALLOW_GC} or {ALLOW_UPDATE}"
+                );
+            }
+        }
+        self.hub.release_policy()?;
+        Ok(())
     }
 
     /// The store root alone, for the commands that operate on a store without serving it
@@ -418,8 +562,17 @@ impl ServerConfig {
             max_connections_per_client: f
                 .max_connections_per_client
                 .unwrap_or(crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT),
+            hub: f.hub.map_or_else(HubSettings::default, |h| HubSettings {
+                allow: h.allow,
+                release_keys: h.release_keys,
+                require_signed: h.require_signed,
+                allow_downgrade: h.allow_downgrade,
+                min_retention_days: h.min_retention_days.unwrap_or(DEFAULT_MIN_RETENTION_DAYS),
+                min_grace_days: h.min_grace_days.unwrap_or(crate::DEFAULT_GC_GRACE_DAYS),
+            }),
         };
         cfg.check_connection_limits()?;
+        cfg.check_hub()?;
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
         // a contradictory file is refused by parsing it at all, not only by the path that
         // goes on to build the auth scheme. The serve path does both, so no message an
@@ -1409,6 +1562,61 @@ mod tests {
         );
         assert!(elsewhere.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[hub]`'s gc floors default to 7 and 1 days, a file may raise them, and the hub's
+    /// windows are held to them.
+    #[test]
+    fn hub_gc_floors_default_and_are_held_to() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-floors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None).unwrap().hub
+        };
+        let default = hub("[hub]\nallow = [\"gc\"]\n");
+        assert_eq!((default.min_retention_days, default.min_grace_days), (7, 1));
+        assert_eq!(hub(""), HubSettings::default());
+        default.check_gc(7, 1).unwrap();
+        assert!(default.check_gc(6, 1).is_err());
+        assert!(default.check_gc(7, 0).is_err());
+
+        let raised = hub("[hub]\nmin_retention_days = 30\nmin_grace_days = 3\n");
+        assert!(raised.check_gc(29, 3).is_err());
+        assert!(raised.check_gc(30, 2).is_err());
+        let policy = |every_secs| GcPolicy {
+            every_secs,
+            retention_days: 30,
+            grace_days: 3,
+        };
+        raised.check_gc_policy(&policy(3600)).unwrap();
+        assert!(raised.check_gc_policy(&policy(0)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[hub] release_keys` check a release signed as `vk-registry`'s, not as `vk`'s.
+    #[test]
+    fn hub_release_keys_take_a_registry_release_only() {
+        use vk_peer::release_key::{Program, generate, sign};
+        let dir = std::env::temp_dir().join(format!("vk-regserve-signed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("release.pk8");
+        let settings = HubSettings {
+            release_keys: vec![generate(&key).unwrap()],
+            ..HubSettings::default()
+        };
+        let binary = dir.join("vk-registry");
+        std::fs::write(&binary, b"a vk-registry").unwrap();
+        let sha = vk_peer::update::hash_file(&binary).unwrap();
+        let policy = settings.release_policy().unwrap();
+        let signed = sign(&key, &binary, "0.89.0", Program::Registry).unwrap();
+        policy.check(&sha, "0.89.0", Some(&signed)).unwrap();
+        let as_vk = sign(&key, &binary, "0.89.0", Program::Vk).unwrap();
+        assert!(policy.check(&sha, "0.89.0", Some(&as_vk)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4231,9 +4231,12 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "vk-fs",
+ "vk-hub-proto",
  "vk-oidc",
+ "vk-peer",
  "vk-selfupdate",
  "zstd",
 ]

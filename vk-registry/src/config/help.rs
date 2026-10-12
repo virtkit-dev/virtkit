@@ -20,6 +20,8 @@ enum Table {
     Oidc,
     /// `[[upstream]]`, repeatable
     Upstream,
+    /// `[hub]`
+    Hub,
 }
 
 /// One config-file key: where it lives, what it is called, and what it does. The order
@@ -116,6 +118,12 @@ const KEYS: &[Key] = &[
         help: "the [[upstream]] tables below; none = no relay",
     },
     Key {
+        table: Table::Top,
+        name: "hub",
+        help: "the [hub] table below: what a vk-hub this registry\n\
+               joined (`vk-registry join`) may do to it",
+    },
+    Key {
         table: Table::Oidc,
         name: "issuer",
         help: "the provider's issuer URL; discovery is fetched from it",
@@ -159,6 +167,46 @@ const KEYS: &[Key] = &[
         table: Table::Upstream,
         name: "ca_file",
         help: "extra PEM CA certificate for the upstream's TLS",
+    },
+    Key {
+        table: Table::Hub,
+        name: "allow",
+        help: "what the hub may do: \"read-only\" (refuse writes),\n\
+               \"gc\" (schedule and run gc), \"update\" (install a\n\
+               release it holds; run serve under a supervisor that\n\
+               restarts it, as a release that cannot reach the hub\n\
+               is ended) [default: nothing, only watch]",
+    },
+    Key {
+        table: Table::Hub,
+        name: "release_keys",
+        help: "ed25519 public keys, base64 (`vk release-key\n\
+               generate`), an update must be signed by one of\n\
+               (`vk release-key sign --program vk-registry`)",
+    },
+    Key {
+        table: Table::Hub,
+        name: "require_signed",
+        help: "refuse unsigned updates [default: true with\n\
+               release_keys, else false]",
+    },
+    Key {
+        table: Table::Hub,
+        name: "allow_downgrade",
+        help: "let an update install an older version\n\
+               [default: false]",
+    },
+    Key {
+        table: Table::Hub,
+        name: "min_retention_days",
+        help: "the shortest retention the hub may schedule or run\n\
+               gc with; it may lengthen it, never shorten it\n\
+               [default: 7]",
+    },
+    Key {
+        table: Table::Hub,
+        name: "min_grace_days",
+        help: "the same floor for gc's grace window [default: 1]",
     },
 ];
 
@@ -228,6 +276,10 @@ fn render() -> String {
             Table::Upstream,
             "[[upstream]] — repeat one table per upstream registry:",
         ),
+        (
+            Table::Hub,
+            "[hub] — what a vk-hub managing this registry may do:",
+        ),
     ] {
         let _ = writeln!(out, "\n{heading}");
         for key in KEYS.iter().filter(|k| k.table == table) {
@@ -252,7 +304,7 @@ fn render() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FileConfig, FileOidc, FileUpstream};
+    use super::super::{FileConfig, FileHub, FileOidc, FileUpstream};
     use super::*;
 
     /// The field names a table will accept, taken from the parser itself: with
@@ -284,10 +336,12 @@ mod tests {
         let top = toml::from_str::<FileConfig>("nope = 1\n").map(|_| ());
         let oidc = toml::from_str::<FileOidc>("nope = 1\n").map(|_| ());
         let upstream = toml::from_str::<FileUpstream>("nope = 1\n").map(|_| ());
+        let hub = toml::from_str::<FileHub>("nope = 1\n").map(|_| ());
         for (table, err) in [
             (Table::Top, top.unwrap_err()),
             (Table::Oidc, oidc.unwrap_err()),
             (Table::Upstream, upstream.unwrap_err()),
+            (Table::Hub, hub.unwrap_err()),
         ] {
             let mut accepted = accepted(&err.to_string());
             let mut documented = documented(table);

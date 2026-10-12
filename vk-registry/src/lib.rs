@@ -52,6 +52,7 @@ pub mod config;
 pub(crate) mod dav;
 pub(crate) mod forms;
 pub(crate) mod html;
+pub mod hub;
 pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
@@ -117,6 +118,21 @@ impl ServerState {
                 &self.auth,
                 Authenticator::Accounts { oidc, .. } if oidc.public_url().starts_with("https://")
             )
+    }
+}
+
+/// Whether `method` on `path` writes to the store: what a read-only registry refuses. The
+/// lock service, sign-ins, keys and captions (the accounts db, not the store) do not touch
+/// it, and the batched exists probe is a read sent as a POST; a tag deleted from the settings
+/// pages is a write.
+fn is_store_write(method: &Method, path: &str) -> bool {
+    match method.as_str() {
+        "GET" | "HEAD" | "OPTIONS" | "PROPFIND" => false,
+        _ if path.starts_with("/lock/") || path == EXISTS_PATH => false,
+        _ if matches!(path, "/login" | "/auth/callback" | "/logout") => false,
+        _ if path == "/settings/keys" || path.starts_with("/settings/keys/") => false,
+        _ if path == "/settings/captions" => false,
+        _ => true,
     }
 }
 
@@ -331,6 +347,19 @@ pub struct Store {
     root: PathBuf,
     /// monotonic upload-id source (unique within this server process)
     next_upload: AtomicU64,
+    /// Refuse writes, as a hub managing the registry asked ([`Store::set_read_only`]).
+    read_only: std::sync::atomic::AtomicBool,
+    /// Connections a server on this store is serving now.
+    connections: std::sync::atomic::AtomicUsize,
+}
+
+/// A connection counted in [`Store::connections`] until dropped.
+struct ConnectionCount<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ConnectionCount<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// What [`Store::remove_empty_repo`] did.
@@ -413,6 +442,8 @@ impl Store {
         Store {
             root,
             next_upload: AtomicU64::new(0),
+            read_only: std::sync::atomic::AtomicBool::new(false),
+            connections: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -790,6 +821,28 @@ impl Store {
             .join(name)
             .join("manifests")
             .join(hex)
+    }
+
+    /// Refuse writes (`true`) or take them again. What a hub managing the registry asks;
+    /// it lasts until the server stops.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::Relaxed);
+    }
+
+    /// Whether writes are refused.
+    pub fn read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
+    /// Connections a server on this store serves now.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    /// Count a connection for as long as the returned guard lives.
+    fn count_connection(&self) -> ConnectionCount<'_> {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionCount(&self.connections)
     }
 
     /// Whether the blob (either form) is present. A hit bumps the blob's mtime: the
@@ -2153,7 +2206,13 @@ pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
 /// Run the registry from a full [`ServerConfig`] (relay upstreams, listen address,
 /// store root).
 pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
+    // A registry its hub is updating: the release on trial, or the binary it replaces taking
+    // its turn, before anything is bound.
+    if let hub::Start::Exec(binary, deadline) = hub::on_start(&cfg.root, vk_peer::now_secs()) {
+        return Err(vk_peer::update::exec(&binary, deadline));
+    }
     let addr = cfg.addr;
+    let facts = cfg.hub_facts();
     let listener = listen(addr).with_context(|| format!("binding {addr}"))?;
     let tls = cfg.build_tls()?;
     // Resolved before `into_state` consumes the config; bound after it, because the
@@ -2191,6 +2250,7 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
             ),
         }
     }
+    hub::start(state.clone(), facts);
     serve_limited(listener, state, limits).await
 }
 
@@ -2505,7 +2565,7 @@ async fn serve_refusing(
         };
         let state = state.clone();
         tokio::spawn(async move {
-            let _slots = (slot, peer_slot);
+            let _slots = (slot, peer_slot, state.store.count_connection());
             match &state.tls {
                 Some(acceptor) => {
                     match tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await {
@@ -2832,6 +2892,31 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             None
         }
     };
+
+    // A hub managing the registry may make it refuse writes for a while; reads go on, as do
+    // sign-ins, key management (the accounts db, not the store) and the lock service.
+    if state.store.read_only() && is_store_write(req.method(), &path) {
+        let mut resp = if is_human {
+            html::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                None,
+                "Read-only for now",
+                "The registry takes no writes for now. Try again later.",
+            )
+        } else {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                "the registry is read-only for now",
+            )
+        };
+        resp.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("60"),
+        );
+        return Ok(resp);
+    }
 
     // Derived from `state.auth`, not from whether a principal happens to be present: in
     // accounts mode a missing one is refused above, and reading its absence as `NoScopes`
@@ -7753,5 +7838,33 @@ mod tests {
         assert_eq!(stage_data_size(b"not json"), None);
         assert!(build_stage_tag("snap-not-a-hash").is_none());
         assert!(build_stage_tag(&format!("base-{:064x}", 1)).is_none());
+    }
+
+    /// What a read-only registry refuses: what writes the store, and nothing else.
+    #[test]
+    fn store_writes_are_told_apart() {
+        let post = Method::POST;
+        for write in [
+            "/v2/r/blobs/uploads/",
+            "/v2/r/manifests/latest",
+            "/settings/tags/delete",
+            "/upload",
+            "/dav/files/f",
+        ] {
+            assert!(is_store_write(&post, write), "{write}");
+        }
+        assert!(is_store_write(&Method::DELETE, "/v2/r/manifests/sha256:00"));
+        for not in [
+            "/lock/k",
+            EXISTS_PATH,
+            "/login",
+            "/logout",
+            "/settings/keys",
+            "/settings/keys/1/revoke",
+            "/settings/captions",
+        ] {
+            assert!(!is_store_write(&post, not), "{not}");
+        }
+        assert!(!is_store_write(&Method::GET, "/settings/tags/delete"));
     }
 }
