@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **vk-hub tells a job building its image from one waiting for another job's build.** A job
+  that prepares reads "preparing" rather than "running: prepare_executor" in the jobs table, on
+  its page and in `vk-hub jobs`, whatever its node, older ones included. While it prepares, its
+  node reports what preparing does — building or pulling an image, or waiting for the job
+  that builds or pulls the same one — and the hub shows it as the job's state ("building
+  image", "waiting for build") and in full on its page, the job holding the image linked.
 - **A job's branch shows the commit it ran: on hover in the jobs table, on its page, and in
   `vk-hub jobs show`.**
 

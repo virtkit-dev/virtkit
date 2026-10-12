@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
+use vk_hub_proto::dispatch::Activity;
 
 /// The boot flavour recorded per cached bundle (`boot.kind`), so a cache hit
 /// — which skips the pull/build — still knows how to boot it.
@@ -305,10 +306,23 @@ pub(crate) struct PullLock {
     _sock: Arc<UnixListener>,
     stop: Arc<AtomicBool>,
     responder: Option<std::thread::JoinHandle<()>>,
+    /// Where its holder tells the job's hub what it does.
+    sink: Arc<crate::activity::Sink>,
+    /// What it told ([`PullLock::report`]), until released.
+    said: Option<crate::activity::Said>,
+}
+
+impl PullLock {
+    /// Tell the job's hub what is done under the lock, until it is released: for a caller
+    /// whose cache, checked again under the lock, missed.
+    pub(crate) fn report(&mut self, activity: Activity) {
+        self.said = Some(self.sink.say(activity));
+    }
 }
 
 impl Drop for PullLock {
     fn drop(&mut self) {
+        self.said = None;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.responder.take() {
             let _ = h.join();
@@ -357,6 +371,7 @@ pub(crate) fn acquire_pull_lock(
         digest,
         std::time::Duration::from_millis(200),
         beat,
+        crate::activity::sink(),
     )
 }
 
@@ -385,12 +400,14 @@ impl WaitBeat {
 /// answers waiters as a waited-for lock does, so they wait for it rather than give up.
 fn try_acquire_pull_lock(dir: &Path) -> Option<PullLock> {
     let addr = pull_lock_addr(pull_lock_hash(dir)).ok()?;
-    UnixListener::bind_addr(&addr).ok().map(spawn_holder)
+    UnixListener::bind_addr(&addr)
+        .ok()
+        .map(|lock| spawn_holder(lock, crate::activity::sink()))
 }
 
 /// [`acquire_pull_lock`], retrying the bind every `poll`, and querying the holder at the first
 /// refusal and every 25 polls after; at those queries, saying the wait is still on every
-/// `beat`, if set.
+/// `beat`, if set; telling `sink` it waits, and for whom, until it is over either way.
 fn acquire_pull_lock_with(
     dir: &Path,
     verb: &str,
@@ -398,9 +415,13 @@ fn acquire_pull_lock_with(
     digest: &str,
     poll: std::time::Duration,
     beat: Option<std::time::Duration>,
+    sink: Arc<crate::activity::Sink>,
 ) -> Result<PullLock> {
     let addr = pull_lock_addr(pull_lock_hash(dir))?;
-    let mut waiting = false;
+    // Said while it waits, and over when the wait is, the lock taken or not.
+    let mut waiting: Option<crate::activity::Said> = None;
+    // The holder it was last said to wait for.
+    let mut waited_for: Option<String> = None;
     let mut polls: u32 = 0;
     // Consecutive unanswered queries while the name stays bound.
     let mut unanswered: u32 = 0;
@@ -412,12 +433,12 @@ fn acquire_pull_lock_with(
     loop {
         polls = polls.wrapping_add(1);
         match UnixListener::bind_addr(&addr) {
-            Ok(lock) => return Ok(spawn_holder(lock)),
+            Ok(lock) => return Ok(spawn_holder(lock, sink)),
             // Asked again every 25 polls (5 s by default), not only at the first refusal: the
             // holder can go and another user's process take the name while this one waits.
             Err(e)
                 if e.kind() == std::io::ErrorKind::AddrInUse
-                    && (!waiting || polls.is_multiple_of(25)) =>
+                    && (waiting.is_none() || polls.is_multiple_of(25)) =>
             {
                 let holder =
                     query_holder(&addr).context("asking the pull-lock holder who it is")?;
@@ -437,7 +458,8 @@ fn acquire_pull_lock_with(
                 }
                 // "A concurrent" build or pull: the holder may also be a sweep reclaiming a dead
                 // staging dir of this entry (`TmpSweep::reclaim_if_dead`), which is brief.
-                if waiting {
+                let who = holder.as_ref().and_then(|h| h.who.clone());
+                if waiting.is_some() {
                     // A later query, `poll * 25` into the wait: say it is still on, at most
                     // every `beat`, so a job log does not go quiet for the whole of it.
                     let waited = since.elapsed();
@@ -448,7 +470,7 @@ fn acquire_pull_lock_with(
                         );
                     }
                 } else {
-                    match holder.and_then(|h| h.who) {
+                    match &who {
                         Some(who) => println!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
                              (held by {who}) ..."
@@ -458,7 +480,23 @@ fn acquire_pull_lock_with(
                         ),
                     }
                 }
-                waiting = true;
+                // Said at the first refusal, and again when another holder answers: the one
+                // waited for went, and another job took the name.
+                let said = Activity::Waiting {
+                    image: name.to_string(),
+                    building: verb == "build",
+                    holder: who.clone(),
+                };
+                if let Some(waiting) = &waiting {
+                    if holder.is_some() && who != waited_for {
+                        waiting.change(said);
+                    }
+                } else {
+                    waiting = Some(sink.say(said));
+                }
+                if holder.is_some() {
+                    waited_for = who;
+                }
                 std::thread::sleep(poll);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -475,7 +513,7 @@ fn acquire_pull_lock_with(
 /// accept errors (`EMFILE`, `ECONNABORTED`, ...) rather than exiting: waiters treat a holder
 /// that stops answering as foreign and give up on it. The guard keeps its own reference to
 /// `lock`, so even if this thread dies the socket stays bound (the lock is held).
-fn spawn_holder(lock: UnixListener) -> PullLock {
+fn spawn_holder(lock: UnixListener, sink: Arc<crate::activity::Sink>) -> PullLock {
     let lock = Arc::new(lock);
     let stop = Arc::new(AtomicBool::new(false));
     let responder = {
@@ -499,6 +537,8 @@ fn spawn_holder(lock: UnixListener) -> PullLock {
         _sock: lock,
         stop,
         responder: Some(responder),
+        sink,
+        said: None,
     }
 }
 
@@ -1193,7 +1233,14 @@ mod tests {
         assert!(query_holder(&addr).unwrap().is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         // And a waiter gives up on it, a few unanswered queries in, rather than waiting
-        // forever on a name no pull of ours holds.
+        // forever on a name no pull of ours holds — and says it waits no more.
+        let said =
+            std::env::temp_dir().join(format!("virtkit-test-full-said-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&said);
+        std::fs::create_dir_all(&said).unwrap();
+        let sink =
+            crate::activity::Sink::new(Some(said.join(crate::node::jobs::journal::ACTIVITY)));
+        let _outer = sink.say(Activity::Other);
         let err = acquire_pull_lock_with(
             &dir,
             "pull",
@@ -1201,11 +1248,17 @@ mod tests {
             "sha256:x",
             std::time::Duration::from_millis(1),
             None,
+            sink.clone(),
         )
         .err()
         .expect("a holder that never answers is refused")
         .to_string();
         assert!(err.contains("does not answer"), "{err}");
+        assert_eq!(
+            crate::node::jobs::journal::read_activity(&said),
+            Some(Activity::Other)
+        );
+        let _ = std::fs::remove_dir_all(&said);
         drop((held, squatter));
     }
 
@@ -1231,6 +1284,7 @@ mod tests {
                     "sha256:x",
                     std::time::Duration::from_millis(1),
                     Some(std::time::Duration::ZERO),
+                    crate::activity::Sink::new(None),
                 )
                 .map(drop)
             })
@@ -1240,6 +1294,105 @@ mod tests {
         assert!(!waiter.is_finished(), "the waiter keeps waiting");
         drop(held);
         waiter.join().unwrap().unwrap();
+    }
+
+    /// Report the wait and its holder until the lock is acquired, updating when the holder
+    /// changes. Releasing a nested lock restores the outer activity; a lock that reported
+    /// nothing leaves it unchanged.
+    #[test]
+    fn a_wait_is_said_until_the_lock_is_taken() {
+        use crate::node::jobs::journal::{ACTIVITY, read_activity};
+        let ms = std::time::Duration::from_millis;
+        let root =
+            std::env::temp_dir().join(format!("virtkit-test-wait-said-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sink = crate::activity::Sink::new(Some(root.join(ACTIVITY)));
+        let acquire = |name: &str, verb: &str| {
+            acquire_pull_lock_with(
+                &root.join(name),
+                verb,
+                name,
+                "sha256:x",
+                ms(1),
+                None,
+                sink.clone(),
+            )
+        };
+        // A holder whose answer the test changes.
+        let answer = Arc::new(std::sync::Mutex::new("job 1".to_string()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let lock = UnixListener::bind_addr(
+                &pull_lock_addr(pull_lock_hash(&root.join("img"))).unwrap(),
+            )
+            .unwrap();
+            lock.set_nonblocking(true).unwrap();
+            let (answer, stop) = (answer.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match lock.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.write_all(answer.lock().unwrap().as_bytes());
+                        }
+                        Err(_) => std::thread::sleep(ms(1)),
+                    }
+                }
+            })
+        };
+        let waiter = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| acquire("img", "build"));
+            let waiting = |holder: Option<&str>| {
+                Some(Activity::Waiting {
+                    image: "img".into(),
+                    building: true,
+                    holder: holder.map(str::to_string),
+                })
+            };
+            let until = |want: Option<Activity>| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while read_activity(&root) != want {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{want:?} is never said: {:?} is",
+                        read_activity(&root)
+                    );
+                    std::thread::sleep(ms(5));
+                }
+            };
+            until(waiting(Some("job 1")));
+            *answer.lock().unwrap() = "job 2".into();
+            until(waiting(Some("job 2")));
+            // A holder that answers without saying who it is.
+            answer.lock().unwrap().clear();
+            until(waiting(None));
+            stop.store(true, Ordering::Relaxed);
+            holder.join().unwrap();
+            waiter.join().unwrap()
+        });
+        let mut lock = waiter.unwrap();
+        assert_eq!(read_activity(&root), None);
+        // Said under the lock, and under another taken within it, as a build restoring its
+        // cache pulls it.
+        let building = Activity::Building {
+            image: "img".into(),
+        };
+        lock.report(building.clone());
+        let mut inner = acquire("cache", "pull").unwrap();
+        inner.report(Activity::Pulling {
+            image: "cache".into(),
+        });
+        assert!(matches!(
+            read_activity(&root),
+            Some(Activity::Pulling { .. })
+        ));
+        drop(inner);
+        assert_eq!(read_activity(&root), Some(building.clone()));
+        drop(acquire("quiet", "pull").unwrap());
+        assert_eq!(read_activity(&root), Some(building));
+        drop(lock);
+        assert_eq!(read_activity(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Report at most once per interval, and never when the interval is unset.

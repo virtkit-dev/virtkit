@@ -69,6 +69,9 @@ pub const SUMMARY_JOBS: usize = 10_000;
 /// How often, at most, requests past [`REQUEST_KEEP`] are swept.
 const REQUEST_SWEEP_SECS: u64 = 600;
 
+/// The stage a node prepares a job's executor in, as gitlab-runner names it.
+pub const PREPARE_STAGE: &str = "prepare_executor";
+
 /// A job the hub has taken.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRow {
@@ -107,6 +110,9 @@ pub struct JobRow {
     pub node: Option<String>,
     #[serde(default)]
     pub stage: Option<String>,
+    /// What its stage does, when the node says: building an image, waiting for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<vk_hub_proto::dispatch::Activity>,
     #[serde(default)]
     pub cancel: Option<CancelMode>,
     #[serde(default)]
@@ -1021,6 +1027,7 @@ mod tests {
             settled_at: None,
             expired_at: None,
             commit: None,
+            activity: None,
         }
     }
 

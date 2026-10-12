@@ -572,7 +572,9 @@ impl Driver {
     }
 
     fn set_stage(&self, stage: &str) {
-        // Best effort: the stage is for the hub's display, the trace says it too.
+        // Best effort: the stage is for the hub's display, the trace says it too. What the
+        // stage before was doing is over.
+        let _ = std::fs::remove_file(self.dir.join(journal::ACTIVITY));
         let _ = vk_fs::write_atomic(&self.dir.join(journal::STAGE), stage.as_bytes(), 0o600);
     }
 
@@ -703,6 +705,10 @@ impl Driver {
             .args(args)
             .stdin(Stdio::null());
         env::apply(&mut command, &self.env);
+        // Where prepare says what it is doing: building an image, or waiting for one.
+        if cmd == "prepare" {
+            command.env(crate::activity::ENV, self.dir.join(journal::ACTIVITY));
+        }
         let to_trace = phase.is_some();
         // Stamped, stdout and stderr are streams of their own (`O` and `E`), as gitlab-runner
         // keeps its executor's; unstamped, one pipe keeps their order exactly.
@@ -943,28 +949,8 @@ mod tests {
     #[tokio::test]
     async fn stamped_stdout_and_stderr_are_streams_of_their_own() {
         let f = Fixture::stamped("driver-run", "https://gitlab.example");
-        // Stands in for `vk gitlab run`. Written by `cp`, not here: a file this process holds
-        // open for writing, as a child another test forks meanwhile inherits it, cannot be run
-        // (ETXTBSY).
-        let exe = f.dir.join("vk");
-        let source = exe.with_extension("sh");
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o755)
-                .open(&source)
-                .unwrap();
-            file.write_all(b"#!/bin/sh\necho out\necho err >&2\n")
-                .unwrap();
-        }
-        let copied = std::process::Command::new("cp")
-            .arg(&source)
-            .arg(&exe)
-            .status();
-        assert!(copied.unwrap().success());
+        // Stands in for `vk gitlab run`.
+        let exe = fake_vk(&f, "#!/bin/sh\necho out\necho err >&2\n");
         let timeout = Duration::from_secs(60);
         let driver = Driver {
             ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
@@ -989,6 +975,66 @@ mod tests {
             .collect();
         lines.sort_unstable();
         assert_eq!(lines, ["01E err", "01O out"], "{output:?}");
+    }
+
+    /// `script`, as the `vk` a driver of `f` runs. Written by `cp`, not here: a file this
+    /// process holds open for writing, as a child another test forks meanwhile inherits it,
+    /// cannot be run (ETXTBSY).
+    fn fake_vk(f: &Fixture, script: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let exe = f.dir.join("vk");
+        let source = exe.with_extension("sh");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&source)
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&exe)
+            .status();
+        assert!(copied.unwrap().success());
+        exe
+    }
+
+    /// Only prepare is told where to say what it does, and the next stage clears what it said.
+    #[tokio::test]
+    async fn only_prepare_says_what_it_does_until_the_next_stage() {
+        let f = Fixture::stamped("driver-activity", "https://gitlab.example");
+        // Says it builds where it is told to.
+        let exe = fake_vk(
+            &f,
+            "#!/bin/sh\n[ -z \"$VK_JOB_ACTIVITY\" ] || \
+             echo '{\"kind\":\"building\",\"image\":\"img\"}' > \"$VK_JOB_ACTIVITY\"\n",
+        );
+        let timeout = Duration::from_secs(60);
+        let driver = Driver {
+            ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
+            env: Vec::new(),
+            dir: f.dir.clone(),
+            job: f.job.clone(),
+            trace: f.trace.clone(),
+            exe,
+            deadline: Instant::now() + timeout,
+            timeout,
+            stopped: CancellationToken::new(),
+        };
+        let run = |cmd| driver.executor(cmd, &[], Some((Phase::Before, None)));
+        assert_eq!(run("run").await.unwrap(), End::Ok);
+        assert_eq!(journal::read_activity(&f.dir), None);
+        assert_eq!(run("prepare").await.unwrap(), End::Ok);
+        assert_eq!(
+            journal::read_activity(&f.dir),
+            Some(vk_hub_proto::dispatch::Activity::Building {
+                image: "img".into()
+            })
+        );
+        driver.set_stage("get_sources");
+        assert_eq!(journal::read_activity(&f.dir), None);
     }
 
     #[test]

@@ -923,6 +923,11 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
         };
         pages::kv_html(h, key, &cell);
     }
+    if let Some(activity) = &j.activity {
+        let mut cell = Html::new();
+        activity_cell(&mut cell, activity);
+        pages::kv_html(h, "Doing", &cell);
+    }
     let mut cell = Html::new();
     ran(&mut cell, j, now);
     pages::kv_html(h, "Ran", &cell);
@@ -941,8 +946,44 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
     pages::end_section(h);
 }
 
+/// What the job's preparation does, whole: the image, and who builds or pulls it when the job
+/// waits — a GitLab job, linked when its URL is a plain web link.
+fn activity_cell(h: &mut Html, activity: &vk_hub_proto::dispatch::Activity) {
+    use vk_hub_proto::dispatch::Activity;
+    match activity {
+        Activity::Building { image } => {
+            h.raw("building ").raw("<code>").node(image).raw("</code>");
+        }
+        Activity::Pulling { image } => {
+            h.raw("pulling ").raw("<code>").node(image).raw("</code>");
+        }
+        Activity::Waiting {
+            image,
+            building,
+            holder,
+        } => {
+            h.raw("waiting for ");
+            match holder {
+                Some(holder) => {
+                    h.external_link(Some(holder), holder);
+                }
+                None => {
+                    h.raw("another job");
+                }
+            }
+            h.raw(if *building { " to build " } else { " to pull " })
+                .raw("<code>")
+                .node(image)
+                .raw("</code>");
+        }
+        Activity::Other => {
+            h.raw("preparing");
+        }
+    }
+}
+
 /// How the job stands: its outcome's colour, with the failure's class and exit code, or the
-/// stage it is in.
+/// stage it is in — what it does, while it prepares.
 fn result_badge(h: &mut Html, j: &JobRow) {
     let result = j.result.as_ref();
     let text = match j.outcome() {
@@ -993,6 +1034,63 @@ fn dash_or(s: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A preparing job's page says what it does, the job it waits for linked only from a plain
+    /// web link.
+    #[test]
+    fn a_preparing_job_s_record_says_what_it_does() {
+        use vk_hub_proto::dispatch::Activity;
+        let mut j = super::super::tests::history_job(1, "acme/web");
+        j.state = JobState::Running;
+        j.started_at = Some(1000);
+        j.stage = Some(crate::store::PREPARE_STAGE.into());
+        let page = |j: &JobRow| {
+            let mut h = Html::new();
+            record(&mut h, j, &HashMap::new(), 1030);
+            h.into_string()
+        };
+        // Nothing said yet: preparing.
+        let shown = page(&j);
+        assert!(shown.contains(">preparing</span>"), "{shown}");
+        assert!(!shown.contains("Doing"), "{shown}");
+        let url = "https://gitlab.example.com/g/p/-/jobs/1";
+        j.activity = Some(Activity::Waiting {
+            image: "docker/<x>".into(),
+            building: true,
+            holder: Some(url.into()),
+        });
+        let shown = page(&j);
+        assert!(shown.contains(">waiting for build</span>"), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "<th>Doing</th><td>waiting for <a href=\"{url}\" target=\"_blank\" \
+                 rel=\"noopener noreferrer\">{url}</a> to build <code>docker/&lt;x&gt;</code>"
+            )),
+            "{shown}"
+        );
+        let doing = |activity| {
+            let mut h = Html::new();
+            activity_cell(&mut h, &activity);
+            h.into_string()
+        };
+        assert_eq!(
+            doing(Activity::Waiting {
+                image: "img".into(),
+                building: false,
+                holder: Some("javascript:alert(1)".into()),
+            }),
+            "waiting for javascript:alert(1) to pull <code>img</code>"
+        );
+        assert_eq!(
+            doing(Activity::Waiting {
+                image: "img".into(),
+                building: true,
+                holder: None,
+            }),
+            "waiting for another job to build <code>img</code>"
+        );
+        assert_eq!(doing(Activity::Other), "preparing");
+    }
 
     /// A long name is split into a head the stylesheet may cut and a tail that stays; a short
     /// one is not split, and what it holds is escaped either way.

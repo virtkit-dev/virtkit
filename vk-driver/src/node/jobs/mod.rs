@@ -107,8 +107,8 @@ struct Track {
     /// Raised once the node's cleanup after the job's lost driver has ended, when one was
     /// started: the result is written then.
     cleaning: Option<Arc<AtomicBool>>,
-    /// The stage last told.
-    told: Option<String>,
+    /// The stage last told, and what it was doing.
+    told: Option<(String, Option<vk_hub_proto::dispatch::Activity>)>,
     result: Option<JobResult>,
     result_told: Option<Instant>,
     started: Instant,
@@ -274,13 +274,14 @@ impl Jobs {
             t.sent = t.acked;
             t.result_told = None;
             let stage = journal::read_stage(&t.dir);
-            t.told = stage.clone();
+            let activity = stage.as_deref().and_then(|s| stage_activity(&t.dir, s));
+            t.told = stage.clone().map(|s| (s, activity.clone()));
             let finished = t.result.is_some();
             jobs.push(HeldJob {
                 job: id.clone(),
                 state: match (finished, stage) {
                     (true, _) => RunState::Finished,
-                    (false, Some(stage)) => RunState::Running { stage },
+                    (false, Some(stage)) => RunState::Running { stage, activity },
                     (false, None) => RunState::Accepted,
                 },
                 output_len: journal::output_len(&t.dir),
@@ -387,7 +388,10 @@ impl Jobs {
         if let Some(t) = state.jobs.get(&job) {
             let run = match (&t.result, journal::read_stage(&t.dir)) {
                 (Some(_), _) => RunState::Finished,
-                (None, Some(stage)) => RunState::Running { stage },
+                (None, Some(stage)) => RunState::Running {
+                    activity: stage_activity(&t.dir, &stage),
+                    stage,
+                },
                 (None, None) => RunState::Accepted,
             };
             return vec![NodeJobMsg::Job { job, state: run }];
@@ -660,14 +664,18 @@ impl Jobs {
                 let result = journal::read_result(&t.dir).or_else(|| self.lost_driver(t, now));
                 t.result = result;
                 if let Some(stage) = journal::read_stage(&t.dir)
-                    && t.told.as_ref() != Some(&stage)
                     && t.result.is_none()
                 {
-                    t.told = Some(stage.clone());
-                    msgs.push(NodeJobMsg::Job {
-                        job: id.clone(),
-                        state: RunState::Running { stage },
-                    });
+                    let activity = stage_activity(&t.dir, &stage);
+                    let told = (stage, activity);
+                    if t.told.as_ref() != Some(&told) {
+                        t.told = Some(told.clone());
+                        let (stage, activity) = told;
+                        msgs.push(NodeJobMsg::Job {
+                            job: id.clone(),
+                            state: RunState::Running { stage, activity },
+                        });
+                    }
                 }
             }
             if t.awaiting_ack && !t.disowned {
@@ -731,6 +739,14 @@ impl Jobs {
         journal::write_json(&t.dir.join(journal::RESULT), &result).ok()?;
         Some(result)
     }
+}
+
+/// Read job `dir`'s activity only during preparation: its supervisor may pull or build
+/// during later stages without describing what those stages do.
+fn stage_activity(dir: &Path, stage: &str) -> Option<vk_hub_proto::dispatch::Activity> {
+    (stage == "prepare_executor")
+        .then(|| journal::read_activity(dir))
+        .flatten()
 }
 
 fn meta_for(slot: u32, project_slot: u32, spec: &CiJob) -> Meta {
@@ -1098,6 +1114,62 @@ pub(crate) mod tests {
     fn running_driver(_: &Jobs, _: &Path, held: Option<crate::admit::Reservation>) -> Result<()> {
         drop(held);
         Ok(())
+    }
+
+    /// A job's stage is told again when only what it does changes, and not when nothing does.
+    #[test]
+    fn a_change_of_activity_alone_is_told() {
+        use vk_hub_proto::dispatch::Activity;
+        let dir = scratch("activity");
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
+        let limits = Limits {
+            admit_dir: dir.join("admit"),
+            jobs_dir: dir.join("vm-jobs"),
+            budget_mib: None,
+            disk_admission: false,
+            max_cpus: 8,
+        };
+        let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, running_driver, fake_cleanup);
+        let now = Instant::now();
+        jobs.handle(start(&hex("b"), None, 2), OPEN, now);
+        let job_dir = dir.join("jobs").join(hex("b"));
+        let told = || -> Vec<RunState> {
+            jobs.poll(now, false)
+                .into_iter()
+                .filter_map(|m| match m {
+                    NodeJobMsg::Job { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect()
+        };
+        let preparing = |activity| RunState::Running {
+            stage: "prepare_executor".into(),
+            activity,
+        };
+        std::fs::write(job_dir.join(journal::STAGE), "prepare_executor").unwrap();
+        assert_eq!(told(), [preparing(None)]);
+        let building = Activity::Building {
+            image: "img".into(),
+        };
+        journal::write_json(&job_dir.join(journal::ACTIVITY), &building).unwrap();
+        assert_eq!(told(), [preparing(Some(building.clone()))]);
+        assert_eq!(told(), []);
+        std::fs::remove_file(job_dir.join(journal::ACTIVITY)).unwrap();
+        assert_eq!(told(), [preparing(None)]);
+        // Past preparing, what the job's supervisor says, starting a service, is not the stage's.
+        std::fs::write(job_dir.join(journal::STAGE), "step_script").unwrap();
+        journal::write_json(&job_dir.join(journal::ACTIVITY), &building).unwrap();
+        let scripting = RunState::Running {
+            stage: "step_script".into(),
+            activity: None,
+        };
+        assert_eq!(told(), std::slice::from_ref(&scripting));
+        let NodeJobMsg::Held(held) = jobs.held(now) else {
+            panic!("not held");
+        };
+        assert_eq!(held.jobs[0].state, scripting);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// At the hub's ceiling, a node refuses new reservations and jobs not on one, counting

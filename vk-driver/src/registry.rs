@@ -1612,10 +1612,13 @@ async fn pull_into(
 ) -> Result<()> {
     // `label` (a Dockerfile stage, a bundle name) is what the trace shows; the cache
     // repo is always `build-cache`, so `name@digest` alone is unreadable.
-    let _lock = image::acquire_pull_lock(dir, "pull", label, digest)?;
+    let mut lock = image::acquire_pull_lock(dir, "pull", label, digest)?;
     if bundle_present(dir) {
         return Ok(());
     }
+    lock.report(vk_hub_proto::dispatch::Activity::Pulling {
+        image: label.to_string(),
+    });
     println!("virtkit: registry: pulling {label} ...");
     let (manifest, _) =
         with_transfer_retry(&format!("pulling the manifest of {name}@{digest}"), || {

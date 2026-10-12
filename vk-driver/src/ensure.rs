@@ -220,11 +220,14 @@ pub fn ensure_build_tier(
     }
     // `label` (the service / git-defined image name) names the stage in the concurrent-build
     // wait message; the fingerprint is the cache identity.
-    let _lock = crate::image::acquire_pull_lock(&dir, "build", label, &expected)?;
+    let mut lock = crate::image::acquire_pull_lock(&dir, "build", label, &expected)?;
     // Re-check under the lock: a concurrent build of the same stage may have just promoted it.
     if let Some(guard) = reference_if_fresh(state_dir, &dir, &expected)? {
         return Ok((dir, guard));
     }
+    lock.report(vk_hub_proto::dispatch::Activity::Building {
+        image: label.to_string(),
+    });
     // Reclaim scratch orphaned by earlier failed/killed builds of *other* stages before
     // asking for more space ourselves — otherwise a tier stuck failing (e.g. ENOSPC) never
     // gets a chance to recover, since the success path below is never reached.
@@ -246,7 +249,7 @@ pub fn ensure_build_tier(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&tmp, &dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))?;
-    // Take the reference right away, still under the pull lock (still `_lock`-held) and with
+    // Take the reference right away, still under the pull lock (still `lock`-held) and with
     // no `.used` marker yet on the freshly promoted dir — so there is no instant, before this
     // returns, in which the idle GC could see the promoted dir as a reclaimable, unreferenced
     // entry.

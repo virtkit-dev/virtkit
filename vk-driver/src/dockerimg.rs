@@ -282,8 +282,11 @@ fn resolve_pinned(
 
     let dir = image_cache_dir(state_dir, name, digest);
     if !dir.join("runner.ext4").is_file() {
-        let _lock = image::acquire_pull_lock(&dir, "pull", name, digest)?;
+        let mut lock = image::acquire_pull_lock(&dir, "pull", name, digest)?;
         if !dir.join("runner.ext4").is_file() {
+            lock.report(vk_hub_proto::dispatch::Activity::Pulling {
+                image: name.to_string(),
+            });
             // Reclaim scratch orphaned by earlier failed/killed pulls of *other* images
             // before asking for more space ourselves — otherwise a tier stuck failing
             // (e.g. ENOSPC) never gets a chance to recover.
