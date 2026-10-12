@@ -29,6 +29,7 @@ use vk_hub_proto::{
     SHA256_LEN, SIGNATURE_LEN, TOOLS_PATH, from_hex_lower,
 };
 
+use crate::session::PeerKind;
 use crate::store::{Db, Enrollment};
 
 /// A response body: whole, or a release binary streamed from its file.
@@ -698,7 +699,7 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     let resp = match (req.method(), req.uri().path()) {
         (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer).await,
-        (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported)),
+        (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported, PeerKind::Node)),
         (&Method::GET, path) if path.starts_with(RELEASE_PATH) => {
             download(&req, &hub, peer, exported, &state, Download::Release).await
         }
@@ -795,7 +796,7 @@ async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<R
     })
 }
 
-/// What a node downloads.
+/// What a peer downloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Download {
     /// The `vk` binary an update names.
@@ -816,6 +817,13 @@ impl Download {
         match self {
             Download::Release => "release",
             Download::Tools => "tools definition",
+        }
+    }
+
+    /// The downloader's ID header and peer kind.
+    fn peer(self) -> (&'static str, &'static str) {
+        match self {
+            Download::Release | Download::Tools => (vk_hub_proto::NODE_HEADER, "node"),
         }
     }
 
@@ -862,14 +870,15 @@ async fn download(
         return Ok(error(StatusCode::NOT_FOUND, &format!("no such {what}")));
     };
     let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    let (id_header, noun) = kind.peer();
     let (Some(node_id), Some(at), Some(signature)) = (
-        header(vk_hub_proto::NODE_HEADER).filter(|id| vk_hub_proto::valid_id(id)),
+        header(id_header).filter(|id| vk_hub_proto::valid_id(id)),
         header(vk_hub_proto::TIME_HEADER).and_then(|t| t.parse::<u64>().ok()),
         header(vk_hub_proto::SIGNATURE_HEADER).and_then(from_hex_lower::<SIGNATURE_LEN>),
     ) else {
         return Ok(error(
             StatusCode::UNAUTHORIZED,
-            &format!("a {what} is downloaded by a node, signing for it"),
+            &format!("a {what} is downloaded by a {noun}, signing for it"),
         ));
     };
     let node_id = node_id.to_string();
@@ -884,25 +893,25 @@ async fn download(
     let (id, sha) = (node_id.clone(), sha256.clone());
     // The node, whether it has a command under way that this download is for, and the size
     // the file is recorded at.
-    let (row, wanted, size) = tokio::task::spawn_blocking(move || match kind {
+    let (pinned, wanted, size) = tokio::task::spawn_blocking(move || match kind {
         Download::Release => anyhow::Ok((
-            db.node(&id)?,
+            db.node(&id)?.map(|r| r.public_key),
             db.updating_to(&id, &sha, now)?,
             db.release(&sha)?.map(|r| r.size),
         )),
         Download::Tools => anyhow::Ok((
-            db.node(&id)?,
+            db.node(&id)?.map(|r| r.public_key),
             db.building_tools(&id, &sha, now)?,
             db.tools(&sha)?.map(|t| t.size),
         )),
     })
     .await
     .context("looking a download up")??;
-    let Some(row) = row else {
-        return Ok(error(StatusCode::FORBIDDEN, "no such node"));
+    let Some(pinned) = pinned else {
+        return Ok(error(StatusCode::FORBIDDEN, &format!("no such {noun}")));
     };
-    let Some(public_key) = from_hex_lower::<PUBLIC_KEY_LEN>(&row.public_key) else {
-        anyhow::bail!("node {node_id} has a corrupt pinned key");
+    let Some(public_key) = from_hex_lower::<PUBLIC_KEY_LEN>(&pinned) else {
+        anyhow::bail!("{noun} {node_id} has a corrupt pinned key");
     };
     let channel = match &exported {
         Some(exported) => vk_hub_proto::Channel::Tls(exported),
@@ -912,8 +921,10 @@ async fn download(
     if !crate::verify(&public_key, &message, &signature) {
         return Ok(error(
             StatusCode::FORBIDDEN,
-            "the signature does not match the node's pinned key; a proxy terminating TLS in \
-             front of the hub breaks its binding to the connection: pass TLS through",
+            &format!(
+                "the signature does not match the {noun}'s pinned key; a proxy terminating TLS \
+                 in front of the hub breaks its binding to the connection: pass TLS through"
+            ),
         ));
     }
     let (Some(recorded), true) = (size, wanted) else {
@@ -974,7 +985,7 @@ async fn download(
             .take(),
     );
     eprintln!(
-        "vk-hub: {peer}: node {node_id} is downloading {what} {}",
+        "vk-hub: {peer}: {noun} {node_id} is downloading {what} {}",
         crate::store::short(&sha256)
     );
     // The slot goes with the body, which hyper drops once it is sent or the peer is gone.
@@ -1006,13 +1017,14 @@ async fn download(
     Ok(resp)
 }
 
-/// `GET /v1/node`: answer the WebSocket handshake and run the session on the upgraded
-/// connection, or 503 with every handshake permit taken.
+/// `GET /v1/node`: answer the WebSocket handshake and run the `kind` of session on the
+/// upgraded connection, or 503 with every handshake permit taken.
 fn upgrade(
     mut req: Request<Incoming>,
     hub: Arc<Hub>,
     peer: SocketAddr,
     exported: Exported,
+    kind: PeerKind,
 ) -> Response<Body> {
     let headers = req.headers();
     let has = |name: header::HeaderName, token: &str| {
@@ -1066,7 +1078,9 @@ fn upgrade(
         let ws =
             WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config))
                 .await;
-        crate::session::run(ws, hub, peer, exported, permit).await;
+        match kind {
+            PeerKind::Node => crate::session::run(ws, hub, peer, exported, permit).await,
+        }
     });
     let mut resp = Response::new(full(Bytes::new()));
     *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
