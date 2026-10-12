@@ -608,17 +608,26 @@ fn job_row(
         }
     }
     h.raw("</div></td><td><div class=\"fit\">");
+    // The commit the job ran appears on hover over the branch or its dash.
+    let commit = j
+        .commit
+        .as_deref()
+        .map(|c| format!(" @ {c}"))
+        .unwrap_or_default();
     match &j.git_ref {
         Some(git_ref) => narrowing_cut(
             h,
             filter,
             |f| f.git_ref = Some(git_ref.clone()),
             git_ref,
-            "",
+            &commit,
             BRANCH_TAIL,
         ),
         None => {
-            h.raw("-");
+            match &j.commit {
+                Some(commit) => h.raw("<span title=\"").text(commit).raw("\">-</span>"),
+                None => h.raw("-"),
+            };
         }
     }
     h.raw("</div></td><td>");
@@ -883,6 +892,19 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
     }
     pages::kv_node(h, "Title", &j.title);
     pages::kv_node(h, "Project", j.project.as_deref().unwrap_or("-"));
+    if j.git_ref.is_some() || j.commit.is_some() {
+        // The branch and the commit it ran, abbreviated with the full commit on hover.
+        let mut cell = Html::new();
+        cell.node(j.git_ref.as_deref().unwrap_or("-"));
+        if let Some(commit) = &j.commit {
+            cell.raw(" @ <code title=\"")
+                .text(commit)
+                .raw("\">")
+                .text(commit.get(..12).unwrap_or(commit))
+                .raw("</code>");
+        }
+        pages::kv_html(h, "Branch", &cell);
+    }
     let mut cell = Html::new();
     node_link(&mut cell, j, names);
     pages::kv_html(h, "Node", &cell);

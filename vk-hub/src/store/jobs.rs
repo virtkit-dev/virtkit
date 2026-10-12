@@ -93,6 +93,10 @@ pub struct JobRow {
     /// GitLab's ID of its pipeline; `None` when the spec has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<u64>,
+    /// The commit it ran, lowercase hex; `None` when the spec has no commit or the record
+    /// comes from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// The job's GitLab page from its spec; `None` for an invalid URL or an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>,
@@ -1016,6 +1020,7 @@ mod tests {
             finished_at: None,
             settled_at: None,
             expired_at: None,
+            commit: None,
         }
     }
 

@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A job's branch shows the commit it ran: on hover in the jobs table, on its page, and in
+  `vk-hub jobs show`.**
+
 ### Fixed
 
 - **A host checkout no longer fails on a branch named under a deleted one** (`a/b` after `a`

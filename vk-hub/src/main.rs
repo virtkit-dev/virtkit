@@ -1556,6 +1556,8 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
         ("job", id.to_string()),
         ("title", j.title.clone()),
         ("project", j.project.clone().unwrap_or_else(dash)),
+        ("branch", j.git_ref.clone().unwrap_or_else(dash)),
+        ("commit", j.commit.clone().unwrap_or_else(dash)),
         ("state", jobs::state_text(j)),
     ];
     if let Some(code) = result.and_then(|r| r.exit_code) {

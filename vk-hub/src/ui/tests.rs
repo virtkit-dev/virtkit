@@ -3379,6 +3379,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3411,6 +3412,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     );
     measured.node = Some(node.clone());
     measured.git_ref = Some("main".into());
+    measured.commit = Some("ab12".into());
     measured.started_at = Some(now - 100);
     measured.finished_at = Some(now - 30);
     submit(102, &measured);
@@ -3455,7 +3457,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
          target=\"_blank\" rel=\"noopener noreferrer\">↗</a></div></td><td><div class=\"fit\">\
          <span class=\"mid\" title=\"acme/web\"><span class=\"head\">acme/web</span></span>\
          </div></td><td><div class=\"fit\"><a href=\"/jobs?ref=main\">\
-         <span class=\"mid\" title=\"main\"><span class=\"head\">main</span></span></a></div></td>\
+         <span class=\"mid\" title=\"main @ ab12\"><span class=\"head\">main</span></span></a></div></td>\
          <td>-</td>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
         "<span class=\"badge ok\">success</span>",
@@ -3647,6 +3649,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     }
 }
 
@@ -3668,6 +3671,8 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         row.node = Some(node.clone());
         row.job_url = Some(format!("https://gitlab.example.com/acme/web/-/jobs/{n}"));
         row.started_at = Some(now - 5);
+        row.git_ref = Some("main".into());
+        row.commit = Some("0123456789abcdef0123".into());
         row.finished_at = Some(now);
         row.settled_at = Some(now);
         row.result = Some(JobResult {
@@ -3686,15 +3691,13 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         (3, Some(FailureClass::Lost)),
         (4, None),
     ] {
+        let mut row = ended(n, failure);
+        if n == 3 {
+            // A commit with no branch.
+            row.git_ref = None;
+        }
         hub.db
-            .submit_job(
-                &id(n),
-                &ended(n, failure),
-                &n.to_string(),
-                b"{}",
-                "key gitlab",
-                now,
-            )
+            .submit_job(&id(n), &row, &n.to_string(), b"{}", "key gitlab", now)
             .unwrap();
     }
     let stamp = "2026-10-09T12:10:43.123456Z";
@@ -3718,6 +3721,11 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         )),
         "{page}"
     );
+    // With no branch, hovering over the dash shows the commit.
+    assert!(
+        page.contains("<span title=\"0123456789abcdef0123\">-</span>"),
+        "{page}"
+    );
     // Every job links to its page.
     assert!(
         page.contains(&format!(
@@ -3736,6 +3744,9 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         "<h1>build-1</h1>",
         "<a href=\"https://gitlab.example.com/acme/web/-/jobs/1\" target=\"_blank\" \
          rel=\"noopener noreferrer\">On GitLab</a>",
+        // Its branch and commit, the commit short and whole on hover.
+        "<tr><th>Branch</th><td>main @ <code title=\"0123456789abcdef0123\">0123456789ab</code>\
+         </td></tr>",
         "<tr><th>Failure class</th><td>system failure</td></tr>",
         "<tr><th>Message</th><td>the VM &lt;did&gt; not boot</td></tr>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
@@ -3754,6 +3765,13 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         .await
         .body;
     assert!(page.contains("<p class=\"empty\">none kept</p>"), "{page}");
+    assert!(
+        page.contains(
+            "<tr><th>Branch</th><td>- @ <code title=\"0123456789abcdef0123\">0123456789ab\
+             </code></td></tr>"
+        ),
+        "{page}"
+    );
     let page = get(addr, &format!("/jobs/{}", id(2)), Some(&viewer))
         .await
         .body;

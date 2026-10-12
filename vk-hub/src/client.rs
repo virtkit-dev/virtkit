@@ -429,6 +429,13 @@ fn conflict() -> ApiError {
     )
 }
 
+/// The commit `sha` names, as lowercase hex of at most 64 characters (a SHA-256), or `None`.
+/// Restricted to hex for display in a tooltip.
+pub(crate) fn commit(sha: &str) -> Option<String> {
+    Some(sha.to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// What a job is, for its record and the audit log.
 fn title(spec: &JobSpec) -> String {
     match spec {
@@ -499,6 +506,9 @@ async fn submit(
         },
         pipeline: match &ask.spec {
             JobSpec::GitlabCi(ci) => Some(ci.job.pipeline_id).filter(|&p| p > 0),
+        },
+        commit: match &ask.spec {
+            JobSpec::GitlabCi(ci) => commit(&ci.sources.sha),
         },
         created_at: crate::now_secs(),
         state: JobState::Queued,

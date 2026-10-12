@@ -206,6 +206,7 @@ fn spec(gitlab_id: u64) -> JobSpec {
     ci.job.name = "test".into();
     ci.job.pipeline_id = 900 + gitlab_id;
     ci.sources.git_ref = "feature/\u{202e}menu".into();
+    ci.sources.sha = "0123456789ABCDEF0123456789ABCDEF01234567".into();
     ci.token = "glcbt-secret".into();
     ci.trace.limit_bytes = 1 << 20;
     JobSpec::GitlabCi(ci)
@@ -1218,6 +1219,10 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     assert_eq!(
         (row.git_ref.as_deref(), row.pipeline),
         (Some("feature/menu"), Some(902))
+    );
+    assert_eq!(
+        row.commit.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
     );
     assert!(row.started_at.is_some() && row.started_at <= row.finished_at);
     assert_eq!(row.ran_ms(crate::now_secs()), Some(4200));
@@ -2982,6 +2987,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3065,6 +3071,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3423,6 +3430,7 @@ fn a_job_is_shown_on_the_command_line() {
         git_ref: None,
         pipeline: None,
         expired_at: None,
+        commit: Some("ab12".into()),
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);
@@ -3435,6 +3443,7 @@ fn a_job_is_shown_on_the_command_line() {
     for want in [
         format!("job          {id}\n"),
         "state        failed: system failure\n".to_string(),
+        "project      g/p\nbranch       -\ncommit       ab12\n".to_string(),
         "message      the VM did not boot\n".to_string(),
         "gitlab       https://gitlab.example.com/g/p/-/jobs/7\n".to_string(),
         "finished     1970-01-01T00:17:50Z\n".to_string(),
@@ -3449,4 +3458,15 @@ fn a_job_is_shown_on_the_command_line() {
     // A link that is not a plain web one is left out.
     row.job_url = Some("javascript:alert(1)".into());
     assert!(!render_job(&id, &row, None, 2000).contains("gitlab "));
+}
+
+/// A spec's commit is kept lowercased, and only as hex no longer than a SHA-256.
+#[test]
+fn a_commit_is_hex_or_nothing() {
+    use crate::client::commit;
+    assert_eq!(commit("AbC123").as_deref(), Some("abc123"));
+    assert_eq!(commit(&"f".repeat(64)), Some("f".repeat(64)));
+    for bad in ["", "abc\"><x", "0123456789 ", &"f".repeat(65)] {
+        assert_eq!(commit(bad), None, "{bad:?}");
+    }
 }
