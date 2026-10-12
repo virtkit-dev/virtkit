@@ -43,8 +43,8 @@ mod keys;
 mod tools;
 
 pub use jobs::{
-    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, RequestRow, SUMMARY_JOBS,
-    Submitted,
+    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, PREPARE_STAGE, RequestRow,
+    SUMMARY_JOBS, Submitted,
 };
 pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
 pub use tools::{Tools, ToolsRow};

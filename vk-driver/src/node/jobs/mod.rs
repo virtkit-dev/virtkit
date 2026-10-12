@@ -107,8 +107,8 @@ struct Track {
     /// Raised once the node's cleanup after the job's lost driver has ended, when one was
     /// started: the result is written then.
     cleaning: Option<Arc<AtomicBool>>,
-    /// The stage last told.
-    told: Option<String>,
+    /// The stage last told, and what it was doing.
+    told: Option<(String, Option<vk_hub_proto::dispatch::Activity>)>,
     result: Option<JobResult>,
     result_told: Option<Instant>,
     started: Instant,
@@ -274,13 +274,14 @@ impl Jobs {
             t.sent = t.acked;
             t.result_told = None;
             let stage = journal::read_stage(&t.dir);
-            t.told = stage.clone();
+            let activity = journal::read_activity(&t.dir);
+            t.told = stage.clone().map(|s| (s, activity.clone()));
             let finished = t.result.is_some();
             jobs.push(HeldJob {
                 job: id.clone(),
                 state: match (finished, stage) {
                     (true, _) => RunState::Finished,
-                    (false, Some(stage)) => RunState::Running { stage },
+                    (false, Some(stage)) => RunState::Running { stage, activity },
                     (false, None) => RunState::Accepted,
                 },
                 output_len: journal::output_len(&t.dir),
@@ -387,7 +388,10 @@ impl Jobs {
         if let Some(t) = state.jobs.get(&job) {
             let run = match (&t.result, journal::read_stage(&t.dir)) {
                 (Some(_), _) => RunState::Finished,
-                (None, Some(stage)) => RunState::Running { stage },
+                (None, Some(stage)) => RunState::Running {
+                    stage,
+                    activity: journal::read_activity(&t.dir),
+                },
                 (None, None) => RunState::Accepted,
             };
             return vec![NodeJobMsg::Job { job, state: run }];
@@ -660,14 +664,17 @@ impl Jobs {
                 let result = journal::read_result(&t.dir).or_else(|| self.lost_driver(t, now));
                 t.result = result;
                 if let Some(stage) = journal::read_stage(&t.dir)
-                    && t.told.as_ref() != Some(&stage)
                     && t.result.is_none()
                 {
-                    t.told = Some(stage.clone());
-                    msgs.push(NodeJobMsg::Job {
-                        job: id.clone(),
-                        state: RunState::Running { stage },
-                    });
+                    let told = (stage, journal::read_activity(&t.dir));
+                    if t.told.as_ref() != Some(&told) {
+                        t.told = Some(told.clone());
+                        let (stage, activity) = told;
+                        msgs.push(NodeJobMsg::Job {
+                            job: id.clone(),
+                            state: RunState::Running { stage, activity },
+                        });
+                    }
                 }
             }
             if t.awaiting_ack && !t.disowned {

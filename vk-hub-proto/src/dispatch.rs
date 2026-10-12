@@ -228,15 +228,83 @@ pub enum RunState {
     },
     /// In `stage`, named as gitlab-runner names its build stages: `prepare_executor`,
     /// `get_sources`, `restore_cache`, `download_artifacts`, `step_<name>`, `after_script`,
-    /// `archive_cache`, `upload_artifacts_on_success` and so on.
-    Running { stage: String },
+    /// `archive_cache`, `upload_artifacts_on_success` and so on, doing `activity` when the
+    /// node can tell. A hub older than `activity` reads the stage alone.
+    Running {
+        stage: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<Activity>,
+    },
     /// Ended; the result follows in [`NodeJobMsg::Result`].
     Finished,
+}
+
+/// What a job's stage is doing, as far as the node can tell: preparing, building or pulling an
+/// image, or waiting while another job on the node builds or pulls the same one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Activity {
+    /// Building `image`: the job's own, or one of its services'.
+    Building { image: String },
+    /// Pulling `image` into the node's cache.
+    Pulling { image: String },
+    /// Waiting for `holder` — another job, when the node can say which — to finish building
+    /// (`building`) or pulling `image`, which this job then uses too.
+    Waiting {
+        image: String,
+        building: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<String>,
+    },
+    /// An activity from a later node.
+    #[serde(other)]
+    Other,
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// A stage's activity, as a node writes it and an older hub ignores it.
+    #[test]
+    fn an_activity_rides_its_stage() {
+        use super::{Activity, RunState};
+        let state = RunState::Running {
+            stage: "prepare_executor".into(),
+            activity: Some(Activity::Waiting {
+                image: "docker/wab/Dockerfile#builder".into(),
+                building: true,
+                holder: Some("https://gitlab.example.com/g/p/-/jobs/1".into()),
+            }),
+        };
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "state": "running",
+                "stage": "prepare_executor",
+                "activity": {
+                    "kind": "waiting",
+                    "image": "docker/wab/Dockerfile#builder",
+                    "building": true,
+                    "holder": "https://gitlab.example.com/g/p/-/jobs/1",
+                },
+            })
+        );
+        assert_eq!(serde_json::from_value::<RunState>(value).unwrap(), state);
+        // A stage without one reads as before, and an activity from a later node as Other.
+        let bare: RunState =
+            serde_json::from_value(json!({"state": "running", "stage": "step_script"})).unwrap();
+        assert_eq!(
+            bare,
+            RunState::Running {
+                stage: "step_script".into(),
+                activity: None
+            }
+        );
+        let later: Activity = serde_json::from_value(json!({"kind": "compiling"})).unwrap();
+        assert_eq!(later, Activity::Other);
+    }
 
     use super::*;
     use crate::job::{ArtifactOutcome, FailureClass, UploadState};
@@ -298,6 +366,7 @@ mod tests {
                     job: id("b"),
                     state: RunState::Running {
                         stage: "step_script".into(),
+                        activity: None,
                     },
                     output_len: 8192,
                     finished: false,

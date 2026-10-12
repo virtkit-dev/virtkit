@@ -55,6 +55,7 @@ use tokio::time::Instant;
 use vk_hub_proto::client::{
     CancelMode, Capacity, ErrorCode, JobState, JobView, Placement, ReservationGrant,
 };
+use vk_hub_proto::dispatch::Activity;
 use vk_hub_proto::dispatch::{
     Held, HubJobMsg, JobStart, LeaseEnd, LeaseState, MAX_LEASE_SECS, MAX_OUTPUT_CHUNK, NodeJobMsg,
     OfferReply, Refusal, RunState,
@@ -494,6 +495,7 @@ fn finish(
     row.revision = row.revision.saturating_add(1);
     row.finished_at = Some(crate::now_secs());
     row.stage = None;
+    row.activity = None;
     let output_len = row.output_len;
     let how = match failure {
         Some(f) => failure_name(f),
@@ -514,6 +516,42 @@ fn finish(
     let events = vec![(row.node.clone(), HUB.to_string(), event)];
     state.finished.insert(id.to_string(), job.row.clone());
     Some((job.row, events))
+}
+
+/// `activity`, as a node said it, with its strings made display-safe.
+fn display_safe_activity(activity: Activity) -> Activity {
+    use vk_hub_proto::display_safe as safe;
+    match activity {
+        Activity::Building { image } => Activity::Building {
+            image: safe(&image),
+        },
+        Activity::Pulling { image } => Activity::Pulling {
+            image: safe(&image),
+        },
+        Activity::Waiting {
+            image,
+            building,
+            holder,
+        } => Activity::Waiting {
+            image: safe(&image),
+            building,
+            holder: holder.as_deref().map(safe),
+        },
+        Activity::Other => Activity::Other,
+    }
+}
+
+/// What `activity` is, in a few words, for a badge: the image it names is on the job's page.
+pub(crate) fn activity_text(activity: &Activity) -> &'static str {
+    match activity {
+        Activity::Building { .. } => "building image",
+        Activity::Pulling { .. } => "pulling image",
+        Activity::Waiting { building: true, .. } => "waiting for build",
+        Activity::Waiting {
+            building: false, ..
+        } => "waiting for pull",
+        Activity::Other => "preparing",
+    }
 }
 
 pub(crate) fn failure_name(f: FailureClass) -> &'static str {
@@ -539,9 +577,12 @@ pub(crate) fn state_text(j: &JobRow) -> String {
             Some(f) => format!("failed: {}", failure_name(f)),
             None => "succeeded".to_string(),
         },
-        (JobState::Running, _) => match &j.stage {
-            Some(stage) => format!("running: {stage}"),
-            None => "running".to_string(),
+        (JobState::Running, _) => match (&j.stage, &j.activity) {
+            // Only ever while preparing: the activity says it.
+            (_, Some(activity)) => activity_text(activity).to_string(),
+            (Some(stage), None) if stage == crate::store::PREPARE_STAGE => "preparing".to_string(),
+            (Some(stage), None) => format!("running: {stage}"),
+            (None, None) => "running".to_string(),
         },
         (JobState::Queued, _) => "queued".to_string(),
         (JobState::Starting, _) => "starting".to_string(),
@@ -959,12 +1000,18 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                     ),
                 ));
             }
-            RunState::Running { stage } => {
+            RunState::Running { stage, activity } => {
                 row.state = JobState::Running;
-                row.started_at.get_or_insert_with(crate::now_secs);
+                let now = crate::now_secs();
+                row.started_at.get_or_insert(now);
                 job.spec = None;
                 job.reservation = None;
+                // Past preparing: what follows is the job's own time.
+                if stage != crate::store::PREPARE_STAGE {
+                    row.prepared_at.get_or_insert(now);
+                }
                 row.stage = Some(vk_hub_proto::display_safe(&stage));
+                row.activity = activity.map(display_safe_activity);
             }
             RunState::Finished => return Ok(Vec::new()),
         }

@@ -1018,14 +1018,49 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     let view: JobView = poll.await.unwrap().json();
     assert!(view.revision > submitted.revision);
     assert_ne!(view.state, JobState::Queued);
+    // Preparing, and waiting for another job's build of its image: said so, and counted as
+    // preparation, not as the job's run.
+    node.send(NodeJobMsg::Job {
+        job: id.clone(),
+        state: RunState::Running {
+            stage: "prepare_executor".into(),
+            activity: Some(vk_hub_proto::dispatch::Activity::Waiting {
+                image: "docker/wab/Dockerfile#builder".into(),
+                building: true,
+                holder: Some("https://gitlab.example.com/g/p/-/jobs/1".into()),
+            }),
+        },
+    });
+    view_until(addr, &key, &id, |v| {
+        v.stage.as_deref() == Some("prepare_executor")
+    })
+    .await;
+    eventually(|| {
+        hub.db.job(&id).unwrap().is_some_and(|row| {
+            crate::jobs::state_text(&row) == "waiting for build"
+                && row.preparing()
+                && row.ran_ms(now_secs()).is_none()
+        })
+    })
+    .await;
     node.send(NodeJobMsg::Job {
         job: id.clone(),
         state: RunState::Running {
             stage: "step_script".into(),
+            activity: None,
         },
     });
     view_until(addr, &key, &id, |v| {
         v.stage.as_deref() == Some("step_script")
+    })
+    .await;
+    eventually(|| {
+        hub.db.job(&id).unwrap().is_some_and(|row| {
+            row.activity.is_none()
+                && row.prepared_at.is_some()
+                && !row.preparing()
+                && crate::jobs::state_text(&row) == "running: step_script"
+        })
     })
     .await;
 
@@ -1105,6 +1140,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         peak_mem_bytes: Some(1 << 30),
         cpus: Some(2),
         mem_mib: Some(4096),
+        prepare_ms: None,
     });
     node.send(NodeJobMsg::Result {
         job: id.clone(),
@@ -1326,6 +1362,7 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
                 job: job.clone(),
                 state: RunState::Running {
                     stage: "step_script".into(),
+                    activity: None,
                 },
                 output_len: 40,
                 finished: false,
@@ -1495,6 +1532,7 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
             job: job.clone(),
             state: RunState::Running {
                 stage: "step_script".into(),
+                activity: None,
             },
             output_len: 0,
             finished: false,
@@ -2686,6 +2724,7 @@ async fn a_job_running_across_a_restart_keeps_its_image() {
             job: job.id.clone(),
             state: RunState::Running {
                 stage: "step_script".into(),
+                activity: None,
             },
             output_len: 0,
             finished: false,
@@ -2720,6 +2759,7 @@ async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
             job: stray.clone(),
             state: RunState::Running {
                 stage: "step_script".into(),
+                activity: None,
             },
             output_len: 0,
             finished: false,
@@ -2983,6 +3023,8 @@ fn the_jobs_table_says_how_each_job_stands() {
         pipeline: None,
         expired_at: None,
         commit: None,
+        activity: None,
+        prepared_at: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3067,6 +3109,8 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         pipeline: None,
         expired_at: None,
         commit: None,
+        activity: None,
+        prepared_at: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3145,6 +3189,7 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
         job: id.clone(),
         state: RunState::Running {
             stage: "step_script".into(),
+            activity: None,
         },
     });
     wait_until(|| jobs.has_changed().unwrap()).await;
@@ -3426,6 +3471,8 @@ fn a_job_is_shown_on_the_command_line() {
         pipeline: None,
         expired_at: None,
         commit: None,
+        activity: None,
+        prepared_at: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);

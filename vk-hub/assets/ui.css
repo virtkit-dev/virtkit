@@ -175,11 +175,11 @@ table.grid tr.down td, .rollout tr.failed td { color: var(--bad); }
    the longest values the other columns show, the job, its project and its branch sharing what
    is left, and text cut short (whole on hover) rather than widening a column. */
 section.jobs-table { overflow-x: auto; }
-table.grid.jobs { table-layout: fixed; min-width: 84rem; }
-/* What the fixed columns leave (74rem of them) goes to the branch, often long, and the job. */
-table.grid.jobs col.job { width: calc((100% - 74rem) * 0.4); }
+table.grid.jobs { table-layout: fixed; min-width: 92rem; }  /* job and branch keep 13.5rem */
+/* What the fixed columns leave (78.5rem of them) goes to the branch, often long, and the job. */
+table.grid.jobs col.job { width: calc((100% - 78.5rem) * 0.4); }
 table.grid.jobs col.project { width: 8rem; }        /* git/proxies-rs */
-table.grid.jobs col.branch { width: calc((100% - 74rem) * 0.6); }
+table.grid.jobs col.branch { width: calc((100% - 78.5rem) * 0.6); }
 table.grid.jobs td { overflow: hidden; text-overflow: ellipsis; }
 /* A long name loses its middle (`.mid`): its head is cut short, its tail stays. */
 table.grid.jobs .fit { display: flex; align-items: baseline; gap: 0.3em; min-width: 0; }
@@ -194,8 +194,9 @@ table.grid.jobs col.pipeline { width: 6.5rem; }   /* 509098 ↗ */
 table.grid.jobs col.node { width: 9rem; }         /* hq-srv41-rd-hv05 */
 table.grid.jobs col.result { width: 10rem; }      /* running: step_script */
 table.grid.jobs col.started { width: 11rem; }     /* 01:40 PM · 11 min ago */
+table.grid.jobs col.prep { width: 5rem; }
 table.grid.jobs col.ran { width: 5.5rem; }
-table.grid.jobs col.mem { width: 7.5rem; }
+table.grid.jobs col.mem { width: 7rem; }
 table.grid.jobs col.cpu { width: 6.5rem; }
 table.grid.jobs col.size { width: 9.5rem; }       /* 16 vCPUs, 32.0 GiB */
 table.kv { width: 100%; }

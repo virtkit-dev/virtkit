@@ -3380,6 +3380,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         pipeline: None,
         expired_at: None,
         commit: None,
+        activity: None,
+        prepared_at: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3407,6 +3409,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
                 peak_mem_bytes: Some(3 << 30),
                 cpus: Some(4),
                 mem_mib: Some(8192),
+                prepare_ms: None,
             }),
         ),
     );
@@ -3637,6 +3640,8 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         pipeline: None,
         expired_at: None,
         commit: None,
+        activity: None,
+        prepared_at: None,
     }
 }
 

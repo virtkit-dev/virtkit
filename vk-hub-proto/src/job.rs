@@ -434,6 +434,10 @@ pub struct JobUsage {
     /// The guest's memory in MiB, sized the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_mib: Option<u64>,
+    /// Of `wall_ms`, what preparing the executor took: admission, building or pulling the
+    /// image, booting the VM, waiting for its services. Absent from older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -871,6 +875,7 @@ pub(crate) mod tests {
                 peak_mem_bytes: Some(3 << 30),
                 cpus: Some(4),
                 mem_mib: Some(8192),
+                prepare_ms: None,
             }),
             ..old.clone()
         };

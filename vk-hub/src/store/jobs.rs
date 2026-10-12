@@ -69,6 +69,9 @@ pub const SUMMARY_JOBS: usize = 10_000;
 /// How often, at most, requests past [`REQUEST_KEEP`] are swept.
 const REQUEST_SWEEP_SECS: u64 = 600;
 
+/// The stage a node prepares a job's executor in, as gitlab-runner names it.
+pub const PREPARE_STAGE: &str = "prepare_executor";
+
 /// A job the hub has taken.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRow {
@@ -107,6 +110,9 @@ pub struct JobRow {
     pub node: Option<String>,
     #[serde(default)]
     pub stage: Option<String>,
+    /// What its stage does, when the node says: building an image, waiting for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<vk_hub_proto::dispatch::Activity>,
     #[serde(default)]
     pub cancel: Option<CancelMode>,
     #[serde(default)]
@@ -117,6 +123,10 @@ pub struct JobRow {
     /// When a node accepted it, on the hub's clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
+    /// When it was prepared — its node reported a stage past `prepare_executor` — on the
+    /// hub's clock; `None` while it prepares, or for an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at: Option<u64>,
     #[serde(default)]
     pub finished_at: Option<u64>,
     /// When its producer settled it and its output was dropped.
@@ -142,24 +152,65 @@ impl JobRow {
         }
     }
 
-    /// Runtime in milliseconds, using the node's measurement when available. Otherwise,
-    /// use the hub's time from acceptance to completion, or to `now` while running.
-    /// `None` for a job no node accepted.
+    /// The job's own runtime in milliseconds, its preparation left out ([`JobRow::prepare_ms`]):
+    /// the node's measurement when there is one, else the hub's time from its preparation's
+    /// end — or its acceptance, for a record that does not say when that was — to its end, or
+    /// to `now` while it runs. `None` for a job no node accepted, or one still preparing.
     pub fn ran_ms(&self, now: u64) -> Option<u64> {
         if let Some(usage) = self.result.as_ref().and_then(|r| r.usage) {
-            return Some(usage.wall_ms);
+            return Some(match usage.prepare_ms {
+                Some(prepare) => usage.wall_ms.saturating_sub(prepare),
+                None => usage.wall_ms,
+            });
+        }
+        if self.preparing() {
+            return None;
         }
         let end = match self.state {
             JobState::Finished => self.finished_at?,
             _ => now,
         };
-        Some(end.saturating_sub(self.started_at?).saturating_mul(1000))
+        let start = self.prepared_at.or(self.started_at)?;
+        Some(end.saturating_sub(start).saturating_mul(1000))
     }
 
-    /// Start time on the hub's clock; `None` before node acceptance or after the job ends.
+    /// How long preparing the executor took — admission, building or pulling the image,
+    /// waiting for another job building it, booting the VM — in milliseconds, or has taken
+    /// until `now` while it goes on. `None` when the record does not say.
+    pub fn prepare_ms(&self, now: u64) -> Option<u64> {
+        if let Some(usage) = self.result.as_ref().and_then(|r| r.usage) {
+            return usage.prepare_ms;
+        }
+        let started = self.started_at?;
+        let end = match self.prepared_at {
+            Some(at) => at,
+            None if self.preparing() => now,
+            None => return None,
+        };
+        Some(end.saturating_sub(started).saturating_mul(1000))
+    }
+
+    /// Whether a node took the job and is still preparing it.
+    pub fn preparing(&self) -> bool {
+        self.state != JobState::Finished
+            && self.result.is_none()
+            && self.started_at.is_some()
+            && self.prepared_at.is_none()
+            && self.stage.as_deref().is_none_or(|s| s == PREPARE_STAGE)
+    }
+
+    /// When its own run started, on the hub's clock, for a page to count on from; `None`
+    /// before, while it prepares, and after it ends.
     pub fn running_since(&self) -> Option<u64> {
-        self.started_at
+        self.prepared_at
+            .or(self.started_at)
             .filter(|_| self.state != JobState::Finished && self.result.is_none())
+            .filter(|_| !self.preparing())
+    }
+
+    /// When its preparation started, while it goes on.
+    pub fn preparing_since(&self) -> Option<u64> {
+        self.started_at.filter(|_| self.preparing())
     }
 
     /// The job's outcome for history filtering.
@@ -1021,6 +1072,8 @@ mod tests {
             settled_at: None,
             expired_at: None,
             commit: None,
+            activity: None,
+            prepared_at: None,
         }
     }
 
@@ -1103,6 +1156,7 @@ mod tests {
         }
         row.started_at = Some(n);
         if state != JobState::Finished {
+            row.stage = Some("step_script".into());
             return row;
         }
         row.finished_at = Some(n + n);
@@ -1516,6 +1570,43 @@ mod tests {
         assert_eq!(page.summary.median_ms, None);
         // Running for 88 seconds of the hub's clock.
         assert_eq!(page.rows[0].2.ran_ms(100), Some(88_000));
+
+        // Prepared from 12 to 30: the job's own time starts there.
+        let mut prepared = page.rows[0].2.clone();
+        prepared.prepared_at = Some(30);
+        assert_eq!(prepared.prepare_ms(100), Some(18_000));
+        assert_eq!(prepared.ran_ms(100), Some(70_000));
+        assert_eq!(prepared.running_since(), Some(30));
+        assert_eq!(prepared.preparing_since(), None);
+        // Still preparing: no run yet, its preparation counting on.
+        let mut preparing = prepared.clone();
+        preparing.prepared_at = None;
+        preparing.stage = Some(PREPARE_STAGE.into());
+        assert_eq!(preparing.ran_ms(100), None);
+        assert_eq!(preparing.prepare_ms(100), Some(88_000));
+        assert_eq!(
+            (preparing.running_since(), preparing.preparing_since()),
+            (None, Some(12))
+        );
+        // Ended: the node's measurement splits its wall time.
+        let mut ended = prepared;
+        ended.state = JobState::Finished;
+        ended.result = Some(JobResult {
+            failure: None,
+            exit_code: Some(0),
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: Some(vk_hub_proto::job::JobUsage {
+                wall_ms: 90_000,
+                prepare_ms: Some(20_000),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            (ended.prepare_ms(100), ended.ran_ms(100)),
+            (Some(20_000), Some(70_000))
+        );
 
         // A row that does not decode is left out.
         let txn = db.db.begin_write().unwrap();

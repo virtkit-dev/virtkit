@@ -6,6 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **vk-hub tells a job building its image from one waiting for another job's build.** While a
+  placed job prepares, its node reports what preparing does — building or pulling an image, or
+  waiting for the job that builds or pulls the same one — and the hub shows it as the job's
+  state ("building image", "waiting for build") and in full on its page, the job holding the
+  image linked.
+- **A placed job's preparation is timed apart from its run.** The jobs table and a job's page
+  show how long preparing took (admission, the image, the VM's boot) beside the job's own run
+  time, which no longer includes it; so does the median run time. Jobs from older nodes keep
+  one time.
 - **A job's branch shows the commit it ran: on hover in the jobs table, and on its page.**
 
 ### Fixed

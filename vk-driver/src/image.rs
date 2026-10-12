@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
+use vk_hub_proto::dispatch::Activity;
 
 /// The boot flavour recorded per cached bundle (`boot.kind`), so a cache hit
 /// — which skips the pull/build — still knows how to boot it.
@@ -305,10 +306,16 @@ pub(crate) struct PullLock {
     _sock: Arc<UnixListener>,
     stop: Arc<AtomicBool>,
     responder: Option<std::thread::JoinHandle<()>>,
+    /// Whether taking it told the job's hub it builds or pulls ([`crate::activity`]), to
+    /// take back on release.
+    reported: bool,
 }
 
 impl Drop for PullLock {
     fn drop(&mut self) {
+        if self.reported {
+            crate::activity::report(None);
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.responder.take() {
             let _ = h.join();
@@ -412,7 +419,17 @@ fn acquire_pull_lock_with(
     loop {
         polls = polls.wrapping_add(1);
         match UnixListener::bind_addr(&addr) {
-            Ok(lock) => return Ok(spawn_holder(lock)),
+            Ok(lock) => {
+                let image = name.to_string();
+                crate::activity::report(Some(&if verb == "build" {
+                    Activity::Building { image }
+                } else {
+                    Activity::Pulling { image }
+                }));
+                let mut held = spawn_holder(lock);
+                held.reported = true;
+                return Ok(held);
+            }
             // Asked again every 25 polls (5 s by default), not only at the first refusal: the
             // holder can go and another user's process take the name while this one waits.
             Err(e)
@@ -448,6 +465,11 @@ fn acquire_pull_lock_with(
                         );
                     }
                 } else {
+                    crate::activity::report(Some(&Activity::Waiting {
+                        image: name.to_string(),
+                        building: verb == "build",
+                        holder: holder.as_ref().and_then(|h| h.who.clone()),
+                    }));
                     match holder.and_then(|h| h.who) {
                         Some(who) => println!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
@@ -499,6 +521,7 @@ fn spawn_holder(lock: UnixListener) -> PullLock {
         _sock: lock,
         stop,
         responder: Some(responder),
+        reported: false,
     }
 }
 

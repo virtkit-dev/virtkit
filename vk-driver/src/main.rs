@@ -15,6 +15,7 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+mod activity;
 mod admit;
 mod atop;
 mod atop_attach;

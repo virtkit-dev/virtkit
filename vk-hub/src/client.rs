@@ -518,6 +518,8 @@ async fn submit(
         finished_at: None,
         settled_at: None,
         expired_at: None,
+        activity: None,
+        prepared_at: None,
     };
     let redacted = match &ask.spec {
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),

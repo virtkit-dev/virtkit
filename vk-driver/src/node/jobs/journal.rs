@@ -24,6 +24,8 @@ pub const META: &str = "meta.json";
 pub const PID: &str = "driver.pid";
 pub const OUTPUT: &str = "output";
 pub const STAGE: &str = "stage";
+/// What the stage does, when prepare says ([`crate::activity`]): JSON.
+pub const ACTIVITY: &str = "activity.json";
 pub const CANCEL: &str = "cancel";
 pub const RESULT: &str = "result.json";
 pub const DRIVER_LOG: &str = "driver.log";
@@ -67,6 +69,16 @@ pub fn read_stage(dir: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// What the job's stage does, as its prepare last said; `None` when it said nothing, or
+/// nothing this node can read.
+pub fn read_activity(dir: &Path) -> Option<vk_hub_proto::dispatch::Activity> {
+    let bytes = std::fs::read(dir.join(ACTIVITY)).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 pub fn read_cancel(dir: &Path) -> Option<CancelMode> {

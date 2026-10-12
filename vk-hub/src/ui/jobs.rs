@@ -413,10 +413,10 @@ fn job_table(
     h.raw("<section class=\"jobs-table\"><table class=\"grid jobs\"><colgroup>")
         .raw("<col class=\"job\"><col class=\"project\"><col class=\"branch\"><col class=\"pipeline\">")
         .raw("<col class=\"node\"><col class=\"result\"><col class=\"started\">")
-        .raw("<col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
+        .raw("<col class=\"prep\"><col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
         .raw("</colgroup><thead><tr><th>job</th><th>project</th>")
         .raw("<th>branch</th><th>pipeline</th>")
-        .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\">ran</th>")
+        .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\" title=\"preparing the executor: admission, building or pulling the image, booting\">prep</th><th class=\"num\">ran</th>")
         .raw("<th class=\"num\">peak memory</th><th class=\"num\">CPU time</th>")
         .raw("<th class=\"num\">size</th></tr></thead><tbody>");
     for (_, id, j) in rows {
@@ -639,6 +639,8 @@ fn job_row(
         None => h.raw("-"),
     };
     h.raw("</td><td class=\"num\">");
+    prep(h, j, now);
+    h.raw("</td><td class=\"num\">");
     ran(h, j, now);
     h.raw("</td><td class=\"num\">")
         .text(dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)))
@@ -845,6 +847,20 @@ fn branch_title(j: &JobRow) -> String {
     }
 }
 
+/// How long preparing the job took, counting on in the browser while it goes on.
+fn prep(h: &mut Html, j: &JobRow, now: u64) {
+    let text = dash_or(j.prepare_ms(now).map(crate::jobs::run_text));
+    match j.preparing_since() {
+        Some(at) => h
+            .raw("<span data-since=\"")
+            .text(crate::utc(at))
+            .raw("\">")
+            .text(text)
+            .raw("</span>"),
+        None => h.text(text),
+    };
+}
+
 fn ran(h: &mut Html, j: &JobRow, now: u64) {
     let text = dash_or(j.ran_ms(now).map(crate::jobs::run_text));
     match j.running_since() {
@@ -908,6 +924,14 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
         };
         pages::kv_html(h, key, &cell);
     }
+    if let Some(activity) = &j.activity {
+        let mut cell = Html::new();
+        activity_cell(&mut cell, activity);
+        pages::kv_html(h, "Doing", &cell);
+    }
+    let mut cell = Html::new();
+    prep(&mut cell, j, now);
+    pages::kv_html(h, "Prepared in", &cell);
     let mut cell = Html::new();
     ran(&mut cell, j, now);
     pages::kv_html(h, "Ran", &cell);
@@ -928,6 +952,45 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
 
 /// How the job stands: its outcome's colour, with the failure's class and exit code, or the
 /// stage it is in.
+/// What the job's preparation does, whole: the image, and who builds or pulls it when the job
+/// waits — a GitLab job, linked when its URL is a plain web link.
+fn activity_cell(h: &mut Html, activity: &vk_hub_proto::dispatch::Activity) {
+    use vk_hub_proto::dispatch::Activity;
+    match activity {
+        Activity::Building { image } => {
+            h.raw("building ").raw("<code>").node(image).raw("</code>");
+        }
+        Activity::Pulling { image } => {
+            h.raw("pulling ").raw("<code>").node(image).raw("</code>");
+        }
+        Activity::Waiting {
+            image,
+            building,
+            holder,
+        } => {
+            h.raw("waiting for ");
+            match holder {
+                Some(holder) if vk_hub_proto::is_web_link(holder) => {
+                    h.external_link(Some(holder), holder);
+                }
+                Some(holder) => {
+                    h.node(holder);
+                }
+                None => {
+                    h.raw("another job");
+                }
+            }
+            h.raw(if *building { " to build " } else { " to pull " })
+                .raw("<code>")
+                .node(image)
+                .raw("</code>");
+        }
+        Activity::Other => {
+            h.raw("preparing");
+        }
+    }
+}
+
 fn result_badge(h: &mut Html, j: &JobRow) {
     let result = j.result.as_ref();
     let text = match j.outcome() {
