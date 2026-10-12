@@ -491,10 +491,13 @@ fn finish(
         warm_touch(state, key, node, crate::now_secs());
     }
     let row = &mut job.row;
+    // Ended while preparing, it keeps that stage: all of its time was preparing.
+    if !row.preparing() {
+        row.stage = None;
+    }
     row.state = JobState::Finished;
     row.revision = row.revision.saturating_add(1);
     row.finished_at = Some(crate::now_secs());
-    row.stage = None;
     row.activity = None;
     let output_len = row.output_len;
     let how = match failure {
@@ -541,10 +544,17 @@ fn display_safe_activity(activity: Activity) -> Activity {
     }
 }
 
-/// Job `row` is in `stage`, doing `activity`, as its node said: only preparing says what it
-/// does.
-fn note_stage(row: &mut JobRow, stage: &str, activity: Option<Activity>) {
+/// Record the node's `stage` and `activity` at `now`; retain activity only during preparation.
+fn note_stage(row: &mut JobRow, stage: &str, activity: Option<Activity>, now: u64) {
     use crate::store::PREPARE_STAGE;
+    // A job's runtime starts after preparation. Exclude cleanup after failed preparation
+    // and jobs already past preparation when the hub started recording this boundary.
+    if stage != PREPARE_STAGE
+        && stage != "cleanup"
+        && (row.stage.as_deref()).is_none_or(|s| s == PREPARE_STAGE)
+    {
+        row.prepared_at.get_or_insert(now);
+    }
     row.stage = Some(vk_hub_proto::display_safe(stage));
     row.activity = activity
         .filter(|_| stage == PREPARE_STAGE)
@@ -592,7 +602,8 @@ pub(crate) fn state_text(j: &JobRow) -> String {
             (_, Some(activity)) => activity_text(activity).to_string(),
             (Some(stage), None) if stage == crate::store::PREPARE_STAGE => "preparing".to_string(),
             (Some(stage), None) => format!("running: {stage}"),
-            (None, None) => "running".to_string(),
+            // Accepted, no stage told yet: preparing still.
+            (None, None) => "preparing".to_string(),
         },
         (JobState::Queued, _) => "queued".to_string(),
         (JobState::Starting, _) => "starting".to_string(),
@@ -793,15 +804,16 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
                 continue;
             };
             let before = job.row.clone();
+            let now = crate::now_secs();
             // Journaled: accepted, whatever answer was lost.
             if job.row.state != JobState::Running {
                 job.row.state = JobState::Running;
-                job.row.started_at.get_or_insert_with(crate::now_secs);
+                job.row.started_at.get_or_insert(now);
                 job.spec = None;
             }
             // Where it is now: the node tells only what changes from here.
             if let RunState::Running { stage, activity } = j.state {
-                note_stage(&mut job.row, &stage, activity);
+                note_stage(&mut job.row, &stage, activity, now);
             }
             if job.row != before {
                 job.row.revision = job.row.revision.saturating_add(1);
@@ -1019,10 +1031,11 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
             }
             RunState::Running { stage, activity } => {
                 row.state = JobState::Running;
-                row.started_at.get_or_insert_with(crate::now_secs);
+                let now = crate::now_secs();
+                row.started_at.get_or_insert(now);
                 job.spec = None;
                 job.reservation = None;
-                note_stage(row, &stage, activity);
+                note_stage(row, &stage, activity, now);
             }
             RunState::Finished => return Ok(Vec::new()),
         }
@@ -3199,23 +3212,70 @@ mod tests {
         assert_eq!(order, ["d", "a", "b", "c", "e"]);
     }
 
-    /// Only preparing says what a job does: not a stage of its own, where the job's supervisor
-    /// starts a service.
+    /// A job's preparation ends when it leaves `prepare_executor`, or a first stage past it;
+    /// a job already past it when the hub started keeping the time is given none.
     #[test]
-    fn only_preparing_says_what_a_job_does() {
+    fn a_job_is_prepared_when_it_leaves_prepare_executor() {
         let mut row = sent("n", 2, Some(60)).row;
         let waiting = Activity::Waiting {
             image: "img".into(),
             building: true,
             holder: None,
         };
-        note_stage(&mut row, "prepare_executor", Some(waiting.clone()));
-        assert_eq!(state_text(&row), "waiting for build");
-        note_stage(&mut row, "step_script", Some(waiting));
+        note_stage(
+            &mut row,
+            "prepare_executor",
+            Some(waiting.clone()),
+            NOW - 50,
+        );
+        assert_eq!(
+            (row.prepared_at, state_text(&row).as_str()),
+            (None, "waiting for build")
+        );
+        // What a stage of its own does is not said: the job's supervisor starting a service.
+        note_stage(&mut row, "step_script", Some(waiting.clone()), NOW - 20);
         assert_eq!(
             (&row.activity, state_text(&row).as_str()),
             (&None, "running: step_script")
         );
+        note_stage(&mut row, "after_script", None, NOW);
+        assert_eq!(row.prepared_at, Some(NOW - 20));
+        // Accepted, then straight past it.
+        let mut row = sent("n", 2, Some(60)).row;
+        note_stage(&mut row, "get_sources", None, NOW);
+        assert_eq!(row.prepared_at, Some(NOW));
+        // Past it before: the next stage is not where its preparation ended.
+        let mut row = sent("n", 2, Some(60)).row;
+        row.stage = Some("step_script".into());
+        note_stage(&mut row, "after_script", None, NOW);
+        assert_eq!(row.prepared_at, None);
+        // Nor is the cleanup after a failed prepare.
+        let mut row = sent("n", 2, Some(60)).row;
+        note_stage(&mut row, "prepare_executor", Some(waiting), NOW - 20);
+        note_stage(&mut row, "cleanup", None, NOW);
+        assert_eq!(row.prepared_at, None);
+    }
+
+    /// A job lost while it prepares keeps that stage: all of its time was preparing.
+    #[test]
+    fn a_job_lost_while_preparing_keeps_its_stage() {
+        let mut state = State::default();
+        for (id, stage) in [("p", "prepare_executor"), ("s", "step_script")] {
+            let mut job = sent("n", 2, Some(60));
+            note_stage(&mut job.row, stage, None, NOW);
+            state.jobs.insert(id.into(), job);
+        }
+        let mut lost = |id| {
+            finish(&mut state, id, Some(FailureClass::Lost), None)
+                .unwrap()
+                .0
+        };
+        let (preparing, running) = (lost("p"), lost("s"));
+        assert_eq!(
+            (preparing.stage.as_deref(), running.stage),
+            (Some("prepare_executor"), None)
+        );
+        assert_eq!(preparing.ran_ms(crate::now_secs()), None);
     }
 
     /// A node of 8 CPUs reporting `load1_hundredths`, and how long it keeps idle images.

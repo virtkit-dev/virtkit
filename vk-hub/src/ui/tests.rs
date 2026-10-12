@@ -3381,6 +3381,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         expired_at: None,
         commit: None,
         activity: None,
+        prepared_at: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3408,6 +3409,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
                 peak_mem_bytes: Some(3 << 30),
                 cpus: Some(4),
                 mem_mib: Some(8192),
+                prepare_ms: None,
             }),
         ),
     );
@@ -3652,6 +3654,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         expired_at: None,
         commit: None,
         activity: None,
+        prepared_at: None,
     }
 }
 
@@ -3894,6 +3897,7 @@ fn running_with_output(hub: &Hub, dir: &std::path::Path, n: u64, output: &[u8]) 
     let mut row = history_job(n, "acme/web");
     row.state = JobState::Running;
     row.started_at = Some(crate::now_secs());
+    row.stage = Some("step_script".into());
     row.output_len = output.len() as u64;
     let now = crate::now_secs();
     hub.db
@@ -3939,7 +3943,7 @@ async fn a_running_job_s_page_follows_its_output() {
     let page = get(addr, "/jobs", Some(&viewer)).await.body;
     assert!(
         page.contains(&format!(
-            "<a href=\"/jobs/{id}\"><span class=\"badge busy\">running</span></a>"
+            "<a href=\"/jobs/{id}\"><span class=\"badge busy\">running: step_script</span></a>"
         )),
         "{page}"
     );
@@ -3982,7 +3986,7 @@ async fn a_running_job_s_page_follows_its_output() {
     let record = stream.next().await.unwrap();
     assert!(
         record.starts_with("event: job\ndata: <section><h2>Job</h2>")
-            && record.contains("<span class=\"badge busy\">running</span>"),
+            && record.contains("<span class=\"badge busy\">running: step_script</span>"),
         "{record}"
     );
 

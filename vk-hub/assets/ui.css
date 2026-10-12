@@ -177,13 +177,14 @@ table.grid tr.down td, .rollout tr.failed td { color: var(--bad); }
    its branch about 8rem each, room for a name's head and kept end. Below it the page scrolls
    sideways, the table running past its section's edge: a scrolling section would take the
    sticky header with it. */
-table.grid.jobs { table-layout: fixed; min-width: 94rem; }
-/* The job and its branch, without a width, share what these leave (78rem). */
+table.grid.jobs { table-layout: fixed; min-width: 99rem; }
+/* The job and its branch, without a width, share what these 83rem leave. */
 table.grid.jobs col.project { width: 8rem; }      /* git/proxies-rs */
 table.grid.jobs col.pipeline { width: 6.5rem; }   /* 509098 ↗ */
 table.grid.jobs col.node { width: 9rem; }         /* hq-srv41-rd-hv05 */
 table.grid.jobs col.result { width: 10rem; }      /* running: step_script */
 table.grid.jobs col.started { width: 15rem; }     /* Oct 11, 01:40 PM · 1 day ago */
+table.grid.jobs col.prep { width: 5rem; }         /* 2m10s */
 table.grid.jobs col.ran { width: 5.5rem; }        /* 1h05m */
 table.grid.jobs col.mem { width: 7.5rem; }        /* PEAK MEMORY */
 table.grid.jobs col.cpu { width: 6.5rem; }        /* 12m30s */

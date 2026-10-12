@@ -123,6 +123,11 @@ pub struct JobRow {
     /// When a node accepted it, on the hub's clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
+    /// Hub time when it learned the job left `prepare_executor` for a job stage.
+    /// Reports received after an outage can lag the actual transition.
+    /// `None` during preparation or for an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at: Option<u64>,
     #[serde(default)]
     pub finished_at: Option<u64>,
     /// When its producer settled it and its output was dropped.
@@ -148,24 +153,78 @@ impl JobRow {
         }
     }
 
-    /// Runtime in milliseconds, using the node's measurement when available. Otherwise,
-    /// use the hub's time from acceptance to completion, or to `now` while running.
-    /// `None` for a job no node accepted.
+    /// The job's own runtime in milliseconds, its preparation left out ([`JobRow::prepare_ms`]):
+    /// the node's measurement when there is one, else the hub's time from its preparation's
+    /// end — or its acceptance, for a record that does not say when that was — to its end, or
+    /// to `now` while it runs. `None` for a job no node accepted, or one still preparing, or
+    /// ended while it did.
     pub fn ran_ms(&self, now: u64) -> Option<u64> {
         if let Some(usage) = self.result.as_ref().and_then(|r| r.usage) {
-            return Some(usage.wall_ms);
+            let prepare = self.prepare_ms(now).unwrap_or(0);
+            return Some(usage.wall_ms.saturating_sub(prepare));
+        }
+        if self.preparing() || self.ended_preparing() {
+            return None;
         }
         let end = match self.state {
             JobState::Finished => self.finished_at?,
             _ => now,
         };
-        Some(end.saturating_sub(self.started_at?).saturating_mul(1000))
+        let start = self.prepared_at.or(self.started_at)?;
+        Some(end.saturating_sub(start).saturating_mul(1000))
     }
 
-    /// Start time on the hub's clock; `None` before node acceptance or after the job ends.
+    /// Preparation duration in milliseconds, through `now` if still preparing: admission,
+    /// building or pulling the image, waiting for another job's build and VM boot.
+    /// Uses the node's measurement, or hub stage times for older nodes without one.
+    /// `None` when the record lacks the timing.
+    pub fn prepare_ms(&self, now: u64) -> Option<u64> {
+        let measured = self.result.as_ref().and_then(|r| r.usage?.prepare_ms);
+        if measured.is_some() {
+            return measured;
+        }
+        let started = self.started_at?;
+        let end = match self.prepared_at {
+            Some(at) => at,
+            None if self.preparing() => now,
+            None if self.ended_preparing() => self.finished_at?,
+            None => return None,
+        };
+        Some(end.saturating_sub(started).saturating_mul(1000))
+    }
+
+    /// Whether a node took the job and is still preparing it, or cleaning up after preparing
+    /// failed.
+    pub fn preparing(&self) -> bool {
+        self.state != JobState::Finished
+            && self.result.is_none()
+            && self.started_at.is_some()
+            && self.prepared_at.is_none()
+            && (self.stage.as_deref()).is_none_or(|s| s == PREPARE_STAGE || s == "cleanup")
+    }
+
+    /// Whether the hub ended it while it prepared — its node lost — with nothing measured: all
+    /// of its time was preparing.
+    fn ended_preparing(&self) -> bool {
+        self.state == JobState::Finished
+            && self.result.as_ref().is_some_and(|r| r.usage.is_none())
+            && self.started_at.is_some()
+            && self.prepared_at.is_none()
+            && (self.stage.as_deref()).is_some_and(|s| s == PREPARE_STAGE || s == "cleanup")
+    }
+
+    /// Run start on the hub's clock, for the page's timer; `None` before the run,
+    /// during preparation and after completion.
     pub fn running_since(&self) -> Option<u64> {
-        self.started_at
+        self.prepared_at
+            .or(self.started_at)
             .filter(|_| self.state != JobState::Finished && self.result.is_none())
+            .filter(|_| !self.preparing())
+    }
+
+    /// When its preparation started, while it goes on.
+    pub fn preparing_since(&self) -> Option<u64> {
+        self.started_at.filter(|_| self.preparing())
     }
 
     /// The job's outcome for history filtering.
@@ -1028,6 +1087,7 @@ mod tests {
             expired_at: None,
             commit: None,
             activity: None,
+            prepared_at: None,
         }
     }
 
@@ -1110,6 +1170,7 @@ mod tests {
         }
         row.started_at = Some(n);
         if state != JobState::Finished {
+            row.stage = Some("step_script".into());
             return row;
         }
         row.finished_at = Some(n + n);
@@ -1523,6 +1584,78 @@ mod tests {
         assert_eq!(page.summary.median_ms, None);
         // Running for 88 seconds of the hub's clock.
         assert_eq!(page.rows[0].2.ran_ms(100), Some(88_000));
+
+        // Prepared from 12 to 30: the job's own time starts there.
+        let mut prepared = page.rows[0].2.clone();
+        prepared.prepared_at = Some(30);
+        assert_eq!(prepared.prepare_ms(100), Some(18_000));
+        assert_eq!(prepared.ran_ms(100), Some(70_000));
+        assert_eq!(prepared.running_since(), Some(30));
+        assert_eq!(prepared.preparing_since(), None);
+        // Still preparing: no run yet, its preparation counting on.
+        let mut preparing = prepared.clone();
+        preparing.prepared_at = None;
+        preparing.stage = Some(PREPARE_STAGE.into());
+        assert_eq!(preparing.ran_ms(100), None);
+        assert_eq!(preparing.prepare_ms(100), Some(88_000));
+        assert_eq!(
+            (preparing.running_since(), preparing.preparing_since()),
+            (None, Some(12))
+        );
+        // Cleaning up after preparing failed: preparing still.
+        let mut cleaning = preparing.clone();
+        cleaning.stage = Some("cleanup".into());
+        assert_eq!(
+            (cleaning.prepare_ms(100), cleaning.ran_ms(100)),
+            (Some(88_000), None)
+        );
+        // Lost while preparing, nothing measured: all of its time was preparing.
+        let mut lost = preparing.clone();
+        lost.state = JobState::Finished;
+        lost.finished_at = Some(50);
+        lost.result = Some(JobResult {
+            failure: Some(FailureClass::Lost),
+            exit_code: None,
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: None,
+        });
+        assert_eq!(
+            (lost.prepare_ms(100), lost.ran_ms(100)),
+            (Some(38_000), None)
+        );
+        // Ended: the node's measurement splits its wall time.
+        let mut ended = prepared;
+        ended.state = JobState::Finished;
+        ended.result = Some(JobResult {
+            failure: None,
+            exit_code: Some(0),
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: Some(vk_hub_proto::job::JobUsage {
+                wall_ms: 90_000,
+                prepare_ms: Some(20_000),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            (ended.prepare_ms(100), ended.ran_ms(100)),
+            (Some(20_000), Some(70_000))
+        );
+        // From an older node, none: the hub's, from the stages it was told, splits it.
+        let older = |prepared_at| {
+            let mut row = ended.clone();
+            row.prepared_at = prepared_at;
+            if let Some(usage) = row.result.as_mut().and_then(|r| r.usage.as_mut()) {
+                usage.prepare_ms = None;
+            }
+            (row.prepare_ms(100), row.ran_ms(100))
+        };
+        assert_eq!(older(Some(30)), (Some(18_000), Some(72_000)));
+        // Nor a stage past preparing seen: one time.
+        assert_eq!(older(None), (None, Some(90_000)));
 
         // A row that does not decode is left out.
         let txn = db.db.begin_write().unwrap();

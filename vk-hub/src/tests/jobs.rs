@@ -1019,7 +1019,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     let view: JobView = poll.await.unwrap().json();
     assert!(view.revision > submitted.revision);
     assert_ne!(view.state, JobState::Queued);
-    // Preparing, and waiting for another job's build of its image: said so.
+    // Waiting for another job's image build is shown and counted as preparation.
     node.send(NodeJobMsg::Job {
         job: id.clone(),
         state: RunState::Running {
@@ -1036,10 +1036,11 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     })
     .await;
     eventually(|| {
-        hub.db
-            .job(&id)
-            .unwrap()
-            .is_some_and(|row| crate::jobs::state_text(&row) == "waiting for build")
+        hub.db.job(&id).unwrap().is_some_and(|row| {
+            crate::jobs::state_text(&row) == "waiting for build"
+                && row.preparing()
+                && row.ran_ms(now_secs()).is_none()
+        })
     })
     .await;
     node.send(NodeJobMsg::Job {
@@ -1055,7 +1056,10 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     .await;
     eventually(|| {
         hub.db.job(&id).unwrap().is_some_and(|row| {
-            row.activity.is_none() && crate::jobs::state_text(&row) == "running: step_script"
+            row.activity.is_none()
+                && row.prepared_at.is_some()
+                && !row.preparing()
+                && crate::jobs::state_text(&row) == "running: step_script"
         })
     })
     .await;
@@ -1136,6 +1140,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         peak_mem_bytes: Some(1 << 30),
         cpus: Some(2),
         mem_mib: Some(4096),
+        prepare_ms: None,
     });
     node.send(NodeJobMsg::Result {
         job: id.clone(),
@@ -1340,8 +1345,7 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
             offset: 15
         }
     );
-    let row = hub.db.job(&job).unwrap().unwrap();
-    assert_eq!(row.stage.as_deref(), Some("prepare_executor"));
+    assert!(hub.db.job(&job).unwrap().unwrap().preparing());
     // A second job, sent but not yet accepted when the hub stops.
     let resp = api(
         addr,
@@ -1422,9 +1426,10 @@ async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest(
     // Past preparing while the hub was away: its `held` says so, and the node tells no more.
     let row = hub.db.job(&job).unwrap().unwrap();
     assert_eq!(
-        (row.stage.as_deref(), &row.activity),
-        (Some("step_script"), &None)
+        (row.stage.as_deref(), &row.activity, row.preparing()),
+        (Some("step_script"), &None, false)
     );
+    assert!(row.prepared_at.is_some());
     node.send(output(&job, 15, b"after restart\n"));
     assert_eq!(
         node.job().await,
@@ -3049,9 +3054,14 @@ fn the_jobs_table_says_how_each_job_stands() {
         expired_at: None,
         commit: None,
         activity: None,
+        prepared_at: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
+    running.prepared_at = Some(1020);
+    let mut preparing = row(JobState::Running, None);
+    preparing.started_at = Some(1030);
+    preparing.stage = Some("prepare_executor".into());
     let mut measured = row(JobState::Finished, Some(result(None, 0)));
     measured.result.as_mut().unwrap().usage = Some(vk_hub_proto::job::JobUsage {
         wall_ms: 185_000,
@@ -3076,19 +3086,24 @@ fn the_jobs_table_says_how_each_job_stands() {
             ),
             ("cc".repeat(16), measured),
             ("dd".repeat(16), small),
+            ("ee".repeat(16), preparing),
         ],
         1060,
     );
     let lines: Vec<&str> = out.lines().collect();
     assert!(
-        lines[0].starts_with("ID") && lines[0].contains("RAN") && lines[0].contains("PEAK"),
+        lines[0].starts_with("ID")
+            && lines[0].contains("PREP")
+            && lines[0].contains("RAN")
+            && lines[0].contains("PEAK"),
         "{out}"
     );
-    // Running for 50 seconds; nothing measured yet.
+    // Prepared in 10 seconds, running for 40; nothing measured yet.
     assert!(
         lines[1].contains("running: step_script")
             && lines[1].contains("1m ago")
-            && lines[1].contains("50s"),
+            && lines[1].contains(" 10s ")
+            && lines[1].contains(" 40s "),
         "{out}"
     );
     assert!(lines[2].contains("failed: lost"), "{out}");
@@ -3099,6 +3114,11 @@ fn the_jobs_table_says_how_each_job_stands() {
     // Under a second and a MiB: neither reads as nothing.
     assert!(
         lines[4].contains("<1s") && lines[4].contains(" 1M "),
+        "{out}"
+    );
+    // Preparing for 30 seconds: no run yet.
+    assert!(
+        lines[5].contains("preparing") && lines[5].contains(" 30s ") && lines[5].contains(" - "),
         "{out}"
     );
 }
@@ -3134,6 +3154,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         expired_at: None,
         commit: None,
         activity: None,
+        prepared_at: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -3495,6 +3516,7 @@ fn a_job_is_shown_on_the_command_line() {
         expired_at: None,
         commit: Some("ab12".into()),
         activity: None,
+        prepared_at: Some(1030),
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);
@@ -3511,7 +3533,7 @@ fn a_job_is_shown_on_the_command_line() {
         "message      the VM did not boot\n".to_string(),
         "gitlab       https://gitlab.example.com/g/p/-/jobs/7\n".to_string(),
         "finished     1970-01-01T00:17:50Z\n".to_string(),
-        "ran          1m00s\n".to_string(),
+        "prepared in  20s\nran          40s\n".to_string(),
         "\nThe last 51 bytes of its output, masked as the node streamed it:\n\
          12:10:43 no kernel\n"
             .to_string(),

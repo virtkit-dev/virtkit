@@ -105,6 +105,8 @@ struct Driver {
     timeout: Duration,
     /// Raised when a stage is stopped, for the host-side transfers.
     stopped: CancellationToken,
+    /// Executor preparation duration, once preparation ends.
+    prepared_in: Option<Duration>,
 }
 
 /// What the driver works from, read from the journal.
@@ -193,6 +195,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         deadline: Instant::now() + timeout,
         timeout,
         stopped: CancellationToken::new(),
+        prepared_in: None,
     };
     Ok(Setup {
         driver,
@@ -250,7 +253,12 @@ impl Driver {
             message,
             output_len: t.len(),
             artifacts,
-            usage: Some(job_usage(began.elapsed(), tree.as_ref(), size)),
+            usage: Some(job_usage(
+                began.elapsed(),
+                self.prepared_in,
+                tree.as_ref(),
+                size,
+            )),
         }
     }
 
@@ -293,9 +301,11 @@ impl Driver {
         self.set_stage("prepare_executor");
         self.trace.section_start("prepare_executor");
         self.header("Preparing the \"vk\" executor");
+        let preparing = Instant::now();
         let prepared = self
             .executor("prepare", &[], Some((Phase::Before, None)))
             .await;
+        self.prepared_in = Some(preparing.elapsed());
         self.trace.section_end("prepare_executor");
         match prepared {
             Ok(End::Ok) => {}
@@ -789,6 +799,7 @@ impl Driver {
 /// (`None` when no VM was up to read), and guest size `(vCPUs, MiB)` when available.
 fn job_usage(
     wall: Duration,
+    prepared_in: Option<Duration>,
     tree: Option<&crate::usage::Usage>,
     size: Option<(u32, u64)>,
 ) -> JobUsage {
@@ -799,6 +810,7 @@ fn job_usage(
         peak_mem_bytes: tree.map(|u| u.peak_rss),
         cpus: size.map(|(cpus, _)| cpus),
         mem_mib: size.map(|(_, mib)| mib),
+        prepare_ms: prepared_in.map(ms),
     }
 }
 
@@ -962,6 +974,7 @@ mod tests {
             deadline: Instant::now() + timeout,
             timeout,
             stopped: CancellationToken::new(),
+            prepared_in: None,
         };
         let end = driver
             .executor("run", &[], Some((Phase::Steps, None)))
@@ -1022,6 +1035,7 @@ mod tests {
             deadline: Instant::now() + timeout,
             timeout,
             stopped: CancellationToken::new(),
+            prepared_in: None,
         };
         let run = |cmd| driver.executor(cmd, &[], Some((Phase::Before, None)));
         assert_eq!(run("run").await.unwrap(), End::Ok);
@@ -1075,13 +1089,19 @@ mod tests {
     #[test]
     fn a_job_reports_what_its_vm_used() {
         let tree = crate::usage::tree(std::process::id() as i32).unwrap();
-        let usage = job_usage(Duration::from_millis(90_500), Some(&tree), Some((4, 8192)));
+        let usage = job_usage(
+            Duration::from_millis(90_500),
+            Some(Duration::from_millis(30_250)),
+            Some(&tree),
+            Some((4, 8192)),
+        );
         assert_eq!(usage.wall_ms, 90_500);
         assert_eq!(usage.cpu_ms, Some(tree.cpu.as_millis() as u64));
         assert!(usage.peak_mem_bytes.is_some_and(|b| b > 0), "{usage:?}");
         assert_eq!((usage.cpus, usage.mem_mib), (Some(4), Some(8192)));
+        assert_eq!(usage.prepare_ms, Some(30_250));
         assert_eq!(
-            job_usage(Duration::from_secs(2), None, None),
+            job_usage(Duration::from_secs(2), None, None, None),
             JobUsage {
                 wall_ms: 2000,
                 ..JobUsage::default()

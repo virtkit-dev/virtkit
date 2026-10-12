@@ -1503,10 +1503,10 @@ fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
     )
 }
 
-/// `vk-hub jobs`' table: how long each job ran, or has been running, and the most memory
+/// `vk-hub jobs`' table: how long each job prepared and ran, or has so far, and the most memory
 /// its VM held, rounded up to a MiB, where its node reported it.
 fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
-    let rows: Vec<[String; 10]> = jobs
+    let rows: Vec<[String; 11]> = jobs
         .iter()
         .map(|(id, j)| {
             let usage = j.result.as_ref().and_then(|r| r.usage);
@@ -1518,6 +1518,8 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
                 j.node.clone().unwrap_or_else(|| "-".to_string()),
                 j.output_len.to_string(),
                 format!("{} ago", human_duration(ago(now, j.created_at))),
+                j.prepare_ms(now)
+                    .map_or_else(|| "-".to_string(), jobs::run_text),
                 j.ran_ms(now)
                     .map_or_else(|| "-".to_string(), jobs::run_text),
                 usage.and_then(|u| u.peak_mem_bytes).map_or_else(
@@ -1537,6 +1539,7 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
             "NODE",
             "OUTPUT",
             "SUBMITTED",
+            "PREP",
             "RAN",
             "PEAK",
             "JOB",
@@ -1578,6 +1581,10 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
         ("started", at(j.started_at)),
         ("finished", at(j.finished_at)),
         ("settled", at(j.settled_at)),
+        (
+            "prepared in",
+            j.prepare_ms(now).map_or_else(dash, jobs::run_text),
+        ),
         ("ran", j.ran_ms(now).map_or_else(dash, jobs::run_text)),
         (
             "peak memory",

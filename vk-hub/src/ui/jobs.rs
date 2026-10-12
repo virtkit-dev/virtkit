@@ -413,10 +413,10 @@ fn job_table(
     h.raw("<section class=\"jobs-table\"><table class=\"grid jobs\"><colgroup>")
         .raw("<col class=\"job\"><col class=\"project\"><col class=\"branch\"><col class=\"pipeline\">")
         .raw("<col class=\"node\"><col class=\"result\"><col class=\"started\">")
-        .raw("<col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
+        .raw("<col class=\"prep\"><col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
         .raw("</colgroup><thead><tr><th>job</th><th>project</th>")
         .raw("<th>branch</th><th>pipeline</th>")
-        .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\">ran</th>")
+        .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\" title=\"preparing the executor: admission, building or pulling the image, booting\">prep</th><th class=\"num\">ran</th>")
         .raw("<th class=\"num\">peak memory</th><th class=\"num\">CPU time</th>")
         .raw("<th class=\"num\">size</th></tr></thead><tbody>");
     for (_, id, j) in rows {
@@ -657,6 +657,8 @@ fn job_row(
         None => h.raw("-"),
     };
     h.raw("</td><td class=\"num\">");
+    prep(h, j, now);
+    h.raw("</td><td class=\"num\">");
     ran(h, j, now);
     h.raw("</td><td class=\"num\">")
         .text(dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)))
@@ -858,6 +860,20 @@ fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], n
     h
 }
 
+/// Preparation duration, updated by the browser while preparation continues.
+fn prep(h: &mut Html, j: &JobRow, now: u64) {
+    let text = dash_or(j.prepare_ms(now).map(crate::jobs::run_text));
+    match j.preparing_since() {
+        Some(at) => h
+            .raw("<span data-since=\"")
+            .text(crate::utc(at))
+            .raw("\">")
+            .text(text)
+            .raw("</span>"),
+        None => h.text(text),
+    };
+}
+
 /// Job `j`'s elapsed run time. While running, `data-since` holds its start time so
 /// `time.js` advances the duration each second between page updates.
 fn ran(h: &mut Html, j: &JobRow, now: u64) {
@@ -928,6 +944,9 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
         activity_cell(&mut cell, activity);
         pages::kv_html(h, "Doing", &cell);
     }
+    let mut cell = Html::new();
+    prep(&mut cell, j, now);
+    pages::kv_html(h, "Prepared in", &cell);
     let mut cell = Html::new();
     ran(&mut cell, j, now);
     pages::kv_html(h, "Ran", &cell);
@@ -1035,8 +1054,8 @@ fn dash_or(s: Option<String>) -> String {
 mod tests {
     use super::*;
 
-    /// A preparing job's page says what it does, the job it waits for linked only from a plain
-    /// web link.
+    /// Show preparation activity and a browser timer; link the awaited job only through
+    /// a plain web link.
     #[test]
     fn a_preparing_job_s_record_says_what_it_does() {
         use vk_hub_proto::dispatch::Activity;
@@ -1049,10 +1068,18 @@ mod tests {
             record(&mut h, j, &HashMap::new(), 1030);
             h.into_string()
         };
-        // Nothing said yet: preparing.
+        // Nothing said yet: preparing, for 30 seconds so far.
         let shown = page(&j);
         assert!(shown.contains(">preparing</span>"), "{shown}");
         assert!(!shown.contains("Doing"), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "<th>Prepared in</th><td><span data-since=\"{}\">30s</span>",
+                crate::utc(1000)
+            )),
+            "{shown}"
+        );
+        assert!(shown.contains("<th>Ran</th><td>-</td>"), "{shown}");
         let url = "https://gitlab.example.com/g/p/-/jobs/1";
         j.activity = Some(Activity::Waiting {
             image: "docker/<x>".into(),
