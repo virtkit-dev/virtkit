@@ -408,7 +408,13 @@ fn job_table(
     names: &HashMap<&str, &str>,
     now: u64,
 ) {
-    h.raw("<section><table class=\"grid\"><thead><tr><th>job</th><th>project</th>")
+    // Live updates replace the table. Fixed widths prevent rows and running timers
+    // from shifting its columns.
+    h.raw("<section class=\"jobs-table\"><table class=\"grid jobs\"><colgroup>")
+        .raw("<col class=\"job\"><col class=\"project\"><col class=\"branch\"><col class=\"pipeline\">")
+        .raw("<col class=\"node\"><col class=\"result\"><col class=\"started\">")
+        .raw("<col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
+        .raw("</colgroup><thead><tr><th>job</th><th>project</th>")
         .raw("<th>branch</th><th>pipeline</th>")
         .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\">ran</th>")
         .raw("<th class=\"num\">peak memory</th><th class=\"num\">CPU time</th>")
@@ -574,24 +580,48 @@ fn job_row(
     now: u64,
 ) {
     let usage = j.result.as_ref().and_then(|r| r.usage);
-    h.raw("<tr><td title=\"").text(id).raw("\">");
+    // Its name, project and branch cut in the middle when too long for their columns, and whole
+    // on hover ([`cut_middle`]), the job's name with its ID.
+    h.raw("<tr><td title=\"")
+        .text(id)
+        .raw("\"><div class=\"fit\">");
     match &j.name {
-        Some(name) => narrowing(h, filter, |f| f.name = Some(name.clone()), name),
-        None => {
-            h.node(&j.title);
+        Some(name) => {
+            let suffix = format!(" · {id}");
+            narrowing_cut(
+                h,
+                filter,
+                |f| f.name = Some(name.clone()),
+                name,
+                &suffix,
+                NAME_TAIL,
+            );
         }
+        None => cut_middle(h, &j.title, &format!(" · {id}"), NAME_TAIL),
     }
     gitlab_link(h, j.job_url.as_deref());
-    h.raw("</td><td>")
-        .node(j.project.as_deref().unwrap_or("-"))
-        .raw("</td><td>");
-    match &j.git_ref {
-        Some(git_ref) => narrowing(h, filter, |f| f.git_ref = Some(git_ref.clone()), git_ref),
+    h.raw("</div></td><td><div class=\"fit\">");
+    match &j.project {
+        Some(project) => cut_middle(h, project, "", PROJECT_TAIL),
         None => {
             h.raw("-");
         }
     }
-    h.raw("</td><td>");
+    h.raw("</div></td><td><div class=\"fit\">");
+    match &j.git_ref {
+        Some(git_ref) => narrowing_cut(
+            h,
+            filter,
+            |f| f.git_ref = Some(git_ref.clone()),
+            git_ref,
+            "",
+            BRANCH_TAIL,
+        ),
+        None => {
+            h.raw("-");
+        }
+    }
+    h.raw("</div></td><td>");
     match j.pipeline {
         Some(p) => {
             narrowing(h, filter, |f| f.pipeline = Some(p), &p.to_string());
@@ -633,11 +663,68 @@ fn job_row(
 /// `label`, a producer's string, linked to the jobs `filter` matches once `narrow` has set
 /// one more of its fields.
 fn narrowing(h: &mut Html, filter: &JobFilter, narrow: impl FnOnce(&mut JobFilter), label: &str) {
+    narrowing_cut(h, filter, narrow, label, "", 0);
+}
+
+/// [`narrowing`], `label` cut in the middle when its column is too narrow for it, keeping its
+/// last `tail` characters, and whole on hover followed by `suffix` ([`cut_middle`]); `0` keeps
+/// it whole.
+fn narrowing_cut(
+    h: &mut Html,
+    filter: &JobFilter,
+    narrow: impl FnOnce(&mut JobFilter),
+    label: &str,
+    suffix: &str,
+    tail: usize,
+) {
     let mut narrowed = filter.clone();
     narrow(&mut narrowed);
     h.raw("<a href=\"");
     href(h, &narrowed, None);
-    h.raw("\">").node(label).raw("</a>");
+    h.raw("\">");
+    cut_middle(h, label, suffix, tail);
+    h.raw("</a>");
+}
+
+// The last characters kept when a job's name, a branch or a project is cut.
+const NAME_TAIL: usize = 8;
+const BRANCH_TAIL: usize = 12;
+const PROJECT_TAIL: usize = 8;
+/// Splitting a head this short shows no more than the whole label: the stylesheet reserves
+/// about this much (2.2em) for the head before the tail shrinks.
+const MIN_HEAD: usize = 3;
+
+/// `label`, a producer's string, as a head the stylesheet cuts short with an ellipsis and its
+/// last `tail` characters, which stay: a long name loses its middle, not its end, which is
+/// often what tells two branches apart. Whole, and read as one, when its column is wide
+/// enough, and on hover, followed by `suffix`. A label hardly longer than `tail` is not split,
+/// only cut at its end if need be; with `tail` 0 it is left whole. The split is between
+/// `char`s, so it may part a letter from a combining mark, which shows only while the label is
+/// cut.
+fn cut_middle(h: &mut Html, label: &str, suffix: &str, tail: usize) {
+    let safe = vk_hub_proto::display_safe(label);
+    if tail == 0 {
+        h.text(&safe);
+        return;
+    }
+    h.raw("<span class=\"mid\" title=\"")
+        .text(&safe)
+        .text(suffix)
+        .raw("\"><span class=\"head\">");
+    let count = safe.chars().count();
+    if count <= tail + MIN_HEAD {
+        h.text(&safe).raw("</span></span>");
+        return;
+    }
+    let split = safe
+        .char_indices()
+        .nth(count - tail)
+        .map_or(safe.len(), |(i, _)| i);
+    let (head, end) = safe.split_at(split);
+    h.text(head)
+        .raw("</span><span class=\"tail\">")
+        .text(end)
+        .raw("</span></span>");
 }
 
 /// ` ↗`, linked to `url` on GitLab, or nothing when `url` is not a plain web link.
@@ -884,6 +971,34 @@ fn dash_or(s: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long name is split into a head the stylesheet may cut and a tail that stays; a short
+    /// one is not split, and what it holds is escaped either way.
+    #[test]
+    fn a_long_name_keeps_its_tail() {
+        let cut = |label: &str, tail: usize| {
+            let mut h = Html::new();
+            cut_middle(&mut h, label, "", tail);
+            h.into_string()
+        };
+        assert_eq!(
+            cut("integration/master-staging/she", 12),
+            "<span class=\"mid\" title=\"integration/master-staging/she\">\
+             <span class=\"head\">integration/master</span>\
+             <span class=\"tail\">-staging/she</span></span>"
+        );
+        assert_eq!(
+            cut("dev-team-core", 12),
+            "<span class=\"mid\" title=\"dev-team-core\"><span class=\"head\">dev-team-core</span></span>"
+        );
+        assert_eq!(
+            cut("élan-<x>-très-long-nom", 5),
+            "<span class=\"mid\" title=\"élan-&lt;x&gt;-très-long-nom\">\
+             <span class=\"head\">élan-&lt;x&gt;-très-lon</span>\
+             <span class=\"tail\">g-nom</span></span>"
+        );
+        assert_eq!(cut("77", 0), "77");
+    }
 
     #[test]
     fn a_filter_value_cannot_leave_its_parameter() {

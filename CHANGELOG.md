@@ -8,6 +8,9 @@ All notable changes to virtkit will be documented in this file.
 
 - **A host checkout no longer fails on a branch named under a deleted one** (`a/b` after `a`
   was deleted, or the reverse) when a runner reuses its checkout.
+- **vk-hub's jobs table no longer jumps around on live updates.** A job, project or branch
+  name too long for its column is shortened in the middle, keeping its end, and is shown
+  whole on hover.
 
 ## [0.88.0] - 2026-10-11
 

@@ -171,6 +171,41 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 table.grid tbody tr:hover td { background: var(--raised); }
 table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
 table.grid tr.down td, .rollout tr.failed td { color: var(--bad); }
+/* The jobs table keeps its columns where they are across live updates: fixed widths, sized for
+   the longest values the other columns show, the job and its branch sharing what is left, and
+   text cut short (whole on hover) rather than widening a column. The minimum leaves the job and
+   its branch about 8rem each, room for a name's head and kept end. Below it the page scrolls
+   sideways, the table running past its section's edge: a scrolling section would take the
+   sticky header with it. */
+table.grid.jobs { table-layout: fixed; min-width: 94rem; }
+/* The job and its branch, without a width, share what these leave (78rem). */
+table.grid.jobs col.project { width: 8rem; }      /* git/proxies-rs */
+table.grid.jobs col.pipeline { width: 6.5rem; }   /* 509098 ↗ */
+table.grid.jobs col.node { width: 9rem; }         /* hq-srv41-rd-hv05 */
+table.grid.jobs col.result { width: 10rem; }      /* running: step_script */
+table.grid.jobs col.started { width: 15rem; }     /* Oct 11, 01:40 PM · 1 day ago */
+table.grid.jobs col.ran { width: 5.5rem; }        /* 1h05m */
+table.grid.jobs col.mem { width: 7.5rem; }        /* PEAK MEMORY */
+table.grid.jobs col.cpu { width: 6.5rem; }        /* 12m30s */
+table.grid.jobs col.size { width: 9.5rem; }       /* 16 vCPUs, 32.0 GiB */
+/* Plain text, such as an older start time, and a long result end in "…" rather than spilling. */
+table.grid.jobs th, table.grid.jobs td { overflow: hidden; text-overflow: ellipsis; }
+table.grid.jobs .badge {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+}
+/* A long name loses its middle (`.mid`): its head is cut short, its tail stays. */
+table.grid.jobs .fit { display: flex; align-items: baseline; gap: 0.3em; min-width: 0; }
+table.grid.jobs .fit > a { display: flex; min-width: 0; }
+table.grid.jobs .fit > * + * { flex-shrink: 0; }
+table.grid.jobs .mid { display: inline-flex; min-width: 0; max-width: 100%; }
+/* The head keeps a few letters and its "…" before the tail gives way too, so a cut never
+   reads as a whole name. */
+table.grid.jobs .mid .head {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 2.2em;
+}
+table.grid.jobs .mid .tail {
+  flex-shrink: 0.001; overflow: hidden; white-space: pre; min-width: 0;
+}
 table.kv { width: 100%; }
 table.kv th, table.kv td { text-align: left; padding: var(--s1) var(--s4) var(--s1) 0; vertical-align: top; }
 table.kv th { color: var(--muted); font-weight: 500; white-space: nowrap; width: 16rem; }
@@ -376,6 +411,10 @@ form.wide legend { color: var(--muted); padding: 0 var(--s1); }
   main > section, main > div > section, #detail > section, #operations > section,
   .rollout { padding: var(--s3); }
   table.grid { display: block; overflow-x: auto; }
+  /* The jobs table keeps its fixed layout; its section scrolls instead, as every grid does in
+     a narrow window. */
+  section.jobs-table { overflow-x: auto; }
+  table.grid.jobs { display: table; overflow: visible; }
   table.kv th { width: auto; white-space: normal; }
   .steer form.act button { min-width: 0; }
   input[type="email"], input[type="text"] { min-width: 0; width: 100%; }
@@ -406,4 +445,9 @@ form.wide legend { color: var(--muted); padding: 0 var(--s1); }
   .topbar form, button, .steer, .filter { display: none; }
   table.grid th { position: static; }
   table.grid { display: table; overflow: visible; }
+  /* Whole names on paper: the fixed columns would not fit a page. */
+  table.grid.jobs { table-layout: auto; min-width: 0; }
+  table.grid.jobs td, table.grid.jobs .mid .head, table.grid.jobs .mid .tail {
+    overflow: visible; flex-shrink: 0;
+  }
 }
