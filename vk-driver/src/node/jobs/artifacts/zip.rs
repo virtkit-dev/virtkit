@@ -900,9 +900,13 @@ fn each_entry<R: Read>(
         };
         let mut entry = entry?;
         // A sparse entry's size is what it claims, not what the stream holds: reading it out
-        // could take forever.
+        // could take forever. The agent writes sparse files dense; a guest that does not is
+        // refused.
         if entry.header().entry_type().is_gnu_sparse() {
-            bail!("the guest's archive has a sparse entry, which artifacts cannot hold");
+            bail!(
+                "{:?}: the guest's archive has a sparse entry, which artifacts cannot hold",
+                String::from_utf8_lossy(&entry.path_bytes())
+            );
         }
         f(&mut entry)?;
         io::copy(&mut entry, &mut io::sink())?;
@@ -1512,6 +1516,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = tar_to_zip(tar.as_slice(), Cursor::new(Vec::new()), &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("sparse entry"), "{err:#}");
+        assert!(err.to_string().starts_with("\"holes\": "), "{err:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
