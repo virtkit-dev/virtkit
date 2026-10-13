@@ -130,6 +130,9 @@ const PRIMARY_VM: u32 = 0;
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
 pub(crate) const HOST_EXEC_PORT: u32 = 1100;
+/// Where a VM with a guest `vk` (`VIRTKIT_VK_CMD`) has it: the agent's own directory, on the
+/// guest's `/run` tmpfs.
+const GUEST_VK_DIR: &str = "/run/vk/bin";
 /// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
 /// the guest agent's forwarder for that guest path and spliced host-side to the host socket
 /// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and
@@ -448,6 +451,8 @@ pub struct RunArgs {
     pub host_exec_wrapper: Option<PathBuf>,
     /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
     pub host_exec_env: Vec<String>,
+    /// give a compose run's primary no `vk exec --service` into its services
+    pub no_service_exec: bool,
     /// a `-f`/`--primary`/compose build may restore stages from the instruction
     /// cache but must not execute anything; a cache miss aborts (exit 3 at the CLI)
     pub require_cached: bool,
@@ -538,6 +543,7 @@ impl Default for RunArgs {
             host_exec: false,
             host_exec_wrapper: None,
             host_exec_env: Vec::new(),
+            no_service_exec: false,
             require_cached: false,
             detach: false,
             inactivity_timeout_secs: None,
@@ -1840,6 +1846,34 @@ async fn build_and_boot(
     if args.host_exec {
         cmdline.push_str(&format!(" VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT}"));
     }
+    // A compose run's primary gets a `vk` that runs `vk exec --service` into the run's
+    // services, over the same channel confined to that form — unless --host-exec opened it
+    // whole, or --no-service-exec turned it off. An image init runs no agent init to give it.
+    let service_exec = !args.host_exec
+        && !args.no_service_exec
+        && !args.init.is_image()
+        && !planned.units.is_empty();
+    if service_exec {
+        check_service_exec_state_dir(
+            work,
+            primary_volumes
+                .iter()
+                .chain(&args.volumes)
+                .chain(compose_units.iter().flat_map(|u| &u.volumes)),
+            args.workdir.as_deref(),
+        )?;
+        cmdline.push_str(&format!(
+            " VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT} VIRTKIT_VK_CMD=1"
+        ));
+        // The command re-exports the image's PATH: keep the guest `vk` on it, last, where the
+        // agent puts it for everything else.
+        if let Some((_, path)) = image_env.iter_mut().find(|(k, _)| k == "PATH")
+            && !path.split(':').any(|d| d == GUEST_VK_DIR)
+        {
+            path.push(':');
+            path.push_str(GUEST_VK_DIR);
+        }
+    }
 
     // Networking: a userspace `vk switch` gives the guest egress — attached as virtio-net
     // NICs; the agent takes the static address from the cmdline fragment.
@@ -2270,7 +2304,7 @@ async fn build_and_boot(
     }
     // Host-exec (guest->host): the guest's /run/vk/host.sock forwarder dials
     // HOST_EXEC_PORT, bridged to the `vk-agent serve` spawned below.
-    if args.host_exec {
+    if args.host_exec || service_exec {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, HOST_EXEC_PORT));
     }
     // The VM's process name follows the boot target: a --primary compose service, a -f
@@ -2544,8 +2578,15 @@ async fn build_and_boot(
     // per-port socket the guest's /run/vk/host.sock forwarder dials. cwd is the
     // --workdir (else our own), so a relative `exec --dir` resolves against the
     // shared tree; the wrapper (if any) enforces what may run.
-    if args.host_exec {
-        match spawn_host_exec_serve(&vsock, agent, args, work) {
+    let served = if args.host_exec {
+        Some(spawn_host_exec_serve(&vsock, agent, args, work))
+    } else if service_exec {
+        Some(crate::vm::spawn_service_exec_serve_at(&vsock, work, agent))
+    } else {
+        None
+    };
+    if let Some(served) = served {
+        match served {
             Ok(fwd) => host_exec_serve = Some(fwd),
             Err(e) => {
                 teardown_run(
@@ -4111,6 +4152,46 @@ fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
             .filter(|secs| *secs > 0)
             .map_or(60, |secs| secs.min(10)),
     )
+}
+
+/// Refuse a state dir the guest can write, in whole or in part, when the primary's `vk exec
+/// --service` is on: the host's `vk` finds the run's services by their directories and
+/// sockets there, so a guest that could add or replace one would aim it at another VM.
+fn check_service_exec_state_dir<'a>(
+    work: &Path,
+    volumes: impl IntoIterator<Item = &'a crate::compose::Volume> + Clone,
+    workdir: Option<&'a Path>,
+) -> Result<()> {
+    const WAY_OUT: &str = "the primary's `vk exec --service` needs a state dir the guest \
+                           cannot write: pass --no-service-exec, or a --state-dir outside \
+                           every writable share";
+    crate::sshclient::check_state_dir_is_host_only(
+        work,
+        volumes.clone(),
+        workdir.map(|d| (d, WORKDIR_MOUNT)),
+    )
+    .context(WAY_OUT)?;
+    // A share at or below the state dir: the check above allows those.
+    let dir =
+        std::fs::canonicalize(work).with_context(|| format!("resolving {}", work.display()))?;
+    let writable = volumes
+        .into_iter()
+        .filter(|v| !(v.read_only || v.overlay || v.disk || v.socket))
+        .map(|v| (v.host.as_path(), v.guest.as_str()))
+        .chain(workdir.map(|d| (d, WORKDIR_MOUNT)));
+    for (host, guest) in writable {
+        let host =
+            std::fs::canonicalize(host).with_context(|| format!("resolving {}", host.display()))?;
+        if host.starts_with(&dir) {
+            bail!(
+                "{WAY_OUT}: {} is in the state dir {}, and the guest mounts it read-write at \
+                 {guest}",
+                host.display(),
+                dir.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Write the managed SSH client setup and return its public key.
@@ -6620,6 +6701,41 @@ mod tests {
 
         // An unknown --primary is a clear error, not a silent empty build.
         assert!(compose_build_selection(&units, &[], Some("nope")).is_err());
+    }
+
+    /// The primary's `vk exec --service` needs a state dir no guest share can write: one in
+    /// a read-write volume or under the `--workdir` is refused, with the way out named.
+    #[test]
+    fn service_exec_refuses_a_guest_writable_state_dir() {
+        let t = crate::qga::tests::TempDir::new("service-exec-state");
+        let repo = t.0.join("repo");
+        let state = repo.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let rw = crate::compose::parse_volume(
+            &format!("{}:/workdir:rw", repo.display()),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        let err = check_service_exec_state_dir(&state, [&rw], None).unwrap_err();
+        assert!(format!("{err:#}").contains("--no-service-exec"), "{err:#}");
+        assert!(check_service_exec_state_dir(&state, [], Some(repo.as_path())).is_err());
+        assert!(check_service_exec_state_dir(&state, [], None).is_ok());
+        let elsewhere = t.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(check_service_exec_state_dir(&elsewhere, [&rw], Some(repo.as_path())).is_ok());
+        // A share inside the state dir — a service's own directory, say — is refused too.
+        std::fs::create_dir_all(elsewhere.join("svc-db")).unwrap();
+        let inside = crate::compose::parse_volume(
+            &format!("{}:/db:rw", elsewhere.join("svc-db").display()),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        let err = check_service_exec_state_dir(&elsewhere, [&inside], None).unwrap_err();
+        assert!(format!("{err:#}").contains("/db"), "{err:#}");
+        let svc = elsewhere.join("svc-db");
+        assert!(check_service_exec_state_dir(&elsewhere, [], Some(svc.as_path())).is_err());
     }
 
     #[test]

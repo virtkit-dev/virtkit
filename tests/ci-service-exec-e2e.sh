@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =====================================================================================
-# A CI job runs commands in its compose services with `vk exec --service`, from its own VM.
+# A CI job, or a `vk run --compose` primary, runs commands in its compose services with
+# `vk exec --service`, from its own VM.
 # =====================================================================================
 # Drives `vk gitlab prepare|run|cleanup` directly, no GitLab needed, on a `compose:` job with a
 # `db` service:
@@ -10,7 +11,9 @@
 #   2. what the host does not allow is refused: another `vk` command, a service the job does
 #      not have, a raw request putting a host `vk` flag first, a fifth request at once; a raw
 #      request's --dir and --user are ignored;
-#   3. with `[executor] guest_service_exec = false`, the job VM has no `vk` and no channel.
+#   3. with `[executor] guest_service_exec = false`, the job VM has no `vk` and no channel;
+#   4. a `vk run --compose` primary reaches its services the same way, has neither with
+#      --no-service-exec, and is refused a state dir the guest can write.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
 # Needs: a `vk` with an embedded agent and kernel, KVM, and network to pull alpine and debian.
@@ -166,6 +169,27 @@ config false
 run_job 'if command -v vk; then exit 1; fi
 [ ! -e /run/vk/host.sock ]' ||
   fail "the job has a vk or a host channel with guest_service_exec = false"
+echo "ok"
+
+echo "== 4. a vk run --compose primary =="
+cat >"$root/run.compose.yaml" <<'EOF'
+services:
+  db:
+    image: alpine:3.21
+    command: ["sh", "-c", "echo served-by-db > /tmp/marker; exec sleep 3600"]
+EOF
+"$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" alpine:3.21 \
+  -- sh -c '[ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]' \
+  >"$root/stage.log" 2>&1 || fail "the primary could not run commands in its service"
+"$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \
+  alpine:3.21 -- sh -c 'if command -v vk; then exit 1; fi; [ ! -e /run/vk/host.sock ]' \
+  >"$root/stage.log" 2>&1 || fail "the primary has a vk or a host channel with --no-service-exec"
+mkdir -p "$root/share"
+if "$VK" run --state-dir "$root/share/state" --workdir "$root/share" \
+  --compose "$root/run.compose.yaml" alpine:3.21 -- true >"$root/stage.log" 2>&1; then
+  fail "the primary booted with a state dir the guest can write"
+fi
+grep -q -- "--no-service-exec" "$root/stage.log" || fail "the refusal does not name the way out"
 echo "ok"
 
 echo "PASS"

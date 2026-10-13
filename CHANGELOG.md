@@ -37,12 +37,14 @@ All notable changes to virtkit will be documented in this file.
   the service's account owns its directory. `vk-registry leave` undoes it. See
   `docs/registry-hub.md`.
 - **`vk-hub release add --program vk-registry`** holds `vk-registry` releases beside `vk` ones.
-- **A CI job runs commands in its compose services with `vk exec --service`**, from inside
-  its own VM: `vk exec --service db -- psql -c 'select 1'` runs in the `db` service, its
-  output and exit status back in the job. The image needs no `vk` of its own. Only that
-  command, into the job's own services, is allowed — but as any user of the service, root
-  included, and with that service's network access. On by default;
-  `[executor] guest_service_exec = false` turns it off.
+- **A CI job, or a `vk run --compose` primary, runs commands in its compose services with
+  `vk exec --service`**, from inside its own VM: `vk exec --service db -- psql -c 'select 1'`
+  runs in the `db` service, its output and exit status back in the caller. The image needs
+  no `vk` of its own. Only that command, into the VM's own services, is allowed — but as
+  any user of the service, root included, and with that service's network access. On by
+  default; `[executor] guest_service_exec = false` turns it off for CI jobs, and
+  `vk run --no-service-exec` for a run, whose `--state-dir` must otherwise be out of the
+  guest's reach.
 
 ### Changed
 
@@ -50,6 +52,9 @@ All notable changes to virtkit will be documented in this file.
   asked for** (`vk run --host-exec-wrapper`, a `vk dev` `[dev.host] wrapper`, `vk-agent serve
   --exec-wrapper`). That directory reaches it as `$VK_EXEC_DIR`: a wrapper that relied on
   starting in it must check and enter `$VK_EXEC_DIR` itself.
+- **A `vk run --compose` run whose `--state-dir` the guest can write — under `--workdir`, or
+  in or holding a read-write volume — now fails to start**, since its primary can run
+  commands in its services; pass `--no-service-exec`, or another `--state-dir`.
 
 ### Fixed
 

@@ -367,6 +367,11 @@ shared LAN by service name and hostname. The runner image in this example must
 provide its own server on port 443; declaring an endpoint does not install or
 start an application.
 
+Inside the primary, `vk exec --service NAME -- CMD` runs a command in one of its
+services, as in `vk run --compose`. The host allows only that form, into this
+environment's services. With `[dev.host]` host commands, the environment has
+the whole host command channel instead, without this `vk`.
+
 ```sh
 vk dev service status
 vk dev service up runner

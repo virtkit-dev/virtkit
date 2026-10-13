@@ -2763,7 +2763,8 @@ fn with_vk_cmd_dir(path: &str) -> String {
     }
 }
 
-/// Give the guest a `vk` command (`VIRTKIT_VK_CMD`: a CI job with services): the agent, linked as `vk` in [`VK_CMD_DIR`], which run_init put last on the
+/// Give the guest a `vk` command (`VIRTKIT_VK_CMD`: a CI job or a compose run's primary with
+/// services): the agent, linked as `vk` in [`VK_CMD_DIR`], which run_init put last on the
 /// `PATH`. It hands what it is given to the host's `vk` over the host command channel —
 /// `vk exec --service NAME -- CMD`, the one form the host allows.
 fn link_vk_cmd() {

@@ -1227,11 +1227,12 @@ enum Cmd {
     },
     /// plumbing: what a guest's `vk` asks of its host, over the VM's host command channel
     ///
-    /// A CI job VM's channel runs every request through this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
+    /// A CI job VM's or a `vk run --compose` primary's channel runs every request through
+    /// this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
     /// anything else is refused with exit 2.
     #[command(name = "service-exec", hide = true)]
     ServiceExec {
-        /// the job's directory, whose `svc-<name>` dirs are its services
+        /// the job's or run's directory, whose `svc-<name>` dirs are its services
         dir: PathBuf,
         /// what the guest's `vk` was given, `vk` first, after `--`
         #[arg(last = true)]
@@ -2256,6 +2257,12 @@ enum Cmd {
             help_heading = "Host access from the guest"
         )]
         host_exec_env: Vec<String>,
+        /// give a --compose primary no `vk exec --service` into its services
+        ///
+        /// By default its `vk` runs that one form, into this run's services, over the
+        /// primary's host command channel; --host-exec replaces it with the whole channel.
+        #[arg(long = "no-service-exec", help_heading = "Host access from the guest")]
+        no_service_exec: bool,
         /// the -f/--primary/compose builds may restore from cache but not build
         ///
         /// A cache miss aborts with exit code 3, so scripts can branch cached-vs-cold without
@@ -3413,6 +3420,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         host_exec,
         host_exec_wrapper,
         host_exec_env,
+        no_service_exec,
         require_cached,
         detach,
         inactivity_timeout,
@@ -3625,6 +3633,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             host_exec: *host_exec,
             host_exec_wrapper: host_exec_wrapper.clone(),
             host_exec_env: host_exec_env.clone(),
+            no_service_exec: *no_service_exec,
             require_cached: *require_cached,
             detach: *detach,
             inactivity_timeout_secs: *inactivity_timeout,

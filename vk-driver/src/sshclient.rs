@@ -357,8 +357,9 @@ pub fn check_state_dir_is_host_only<'a>(
         if dir.starts_with(&host) || managed.iter().any(|a| hits_managed(a)) {
             bail!(
                 "the state dir {} overlaps {}, which the guest mounts read-write at {guest}: \
-                 its SSH key and ProxyCommand are the host's, so the guest must not be able \
-                 to rewrite them — put the state dir outside every writable share",
+                 what vk keeps there (an SSH key and ProxyCommand, the services' sockets) is \
+                 the host's, so the guest must not be able to rewrite it — put the state dir \
+                 outside every writable share",
                 dir.display(),
                 host.display(),
             );

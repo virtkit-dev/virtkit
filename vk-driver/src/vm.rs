@@ -1789,7 +1789,7 @@ const SERVICE_EXEC_LOG_MAX: u64 = 1 << 20;
 /// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
 /// serve`, every command forced through `vk service-exec <dir> -- …` (the guest's argv only
 /// after the `--`), which allows `vk exec --service` into the `svc-<name>` services under
-/// `dir`, a CI job's dir, and nothing else. It runs in `dir` as
+/// `dir` — a CI job's dir, or a `vk run --compose`'s — and nothing else. It runs in `dir` as
 /// the serve's user, whatever directory or user the guest asks for, in the foreground of its
 /// session, at most [`SERVICE_EXEC_MAX_CONCURRENT`] at once. Its log is
 /// `dir/service-exec.log`, at most [`SERVICE_EXEC_LOG_MAX`] bytes of it.
@@ -1871,7 +1871,7 @@ fn copy_capped(mut from: impl Read, mut to: impl std::io::Write, max: u64) -> st
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "vk",
-    about = "vk inside a CI job: run commands in its services"
+    about = "vk inside a CI job or a compose run's primary: run commands in its services"
 )]
 struct GuestVk {
     #[command(subcommand)]
@@ -1924,8 +1924,8 @@ struct ServiceRequest {
 }
 
 /// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's `vk` asked, run
-/// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir) and
-/// refused with exit 2 otherwise.
+/// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir, a
+/// compose run's) and refused with exit 2 otherwise.
 pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode {
     let req = match service_request(dir, argv) {
         Ok(req) => req,
@@ -2023,8 +2023,16 @@ fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::p
     let Some(program) = cmd.next() else {
         return Err(refuse("no command to run".to_string()));
     };
+    // The socket the service's VMM listens on, not a link to another VM's.
+    let vsock = svc_dir.join("vsock.sock");
+    let dialed = vk_core::net::hybrid_socket(&vsock, crate::units::VSOCK_PORT);
+    if !std::fs::symlink_metadata(&dialed)
+        .is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
+    {
+        return Err(refuse(format!("service {service:?} is not running")));
+    }
     Ok(ServiceRequest {
-        addr: crate::vmm::exec_addr(&svc_dir.join("vsock.sock"), crate::units::VSOCK_PORT),
+        addr: crate::vmm::exec_addr(&vsock, crate::units::VSOCK_PORT),
         background,
         clear_env,
         env,
@@ -3639,6 +3647,16 @@ mod tests {
         std::fs::create_dir_all(job.0.join("other")).unwrap();
         // A link named like a service is not one: it could name another run's.
         std::os::unix::fs::symlink(job.0.join("other"), job.0.join("svc-linked")).unwrap();
+        // Nor is a link where a service's socket goes, or a service with none.
+        let socket = |svc: &str| {
+            job.0
+                .join(svc)
+                .join(format!("vsock.sock_{}", crate::units::VSOCK_PORT))
+        };
+        let _listener = std::os::unix::net::UnixListener::bind(socket("svc-db")).unwrap();
+        std::fs::create_dir_all(job.0.join("svc-relinked")).unwrap();
+        std::os::unix::fs::symlink(socket("svc-db"), socket("svc-relinked")).unwrap();
+        std::fs::create_dir_all(job.0.join("svc-down")).unwrap();
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for asked in [
             argv(&["sh", "-c", "id"]),
@@ -3652,6 +3670,8 @@ mod tests {
             argv(&["vk", "exec", "--service", "db", "-b", "-t", "--", "true"]),
             argv(&["vk", "exec", "--", "true"]),
             argv(&["vk", "exec", "--service", "linked", "--", "true"]),
+            argv(&["vk", "exec", "--service", "relinked", "--", "true"]),
+            argv(&["vk", "exec", "--service", "down", "--", "true"]),
         ] {
             let refused = service_request(&job.0, &asked).map(|_| ());
             assert_eq!(refused, Err(std::process::ExitCode::from(2)), "{asked:?}");

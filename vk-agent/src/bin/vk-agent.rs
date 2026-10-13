@@ -170,7 +170,7 @@ enum Commands {
 }
 
 fn main() {
-    // Invoked as `vk` (init links it so in a CI job VM with services): the host's
+    // Invoked as `vk` (init links it so in a CI job VM or a compose run's primary): the host's
     // `vk`, over the host command channel, which runs `vk exec --service` into the VM's own
     // services and nothing else. Everything given goes to the host as is; a terminal on both
     // ends gets a pty.
@@ -350,8 +350,8 @@ fn guest_vk() -> i32 {
     };
     if !std::path::Path::new(HOST_SOCK).exists() {
         eprintln!(
-            "vk: this VM has no host command channel: `vk exec --service` is for CI jobs with \
-             compose services"
+            "vk: this VM has no host command channel: `vk exec --service` is for CI jobs and \
+             `vk run --compose` primaries with compose services"
         );
         return 1;
     }
