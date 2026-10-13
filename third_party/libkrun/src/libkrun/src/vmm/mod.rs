@@ -528,7 +528,8 @@ impl Vmm {
     /// Bring this VM, built on the configuration of the snapshot in `dir` and its vCPUs
     /// started paused, to that snapshot, then run it: memory first (the devices read their
     /// queues' positions from it), then the legacy and virtio-pci devices, then the vCPUs and
-    /// the in-kernel devices, and only then wake the virtio devices and the guest. A guest
+    /// the in-kernel devices, then the RTC's periodic interrupt, and only then wake the virtio
+    /// devices and the guest. A guest
     /// with a VM generation ID gets this VM's, and the notification that it changed.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
     pub fn restore(&mut self, dir: &std::path::Path) -> std::result::Result<(), String> {
@@ -576,6 +577,7 @@ impl Vmm {
         snapshot::restore_transports(&transports, &saved.pci)
             .map_err(|e| format!("restoring the devices: {e}"))?;
         self.restore_cpu_state(saved.cpu)?;
+        legacy.cmos.lock().unwrap().resume_irq();
         for transport in &transports {
             transport.lock().unwrap().kick_restored();
         }

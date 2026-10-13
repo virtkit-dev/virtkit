@@ -2500,6 +2500,7 @@ fn attach_legacy_devices(
     register_irqfd_evt!(com_evt_3, 4);
     register_irqfd_evt!(com_evt_4, 3);
     register_irqfd_evt!(kbd_evt, 1);
+    register_irqfd_evt!(rtc_evt, 8);
     register_irqfd_evt!(sci_evt, arch::x86_64::layout::SCI_GSI);
     Ok(())
 }

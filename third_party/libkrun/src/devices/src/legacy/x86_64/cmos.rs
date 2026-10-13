@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::min;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
 
@@ -47,6 +51,154 @@ const REG_B_24H: u8 = 0x02;
 const REG_D_VRT: u8 = 0x80;
 /// The PM flag in the hours register in 12-hour mode.
 const HOURS_PM: u8 = 0x80;
+
+/// Register B: PIE, the periodic interrupt's enable.
+const REG_B_PIE: u8 = 0x40;
+/// Register C: IRQF, an enabled interrupt is pending; PF, a periodic tick happened since the
+/// last read.
+const REG_C_IRQF: u8 = 0x80;
+const REG_C_PF: u8 = 0x40;
+
+/// The periodic interrupt (local patch, see VENDOR.md): while register B's PIE is set, each
+/// tick of [`tick_period`] sets PF in register C and, with no interrupt pending, IRQF and an
+/// edge on IRQ 8. Reading register C clears both, as on the MC146818, so a guest that does not
+/// acknowledge gets no further edge. As in QEMU, PF is not set while PIE is clear, so the
+/// ticker sleeps then. The alarm and update-ended interrupts stay unimplemented.
+struct RtcIrq {
+    state: Mutex<IrqState>,
+    changed: Condvar,
+    evt: EventFd,
+}
+
+#[derive(Default)]
+struct IrqState {
+    period: Option<Duration>,
+    pie: bool,
+    flags: u8,
+    /// Bumped by each change of `period` or `pie`: the ticker restarts its count from then.
+    generation: u64,
+    stop: bool,
+}
+
+/// The tick period register A selects: none for rate 0 or a divider other than 32.768 kHz.
+/// Rates 1 and 2 tick as 8 and 9 do (MC146818 datasheet, table 3).
+fn tick_period(reg_a: u8) -> Option<Duration> {
+    let rate = u32::from(reg_a & 0x0f);
+    if rate == 0 || (reg_a >> 4) & 0x07 != 0x02 {
+        return None;
+    }
+    let rate = if rate < 3 { rate + 7 } else { rate };
+    Some(Duration::from_nanos(
+        (1_000_000_000u64 << (rate - 1)) / 32_768,
+    ))
+}
+
+impl IrqState {
+    /// Set IRQF and return true when PF is pending, PIE set and no interrupt is pending yet.
+    fn raise(&mut self) -> bool {
+        if !self.pie || self.flags & REG_C_PF == 0 || self.flags & REG_C_IRQF != 0 {
+            return false;
+        }
+        self.flags |= REG_C_IRQF;
+        true
+    }
+}
+
+impl RtcIrq {
+    fn start(evt: EventFd, reg_a: u8, reg_b: u8) -> std::io::Result<Arc<RtcIrq>> {
+        let irq = Arc::new(RtcIrq {
+            state: Mutex::new(IrqState {
+                period: tick_period(reg_a),
+                pie: reg_b & REG_B_PIE != 0,
+                ..IrqState::default()
+            }),
+            changed: Condvar::new(),
+            evt,
+        });
+        let ticker = irq.clone();
+        std::thread::Builder::new()
+            .name("rtc-periodic".into())
+            .spawn(move || ticker.run())?;
+        Ok(irq)
+    }
+
+    fn pulse(&self) {
+        if let Err(e) = self.evt.write(1) {
+            error!("cmos: raising the RTC interrupt: {e}");
+        }
+    }
+
+    fn run(&self) {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.stop {
+                return;
+            }
+            let (Some(period), true) = (state.period, state.pie) else {
+                state = self.changed.wait(state).unwrap();
+                continue;
+            };
+            let generation = state.generation;
+            let mut next = Instant::now() + period;
+            while !state.stop && state.generation == generation {
+                let now = Instant::now();
+                if now < next {
+                    state = self.changed.wait_timeout(state, next - now).unwrap().0;
+                    continue;
+                }
+                state.flags |= REG_C_PF;
+                if state.raise() {
+                    self.pulse();
+                }
+                // A late ticker skips the ticks it missed rather than bursting them. Under host
+                // load this loses guest ticks, a drift for a guest that keeps the RTC as its
+                // clock timer (QEMU can slew them back instead: lost_tick_policy=slew).
+                next += period;
+                if next < now {
+                    next = now + period;
+                }
+            }
+        }
+    }
+
+    /// Take registers A and B's new values. Clearing PIE clears IRQF; setting it with PF
+    /// pending raises at once, as on the MC146818.
+    fn update(&self, reg_a: u8, reg_b: u8) {
+        let mut state = self.state.lock().unwrap();
+        let period = tick_period(reg_a);
+        let pie = reg_b & REG_B_PIE != 0;
+        if period != state.period || pie != state.pie {
+            state.period = period;
+            state.pie = pie;
+            state.generation = state.generation.wrapping_add(1);
+            self.changed.notify_all();
+        }
+        if !pie {
+            state.flags &= !REG_C_IRQF;
+        } else if state.raise() {
+            self.pulse();
+        }
+    }
+
+    /// Stop ticking and clear register C's flags until the next [`RtcIrq::update`].
+    fn park(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.period = None;
+        state.flags = 0;
+        state.generation = state.generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    /// Register C's flags, cleared by the read.
+    fn take_flags(&self) -> u8 {
+        std::mem::take(&mut self.state.lock().unwrap().flags)
+    }
+
+    fn stop(&self) {
+        self.state.lock().unwrap().stop = true;
+        self.changed.notify_all();
+    }
+}
 
 fn to_bcd(value: u8) -> u8 {
     ((value / 10) << 4) | (value % 10)
@@ -130,6 +282,8 @@ pub struct Cmos {
     pending: Option<DateTime>,
     /// Guest RTC time minus host time, in seconds.
     rtc_offset: i64,
+    /// The periodic interrupt, once the VMM has given its IRQ ([`Cmos::set_irq`]).
+    irq: Option<Arc<RtcIrq>>,
 }
 
 /// [`Cmos::save_state`].
@@ -163,6 +317,12 @@ impl Cmos {
         self.data[..len].copy_from_slice(&state.data[..len]);
         self.rtc_offset = state.rtc_offset;
         self.pending = state.pending;
+        // Register C's flags are not saved: a restored guest reads them clear. The ticker waits
+        // for [`Cmos::resume_irq`], since an edge raised before the irqchip is restored would
+        // be lost while IRQF, left set, blocks every later one.
+        if let Some(irq) = &self.irq {
+            irq.park();
+        }
     }
 
     pub fn new(mem_below_4g: u64, mem_above_4g: u64) -> Cmos {
@@ -193,6 +353,30 @@ impl Cmos {
             data,
             pending: None,
             rtc_offset: 0,
+            irq: None,
+        }
+    }
+
+    /// Raise the periodic interrupt on `evt` (IRQ 8) from now on (local patch).
+    pub fn set_irq(&mut self, evt: EventFd) -> std::io::Result<()> {
+        if let Some(old) = self.irq.take() {
+            old.stop();
+        }
+        let (a, b) = (self.data[RTC_REG_A as usize], self.data[RTC_REG_B as usize]);
+        self.irq = Some(RtcIrq::start(evt, a, b)?);
+        Ok(())
+    }
+
+    /// Restart the periodic interrupt after [`Cmos::restore_state`], once the irqchip is
+    /// restored too.
+    pub fn resume_irq(&self) {
+        self.sync_irq();
+    }
+
+    /// Push registers A and B to the periodic interrupt.
+    fn sync_irq(&self) {
+        if let Some(irq) = &self.irq {
+            irq.update(self.data[RTC_REG_A as usize], self.data[RTC_REG_B as usize]);
         }
     }
 
@@ -252,8 +436,8 @@ impl Cmos {
                     && host_time().subsec_nanos() >= 1_000_000_000 - UIP_NANOS;
                 self.data[RTC_REG_A as usize] | if updating { REG_A_UIP } else { 0 }
             }
-            // No RTC interrupt is ever raised, so no flag is ever pending.
-            RTC_REG_C => 0,
+            // Read to acknowledge: the flags clear.
+            RTC_REG_C => self.irq.as_ref().map_or(0, |irq| irq.take_flags()),
             RTC_REG_D => REG_D_VRT,
             _ => return None,
         })
@@ -277,6 +461,7 @@ impl Cmos {
             RTC_DAY_OF_WEEK => return true,
             RTC_REG_A => {
                 self.data[RTC_REG_A as usize] = value & !REG_A_UIP;
+                self.sync_irq();
                 return true;
             }
             RTC_REG_B => {
@@ -288,6 +473,7 @@ impl Cmos {
                 } else if self.pending.is_none() {
                     self.pending = Some(t);
                 }
+                self.sync_irq();
                 return true;
             }
             RTC_REG_C | RTC_REG_D => return true,
@@ -302,6 +488,14 @@ impl Cmos {
             self.rtc_offset = t.to_epoch() - host_epoch_secs();
         }
         true
+    }
+}
+
+impl Drop for Cmos {
+    fn drop(&mut self) {
+        if let Some(irq) = self.irq.take() {
+            irq.stop();
+        }
     }
 }
 
@@ -503,5 +697,162 @@ mod tests {
         assert_eq!(read(&mut cmos, EXT_MEM_LOW), ext);
         write(&mut cmos, 0x40, 0x5a);
         assert_eq!(read(&mut cmos, 0x40), 0x5a);
+    }
+
+    #[test]
+    fn register_a_selects_the_tick_period() {
+        assert_eq!(tick_period(0x20), None, "rate 0 is off");
+        assert_eq!(tick_period(0x06), None, "the divider is held");
+        assert_eq!(tick_period(0x26), Some(Duration::from_nanos(976_562)));
+        assert_eq!(tick_period(0x2a), Some(Duration::from_nanos(15_625_000)));
+        assert_eq!(tick_period(0x21), tick_period(0x28));
+        assert_eq!(tick_period(0x22), tick_period(0x29));
+    }
+
+    /// A `Cmos` raising its periodic interrupt on the returned eventfd.
+    fn with_irq() -> (Cmos, EventFd) {
+        let mut cmos = Cmos::new(1 << 30, 0);
+        let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        cmos.set_irq(evt.try_clone().unwrap()).unwrap();
+        (cmos, evt)
+    }
+
+    /// The edges raised on `evt` within `wait`.
+    fn edges_within(evt: &EventFd, wait: Duration) -> u64 {
+        std::thread::sleep(wait);
+        evt.read().unwrap_or(0)
+    }
+
+    /// Wait up to 5 s for an edge on `evt`.
+    fn wait_edge(evt: &EventFd) -> u64 {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(n) = evt.read() {
+                return n;
+            }
+            assert!(Instant::now() < end, "no RTC interrupt");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// With PIE set, ticks raise IRQ 8 once per acknowledgement: register C reads IRQF|PF and
+    /// clears, and an unacknowledged tick raises no second edge.
+    #[test]
+    fn the_periodic_interrupt_ticks_until_acknowledged() {
+        let (mut cmos, evt) = with_irq();
+        // 1024 Hz, PIE.
+        write(&mut cmos, RTC_REG_A, 0x26);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(wait_edge(&evt), 1);
+        // Unacknowledged: many periods pass with no further edge.
+        assert_eq!(
+            edges_within(&evt, Duration::from_millis(30)),
+            0,
+            "a second edge before the acknowledgement"
+        );
+        assert_eq!(read(&mut cmos, RTC_REG_C), REG_C_IRQF | REG_C_PF);
+        assert_eq!(
+            wait_edge(&evt),
+            1,
+            "acknowledged, the next tick raises again"
+        );
+    }
+
+    /// PIE clear: no tick, no flag.
+    #[test]
+    fn without_pie_nothing_ticks() {
+        let (mut cmos, evt) = with_irq();
+        write(&mut cmos, RTC_REG_A, 0x26);
+        assert_eq!(edges_within(&evt, Duration::from_millis(20)), 0);
+        assert_eq!(read(&mut cmos, RTC_REG_C), 0);
+    }
+
+    /// Clearing PIE drops IRQF but keeps PF; setting PIE again over the pending PF raises at
+    /// once, with no acknowledgement in between.
+    #[test]
+    fn pie_toggles_irqf_over_a_pending_tick() {
+        let (mut cmos, evt) = with_irq();
+        write(&mut cmos, RTC_REG_A, 0x26);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(wait_edge(&evt), 1);
+        write(&mut cmos, RTC_REG_B, REG_B_24H);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(evt.read().unwrap(), 1);
+        write(&mut cmos, RTC_REG_B, REG_B_24H);
+        assert_eq!(read(&mut cmos, RTC_REG_C), REG_C_PF);
+    }
+
+    /// A rate change restarts the period: a 500 ms period cut to 1 ms ticks within it.
+    #[test]
+    fn a_rate_change_restarts_the_period() {
+        let (mut cmos, evt) = with_irq();
+        write(&mut cmos, RTC_REG_A, 0x2f);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        let start = Instant::now();
+        write(&mut cmos, RTC_REG_A, 0x26);
+        assert_eq!(wait_edge(&evt), 1);
+        assert!(start.elapsed() < Duration::from_millis(250));
+    }
+
+    /// Holding the divider in reset stops the ticks.
+    #[test]
+    fn a_divider_reset_stops_the_ticks() {
+        let (mut cmos, evt) = with_irq();
+        write(&mut cmos, RTC_REG_A, 0x26);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(wait_edge(&evt), 1);
+        write(&mut cmos, RTC_REG_A, 0x66);
+        read(&mut cmos, RTC_REG_C);
+        assert_eq!(edges_within(&evt, Duration::from_millis(20)), 0);
+        assert_eq!(read(&mut cmos, RTC_REG_C), 0);
+    }
+
+    /// A restore applies the saved registers A and B, but ticks only once resumed.
+    #[test]
+    fn a_restore_applies_the_periodic_registers_on_resume() {
+        let mut saved = Cmos::new(1 << 30, 0);
+        write(&mut saved, RTC_REG_A, 0x26);
+        write(&mut saved, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        let (mut cmos, evt) = with_irq();
+        cmos.restore_state(&saved.save_state());
+        assert_eq!(edges_within(&evt, Duration::from_millis(20)), 0);
+        cmos.resume_irq();
+        assert_eq!(wait_edge(&evt), 1);
+    }
+
+    /// A restore drops register C's pending flags: they are not part of the snapshot.
+    #[test]
+    fn a_restore_clears_pending_flags() {
+        let (mut cmos, evt) = with_irq();
+        write(&mut cmos, RTC_REG_A, 0x26);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(wait_edge(&evt), 1);
+        let saved = cmos.save_state();
+        cmos.restore_state(&saved);
+        assert_eq!(read(&mut cmos, RTC_REG_C), 0);
+        cmos.resume_irq();
+        assert_eq!(wait_edge(&evt), 1, "no IRQF left to block the next edge");
+    }
+
+    /// Dropping the `Cmos` ends its ticker thread.
+    #[test]
+    fn a_dropped_cmos_stops_its_ticker() {
+        let (mut cmos, _evt) = with_irq();
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        let irq = cmos.irq.clone().unwrap();
+        drop(cmos);
+        let end = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&irq) > 1 {
+            assert!(Instant::now() < end, "the ticker thread outlived its Cmos");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Without an IRQ, as before: register C reads 0.
+    #[test]
+    fn without_an_irq_register_c_reads_zero() {
+        let mut cmos = Cmos::new(1 << 30, 0);
+        write(&mut cmos, RTC_REG_B, REG_B_24H | REG_B_PIE);
+        assert_eq!(read(&mut cmos, RTC_REG_C), 0);
     }
 }

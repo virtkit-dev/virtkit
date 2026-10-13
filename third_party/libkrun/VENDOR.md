@@ -478,9 +478,19 @@ bridge's `_CRS`, and virtio-mmio devices start above it (`MMIO_DEVICES_START`). 
 only on Windows hosts and served plain NVRAM elsewhere. Time fields read the host clock plus a
 guest-set offset. Register B selects BCD or binary and 12- or 24-hour mode; its SET bit holds
 the clock during field writes. Register A shows an update in progress in each second's last
-244 µs, C reads 0 and D reads valid-RAM-and-time. edk2's `PcRtc` reported "Device Error" against
-plain NVRAM and stopped the boot; Windows also reads and sets the clock through it. Memory-size
-bytes remain read-only. Covered by the tests in that file.
+244 µs, C reads the periodic interrupt's flags (below) and D reads valid-RAM-and-time. edk2's
+`PcRtc` reported "Device Error" against plain NVRAM and stopped the boot; Windows also reads and
+sets the clock through it. Memory-size bytes remain read-only. Covered by the tests in that file.
+
+The same file raises the RTC periodic interrupt on IRQ 8 through an irqfd (`rtc_evt`) created
+in `device_manager/legacy.rs` and registered on GSI 8 in `vmm/builder.rs`. With register B's
+PIE set, it ticks at the period register A selects. Reading register C returns IRQF|PF and
+clears the flags; unacknowledged ticks raise no further edge. Clearing PIE clears IRQF; the
+ticker sleeps while PIE is clear or register A selects no period. Snapshots omit register C's
+flags; restore parks the ticker until `vmm/mod.rs` has restored the irqchip. Without an HPET,
+Windows 10's HAL needs it as its clock timer; without ticks its installer bug-checked with
+`HAL_INITIALIZATION_FAILED` (0x5C, 0x110) before any output. The alarm and update-ended
+interrupts remain unimplemented. Covered by the periodic-interrupt tests in that file.
 
 `src/devices/src/virtio/pci.rs` — enabling a queue copies its size from `queue_size`, which
 resets to the maximum. edk2 leaves that register unchanged; the queue itself started at size 0,

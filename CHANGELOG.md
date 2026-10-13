@@ -60,6 +60,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Windows 10 guests install.** Their installer stopped immediately after loading with no
+  console output, then timed out. Windows 11 and Windows Server were not affected.
 - **A host command a guest asks for through a wrapper (`vk run --host-exec-wrapper`, `vk dev`
   host commands, `vk-agent serve --exec-wrapper`) no longer runs the wrapper as the user, in
   the directory, or with the `TERM` the guest names.** The wrapper runs as the host user in

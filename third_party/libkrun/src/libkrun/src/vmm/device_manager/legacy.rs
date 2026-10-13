@@ -22,6 +22,9 @@ pub enum Error {
     BusError(devices::BusError),
     /// Cannot create EventFd.
     EventFd(std::io::Error),
+    /// Cannot start the RTC's periodic interrupt thread.
+    #[cfg(target_os = "linux")]
+    RtcThread(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +34,8 @@ impl fmt::Display for Error {
         match *self {
             BusError(ref err) => write!(f, "Failed to add legacy device to Bus: {err}"),
             EventFd(ref err) => write!(f, "Failed to create EventFd: {err}"),
+            #[cfg(target_os = "linux")]
+            RtcThread(ref err) => write!(f, "Failed to start the RTC interrupt thread: {err}"),
         }
     }
 }
@@ -56,13 +61,17 @@ pub struct PortIODeviceManager {
     pub com_evt_4: EventFd,
     #[cfg(not(windows))]
     pub kbd_evt: EventFd,
+    /// The RTC's periodic interrupt; an irqfd on GSI 8 (local patch, see VENDOR.md).
+    #[cfg(target_os = "linux")]
+    pub rtc_evt: EventFd,
     /// Raises the ACPI SCI; an irqfd on `SCI_GSI`.
     #[cfg(target_os = "linux")]
     pub sci_evt: EventFd,
 }
 
 impl PortIODeviceManager {
-    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM).
+    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM, the RTC
+    /// interrupt).
     ///
     /// `exit_evt` is the Vmm exit event, fired by the i8042 CPU-reset command and by the ACPI
     /// power-off and reset registers. `reset_flag` is shared with those devices and the Vmm so
@@ -95,6 +104,16 @@ impl PortIODeviceManager {
 
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
+        #[cfg(target_os = "linux")]
+        let rtc_evt = {
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+            cmos.lock()
+                .unwrap()
+                .set_irq(evt.try_clone().map_err(Error::EventFd)?)
+                .map_err(Error::RtcThread)?;
+            evt
+        };
+
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
             exit_evt.try_clone().map_err(Error::EventFd)?,
             reset_flag.clone(),
@@ -123,6 +142,8 @@ impl PortIODeviceManager {
             com_evt_4: evts[3].try_clone().map_err(Error::EventFd)?,
             #[cfg(not(windows))]
             kbd_evt,
+            #[cfg(target_os = "linux")]
+            rtc_evt,
             #[cfg(target_os = "linux")]
             sci_evt,
         })
