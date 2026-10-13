@@ -56,6 +56,17 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// What `winiso/setup.cmd` writes to the serial console when WinPE found no install medium.
 const SETUP_FAILED: &str = "vk-install-failed";
 
+/// How long Setup has to start writing the install disk. Setup that cannot go on (an edition
+/// the medium does not hold by that name, a key it refuses, no driver for the disk) waits on a
+/// window nobody sees and writes next to nothing; a working one lays the disk out and applies
+/// the image within a few minutes.
+const SETUP_STALL: Duration = Duration::from_secs(20 * 60);
+
+/// Less than this written to the install disk is Setup not having started on it: an empty
+/// qcow2, partitions and freshly formatted volumes (an NTFS log can reach 64 MiB), far below
+/// any image apply.
+const SETUP_STARTED_BYTES: u64 = 256 << 20;
+
 /// How often the settle boot runs its script, restarts included, before giving up.
 const SETTLE_ATTEMPTS: u32 = 6;
 
@@ -941,7 +952,17 @@ fn install(
         }
         let written = std::fs::metadata(disk)
             .map(|m| m.blocks() * 512)
-            .unwrap_or(0);
+            .with_context(|| format!("reading the size of {}", disk.display()))?;
+        if setup_stalled(written, started.elapsed()) {
+            bail!(
+                "Windows Setup wrote under {} MiB to the disk in {}: it waits at a prompt, \
+                 often an edition (--edition) the ISO does not hold by that name, a product \
+                 key (--product-key) it refuses, or virtio drivers (--drivers) \
+                 that do not match this Windows",
+                SETUP_STARTED_BYTES >> 20,
+                humantime(SETUP_STALL)
+            );
+        }
         eprintln!(
             "virtkit: winiso: installing, {:.1} GiB written in {}",
             written as f64 / (1u64 << 30) as f64,
@@ -961,6 +982,10 @@ fn install(
         humantime(started.elapsed())
     );
     Ok(())
+}
+
+fn setup_stalled(written: u64, elapsed: Duration) -> bool {
+    written < SETUP_STARTED_BYTES && elapsed > SETUP_STALL
 }
 
 /// Whether the install's serial console says WinPE found no install medium (`winiso/setup.cmd`).
@@ -1439,6 +1464,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn setup_stalls_on_a_disk_barely_written_past_its_window() {
+        let late = SETUP_STALL + Duration::from_secs(1);
+        assert!(setup_stalled(SETUP_STARTED_BYTES - 1, late));
+        assert!(setup_stalled(0, late));
+        assert!(!setup_stalled(SETUP_STARTED_BYTES, late));
+        assert!(!setup_stalled(0, SETUP_STALL));
     }
 
     #[test]

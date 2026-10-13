@@ -62,6 +62,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Windows installs stalled in Setup fail after 20 minutes** instead of waiting for the
+  two-hour timeout. The error names likely causes: an edition name absent from the ISO,
+  a refused product key, or virtio drivers that do not match this Windows.
 - **Two builds installing the same Windows base at once on one host both work.** The one
   that finished second went on with a wrong Administrator password.
 
