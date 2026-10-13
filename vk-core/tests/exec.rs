@@ -281,6 +281,75 @@ async fn connect_refused_on_wrapped_channel() {
     }
 }
 
+/// A wrapped command runs as the server's user and in its directory, whatever the client
+/// names; the requested directory only reaches the wrapper, in `VK_EXEC_DIR`. Run in a
+/// microVM, the server inherits a VIRTKIT_DEFAULT_RUN_USER it cannot switch to, which a
+/// wrapper falling back to it would fail on.
+#[tokio::test]
+async fn a_wrapped_exec_ignores_the_client_user_and_dir() {
+    let path = tmp_socket_path("wrapped-user-dir");
+    let _ = std::fs::remove_file(&path);
+    let addr = SocketAddr::Unix(path.clone());
+    let server_addr = addr.clone();
+    // /bin/sh as the wrapper: the request's name and args become `sh -c SCRIPT ls -l`.
+    tokio::spawn(async move {
+        run_server(
+            &server_addr,
+            Some(Duration::from_secs(60)),
+            Some(std::path::PathBuf::from("/bin/sh")),
+            vec![],
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+    });
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdExec(CmdExec {
+        name: "-c".into(),
+        args: vec![
+            "echo \"$(id -u) $(pwd -P) [$VK_EXEC_DIR] $0 $*\"".into(),
+            "ls".into(),
+            "-l".into(),
+        ],
+        env: vec![],
+        clear_env: false,
+        mode: RunMode::Interactive,
+        tty: None,
+        dir: Some("/nonexistent/vk-test".into()),
+        user: Some("root".into()),
+    }))
+    .await
+    .unwrap();
+    let mut stdout = Vec::new();
+    let code = timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await.unwrap().unwrap() {
+                Message::Data {
+                    fd: Fd::Stdout,
+                    msg,
+                } => stdout.extend(msg),
+                Message::ExecDone(result) => return result.code,
+                Message::StartErr { msg } => panic!("the wrapper did not start: {msg}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(0));
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!("{uid} {} [/nonexistent/vk-test] ls -l\n", cwd.display())
+    );
+}
+
 /// `client_run_connect` end to end: a real local TCP connection (standing in for
 /// `vk publish`'s already-accepted host side) relayed through the agent to a real
 /// TCP target, exercising the same path `vk publish` will use.

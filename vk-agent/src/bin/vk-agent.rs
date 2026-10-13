@@ -87,7 +87,10 @@ enum Commands {
         /// Force every exec through this program (like SSH's ForceCommand)
         ///
         /// It receives the requested command line as its arguments and decides what to run. Use
-        /// it to enforce an allowlist. Omitted = run commands directly.
+        /// it to enforce an allowlist. It runs as serve's own user, in serve's working
+        /// directory, whatever the client asks; the client's --dir reaches it as $VK_EXEC_DIR
+        /// (empty when none), for it to check before entering it. Omitted = run commands
+        /// directly.
         #[arg(long, value_name = "PROGRAM")]
         exec_wrapper: Option<PathBuf>,
         /// Allow these client-supplied environment variables through to --exec-wrapper

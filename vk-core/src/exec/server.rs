@@ -313,12 +313,21 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// Rewrite a request to run through the exec wrapper: the wrapper becomes the
-/// command, and the originally-requested name + args become its arguments. dir,
-/// user and tty are untouched, so the real command the wrapper execs runs as the
-/// client asked. Client-supplied env is filtered to the wrapper's allowlist, and
-/// the client cannot clear the (trusted) server env the wrapper inherits — so
-/// neither path lets it tamper with how the wrapper itself runs.
+/// The variable a wrapped command's requested working directory reaches the wrapper in
+/// ([`wrap_cmd`]); empty when the client named none.
+pub const WRAPPER_DIR_ENV: &str = "VK_EXEC_DIR";
+
+/// Rewrite a request to run through the exec wrapper: the wrapper becomes the command, and
+/// the originally-requested name + args become its arguments. Nothing the client sends
+/// decides how the wrapper itself runs:
+/// - it runs as the server's own user, whatever user the client names — not even the
+///   server's default run user, which the server could not switch to unprivileged;
+/// - it runs in the server's working directory, never entering one the client names (which
+///   would tell the client whether that directory exists): the client's dir reaches the
+///   wrapper as [`WRAPPER_DIR_ENV`], to check before it enters it;
+/// - client env is filtered to the wrapper's allowlist, and the client cannot clear the
+///   (trusted) server env the wrapper inherits;
+/// - a tty keeps the client's size and modes, but its `TERM` only when the allowlist has it.
 fn wrap_cmd(mut cmd: CmdExec, wrapper: &ExecWrapper) -> CmdExec {
     let mut args = Vec::with_capacity(cmd.args.len() + 1);
     args.push(std::mem::take(&mut cmd.name));
@@ -330,6 +339,14 @@ fn wrap_cmd(mut cmd: CmdExec, wrapper: &ExecWrapper) -> CmdExec {
         wrapper.env_allowed(key)
     });
     cmd.clear_env = false;
+    cmd.user = Some(String::new());
+    let dir = cmd.dir.take().unwrap_or_default();
+    cmd.env.push(format!("{WRAPPER_DIR_ENV}={dir}"));
+    if let Some(tty) = &mut cmd.tty
+        && !wrapper.env_allowed("TERM")
+    {
+        tty.term = None;
+    }
     cmd
 }
 
@@ -1550,7 +1567,7 @@ mod tests {
             mode: RunMode::Interactive,
             dir: Some("./sub".into()),
             tty: None,
-            user: None,
+            user: Some("root".into()),
         }
     }
 
@@ -1564,8 +1581,33 @@ mod tests {
         assert_eq!(wrapped.name, "/run/host-dispatch");
         // the requested command line becomes the wrapper's argv
         assert_eq!(wrapped.args, vec!["git", "status"]);
-        // dir/user are preserved so the real command runs as the client asked
-        assert_eq!(wrapped.dir.as_deref(), Some("./sub"));
+    }
+
+    /// The client chooses neither who the wrapper runs as nor where: the user is the server's
+    /// own (an empty one, which no default run user replaces), and the requested dir is
+    /// only handed to the wrapper. Its TERM goes through only if allowlisted.
+    #[test]
+    fn wrap_cmd_drops_the_client_user_dir_and_term() {
+        let with_tty = || CmdExec {
+            tty: Some(crate::messages::Tty {
+                term: Some("evil".into()),
+                rows: 24,
+                cols: 80,
+                modes: vec![],
+            }),
+            ..sample_cmd()
+        };
+        let wrapped = wrap_cmd(with_tty(), &wrapper(vec![]));
+        assert_eq!(wrapped.user.as_deref(), Some(""));
+        assert_eq!(run_as(wrapped.user.as_deref(), Some("app".into())), None);
+        assert_eq!(wrapped.dir, None);
+        assert_eq!(wrapped.env, ["VK_EXEC_DIR=./sub"]);
+        assert_eq!(wrapped.tty.as_ref().map(|t| t.term.clone()), Some(None));
+        let wrapped = wrap_cmd(with_tty(), &wrapper(vec!["TERM".into()]));
+        assert_eq!(wrapped.tty.and_then(|t| t.term).as_deref(), Some("evil"));
+        let mut cmd = sample_cmd();
+        cmd.dir = None;
+        assert_eq!(wrap_cmd(cmd, &wrapper(vec![])).env, ["VK_EXEC_DIR="]);
     }
 
     #[test]
@@ -1582,7 +1624,12 @@ mod tests {
         let wrapped = wrap_cmd(cmd, &wrapper(vec!["MYAPP_*".into()]));
         assert_eq!(
             wrapped.env,
-            vec!["LANG=en_US.UTF-8", "LC_ALL=C", "MYAPP_TOKEN=abc"],
+            vec![
+                "LANG=en_US.UTF-8",
+                "LC_ALL=C",
+                "MYAPP_TOKEN=abc",
+                "VK_EXEC_DIR=./sub"
+            ],
         );
         // the client cannot clear the trusted server env the wrapper inherits
         assert!(!wrapped.clear_env);

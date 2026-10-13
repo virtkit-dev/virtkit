@@ -2224,7 +2224,9 @@ enum Cmd {
         host_exec: bool,
         /// force every --host-exec command through this program
         ///
-        /// It receives the requested command line as its arguments and decides what to run.
+        /// It receives the requested command line as its arguments and decides what to run. It
+        /// runs in the --workdir (else here), as this user; the guest's `exec --dir` reaches it
+        /// as $VK_EXEC_DIR, for it to check and enter.
         #[arg(
             long = "host-exec-wrapper",
             value_name = "PROGRAM",
@@ -5070,6 +5072,19 @@ fn host_policy_cmd(policy: &str, workspace: &Path, argv: &[String]) -> ExitCode 
     };
     if policy != "git-gui" {
         return refuse(format!("unknown policy: {policy}"));
+    }
+    // The exec channel runs this in the --workdir, the guest's `exec --dir` (relative to it)
+    // in VK_EXEC_DIR. Entered first and checked as the directory this process is in, which
+    // the command inherits: a path checked and then entered again could be a different
+    // directory by then.
+    let asked = std::env::var_os("VK_EXEC_DIR").unwrap_or_default();
+    if !asked.is_empty()
+        && let Err(e) = std::env::set_current_dir(&asked)
+    {
+        return refuse(format!(
+            "cannot enter the working directory {}: {e}",
+            Path::new(&asked).display()
+        ));
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,

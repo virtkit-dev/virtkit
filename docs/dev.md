@@ -793,9 +793,13 @@ git-gui = true
 against the mapped workspace, with argument and environment filtering.
 
 For other host commands, `wrapper` names a project dispatcher relative to the
-workspace and `wrapper-env` lists environment-variable patterns it accepts.
+workspace and `wrapper-env` lists environment-variable patterns it accepts. It runs in
+the workspace; the directory the guest asked to run in reaches it as `$VK_EXEC_DIR`,
+for it to check before entering it.
 `git-gui` and a custom `wrapper` cannot both be configured; a custom dispatcher
-can call `vk host-policy git-gui` itself.
+can call `vk host-policy git-gui` itself. That reads `$VK_EXEC_DIR` relative to its own
+working directory, so call it before changing directory, or unset `VK_EXEC_DIR` once you
+have entered it.
 
 These are explicit host capabilities. A strict config schema does not sandbox a
 host hook or custom dispatcher, and a writable host mount lets guest code modify

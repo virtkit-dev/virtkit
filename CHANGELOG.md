@@ -38,8 +38,20 @@ All notable changes to virtkit will be documented in this file.
   `docs/registry-hub.md`.
 - **`vk-hub release add --program vk-registry`** holds `vk-registry` releases beside `vk` ones.
 
+### Changed
+
+- **A host-command wrapper now runs in the run's working directory, not in the one the guest
+  asked for** (`vk run --host-exec-wrapper`, a `vk dev` `[dev.host] wrapper`, `vk-agent serve
+  --exec-wrapper`). That directory reaches it as `$VK_EXEC_DIR`: a wrapper that relied on
+  starting in it must check and enter `$VK_EXEC_DIR` itself.
+
 ### Fixed
 
+- **A host command a guest asks for through a wrapper (`vk run --host-exec-wrapper`, `vk dev`
+  host commands, `vk-agent serve --exec-wrapper`) no longer runs the wrapper as the user, in
+  the directory, or with the `TERM` the guest names.** The wrapper runs as the host user in
+  the run's working directory; the directory the guest asked for reaches it as
+  `$VK_EXEC_DIR`, for it to check before entering it.
 - **A command a guest runs on its host (`vk run --host-exec`) no longer occasionally loses
   its exit status ("stream interrupted unexpectedly").**
 - **A running job's size is its VM's, once its node has sized it.** The jobs table and job

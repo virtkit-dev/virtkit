@@ -3807,10 +3807,11 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
 /// guest's `/run/vk/host.sock` forwarder dials. The serve runs with the `--workdir`
 /// (else our own cwd) as its working directory, so a guest `exec --dir .` resolves
 /// against the shared tree; `--host-exec-wrapper` forces every command through an
-/// allowlist program. Without a wrapper the guest can run any host command as the
-/// host user — the opt-in contract of `--host-exec`. The serve inherits virtkit's
-/// host environment so the commands it runs (docker, a browser, …) have a working
-/// host PATH/HOME; the wrapper's own allowlist gates the *client* env on top.
+/// allowlist program, which runs there and gets that `--dir` as `$VK_EXEC_DIR`.
+/// Without a wrapper the guest can run any host command as the host user — the opt-in
+/// contract of `--host-exec`. The serve inherits virtkit's host environment so the
+/// commands it runs (docker, a browser, …) have a working host PATH/HOME; the
+/// wrapper's own allowlist gates the *client* env on top.
 /// Long-lived for the VM's lifetime; the caller kills it on teardown, and
 /// `spawn_tied` reaps it if virtkit dies first.
 fn spawn_host_exec_serve(vsock: &Path, agent: &Path, args: &RunArgs, work: &Path) -> Result<Child> {
