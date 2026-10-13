@@ -433,6 +433,16 @@ impl BuildNet {
             other => bail!("--build-net {other:?} (want all or none)"),
         }
     }
+
+    /// A `RUN` guest's egress policy for `vk switch`: allowed CIDRs, names, and whether to
+    /// restrict egress to them. Empty restricted lists deny everything; `All` is unrestricted.
+    /// `None` has no switch, so nothing to enforce.
+    pub fn switch_policy(&self) -> (&[String], &[String], bool) {
+        match self {
+            BuildNet::Allow { ips, names } => (ips, names, true),
+            BuildNet::All | BuildNet::None => (&[], &[], false),
+        }
+    }
 }
 
 /// What a completed build exposes to its caller: the target stage's runtime config
@@ -6325,6 +6335,31 @@ mod tests {
         assert!(BuildNet::from_flags("none", &ips, &[]).is_err());
         assert!(BuildNet::from_flags("all", &["not-a-cidr".into()], &[]).is_err());
         assert!(BuildNet::from_flags("half", &[], &[]).is_err());
+    }
+
+    #[test]
+    fn a_restricted_build_net_restricts_its_switch() {
+        let allow = BuildNet::Allow {
+            ips: vec!["10.0.0.0/8".into()],
+            names: vec!["crates.io".into()],
+        };
+        let (ips, names, restrict) = allow.switch_policy();
+        assert_eq!(
+            (ips, names, restrict),
+            (
+                &["10.0.0.0/8".to_string()][..],
+                &["crates.io".to_string()][..],
+                true
+            )
+        );
+        // An empty allowlist is CI's deny-all, not an unrestricted switch.
+        let deny = BuildNet::Allow {
+            ips: vec![],
+            names: vec![],
+        };
+        assert!(deny.switch_policy().2);
+        assert!(!BuildNet::All.switch_policy().2);
+        assert!(!BuildNet::None.switch_policy().2);
     }
 
     #[test]

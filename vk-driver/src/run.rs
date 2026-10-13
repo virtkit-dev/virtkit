@@ -5118,10 +5118,7 @@ pub(crate) async fn boot_session(
     let mut net_attach: Option<crate::vmm::SwitchAttach> = None;
     let net_on = !matches!(net, crate::build::BuildNet::None);
     if net_on {
-        let (allow_ip, allow_name): (&[String], &[String]) = match net {
-            crate::build::BuildNet::Allow { ips, names } => (ips, names),
-            _ => (&[], &[]),
-        };
+        let (allow_ip, allow_name, restrict) = net.switch_policy();
         let (child, attach) = spawn_vm_switch(
             &vsock,
             &work,
@@ -5138,9 +5135,7 @@ pub(crate) async fn boot_session(
             None,
             audit_log.map(Path::to_path_buf),
             bytes_log.map(Path::to_path_buf),
-            // A restricted build policy (`BuildNet::Allow`, incl. empty = deny) forces
-            // allowlist mode; `BuildNet::All` is unrestricted.
-            matches!(net, crate::build::BuildNet::Allow { .. }),
+            restrict,
             None,
             crate::prio::Prio::Build,
         )
