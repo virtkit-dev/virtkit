@@ -99,6 +99,7 @@ mod vmm;
 mod vmmctl;
 mod vms;
 mod winbuild;
+mod wincache;
 mod wineval;
 mod winexec;
 mod winiso;

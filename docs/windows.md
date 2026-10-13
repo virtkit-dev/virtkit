@@ -79,6 +79,7 @@ its rationale and test. For Windows they add:
 | --- | --- |
 | `winiso` | The unattended install: the FAT32 install disk (made in a Linux helper VM), Setup, the first boots' servicing, the settle step. |
 | `winbuild` | Windows Dockerfile stages: the `RUN`/`COPY` layers through qemu-ga, sysprep, the bundle. |
+| `wincache` | Layers shared through the build cache registry. |
 | `uefi` | Booting a UEFI guest: its spec, the firmware, its run directory, waiting for Windows to finish starting, stopping it. |
 | `qga` | The qemu-ga client: one connection at a time, resynchronized after a guest reboot. |
 | `relay` | The boot child's sockets: qemu-ga shared among its clients, COM1's input. |
@@ -106,8 +107,24 @@ button.
 ## Sharing builds between hosts
 
 With a build cache registry server (`[build] cache_registry`, or `--cache-registry`), a Windows
-build shares through it:
+build shares its layers as Linux build steps do (`wincache`):
 
+- **Push.** The install, once settled, and each `RUN`/`COPY` layer go to
+  `build-cache:win-<key>`, chunked by content (FastCDC, zstd), each chunk stored once registry
+  wide. A layer whose parent is in the registry as this host has it is pushed as a diff: the
+  parent's chunks are reused and only the ranges the step wrote are chunked again. The install
+  is pushed whole.
+- **Pull.** A host missing a layer pulls it as a `.vk_ro_img` view: its chunks are fetched,
+  then decompressed as Windows reads them, and the next step's overlay or a bundle builds on
+  it. A pulled layer stands alone; it needs none of the layers under it. A failed pull builds
+  the layer locally; a failed push leaves it local.
+- **Once.** While a host makes a layer it holds the registry's build lock on its key; the others
+  wait for its push rather than install Windows again (up to three hours, longer than a
+  Windows 11 install; then they build too, and say so).
+- **Passwords.** Each layer's entry records its install's Administrator password. Concurrent
+  installs of the same key get different passwords, so a pulled layer must carry its own.
+  These passwords are stored in plaintext: anyone who can pull from `build-cache` can read
+  them, so restrict pull access to the build hosts.
 - **Media.** `vk registry put <iso>...` stores install media in the registry's `files/` area,
   by digest (`files/sha256:<hex>`). A `winiso:` stage whose file is not in its build context
   fetches the one it pins from there (into the host's Windows cache), so neither the
@@ -116,8 +133,10 @@ build shares through it:
   were put with `--ttl`, which drops them on time. `vk registry put --keep` keeps them
   regardless.
 
-A store on disk — the builtin one, or a `cache_registry` naming a path — is not used, and
-`--cache-registry` naming one is refused.
+A store on disk — the builtin one, or a `cache_registry` naming a path — is not used: it would
+only hold a second copy of the host's own layer cache, and `--cache-registry` naming one is
+refused. A `--reinstall` never pulls the install: its keys count this host's reinstalls, which
+another host's count may match, so it installs again and pushes over what that host pushed.
 
 ## Tests
 

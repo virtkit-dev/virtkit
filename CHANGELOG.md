@@ -23,6 +23,13 @@ All notable changes to virtkit will be documented in this file.
   the build cache registry.** Upload them once with `vk registry put` instead of keeping
   copies on every build host or in the repository. Windows builds accept `--cache-registry`
   and `--cache-insecure`, but reject `--cache-registry` naming a store on disk.
+- **Hosts sharing a build cache registry install Windows once between them.** A Windows
+  build's install and each `RUN`/`COPY` layer go to the build cache registry server
+  (`[build] cache_registry`), and another host takes a layer it lacks from there instead of
+  installing Windows again; while one host makes a layer, the others wait for it, for up to
+  three hours. Builds without a registry server keep their layers on the host, as before.
+  The registry holds each install's Administrator password in clear: restrict pull access
+  to `build-cache`.
 
 ### Changed
 

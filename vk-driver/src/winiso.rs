@@ -419,7 +419,7 @@ pub(crate) struct Base {
 }
 
 /// The base layer `key` recorded in its directory `dir`, if `dir` holds one.
-fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
+pub(crate) fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
     let path = dir.join("base.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -432,7 +432,7 @@ fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
         .with_context(|| format!("{}: no password", path.display()))?
         .to_string();
     Ok(Some(Base {
-        disk: dir.join("disk.qcow2"),
+        disk: crate::wincache::layer_disk(dir),
         password,
         key: key.to_string(),
     }))
@@ -457,7 +457,7 @@ pub(crate) fn cached_base(cache: &Path, key: &str) -> Option<PathBuf> {
     let dir = cache.join("settled").join(key);
     dir.join("base.json")
         .is_file()
-        .then(|| dir.join("disk.qcow2"))
+        .then(|| crate::wincache::layer_disk(&dir))
 }
 
 /// The virtio-win directory of the Windows `edition` names, if vk knows it.
@@ -527,7 +527,9 @@ fn keep_media(rg: &crate::config::Registry, source: &Source) {
 /// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`; with `reinstall`,
 /// a new one under new keys. Cache the install by its medium and disk size, and the settle
 /// overlay by the install and settle step, so changing the settle does not reinstall. Media
-/// missing here are fetched from `registry`, which every build keeps them alive in.
+/// missing here are fetched from `registry`, which every build keeps them alive in; a base
+/// another host made is pulled from it, and one made here is pushed to it
+/// ([`crate::wincache`]).
 pub(crate) fn base(
     source: &Source,
     disk_size: u64,
@@ -545,16 +547,119 @@ pub(crate) fn base(
         count_reinstall(&count)?;
     }
     let (install_key, key) = keys(&first, reinstalls(&count));
-    if let Some(rg) = registry {
-        keep_media(rg, source);
-    }
     let dir = cache.join("settled").join(&key);
+    if let Some(base) = read_base(&dir, &key)? {
+        eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
+        if let Some(rg) = registry {
+            keep_media(rg, source);
+        }
+        return Ok(base);
+    }
+    let Some(rg) = registry else {
+        return make_base(
+            source,
+            disk_size,
+            cpus,
+            mem,
+            cache,
+            &install_key,
+            &key,
+            None,
+        );
+    };
+    keep_media(rg, source);
+    // Held while this host installs, so the others wait for its push.
+    let _lock = crate::wincache::lock(rg, &key, "Windows install");
     if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
         return Ok(base);
     }
+    // Reinstall counts are host-local: another host may have the same key, but pulling its
+    // install would skip the requested reinstall.
+    if !reinstall {
+        let root = cache.parent().unwrap_or(cache);
+        let tmp = scratch_beside(&dir)?;
+        let placed = (|| {
+            let Some(record) = crate::wincache::pull(rg, root, &key, &tmp)? else {
+                return Ok(false);
+            };
+            if !record["password"].is_string() {
+                eprintln!(
+                    "virtkit: warning: the build cache's base {} has no password; \
+                     installing again",
+                    &key[..12]
+                );
+                return Ok(false);
+            }
+            write_base_record(&tmp, &record)?;
+            publish(&tmp, &dir)?;
+            Ok::<_, anyhow::Error>(true)
+        })();
+        if !matches!(placed, Ok(true)) {
+            // Best effort: a leftover is cleared by the next build of the key (`scratch_beside`).
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+        // Best effort, like the push: a failed pull triggers a local install.
+        let placed = placed.unwrap_or_else(|e| {
+            eprintln!(
+                "virtkit: warning: pulling base {} failed, installing here: {e:#}",
+                &key[..12]
+            );
+            false
+        });
+        if placed {
+            eprintln!(
+                "virtkit: winiso: base {} (from the build cache)",
+                &key[..12]
+            );
+            return read_base(&dir, &key)?.context("a pulled base without its record");
+        }
+    }
+    let base = make_base(
+        source,
+        disk_size,
+        cpus,
+        mem,
+        cache,
+        &install_key,
+        &key,
+        Some(rg),
+    )?;
+    // A disk built on this host, not pulled, is pushed. A concurrent build here that placed
+    // its own first may push the same base too, which is harmless.
+    if base.disk.ends_with(crate::wincache::BUILT_DISK) {
+        let path = dir.join("base.json");
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?;
+        if let Err(e) = crate::wincache::push(rg, &key, &base.disk, None, record) {
+            eprintln!(
+                "virtkit: warning: pushing base {} failed: {e:#}",
+                &key[..12]
+            );
+        }
+    }
+    Ok(base)
+}
 
-    let install_dir = cache.join("install").join(&install_key);
+/// Install `source` on a `disk_size`-byte disk, or take the install `install_key` from `cache`,
+/// and settle it into the base layer `key`. Media missing here are fetched from `registry`.
+#[allow(clippy::too_many_arguments)]
+fn make_base(
+    source: &Source,
+    disk_size: u64,
+    cpus: u32,
+    mem: &str,
+    cache: &Path,
+    install_key: &str,
+    key: &str,
+    registry: Option<&crate::config::Registry>,
+) -> Result<Base> {
+    let dir = cache.join("settled").join(key);
+
+    let install_dir = cache.join("install").join(install_key);
     let installed_disk = install_dir.join("disk.qcow2");
     if !install_dir.join("installed").exists() {
         let media = media(source, cache, registry)?;
@@ -596,7 +701,7 @@ pub(crate) fn base(
     publish(&tmp, &dir)?;
     // What is in place, which is another build's base if it placed one first: its disk was
     // given that build's password, not this one's.
-    read_base(&dir, &key)?.context("the base just placed has no record")
+    read_base(&dir, key)?.context("the base just placed has no record")
 }
 
 /// The install medium of `source`, cached or built in a helper VM. Only building the medium
@@ -1320,6 +1425,62 @@ mod tests {
             absent.local_or_fetched(&cache, Some(&rg)).unwrap_err()
         );
         assert!(err.contains("vk registry put"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A base another host pushed is pulled, with the password of its own install, rather than
+    /// installed; a `--reinstall` never pulls one.
+    #[test]
+    fn a_base_in_the_registry_is_pulled_unless_reinstalling() {
+        let dir = std::env::temp_dir().join(format!("vk-winiso-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rg = local_registry(&dir);
+        let source = Source {
+            iso: Pinned {
+                path: dir.join("absent.iso"),
+                sha256: "11".repeat(32),
+            },
+            drivers: Pinned {
+                path: dir.join("absent-drivers.iso"),
+                sha256: "22".repeat(32),
+            },
+            edition: None,
+        };
+        let size = 8 << 20;
+        let cache = dir.join("winiso");
+        let first = install_key(&source.media_key(), size);
+        // What another host pushed, under the keys of its first install and first reinstall.
+        let raw = dir.join("installed.raw");
+        std::fs::write(&raw, vec![7u8; size as usize]).unwrap();
+        for n in [0, 1] {
+            let (_, key) = keys(&first, n);
+            let made = dir.join("other").join(&key);
+            std::fs::create_dir_all(&made).unwrap();
+            let disk = made.join(crate::wincache::BUILT_DISK);
+            crate::qcow2::create_overlay(&disk, &raw).unwrap();
+            crate::wincache::push(
+                &rg,
+                &key,
+                &disk,
+                None,
+                serde_json::json!({"password": format!("theirs-{n}")}),
+            )
+            .unwrap();
+        }
+
+        let base = base(&source, size, 1, "1G", &cache, false, Some(&rg)).unwrap();
+        assert_eq!(base.password, "theirs-0");
+        assert_eq!(base.key, keys(&first, 0).1);
+        assert!(!base.disk.ends_with(crate::wincache::BUILT_DISK));
+
+        // Reinstalling installs, which here fails on the absent media, instead of pulling.
+        let err = format!(
+            "{:#}",
+            super::base(&source, size, 1, "1G", &cache, true, Some(&rg)).unwrap_err()
+        );
+        assert!(err.contains("vk registry put"), "{err}");
+        assert!(!cache.join("settled").join(keys(&first, 1).1).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
