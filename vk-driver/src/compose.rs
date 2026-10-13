@@ -834,9 +834,14 @@ pub fn parse(
     // Interpolate on the parsed YAML *values* (never keys), then deserialize: a
     // value may expand to embedded newlines (a volume-list variable) without
     // disturbing the document structure, and `deny_unknown_fields` still runs.
-    let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
+    let mut doc = yaml_value(yaml)?;
+    match &doc {
+        serde_json::Value::Object(_) => {}
+        serde_json::Value::Null => bail!("no services declared"),
+        _ => bail!("a compose file is a mapping"),
+    }
     interpolate_values(&mut doc, resolve, builtins)?;
-    let file: ComposeFile = serde_yaml_ng::from_value(doc)?;
+    let file: ComposeFile = serde_json::from_value(doc)?;
     if file.services.is_empty() {
         bail!("no services declared");
     }
@@ -880,23 +885,206 @@ pub fn parse(
     Ok(units)
 }
 
+/// Shared parsing options for `vk run` and `vk dev init`. Only YAML 1.2's `true`/`false`
+/// are booleans, so `off` stays a string for `x-virtkit` axes. Unknown tags
+/// (`!reset`) are errors; `!!binary` keeps its text, `.inf` and `.nan` stay strings,
+/// and errors are one line.
+fn yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        reject_unsupported_tags: true,
+        ignore_binary_tag_for_string: true,
+        reject_non_finite_typeless_float: false,
+        with_snippet: false,
+    }
+}
+
+/// A YAML document as a node tree, its mapping keys all strings.
+pub(crate) fn yaml_node(yaml: &str) -> Result<YamlNode> {
+    serde_saphyr::from_str_with_options(yaml, yaml_options()).map_err(plain_error)
+}
+
+/// The error without the advice serde-saphyr appends for its own callers (`, set
+/// DuplicateKeyPolicy in Options if acceptable`, `; use from_multiple`).
+fn plain_error(e: serde_saphyr::Error) -> anyhow::Error {
+    let msg = e.to_string();
+    let (text, at) = match msg.rsplit_once(" at line ") {
+        Some((text, at)) => (text, Some(at)),
+        None => (msg.as_str(), None),
+    };
+    let text = [
+        ", set DuplicateKeyPolicy in Options if acceptable",
+        "; use from_multiple or from_multiple_with_options",
+    ]
+    .iter()
+    .find_map(|advice| text.strip_suffix(advice))
+    .unwrap_or(text);
+    match at {
+        Some(at) => anyhow::anyhow!("{text} at line {at}"),
+        None => anyhow::anyhow!("{text}"),
+    }
+}
+
+/// A YAML value tree. Numbers with a leading zero or an `_`, or too large for 64 bits,
+/// keep their source text as strings, so `UMASK: 0022` keeps its zeros. So does a boolean
+/// in a case YAML 1.2 does not define (`tRuE`).
+fn yaml_value(yaml: &str) -> Result<serde_json::Value> {
+    Ok(yaml_node(yaml)?.into_json(yaml, None))
+}
+
+/// A parsed YAML node whose children retain source locations to recover number spellings.
+pub(crate) enum YamlNode {
+    Leaf(serde_json::Value),
+    Seq(Vec<serde_saphyr::Spanned<YamlNode>>),
+    Map(Vec<(YamlKey, serde_saphyr::Spanned<YamlNode>)>),
+}
+
+/// Mapping keys must be strings: `1:` and `true:` are refused, not coerced to strings.
+pub(crate) struct YamlKey(pub(crate) String);
+
+impl YamlNode {
+    /// `at` is where the node is defined: an alias or a merged key points at its anchor.
+    fn into_json(self, yaml: &str, at: Option<serde_saphyr::Location>) -> serde_json::Value {
+        use serde_json::Value;
+        match self {
+            YamlNode::Leaf(Value::Number(n)) => match at.and_then(|at| source_text(yaml, at)) {
+                Some(text) if spelled_as_string(text) || (n.is_f64() && integer_shaped(text)) => {
+                    Value::String(text.to_string())
+                }
+                _ => Value::Number(n),
+            },
+            YamlNode::Leaf(Value::Bool(b)) => match at.and_then(|at| source_text(yaml, at)) {
+                Some(text) if !yaml_1_2_bool(text) => Value::String(text.to_string()),
+                _ => Value::Bool(b),
+            },
+            YamlNode::Leaf(v) => v,
+            YamlNode::Seq(items) => items
+                .into_iter()
+                .map(|item| item.value.into_json(yaml, Some(item.defined)))
+                .collect(),
+            YamlNode::Map(entries) => entries
+                .into_iter()
+                .map(|(k, v)| (k.0, v.value.into_json(yaml, Some(v.defined))))
+                .collect(),
+        }
+    }
+}
+
+fn source_text(yaml: &str, at: serde_saphyr::Location) -> Option<&str> {
+    let span = at.span();
+    let start = usize::try_from(span.byte_offset()?).ok()?;
+    let len = usize::try_from(span.byte_len()?).ok()?;
+    yaml.get(start..start.checked_add(len)?)
+}
+
+/// `0022`, `1_000`: YAML 1.2 reads them as numbers, which drops the zeros or the `_`.
+fn spelled_as_string(number: &str) -> bool {
+    let digits = number.trim_start_matches(['+', '-']).as_bytes();
+    number.contains('_') || matches!(digits, [b'0', d, ..] if d.is_ascii_digit())
+}
+
+fn yaml_1_2_bool(text: &str) -> bool {
+    matches!(text, "true" | "True" | "TRUE" | "false" | "False" | "FALSE")
+}
+
+/// A decimal integer literal: one read as a float overflowed 64 bits and would lose digits.
+fn integer_shaped(number: &str) -> bool {
+    let digits = number.trim_start_matches(['+', '-']);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl<'de> Deserialize<'de> for YamlKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = YamlKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string key")
+            }
+            fn visit_str<E>(self, s: &str) -> Result<YamlKey, E> {
+                Ok(YamlKey(s.to_string()))
+            }
+            fn visit_string<E>(self, s: String) -> Result<YamlKey, E> {
+                Ok(YamlKey(s))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for YamlNode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess};
+        use serde_json::Value;
+
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = YamlNode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a YAML value")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(Value::Bool(b)))
+            }
+            fn visit_i64<E>(self, n: i64) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(n.into()))
+            }
+            fn visit_u64<E>(self, n: u64) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(n.into()))
+            }
+            fn visit_f64<E: Error>(self, n: f64) -> Result<YamlNode, E> {
+                serde_json::Number::from_f64(n)
+                    .map(|n| YamlNode::Leaf(Value::Number(n)))
+                    .ok_or_else(|| E::custom(format!("{n} is not a finite number")))
+            }
+            fn visit_str<E>(self, s: &str) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(s.into()))
+            }
+            fn visit_string<E>(self, s: String) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(s.into()))
+            }
+            fn visit_unit<E>(self) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(Value::Null))
+            }
+            fn visit_none<E>(self) -> Result<YamlNode, E> {
+                Ok(YamlNode::Leaf(Value::Null))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<YamlNode, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(YamlNode::Seq(items))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<YamlNode, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(YamlNode::Map(entries))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
 /// Interpolate every string *value* in a parsed YAML document (mapping keys are
 /// left untouched, matching docker-compose — only values carry `${VAR}`). Applied
 /// before deserializing so it covers every field uniformly.
 fn interpolate_values(
-    v: &mut serde_yaml_ng::Value,
+    v: &mut serde_json::Value,
     resolve: &dyn Fn(&str) -> Option<String>,
     builtins: Option<&Builtins>,
 ) -> Result<()> {
-    use serde_yaml_ng::Value;
+    use serde_json::Value;
     match v {
         Value::String(s) => *s = interpolate(s, resolve, builtins)?,
-        Value::Sequence(seq) => {
+        Value::Array(seq) => {
             for e in seq {
                 interpolate_values(e, resolve, builtins)?;
             }
         }
-        Value::Mapping(m) => {
+        Value::Object(m) => {
             for (_k, val) in m.iter_mut() {
                 interpolate_values(val, resolve, builtins)?;
             }
@@ -1212,16 +1400,16 @@ fn service_secrets(
     Ok(secrets)
 }
 
-fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
+fn map_build(build: serde_json::Value, base: &Path) -> Result<Source> {
     let spec = match build {
         // `build: <dir>` is the compose shorthand for a context dir. The mapping
         // form is dispatched explicitly (not via an untagged enum) so an unknown
         // build key errors naming that key, like every other unsupported key.
-        serde_yaml_ng::Value::String(dir) => BuildSpec {
+        serde_json::Value::String(dir) => BuildSpec {
             context: Some(dir.into()),
             ..Default::default()
         },
-        other => serde_yaml_ng::from_value(other).context("build:")?,
+        other => serde_json::from_value(other).context("build:")?,
     };
     let context = base.join(spec.context.as_deref().unwrap_or(Path::new(".")));
     let dockerfiles: Vec<PathBuf> = match spec.dockerfile {
@@ -2023,9 +2211,9 @@ impl<'de> Deserialize<'de> for EnvFile {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // An untagged enum would swallow an entry's "unknown key" error and report only
         // that no variant matched.
-        match serde_yaml_ng::Value::deserialize(d)? {
-            serde_yaml_ng::Value::String(p) => Ok(EnvFile::One(p)),
-            serde_yaml_ng::Value::Sequence(items) => items
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(p) => Ok(EnvFile::One(p)),
+            serde_json::Value::Array(items) => items
                 .into_iter()
                 .map(|v| EnvFileEntry::deserialize(v).map_err(serde::de::Error::custom))
                 .collect::<Result<Vec<_>, _>>()
@@ -2059,9 +2247,9 @@ fn default_true() -> bool {
 
 impl<'de> Deserialize<'de> for EnvFileEntry {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = serde_yaml_ng::Value::deserialize(d)?;
+        let value = serde_json::Value::deserialize(d)?;
         match value {
-            serde_yaml_ng::Value::String(p) => Ok(EnvFileEntry::Path(p)),
+            serde_json::Value::String(p) => Ok(EnvFileEntry::Path(p)),
             other => EnvFileSpec::deserialize(other)
                 .map(EnvFileEntry::Spec)
                 .map_err(serde::de::Error::custom),
@@ -2090,7 +2278,7 @@ struct ComposeService {
     /// `KEY=VALUE` files beneath `environment`. Empty `KEY:` and bare `- KEY` entries
     /// override file values with empty strings rather than importing host values.
     env_file: Option<EnvFile>,
-    build: Option<serde_yaml_ng::Value>,
+    build: Option<serde_json::Value>,
     environment: Option<Env>,
     command: Option<Cmd>,
     entrypoint: Option<Cmd>,
@@ -2364,7 +2552,7 @@ impl Env {
 #[serde(untagged)]
 enum Scalar {
     Str(String),
-    Num(serde_yaml_ng::Number),
+    Num(serde_json::Number),
     Bool(bool),
     Null,
 }
@@ -2920,6 +3108,130 @@ mod tests {
         }
         let err = parse(&file("required: false"), Path::new("/b")).unwrap_err();
         assert!(format!("{err:#}").contains("not supported"), "{err:#}");
+    }
+
+    #[test]
+    fn environment_values_keep_their_spelling() {
+        let u = one(
+            "services:\n  a:\n    image: x\n    environment:\n      UMASK: 0022\n\
+             \x20     BIG: 1_000\n      ON: yes\n      OFF: off\n      HEX: 0x1F\n\
+             \x20     HALF: 0.5\n      ZERO: 0\n      ANCHORED: &n 007\n      ALIAS: *n\n",
+        );
+        let env: BTreeMap<_, _> = u.environment.into_iter().collect();
+        assert_eq!(env["UMASK"], "0022");
+        assert_eq!(env["BIG"], "1_000");
+        assert_eq!(env["ON"], "yes");
+        assert_eq!(env["OFF"], "off");
+        assert_eq!(env["HEX"], "31");
+        assert_eq!(env["HALF"], "0.5");
+        assert_eq!(env["ZERO"], "0");
+        assert_eq!(env["ANCHORED"], "007");
+        assert_eq!(env["ALIAS"], "007");
+    }
+
+    #[test]
+    fn environment_values_keep_what_yaml_1_2_cannot_hold() {
+        let u = one(
+            "services:\n  a:\n    image: x\n    environment:\n      LEAD: 00.5\n\
+             \x20     BIG: 18446744073709551616\n      LOW: -9223372036854775809\n\
+             \x20     INF: .inf\n      NINF: -.inf\n      NAN: .nan\n      BIN: !!binary aGk=\n",
+        );
+        let env: BTreeMap<_, _> = u.environment.into_iter().collect();
+        assert_eq!(env["LEAD"], "00.5");
+        assert_eq!(env["BIG"], "18446744073709551616");
+        assert_eq!(env["LOW"], "-9223372036854775809");
+        assert_eq!(env["INF"], ".inf");
+        assert_eq!(env["NINF"], "-.inf");
+        assert_eq!(env["NAN"], ".nan");
+        assert_eq!(env["BIN"], "aGk=");
+    }
+
+    #[test]
+    fn booleans_are_only_the_yaml_1_2_spellings() {
+        let u = one(
+            "services:\n  a:\n    image: x\n    environment:\n      T: True\n      F: FALSE\n\
+             \x20     ODD: tRuE\n      ANCHORED: &b fAlse\n      ALIAS: *b\n",
+        );
+        let env: BTreeMap<_, _> = u.environment.into_iter().collect();
+        assert_eq!(env["T"], "true");
+        assert_eq!(env["F"], "false");
+        assert_eq!(env["ODD"], "tRuE");
+        assert_eq!(env["ANCHORED"], "fAlse");
+        assert_eq!(env["ALIAS"], "fAlse");
+    }
+
+    #[test]
+    fn aliased_numbers_keep_their_spelling_in_a_sequence() {
+        let u = one("services:\n  a:\n    image: x\n    command: [&n 08, *n]\n");
+        assert_eq!(u.command, Some(vec!["08".to_string(), "08".to_string()]));
+    }
+
+    #[test]
+    fn merge_keys_expand() {
+        let u = one(
+            "services:\n  a:\n    image: x\n    environment:\n      <<: &base { A: 1, B: 02 }\n\
+             \x20     B: 3\n",
+        );
+        assert_eq!(
+            u.environment,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "3".to_string())
+            ]
+        );
+        let u = one("services:\n  a:\n    image: x\n    environment:\n\
+             \x20     <<: [&a { A: 1 }, &b { B: 2, Z: 007 }]\n      C: 3\n");
+        let env: BTreeMap<_, _> = u.environment.into_iter().collect();
+        assert_eq!((&*env["A"], &*env["B"], &*env["C"]), ("1", "2", "3"));
+        assert_eq!(env["Z"], "007");
+    }
+
+    #[test]
+    fn duplicate_keys_are_refused_with_their_line() {
+        for yaml in [
+            "services:\n  a:\n    image: x\n  a:\n    image: y\n",
+            "services:\n  a:\n    environment:\n      A: 1\n      A: 2\n    image: x\n",
+        ] {
+            let err = format!("{:#}", parse(yaml, Path::new("/base")).unwrap_err());
+            assert!(err.contains("duplicate mapping key"), "{err}");
+            assert!(err.contains("at line "), "{err}");
+            assert!(!err.contains("DuplicateKeyPolicy"), "{err}");
+        }
+    }
+
+    #[test]
+    fn unreadable_documents_are_refused() {
+        for (yaml, want) in [
+            (
+                "services:\n  a:\n    image: x\n---\nservices: {}\n",
+                "multiple YAML documents",
+            ),
+            (
+                "services:\n  a:\n    image: x\n    command: !reset []\n",
+                "unsupported tag `!reset`",
+            ),
+            ("services:\n  1:\n    image: x\n", "expected a string key"),
+            (
+                "services:\n  a:\n    image: x\n    environment:\n      true: x\n",
+                "expected a string key",
+            ),
+            ("- a\n", "a compose file is a mapping"),
+            ("", "no services declared"),
+        ] {
+            let err = format!("{:#}", parse(yaml, Path::new("/base")).unwrap_err());
+            assert!(err.contains(want), "{yaml:?}: {err}");
+            assert!(!err.contains("from_multiple"), "{err}");
+        }
+    }
+
+    #[test]
+    fn integer_shaped_is_an_integer_literal() {
+        for text in ["12", "-12", "+0"] {
+            assert!(integer_shaped(text), "{text}");
+        }
+        for text in ["", "-", "1.5", "1e3", "-.inf", "0x1F"] {
+            assert!(!integer_shaped(text), "{text}");
+        }
     }
 
     #[test]

@@ -35,19 +35,9 @@
 # union of all optional dependencies, and cargo-audit scans the lockfile.
 # `cargo tree -i proc-macro-error2 --target all` confirms it is absent from every build.
 # Revisit and drop this entry when jiff or defmt-macros move off proc-macro-error2.
-#
-# RUSTSEC-2024-0449 — `unsafe-libyaml` is unmaintained (informational, no vulnerability).
-# It is serde_yaml_ng's parser, which vk-driver uses for compose files and `vk dev init`'s
-# service list. Under the GitLab executor those compose files are untrusted, job-authored
-# input; the advisory reports an archived upstream, not a known bug. serde_yaml_ng 0.10
-# (latest) still depends on it. Moving to serde-saphyr means rewriting compose parsing,
-# which is built on serde_yaml_ng::Value (pre-deserialize interpolation, untagged fields),
-# and re-checking YAML 1.2 scalar semantics. Revisit and drop this entry when serde_yaml_ng
-# moves off unsafe-libyaml or compose parsing moves off serde_yaml_ng.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071", # rsa: Marvin attack (see above)
     "RUSTSEC-2025-0141", # bincode: unmaintained (see above)
     "RUSTSEC-2026-0173", # proc-macro-error2: unmaintained, never compiled (see above)
-    "RUSTSEC-2024-0449", # unsafe-libyaml: unmaintained (see above)
 ]

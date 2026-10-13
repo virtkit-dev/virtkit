@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::compose::YamlNode;
 use crate::dev::config::Draft;
 
 /// Where `vk dev init` reads from.
@@ -224,21 +225,16 @@ fn from_compose(path: &Path, workspace: &Path) -> Result<Draft> {
 fn service_names(path: &Path) -> Result<Vec<String>> {
     let text = crate::dev::config::read_regular(path)?
         .with_context(|| format!("{} is gone", path.display()))?;
-    let doc: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let services = doc
-        .get("services")
-        .and_then(|s| s.as_mapping())
-        .with_context(|| format!("{} declares no services", path.display()))?;
-    let mut names = Vec::new();
-    for key in services.keys() {
-        match key.as_str() {
-            Some(name) => names.push(name.to_string()),
-            // Dropping it would leave the draft asking "which of a, b" about three services.
-            None => bail!("{}: {key:?} is not a service name", path.display()),
-        }
+    let doc =
+        crate::compose::yaml_node(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let services = match doc {
+        YamlNode::Map(entries) => entries.into_iter().find(|(key, _)| key.0 == "services"),
+        _ => None,
+    };
+    match services.map(|(_, services)| services.value) {
+        Some(YamlNode::Map(entries)) => Ok(entries.into_iter().map(|(key, _)| key.0).collect()),
+        _ => bail!("{} declares no services", path.display()),
     }
-    Ok(names)
 }
 
 /// A Dockerfile: built from the project root. The stage is the reader's choice when there is
@@ -652,5 +648,37 @@ mod tests {
             "{}",
             out.report
         );
+    }
+
+    #[test]
+    fn compose_service_names_come_in_file_order() {
+        let f = project("service-order");
+        let path = f.0.join("compose.yaml");
+        std::fs::write(
+            &path,
+            "services:\n  web:\n    image: x\n  db:\n    image: y\n  api: {}\n",
+        )
+        .unwrap();
+        assert_eq!(service_names(&path).unwrap(), ["web", "db", "api"]);
+    }
+
+    #[test]
+    fn compose_services_must_be_a_mapping_of_names() {
+        let f = project("service-shape");
+        let path = f.0.join("compose.yaml");
+        for (yaml, want) in [
+            ("services:\n  - web\n", "declares no services"),
+            ("services: web\n", "declares no services"),
+            ("- services\n", "declares no services"),
+            (
+                "services:\n  1:\n    image: x\n",
+                "expected a string key at line 2",
+            ),
+        ] {
+            std::fs::write(&path, yaml).unwrap();
+            let err = format!("{:#}", service_names(&path).unwrap_err());
+            assert!(err.contains(want), "{yaml:?}: {err}");
+            assert!(!err.contains('\n'), "{yaml:?}: {err}");
+        }
     }
 }

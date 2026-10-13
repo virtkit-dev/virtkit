@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Compose files accept YAML merge keys.** `<<: *base` merges an anchor defined elsewhere
+  in a service. A number written with a leading zero, such as `00.5`, or too large for 64
+  bits is now kept as written.
+
 ## [0.89.0] - 2026-10-13
 
 ### Added
