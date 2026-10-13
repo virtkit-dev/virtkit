@@ -22,7 +22,7 @@
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -683,6 +683,19 @@ impl Store {
         size: u64,
         title: Option<&str>,
     ) -> Result<String> {
+        self.put_raw_file_annotated(name, tag, layer_hex, size, title, &BTreeMap::new())
+    }
+
+    /// [`Store::put_raw_file`] with `annotations` on the manifest: a [`Retention`].
+    fn put_raw_file_annotated(
+        &self,
+        name: &str,
+        tag: &str,
+        layer_hex: &str,
+        size: u64,
+        title: Option<&str>,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<String> {
         let config_digest = self.put_blob(RAW_FILE_EMPTY_CONFIG)?;
         // Record both blobs here: this server received their bytes for this repository.
         // `put_manifest` records only the manifest's membership; a reference alone does not
@@ -700,7 +713,7 @@ impl Store {
                 "org.opencontainers.image.title": title,
             });
         }
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": DEFAULT_MANIFEST_TYPE,
             "config": {
@@ -710,12 +723,98 @@ impl Store {
             },
             "layers": [layer],
         });
+        if !annotations.is_empty() {
+            manifest["annotations"] = serde_json::to_value(annotations)?;
+        }
         self.put_manifest(
             name,
             tag,
             DEFAULT_MANIFEST_TYPE,
             serde_json::to_vec(&manifest)?.as_slice(),
         )
+    }
+
+    /// Store the file at `path`, whose sha256 hex is `sha256`, as one blob, tagged as a raw
+    /// file under each `(name, tag)` of `tags` with `annotations` on the manifest — what
+    /// `vk registry put` does to a store it reaches on disk. Streamed through a staging file,
+    /// so the file is never held in memory, and hashed on the way: one that no longer hashes
+    /// to `sha256` is refused before any tag names it. `title` becomes the layer's OCI title.
+    pub fn put_file(
+        &self,
+        tags: &[(&str, &str)],
+        path: &Path,
+        sha256: &str,
+        title: Option<&str>,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (name, tag) in tags {
+            if !valid_name(name) || !valid_tag(tag) {
+                bail!("{name}:{tag} is not a valid repository and tag");
+            }
+        }
+        // Stage even an existing blob to recheck the file's hash and measure its size.
+        let (staging, file) = self.stage_file()?;
+        let staged = (|| {
+            let mut src =
+                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            let mut out = Sha256Writer::new(std::io::BufWriter::new(file));
+            let size = std::io::copy(&mut src, &mut out)
+                .with_context(|| format!("copying {}", path.display()))?;
+            std::io::Write::flush(&mut out)?;
+            let (_, hex) = out.into_hex();
+            if hex != sha256 {
+                bail!("{} changed while it was put", path.display());
+            }
+            Ok::<_, anyhow::Error>((size, self.stage_promotion(&hex, &staging)?))
+        })();
+        let (size, staged) = match staged {
+            Ok(s) => s,
+            Err(e) => {
+                // Preserve the put error; gc sweeps any staging file left in uploads/.
+                let _ = std::fs::remove_file(&staging);
+                return Err(e);
+            }
+        };
+        let _lock = match self.lock_shared() {
+            Ok(lock) => lock,
+            Err(e) => {
+                staged.discard();
+                return Err(e);
+            }
+        };
+        self.promote_staged(sha256, staged)?;
+        for (name, tag) in tags {
+            self.put_raw_file_annotated(name, tag, sha256, size, title, annotations)?;
+        }
+        Ok(())
+    }
+
+    /// The raw file tagged `name:tag`; `None` when the tag is absent or is not a raw file.
+    /// The read bumps the tag, as a pull does.
+    pub fn open_file(&self, name: &str, tag: &str) -> Result<Option<OpenFile>> {
+        let Some((_, manifest, _)) = self.get_manifest(name, tag)? else {
+            return Ok(None);
+        };
+        let Some((hex, size)) = raw_file_layer(&manifest) else {
+            return Ok(None);
+        };
+        let title = raw_file_title(&manifest);
+        let Some((path, is_zstd)) = self.find_blob(&hex) else {
+            bail!("{name}:{tag}: its blob sha256:{hex} is missing");
+        };
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let reader: Box<dyn std::io::Read + Send> = if is_zstd {
+            Box::new(zstd::stream::read::Decoder::new(file).context("decompressing a stored blob")?)
+        } else {
+            Box::new(file)
+        };
+        Ok(Some(OpenFile {
+            sha256: hex,
+            size,
+            title,
+            reader,
+        }))
     }
 
     /// Check for a valid repository with at least one repository subdirectory, without walking
@@ -1893,18 +1992,70 @@ const MAX_MANIFEST_REFERENCES: usize = 4096;
 /// The layer media type of a file stored as one blob under a single-layer manifest — what
 /// `/upload` and `/dav/files/` write, and what `vk registry pull` refuses: a raw file is for
 /// fetching, not for booting.
-pub(crate) const RAW_FILE_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file";
-pub(crate) const RAW_FILE_CONFIG_MEDIA_TYPE: &str =
-    "application/vnd.virtkit.raw-file.config.v1+json";
+pub const RAW_FILE_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file";
+pub const RAW_FILE_CONFIG_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file.config.v1+json";
 
 /// Shared empty config: raw files have no build config, but OCI manifests require a
 /// config descriptor. Every raw file references this blob, so it is stored only once.
-pub(crate) const RAW_FILE_EMPTY_CONFIG: &[u8] = b"{}";
+pub const RAW_FILE_EMPTY_CONFIG: &[u8] = b"{}";
+
+/// A writer that hashes the bytes it forwards with sha256.
+pub struct Sha256Writer<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W> Sha256Writer<W> {
+    pub fn new(inner: W) -> Self {
+        Sha256Writer {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// The writer back, and the sha256 hex of everything written through it.
+    pub fn into_hex(self) -> (W, String) {
+        (self.inner, hex_of(&self.hasher.finalize()))
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Sha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // `Write::write` returns at most `buf.len()`; `buf.get(..n)` keeps a writer that
+        // breaks that contract from panicking here, and the digest check catches it.
+        self.hasher.update(buf.get(..n).unwrap_or(buf));
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A raw file [`Store::open_file`] opened.
+pub struct OpenFile {
+    /// Its sha256 hex, which is its blob's digest.
+    pub sha256: String,
+    pub size: u64,
+    /// Its layer's title: the file's name, when its writer gave one.
+    pub title: Option<String>,
+    /// Its bytes.
+    pub reader: Box<dyn std::io::Read + Send>,
+}
+
+/// The OCI title annotation of a raw-file manifest's layer: the file's name, when its
+/// writer gave one.
+pub fn raw_file_title(manifest: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    v.pointer("/layers/0/annotations/org.opencontainers.image.title")?
+        .as_str()
+        .map(str::to_string)
+}
 
 /// The layer of a raw-file manifest as `(hex, canonical size)`, or `None` for a manifest of
 /// any other shape: an image pushed over `/v2/` into a `files/` repository is not a file
 /// the WebDAV view serves.
-pub(crate) fn raw_file_layer(manifest: &[u8]) -> Option<(String, u64)> {
+pub fn raw_file_layer(manifest: &[u8]) -> Option<(String, u64)> {
     let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
     let [layer] = v.pointer("/layers")?.as_array()?.as_slice() else {
         return None;
@@ -1931,18 +2082,18 @@ pub(crate) const DEFAULT_GC_GRACE: Duration = Duration::from_secs(DEFAULT_GC_GRA
 
 /// The manifest annotation that exempts a tag from [`Store::gc`]'s retention window:
 /// value [`RETENTION_KEEP`].
-pub(crate) const RETENTION_ANNOTATION: &str = "org.virtkit.retention";
+pub const RETENTION_ANNOTATION: &str = "org.virtkit.retention";
 
 /// [`RETENTION_ANNOTATION`]'s one value.
-pub(crate) const RETENTION_KEEP: &str = "keep";
+pub const RETENTION_KEEP: &str = "keep";
 
 /// The manifest annotation that gives a tag a fixed expiry, in seconds since the Unix
 /// epoch: [`Store::gc`] drops the tag past it, used or not, and never before it.
-pub(crate) const EXPIRES_ANNOTATION: &str = "org.virtkit.expires";
+pub const EXPIRES_ANNOTATION: &str = "org.virtkit.expires";
 
 /// Tag retention for [`Store::gc`], set by manifest annotations.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Retention {
+pub enum Retention {
     /// Until it sits unused past the gc's retention window: no annotation.
     Idle,
     /// For good: [`RETENTION_ANNOTATION`].
@@ -1957,7 +2108,7 @@ impl Retention {
     /// sign or blanks); an expiry past what [`SystemTime`] can hold reads as
     /// [`Retention::Keep`]. A manifest that does not parse, or an annotation that does not,
     /// asks for none: the window applies, as it always has.
-    pub(crate) fn of_manifest(bytes: &[u8]) -> Retention {
+    pub fn of_manifest(bytes: &[u8]) -> Retention {
         let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return Retention::Idle;
         };
@@ -4189,7 +4340,7 @@ pub(crate) const MAX_NAME_SEGMENTS: usize = 16;
 /// non-empty run of `[A-Za-z0-9._-]` and not `.`/`..` — so it never escapes the store dir.
 /// Shared with `/browse`, whose repo segment is just as untrusted as the OCI API's
 /// `<name>`.
-pub(crate) fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.split('/').count() <= MAX_NAME_SEGMENTS
         && name.split('/').all(|seg| {
@@ -4228,7 +4379,7 @@ pub(crate) fn valid_reference(r: &str) -> bool {
 /// Shared with `/upload`, whose tag field must be a tag, not a digest — a digest-shaped
 /// value there would silently skip the tag-pointer write ([`Store::put_manifest`]'s
 /// digest-reference rule) instead of erroring, which would confuse rather than help.
-pub(crate) fn valid_tag(t: &str) -> bool {
+pub fn valid_tag(t: &str) -> bool {
     !t.is_empty()
         && t != "."
         && t != ".."
@@ -6253,6 +6404,47 @@ mod tests {
             Retention::Keep
         );
         assert_eq!(Retention::of_manifest(b"not json"), Retention::Idle);
+    }
+
+    /// A file put on disk reads back whole under each of its tags, as the raw file the
+    /// WebDAV view serves, and carries the retention it was put with.
+    #[test]
+    fn a_put_file_reads_back_under_each_tag() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-putfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.join("store")).unwrap();
+        let src = dir.join("medium.iso");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+        let keep = BTreeMap::from([(RETENTION_ANNOTATION.to_string(), RETENTION_KEEP.to_string())]);
+        let hex = sha256_hex_raw(&bytes);
+        let tags = [("files/sha256", "x"), ("files/iso", "medium.iso")];
+        store
+            .put_file(&tags, &src, &hex, Some("medium.iso"), &keep)
+            .unwrap();
+        for (name, tag) in tags {
+            let mut f = store.open_file(name, tag).unwrap().unwrap();
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut f.reader, &mut got).unwrap();
+            assert_eq!(
+                (f.sha256.as_str(), f.size, f.title.as_deref()),
+                (hex.as_str(), bytes.len() as u64, Some("medium.iso"))
+            );
+            assert_eq!(got, bytes);
+            let (_, manifest, _) = store.get_manifest(name, tag).unwrap().unwrap();
+            assert_eq!(Retention::of_manifest(&manifest), Retention::Keep);
+        }
+        assert!(store.open_file("files/iso", "absent").unwrap().is_none());
+        // A file that no longer hashes as the caller said is refused, and no tag names it.
+        let stale = "0".repeat(64);
+        assert!(
+            store
+                .put_file(&[("files/iso", "stale")], &src, &stale, None, &keep)
+                .is_err()
+        );
+        assert!(store.get_manifest("files/iso", "stale").unwrap().is_none());
+        assert!(store.find_blob(&stale).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A dry run reports exactly what the real pass then drops, and removes

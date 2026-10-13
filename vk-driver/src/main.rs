@@ -43,6 +43,7 @@ mod exec;
 mod executor;
 mod ext4;
 mod ext4_read;
+mod files;
 mod fullvm;
 mod health;
 mod hostpolicy;
@@ -490,6 +491,53 @@ enum RegistryCmd {
     Inspect {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
+    },
+    /// Put files in the build cache registry
+    ///
+    /// Each file is stored once, tagged by its digest (`sha256:<hex>`) and, with --dir, as
+    /// `<dir>/<its name>`: the registry's WebDAV view serves it at `/dav/files/sha256/<hex>`
+    /// and `/dav/files/<dir>/<name>`. A file is kept while it gets used, unless --ttl or
+    /// --keep say otherwise; putting it again sets its retention anew, under its digest too.
+    /// The build cache registry is --cache-registry, else `[build] cache_registry`, else this
+    /// host's builtin store: a registry server, or a store on disk.
+    Put {
+        /// files to put
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// also name each file `<DIR>/<its name>`
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
+        /// drop the files this long after the put (30m, 12h, 7d), used or not
+        #[arg(long, value_name = "DURATION", conflicts_with = "keep", value_parser = files::parse_ttl)]
+        ttl: Option<std::time::Duration>,
+        /// keep the files however long they go unused
+        #[arg(long)]
+        keep: bool,
+        /// the build cache registry [default: `[build] cache_registry`, else the builtin store]
+        #[arg(long, value_name = "REPO")]
+        cache_registry: Option<String>,
+        /// reach the registry over plain HTTP
+        #[arg(long)]
+        cache_insecure: bool,
+    },
+    /// Fetch a file from the build cache registry
+    ///
+    /// The file is checked against its digest before it lands, and one fetched by digest
+    /// must be the file of that digest. Without --output it lands in the current directory
+    /// under its name — for a digest, the last component of the name it was put with — and
+    /// never over a file already there.
+    Get {
+        /// `sha256:<hex>`, or `<dir>/<name>`
+        reference: String,
+        /// where to write it, over what is there [default: its name, in the current dir]
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// the build cache registry [default: `[build] cache_registry`, else the builtin store]
+        #[arg(long, value_name = "REPO")]
+        cache_registry: Option<String>,
+        /// reach the registry over plain HTTP
+        #[arg(long)]
+        cache_insecure: bool,
     },
     // Serving a store over HTTP now lives in the standalone `vk-registry` daemon;
     // `vk` accesses its local filesystem store in-process (registry.rs `mod local`).
@@ -4235,6 +4283,56 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     if let Cmd::Registry { cmd } = &cli.cmd {
         return match cmd {
+            RegistryCmd::Put {
+                files: paths,
+                dir,
+                ttl,
+                keep,
+                cache_registry,
+                cache_insecure,
+            } => {
+                let rg = match files_registry(&cfg, cache_registry.as_deref(), *cache_insecure) {
+                    Ok(rg) => rg,
+                    Err(e) => return fail(&e, 2),
+                };
+                let retention = match (ttl, keep) {
+                    (Some(ttl), _) => files::PutRetention::Ttl(*ttl),
+                    (None, true) => files::PutRetention::Keep,
+                    (None, false) => files::PutRetention::Idle,
+                };
+                for path in paths {
+                    match files::put(&rg, path, dir.as_deref(), retention) {
+                        Ok((_, refs)) => println!("{} {}", path.display(), refs.join(" ")),
+                        Err(e) => {
+                            return fail(&e.context(format!("putting {}", path.display())), 1);
+                        }
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            RegistryCmd::Get {
+                reference,
+                output,
+                cache_registry,
+                cache_insecure,
+            } => {
+                let rg = match files_registry(&cfg, cache_registry.as_deref(), *cache_insecure) {
+                    Ok(rg) => rg,
+                    Err(e) => return fail(&e, 2),
+                };
+                let dest = match output {
+                    Some(path) => files::Dest::File(path),
+                    None => files::Dest::Into(std::path::Path::new(".")),
+                };
+                match files::get(&rg, reference, dest) {
+                    Ok(Some((file, dest))) => {
+                        println!("{} sha256:{}", dest.display(), file.sha256);
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => fail(&anyhow::anyhow!("{reference}: no such file"), 1),
+                    Err(e) => fail(&e, 1),
+                }
+            }
             RegistryCmd::Push { dir, reference } => match registry::push(&cfg, dir, reference) {
                 Ok(_digest) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),
@@ -5317,6 +5415,21 @@ fn act_on_vms(
         },
         Err(e) => fail(&e, 2),
     }
+}
+
+/// The build cache registry `vk registry put|get` use: `--cache-registry`, else
+/// `[build] cache_registry`, else the builtin store.
+fn files_registry(
+    cfg: &config::Config,
+    cache_registry: Option<&str>,
+    cache_insecure: bool,
+) -> anyhow::Result<config::Registry> {
+    let cache = build::CacheOpts::resolve(cache_registry, cache_insecure, &cfg.build);
+    build::cache_registry(&cache)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the build cache is off (`none`): set [build] cache_registry or pass --cache-registry"
+        )
+    })
 }
 
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {

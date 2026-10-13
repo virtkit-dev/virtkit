@@ -10,6 +10,15 @@ All notable changes to virtkit will be documented in this file.
   their tags indefinitely; `org.virtkit.expires=<unix seconds>` expires them at that
   time, even if still in use. Both `vk-registry gc` and `vk registry gc` honour these
   annotations.
+- **`vk registry put` and `vk registry get` keep plain files in the build cache registry**, in
+  `vk-registry`'s `files/` area: each file is stored once, by digest (`sha256:<hex>`, served
+  over WebDAV at `/dav/files/sha256/<hex>`) and, with `--dir`, by name (`<dir>/<name>`).
+  `--keep` keeps a file however long it goes unused, `--ttl <duration>` drops it that long
+  after the put, used or not. Putting a file again sets its retention anew, under its digest
+  too, so a put without `--keep` ends a keep someone else set on the same bytes. `get`
+  checks each file against its digest. The registry is `--cache-registry`, else
+  `[build] cache_registry`, else this host's builtin store: a `vk-registry` server or a store
+  on disk.
 
 ### Changed
 

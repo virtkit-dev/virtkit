@@ -815,6 +815,15 @@ with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry 
 retention like any other tag, unless their manifest keeps or expires them. Set
 `webdav = false` in the server config to disable WebDAV.
 
+`vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
+digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and
+`vk registry get <sha256:hex | dir/name>` fetches one back, checked against its digest;
+without `-o` it lands in the current directory and never over a file there. A put file is
+kept while it is used, for `--ttl` after the put whether used or not, or with `--keep` until
+a later put changes that — a put of the same file into any `--dir` changes it under its
+digest too. The registry is `--cache-registry`, else `[build] cache_registry`, else this
+host's builtin store: a `vk-registry` server or a store on disk.
+
 A registry that turns requests away, as a busy `vk-registry` does past its per-host
 connection cap, is waited out: `vk` retries a 503 or 429, or a connection closed before any
 answer, with growing randomized delays for up to three minutes before a pull or push fails.

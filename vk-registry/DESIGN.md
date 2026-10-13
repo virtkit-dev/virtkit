@@ -523,10 +523,14 @@ which is what opendal's parent walk asks, always answers.
 
 An object is a tag, so `gc` expires it as it expires every tag: dropped once idle past the
 retention window, its blobs swept once unreferenced and past the grace window, both windows
-store-wide. Idleness is the tag's mtime, which a `PUT` sets and a `GET` refreshes once it is an
-hour old, so a read-only pipeline's hits keep an entry alive as a writer's do. There is no
-per-directory policy and no size cap; a replaced or deleted object frees no disk until the
-next `gc`. A staging file a crashed `PUT` left in `uploads/` goes with the idle uploads.
+store-wide, unless its manifest keeps or expires it ("Garbage collection and reporting"). A
+WebDAV `PUT` writes none of those annotations; `vk registry put --keep|--ttl` does. Like an
+`/upload` or a `/v2/` push, `vk registry put` takes no WebDAV namespace lock, so it can tag
+an object under a name a collection already holds. Idleness is the tag's mtime, which a
+`PUT` sets and a `GET` refreshes once it is an hour old, so a read-only pipeline's hits keep
+an entry alive as a writer's do. There is no per-directory policy and no size cap; a
+replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
+left in `uploads/` goes with the idle uploads.
 
 ## Accounts administration
 
@@ -608,8 +612,8 @@ A manifest without either, with one that does not parse, or one that is missing 
 oversized, takes the window. One that is there but cannot be read aborts the pass, since it
 might be the one keeping the tag: remove the tag or its blob to unwedge gc. The policy
 follows the manifest, so every tag on it shares it, and re-tagging a manifest whose
-annotations differ is how a pusher changes it. An expired tag's blobs go as any unreferenced
-blob does, after the grace window.
+annotations differ is how a pusher changes it (`vk registry put --keep|--ttl` does). An
+expired tag's blobs go as any unreferenced blob does, after the grace window.
 
 Membership markers are not roots. After sweeping blobs, `gc` removes markers and manifest
 sidecars whose content no longer exists. Repository traversal does not follow symlinks and

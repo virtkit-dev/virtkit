@@ -249,6 +249,22 @@ impl CacheOpts {
     }
 }
 
+/// The server or on-disk store for cached builds and plain files, with its credentials.
+/// `None` when caching is off.
+pub(crate) fn cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::Registry>> {
+    Ok(cache_repo(cache.registry.as_deref())?.map(|repo| {
+        crate::config::Registry::for_share(
+            repo,
+            cache.insecure,
+            cache.auth.ca_file.clone(),
+            cache.auth.username.clone(),
+            cache.auth.password_file.clone(),
+            cache.auth.token_file.clone(),
+            None,
+        )
+    }))
+}
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).
