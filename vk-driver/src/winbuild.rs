@@ -800,9 +800,6 @@ const GENERALIZE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     </component>
   </settings>
   <settings pass="oobeSystem">
-    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
-    </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <UserAccounts>
         <AdministratorPassword><Value>@PASSWORD@</Value><PlainText>true</PlainText></AdministratorPassword>
@@ -2281,6 +2278,8 @@ mod tests {
     fn the_generalize_answer_carries_the_password_escaped_and_keys_the_step() {
         let answer = generalize_answer("a&<b");
         assert!(answer.contains("<Value>a&amp;&lt;b</Value>"), "{answer}");
+        // The install's own languages stay: a localized Windows has no en-US to switch to.
+        assert!(!answer.contains("en-US"), "{answer}");
         let key = |password: &str| {
             step_key(
                 &layer(),

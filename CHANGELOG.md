@@ -35,6 +35,9 @@ All notable changes to virtkit will be documented in this file.
   registry is configured. It boots beside the Linux job VM on the job's LAN and runs its
   provisioning (`CMD`) before the script starts. Raise gitlab-runner's `prepare_exec_timeout`
   to cover a first install.
+- **Localized Windows media install.** Setup runs in the medium's own language instead of
+  en-US, and a generalized image keeps it. Hosts install Windows again once, as the install
+  medium changed.
 
 ### Changed
 

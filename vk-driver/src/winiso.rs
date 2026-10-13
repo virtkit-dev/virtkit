@@ -914,8 +914,12 @@ while ((Get-Process TiWorker -ErrorAction SilentlyContinue) -and ((Get-Date) -lt
 $cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
 $wu = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
 if ((Test-Path $cbs) -or (Test-Path $wu)) { exit 3010 }
-net user Administrator '@PASSWORD@' | Out-Null
-if ($LASTEXITCODE -ne 0) { 'setting the Administrator password failed'; exit 1 }
+# The built-in Administrator by its well-known RID, 500: localized Windows names it otherwise
+# (Administrateur, Administrador).
+$admin = (Get-CimInstance Win32_UserAccount -Filter 'LocalAccount = TRUE' | Where-Object SID -like 'S-1-5-21-*-500').Name
+if (-not $admin) { 'no built-in Administrator (RID 500)'; exit 1 }
+net user $admin '@PASSWORD@' | Out-Null
+if ($LASTEXITCODE -ne 0) { "setting the password of $admin failed"; exit 1 }
 $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 Set-ItemProperty $wl AutoAdminLogon '0'
 Remove-ItemProperty $wl -Name DefaultPassword -ErrorAction SilentlyContinue
@@ -1123,6 +1127,9 @@ mod tests {
             assert!(!answer.contains("@QEMU_GA_MSI@"), "{edition}");
         }
         assert!(SETTLE_PS1.contains("Unregister-ScheduledTask -TaskName 'vk qemu-ga'"));
+        // The built-in Administrator by its RID, whatever a localized Windows calls it.
+        assert!(SETTLE_PS1.contains("Where-Object SID -like 'S-1-5-21-*-500'"));
+        assert!(SETTLE_PS1.contains("no built-in Administrator (RID 500)"));
         // The settled layer waits on a slow disk rather than failing its I/O.
         assert!(
             SETTLE_PS1.contains(r"Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord")
@@ -1211,6 +1218,16 @@ mod tests {
             src(None).media_key(),
             src(Some("Windows Server 2022 Standard")).media_key()
         );
+    }
+
+    /// The media script parses as POSIX sh, the helper VM's shell.
+    #[test]
+    fn the_media_script_parses() {
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", MEDIA_SH])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
