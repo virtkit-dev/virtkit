@@ -2581,7 +2581,7 @@ mod tests {
     }
 
     /// A configured vCPU, with Hyper-V enlightenments or not.
-    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    #[cfg(target_arch = "x86_64")]
     fn configured_vcpu(hyperv: bool) -> (Vm, Vcpu, GuestMemoryMmap) {
         let config = VcpuConfig {
             vcpu_count: 1,
