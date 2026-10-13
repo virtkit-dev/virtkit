@@ -2674,31 +2674,38 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
 /// not size a service past what the runner's config lets a job declare. Silent, like
 /// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
 fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Unit) -> Result<()> {
-    let vm = &cfg.executor.vm;
+    let (max_cpus, max_mib) = service_ceiling(cfg)?;
     if let Some(n) = unit.cpus {
-        unit.cpus = Some(n.min(vm.max_cpus.unwrap_or(vm.cpus)));
+        unit.cpus = Some(n.min(max_cpus));
     }
     if let Some(mem) = &unit.mem {
         // parse validated at compose load; the context covers a unit built elsewhere.
         let req_mib = crate::run::parse_mem_mib(mem)
             .with_context(|| format!("service {:?}: invalid mem {mem:?}", unit.name))?;
-        let max_mib = match &vm.max_mem {
-            Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
-            None => parse_gib(&vm.mem).context("invalid vm.mem")?,
-        }
-        .checked_mul(1024)
-        .context("guest memory ceiling is absurdly large")?;
-        // `[executor.schedule] mem_budget` is a host ceiling like the others (see `vm_size`): a service
-        // sized above the whole budget could never boot healthily on this runner.
-        let max_mib = match budget_mib(cfg) {
-            Some(b) => max_mib.min(b?),
-            None => max_mib,
-        };
         if req_mib > max_mib {
             unit.mem = Some(format!("{max_mib}M"));
         }
     }
     Ok(())
+}
+
+/// Maximum CPU count and memory in MiB for this runner's job guests, bounded by the job
+/// VM's limits and the host's `[executor.schedule] mem_budget`.
+fn service_ceiling(cfg: &crate::config::Config) -> Result<(u32, u64)> {
+    let vm = &cfg.executor.vm;
+    let max_mib = match &vm.max_mem {
+        Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
+        None => parse_gib(&vm.mem).context("invalid vm.mem")?,
+    }
+    .checked_mul(1024)
+    .context("guest memory ceiling is absurdly large")?;
+    // `[executor.schedule] mem_budget` also caps guest memory (see `vm_size`): a guest above
+    // the whole budget cannot boot healthily on this runner.
+    let max_mib = match budget_mib(cfg) {
+        Some(b) => max_mib.min(b?),
+        None => max_mib,
+    };
+    Ok((vm.max_cpus.unwrap_or(vm.cpus), max_mib))
 }
 
 /// Where this job's VM goes on a multi-socket host, announced in the job trace.
