@@ -435,6 +435,16 @@ a resettable device look like one that cannot reset. Covered by
 `a_reset_the_device_cannot_do_still_reads_back_as_done` and
 `a_driver_written_failed_is_cleared_by_a_reset`.
 
+### No split irqchip with virtio-pci
+
+`src/libkrun/src/{vmm/builder.rs,api/vmm_builder.rs}` — the split irqchip and virtio-pci MSI-X
+cannot share KVM's GSI routing table. Under a split irqchip KVM rejects the in-kernel IOAPIC and
+PIC entries every `GsiRoutes` commit includes, so its MSI-X routes never install, and the
+userspace IOAPIC's own full-table commits would drop them anyway. `VmmBuilder::build` refuses the
+combination, with `PciRequiresKernelIrqchip` as the backstop in `build_microvm`. vk never enables
+the split irqchip; the check guards libkrun's own API. Covered by
+`pci_with_the_split_irqchip_is_refused`.
+
 ### virtio-fs stall check
 
 `src/devices/src/virtio/{fs/worker.rs,queue.rs}` — every 10s, busy or idle, a virtio-fs worker

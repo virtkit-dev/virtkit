@@ -230,6 +230,11 @@ pub enum StartMicrovmError {
     /// PCI devices require ACPI discovery.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     PciRequiresAcpi,
+    /// virtio-pci MSI-X and the split irqchip's userspace IOAPIC cannot share KVM's GSI routing
+    /// table: KVM rejects the in-kernel irqchip entries `GsiRoutes` commits under a split irqchip,
+    /// and the IOAPIC's own full-table commits would drop the MSI-X routes.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    PciRequiresKernelIrqchip,
     /// The GPU's shared-memory region cannot be exposed over virtio-pci yet.
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
     PciSharedMemoryNotSupported,
@@ -516,6 +521,10 @@ impl Display for StartMicrovmError {
             RegisterPciDevice(ref err) => write!(f, "Cannot register PCI device: {err}"),
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             PciRequiresAcpi => write!(f, "PCI devices require ACPI to be enabled"),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            PciRequiresKernelIrqchip => {
+                write!(f, "PCI devices require the in-kernel irqchip")
+            }
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
             PciSharedMemoryNotSupported => {
                 write!(
@@ -757,6 +766,9 @@ pub fn build_microvm(
         let enabled = device_manager.uses_pci();
         if enabled && !vm_resources.acpi_enabled {
             return Err(StartMicrovmError::PciRequiresAcpi);
+        }
+        if enabled && vm_resources.split_irqchip {
+            return Err(StartMicrovmError::PciRequiresKernelIrqchip);
         }
         enabled
     };

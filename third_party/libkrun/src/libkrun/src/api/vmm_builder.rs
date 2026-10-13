@@ -491,6 +491,12 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     if (pci_enabled || builder_cfg.vm_generation_id.is_some()) && !builder_cfg.acpi {
         return Err(VmmError::InvalidParam());
     }
+    // The split irqchip's userspace IOAPIC and virtio-pci MSI-X cannot share KVM's GSI routing
+    // table (local patch, see VENDOR.md).
+    if pci_enabled && builder_cfg.split_irqchip {
+        log::error!("PCI devices require the in-kernel irqchip, not the split irqchip");
+        return Err(VmmError::InvalidParam());
+    }
     // On x86_64 Linux the shutdown device is the ACPI power button: without ACPI the guest
     // would never see it, and `VmmHandle::shutdown` would succeed doing nothing.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -699,5 +705,26 @@ mod tests {
         let err = handle.resume().unwrap_err();
         assert!(format!("{err:?}").contains("vcpu 1 exited"), "{err:?}");
         event_loop.join().unwrap();
+    }
+
+    /// PCI devices with the split irqchip are refused before any KVM call.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pci_with_the_split_irqchip_is_refused() {
+        let err = VmmBuilder::new()
+            .vcpus(1)
+            .unwrap()
+            .ram_mib(64)
+            .unwrap()
+            .payload(Payload::load_firmware("/nonexistent", "").unwrap())
+            .devices(crate::api::device_builders::PciDeviceManager::new())
+            .acpi(true)
+            .unwrap()
+            .split_irqchip(true)
+            .unwrap()
+            .build()
+            .err()
+            .expect("build should fail");
+        assert!(matches!(err, VmmError::InvalidParam()), "{err:?}");
     }
 }
