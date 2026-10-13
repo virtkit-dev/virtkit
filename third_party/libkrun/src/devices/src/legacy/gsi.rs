@@ -63,6 +63,11 @@ impl GsiRoutes {
         self.commit();
     }
 
+    /// Whether an MSI route for `gsi` is in the table.
+    pub fn has_msi_route(&self, gsi: u32) -> bool {
+        self.msi.contains_key(&gsi)
+    }
+
     /// Remove the MSI route for `gsi` (if any) and re-commit the table.
     pub fn clear_msi_route(&mut self, gsi: u32) {
         if self.msi.remove(&gsi).is_some() {

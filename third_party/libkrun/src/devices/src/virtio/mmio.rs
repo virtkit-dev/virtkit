@@ -137,6 +137,13 @@ impl InterruptHandler for MmioInterrupt {
         debug!(target: &self.0.log_target, "interrupt: {name}");
         self.try_signal_status(status)
     }
+
+    fn describe(&self) -> String {
+        format!(
+            "mmio interrupt status {:#x}",
+            self.status().load(Ordering::SeqCst)
+        )
+    }
 }
 
 impl InterruptTransport {

@@ -457,8 +457,11 @@ while the guest's other submissions keep the worker busy. Either left a guest re
 a CI job sat 3 hours in a `READDIR` on an overlay's virtio-fs lower layer, freed within seconds
 by one more `readdir`. The worker logs the ring indices as a `virtio-fs <share>: … suspected
 lost kick` or `… suspected lost interrupt` warning in the VMM log, then serves the chains or
-signals again; a stall that comes back at the same positions, the recovery not getting through,
-is logged at debug level until the ring moves. A `used_event` of 0 reads as nothing unconsumed:
+signals again. Each warning also gives the transport's interrupt state: for virtio-pci MSI-X
+enabled and function mask, per vector its mask, PBA bit, GSI and whether its route is installed,
+the vectors the driver mapped and the ISR; for virtio-mmio its interrupt status. A stall that
+comes back at the same positions, the recovery not getting through, is logged at debug level
+until the ring moves. A `used_event` of 0 reads as nothing unconsumed:
 Linux (since 5.13) writes 0 there when it disables callbacks, so a real stall exactly there,
 once per 65536 completions, goes undetected. While bus mastering is off neither ring is read.
 An idle share costs one wakeup per 10s. Covered by
@@ -466,8 +469,9 @@ An idle share costs one wakeup per 10s. Covered by
 `after_a_lost_interrupt_later_completions_ask_for_none`,
 `a_used_event_of_zero_reads_as_callbacks_off`, `stall_check_reads_nothing_with_bus_mastering_off`,
 `a_stall_needs_two_checks_on_an_unmoved_ring`, `a_moving_ring_never_stalls`,
-`an_idle_ring_never_stalls`, `more_chains_pending_than_the_queue_holds_are_not_a_lost_kick` and
-`a_stall_the_recovery_does_not_clear_is_warned_once`.
+`an_idle_ring_never_stalls`, `more_chains_pending_than_the_queue_holds_are_not_a_lost_kick`,
+`a_stall_the_recovery_does_not_clear_is_warned_once` and
+`describe_names_masks_pending_bits_and_routes`.
 
 ### Not carried from the 1.19 tree
 

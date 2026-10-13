@@ -364,6 +364,25 @@ impl InterruptHandler for PciInterrupt {
         debug!(target: &self.0.log_target, "interrupt: {description}");
         self.signal(bit)
     }
+
+    fn describe(&self) -> String {
+        // Lock order: msix (then routes, inside its describe), vectors, state.
+        let msix = self.0.msix.lock().unwrap();
+        let vectors = *self.0.vectors.lock().unwrap();
+        let state = self.0.state.lock().unwrap();
+        format!(
+            "{}; config vector {}, queue vectors {:#x}; intx isr {:#x}{}",
+            msix.describe(),
+            vectors.config,
+            vectors.queues,
+            state.isr,
+            if state.intx_disabled {
+                " (disabled)"
+            } else {
+                ""
+            },
+        )
+    }
 }
 
 #[derive(Clone, Copy)]

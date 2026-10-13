@@ -51,6 +51,11 @@ pub(crate) enum InterruptType {
 
 pub(crate) trait InterruptHandler: Send + Sync {
     fn try_signal(&self, interrupt: InterruptType) -> Result<(), crate::Error>;
+
+    /// The interrupt path's state, for a log line about a notification that went missing.
+    fn describe(&self) -> String {
+        "interrupt state unknown".to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +64,12 @@ pub struct InterruptTransport(Arc<dyn InterruptHandler>);
 impl InterruptTransport {
     pub(crate) fn from_handler(handler: Arc<dyn InterruptHandler>) -> Self {
         Self(handler)
+    }
+
+    /// The interrupt path's state (MSI-X masks, pending bits, routes; ISR or mmio interrupt status), for a log
+    /// line about a notification that went missing.
+    pub fn describe(&self) -> String {
+        self.0.describe()
     }
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {

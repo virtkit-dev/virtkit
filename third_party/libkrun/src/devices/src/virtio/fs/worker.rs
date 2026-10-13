@@ -439,13 +439,14 @@ impl FsWorker {
                 log!(
                     level,
                     "virtio-fs {}: queue {queue_index}: {pending} request(s) available and not \
-                     popped for {}s (avail_idx {}, next_avail {}, {}): \
+                     popped for {}s (avail_idx {}, next_avail {}, {}; {}): \
                      suspected lost kick, serving them",
                     self.label,
                     STALL_CHECK.as_secs(),
                     avail.avail_idx,
                     avail.next_avail,
                     describe_used(&used),
+                    self.interrupt.describe(),
                 );
                 self.drain(queue_index);
                 // `pop` refuses a chain with an invalid head, leaving `next_avail` where it was.
@@ -465,13 +466,14 @@ impl FsWorker {
                 log!(
                     level,
                     "virtio-fs {}: queue {queue_index}: {count} completion(s) past used_event \
-                     for {}s (used_event {}, next_used {}, avail_idx {}): suspected \
+                     for {}s (used_event {}, next_used {}, avail_idx {}; {}): suspected \
                      lost interrupt, signalling again",
                     self.label,
                     STALL_CHECK.as_secs(),
                     used.used_event,
                     used.next_used,
                     avail.avail_idx,
+                    self.interrupt.describe(),
                 );
                 self.interrupt.signal_used_queue();
             }

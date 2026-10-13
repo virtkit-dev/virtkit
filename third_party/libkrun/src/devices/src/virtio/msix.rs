@@ -41,6 +41,8 @@ pub trait MsiRoutes: Send {
     fn set_msi_route(&mut self, gsi: u32, addr: u64, data: u32);
     /// Remove the route of `gsi`, if any.
     fn clear_msi_route(&mut self, gsi: u32);
+    /// Whether `gsi` has a route installed.
+    fn has_msi_route(&self, gsi: u32) -> bool;
 }
 
 #[cfg(target_os = "linux")]
@@ -51,6 +53,10 @@ impl MsiRoutes for GsiRoutes {
 
     fn clear_msi_route(&mut self, gsi: u32) {
         GsiRoutes::clear_msi_route(self, gsi);
+    }
+
+    fn has_msi_route(&self, gsi: u32) -> bool {
+        GsiRoutes::has_msi_route(self, gsi)
     }
 }
 
@@ -178,6 +184,53 @@ impl MsixConfig {
     /// Number of MSI-X table entries advertised in the capability.
     pub fn table_size() -> u16 {
         NUM_VECTORS
+    }
+
+    /// MSI-X's state for a log line: enabled and function mask, then per vector its mask, PBA
+    /// bit, GSI and, while MSI-X is enabled, whether that GSI's route is installed.
+    pub fn describe(&self) -> String {
+        let routes = self.routes.as_ref().map(|r| r.lock().unwrap());
+        let vectors: Vec<String> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                let route = match &routes {
+                    Some(routes) if self.enabled && v.gsi != 0 => {
+                        if routes.has_msi_route(v.gsi) {
+                            "routed"
+                        } else {
+                            "no route"
+                        }
+                    }
+                    _ => "-",
+                };
+                format!(
+                    "v{idx} {}{} gsi {} {route}",
+                    if v.entry.masked() {
+                        "masked"
+                    } else {
+                        "unmasked"
+                    },
+                    if self.get_pba_bit(idx) == 1 {
+                        " PENDING"
+                    } else {
+                        ""
+                    },
+                    v.gsi,
+                )
+            })
+            .collect();
+        format!(
+            "msix {}{}: {}",
+            if self.enabled { "enabled" } else { "disabled" },
+            if self.function_masked {
+                " FUNCTION MASKED"
+            } else {
+                ""
+            },
+            vectors.join(", "),
+        )
     }
 
     /// True if the driver has enabled MSI-X (message-control enable bit).
@@ -540,6 +593,14 @@ mod tests {
         fn clear_msi_route(&mut self, gsi: u32) {
             self.0.push(RouteOp::Clear(gsi));
         }
+
+        fn has_msi_route(&self, gsi: u32) -> bool {
+            self.0.iter().rev().find_map(|op| match *op {
+                RouteOp::Set(g, ..) if g == gsi => Some(true),
+                RouteOp::Clear(g) if g == gsi => Some(false),
+                _ => None,
+            }) == Some(true)
+        }
     }
 
     /// A vector reprogrammed while the function is masked keeps its old route until the unmask
@@ -580,6 +641,35 @@ mod tests {
 
         cfg.set_msg_ctl(0);
         assert_eq!(take(), [RouteOp::Clear(32), RouteOp::Clear(33)]);
+    }
+
+    #[test]
+    fn describe_names_masks_pending_bits_and_routes() {
+        let enable = 1 << MSIX_ENABLE_BIT;
+        let routes = Arc::new(Mutex::new(RecordingRoutes::default()));
+        let mut cfg = MsixConfig::new();
+        cfg.set_gsi(0, 32);
+        cfg.set_gsi(1, 33);
+        cfg.set_routes(routes);
+
+        cfg.set_msg_ctl(enable);
+        table_write_u32(&mut cfg, 0x10, 0xfee0_0000);
+        table_write_u32(&mut cfg, 0x18, 0x0000_0041);
+        table_write_u32(&mut cfg, 0x1c, 0);
+        cfg.set_msg_ctl(enable | 1 << FUNCTION_MASK_BIT);
+        assert!(cfg.signal(1));
+        assert_eq!(
+            cfg.describe(),
+            "msix enabled FUNCTION MASKED: v0 masked gsi 32 no route, \
+             v1 unmasked PENDING gsi 33 routed"
+        );
+
+        // Disabled, routes are not expected: none is reported missing.
+        cfg.set_msg_ctl(0);
+        assert_eq!(
+            cfg.describe(),
+            "msix disabled: v0 masked gsi 32 -, v1 unmasked PENDING gsi 33 -"
+        );
     }
 
     #[test]
