@@ -446,8 +446,9 @@ async fn resumed_jobs_hold_their_slots() {
     h.hub.set_slots("p1", 5);
     h.gl.push_job(job_json(34));
     h.gl.push_job(job_json(35));
-    let (first, _) = h.accepted_job(1).await;
-    let (second, _) = h.accepted_job(2).await;
+    // Taken one after the other, but submitted by tasks of their own, in either order.
+    let (first, a) = h.accepted_job(1).await;
+    let (second, b) = h.accepted_job(2).await;
     let state = h.state_dir.join("r1.json");
     eventually("both jobs committed in the state file", || {
         let recs = records(&state);
@@ -466,11 +467,11 @@ async fn resumed_jobs_hold_their_slots() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(h.job_requests(), requests, "no request past concurrent");
     h.hub.finish(&first, None, None);
-    h.final_update(34).await;
+    h.final_update(a.gitlab_job).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(h.job_requests(), requests, "one resumed job still runs");
     h.hub.finish(&second, None, None);
-    h.final_update(35).await;
+    h.final_update(b.gitlab_job).await;
     let (third, sub) = h.accepted_job(3).await;
     assert_eq!(sub.gitlab_job, 36);
     h.hub.finish(&third, None, None);
