@@ -40,6 +40,9 @@ All notable changes to virtkit will be documented in this file.
   medium changed.
 - **Retail Windows media install.** ISOs that carry `install.esd` instead of `install.wim`
   install too.
+- **`FROM winiso:` accepts `--product-key=<key>`** for retail and volume media that require one.
+  Windows retains the key in every layer and bundle built on the install, including those in
+  the build cache registry.
 
 ### Changed
 

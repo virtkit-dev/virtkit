@@ -1,5 +1,6 @@
-//! `FROM winiso:<iso>@sha256:<hex> --drivers=<iso>@sha256:<hex> [--edition=<name>]`: a Windows
-//! base layer installed from Microsoft's ISO under vk, with no AHCI or ATAPI and no other VMM.
+//! `FROM winiso:<iso>@sha256:<hex> --drivers=<iso>@sha256:<hex> [--edition=<name>]
+//! [--product-key=<key>]`: a Windows base layer installed from Microsoft's ISO under vk, with no
+//! AHCI or ATAPI and no other VMM.
 //!
 //! The install medium is a GPT disk whose FAT32 partition holds the ISO's files (built in a Linux
 //! helper VM by `winiso/media.sh`: 7z, wimlib, mtools); WinPE loads viostor from `boot.wim`, sees
@@ -285,11 +286,16 @@ pub(crate) struct Source {
     pub iso: Pinned,
     pub drivers: Pinned,
     pub edition: Option<String>,
+    /// Setup's key for retail or volume media that require one. An edition's KMS client setup
+    /// key supports an unactivated build. Windows retains the key, recoverable from its registry
+    /// and disk, in every derived layer and bundle, including build cache registry copies.
+    /// Use a retail or MAK key only when builds stay with users allowed to use it.
+    pub product_key: Option<String>,
 }
 
 impl Source {
-    /// The stage `FROM <image>` with its `--drivers`/`--edition` `flags`, paths against
-    /// `context`; `None` when `image` is not a `winiso:` one.
+    /// The stage `FROM <image>` with its `--drivers`/`--edition`/`--product-key` `flags`, paths
+    /// against `context`; `None` when `image` is not a `winiso:` one.
     pub fn of_stage(
         image: &str,
         flags: &[(String, String)],
@@ -300,11 +306,13 @@ impl Source {
         };
         if let Some((name, _)) = flags
             .iter()
-            .find(|(k, _)| !matches!(k.as_str(), "edition" | "drivers"))
+            .find(|(k, _)| !matches!(k.as_str(), "edition" | "drivers" | "product-key"))
         {
-            bail!("FROM {image}: unknown flag --{name} (expected --drivers, --edition)");
+            bail!(
+                "FROM {image}: unknown flag --{name} (expected --drivers, --edition, --product-key)"
+            );
         }
-        for name in ["drivers", "edition"] {
+        for name in ["drivers", "edition", "product-key"] {
             if flags.iter().filter(|(k, _)| k == name).count() > 1 {
                 bail!("FROM {image}: --{name} given twice");
             }
@@ -321,10 +329,17 @@ impl Source {
                  such as \"Windows Server 2025 Standard\": Server 2016 to 2025, Windows 10 or 11)"
             );
         }
+        let product_key = flag(flags, "product-key");
+        if let Some(key) = product_key
+            && !is_product_key(key)
+        {
+            bail!("FROM {image}: --product-key: expected five groups of five letters and digits");
+        }
         Ok(Some(Source {
             iso: Pinned::parse(iso, context)?,
             drivers: Pinned::parse(drivers, context)?,
             edition: edition.map(str::to_string),
+            product_key: product_key.map(str::to_ascii_uppercase),
         }))
     }
 
@@ -400,6 +415,10 @@ impl Source {
         } else {
             (VIRTIO_WIN_MSI, QEMU_GA_MSI)
         };
+        // Preserve the existing answer file for keyless installs.
+        let product_key = self.product_key.as_deref().map_or(String::new(), |key| {
+            format!("<ProductKey><Key>{key}</Key><WillShowUI>OnError</WillShowUI></ProductKey>")
+        });
         ANSWER_TEMPLATE
             .replace("@FIRST_MSI@", first)
             .replace("@SECOND_MSI@", second)
@@ -407,7 +426,17 @@ impl Source {
             .replace("@IMAGE_KEY@", key)
             .replace("@IMAGE_VALUE@", &value)
             .replace("@INSTALL_PASSWORD@", INSTALL_PASSWORD)
+            .replace("@PRODUCT_KEY@", &product_key)
     }
+}
+
+/// Whether `key` has a Windows product key's shape: `XXXXX-XXXXX-XXXXX-XXXXX-XXXXX`.
+fn is_product_key(key: &str) -> bool {
+    let groups: Vec<&str> = key.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// A base layer: its disk, the Administrator password the settle boot gave it, and its key.
@@ -725,6 +754,10 @@ fn media(
     let answer = source.answer_file();
     let setup_cmd = source.setup_cmd();
     let out = scratch_beside(&dir)?;
+    // The answer file and boot.wim contain any supplied product key: restrict access to the
+    // owner, as for `base.json`.
+    std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .with_context(|| format!("restricting {}", out.display()))?;
     let img = out.join("media.img");
     let assets = out.join("assets");
     std::fs::create_dir_all(&assets)?;
@@ -755,6 +788,8 @@ fn media(
     if !status.success() || !img.exists() {
         bail!("building the Windows install medium failed ({status})");
     }
+    // The unused assets contain a plaintext copy of the answer file.
+    std::fs::remove_dir_all(&assets).with_context(|| format!("removing {}", assets.display()))?;
     std::fs::write(out.join("complete"), "")?;
     publish(&out, &dir)?;
     Ok(dir.join("media.img"))
@@ -924,6 +959,11 @@ $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 Set-ItemProperty $wl AutoAdminLogon '0'
 Remove-ItemProperty $wl -Name DefaultPassword -ErrorAction SilentlyContinue
 Remove-Item C:\vk\*.msi -ErrorAction SilentlyContinue
+# Setup keeps the answer file it ran, product key included: not left as a plain file in the
+# layers built on this one. Windows itself still holds the key.
+foreach ($f in 'C:\Windows\Panther\unattend.xml', 'C:\Windows\Panther\Unattend\unattend.xml') {
+  if (Test-Path $f) { Remove-Item $f -ErrorAction Stop }
+}
 Unregister-ScheduledTask -TaskName 'vk qemu-ga' -Confirm:$false -ErrorAction SilentlyContinue
 # A loaded host can take tens of seconds per write: past the disk's timeout (60 s in these
 # guests), Windows fails the I/O, and BitLocker's conversion then bug-checks. Wait as long as a VM
@@ -1084,6 +1124,7 @@ mod tests {
             iso: pinned("a.iso"),
             drivers: pinned("b.iso"),
             edition: Some(edition.into()),
+            product_key: None,
         };
         // Server scripts match the file before the placeholder was added.
         let server = source("Windows Server 2025 Standard Evaluation").setup_cmd();
@@ -1130,6 +1171,7 @@ mod tests {
         // The built-in Administrator by its RID, whatever a localized Windows calls it.
         assert!(SETTLE_PS1.contains("Where-Object SID -like 'S-1-5-21-*-500'"));
         assert!(SETTLE_PS1.contains("no built-in Administrator (RID 500)"));
+        assert!(SETTLE_PS1.contains(r"C:\Windows\Panther\unattend.xml"));
         // The settled layer waits on a slow disk rather than failing its I/O.
         assert!(
             SETTLE_PS1.contains(r"Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord")
@@ -1146,12 +1188,53 @@ mod tests {
         assert!(SETTLE_PS1.contains("-eq ''Stopped'' -and $s.ExitCode -ne 0"));
     }
 
+    /// Validate and uppercase the key in UserData; reject duplicates and preserve the
+    /// existing answer file for keyless installs.
+    #[test]
+    fn a_product_key_reaches_setup() {
+        let flags = |key: &str| {
+            vec![
+                ("drivers".to_string(), format!("v.iso@sha256:{DIGEST}")),
+                ("edition".to_string(), "Windows 10 Pro".to_string()),
+                ("product-key".to_string(), key.to_string()),
+            ]
+        };
+        let image = format!("winiso:w.iso@sha256:{DIGEST}");
+        let src = Source::of_stage(
+            &image,
+            &flags("w269n-WFGWX-YVC9B-4J6C9-T83GX"),
+            Path::new("/"),
+        )
+        .unwrap()
+        .unwrap();
+        let answer = src.answer_file();
+        assert!(answer.contains(
+            "<Organization>vk</Organization><ProductKey><Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key>"
+        ));
+        let keyless = Source {
+            product_key: None,
+            ..src
+        }
+        .answer_file();
+        assert!(keyless.contains("<Organization>vk</Organization></UserData>"));
+        assert!(!keyless.contains("@PRODUCT_KEY@"));
+        for bad in ["", "W269N-WFGWX", "W269N-WFGWX-YVC9B-4J6C9-T83G!", "<x>"] {
+            let err = Source::of_stage(&image, &flags(bad), Path::new("/")).unwrap_err();
+            assert!(format!("{err:#}").contains("--product-key"), "{bad}");
+        }
+        let mut twice = flags("W269N-WFGWX-YVC9B-4J6C9-T83GX");
+        twice.push(twice[2].clone());
+        let err = Source::of_stage(&image, &twice, Path::new("/")).unwrap_err();
+        assert!(format!("{err:#}").contains("--product-key given twice"));
+    }
+
     #[test]
     fn without_an_edition_the_first_image_is_installed() {
         let src = Source {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: None,
+            product_key: None,
         };
         assert!(
             src.answer_file()
@@ -1209,14 +1292,25 @@ mod tests {
         assert_eq!(key, install_key("m", 40 << 30));
         assert_ne!(key, install_key("m", 60 << 30));
         assert_ne!(key, install_key("n", 40 << 30));
-        let src = |edition: Option<&str>| Source {
+        let src = |edition: Option<&str>, key: Option<&str>| Source {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: edition.map(str::to_string),
+            product_key: key.map(str::to_string),
         };
         assert_ne!(
-            src(None).media_key(),
-            src(Some("Windows Server 2022 Standard")).media_key()
+            src(None, None).media_key(),
+            src(Some("Windows Server 2022 Standard"), None).media_key()
+        );
+        // A key is in the answer file, so in the medium.
+        let keyed = |key| src(None, Some(key)).media_key();
+        assert_ne!(
+            src(None, None).media_key(),
+            keyed("AAAAA-AAAAA-AAAAA-AAAAA-AAAAA")
+        );
+        assert_ne!(
+            keyed("AAAAA-AAAAA-AAAAA-AAAAA-AAAAA"),
+            keyed("BBBBB-BBBBB-BBBBB-BBBBB-BBBBB")
         );
     }
 
@@ -1256,6 +1350,7 @@ mod tests {
             iso: Pinned::parse(&format!("a.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             drivers: Pinned::parse(&format!("b.iso@sha256:{DIGEST}"), Path::new("/")).unwrap(),
             edition: Some("Windows Server 2025 R&D <\"x\">".to_string()),
+            product_key: None,
         };
         let answer = src.answer_file();
         assert!(
@@ -1463,6 +1558,7 @@ mod tests {
                 sha256: "22".repeat(32),
             },
             edition: None,
+            product_key: None,
         };
         let size = 8 << 20;
         let cache = dir.join("winiso");

@@ -679,12 +679,13 @@ vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-pass
 - The ISOs are local files pinned by digest; `--drivers` is virtio-win's ISO (drivers and
   qemu-ga). Without `--edition` the ISO's first image installs. For Windows 11, `--edition`
   must name a Windows 11 edition: otherwise it installs as a server would and Setup stops at
-  its TPM check. Localized and retail media install too: Setup runs in the medium's own
-  language, and an `install.esd` is converted. The install takes about 20 minutes (70 for
-  Windows 11) and is cached; so is every later step. With a build cache registry server,
-  hosts share both
-  ([how](docs/windows.md#sharing-builds-between-hosts)), and `vk registry put` keeps the ISOs
-  there for hosts that lack them.
+  its TPM check. Retail and volume media install too: Setup runs in the medium's own language,
+  an `install.esd` is converted, and `--product-key=<key>` gives Setup the key such media ask
+  for (a KMS client setup key of the edition installs without activating); Windows keeps that
+  key, so it travels with every layer and bundle built on the install. The install takes
+  about 20 minutes (70 for Windows 11) and is cached; so is every later step. With a build
+  cache registry server, hosts share both ([how](docs/windows.md#sharing-builds-between-hosts)),
+  and `vk registry put` keeps the ISOs there for hosts that lack them.
 - `# vk:` directives: `disk=<size>` sizes the install (default 40G), `generalize=on` ends
   the stage with sysprep (each copy gets its own name and SID), `firmware=uefi-secboot`
   enrolls Microsoft's Secure Boot keys, `tpm=on` gives each machine a TPM 2.0, and

@@ -121,6 +121,9 @@ build shares its layers as Linux build steps do (`wincache`):
 - **Once.** While a host makes a layer it holds the registry's build lock on its key; the others
   wait for its push rather than install Windows again (up to three hours, longer than a
   Windows 11 install; then they build too, and say so).
+- **Product keys.** A `--product-key` stays in the install and every derived layer, including
+  registry copies. Use a retail or MAK key only where every host and puller may use it.
+  On the building host, the install medium containing it is accessible only to its owner.
 - **Passwords.** Each layer's entry records its install's Administrator password. Concurrent
   installs of the same key get different passwords, so a pulled layer must carry its own.
   These passwords are stored in plaintext: anyone who can pull from `build-cache` can read
