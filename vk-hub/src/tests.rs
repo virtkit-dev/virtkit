@@ -274,15 +274,18 @@ async fn closed(ws: &mut Client, within: Duration) {
     .expect("the hub left the connection open");
 }
 
-/// Poll `cond` until it holds, for effects a session applies after its reply.
+/// Poll `cond` until it holds, for effects a session applies after its reply. Some are paced
+/// to the next heartbeat (a report the session holds back), and a loaded machine stretches
+/// that and the write after it, so the deadline is several heartbeats away.
 async fn eventually(mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if cond() {
-            return;
-        }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never held"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("condition never held");
 }
 
 #[tokio::test(flavor = "multi_thread")]

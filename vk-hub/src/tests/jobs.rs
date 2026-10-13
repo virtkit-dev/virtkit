@@ -1260,7 +1260,12 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         Some("0123456789abcdef0123456789abcdef01234567")
     );
     assert!(row.started_at.is_some() && row.started_at <= row.finished_at);
-    assert_eq!(row.ran_ms(crate::now_secs()), Some(4200));
+    // Its run excludes preparation, which the node did not measure: the hub's stage times
+    // give it in whole seconds, more than 0 when a second turned while it prepared.
+    let now = crate::now_secs();
+    let prepare = row.prepare_ms(now).unwrap();
+    assert_eq!(prepare % 1000, 0);
+    assert_eq!(row.ran_ms(now), Some(4200 - prepare));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

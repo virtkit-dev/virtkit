@@ -1428,10 +1428,12 @@ mod tests {
         );
         let local = Local::new(vk, dir.join("actions"));
         let began = Instant::now();
-        let ran = local.run_action(&[], Duration::from_secs(1)).await.unwrap();
-        assert!(began.elapsed() >= Duration::from_secs(1) + TERM_GRACE);
+        // Time enough for the script to set its trap and write what it reports on a loaded
+        // machine: a SIGTERM before that ends it at once, or its `$(…)` with nothing read.
+        let ran = local.run_action(&[], Duration::from_secs(3)).await.unwrap();
+        assert!(began.elapsed() >= Duration::from_secs(3) + TERM_GRACE);
         assert!(!ran.ok);
-        assert_eq!(ran.status, "terminated after 1s, then killed 1s later");
+        assert_eq!(ran.status, "terminated after 3s, then killed 1s later");
         assert_eq!(
             std::fs::read_to_string(dir.join("termed")).unwrap(),
             "term\n"
