@@ -73,7 +73,8 @@ enum Cmd {
     /// Installs and starts a `systemd --user` one, or with `--system` prints a machine-wide one
     /// for an admin to install. The `--user` unit runs as you, on a port you can bind, and
     /// comes back with your session (or without one, after `loginctl enable-linger`). The
-    /// `--system` unit runs as an unprivileged account of its own, may write only the store,
+    /// `--system` unit runs as an unprivileged account of its own, may write only the store
+    /// (and the binary's directory, which a hub's update needs the account to own),
     /// and is allowed to bind a privileged port only when the port is one — it is printed, not
     /// installed, because creating that account and writing under /etc are the admin's step, so
     /// nothing here needs root.
@@ -671,6 +672,11 @@ async fn run(cli: Cli) -> Result<()> {
             );
             eprintln!("      sudo tee /etc/systemd/system/{unit}");
             eprintln!("    sudo systemctl daemon-reload && sudo systemctl enable --now {unit}");
+            eprintln!(
+                "\nvk-registry: for a hub to update it, {service_user} has to own the binary's \
+                 directory, {}",
+                exe.parent().unwrap_or(Path::new("")).display()
+            );
             Ok(())
         }
         // Both resolve their store through `store_root`, which is where the order is: it

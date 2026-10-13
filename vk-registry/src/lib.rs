@@ -4527,7 +4527,8 @@ fn unit_path(what: &str, p: &Path) -> Result<String> {
 ///
 /// Returned rather than installed: writing under `/etc` and owning the store are the
 /// admin's, and this binary stays free of any privileged step. The unit it hands back is
-/// the point — the server it starts holds one capability and can write one directory.
+/// the point — the server it starts holds one capability and can write only the store, and
+/// the binary's directory if its account owns it, for a hub's update to replace the binary.
 /// `exe` is the installed `vk-registry` the unit should run — the caller's `current_exe`
 /// in practice, a parameter so the check below is exercisable.
 pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<String> {
@@ -4553,6 +4554,12 @@ pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<Strin
             );
         }
     }
+    // A hub's update renames the release over the binary, which `ProtectSystem=strict`
+    // would refuse in any directory. Lifting that leaves file permissions in charge: the
+    // account still writes the directory only if it owns it, as the update requires.
+    let bin_dir = exe
+        .parent()
+        .with_context(|| format!("the binary {} has no directory", exe.display()))?;
     // Binding below 1024 is the one thing an ordinary account cannot do. Granting the
     // capability only when the port actually needs it keeps the common case at none, and
     // the bounding set stops any other from ever being acquired either way.
@@ -4581,6 +4588,7 @@ pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<Strin
          ProtectSystem=strict\n\
          ProtectHome=yes\n\
          ReadWritePaths={store}\n\
+         ReadWritePaths={bin_dir}\n\
          PrivateTmp=yes\n\
          PrivateDevices=yes\n\
          ProtectClock=yes\n\
@@ -4606,6 +4614,7 @@ pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<Strin
         exe = unit_path("the binary", exe)?,
         args = facts.exec_args()?,
         store = unit_path("the store", store)?,
+        bin_dir = unit_path("the binary's directory", bin_dir)?,
     ))
 }
 
@@ -5221,14 +5230,20 @@ mod tests {
         assert!(!plain.contains("Ambient"), "{plain}");
         assert!(plain.contains("CapabilityBoundingSet=\n"), "{plain}");
 
-        // the account is the one asked for, and the store is the only writable path. No
-        // `Group=`: the account's own primary group is whatever `useradd` gave it.
+        // the account is the one asked for, and the store and the binary's directory, for a
+        // hub's update to replace it, are the only writable paths. No `Group=`: the account's
+        // own primary group is whatever `useradd` gave it.
         let unit = system_unit(&facts("127.0.0.1:5000"), "registry-svc", installed).unwrap();
         assert!(unit.contains("User=registry-svc\n"), "{unit}");
         assert!(!unit.contains("Group="), "{unit}");
-        assert!(
-            unit.contains("ReadWritePaths=\"/srv/vk-registry\"\n")
-                && unit.contains("ProtectSystem=strict\n"),
+        assert!(unit.contains("ProtectSystem=strict\n"), "{unit}");
+        let writable: Vec<&str> = unit
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+            .collect();
+        assert_eq!(
+            writable,
+            ["\"/srv/vk-registry\"", "\"/usr/local/bin\""],
             "{unit}"
         );
         assert!(unit.contains("NoNewPrivileges=yes\n"), "{unit}");

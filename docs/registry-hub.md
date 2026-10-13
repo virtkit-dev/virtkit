@@ -280,7 +280,7 @@ alone. Client changes are listed below.
 |---|---|---|---|
 | 1. Registration and monitoring | `vk-hub token create --kind registry`, then `vk-registry join` on the registry host | nothing: same URL, same mode, same keys, same UI | `vk-registry leave`, then restart `serve`; the registry runs as before. `vk-hub registries remove <id>` drops it from the hub |
 | 2. Steering | list `read-only` and `gc` in `[hub] allow`; set a gc schedule on the hub, and drop `vk-registry gc` from cron | nothing, unless the hub makes the registry read-only | drop them from `[hub] allow`, restart `serve`, and put the cron entry back; what the hub asked is no longer applied |
-| 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (`install-service`'s user unit as is; the `--system` unit needs a `ReadWritePaths=` for it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry restarts on the new version, dropping open connections, as after a manual upgrade | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
+| 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (either of `install-service`'s units: the `--system` one lets its account write the binary's directory when it owns it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry restarts on the new version, dropping open connections, as after a manual upgrade | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
 | 4. Hub tokens | `[hub] tokens = true` | clients may also get tokens from the hub; `vkr_` keys and sessions keep working | `tokens = false` |
 | 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; imported `vkr_` keys keep working, and new keys come from the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted, but holds nothing created on the hub since the import |
 | 6. Locks on the hub | to be designed | — | — |
@@ -381,8 +381,9 @@ differs from a `vk` release's, so neither signature verifies as the other.
 
 Until then the installed binary is left as it is. Run `serve` under a supervisor that restarts
 it (`vk-registry install-service`), from a binary in a directory its user can write: the
-user unit works as is, while the `--system` unit (`ProtectSystem=strict`) needs a
-`ReadWritePaths=` for that directory. A release that crashes or hangs is restarted as the
+user unit as is, or the `--system` unit, which lets its account write the binary's directory
+(an account owning it, such as `/opt/vk-registry/`, rather than a shared `/usr/local/bin`). A
+release that crashes or hangs is restarted as the
 previous binary, which hands over again up to three starts, then takes the registry back and
 reports the update rolled back.
 

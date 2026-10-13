@@ -31,7 +31,9 @@ All notable changes to virtkit will be documented in this file.
   gc never with windows shorter than its `[hub] min_retention_days` (7) and `min_grace_days`
   (1). An update needs `vk-registry serve` run under a supervisor that restarts it: a release
   that cannot reach the hub is ended, and the previous binary takes over only when started
-  again. `vk-registry leave` undoes it. See `docs/registry-hub.md`.
+  again; `vk-registry install-service --system`'s unit lets an update replace the binary when
+  the service's account owns its directory. `vk-registry leave` undoes it. See
+  `docs/registry-hub.md`.
 - **`vk-hub release add --program vk-registry`** holds `vk-registry` releases beside `vk` ones.
 
 ### Fixed
