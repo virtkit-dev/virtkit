@@ -491,6 +491,30 @@ pub fn write_new(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::
     )
 }
 
+/// [`write_atomic`], or with `replace` false [`write_new`], of what `fill` writes into the
+/// staged file — for contents streamed rather than held in memory. The file is fsynced
+/// before it is published either way. `fill`'s error fails the write and nothing is
+/// published; the staged file is removed on a best-effort basis.
+pub fn write_atomic_streamed(
+    path: &Path,
+    mode: u32,
+    replace: bool,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    write_atomic_with(
+        path,
+        mode,
+        Durability::Synced,
+        if replace {
+            Publish::Replace
+        } else {
+            Publish::NoReplace
+        },
+        staging_names(),
+        fill,
+    )
+}
+
 /// Whether [`write_atomic_from`] fsyncs the staged file before publishing it.
 #[derive(Clone, Copy)]
 enum Durability {
@@ -511,7 +535,21 @@ fn write_atomic_from(
     mode: u32,
     durability: Durability,
     publish: Publish,
+    next_name: impl FnMut() -> Result<String, anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    write_atomic_with(path, mode, durability, publish, next_name, |staged| {
+        Ok(std::io::Write::write_all(staged, contents)?)
+    })
+}
+
+/// [`write_atomic_from`] of what `fill` writes into the staged file.
+fn write_atomic_with(
+    path: &Path,
+    mode: u32,
+    durability: Durability,
+    publish: Publish,
     mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
     let Some(final_name) = path.file_name() else {
         bail!("{path:?} is not a path a file can be written at");
@@ -519,6 +557,7 @@ fn write_atomic_from(
     let final_name = cstr(final_name)?;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let parent_fd = open_dir(parent.unwrap_or(Path::new(".")))?;
+    let mut fill = Some(fill);
     for _ in 0..STAGING_ATTEMPTS {
         let name = cstr(OsStr::new(&next_name()?))?;
         // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the
@@ -541,12 +580,19 @@ fn write_atomic_from(
         }
         // SAFETY: `fd` is a fresh descriptor this call owns.
         let mut staged = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        let written = std::io::Write::write_all(&mut staged, contents)
-            .and_then(|()| match durability {
-                Durability::Synced => staged.sync_all(),
-                Durability::Unsynced => Ok(()),
+        // Every iteration reaching here returns below, so `fill` is still available.
+        let Some(fill) = fill.take() else {
+            bail!("staging {path:?} twice");
+        };
+        let written = fill(&mut staged)
+            .and_then(|()| {
+                match durability {
+                    Durability::Synced => staged.sync_all(),
+                    Durability::Unsynced => Ok(()),
+                }
+                .map_err(anyhow::Error::from)
             })
-            .map_err(|e| anyhow!(e).context(format!("writing the staged file for {path:?}")))
+            .map_err(|e| e.context(format!("writing the staged file for {path:?}")))
             .and_then(|()| {
                 let published = match publish {
                     Publish::Replace => {
@@ -1530,6 +1576,33 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["key", "link"], "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A streamed write publishes what `fill` wrote, replacing or not as asked; a `fill`
+    /// that fails publishes nothing and leaves no staging name.
+    #[test]
+    fn a_streamed_write_publishes_what_it_was_filled_with() {
+        let dir = scratch("write-streamed");
+        let path = dir.join("medium");
+        let fill = |bytes: &'static [u8]| {
+            move |f: &mut std::fs::File| Ok(std::io::Write::write_all(f, bytes)?)
+        };
+        write_atomic_streamed(&path, 0o644, false, fill(b"first")).unwrap();
+        assert!(write_atomic_streamed(&path, 0o644, false, fill(b"second")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic_streamed(&path, 0o644, true, fill(b"third")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        let failed = write_atomic_streamed(&dir.join("other"), 0o644, true, |f| {
+            std::io::Write::write_all(f, b"partial")?;
+            bail!("the source went away")
+        });
+        assert!(failed.is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["medium"], "{left:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
