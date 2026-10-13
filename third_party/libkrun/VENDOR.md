@@ -426,6 +426,30 @@ a resettable device look like one that cannot reset. Covered by
 `a_reset_the_device_cannot_do_still_reads_back_as_done` and
 `a_driver_written_failed_is_cleared_by_a_reset`.
 
+### virtio-fs stall check
+
+`src/devices/src/virtio/{fs/worker.rs,queue.rs}` — every 10s, busy or idle, a virtio-fs worker
+checks its queues for a notification that went missing, from rings that held work and did not
+move since the previous check: chains the driver made available and the worker never popped (a
+kick it did not see), and, with `VIRTIO_F_EVENT_IDX`, completions published past the
+`used_event` the driver last wrote (an interrupt it did not get). A deadline rather than an idle
+timeout, because under `EVENT_IDX` the completions after a lost interrupt raise none either,
+while the guest's other submissions keep the worker busy. Either left a guest request blocked:
+a CI job sat 3 hours in a `READDIR` on an overlay's virtio-fs lower layer, freed within seconds
+by one more `readdir`. The worker logs the ring indices as a `virtio-fs <share>: … suspected
+lost kick` or `… suspected lost interrupt` warning in the VMM log, then serves the chains or
+signals again; a stall that comes back at the same positions, the recovery not getting through,
+is logged at debug level until the ring moves. A `used_event` of 0 reads as nothing unconsumed:
+Linux (since 5.13) writes 0 there when it disables callbacks, so a real stall exactly there,
+once per 65536 completions, goes undetected. While bus mastering is off neither ring is read.
+An idle share costs one wakeup per 10s. Covered by
+`stall_check_reads_unpopped_chains_and_unconsumed_completions`,
+`after_a_lost_interrupt_later_completions_ask_for_none`,
+`a_used_event_of_zero_reads_as_callbacks_off`, `stall_check_reads_nothing_with_bus_mastering_off`,
+`a_stall_needs_two_checks_on_an_unmoved_ring`, `a_moving_ring_never_stalls`,
+`an_idle_ring_never_stalls`, `more_chains_pending_than_the_queue_holds_are_not_a_lost_kick` and
+`a_stall_the_recovery_does_not_clear_is_warned_once`.
+
 ### Not carried from the 1.19 tree
 
 - Initrd placement below 4 GiB: upstream in 2.0.

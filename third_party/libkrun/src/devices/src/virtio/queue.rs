@@ -354,6 +354,51 @@ pub struct Queue {
     num_added: Wrapping<u16>,
 }
 
+/// Where the device stands in the avail ring against the driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AvailPosition {
+    /// The `idx` the driver last published in the avail ring.
+    pub(crate) avail_idx: Wrapping<u16>,
+    /// The index of the next available entry the device will pop.
+    pub(crate) next_avail: Wrapping<u16>,
+}
+
+impl AvailPosition {
+    /// How many chains the driver made available that the device has not popped.
+    pub(crate) fn pending(&self) -> u16 {
+        (self.avail_idx - self.next_avail).0
+    }
+}
+
+/// Where the used ring stands against the driver's `EVENT_IDX` threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UsedPosition {
+    /// The `used_event` the driver last wrote.
+    pub(crate) used_event: Wrapping<u16>,
+    /// The index of the next used entry the device will publish.
+    pub(crate) next_used: Wrapping<u16>,
+}
+
+impl UsedPosition {
+    /// How many published used entries lie at or past `used_event`. A driver re-arming its
+    /// interrupt writes its last consumed index there, so entries past it, still there once the
+    /// device has been idle a while, are completions whose interrupt never reached it.
+    ///
+    /// Zero in two cases where the driver is not waiting for them. A `used_event` ahead of
+    /// `next_used`, as `virtqueue_enable_cb_delayed` sets it, asks for an entry not yet
+    /// published; a lag past half the index space reads as such. A `used_event` of 0 is what
+    /// Linux (since 5.13) writes when it disables callbacks, so it cannot be told from a
+    /// threshold: a genuine stall exactly at a `used_event` of 0, once per 65536 completions,
+    /// goes undetected.
+    pub(crate) fn unconsumed(&self) -> u16 {
+        if self.used_event.0 == 0 {
+            return 0;
+        }
+        let ahead = (self.next_used - self.used_event).0;
+        if ahead < 0x8000 { ahead } else { 0 }
+    }
+}
+
 impl PartialEq for Queue {
     fn eq(&self, other: &Self) -> bool {
         self.max_size == other.max_size
@@ -485,6 +530,39 @@ impl Queue {
     /// Checks if the driver has made any descriptor chains available in the avail ring.
     pub fn is_empty(&self, mem: &GuestMemoryMmap) -> bool {
         self.len(mem) == 0
+    }
+
+    /// The driver's `avail_idx` and the device's `next_avail`: chains between them were made
+    /// available and not popped. For a device that has been idle a while, that means a kick
+    /// it never saw. `None` while bus mastering is off, where `pop` serves nothing either.
+    pub(crate) fn avail_position(
+        &self,
+        mem: &GuestMemoryMmap,
+    ) -> Result<Option<AvailPosition>, Error> {
+        if !self.bus_master_enabled() {
+            return Ok(None);
+        }
+        Ok(Some(AvailPosition {
+            avail_idx: self.avail_idx(mem, Ordering::Acquire)?,
+            next_avail: self.next_avail,
+        }))
+    }
+
+    /// With `VIRTIO_F_EVENT_IDX`, the `used_event` the driver last wrote and the device's
+    /// `next_used`. `None` without `EVENT_IDX`, where the device cannot tell what the driver
+    /// consumed, and while bus mastering is off.
+    pub(crate) fn unconsumed_used(
+        &self,
+        mem: &GuestMemoryMmap,
+    ) -> Result<Option<UsedPosition>, Error> {
+        if !self.event_idx_enabled || !self.bus_master_enabled() {
+            return Ok(None);
+        }
+        fence(Ordering::SeqCst);
+        Ok(Some(UsedPosition {
+            used_event: self.used_event(mem, Ordering::Relaxed)?,
+            next_used: self.next_used,
+        }))
     }
 
     /// Pop the first available descriptor chain from the avail ring.
@@ -1244,6 +1322,112 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    /// The stall check sees chains made available and never popped, and with `EVENT_IDX` the
+    /// completions published past the `used_event` the driver last wrote.
+    #[test]
+    fn stall_check_reads_unpopped_chains_and_unconsumed_completions() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+
+        vq.dtable[0].set(0x1000, 0x1000, 0, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(3);
+        let position = |q: &Queue| {
+            let avail = q.avail_position(m).unwrap().unwrap();
+            (avail.avail_idx.0, avail.next_avail.0, avail.pending())
+        };
+        assert_eq!(position(&q), (3, 0, 3));
+        q.pop(m).unwrap();
+        assert_eq!(position(&q), (3, 1, 2));
+
+        // Without EVENT_IDX the device cannot tell what the driver consumed.
+        assert!(q.unconsumed_used(m).unwrap().is_none());
+
+        q.set_event_idx(true);
+        for i in 0..3 {
+            q.add_used(m, i, 1).unwrap();
+        }
+        let count = |q: &Queue| q.unconsumed_used(m).unwrap().unwrap().unconsumed();
+        // Re-armed at 1, with entries 0 to 2 published: two completions it never consumed.
+        vq.avail.event.set(1);
+        assert_eq!(count(&q), 2);
+        // Caught up.
+        vq.avail.event.set(3);
+        assert_eq!(count(&q), 0);
+        // Waiting for an entry not yet published is not a stall.
+        vq.avail.event.set(4);
+        assert_eq!(count(&q), 0);
+    }
+
+    /// Linux writes a `used_event` of 0 when it disables callbacks: completions published since
+    /// do not read as unconsumed.
+    #[test]
+    fn a_used_event_of_zero_reads_as_callbacks_off() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+        q.set_event_idx(true);
+        for i in 0..100 {
+            q.add_used(m, i % 16, 1).unwrap();
+        }
+        vq.avail.event.set(0);
+
+        let used = q.unconsumed_used(m).unwrap().unwrap();
+        assert_eq!((used.used_event.0, used.next_used.0), (0, 100));
+        assert_eq!(used.unconsumed(), 0);
+    }
+
+    /// With bus mastering off the device may not read the rings: the stall check sees neither
+    /// available chains nor used entries, as `pop` serves nothing.
+    #[test]
+    fn stall_check_reads_nothing_with_bus_mastering_off() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+        q.set_event_idx(true);
+        q.add_used(m, 0, 1).unwrap();
+        vq.avail.event.set(1);
+        vq.avail.idx.set(3);
+        let gate = Arc::new(AtomicBool::new(true));
+        q.set_bus_master_gate(gate.clone());
+        assert!(q.avail_position(m).unwrap().is_some());
+        assert!(q.unconsumed_used(m).unwrap().is_some());
+
+        gate.store(false, Ordering::Release);
+        assert!(q.avail_position(m).unwrap().is_none());
+        assert!(q.unconsumed_used(m).unwrap().is_none());
+    }
+
+    /// Under EVENT_IDX, losing the interrupt for one completion means the next one asks for
+    /// none either — the driver's `used_event` stays behind, so later completions never cross
+    /// it again — which is why a lost interrupt needs the stall check, and why that check sees
+    /// both completions as unconsumed.
+    #[test]
+    fn after_a_lost_interrupt_later_completions_ask_for_none() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+        q.set_event_idx(true);
+        q.add_used(m, 0, 1).unwrap();
+        // The driver consumed entry 0 and re-armed: interrupt me after entry 1.
+        vq.avail.event.set(1);
+
+        q.add_used(m, 1, 1).unwrap();
+        assert!(
+            q.needs_notification(m).unwrap(),
+            "entry 1 crosses used_event"
+        );
+        // ... and that interrupt is lost. The driver never runs, so used_event stays at 1.
+        q.add_used(m, 2, 1).unwrap();
+        assert!(
+            !q.needs_notification(m).unwrap(),
+            "entry 2 does not cross it again"
+        );
+
+        assert_eq!(q.unconsumed_used(m).unwrap().unwrap().unconsumed(), 2);
     }
 
     /// A device handing over several chains as one step records them all before the index

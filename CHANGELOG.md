@@ -67,6 +67,13 @@ All notable changes to virtkit will be documented in this file.
   a refused product key, or virtio drivers that do not match this Windows.
 - **Two builds installing the same Windows base at once on one host both work.** The one
   that finished second went on with a wrong Administrator password.
+- **A virtio-fs request whose notification went missing no longer blocks its guest for good.**
+  A CI job sat for hours in a directory read on its checkout's virtio-fs layer, waiting on a
+  request the VMM had either not noticed or answered without the guest being told. Every 10
+  seconds the VMM now checks each virtio-fs queue that held work and did not move since the
+  previous check, and serves the requests it had not noticed or notifies the guest again of
+  answers it has not picked up: such a request now waits 10 to 20 seconds. The first recovery
+  at a given point is logged as a warning in the VMM log.
 
 ## [0.89.0] - 2026-10-13
 
