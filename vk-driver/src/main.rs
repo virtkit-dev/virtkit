@@ -2772,43 +2772,19 @@ fn raise_nofile() {
 }
 
 /// Drive a `vk service` subcommand against the host service manager over the vsock control
-/// plane. `up` streams the on-demand build's progress to stderr as it arrives, then prints
-/// the final reply. `down` and `status` are single round-trips, but `down` may take up to a
-/// minute while the guest powers off.
+/// plane (see [`vk_core::fleetctl::ServiceOp::run`]).
 async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
-    use vk_core::fleetctl::{Client, Request};
-    let mut client = Client::new();
-    let reply = match cmd {
-        ServiceCmd::Up { name } => {
-            // build progress goes to stderr so stdout carries only the final result line.
-            let mut on_progress = |line: &str| eprintln!("{line}");
-            client
-                .request_streamed(&Request::Start { unit: name.clone() }, &mut on_progress)
-                .await
-        }
-        ServiceCmd::Down { name } => client.request(&Request::Stop { unit: name.clone() }).await,
-        ServiceCmd::Reboot { name } => {
-            client
-                .request(&Request::Reboot { unit: name.clone() })
-                .await
-        }
-        ServiceCmd::Status { name: Some(n) } => {
-            client.request(&Request::Status { unit: n.clone() }).await
-        }
-        ServiceCmd::Status { name: None } => client.request(&Request::List).await,
+    use vk_core::fleetctl::{Client, ServiceOp};
+    let op = match cmd {
+        ServiceCmd::Up { name } => ServiceOp::Up(name.clone()),
+        ServiceCmd::Down { name } => ServiceOp::Down(name.clone()),
+        ServiceCmd::Reboot { name } => ServiceOp::Reboot(name.clone()),
+        ServiceCmd::Status { name } => ServiceOp::Status(name.clone()),
     };
+    let reply = op.run(&mut Client::new()).await;
     match reply {
         Ok(reply) => {
-            for u in &reply.units {
-                println!("{:<16} {:<9} {}", u.name, u.state, u.ip);
-            }
-            if !reply.message.is_empty() {
-                if reply.ok {
-                    println!("{}", reply.message);
-                } else {
-                    eprintln!("{}", reply.message);
-                }
-            }
+            reply.print();
             if reply.ok {
                 ExitCode::SUCCESS
             } else {

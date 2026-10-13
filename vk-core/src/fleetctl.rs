@@ -54,6 +54,62 @@ pub struct Reply {
     pub units: Vec<UnitStatus>,
 }
 
+/// What `vk service` asks the manager, one variant per subcommand.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServiceOp {
+    Up(String),
+    Down(String),
+    Reboot(String),
+    /// One service, or every one.
+    Status(Option<String>),
+}
+
+/// Usage for `vk service` arguments parsed by [`ServiceOp::parse`].
+pub const SERVICE_USAGE: &str = "usage: vk service up|down|reboot NAME | vk service status [NAME]";
+
+impl ServiceOp {
+    /// Parse the arguments after `vk service`.
+    pub fn parse(args: &[String]) -> Option<ServiceOp> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        Some(match args.as_slice() {
+            ["up", name] => ServiceOp::Up(name.to_string()),
+            ["down", name] => ServiceOp::Down(name.to_string()),
+            ["reboot", name] => ServiceOp::Reboot(name.to_string()),
+            ["status"] => ServiceOp::Status(None),
+            ["status", name] => ServiceOp::Status(Some(name.to_string())),
+            _ => return None,
+        })
+        .filter(|op| match op {
+            ServiceOp::Up(n) | ServiceOp::Down(n) | ServiceOp::Reboot(n) => !n.starts_with('-'),
+            ServiceOp::Status(n) => !n.as_deref().is_some_and(|n| n.starts_with('-')),
+        })
+    }
+
+    /// Ask the manager. `up` streams its on-demand build's progress to stderr, so stdout
+    /// carries only the result. `down` may take up to a minute while the guest powers off.
+    pub async fn run(&self, client: &mut Client) -> Result<Reply> {
+        let mut on_progress = |line: &str| eprintln!("{line}");
+        match self {
+            ServiceOp::Up(unit) => {
+                let req = Request::Start { unit: unit.clone() };
+                client.request_streamed(&req, &mut on_progress).await
+            }
+            ServiceOp::Down(unit) => client.request(&Request::Stop { unit: unit.clone() }).await,
+            ServiceOp::Reboot(unit) => {
+                client
+                    .request(&Request::Reboot { unit: unit.clone() })
+                    .await
+            }
+            ServiceOp::Status(Some(unit)) => {
+                client
+                    .request(&Request::Status { unit: unit.clone() })
+                    .await
+            }
+            ServiceOp::Status(None) => client.request(&Request::List).await,
+        }
+    }
+}
+
 /// A response frame. Every request is answered by a frame stream: zero or more `Progress`
 /// lines — a streamed op, e.g. `Start` forwarding an on-demand service build's output — then
 /// exactly one terminal `Done` carrying the reply. A non-streaming op sends only `Done`.
@@ -64,6 +120,23 @@ pub enum Frame {
 }
 
 impl Reply {
+    /// Print as `vk service` does: the units, then the message — on stderr for a failure,
+    /// with a stand-in when it has none, so a failure is never silent.
+    pub fn print(&self) {
+        for u in &self.units {
+            println!("{:<16} {:<9} {}", u.name, u.state, u.ip);
+        }
+        if !self.ok {
+            if self.message.is_empty() {
+                eprintln!("the service manager reported a failure with no detail");
+            } else {
+                eprintln!("{}", self.message);
+            }
+        } else if !self.message.is_empty() {
+            println!("{}", self.message);
+        }
+    }
+
     pub fn ok(message: impl Into<String>) -> Self {
         Reply {
             ok: true,
@@ -231,6 +304,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_op_parses_vk_service_args() {
+        let parse =
+            |a: &[&str]| ServiceOp::parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse(&["up", "db"]), Some(ServiceOp::Up("db".into())));
+        assert_eq!(parse(&["down", "db"]), Some(ServiceOp::Down("db".into())));
+        assert_eq!(
+            parse(&["reboot", "db"]),
+            Some(ServiceOp::Reboot("db".into()))
+        );
+        assert_eq!(parse(&["status"]), Some(ServiceOp::Status(None)));
+        assert_eq!(
+            parse(&["status", "db"]),
+            Some(ServiceOp::Status(Some("db".into())))
+        );
+        for bad in [
+            &[][..],
+            &["up"],
+            &["up", "a", "b"],
+            &["up", "--help"],
+            &["start", "db"],
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?}");
+        }
+    }
 
     /// A peer that never ends its line is cut off at the bound rather than buffered without end.
     #[tokio::test]
