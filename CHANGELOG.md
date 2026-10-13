@@ -38,6 +38,8 @@ All notable changes to virtkit will be documented in this file.
 - **Localized Windows media install.** Setup runs in the medium's own language instead of
   en-US, and a generalized image keeps it. Hosts install Windows again once, as the install
   medium changed.
+- **Retail Windows media install.** ISOs that carry `install.esd` instead of `install.wim`
+  install too.
 
 ### Changed
 
