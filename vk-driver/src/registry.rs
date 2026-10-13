@@ -1059,7 +1059,7 @@ pub fn push_ext4_diff(
     parent_layers: &[OciDescriptor],
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
     if let Some(root) = rg.local_root() {
-        return local::push_ext4_diff(
+        return local::push_disk_diff(
             &root,
             name,
             tag,
@@ -1072,7 +1072,7 @@ pub fn push_ext4_diff(
         );
     }
     block_on(with_upload_retry("diff push", |force| {
-        push_ext4_diff_async(
+        push_disk_diff_async(
             rg,
             name,
             tag,
@@ -1088,11 +1088,11 @@ pub fn push_ext4_diff(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn push_ext4_diff_async(
+async fn push_disk_diff_async(
     rg: &Registry,
     name: &str,
     tag: &str,
-    ext4: &Path,
+    disk: &Path,
     boot_kind: &str,
     total_size: u64,
     dirty: &[(u64, u64)],
@@ -1120,11 +1120,11 @@ async fn push_ext4_diff_async(
         None
     };
 
-    // `ext4` is the stage's captured overlay (a qcow2 over the stage image); read changed
+    // `disk` is the stage's captured overlay (a qcow2 over the stage image); read changed
     // regions from it directly via the native reader — no flat-raw `qemu-img convert`. A
     // parent chunk straddling a dirty extent still reads correctly: `read_at` resolves the
     // unchanged part through the backing chain.
-    let mut q = crate::qcow2::Qcow2::open(ext4)?;
+    let mut q = crate::qcow2::Qcow2::open(disk)?;
     let mut layers: Vec<OciDescriptor> = Vec::with_capacity(parent_layers.len());
     let (mut uploaded, mut reused, mut regened, mut added) = (0usize, 0usize, 0usize, 0usize);
     let mut covered: Vec<(u64, u64)> = Vec::with_capacity(parent_layers.len());
@@ -1155,7 +1155,7 @@ async fn push_ext4_diff_async(
         // keeps the parent's stale bytes. Freed clusters read safely: imago maps them to zero.
         let mut buf = vec![0u8; length as usize];
         q.read_at(offset, &mut buf).with_context(|| {
-            format!("reading {length} bytes at {offset} from {}", ext4.display())
+            format!("reading {length} bytes at {offset} from {}", disk.display())
         })?;
         zero_ranges(&mut buf, offset, holes);
         regened += 1;
@@ -1183,7 +1183,7 @@ async fn push_ext4_diff_async(
     // Writes into regions that were holes in the parent (e.g. new files in former free
     // space): dirty and covered by no parent chunk. With no parent at all, this must become
     // a full chain re-chunk; otherwise a FROM-scratch stage (or a push after a missed
-    // parent) would cache only the dirty overlay clusters and omit untouched ext4 metadata
+    // parent) would cache only the dirty overlay clusters and omit untouched disk metadata
     // inherited from its backing image.
     let new_regions = if parent_layers.is_empty() {
         q.chain_data_extents()?
@@ -1196,7 +1196,7 @@ async fn push_ext4_diff_async(
     for (start, len) in new_regions {
         // stream this region from the captured overlay (qcow2) via the native reader.
         let reader: Box<dyn std::io::Read + Send> = Box::new(crate::qcow2::RegionReader::new(
-            crate::qcow2::Qcow2::open(ext4)?,
+            crate::qcow2::Qcow2::open(disk)?,
             start,
             len,
         ));
@@ -1209,7 +1209,7 @@ async fn push_ext4_diff_async(
             chunkmap.as_deref(),
             reader,
             start,
-            ext4,
+            disk,
             force,
         )
         .await?
@@ -1233,7 +1233,7 @@ async fn push_ext4_diff_async(
         compression: "zstd".to_string(),
         has_kernel: false,
         has_initrd: false,
-        // The build-sharing path pushes an ext4 by fingerprint; no runtime config rides it.
+        // The build-sharing path pushes a disk by fingerprint; no runtime config rides it.
         run_config: None,
     };
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
@@ -3392,11 +3392,11 @@ mod local {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn push_ext4_diff(
+    pub(super) fn push_disk_diff(
         root: &Path,
         name: &str,
         tag: &str,
-        ext4: &Path,
+        disk: &Path,
         boot_kind: &str,
         total_size: u64,
         dirty: &[(u64, u64)],
@@ -3405,10 +3405,10 @@ mod local {
     ) -> Result<(Vec<OciDescriptor>, u64, String)> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
-        // same shape as push_ext4_diff_async: reuse clean parent chunks, drop freed ones as
+        // same shape as push_disk_diff_async: reuse clean parent chunks, drop freed ones as
         // holes, re-chunk the dirty ones from the captured overlay, then chunk writes into
         // former holes.
-        let mut q = crate::qcow2::Qcow2::open(ext4)?;
+        let mut q = crate::qcow2::Qcow2::open(disk)?;
         let mut layers: Vec<OciDescriptor> = Vec::with_capacity(parent_layers.len());
         let mut covered: Vec<(u64, u64)> = Vec::with_capacity(parent_layers.len());
         for layer in parent_layers {
@@ -3430,7 +3430,7 @@ mod local {
             // hole never reassembles as the parent's stale data.
             let mut buf = vec![0u8; length as usize];
             q.read_at(offset, &mut buf).with_context(|| {
-                format!("reading {length} bytes at {offset} from {}", ext4.display())
+                format!("reading {length} bytes at {offset} from {}", disk.display())
             })?;
             zero_ranges(&mut buf, offset, holes);
             if buf.iter().all(|&b| b == 0) {
@@ -3456,12 +3456,12 @@ mod local {
         chunk_regions_into(
             &store,
             &new_regions,
-            ext4,
+            disk,
             |start, len| {
                 // a private qcow2 handle per region: the mapping cache is not shared, and a
                 // reader owns its position.
                 Ok(crate::qcow2::RegionReader::new(
-                    crate::qcow2::Qcow2::open(ext4)?,
+                    crate::qcow2::Qcow2::open(disk)?,
                     start,
                     len,
                 ))
@@ -3711,7 +3711,7 @@ mod local {
     }
 
     /// Store the config blob + the bundle manifest and tag it — the local counterpart
-    /// of the config/manifest tail of `push_async`/`push_ext4_diff_async`, producing
+    /// of the config/manifest tail of `push_async`/`push_disk_diff_async`, producing
     /// the identical manifest JSON. Returns the manifest digest.
     fn put_bundle_manifest(
         store: &Store,
@@ -5353,7 +5353,7 @@ mod tests {
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         // A dense parent, then an untouched overlay with one dirty cluster: the diff
-        // push (push_ext4_diff_async) reuses the clean parent chunks and pushes only the
+        // push (push_disk_diff_async) reuses the clean parent chunks and pushes only the
         // dirty one. Its manifest PUT is answered with a `Location` URL; the caller needs
         // the digest, which pins the child stage and anything derived from it.
         let base = dir.join("base.ext4");
