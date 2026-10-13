@@ -181,7 +181,7 @@ job's plain GitLab `image:` is read the same way):
   one job to the next.
   The job's script runs commands in its services with `vk exec --service NAME [-b] [-t]
   [--user U] [--dir D] [--env K=V] [--clear-env] -- CMD…`, as on a host: the job VM's
-  `vk` (`/run/vk/bin/vk`, last on its `PATH`) passes
+  `vk` (`/run/vk/bin/vk`, last on its `PATH`; an image's own `vk` hands off to it) passes
   it to the host over the VM's host command channel, which runs that one form, into the
   job's own services, and refuses anything else — no other host command, no other job.
   It does grant the job more than its network does: each request starts a host `vk`

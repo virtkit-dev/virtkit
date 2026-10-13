@@ -3141,6 +3141,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
     {
         return host_policy_cmd(policy, workspace, argv);
     }
+    // Inside a VM whose host serves its services' `vk exec` (a CI job, a compose run's
+    // primary), `vk exec --service` goes through that channel's own `vk` — unless the current
+    // directory names a VM run inside this one, which is local. Before Config::load: this VM
+    // need not have a config, and the guest `vk` takes none.
+    if let Some(argv) = guest_vk_exec_argv(&cli.cmd)
+        && Path::new(GUEST_VK).exists()
+        && !vms::still_registered(None)
+    {
+        use std::os::unix::process::CommandExt;
+        let e = std::process::Command::new(GUEST_VK).args(argv).exec();
+        return fail(&anyhow::anyhow!("running {GUEST_VK}: {e}"), 1);
+    }
     // What a guest's `vk` asks decides on its argv and the services under its dir alone —
     // before Config::load, so nothing the guest sends reaches the config or its loading.
     if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
@@ -5087,6 +5099,49 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// The guest `vk` of a VM whose host serves its services' `vk exec`.
+const GUEST_VK: &str = "/run/vk/bin/vk";
+
+/// Rebuild `vk exec --service` without a target for [`GUEST_VK`] from parsed flags,
+/// excluding this vk's global flags (`--config`).
+fn guest_vk_exec_argv(cmd: &Cmd) -> Option<Vec<String>> {
+    let Cmd::Exec {
+        target: None,
+        service: Some(service),
+        background,
+        clear_env,
+        env,
+        dir,
+        tty,
+        user,
+        command,
+    } = cmd
+    else {
+        return None;
+    };
+    let mut argv = vec!["exec".to_string(), "--service".to_string(), service.clone()];
+    for (set, flag) in [
+        (*background, "--background"),
+        (*tty, "--tty"),
+        (*clear_env, "--clear-env"),
+    ] {
+        if set {
+            argv.push(flag.to_string());
+        }
+    }
+    for (flag, value) in [("--user", user), ("--dir", dir)] {
+        if let Some(value) = value {
+            argv.extend([flag.to_string(), value.clone()]);
+        }
+    }
+    for e in env {
+        argv.extend(["--env".to_string(), e.clone()]);
+    }
+    argv.push("--".to_string());
+    argv.extend(command.iter().cloned());
+    Some(argv)
+}
+
 /// `vk host-policy <policy> --workspace DIR -- <argv…>`: decide, then become the command.
 ///
 /// 126 is the shell's "found but not executable" code, and what the guest sees for anything
@@ -6339,6 +6394,59 @@ mod tests {
         assert!(
             err.contains("127.0.0.1:5000") && err.contains("--root"),
             "{err}"
+        );
+    }
+
+    /// An image's `vk exec --service` reaches the guest `vk` as the same request, rebuilt
+    /// without this vk's own flags; one with a target, or no service, stays here.
+    #[test]
+    fn the_guest_vk_gets_the_exec_rebuilt_without_global_flags() {
+        let argv = |a: &[&str]| guest_vk_exec_argv(&Cli::try_parse_from(a).unwrap().cmd);
+        assert_eq!(
+            argv(&[
+                "vk",
+                "--config",
+                "exec",
+                "exec",
+                "--service",
+                "db",
+                "-b",
+                "--user",
+                "pg",
+                "--env",
+                "A=1",
+                "--dir",
+                "/srv",
+                "--",
+                "sh",
+                "-c",
+                "--config=x",
+            ]),
+            Some(
+                [
+                    "exec",
+                    "--service",
+                    "db",
+                    "--background",
+                    "--user",
+                    "pg",
+                    "--dir",
+                    "/srv",
+                    "--env",
+                    "A=1",
+                    "--",
+                    "sh",
+                    "-c",
+                    "--config=x",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        assert_eq!(argv(&["vk", "exec", "--", "true"]), None);
+        assert_eq!(
+            argv(&["vk", "exec", "/proj", "--service", "db", "--", "true"]),
+            None
         );
     }
 

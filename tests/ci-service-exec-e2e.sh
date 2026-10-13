@@ -13,7 +13,8 @@
 #      request's --dir and --user are ignored;
 #   3. with `[executor] guest_service_exec = false`, the job VM has no `vk` and no channel;
 #   4. a `vk run --compose` primary reaches its services the same way, has neither with
-#      --no-service-exec, and is refused a state dir the guest can write.
+#      --no-service-exec, and is refused a state dir the guest can write;
+#   5. an image's own `vk` hands `vk exec --service` off to the guest one.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
 # Needs: a `vk` with an embedded agent and kernel, KVM, and network to pull alpine and debian.
@@ -192,4 +193,11 @@ fi
 grep -q -- "--no-service-exec" "$root/stage.log" || fail "the refusal does not name the way out"
 echo "ok"
 
+echo "== 5. an image's own vk hands off =="
+"$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" \
+  -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c '
+    [ "$(command -v vk)" = /usr/local/bin/vk ] &&
+    [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]' \
+  >"$root/stage.log" 2>&1 || fail "the image's vk did not reach the service"
+echo "ok"
 echo "PASS"

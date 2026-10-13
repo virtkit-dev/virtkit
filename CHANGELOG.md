@@ -40,11 +40,11 @@ All notable changes to virtkit will be documented in this file.
 - **A CI job, or a `vk run --compose` primary, runs commands in its compose services with
   `vk exec --service`**, from inside its own VM: `vk exec --service db -- psql -c 'select 1'`
   runs in the `db` service, its output and exit status back in the caller. The image needs
-  no `vk` of its own. Only that command, into the VM's own services, is allowed — but as
-  any user of the service, root included, and with that service's network access. On by
-  default; `[executor] guest_service_exec = false` turns it off for CI jobs, and
-  `vk run --no-service-exec` for a run, whose `--state-dir` must otherwise be out of the
-  guest's reach.
+  no `vk` of its own, and an image's own `vk` does the same. Only that command, into the
+  VM's own services, is allowed — but as any user of the service, root included, and with
+  that service's network access. On by default; `[executor] guest_service_exec = false`
+  turns it off for CI jobs, and `vk run --no-service-exec` for a run, whose `--state-dir`
+  must otherwise be out of the guest's reach.
 
 ### Changed
 

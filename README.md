@@ -469,7 +469,7 @@ guest in place on the same disks; `status` reports one or all.
 `vk exec --service NAME -- CMD` runs a command in one of them, with the host `vk exec`'s
 flags. The primary needs no `vk` of its own for it: `/run/vk/bin/vk`, last on its `PATH`,
 passes the command to the host over the primary's host command channel. The host runs that
-one form, into this run's services, and nothing else.
+one form, into this run's services, and nothing else; an image's own `vk` hands off to it.
 `--no-service-exec` turns it off, and `--host-exec` replaces this restricted channel, and
 that `vk`, with the whole channel. The run's `--state-dir` must then be out of the guest's
 reach: not in a read-write volume nor under `--workdir`.
