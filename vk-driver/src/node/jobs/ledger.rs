@@ -231,7 +231,7 @@ impl Ledger {
 
     /// Give a reservation back; one already gone answers `released` too.
     pub fn release(&mut self, id: &str) -> LeaseState {
-        self.entries.remove(id);
+        self.drop_entry(id);
         LeaseState::Gone {
             why: LeaseEnd::Released,
         }
@@ -239,7 +239,20 @@ impl Ledger {
 
     /// Release every reservation, as a quarantine does: their IDs.
     pub fn release_all(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.entries).into_keys().collect()
+        let ids: Vec<String> = self.entries.keys().cloned().collect();
+        for id in &ids {
+            self.drop_entry(id);
+        }
+        ids
+    }
+
+    /// Drop reservation `id` and its ledger entry. The entry's file goes too: closing it is
+    /// not enough, as a child forked meanwhile and not yet exec'd shares its lock, keeping
+    /// it counted until then.
+    fn drop_entry(&mut self, id: &str) {
+        if let Some(Entry { held: Some(_), .. }) = self.entries.remove(id) {
+            admit::release(&self.limits.admit_dir, &ledger_name(id));
+        }
     }
 
     /// Drop the reservations whose lease ran out: their IDs.
@@ -251,7 +264,7 @@ impl Ledger {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &gone {
-            self.entries.remove(id);
+            self.drop_entry(id);
         }
         gone
     }
