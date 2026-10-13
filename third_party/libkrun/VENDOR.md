@@ -380,7 +380,11 @@ and would drop it. Each queue's notification register gets an ioeventfd on the q
 so a kick no longer traps to the VMM thread; when the guest relocates BAR0 the transport tells
 the VMM (`on_bar0_moved`), which moves the ioeventfds with it, so none is left to swallow writes
 at the old address. They stay armed while the guest turns memory decoding off (the trapping path
-then answers nothing).
+then answers nothing). Re-enabling bus mastering on a live device wakes every ready queue: a kick
+that came through the ioeventfd while it was off was read by a worker that could pop nothing. A
+device that refused its reset is not woken. A kernel that clears bus mastering at shutdown without
+resetting the device (as before a kexec) leaves it live: its old rings are woken when the next
+kernel sets bus mastering, until that kernel resets it.
 
 `src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
 builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
@@ -405,8 +409,9 @@ past the INTx GSIs (5–23 less the SCI's 9) get interrupt pin 0, line 0xff and 
 and interrupt over MSI-X alone, so bus 0's 31 slots are the limit.
 
 Covered by the `virtio::pci::tests` (`msix_*`, `with_msix_enabled_*`, `without_msix_*`,
-`queue_notify_ioevents_*`, `a_shared_memory_region_*`, `a_device_without_intx_*`), the
-`virtio::msix` tests (masked-function routes: `function_mask_keeps_routes_only_disable_clears_them`,
+`queue_notify_ioevents_*`, `a_shared_memory_region_*`, `a_device_without_intx_*`,
+`bus_master_reenable_*`), the `virtio::msix` tests
+(masked-function routes: `function_mask_keeps_routes_only_disable_clears_them`,
 `function_mask_defers_route_updates_and_replays_pending`) and the `legacy::gsi` tests.
 
 ### Interrupt trigger mode

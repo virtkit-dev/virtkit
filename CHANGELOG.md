@@ -74,9 +74,9 @@ All notable changes to virtkit will be documented in this file.
   previous check, and serves the requests it had not noticed or notifies the guest again of
   answers it has not picked up: such a request now waits 10 to 20 seconds. The first recovery
   at a given point is logged as a warning in the VMM log.
-- **A VM no longer loses a virtio-pci interrupt raised just before its MSI-X function is
-  masked.** Masking removed the interrupt routes, so a signal KVM injected after the mask was
-  dropped.
+- **A VM no longer loses virtio-pci interrupts or stalls requests when its driver masks MSI-X
+  or disables bus mastering.** Masking removed interrupt routes and dropped signals delivered
+  afterward; requests queued with bus mastering off could stall until the next request.
 
 ## [0.89.0] - 2026-10-13
 

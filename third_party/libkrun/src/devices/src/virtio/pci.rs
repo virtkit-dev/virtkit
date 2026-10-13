@@ -1336,17 +1336,28 @@ impl VirtioPciTransport {
         }
     }
 
-    fn activate_if_ready(&mut self) {
-        if !self.bus_master_enabled.load(Ordering::Acquire)
-            || self.state.device_status & device_status::DRIVER_OK == 0
-        {
+    /// Bus mastering came on: activate a device the driver finished setting up while it was
+    /// off and replay the notifications held meanwhile, or wake every ready queue of a live one.
+    /// A device that refused its reset is left alone: the driver that reset it no longer uses its
+    /// rings, and no later one can bring it up again.
+    fn on_bus_master_enable(&mut self) {
+        debug_assert!(self.bus_master_enabled.load(Ordering::Acquire));
+        if self.reset_unsupported {
+            for registers in &mut self.queue_registers {
+                registers.notification_pending = false;
+            }
             return;
         }
-
-        if !self.state.locked_device().is_activated() {
-            self.state.activate(self.device_interrupt.clone());
+        if self.state.device_status & device_status::DRIVER_OK == 0 {
+            return;
         }
-        self.replay_pending_queue_notifications();
+        let activated = self.state.locked_device().is_activated();
+        if activated {
+            self.wake_ready_queues();
+        } else {
+            self.state.activate(self.device_interrupt.clone());
+            self.replay_pending_queue_notifications();
+        }
     }
 
     fn replay_pending_queue_notifications(&mut self) {
@@ -1364,6 +1375,28 @@ impl VirtioPciTransport {
                 if let Err(err) = event.write(QUEUE_EVENT_SIGNAL) {
                     warn!("failed to notify virtio-pci queue {queue_index}: {err}");
                 }
+            }
+        }
+    }
+
+    /// Bus mastering came back on a live device: wake every ready queue, not only those whose
+    /// notification this transport held. A notification can bypass it — KVM's ioeventfd writes
+    /// the queue's eventfd directly — and a worker that read that eventfd while the gate was
+    /// closed popped nothing and armed nothing, so the chains the driver queued meanwhile would
+    /// wait for a kick that already happened. A wake with nothing queued costs an empty drain.
+    fn wake_ready_queues(&mut self) {
+        for (queue_index, ((registers, setup), event)) in self
+            .queue_registers
+            .iter_mut()
+            .zip(self.state.queue_setups())
+            .zip(self.state.queue_evts())
+            .enumerate()
+        {
+            registers.notification_pending = false;
+            if setup.ready
+                && let Err(err) = event.write(QUEUE_EVENT_SIGNAL)
+            {
+                warn!("failed to notify virtio-pci queue {queue_index}: {err}");
             }
         }
     }
@@ -1716,7 +1749,7 @@ impl PciFunction for VirtioPciTransport {
             self.interrupt
                 .set_intx_disabled(command & PCI_COMMAND_INTX_DISABLE != 0);
             if !bus_master_was_enabled && bus_master_enabled {
-                self.activate_if_ready();
+                self.on_bus_master_enable();
             }
         }
 
@@ -1956,6 +1989,37 @@ mod tests {
         assert_eq!(
             PciFunction::read_bar(transport, address, data),
             PciBarAccess::Handled
+        );
+    }
+
+    /// Set up queue `index` as a driver does between FEATURES_OK and DRIVER_OK, its rings
+    /// apart from every other queue's.
+    fn enable_queue(transport: &mut VirtioPciTransport, bar: u64, index: u16) {
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_SELECT,
+            &index.to_le_bytes(),
+        );
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_SIZE,
+            &TEST_SELECTED_QUEUE_SIZE.to_le_bytes(),
+        );
+        let apart = 0x100 * u32::from(index);
+        for (offset, address) in [
+            (common_cfg::QUEUE_DESCRIPTOR, TEST_DESCRIPTOR_ADDRESS),
+            (common_cfg::QUEUE_DRIVER, TEST_DRIVER_ADDRESS),
+            (common_cfg::QUEUE_DEVICE, TEST_DEVICE_ADDRESS),
+        ] {
+            write_bar(transport, bar, offset, &(address + apart).to_le_bytes());
+        }
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_ENABLE,
+            &VIRTIO_QUEUE_READY.to_le_bytes(),
         );
     }
 
@@ -2954,6 +3018,8 @@ mod tests {
                     as u8,
             ],
         );
+        enable_queue(&mut transport, bar_base, 0);
+        enable_queue(&mut transport, bar_base, 1);
         write_bar(
             &mut transport,
             bar_base,
@@ -3003,7 +3069,138 @@ mod tests {
             pci_config::COMMAND as u16,
             &(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER).to_le_bytes(),
         );
+        // The device is live: every ready queue is woken once, queue 0's held notification
+        // among them.
         assert_eq!(queue_events[0].read().unwrap(), QUEUE_EVENT_SIGNAL);
-        assert!(queue_events[1].read().is_err());
+        assert_eq!(queue_events[1].read().unwrap(), QUEUE_EVENT_SIGNAL);
+    }
+
+    /// A kick that reached a queue's eventfd through KVM's ioeventfd while bus mastering was
+    /// off — the transport never saw it, so held nothing — is still served once mastering is
+    /// back: the worker that read it then popped nothing, so the queue must be woken again.
+    #[test]
+    fn bus_master_reenable_wakes_queues_whose_kick_bypassed_the_transport() {
+        let (mut transport, _) = transport_with_queue_config(&MULTI_QUEUE_CONFIG);
+        let bar_base = enable_memory_bar(&mut transport);
+        let queue_events = transport.state.queue_evts().to_vec();
+        for status in [
+            device_status::ACKNOWLEDGE,
+            device_status::ACKNOWLEDGE | device_status::DRIVER,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        ] {
+            write_bar(
+                &mut transport,
+                bar_base,
+                common_cfg::DEVICE_STATUS,
+                &[status as u8],
+            );
+        }
+        // Queue 1 only: queue 0 stays as the driver left it, never enabled.
+        enable_queue(&mut transport, bar_base, 1);
+        write_bar(
+            &mut transport,
+            bar_base,
+            common_cfg::DEVICE_STATUS,
+            &[(device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK) as u8],
+        );
+        assert!(transport.state.locked_device().is_activated());
+
+        write_config(
+            &mut transport,
+            pci_config::COMMAND as u16,
+            &PCI_COMMAND_MEMORY.to_le_bytes(),
+        );
+        // The ioeventfd path: the eventfd is written behind the transport's back, and the
+        // worker consumes it while its queue's gate is closed.
+        queue_events[1].write(QUEUE_EVENT_SIGNAL).unwrap();
+        assert_eq!(queue_events[1].read().unwrap(), QUEUE_EVENT_SIGNAL);
+        // A notification the transport holds for the queue that was never enabled is dropped.
+        write_bar(
+            &mut transport,
+            bar_base,
+            NOTIFY_CFG_OFFSET,
+            &0u16.to_le_bytes(),
+        );
+
+        write_config(
+            &mut transport,
+            pci_config::COMMAND as u16,
+            &(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER).to_le_bytes(),
+        );
+        assert_eq!(queue_events[1].read().unwrap(), QUEUE_EVENT_SIGNAL);
+        // A queue the driver never enabled has no rings to pop from.
+        assert!(queue_events[0].read().is_err());
+    }
+
+    /// A device that refused its reset keeps the old driver's rings: bus mastering coming back
+    /// (the next kernel after a kexec) must not wake its workers on them.
+    #[test]
+    fn bus_master_reenable_leaves_a_device_that_refused_its_reset_alone() {
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_GUEST_MEMORY_SIZE)]).unwrap();
+        let mut transport = VirtioPciTransport::new(
+            mem,
+            Arc::new(Mutex::new(DummyDevice {
+                acked_features: 0,
+                activated: false,
+                first_queue_at: None,
+                queue_config: &MULTI_QUEUE_CONFIG,
+                shm: None,
+                resettable: false,
+            })),
+            Some(5),
+            Arc::new(DummyIntxLine::default()),
+            0,
+        )
+        .unwrap();
+        let bar_base = enable_memory_bar(&mut transport);
+        let queue_events = transport.state.queue_evts().to_vec();
+        for status in [
+            device_status::ACKNOWLEDGE,
+            device_status::ACKNOWLEDGE | device_status::DRIVER,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        ] {
+            write_bar(
+                &mut transport,
+                bar_base,
+                common_cfg::DEVICE_STATUS,
+                &[status as u8],
+            );
+        }
+        enable_queue(&mut transport, bar_base, 0);
+        enable_queue(&mut transport, bar_base, 1);
+        write_bar(
+            &mut transport,
+            bar_base,
+            common_cfg::DEVICE_STATUS,
+            &[(device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK) as u8],
+        );
+        assert!(transport.state.locked_device().is_activated());
+        write_bar(&mut transport, bar_base, common_cfg::DEVICE_STATUS, &[0]);
+        assert!(transport.reset_unsupported);
+        // Drain what the activation signalled.
+        for event in &queue_events {
+            let _ = event.read();
+        }
+
+        write_config(
+            &mut transport,
+            pci_config::COMMAND as u16,
+            &PCI_COMMAND_MEMORY.to_le_bytes(),
+        );
+        write_config(
+            &mut transport,
+            pci_config::COMMAND as u16,
+            &(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER).to_le_bytes(),
+        );
+        for event in &queue_events {
+            assert!(event.read().is_err());
+        }
     }
 }
