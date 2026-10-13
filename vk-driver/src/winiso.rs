@@ -418,6 +418,40 @@ pub(crate) struct Base {
     pub key: String,
 }
 
+/// The base layer `key` recorded in its directory `dir`, if `dir` holds one.
+fn read_base(dir: &Path, key: &str) -> Result<Option<Base>> {
+    let path = dir.join("base.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let password = serde_json::from_str::<serde_json::Value>(&text)
+        .with_context(|| format!("parsing {}", path.display()))?["password"]
+        .as_str()
+        .with_context(|| format!("{}: no password", path.display()))?
+        .to_string();
+    Ok(Some(Base {
+        disk: dir.join("disk.qcow2"),
+        password,
+        key: key.to_string(),
+    }))
+}
+
+/// Write `record`, a base layer's `base.json`, into its unpublished directory `tmp`, readable
+/// by its owner only: it holds the Administrator password.
+fn write_base_record(tmp: &Path, record: &serde_json::Value) -> Result<()> {
+    let path = tmp.join("base.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut file, serde_json::to_string_pretty(record)?.as_bytes())?;
+    Ok(())
+}
+
 /// The disk of the base layer `key` if `cache` holds it.
 pub(crate) fn cached_base(cache: &Path, key: &str) -> Option<PathBuf> {
     let dir = cache.join("settled").join(key);
@@ -515,18 +549,9 @@ pub(crate) fn base(
         keep_media(rg, source);
     }
     let dir = cache.join("settled").join(&key);
-    let record = dir.join("base.json");
-    if let Ok(text) = std::fs::read_to_string(&record) {
-        let password = serde_json::from_str::<serde_json::Value>(&text)?["password"]
-            .as_str()
-            .context("base.json without a password")?
-            .to_string();
+    if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
-        return Ok(Base {
-            disk: dir.join("disk.qcow2"),
-            password,
-            key,
-        });
+        return Ok(base);
     }
 
     let install_dir = cache.join("install").join(&install_key);
@@ -558,28 +583,20 @@ pub(crate) fn base(
             return Err(e);
         }
     };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(tmp.join("base.json"))?;
-    std::io::Write::write_all(
-        &mut file,
-        serde_json::to_string_pretty(&serde_json::json!({
+    write_base_record(
+        &tmp,
+        &serde_json::json!({
             "password": password,
             "edition": source.edition,
             "iso": source.iso.sha256,
             "drivers": source.drivers.sha256,
-        }))?
-        .as_bytes(),
+        }),
     )?;
     let _ = std::fs::remove_dir_all(tmp.join("settle"));
     publish(&tmp, &dir)?;
-    Ok(Base {
-        disk: dir.join("disk.qcow2"),
-        password,
-        key,
-    })
+    // What is in place, which is another build's base if it placed one first: its disk was
+    // given that build's password, not this one's.
+    read_base(&dir, &key)?.context("the base just placed has no record")
 }
 
 /// The install medium of `source`, cached or built in a helper VM. Only building the medium
@@ -847,6 +864,32 @@ fn humantime(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A base placed after another build placed its own first reads back as that build's:
+    /// its record, password included, is what stays in place.
+    #[test]
+    fn a_base_placed_second_reads_back_as_the_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("vk-winiso-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("settled").join("k");
+        assert!(read_base(&dir, "k").unwrap().is_none());
+        for password in ["first", "second"] {
+            let tmp = scratch_beside(&dir).unwrap();
+            write_base_record(&tmp, &serde_json::json!({ "password": password })).unwrap();
+            let mode = std::fs::metadata(tmp.join("base.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+            publish(&tmp, &dir).unwrap();
+            assert_eq!(read_base(&dir, "k").unwrap().unwrap().password, "first");
+        }
+        std::fs::write(dir.join("base.json"), "{}").unwrap();
+        let err = format!("{:#}", read_base(&dir, "k").unwrap_err());
+        assert!(err.contains("no password"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     const DIGEST: &str = "7b052573ba7894c9924e3e87ba732ccd354d18cb75a883efa9b900ea125bfd51";
 

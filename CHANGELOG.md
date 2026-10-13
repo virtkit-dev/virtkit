@@ -30,6 +30,11 @@ All notable changes to virtkit will be documented in this file.
   in a service. A number written with a leading zero, such as `00.5`, or too large for 64
   bits is now kept as written.
 
+### Fixed
+
+- **Two builds installing the same Windows base at once on one host both work.** The one
+  that finished second went on with a wrong Administrator password.
+
 ## [0.89.0] - 2026-10-13
 
 ### Added
