@@ -4329,6 +4329,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-testkit"
+version = "0.89.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "sha1",
+]
+
+[[package]]
 name = "vk-tpm"
 version = "0.89.0"
 dependencies = [

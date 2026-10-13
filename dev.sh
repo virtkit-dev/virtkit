@@ -13,6 +13,7 @@
 #   ./dev.sh fmt
 #   ./dev.sh fmt --check
 #   ./dev.sh test
+#   ./dev.sh build -p vk-testkit
 #   ./dev.sh check -p vk-core
 #   ./dev.sh clippy -p vk-driver --lib
 #   ./dev.sh test -p vk-core dockerignore::tests
@@ -39,8 +40,12 @@ usage: ./dev.sh check  [-p <package>] [cargo check arguments]
        ./dev.sh clippy [-p <package>] [cargo clippy arguments] [-- <lint flags>]
        ./dev.sh fmt    [-p <package>] [cargo fmt arguments] [-- <rustfmt flags>]
        ./dev.sh test   [-p <package>] [target] [test filter]
+       ./dev.sh build  -p <package> [cargo build arguments]
        ./dev.sh shell
        ./dev.sh stop
+
+`build` makes debug binaries of helpers such as vk-testkit; a runnable vk, which embeds the
+kernel and agent, comes from ./build.sh --fast.
 
 Bare `./dev.sh check`, `clippy` or `test` covers the whole workspace, every target, the
 way CI does it — so nothing hides in a crate or a test file you did not think to name.
@@ -93,7 +98,7 @@ lock_state_dir() {
 
 MODE=${1:-}
 case "$MODE" in
-  check | clippy | fmt | test)
+  check | clippy | fmt | test | build)
     shift
     ;;
   shell)
@@ -128,9 +133,10 @@ args=("$@")
 # Reject optimized profiles; broad validation is the default, and ./build.sh produces
 # shippable binaries.
 has_target=""
-# Only fmt uses this to preserve an explicit scope (`--all`, `-p`). The shared parser
-# also recognizes scope flags that cargo fmt does not use.
+# fmt uses this to preserve an explicit scope (`--all`, `-p`); build requires a package.
+# The shared parser also recognizes scope flags that cargo fmt does not use.
 has_scope=""
+has_package=""
 
 reject() {
   echo "dev.sh: $1" >&2
@@ -180,8 +186,12 @@ check_cargo_args() {
         has_target=1
         ;;
       # `-p?*` covers both the attached (`-pvk-core`) and the `=` (`-p=vk-core`) forms.
-      --all | --workspace | -p | -p?* | --package | --package=*)
+      --all | --workspace)
         has_scope=1
+        ;;
+      -p | -p?* | --package | --package=*)
+        has_scope=1
+        has_package=1
         ;;
     esac
   done
@@ -196,6 +206,8 @@ case "$MODE" in
   # Insert before `--` to support both Cargo's `./dev.sh fmt --check` and
   # rustfmt's `./dev.sh fmt -- --check`.
   fmt) [ -n "$has_scope" ] || insert_cargo_arg --all ;;
+  # A whole-workspace build would make a vk without its embedded kernel: not a usable one.
+  build) [ -n "$has_package" ] || reject "build needs -p <package>; a runnable vk comes from ./build.sh --fast" ;;
 esac
 
 # Match CI's `-D warnings` default unless the caller provides lint flags after a bare

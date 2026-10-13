@@ -16,6 +16,7 @@ members = [
     "vk-tpm",
     "vk-uefi-vars",
     "bench",
+    "vk-testkit",
 ]
 # third_party/libkrun is upstream libkrun's own cargo workspace (the 2.0 development branch),
 # vendored and locally patched (see third_party/libkrun/VENDOR.md). vk-driver depends on its

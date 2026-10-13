@@ -32,7 +32,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with fourteen crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with fifteen crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -115,6 +115,9 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with fourteen crates:
   them, Secure Boot's authenticated writes (PKCS#7, signature lists), private authenticated
   variables, variable policies and locks; crypto from RustCrypto crates only. See
   `docs/uefi-vars-design.md`.
+- **`vk-testkit/`** — helpers the end-to-end tests (`tests/*.sh`) run on the host, so a test
+  needs nothing of it but a shell and `vk`: `git-repo` writes a bare repository git's dumb
+  HTTP transport can clone. Test-only, never shipped.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list. Its `devices` crate depends on
@@ -148,6 +151,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./dev.sh test                       # the whole test suite, doctests included
 ./dev.sh check -p vk-core           # the same, narrowed to one affected crate
 ./dev.sh test -p vk-core --lib …    # one module's unit tests (see below)
+./dev.sh build -p vk-testkit        # debug binary of a test helper (not `vk`: see build.sh)
 ./dev.sh shell                      # interactive shell in that same VM
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
 ./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
@@ -173,9 +177,10 @@ the embedded kernel instead (it then needs `--kernel` at runtime, and is not shi
 
 ### Fast edit/check/test loop
 
-During iterative edits, do not run `cargo build` or release builds. Start with
-`./dev.sh check -p <affected-crate>` for type and borrow checking. Then run only the test
-target and module affected by the change, for example:
+During iterative edits, do not run `cargo build` or release builds: `./dev.sh build` is
+for a non-shipped helper such as vk-testkit, and a runnable `vk` comes from
+`./build.sh --fast`. Start with `./dev.sh check -p <affected-crate>` for type and borrow
+checking. Then run only the test target and module affected by the change, for example:
 
 ```bash
 ./dev.sh test -p vk-core --lib dockerignore::tests

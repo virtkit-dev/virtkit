@@ -1,0 +1,13 @@
+[package]
+name = "vk-testkit"
+description = "Helpers the end-to-end tests run, so they need nothing of the host but a shell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+sha1.workspace = true
