@@ -653,10 +653,13 @@ fn expand_braces(p: &str) -> Option<Vec<String>> {
 }
 
 /// A tar of `files` under `root`: directories as directories, symlinks as symlinks, with
-/// their modes and times; sockets, fifos and devices left out.
+/// their modes and times; sockets, fifos and devices left out. A sparse file is written
+/// dense, its holes as zeros: the host's artifact conversion refuses GNU sparse entries,
+/// and zip cannot hold them. Caches get it dense too, as gitlab-runner's are.
 fn write_tar(root: &Path, files: &BTreeSet<String>, out: impl Write) -> std::io::Result<()> {
     let mut tar = tar::Builder::new(out);
     tar.follow_symlinks(false);
+    tar.sparse(false);
     for rel in files {
         let abs = root.join(rel);
         let meta = match std::fs::symlink_metadata(&abs) {
@@ -1039,6 +1042,29 @@ mod tests {
         };
         assert_eq!(mode("suid"), 0o755);
         assert_eq!(mode("sgid"), 0o775);
+    }
+
+    #[test]
+    fn a_sparse_file_is_archived_dense() {
+        use std::os::unix::fs::FileExt;
+        let tmp = Tmp::new("sparse");
+        let f = std::fs::File::create(tmp.0.join("holes")).unwrap();
+        f.set_len(1 << 20).unwrap();
+        f.write_all_at(b"data", 512 << 10).unwrap();
+        let mut tar = Vec::new();
+        write_tar(&tmp.0, &BTreeSet::from(["holes".to_string()]), &mut tar).unwrap();
+        let mut archive = tar::Archive::new(tar.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.header().entry_type(), tar::EntryType::Regular);
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+        drop(entry);
+        assert_eq!(data.len(), 1 << 20);
+        let mut want = vec![0u8; 1 << 20];
+        want[512 << 10..][..4].copy_from_slice(b"data");
+        assert!(data == want, "the holes or the data moved");
+        assert!(entries.next().is_none());
     }
 
     /// Append an entry named `name` verbatim, `..` and all, linking to `link`.

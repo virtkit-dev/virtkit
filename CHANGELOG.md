@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitLab artifacts support sparse files.** Uploads fill holes with zeros, as
+  gitlab-runner uploads them, instead of failing the job after its script passes.
+  Caches also restore sparse files with their holes as zeros.
+
 ## [0.92.0] - 2026-10-16
 
 ### Added
