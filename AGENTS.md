@@ -120,7 +120,9 @@ libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list. Its `devices` crate depends on
 `vk-tpm` and `vk-uefi-vars` by path, so its `Cargo.lock` locks their dependencies too: after
 changing them, run `cargo update -p vk-tpm` (or `-p vk-uefi-vars`) in `third_party/libkrun` as
-well.
+well. CI lints and tests that workspace separately (`quality.yml`'s `libkrun` job); locally,
+point `./dev.sh` at it with `--manifest-path third_party/libkrun/Cargo.toml`, e.g.
+`./dev.sh test --manifest-path third_party/libkrun/Cargo.toml -p krun-devices --lib cmos`.
 
 The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragment
 (`kernel/`); it is pinned and built separately from the binaries.

@@ -1,7 +1,7 @@
 name: Quality
 
-# Reusable lint + test + audit + script checks, called by ci.yml (push/PR) and release.yml
-# (release gate).
+# Reusable lint + test + audit + script checks, including libkrun's separate workspace.
+# Called by ci.yml (push/PR) and release.yml (release gate).
 #
 # The cargo jobs run inside the pinned virtkit-build devcontainer image (same one
 # build.sh uses), so clippy/rustfmt are the exact versions from rust-toolchain.toml
@@ -74,6 +74,60 @@ jobs:
             -v "$PWD":/work -w /work \
             virtkit-build \
             cargo test --workspace --locked
+
+  # third_party/libkrun is a separate Cargo workspace, outside the jobs above.
+  # Lint with its default features and vk's; test with vk's. Read vk's features
+  # from vk-driver/Cargo.toml to keep them in sync. Pass the runner's /dev/kvm
+  # into the container for the vCPU tests.
+  libkrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable KVM for the runner user
+        uses: ./.github/actions/enable-kvm
+
+      - name: Build toolchain image
+        run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+
+      - name: vk's libkrun features
+        run: |
+          features=$(sed -n '/^\[dependencies.krun\]/,/^\[/s/^features = \[\(.*\)\]/\1/p' \
+            vk-driver/Cargo.toml | tr -d ' "' | sed 's/[^,]*/libkrun\/&/g')
+          [ -n "$features" ] || { echo "no krun features in vk-driver/Cargo.toml"; exit 1; }
+          echo "VK_FEATURES=$features" >> "$GITHUB_ENV"
+
+      - name: rustfmt
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD":/work -w /work/third_party/libkrun \
+            virtkit-build \
+            cargo fmt --all -- --check
+
+      - name: clippy
+        run: |
+          for features in "" "--no-default-features --features $VK_FEATURES"; do
+            docker run --rm \
+              --user "$(id -u):$(id -g)" -e HOME=/tmp \
+              -e CARGO_HOME=/work/target/.cargo-home \
+              -e CARGO_TARGET_DIR=/work/target \
+              -v "$PWD":/work -w /work/third_party/libkrun \
+              virtkit-build \
+              cargo clippy --workspace --all-targets --locked $features -- -D warnings
+          done
+
+      - name: cargo test
+        run: |
+          docker run --rm --init \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e CARGO_HOME=/work/target/.cargo-home \
+            -e CARGO_TARGET_DIR=/work/target \
+            --device /dev/kvm \
+            -v "$PWD":/work -w /work/third_party/libkrun \
+            virtkit-build \
+            cargo test --workspace --locked --no-default-features --features "$VK_FEATURES"
 
   # These two checks run on the runner without the toolchain image.
   scripts:
