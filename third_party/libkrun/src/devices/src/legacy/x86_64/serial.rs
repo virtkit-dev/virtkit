@@ -391,7 +391,7 @@ mod tests {
     }
     impl ReadableFd for SharedBuffer {}
 
-    static RAW_INPUT_BUF: [u8; 3] = [b'a', b'b', b'c'];
+    static RAW_INPUT_BUF: [u8; 3] = *b"abc";
 
     #[test]
     fn test_event_handling_no_in() {

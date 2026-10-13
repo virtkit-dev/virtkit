@@ -789,3 +789,6 @@ otherwise fails on (event 15, STATUS_OBJECT_NAME_NOT_FOUND, `Get-Tpm` then error
 Presence 1.3 with nothing pending and the requests that would queue an operation not
 implemented, and the memory clear interface, accepted as a no-op (a guest reboot relaunches the
 VMM, with zeroed RAM). Windows Server 2025 then reports the TPM present, ready and owned.
+
+`src/devices/src/legacy/x86_64/serial.rs` — a test buffer is written as a byte string, as the
+pinned clippy requires (`byte_char_slices`).

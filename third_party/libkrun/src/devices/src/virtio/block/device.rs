@@ -446,7 +446,9 @@ mod dirty_tests {
         let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         assert_eq!(count, ranges.len());
         let mut decoded = Vec::with_capacity(count);
-        for c in buf[4..].chunks_exact(16) {
+        let (chunks, rest) = buf[4..].as_chunks::<16>();
+        assert!(rest.is_empty());
+        for c in chunks {
             let off = u64::from_le_bytes(c[..8].try_into().unwrap());
             let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
             decoded.push((off, len));
