@@ -51,6 +51,10 @@ All notable changes to virtkit will be documented in this file.
 - **Compose files accept YAML merge keys.** `<<: *base` merges an anchor defined elsewhere
   in a service. A number written with a leading zero, such as `00.5`, or too large for 64
   bits is now kept as written.
+- **A CI job's memory admission counts its services**, Linux and Windows: each one's
+  `x-virtkit.mem`, else a Windows Dockerfile's `# vk: mem=`, else the default. On a host
+  with a budget and `net.mode = "switch"`, a `compose:` job's admission runs after its host
+  checkout, which holds its services.
 
 ### Fixed
 

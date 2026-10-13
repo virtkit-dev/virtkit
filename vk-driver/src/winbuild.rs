@@ -258,16 +258,6 @@ fn target_index(stages: &[Stage], target: Option<&str>) -> Result<usize> {
     }
 }
 
-/// The memory of `stage`'s guests: its `# vk: mem=`, else `mem`.
-fn stage_mem(stage: &Stage, mem: &str) -> String {
-    stage
-        .from
-        .guest
-        .mem
-        .clone()
-        .unwrap_or_else(|| mem.to_string())
-}
-
 /// The least memory, in MiB, a Windows guest installs and runs with.
 pub(crate) const WINDOWS_MIN_MIB: u64 = 2048;
 
@@ -295,6 +285,27 @@ fn guest_size(stage: &Stage, opts: &Options) -> Result<(u32, String)> {
         return Ok((cpus.min(max_cpus), format!("{max_mib}M")));
     }
     Ok((cpus.min(max_cpus), mem))
+}
+
+/// The memory the bundle `dockerfile`'s stage `target` builds boots with: its `# vk: mem=`,
+/// else `mem`, as [`build`] writes it into the bundle.
+pub(crate) fn target_mem(dockerfile: &Path, target: Option<&str>, mem: &str) -> Result<String> {
+    let text = std::fs::read_to_string(dockerfile)
+        .with_context(|| format!("reading {}", dockerfile.display()))?;
+    let stages =
+        stages(parser::parse(&text)?).with_context(|| format!("{}", dockerfile.display()))?;
+    let stage = &stages[target_index(&stages, target)?];
+    Ok(stage_mem(stage, mem))
+}
+
+/// The memory of `stage`'s guests: its `# vk: mem=`, else `mem`.
+fn stage_mem(stage: &Stage, mem: &str) -> String {
+    stage
+        .from
+        .guest
+        .mem
+        .clone()
+        .unwrap_or_else(|| mem.to_string())
 }
 
 /// Build `opts` and write its bundle.

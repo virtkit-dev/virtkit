@@ -798,7 +798,13 @@ every job on the host fail admission.
 
 By default the budget counts what a job **declares** (`MICROVM_MEM`, or `[executor.vm] mem`), which
 is nearly always far more than it uses — so a runner gated this way runs fewer jobs than it
-could.
+could. A job's services count too, each at its `x-virtkit.mem`, else a Windows Dockerfile's
+`# vk: mem=`, else the default, held under the same ceilings; a job and services that together
+exceed the whole budget are refused. Under `from_history` the job's history already holds its
+services, whose VMs are the supervisor's children, so it is capped at the guest's and the
+services' declared sizes together. With `host_checkout` and `net.mode = "switch"`, a
+`compose:` job's admission runs after the checkout, which holds its services: the clone
+itself is not admitted.
 
 ### Reserving what jobs actually use
 
@@ -1443,9 +1449,9 @@ ad-tests:
 - Its size is the compose `x-virtkit` one, else its Dockerfile's `# vk:` line, else the
   runner's `[build]` guest size, held under the runner's `vm.max_cpus`/`vm.max_mem` and
   `mem_budget` like any service; its build guests are held under them too, and less than
-  the 2G Windows needs, asked for or left by a ceiling, fails the build up front. Admission
-  does not count it yet: not its memory (as for any service), its build guests, or its disk
-  growth.
+  the 2G Windows needs, asked for or left by a ceiling, fails the build up front. Its memory
+  counts in the job's [admission](#keeping-the-host-inside-its-memory), as every service's
+  does; its build guests and its disk growth do not yet.
 - A step's network (`RUN --network=default`) follows `[egress.build]`'s allowlist as a Linux
   step's does; its audit does not cover a Windows step. Under an allowlist Windows reports no
   Internet, so BITS or winget may refuse to run unless the allowlist lets its connectivity

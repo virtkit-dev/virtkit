@@ -956,13 +956,14 @@ fn under_ceiling(samples: &[Sample], ceiling: u64) -> Vec<Sample> {
 }
 
 /// What to reserve for a job of this kind: the most it has used lately plus headroom, never
-/// below the floor and never above what the job declares. `None` when it has no history —
-/// the first run of a job is admitted against its declared size.
-pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64) -> Option<u64> {
+/// below the floor and never above `cap_mib`, what the job declares for everything its runs
+/// measured. Its history is the runs stamped with `declared_mib`, its guest's size. `None`
+/// when it has none — the first run of a job is admitted against its declared size.
+pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64, cap_mib: u64) -> Option<u64> {
     // A declared size too large to express in bytes has no history to match it: the ceiling
     // every run was stamped with went through the same conversion.
     let recent = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
-    Some(reserve_mib(recent.most / MIB, declared_mib))
+    Some(reserve_mib(recent.most / MIB, cap_mib))
 }
 
 /// What a job of this kind is expected to write into its job dir, in bytes: the most its dir
@@ -1007,7 +1008,7 @@ pub fn all_expected(root: &Path) -> Vec<u64> {
 /// is the one it would run under now.
 pub fn expect_last_mib(dir: &Path, key: &Path) -> Option<u64> {
     let ceiling = read(dir, key).last()?.ceiling;
-    expect_mib(dir, key, ceiling / MIB)
+    expect_mib(dir, key, ceiling / MIB, ceiling / MIB)
 }
 
 fn reserve_mib(most_mib: u64, declared_mib: u64) -> u64 {
@@ -2244,7 +2245,7 @@ mod tests {
         let now = 1_700_000_000;
         let day = 24 * 60 * 60;
         // No history: the caller falls back to the declared size.
-        assert_eq!(expect_mib(&dir, key("proj-test"), 8192), None);
+        assert_eq!(expect_mib(&dir, key("proj-test"), 8192, 8192), None);
 
         // The largest run in the window plus headroom, not the average — a job that peaks
         // once needs room for that run.
@@ -2547,7 +2548,7 @@ mod tests {
         // Given four times the room, the job is unknown again rather than predicted from
         // runs that were pressed against the old ceiling.
         assert_eq!(most_recent_at(&dir, key("job"), ceiling(16384), now), None);
-        assert_eq!(expect_mib(&dir, key("job"), 16384), None);
+        assert_eq!(expect_mib(&dir, key("job"), 16384, 16384), None);
 
         // Its first run at the new ceiling is what it is then read against.
         remember_at(&dir, key("job"), run(11000, 16384), now);

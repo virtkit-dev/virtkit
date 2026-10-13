@@ -355,12 +355,31 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         .with_context(|| format!("creating {}", ctx.job_dir.display()))
         .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
 
-    // Admission (`[executor.schedule]`): claim the guest RAM this job is about to boot and the
-    // room its job dir will grow into before booting it, waiting for both on a full host. Held
-    // for the rest of prepare; the supervisor takes its own hold on the same reservation, so it
-    // never lapses between the two. After the stale-job teardown above, which frees a
-    // predecessor's claim, and before anything is written into the job dir.
-    let _reservation = admit(ctx, &mem)?;
+    // Admission (`[executor.schedule]`) reserves guest and service RAM and job-dir growth,
+    // waiting for both before boot. Reserve after stale-job teardown frees the previous claim,
+    // before writing into the job dir. Hold through prepare until the supervisor has its own
+    // hold, so the reservation never lapses. With a budget and switch networking, `compose:`
+    // jobs need their checkout to size services, so checkout comes first. The clone (RAM on a
+    // tmpfs `checkout_dir`) is not admitted and stays held while admission waits. Otherwise
+    // admission comes first: the checkout has no sizes it needs.
+    let services_in_checkout = budget_mib(cfg).is_some()
+        && cfg.net.mode == "switch"
+        && ctx
+            .image_ref
+            .as_deref()
+            .is_some_and(|image| image.starts_with("compose:"));
+    let (_checkout_use, _reservation) = if services_in_checkout {
+        let checkout_use = host_checkout(ctx)?;
+        (checkout_use, admit(ctx, &mem, services_mem_mib(ctx)?)?)
+    } else {
+        // Without a budget nothing reads the services' sizes; env `services:` need no checkout.
+        let services_mib = match budget_mib(cfg) {
+            Some(_) => services_mem_mib(ctx)?,
+            None => 0,
+        };
+        let reservation = admit(ctx, &mem, services_mib)?;
+        (host_checkout(ctx)?, reservation)
+    };
     // Record job metadata beside the VM for `vk workloads`. Like the VM registry, this is
     // best-effort: failure to record metadata must not prevent the job from running.
     if let Err(e) = ctx.record(cpus, &mem) {
@@ -402,9 +421,6 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             Err((e, _)) => eprintln!("virtkit: warning: not recording guest stats: {e:#}"),
         }
     }
-
-    // Held to the end of prepare, which outlasts the supervisor taking its own hold below.
-    let _checkout_use = host_checkout(ctx)?;
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build).
@@ -2367,16 +2383,6 @@ fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
     }
 }
 
-/// The services this job boots beside its guest: a `compose:` fleet's, else the job's
-/// `services:`. What admission counts and what supervise boots.
-fn job_service_units(ctx: &JobCtx) -> Result<Vec<crate::compose::Unit>> {
-    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
-    match image_ref.strip_prefix("compose:") {
-        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?),
-        None => Ok(crate::services::to_units(crate::services::from_env()?)),
-    }
-}
-
 /// Map the job's services onto provisioned units, assigning static addresses from the top of
 /// the job subnet and CIDs from the service range, and merging each unit's boot config. The
 /// services come from a `compose:<file>#<primary>` fleet (every enabled unit but the primary)
@@ -3053,10 +3059,26 @@ fn host_checkout(ctx: &JobCtx) -> Result<Option<crate::cachelock::Guard>> {
 /// both (see admit). `None` when both are off — the host then admits every job the runner hands
 /// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
 /// system failure, not the job's fault.
-fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
+fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::admit::Reservation>> {
     let declared_mib = mem_mib(mem)?;
+    let mem_ask = admit_memory(ctx, declared_mib, services_mib)?;
+    if let Some(ask) = &mem_ask
+        && services_mib > 0
+    {
+        println!("virtkit: the job's services count {services_mib} MiB of its reservation");
+        // Said here, as `admit::acquire` would blame the guest's size alone.
+        if ask.want_mib > ask.budget_mib {
+            bail!(
+                "this job's reservation of {} MiB, its services' {services_mib} MiB included, \
+                 exceeds the host's whole {} MiB budget ([executor.schedule] mem_budget) — it \
+                 can never be admitted",
+                ask.want_mib,
+                ask.budget_mib
+            );
+        }
+    }
     let ask = crate::admit::Ask {
-        mem: admit_memory(ctx, declared_mib)?,
+        mem: mem_ask,
         disk: admit_disk(ctx, declared_mib)?,
     };
     if ask.mem.is_none() && ask.disk.is_none() {
@@ -3075,28 +3097,90 @@ fn mem_mib(mem: &str) -> Result<u64> {
         .context("guest memory size is absurdly large")
 }
 
-/// This job's share of `[executor.schedule] mem_budget`, or `None` when no budget is configured.
-fn admit_memory(ctx: &JobCtx, declared_mib: u64) -> Result<Option<crate::admit::MemAsk>> {
+/// The services this job boots beside its guest: a `compose:` fleet's, else the job's
+/// `services:`. What admission counts and what supervise boots.
+fn job_service_units(ctx: &JobCtx) -> Result<Vec<crate::compose::Unit>> {
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    match image_ref.strip_prefix("compose:") {
+        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?),
+        None => Ok(crate::services::to_units(crate::services::from_env()?)),
+    }
+}
+
+/// Service RAM in MiB, sized as in [`plan_services`] and capped by [`clamp_service_size`].
+/// Windows uses [`size_windows_service`]: `x-virtkit.mem`, else the Dockerfile's `# vk: mem=`,
+/// else the build's size. Refuse less than Windows needs before waiting for admission.
+/// Linux uses `x-virtkit.mem`, else the default. Zero outside `net.mode = "switch"`,
+/// where no service boots.
+fn services_mem_mib(ctx: &JobCtx) -> Result<u64> {
+    if ctx.cfg.net.mode != "switch" {
+        return Ok(0);
+    }
+    let mut total: u64 = 0;
+    for unit in job_service_units(ctx)? {
+        let mut sized = unit.clone();
+        match windows_build(&unit)? {
+            Some(build) => {
+                let mem = crate::winbuild::target_mem(
+                    &build.dockerfile,
+                    build.target.as_deref(),
+                    &crate::winbuild::default_size().1,
+                )
+                .with_context(|| format!("service {}", unit.name))?;
+                size_windows_service(&ctx.cfg, &mut sized, None, Some(mem))?;
+            }
+            None => {
+                sized.mem = sized
+                    .mem
+                    .or_else(|| Some(crate::units::DEFAULT_MEM.to_string()));
+                clamp_service_size(&ctx.cfg, &mut sized)?;
+            }
+        }
+        // Both branches size it: a Windows one from its bundle, a Linux one by default.
+        let mem = sized.mem.context("a service sized to nothing")?;
+        let mib = crate::run::parse_mem_mib(&mem)
+            .with_context(|| format!("service {}: memory size {mem:?}", unit.name))?;
+        total = total.saturating_add(mib);
+    }
+    Ok(total)
+}
+
+/// This job's share of `[executor.schedule] mem_budget`, or `None` without a budget.
+/// Reserve the guest's declared RAM plus service RAM, or under `from_history` the job's
+/// usage capped at that sum. History covers the supervisor's whole process tree,
+/// including service VMs.
+fn admit_memory(
+    ctx: &JobCtx,
+    declared_mib: u64,
+    services_mib: u64,
+) -> Result<Option<crate::admit::MemAsk>> {
     let Some(budget) = budget_mib(&ctx.cfg) else {
         return Ok(None);
     };
     let budget_mib = budget?;
     // `[executor.schedule] from_history`: reserve what this job has been using rather than what it
     // declares. Announced, because it is the difference between a job waiting and not.
+    let ceiling_mib = declared_mib.saturating_add(services_mib);
     let want_mib = match ctx.cfg.executor.schedule.from_history {
-        true => crate::admit::expect_mib(&ctx.history_dir(), &ctx.usage_key(), declared_mib)
-            .inspect(|mib| {
-                // Only worth saying when it changes the reservation: a job whose peak fills
-                // its ceiling would otherwise be told it reserves what it declares.
-                if *mib < declared_mib {
-                    println!(
-                        "virtkit: reserving {mib} MiB from what this job has been using \
-                         (it declares {declared_mib} MiB)"
-                    );
-                }
-            })
-            .unwrap_or(declared_mib),
-        false => declared_mib,
+        true => crate::admit::expect_mib(
+            &ctx.history_dir(),
+            &ctx.usage_key(),
+            declared_mib,
+            ceiling_mib,
+        )
+        .inspect(|mib| {
+            // Only worth saying when it changes the reservation: a job whose peak fills
+            // its ceiling would otherwise be told it reserves what it declares.
+            if *mib < ceiling_mib {
+                println!(
+                    "virtkit: reserving {mib} MiB from what this job has been using \
+                         (its guest declares {declared_mib} MiB, its services \
+                         {services_mib} MiB)"
+                );
+            }
+        })
+        .unwrap_or(ceiling_mib),
+        false => ceiling_mib,
     };
     Ok(Some(crate::admit::MemAsk {
         want_mib,
@@ -4029,6 +4113,64 @@ mod tests {
         let mut out = Vec::new();
         copy_capped(&b"0123"[..], &mut out, 4).unwrap();
         assert_eq!(out, b"0123");
+    }
+
+    /// A `compose:` job's services count in its admission: each one's `x-virtkit.mem`, else a
+    /// Windows build's `# vk: mem=`, else the Linux default, held under the ceilings; the
+    /// primary is the job's own. A Windows service under 2G is refused before any wait, and
+    /// outside `net.mode = "switch"` no service boots, so none counts.
+    #[test]
+    fn a_compose_jobs_services_count_in_its_memory() {
+        let dir = std::env::temp_dir().join(format!("vk-svc-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        cfg.executor.host_checkout = true;
+        cfg.net.mode = "switch".into();
+        let mut ctx = JobCtx::new_for_job(cfg, "9".into()).unwrap();
+        ctx.image_ref = Some("compose:ci/c.yaml#job".into());
+        let checkout = ctx.host_checkout_dir();
+        std::fs::create_dir_all(checkout.join("ci")).unwrap();
+        std::fs::write(
+            checkout.join("ci/win.Dockerfile"),
+            "# vk: mem=3G\nFROM winiso:ws.iso@sha256:aa --drivers=v.iso@sha256:bb AS base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("ci/c.yaml"),
+            "services:\n\
+             \x20 job:\n    image: alpine:3.21\n\
+             \x20 win:\n    build: { context: ., dockerfile: win.Dockerfile }\n\
+             \x20 db:\n    image: postgres:17\n\
+             \x20 cache:\n    image: redis:7\n    x-virtkit: { mem: 512M }\n\
+             \x20 big:\n    image: x\n    x-virtkit: { mem: 100000G }\n",
+        )
+        .unwrap();
+        let (_, max_mib) = service_ceiling(&ctx.cfg).unwrap();
+        assert_eq!(
+            services_mem_mib(&ctx).unwrap(),
+            3 * 1024 + 1024 + 512 + max_mib
+        );
+        std::fs::write(
+            checkout.join("ci/win.Dockerfile"),
+            "# vk: mem=1G\nFROM winiso:ws.iso@sha256:aa --drivers=v.iso@sha256:bb AS base\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", services_mem_mib(&ctx).unwrap_err());
+        assert!(err.contains("Windows needs"), "{err}");
+        ctx.cfg.net.mode = "none".into();
+        assert_eq!(services_mem_mib(&ctx).unwrap(), 0);
+        // The services count beside the guest; under `from_history`, a job without one yet
+        // reserves both, which is also the ceiling its history is capped at.
+        ctx.cfg.executor.schedule.mem_budget = Some("64G".into());
+        for from_history in [false, true] {
+            ctx.cfg.executor.schedule.from_history = from_history;
+            let ask = admit_memory(&ctx, 4096, 1024).unwrap().unwrap();
+            assert_eq!(ask.want_mib, 5120, "{from_history}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Detect Windows `build:` services anywhere in the Dockerfile list; leave Linux builds alone.
@@ -5333,10 +5475,60 @@ mod tests {
         );
         // 1000 MiB + 25% headroom, under the 8 GiB it declares.
         assert_eq!(
-            crate::admit::expect_mib(&ctx.history_dir(), &ctx.usage_key(), ceiling_mib),
+            crate::admit::expect_mib(
+                &ctx.history_dir(),
+                &ctx.usage_key(),
+                ceiling_mib,
+                ceiling_mib
+            ),
             Some(1250),
             "the run just recorded is what the next admission reserves"
         );
+        // With services, the history is still the one stamped with the guest's size, and
+        // capped at the guest's and the services' together: their VMs are in its peaks.
+        assert_eq!(
+            admit_memory(&ctx, ceiling_mib, 4096)
+                .unwrap()
+                .unwrap()
+                .want_mib,
+            1250
+        );
+        crate::admit::remember(
+            &ctx.history_dir(),
+            &ctx.usage_key(),
+            crate::admit::Run {
+                peak: 20000 * 1024 * 1024,
+                ceiling: ceiling_mib * 1024 * 1024,
+                ..crate::admit::Run::default()
+            },
+        );
+        assert_eq!(
+            admit_memory(&ctx, ceiling_mib, 4096)
+                .unwrap()
+                .unwrap()
+                .want_mib,
+            ceiling_mib + 4096
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's services count against the budget beside its guest; a job and services that
+    /// never fit are refused, naming the services rather than the guest's size alone.
+    #[test]
+    fn admission_counts_the_services() {
+        let dir = std::env::temp_dir().join(format!("vk-admit-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        cfg.executor.schedule.disk_admission = Some(false);
+        cfg.executor.schedule.mem_budget = Some("8G".into());
+        cfg.executor.schedule.wait_timeout_secs = Some(0);
+        let ctx = JobCtx::new_for_job(cfg, "43".into()).unwrap();
+        drop(admit(&ctx, "4G", 4096).unwrap().unwrap());
+        let err = format!("{:#}", admit(&ctx, "4G", 5120).unwrap_err());
+        assert!(err.contains("its services' 5120 MiB"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5354,7 +5546,7 @@ mod tests {
         cfg.executor.schedule.disk_admission = Some(false);
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
-        assert!(admit(&ctx, "8G").unwrap().is_none());
+        assert!(admit(&ctx, "8G", 0).unwrap().is_none());
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
 
         let schedule = &mut ctx.cfg.executor.schedule;
@@ -5362,7 +5554,7 @@ mod tests {
         schedule.disk_default = Some("1G".into());
         schedule.wait_timeout_secs = Some(0);
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
-        let held = admit(&ctx, "8G").unwrap();
+        let held = admit(&ctx, "8G", 0).unwrap();
         assert!(held.is_some(), "disk admission is on by default");
         let entry = std::fs::read_to_string(ctx.admit_dir().join("42")).unwrap();
         assert!(
@@ -5373,7 +5565,7 @@ mod tests {
 
         // Not a size at all (only `G` is): refused before any history is consulted.
         ctx.cfg.executor.schedule.disk_default = Some("1T".into());
-        let err = admit(&ctx, "8G").unwrap_err();
+        let err = admit(&ctx, "8G", 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("disk_default \"1T\""),
             "{err:#}"
