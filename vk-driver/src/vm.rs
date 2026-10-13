@@ -403,45 +403,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     }
 
-    // [executor] host_checkout: check the sources out on the host NOW — before resolving the
-    // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
-    // guest boots — so supervise can share the tree in and the git token never enters the
-    // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
-    // beat a supervisor-log pointer; like any prepare failure a checkout error exits
-    // system_failure.
-    // Held to the end of prepare, which outlasts the supervisor taking its own hold below, so the
-    // tree is referenced continuously from the clone until the job's VM is gone.
-    let _checkout_use = if cfg.executor.host_checkout {
-        let url = ctx
-            .ci_repo_url
-            .as_deref()
-            .context("host_checkout is set but CI_REPOSITORY_URL is unset")?;
-        let sha = ctx
-            .ci_commit_sha
-            .as_deref()
-            .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
-        let dest = ctx.host_checkout_dir();
-        let guard = crate::checkout::acquire_use_lock(&dest)
-            .with_context(|| format!("locking host checkout {}", dest.display()))?;
-        // Bound what abandoned checkouts cost the host before adding one more — on a tmpfs
-        // `checkout_dir` they hold RAM that `vk tune` charges against this runner's concurrency.
-        // Swept while already holding our own reference, so an idle window that has just
-        // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
-        // re-clone.
-        crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
-        println!("virtkit: host checkout of {sha} -> {}", dest.display());
-        crate::checkout::discard_if_untrusted(&dest, url)
-            .with_context(|| format!("checking host checkout {}", dest.display()))?;
-        // Bind the external bookkeeping to the destination before the clone fills it, so a
-        // prepare killed part-way through leaves a partial tree the idle sweep can still find.
-        crate::checkout::claim(&dest)
-            .with_context(|| format!("claiming host checkout {}", dest.display()))?;
-        crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
-            .context("host checkout")?;
-        Some(guard)
-    } else {
-        None
-    };
+    // Held to the end of prepare, which outlasts the supervisor taking its own hold below.
+    let _checkout_use = host_checkout(ctx)?;
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build).
@@ -2404,6 +2367,16 @@ fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
     }
 }
 
+/// The services this job boots beside its guest: a `compose:` fleet's, else the job's
+/// `services:`. What admission counts and what supervise boots.
+fn job_service_units(ctx: &JobCtx) -> Result<Vec<crate::compose::Unit>> {
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    match image_ref.strip_prefix("compose:") {
+        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?),
+        None => Ok(crate::services::to_units(crate::services::from_env()?)),
+    }
+}
+
 /// Map the job's services onto provisioned units, assigning static addresses from the top of
 /// the job subnet and CIDs from the service range, and merging each unit's boot config. The
 /// services come from a `compose:<file>#<primary>` fleet (every enabled unit but the primary)
@@ -2418,11 +2391,7 @@ fn plan_services(
     guards: &mut Vec<crate::cachelock::Guard>,
     windows: &mut HashMap<String, crate::winsvc::Provisioning>,
 ) -> Result<Vec<crate::units::Provisioned>> {
-    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
-    let units = match image_ref.strip_prefix("compose:") {
-        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?)?,
-        None => crate::services::to_units(crate::services::from_env()?),
-    };
+    let units = job_service_units(ctx)?;
     let mut out = Vec::new();
     // Addresses for the NICs after eth0, from the static region past the service slots — one
     // allocator for the job's whole LAN, so no two services are handed the same address. The
@@ -3039,16 +3008,53 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
     Ok(declared_size(ctx)?.1)
 }
 
+/// `[executor] host_checkout`: check the sources out on the host, before the image is resolved
+/// (a `dockerfile:`/`compose:` image is built from them) and before the guest boots, so
+/// supervise can share the tree in and the git token never enters the guest (the job sets
+/// GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare) beat a supervisor-log
+/// pointer; like any prepare failure a checkout error exits system_failure. The use lock it
+/// returns is held to the end of prepare, which outlasts the supervisor taking its own, so the
+/// tree is referenced continuously from the clone until the job's VM is gone.
+fn host_checkout(ctx: &JobCtx) -> Result<Option<crate::cachelock::Guard>> {
+    if !ctx.cfg.executor.host_checkout {
+        return Ok(None);
+    }
+    let url = ctx
+        .ci_repo_url
+        .as_deref()
+        .context("host_checkout is set but CI_REPOSITORY_URL is unset")?;
+    let sha = ctx
+        .ci_commit_sha
+        .as_deref()
+        .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
+    let dest = ctx.host_checkout_dir();
+    let guard = crate::checkout::acquire_use_lock(&dest)
+        .with_context(|| format!("locking host checkout {}", dest.display()))?;
+    // Bound what abandoned checkouts cost the host before adding one more — on a tmpfs
+    // `checkout_dir` they hold RAM that `vk tune` charges against this runner's concurrency.
+    // Swept while already holding our own reference, so an idle window that has just
+    // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
+    // re-clone.
+    crate::checkout::gc_idle(&ctx.host_checkout_root(), ctx.cfg.checkout_cache_idle());
+    println!("virtkit: host checkout of {sha} -> {}", dest.display());
+    crate::checkout::discard_if_untrusted(&dest, url)
+        .with_context(|| format!("checking host checkout {}", dest.display()))?;
+    // Bind the external bookkeeping to the destination before the clone fills it, so a
+    // prepare killed part-way through leaves a partial tree the idle sweep can still find.
+    crate::checkout::claim(&dest)
+        .with_context(|| format!("claiming host checkout {}", dest.display()))?;
+    crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
+        .context("host checkout")?;
+    Ok(Some(guard))
+}
+
 /// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, and room for
 /// its job dir on the filesystem holding it (`disk_admission`), blocking until there is room for
 /// both (see admit). `None` when both are off — the host then admits every job the runner hands
 /// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
 /// system failure, not the job's fault.
 fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
-    let declared_mib = parse_gib(mem)
-        .context("invalid guest memory size")?
-        .checked_mul(1024)
-        .context("guest memory size is absurdly large")?;
+    let declared_mib = mem_mib(mem)?;
     let ask = crate::admit::Ask {
         mem: admit_memory(ctx, declared_mib)?,
         disk: admit_disk(ctx, declared_mib)?,
@@ -3059,6 +3065,14 @@ fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
     let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
     let reservation = crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, &ask, timeout)?;
     Ok(Some(reservation))
+}
+
+/// `mem`, a whole number of GiB (`4G`), in MiB.
+fn mem_mib(mem: &str) -> Result<u64> {
+    parse_gib(mem)
+        .context("invalid guest memory size")?
+        .checked_mul(1024)
+        .context("guest memory size is absurdly large")
 }
 
 /// This job's share of `[executor.schedule] mem_budget`, or `None` when no budget is configured.

@@ -258,6 +258,16 @@ fn target_index(stages: &[Stage], target: Option<&str>) -> Result<usize> {
     }
 }
 
+/// The memory of `stage`'s guests: its `# vk: mem=`, else `mem`.
+fn stage_mem(stage: &Stage, mem: &str) -> String {
+    stage
+        .from
+        .guest
+        .mem
+        .clone()
+        .unwrap_or_else(|| mem.to_string())
+}
+
 /// The least memory, in MiB, a Windows guest installs and runs with.
 pub(crate) const WINDOWS_MIN_MIB: u64 = 2048;
 
@@ -267,7 +277,7 @@ pub(crate) const WINDOWS_MIN_MIB: u64 = 2048;
 fn guest_size(stage: &Stage, opts: &Options) -> Result<(u32, String)> {
     let guest = &stage.from.guest;
     let cpus = guest.cpus.unwrap_or(opts.cpus);
-    let mem = guest.mem.clone().unwrap_or_else(|| opts.mem.clone());
+    let mem = stage_mem(stage, &opts.mem);
     let mib = crate::run::parse_mem_mib(&mem).with_context(|| format!("invalid mem {mem:?}"))?;
     let Some((max_cpus, max_mib)) = opts.ceiling else {
         return Ok((cpus, mem));
