@@ -34,6 +34,26 @@ const BITS_PER_PBA_ENTRY: usize = 64;
 const FUNCTION_MASK_BIT: u8 = 14;
 const MSIX_ENABLE_BIT: u8 = 15;
 
+/// Sink for the vectors' KVM MSI routes: the shared `GsiRoutes` in the VMM, a recorder in tests.
+#[cfg(target_os = "linux")]
+pub trait MsiRoutes: Send {
+    /// Insert or update the route of `gsi`.
+    fn set_msi_route(&mut self, gsi: u32, addr: u64, data: u32);
+    /// Remove the route of `gsi`, if any.
+    fn clear_msi_route(&mut self, gsi: u32);
+}
+
+#[cfg(target_os = "linux")]
+impl MsiRoutes for GsiRoutes {
+    fn set_msi_route(&mut self, gsi: u32, addr: u64, data: u32) {
+        GsiRoutes::set_msi_route(self, gsi, addr, data);
+    }
+
+    fn clear_msi_route(&mut self, gsi: u32) {
+        GsiRoutes::clear_msi_route(self, gsi);
+    }
+}
+
 /// A single MSI-X table entry. Defaults masked (vector_ctl bit 0 set) per spec.
 #[derive(Clone, Copy)]
 pub struct MsixTableEntry {
@@ -82,7 +102,33 @@ pub struct MsixConfig {
     function_masked: bool,
     /// Shared KVM GSI routing manager, set at device registration.
     #[cfg(target_os = "linux")]
-    routes: Option<Arc<Mutex<GsiRoutes>>>,
+    routes: Option<Arc<Mutex<dyn MsiRoutes>>>,
+}
+
+/// What a write to the message-control register does to the installed MSI routes.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteChange {
+    /// (Re)program the route of every unmasked vector.
+    Install,
+    /// Remove them all.
+    Clear,
+    /// Leave them as they are.
+    Keep,
+}
+
+/// Routes stay installed while the function is masked: a masked vector's signal is held in the
+/// PBA rather than raised, so a route does no harm there, and removing it races an interrupt
+/// KVM took before the mask but injects later (its deferred irqfd path resolves the GSI then),
+/// which finds no route and is lost — and never reached the PBA either. Only disabling MSI-X
+/// removes them; that keeps the window, acceptable since the driver is turning MSI-X off.
+fn route_change(old_enabled: bool, enabled: bool, old_masked: bool, masked: bool) -> RouteChange {
+    if old_enabled && !enabled {
+        RouteChange::Clear
+    } else if enabled && !masked && (!old_enabled || old_masked) {
+        RouteChange::Install
+    } else {
+        RouteChange::Keep
+    }
 }
 
 impl MsixConfig {
@@ -125,7 +171,7 @@ impl MsixConfig {
 
     /// Attach the shared KVM GSI routing manager.
     #[cfg(target_os = "linux")]
-    pub fn set_routes(&mut self, routes: Arc<Mutex<GsiRoutes>>) {
+    pub fn set_routes(&mut self, routes: Arc<Mutex<dyn MsiRoutes>>) {
         self.routes = Some(routes);
     }
 
@@ -140,8 +186,9 @@ impl MsixConfig {
     }
 
     /// Apply a write to the message-control register (enable / function-mask
-    /// bits). Updates routes on enable and, when unmasking the function, injects
-    /// any pending vectors from the PBA.
+    /// bits). Installs routes on enable or function unmask and removes them only
+    /// on disable; when unmasking the function, injects any pending vectors from
+    /// the PBA.
     pub fn set_msg_ctl(&mut self, reg: u16) {
         let old_enabled = self.enabled;
         let old_masked = self.function_masked;
@@ -149,17 +196,16 @@ impl MsixConfig {
         self.function_masked = ((reg >> FUNCTION_MASK_BIT) & 1) == 1;
         self.enabled = ((reg >> MSIX_ENABLE_BIT) & 1) == 1;
 
-        if old_enabled != self.enabled || old_masked != self.function_masked {
-            if self.enabled && !self.function_masked {
+        match route_change(old_enabled, self.enabled, old_masked, self.function_masked) {
+            RouteChange::Install => {
                 for idx in 0..self.vectors.len() {
                     if !self.vectors[idx].entry.masked() {
                         self.update_route(idx);
                     }
                 }
-            } else if old_enabled {
-                // MSI-X was disabled: drop all installed routes.
-                self.clear_all_routes();
             }
+            RouteChange::Clear => self.clear_all_routes(),
+            RouteChange::Keep => {}
         }
 
         // Function-mask cleared: inject any pending, unmasked vectors.
@@ -454,6 +500,86 @@ mod tests {
         assert!(cfg.signal(1));
         // The eventfd was written: it should read back a count.
         assert_eq!(evt.read().unwrap(), 1);
+    }
+
+    /// Masking the function keeps the routes (an interrupt KVM injects late still has one);
+    /// only disabling MSI-X removes them, and enabling or unmasking installs them.
+    #[test]
+    fn function_mask_keeps_routes_only_disable_clears_them() {
+        // (old_enabled, enabled, old_masked, masked)
+        assert_eq!(route_change(true, true, false, true), RouteChange::Keep);
+        assert_eq!(route_change(true, true, true, true), RouteChange::Keep);
+        assert_eq!(route_change(true, false, false, false), RouteChange::Clear);
+        assert_eq!(route_change(true, false, true, true), RouteChange::Clear);
+        assert_eq!(route_change(true, true, true, false), RouteChange::Install);
+        assert_eq!(
+            route_change(false, true, false, false),
+            RouteChange::Install
+        );
+        assert_eq!(route_change(false, true, true, true), RouteChange::Keep);
+        assert_eq!(route_change(true, true, false, false), RouteChange::Keep);
+        assert_eq!(route_change(false, false, false, false), RouteChange::Keep);
+        assert_eq!(route_change(false, true, true, false), RouteChange::Install);
+        assert_eq!(route_change(true, false, false, true), RouteChange::Clear);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RouteOp {
+        Set(u32, u64, u32),
+        Clear(u32),
+    }
+
+    #[derive(Default)]
+    struct RecordingRoutes(Vec<RouteOp>);
+
+    impl MsiRoutes for RecordingRoutes {
+        fn set_msi_route(&mut self, gsi: u32, addr: u64, data: u32) {
+            self.0.push(RouteOp::Set(gsi, addr, data));
+        }
+
+        fn clear_msi_route(&mut self, gsi: u32) {
+            self.0.push(RouteOp::Clear(gsi));
+        }
+    }
+
+    /// A vector reprogrammed while the function is masked keeps its old route until the unmask
+    /// installs the new one and replays the pending signal; only disabling clears the routes.
+    #[test]
+    fn function_mask_defers_route_updates_and_replays_pending() {
+        let enable = 1 << MSIX_ENABLE_BIT;
+        let mask = 1 << FUNCTION_MASK_BIT;
+        let routes = Arc::new(Mutex::new(RecordingRoutes::default()));
+        let mut cfg = MsixConfig::new();
+        cfg.set_gsi(0, 32);
+        cfg.set_gsi(1, 33);
+        cfg.set_routes(routes.clone());
+        let take = || std::mem::take(&mut routes.lock().unwrap().0);
+        let evt = cfg.vector_irqfds()[1].clone();
+
+        cfg.set_msg_ctl(enable);
+        table_write_u32(&mut cfg, 0x10, 0xfee0_0000);
+        table_write_u32(&mut cfg, 0x18, 0x0000_0041);
+        table_write_u32(&mut cfg, 0x1c, 0);
+        assert_eq!(take(), [RouteOp::Set(33, 0xfee0_0000, 0x41)]);
+
+        cfg.set_msg_ctl(enable | mask);
+        assert!(take().is_empty());
+
+        table_write_u32(&mut cfg, 0x10, 0xfee0_1000);
+        table_write_u32(&mut cfg, 0x18, 0x0000_0042);
+        assert!(take().is_empty());
+
+        assert!(cfg.signal(1));
+        assert_eq!(cfg.get_pba_bit(1), 1);
+        assert!(evt.read().is_err());
+
+        cfg.set_msg_ctl(enable);
+        assert_eq!(take(), [RouteOp::Set(33, 0xfee0_1000, 0x42)]);
+        assert_eq!(evt.read().unwrap(), 1);
+        assert_eq!(cfg.get_pba_bit(1), 0);
+
+        cfg.set_msg_ctl(0);
+        assert_eq!(take(), [RouteOp::Clear(32), RouteOp::Clear(33)]);
     }
 
     #[test]

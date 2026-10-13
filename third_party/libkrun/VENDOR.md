@@ -373,11 +373,14 @@ deasserts an INTx left pending, and a device reset drops pending PBA bits. Only 
 aligned 4- and 8-byte table and PBA accesses reach the MSI-X state; others read all ones.
 `MsixConfig` and `GsiRoutes` are the 1.19 tree's: each vector has an eventfd registered as a
 KVM irqfd on its own MSI GSI above the IOAPIC pins, and a message write re-commits the full
-`KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC routes plus the MSI ones). Each queue's
-notification register gets an ioeventfd on the queue eventfd, so a kick no longer traps to the
-VMM thread; when the guest relocates BAR0 the transport tells the VMM (`on_bar0_moved`), which
-moves the ioeventfds with it, so none is left to swallow writes at the old address. They stay
-armed while the guest turns memory decoding off (the trapping path then answers nothing).
+`KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC routes plus the MSI ones). Routes stay
+installed while the function is masked (a masked signal goes to the PBA, replayed on unmask);
+only disabling MSI-X removes them, since KVM resolves a deferred irqfd injection's route late
+and would drop it. Each queue's notification register gets an ioeventfd on the queue eventfd,
+so a kick no longer traps to the VMM thread; when the guest relocates BAR0 the transport tells
+the VMM (`on_bar0_moved`), which moves the ioeventfds with it, so none is left to swallow writes
+at the old address. They stay armed while the guest turns memory decoding off (the trapping path
+then answers nothing).
 
 `src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
 builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
@@ -403,7 +406,8 @@ and interrupt over MSI-X alone, so bus 0's 31 slots are the limit.
 
 Covered by the `virtio::pci::tests` (`msix_*`, `with_msix_enabled_*`, `without_msix_*`,
 `queue_notify_ioevents_*`, `a_shared_memory_region_*`, `a_device_without_intx_*`), the
-`virtio::msix` and `legacy::gsi` tests.
+`virtio::msix` tests (masked-function routes: `function_mask_keeps_routes_only_disable_clears_them`,
+`function_mask_defers_route_updates_and_replays_pending`) and the `legacy::gsi` tests.
 
 ### Interrupt trigger mode
 
