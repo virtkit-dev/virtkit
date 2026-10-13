@@ -33,6 +33,7 @@ async fn start_server(tag: &str) -> SocketAddr {
             Some(Duration::from_secs(60)),
             None,
             vec![],
+            vec![],
             Limits::default(),
         )
         .await
@@ -260,6 +261,7 @@ async fn connect_refused_on_wrapped_channel() {
             Some(Duration::from_secs(60)),
             Some(std::path::PathBuf::from("/bin/true")),
             vec![],
+            vec![],
             Limits::default(),
         )
         .await
@@ -297,6 +299,7 @@ async fn a_wrapped_exec_ignores_the_client_user_and_dir() {
             &server_addr,
             Some(Duration::from_secs(60)),
             Some(std::path::PathBuf::from("/bin/sh")),
+            vec![],
             vec![],
             Limits::default(),
         )
@@ -823,6 +826,7 @@ async fn a_capped_channel_refuses_a_request_past_its_cap() {
             Some(Duration::from_secs(60)),
             None,
             vec![],
+            vec![],
             Limits {
                 max_concurrent: std::num::NonZeroUsize::new(1),
                 ..Limits::default()
@@ -893,6 +897,44 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// A server that does not allow background commands refuses one, before running anything.
+#[tokio::test]
+async fn background_commands_can_be_refused() {
+    let path = tmp_socket_path("no-background");
+    let _ = std::fs::remove_file(&path);
+    let addr = SocketAddr::Unix(path.clone());
+    let server_addr = addr.clone();
+    tokio::spawn(async move {
+        run_server(
+            &server_addr,
+            Some(Duration::from_secs(60)),
+            None,
+            vec![],
+            vec![],
+            Limits {
+                background: false,
+                ..Limits::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let marker = tmp_socket_path("no-background-marker");
+    let _ = std::fs::remove_file(&marker);
+    match first_reply(&addr, &format!("touch {}", marker.display()), true).await {
+        Message::StartErr { msg } => assert!(msg.contains("background"), "got: {msg}"),
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+    assert!(matches!(
+        first_reply(&addr, "true", false).await,
+        Message::StartOK
+    ));
+    assert!(!marker.exists());
+}
+
 /// A connection that sends no request is closed after its first-message timeout, so idle
 /// connections hold nothing open for long.
 #[tokio::test]
@@ -907,6 +949,7 @@ async fn an_idle_connection_is_closed() {
             &server_addr,
             Some(Duration::from_secs(60)),
             None,
+            vec![],
             vec![],
             Limits {
                 first_message_timeout: wait,

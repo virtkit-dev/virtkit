@@ -100,12 +100,25 @@ enum Commands {
         /// wrapper (e.g. LD_PRELOAD).
         #[arg(long, requires = "exec_wrapper", value_name = "GLOB")]
         exec_wrapper_env: Vec<String>,
+        /// Give --exec-wrapper this argument first, before the requested command line
+        ///
+        /// Repeatable, in order. Nothing the client sends comes before these.
+        #[arg(
+            long,
+            requires = "exec_wrapper",
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        exec_wrapper_arg: Vec<String>,
         /// Run at most this many commands at once; one more is refused, not queued
         ///
         /// A background command counts until it exits. Status probes are never refused.
         /// Omitted = no cap.
         #[arg(long, value_name = "N")]
         max_concurrent: Option<std::num::NonZeroUsize>,
+        /// Refuse background commands: each runs only as long as its session
+        #[arg(long)]
+        no_background: bool,
     },
     /// Probe the agent at --socket and print its status reply
     Status,
@@ -157,6 +170,21 @@ enum Commands {
 }
 
 fn main() {
+    // Invoked as `vk` (init links it so in a CI job VM with services): the host's
+    // `vk`, over the host command channel, which runs `vk exec --service` into the VM's own
+    // services and nothing else. Everything given goes to the host as is; a terminal on both
+    // ends gets a pty.
+    if std::env::args_os()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|n| n == std::ffi::OsStr::new("vk"))
+        })
+        .unwrap_or(false)
+    {
+        std::process::exit(guest_vk());
+    }
     // The compose control filesystem (no --socket: it dials the manager over
     // vsock itself); handled before clap since init forks it with plain args.
     let args: Vec<String> = std::env::args().collect();
@@ -305,6 +333,81 @@ fn main() {
         .block_on(async_main(socket, cli_args.command));
 }
 
+/// The guest's `vk`: what it was given, run as `vk …` by the host through the host command
+/// channel at `/run/vk/host.sock`. Its exit status, or 1 when the host cannot be reached.
+fn guest_vk() -> i32 {
+    const HOST_SOCK: &str = "/run/vk/host.sock";
+    let Ok(args) = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+    else {
+        eprintln!("vk: an argument is not valid UTF-8");
+        return 2;
+    };
+    let Ok(socket) = HOST_SOCK.parse::<SocketAddr>() else {
+        return 1;
+    };
+    if !std::path::Path::new(HOST_SOCK).exists() {
+        eprintln!(
+            "vk: this VM has no host command channel: `vk exec --service` is for CI jobs with \
+             compose services"
+        );
+        return 1;
+    }
+    // A pty only when asked for (it merges stderr into stdout), and only on a terminal.
+    // SAFETY: isatty on the inherited stdio fds.
+    let tty =
+        (asks_for_tty(&args) && unsafe { libc::isatty(0) } == 1 && unsafe { libc::isatty(1) } == 1)
+            .then(Tty::local);
+    let ran = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(execute(
+            socket,
+            "vk".into(),
+            args,
+            false,
+            Vec::new(),
+            RunMode::Interactive,
+            None,
+            tty,
+            None,
+        ));
+    match ran {
+        Ok(result) => {
+            if let Some(code) = result.code {
+                return code;
+            }
+            if let Some(signal) = result.signal {
+                // SAFETY: re-raise the command's terminating signal on this process.
+                unsafe { libc::kill(std::process::id() as i32, signal) };
+                return 128 + signal;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            1
+        }
+    }
+}
+
+/// Whether the guest `vk`'s `args` ask for a pty: `-t`/`--tty`, alone or among short flags,
+/// before the `--` that starts the command.
+fn asks_for_tty(args: &[String]) -> bool {
+    args.iter().take_while(|a| *a != "--").any(|a| {
+        a == "--tty"
+            || a.strip_prefix('-').is_some_and(|short| {
+                !short.starts_with('-')
+                    && !short.is_empty()
+                    && short.bytes().all(|b| b.is_ascii_alphabetic())
+                    && short.contains('t')
+            })
+    })
+}
+
 /// Configure logging for PID 1 and the long-running `serve`, `forward` and `ssh-serve`
 /// subcommands. They write to stdout: the guest console is captured in the host's
 /// `console.log`, while the host-side `--host-exec` server writes to a dedicated log.
@@ -409,7 +512,9 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             inactivity_timeout,
             exec_wrapper,
             exec_wrapper_env,
+            exec_wrapper_arg,
             max_concurrent,
+            no_background,
         } => {
             let log_level = if debug {
                 LevelFilter::Debug
@@ -424,8 +529,10 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 duration,
                 exec_wrapper,
                 exec_wrapper_env,
+                exec_wrapper_arg,
                 vk_core::exec::server::Limits {
                     max_concurrent,
+                    background: !no_background,
                     ..Default::default()
                 },
             )
@@ -511,7 +618,26 @@ async fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, asks_for_tty};
+
+    /// The guest `vk` asks for a pty for `-t`/`--tty` before the command only.
+    #[test]
+    fn the_guest_vk_asks_for_a_pty_only_with_tty() {
+        let asks = |a: &[&str]| asks_for_tty(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(asks(&["exec", "--service", "db", "-t", "--", "sh"]));
+        assert!(asks(&["exec", "--tty", "--service", "db", "--", "sh"]));
+        assert!(!asks(&["exec", "--service", "db", "--", "ls", "-t"]));
+        assert!(!asks(&[
+            "exec",
+            "--service",
+            "db",
+            "--env",
+            "T=t",
+            "--",
+            "sh"
+        ]));
+        assert!(!asks(&["exec", "--service=tty", "--", "sh"]));
+    }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with
     // the detail in the doc comment's second paragraph (which clap shows as `--help`). A

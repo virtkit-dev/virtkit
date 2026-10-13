@@ -37,6 +37,12 @@ All notable changes to virtkit will be documented in this file.
   the service's account owns its directory. `vk-registry leave` undoes it. See
   `docs/registry-hub.md`.
 - **`vk-hub release add --program vk-registry`** holds `vk-registry` releases beside `vk` ones.
+- **A CI job runs commands in its compose services with `vk exec --service`**, from inside
+  its own VM: `vk exec --service db -- psql -c 'select 1'` runs in the `db` service, its
+  output and exit status back in the job. The image needs no `vk` of its own. Only that
+  command, into the job's own services, is allowed — but as any user of the service, root
+  included, and with that service's network access. On by default;
+  `[executor] guest_service_exec = false` turns it off.
 
 ### Changed
 

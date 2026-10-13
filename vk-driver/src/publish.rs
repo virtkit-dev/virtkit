@@ -1063,6 +1063,7 @@ mod tests {
                 Some(Duration::from_secs(60)),
                 None,
                 vec![],
+                vec![],
                 vk_core::exec::server::Limits::default(),
             )
             .await
@@ -1113,6 +1114,7 @@ mod tests {
                 Some(Duration::from_secs(60)),
                 None,
                 vec![],
+                vec![],
                 vk_core::exec::server::Limits::default(),
             )
             .await
@@ -1154,6 +1156,7 @@ mod tests {
                 &server_addr,
                 Some(Duration::from_secs(60)),
                 None,
+                vec![],
                 vec![],
                 vk_core::exec::server::Limits::default(),
             )

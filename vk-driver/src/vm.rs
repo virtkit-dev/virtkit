@@ -1465,6 +1465,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let mut net_info: Option<(String, u32, String, String)> = None;
     // The job VM's switch attach (`net.mode = switch`): its NICs or vsock bridge.
     let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
+    // The job's services, by name, for its `vk exec --service` ([`service_exec`]).
+    let mut service_names: Vec<String> = Vec::new();
     match cfg.net.mode.as_str() {
         "none" => {}
         "tap" => {
@@ -1499,6 +1501,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // git-defined/`build:` service's the moment its build promotes it, an `image:`
             // service's fresh off `image::resolve_ref` — no gap either way.
             let services = plan_services(ctx, gateway, prefix, &mut use_guards)?;
+            service_names = services.iter().map(|s| s.name.clone()).collect();
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -1585,6 +1588,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
 
+    // The guest's `vk exec --service`: its host command channel, served below.
+    let service_exec = cfg.executor.guest_service_exec && !service_names.is_empty();
+    if service_exec {
+        cmdline.push_str(&format!(
+            " VIRTKIT_HOST_EXEC_PORT={} VIRTKIT_VK_CMD=1",
+            crate::run::HOST_EXEC_PORT
+        ));
+    }
+
     if !cfg.executor.vm.cmdline_extra.is_empty() {
         cmdline.push(' ');
         cmdline.push_str(&cfg.executor.vm.cmdline_extra);
@@ -1608,6 +1620,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),
             crate::run::SSH_AGENT_VSOCK_PORT,
+        ));
+    }
+    if service_exec {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(
+            &ctx.vsock_sock(),
+            crate::run::HOST_EXEC_PORT,
         ));
     }
 
@@ -1659,6 +1677,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             spawn_tied_logged(fwd, &ctx.ssh_agent_forward_log())
                 .context("spawning the ssh-agent forward")?,
         );
+    }
+    // Without it the job still runs: its `vk` then finds no one serving the channel.
+    if service_exec {
+        match spawn_service_exec_serve(ctx, &agent.path) {
+            Ok(child) => children.push(child),
+            Err(e) => eprintln!("virtkit: warning: the job's `vk exec --service` is off: {e:#}"),
+        }
     }
     let vmm = crate::vmm::selected();
     // The one VMM spawn shared with `vk run`/`vk build`: it clears CLOEXEC on the
@@ -1745,6 +1770,270 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
         .arg("--max-conns")
         .arg(crate::run::SSH_AGENT_MAX_CONNS.to_string());
     Ok(Some(fwd))
+}
+
+/// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk` dials — for
+/// its services' `vk exec` ([`spawn_service_exec_serve_at`]).
+fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
+    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent)
+}
+
+/// How many of a VM's `vk exec --service` its host runs at once: each is a host `vk` (and a
+/// pty with `-t`), outside the VM's own limits. One past it is refused.
+const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
+
+/// The most of a service exec channel's log that is kept, the rest dropped: the guest decides
+/// how many requests it makes, so how much the log says.
+const SERVICE_EXEC_LOG_MAX: u64 = 1 << 20;
+
+/// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
+/// serve`, every command forced through `vk service-exec <dir> -- …` (the guest's argv only
+/// after the `--`), which allows `vk exec --service` into the `svc-<name>` services under
+/// `dir`, a CI job's dir, and nothing else. It runs in `dir` as
+/// the serve's user, whatever directory or user the guest asks for, in the foreground of its
+/// session, at most [`SERVICE_EXEC_MAX_CONCURRENT`] at once. Its log is
+/// `dir/service-exec.log`, at most [`SERVICE_EXEC_LOG_MAX`] bytes of it.
+pub(crate) fn spawn_service_exec_serve_at(
+    vsock: &Path,
+    dir: &Path,
+    agent: &Path,
+) -> Result<std::process::Child> {
+    // This vk by its path, read now: a `vk update` while the VM runs puts a new binary there,
+    // which the requests from then on run.
+    let exe = std::env::current_exe().context("finding the vk binary")?;
+    let dir_arg = dir
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
+    let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
+    let (log_read, log_write) = std::io::pipe().context("creating the service exec log pipe")?;
+    let mut cmd = Command::new(agent);
+    cmd.arg("-s")
+        .arg(&listen)
+        .arg("serve")
+        .arg("--exec-wrapper")
+        .arg(&exe);
+    // `--` ends this vk's own arguments: the guest's words are the guest `vk`'s argv.
+    for arg in ["service-exec", dir_arg, "--"] {
+        cmd.arg("--exec-wrapper-arg").arg(arg);
+    }
+    cmd.arg("--max-concurrent")
+        .arg(SERVICE_EXEC_MAX_CONCURRENT.to_string())
+        .arg("--no-background")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(log_write.try_clone()?)
+        .stderr(log_write);
+    let log_path = dir.join("service-exec.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let child = crate::spawn::spawn_tied(cmd).context("spawning the service exec channel")?;
+    // Ends with the serve, whose exit closes the pipe; the command above holds the only other
+    // write end, so dropping it here is what lets that happen.
+    std::thread::spawn(move || {
+        if let Err(e) = copy_capped(log_read, log, SERVICE_EXEC_LOG_MAX) {
+            eprintln!("virtkit: the service exec log: {e}");
+        }
+    });
+    Ok(child)
+}
+
+/// Copy `from` to `to` until end of file, keeping the first `max` bytes and a line saying the
+/// rest was dropped; what follows is read and discarded, so the writer never blocks on it.
+fn copy_capped(mut from: impl Read, mut to: impl std::io::Write, max: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    let mut room = max;
+    let mut capped = false;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if capped {
+            continue;
+        }
+        let take = n.min(usize::try_from(room).unwrap_or(usize::MAX));
+        to.write_all(buf.get(..take).unwrap_or_default())?;
+        room = room.saturating_sub(take as u64);
+        if take < n {
+            to.write_all(b"\n[log capped: the rest is dropped]\n")?;
+            capped = true;
+        }
+    }
+}
+
+/// The command a VM's `vk` may run on the host: `vk exec --service`, with the host's `vk exec`
+/// flags that apply to a service.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "vk",
+    about = "vk inside a CI job: run commands in its services"
+)]
+struct GuestVk {
+    #[command(subcommand)]
+    cmd: GuestVkCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GuestVkCmd {
+    /// Run a command in one of this VM's compose services
+    Exec {
+        /// The service, as the compose file names it
+        #[arg(long)]
+        service: String,
+        /// Background mode: no stdio, do not wait for the command to exit
+        #[arg(short, long, conflicts_with = "tty")]
+        background: bool,
+        /// Start the command with an empty environment
+        #[arg(long)]
+        clear_env: bool,
+        /// Allocate a pty: stdin and stdout must be a terminal
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Run as this user of the service
+        #[arg(long)]
+        user: Option<String>,
+        /// Working directory in the service
+        #[arg(long)]
+        dir: Option<String>,
+        /// Add an environment variable, KEY=value (repeatable)
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// The command and its arguments, after `--`
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+}
+
+/// What a VM's `vk` asked to run in one of its services ([`service_request`]).
+#[derive(Debug)]
+struct ServiceRequest {
+    addr: vk_core::addr::SocketAddr,
+    background: bool,
+    clear_env: bool,
+    env: Vec<String>,
+    workdir: Option<String>,
+    tty: bool,
+    user: Option<String>,
+    program: String,
+    args: Vec<String>,
+}
+
+/// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's `vk` asked, run
+/// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir) and
+/// refused with exit 2 otherwise.
+pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode {
+    let req = match service_request(dir, argv) {
+        Ok(req) => req,
+        Err(code) => return code,
+    };
+    match crate::exec::run(
+        req.addr,
+        req.background,
+        req.clear_env,
+        req.env,
+        req.workdir,
+        req.tty,
+        req.user,
+        req.program,
+        req.args,
+        vk_core::exec::client::Stdin::Forward,
+    )
+    .await
+    {
+        Ok(result) => crate::exec::exit(result),
+        // As the host's `vk exec` fails.
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+/// [`service_exec`]'s decision: the request when `argv` is the guest `vk`'s `exec --service`
+/// into a service under `dir`, else the exit status, the reason already on stderr.
+fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::process::ExitCode> {
+    use clap::Parser;
+    let refuse = |why: String| {
+        eprintln!("vk: {why}");
+        std::process::ExitCode::from(2)
+    };
+    // The guest's own `vk` names itself first; anything else is not that `vk`.
+    if argv.first().map(String::as_str) != Some("vk") {
+        return Err(refuse(
+            "this VM runs only `vk exec --service NAME -- CMD` on its host".to_string(),
+        ));
+    }
+    let parsed = match GuestVk::try_parse_from(argv) {
+        Ok(p) => p,
+        Err(e) => {
+            // Usage or help text, for the guest's stderr; the exit status says the rest.
+            let _ = e.print();
+            return Err(std::process::ExitCode::from(
+                u8::try_from(e.exit_code()).unwrap_or(2),
+            ));
+        }
+    };
+    let GuestVkCmd::Exec {
+        service,
+        background,
+        clear_env,
+        tty,
+        user,
+        dir: workdir,
+        env,
+        cmd,
+    } = parsed.cmd;
+    let valid = !service.is_empty()
+        && service
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !service.starts_with('.');
+    let svc_dir = dir.join(format!("svc-{service}"));
+    // The service's own directory, not a link to some other one.
+    let is_dir = std::fs::symlink_metadata(&svc_dir).is_ok_and(|m| m.is_dir());
+    if !valid || !is_dir {
+        let mut known: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|n| n.strip_prefix("svc-"))
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        known.sort();
+        return Err(refuse(format!(
+            "no service {service:?} here; the services: {}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        )));
+    }
+    let mut cmd = cmd.into_iter();
+    let Some(program) = cmd.next() else {
+        return Err(refuse("no command to run".to_string()));
+    };
+    Ok(ServiceRequest {
+        addr: crate::vmm::exec_addr(&svc_dir.join("vsock.sock"), crate::units::VSOCK_PORT),
+        background,
+        clear_env,
+        env,
+        workdir,
+        tty,
+        user,
+        program,
+        args: cmd.collect(),
+    })
 }
 
 /// Probe the booted guest for bash and record the result for the run stage (a
@@ -3335,8 +3624,92 @@ fn log_tail(path: &Path, lines: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    /// What a VM's `vk` may ask of its host: an exec into one of its own services, with the
+    /// host `vk exec`'s flags. Any other `vk` command, a service the VM does not have, a name
+    /// that would leave its dir, a flag where the name goes, a command not after `--`, and a
+    /// caller that is not the guest's `vk` are refused, before anything is dialed.
+    #[test]
+    fn a_vms_vk_reaches_only_its_own_services() {
+        let job = crate::qga::tests::TempDir::new("service-exec");
+        std::fs::create_dir_all(job.0.join("svc-db")).unwrap();
+        std::fs::create_dir_all(job.0.join("other")).unwrap();
+        // A link named like a service is not one: it could name another run's.
+        std::os::unix::fs::symlink(job.0.join("other"), job.0.join("svc-linked")).unwrap();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for asked in [
+            argv(&["sh", "-c", "id"]),
+            argv(&["vk", "run", "alpine"]),
+            argv(&["vk", "exec", "--service", "web", "--", "true"]),
+            argv(&["vk", "exec", "--service", "../other", "--", "true"]),
+            argv(&["vk", "exec", "--service=../other", "--", "true"]),
+            argv(&["vk", "exec", "--service", "..", "--", "true"]),
+            argv(&["vk", "exec", "--service", "-x", "--", "true"]),
+            argv(&["vk", "exec", "--service", "db", "true"]),
+            argv(&["vk", "exec", "--service", "db", "-b", "-t", "--", "true"]),
+            argv(&["vk", "exec", "--", "true"]),
+            argv(&["vk", "exec", "--service", "linked", "--", "true"]),
+        ] {
+            let refused = service_request(&job.0, &asked).map(|_| ());
+            assert_eq!(refused, Err(std::process::ExitCode::from(2)), "{asked:?}");
+        }
+
+        let req = service_request(
+            &job.0,
+            &argv(&[
+                "vk",
+                "exec",
+                "--service",
+                "db",
+                "-t",
+                "--user",
+                "pg",
+                "--dir",
+                "/srv",
+                "--env",
+                "A=1",
+                "--clear-env",
+                "--",
+                "psql",
+                "-c",
+                "select 1",
+            ]),
+        )
+        .unwrap();
+        let vk_core::addr::SocketAddr::VsockAuto { path, .. } = &req.addr else {
+            panic!("a service's exec address is vsock-auto: {:?}", req.addr)
+        };
+        assert_eq!(path, &job.0.join("svc-db/vsock.sock"));
+        assert!(req.tty && req.clear_env && !req.background);
+        assert_eq!(req.user.as_deref(), Some("pg"));
+        assert_eq!(req.workdir.as_deref(), Some("/srv"));
+        assert_eq!(req.env, ["A=1"]);
+        assert_eq!(
+            (req.program.as_str(), req.args),
+            ("psql", argv(&["-c", "select 1"]))
+        );
+        let req = service_request(
+            &job.0,
+            &argv(&["vk", "exec", "--service", "db", "-b", "--", "x"]),
+        )
+        .unwrap();
+        assert!(req.background);
+    }
+
+    /// The service exec log keeps its first bytes and says it dropped the rest, reading
+    /// everything so the serve never blocks on it.
+    #[test]
+    fn the_service_exec_log_is_capped() {
+        let mut out = Vec::new();
+        copy_capped(&b"0123456789"[..], &mut out, 4).unwrap();
+        assert_eq!(out, b"0123\n[log capped: the rest is dropped]\n");
+        let mut out = Vec::new();
+        copy_capped(&b"0123"[..], &mut out, 4).unwrap();
+        assert_eq!(out, b"0123");
+    }
 
     #[test]
     fn a_service_policy_covers_every_address_it_can_source() {

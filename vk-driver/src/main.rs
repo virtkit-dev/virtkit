@@ -1225,6 +1225,18 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// plumbing: what a guest's `vk` asks of its host, over the VM's host command channel
+    ///
+    /// A CI job VM's channel runs every request through this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
+    /// anything else is refused with exit 2.
+    #[command(name = "service-exec", hide = true)]
+    ServiceExec {
+        /// the job's directory, whose `svc-<name>` dirs are its services
+        dir: PathBuf,
+        /// what the guest's `vk` was given, `vk` first, after `--`
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
     /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
     ///
     /// ssh hands its protocol stream on stdio; we relay it to the guest's ssh-serve (`run
@@ -3122,6 +3134,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
     {
         return host_policy_cmd(policy, workspace, argv);
     }
+    // What a guest's `vk` asks decides on its argv and the services under its dir alone —
+    // before Config::load, so nothing the guest sends reaches the config or its loading.
+    if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
+        return vm::service_exec(dir, argv).await;
+    }
     // `update` replaces the binary and reads nothing from the config — handle it before
     // Config::load, so a config file that no longer parses cannot block the upgrade that
     // fixes it.
@@ -4995,6 +5012,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Update { .. }
         | Cmd::Toolchain { .. }
         | Cmd::HostPolicy { .. }
+        | Cmd::ServiceExec { .. }
         | Cmd::Service { .. } => {
             unreachable!()
         }
@@ -6313,6 +6331,40 @@ mod tests {
             err.contains("127.0.0.1:5000") && err.contains("--root"),
             "{err}"
         );
+    }
+
+    /// The service-exec wrapper puts the guest's argv after `--`, so a word the guest chose
+    /// is never one of this vk's own flags: `--config=/x` in the program's slot stays the
+    /// guest's argv[0], reaches no config, and is refused as not the guest's `vk`.
+    #[tokio::test]
+    async fn service_exec_keeps_the_guests_argv_away_from_vk_flags() {
+        let cli = Cli::try_parse_from([
+            "vk",
+            "service-exec",
+            "/nonexistent/job",
+            "--",
+            "--config=/x",
+            "vk",
+            "exec",
+            "--service",
+            "db",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, None);
+        let Cmd::ServiceExec { dir, argv } = cli.cmd else {
+            panic!("expected service-exec")
+        };
+        assert_eq!(argv[0], "--config=/x");
+        assert_eq!(argv[1..3], ["vk", "exec"]);
+        assert_eq!(
+            vm::service_exec(&dir, &argv).await,
+            ExitCode::from(2),
+            "{argv:?}"
+        );
+        // Without the `--` nothing runs at all.
+        assert!(Cli::try_parse_from(["vk", "service-exec", "/job", "vk", "exec"]).is_err());
     }
 
     // `vk publish` CLI shape. The foreground form takes a positional target and requires

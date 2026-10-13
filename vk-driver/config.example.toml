@@ -272,6 +272,10 @@
 #                        # day past the window is dropped whole by the first job recorded the
 #                        # next day (0 = only today, and loses the log of a job still running
 #                        # from yesterday). Reclamation stops with `atop = false`
+# guest_service_exec = true  # a job with compose services runs commands in them from its
+#                        # own VM: `vk exec --service NAME -- CMD`, which the host runs into
+#                        # that job's services and nothing else. Costs a host `vk` process
+#                        # per request; false gives the job VM no `vk` and no host channel
 
 [executor.vm]            # the job-VM template (only the CI job path reads it; `vk run` takes
                          # its sizing from flags and service VMs from the service name)

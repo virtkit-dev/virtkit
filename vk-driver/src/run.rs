@@ -129,7 +129,7 @@ const PRIMARY_VM: u32 = 0;
 /// vsock port the guest's host-exec forwarder dials (`--host-exec`); the host side
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
-const HOST_EXEC_PORT: u32 = 1100;
+pub(crate) const HOST_EXEC_PORT: u32 = 1100;
 /// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
 /// the guest agent's forwarder for that guest path and spliced host-side to the host socket
 /// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and

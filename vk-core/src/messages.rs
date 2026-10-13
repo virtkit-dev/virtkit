@@ -106,17 +106,29 @@ impl Tty {
     }
 }
 
+/// The longest a [`CmdExec`] is shown in a log line: the request is the client's, and a line
+/// per request must not be as long as the client likes.
+const SHOWN_MAX: usize = 256;
+
 impl fmt::Display for CmdExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
+        let mut shown = format!(
             "(name:{}, args:{:?}, {:?}{}{})",
             self.name,
             self.args,
             self.mode,
             if self.clear_env { ", clear_env" } else { "" },
             self.env.join(" ")
-        )
+        );
+        if shown.len() > SHOWN_MAX {
+            let mut end = SHOWN_MAX;
+            while !shown.is_char_boundary(end) {
+                end -= 1;
+            }
+            shown.truncate(end);
+            shown.push('…');
+        }
+        f.write_str(&shown)
     }
 }
 
@@ -128,7 +140,25 @@ pub struct CmdResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROTOCOL_VERSION, Status};
+    use super::{CmdExec, PROTOCOL_VERSION, RunMode, SHOWN_MAX, Status};
+
+    /// A request is shown at most [`SHOWN_MAX`] bytes long, cut on a character boundary.
+    #[test]
+    fn a_long_request_is_shown_cut() {
+        let cmd = CmdExec {
+            name: "é".repeat(400),
+            args: vec![],
+            env: vec![],
+            clear_env: false,
+            mode: RunMode::Interactive,
+            dir: None,
+            tty: None,
+            user: None,
+        };
+        let shown = cmd.to_string();
+        assert!(shown.len() <= SHOWN_MAX + '…'.len_utf8(), "{}", shown.len());
+        assert!(shown.ends_with('…'));
+    }
 
     #[test]
     fn default_status_reports_current_protocol() {

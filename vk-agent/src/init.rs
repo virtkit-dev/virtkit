@@ -197,6 +197,14 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     ensure_home_for_default_user(); // default user's passwd HOME, not the kernel's inherited /
+    if cmdline.contains_key("VIRTKIT_VK_CMD") {
+        // The guest `vk` (link_vk_cmd), for every command and login shell — last, so an
+        // image's own `vk` keeps its place.
+        set_env(
+            "PATH",
+            &with_vk_cmd_dir(&std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.into())),
+        );
+    }
     publish_env(boot_config.as_ref(), legacy_env, &cmdline); // the merged env, for login shells
     // Filesystems to freeze clean at poweroff: disk volumes and any persistent overlay uppers
     // (both host-backed ext4); see [`DISK_MOUNTS`].
@@ -1299,6 +1307,15 @@ fn publish_env(
         match env.iter_mut().find(|(ek, _)| ek == k) {
             Some(e) => e.1 = v.clone(),
             None => env.push((k.clone(), v.clone())),
+        }
+    }
+    // The PATH run_init gave every command, with the guest `vk` on it.
+    if cmdline.contains_key("VIRTKIT_VK_CMD")
+        && let Ok(path) = std::env::var("PATH")
+    {
+        match env.iter_mut().find(|(k, _)| k == "PATH") {
+            Some(e) => e.1 = path,
+            None => env.push(("PATH".to_string(), path)),
         }
     }
     let run = user_ids(&std::env::var("VIRTKIT_DEFAULT_RUN_USER").unwrap_or_default());
@@ -2715,7 +2732,7 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
         warn!("vk-agent init: creating /run/vk failed: {e}");
         return;
     }
-    install_agent_bin();
+    let agent_bin = install_agent_bin();
     // Give the socket to the run user (VIRTKIT_DEFAULT_RUN_USER, set above by
     // export_default_run_user/apply_boot_config; unset when the stage runs as root)
     // so a non-root job stage can reach the host channel.
@@ -2723,20 +2740,57 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
     if let Err(e) = fork_agent(&host_exec_forward_args(port, run_user.as_deref())) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
+    if cmdline.contains_key("VIRTKIT_VK_CMD") && agent_bin {
+        link_vk_cmd();
+    }
+}
+
+/// The directory of the guest's `vk`, on the `PATH` of a VM that has one; on the `/run`
+/// tmpfs, beside [`crate::runenv::AGENT_BIN`], never in the image.
+const VK_CMD_DIR: &str = "/run/vk/bin";
+
+/// Where the guest's `vk` is: the agent under the name it answers to as the host's `vk`.
+const VK_CMD: &str = "/run/vk/bin/vk";
+
+/// `path` with [`VK_CMD_DIR`] last, once.
+fn with_vk_cmd_dir(path: &str) -> String {
+    if path.split(':').any(|d| d == VK_CMD_DIR) {
+        path.to_string()
+    } else if path.is_empty() {
+        VK_CMD_DIR.to_string()
+    } else {
+        format!("{path}:{VK_CMD_DIR}")
+    }
+}
+
+/// Give the guest a `vk` command (`VIRTKIT_VK_CMD`: a CI job with services): the agent, linked as `vk` in [`VK_CMD_DIR`], which run_init put last on the
+/// `PATH`. It hands what it is given to the host's `vk` over the host command channel —
+/// `vk exec --service NAME -- CMD`, the one form the host allows.
+fn link_vk_cmd() {
+    // Nothing is there on a fresh /run; a failure that matters fails the symlink below.
+    let _ = std::fs::remove_file(VK_CMD);
+    if let Err(e) = std::os::unix::fs::symlink("vk-agent", VK_CMD) {
+        warn!("vk-agent init: linking {VK_CMD} failed: {e}");
+    }
 }
 
 /// Make the running agent reachable at [`crate::runenv::AGENT_BIN`] for guest processes — the
 /// host-exec client and the login-shell hook — once per boot, whichever needs it first.
-fn install_agent_bin() {
-    static DONE: OnceLock<()> = OnceLock::new();
-    DONE.get_or_init(|| {
-        if let Err(e) = install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, crate::runenv::AGENT_BIN) {
-            warn!(
-                "vk-agent init: mounting {} failed: {e:#}",
-                crate::runenv::AGENT_BIN
-            );
+/// Whether it is there.
+fn install_agent_bin() -> bool {
+    static DONE: OnceLock<bool> = OnceLock::new();
+    *DONE.get_or_init(|| {
+        match install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, crate::runenv::AGENT_BIN) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "vk-agent init: mounting {} failed: {e:#}",
+                    crate::runenv::AGENT_BIN
+                );
+                false
+            }
         }
-    });
+    })
 }
 
 fn install_host_exec_agent(src: &str, dest: &str) -> Result<()> {
@@ -3461,6 +3515,20 @@ fn cstr(s: &str) -> CString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest `vk` goes last on the PATH, after an image `vk` anywhere on it, and once.
+    #[test]
+    fn the_guest_vk_goes_last_on_the_path() {
+        assert_eq!(
+            with_vk_cmd_dir("/usr/local/bin:/usr/bin"),
+            "/usr/local/bin:/usr/bin:/run/vk/bin"
+        );
+        assert_eq!(
+            with_vk_cmd_dir("/run/vk/bin:/usr/bin"),
+            "/run/vk/bin:/usr/bin"
+        );
+        assert_eq!(with_vk_cmd_dir(""), "/run/vk/bin");
+    }
 
     #[test]
     fn only_a_job_a_hub_placed_needs_no_gitlab_runner() {

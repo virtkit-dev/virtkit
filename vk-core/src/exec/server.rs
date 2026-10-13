@@ -84,6 +84,9 @@ pub struct Limits {
     pub max_concurrent: Option<NonZeroUsize>,
     /// How long a new connection may take to send its request.
     pub first_message_timeout: Duration,
+    /// Whether a background command may run. Without it, every command runs only as long as
+    /// its session, and no child of the server outlives it unsupervised.
+    pub background: bool,
 }
 
 impl Default for Limits {
@@ -91,6 +94,7 @@ impl Default for Limits {
         Limits {
             max_concurrent: None,
             first_message_timeout: FIRST_MESSAGE_TIMEOUT,
+            background: true,
         }
     }
 }
@@ -99,12 +103,14 @@ impl Default for Limits {
 /// running at once; one past the cap is refused with a `StartErr` rather than queued. A background
 /// command counts until it exits, but not a process it double-forks away: the cap bounds
 /// requests, not processes. Status probes are never refused, and a connection that names no
-/// request within `limits.first_message_timeout` is closed, so neither takes up the cap.
+/// request within `limits.first_message_timeout` is closed, so neither takes up the cap. With
+/// `exec_wrapper`, every command runs through it, `exec_wrapper_args` first ([`wrap_cmd`]).
 pub async fn run_server(
     socket: &SocketAddr,
     inactivity_timeout: Option<Duration>,
     exec_wrapper: Option<PathBuf>,
     exec_wrapper_env: Vec<String>,
+    exec_wrapper_args: Vec<String>,
     limits: Limits,
 ) -> Result<(), anyhow::Error> {
     // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
@@ -115,7 +121,10 @@ pub async fn run_server(
     // Force every exec through this program (like SSH's ForceCommand): it receives
     // the requested command line as its arguments and decides what to run.
     // None = run requested commands directly (the default, unrestricted).
-    let exec_wrapper = Arc::new(exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env)));
+    let exec_wrapper = Arc::new(
+        exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env, exec_wrapper_args)),
+    );
+    let allow_background = limits.background;
     let first_message_timeout = limits.first_message_timeout;
     let limit = limits.max_concurrent.map(|n| Limit {
         max: n.get(),
@@ -168,7 +177,7 @@ pub async fn run_server(
                     // A new task is spawned for each socket. The socket is moved to the new task and processed there.
                     tokio::spawn(async move {
                         let mut update_last = true;
-                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref(), limit.as_ref(), first_message_timeout).await {
+                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref(), limit.as_ref(), first_message_timeout, allow_background).await {
                             // A connection that failed before naming itself counts as activity:
                             // only a completed status request is known not to be one.
                             Err(e) => info!("{e}"),
@@ -265,16 +274,22 @@ pub(crate) struct ExecWrapper {
     /// var names; client env not matching any pattern is dropped before the
     /// wrapper runs, so it cannot be subverted (LD_PRELOAD, BASH_ENV, ...).
     env_allow: Vec<String>,
+    /// Arguments the wrapper gets first, before the requested command line.
+    args: Vec<String>,
 }
 
 impl ExecWrapper {
-    pub(crate) fn new(path: PathBuf, extra_env_allow: Vec<String>) -> Self {
+    pub(crate) fn new(path: PathBuf, extra_env_allow: Vec<String>, args: Vec<String>) -> Self {
         let mut env_allow: Vec<String> = WRAPPER_ENV_ALLOW_DEFAULTS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
         env_allow.extend(extra_env_allow);
-        Self { path, env_allow }
+        Self {
+            path,
+            env_allow,
+            args,
+        }
     }
 
     fn env_allowed(&self, name: &str) -> bool {
@@ -329,7 +344,8 @@ pub const WRAPPER_DIR_ENV: &str = "VK_EXEC_DIR";
 ///   (trusted) server env the wrapper inherits;
 /// - a tty keeps the client's size and modes, but its `TERM` only when the allowlist has it.
 fn wrap_cmd(mut cmd: CmdExec, wrapper: &ExecWrapper) -> CmdExec {
-    let mut args = Vec::with_capacity(cmd.args.len() + 1);
+    let mut args = Vec::with_capacity(wrapper.args.len() + cmd.args.len() + 1);
+    args.extend(wrapper.args.iter().cloned());
     args.push(std::mem::take(&mut cmd.name));
     args.append(&mut cmd.args);
     cmd.name = wrapper.path.to_string_lossy().into_owned();
@@ -357,6 +373,7 @@ async fn do_handle_conn(
     exec_wrapper: Option<&ExecWrapper>,
     limit: Option<&Limit>,
     first_message_timeout: Duration,
+    allow_background: bool,
 ) -> Result<bool, anyhow::Error> {
     let client_request = time::timeout(first_message_timeout, stream.next())
         .await
@@ -382,6 +399,13 @@ async fn do_handle_conn(
 
     match client_request {
         Message::CmdExec(cmd) => {
+            if cmd.mode == RunMode::Background && !allow_background {
+                let msg = "background commands are refused on this channel".to_string();
+                // The refusal is the session's only reply; a client already gone has nothing
+                // left to tell.
+                let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
+                return Err(anyhow!(msg));
+            }
             let cmd = match exec_wrapper {
                 Some(w) => wrap_cmd(cmd, w),
                 None => cmd,
@@ -1572,7 +1596,7 @@ mod tests {
     }
 
     fn wrapper(extra_env_allow: Vec<String>) -> ExecWrapper {
-        ExecWrapper::new(PathBuf::from("/run/host-dispatch"), extra_env_allow)
+        ExecWrapper::new(PathBuf::from("/run/host-dispatch"), extra_env_allow, vec![])
     }
 
     #[test]
@@ -1581,6 +1605,23 @@ mod tests {
         assert_eq!(wrapped.name, "/run/host-dispatch");
         // the requested command line becomes the wrapper's argv
         assert_eq!(wrapped.args, vec!["git", "status"]);
+    }
+
+    /// Fixed wrapper arguments come first, so nothing the client sends lands before them.
+    #[test]
+    fn wrap_cmd_puts_the_wrapper_args_first() {
+        let wrapper = ExecWrapper::new(
+            PathBuf::from("/usr/bin/vk"),
+            vec![],
+            vec!["service-exec".into(), "/job".into(), "--".into()],
+        );
+        let mut cmd = sample_cmd();
+        cmd.name = "--config=/x".into();
+        let wrapped = wrap_cmd(cmd, &wrapper);
+        assert_eq!(
+            wrapped.args,
+            ["service-exec", "/job", "--", "--config=/x", "status"]
+        );
     }
 
     /// The client chooses neither who the wrapper runs as nor where: the user is the server's
