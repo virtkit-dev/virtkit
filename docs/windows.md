@@ -143,6 +143,8 @@ another host's count may match, so it installs again and pushes over what that h
 - `tests/windows-ad-e2e.sh`: the AD lab (a DC, a Linux job creating its users, two members,
   RDP sign-ins), then a snapshot of the lab and its restore.
 - `tests/windows-rdp-e2e.sh`: a full Remote Desktop session into a standalone server.
+- `tests/windows-ci-e2e.sh`: a CI job's Windows service built from a Dockerfile, with ISOs
+  from `REGISTRY` or a local build cache registry filled from `ISO_DIR`.
 - `tests/int1-e2e.sh`: a guest's `int1` traps once, with the VMM stepping over it; says
   whether the host has the nested-SVM fault without it.
 - `tests/release-e2e.sh` runs the Windows tests when `ISO_DIR` names where the ISOs are, and

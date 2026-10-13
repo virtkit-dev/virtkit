@@ -153,9 +153,34 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether the process `pid` is running: there, and not a zombie its parent has yet to reap,
+/// which [`pid_alive`] counts as alive.
+pub(crate) fn pid_running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        // The state follows the command name, which is parenthesized and may hold anything.
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process that exited but is not reaped yet is not running.
+    #[test]
+    fn a_zombie_is_not_running() {
+        assert!(pid_running(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pid_running(pid) {
+            assert!(std::time::Instant::now() < deadline, "{pid} still running");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.wait().unwrap();
+        assert!(!pid_running(pid));
+    }
 
     /// The session id of `pid`, from `/proc/<pid>/stat`.
     fn sid_of(pid: u32) -> u32 {

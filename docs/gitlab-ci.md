@@ -1407,6 +1407,54 @@ A service reaches the job VM back as `build`, the alias GitLab's docker executor
 job container on a per-build network, or by `[executor.vm] hostname`; a service aliased
 either name keeps that name.
 
+### Windows services
+
+A `compose:` job's service whose `build:` Dockerfile installs Windows (`FROM winiso:`, see
+[Windows guests](windows.md)) runs beside the job VM, which stays Linux:
+
+```yaml
+# ci/lab.compose.yaml
+services:
+  job:
+    build: { context: ., dockerfile: job.Dockerfile }
+  dc:
+    build: { context: windows, dockerfile: lab.Dockerfile, target: dc }
+    x-virtkit: { cpus: 2, mem: 3G }
+```
+
+```yaml
+ad-tests:
+  variables:
+    MICROVM_IMAGE: compose:ci/lab.compose.yaml#job
+  script:
+    - ./tests/ad.sh dc            # the DC by its service name
+```
+
+- Prepare builds it with `vk build`'s Windows path into the job dir. Its layers come from the
+  host's Windows cache or, with `[build] cache_registry` on a registry server, from the hosts
+  that built them ([sharing builds](windows.md#sharing-builds-between-hosts)); the ISOs a
+  `winiso:` stage pins come from that registry too (`vk registry put`), so they need not
+  be in the repository. A first install takes 20 minutes or more, once for the fleet.
+- The supervisor boots it on the job's LAN under its service name and runs its provisioning
+  (`CMD`, compose `environment`); prepare waits for that, up to 30 minutes, before the script
+  starts, and fails the job as soon as the supervisor is gone.
+- All of it happens inside prepare: raise gitlab-runner's `prepare_exec_timeout` (custom
+  executor settings) to cover a first install plus provisioning.
+- Its size is the compose `x-virtkit` one, else its Dockerfile's `# vk:` line, else the
+  runner's `[build]` guest size, held under the runner's `vm.max_cpus`/`vm.max_mem` and
+  `mem_budget` like any service; its build guests are held under them too, and less than
+  the 2G Windows needs, asked for or left by a ceiling, fails the build up front. Admission does
+  not count it yet: not its memory (as for any service), its build guests, or its disk growth.
+- A step reaches the network (`RUN --network=default`) only when `[egress.build]` is
+  unrestricted: a Windows step's switch applies no allowlist, and `[egress.build]` audit does
+  not cover it.
+- The Dockerfile's `winiso:` paths (the medium, its `--drivers`) must stay inside the build
+  context: an absolute path, a `..` or a symlink out is refused. A stage builds on a
+  `winiso:` medium or an earlier stage, never on a bundle: a bundle names its layer by key
+  alone, which would hand the job any layer of the host's cache or the registry.
+- One Dockerfile per service, no build args and no additional contexts, one NIC; a bundle
+  `image:` path is refused, and the job VM cannot be Windows.
+
 ### Per-service networking
 
 Each service is a real VM with its own address on the shared switch, so a service

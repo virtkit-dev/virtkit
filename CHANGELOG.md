@@ -30,6 +30,11 @@ All notable changes to virtkit will be documented in this file.
   three hours. Builds without a registry server keep their layers on the host, as before.
   The registry holds each install's Administrator password in clear: restrict pull access
   to `build-cache`.
+- **CI jobs run Windows services.** A `compose:` service with a Windows `build:` Dockerfile
+  builds during prepare, reusing cached layers shared between hosts when a build cache
+  registry is configured. It boots beside the Linux job VM on the job's LAN and runs its
+  provisioning (`CMD`) before the script starts. Raise gitlab-runner's `prepare_exec_timeout`
+  to cover a first install.
 
 ### Changed
 

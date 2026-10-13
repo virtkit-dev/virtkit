@@ -5383,16 +5383,18 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
             );
         }
     };
+    let (cpus, mem) = winbuild::default_size();
     let opts = winbuild::Options {
         dockerfile: dockerfile.clone(),
         context,
         target: target.first().cloned(),
         out,
-        cpus: build::configured_build_cpus().unwrap_or(4),
-        mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
+        cpus,
+        mem,
         no_network,
         reinstall: *reinstall,
         registry,
+        ceiling: None,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
         Ok(Ok(())) => ExitCode::SUCCESS,

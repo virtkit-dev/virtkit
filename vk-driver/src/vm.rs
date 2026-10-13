@@ -1,6 +1,7 @@
 //! microVM lifecycle: prepare (overlay + VMM + wait for the in-guest
 //! agent) and cleanup (ACPI poweroff, escalation, state removal). One VM per job.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
@@ -472,16 +473,20 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // plan_services) keeps the guest boot within the runner's readiness budget. supervise then
     // just hits the fresh tier. Non-build services are left for supervise (a pull is quick).
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
-    let mut service_names: Vec<String> = Vec::new();
+    // Each service, and whether it is a Windows one.
+    let mut service_names: Vec<(String, bool)> = Vec::new();
     if let Some(spec) = image_ref.strip_prefix("compose:") {
         for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
             validate_service_egress(cfg, &unit)?;
-            if matches!(unit.source, crate::compose::Source::Build { .. }) {
+            let windows = windows_build(&unit)?;
+            if let Some(build) = &windows {
+                build_windows_unit(ctx, &unit, build)?;
+            } else if matches!(unit.source, crate::compose::Source::Build { .. }) {
                 let (_, _, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
                 warm_guards.push(guard);
             }
-            service_names.push(unit.name);
+            service_names.push((unit.name, windows.is_some()));
         }
     } else {
         for unit in crate::services::to_units(crate::services::from_env()?) {
@@ -493,7 +498,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
                 warm_guards.push(guard);
             }
-            service_names.push(unit.name);
+            service_names.push((unit.name, false));
         }
     }
 
@@ -561,7 +566,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                 // Only signal ready (exit 0) once the services the job declared are up too:
                 // they boot concurrently in the supervisor and the job script runs the moment
                 // this stage exits.
-                wait_for_services(ctx, &service_names).await?;
+                wait_for_services(ctx, &service_names, &mut sup).await?;
                 // The supervisor holds its own references now: this phase is done depending
                 // on the bases it warmed. Explicit so a later edit cannot shorten the hold
                 // without noticing.
@@ -594,14 +599,37 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 /// accepts connections (see vk-agent's `wait_for_exposed_ports`), so a database service gates on
 /// the port being up, not merely on the guest booting. The names mirror `plan_services`, so each
 /// path addresses the same `svc-<name>` runtime dir.
-async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
+async fn wait_for_services(
+    ctx: &JobCtx,
+    names: &[(String, bool)],
+    sup: &mut std::process::Child,
+) -> Result<()> {
     let cfg = &ctx.cfg;
     // The siblings boot concurrently in the supervisor, so a single readiness budget spans them
     // all rather than a fresh one per service.
     let start = Instant::now();
     let deadline = start + Duration::from_secs(cfg.executor.vm.boot_timeout_secs);
-    for name in names {
+    // The Windows services last: their wait has a budget of its own, and one spent before a
+    // Linux service's probes would leave that service a single try.
+    let mut ordered: Vec<_> = names.iter().collect();
+    ordered.sort_by_key(|(_, windows)| *windows);
+    for (name, windows) in ordered {
         let dir = ctx.job_dir.join(format!("svc-{name}"));
+        if *windows {
+            // The supervisor runs the provisioning: once it is gone, no outcome is coming.
+            let mut supervisor = || -> Result<Option<String>> {
+                let Some(status) = sup.try_wait()? else {
+                    return Ok(None);
+                };
+                log_tail(&ctx.supervisor_log(), 15);
+                Ok(Some(format!(
+                    "the job supervisor exited ({status}, see {})",
+                    ctx.supervisor_log().display()
+                )))
+            };
+            wait_for_windows(&dir, name, start, WINDOWS_READY, &mut supervisor).await?;
+            continue;
+        }
         let addr = crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT);
         loop {
             match vk_core::status::get_status_within(&addr, vk_core::status::BOOT_PROBE_BUDGET)
@@ -628,6 +656,49 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wait up to `ready` for the Windows service `name`, whose runtime dir is `dir`, to be
+/// provisioned: its supervisor thread marks the outcome there. `start` is when the services
+/// began booting. `supervisor` says why no outcome can come any more, once the supervisor that
+/// runs the provisioning is gone.
+async fn wait_for_windows(
+    dir: &Path,
+    name: &str,
+    start: Instant,
+    ready: Duration,
+    supervisor: &mut dyn FnMut() -> Result<Option<String>>,
+) -> Result<()> {
+    let mut said = Instant::now();
+    loop {
+        if dir.join(PROVISIONED).exists() {
+            println!(
+                "vk: service {name} ready in {:.1}s",
+                start.elapsed().as_secs_f32()
+            );
+            return Ok(());
+        }
+        if let Ok(why) = std::fs::read_to_string(dir.join(PROVISION_FAILED)) {
+            log_tail(&dir.join(crate::run::CONSOLE_LOG), 30);
+            bail!("service {name}: provisioning failed: {why}");
+        }
+        if let Some(gone) = supervisor()? {
+            log_tail(&dir.join(crate::run::CONSOLE_LOG), 30);
+            bail!("service {name}: not provisioned: {gone}");
+        }
+        if start.elapsed() >= ready {
+            log_tail(&dir.join(crate::run::CONSOLE_LOG), 30);
+            bail!("service {name} not provisioned after {}s", ready.as_secs());
+        }
+        if said.elapsed() >= Duration::from_secs(60) {
+            println!(
+                "vk: service {name}: Windows still starting ({:.0}s)",
+                start.elapsed().as_secs_f32()
+            );
+            said = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Resolve MICROVM_IMAGE to the [`BootPlan`] the job VM boots: its media, plus
@@ -1075,15 +1146,141 @@ fn compose_service_units(fleet: &ComposeFleet) -> Result<Vec<crate::compose::Uni
 /// Why a CI job does not boot the Windows service `unit`.
 fn windows_service_refused(unit: &crate::compose::Unit) -> anyhow::Error {
     anyhow!(
-        "service {}: a Windows bundle runs under `vk run --compose`, not in a CI job",
+        "service {}: a CI job builds its Windows services from their Dockerfile (`build:`); \
+         a bundle `image:` path runs under `vk run --compose` only",
         unit.name
     )
 }
+
+/// What a compose `build:` unit with a Windows Dockerfile builds.
+struct WindowsBuild {
+    dockerfile: PathBuf,
+    context: PathBuf,
+    target: Option<String>,
+}
+
+/// The Windows build of `unit`, if it is a `build:` unit one of whose Dockerfiles builds
+/// Windows. Its `FROM`s must stay inside its context ([`crate::winbuild::check_confined`]): the
+/// Dockerfile is the job's, and its paths must not reach another job's bundle or the host.
+fn windows_build(unit: &crate::compose::Unit) -> Result<Option<WindowsBuild>> {
+    let crate::compose::Source::Build {
+        dockerfiles,
+        context,
+        build_contexts,
+        target,
+        args,
+    } = &unit.source
+    else {
+        return Ok(None);
+    };
+    let mut windows = None;
+    for dockerfile in dockerfiles {
+        // An unreadable Dockerfile is the Linux build's to report.
+        let Ok(text) = std::fs::read_to_string(dockerfile) else {
+            continue;
+        };
+        // By its text alone: a job may not build on a bundle (see `check_confined`), so the
+        // filesystem is not probed for one.
+        if crate::winbuild::installs_windows(&text)
+            .with_context(|| format!("service {}: {}", unit.name, dockerfile.display()))?
+        {
+            windows = Some((dockerfile, text));
+            break;
+        }
+    }
+    let Some((dockerfile, text)) = windows else {
+        return Ok(None);
+    };
+    crate::winbuild::check_confined(&text, context)
+        .with_context(|| format!("service {}: {}", unit.name, dockerfile.display()))?;
+    // Before the build, which a first install makes long.
+    refuse_windows_nics(unit)?;
+    if dockerfiles.len() > 1 || !build_contexts.is_empty() || !args.is_empty() {
+        bail!(
+            "service {}: a Windows build takes one Dockerfile, without build args or \
+             additional contexts",
+            unit.name
+        );
+    }
+    Ok(Some(WindowsBuild {
+        dockerfile: dockerfile.clone(),
+        context: context.clone(),
+        target: target.clone(),
+    }))
+}
+
+/// The bundle the Windows service `name` boots: built into the job dir, over layers kept in the
+/// host's Windows layer cache and shared through the build cache registry.
+fn windows_bundle_dir(ctx: &JobCtx, name: &str) -> PathBuf {
+    ctx.job_dir.join(format!("win-{name}"))
+}
+
+/// Build the Windows service `unit` into its bundle ([`windows_bundle_dir`]), unless prepare's
+/// warm pass did already. Steps reach the network (`RUN --network=default`) only when the
+/// `[egress.build]` policy is unrestricted: a Windows step's switch applies no allowlist.
+fn build_windows_unit(
+    ctx: &JobCtx,
+    unit: &crate::compose::Unit,
+    build: &WindowsBuild,
+) -> Result<PathBuf> {
+    let out = windows_bundle_dir(ctx, &unit.name);
+    if out.join(crate::uefi::MANIFEST).is_file()
+        && out.join(crate::winbuild::LAYER_RECORD).is_file()
+    {
+        return Ok(out);
+    }
+    let cfg = &ctx.cfg;
+    let (net, audit) = effective_build_egress(cfg, ctx)?;
+    if audit {
+        println!(
+            "virtkit: warning: service {}: [egress.build] audit does not cover a Windows build's \
+             steps",
+            unit.name
+        );
+    }
+    let registry = crate::windows_registry(None, false, &cfg.build)?;
+    let (cpus, mem) = crate::winbuild::default_size();
+    let opts = crate::winbuild::Options {
+        dockerfile: build.dockerfile.clone(),
+        context: build.context.clone(),
+        target: build.target.clone(),
+        out: out.clone(),
+        cpus,
+        mem,
+        no_network: !matches!(net, crate::build::BuildNet::All),
+        reinstall: false,
+        registry,
+        // A job's Dockerfile sizes its build guests no larger than its services.
+        ceiling: Some(service_ceiling(cfg)?),
+    };
+    println!("virtkit: service {}: building its Windows image", unit.name);
+    // A step's switch needs a runtime outside prepare's runtime.
+    std::thread::spawn(move || crate::winbuild::build(&opts))
+        .join()
+        .map_err(|_| anyhow!("the Windows build panicked"))?
+        .with_context(|| format!("service {}: building its Windows image", unit.name))?;
+    Ok(out)
+}
+
+/// In a Windows service's runtime dir: written by the supervisor once the service's
+/// provisioning has run, which is when it is ready; [`PROVISION_FAILED`] holds why it did not.
+const PROVISIONED: &str = "provisioned";
+const PROVISION_FAILED: &str = "provision-failed";
+/// How long prepare waits for a Windows service: a boot, then provisioning that may restart it.
+/// Shorter than what the supervisor allows (`winsvc::START_TIMEOUT` per boot, restarts
+/// included): a service still starting by then fails the job rather than hold prepare for hours.
+const WINDOWS_READY: Duration = Duration::from_secs(30 * 60);
 
 /// Resolve one compose unit to boot media: a `build:` unit is built into the shared build tier
 /// (from the host checkout), an `image:` unit resolves through the shared image cache. Its
 /// compose `environment`/`user` overrides are merged into the boot config either way.
 fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootPlan> {
+    if windows_build(unit)?.is_some() {
+        bail!(
+            "service {}: the job VM runs the script and is Linux; a Windows service runs beside it",
+            unit.name
+        );
+    }
     match &unit.source {
         crate::compose::Source::Bundle { .. } => Err(windows_service_refused(unit)),
         crate::compose::Source::Build { .. } => {
@@ -1200,6 +1397,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
     let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, cfg.build.kernel.as_deref())?;
     let mut children: Vec<std::process::Child> = Vec::new();
+    // Windows VMMs read firmware through these handles; keep them until supervision ends.
+    let mut firmwares = Vec::new();
     // Remember the switch so `stop_helpers` can drain it after stopping the other helpers.
     // `None` unless `net.mode = "switch"`.
     let mut switch_pid: Option<u32> = None;
@@ -1500,7 +1699,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // Every service's guard lands directly in `use_guards` inside `plan_services`: a
             // git-defined/`build:` service's the moment its build promotes it, an `image:`
             // service's fresh off `image::resolve_ref` — no gap either way.
-            let services = plan_services(ctx, gateway, prefix, &mut use_guards)?;
+            let mut windows = HashMap::new();
+            let services = plan_services(ctx, gateway, prefix, &mut use_guards, &mut windows)?;
             service_names = services.iter().map(|s| s.name.clone()).collect();
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
@@ -1513,6 +1713,32 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             children.push(switch);
             for svc in &services {
                 let dir = ctx.job_dir.join(format!("svc-{}", svc.name));
+                if let Some(provisioning) = windows.remove(&svc.name) {
+                    let (child, firmware) =
+                        crate::winsvc::boot(svc, &dir, cfg.net.net_port, gateway)
+                            .with_context(|| format!("booting service {}", svc.name))?;
+                    firmwares.push(firmware);
+                    println!("virtkit: service {} booting Windows ({})", svc.name, svc.ip);
+                    let pid = child.id();
+                    children.push(child);
+                    std::thread::spawn(move || {
+                        let running = &mut || crate::spawn::pid_running(pid);
+                        let (marker, body) = match provisioning.run(running) {
+                            Ok(()) => (PROVISIONED, String::new()),
+                            Err(e) => (PROVISION_FAILED, format!("{e:#}")),
+                        };
+                        // Whole or not at all: prepare reads it as it polls. A marker that
+                        // cannot be written ends in prepare's timeout; say why here.
+                        let path = provisioning.dir.join(marker);
+                        if let Err(e) = vk_fs::write_atomic(&path, body.as_bytes(), 0o644) {
+                            eprintln!(
+                                "virtkit: service {}: recording its provisioning: {e:#}",
+                                provisioning.name
+                            );
+                        }
+                    });
+                    continue;
+                }
                 let (child, aux) = crate::units::boot_unit(
                     svc,
                     &dir,
@@ -2190,6 +2416,7 @@ fn plan_services(
     gateway: Ipv4Addr,
     prefix: u8,
     guards: &mut Vec<crate::cachelock::Guard>,
+    windows: &mut HashMap<String, crate::winsvc::Provisioning>,
 ) -> Result<Vec<crate::units::Provisioned>> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     let units = match image_ref.strip_prefix("compose:") {
@@ -2226,6 +2453,20 @@ fn plan_services(
             slot: slot as u32,
             extra_ips,
         };
+        if let Some(build) = windows_build(&unit)? {
+            let bundle = build_windows_unit(ctx, &unit, &build)?;
+            let manifest = crate::uefi::Bundle::open(&bundle)?.manifest;
+            size_windows_service(&ctx.cfg, &mut unit, manifest.cpus, manifest.mem)?;
+            let config = crate::compose::merged_config(&Default::default(), &unit);
+            let prov = crate::units::provisioned(&unit, bundle, config, siting(slot, extra_ips))?;
+            let dir = ctx.job_dir.join(format!("svc-{}", unit.name));
+            windows.insert(
+                unit.name.clone(),
+                crate::winsvc::Provisioning::of(&prov, &unit, &dir, gateway)?,
+            );
+            out.push(prov);
+            continue;
+        }
         let prov = match service_media(&unit.source) {
             ServiceMedia::Bundle => return Err(windows_service_refused(&unit)),
             ServiceMedia::Git(spec) => {
@@ -2663,6 +2904,44 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
         bail!(
             "[executor.vm] nested is set but this host does not allow nesting — load kvm_intel or \
              kvm_amd with nested=1, or unset it"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a Windows service with more than one NIC: winsvc attaches it to the job switch alone.
+fn refuse_windows_nics(unit: &crate::compose::Unit) -> Result<()> {
+    if unit.nics > 1 {
+        bail!(
+            "service {}: x-virtkit.nics: a Windows service has one NIC in a CI job",
+            unit.name
+        );
+    }
+    Ok(())
+}
+
+/// Size a Windows service as its compose file says, else as its bundle records (`cpus`, `mem`:
+/// the Dockerfile's `# vk:` line, else the build's guest size), and either way under the
+/// ceilings a declared size is held to ([`clamp_service_size`]). Less memory than Windows needs
+/// is refused: the service would fail late, at prepare's wait.
+fn size_windows_service(
+    cfg: &crate::config::Config,
+    unit: &mut crate::compose::Unit,
+    cpus: Option<u32>,
+    mem: Option<String>,
+) -> Result<()> {
+    unit.cpus = unit.cpus.or(cpus);
+    unit.mem = unit.mem.take().or(mem);
+    clamp_service_size(cfg, unit)?;
+    if let Some(mem) = &unit.mem
+        && crate::run::parse_mem_mib(mem)
+            .with_context(|| format!("service {}: invalid mem {mem:?}", unit.name))?
+            < crate::winbuild::WINDOWS_MIN_MIB
+    {
+        bail!(
+            "service {}: mem {mem}: less than the {}M Windows needs",
+            unit.name,
+            crate::winbuild::WINDOWS_MIN_MIB
         );
     }
     Ok(())
@@ -3738,6 +4017,110 @@ mod tests {
         assert_eq!(out, b"0123");
     }
 
+    /// Detect Windows `build:` services anywhere in the Dockerfile list; leave Linux builds alone.
+    /// Reject Windows builds with args, multiple Dockerfiles, additional contexts, or a `FROM`
+    /// outside the checkout. The job VM must remain Linux.
+    #[test]
+    fn windows_builds_are_told_from_linux_ones() {
+        let dir = std::env::temp_dir().join(format!("vk-winbuild-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("shared")).unwrap();
+        let pin = |c: &str| c.repeat(64);
+        std::fs::write(
+            dir.join("win.Dockerfile"),
+            format!(
+                "FROM winiso:ws.iso@sha256:{} --drivers=v.iso@sha256:{} AS base\nRUN echo\n",
+                pin("a"),
+                pin("b")
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("linux.Dockerfile"), "FROM debian:13\nRUN true\n").unwrap();
+        std::fs::write(
+            dir.join("escape.Dockerfile"),
+            format!(
+                "FROM winiso:../other-job/ws.iso@sha256:{} --drivers=v.iso@sha256:{}\n",
+                pin("a"),
+                pin("b")
+            ),
+        )
+        .unwrap();
+        // Not even probed for: a bundle is no base a job may build on.
+        std::fs::write(dir.join("bundle.Dockerfile"), "FROM ../other-job/win-dc\n").unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            "services:\n\
+             \x20 win:\n    build: { context: ., dockerfile: win.Dockerfile, target: base }\n\
+             \x20 lin:\n    build: { context: ., dockerfile: linux.Dockerfile }\n\
+             \x20 args:\n    build: { context: ., dockerfile: win.Dockerfile, args: { A: b } }\n\
+             \x20 two:\n    build: { context: ., dockerfile: [linux.Dockerfile, win.Dockerfile] }\n\
+             \x20 ctx:\n    build:\n      context: .\n      dockerfile: win.Dockerfile\n      \
+             additional_contexts: { shared: ./shared }\n\
+             \x20 escape:\n    build: { context: ., dockerfile: escape.Dockerfile }\n\
+             \x20 bundle:\n    build: { context: ., dockerfile: bundle.Dockerfile }\n",
+        )
+        .unwrap();
+        let units = crate::compose::load(&dir.join("compose.yaml"), None).unwrap();
+        let unit = |name: &str| units.iter().find(|u| u.name == name).unwrap();
+        let win = windows_build(unit("win")).unwrap().unwrap();
+        assert!(win.dockerfile.ends_with("win.Dockerfile"));
+        assert_eq!(win.target.as_deref(), Some("base"));
+        assert!(windows_build(unit("lin")).unwrap().is_none());
+        for name in ["args", "two", "ctx"] {
+            let err = format!("{:#}", windows_build(unit(name)).err().unwrap());
+            assert!(err.contains("without build args"), "{name}: {err}");
+        }
+        let err = format!("{:#}", windows_build(unit("escape")).err().unwrap());
+        assert!(err.contains("outside the build context"), "{err}");
+        assert!(windows_build(unit("bundle")).unwrap().is_none());
+        let ctx = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
+        let err = format!("{:#}", compose_unit_media(&ctx, unit("win")).err().unwrap());
+        assert!(
+            err.contains("the job VM runs the script and is Linux"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Prepare's wait on a Windows service ends on its supervisor's verdict — ready, or failed
+    /// with why — or as soon as the supervisor is gone, or at its deadline.
+    #[tokio::test]
+    async fn a_windows_service_wait_ends_on_its_outcome() {
+        let dir = std::env::temp_dir().join(format!("vk-winwait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wait = |ready: u64, gone: Option<&'static str>| {
+            let dir = dir.clone();
+            async move {
+                let mut supervisor = || Ok(gone.map(str::to_string));
+                wait_for_windows(
+                    &dir,
+                    "dc",
+                    Instant::now(),
+                    Duration::from_secs(ready),
+                    &mut supervisor,
+                )
+                .await
+            }
+        };
+        let err = format!("{:#}", wait(0, None).await.unwrap_err());
+        assert!(err.contains("not provisioned after 0s"), "{err}");
+        let err = format!(
+            "{:#}",
+            wait(60, Some("the job supervisor exited"))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("the job supervisor exited"), "{err}");
+        std::fs::write(dir.join(PROVISION_FAILED), "CMD exited 3").unwrap();
+        let err = format!("{:#}", wait(60, None).await.unwrap_err());
+        assert!(err.contains("provisioning failed: CMD exited 3"), "{err}");
+        std::fs::remove_file(dir.join(PROVISION_FAILED)).unwrap();
+        std::fs::write(dir.join(PROVISIONED), "").unwrap();
+        wait(60, Some("ignored once provisioned")).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_service_policy_covers_every_address_it_can_source() {
         let compose = "services:\n  db:\n    image: x\n    x-virtkit: { nics: 2 }\n    \
@@ -4771,6 +5154,42 @@ mod tests {
         let mut unit = service("");
         clamp_service_size(&ctx.cfg, &mut unit).unwrap();
         assert_eq!((unit.cpus, unit.mem), (None, None));
+    }
+
+    /// A Windows service takes its compose size, else its bundle's, clamped either way; and it
+    /// has one NIC.
+    #[test]
+    fn a_windows_service_is_sized_from_its_bundle_and_clamped() {
+        let ctx = ctx(None, None); // vm: 4 cpus / 8G, max: 16 / 64G
+        let service = |marker: &str| {
+            crate::compose::parse(
+                &format!("services:\n  dc:\n    image: x\n{marker}"),
+                std::path::Path::new("/b"),
+                &|_| None,
+                None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let mut unit = service("");
+        size_windows_service(&ctx.cfg, &mut unit, Some(32), Some("6G".into())).unwrap();
+        assert_eq!((unit.cpus, unit.mem.as_deref()), (Some(16), Some("6G")));
+        let mut unit = service("    x-virtkit: { cpus: 2, mem: 100G }\n");
+        size_windows_service(&ctx.cfg, &mut unit, Some(8), Some("6G".into())).unwrap();
+        assert_eq!((unit.cpus, unit.mem.as_deref()), (Some(2), Some("65536M")));
+        let mut unit = service("    x-virtkit: { mem: 1G }\n");
+        let err = format!(
+            "{:#}",
+            size_windows_service(&ctx.cfg, &mut unit, None, None).unwrap_err()
+        );
+        assert!(err.contains("Windows needs"), "{err}");
+        assert!(refuse_windows_nics(&service("")).is_ok());
+        let err = format!(
+            "{:#}",
+            refuse_windows_nics(&service("    x-virtkit: { nics: 2 }\n")).unwrap_err()
+        );
+        assert!(err.contains("one NIC"), "{err}");
     }
 
     /// A job-authored fleet cannot grant itself host KVM. Checked where the fleet loads, so

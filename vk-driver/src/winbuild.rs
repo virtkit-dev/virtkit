@@ -45,7 +45,7 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SYSPREP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A bundle's record of the layer it boots.
-const LAYER_RECORD: &str = "layer.json";
+pub(crate) const LAYER_RECORD: &str = "layer.json";
 
 /// The version of the [`LAYER_RECORD`] format this build writes and reads.
 const LAYER_RECORD_VERSION: u64 = 1;
@@ -59,15 +59,87 @@ const EVALUATION: &str = "evaluation.json";
 /// `context`).
 pub(crate) fn is_windows(text: &str, context: &Path) -> Result<bool> {
     Ok(parser::parse(text)?.instructions.iter().any(|i| match i {
-        Instruction::From(f) => {
-            f.image.starts_with(crate::winiso::SCHEME)
-                || f.platform
-                    .as_deref()
-                    .is_some_and(|p| p.starts_with("windows"))
-                || layer_record(&context.join(&f.image)).is_some()
-        }
+        Instruction::From(f) => names_windows(f) || layer_record(&context.join(&f.image)).is_some(),
         _ => false,
     }))
+}
+
+/// Whether a stage of the Dockerfile `text` installs Windows or targets a Windows platform,
+/// by its text alone: [`is_windows`] without looking for a bundle on disk.
+pub(crate) fn installs_windows(text: &str) -> Result<bool> {
+    Ok(parser::parse(text)?.instructions.iter().any(|i| match i {
+        Instruction::From(f) => names_windows(f),
+        _ => false,
+    }))
+}
+
+fn names_windows(f: &parser::From) -> bool {
+    f.image.starts_with(crate::winiso::SCHEME)
+        || f.platform
+            .as_deref()
+            .is_some_and(|p| p.starts_with("windows"))
+}
+
+/// The vCPUs and memory a Windows build's guests get unless a stage says otherwise:
+/// `[build] cpus` and `mem`, else 4 and 4G.
+pub(crate) fn default_size() -> (u32, String) {
+    (
+        crate::build::configured_build_cpus().unwrap_or(4),
+        crate::build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
+    )
+}
+
+/// Refuse a Dockerfile one of whose `FROM`s names a path outside `context` — a `winiso:`
+/// medium (`--drivers=` too) given absolute, through `..`, or through a symlink leading out —
+/// or a bundle to build on anywhere. For a Dockerfile a CI job wrote, whose `FROM` must not
+/// probe the host's files, nor build on a bundle: its layer record names a layer by key alone,
+/// which would hand the job any layer of the host's cache or the registry, another project's
+/// included. A path naming nothing there is left alone: an image reference, or a medium
+/// fetched by its digest. The build resolves these paths again; the checkout is the job's own
+/// and does not change while it prepares, so what is checked here is what is built.
+pub(crate) fn check_confined(text: &str, context: &Path) -> Result<()> {
+    let root = context
+        .canonicalize()
+        .with_context(|| format!("resolving {}", context.display()))?;
+    for instruction in parser::parse(text)?.instructions {
+        let Instruction::From(from) = instruction else {
+            continue;
+        };
+        let mut paths = Vec::new();
+        if let Some(iso) = from.image.strip_prefix(crate::winiso::SCHEME) {
+            let drivers = from
+                .extra_flags
+                .iter()
+                .filter(|(k, _)| k == "drivers")
+                .map(|(_, v)| v.as_str());
+            for spec in std::iter::once(iso).chain(drivers) {
+                paths.push(spec.rsplit_once("@sha256:").map_or(spec, |(path, _)| path));
+            }
+        } else {
+            paths.push(from.image.as_str());
+        }
+        for path in paths {
+            let p = Path::new(path);
+            if p.is_absolute() || p.components().any(|c| c == Component::ParentDir) {
+                bail!(
+                    "FROM {}: {path} leads outside the build context",
+                    from.image
+                );
+            }
+            let joined = root.join(p);
+            if joined.symlink_metadata().is_ok() {
+                inside(&root, &joined).with_context(|| format!("FROM {}", from.image))?;
+                if layer_record(&joined).is_some() {
+                    bail!(
+                        "FROM {}: a CI job's Windows image builds on a winiso: medium or an \
+                         earlier stage, not on a bundle",
+                        from.image
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What to build.
@@ -86,6 +158,9 @@ pub(crate) struct Options {
     /// The build cache registry the hosts share layers through ([`crate::wincache`]); `None`
     /// keeps them on this host.
     pub registry: Option<crate::config::Registry>,
+    /// The most vCPUs and MiB of memory a build guest may have, whatever the Dockerfile's
+    /// `# vk:` lines ask: a CI runner's ceilings. `None` leaves them as asked.
+    pub ceiling: Option<(u32, u64)>,
 }
 
 /// A stage as it builds: its current layer and what its later `RUN`s inherit. A bundle
@@ -182,13 +257,33 @@ fn target_index(stages: &[Stage], target: Option<&str>) -> Result<usize> {
     }
 }
 
-/// The vCPUs and memory of a stage's guests: its `# vk:` line's, else the build's.
-fn guest_size(stage: &Stage, opts: &Options) -> (u32, String) {
+/// The least memory, in MiB, a Windows guest installs and runs with.
+pub(crate) const WINDOWS_MIN_MIB: u64 = 2048;
+
+/// The vCPUs and memory of a stage's guests: its `# vk:` line's, else the build's, held under
+/// the build's [`Options::ceiling`]. Under a ceiling (a CI job's build), a size below what
+/// Windows needs is refused up front, rather than left to fail the install late and obscurely.
+fn guest_size(stage: &Stage, opts: &Options) -> Result<(u32, String)> {
     let guest = &stage.from.guest;
-    (
-        guest.cpus.unwrap_or(opts.cpus),
-        guest.mem.clone().unwrap_or_else(|| opts.mem.clone()),
-    )
+    let cpus = guest.cpus.unwrap_or(opts.cpus);
+    let mem = guest.mem.clone().unwrap_or_else(|| opts.mem.clone());
+    let mib = crate::run::parse_mem_mib(&mem).with_context(|| format!("invalid mem {mem:?}"))?;
+    let Some((max_cpus, max_mib)) = opts.ceiling else {
+        return Ok((cpus, mem));
+    };
+    if max_mib < WINDOWS_MIN_MIB {
+        bail!(
+            "this runner's guests get at most {max_mib}M, less than the {WINDOWS_MIN_MIB}M \
+             Windows needs"
+        );
+    }
+    if mib < WINDOWS_MIN_MIB {
+        bail!("mem {mem}: less than the {WINDOWS_MIN_MIB}M Windows needs");
+    }
+    if mib > max_mib {
+        return Ok((cpus.min(max_cpus), format!("{max_mib}M")));
+    }
+    Ok((cpus.min(max_cpus), mem))
 }
 
 /// Build `opts` and write its bundle.
@@ -214,7 +309,7 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
              nothing was installed again"
         );
     }
-    let (cpus, mem) = guest_size(&stages[target], opts);
+    let (cpus, mem) = guest_size(&stages[target], opts)?;
     let evaluation = read_evaluation(&cache.join("layers").join(&layer.key));
     write_bundle(&layer, cpus, &mem, evaluation, &opts.out)?;
     eprintln!(
@@ -390,7 +485,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     let stage = &stages[index];
     let label = stage.label(index);
     check_stage(stage, &opts.context, opts.no_network).with_context(|| format!("stage {label}"))?;
-    let (cpus, mem) = guest_size(stage, opts);
+    let (cpus, mem) = guest_size(stage, opts)?;
     let bundle = opts.context.join(&stage.from.image);
     let mut layer = if let Some(source) =
         crate::winiso::Source::of_stage(&stage.from.image, &stage.from.extra_flags, &opts.context)?
@@ -1385,6 +1480,48 @@ mod tests {
         stages(parser::parse(text).unwrap()).unwrap()
     }
 
+    /// A stage's guests take its `# vk:` size, else the build's, held under a ceiling when the
+    /// build has one.
+    #[test]
+    fn a_ceiling_holds_the_guest_size_a_dockerfile_asks() {
+        let opts = |ceiling| Options {
+            dockerfile: PathBuf::new(),
+            context: PathBuf::new(),
+            target: None,
+            out: PathBuf::new(),
+            cpus: 2,
+            mem: "2G".into(),
+            no_network: false,
+            reinstall: false,
+            registry: None,
+            ceiling,
+        };
+        let big = &parsed("# vk: cpus=8 mem=16G\nFROM base\n")[0];
+        let plain = &parsed("FROM base\n")[0];
+        assert_eq!(guest_size(big, &opts(None)).unwrap(), (8, "16G".into()));
+        assert_eq!(
+            guest_size(big, &opts(Some((4, 4096)))).unwrap(),
+            (4, "4096M".into())
+        );
+        assert_eq!(
+            guest_size(plain, &opts(Some((4, 4096)))).unwrap(),
+            (2, "2G".into())
+        );
+        // A ceiling below what Windows needs is refused, not clamped to.
+        let err = format!("{:#}", guest_size(big, &opts(Some((4, 1024)))).unwrap_err());
+        assert!(err.contains("Windows needs"), "{err}");
+        let small = &parsed("# vk: mem=1G\nFROM base\n")[0];
+        let err = format!(
+            "{:#}",
+            guest_size(small, &opts(Some((4, 4096)))).unwrap_err()
+        );
+        assert!(err.contains("Windows needs"), "{err}");
+        // An invalid size is refused with or without a ceiling.
+        let mut bad = opts(None);
+        bad.mem = "lots".into();
+        assert!(guest_size(plain, &bad).is_err());
+    }
+
     /// The error checking the one stage of `text` gives.
     fn refusal(text: &str) -> String {
         let stages = parsed(text);
@@ -1747,6 +1884,46 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
+    /// A `FROM` reaching outside the context — absolute, through `..`, or through a symlink
+    /// out — is refused, for a bundle and for a `winiso:` medium or its drivers alike, and so
+    /// is a bundle inside it; image references and other paths inside pass.
+    #[test]
+    fn a_from_outside_the_context_is_refused() {
+        let root = scratch("confined");
+        let context = root.join("ctx");
+        std::fs::create_dir_all(context.join("out")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), context.join("link")).unwrap();
+        let pin = format!("@sha256:{}", "a".repeat(64));
+        for ok in [
+            "FROM debian:13\n".to_string(),
+            "FROM out\n".to_string(),
+            format!("FROM winiso:ws.iso{pin} --drivers=v.iso{pin}\n"),
+        ] {
+            check_confined(&ok, &context).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+        }
+        for refused in [
+            "FROM ../ctx/out\n".to_string(),
+            "FROM /abs/bundle\n".to_string(),
+            "FROM link\n".to_string(),
+            format!("FROM winiso:/etc/passwd{pin} --drivers=v.iso{pin}\n"),
+            format!("FROM winiso:ws.iso{pin} --drivers=../v.iso{pin}\n"),
+            format!("FROM debian:13\nFROM winiso:a/../../x.iso{pin} --drivers=v.iso{pin}\n"),
+        ] {
+            assert!(check_confined(&refused, &context).is_err(), "{refused}");
+        }
+        // A bundle names its layer by key alone: a job may not build on one, even its own.
+        std::fs::write(
+            context.join("out").join(LAYER_RECORD),
+            serde_json::json!({ "version": LAYER_RECORD_VERSION, "key": "a".repeat(64) })
+                .to_string(),
+        )
+        .unwrap();
+        let err = format!("{:#}", check_confined("FROM out\n", &context).unwrap_err());
+        assert!(err.contains("not on a bundle"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn copy_sources_walk_directories_relative_to_the_context() {
         let ctx = scratch("walk");
@@ -1875,6 +2052,7 @@ mod tests {
             no_network: false,
             reinstall: false,
             registry: None,
+            ceiling: None,
         };
         let mut build = Build {
             opts: &opts,
