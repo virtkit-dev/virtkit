@@ -170,10 +170,10 @@ enum Commands {
 }
 
 fn main() {
-    // Invoked as `vk` (init links it so in a CI job VM or a compose run's primary): the host's
-    // `vk`, over the host command channel, which runs `vk exec --service` into the VM's own
-    // services and nothing else. Everything given goes to the host as is; a terminal on both
-    // ends gets a pty.
+    // Invoked as `vk` (init links it so in a CI job VM or a compose run's primary): `vk service`
+    // goes to the service manager; anything else, as is, to the host's `vk` over the host
+    // command channel, which runs `vk exec --service` into the VM's own services and nothing
+    // else. A terminal on both ends gets a pty.
     if std::env::args_os()
         .next()
         .and_then(|a| {
@@ -333,8 +333,9 @@ fn main() {
         .block_on(async_main(socket, cli_args.command));
 }
 
-/// The guest's `vk`: what it was given, run as `vk …` by the host through the host command
-/// channel at `/run/vk/host.sock`. Its exit status, or 1 when the host cannot be reached.
+/// The guest's `vk`: `vk service` answered by the service manager, anything else run as
+/// `vk …` by the host through the host command channel at `/run/vk/host.sock`. Its exit
+/// status, or 1 when the host cannot be reached.
 fn guest_vk() -> i32 {
     const HOST_SOCK: &str = "/run/vk/host.sock";
     let Ok(args) = std::env::args_os()
@@ -345,6 +346,9 @@ fn guest_vk() -> i32 {
         eprintln!("vk: an argument is not valid UTF-8");
         return 2;
     };
+    if args.first().map(String::as_str) == Some("service") {
+        return guest_vk_service(&args[1..]);
+    }
     let Ok(socket) = HOST_SOCK.parse::<SocketAddr>() else {
         return 1;
     };
@@ -406,6 +410,38 @@ fn asks_for_tty(args: &[String]) -> bool {
                     && short.contains('t')
             })
     })
+}
+
+/// Run `vk service up|down|reboot|status` in a compose primary through the host's service
+/// manager over the VM's control plane, like `/run/vk/services`, without a host command.
+fn guest_vk_service(args: &[String]) -> i32 {
+    use vk_core::fleetctl::{Client, NoManager, SERVICE_USAGE, ServiceOp};
+    let Some(op) = ServiceOp::parse(args) else {
+        eprintln!("{SERVICE_USAGE}");
+        return 2;
+    };
+    let reply = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(op.run(&mut Client::new()));
+    match reply {
+        Ok(reply) => {
+            reply.print();
+            if reply.ok { 0 } else { 1 }
+        }
+        Err(e) if e.downcast_ref::<NoManager>().is_some() => {
+            eprintln!(
+                "vk: {e:#}\nvk: `vk service` needs a service manager, which a `vk run --compose` \
+                 primary has; a CI job's services are fixed for the job"
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            1
+        }
+    }
 }
 
 /// Configure logging for PID 1 and the long-running `serve`, `forward` and `ssh-serve`

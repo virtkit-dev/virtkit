@@ -212,6 +212,20 @@ where
     serde_json::from_str(line.trim_end()).context("decoding control message")
 }
 
+/// The context of a failed connection to the service manager, as in a CI job, which has
+/// none. Found with `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct NoManager;
+
+impl std::fmt::Display for NoManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "connecting to the service manager (vsock host:{CONTROL_PORT})"
+        )
+    }
+}
+
 /// The guest side of the control protocol: a session client that keeps one
 /// vsock connection to the service manager (host:CONTROL_PORT) across
 /// requests and transparently reconnects — per-operation connection churn is
@@ -254,9 +268,7 @@ impl Client {
                         self.conn = Some((BufReader::new(rd), wr));
                     }
                     Err(e) => {
-                        last = Some(anyhow::Error::new(e).context(format!(
-                            "connecting to the service manager (vsock host:{CONTROL_PORT})"
-                        )));
+                        last = Some(anyhow::Error::new(e).context(NoManager));
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }

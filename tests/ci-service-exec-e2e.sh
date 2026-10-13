@@ -9,11 +9,12 @@
 #      its output and exit status come back; --env, --dir, --user, -b, --clear-env and -t
 #      (under script(1), for a terminal) apply;
 #   2. what the host does not allow is refused: another `vk` command, a service the job does
-#      not have, a raw request putting a host `vk` flag first, a fifth request at once; a raw
-#      request's --dir and --user are ignored;
+#      not have, `vk service` (a job's services are fixed for it), a raw request putting a host
+#      `vk` flag first, a fifth request at once; a raw request's --dir and --user are ignored;
 #   3. with `[executor] guest_service_exec = false`, the job VM has no `vk` and no channel;
-#   4. a `vk run --compose` primary reaches its services the same way, has neither with
-#      --no-service-exec, and is refused a state dir the guest can write;
+#   4. a `vk run --compose` primary reaches its services the same way and the service manager
+#      with `vk service`; --no-service-exec removes its `vk` and channel, and a state dir the
+#      guest can write is refused;
 #   5. an image's own `vk` hands `vk exec --service` off to the guest one.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
@@ -143,6 +144,9 @@ cat err
 grep -q "no service" err
 if vk version 2>err; then exit 1; fi
 cat err
+if vk service down db 2>err; then exit 1; fi
+cat err
+grep -q "fixed for the job" err
 # A raw request: a host `vk` flag first reaches no host `vk`, and its --dir is ignored.
 raw="/run/vk/bin/vk-agent -s /run/vk/host.sock exec"
 if $raw -- --config=/etc/passwd vk exec --service db -- true 2>err; then exit 1; fi
@@ -180,8 +184,9 @@ services:
     command: ["sh", "-c", "echo served-by-db > /tmp/marker; exec sleep 3600"]
 EOF
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" alpine:3.21 \
-  -- sh -c '[ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]' \
-  >"$root/stage.log" 2>&1 || fail "the primary could not run commands in its service"
+  -- sh -c '[ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ] &&
+    vk service status db | grep "^db "' \
+  >"$root/stage.log" 2>&1 || fail "the primary could not reach its service"
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \
   alpine:3.21 -- sh -c 'if command -v vk; then exit 1; fi; [ ! -e /run/vk/host.sock ]' \
   >"$root/stage.log" 2>&1 || fail "the primary has a vk or a host channel with --no-service-exec"

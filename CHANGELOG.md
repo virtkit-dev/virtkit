@@ -44,7 +44,9 @@ All notable changes to virtkit will be documented in this file.
   VM's own services, is allowed — but as any user of the service, root included, and with
   that service's network access. On by default; `[executor] guest_service_exec = false`
   turns it off for CI jobs, and `vk run --no-service-exec` for a run, whose `--state-dir`
-  must otherwise be out of the guest's reach.
+  must otherwise be out of the guest's reach. Compose primaries also support
+  `vk service up|down|reboot|status` without `vk` in the image, through the same service
+  manager as `/run/vk/services`.
 
 ### Changed
 
