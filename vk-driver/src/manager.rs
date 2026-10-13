@@ -1338,6 +1338,7 @@ mod tests {
                 Some(std::time::Duration::from_secs(60)),
                 None,
                 vec![],
+                vk_core::exec::server::Limits::default(),
             )
             .await
             .unwrap();

@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk-agent serve --max-concurrent N`** runs at most N commands at once and refuses one
+  more, rather than queueing it; a background command counts until it exits.
 - **vk-hub tells a job building its image from one waiting for another job's build.** A job
   that prepares reads "preparing" rather than "running: prepare_executor" in the jobs table, on
   its page and in `vk-hub jobs`, whatever its node, older ones included. While it prepares, its

@@ -97,6 +97,12 @@ enum Commands {
         /// wrapper (e.g. LD_PRELOAD).
         #[arg(long, requires = "exec_wrapper", value_name = "GLOB")]
         exec_wrapper_env: Vec<String>,
+        /// Run at most this many commands at once; one more is refused, not queued
+        ///
+        /// A background command counts until it exits. Status probes are never refused.
+        /// Omitted = no cap.
+        #[arg(long, value_name = "N")]
+        max_concurrent: Option<std::num::NonZeroUsize>,
     },
     /// Probe the agent at --socket and print its status reply
     Status,
@@ -400,6 +406,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             inactivity_timeout,
             exec_wrapper,
             exec_wrapper_env,
+            max_concurrent,
         } => {
             let log_level = if debug {
                 LevelFilter::Debug
@@ -409,7 +416,18 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             install_console_logger(log_level);
             // run_server reads a zero timeout as no timeout, so it needs no filtering here.
             let duration = inactivity_timeout.map(Duration::from_secs);
-            if let Err(e) = run_server(&socket, duration, exec_wrapper, exec_wrapper_env).await {
+            if let Err(e) = run_server(
+                &socket,
+                duration,
+                exec_wrapper,
+                exec_wrapper_env,
+                vk_core::exec::server::Limits {
+                    max_concurrent,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
                 error!("run_server: {e}");
                 std::process::exit(1)
             };

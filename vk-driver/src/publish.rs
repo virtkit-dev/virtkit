@@ -1058,9 +1058,15 @@ mod tests {
         let agent_addr = SocketAddr::Unix(agent_path.clone());
         let server_addr = agent_addr.clone();
         tokio::spawn(async move {
-            run_server(&server_addr, Some(Duration::from_secs(60)), None, vec![])
-                .await
-                .unwrap();
+            run_server(
+                &server_addr,
+                Some(Duration::from_secs(60)),
+                None,
+                vec![],
+                vk_core::exec::server::Limits::default(),
+            )
+            .await
+            .unwrap();
         });
         while !agent_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1102,9 +1108,15 @@ mod tests {
         let agent_addr = SocketAddr::Unix(agent_path.clone());
         let server_addr = agent_addr.clone();
         tokio::spawn(async move {
-            run_server(&server_addr, Some(Duration::from_secs(60)), None, vec![])
-                .await
-                .unwrap();
+            run_server(
+                &server_addr,
+                Some(Duration::from_secs(60)),
+                None,
+                vec![],
+                vk_core::exec::server::Limits::default(),
+            )
+            .await
+            .unwrap();
         });
         while !agent_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1138,9 +1150,15 @@ mod tests {
         let agent_addr = SocketAddr::Unix(agent_path.clone());
         let server_addr = agent_addr.clone();
         tokio::spawn(async move {
-            run_server(&server_addr, Some(Duration::from_secs(60)), None, vec![])
-                .await
-                .unwrap();
+            run_server(
+                &server_addr,
+                Some(Duration::from_secs(60)),
+                None,
+                vec![],
+                vk_core::exec::server::Limits::default(),
+            )
+            .await
+            .unwrap();
         });
         while !agent_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;

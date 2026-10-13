@@ -7,6 +7,7 @@ use crate::status::get_status;
 use anyhow::anyhow;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info, warn};
+use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::select;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::{task, time};
 
 #[derive(Clone)]
@@ -76,11 +77,35 @@ fn inactivity_check_period(inactivity_timeout: Option<Duration>) -> Duration {
         })
 }
 
+/// How much a served channel takes on ([`run_server`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// The commands and connects running at once; `None` caps nothing.
+    pub max_concurrent: Option<NonZeroUsize>,
+    /// How long a new connection may take to send its request.
+    pub first_message_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_concurrent: None,
+            first_message_timeout: FIRST_MESSAGE_TIMEOUT,
+        }
+    }
+}
+
+/// Serve the exec channel on `socket`. `limits.max_concurrent` caps the commands and connects
+/// running at once; one past the cap is refused with a `StartErr` rather than queued. A background
+/// command counts until it exits, but not a process it double-forks away: the cap bounds
+/// requests, not processes. Status probes are never refused, and a connection that names no
+/// request within `limits.first_message_timeout` is closed, so neither takes up the cap.
 pub async fn run_server(
     socket: &SocketAddr,
     inactivity_timeout: Option<Duration>,
     exec_wrapper: Option<PathBuf>,
     exec_wrapper_env: Vec<String>,
+    limits: Limits,
 ) -> Result<(), anyhow::Error> {
     // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
     // from reading it as a timeout that has always already elapsed, and hands a zero-timeout
@@ -91,6 +116,11 @@ pub async fn run_server(
     // the requested command line as its arguments and decides what to run.
     // None = run requested commands directly (the default, unrestricted).
     let exec_wrapper = Arc::new(exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env)));
+    let first_message_timeout = limits.first_message_timeout;
+    let limit = limits.max_concurrent.map(|n| Limit {
+        max: n.get(),
+        permits: Arc::new(Semaphore::new(n.get())),
+    });
 
     let listener = listen(socket)?;
 
@@ -130,6 +160,7 @@ pub async fn run_server(
                     let c_state = Arc::clone(&state);
                     let status = status.clone();
                     let exec_wrapper = Arc::clone(&exec_wrapper);
+                    let limit = limit.clone();
                     {
                         let mut lock = c_state.lock().unwrap();
                         lock.inc();
@@ -137,7 +168,7 @@ pub async fn run_server(
                     // A new task is spawned for each socket. The socket is moved to the new task and processed there.
                     tokio::spawn(async move {
                         let mut update_last = true;
-                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref()).await {
+                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref(), limit.as_ref(), first_message_timeout).await {
                             // A connection that failed before naming itself counts as activity:
                             // only a completed status request is known not to be one.
                             Err(e) => info!("{e}"),
@@ -196,6 +227,27 @@ fn start_watchdog(status: Status, socket: SocketAddr) {
             process::exit(1);
         }
     });
+}
+
+/// The cap on concurrent requests ([`Limits::max_concurrent`]).
+#[derive(Clone)]
+struct Limit {
+    max: usize,
+    permits: Arc<Semaphore>,
+}
+
+impl Limit {
+    /// A permit to run one request, held until it ends; `None` when `max` already run.
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
+    fn refusal(&self) -> String {
+        format!(
+            "too many requests at once on this channel (at most {}); retry once one ends",
+            self.max
+        )
+    }
 }
 
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
@@ -286,8 +338,30 @@ async fn do_handle_conn(
     mut stream: SerStream,
     sink: DeSink,
     exec_wrapper: Option<&ExecWrapper>,
+    limit: Option<&Limit>,
+    first_message_timeout: Duration,
 ) -> Result<bool, anyhow::Error> {
-    let client_request = stream.next().await.ok_or(anyhow!("no data"))??;
+    let client_request = time::timeout(first_message_timeout, stream.next())
+        .await
+        .map_err(|_| anyhow!("no request within {first_message_timeout:?}"))?
+        .ok_or(anyhow!("no data"))??;
+    // A command or a connect takes a permit, held until it ends; a status probe does not, so
+    // a full channel still answers the watchdog's.
+    let permit = match (&client_request, limit) {
+        (Message::CmdExec(_) | Message::CmdConnect { .. }, Some(limit)) => {
+            match limit.try_acquire() {
+                Some(permit) => Some(permit),
+                None => {
+                    let msg = limit.refusal();
+                    // The refusal is the session's only reply; a client already gone has
+                    // nothing left to tell.
+                    let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
+                    return Err(anyhow!(msg));
+                }
+            }
+        }
+        _ => None,
+    };
 
     match client_request {
         Message::CmdExec(cmd) => {
@@ -301,7 +375,9 @@ async fn do_handle_conn(
                     .await
                     .and(Ok(false))
             } else {
-                srv_run_cmd(req_id, stream, sink, cmd).await.and(Ok(false))
+                srv_run_cmd(req_id, stream, sink, cmd, permit)
+                    .await
+                    .and(Ok(false))
             }
         }
         Message::CmdStatus => {
@@ -917,6 +993,7 @@ async fn srv_run_cmd(
     + 'static,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), anyhow::Error> {
     info!("command [{}] {}", req_id, cmd);
     let mut command = build_command(&cmd, session_user(&cmd));
@@ -950,6 +1027,14 @@ async fn srv_run_cmd(
 
     if cmd.mode == RunMode::Background {
         info!("command [{req_id}] background task started");
+        // A background command counts against the cap until it exits, not just until it
+        // starts. Its exit status has no one to go to.
+        if let Some(permit) = permit {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+                drop(permit);
+            });
+        }
         send_last(stream, sink, Message::StartOK).await?;
         return Ok(());
     }
@@ -1232,6 +1317,10 @@ async fn reader_task<T: AsyncRead + Unpin>(
     drop(tx);
     debug!("command [{req_id}] done reading from {fd_kind} ({read_count} bytes)");
 }
+
+/// How long a new connection may take to send its request by default ([`Limits`]): a client
+/// sends it at once, and an idle connection holds a task and a descriptor for nothing.
+pub const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum wait for the client to close after the session's last message.
 const CLIENT_CLOSE_GRACE: Duration = Duration::from_secs(2);
