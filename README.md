@@ -153,7 +153,8 @@ resolves to nothing, and the guest may reach the addresses an allowed name resol
 `--allow-ip` takes IPv4 CIDRs, each optionally scoped to one port, for destinations dialed
 by address; IPv6 is refused. `--egress-restrict` alone denies all egress. The flags need
 `--net` (or `--compose`, whose services they bind too) and refuse `--tap`, whose egress
-bypasses the switch.
+bypasses the switch. `--build-allow-name` / `--build-allow-ip` hold a build's `RUN` steps
+the same way, and check their entries as these flags do.
 
 ```sh
 vk run --net --allow-name debian.org debian:12 -- apt-get update

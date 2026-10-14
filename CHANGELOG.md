@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
 
 - **IPv6 egress allowlist entries are rejected with an IPv6 error**, instead of a bad
   port or address error.
+- **`--build-allow-name` and `--build-allow-ip` check their entries as `vk run --allow-*`
+  does**, naming the flag at fault: a name is a bare DNS suffix, never a URL, a pattern, a
+  port or a trailing dot.
 
 ## [0.90.0] - 2026-10-14
 

@@ -423,7 +423,13 @@ impl BuildNet {
             }
             "none" => Ok(BuildNet::None),
             "all" if restricted => {
-                crate::switch::Egress::new(ips, names)?;
+                // The checks `vk run --allow-*` makes, named after these flags.
+                crate::switch::check_allowlist(
+                    ips,
+                    names,
+                    "--build-allow-ip",
+                    "--build-allow-name",
+                )?;
                 Ok(BuildNet::Allow {
                     ips: ips.to_vec(),
                     names: names.to_vec(),
@@ -6335,6 +6341,30 @@ mod tests {
         assert!(BuildNet::from_flags("none", &ips, &[]).is_err());
         assert!(BuildNet::from_flags("all", &["not-a-cidr".into()], &[]).is_err());
         assert!(BuildNet::from_flags("half", &[], &[]).is_err());
+        // Names get the check `vk run --allow-name` makes, named after the build flag.
+        for bad in [
+            "https://crates.io",
+            "*.crates.io",
+            "crates.io.",
+            "crates.io:443",
+        ] {
+            let msg = format!(
+                "{:#}",
+                BuildNet::from_flags("all", &[], &[bad.into()]).unwrap_err()
+            );
+            assert!(
+                msg.contains("--build-allow-name") && msg.contains("DNS suffix"),
+                "{bad}: {msg}"
+            );
+        }
+        let msg = format!(
+            "{:#}",
+            BuildNet::from_flags("all", &["2001:db8::/32".into()], &[]).unwrap_err()
+        );
+        assert!(
+            msg.contains("--build-allow-ip") && msg.contains("IPv6 is refused"),
+            "{msg}"
+        );
     }
 
     #[test]
