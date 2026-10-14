@@ -452,26 +452,26 @@ fn rollout_plan(form: &[(String, String)]) -> Result<RolloutPlan, String> {
             }
         }
         if out.is_empty() {
-            return Err("choose at least one node, or all".into());
+            return Err("choose at least one node".into());
         }
         Ok(Selection::Nodes(out))
     };
-    let nodes = match (field(form, "nodes"), field(form, "select")) {
-        (Some("all"), _) | (None, Some("all")) => Selection::All,
-        (Some(list), _) => ids(list.split(',').collect())?,
-        (None, Some("some")) => ids(form
+    // The form checks nodes; a question's answer carries them as `asked` wrote them.
+    let nodes = match field(form, "nodes") {
+        Some("all") => Selection::All,
+        Some(list) => ids(list.split(',').collect())?,
+        None => ids(form
             .iter()
             .filter(|(k, _)| k == "node")
             .map(|(_, v)| v.as_str())
             .collect())?,
-        (None, _) => return Err("choose the nodes".into()),
     };
     let number = |name: &str, what: &str| -> Result<u32, String> {
         field(form, name)
             .unwrap_or("")
             .trim()
             .parse()
-            .map_err(|_| format!("{what} is a whole number"))
+            .map_err(|_| format!("{what} must be a whole number"))
     };
     let window = |name: &str, what: &str| -> Result<u64, String> {
         crate::parse_window(field(form, name).unwrap_or("").trim())
@@ -482,9 +482,9 @@ fn rollout_plan(form: &[(String, String)]) -> Result<RolloutPlan, String> {
     Ok(RolloutPlan {
         release: release.to_string(),
         nodes,
-        batch: number("batch", "the batch")?,
+        batch: number("batch", "the number of nodes at a time")?,
         canary_per_profile: yes("canary_per_profile"),
-        max_failures: number("max_failures", "the failures to absorb")?,
+        max_failures: number("max_failures", "the number of failed nodes tolerated")?,
         node_timeout_secs: window("node_timeout", "the node timeout")?,
         drain_timeout_secs: window("drain_timeout", "the drain timeout")?,
         force: yes("force"),
@@ -643,6 +643,10 @@ pub(super) fn forms(
         .iter()
         .filter(|r| r.row.program() == "vk")
         .collect();
+    let nodes: Vec<&NodeView> = nodes
+        .iter()
+        .filter(|n| vk_hub_proto::valid_id(&n.id))
+        .collect();
     if releases.is_empty() || nodes.is_empty() {
         h.raw("<p class=\"empty\">")
             .raw(if releases.is_empty() {
@@ -675,29 +679,34 @@ pub(super) fn forms(
             })
             .raw("</option>");
     }
-    h.raw("</select></label><fieldset><legend>Nodes</legend>")
-        .raw("<label><input type=\"radio\" name=\"select\" value=\"all\" checked> All</label>")
-        .raw("<label><input type=\"radio\" name=\"select\" value=\"some\"> Only:</label>");
-    for n in nodes.iter().filter(|n| vk_hub_proto::valid_id(&n.id)) {
+    // Every node checked to start with: unchecking is how some are left out, and `checks.js`
+    // checks or unchecks them all at once.
+    h.raw("</select></label><fieldset class=\"nodes\"><legend>Nodes</legend>")
+        .raw("<button type=\"button\" class=\"secondary\" data-check=\"all\">All</button>")
+        .raw("<button type=\"button\" class=\"secondary\" data-check=\"none\">None</button>");
+    for n in nodes {
         h.raw("<label><input type=\"checkbox\" name=\"node\" value=\"")
             .text(&n.id)
-            .raw("\"> ")
+            .raw("\" checked> ")
             .node(&n.hostname)
             .raw("</label>");
     }
     h.raw("</fieldset>")
-        .raw("<label>Batch <input type=\"number\" name=\"batch\" min=\"1\" value=\"1\" ")
-        .raw("required size=\"4\"></label>")
-        .raw("<label><input type=\"checkbox\" name=\"canary_per_profile\" value=\"yes\"> ")
-        .raw("A canary per hardware profile first</label>")
-        .raw("<label>Failures to absorb <input type=\"number\" name=\"max_failures\" ")
+        .raw("<label>Nodes at a time <input type=\"number\" name=\"batch\" min=\"1\" ")
+        .raw("value=\"1\" required size=\"4\"></label>")
+        .raw("<label>Failed nodes tolerated <input type=\"number\" name=\"max_failures\" ")
         .raw("min=\"0\" value=\"0\" required size=\"4\"></label>")
+        .raw("<span class=\"sub\">Each failure up to this many pauses the rollout; one more ")
+        .raw("aborts it.</span>")
+        .raw("<details><summary>Advanced</summary><div>")
         .raw("<label>Node timeout <input name=\"node_timeout\" value=\"30m\" required ")
         .raw("size=\"5\"></label>")
         .raw("<label>Drain timeout <input name=\"drain_timeout\" value=\"4h\" required ")
         .raw("size=\"5\"></label>")
+        .raw("<label><input type=\"checkbox\" name=\"canary_per_profile\" value=\"yes\"> ")
+        .raw("One node per hardware profile first</label>")
         .raw("<label><input type=\"checkbox\" name=\"force\" value=\"yes\"> ")
-        .raw("Include external runners, without a drain</label>")
+        .raw("Include external runners, without a drain</label></div></details>")
         .raw("<button class=\"primary\">Start rollout</button></form></section>");
 }
 
@@ -776,7 +785,6 @@ mod tests {
         let (a, b) = ("12".repeat(16), "34".repeat(16));
         let asked = rollout_plan(&form(&[
             ("release", &sha),
-            ("select", "some"),
             ("node", &a),
             ("node", &b),
             ("node", &a),
@@ -807,11 +815,11 @@ mod tests {
         assert_eq!(asked, answer);
         for bad in [
             vec![("release", "ab")],
-            vec![("release", sha.as_str()), ("select", "some")],
+            vec![("release", sha.as_str()), ("batch", "1")],
             vec![("release", sha.as_str()), ("nodes", "zz")],
             vec![
                 ("release", sha.as_str()),
-                ("select", "all"),
+                ("node", a.as_str()),
                 ("batch", "x"),
                 ("max_failures", "0"),
                 ("node_timeout", "30m"),
@@ -819,7 +827,7 @@ mod tests {
             ],
             vec![
                 ("release", sha.as_str()),
-                ("select", "all"),
+                ("node", a.as_str()),
                 ("batch", "1"),
                 ("max_failures", "0"),
                 ("node_timeout", "10s"),
@@ -828,5 +836,75 @@ mod tests {
         ] {
             assert!(rollout_plan(&form(&bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// An all-node confirmation from `asked` parses back to the same plan.
+    #[test]
+    fn an_answer_for_all_nodes_asks_for_all() {
+        let release = Release {
+            sha256: "ab".repeat(32),
+            row: crate::store::ReleaseRow {
+                version: "0.85.0".into(),
+                size: 3 << 20,
+                signature: None,
+                program: None,
+                added_at: 1,
+                added_by: "uid 0".into(),
+            },
+        };
+        let plan = RolloutPlan {
+            release: release.sha256.clone(),
+            nodes: Selection::All,
+            batch: 2,
+            canary_per_profile: false,
+            max_failures: 1,
+            node_timeout_secs: 1800,
+            drain_timeout_secs: 14_400,
+            force: true,
+        };
+        let answer: Vec<(String, String)> = asked(&plan, &release, &[])
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(field(&answer, "nodes"), Some("all"));
+        assert_eq!(rollout_plan(&answer), Ok(plan));
+    }
+
+    /// Offer only nodes with valid hub IDs; explain when none are available.
+    #[test]
+    fn a_rollout_is_offered_only_nodes_with_a_valid_id() {
+        let release = Release {
+            sha256: "ab".repeat(32),
+            row: crate::store::ReleaseRow {
+                version: "0.85.0".into(),
+                size: 3 << 20,
+                signature: None,
+                program: None,
+                added_at: 1,
+                added_by: "uid 0".into(),
+            },
+        };
+        let node = NodeView {
+            id: "zz".into(),
+            hostname: "ci-1".into(),
+            ..Default::default()
+        };
+        let auth = Auth {
+            session: crate::store::UiSession {
+                id: "0".repeat(16),
+                role: crate::store::Role::Operator,
+                issued_by: "uid 0".into(),
+                created_at: 1,
+                expires_at: 2,
+                identity: None,
+            },
+            csrf: String::new(),
+            secret: String::new(),
+        };
+        let mut h = Html::new();
+        forms(&mut h, &auth, &[release], &[node], None);
+        let h = h.into_string();
+        assert!(h.contains("No node has enrolled yet."), "{h}");
+        assert!(!h.contains("<fieldset"), "{h}");
     }
 }

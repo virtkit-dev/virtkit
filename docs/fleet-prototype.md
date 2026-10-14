@@ -1322,11 +1322,13 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   `release fetch` in the background; the fragment shows its progress and how it ended. "Check
   the latest" asks which version that is and shows it, giving the last answer, or the last
   failure, again within 30 seconds. The form is absent with `release_repository = "none"`.
-- **Start a rollout** takes a held release, all nodes or a chosen few, and `rollout create`'s
-  options, and posts to `/rollouts`. It is asked again first, as a reset is, showing the
-  release, whether it is signed, and the nodes wave by wave with those skipped and why; the
-  answer counts once, from the same session, within ten minutes, and only while the plan is
-  still what was shown — a node enrolled, removed or updated meanwhile refuses it.
+- **Start a rollout** takes a held release, the nodes to update — all checked to start with, with
+  All and None to check or uncheck them at once — and `rollout create`'s options, the timeouts,
+  per-profile canaries and external runners folded under "Advanced", and posts to `/rollouts`. It
+  is asked again first, as a reset is, showing the release, whether it is signed, and the nodes
+  wave by wave with those skipped and why; the answer counts once, from the same session, within
+  ten minutes, and only while the plan is still what was shown — one of its nodes removed or
+  updated meanwhile refuses it.
 
 The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page
 stay live over server-sent events. The hub notes every heartbeat, report, session, command
@@ -1364,12 +1366,12 @@ browser opens to one host, which every tab shares; past either a stream is refus
 seconds. There is no per-address cap: the people using the UI are few and often share one
 proxy or NAT address.
 
-htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their
-sources and digests), embedded, and served under a hash of their content with a year's
-caching, as are the UI's own stylesheet and `time.js`: every page loads htmx, its SSE
-extension and `time.js`, and no other script. htmx runs with `allowEval`, `allowScriptTags`
-and `includeIndicatorStyles` off and `selfRequestsOnly` on; the pages have no inline script
-or style for the policy to refuse.
+htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their sources
+and digests), embedded, and served under a hash of their content with a year's caching, as are the
+UI's own stylesheet and scripts: every page loads htmx, its SSE extension, `time.js`, `follow.js`
+and `checks.js`, and no other script. htmx runs with `allowEval`, `allowScriptTags` and
+`includeIndicatorStyles` off and `selfRequestsOnly` on; the pages have no inline script or style
+for the policy to refuse.
 
 The stylesheet is the UI's only styling: no framework, font or other file. Each page opens on
 a top bar with the site's pages, the one it is under marked (`aria-current`), and who is

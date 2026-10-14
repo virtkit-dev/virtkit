@@ -1,8 +1,8 @@
 //! The files pages load, embedded in the binary and served under a path carrying a hash of
 //! their content, so a browser may keep each for good: a new build that changes one changes
 //! its path. `assets/VENDOR.md` says where the vendored ones come from; `ui.css`, `time.js`,
-//! `follow.js` and `favicon.svg` (virtkit's mark, `docs/assets/logo-mark.svg`) are the UI's
-//! own.
+//! `follow.js`, `checks.js` and `favicon.svg` (virtkit's mark, `docs/assets/logo-mark.svg`)
+//! are the UI's own.
 
 use std::sync::LazyLock;
 
@@ -23,9 +23,10 @@ pub const HTMX: &str = "htmx.min.js";
 pub const SSE: &str = "sse.min.js";
 pub const TIME: &str = "time.js";
 pub const FOLLOW: &str = "follow.js";
+pub const CHECKS: &str = "checks.js";
 pub const ICON: &str = "favicon.svg";
 
-static FILES: [Asset; 6] = [
+static FILES: [Asset; 7] = [
     Asset {
         name: CSS,
         content_type: "text/css; charset=utf-8",
@@ -50,6 +51,11 @@ static FILES: [Asset; 6] = [
         name: FOLLOW,
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../assets/follow.js"),
+    },
+    Asset {
+        name: CHECKS,
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/checks.js"),
     },
     Asset {
         name: ICON,

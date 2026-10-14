@@ -574,6 +574,7 @@ async fn assets_are_served_for_good_under_their_hash() {
         (assets::SSE, include_str!("../../assets/sse.min.js")),
         (assets::TIME, include_str!("../../assets/time.js")),
         (assets::FOLLOW, include_str!("../../assets/follow.js")),
+        (assets::CHECKS, include_str!("../../assets/checks.js")),
     ] {
         let reply = get(addr, assets::url(name), None).await;
         assert_eq!(reply.status, 200);
@@ -1067,8 +1068,8 @@ async fn pages_load_only_the_embedded_scripts() {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert!(body.contains("\"allowEval\":false"), "{body}");
         assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 4, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 4, "{body}");
+        assert_eq!(body.matches("<script").count(), 5, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 5, "{body}");
         // The script that shows times in the browser's zone, run once the page is read.
         let time = format!(
             "<script src=\"{}\" defer></script>",
@@ -2581,8 +2582,8 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
 fn assert_only_embedded_scripts(body: &str) {
     assert!(body.contains("\"allowEval\":false"), "{body}");
     assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-    assert_eq!(body.matches("<script").count(), 4, "{body}");
-    assert_eq!(body.matches("<script src=\"/assets/").count(), 4, "{body}");
+    assert_eq!(body.matches("<script").count(), 5, "{body}");
+    assert_eq!(body.matches("<script src=\"/assets/").count(), 5, "{body}");
     // The script that shows times in the browser's zone, run once the page is read.
     let time = format!(
         "<script src=\"{}\" defer></script>",
@@ -6016,14 +6017,14 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     for want in [
         "action=\"/rollouts\" hx-post=\"/rollouts\"",
         &format!("<option value=\"{sha}\">vk 0.85.0 (abababababab)</option>"),
-        &format!("name=\"node\" value=\"{a}\"> ci-a"),
-        &format!("name=\"node\" value=\"{b}\"> ci-b"),
+        &format!("name=\"node\" value=\"{a}\" checked> ci-a"),
+        &format!("name=\"node\" value=\"{b}\" checked> ci-b"),
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
 
     let form = format!(
-        "_csrf={csrf}&op=create&release={sha}&select=all&batch=1&max_failures=0&\
+        "_csrf={csrf}&op=create&release={sha}&node={a}&node={b}&batch=1&max_failures=0&\
          node_timeout=30m&drain_timeout=4h"
     );
     let reply = post_action(
@@ -6045,6 +6046,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
     }
+    assert_eq!(hidden(&reply.body, "nodes"), format!("{a},{b}"));
     assert!(hub.db.rollouts().unwrap().is_empty());
     let answer: String = [
         "_csrf",
@@ -6109,7 +6111,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(hub.db.rollouts().unwrap().len(), 1);
 
-    // An answer posting another plan than it was asked, and a node enrolled between the
+    // An answer posting another plan than it was asked, and a node changed between the
     // question and the answer, are refused: neither is what was shown.
     let ask_for = |form: String| {
         let (operator, origin) = (operator.clone(), origin.clone());
@@ -6147,7 +6149,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
         }
     };
     let some = format!(
-        "_csrf={csrf}&op=create&release={sha}&select=some&node={a}&batch=1&max_failures=0&\
+        "_csrf={csrf}&op=create&release={sha}&node={a}&batch=1&max_failures=0&\
          node_timeout=30m&drain_timeout=4h"
     );
     let (asked, answer) = ask_for(some).await;
@@ -6165,7 +6167,15 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(reply.body.contains("changed"), "{}", reply.body);
     let (_, answer) = ask_for(form.clone()).await;
-    enroll("ci-c", "c1");
+    // Its runner external now, so skipped without --force.
+    let external = vk_hub_proto::Report {
+        state: Some(vk_hub_proto::NodeState::Ready),
+        runner: Some(vk_hub_proto::RunnerMode::External),
+        ..Default::default()
+    };
+    hub.db
+        .record_report(&b, external, crate::now_secs())
+        .unwrap();
     let reply = post_action(
         addr,
         &origin,
@@ -6192,7 +6202,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     )
     .await;
     assert_eq!(reply.status, 403, "{}", reply.body);
-    let form = format!("_csrf={csrf}&op=create&select=all&batch=1");
+    let form = format!("_csrf={csrf}&op=create&node={a}&batch=1");
     let reply = post_action(
         addr,
         &origin,

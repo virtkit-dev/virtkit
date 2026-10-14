@@ -366,6 +366,10 @@ form.wide fieldset {
   border-radius: 6px;
 }
 form.wide legend { color: var(--muted); padding: 0 var(--s1); }
+form.wide fieldset.nodes, form.wide details { flex-basis: 100%; }
+form.wide fieldset.nodes button { padding: 0 var(--s2); font-size: 0.85em; }
+form.wide summary { color: var(--muted); cursor: pointer; }
+form.wide details > div { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; margin-top: var(--s2); }
 
 /* What an action said, or the question it asks first. */
 #flash:empty { display: none; }
