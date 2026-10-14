@@ -1895,20 +1895,7 @@ async fn build_and_boot(
             }
             None => None,
         };
-        // A followed file carries the allowlist itself; written before the switch reads it.
-        let egress_file = match (&args.egress_allow, &args.egress_file) {
-            (Some(allow), Some(path)) => {
-                allow
-                    .write(path)
-                    .with_context(|| format!("writing the egress allowlist {}", path.display()))?;
-                Some(path.as_path())
-            }
-            _ => None,
-        };
-        let (allow_ip, allow_name) = match (&args.egress_allow, egress_file) {
-            (Some(allow), None) => (allow.allow_ip.as_slice(), allow.allow_name.as_slice()),
-            _ => (&[][..], &[][..]),
-        };
+        let egress = switch_egress(args)?;
         let mut unrouted = planned.unrouted.clone();
         if primary_tap.is_some() {
             unrouted.push(primary_ip);
@@ -1918,8 +1905,8 @@ async fn build_and_boot(
             &vsock,
             work,
             NET_VSOCK_PORT,
-            allow_ip,
-            allow_name,
+            egress.allow_ip,
+            egress.allow_name,
             &planned.listen,
             &planned.primary_extra_ips,
             &hosts,
@@ -1928,10 +1915,8 @@ async fn build_and_boot(
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
             Some(work.join(NET_BYTES)),
-            // An allowlist, even an empty one, is restricted: `vk dev`'s `egress =
-            // "restricted"` with no names denies everything rather than nothing.
-            args.egress_allow.is_some() && egress_file.is_none(),
-            egress_file,
+            egress.restrict,
+            egress.file,
             crate::prio::Prio::Normal,
         )
         .await?;
@@ -4802,6 +4787,44 @@ pub(crate) struct VmSession {
 /// Guest mountpoint of the build-context virtiofs share (for `COPY` from the context).
 pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 
+/// A run switch's default egress policy, as [`spawn_vm_switch`] takes it.
+struct SwitchEgress<'a> {
+    /// The allowlist passed once, fixed for the switch's life.
+    allow_ip: &'a [String],
+    allow_name: &'a [String],
+    /// Whether the lists restrict even when empty.
+    restrict: bool,
+    /// The file the switch follows instead of the lists.
+    file: Option<&'a Path>,
+}
+
+/// The run switch's policy from [`RunArgs::egress_allow`]: unrestricted without one; with
+/// one, its lists — or, given [`RunArgs::egress_file`], that file, written here before the
+/// switch first reads it.
+fn switch_egress(args: &RunArgs) -> Result<SwitchEgress<'_>> {
+    let file = match (&args.egress_allow, &args.egress_file) {
+        (Some(allow), Some(path)) => {
+            allow
+                .write(path)
+                .with_context(|| format!("writing the egress allowlist {}", path.display()))?;
+            Some(path.as_path())
+        }
+        _ => None,
+    };
+    let (allow_ip, allow_name) = match (&args.egress_allow, file) {
+        (Some(allow), None) => (allow.allow_ip.as_slice(), allow.allow_name.as_slice()),
+        _ => (&[][..], &[][..]),
+    };
+    Ok(SwitchEgress {
+        allow_ip,
+        allow_name,
+        // An allowlist, even an empty one, is restricted: `vk dev`'s `egress = "restricted"`
+        // with no names denies everything rather than nothing. A followed file is always restricted.
+        restrict: args.egress_allow.is_some() && file.is_none(),
+        file,
+    })
+}
+
 /// Spawn a `vk switch` giving one VM a userspace LAN + egress over `vsock` (DHCP +
 /// DNS + transparent proxy, unrestricted). Returns the switch child and how the guest
 /// attaches to it (its NICs or vsock bridges, plus the agent's cmdline fragment). Waits for
@@ -6158,6 +6181,55 @@ mod tests {
         accept.abort();
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    /// The run switch is restricted by any allowlist, an empty one included, unless it follows
+    /// a file — which then carries the lists, written before the switch reads it.
+    #[test]
+    fn switch_egress_restricts_by_list_or_follows_a_file() {
+        let open = RunArgs::default();
+        let e = switch_egress(&open).unwrap();
+        assert!(
+            !e.restrict && e.file.is_none() && e.allow_ip.is_empty() && e.allow_name.is_empty()
+        );
+
+        let allow = crate::switch::EgressFile {
+            allow_ip: vec!["10.0.0.0/8".into()],
+            allow_name: vec!["debian.org".into()],
+        };
+        let listed = RunArgs {
+            egress_allow: Some(allow.clone()),
+            ..RunArgs::default()
+        };
+        let e = switch_egress(&listed).unwrap();
+        assert!(e.restrict && e.file.is_none());
+        assert_eq!(
+            (e.allow_ip, e.allow_name),
+            (&allow.allow_ip[..], &allow.allow_name[..])
+        );
+
+        let deny = RunArgs {
+            egress_allow: Some(crate::switch::EgressFile::default()),
+            ..RunArgs::default()
+        };
+        assert!(switch_egress(&deny).unwrap().restrict);
+
+        let dir = std::env::temp_dir().join(format!("vk-run-egress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress.json");
+        let followed = RunArgs {
+            egress_allow: Some(allow.clone()),
+            egress_file: Some(path.clone()),
+            ..RunArgs::default()
+        };
+        let e = switch_egress(&followed).unwrap();
+        assert!(!e.restrict && e.allow_ip.is_empty() && e.allow_name.is_empty());
+        assert_eq!(e.file, Some(path.as_path()));
+        let written: crate::switch::EgressFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written, allow);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
