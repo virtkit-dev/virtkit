@@ -154,7 +154,10 @@ resolves to nothing, and the guest may reach the addresses an allowed name resol
 by address; IPv6 is refused. `--egress-restrict` alone denies all egress. The flags need
 `--net` (or `--compose`, whose services they bind too) and refuse `--tap`, whose egress
 bypasses the switch. `--build-allow-name` / `--build-allow-ip` hold a build's `RUN` steps
-the same way, and check their entries as these flags do.
+the same way, and check their entries as these flags do. Every other allowlist (`vk dev`,
+`vk switch`, an egress file, the CI executor's `[egress]` and `[egress.build]`) checks its
+entries alike: a name is a bare DNS suffix, never a URL, a pattern, a port or a trailing
+dot.
 
 ```sh
 vk run --net --allow-name debian.org debian:12 -- apt-get update

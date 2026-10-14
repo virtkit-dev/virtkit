@@ -1194,7 +1194,13 @@ The list semantics are the load-bearing part:
 - consequently, once **either** dimension is present the phase is a restricted
   allowlist and the **other, omitted dimension is deny-all**. For example, with
   `allow_name` set but `allow_ip` absent, all direct-IP egress is denied — a job
-  reaching a host by literal IP needs that IP added to `allow_ip`.
+  reaching a host by literal IP needs that IP added to `allow_ip`;
+- every entry is checked as every allowlist in `vk` is (`vk run --allow-*`,
+  `--build-allow-*`, `vk dev`, the switch): a name is a bare DNS suffix, never a URL, a
+  pattern, a port or a fully qualified name with its trailing dot; an IP entry is an IPv4
+  CIDR, IPv6 refused. A bad entry in the config, or in a job's (or its services')
+  `MICROVM_EGRESS_ALLOW_*` / `MICROVM_BUILD_EGRESS_ALLOW_*`, fails the job by its config key
+  or variable.
 
 Under an allowlist, a name outside `allow_name` resolves to `NXDOMAIN`, reverse (PTR)
 lookups included, and a query the gateway cannot parse is `REFUSED`; the job's own

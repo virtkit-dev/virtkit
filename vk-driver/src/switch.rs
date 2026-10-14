@@ -315,6 +315,10 @@ impl Egress {
     /// executor uses this when a job's phase configures egress (see the switch's
     /// `--egress-restrict`), so `allow_name = []` means "no names", not "any name".
     pub fn restricted(ips: &[String], names: &[String]) -> Result<Egress> {
+        // Apply the flag and config checks to every policy, including egress files and
+        // executor caps. Flags and config lists are checked first under their own keys;
+        // `allow_name` is the egress file's key.
+        check_allow_names(names, "allow_name")?;
         let ips = ips.iter().map(|s| Cidr4::parse(s)).collect::<Result<_>>()?;
         let names = names
             .iter()
@@ -6151,6 +6155,10 @@ mod tests {
                 msg.starts_with("--allow-name ") && msg.contains("DNS suffix"),
                 "{bad:?}: {msg}"
             );
+            // Egress files, `vk switch --allow-name` and executor caps use this parser
+            // and must reject the same names as the flags.
+            assert!(Egress::restricted(&[], &[bad.into()]).is_err(), "{bad:?}");
+            assert!(Egress::new(&[], &[bad.into()]).is_err(), "{bad:?}");
         }
         let ip = format!(
             "{:#}",
@@ -6354,6 +6362,16 @@ mod tests {
         // A misspelt key or a bad range is refused rather than read as "nothing allowed".
         assert!(EgressFile::parse(br#"{"allow_names": ["debian.org"]}"#).is_err());
         assert!(EgressFile::parse(br#"{"allow_ip": ["10.0.0.0/33"]}"#).is_err());
+        let msg = format!(
+            "{:#}",
+            EgressFile::parse(br#"{"allow_name": ["*.debian.org"]}"#)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            msg.contains("allow_name") && msg.contains("DNS suffix"),
+            "{msg}"
+        );
         assert!(EgressFile::parse(b"not json").is_err());
 
         let dir = std::env::temp_dir().join(format!("vk-egress-file-{}", std::process::id()));
@@ -6424,6 +6442,10 @@ mod tests {
         std::fs::write(&path, b"{\"allow_name\": [").unwrap();
         tokio::time::sleep(EGRESS_FILE_POLL * 3).await;
         assert!(g.name_allowed(src, "deb.debian.org") && !g.name_allowed(src, "github.com"));
+        // So does an edit naming a pattern rather than a suffix.
+        write(&["*.github.com"]);
+        tokio::time::sleep(EGRESS_FILE_POLL * 3).await;
+        assert!(g.name_allowed(src, "deb.debian.org") && !g.name_allowed(src, "api.github.com"));
         std::fs::remove_file(&path).unwrap();
         tokio::time::sleep(EGRESS_FILE_POLL * 3).await;
         assert!(g.name_allowed(src, "deb.debian.org") && !g.name_allowed(src, "github.com"));

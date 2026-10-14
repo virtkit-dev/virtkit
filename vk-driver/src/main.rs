@@ -1619,9 +1619,10 @@ enum Cmd {
         /// egress is unrestricted.
         #[arg(long = "allow-ip", value_name = "CIDR[:PORT]")]
         allow_ip: Vec<String>,
-        /// egress allowlist — hostname suffix the http(s) proxy permits (repeatable)
+        /// egress allowlist — DNS suffix the guest may resolve and reach (repeatable)
         ///
-        /// A suffix is e.g. `corp.example.com`.
+        /// A suffix is e.g. `corp.example.com`, dot-anchored; a URL, a pattern, a port or a
+        /// trailing dot is refused, as for `vk run --allow-name`.
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
         /// force allowlist mode even with no --allow-ip/--allow-name
@@ -3180,6 +3181,23 @@ fn journal_enabled(cli_no_journal: bool, cfg_no_journal: bool) -> bool {
     !(cli_no_journal || cfg_no_journal)
 }
 
+/// Build `vk switch`'s policy from `--allow-ip`, `--allow-name` and `--egress-restrict`,
+/// using `vk run`'s checks and naming the flags in errors.
+fn switch_egress_from_flags(
+    allow_ip: &[String],
+    allow_name: &[String],
+    restrict: bool,
+) -> anyhow::Result<switch::Egress> {
+    switch::check_allowlist(allow_ip, allow_name, "--allow-ip", "--allow-name")?;
+    // The CI executor sets --egress-restrict when a job configures egress, so empty lists
+    // deny everything. Without it, empty lists mean unrestricted, as in `vk run`.
+    if restrict {
+        switch::Egress::restricted(allow_ip, allow_name)
+    } else {
+        switch::Egress::new(allow_ip, allow_name)
+    }
+}
+
 async fn cli_main(cli: Cli) -> ExitCode {
     // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
     // to keep aws-lc-rs out of the build); install ring — the backend russh already
@@ -4515,9 +4533,6 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 None => return fail(&anyhow::anyhow!("bad --reserve {r:?} (want mac=ip)"), 2),
             }
         }
-        // --egress-restrict forces allowlist mode: an empty allowlist denies everything
-        // (the CI executor sets it when a job configures egress) rather than collapsing to
-        // unrestricted the way the dev `vk switch` / `vk run` path does.
         let mut followed = None;
         let built = if let Some(f) = egress_file {
             // The bytes read are what the follower compares against, so an edit landing
@@ -4526,10 +4541,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 followed = Some((f.clone(), text));
                 policy
             })
-        } else if *egress_restrict {
-            switch::Egress::restricted(allow_ip, allow_name)
         } else {
-            switch::Egress::new(allow_ip, allow_name)
+            switch_egress_from_flags(allow_ip, allow_name, *egress_restrict)
         };
         let egress = match built {
             Ok(e) => e,
@@ -7097,6 +7110,24 @@ mod tests {
             };
             assert!(err.to_string().contains("--tap"), "{err}");
         }
+    }
+
+    /// `vk switch`'s lists fail by the flag at fault, before the switch binds anything.
+    #[test]
+    fn switch_flags_name_the_list_at_fault() {
+        let err = |ips: &[&str], names: &[&str]| {
+            let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            format!(
+                "{:#}",
+                switch_egress_from_flags(&v(ips), &v(names), false)
+                    .err()
+                    .unwrap()
+            )
+        };
+        assert!(err(&[], &["*.a.com"]).starts_with("--allow-name "));
+        assert!(err(&["10.0.0.0/33"], &[]).starts_with("--allow-ip"));
+        assert!(switch_egress_from_flags(&[], &[], false).is_ok());
+        assert!(switch_egress_from_flags(&[], &["a.com".into()], true).is_ok());
     }
 
     /// `--numa` takes a mode or a node id, and nothing else — a typo names a node the host

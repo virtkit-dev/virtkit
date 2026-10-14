@@ -2608,6 +2608,7 @@ pub(crate) fn effective_run_egress(
         cfg.egress.allow_name.as_deref(),
         ctx.egress_allow_ip_req.as_deref(),
         ctx.egress_allow_name_req.as_deref(),
+        "[egress]",
         "MICROVM_EGRESS_ALLOW_IP",
         "MICROVM_EGRESS_ALLOW_NAME",
     )?;
@@ -2630,6 +2631,7 @@ fn validate_service_egress(cfg: &crate::config::Config, unit: &crate::compose::U
         cfg.egress.allow_name.as_deref(),
         ip_req.as_deref(),
         name_req.as_deref(),
+        "[egress]",
         &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", unit.name),
         &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", unit.name),
     )?;
@@ -2657,6 +2659,7 @@ fn service_per_source(
             cfg.egress.allow_name.as_deref(),
             svc.egress_allow_ip_req.as_deref(),
             svc.egress_allow_name_req.as_deref(),
+            "[egress]",
             &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", svc.name),
             &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", svc.name),
         )?;
@@ -2681,6 +2684,7 @@ fn effective_build_egress(
         cfg.egress.build.allow_name.as_deref(),
         ctx.egress_build_allow_ip_req.as_deref(),
         ctx.egress_build_allow_name_req.as_deref(),
+        "[egress.build]",
         "MICROVM_BUILD_EGRESS_ALLOW_IP",
         "MICROVM_BUILD_EGRESS_ALLOW_NAME",
     )?;
@@ -2704,15 +2708,25 @@ fn effective_build_egress(
 /// enforcement (`restrict = ips.is_some() || names.is_some()`). Validating against that
 /// collapsed cap is a security boundary: without it a job could pass e.g. a
 /// `MICROVM_EGRESS_ALLOW_IP` against a name-only cap and widen its egress past the cap.
+///
+/// `section` names the cap's config table (`[egress]`, `[egress.build]`), so a bad cap entry
+/// fails the job by its key rather than as the job's own request.
 #[allow(clippy::type_complexity)]
 fn effective_policy(
     cap_ip: Option<&[String]>,
     cap_name: Option<&[String]>,
     ip_req: Option<&str>,
     name_req: Option<&str>,
+    section: &str,
     ip_var: &str,
     name_var: &str,
 ) -> Result<(Option<Vec<String>>, Option<Vec<String>>)> {
+    crate::switch::check_allowlist(
+        cap_ip.unwrap_or_default(),
+        cap_name.unwrap_or_default(),
+        &format!("{section} allow_ip"),
+        &format!("{section} allow_name"),
+    )?;
     // A restricted phase denies an omitted dimension, so validate against that collapsed
     // (deny-all) cap rather than treating the absent list as unconstrained.
     let restricted = cap_ip.is_some() || cap_name.is_some();
@@ -2756,6 +2770,8 @@ fn split_req(req: &str) -> Vec<String> {
 /// suffix, `Some([])` ⇒ none). A name outside the cap fails the job — it can narrow, not widen.
 fn narrow_names(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String>> {
     let requested = split_req(req);
+    // Check suffixes here so errors name the job variable.
+    crate::switch::check_allow_names(&requested, var)?;
     let policy = match cap {
         None => crate::switch::Egress::AllowAll,
         Some(c) => crate::switch::Egress::restricted(&[], c)?,
@@ -2773,6 +2789,8 @@ fn narrow_names(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<Stri
 /// outside the cap fails the job.
 fn narrow_ips(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String>> {
     let requested = split_req(req);
+    // Check CIDRs here so errors name the job variable.
+    crate::switch::Egress::restricted(&requested, &[]).with_context(|| var.to_string())?;
     let policy = match cap {
         None => crate::switch::Egress::AllowAll,
         Some(c) => crate::switch::Egress::restricted(c, &[])?,
@@ -4935,11 +4953,43 @@ mod tests {
         assert!(narrow_names(Some(&cap), "api.corp.example.com", "V").is_ok());
         assert!(narrow_names(Some(&cap), "evil.com", "V").is_err());
         assert!(narrow_names(Some(&[]), "anything.com", "V").is_err());
+        // A request that is not a DNS suffix fails by its variable, whatever the cap.
+        let msg = format!(
+            "{:#}",
+            narrow_names(None, "https://a.com", "V").unwrap_err()
+        );
+        assert!(
+            msg.contains("V \"https://a.com\"") && msg.contains("DNS suffix"),
+            "{msg}"
+        );
 
         let ipcap = ["10.0.0.0/8".to_string()];
         assert!(narrow_ips(Some(&ipcap), "10.1.2.0/24", "V").is_ok());
         assert!(narrow_ips(Some(&ipcap), "192.168.0.0/16", "V").is_err());
         assert!(narrow_ips(Some(&[]), "10.0.0.0/8", "V").is_err());
+        // A malformed IP request fails by its variable too.
+        let msg = format!("{:#}", narrow_ips(None, "2001:db8::/32", "V").unwrap_err());
+        assert!(
+            msg.starts_with("V: ") && msg.contains("IPv6 is refused"),
+            "{msg}"
+        );
+    }
+
+    /// Invalid caps fail by config key, whether or not the job supplies a request.
+    #[test]
+    fn a_bad_cap_fails_by_its_config_key() {
+        let bad_name = ["*.corp.com".to_string()];
+        let bad_ip = ["2001:db8::/32".to_string()];
+        let policy = |ip: Option<&[String]>, name: Option<&[String]>, req: Option<&str>| {
+            let r = effective_policy(ip, name, None, req, "[egress.build]", "VI", "VN");
+            format!("{:#}", r.unwrap_err())
+        };
+        for req in [None, Some("api.corp.com")] {
+            let msg = policy(None, Some(&bad_name), req);
+            assert!(msg.starts_with("[egress.build] allow_name "), "{msg}");
+            let msg = policy(Some(&bad_ip), None, req);
+            assert!(msg.starts_with("[egress.build] allow_ip"), "{msg}");
+        }
     }
 
     #[test]

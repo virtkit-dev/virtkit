@@ -17,6 +17,12 @@ All notable changes to virtkit will be documented in this file.
 - **`--build-allow-name` and `--build-allow-ip` check their entries as `vk run --allow-*`
   does**, naming the flag at fault: a name is a bare DNS suffix, never a URL, a pattern, a
   port or a trailing dot.
+- **Every other egress allowlist refuses a name that is not a bare DNS suffix**: the
+  executor's `[egress]` and `[egress.build]` caps, a job's (or its services')
+  `MICROVM_EGRESS_ALLOW_*` and `MICROVM_BUILD_EGRESS_ALLOW_*`, an egress file and
+  `vk switch --allow-name`, each naming the key, variable or flag at fault. Such a name used
+  to match nothing. **An executor config holding a bad `[egress]` or `[egress.build]` entry,
+  name or IP, now fails the jobs that use it, whatever `net.mode`**, until it is corrected.
 
 ## [0.90.0] - 2026-10-14
 
