@@ -688,6 +688,11 @@ impl Jobs {
         for (id, t) in &mut state.jobs {
             if t.result.is_none() {
                 let result = journal::read_result(&t.dir).or_else(|| self.lost_driver(t, now));
+                // Keep machine events in the daemon log beyond job-directory cleanup
+                // so operators can find them across the fleet.
+                for event in result.iter().flat_map(|r| &r.events) {
+                    say!("job {id}: {event}");
+                }
                 t.result = result;
                 if let Some(stage) = journal::read_stage(&t.dir)
                     && t.result.is_none()

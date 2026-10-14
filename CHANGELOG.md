@@ -49,10 +49,11 @@ All notable changes to virtkit will be documented in this file.
   the build cache registry.
 - **A Windows build's `RUN --network=default` follows `--build-allow-ip`/`--build-allow-name`**
   (`[egress.build]` in CI), as a Linux build's does.
-- **vk-hub shows the unusual events a job's node reports.** A job's result sent to vk-hub can
-  carry what the node saw go wrong on the machine while the job ran. vk-hub shows them in the
-  jobs table, on the job's page and in `vk-hub jobs`, and can filter on them. Older nodes
-  report none, and an older hub ignores them.
+- **Jobs report unusual events, and vk-hub shows them.** A job's trace and its result sent
+  to vk-hub carry what the node saw go wrong on the machine while the job ran; the first kind
+  is a virtio-fs stall the VMM detected and retried (see Fixed). vk-hub shows them in the jobs
+  table, on the job's page and in `vk-hub jobs`, and can filter on them. Older nodes report
+  none, and an older hub ignores them.
 
 ### Changed
 
@@ -76,8 +77,9 @@ All notable changes to virtkit will be documented in this file.
   request the VMM had either not noticed or answered without the guest being told. Every 10
   seconds the VMM now checks each virtio-fs queue that held work and did not move since the
   previous check, and serves the requests it had not noticed or notifies the guest again of
-  answers it has not picked up: such a request now waits 10 to 20 seconds. The first recovery
-  at a given point is logged as a warning in the VMM log.
+  answers it has not picked up: such a request now waits 10 to 20 seconds. The first time it
+  detects a stall at a given point, it logs a warning in the VMM log, and the job reports it
+  among its events (see Added).
 - **A VM no longer loses virtio-pci interrupts or stalls requests when its driver masks MSI-X
   or disables bus mastering.** Masking removed interrupt routes and dropped signals delivered
   afterward; requests queued with bus mastering off could stall until the next request.

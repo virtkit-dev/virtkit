@@ -51,6 +51,7 @@ mod image;
 mod initramfs;
 mod iso9660;
 mod jobctx;
+mod jobevents;
 mod libkrun_sys;
 mod local;
 mod manager;

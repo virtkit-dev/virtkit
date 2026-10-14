@@ -1166,7 +1166,8 @@ ended, node, output length, age, how long it ran (or has been running), its VM's
 the events it reported (EVENTS: each kind and how many times, `virtio-fs stall ×2`), and what
 the job is. `--events` lists only jobs that reported events; a `vk-hub serve` older than the
 command ignores it and lists every job. A job's events are what its node saw go wrong on the
-machine while it ran, beside why it failed. `vk-hub jobs show <id>` prints one job's record,
+machine while it ran, beside why it failed: today a virtio-fs stall the VMM detected and
+retried, counted in the VMM's stall warnings. `vk-hub jobs show <id>` prints one job's record,
 one field per line: outcome, exit code, node message, GitLab page, node, pool, key,
 submission/start/finish/settlement times, run time, VM size and resource usage, then an
 `event` line for each event with its first occurrence whole. It also prints the end of a

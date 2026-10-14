@@ -312,6 +312,18 @@ async fn report_resource_usage(ctx: &JobCtx) {
     if let Some(line) = crate::oomkills::line(oom.as_deref(), "raise MICROVM_MEM") {
         eprintln!("virtkit: {line}");
     }
+    // The fleet driver reports events with the job result; classic gitlab-runner
+    // executors report them here in the trace.
+    let from_node = std::env::var_os(crate::jobevents::FROM_NODE_ENV);
+    let vmm_log = ctx.vmm_log();
+    let events = tokio::task::spawn_blocking(move || {
+        crate::jobevents::for_executor(&vmm_log, from_node.as_deref())
+    })
+    .await
+    .unwrap_or_default();
+    for event in events {
+        eprintln!("virtkit: {event}");
+    }
     // Report `vm::pack_checkout_seed`'s guest tmpfs seed figures here: the supervisor's output
     // stays in its own log, outside the job trace.
     if let Ok(seed) = std::fs::read_to_string(ctx.checkout_seed_log())

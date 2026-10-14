@@ -234,6 +234,16 @@ A step that exits with signal 9 and no message often indicates an OOM kill; rais
 `MICROVM_MEM`. No line means either that no process was killed or that the guest was too old
 or unresponsive to report it.
 
+When the VMM detects and retries a virtio-fs request with a missing notification, a line near
+the end of the trace reports the warning count and quotes the first warning from the VMM log:
+
+```
+virtkit: virtio-fs stall (2 times): virtio-fs /builds/acme/web: queue 1: 1 completion(s) past used_event for 10s (…): suspected lost interrupt, signalling again
+```
+
+Under a fleet node the job also reports it to vk-hub among its events (see
+[`fleet-prototype.md`](fleet-prototype.md#placed-jobs)).
+
 `peak memory` is the most the phase held at one time, not the memory left at the end: a
 guest hands freed RAM straight back to the host, so its live figure says little about the
 peak it passed through. A build reports its largest single process as well, because the

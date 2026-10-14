@@ -183,13 +183,14 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>, restore: bool) -> Result<()> {
     set_process_name(&spec.proc_name);
 
     // libkrun logs to stderr (captured to the VMM log). Debug fires on the block and
-    // virtio-fs I/O paths and slows a build, so only under VIRTKIT_DEBUG=1.
+    // virtio-fs I/O paths and slows a build, so only under VIRTKIT_DEBUG=1. RUST_LOG and
+    // RUST_LOG_STYLE are ignored: the job's events are read from this log's WARN lines.
     let level = if std::env::var("VIRTKIT_DEBUG").as_deref() == Ok("1") {
         LogLevel::Debug
     } else {
         LogLevel::Warn
     };
-    krun::init_log(None, level, LogStyle::Auto, LogOptions::empty()).map_err(krun("logging"))?;
+    krun::init_log(None, level, LogStyle::Auto, LogOptions::NO_ENV).map_err(krun("logging"))?;
 
     // qemu-ga's port for an agent-less guest: libkrun dups one socketpair end; the other
     // is relayed to the spec's socket. Created before the devices, which borrow it.

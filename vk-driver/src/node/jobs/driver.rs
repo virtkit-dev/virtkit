@@ -227,6 +227,11 @@ impl Driver {
             t.warning(w);
         }
         let (end, class, artifacts) = self.stages(vars, settings, place).await;
+        // Read before cleanup removes the job directory and the VMM log in it.
+        let vmm_log = self.ctx.vmm_log();
+        let events = tokio::task::spawn_blocking(move || crate::jobevents::from_vmm_log(&vmm_log))
+            .await
+            .unwrap_or_default();
         // Read before cleanup stops the VM and its process counters disappear.
         let tree = crate::vm::live_supervisor_pid(&self.ctx).and_then(crate::usage::tree);
         let size = crate::vm::declared_size(&self.ctx).ok();
@@ -235,6 +240,9 @@ impl Driver {
             Ok(End::Ok) => {}
             Ok(end) => say_log(&self.dir, &format!("cleanup: {end:?}")),
             Err(e) => say_log(&self.dir, &format!("cleanup: {e:#}")),
+        }
+        for event in &events {
+            t.warning(&format!("virtkit: {event}"));
         }
         let (failure, exit_code, message) = match (&end, class) {
             (End::Ok, None) => {
@@ -260,7 +268,7 @@ impl Driver {
                 tree.as_ref(),
                 size,
             )),
-            events: Vec::new(),
+            events,
         }
     }
 
@@ -738,6 +746,8 @@ impl Driver {
             .args(args)
             .stdin(Stdio::null());
         env::apply(&mut command, &self.env);
+        // This driver reports the job's events itself; the executor leaves them out.
+        command.env(crate::jobevents::FROM_NODE_ENV, "1");
         // Where prepare says what it is doing: building an image, or waiting for one.
         if cmd == "prepare" {
             command.env(crate::activity::ENV, self.dir.join(journal::ACTIVITY));
@@ -1088,6 +1098,53 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The stall warnings the job's VMM log holds go into its trace and its result, read
+    /// before cleanup; a job whose prepare failed has them all the same.
+    #[tokio::test]
+    async fn a_job_s_vmm_log_events_reach_its_trace_and_result() {
+        let f = Fixture::new("driver-events", "https://gitlab.example");
+        let exe = fake_vk(&f, "#!/bin/sh\nexit 1\n");
+        let mut driver = driver(&f, exe);
+        driver.ctx.job_dir = f.dir.join("job");
+        std::fs::create_dir_all(&driver.ctx.job_dir).unwrap();
+        std::fs::write(
+            driver.ctx.vmm_log(),
+            "[2026-10-13T12:58:12Z WARN  krun_devices::virtio::fs::worker] virtio-fs /builds: \
+             queue 1: suspected lost interrupt, signalling again\n",
+        )
+        .unwrap();
+        let mut vars = Vars::default();
+        let settings = Settings::of(&f.job, &vars);
+        let place = super::super::vars::Place {
+            builds_dir: "/builds".into(),
+            project_dir: "/builds/acme/web".into(),
+            concurrent_id: 0,
+            concurrent_project_id: 0,
+        };
+        let meta = Meta {
+            gitlab_id: 4242,
+            slot: 0,
+            project_slot: 0,
+            project_id: 1,
+        };
+        let result = driver.run_job(&mut vars, &settings, &place, &meta).await;
+        assert_eq!(result.failure, Some(FailureClass::System));
+        let detail = "virtio-fs /builds: queue 1: suspected lost interrupt, signalling again";
+        assert_eq!(
+            result.events,
+            [vk_hub_proto::job::JobEvent::new(
+                vk_hub_proto::job::JobEventKind::VirtioFsStall,
+                1,
+                detail
+            )]
+        );
+        let output = f.output();
+        assert!(
+            output.contains(&format!("virtkit: virtio-fs stall: {detail}")),
+            "{output}"
+        );
     }
 
     #[test]
