@@ -412,6 +412,20 @@ pub fn check_allow_names(names: &[String], key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate user allowlists before startup, naming the faulty flag or config key.
+/// Check DNS suffixes and parse CIDRs with the switch's parser so all entry points
+/// accept the same lists.
+pub fn check_allowlist(
+    ips: &[String],
+    names: &[String],
+    ip_key: &str,
+    name_key: &str,
+) -> Result<()> {
+    check_allow_names(names, name_key)?;
+    Egress::restricted(ips, &[]).with_context(|| ip_key.to_string())?;
+    Ok(())
+}
+
 /// How often a switch with an `--egress-file` checks it for an edit.
 const EGRESS_FILE_POLL: Duration = Duration::from_secs(1);
 
@@ -6138,6 +6152,15 @@ mod tests {
                 "{bad:?}: {msg}"
             );
         }
+        let ip = format!(
+            "{:#}",
+            check_allowlist(&["10.0.0.0/33".into()], &[], "--x-ip", "--x-name").unwrap_err()
+        );
+        assert!(ip.starts_with("--x-ip"), "{ip}");
+        let name = check_allowlist(&[], &["*.a.com".into()], "--x-ip", "--x-name")
+            .unwrap_err()
+            .to_string();
+        assert!(name.starts_with("--x-name "), "{name}");
     }
 
     #[test]
