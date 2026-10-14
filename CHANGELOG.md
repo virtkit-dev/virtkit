@@ -30,6 +30,7 @@ All notable changes to virtkit will be documented in this file.
   name or IP, now fails the jobs that use it, whatever `net.mode`**, until it is corrected.
 - **The vk-hub web UI shows times on a 24-hour clock** whatever the browser's locale, instead
   of AM/PM in locales that use it.
+- The pinned guest kernel is bumped to 6.18.56.
 
 ## [0.90.0] - 2026-10-14
 
