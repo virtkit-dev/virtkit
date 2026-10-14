@@ -581,20 +581,7 @@ impl Network {
             }
             return Ok(());
         }
-        for name in &self.allow_name {
-            let bare = name.trim_start_matches('.');
-            // A trailing dot is a fully qualified name, which no suffix match the switch
-            // makes would ever equal.
-            if bare.is_empty()
-                || bare.ends_with('.')
-                || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
-            {
-                bail!(
-                    "allow-name {name:?}: expected a DNS suffix such as \"debian.org\", which \
-                     also allows every host under it"
-                );
-            }
-        }
+        crate::switch::check_allow_names(&self.allow_name, "allow-name")?;
         // The switch's own parser, so a CIDR the config accepts is one the switch enforces.
         crate::switch::Egress::restricted(&self.allow_ip, &[]).context("allow-ip")?;
         Ok(())

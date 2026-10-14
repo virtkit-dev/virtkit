@@ -386,6 +386,27 @@ impl EgressFile {
     }
 }
 
+/// Validate user-supplied allowlist suffixes before matching: a URL, a pattern or a
+/// fully qualified name would match nothing. `key` names the list in errors
+/// (`allow-name`, `--allow-name`).
+pub fn check_allow_names(names: &[String], key: &str) -> Result<()> {
+    for name in names {
+        let bare = name.trim_start_matches('.');
+        // A trailing dot is a fully qualified name, which no suffix match the switch
+        // makes would ever equal.
+        if bare.is_empty()
+            || bare.ends_with('.')
+            || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
+        {
+            bail!(
+                "{key} {name:?}: expected a DNS suffix such as \"debian.org\", which also \
+                 allows every host under it"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// How often a switch with an `--egress-file` checks it for an edit.
 const EGRESS_FILE_POLL: Duration = Duration::from_secs(1);
 
@@ -6075,6 +6096,33 @@ mod tests {
         assert!(!h.allows_ip("1.2.3.4".parse().unwrap(), 5433));
         // a bad port is rejected at parse time
         assert!(Egress::new(&["1.2.3.4:notaport".into()], &[]).is_err());
+    }
+
+    /// Bare DNS suffixes may have a leading dot. URLs, patterns and fully qualified
+    /// names would match nothing, so errors reject them with the list's own name.
+    #[test]
+    fn allow_names_are_bare_dns_suffixes() {
+        let ok = |n: &str| check_allow_names(&[n.to_string()], "--allow-name").is_ok();
+        assert!(ok("debian.org") && ok(".debian.org") && ok("localhost"));
+        assert!(check_allow_names(&[], "--allow-name").is_ok());
+        for bad in [
+            "",
+            ".",
+            "debian.org.",
+            "*.debian.org",
+            "https://debian.org",
+            "debian.org:443",
+            "user@debian.org",
+            "debian .org",
+        ] {
+            let msg = check_allow_names(&["ok.example".into(), bad.into()], "--allow-name")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.starts_with("--allow-name ") && msg.contains("DNS suffix"),
+                "{bad:?}: {msg}"
+            );
+        }
     }
 
     #[test]
