@@ -7,12 +7,18 @@
 (function () {
   "use strict";
 
-  var clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+  // 24-hour clock whatever the locale; `hour12: false` shows midnight as 24:00 in some engines.
+  var clock = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
   var thisYear = new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
+    hourCycle: "h23",
   });
   var otherYear = new Intl.DateTimeFormat(undefined, {
     year: "numeric",
@@ -20,6 +26,7 @@
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
+    hourCycle: "h23",
   });
 
   // `at`, local: its time alone today, its date too otherwise.

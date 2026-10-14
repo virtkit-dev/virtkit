@@ -26,6 +26,8 @@ All notable changes to virtkit will be documented in this file.
   `vk switch --allow-name`, each naming the key, variable or flag at fault. Such a name used
   to match nothing. **An executor config holding a bad `[egress]` or `[egress.build]` entry,
   name or IP, now fails the jobs that use it, whatever `net.mode`**, until it is corrected.
+- **The vk-hub web UI shows times on a 24-hour clock** whatever the browser's locale, instead
+  of AM/PM in locales that use it.
 
 ## [0.90.0] - 2026-10-14
 
