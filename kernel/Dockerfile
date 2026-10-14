@@ -3,9 +3,10 @@
 # + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off) + virtkit's
 # removals overlay (kernel-removals.config — drops options virtkit never uses:
 # Mellanox/VFIO/SGX/NVDIMM-pmem/CIFS/9p/XFS/SCSI/FIPS, debug, exotic netfilter, CPU-freq/
-# thermal/NUMA, unprivileged eBPF, and WireGuard/IPsec/VXLAN/tunnels — networking is host-side via the
-# switch, and jobs needing those ship their own per-bundle kernel). The result is the
-# pinned vmlinux a generic guest boots — no per-image kernel, initrd or modules.
+# thermal/NUMA, unprivileged eBPF, and WireGuard/IPsec/VXLAN/tunnels — networking is
+# host-side via the switch, and jobs needing those ship their own per-bundle kernel —
+# and turns Landlock on). The result is the pinned vmlinux a generic guest boots — no
+# per-image kernel, initrd or modules.
 #
 # Built in the SAME image as the binaries (virtkit-build, the .devcontainer Nix image —
 # base digest- and flake.lock-pinned, and it carries the rust toolchain recent kernels want
@@ -63,8 +64,9 @@ RUN set -e; \
     rm -f /tmp/kernel-signing-key.asc
 
 COPY kernel-fragment.config /build/kernel-fragment.config
-# Removals overlay: base-config options virtkit does not use. Merged AFTER the
-# base fragment so it overrides those defaults (see kernel-removals.config).
+# Removals overlay: base-config options virtkit does not use, plus the few it adds.
+# Merged AFTER the base fragment so it overrides those defaults (see
+# kernel-removals.config).
 COPY kernel-removals.config /build/kernel-removals.config
 
 WORKDIR /build/linux-${KERNEL_VERSION}
@@ -96,9 +98,10 @@ RUN export ARCH=x86_64 \
                   CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
                   CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD \
                   CONFIG_DEBUG_FS CONFIG_LRU_GEN CONFIG_STACKTRACE \
-                  CONFIG_BPF_UNPRIV_DEFAULT_OFF; do \
+                  CONFIG_BPF_UNPRIV_DEFAULT_OFF CONFIG_SECURITY_LANDLOCK; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
+    && { grep -q '^CONFIG_LSM=".*landlock' .config || { echo "landlock missing from CONFIG_LSM"; exit 1; }; } \
     && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
                   CONFIG_CIFS CONFIG_NET_9P CONFIG_XFS_FS CONFIG_CRYPTO_FIPS \
                   CONFIG_SCSI CONFIG_IP_VS CONFIG_IP_SET \

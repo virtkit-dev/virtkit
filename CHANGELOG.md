@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **The guest kernel supports Landlock.** Unprivileged processes in a VM can sandbox
+  themselves and their children, e.g. restrict a build command to the files it declares.
 - **`vk run --allow-name SUFFIX` and `--allow-ip CIDR[:PORT]` hold the booted guest's egress
   to an allowlist**, as `vk dev`'s `egress = "restricted"` does, and `--egress-restrict`
   alone cuts it off. They need `--net` or `--compose`, and bind the compose services too.
