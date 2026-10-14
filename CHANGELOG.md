@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.90.0] - 2026-10-14
+
 ### Added
 
 - **Pushed manifests can control tag retention.** `org.virtkit.retention=keep` keeps
@@ -4269,7 +4271,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.89.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.90.0...HEAD
+[0.90.0]: https://github.com/virtkit-dev/virtkit/compare/v0.89.0...v0.90.0
 [0.89.0]: https://github.com/virtkit-dev/virtkit/compare/v0.88.0...v0.89.0
 [0.88.0]: https://github.com/virtkit-dev/virtkit/compare/v0.87.0...v0.88.0
 [0.87.0]: https://github.com/virtkit-dev/virtkit/compare/v0.86.1...v0.87.0
