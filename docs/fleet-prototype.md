@@ -1330,12 +1330,12 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   ten minutes, and only while the plan is still what was shown — one of its nodes removed or
   updated meanwhile refuses it.
 
-The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page
-stay live over server-sent events. The hub notes every heartbeat, report, session, command
-outcome and desired-state change, by node; every release added or removed and rollout step;
-every change to a placed job's record — submitted, placed, accepted, at a new stage, finished,
-canceled or settled — and each hourly trim of the history; and, by job, each piece of its
-output stored, which wakes that job's page alone, never `/jobs`. The nodes table
+The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page stay
+live over server-sent events. The hub notes every heartbeat, report, session, command outcome and
+desired-state change, by node; every release added or removed, rollout step and node enrolled,
+renamed or removed; every change to a placed job's record — submitted, placed, accepted, at a new
+stage, finished, canceled or settled — and each hourly trim of the history; and, by job, each piece
+of its output stored, which wakes that job's page alone, never `/jobs`. The nodes table
 is the same for everyone, so one task renders it on a change and every nodes page is sent that
 one rendering; `/operations` likewise, once for every viewer's page and once for every
 operator's. A node's page is woken by changes to that node alone, and `/jobs` by changes to

@@ -666,6 +666,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
             if removed {
                 hub.revoke(&id);
+                hub.touch();
             }
             eprintln!(
                 "vk-hub: admin: uid {uid} removed node {} ({})",
@@ -1072,6 +1073,7 @@ mod tests {
             .enroll(&created.token, "aa", "ci-1", "peer p", crate::now_secs())
             .unwrap();
         let client = Client::connect(&path).unwrap();
+        let touched = hub.subscribe_touched();
         let (nodes, refused, removed) = tokio::task::spawn_blocking(move || {
             let nodes = client.list_nodes().unwrap();
             let refused = client
@@ -1088,6 +1090,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(removed, (true, false, 0));
+        // A removal touches the hub, which pages beyond the node's row follow.
+        assert!(touched.has_changed().unwrap());
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].hostname, "ci-1");
         assert!(!nodes[0].connected);

@@ -666,15 +666,19 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Peer, write: Write) -> Result<Opti
     let db = hub.db.clone();
     let id = node.id.clone();
     let now = crate::now_secs();
+    // Whether the node was renamed, which pages beyond its row show.
     let written = tokio::task::spawn_blocking(move || match write {
         Write::Inventory(inventory, durable) => db.record_inventory(&id, inventory, durable, now),
-        Write::Heartbeat(heartbeat) => db.record_heartbeat(&id, heartbeat, now),
-        Write::Report(report) => db.record_report(&id, report, now),
+        Write::Heartbeat(heartbeat) => db.record_heartbeat(&id, heartbeat, now).map(|()| false),
+        Write::Report(report) => db.record_report(&id, report, now).map(|()| false),
     })
     .await?;
     match written {
-        Ok(()) => {
+        Ok(renamed) => {
             hub.changed(&node.id);
+            if renamed {
+                hub.touch();
+            }
             Ok(None)
         }
         Err(e) if e.is::<NotEnrolled>() => {

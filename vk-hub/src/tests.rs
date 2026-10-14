@@ -292,7 +292,11 @@ async fn eventually(mut cond: impl FnMut() -> bool) {
 async fn a_node_enrolls_authenticates_and_reports() {
     let (addr, hub) = start().await;
     let key = keypair();
+    // An enrollment and a rename touch the hub, which pages beyond the node's row follow.
+    let mut touched = hub.subscribe_touched();
     let node_id = enrolled(addr, &hub, &key).await;
+    assert!(touched.has_changed().unwrap());
+    touched.borrow_and_update();
     let incarnation = "ab".repeat(16);
     let mut ws = dial(addr).await;
     assert_eq!(
@@ -324,6 +328,7 @@ async fn a_node_enrolls_authenticates_and_reports() {
     let row = hub.db.node(&node_id).unwrap().unwrap();
     assert_eq!(row.inventory, Some(inventory));
     assert_eq!(row.hostname, "ci-1.example");
+    assert!(touched.has_changed().unwrap());
     assert_eq!(row.incarnation.as_deref(), Some(incarnation.as_str()));
     assert_eq!(hub.reach(&node_id), Reach::Connected);
     ws.close(None).await.unwrap();

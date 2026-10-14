@@ -251,7 +251,7 @@ impl Hub {
     }
 
     /// Note that something a page shows beyond one node's row may have changed: a release, a
-    /// rollout, or in local mode the VMs listed.
+    /// rollout, a node enrolled, renamed or removed, or in local mode the VMs listed.
     pub(crate) fn touch(&self) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
         self.touched.send_modify(|n| *n = n.wrapping_add(1));
@@ -808,6 +808,7 @@ async fn enroll(
     Ok(match outcome {
         Enrollment::Enrolled { node_id } => {
             eprintln!("vk-hub: {peer}: enrolled node {node_id}");
+            hub.touch();
             json(StatusCode::OK, &EnrollResponse { node_id })
         }
         Enrollment::Reenrolled { node_id } => {

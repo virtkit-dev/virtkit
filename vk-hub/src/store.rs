@@ -937,20 +937,21 @@ impl Db {
         Ok(removed)
     }
 
-    /// Store an inventory, durably if `durable`. Its hostname replaces the enrollment's unless
-    /// it is empty. One identical to the stored one only refreshes `last_seen`, without a
-    /// durable write.
+    /// Store an inventory and return whether it renamed the node. A nonempty hostname
+    /// replaces the enrollment's. Write durably if `durable`, unless the inventory is
+    /// unchanged: then only refresh `last_seen`, without a durable write.
     pub fn record_inventory(
         &self,
         id: &str,
         inventory: Inventory,
         durable: bool,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let inventory = display_safe_inventory(inventory);
         self.update_txn(now, id, |row, _| {
             let changed = row.inventory.as_ref() != Some(&inventory);
-            if !inventory.hostname.is_empty() {
+            let renamed = !inventory.hostname.is_empty() && row.hostname != inventory.hostname;
+            if renamed {
                 row.hostname = inventory.hostname.clone();
             }
             row.inventory = Some(inventory);
@@ -960,7 +961,7 @@ impl Db {
             } else {
                 Durability::None
             };
-            Ok(((), Vec::new(), durability))
+            Ok((renamed, Vec::new(), durability))
         })
     }
 
@@ -3005,10 +3006,15 @@ mod tests {
             hostname: "ci-1".into(),
             ..Inventory::default()
         };
-        db.record_inventory(&node_id, inventory.clone(), true, 2)
-            .unwrap();
-        db.record_inventory(&node_id, inventory.clone(), true, 3)
-            .unwrap();
+        // Renamed from its enrollment's hostname once.
+        assert!(
+            db.record_inventory(&node_id, inventory.clone(), true, 2)
+                .unwrap()
+        );
+        assert!(
+            !db.record_inventory(&node_id, inventory.clone(), true, 3)
+                .unwrap()
+        );
         let row = db.node(&node_id).unwrap().unwrap();
         assert_eq!(row.last_seen, Some(3));
         assert_eq!(row.inventory.as_ref(), Some(&inventory));
@@ -3017,8 +3023,10 @@ mod tests {
             hostname: "ci-2".into(),
             ..inventory
         };
-        db.record_inventory(&node_id, changed.clone(), false, 4)
-            .unwrap();
+        assert!(
+            db.record_inventory(&node_id, changed.clone(), false, 4)
+                .unwrap()
+        );
         let row = db.node(&node_id).unwrap().unwrap();
         assert_eq!((row.last_seen, row.inventory), (Some(4), Some(changed)));
         assert_eq!(row.hostname, "ci-2");
