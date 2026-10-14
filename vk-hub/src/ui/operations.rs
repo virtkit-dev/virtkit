@@ -594,7 +594,8 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
 }
 
 /// An operator's forms on `/operations`, outside the live fragment so an update never clears
-/// one being filled in: upload a release, fetch one, start a rollout.
+/// one being filled in: upload a release and fetch one. Then the section that starts a
+/// rollout, which the page's stream keeps current on its own ([`start_rollout`]).
 pub(super) fn forms(
     h: &mut Html,
     auth: &Auth,
@@ -637,7 +638,28 @@ pub(super) fn forms(
                    unsigned.</p>",
             );
     }
-    h.raw("</section><section><h2>Start a rollout</h2>");
+    h.raw("</section><section id=\"start-rollout\" sse-swap=\"")
+        .raw(START_ROLLOUT)
+        .raw("\">");
+    start_rollout(h, releases, nodes, Some(&auth.csrf));
+    h.raw("</section>");
+}
+
+/// The event an operator's `/operations` stream sends the form that starts a rollout as.
+pub(super) const START_ROLLOUT: &str = "start-rollout";
+
+/// Render `<section id="start-rollout">`: the rollout form, or why it is unavailable.
+/// An operator's `/operations` stream sends it as [`START_ROLLOUT`] on connect and when
+/// its choices change: a vk release added or removed, a node enrolled, renamed or removed.
+/// The shared copy omits `csrf` and posts with the page's `hx-headers` token. The form's ID
+/// hashes its choices so `hx-preserve` keeps a form being filled in until they change.
+pub(super) fn start_rollout(
+    h: &mut Html,
+    releases: &[Release],
+    nodes: &[NodeView],
+    csrf: Option<&str>,
+) {
+    h.raw("<h2>Start a rollout</h2>");
     // A rollout updates nodes, so only to a vk release.
     let releases: Vec<&Release> = releases
         .iter()
@@ -654,19 +676,14 @@ pub(super) fn forms(
             } else {
                 "No node has enrolled yet."
             })
-            .raw("</p></section>");
+            .raw("</p>");
         return;
     }
-    h.raw("<form class=\"wide\" method=\"post\" action=\"")
-        .raw(ROLLOUT_PATH)
-        .raw("\" hx-post=\"")
-        .raw(ROLLOUT_PATH)
-        .raw("\" hx-swap=\"none\">");
-    csrf_field(h, auth);
-    h.raw("<input type=\"hidden\" name=\"op\" value=\"create\">")
+    let mut form = Html::new();
+    form.raw("<input type=\"hidden\" name=\"op\" value=\"create\">")
         .raw("<label>Release <select name=\"release\" required>");
     for r in releases {
-        h.raw("<option value=\"")
+        form.raw("<option value=\"")
             .text(&r.sha256)
             .raw("\">vk ")
             .text(&r.row.version)
@@ -681,17 +698,17 @@ pub(super) fn forms(
     }
     // Every node checked to start with: unchecking is how some are left out, and `checks.js`
     // checks or unchecks them all at once.
-    h.raw("</select></label><fieldset class=\"nodes\"><legend>Nodes</legend>")
+    form.raw("</select></label><fieldset class=\"nodes\"><legend>Nodes</legend>")
         .raw("<button type=\"button\" class=\"secondary\" data-check=\"all\">All</button>")
         .raw("<button type=\"button\" class=\"secondary\" data-check=\"none\">None</button>");
     for n in nodes {
-        h.raw("<label><input type=\"checkbox\" name=\"node\" value=\"")
+        form.raw("<label><input type=\"checkbox\" name=\"node\" value=\"")
             .text(&n.id)
             .raw("\" checked> ")
             .node(&n.hostname)
             .raw("</label>");
     }
-    h.raw("</fieldset>")
+    form.raw("</fieldset>")
         .raw("<label>Nodes at a time <input type=\"number\" name=\"batch\" min=\"1\" ")
         .raw("value=\"1\" required size=\"4\"></label>")
         .raw("<label>Failed nodes tolerated <input type=\"number\" name=\"max_failures\" ")
@@ -707,7 +724,19 @@ pub(super) fn forms(
         .raw("One node per hardware profile first</label>")
         .raw("<label><input type=\"checkbox\" name=\"force\" value=\"yes\"> ")
         .raw("Include external runners, without a drain</label></div></details>")
-        .raw("<button class=\"primary\">Start rollout</button></form></section>");
+        .raw("<button class=\"primary\">Start rollout</button>");
+    let id = vk_hub_proto::to_hex(&Sha256::digest(form.as_str().as_bytes())[..8]);
+    h.raw("<form id=\"rollout-")
+        .text(&id)
+        .raw("\" hx-preserve=\"true\" class=\"wide\" method=\"post\" action=\"")
+        .raw(ROLLOUT_PATH)
+        .raw("\" hx-post=\"")
+        .raw(ROLLOUT_PATH)
+        .raw("\" hx-swap=\"none\">");
+    if let Some(csrf) = csrf {
+        pages::csrf_input(h, csrf);
+    }
+    h.html(&form).raw("</form>");
 }
 
 /// The fetch under way or last ended, and the latest release last asked about: a line of
@@ -889,20 +918,8 @@ mod tests {
             hostname: "ci-1".into(),
             ..Default::default()
         };
-        let auth = Auth {
-            session: crate::store::UiSession {
-                id: "0".repeat(16),
-                role: crate::store::Role::Operator,
-                issued_by: "uid 0".into(),
-                created_at: 1,
-                expires_at: 2,
-                identity: None,
-            },
-            csrf: String::new(),
-            secret: String::new(),
-        };
         let mut h = Html::new();
-        forms(&mut h, &auth, &[release], &[node], None);
+        start_rollout(&mut h, &[release], &[node], None);
         let h = h.into_string();
         assert!(h.contains("No node has enrolled yet."), "{h}");
         assert!(!h.contains("<fieldset"), "{h}");

@@ -853,15 +853,23 @@ impl Events {
     }
 }
 
-/// The stream's next event containing `want`, within a few.
-async fn next_with(events: &mut Events, want: &str) -> String {
-    for _ in 0..5 {
+/// Collect events through the first containing `want`, within a few events.
+async fn events_until(events: &mut Events, want: &str) -> Vec<String> {
+    let mut seen = Vec::new();
+    for _ in 0..10 {
         let event = events.next().await.unwrap();
-        if event.contains(want) {
-            return event;
+        let found = event.contains(want);
+        seen.push(event);
+        if found {
+            return seen;
         }
     }
-    panic!("no event with {want:?}");
+    panic!("no event with {want:?}: {seen:?}");
+}
+
+/// The stream's next event containing `want`, within a few.
+async fn next_with(events: &mut Events, want: &str) -> String {
+    events_until(events, want).await.pop().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3278,11 +3286,13 @@ async fn releases_and_rollouts_are_shown_live() {
     assert!(!page.body.contains("<script>alert"), "{}", page.body);
     assert!(!page.body.contains("hx-post"), "{}", page.body);
     assert!(!page.body.contains("hx-headers"), "{}", page.body);
+    assert!(!page.body.contains("start-rollout"), "{}", page.body);
 
     let mut events = Events::open(addr, "/events/operations", &viewer).await;
     let first = events.next().await.unwrap();
     assert!(first.starts_with("event: operations\ndata: "), "{first}");
     assert!(!first.contains("hx-post"), "{first}");
+    assert!(!first.contains("start-rollout"), "{first}");
     // A release removed and a rollout steered, by the operations the admin socket runs,
     // reach a viewer's page.
     assert!(crate::releases::remove(&hub, "uid 0", &"cd".repeat(32)).unwrap());
@@ -4375,6 +4385,182 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
         again.body.ends_with("\n\nevent: close\ndata: \n\n"),
         "{}",
         again.body
+    );
+}
+
+/// Node `hostname` enrolled straight into the database under `key` repeated 16 times, so
+/// the hub's enrollment handler does not run and the caller touches it ([`Hub::touch`]).
+fn enrolled_as(hub: &Hub, hostname: &str, key: &str) -> String {
+    let (token, _) = hub
+        .db
+        .create_token(Duration::from_secs(60), "uid 0", crate::now_secs())
+        .unwrap();
+    let crate::store::Enrollment::Enrolled { node_id } = hub
+        .db
+        .enroll(&token, &key.repeat(16), hostname, "peer p", 1)
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    node_id
+}
+
+/// The ID of the rollout form in `html`.
+fn rollout_form_id(html: &str) -> String {
+    let at = html.find("<form id=\"rollout-").expect(html);
+    html[at..at + 34].to_string()
+}
+
+/// An operator's stream sends the form that starts a rollout beside the fragment, without the
+/// session's token, under an ID that changes with what it offers alone, and again only once
+/// that changes: a node enrolled, a release added, not a rollout steered. Its live copy posts
+/// with the token the page sets as a header around it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rollout_form_follows_what_it_offers() {
+    let (addr, hub, origin) = start_fleet().await;
+    let rollout = rollout_of(&hub, "ci-1");
+    let node = hub.db.nodes().unwrap()[0].0.clone();
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let form = rollout_form_id(&page.body);
+    // The section and the fragment are inside the element setting the header.
+    let at = |what: &str| page.body.find(what).expect(what);
+    assert!(at("hx-headers=") < at("<section id=\"start-rollout\" sse-swap=\"start-rollout\">"));
+    assert!(at("id=\"start-rollout\"") < at("<div id=\"operations\" sse-swap=\"operations\">"));
+    assert!(
+        page.body.ends_with("</div></div></main></body></html>"),
+        "{}",
+        page.body
+    );
+    let section = page.body.split("id=\"start-rollout\"").nth(1).unwrap();
+    assert!(section.contains(&format!("value=\"{csrf}\"")), "{section}");
+    assert!(section.contains("hx-preserve=\"true\""), "{section}");
+    assert!(!section.contains("name=\"select\""), "{section}");
+
+    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let first = live.next().await.unwrap();
+    assert!(first.starts_with("event: operations\ndata: "), "{first}");
+    let offered = live.next().await.unwrap();
+    assert!(
+        offered.starts_with("event: start-rollout\ndata: <h2>Start a rollout</h2>"),
+        "{offered}"
+    );
+    assert_eq!(rollout_form_id(&offered), form, "{offered}");
+    assert!(!offered.contains(&csrf), "{offered}");
+
+    // Posted as the live copy is, with the header's token and no field.
+    let reply = request(
+        addr,
+        "POST",
+        operations::ROLLOUT_PATH,
+        &[
+            &format!("Cookie: {operator}"),
+            &format!("Origin: {origin}"),
+            &format!("X-CSRF-Token: {csrf}"),
+            "HX-Request: true",
+            "Content-Type: application/x-www-form-urlencoded",
+        ],
+        &format!(
+            "op=create&release={}&node={node}&batch=1&max_failures=0&node_timeout=30m&\
+             drain_timeout=4h",
+            "ab".repeat(32)
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("Start this rollout?"), "{}", reply.body);
+
+    // A rollout steered changes the fragment, not the form: it is not sent again.
+    crate::ops::steer_rollout(
+        &hub,
+        "uid 0",
+        &rollout,
+        crate::rollout::RolloutAction::Pause,
+    )
+    .unwrap();
+    let mut seen = events_until(&mut live, ">paused<").await;
+    crate::ops::steer_rollout(
+        &hub,
+        "uid 0",
+        &rollout,
+        crate::rollout::RolloutAction::Resume,
+    )
+    .unwrap();
+    seen.extend(events_until(&mut live, ">running<").await);
+    assert!(
+        seen.iter().all(|e| e.starts_with("event: operations\n")),
+        "{seen:?}"
+    );
+    // A stream of its own still starts with the form: what one stream left out is per stream.
+    let mut other = Events::open(addr, "/events/operations", &operator).await;
+    let again = next_with(&mut other, "event: start-rollout\n").await;
+    assert_eq!(rollout_form_id(&again), form, "{again}");
+    drop(other);
+
+    // A node enrolled is offered, in a form of another ID.
+    let added = enrolled_as(&hub, "ci-3", "cd");
+    hub.touch();
+    let next = next_with(&mut live, &format!("value=\"{added}\" checked> ci-3")).await;
+    assert!(next.starts_with("event: start-rollout\n"), "{next}");
+    let enrolled = rollout_form_id(&next);
+    assert_ne!(enrolled, form, "{next}");
+
+    // As is a release added.
+    let release = crate::store::ReleaseRow {
+        version: "0.87.0".into(),
+        size: 3 << 20,
+        signature: None,
+        program: None,
+        added_at: 2,
+        added_by: "uid 0".into(),
+    };
+    hub.db
+        .add_release(&"12".repeat(32), &release, "uid 0")
+        .unwrap();
+    hub.touch();
+    let next = next_with(&mut live, ">vk 0.87.0 (").await;
+    assert!(next.starts_with("event: start-rollout\n"), "{next}");
+    assert_ne!(rollout_form_id(&next), enrolled, "{next}");
+}
+
+/// The live rollout section says what a rollout lacks, a vk release then a node, and offers
+/// the form once there is both.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rollout_section_says_live_what_a_rollout_lacks() {
+    let (addr, hub, _) = start_fleet().await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/operations", Some(&operator)).await;
+    let section = page.body.split("id=\"start-rollout\"").nth(1).unwrap();
+    assert!(section.contains("Add a vk release first."), "{section}");
+
+    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let first = next_with(&mut live, "event: start-rollout\n").await;
+    assert!(first.contains("Add a vk release first."), "{first}");
+
+    let release = crate::store::ReleaseRow {
+        version: "0.85.0".into(),
+        size: 3 << 20,
+        signature: None,
+        program: None,
+        added_at: 1,
+        added_by: "uid 0".into(),
+    };
+    hub.db
+        .add_release(&"ab".repeat(32), &release, "uid 0")
+        .unwrap();
+    hub.touch();
+    let next = next_with(&mut live, "No node has enrolled yet.").await;
+    assert!(next.starts_with("event: start-rollout\n"), "{next}");
+
+    let node = enrolled_as(&hub, "ci-1", "ab");
+    hub.touch();
+    let next = next_with(&mut live, "<form id=\"rollout-").await;
+    assert!(next.starts_with("event: start-rollout\n"), "{next}");
+    assert!(
+        next.contains(&format!("value=\"{node}\" checked> ci-1")),
+        "{next}"
     );
 }
 

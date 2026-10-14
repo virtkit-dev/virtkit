@@ -1328,7 +1328,11 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   is asked again first, as a reset is, showing the release, whether it is signed, and the nodes
   wave by wave with those skipped and why; the answer counts once, from the same session, within
   ten minutes, and only while the plan is still what was shown — one of its nodes removed or
-  updated meanwhile refuses it.
+  updated meanwhile refuses it. The page's stream also sends the form, as an event of its own, when
+  it connects and whenever what the form offers changes — a vk release added or removed, a node
+  enrolled, renamed or removed. Its ID hashes what it offers and it is `hx-preserve`d, so one being
+  filled in is kept until that changes. That copy, shared by every operator, has no CSRF field: it
+  posts with the token the page sets through `hx-headers` around the forms and the fragment.
 
 The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page stay
 live over server-sent events. The hub notes every heartbeat, report, session, command outcome and

@@ -57,8 +57,9 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 
 /// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
 /// viewer's page and once for every operator's, each rendered once for every page showing it
-/// ([`sse::feed`]). `/operations` shows only releases and rollouts, so it follows
-/// [`Hub::touch`] alone, not every node's heartbeat.
+/// ([`sse::feed`]). `/operations` shows releases and rollouts and, for an operator, the form
+/// that starts one; it follows [`Hub::touch`] alone — which also notes a node enrolled, renamed
+/// or removed — not every node's heartbeat.
 pub(super) struct FleetSite {
     /// Pending reset and rollout confirmations.
     pub(super) questions: actions::Questions,
@@ -278,14 +279,29 @@ fn nodes_events(hub: &Arc<Hub>) -> sse::Events {
 }
 
 /// `/operations`' fragment, as one rendering for every page showing it: with the rollouts'
-/// buttons for an operator's, without for a viewer's.
+/// buttons for an operator's, without for a viewer's. An operator's has the form that starts
+/// a rollout beside it, as its own event ([`operations::start_rollout`]).
 fn operations_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
-    let hub = hub.clone();
-    let render: sse::Render = Arc::new(move || {
-        let ops = read_operations(&hub)?;
-        Ok(operations_fragment(&ops, steer, crate::now_secs()).into_string())
-    });
-    sse::Events::from([("operations", render)])
+    let fragment: sse::Render = {
+        let hub = hub.clone();
+        Arc::new(move || {
+            let ops = read_operations(&hub)?;
+            Ok(operations_fragment(&ops, steer, crate::now_secs()).into_string())
+        })
+    };
+    if !steer {
+        return sse::Events::from([("operations", fragment)]);
+    }
+    let form: sse::Render = {
+        let hub = hub.clone();
+        Arc::new(move || {
+            let nodes = crate::ops::node_views(&hub)?;
+            let mut h = Html::new();
+            operations::start_rollout(&mut h, &hub.db.releases()?, &nodes, None);
+            Ok(h.into_string())
+        })
+    };
+    sse::Events::from([("operations", fragment), (operations::START_ROLLOUT, form)])
 }
 
 /// What `/operations` shows.
@@ -1680,29 +1696,30 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
 /// `/operations`: the releases the hub holds and its latest rollouts, kept live.
 ///
 /// The live fragment is rendered once for every viewer and once for every operator
-/// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it around
-/// the fragment as a header on every htmx request from inside it (`hx-headers`), which is how
-/// the rollouts' buttons post. Those buttons need htmx; `vk-hub rollout pause|resume|abort`
-/// does the same without it. An operator's page carries the forms that add a release and start
-/// a rollout above it.
+/// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it on the
+/// element holding the forms, `#flash` and the fragment, as a header on every htmx request
+/// from inside it (`hx-headers`), which is how the rollouts' buttons and the live copies of
+/// the rollout form post. Those buttons need htmx; `vk-hub rollout pause|resume|abort` does
+/// the same without it. An operator's page carries the forms that add a release and start a
+/// rollout above the fragment.
 fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
-    main.raw("<h1>Operations</h1>");
+    main.raw("<h1>Operations</h1><div hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
+        .raw("sse-close=\"close\"");
     if steer {
-        operations::forms(&mut main, auth, &ops.releases, nodes, ops.source.as_deref());
         // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
-        main.raw("<div id=\"flash\"></div><div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
+        main.raw(" hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
             .text(&auth.csrf)
             .raw("&quot;}\">");
+        operations::forms(&mut main, auth, &ops.releases, nodes, ops.source.as_deref());
+        main.raw("<div id=\"flash\"></div>");
+    } else {
+        main.raw(">");
     }
-    main.raw("<div id=\"operations\" hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
-        .raw("sse-swap=\"operations\" sse-close=\"close\">")
+    main.raw("<div id=\"operations\" sse-swap=\"operations\">")
         .html(&operations_fragment(ops, steer, now))
-        .raw("</div>");
-    if steer {
-        main.raw("</div>");
-    }
+        .raw("</div></div>");
     layout("Operations", "/operations", auth, &main)
 }
 
