@@ -146,6 +146,19 @@ Use `--net` to allow guest egress. Networking is implemented by a userspace swit
 the `vk` process, and outbound traffic leaves through ordinary host sockets. The host
 does not need a bridge, tap device, or firewall changes.
 
+To hold the guest to an allowlist, add `--allow-name SUFFIX` and `--allow-ip CIDR[:PORT]`
+(both repeatable), as `vk dev`'s `egress = "restricted"` does. A name suffix is
+dot-anchored: `debian.org` also allows `deb.debian.org`. A name outside every suffix
+resolves to nothing, and the guest may reach the addresses an allowed name resolved to.
+`--allow-ip` takes IPv4 CIDRs, each optionally scoped to one port, for destinations dialed
+by address; IPv6 is refused. `--egress-restrict` alone denies all egress. The flags need
+`--net` (or `--compose`, whose services they bind too) and refuse `--tap`, whose egress
+bypasses the switch.
+
+```sh
+vk run --net --allow-name debian.org debian:12 -- apt-get update
+```
+
 For images intended to boot as full machines, `--kernel image --init image` loads the
 image's `/boot/vmlinuz`, modules, and init system. `--init entrypoint` instead runs the
 image's ENTRYPOINT and CMD as PID 1. A kernel supplied with `--kernel <path>` is also
