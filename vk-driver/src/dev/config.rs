@@ -581,10 +581,8 @@ impl Network {
             }
             return Ok(());
         }
-        crate::switch::check_allow_names(&self.allow_name, "allow-name")?;
-        // The switch's own parser, so a CIDR the config accepts is one the switch enforces.
-        crate::switch::Egress::restricted(&self.allow_ip, &[]).context("allow-ip")?;
-        Ok(())
+        // The switch's own checks, so a list the config accepts is one the switch enforces.
+        crate::switch::check_allowlist(&self.allow_ip, &self.allow_name, "allow-ip", "allow-name")
     }
 }
 

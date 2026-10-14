@@ -314,6 +314,10 @@ impl Egress {
     /// executor uses this when a job's phase configures egress (see the switch's
     /// `--egress-restrict`), so `allow_name = []` means "no names", not "any name".
     pub fn restricted(ips: &[String], names: &[String]) -> Result<Egress> {
+        // The one parser of an allowlist: every entry point (`vk run`, `vk build`, `vk dev`, the
+        // executor's caps and job requests, `vk switch`, an egress file) reaches the switch
+        // through here, so a name or a CIDR is accepted or refused the same way everywhere.
+        check_allow_names(names, "allow-name")?;
         let ips = ips.iter().map(|s| Cidr4::parse(s)).collect::<Result<_>>()?;
         let names = names
             .iter()
@@ -408,6 +412,21 @@ pub fn check_allow_names(names: &[String], key: &str) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Check an allowlist given by a user (a flag, a config key) before anything runs, naming the
+/// flag or key at fault: the names as DNS suffixes, the CIDRs through the switch's own parser.
+/// `vk run --allow-*`, `vk build`/`vk run -f --build-allow-*` and `vk dev`'s `[dev.network]`
+/// all call it, so a list one accepts is a list the others accept.
+pub fn check_allowlist(
+    ips: &[String],
+    names: &[String],
+    ip_key: &str,
+    name_key: &str,
+) -> Result<()> {
+    check_allow_names(names, name_key)?;
+    Egress::restricted(ips, &[]).with_context(|| ip_key.to_string())?;
     Ok(())
 }
 
@@ -6131,7 +6150,21 @@ mod tests {
                 msg.starts_with("--allow-name ") && msg.contains("DNS suffix"),
                 "{bad:?}: {msg}"
             );
+            // The switch's parser refuses it too: an egress file, `vk switch --allow-name` and
+            // the executor's caps get the same check as the flags.
+            assert!(Egress::restricted(&[], &[bad.into()]).is_err(), "{bad:?}");
+            assert!(Egress::new(&[], &[bad.into()]).is_err(), "{bad:?}");
         }
+        // The shared flag check names whichever list is at fault.
+        let ip = format!(
+            "{:#}",
+            check_allowlist(&["10.0.0.0/33".into()], &[], "--x-ip", "--x-name").unwrap_err()
+        );
+        assert!(ip.starts_with("--x-ip"), "{ip}");
+        let name = check_allowlist(&[], &["*.a.com".into()], "--x-ip", "--x-name")
+            .unwrap_err()
+            .to_string();
+        assert!(name.starts_with("--x-name "), "{name}");
     }
 
     #[test]

@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
 
 - **An egress allowlist entry written as IPv6 is refused as IPv6**, rather than as a bad
   port.
+- **Every egress allowlist checks its names the same way**: `--build-allow-name`, the
+  executor's `[egress]` `allow_name` and a job's `MICROVM_EGRESS_ALLOW_NAME`, an egress file
+  and `vk switch --allow-name` refuse a URL, a pattern, a port or a trailing dot, as
+  `vk run --allow-name` and `vk dev` do, naming the flag or key at fault.
 
 ## [0.89.0] - 2026-10-13
 

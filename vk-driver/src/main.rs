@@ -1085,8 +1085,9 @@ enum Cmd {
         build_allow_ip: Vec<String>,
         /// restrict RUN egress to hosts at or under this DNS suffix
         ///
-        /// A suffix is e.g. `crates.io`. Repeatable; any --build-allow-* flag turns
-        /// filtering on.
+        /// A suffix is e.g. `crates.io`, dot-anchored; a URL, a pattern, a port or a trailing
+        /// dot is refused, as for `vk run --allow-name`. Repeatable; any --build-allow-* flag
+        /// turns filtering on.
         #[arg(
             long = "build-allow-name",
             value_name = "SUFFIX",
@@ -1726,8 +1727,9 @@ enum Cmd {
         build_allow_ip: Vec<String>,
         /// restrict the --file build's RUN egress to hosts at or under this DNS suffix
         ///
-        /// A suffix is e.g. `crates.io`. Repeatable; any --build-allow-* flag turns
-        /// filtering on.
+        /// A suffix is e.g. `crates.io`, dot-anchored; a URL, a pattern, a port or a trailing
+        /// dot is refused, as for `vk run --allow-name`. Repeatable; any --build-allow-* flag
+        /// turns filtering on.
         #[arg(
             long = "build-allow-name",
             value_name = "SUFFIX",

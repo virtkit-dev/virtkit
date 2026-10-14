@@ -575,8 +575,7 @@ pub fn egress_from_flags(
         "--allow-ip, --allow-name and --egress-restrict hold the guest's egress at the switch, \
          so they require --net (or --compose)"
     );
-    crate::switch::check_allow_names(names, "--allow-name")?;
-    crate::switch::Egress::restricted(ips, &[]).context("--allow-ip")?;
+    crate::switch::check_allowlist(ips, names, "--allow-ip", "--allow-name")?;
     Ok(Some(crate::switch::EgressFile {
         allow_ip: ips.to_vec(),
         allow_name: names.to_vec(),

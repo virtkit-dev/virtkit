@@ -2528,6 +2528,8 @@ fn split_req(req: &str) -> Vec<String> {
 /// suffix, `Some([])` ⇒ none). A name outside the cap fails the job — it can narrow, not widen.
 fn narrow_names(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String>> {
     let requested = split_req(req);
+    // The suffix check every allowlist gets, here so a bad request fails the job by its name.
+    crate::switch::check_allow_names(&requested, var)?;
     let policy = match cap {
         None => crate::switch::Egress::AllowAll,
         Some(c) => crate::switch::Egress::restricted(&[], c)?,
@@ -4377,6 +4379,15 @@ mod tests {
         assert!(narrow_names(Some(&cap), "api.corp.example.com", "V").is_ok());
         assert!(narrow_names(Some(&cap), "evil.com", "V").is_err());
         assert!(narrow_names(Some(&[]), "anything.com", "V").is_err());
+        // A request that is not a DNS suffix fails by its variable, whatever the cap.
+        let msg = format!(
+            "{:#}",
+            narrow_names(None, "https://a.com", "V").unwrap_err()
+        );
+        assert!(
+            msg.contains("V \"https://a.com\"") && msg.contains("DNS suffix"),
+            "{msg}"
+        );
 
         let ipcap = ["10.0.0.0/8".to_string()];
         assert!(narrow_ips(Some(&ipcap), "10.1.2.0/24", "V").is_ok());
