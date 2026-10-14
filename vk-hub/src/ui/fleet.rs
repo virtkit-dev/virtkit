@@ -76,16 +76,11 @@ impl FleetSite {
         FleetSite {
             questions: actions::Questions::new(),
             uploading: operations::Uploading::new(),
-            nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
-            operations_feed: sse::feed(
-                hub.subscribe_touched(),
-                "operations",
-                render_operations(hub.clone(), false),
-            ),
+            nodes_feed: sse::feed(hub.subscribe(), nodes_events(hub)),
+            operations_feed: sse::feed(hub.subscribe_touched(), operations_events(hub, false)),
             steered_operations_feed: sse::feed(
                 hub.subscribe_touched(),
-                "operations",
-                render_operations(hub.clone(), true),
+                operations_events(hub, true),
             ),
             jobs: Arc::default(),
         }
@@ -141,7 +136,7 @@ pub(super) fn source(
             return Some(Source::Shared {
                 name: "nodes",
                 feed: site.nodes_feed.subscribe(),
-                render: render_nodes(hub.clone()),
+                events: nodes_events(hub),
             });
         }
         "operations" => {
@@ -153,7 +148,7 @@ pub(super) fn source(
             return Some(Source::Shared {
                 name: "operations",
                 feed: feed.subscribe(),
-                render: render_operations(hub.clone(), steer),
+                events: operations_events(hub, steer),
             });
         }
         _ => {}
@@ -273,20 +268,24 @@ pub(super) async fn get(
 }
 
 /// The nodes table, as one rendering for every nodes page.
-fn render_nodes(hub: Arc<Hub>) -> sse::Render {
-    Arc::new(move || {
+fn nodes_events(hub: &Arc<Hub>) -> sse::Events {
+    let hub = hub.clone();
+    let render: sse::Render = Arc::new(move || {
         let nodes = crate::ops::node_views(&hub)?;
         Ok(nodes_table(&nodes, crate::now_secs()).into_string())
-    })
+    });
+    sse::Events::from([("nodes", render)])
 }
 
 /// `/operations`' fragment, as one rendering for every page showing it: with the rollouts'
 /// buttons for an operator's, without for a viewer's.
-fn render_operations(hub: Arc<Hub>, steer: bool) -> sse::Render {
-    Arc::new(move || {
+fn operations_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
+    let hub = hub.clone();
+    let render: sse::Render = Arc::new(move || {
         let ops = read_operations(&hub)?;
         Ok(operations_fragment(&ops, steer, crate::now_secs()).into_string())
-    })
+    });
+    sse::Events::from([("operations", render)])
 }
 
 /// What `/operations` shows.

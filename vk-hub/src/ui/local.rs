@@ -64,11 +64,14 @@ pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html 
 
 /// Start the task that renders the VMs table once for every page listing it.
 fn feed(hub: &Hub, local: &Arc<Local>) -> watch::Sender<Option<Bytes>> {
-    sse::feed(hub.subscribe(), "vms", render_vms(local.clone()))
+    sse::feed(hub.subscribe(), vms_events(local))
 }
 
-fn render_vms(local: Arc<Local>) -> sse::Render {
-    Arc::new(move || Ok(vms_table(&local.listing()).into_string()))
+/// The VMs table, as the one event of its feed.
+fn vms_events(local: &Arc<Local>) -> sse::Events {
+    let local = local.clone();
+    let render: sse::Render = Arc::new(move || Ok(vms_table(&local.listing()).into_string()));
+    sse::Events::from([("vms", render)])
 }
 
 /// The event `/events/<event>` swaps its fragment in on, if it is one of local mode's.
@@ -88,7 +91,7 @@ pub(super) fn source(event: &str, hub: &Hub, site: &LocalSite) -> Option<Source>
         return Some(Source::Shared {
             name: "vms",
             feed: site.vms_feed.subscribe(),
-            render: render_vms(site.local.clone()),
+            events: vms_events(&site.local),
         });
     }
     let id = event

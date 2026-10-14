@@ -8,8 +8,11 @@
 //! way a fragment is rendered at most once per [`DEBOUNCE`] however fast what it shows
 //! changes, and sent only when it differs from the last one that stream sent; ages on the
 //! pages move in steps of a heartbeat, so a page with nothing new to show is sent nothing but
-//! keep-alives. A page that grows — a running job's output — is sent what is new, at most
-//! once per [`DEBOUNCE`] too, and told when nothing more will come ([`Source::Follow`]).
+//! keep-alives. A shared feed may render other parts of its page beside the fragment, each its
+//! own event and each sent only when it changes, so a part rarely changing is not swapped in
+//! again every time the fragment's ages move. A page that grows — a running job's output — is
+//! sent what is new, at most once per [`DEBOUNCE`] too, and told when nothing more will come
+//! ([`Source::Follow`]).
 //!
 //! Streams hold connections, so there are at most [`MAX_STREAMS`] of them — the rest of the
 //! UI's connections stay for pages and posts — and [`MAX_SESSION_STREAMS`] per session. A
@@ -163,13 +166,13 @@ impl Streams {
 /// How a fragment is rendered: called off the runtime, as it may read the database.
 pub type Render = Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>;
 
-/// Start a shared rendering task woken by `changes` and return its feed of framed `name`
-/// events. Render only while the feed has subscribers.
-pub fn feed(
-    mut changes: watch::Receiver<u64>,
-    name: &'static str,
-    render_fn: Render,
-) -> watch::Sender<Option<Bytes>> {
+/// The events a shared feed renders, `(name, render)`: the page's fragment first, then any
+/// other parts of the page.
+pub type Events = Arc<[(&'static str, Render)]>;
+
+/// Start a shared rendering task woken by `changes` and return its feed of frames, each
+/// holding `events` rendered. Render only while the feed has subscribers.
+pub fn feed(mut changes: watch::Receiver<u64>, events: Events) -> watch::Sender<Option<Bytes>> {
     let (feed, _) = watch::channel(None);
     let publish = feed.clone();
     tokio::spawn(async move {
@@ -182,12 +185,11 @@ pub fn feed(
             if publish.receiver_count() == 0 {
                 continue;
             }
-            let f = render_fn.clone();
             // Publish even unchanged fragments: a new stream renders its first fragment
             // independently and may need this one to replace it. Each stream deduplicates
-            // against its own last sent fragment.
-            if let Some(html) = blocking(RENDERING, move || f()).await {
-                publish.send_replace(Some(event(name, &html)));
+            // against its own last sent events.
+            if let Some(frame) = render(events.clone()).await {
+                publish.send_replace(Some(frame));
             }
             tokio::time::sleep(DEBOUNCE).await;
         }
@@ -196,6 +198,66 @@ pub fn feed(
 }
 
 const RENDERING: &str = "rendering a live update";
+
+/// The events after a feed's first whose rendering last failed, logged once until it succeeds.
+static FAILING: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Render `events` into one frame off the runtime. Return `None` if the first fails,
+/// leaving no fragment to show; omit and log later failures ([`FAILING`]).
+async fn render(events: Events) -> Option<Bytes> {
+    blocking(RENDERING, move || {
+        let mut frame = Vec::new();
+        for (i, (name, f)) in events.iter().enumerate() {
+            let result = f();
+            if i > 0 {
+                let mut failing = lock(&FAILING);
+                let was = failing.iter().position(|n| n == name);
+                match (&result, was) {
+                    (Ok(_), Some(at)) => {
+                        failing.swap_remove(at);
+                    }
+                    (Err(e), None) => {
+                        eprintln!("vk-hub: ui: {RENDERING} ({name}): {e:#}");
+                        failing.push(name);
+                    }
+                    _ => {}
+                }
+            }
+            match result {
+                Ok(html) => frame.extend_from_slice(&event(name, &html)),
+                Err(_) if i > 0 => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Bytes::from(frame))
+    })
+    .await
+}
+
+/// The last event of each name a stream sent.
+#[derive(Default)]
+struct Sent(Vec<Bytes>);
+
+impl Sent {
+    /// Return changed events from `frame` and record them as sent, comparing by name.
+    /// Return `None` if none changed.
+    fn news(&mut self, frame: &Bytes) -> Option<Bytes> {
+        let mut out = Vec::new();
+        let mut rest = frame.clone();
+        // `event` ends each event with the frame's only blank line.
+        while let Some(end) = rest.windows(2).position(|w| w == b"\n\n") {
+            let one = rest.split_to(end + 2);
+            let name_line = one.iter().position(|&b| b == b'\n').map_or(0, |at| at + 1);
+            match self.0.iter_mut().find(|s| s.starts_with(&one[..name_line])) {
+                Some(last) if *last == one => continue,
+                Some(last) => *last = one.clone(),
+                None => self.0.push(one.clone()),
+            }
+            out.extend_from_slice(&one);
+        }
+        (!out.is_empty()).then(|| Bytes::from(out))
+    }
+}
 
 /// Run `f` off the runtime; on failure, log `what` and return `None`.
 async fn blocking<T: Send + 'static>(
@@ -223,11 +285,12 @@ fn refresh_interval() -> tokio::time::Interval {
 
 /// What a stream follows.
 pub enum Source {
-    /// A fragment rendered once for everyone following it.
+    /// A fragment, and any parts beside it, rendered once for everyone following them: `feed`
+    /// publishes `events` rendered ([`feed`]). `name` is the event a session's end is shown in.
     Shared {
         name: &'static str,
         feed: watch::Receiver<Option<Bytes>>,
-        render: Render,
+        events: Events,
     },
     /// A fragment of this page's own, rendered whenever `changes` says it may have changed.
     Own {
@@ -347,13 +410,13 @@ struct Stalled;
 /// the session ends. Nothing is sent before the session is checked; a check that fails ends
 /// the stream without the `close` event, for the page to open it again.
 async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> Result<(), Stalled> {
-    let (name, mut feed, mut own, render_fn) = match source {
-        Source::Shared { name, feed, render } => (name, Some(feed), None, render),
+    let (name, mut feed, mut own, events) = match source {
+        Source::Shared { name, feed, events } => (name, Some(feed), None, events),
         Source::Own {
             name,
             changes,
             render,
-        } => (name, None, Some(changes), render),
+        } => (name, None, Some(changes), Events::from([(name, render)])),
         Source::Follow {
             name,
             changes,
@@ -367,8 +430,7 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
     if let Some(feed) = feed.as_mut() {
         feed.borrow_and_update();
     }
-    let f = render_fn.clone();
-    let Some(first) = blocking(RENDERING, move || f()).await else {
+    let Some(first) = render(events.clone()).await else {
         return Ok(());
     };
     match session.live(false).await {
@@ -376,8 +438,10 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
         Some(false) => return end(&tx, name, session.sign_in).await,
         None => return Ok(()),
     }
-    let mut last_frame = event(name, &first);
-    if !send(&tx, last_frame.clone()).await? {
+    let mut sent = Sent::default();
+    if let Some(first) = sent.news(&first)
+        && !send(&tx, first).await?
+    {
         return Ok(());
     }
     loop {
@@ -417,10 +481,7 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
                 if let Some(changes) = own.as_mut() {
                     changes.borrow_and_update();
                     last_render = Instant::now();
-                    let f = render_fn.clone();
-                    frame = blocking(RENDERING, move || f())
-                        .await
-                        .map(|html| event(name, &html));
+                    frame = render(events.clone()).await;
                 }
             }
             Wake::Own | Wake::Sessions | Wake::Tick => {}
@@ -433,11 +494,8 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
             Some(false) => return end(&tx, name, session.sign_in).await,
             None => return Ok(()),
         }
-        let frame = match frame.filter(|frame| *frame != last_frame) {
-            Some(frame) => {
-                last_frame = frame.clone();
-                Some(frame)
-            }
+        let frame = match frame.and_then(|frame| sent.news(&frame)) {
+            Some(news) => Some(news),
             None if last_sent.elapsed() >= KEEP_ALIVE => Some(Bytes::from_static(COMMENT)),
             None => None,
         };
@@ -586,7 +644,7 @@ mod tests {
         let (hub, auth) = signed_in();
         let shown = Arc::new(Mutex::new("A".to_string()));
         let (changes, changes_rx) = watch::channel(0u64);
-        let publish = feed(changes_rx, "t", showing(&shown));
+        let publish = feed(changes_rx, Events::from([("t", showing(&shown))]));
         let mut published = publish.subscribe();
         changes.send_modify(|n| *n += 1);
         published.changed().await.unwrap();
@@ -596,7 +654,7 @@ mod tests {
         let source = Source::Shared {
             name: "t",
             feed: publish.subscribe(),
-            render: showing(&shown),
+            events: Events::from([("t", showing(&shown))]),
         };
         let slot = Streams::new().take("s").unwrap();
         let mut resp = GIVE_UP
@@ -641,6 +699,24 @@ mod tests {
             .await
             .unwrap();
         drop(resp);
+    }
+
+    /// Each event of a frame is sent only when it differs from the last of its name sent.
+    #[test]
+    fn a_stream_sends_only_the_events_that_changed() {
+        let frame = |a: &str, b: &str| {
+            let mut frame = event("a", a).to_vec();
+            frame.extend_from_slice(&event("b", b));
+            Bytes::from(frame)
+        };
+        let mut sent = Sent::default();
+        assert_eq!(sent.news(&frame("1", "x")), Some(frame("1", "x")));
+        assert_eq!(sent.news(&frame("2", "x")), Some(event("a", "2")));
+        assert_eq!(sent.news(&frame("2", "x")), None);
+        assert_eq!(sent.news(&frame("2", "y")), Some(event("b", "y")));
+        // A name another's starts with is an event of its own.
+        assert_eq!(sent.news(&event("ab", "2")), Some(event("ab", "2")));
+        assert_eq!(sent.news(&event("a", "2")), None);
     }
 
     #[test]
