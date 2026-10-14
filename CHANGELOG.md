@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **IPv6 egress allowlist entries are rejected with an IPv6 error**, instead of a bad
+  port or address error.
+
 ## [0.90.0] - 2026-10-14
 
 ### Added

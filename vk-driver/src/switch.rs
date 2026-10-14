@@ -246,6 +246,11 @@ pub struct Cidr4 {
 
 impl Cidr4 {
     fn parse(s: &str) -> Result<Self> {
+        // Report IPv6 explicitly before port or IPv4 parsing.
+        let host = s.split(['/', '%']).next().unwrap_or(s);
+        if s.starts_with('[') || host.parse::<std::net::Ipv6Addr>().is_ok() {
+            bail!("{s:?}: IPv6 is refused; an allowlist takes IPv4 CIDRs (optionally CIDR:port)");
+        }
         // Optional `:port` suffix; IPv4 has no colons, so a colon unambiguously starts it.
         let (cidr, port) = match s.rsplit_once(':') {
             Some((c, p)) => (
@@ -6096,6 +6101,16 @@ mod tests {
         assert!(!h.allows_ip("1.2.3.4".parse().unwrap(), 5433));
         // a bad port is rejected at parse time
         assert!(Egress::new(&["1.2.3.4:notaport".into()], &[]).is_err());
+        // IPv6 is refused as such, not as a bad port or address
+        for v6 in ["2001:db8::/32", "::1", "[::1]:443", "fe80::1%eth0"] {
+            let msg = format!("{:#}", Egress::new(&[v6.into()], &[]).err().unwrap());
+            assert!(msg.contains("IPv6 is refused"), "{v6}: {msg}");
+        }
+        // extra colons in an IPv4 entry do not imply IPv6
+        for v4 in ["1.2.3.4:80:90", "10.0.0.0/8::443"] {
+            let msg = format!("{:#}", Egress::new(&[v4.into()], &[]).err().unwrap());
+            assert!(!msg.contains("IPv6"), "{v4}: {msg}");
+        }
     }
 
     /// Bare DNS suffixes may have a leading dot. URLs, patterns and fully qualified
