@@ -36,7 +36,9 @@ pub fn openpty(rows: u16, cols: u16) -> io::Result<(PtyMaster, OwnedFd)> {
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     set_winsize(slave.as_raw_fd(), rows, cols)?;
     set_nonblocking(master.as_raw_fd())?;
-    Ok((PtyMaster(AsyncFd::new(master)?), slave))
+    // SAFETY: an `OwnedFd` keeps its descriptor open, and returns it, until it is dropped.
+    let master = unsafe { AsyncFd::register(master) }?;
+    Ok((PtyMaster(master), slave))
 }
 
 impl PtyMaster {
