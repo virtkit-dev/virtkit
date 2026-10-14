@@ -2733,7 +2733,19 @@ mod tests {
         assert_eq!(hv(&saved, 0x4000_0080), Some(1));
 
         let again = through_json_into_a_fresh_vcpu(&saved, true);
-        assert_eq!(json(&again.hyperv_msrs), json(&saved.hyperv_msrs));
+        // VP_RUNTIME reads as the calling thread's run time plus the offset a restore sets, so
+        // it moves on whenever the scheduler accounts that time between restore and save.
+        const VP_RUNTIME: u32 = 0x4000_0010;
+        assert!(hv(&again, VP_RUNTIME) >= hv(&saved, VP_RUNTIME));
+        let others = |state: &VcpuState| {
+            let msrs: Vec<_> = state
+                .hyperv_msrs
+                .iter()
+                .filter(|m| m.index != VP_RUNTIME)
+                .collect();
+            json(&msrs)
+        };
+        assert_eq!(others(&again), others(&saved));
         assert_eq!(json(&again.regs), json(&saved.regs));
         assert_eq!(json(&again.sregs), json(&saved.sregs));
         assert_eq!(json(&again.lapic), json(&saved.lapic));
