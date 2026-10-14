@@ -1932,6 +1932,41 @@ enum Cmd {
         /// restrict egress. Requires --net (or --compose).
         #[arg(long = "audit-egress", help_heading = "Network")]
         audit_egress: bool,
+        /// restrict the booted guest's egress to hosts at or under this DNS suffix
+        ///
+        /// Dot-anchored: `debian.org` also allows `deb.debian.org`. A name outside every
+        /// suffix resolves to nothing, and the guest may reach the addresses an allowed name
+        /// resolved to. Repeatable; any --allow-* flag turns filtering on. Requires --net (or
+        /// --compose), whose services it binds too.
+        #[arg(
+            long = "allow-name",
+            value_name = "SUFFIX",
+            conflicts_with = "tap",
+            help_heading = "Network"
+        )]
+        allow_name: Vec<String>,
+        /// restrict the booted guest's egress to this destination IPv4 CIDR
+        ///
+        /// For destinations dialed by address, optionally port-scoped as CIDR:port; IPv6 is
+        /// refused. Repeatable; any --allow-* flag turns filtering on. Requires --net (or
+        /// --compose), whose services it binds too.
+        #[arg(
+            long = "allow-ip",
+            value_name = "CIDR[:PORT]",
+            conflicts_with = "tap",
+            help_heading = "Network"
+        )]
+        allow_ip: Vec<String>,
+        /// restrict the booted guest's egress to the --allow-* lists, even empty ones
+        ///
+        /// Alone, it denies all egress; the compose services' names still resolve. Requires
+        /// --net (or --compose).
+        #[arg(
+            long = "egress-restrict",
+            conflicts_with = "tap",
+            help_heading = "Network"
+        )]
+        egress_restrict: bool,
         /// audit the `-f`/`--compose` build's RUN egress
         ///
         /// The build-phase counterpart of --audit-egress, like --build-net to --net. Prints
@@ -3379,6 +3414,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
         tap_gw,
         tap_dns,
         audit_egress,
+        allow_name,
+        allow_ip,
+        egress_restrict,
         build_audit_egress,
         registry_proxy,
         compose,
@@ -3495,6 +3533,15 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(n) => n,
             Err(e) => return fail(&e, 2),
         };
+        let egress_allow = match run::egress_from_flags(
+            allow_ip,
+            allow_name,
+            *egress_restrict,
+            *net || compose.is_some(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return fail(&e, 2),
+        };
         // --volume: compose bind-mount syntax, relative host paths anchored at the
         // caller's cwd (the compose loader anchors at the file's directory).
         let volumes = if volume.is_empty() {
@@ -3593,8 +3640,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
             tap,
             audit_egress: *audit_egress,
             build_audit_egress: *build_audit_egress,
-            // A `vk dev` config setting; `vk run` has no allowlist flag for the booted guest.
-            egress_allow: None,
+            egress_allow,
+            // Fixed for the run: only `vk dev` edits a running guest's allowlist.
             egress_file: None,
             registry_proxy: registry_proxy.clone(),
             compose: compose.clone(),
@@ -6788,6 +6835,92 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "run", "--atop", "30", "debian:12"]).is_err());
         // A zero interval would have the guest sampling without pause.
         assert!(Cli::try_parse_from(["vk", "run", "--atop=0", "debian:12"]).is_err());
+    }
+
+    /// `vk run --allow-name/--allow-ip` repeat and `--egress-restrict` is a switch; together
+    /// they become the run's allowlist, and a tap primary, whose egress bypasses the switch,
+    /// refuses them.
+    #[test]
+    fn run_egress_flags_repeat_and_refuse_a_tap() {
+        let egress_of = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Run {
+                allow_ip,
+                allow_name,
+                egress_restrict,
+                net,
+                compose,
+                ..
+            } = cli.cmd
+            else {
+                panic!("expected Cmd::Run")
+            };
+            run::egress_from_flags(
+                &allow_ip,
+                &allow_name,
+                egress_restrict,
+                net || compose.is_some(),
+            )
+        };
+        assert_eq!(
+            egress_of(&["vk", "run", "--net", "debian:12"]).unwrap(),
+            None
+        );
+        let argv = [
+            "vk",
+            "run",
+            "--net",
+            "--allow-name",
+            "debian.org",
+            "--allow-name",
+            "pypi.org",
+            "--allow-ip",
+            "192.0.2.10/32:22",
+            "debian:12",
+        ];
+        assert_eq!(
+            egress_of(&argv).unwrap(),
+            Some(switch::EgressFile {
+                allow_ip: vec!["192.0.2.10/32:22".into()],
+                allow_name: vec!["debian.org".into(), "pypi.org".into()],
+            })
+        );
+        assert_eq!(
+            egress_of(&["vk", "run", "--net", "--egress-restrict", "debian:12"]).unwrap(),
+            Some(switch::EgressFile::default())
+        );
+        // --compose gives the run its switch.
+        assert!(
+            egress_of(&[
+                "vk",
+                "run",
+                "--compose",
+                "c.yml",
+                "--allow-name",
+                "debian.org"
+            ])
+            .unwrap()
+            .is_some()
+        );
+        // No switch, nothing to enforce it.
+        let msg = format!(
+            "{:#}",
+            egress_of(&["vk", "run", "--allow-name", "debian.org", "debian:12"]).unwrap_err()
+        );
+        assert!(msg.contains("require --net"), "{msg}");
+        for flag in [
+            &["--allow-name", "debian.org"][..],
+            &["--allow-ip", "10.0.0.0/8"],
+            &["--egress-restrict"],
+        ] {
+            let mut argv = vec!["vk", "run", "--net", "--tap", "vk0"];
+            argv.extend_from_slice(flag);
+            argv.push("debian:12");
+            let Err(err) = Cli::try_parse_from(&argv) else {
+                panic!("{flag:?} with --tap must be rejected")
+            };
+            assert!(err.to_string().contains("--tap"), "{err}");
+        }
     }
 
     /// `--numa` takes a mode or a node id, and nothing else — a typo names a node the host

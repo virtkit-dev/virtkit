@@ -1381,7 +1381,10 @@ rollout-egress-job:
 
 Outside CI, the same controls are CLI flags on `vk run` / `vk build`:
 `--audit-egress` audits the booted guest and `--build-audit-egress` a build's
-`RUN` steps (mirroring the `--net` / `--build-net` phase split). Dry-run is CI-only.
+`RUN` steps (mirroring the `--net` / `--build-net` phase split). `vk run`'s
+`--allow-name` / `--allow-ip` restrict the booted guest's egress, and `--egress-restrict`
+alone denies it all; `--build-allow-name` / `--build-allow-ip` restrict a build's `RUN`
+steps. Dry-run is CI-only.
 
 ## Services
 

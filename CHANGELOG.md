@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk run --allow-name SUFFIX` and `--allow-ip CIDR[:PORT]` hold the booted guest's egress
+  to an allowlist**, as `vk dev`'s `egress = "restricted"` does, and `--egress-restrict`
+  alone cuts it off. They need `--net` or `--compose`, and bind the compose services too.
+
+### Changed
+
+- **An egress allowlist entry written as IPv6 is refused as IPv6**, rather than as a bad
+  port.
+
 ## [0.89.0] - 2026-10-13
 
 ### Added

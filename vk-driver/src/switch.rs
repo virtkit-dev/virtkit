@@ -246,6 +246,10 @@ pub struct Cidr4 {
 
 impl Cidr4 {
     fn parse(s: &str) -> Result<Self> {
+        // Every IPv6 address has two colons or more, where `CIDR:port` has one.
+        if s.matches(':').count() > 1 {
+            bail!("{s:?}: IPv6 is refused, an allowlist takes IPv4 CIDRs (optionally CIDR:port)");
+        }
         // Optional `:port` suffix; IPv4 has no colons, so a colon unambiguously starts it.
         let (cidr, port) = match s.rsplit_once(':') {
             Some((c, p)) => (
@@ -384,6 +388,27 @@ impl EgressFile {
         let body = serde_json::to_vec_pretty(self)?;
         vk_fs::write_atomic(path, &body, 0o600)
     }
+}
+
+/// Check allowlist name suffixes as a person wrote them, before a switch matches against
+/// them: a URL, a pattern or a fully qualified name would match nothing. `key` names the
+/// list in the error, as the caller's user wrote it (`allow-name`, `--allow-name`).
+pub fn check_allow_names(names: &[String], key: &str) -> Result<()> {
+    for name in names {
+        let bare = name.trim_start_matches('.');
+        // A trailing dot is a fully qualified name, which no suffix match the switch
+        // makes would ever equal.
+        if bare.is_empty()
+            || bare.ends_with('.')
+            || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
+        {
+            bail!(
+                "{key} {name:?}: expected a DNS suffix such as \"debian.org\", which also \
+                 allows every host under it"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// How often a switch with an `--egress-file` checks it for an edit.
@@ -6075,6 +6100,38 @@ mod tests {
         assert!(!h.allows_ip("1.2.3.4".parse().unwrap(), 5433));
         // a bad port is rejected at parse time
         assert!(Egress::new(&["1.2.3.4:notaport".into()], &[]).is_err());
+        // IPv6 is refused by name, not as a bad port
+        for v6 in ["2001:db8::/32", "::1", "[::1]:443"] {
+            let msg = format!("{:#}", Egress::new(&[v6.into()], &[]).err().unwrap());
+            assert!(msg.contains("IPv6 is refused"), "{v6}: {msg}");
+        }
+    }
+
+    /// An allowlist suffix is a bare DNS suffix, a leading dot tolerated: a URL, a pattern or a
+    /// fully qualified name would match nothing, so each is refused with the list's own name.
+    #[test]
+    fn allow_names_are_bare_dns_suffixes() {
+        let ok = |n: &str| check_allow_names(&[n.to_string()], "--allow-name").is_ok();
+        assert!(ok("debian.org") && ok(".debian.org") && ok("localhost"));
+        assert!(check_allow_names(&[], "--allow-name").is_ok());
+        for bad in [
+            "",
+            ".",
+            "debian.org.",
+            "*.debian.org",
+            "https://debian.org",
+            "debian.org:443",
+            "user@debian.org",
+            "debian .org",
+        ] {
+            let msg = check_allow_names(&["ok.example".into(), bad.into()], "--allow-name")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.starts_with("--allow-name ") && msg.contains("DNS suffix"),
+                "{bad:?}: {msg}"
+            );
+        }
     }
 
     #[test]

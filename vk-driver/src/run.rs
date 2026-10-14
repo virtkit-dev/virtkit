@@ -361,8 +361,9 @@ pub struct RunArgs {
     /// mirroring `--net` vs `--build-net`. Unused for a plain image boot (no build).
     pub build_audit_egress: bool,
     /// Hold the booted guest's egress to this allowlist, where empty lists deny everything;
-    /// `None` = unrestricted. `vk dev`'s `egress = "restricted"`: the run's own switch
-    /// enforces it, so it binds compose siblings too. Requires `net`, and fails closed
+    /// `None` = unrestricted. `vk dev`'s `egress = "restricted"`, `vk run`'s `--allow-ip`,
+    /// `--allow-name` and `--egress-restrict` (see [`egress_from_flags`]): the run's own
+    /// switch enforces it, so it binds compose siblings too. Requires `net`, and fails closed
     /// without it: no switch means no egress at all.
     pub egress_allow: Option<crate::switch::EgressFile>,
     /// Where `egress_allow` is written for the switch to follow: edits to this file change a
@@ -551,6 +552,35 @@ impl Default for RunArgs {
             command: Vec::new(),
         }
     }
+}
+
+/// Map `vk run`'s `--allow-ip` / `--allow-name` / `--egress-restrict` to the booted guest's
+/// [`RunArgs::egress_allow`]: `None` (unrestricted) with none of them, otherwise an
+/// allowlist that is always restricted, so `--egress-restrict` alone denies everything — `vk
+/// dev`'s `egress = "restricted"`. `net` is whether the run has a switch (`--net`, or
+/// `--compose`, which implies it): without one nothing would enforce the list. Names are
+/// checked as `vk dev` checks them and CIDRs by the switch's own parser, so a bad flag fails
+/// before any pull or build.
+pub fn egress_from_flags(
+    ips: &[String],
+    names: &[String],
+    restrict: bool,
+    net: bool,
+) -> Result<Option<crate::switch::EgressFile>> {
+    if ips.is_empty() && names.is_empty() && !restrict {
+        return Ok(None);
+    }
+    ensure!(
+        net,
+        "--allow-ip, --allow-name and --egress-restrict hold the guest's egress at the switch, \
+         so they require --net (or --compose)"
+    );
+    crate::switch::check_allow_names(names, "--allow-name")?;
+    crate::switch::Egress::restricted(ips, &[]).context("--allow-ip")?;
+    Ok(Some(crate::switch::EgressFile {
+        allow_ip: ips.to_vec(),
+        allow_name: names.to_vec(),
+    }))
 }
 
 pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
@@ -3492,11 +3522,6 @@ async fn compose_up(
         .compose
         .as_ref()
         .expect("compose_up requires --compose");
-    // Its switch is started unrestricted: refuse an allowlist rather than drop it.
-    ensure!(
-        args.egress_allow.is_none(),
-        "`compose up` does not enforce an egress allowlist"
-    );
     ensure!(
         args.tap.is_none(),
         "--tap sets the primary's eth0, and a services-only compose run boots none"
@@ -3506,6 +3531,10 @@ async fn compose_up(
         bail!("{} declares no services", compose.display());
     }
     if units.iter().any(|u| u.tap.is_some()) {
+        ensure!(
+            args.egress_allow.is_none(),
+            "a restricted egress policy is enforced by the switch; a tap guest bypasses it"
+        );
         ensure!(
             !args.audit_egress,
             "--audit-egress observes the switch; a tap guest's egress bypasses it"
@@ -3545,12 +3574,14 @@ async fn compose_up(
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
     let vsock = work.join("vsock.sock");
+    // The run's allowlist binds every service, as it binds a primary's siblings.
+    let egress = switch_egress(args)?;
     let (switch, _attach) = spawn_vm_switch(
         &vsock,
         work,
         NET_VSOCK_PORT,
-        &[],
-        &[],
+        egress.allow_ip,
+        egress.allow_name,
         &planned.listen,
         // compose up has no primary VM, so no primary NICs to attach.
         &[],
@@ -3560,8 +3591,8 @@ async fn compose_up(
         None,
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
-        false,
-        None,
+        egress.restrict,
+        egress.file,
         crate::prio::Prio::Normal,
     )
     .await?;
@@ -4819,7 +4850,8 @@ fn switch_egress(args: &RunArgs) -> Result<SwitchEgress<'_>> {
         allow_ip,
         allow_name,
         // An allowlist, even an empty one, is restricted: `vk dev`'s `egress = "restricted"`
-        // with no names denies everything rather than nothing. A followed file is always restricted.
+        // with no names, or `vk run --egress-restrict` alone, denies everything rather than
+        // nothing. A followed file is always restricted.
         restrict: args.egress_allow.is_some() && file.is_none(),
         file,
     })
@@ -6181,6 +6213,75 @@ mod tests {
         accept.abort();
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    /// `vk run`'s allowlist flags: none of them leaves egress unrestricted; any of them,
+    /// `--egress-restrict` alone included, is a restricted list, as `vk dev`'s `egress =
+    /// "restricted"` reads its own.
+    #[test]
+    fn egress_flags_make_a_restricted_allowlist() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(egress_from_flags(&[], &[], false, true).unwrap(), None);
+        // No flag needs no switch.
+        assert_eq!(egress_from_flags(&[], &[], false, false).unwrap(), None);
+        assert_eq!(
+            egress_from_flags(
+                &s(&["10.0.0.0/8", "192.0.2.10:22"]),
+                &s(&["debian.org"]),
+                false,
+                true
+            )
+            .unwrap(),
+            Some(crate::switch::EgressFile {
+                allow_ip: s(&["10.0.0.0/8", "192.0.2.10:22"]),
+                allow_name: s(&["debian.org"]),
+            })
+        );
+        // Empty lists under --egress-restrict: deny everything, not nothing.
+        assert_eq!(
+            egress_from_flags(&[], &[], true, true).unwrap(),
+            Some(crate::switch::EgressFile::default())
+        );
+    }
+
+    /// A bad entry or a run with no switch to enforce the list fails before any work, naming
+    /// the flag.
+    #[test]
+    fn egress_flags_refuse_what_the_switch_could_not_enforce() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = |ips: &[&str], names: &[&str], restrict: bool, net: bool| {
+            format!(
+                "{:#}",
+                egress_from_flags(&s(ips), &s(names), restrict, net).unwrap_err()
+            )
+        };
+        for (ips, names, restrict) in [
+            (&["10.0.0.0/8"][..], &[][..], false),
+            (&[], &["debian.org"], false),
+            (&[], &[], true),
+        ] {
+            let msg = err(ips, names, restrict, false);
+            assert!(msg.contains("require --net (or --compose)"), "{msg}");
+        }
+        let msg = err(&[], &["https://debian.org"], false, true);
+        assert!(
+            msg.contains("--allow-name") && msg.contains("DNS suffix"),
+            "{msg}"
+        );
+        let msg = err(&[], &["*.debian.org"], false, true);
+        assert!(msg.contains("--allow-name"), "{msg}");
+        let msg = err(&["2001:db8::/32"], &[], false, true);
+        assert!(
+            msg.contains("--allow-ip") && msg.contains("IPv6 is refused"),
+            "{msg}"
+        );
+        let msg = err(&["10.0.0.0/33"], &[], false, true);
+        assert!(
+            msg.contains("--allow-ip") && msg.contains("prefix"),
+            "{msg}"
+        );
+        let msg = err(&["debian.org"], &[], false, true);
+        assert!(msg.contains("--allow-ip"), "{msg}");
     }
 
     /// The run switch is restricted by any allowlist, an empty one included, unless it follows
