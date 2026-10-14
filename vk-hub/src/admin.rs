@@ -28,7 +28,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops::{self, AccountOutcome, NodeView};
 use crate::registries::RegistryView;
-use crate::rollout::{Rollout, RolloutAction};
+use crate::rollout::{DeleteRule, Rollout, RolloutAction};
 use crate::server::Hub;
 use crate::store::{
     AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, TokenKind, Tools, UiSession,
@@ -176,6 +176,10 @@ enum Call {
     SteerRollout {
         id: String,
         action: RolloutAction,
+    },
+    /// Delete an ended rollout, named by its ID or a prefix of it.
+    DeleteRollout {
+        id: String,
     },
     /// The latest `limit` audit lines, of one node or of all.
     Audit {
@@ -564,6 +568,12 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::SteerRollout { id, action } => {
             serde_json::to_value(ops::steer_rollout(hub, &actor, &id, action)?)?
         }
+        Call::DeleteRollout { id } => {
+            let Some(deleted) = ops::delete_rollout(hub, &actor, &id, DeleteRule::Ended)? else {
+                bail!("there is no rollout {id}");
+            };
+            serde_json::to_value(deleted)?
+        }
         Call::Audit { node, limit } => serde_json::to_value(audit(hub, node.as_deref(), limit)?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
@@ -911,6 +921,11 @@ impl Client {
             id: id.to_string(),
             action,
         })
+    }
+
+    /// Return the rollout as it was before deletion.
+    pub fn delete_rollout(&self, id: &str) -> Result<Rollout> {
+        self.call(Call::DeleteRollout { id: id.to_string() })
     }
 
     /// Oldest first.
@@ -1293,6 +1308,75 @@ mod tests {
                 &format!("uid 7 issued drain (command {})", issued.id),
                 &format!("uid 7 issued reset, images included (command {})", reset.id)
             ]
+        );
+    }
+
+    /// A rollout is deleted over the socket by a prefix of its ID, audited as the caller's,
+    /// once it has ended; one still running is refused.
+    #[test]
+    fn an_ended_rollout_is_deleted_over_the_socket() {
+        use crate::rollout::{RolloutRow, RolloutState};
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let release = crate::store::ReleaseRow {
+            version: "0.85.0".into(),
+            size: 1,
+            signature: None,
+            program: None,
+            added_at: 1,
+            added_by: "uid 0".into(),
+        };
+        hub.db
+            .add_release(&"ab".repeat(32), &release, "uid 0")
+            .unwrap();
+        let row = |state| RolloutRow {
+            release: "ab".repeat(32),
+            version: "0.85.0".into(),
+            created_at: 1,
+            created_by: "uid 0".into(),
+            batch: 1,
+            canary_per_profile: false,
+            max_failures: 0,
+            node_timeout_secs: 600,
+            drain_timeout_secs: 600,
+            force: false,
+            state,
+            failures: 0,
+            nodes: Vec::new(),
+        };
+        let (running, done) = ("cd".repeat(16), "ef".repeat(16));
+        hub.db
+            .create_rollout(&done, &row(RolloutState::Done), "uid 0")
+            .unwrap();
+        hub.db
+            .create_rollout(&running, &row(RolloutState::Running), "uid 0")
+            .unwrap();
+        let call = |call: serde_json::Value| {
+            dispatch(
+                serde_json::json!({"v": 1, "call": call})
+                    .to_string()
+                    .as_bytes(),
+                &hub,
+                7,
+            )
+        };
+        let err = call(serde_json::json!({"op": "delete-rollout", "id": "cdcd"})).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rollout cdcdcdcd is running; abort it"),
+            "{err:#}"
+        );
+        let deleted: Rollout = serde_json::from_value(
+            call(serde_json::json!({"op": "delete-rollout", "id": "efef"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleted.id, done);
+        assert!(hub.db.rollout(&done).unwrap().is_none());
+        assert!(hub.db.rollout(&running).unwrap().is_some());
+        let err = call(serde_json::json!({"op": "delete-rollout", "id": "efef"})).unwrap_err();
+        assert!(format!("{err:#}").contains("no rollout efef"), "{err:#}");
+        let last = hub.db.audits(None, 1).unwrap().remove(0);
+        assert_eq!(
+            (last.actor.as_str(), last.event.as_str()),
+            ("uid 7", "uid 7 deleted rollout efefefef of vk 0.85.0")
         );
     }
 

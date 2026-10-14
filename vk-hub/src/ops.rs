@@ -7,7 +7,9 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
-use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutNode, RolloutRow, RolloutState};
+use crate::rollout::{
+    DeleteRule, NodeStatus, Rollout, RolloutAction, RolloutNode, RolloutRow, RolloutState,
+};
 use crate::server::{Hub, Reach};
 use crate::store::{
     AccountChange, DesiredChange, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, Tools,
@@ -498,6 +500,29 @@ pub fn steer_rollout(hub: &Hub, actor: &str, id: &str, action: RolloutAction) ->
     );
     hub.touch();
     Ok(Rollout { id, row })
+}
+
+/// Delete the rollout whose ID starts with `id`, as `actor`, if `rule` lets it. Returns it as
+/// it was, or `None` when there is no such rollout, or it was deleted meanwhile.
+pub fn delete_rollout(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    rule: DeleteRule,
+) -> Result<Option<Rollout>> {
+    let Some((id, _)) = hub.db.find_rollout(id)? else {
+        return Ok(None);
+    };
+    let Some(row) = hub.db.delete_rollout(&id, rule, actor, crate::now_secs())? else {
+        return Ok(None);
+    };
+    eprintln!(
+        "vk-hub: {actor} deleted rollout {} of vk {}",
+        crate::rollout::short_id(&id),
+        row.version
+    );
+    hub.touch();
+    Ok(Some(Rollout { id, row }))
 }
 
 /// The result of granting or revoking a role.

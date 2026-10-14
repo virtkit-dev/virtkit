@@ -31,10 +31,11 @@ use super::{
     Auth, Body, Ui, actions, blocking, decode_form, field, job_output, message, operations, page,
 };
 use crate::ops::{self, NodeView};
-use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutState};
+use crate::rollout::{DeleteRule, NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
     CommandRow, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, RolloutConflict,
+    RolloutUndeletable,
 };
 
 /// A node page's latest commands.
@@ -533,12 +534,13 @@ pub(super) fn action_rollout(path: &str) -> Option<&str> {
         .filter(|id| vk_hub_proto::valid_id(id))
 }
 
-/// `POST /rollout/<id>/action`: pause, resume or abort as the operator session's principal,
-/// using the admin socket's operation. Like node actions, return a status message for htmx
-/// or redirect to `/operations`.
+/// `POST /rollout/<id>/action`: pause, resume, abort or delete as the operator session's
+/// principal, using the admin socket's operation. Like node actions, return a status message
+/// for htmx or redirect to `/operations`.
 pub(super) async fn rollout_action(
     req: Request<Incoming>,
     ui: &Ui,
+    site: &FleetSite,
     id: &str,
 ) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -550,6 +552,7 @@ pub(super) async fn rollout_action(
         Some("pause") => RolloutAction::Pause,
         Some("resume") => RolloutAction::Resume,
         Some("abort") => RolloutAction::Abort,
+        Some("delete") => return delete_rollout(ui, site, htmx, &auth, &form, id).await,
         _ => {
             return Ok(actions::refused(
                 htmx,
@@ -591,14 +594,99 @@ pub(super) async fn rollout_action(
         }
         Some(Err(e)) => return Err(e),
     };
+    Ok(back_to_operations(htmx, &said))
+}
+
+/// `op=delete` of `POST /rollout/<id>/action`: delete an ended rollout that updated no node,
+/// once the operator has confirmed it. `vk-hub rollout delete` deletes any ended one.
+async fn delete_rollout(
+    ui: &Ui,
+    site: &FleetSite,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    id: &str,
+) -> Result<Response<Body>> {
+    let hub = ui.hub.clone();
+    let rollout = id.to_string();
+    let Some(row) = blocking(move || hub.db.rollout(&rollout)).await? else {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such rollout.",
+        ));
+    };
+    // Checked on the question and on its answer, and again where the deletion commits.
+    if let Some(kept) = RolloutUndeletable::of(id, &row, DeleteRule::UpdatedNoNode) {
+        return Ok(refused_to_delete(htmx, &kept));
+    }
+    let path = format!("/rollout/{id}/action");
+    let mut detail = Html::new();
+    detail
+        .raw("<p>Rollout <code>")
+        .text(crate::rollout::short_id(id))
+        .raw("</code> of vk ")
+        .text(&row.version)
+        .raw(", ")
+        .raw(row.state.name())
+        .raw(".</p>");
+    let ask = actions::Ask {
+        path,
+        back: "/operations".to_string(),
+        op: "delete".into(),
+        what: "Delete this rollout? It updated no node. Its audit lines stay.",
+        detail,
+        asked: Vec::new(),
+    };
+    if let Some(asked) = actions::ask_first(&site.questions, layout, htmx, auth, form, &ask)? {
+        return Ok(asked);
+    }
+    let (hub, principal, rollout) = (ui.hub.clone(), auth.session.principal(), id.to_string());
+    let deleted = blocking(move || {
+        Ok(ops::delete_rollout(
+            &hub,
+            &principal,
+            &rollout,
+            DeleteRule::UpdatedNoNode,
+        ))
+    })
+    .await?;
+    let said = match deleted {
+        Ok(Some(r)) => format!(
+            "Deleted rollout {} of vk {}.",
+            crate::rollout::short_id(&r.id),
+            r.row.version
+        ),
+        // Another operator's confirmation got there first.
+        Ok(None) => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::NOT_FOUND,
+                "There is no such rollout.",
+            ));
+        }
+        Err(e) => match e.downcast::<RolloutUndeletable>() {
+            Ok(kept) => return Ok(refused_to_delete(htmx, &kept)),
+            Err(e) => return Err(e),
+        },
+    };
+    Ok(back_to_operations(htmx, &said))
+}
+
+fn refused_to_delete(htmx: bool, kept: &RolloutUndeletable) -> Response<Body> {
+    actions::refused(htmx, StatusCode::CONFLICT, &format!("Refused: {kept}."))
+}
+
+/// For htmx, `said` in the flash; for a plain form, a redirect back to `/operations`.
+fn back_to_operations(htmx: bool, said: &str) -> Response<Body> {
     if !htmx {
         let mut resp = Response::new(Body::default());
         *resp.status_mut() = StatusCode::SEE_OTHER;
         resp.headers_mut()
             .insert(header::LOCATION, HeaderValue::from_static("/operations"));
-        return Ok(resp);
+        return resp;
     }
-    Ok(said_so(&said))
+    said_so(said)
 }
 
 /// The page around `main`, with the fleet's navigation.
@@ -1699,9 +1787,9 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
 /// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it on the
 /// element holding the forms, `#flash` and the fragment, as a header on every htmx request
 /// from inside it (`hx-headers`), which is how the rollouts' buttons and the live copies of
-/// the rollout form post. Those buttons need htmx; `vk-hub rollout pause|resume|abort` does
-/// the same without it. An operator's page carries the forms that add a release and start a
-/// rollout above the fragment.
+/// the rollout form post. Those buttons need htmx; `vk-hub rollout pause|resume|abort|delete`
+/// does the same without it. An operator's page carries the forms that add a release and
+/// start a rollout above the fragment.
 fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
@@ -1724,7 +1812,7 @@ fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Ht
 }
 
 /// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
-/// that steer it.
+/// that steer it, and each ended one that updated no node the one that deletes it.
 fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     let mut h = Html::new();
     h.raw("<section><h2>Releases</h2>");
@@ -1841,12 +1929,14 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
         // A failure's reason quotes what a node said.
         h.raw("<p class=\"reason\">").node(reason).raw("</p>");
     }
-    if steer && row.state.active() {
+    let ops: &[(&str, &str)] = match row.state {
+        RolloutState::Running => &[("pause", "Pause"), ("abort", "Abort")],
+        RolloutState::Paused { .. } => &[("resume", "Resume"), ("abort", "Abort")],
+        _ if row.undeletable(DeleteRule::UpdatedNoNode).is_none() => &[("delete", "Delete")],
+        _ => &[],
+    };
+    if steer && !ops.is_empty() {
         h.raw("<div class=\"actions\">");
-        let ops: [(&str, &str); 2] = match row.state {
-            RolloutState::Running => [("pause", "Pause"), ("abort", "Abort")],
-            _ => [("resume", "Resume"), ("abort", "Abort")],
-        };
         let path = format!("/rollout/{}/action", r.id);
         for (op, label) in ops {
             // The ID is one the hub issued, and the router takes only hex for one. No CSRF

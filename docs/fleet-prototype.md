@@ -35,8 +35,8 @@ The prototype provides, all experimentally:
   their masked output streamed to the hub;
 - `vk-hub workloads`: each node's VMs;
 - live nodes, node detail and operations pages, steering and resetting from a node's page,
-  pausing, resuming and aborting rollouts from the operations page, a live job history, and an
-  audit log, with sign-in links from `vk-hub ui login`;
+  pausing, resuming, aborting and deleting rollouts from the operations page, a live job
+  history, and an audit log, with sign-in links from `vk-hub ui login`;
 - on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: API keys (`vk-hub
   keys`), pools (`vk-hub nodes pools`), the client API, reservations and job placement over
   protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs).
@@ -641,14 +641,15 @@ external runner that `vk node` cannot drain. When its wave comes, a node is skip
 these, when it has been removed, when it is draining or in maintenance of its own, or when an
 update an operator issued it before the rollout reached it is still under way.
 `rollout status [<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues
-nothing more, and updates under way finish and are still recorded. One rollout runs at a time,
-a release is kept while a rollout of it is not over, and `vk-hub nodes update` refuses a node a
-running or paused rollout has still to update. The rollout and its nodes' states are one row in
-the hub's database, written in one transaction with the commands it issues and the audit lines
-that describe each step; a pass that changes nothing writes nothing; the hub task advances
-every rollout from the database at start, whenever a node reports, and every five seconds, so a
-restarted hub carries on where it stopped. A rollout that cannot advance holds none of the
-others back.
+nothing more, and updates under way finish and are still recorded. `rollout delete <id>`
+forgets an ended rollout, done or aborted, once no update it issued is under way; its audit
+lines stay. One rollout runs at a time, a release is kept while a rollout of it is not over,
+and `vk-hub nodes update` refuses a node a running or paused rollout has still to update. The
+rollout and its nodes' states are one row in the hub's database, written in one transaction
+with the commands it issues and the audit lines that describe each step; a pass that changes
+nothing writes nothing; the hub task advances every rollout from the database at start,
+whenever a node reports, and every five seconds, so a restarted hub carries on where it
+stopped. A rollout that cannot advance holds none of the others back.
 
 ## CI tools
 
@@ -1297,12 +1298,14 @@ The nodes table and `vk-hub nodes` show an update under way beside the node's st
 node's page shows the update's release, phase and what the node said of it, and the sha256 of
 the `vk` it runs. `/operations` lists the releases the hub holds, signed or not, and its ten
 latest rollouts with their state, counts, current wave, and each node's status and profile
-by wave. Operators can pause, resume and abort active rollouts. These actions post to
-`/rollout/<id>/action` with the node actions' origin, CSRF and role checks, and run the admin
-socket's operation as the session's principal. Invalid state transitions return 409. The
-shared fragment carries no session token: the surrounding page supplies its session's CSRF
-token through `hx-headers`, as JSON that htmx parses without evaluating. The buttons require
-htmx; `vk-hub rollout pause|resume|abort` works without it.
+by wave. Operators can pause, resume and abort active rollouts, and delete, once confirmed,
+an ended one that updated no node: every update it issued was refused or expired before it
+ran. These actions post to `/rollout/<id>/action` with the node actions' origin, CSRF and role
+checks, and run the admin socket's operation as the session's principal. Invalid state
+transitions return 409. The shared fragment carries no session token: the surrounding page
+supplies its session's CSRF token through `hx-headers`, as JSON that htmx parses without
+evaluating. The buttons require htmx; `vk-hub rollout pause|resume|abort|delete` works
+without it.
 
 Above the fragment, an operator's `/operations` carries three forms, each with the same
 origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
@@ -1533,9 +1536,9 @@ Every state-changing request is a `POST` from the UI's own origin — its `Origi
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
 is done as the session's principal, `ui session <id> (<role>)`, or `ui session <id> (<role>,
 <identity>)` for one opened through OIDC, which is what the audit log records. On a fleet hub
-they are signing out, a node's steering actions, a rollout's pause, resume and abort,
-uploading and fetching a release, starting a rollout, and granting, changing and revoking a
-role on `/users`. Issuing a link, signing in and out,
+they are signing out, a node's steering actions, a rollout's pause, resume, abort and
+deletion, uploading and fetching a release, starting a rollout, and granting, changing and
+revoking a role on `/users`. Issuing a link, signing in and out,
 a refused OIDC sign-in, granting and revoking roles, and ending sessions are audited too.
 
 ## Local mode

@@ -3223,8 +3223,9 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
                 profile: format!("{hostname} CPU · 64G · jobs fast"),
                 wave: 0,
                 status: crate::rollout::NodeStatus::Failed {
-                    reason: format!("rolled back: {hostname}"),
+                    reason: format!("refused: {hostname}"),
                     at: 2,
+                    ran: false,
                 },
             },
             crate::rollout::RolloutNode {
@@ -3278,7 +3279,7 @@ async fn releases_and_rollouts_are_shown_live() {
             "<a href=\"/node/{}\">ci-2</a></td><td>pending</td>",
             "12".repeat(16)
         ),
-        "failed: rolled back: ci&lt;script&gt;",
+        "failed: refused: ci&lt;script&gt;",
         "ci&lt;script&gt;alert(1)&lt;/script&gt; CPU",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
@@ -4658,7 +4659,13 @@ async fn an_operator_steers_a_rollout_from_operations() {
     assert_eq!(reply.header("location"), Some("/operations"));
     assert!(matches!(state(), RolloutState::Aborted { .. }));
     let aborted = next_with(&mut live, ">aborted<").await;
-    assert!(!aborted.contains("<button>"), "{aborted}");
+    // Its nodes were refused or never started: deleting it is all that is left.
+    for gone in ["Pause", "Resume", "Abort"] {
+        assert!(
+            !aborted.contains(&format!("<button>{gone}</button>")),
+            "{aborted}"
+        );
+    }
 
     let audit: Vec<String> = hub
         .db
@@ -4673,6 +4680,208 @@ async fn an_operator_steers_a_rollout_from_operations() {
         let line = format!("{principal} {want} rollout {short}");
         assert!(audit.contains(&line), "{line}: {audit:?}");
     }
+}
+
+/// An ended rollout that updated no node carries a "Delete" button, which deletes it once
+/// confirmed, as the session's principal, and the live page drops it; one running or paused,
+/// one whose update is under way, and one whose update may have run have none, and the handler
+/// refuses them too.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
+    use crate::rollout::{NodeStatus, RolloutAction, RolloutState};
+    let (addr, hub, origin) = start_fleet().await;
+    let id = rollout_of(&hub, "ci-1");
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let path = |id: &str| format!("/rollout/{id}/action");
+    let delete = format!("_csrf={csrf}&op=delete");
+    let button = "<button>Delete</button>";
+    let heading = |id: &str| format!("<h3><code>{}</code>", &id[..8]);
+
+    // Running or paused: no button, and the handler says why.
+    for (state, action) in [("running", None), ("paused", Some(RolloutAction::Pause))] {
+        if let Some(action) = action {
+            hub.db
+                .steer_rollout(&id, action, "uid 0", crate::now_secs())
+                .unwrap();
+        }
+        let page = get(addr, "/operations", Some(&operator)).await;
+        assert!(!page.body.contains(button), "{}", page.body);
+        let reply = post_action(addr, &origin, &operator, &path(&id), &delete, true).await;
+        assert_eq!(reply.status, 409, "{}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains(&format!("Refused: rollout {} is {state}; ", &id[..8])),
+            "{}",
+            reply.body
+        );
+    }
+
+    hub.db
+        .steer_rollout(&id, RolloutAction::Abort, "uid 0", crate::now_secs())
+        .unwrap();
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(page.body.contains(button), "{}", page.body);
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    assert!(!page.body.contains(button), "{}", page.body);
+    let form = format!("_csrf={viewer_csrf}&op=delete");
+    let reply = post_action(addr, &origin, &viewer, &path(&id), &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let first = live.next().await.unwrap();
+    assert!(first.contains(&heading(&id)), "{first}");
+    let reply = post_action(addr, &origin, &operator, &path(&id), &delete, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Delete this rollout?",
+        &format!("Rollout <code>{}</code> of vk 0.85.0, aborted.", &id[..8]),
+        "name=\"confirm\" value=\"yes\"",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(hub.db.rollout(&id).unwrap().is_some());
+    let answer = format!(
+        "{delete}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, &path(&id), &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains(&format!("Deleted rollout {} of vk 0.85.0.", &id[..8])),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.rollout(&id).unwrap().is_none());
+    let gone = next_with(&mut live, "none yet").await;
+    assert!(!gone.contains(&heading(&id)), "{gone}");
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(!page.body.contains(&heading(&id)), "{}", page.body);
+    let line = format!("{principal} deleted rollout {} of vk 0.85.0", &id[..8]);
+    let audit: Vec<String> = hub
+        .db
+        .audits(None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(audit.contains(&line), "{line}: {audit:?}");
+    // Answered once: the same answer again finds no rollout.
+    let reply = post_action(addr, &origin, &operator, &path(&id), &answer, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    let ended = |state, status| crate::rollout::RolloutRow {
+        release: "ab".repeat(32),
+        version: "0.85.0".into(),
+        created_at: 1,
+        created_by: "uid 0".into(),
+        batch: 1,
+        canary_per_profile: false,
+        max_failures: 0,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+        state,
+        failures: 0,
+        nodes: vec![crate::rollout::RolloutNode {
+            id: "12".repeat(16),
+            hostname: "ci-2".into(),
+            profile: "p".into(),
+            wave: 0,
+            status,
+        }],
+    };
+    let aborted = || RolloutState::Aborted {
+        reason: "aborted by uid 0".into(),
+    };
+    let failed = |reason: &str, ran| NodeStatus::Failed {
+        reason: reason.into(),
+        at: 2,
+        ran,
+    };
+    let updating = NodeStatus::Updating {
+        command: "c".into(),
+        since: 1,
+        resume: vk_hub_proto::NodeState::Ready,
+        drained_at: None,
+    };
+    let ran = "an update it issued may have run, so only `vk-hub rollout delete` deletes it";
+    let kept = [
+        (
+            aborted(),
+            updating,
+            "is aborted; an update it issued is still under way",
+        ),
+        (
+            aborted(),
+            failed("quarantined during its update", true),
+            ran,
+        ),
+        (aborted(), failed("still draining after 10m", true), ran),
+        (RolloutState::Done, NodeStatus::Succeeded { at: 2 }, ran),
+    ];
+    for (n, (state, status, why)) in kept.into_iter().enumerate() {
+        let kept = format!("a{n}").repeat(16);
+        hub.db
+            .create_rollout(&kept, &ended(state, status), "uid 0")
+            .unwrap();
+        let page = get(addr, "/operations", Some(&operator)).await;
+        assert!(page.body.contains(&heading(&kept)), "{}", page.body);
+        assert!(!page.body.contains(&path(&kept)), "{}", page.body);
+        let reply = post_action(addr, &origin, &operator, &path(&kept), &delete, true).await;
+        assert_eq!(reply.status, 409, "{}", reply.body);
+        let refused = format!("Refused: rollout {} ", &kept[..8]);
+        assert!(reply.body.contains(&refused), "{}", reply.body);
+        assert!(reply.body.contains(why), "{why}: {}", reply.body);
+        assert!(hub.db.rollout(&kept).unwrap().is_some());
+    }
+
+    // Its only failure never ran: the operator may delete it.
+    let expired = "b0".repeat(16);
+    let row = ended(aborted(), failed("the update expired before it ran", false));
+    hub.db.create_rollout(&expired, &row, "uid 0").unwrap();
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(page.body.contains(&path(&expired)), "{}", page.body);
+    let reply = post_action(addr, &origin, &operator, &path(&expired), &delete, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Delete this rollout?"),
+        "{}",
+        reply.body
+    );
+    let answer = format!(
+        "{delete}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, &path(&expired), &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Deleted rollout b0b0b0b0"),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.rollout(&expired).unwrap().is_none());
+
+    // Deleted by someone else between the question and its answer.
+    let raced = "c0".repeat(16);
+    hub.db.create_rollout(&raced, &row, "uid 0").unwrap();
+    let reply = post_action(addr, &origin, &operator, &path(&raced), &delete, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let answer = format!(
+        "{delete}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let deleted =
+        crate::ops::delete_rollout(&hub, "uid 0", &raced, crate::rollout::DeleteRule::Ended)
+            .unwrap();
+    assert!(deleted.is_some());
+    let reply = post_action(addr, &origin, &operator, &path(&raced), &answer, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    assert!(reply.body.contains("no such rollout"), "{}", reply.body);
 }
 
 /// A viewer's post, an operator's without the session's CSRF token or from another origin,

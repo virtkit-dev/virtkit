@@ -320,6 +320,13 @@ enum RolloutCmd {
     Resume { id: String },
     /// End a rollout for good; updates under way finish
     Abort { id: String },
+    /// Forget an ended rollout; its audit lines stay
+    ///
+    /// Refused while it is running or paused, or while an update it issued is still under way.
+    Delete {
+        /// The rollout's ID, or at least its first 4 hex digits
+        id: String,
+    },
 }
 
 /// A rollout's window for a node: from a minute to a week.
@@ -1145,6 +1152,14 @@ async fn rollout_cmd(client: admin::Client, cmd: RolloutCmd) -> Result<()> {
         RolloutCmd::Pause { id } => steer_rollout(client, id, RolloutAction::Pause).await?,
         RolloutCmd::Resume { id } => steer_rollout(client, id, RolloutAction::Resume).await?,
         RolloutCmd::Abort { id } => steer_rollout(client, id, RolloutAction::Abort).await?,
+        RolloutCmd::Delete { id } => {
+            let r = tokio::task::spawn_blocking(move || client.delete_rollout(&id)).await??;
+            eprintln!(
+                "vk-hub: deleted rollout {} of vk {}",
+                rollout::short_id(&r.id),
+                r.row.version
+            );
+        }
     }
     Ok(())
 }

@@ -66,6 +66,36 @@ pub struct RolloutRow {
     pub nodes: Vec<RolloutNode>,
 }
 
+/// Who may delete a rollout: an admin any ended one, an operator in the web UI only one that
+/// updated no node, every update it issued refused or expired unrun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteRule {
+    Ended,
+    UpdatedNoNode,
+}
+
+impl RolloutRow {
+    /// Why `rule` keeps it, if it does: it is still running or paused, or an update it issued
+    /// is still under way — an abort's straggler, whose end it still records — or, under
+    /// [`DeleteRule::UpdatedNoNode`], an update it issued may have run. Once it can be deleted,
+    /// nothing changes it any more.
+    pub fn undeletable(&self, rule: DeleteRule) -> Option<&'static str> {
+        if self.state.active() {
+            Some("abort it, or let it finish, first")
+        } else if self
+            .nodes
+            .iter()
+            .any(|n| matches!(n.status, NodeStatus::Updating { .. }))
+        {
+            Some("an update it issued is still under way")
+        } else if rule == DeleteRule::UpdatedNoNode && self.nodes.iter().any(|n| n.status.ran()) {
+            Some("an update it issued may have run, so only `vk-hub rollout delete` deletes it")
+        } else {
+            None
+        }
+    }
+}
+
 /// How long a drain may take unless a rollout says otherwise: a long CI job's worth.
 pub const DRAIN_TIMEOUT_SECS: u64 = 4 * 3600;
 
@@ -139,7 +169,15 @@ pub enum NodeStatus {
     Failed {
         reason: String,
         at: u64,
+        /// Whether its update may have run: false only when the node refused it or it expired
+        /// before it ran. A row without it is taken to have run.
+        #[serde(default = "may_have_run")]
+        ran: bool,
     },
+}
+
+fn may_have_run() -> bool {
+    true
 }
 
 impl NodeStatus {
@@ -150,6 +188,15 @@ impl NodeStatus {
             NodeStatus::Updating { .. } => "updating",
             NodeStatus::Succeeded { .. } => "succeeded",
             NodeStatus::Failed { .. } => "failed",
+        }
+    }
+
+    /// Whether the rollout's update may have run on the node.
+    fn ran(&self) -> bool {
+        match self {
+            NodeStatus::Pending | NodeStatus::Skipped { .. } => false,
+            NodeStatus::Updating { .. } | NodeStatus::Succeeded { .. } => true,
+            NodeStatus::Failed { ran, .. } => *ran,
         }
     }
 
@@ -328,34 +375,41 @@ pub fn step(
         }
         // An operator may drain or undrain a node during its update, so it may end either way.
         let back = |f: &Facts| matches!(f.state, Some(NodeState::Ready | NodeState::Drained));
+        // A failure says whether its update may have run: only a refusal or an expiry ran none.
         let verdict = match f.and_then(|f| f.outcome.as_ref()) {
-            _ if f.is_none() => Some(Err("the node was removed from the hub".to_string())),
+            _ if f.is_none() => Some(Err(("the node was removed from the hub".to_string(), true))),
             Some(Outcome::Done) if f.is_some_and(|f| on_target(&target, f) && back(f)) => {
                 Some(Ok(()))
             }
             Some(Outcome::Done) if f.is_some_and(|f| f.state == Some(NodeState::Quarantined)) => {
-                Some(Err("quarantined during its update".into()))
+                Some(Err(("quarantined during its update".into(), true)))
             }
-            Some(Outcome::Failed { message }) => Some(Err(message.clone())),
-            Some(Outcome::Refused { reason }) => Some(Err(format!("refused: {reason}"))),
-            Some(Outcome::Expired) => Some(Err("the update expired before it ran".into())),
+            Some(Outcome::Failed { message }) => Some(Err((message.clone(), true))),
+            Some(Outcome::Refused { reason }) => Some(Err((format!("refused: {reason}"), false))),
+            Some(Outcome::Expired) => Some(Err(("the update expired before it ran".into(), false))),
             _ if now < not_before => None,
             _ => match *drained_at {
                 None if now.saturating_sub(*since)
                     >= drain_timeout.saturating_add(GIVE_UP_GRACE_SECS) =>
                 {
-                    Some(Err(format!(
-                        "still draining after {}",
-                        crate::human_duration(Duration::from_secs(drain_timeout))
+                    Some(Err((
+                        format!(
+                            "still draining after {}",
+                            crate::human_duration(Duration::from_secs(drain_timeout))
+                        ),
+                        true,
                     )))
                 }
                 Some(at)
                     if now.saturating_sub(at) >= timeout.saturating_add(GIVE_UP_GRACE_SECS) =>
                 {
-                    Some(Err(format!(
-                        "not updated and back {} within {} of its drain",
-                        crate::store::state_name(*resume),
-                        crate::human_duration(Duration::from_secs(timeout))
+                    Some(Err((
+                        format!(
+                            "not updated and back {} within {} of its drain",
+                            crate::store::state_name(*resume),
+                            crate::human_duration(Duration::from_secs(timeout))
+                        ),
+                        true,
                     )))
                 }
                 _ => None,
@@ -371,7 +425,7 @@ pub fn step(
                     event: format!("updated to vk {version} (command {command})"),
                 });
             }
-            Some(Err(reason)) => {
+            Some(Err((reason, ran))) => {
                 let reason = vk_hub_proto::display_safe(&reason);
                 effects.push(Effect::Audit {
                     node: Some(node.id.clone()),
@@ -382,7 +436,11 @@ pub fn step(
                     node.hostname,
                     short_id(&node.id)
                 ));
-                node.status = NodeStatus::Failed { reason, at: now };
+                node.status = NodeStatus::Failed {
+                    reason,
+                    at: now,
+                    ran,
+                };
             }
         }
     }
@@ -817,6 +875,40 @@ mod tests {
         step(&mut rest, &facts, 10_000, 0);
         assert!(matches!(rest.nodes[2].status, NodeStatus::Failed { .. }));
         assert_eq!(rest.failures, 2);
+    }
+
+    /// A failure records whether its update may have run: not when the node refused it or it
+    /// expired first, but when it failed, was quarantined during it, or timed out.
+    #[test]
+    fn a_failure_records_whether_its_update_may_have_run() {
+        let failed = |message: &str| Outcome::Failed {
+            message: message.into(),
+        };
+        let refused = Outcome::Refused {
+            reason: "no".into(),
+        };
+        let cases = [
+            (Some(refused), NodeState::Ready, 1, false),
+            (Some(Outcome::Expired), NodeState::Ready, 1, false),
+            (Some(failed("rolled back")), NodeState::Ready, 1, true),
+            (Some(Outcome::Done), NodeState::Quarantined, 1, true),
+            (None, NodeState::Draining, 50 + GIVE_UP_GRACE_SECS, true),
+        ];
+        for (outcome, state, now, ran) in cases {
+            let one = vec![("n1".into(), "a".into(), "big".into())];
+            let mut r = row(plan(one, 1, false), 10);
+            let mut facts = HashMap::from([("n1".to_string(), ready(false))]);
+            let e = step(&mut r, &facts, 0, 0);
+            apply(&mut r, &e, 0);
+            let f = facts.get_mut("n1").unwrap();
+            (f.outcome, f.state) = (outcome, Some(state));
+            step(&mut r, &facts, now, 0);
+            let status = &r.nodes[0].status;
+            assert!(
+                matches!(status, NodeStatus::Failed { .. }) && status.ran() == ran,
+                "{status:?}"
+            );
+        }
     }
 
     #[test]

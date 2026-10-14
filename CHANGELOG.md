@@ -9,6 +9,9 @@ All notable changes to virtkit will be documented in this file.
 - **`vk run --allow-name SUFFIX` and `--allow-ip CIDR[:PORT]` hold the booted guest's egress
   to an allowlist**, as `vk dev`'s `egress = "restricted"` does, and `--egress-restrict`
   alone cuts it off. They need `--net` or `--compose`, and bind the compose services too.
+- **`vk-hub rollout delete <id>` removes an ended rollout** from the hub once none of its
+  updates is still under way; its audit lines stay. The operations page offers the same for an
+  ended rollout that updated no node.
 
 ### Changed
 

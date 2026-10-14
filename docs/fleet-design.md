@@ -451,8 +451,9 @@ model, commands and process handling.
   credential is a separate one, scoped to managing runners (pause, resume, list). With
   [GitLab jobs](#gitlab-jobs), runner tokens are `vk-gitlab`'s alone and leave no node.
 - Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine,
-  pausing, resuming and aborting rollouts, resets); admin (enrollment, releases,
-  starting a rollout, and the proposed redeploy). Proposed: BMC
+  pausing, resuming and aborting rollouts, deleting an ended rollout that updated no node,
+  resets); admin (enrollment, releases, starting a rollout, deleting any ended rollout,
+  and the proposed redeploy). Proposed: BMC
   credentials are held apart and used only by redeploys. Admin is the admin socket's:
   whoever runs as the hub's user or root, who also issues the web UI's sign-in links; a web
   UI session is a viewer or an operator: an operator steers a node from its page and a

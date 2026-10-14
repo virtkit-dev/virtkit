@@ -36,7 +36,9 @@ use vk_hub_proto::{
     Outcome, Report, STEERING, Workload,
 };
 
-use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState};
+use crate::rollout::{
+    DeleteRule, Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState,
+};
 
 mod jobs;
 mod keys;
@@ -503,6 +505,39 @@ impl std::fmt::Display for RolloutConflict {
 }
 
 impl std::error::Error for RolloutConflict {}
+
+/// A deletion refused by [`RolloutRow::undeletable`] under the requested rule.
+#[derive(Debug)]
+pub struct RolloutUndeletable {
+    pub id: String,
+    pub state: &'static str,
+    pub why: &'static str,
+}
+
+impl RolloutUndeletable {
+    /// What keeps rollout `id` under `rule`, if anything does.
+    pub fn of(id: &str, row: &RolloutRow, rule: DeleteRule) -> Option<Self> {
+        Some(RolloutUndeletable {
+            id: id.to_string(),
+            state: row.state.name(),
+            why: row.undeletable(rule)?,
+        })
+    }
+}
+
+impl std::fmt::Display for RolloutUndeletable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rollout {} is {}; {}",
+            crate::rollout::short_id(&self.id),
+            self.state,
+            self.why
+        )
+    }
+}
+
+impl std::error::Error for RolloutUndeletable {}
 
 /// The node's latest session ran a protocol version below [`STEERING`]: the hub can monitor
 /// it, not steer it.
@@ -1527,16 +1562,22 @@ impl Db {
 
     /// The one rollout whose ID starts with `prefix`, of at least 4 lowercase hex digits.
     pub fn resolve_rollout(&self, prefix: &str) -> Result<(String, RolloutRow)> {
+        self.find_rollout(prefix)?
+            .with_context(|| format!("there is no rollout {prefix}"))
+    }
+
+    /// The rollout whose ID starts with `prefix`, or `None` when no rollout's does.
+    pub fn find_rollout(&self, prefix: &str) -> Result<Option<(String, RolloutRow)>> {
         crate::rollout::check_prefix(prefix)?;
         let mut found = self
             .rollouts()?
             .into_iter()
             .filter(|(id, _)| id.starts_with(prefix));
-        match (found.next(), found.next()) {
-            (Some(r), None) => Ok(r),
-            (None, _) => bail!("there is no rollout {prefix}"),
-            (Some(_), Some(_)) => bail!("{prefix} names more than one rollout; give more digits"),
+        let first = found.next();
+        if first.is_some() && found.next().is_some() {
+            bail!("{prefix} names more than one rollout; give more digits");
         }
+        Ok(first)
     }
 
     /// Advance rollout `id` by one [`crate::rollout::step`], committing commands, state and
@@ -1650,6 +1691,42 @@ impl Db {
         };
         txn.commit().context("steering a rollout")?;
         Ok(row)
+    }
+
+    /// Delete rollout `id` under `rule` and audit as `actor`, unless
+    /// [`RolloutRow::undeletable`] refuses it. Return the row before deletion, or `None`
+    /// if it does not exist.
+    pub fn delete_rollout(
+        &self,
+        id: &str,
+        rule: DeleteRule,
+        actor: &str,
+        now: u64,
+    ) -> Result<Option<RolloutRow>> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let row = {
+            let mut table = txn.open_table(ROLLOUTS)?;
+            let Some(row) = table
+                .get(id)?
+                .map(|g| decode::<RolloutRow>(g.value()))
+                .transpose()?
+            else {
+                return Ok(None);
+            };
+            if let Some(kept) = RolloutUndeletable::of(id, &row, rule) {
+                return Err(kept.into());
+            }
+            table.remove(id)?;
+            let event = format!(
+                "{actor} deleted rollout {} of vk {}",
+                crate::rollout::short_id(id),
+                row.version
+            );
+            append_audit(&txn, None, actor, &event, now)?;
+            row
+        };
+        txn.commit().context("deleting a rollout")?;
+        Ok(Some(row))
     }
 
     /// The last `limit` audit lines, oldest first, of one node or of all.
@@ -3709,6 +3786,141 @@ mod tests {
         assert!(
             events.contains(&"uid 0 removed release abababababab".to_string()),
             "{events:?}"
+        );
+    }
+
+    /// A rollout is deleted, audited, once it has ended and no update it issued is under way;
+    /// the web UI deletes only one that updated no node.
+    #[test]
+    fn an_ended_rollout_is_deleted_once_its_updates_are_over() {
+        use crate::rollout::RolloutNode;
+        let db = Db::open_memory().unwrap();
+        let sha = "ab".repeat(32);
+        let release = ReleaseRow {
+            version: "0.84.0".into(),
+            size: 10,
+            signature: None,
+            program: None,
+            added_at: 5,
+            added_by: "uid 0".into(),
+        };
+        db.add_release(&sha, &release, "uid 0").unwrap();
+        let node = |status| RolloutNode {
+            id: "12".repeat(16),
+            hostname: "ci-1".into(),
+            profile: "p".into(),
+            wave: 0,
+            status,
+        };
+        let updating = NodeStatus::Updating {
+            command: "c".into(),
+            since: 1,
+            resume: NodeState::Ready,
+            drained_at: None,
+        };
+        let row = |state, status| RolloutRow {
+            release: sha.clone(),
+            version: "0.84.0".into(),
+            created_at: 1,
+            created_by: "uid 0".into(),
+            batch: 1,
+            canary_per_profile: false,
+            max_failures: 0,
+            node_timeout_secs: 600,
+            drain_timeout_secs: 600,
+            force: false,
+            state,
+            failures: 0,
+            nodes: vec![node(status)],
+        };
+        let aborted = || RolloutState::Aborted {
+            reason: "aborted by uid 0".into(),
+        };
+        let kept = [
+            (
+                RolloutState::Running,
+                NodeStatus::Pending,
+                "is running; abort it",
+            ),
+            (
+                RolloutState::Paused {
+                    reason: "paused".into(),
+                },
+                NodeStatus::Pending,
+                "is paused; abort it",
+            ),
+            (
+                aborted(),
+                updating.clone(),
+                "is aborted; an update it issued is still under way",
+            ),
+        ];
+        for (n, (state, status, why)) in kept.into_iter().enumerate() {
+            let id = format!("{n:02}").repeat(16);
+            db.create_rollout(&id, &row(state, status), "uid 0")
+                .unwrap();
+            let err = db
+                .delete_rollout(&id, DeleteRule::Ended, "uid 7", 2)
+                .unwrap_err();
+            assert!(err.is::<RolloutUndeletable>(), "{err:#}");
+            assert!(format!("{err:#}").contains(why), "{err:#}");
+            assert!(db.rollout(&id).unwrap().is_some());
+            // Ended, so that the next one may start; the last one has already.
+            let _ = db.steer_rollout(&id, RolloutAction::Abort, "uid 0", 2);
+        }
+        let operators = |r: &RolloutRow| r.undeletable(DeleteRule::UpdatedNoNode).is_none();
+        assert!(!operators(&row(aborted(), updating)));
+        let succeeded = row(RolloutState::Done, NodeStatus::Succeeded { at: 3 });
+        assert!(succeeded.undeletable(DeleteRule::Ended).is_none() && !operators(&succeeded));
+        let failed = |reason: &str, ran| NodeStatus::Failed {
+            reason: reason.into(),
+            at: 3,
+            ran,
+        };
+        // Its update may have run, or may still: an admin's alone to delete.
+        let ran = row(aborted(), failed("quarantined during its update", true));
+        assert!(ran.undeletable(DeleteRule::Ended).is_none() && !operators(&ran));
+        let refused = failed("refused: /opt/vk-next is not writable by this user", false);
+        assert!(operators(&row(aborted(), refused.clone())));
+        // A row from before the marker is taken to have run.
+        let old: NodeStatus =
+            serde_json::from_str(r#"{"status":"failed","reason":"refused: no","at":3}"#).unwrap();
+        assert_eq!(old, failed("refused: no", true));
+
+        let (done, ran_id, unused) = ("ef".repeat(16), "ab".repeat(16), "cd".repeat(16));
+        db.create_rollout(&done, &succeeded, "uid 0").unwrap();
+        db.create_rollout(&ran_id, &ran, "uid 0").unwrap();
+        db.create_rollout(&unused, &row(aborted(), refused), "uid 0")
+            .unwrap();
+        let err = db
+            .delete_rollout(&ran_id, DeleteRule::UpdatedNoNode, "uid 7", 4)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is aborted; an update it issued may have run"),
+            "{err:#}"
+        );
+        assert!(db.rollout(&ran_id).unwrap().is_some());
+        assert_eq!(
+            db.delete_rollout(&done, DeleteRule::Ended, "uid 7", 4)
+                .unwrap(),
+            Some(succeeded)
+        );
+        let delete_unused = || db.delete_rollout(&unused, DeleteRule::UpdatedNoNode, "uid 7", 4);
+        assert!(delete_unused().unwrap().is_some());
+        assert!(delete_unused().unwrap().is_none());
+        assert!(db.rollout(&done).unwrap().is_none());
+        let events: Vec<String> = db
+            .audits(None, 2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "uid 7 deleted rollout efefefef of vk 0.84.0",
+                "uid 7 deleted rollout cdcdcdcd of vk 0.84.0"
+            ]
         );
     }
 

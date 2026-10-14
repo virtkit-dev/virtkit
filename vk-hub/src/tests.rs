@@ -1851,8 +1851,8 @@ async fn an_aborted_rollout_issues_nothing_more_and_frees_its_nodes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// An update still under way when its rollout is aborted keeps the release, and its failure is
-/// recorded without counting against the rollout.
+/// An update still under way when its rollout is aborted keeps the release and the rollout,
+/// and its failure is recorded without counting against the rollout.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_aborted_rollouts_straggler_keeps_its_release_and_fails_uncounted() {
     let (dir, _, hub) = start_releases("rollout-straggler", None).await;
@@ -1868,6 +1868,12 @@ async fn an_aborted_rollouts_straggler_keeps_its_release_and_fails_uncounted() {
     let err = releases::remove(&hub, "uid 0", &release.sha256).unwrap_err();
     assert!(
         format!("{err:#}").contains("still being updated"),
+        "{err:#}"
+    );
+    let err = ops::delete_rollout(&hub, "uid 0", &rollout.id[..4], rollout::DeleteRule::Ended)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("an update it issued is still under way"),
         "{err:#}"
     );
     ack_only(
@@ -1887,6 +1893,16 @@ async fn an_aborted_rollouts_straggler_keeps_its_release_and_fails_uncounted() {
     assert_eq!(row.failures, 0);
     assert!(matches!(row.state, rollout::RolloutState::Aborted { .. }));
     assert!(releases::remove(&hub, "uid 0", &release.sha256).unwrap());
+    // It rolled back, so it ran: only an admin deletes the rollout.
+    assert!(
+        row.undeletable(rollout::DeleteRule::UpdatedNoNode)
+            .is_some()
+    );
+    let delete = || ops::delete_rollout(&hub, "uid 0", &rollout.id, rollout::DeleteRule::Ended);
+    assert!(delete().unwrap().is_some());
+    assert!(hub.db.rollouts().unwrap().is_empty());
+    // Deleted already: no such rollout, not an error.
+    assert!(delete().unwrap().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2042,6 +2058,7 @@ fn a_rollout_status_shows_each_node_by_wave() {
                 status: rollout::NodeStatus::Failed {
                     reason: "rolled back".into(),
                     at: 1_800_000_120,
+                    ran: true,
                 },
             },
             rollout::RolloutNode {
