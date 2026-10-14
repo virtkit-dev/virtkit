@@ -1070,16 +1070,18 @@ mod tests {
         drop(reference(&never).unwrap());
         set_old(&sidecars(&never).1);
 
-        gc(&root, std::time::Duration::from_secs(60));
+        let (lock, used) = sidecars(&never);
+        assert!(
+            crate::cachelock::reclaimed_eventually(|| {
+                gc(&root, std::time::Duration::from_secs(60));
+                !used.exists() && !lock.exists()
+            }),
+            "orphan sidecars go once idle"
+        );
         assert!(install.exists(), "the install under an undated layer stays");
         assert!(
             step.exists() && sidecars(&step).1.exists(),
             "the undated layer is dated"
-        );
-        let (lock, used) = sidecars(&never);
-        assert!(
-            !used.exists() && !lock.exists(),
-            "orphan sidecars go once idle"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
