@@ -136,6 +136,29 @@ fn reclaim_opened(
     now: SystemTime,
     remove: impl FnOnce(),
 ) -> bool {
+    if !lock_exclusive(file, lock) || !is_idle(used, idle, now) {
+        return false;
+    }
+    remove();
+    true
+}
+
+/// Whether the entry dated by `used` has been idle at least `idle` at `now`. A missing or
+/// unreadable marker is an entry mid-setup, never idle.
+fn is_idle(used: &Path, idle: Duration, now: SystemTime) -> bool {
+    match std::fs::metadata(used).and_then(|m| m.modified()) {
+        // A `.used` timestamp can read microseconds *ahead* of `now`: the filesystem stamps
+        // mtime from a coarse clock while `now` is precise, so under load the marker can appear
+        // to be in the future. Treat that as "used just now" (zero elapsed) rather than "keep
+        // forever", so a zero idle window still reclaims an unreferenced entry.
+        Ok(t) => now.duration_since(t).unwrap_or_default() >= idle,
+        Err(_) => false,
+    }
+}
+
+/// Lock the open sidecar `file` exclusively without waiting. Return `false` if a user holds
+/// it or `lock` names another file.
+fn lock_exclusive(file: &std::fs::File, lock: &Path) -> bool {
     // A live user holds LOCK_SH, so a non-blocking LOCK_EX fails (EWOULDBLOCK): a sweep never
     // waits behind one.
     // SAFETY: the fd is owned by `file`, which outlives the call.
@@ -144,22 +167,7 @@ fn reclaim_opened(
     }
     // As in `acquire_shared`, a lock on an unlinked file does not exclude users of an entry
     // rebuilt at the same path after reclamation.
-    if !same_file(file, lock).unwrap_or(false) {
-        return false;
-    }
-    let idle_ok = match std::fs::metadata(used).and_then(|m| m.modified()) {
-        // A `.used` timestamp can read microseconds *ahead* of `now`: the filesystem stamps
-        // mtime from a coarse clock while `now` is precise, so under load the marker can appear
-        // to be in the future. Treat that as "used just now" (zero elapsed) rather than "keep
-        // forever", so a zero idle window still reclaims an unreferenced entry.
-        Ok(t) => now.duration_since(t).unwrap_or_default() >= idle,
-        Err(_) => false, // missing/unreadable marker: mid-setup, leave alone
-    };
-    if !idle_ok {
-        return false;
-    }
-    remove();
-    true
+    same_file(file, lock).unwrap_or(false)
 }
 
 fn open_lock(lock: &Path) -> Result<std::fs::File> {

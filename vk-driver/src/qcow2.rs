@@ -112,29 +112,12 @@ impl Qcow2 {
         let (l1_entries, _) = l1_raw.as_chunks::<8>();
         let l1: Vec<u64> = l1_entries.iter().map(|c| be64(c, 0)).collect();
 
-        // backing file: a path string at backing_file_offset, resolved relative to this image.
-        let backing_off = be64(&h, 8);
-        let backing_len = be32(&h, 16) as usize;
-        if backing_len > 4096 {
-            bail!(
-                "{}: implausible backing file name length {backing_len}",
-                path.display()
-            );
-        }
-        let mut backing_path = None;
-        let backing = if backing_off != 0 && backing_len != 0 {
-            let mut name = vec![0u8; backing_len];
-            file.read_exact_at(&mut name, backing_off)
-                .context("reading backing file name")?;
-            let name = String::from_utf8(name).context("backing file name not utf-8")?;
-            let bpath = resolve_backing(path, &name);
-            let b = open_backing(&bpath).with_context(|| {
+        let backing_path = read_backing_name(&file, &h, path)?;
+        let backing = match &backing_path {
+            Some(bpath) => open_backing(bpath).with_context(|| {
                 format!("opening backing {} of {}", bpath.display(), path.display())
-            })?;
-            backing_path = Some(bpath);
-            b
-        } else {
-            Backing::None
+            })?,
+            None => Backing::None,
         };
 
         Ok(Qcow2 {
@@ -1286,6 +1269,27 @@ impl VkRoImg {
         }
         Ok(())
     }
+}
+
+/// The backing file the qcow2 header `h` of `file` (opened from `path`) names, resolved
+/// relative to `path`: a path string at backing_file_offset.
+fn read_backing_name(file: &File, h: &[u8], path: &Path) -> Result<Option<PathBuf>> {
+    let backing_off = be64(h, 8);
+    let backing_len = be32(h, 16) as usize;
+    if backing_len > 4096 {
+        bail!(
+            "{}: implausible backing file name length {backing_len}",
+            path.display()
+        );
+    }
+    if backing_off == 0 || backing_len == 0 {
+        return Ok(None);
+    }
+    let mut name = vec![0u8; backing_len];
+    file.read_exact_at(&mut name, backing_off)
+        .context("reading backing file name")?;
+    let name = String::from_utf8(name).context("backing file name not utf-8")?;
+    Ok(Some(resolve_backing(path, &name)))
 }
 
 /// Resolve a backing-file name (often absolute, as this tool writes it) relative to the
