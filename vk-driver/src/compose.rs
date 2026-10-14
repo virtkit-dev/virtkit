@@ -894,7 +894,7 @@ fn yaml_options() -> serde_saphyr::Options {
         strict_booleans: true,
         reject_unsupported_tags: true,
         ignore_binary_tag_for_string: true,
-        reject_non_finite_typeless_float: false,
+        non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::AsString,
         with_snippet: false,
     }
 }
