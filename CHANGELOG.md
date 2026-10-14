@@ -49,6 +49,10 @@ All notable changes to virtkit will be documented in this file.
   the build cache registry.
 - **A Windows build's `RUN --network=default` follows `--build-allow-ip`/`--build-allow-name`**
   (`[egress.build]` in CI), as a Linux build's does.
+- **vk-hub shows the unusual events a job's node reports.** A job's result sent to vk-hub can
+  carry what the node saw go wrong on the machine while the job ran. vk-hub shows them in the
+  jobs table, on the job's page and in `vk-hub jobs`, and can filter on them. Older nodes
+  report none, and an older hub ignores them.
 
 ### Changed
 

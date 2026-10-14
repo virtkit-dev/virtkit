@@ -3352,6 +3352,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
             output_len: 0,
             artifacts: Vec::new(),
             usage,
+            events: Vec::new(),
         })
     };
     let job = |n: u64, project: &str, url: &str, state, result| crate::store::JobRow {
@@ -3714,6 +3715,7 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
             output_len: 0,
             artifacts: Vec::new(),
             usage: None,
+            events: Vec::new(),
         });
         row
     };
@@ -4054,6 +4056,7 @@ async fn a_running_job_s_page_follows_its_output() {
         output_len: row.output_len,
         artifacts: Vec::new(),
         usage: None,
+        events: Vec::new(),
     });
     hub.db.put_job(&id, &row, &[], crate::now_secs()).unwrap();
     hub.job_changed(&id);
@@ -4231,10 +4234,12 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     for want in [
         " method=\"get\" action=\"/jobs\" hx-get=\"/jobs\"",
         " hx-trigger=\"submit, change from:(#jobs-filter select), \
+         change from:(#jobs-filter input[type=checkbox]), \
          input changed delay:300ms from:(#jobs-filter input)\"",
         " hx-target=\"#jobs-results\" hx-select=\"#jobs-results\" hx-swap=\"outerHTML\"",
         " hx-push-url=\"true\" hx-sync=\"this:replace\"",
-        "\"> <button>Show</button>",
+        "<input type=\"checkbox\" name=\"events\" value=\"1\"> With events</label> \
+         <button>Show</button>",
     ] {
         assert!(form.contains(want), "{want}: {form}");
     }
@@ -4327,6 +4332,7 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
         output_len: 0,
         artifacts: Vec::new(),
         usage: None,
+        events: Vec::new(),
     });
     hub.db.put_job(&id(1), &ended, &[], now).unwrap();
     submit(2, &history_job(2, "acme/web"));

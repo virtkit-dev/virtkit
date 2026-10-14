@@ -416,6 +416,7 @@ mod fake {
                     output_len: j.output.len() as u64,
                     artifacts: Vec::new(),
                     usage: None,
+                    events: Vec::new(),
                 });
             });
         }

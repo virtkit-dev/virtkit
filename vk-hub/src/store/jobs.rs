@@ -315,6 +315,8 @@ pub struct JobFilter {
     pub git_ref: Option<String>,
     /// Its pipeline's ID.
     pub pipeline: Option<u64>,
+    /// Only jobs that reported events (a virtio-fs stall, …).
+    pub events: bool,
 }
 
 impl JobFilter {
@@ -331,6 +333,7 @@ impl JobFilter {
             && holds(&self.name, &row.name)
             && holds(&self.git_ref, &row.git_ref)
             && self.pipeline.is_none_or(|p| row.pipeline == Some(p))
+            && (!self.events || row.result.as_ref().is_some_and(|r| !r.events.is_empty()))
     }
 }
 
@@ -1199,6 +1202,7 @@ mod tests {
             output_len: 0,
             artifacts: Vec::new(),
             usage: None,
+            events: Vec::new(),
         });
         row
     }
@@ -1638,6 +1642,7 @@ mod tests {
             output_len: 0,
             artifacts: Vec::new(),
             usage: None,
+            events: Vec::new(),
         });
         assert_eq!(
             (lost.prepare_ms(100), lost.ran_ms(100)),
@@ -1657,6 +1662,7 @@ mod tests {
                 prepare_ms: Some(20_000),
                 ..Default::default()
             }),
+            events: Vec::new(),
         });
         assert_eq!(
             (ended.prepare_ms(100), ended.ran_ms(100)),

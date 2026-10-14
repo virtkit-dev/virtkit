@@ -177,6 +177,9 @@ enum Cmd {
         /// How many of the latest
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Only jobs that reported events: a virtio-fs stall the VMM detected and retried, …
+        #[arg(long)]
+        events: bool,
         #[command(subcommand)]
         cmd: Option<JobsCmd>,
     },
@@ -1008,10 +1011,11 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Jobs {
             config,
             limit,
+            events,
             cmd: None,
         } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
-            let jobs = tokio::task::spawn_blocking(move || client.jobs(limit)).await??;
+            let jobs = tokio::task::spawn_blocking(move || client.jobs(limit, events)).await??;
             print!("{}", render_jobs(&jobs, now_secs()));
             Ok(())
         }
@@ -1616,7 +1620,7 @@ fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
 /// `vk-hub jobs`' table: how long each job prepared and ran, or has so far, and the most memory
 /// its VM held, rounded up to a MiB, where its node reported it.
 fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
-    let rows: Vec<[String; 11]> = jobs
+    let rows: Vec<[String; 12]> = jobs
         .iter()
         .map(|(id, j)| {
             let usage = j.result.as_ref().and_then(|r| r.usage);
@@ -1636,6 +1640,10 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
                     || "-".to_string(),
                     |b| workloads::size_mib(b.div_ceil(1 << 20)),
                 ),
+                j.result
+                    .as_ref()
+                    .and_then(|r| jobs::events_summary(&r.events))
+                    .unwrap_or_else(|| "-".to_string()),
                 j.title.clone(),
             ]
         })
@@ -1652,6 +1660,7 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
             "PREP",
             "RAN",
             "PEAK",
+            "EVENTS",
             "JOB",
         ],
         &rows,
@@ -1718,6 +1727,11 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
     for (key, value) in fields {
         let value = vk_hub_proto::display_safe(&value);
         out.push_str(&format!("{key:<12} {value}\n"));
+    }
+    // Print the full sanitized detail: its ending explains what happened and can exceed
+    // the usual field limit.
+    for event in result.map_or(&[][..], |r| &r.events) {
+        out.push_str(&format!("{:<12} {event}\n", "event"));
     }
     if let Some(output) = output {
         out.push_str(&format!(

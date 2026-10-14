@@ -382,6 +382,7 @@ mod tests {
                         state: UploadState::Skipped,
                     }],
                     usage: None,
+                    events: Vec::new(),
                 },
             },
         ]

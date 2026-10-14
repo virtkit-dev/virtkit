@@ -147,6 +147,7 @@ pub async fn run(cfg: Config, dir: &Path, ledger_fd: Option<i32>) -> Result<()> 
                 output_len: journal::output_len(dir),
                 artifacts: Vec::new(),
                 usage: None,
+                events: Vec::new(),
             };
             journal::write_json(&dir.join(journal::RESULT), &result)?;
             return Err(e);
@@ -259,6 +260,7 @@ impl Driver {
                 tree.as_ref(),
                 size,
             )),
+            events: Vec::new(),
         }
     }
 

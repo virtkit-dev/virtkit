@@ -17,7 +17,9 @@ use vk_hub_proto::dispatch::{
     Held, HeldJob, HeldReservation, HubJobMsg, LeaseEnd, LeaseState, NodeJobMsg, OfferReply,
     Refusal, RunState,
 };
-use vk_hub_proto::job::{CiJob, Envelope, FailureClass, JobResult, JobSpec};
+use vk_hub_proto::job::{
+    CiJob, Envelope, FailureClass, JobEvent, JobEventKind, JobResult, JobSpec, MAX_JOB_EVENTS,
+};
 use vk_hub_proto::{
     Admission, FsUsage, Hardware, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, NodeState, Report,
     StorageRole, VersionRange,
@@ -544,6 +546,7 @@ fn result(failure: Option<FailureClass>, output_len: u64) -> JobResult {
         output_len,
         artifacts: vec![],
         usage: None,
+        events: Vec::new(),
     }
 }
 
@@ -1279,6 +1282,115 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Events a node reports with a job's result are kept, held to their bounds and made
+/// displayable without losing the end of a long detail, named in the job's audit line, found by
+/// the events filter, and shown by `vk-hub jobs` and `vk-hub jobs show`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_s_events_are_kept_bounded_found_and_shown() {
+    let dir = scratch("job-events");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 8192).await;
+
+    let stalled = running_job(addr, &key, &mut node, 1).await;
+    let long_tail = format!(
+        "{}: suspected lost interrupt, signalling again",
+        "x".repeat(300)
+    );
+    let mut ended = result(None, 0);
+    ended.events = (0..20)
+        .map(|i| {
+            let detail = if i == 0 {
+                long_tail.clone()
+            } else {
+                format!("stall {i}\x1b[31m")
+            };
+            JobEvent::new(JobEventKind::VirtioFsStall, 2, &detail)
+        })
+        .collect();
+    node.send(NodeJobMsg::Result {
+        job: stalled.clone(),
+        result: ended,
+    });
+    assert_eq!(
+        node.job().await,
+        HubJobMsg::Recorded {
+            job: stalled.clone()
+        }
+    );
+    let done = view_until(addr, &key, &stalled, |v| v.state == JobState::Finished).await;
+    let events = done.result.unwrap().events;
+    assert_eq!(events.len(), MAX_JOB_EVENTS);
+    assert_eq!(
+        events[0].detail, long_tail,
+        "kept whole, past the usual 256 characters"
+    );
+    assert_eq!(
+        events[1].detail, "stall 1[31m",
+        "control characters dropped"
+    );
+
+    let quiet = running_job(addr, &key, &mut node, 2).await;
+    node.send(NodeJobMsg::Result {
+        job: quiet.clone(),
+        result: result(None, 0),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: quiet.clone() });
+    view_until(addr, &key, &quiet, |v| v.state == JobState::Finished).await;
+
+    let with_events = crate::store::JobFilter {
+        events: true,
+        ..Default::default()
+    };
+    let page = crate::jobs::history(&hub, &with_events, None, 10).unwrap();
+    let found: Vec<&str> = page.rows.iter().map(|(_, id, _)| id.as_str()).collect();
+    assert_eq!(found, [stalled.as_str()]);
+    // `vk-hub jobs --events`.
+    let listed = crate::admin::dispatch(
+        br#"{"v":1,"call":{"op":"list-jobs","limit":10,"events":true}}"#,
+        &hub,
+        0,
+    )
+    .unwrap();
+    let listed: Vec<(String, crate::store::JobRow)> = serde_json::from_value(listed).unwrap();
+    let found: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(found, [stalled.as_str()]);
+
+    let node_id = node.id.clone();
+    wait_until(|| {
+        hub.db.audits(Some(&node_id), 50).unwrap().iter().any(|a| {
+            a.event.contains(&format!("job {stalled} finished"))
+                && a.event.contains("; events: virtio-fs stall ×2")
+        })
+    })
+    .await;
+
+    let rows = crate::jobs::listing(&hub, 10).unwrap();
+    let listed = crate::render_jobs(&rows, crate::now_secs());
+    assert!(
+        listed.lines().next().unwrap().contains("EVENTS"),
+        "{listed}"
+    );
+    let row = |id: &str| {
+        listed
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap()
+            .to_string()
+    };
+    assert!(row(&stalled).contains("virtio-fs stall ×2"), "{listed}");
+    assert!(!row(&quiet).contains("virtio-fs"), "{listed}");
+
+    let (detail, _) = crate::jobs::detail(&hub, &stalled).unwrap().unwrap();
+    let shown = crate::render_job(&stalled, &detail, None, crate::now_secs());
+    assert!(
+        shown.contains(&format!(
+            "event        virtio-fs stall (2 times): {long_tail}\n"
+        )),
+        "{shown}"
+    );
+}
+
 /// A job ended in memory but not yet written is read as it ended, never as the older row
 /// the database still holds, whose output is shorter than a reader was already given.
 #[tokio::test(flavor = "multi_thread")]
@@ -1616,6 +1728,7 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
             output_len: 5,
             artifacts: vec![],
             usage: None,
+            events: Vec::new(),
         },
     });
     assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });

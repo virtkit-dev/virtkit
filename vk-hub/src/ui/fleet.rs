@@ -1618,7 +1618,9 @@ fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
         .text(&d.view.id)
         .raw("\">The node's audit log</a> · <a href=\"/jobs?node=")
         .text(&d.view.id)
-        .raw("\">Its jobs</a></p></section>");
+        .raw("\">Its jobs</a> · <a href=\"/jobs?node=")
+        .text(&d.view.id)
+        .raw("&amp;events=1\">Its jobs with events</a></p></section>");
 }
 
 /// The VMs the node reports running, with what each holds from the last heartbeat. Every

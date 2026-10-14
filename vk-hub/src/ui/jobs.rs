@@ -46,11 +46,13 @@ const JOBS_PAGE: usize = 100;
 const MAX_TEXT: usize = 1024;
 
 /// The filter's parameters, in the order a query carries them.
-const FIELDS: [&str; 6] = ["node", "project", "result", "name", "ref", "pipeline"];
+const FIELDS: [&str; 7] = [
+    "node", "project", "result", "name", "ref", "pipeline", "events",
+];
 
-/// `GET /jobs[?node=…&project=…&result=…&name=…&ref=…&pipeline=…&before=…]`. A filter value
-/// that cannot be one is ignored, as the audit log ignores a node that is not an ID. `swap`:
-/// the filter's form asks for it ([`filter_swap`]).
+/// `GET /jobs[?node=…&project=…&result=…&name=…&ref=…&pipeline=…&events=1&before=…]`. A
+/// filter value that cannot be one is ignored, as the audit log ignores a node that is not an
+/// ID. `swap`: the filter's form asks for it ([`filter_swap`]).
 pub(super) async fn get(
     query: Option<&str>,
     auth: &Auth,
@@ -132,6 +134,7 @@ fn set(filter: &mut JobFilter, name: &str, value: &str) -> bool {
         "name" => part(value).map(|v| filter.name = Some(v)),
         "ref" => part(value).map(|v| filter.git_ref = Some(v)),
         "pipeline" => pipeline(value).map(|v| filter.pipeline = Some(v)),
+        "events" => (value.trim() == "1").then(|| filter.events = true),
         _ => None,
     }
     .is_some()
@@ -439,6 +442,7 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
         .raw("\" hx-get=\"")
         .raw(PATH)
         .raw("\" hx-trigger=\"submit, change from:(#jobs-filter select), ")
+        .raw("change from:(#jobs-filter input[type=checkbox]), ")
         .raw("input changed delay:300ms from:(#jobs-filter input)\" hx-target=\"#")
         .raw(RESULTS)
         .raw("\" hx-select=\"#")
@@ -519,7 +523,11 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
     h.raw("<input type=\"number\" name=\"pipeline\" min=\"1\" placeholder=\"Pipeline\" ")
         .raw("aria-label=\"Pipeline\" value=\"")
         .text(pipeline.as_deref().unwrap_or(""))
-        .raw("\"> <button>Show</button></form>");
+        .raw("\"><label class=\"check\" title=\"Jobs during which the node saw something ")
+        .raw("unusual: a virtio-fs stall the VMM detected and retried, …\">")
+        .raw("<input type=\"checkbox\" name=\"events\" value=\"1\"")
+        .raw(if filter.events { " checked" } else { "" })
+        .raw("> With events</label> <button>Show</button></form>");
 }
 
 /// `/jobs` with `filter`, and `before` if given, as its query.
@@ -533,6 +541,7 @@ fn href(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
 /// branch's name cannot end the attribute or add a parameter.
 fn query(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
     let pipeline = filter.pipeline.map(|p| p.to_string());
+    let events = filter.events.then_some("1");
     let before = before.map(|b| b.to_string());
     let fields = [
         ("node", filter.node.as_deref()),
@@ -541,6 +550,7 @@ fn query(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
         ("name", filter.name.as_deref()),
         ("ref", filter.git_ref.as_deref()),
         ("pipeline", pipeline.as_deref()),
+        ("events", events),
         ("before", before.as_deref()),
     ];
     let mut separator = "?";
@@ -651,6 +661,7 @@ fn job_row(
     } else {
         result_badge(h, j);
     }
+    events_badge(h, j);
     h.raw("</td><td>");
     match j.started_at {
         Some(at) => pages::at(h, at),
@@ -896,6 +907,11 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
     if let Some(message) = result.and_then(|r| r.message.as_deref()) {
         pages::kv_node(h, "Message", message);
     }
+    // Show each kind, count and first occurrence, as in `vk-hub jobs show`. Keep the full
+    // sanitized detail: its ending explains what happened and can exceed the field limit.
+    for event in result.map_or(&[][..], |r| &r.events) {
+        pages::kv(h, "Event", &event.to_string());
+    }
     pages::kv_node(h, "Title", &j.title);
     pages::kv_node(h, "Project", j.project.as_deref().unwrap_or("-"));
     if j.git_ref.is_some() || j.commit.is_some() {
@@ -1023,6 +1039,35 @@ fn result_badge(h: &mut Html, j: &JobRow) {
     h.raw(">").node(&text).raw("</span>");
 }
 
+/// What the node saw happen to the job, beside its result: `virtio-fs stall ×2`, the end of
+/// each event's first occurrence on hover. Nothing for a job without events.
+fn events_badge(h: &mut Html, j: &JobRow) {
+    let Some(events) = j.result.as_ref().map(|r| &r.events) else {
+        return;
+    };
+    let Some(text) = crate::jobs::events_summary(events) else {
+        return;
+    };
+    let details: Vec<String> = events.iter().map(|e| tail(&e.detail, TITLE_TAIL)).collect();
+    h.raw("<span class=\"badge warn event\" title=\"")
+        .text(details.join("\n"))
+        .raw("\">")
+        .node(&text)
+        .raw("</span>");
+}
+
+/// The most characters of each event's detail the events badge shows on hover: its end, which
+/// says what happened. The job's page has them whole.
+const TITLE_TAIL: usize = 160;
+
+/// The last `max` characters of `s`, after a "…" when it has more.
+fn tail(s: &str, max: usize) -> String {
+    match s.char_indices().rev().nth(max) {
+        Some((at, c)) => format!("…{}", &s[at + c.len_utf8()..]),
+        None => s.to_string(),
+    }
+}
+
 /// `n` with a comma between thousands: `10,000`.
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -1043,6 +1088,56 @@ fn dash_or(s: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job's events show on its page, each with its whole detail escaped, and beside its
+    /// result in the jobs table, the details on hover; a job without any shows neither.
+    #[test]
+    fn a_job_s_events_show_on_its_page_and_in_the_table() {
+        use vk_hub_proto::job::{JobEvent, JobEventKind, JobResult};
+        let mut j = super::super::tests::history_job(1, "acme/web");
+        j.state = JobState::Finished;
+        let detail = format!("{}<b>: suspected lost interrupt", "x".repeat(300));
+        j.result = Some(JobResult {
+            failure: None,
+            exit_code: None,
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: None,
+            events: vec![JobEvent::new(JobEventKind::VirtioFsStall, 2, &detail)],
+        });
+        let mut h = Html::new();
+        record(&mut h, &j, &HashMap::new(), 1030);
+        let page = h.into_string();
+        let escaped = format!("{}&lt;b&gt;: suspected lost interrupt", "x".repeat(300));
+        assert!(
+            page.contains(&format!(
+                "<th>Event</th><td>virtio-fs stall (2 times): {escaped}</td>"
+            )),
+            "{page}"
+        );
+        let mut h = Html::new();
+        events_badge(&mut h, &j);
+        let ending = format!("{}&lt;b&gt;: suspected lost interrupt", "x".repeat(131));
+        assert_eq!(
+            h.into_string(),
+            format!(
+                "<span class=\"badge warn event\" title=\"…{ending}\">virtio-fs stall ×2</span>"
+            )
+        );
+        // An uncounted event, from a peer that sent no count, shows as once.
+        j.result.as_mut().unwrap().events[0].count = 0;
+        let mut h = Html::new();
+        events_badge(&mut h, &j);
+        assert!(h.into_string().ends_with(">virtio-fs stall ×1</span>"));
+        j.result.as_mut().unwrap().events.clear();
+        let mut h = Html::new();
+        events_badge(&mut h, &j);
+        assert_eq!(h.into_string(), "");
+        let mut h = Html::new();
+        record(&mut h, &j, &HashMap::new(), 1030);
+        assert!(!h.into_string().contains("<th>Event</th>"));
+    }
 
     /// Show preparation activity and a browser timer; link the awaited job only through
     /// a plain web link.
@@ -1174,6 +1269,7 @@ mod tests {
             name: Some("test: \"e2e\" <x>".into()),
             git_ref: Some("feature/é&x=1".into()),
             pipeline: Some(4012),
+            events: true,
         };
         let mut h = Html::new();
         query(&mut h, &filter, None);
@@ -1183,7 +1279,7 @@ mod tests {
             format!(
                 "?node={}&amp;project=g%2Fp%20q&amp;result=running\
                  &amp;name=test%3A%20%22e2e%22%20%3Cx%3E&amp;ref=feature%2F%C3%A9%26x%3D1\
-                 &amp;pipeline=4012",
+                 &amp;pipeline=4012&amp;events=1",
                 "ab".repeat(16)
             )
         );
@@ -1343,6 +1439,15 @@ mod tests {
                 ..JobFilter::default()
             })
         );
+        // The "With events" checkbox, ticked or not.
+        assert_eq!(
+            stream_filter(Some("pipeline=&events=1")),
+            Some(JobFilter {
+                events: true,
+                ..JobFilter::default()
+            })
+        );
+        assert_eq!(stream_filter(Some("events=")), Some(JobFilter::default()));
         let long = "p".repeat(MAX_TEXT + 1);
         let longest = "é".repeat(vk_hub_proto::MAX_DISPLAY);
         assert_eq!(
@@ -1369,6 +1474,8 @@ mod tests {
             // An older page has no stream.
             "before=3".to_string(),
             "other=1".to_string(),
+            "events=0".to_string(),
+            "events=yes".to_string(),
         ] {
             assert_eq!(stream_filter(Some(&bad)), None, "{bad}");
         }

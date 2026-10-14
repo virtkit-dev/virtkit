@@ -213,9 +213,11 @@ enum Call {
     RevokeKey {
         name: String,
     },
-    /// The latest `limit` placed jobs.
+    /// The latest `limit` placed jobs; with `events`, the latest that reported events.
     ListJobs {
         limit: usize,
+        #[serde(default)]
+        events: bool,
     },
     /// One placed job's record, and for a failed one the end of its output.
     ShowJob {
@@ -429,7 +431,7 @@ async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_js
     }
 }
 
-fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
+pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     let probe: VersionProbe =
         serde_json::from_slice(body).context("this does not look like a vk-hub admin request")?;
     if probe.v != PROTOCOL_VERSION {
@@ -636,8 +638,22 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             }
             serde_json::to_value(revoked)?
         }
-        Call::ListJobs { limit } => {
-            serde_json::to_value(crate::jobs::listing(hub, limit.min(10_000))?)?
+        Call::ListJobs { limit, events } => {
+            let limit = limit.min(10_000);
+            let rows = if events {
+                let filter = crate::store::JobFilter {
+                    events: true,
+                    ..Default::default()
+                };
+                (crate::jobs::history(hub, &filter, None, limit)?
+                    .rows
+                    .into_iter())
+                .map(|(_, id, row)| (id, row))
+                .collect()
+            } else {
+                crate::jobs::listing(hub, limit)?
+            };
+            serde_json::to_value(rows)?
         }
         Call::ShowJob { id } => {
             let detail = crate::jobs::detail(hub, &id)?.map(|(row, output)| JobDetail {
@@ -968,8 +984,8 @@ impl Client {
     }
 
     /// Newest first.
-    pub fn jobs(&self, limit: usize) -> Result<Vec<(String, JobRow)>> {
-        self.call(Call::ListJobs { limit })
+    pub fn jobs(&self, limit: usize, events: bool) -> Result<Vec<(String, JobRow)>> {
+        self.call(Call::ListJobs { limit, events })
     }
 
     /// Job `id`'s record and, for a failed job, the end of its output; `None` for a job not in

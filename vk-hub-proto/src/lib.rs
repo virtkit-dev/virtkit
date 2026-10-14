@@ -507,9 +507,15 @@ pub fn gitlab_job_url(server_url: &str, project_path: &str, job_id: &str) -> Opt
 /// `s` made safe to print, cut to [`MAX_DISPLAY`] characters. Dropped: control characters
 /// and the [`invisible`] ones.
 pub fn display_safe(s: &str) -> String {
+    display_safe_up_to(s, MAX_DISPLAY)
+}
+
+/// [`display_safe`] keeping up to `max` characters, for text whose end matters past
+/// [`MAX_DISPLAY`]: a job event's detail, which ends with what happened.
+pub fn display_safe_up_to(s: &str, max: usize) -> String {
     s.chars()
         .filter(|&c| !c.is_control() && !invisible(c))
-        .take(MAX_DISPLAY)
+        .take(max)
         .collect()
 }
 

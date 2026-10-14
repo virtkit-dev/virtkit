@@ -515,6 +515,7 @@ fn finish(
         output_len,
         artifacts: Vec::new(),
         usage: None,
+        events: Vec::new(),
     });
     let events = vec![(row.node.clone(), HUB.to_string(), event)];
     state.finished.insert(id.to_string(), job.row.clone());
@@ -1147,7 +1148,7 @@ async fn on_result(
     let recorded = vec![HubJobMsg::Recorded {
         job: id.to_string(),
     }];
-    let write = {
+    let (row, events) = {
         let mut state = hub.dispatch.lock();
         let Some(job) = state.jobs.get_mut(id).filter(|j| j.node() == Some(node)) else {
             // Ended by the hub, or never its: recorded all the same, so the node stops.
@@ -1169,6 +1170,21 @@ async fn on_result(
         if let Some(m) = result.message.as_mut() {
             *m = vk_hub_proto::display_safe(m);
         }
+        // Enforce the node's bounds again and sanitize events for the web UI and CLI.
+        result.events.truncate(vk_hub_proto::job::MAX_JOB_EVENTS);
+        for event in &mut result.events {
+            *event = vk_hub_proto::job::JobEvent::new(
+                event.kind,
+                event.count,
+                &vk_hub_proto::display_safe_up_to(
+                    &event.detail,
+                    vk_hub_proto::job::MAX_JOB_EVENT_DETAIL,
+                ),
+            );
+        }
+        let noted = events_summary(&result.events)
+            .map(|s| format!("; events: {s}"))
+            .unwrap_or_default();
         let failure = result.failure;
         let Some((mut row, mut events)) = finish(&mut state, id, failure, None) else {
             return Ok(recorded);
@@ -1179,13 +1195,34 @@ async fn on_result(
             .into_iter()
             .map(|(n, a, _)| {
                 let how = failure.map_or("success", failure_name);
-                (n, a, format!("job {id} finished on node {node}: {how}"))
+                (
+                    n,
+                    a,
+                    format!("job {id} finished on node {node}: {how}{noted}"),
+                )
             })
             .collect();
         (row, events)
     };
-    persist(hub, id, write.0, write.1).await?;
+    // Outside the lock: whoever waits on it does not wait on stderr.
+    for event in row.result.iter().flat_map(|r| &r.events) {
+        eprintln!("vk-hub: node {node}: job {id}: {event}");
+    }
+    persist(hub, id, row, events).await?;
     Ok(recorded)
+}
+
+/// A job's events in short, `virtio-fs stall ×2`, for its row in a table and its audit line;
+/// `None` without any. An uncounted event (count 0, from a peer that sent none) shows as once.
+pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = events
+        .iter()
+        .map(|e| format!("{} ×{}", e.kind.name(), e.count.max(1)))
+        .collect();
+    Some(named.join(", "))
 }
 
 // ---------------------------------------------------------------------------------------------

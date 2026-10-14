@@ -1161,13 +1161,17 @@ answers its result with `recorded` without changing the job's.
 or past its 30 days is deleted. Queued or starting jobs end `lost`; running jobs continue, with
 nodes resending output from the end of the stored file.
 
-`vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
-output length, age, how long it ran (or has been running), its VM's peak memory, and what the
-job is. `vk-hub jobs show <id>` prints one job's record, one field per line: outcome, exit
-code, node message, GitLab page, node, pool, key, submission/start/finish/settlement times,
-run time, VM size and resource usage. It also prints the end of a finished job's output the
-hub kept, or before it is settled as much as settling would keep, made readable as in the web
-UI (below), so the job's escape sequences never reach the terminal.
+`vk-hub jobs [--limit 50] [--events]` lists the latest jobs: ID, key, pool, state or how it
+ended, node, output length, age, how long it ran (or has been running), its VM's peak memory,
+the events it reported (EVENTS: each kind and how many times, `virtio-fs stall ×2`), and what
+the job is. `--events` lists only jobs that reported events; a `vk-hub serve` older than the
+command ignores it and lists every job. A job's events are what its node saw go wrong on the
+machine while it ran, beside why it failed. `vk-hub jobs show <id>` prints one job's record,
+one field per line: outcome, exit code, node message, GitLab page, node, pool, key,
+submission/start/finish/settlement times, run time, VM size and resource usage, then an
+`event` line for each event with its first occurrence whole. It also prints the end of a
+finished job's output the hub kept, or before it is settled as much as settling would keep,
+made readable as in the web UI (below), so the job's escape sequences never reach the terminal.
 The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 
@@ -1222,17 +1226,19 @@ first, 100 jobs per page, with a link to older jobs. Each row shows the job's na
 (`↗`) to it on GitLab when the spec names a plain web URL; its project; its branch or tag; its
 pipeline, linked to GitLab's page of it (`<project URL>/-/pipelines/<pipeline ID>`) when the
 job's URL is one; its node, linked to the node's page; and its result, linked to the job's
-page: running with its stage, succeeded, failed with its class and exit code (the node's
-message on hover), or canceled. It also shows when a node accepted the job, its elapsed run
-time, its VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the
-placement envelope when the node did not report the guest size.
+page: running with its stage, succeeded, failed with its class and exit code (the node's message
+on hover), or canceled, followed by a badge of the job's events, if any, the end of each one's
+first occurrence on hover. It also shows when a node accepted the job, its elapsed run time, its
+VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the placement
+envelope when the node did not report the guest size.
 
 Node, project, result (`running` for queued or running jobs, `success`, `failed`, `canceled`),
-job name, branch and pipeline filters carry over to older pages. Project and node filters
-match exactly. Job name and branch filters match substrings, ignoring ASCII case and trimming
-surrounding whitespace (`main` matches `main` and `feature/Main-menu`). Pipeline filters match
-the ID. A job's name, branch and pipeline link to the page with that
-filter added. A job whose spec has no ref or pipeline matches no such filter. Every filter is a scan
+job name, branch and pipeline filters, and *With events* (`events=1`: only jobs that reported
+events), carry over to older pages. Project and node filters match exactly. Job name and branch
+filters match substrings, ignoring ASCII case and trimming surrounding whitespace (`main`
+matches `main` and `feature/Main-menu`). Pipeline filters match the ID. A job's name, branch and
+pipeline link to the page with that filter added. A job whose spec has no ref or pipeline
+matches no such filter. Every filter is a scan
 of the history from its newest job, a record decoded and matched at a time, until the page and the
 summary are complete: a rare value reads the whole history, `job_history` records (10,000 by
 default), on each load of the page and, for the live newest page, at most twice a heartbeat (below),
@@ -1246,11 +1252,13 @@ including the live fragment, closing the old stream and opening the new one. The
 filter for bookmarking or sharing. Each applied filter adds a history entry; Back and Forward
 reload that URL because htmx's history cache is disabled. *Show* or Enter applies the filter
 immediately and loads the page without JavaScript. Refused or failed requests, including expired
-sessions, trigger a full page load. Each node's page links to its jobs.
+sessions, trigger a full page load. Each node's page links to its jobs, and to its jobs with
+events.
 
 `/jobs/<id>`, for viewers and operators alike, shows a job's record: its result, failure class,
-exit code and the node's message, its GitLab page when the spec names a plain web URL, its
-project, node, pool and key, when it was submitted, started, finished and settled, how long it
+exit code and the node's message, an Event row for each event it reported with its first
+occurrence whole, its GitLab page when the spec names a plain web URL, its project, node, pool
+and key, when it was submitted, started, finished and settled, how long it
 ran and what it used, in a column to the right of the output, as in GitLab (above it on narrow
 screens). The output is masked by the node and shown on a dark terminal background, with lines
 numbered from the first shown. Continued lines are rejoined, carriage returns keep the final

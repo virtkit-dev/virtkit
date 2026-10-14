@@ -412,6 +412,82 @@ pub struct JobResult {
     /// What the job used on its node; absent from the hub's own results (`no_capacity`, `lost`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<JobUsage>,
+    /// Unusual things the node saw while the job ran, at most [`MAX_JOB_EVENTS`] kinds.
+    /// Absent from older nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<JobEvent>,
+}
+
+/// The most event kinds a job result carries.
+pub const MAX_JOB_EVENTS: usize = 16;
+/// The longest event detail a job result carries, in bytes.
+pub const MAX_JOB_EVENT_DETAIL: usize = 1024;
+
+/// Something unusual the node saw while a job ran — not why it failed, which `failure` says,
+/// but what an operator should know about the machine: a VM device that stalled and that the
+/// VMM detected and retried, and in time a full disk, I/O or memory errors. One per kind,
+/// counted. Displayed as `kind: detail`, or `kind (N times): detail` for more than one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobEvent {
+    pub kind: JobEventKind,
+    /// How many times it happened during the job. For a [`JobEventKind::VirtioFsStall`], the
+    /// VMM's stall warnings: one per episode on a queue and kind of suspicion, so a check that
+    /// finds both a lost kick and a lost interrupt counts 2. 0 from a peer that sent none.
+    #[serde(default)]
+    pub count: u32,
+    /// The first occurrence, as the node logged it, at most [`MAX_JOB_EVENT_DETAIL`] bytes.
+    #[serde(default)]
+    pub detail: String,
+}
+
+impl JobEvent {
+    /// `detail` cut to [`MAX_JOB_EVENT_DETAIL`] bytes, on a character boundary.
+    pub fn new(kind: JobEventKind, count: u32, detail: &str) -> Self {
+        let mut end = detail.len().min(MAX_JOB_EVENT_DETAIL);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        JobEvent {
+            kind,
+            count,
+            detail: detail[..end].to_string(),
+        }
+    }
+}
+
+/// How the trace, the node's log and the hub show an event.
+impl std::fmt::Display for JobEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.kind.name())?;
+        if self.count > 1 {
+            write!(f, " ({} times)", self.count)?;
+        }
+        if !self.detail.is_empty() {
+            write!(f, ": {}", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobEventKind {
+    /// A virtio-fs request whose notification went missing, detected by the VMM's stall check
+    /// after 10 to 20 seconds and retried: a suspected lost kick or interrupt.
+    VirtioFsStall,
+    /// A kind from a later peer; an older hub stores it as this.
+    #[serde(other)]
+    Other,
+}
+
+impl JobEventKind {
+    /// How the hub and the trace name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            JobEventKind::VirtioFsStall => "virtio-fs stall",
+            JobEventKind::Other => "other",
+        }
+    }
 }
 
 /// Resource usage on the node, for the hub's history. Unavailable measurements are absent:
@@ -900,5 +976,66 @@ pub(crate) mod tests {
         // Unknown measurements from newer nodes are ignored.
         let later: JobUsage = serde_json::from_value(json!({"wall_ms": 1, "gpu_ms": 5})).unwrap();
         assert_eq!(later.wall_ms, 1);
+    }
+
+    /// Results from older nodes carry no events and send none; events round-trip, and a kind
+    /// from a later peer reads as `Other` with its count and detail intact.
+    #[test]
+    fn a_result_carries_its_events_and_reads_later_kinds() {
+        let old: JobResult = serde_json::from_value(json!({"output_len": 7})).unwrap();
+        assert!(old.events.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("events"));
+
+        let stalled = JobResult {
+            events: vec![JobEvent::new(
+                JobEventKind::VirtioFsStall,
+                2,
+                "virtio-fs /builds: queue 1: suspected lost interrupt",
+            )],
+            ..old.clone()
+        };
+        let wire = serde_json::to_value(&stalled).unwrap();
+        assert_eq!(
+            wire["events"],
+            json!([{"kind": "virtio_fs_stall", "count": 2,
+                    "detail": "virtio-fs /builds: queue 1: suspected lost interrupt"}])
+        );
+        assert_eq!(serde_json::from_value::<JobResult>(wire).unwrap(), stalled);
+
+        let later: JobResult = serde_json::from_value(json!({
+            "output_len": 7,
+            "events": [{"kind": "ecc_error", "count": 1, "detail": "EDAC MC0: 1 CE"}],
+        }))
+        .unwrap();
+        assert_eq!(later.events[0].kind, JobEventKind::Other);
+        assert_eq!(
+            (later.events[0].count, later.events[0].detail.as_str()),
+            (1, "EDAC MC0: 1 CE")
+        );
+    }
+
+    /// An event without a count, from a peer that leaves it out, reads as uncounted, and shows
+    /// as its kind and detail; a counted one says how many times.
+    #[test]
+    fn an_event_without_a_count_decodes_and_events_display() {
+        let event: JobEvent =
+            serde_json::from_value(json!({"kind": "virtio_fs_stall", "detail": "queue 1"}))
+                .unwrap();
+        assert_eq!(event.count, 0);
+        assert_eq!(event.to_string(), "virtio-fs stall: queue 1");
+        let once = JobEvent::new(JobEventKind::VirtioFsStall, 1, "queue 1");
+        assert_eq!(once.to_string(), "virtio-fs stall: queue 1");
+        let twice = JobEvent::new(JobEventKind::VirtioFsStall, 2, "queue 1");
+        assert_eq!(twice.to_string(), "virtio-fs stall (2 times): queue 1");
+        let bare = JobEvent::new(JobEventKind::Other, 3, "");
+        assert_eq!(bare.to_string(), "other (3 times)");
+    }
+
+    #[test]
+    fn an_event_detail_is_cut_on_a_character_boundary() {
+        let long = "é".repeat(MAX_JOB_EVENT_DETAIL);
+        let event = JobEvent::new(JobEventKind::VirtioFsStall, 1, &long);
+        assert!(event.detail.len() <= MAX_JOB_EVENT_DETAIL);
+        assert!(event.detail.chars().all(|c| c == 'é'));
     }
 }

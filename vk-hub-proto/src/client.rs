@@ -296,6 +296,7 @@ mod tests {
                 output_len: 8192,
                 artifacts: vec![],
                 usage: None,
+                events: Vec::new(),
             }),
         });
         round_trip(&CancelRequest {
