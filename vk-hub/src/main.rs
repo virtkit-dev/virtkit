@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 
 mod admin;
 mod client;
+mod clients;
 mod config;
 mod fetch;
 mod jobs;
@@ -1404,6 +1405,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     );
     jobs::recover(&hub).await?;
     tokio::spawn(jobs::drive(hub.clone()));
+    tokio::spawn(clients::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;

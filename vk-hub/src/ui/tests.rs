@@ -3370,6 +3370,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     let job = |n: u64, project: &str, url: &str, state, result| crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
+        instance: None,
         request_id: format!("{n:032}"),
         placement: Placement {
             pool: "ci".into(),
@@ -3667,6 +3668,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
     crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
+        instance: None,
         request_id: format!("{n:032}"),
         placement: Placement {
             pool: "ci".into(),

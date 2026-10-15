@@ -18,10 +18,11 @@ use hyper::{Method, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use vk_hub_proto::client::{
-    AUTHORIZATION, CAPACITY_PATH, CancelRequest, CapacityRequest, ClientError, ErrorCode,
-    JOBS_PATH, JobState, JobSubmission, MAX_OUTPUT_READ, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER,
-    OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RESERVATIONS_PATH, RenewRequest,
-    ReservationGrant, ReservationRequest,
+    AUTHORIZATION, CAPACITY_PATH, CLIENTS_PATH, CancelRequest, CapacityRequest, ClientError,
+    ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobState, JobSubmission,
+    MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS, MAX_INSTANCE_LEN, MAX_OUTPUT_READ, MAX_WAIT_SECS,
+    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement,
+    RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, valid_instance,
 };
 use vk_hub_proto::job::{JobSpec, MAX_JOB_SPEC};
 
@@ -109,9 +110,20 @@ pub fn is_client_path(path: &str) -> bool {
         || path.starts_with(&format!("{RESERVATIONS_PATH}/"))
         || path == JOBS_PATH
         || path.starts_with(&format!("{JOBS_PATH}/"))
+        || path == CLIENTS_PATH
 }
 
-/// The key the request carries, if the hub knows it and it still works.
+/// The client instance `headers` name, if well-formed.
+fn instance(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(INSTANCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| valid_instance(v))
+        .map(str::to_string)
+}
+
+/// The key the request carries, if the hub knows it and it still works, with the instance
+/// the request names.
 pub async fn authenticate(headers: &HeaderMap, hub: &Hub) -> Result<ApiPrincipal, ApiError> {
     let unauthorized = || {
         ApiError::new(
@@ -131,7 +143,11 @@ pub async fn authenticate(headers: &HeaderMap, hub: &Hub) -> Result<ApiPrincipal
     let found = tokio::task::spawn_blocking(move || db.api_key(&key, crate::now_secs()))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    found.ok_or_else(unauthorized)
+    let principal = found.ok_or_else(unauthorized)?;
+    Ok(ApiPrincipal {
+        instance: instance(headers),
+        ..principal
+    })
 }
 
 /// Serve an authenticated request.
@@ -153,7 +169,7 @@ async fn route(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or_default().to_string();
     let method = req.method().clone();
-    let wanted = if path == CAPACITY_PATH {
+    let wanted = if path == CAPACITY_PATH || path == CLIENTS_PATH {
         [Scope::Capacity, Scope::Jobs].as_slice()
     } else {
         [Scope::Jobs].as_slice()
@@ -199,6 +215,7 @@ async fn route(
             jobs::settle(hub, principal, &id(j)?).await?;
             Ok(empty(StatusCode::NO_CONTENT))
         }
+        (Method::POST, ["v1", "clients"]) => hello(req, hub, principal).await,
         _ => Err(ApiError::new(
             StatusCode::NOT_FOUND,
             ErrorCode::NotFound,
@@ -329,6 +346,42 @@ async fn capacity(
             () = tokio::time::sleep_until(deadline) => {}
         }
     }
+}
+
+async fn hello(
+    req: Request<Incoming>,
+    hub: &Hub,
+    principal: &ApiPrincipal,
+) -> Result<Response<Body>, ApiError> {
+    let (hello, _) = read_json::<ClientHello>(req, MAX_BODY).await?;
+    if !valid_instance(&hello.instance) {
+        return Err(ApiError::invalid(format!(
+            "instance is 1 to {MAX_INSTANCE_LEN} letters, digits, '.', '_' or '-', starting \
+             with a letter or digit"
+        )));
+    }
+    if principal
+        .instance
+        .as_ref()
+        .is_some_and(|i| *i != hello.instance)
+    {
+        return Err(ApiError::invalid(format!(
+            "the hello's instance is not the one {INSTANCE_HEADER} names"
+        )));
+    }
+    if hello.runners.len() > MAX_CLIENT_RUNNERS
+        || hello
+            .runners
+            .iter()
+            .any(|r| r.labels.len() > MAX_CLIENT_RUNNER_LABELS)
+    {
+        return Err(ApiError::invalid(format!(
+            "a hello lists at most {MAX_CLIENT_RUNNERS} runners, each with at most \
+             {MAX_CLIENT_RUNNER_LABELS} labels"
+        )));
+    }
+    crate::clients::hello(hub, principal, hello).await?;
+    Ok(empty(StatusCode::NO_CONTENT))
 }
 
 async fn reserve(
@@ -472,6 +525,7 @@ async fn submit(
     let row = JobRow {
         key: principal.id.clone(),
         key_name: principal.row.name.clone(),
+        instance: principal.instance.clone(),
         request_id: ask.request_id.clone(),
         placement: ask.placement.clone(),
         title: title(&ask.spec),

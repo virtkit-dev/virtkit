@@ -162,6 +162,7 @@ request carries `authorization: Bearer <api key>`. Bodies are `vk_hub_proto::cli
 | `GET /v1/jobs/<id>/output?offset=<n>&wait=<secs>` | — | 200 bytes |
 | `POST /v1/jobs/<id>/cancel` | `CancelRequest` | 202 `JobView` |
 | `POST /v1/jobs/<id>/settle` | — | 204 |
+| `POST /v1/clients` | `ClientHello` | 204 |
 
 **Long polls.** `wait` on the two `GET`s, and `wait_secs` in a capacity request, hold a
 request for at most 60 seconds: a capacity answer until its `revision` passes `after`, a job
@@ -204,6 +205,23 @@ cancelling a finished job changes nothing and answers its view.
 **Settle.** The daemon has delivered the outcome to GitLab; the hub drops the job's output and
 keeps its record.
 
+**Instances.** Several daemons may share a key; a request names the one it comes from in a
+`vk-client-instance` header, 1 to 64 letters, digits, `.`, `_` or `-`, the first a letter or
+digit. The hub records when it last heard from each instance of each key, and puts the
+instance on the jobs it submits; a request without the header, or with a malformed one,
+counts as the key's unknown instance. A hello — `{instance, program, version, hostname,
+concurrent?, runners}`, each runner `{name, url, pool, labels, limit?}`, at most 64 runners
+of at most 32 labels each and never a credential — says what an instance is; a key of either
+scope may send one, and the hub keeps only the latest, stored display-safe, with any
+credentials, query or fragment cut from runner URLs; a URL that is not `http://` or
+`https://`, or has an `@` past its host, is dropped. A hello is recorded under the instance
+its body names; one whose well-formed header names another is refused, and one without a
+well-formed header — a malformed one counts as none — does not also count for the key's
+unknown instance. Neither decides anything. The hub keeps up to 32 instances per key, drops
+those unheard from for 30 days, and those of a key once it is removed. A hub that predates
+`/v1/clients` answers a hello with a 404 without a `code` and ignores the header, so a
+client stops sending hellos on that 404 and goes on as before.
+
 **Idempotency and retries.** `request_id` — 16 random bytes, hex — makes a create
 idempotent for a day: the same ID with the same body answers the first answer again, or 410
 `not_found` once the hub has dropped that job from its history; with another body, 409
@@ -213,7 +231,7 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|
-| 400 | `invalid` | unparseable body, malformed ID | no |
+| 400 | `invalid` | unparseable body, malformed ID, a hello's malformed instance or one its header contradicts | no |
 | 401 | `unauthorized` | no key, or expired or revoked | no |
 | 403 | `forbidden` | pool or envelope outside the key's policy | no |
 | 404 | `not_found` | no such job or reservation of this key's | no |

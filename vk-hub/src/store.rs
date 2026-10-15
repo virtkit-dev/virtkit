@@ -40,11 +40,13 @@ use crate::rollout::{
     DeleteRule, Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState,
 };
 
+mod clients;
 mod jobs;
 mod keys;
 mod registries;
 mod tools;
 
+pub use clients::MAX_INSTANCES_PER_KEY;
 pub use jobs::{
     DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, PREPARE_STAGE, RequestRow,
     SUMMARY_JOBS, Submitted,
@@ -741,6 +743,8 @@ impl Db {
             .context("opening the accounts table")?;
         txn.open_table(keys::API_KEYS)
             .context("opening the API keys table")?;
+        txn.open_table(clients::CLIENTS)
+            .context("opening the client instances table")?;
         txn.open_table(jobs::JOBS)
             .context("opening the jobs table")?;
         txn.open_table(tools::TOOLS)

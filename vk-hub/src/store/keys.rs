@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::Placement;
 use vk_hub_proto::job::Envelope;
 
+use super::clients::remove_clients_of;
 use super::{Db, append_audit, decode, encode, token_key};
 
 /// Key: `sha256(key)`, hex. Value: JSON [`KeyRow`].
@@ -122,6 +123,10 @@ pub struct ApiPrincipal {
     /// key of the same name does not inherit them.
     pub id: String,
     pub row: KeyRow,
+    /// The client instance the request named in
+    /// [`INSTANCE_HEADER`](vk_hub_proto::client::INSTANCE_HEADER); `None` when it named
+    /// none, or a malformed one.
+    pub instance: Option<String>,
 }
 
 impl ApiPrincipal {
@@ -295,7 +300,11 @@ impl Db {
         else {
             return Ok(None);
         };
-        Ok(row.live(now).then_some(ApiPrincipal { id, row }))
+        Ok(row.live(now).then_some(ApiPrincipal {
+            id,
+            row,
+            instance: None,
+        }))
     }
 
     /// Every key, revoked and expired ones included, oldest first.
@@ -321,8 +330,8 @@ impl Db {
     }
 
     /// Revoke the working key named `name`, audited as `actor`'s; with none working, remove
-    /// the keys of that name that no longer work, so their names and slots are free. Whether
-    /// anything changed.
+    /// the keys of that name that no longer work, and their client instances, so their names
+    /// and slots are free. Whether anything changed.
     pub fn revoke_api_key(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let event = {
@@ -350,6 +359,7 @@ impl Db {
             } else {
                 for id in &dead {
                     table.remove(id.as_str())?;
+                    remove_clients_of(&txn, id)?;
                 }
                 Some(format!(
                     "{actor} removed {} revoked or expired API key(s) named {name}",

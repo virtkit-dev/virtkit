@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use vk_hub_proto::client::{Capacity, ErrorCode, JobState, JobView, Placement, ReservationGrant};
+use vk_hub_proto::client::{
+    Capacity, ErrorCode, INSTANCE_HEADER, JobState, JobView, Placement, ReservationGrant,
+};
 use vk_hub_proto::dispatch::{
     Held, HeldJob, HeldReservation, HubJobMsg, LeaseEnd, LeaseState, NodeJobMsg, OfferReply,
     Refusal, RunState,
@@ -154,6 +156,18 @@ async fn api(
     key: Option<&str>,
     body: Option<Value>,
 ) -> Resp {
+    api_as(addr, method, path, key, None, body).await
+}
+
+/// [`api`], naming client instance `instance`.
+async fn api_as(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    instance: Option<&str>,
+    body: Option<Value>,
+) -> Resp {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let body = body
         .map(|b| serde_json::to_vec(&b).unwrap())
@@ -161,9 +175,12 @@ async fn api(
     let auth = key
         .map(|k| format!("Authorization: Bearer {k}\r\n"))
         .unwrap_or_default();
+    let instance = instance
+        .map(|i| format!("{INSTANCE_HEADER}: {i}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: hub\r\n{auth}Content-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: hub\r\n{auth}{instance}\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await.unwrap();
@@ -638,6 +655,278 @@ async fn api_keys_are_checked_on_every_request() {
     )
     .await;
     assert_eq!((resp.status, resp.code()), (404, ErrorCode::NotFound));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn hello_body(instance: &str) -> Value {
+    json!({
+        "instance": instance,
+        "program": "vk-gitlab",
+        "version": "0.91.1",
+        "hostname": "ci-1",
+        "runners": [{"name": "docker", "url": "https://gitlab.example.com", "pool": "ci"}],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_instances_are_recorded_from_their_requests_and_hellos() {
+    let dir = scratch("clients");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let watcher = api_key(
+        &hub,
+        "watcher",
+        &[Scope::Capacity],
+        now_secs(),
+        Duration::from_secs(60),
+    );
+    let hello = |key: &str, instance: &str, body: Value| {
+        let (key, instance) = (key.to_string(), instance.to_string());
+        async move {
+            api_as(
+                addr,
+                "POST",
+                "/v1/clients",
+                Some(&key),
+                Some(&instance),
+                Some(body),
+            )
+            .await
+        }
+    };
+
+    // A hello from a key of either scope; none from a request without a key.
+    assert_eq!(hello(&key, "s_1", hello_body("s_1")).await.status, 204);
+    assert_eq!(hello(&watcher, "s_2", hello_body("s_2")).await.status, 204);
+    let resp = api(addr, "POST", "/v1/clients", None, Some(hello_body("s_3"))).await;
+    assert_eq!((resp.status, resp.code()), (401, ErrorCode::Unauthorized));
+
+    // Malformed or oversized hellos.
+    let resp = hello(&key, "s_1", hello_body("a/b")).await;
+    assert_eq!((resp.status, resp.code()), (400, ErrorCode::Invalid));
+    let mut body = hello_body("s_1");
+    body["runners"] = json!(vec![body["runners"][0].clone(); 65]);
+    assert_eq!(hello(&key, "s_1", body).await.status, 400);
+    let mut body = hello_body("s_1");
+    body["hostname"] = json!("x".repeat(70_000));
+    let resp = hello(&key, "s_1", body).await;
+    assert_eq!((resp.status, resp.code()), (413, ErrorCode::TooLarge));
+
+    // The header names the instance a job comes from; without it, or malformed, the
+    // request is recorded under its key alone.
+    let resp = api_as(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some("s_1"),
+        Some(job_body(1, None, 300)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let job = resp.json::<JobView>().id;
+    let row = hub.db.job(&job).unwrap().unwrap();
+    assert_eq!(row.instance.as_deref(), Some("s_1"));
+    let ask = || Some(json!({"placement": placement()}));
+    let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("a b"), ask()).await;
+    assert_eq!(resp.status, 200);
+    wait_until(|| hub.db.clients().unwrap().len() == 3).await;
+    let mut rows: Vec<_> = hub.db.clients().unwrap().into_iter().map(|c| c.1).collect();
+    rows.sort_by(|a, b| (&a.key_name, &a.instance).cmp(&(&b.key_name, &b.instance)));
+    let names: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r.key_name.as_str(), r.instance.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [("gitlab", ""), ("gitlab", "s_1"), ("watcher", "s_2")]
+    );
+    assert_eq!(rows[1].hostname, "ci-1");
+    assert_eq!(rows[1].runners[0].pool, "ci");
+    assert_eq!(rows[0].hello_at, None);
+
+    // A revoked key's requests are not recorded.
+    assert!(
+        hub.db
+            .revoke_api_key("gitlab", "uid 0", now_secs())
+            .unwrap()
+    );
+    let resp = hello(&key, "s_9", hello_body("s_9")).await;
+    assert_eq!(resp.status, 401);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hub.db.clients().unwrap().len(), 3);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_is_recorded_under_the_instance_its_body_names() {
+    let dir = scratch("hello-instance");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let hello = |header: Option<&'static str>, body: &str| {
+        let (key, body) = (key.clone(), hello_body(body));
+        async move { api_as(addr, "POST", "/v1/clients", Some(&key), header, Some(body)).await }
+    };
+    // The header names one instance, the body another.
+    let resp = hello(Some("s_1"), "s_2").await;
+    assert_eq!((resp.status, resp.code()), (400, ErrorCode::Invalid));
+    // No header, or a malformed one: the body's instance alone, not the key's unknown one.
+    assert_eq!(hello(None, "s_3").await.status, 204);
+    assert_eq!(hello(Some("a b"), "s_4").await.status, 204);
+    assert_eq!(hello(Some("s_5"), "s_5").await.status, 204);
+    // `s_1` was heard from all the same.
+    wait_until(|| hub.db.clients().unwrap().len() == 4).await;
+    crate::clients::flush(&hub).await.unwrap();
+    let names: Vec<String> = hub
+        .db
+        .clients()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.1.instance)
+        .collect();
+    assert_eq!(names, ["s_1", "s_3", "s_4", "s_5"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_at_a_full_key_evicts_as_memory_does() {
+    let dir = scratch("hello-evict");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = crate::store::token_key(&key);
+    let now = now_secs();
+    for i in 0..crate::store::MAX_INSTANCES_PER_KEY {
+        hub.instances
+            .note(&id, &format!("s_{i:02}"), now - 1000 + i as u64);
+    }
+    crate::clients::flush(&hub).await.unwrap();
+    // `s_00` heard from since, in memory only: no longer the least recent.
+    hub.instances.note(&id, "s_00", now - 10);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/clients",
+        Some(&key),
+        Some(hello_body("new")),
+    )
+    .await;
+    assert_eq!(resp.status, 204, "{resp:?}");
+    let names: Vec<String> = hub
+        .db
+        .clients()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.1.instance)
+        .collect();
+    assert_eq!(names.len(), crate::store::MAX_INSTANCES_PER_KEY);
+    assert!(names.contains(&"s_00".into()) && names.contains(&"new".into()));
+    assert!(!names.contains(&"s_01".into()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_contact_at_a_full_key_evicts_as_memory_does() {
+    let dir = scratch("contact-evict");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = crate::store::token_key(&key);
+    let now = now_secs();
+    // As after a restart: the database holds a full key, memory nothing of it.
+    for i in 0..crate::store::MAX_INSTANCES_PER_KEY {
+        hub.db
+            .record_client(
+                &id,
+                "gitlab",
+                &format!("s_{i:02}"),
+                None,
+                now - 1000 + i as u64,
+                redb::Durability::Immediate,
+            )
+            .unwrap();
+    }
+    // `s_00` heard from since, its contact not yet written: no longer the least recent.
+    hub.instances.note(&id, "s_00", now - 10);
+    let ask = Some(json!({"placement": placement()}));
+    let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("new"), ask).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let names = || -> Vec<String> {
+        hub.db
+            .clients()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.1.instance)
+            .collect()
+    };
+    wait_until(|| names().contains(&"new".into())).await;
+    let names = names();
+    assert_eq!(names.len(), crate::store::MAX_INSTANCES_PER_KEY);
+    assert!(names.contains(&"s_00".into()));
+    assert!(!names.contains(&"s_01".into()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contacts_reach_the_database_through_the_flush() {
+    let dir = scratch("clients-flush");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = crate::store::token_key(&key);
+    let ask = || Some(json!({"placement": placement()}));
+    let row = |instance: &str| {
+        hub.db
+            .clients()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.1)
+            .find(|r| r.instance == instance)
+    };
+    let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("s_1"), ask()).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    wait_until(|| row("s_1").is_some()).await;
+    let first = row("s_1").unwrap().last_seen;
+    while now_secs() <= first {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("s_1"), ask()).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    // Held in memory until the flush.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(row("s_1").unwrap().last_seen, first);
+    crate::clients::flush(&hub).await.unwrap();
+    let flushed = row("s_1").unwrap();
+    assert!(flushed.last_seen > first);
+    assert_eq!(flushed.first_seen, first);
+
+    // An instance whose first write failed: memory holds it, the database does not.
+    let now = now_secs();
+    assert!(hub.instances.note(&id, "s_2", now));
+    assert!(row("s_2").is_none());
+    crate::clients::flush(&hub).await.unwrap();
+    assert_eq!(row("s_2").unwrap().last_seen, now);
+
+    // One the database evicted while memory still holds it, heard from again.
+    for i in 0..crate::store::MAX_INSTANCES_PER_KEY {
+        let at = now + 10 + i as u64;
+        hub.db
+            .record_client(
+                &id,
+                "gitlab",
+                &format!("x_{i:02}"),
+                None,
+                at,
+                redb::Durability::Immediate,
+            )
+            .unwrap();
+    }
+    assert!(row("s_1").is_none() && row("s_2").is_none());
+    assert!(!hub.instances.note(&id, "s_1", now + 1000));
+    crate::clients::flush(&hub).await.unwrap();
+    assert_eq!(row("s_1").unwrap().last_seen, now + 1000);
+    assert!(row("x_00").is_none());
+    assert_eq!(
+        hub.db.clients().unwrap().len(),
+        crate::store::MAX_INSTANCES_PER_KEY
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2309,7 +2598,7 @@ async fn client_connections_past_the_cap_are_told_to_retry() {
         .clone()
         .try_acquire_many_owned(all)
         .unwrap();
-    let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
+    let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("s_1"), ask()).await;
     assert_eq!((resp.status, resp.code()), (503, ErrorCode::Unavailable));
     assert_eq!(
         resp.json::<vk_hub_proto::client::ClientError>()
@@ -2320,6 +2609,11 @@ async fn client_connections_past_the_cap_are_told_to_retry() {
     drop(held);
     let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
     assert_eq!(resp.status, 200, "{resp:?}");
+    // The request turned away is no contact.
+    crate::clients::flush(&hub).await.unwrap();
+    let rows = hub.db.clients().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.instance, "");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -3180,6 +3474,7 @@ fn the_jobs_table_says_how_each_job_stands() {
     let row = |state, result: Option<JobResult>| crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
+        instance: None,
         request_id: request_id(1),
         placement: placement(),
         title: "GitLab job 7 of g/p (test)".into(),
@@ -3281,6 +3576,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
     let row = |n: u8| crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
+        instance: None,
         request_id: request_id(n),
         placement: placement(),
         title: format!("GitLab job {n}"),
@@ -3645,6 +3941,7 @@ fn a_job_is_shown_on_the_command_line() {
     let mut row = crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
+        instance: None,
         request_id: request_id(1),
         placement: placement(),
         title: "GitLab job 7 of g/p (test)".into(),

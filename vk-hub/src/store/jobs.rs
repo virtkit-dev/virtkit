@@ -79,6 +79,9 @@ pub struct JobRow {
     pub key: String,
     /// Its name, for display.
     pub key_name: String,
+    /// The client instance that submitted it ([`super::ApiPrincipal::instance`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     pub request_id: String,
     pub placement: Placement,
     /// What the job is, for display: GitLab's job ID, project and name.
@@ -1071,6 +1074,7 @@ mod tests {
         JobRow {
             key: "k".into(),
             key_name: "gitlab".into(),
+            instance: None,
             request_id: "1".repeat(32),
             placement: Placement {
                 pool: "ci".into(),
@@ -1724,6 +1728,23 @@ mod tests {
         assert_eq!(ids(&JobFilter::default()).last(), Some(&id(1)));
         assert!(ids(&by(Some("b"), None, None)).iter().all(|j| *j != id(1)));
         assert!(contains_folded("é-Main", "MAIN") && !contains_folded("É", "é"));
+    }
+
+    /// A record from before jobs named their client instance still reads, naming none.
+    #[test]
+    fn a_job_recorded_without_its_instance_decodes() {
+        let mut row = row(1);
+        row.instance = Some("runner-1".into());
+        let mut json = serde_json::to_value(&row).unwrap();
+        json.as_object_mut().unwrap().remove("instance").unwrap();
+        let older: JobRow = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            older,
+            JobRow {
+                instance: None,
+                ..row
+            }
+        );
     }
 
     /// The summary is of the newest jobs the filter matches, up to its bound, and says when

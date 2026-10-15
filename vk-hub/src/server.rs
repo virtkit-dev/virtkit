@@ -145,6 +145,8 @@ pub struct Hub {
     sessions: watch::Sender<u64>,
     /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
     pub(crate) client_conns: Arc<Semaphore>,
+    /// The client instances heard from.
+    pub(crate) instances: crate::clients::Instances,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
 }
@@ -199,6 +201,7 @@ impl Hub {
             jobs: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
+            instances: crate::clients::Instances::default(),
             dispatch: crate::jobs::Dispatch::new(
                 None,
                 crate::jobs::DEFAULT_LOST_AFTER,
@@ -745,6 +748,12 @@ async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Re
         )
         .retry_after(1)
         .response();
+    }
+    // A hello naming no instance in its header is recorded under the one its body names.
+    let hello =
+        req.method() == Method::POST && req.uri().path() == vk_hub_proto::client::CLIENTS_PATH;
+    if principal.instance.is_some() || !hello {
+        crate::clients::seen(hub, &principal, crate::now_secs());
     }
     crate::client::serve(req, hub, principal).await
 }
