@@ -469,29 +469,19 @@ impl Db {
             .filter(|r| now.saturating_sub(r.at) < REQUEST_KEEP))
     }
 
-    /// Record that the request `request_id` of key `key` was answered `answer`, with `event`
-    /// audited as `actor`'s against `node`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_request(
-        &self,
-        key: &str,
-        request_id: &str,
-        row: &RequestRow,
-        node: Option<&str>,
-        actor: &str,
-        event: &str,
-        now: u64,
-    ) -> Result<()> {
+    /// Record that the request `request_id` of key `key` was answered with `row`. Unaudited: a
+    /// runner reserves before every poll, and the reservation a job uses is audited when the
+    /// job is sent to its node.
+    pub fn record_request(&self, key: &str, request_id: &str, row: &RequestRow) -> Result<()> {
         let txn = self.db.begin_write().context("starting a write")?;
         {
             let mut requests = txn.open_table(REQUESTS)?;
-            sweep_requests(self, &mut requests, now)?;
+            sweep_requests(self, &mut requests, row.at)?;
             requests.insert(
                 request_key(key, request_id).as_str(),
                 encode(row)?.as_slice(),
             )?;
         }
-        append_audit(&txn, node, actor, event, now)?;
         txn.commit().context("recording a request")
     }
 

@@ -375,26 +375,11 @@ async fn reserve(
         digest,
         answer: serde_json::to_value(&grant).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?,
     };
-    let actor = principal.actor();
-    let event = format!(
-        "{actor} reserved {} on node {} for {}s (reservation {})",
-        crate::store::envelope_text(grant.envelope),
-        grant.node,
-        grant.lease_secs,
-        grant.reservation
-    );
-    let (db, key, rid, node) = (
-        hub.db.clone(),
-        principal.id.clone(),
-        ask.request_id.clone(),
-        grant.node.clone(),
-    );
-    let recorded = tokio::task::spawn_blocking(move || {
-        db.record_request(&key, &rid, &row, Some(&node), &actor, &event, row.at)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!(e))
-    .and_then(|r| r);
+    let (db, key, rid) = (hub.db.clone(), principal.id.clone(), ask.request_id.clone());
+    let recorded = tokio::task::spawn_blocking(move || db.record_request(&key, &rid, &row))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .and_then(|r| r);
     recorded?;
     unrecorded.disarm();
     Ok(json(StatusCode::CREATED, &grant))

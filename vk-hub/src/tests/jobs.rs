@@ -763,6 +763,12 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
         Some("memory: 4096 MiB does not fit")
     );
     assert_eq!(refusal(&small.id), None);
+    // A runner reserves before every poll, so a grant is not audited.
+    let audit = hub.db.audits(None, 50).unwrap();
+    assert!(
+        audit.iter().all(|a| !a.event.contains(" reserved ")),
+        "{audit:?}"
+    );
 
     // The same request again is answered the same, with no second offer; with another body,
     // it conflicts.

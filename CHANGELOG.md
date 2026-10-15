@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The hub's audit log no longer records capacity reservations**, which an idle runner
+  takes before every GitLab poll. The audit line for a job's start still names its
+  reservation.
+
 ## [0.91.0] - 2026-10-14
 
 ### Added
