@@ -378,6 +378,14 @@ Once the job's VM is gone, the host compresses the log with zstd to `atop.log.zs
 about twenty times smaller; a runner that died before its job's cleanup leaves the log plain,
 and a later day's first job compresses it — one over 512 MiB stays plain. `vk atop` reads either.
 
+Beside it, `vmm-threads.txt` records what the threads of the job VM's VMM were doing when the
+host stopped it: each thread's name, state, wait channel and the syscall it was blocked in, with
+the file its first argument names when that is an fd. A job that hung on a guest request the
+host never answered (e.g. an `fs worker` thread stuck in a syscall) ends at its timeout, and
+this is what is left of the VMM. Kernel stacks are included only when the runner runs as root.
+The record is kept only where the guest's statistics are, and a runner that dies before the
+job's cleanup loses it.
+
 Every job's trace ends with the account of it, in a section GitLab's web UI shows folded — one
 line to open when a job is worth looking into, and out of the way when it is not:
 

@@ -98,6 +98,7 @@ mod vm;
 mod vmdk;
 mod vmm;
 mod vmmctl;
+mod vmmthreads;
 mod vms;
 mod winbuild;
 mod wincache;

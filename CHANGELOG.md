@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **CI jobs save a host-side thread snapshot when their VM stops** in `vmm-threads.txt`
+  beside the job's statistics log, showing what each thread was blocked on when a job timed out.
+
 ## [0.91.1] - 2026-10-15
 
 ### Changed

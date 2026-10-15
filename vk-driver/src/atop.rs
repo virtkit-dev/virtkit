@@ -133,6 +133,13 @@ pub fn job_archive_dir(ctx: &JobCtx) -> Option<PathBuf> {
     job_archive_dir_in(&ctx.job_dir)
 }
 
+/// [`job_archive_dir`], or `None` while the supervisor, and so the guest sharing that
+/// directory, may still be alive.
+pub fn job_archive_dir_after_vm(ctx: &JobCtx) -> Option<PathBuf> {
+    let dir = job_archive_dir(ctx)?;
+    crate::vm::live_supervisor_pid(ctx).is_none().then_some(dir)
+}
+
 /// [`job_archive_dir`] of the job in `job_dir`.
 fn job_archive_dir_in(job_dir: &Path) -> Option<PathBuf> {
     let raw = std::fs::read(JobCtx::atop_dir_file_in(job_dir)).ok()?;
@@ -435,12 +442,9 @@ fn prune_archive_as_of(root: &Path, days: u64, today: i64) {
 /// A supervisor still alive is a guest that may still write, and its log is left plain for the
 /// sweep. Best effort: a log that will not compress stays readable as it is.
 pub fn compress_job_log(ctx: &JobCtx) {
-    let Some(dir) = job_archive_dir(ctx) else {
+    let Some(dir) = job_archive_dir_after_vm(ctx) else {
         return;
     };
-    if crate::vm::live_supervisor_pid(ctx).is_some() {
-        return;
-    }
     // A SIGKILLed supervisor's VMM gets its `PDEATHSIG` asynchronously, so a last
     // guest write can land after this point: one while the log is read breaks the pledged size
     // and leaves it plain; one after its end is read and before the unlink is lost. The signals

@@ -3405,8 +3405,10 @@ pub fn stop_supervisor(ctx: &JobCtx) {
 }
 
 /// Gracefully stop the supervisor's own VMM child: SIGTERM, which the libkrun boot child
-/// turns into an ACPI power-button press, then SIGKILL once the timeout passes.
+/// turns into an ACPI power-button press, then SIGKILL once the timeout passes. What its
+/// threads were doing is recorded first, for a job stopped because it hung.
 fn graceful_vmm_stop(ctx: &JobCtx, child: &mut std::process::Child) {
+    crate::vmmthreads::record(ctx, child.id());
     let timeout = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs);
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     if !wait_child_gone(child, timeout) {
@@ -3438,6 +3440,7 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     crate::admit::release(&ctx.admit_dir(), &ctx.job_id);
     // Before the job dir goes: the marker naming the archive directory is in it.
     crate::atop::compress_job_log(ctx);
+    crate::vmmthreads::archive(ctx);
     let removed = match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

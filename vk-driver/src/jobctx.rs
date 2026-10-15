@@ -320,6 +320,10 @@ impl JobCtx {
     pub fn vmm_log(&self) -> PathBuf {
         self.job_dir.join("console.vmm.log")
     }
+    /// What the VMM's threads were doing when the supervisor stopped it ([`crate::vmmthreads`]).
+    pub fn vmm_threads_file(&self) -> PathBuf {
+        self.job_dir.join(crate::vmmthreads::FILE_NAME)
+    }
     pub fn net_lease(&self) -> PathBuf {
         self.job_dir.join("net.lease")
     }
