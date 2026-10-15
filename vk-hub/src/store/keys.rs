@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::Placement;
@@ -98,6 +98,23 @@ pub struct KeyPolicy {
     pub max_envelope: Option<Envelope>,
 }
 
+/// A refusal from [`Db::create_api_key`]: invalid name, lifetime or policy, a name taken
+/// by a live key, or no room for another key. Its message can be shown to the user.
+#[derive(Debug)]
+pub struct KeyRefused(pub String);
+
+impl std::fmt::Display for KeyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyRefused {}
+
+fn refused(why: impl Into<String>) -> anyhow::Error {
+    KeyRefused(why.into()).into()
+}
+
 /// Who a client request authenticated as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiPrincipal {
@@ -182,29 +199,31 @@ impl Db {
         now: u64,
     ) -> Result<(String, KeyRow)> {
         if !valid_name(name) {
-            bail!(
+            return Err(refused(format!(
                 "{name:?}: a key's name is 1 to {MAX_NAME} letters, digits, '.', '_' or '-', \
                  starting with a letter or digit"
-            );
+            )));
         }
         if ttl.is_zero() || ttl > MAX_KEY_TTL {
-            bail!(
+            return Err(refused(format!(
                 "a key's lifetime must be between 1s and {} days",
                 MAX_KEY_TTL.as_secs() / 86_400
-            );
+            )));
         }
         if policy.scopes.is_empty() {
-            bail!("a key needs at least one scope");
+            return Err(refused("a key needs at least one scope"));
         }
         if policy.pools.is_empty() {
-            bail!("a key needs at least one pool, or {ANY_POOL} for any");
+            return Err(refused(format!(
+                "a key needs at least one pool, or {ANY_POOL} for any"
+            )));
         }
         if let Some(bad) = policy
             .pools
             .iter()
             .find(|p| *p != ANY_POOL && !valid_name(p))
         {
-            bail!("{bad:?} is not a pool's name");
+            return Err(refused(format!("{bad:?} is not a pool's name")));
         }
         let mut scopes = policy.scopes.clone();
         scopes.sort();
@@ -233,12 +252,14 @@ impl Db {
                 let (_, value) = entry?;
                 let other = decode::<KeyRow>(value.value())?;
                 if other.name == name && other.live(now) {
-                    bail!("a key named {name:?} already works; revoke it first");
+                    return Err(refused(format!(
+                        "a key named {name:?} already works; revoke it first"
+                    )));
                 }
                 count = count.saturating_add(1);
             }
             if count >= MAX_KEYS {
-                bail!("the hub holds {MAX_KEYS} keys already");
+                return Err(refused(format!("the hub holds {MAX_KEYS} keys already")));
             }
             table.insert(token_key(&key).as_str(), encode(&row)?.as_slice())?;
         }
@@ -279,14 +300,23 @@ impl Db {
 
     /// Every key, revoked and expired ones included, oldest first.
     pub fn api_keys(&self) -> Result<Vec<KeyRow>> {
+        Ok(self
+            .api_keys_with_ids()?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// [`api_keys`](Self::api_keys) with each key's [`ApiPrincipal::id`].
+    pub fn api_keys_with_ids(&self) -> Result<Vec<(String, KeyRow)>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(API_KEYS)?;
         let mut keys = Vec::new();
         for entry in table.iter()? {
-            let (_, value) = entry?;
-            keys.push(decode::<KeyRow>(value.value())?);
+            let (id, value) = entry?;
+            keys.push((id.value().to_string(), decode::<KeyRow>(value.value())?));
         }
-        keys.sort_by(|a, b| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
+        keys.sort_by(|(_, a), (_, b)| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
         Ok(keys)
     }
 
@@ -370,10 +400,10 @@ mod tests {
         assert!(db.api_key("vkk_00", 101).unwrap().is_none());
         assert!(db.api_key("", 101).unwrap().is_none());
         // A second working key of the same name is refused; a revoked one frees it.
-        assert!(
-            db.create_api_key("gitlab", &policy(), DAY, "uid 0", 102)
-                .is_err()
-        );
+        let taken = db
+            .create_api_key("gitlab", &policy(), DAY, "uid 0", 102)
+            .unwrap_err();
+        assert!(taken.is::<KeyRefused>(), "{taken:#}");
         assert!(db.revoke_api_key("gitlab", "uid 0", 103).unwrap());
         assert!(db.api_key(&key, 104).unwrap().is_none());
         let (again, _) = db
@@ -381,6 +411,13 @@ mod tests {
             .unwrap();
         assert!(db.api_key(&again, 106).unwrap().is_some());
         assert_eq!(db.api_keys().unwrap().len(), 2);
+        let ids: Vec<String> = db
+            .api_keys_with_ids()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, [token_key(&key), token_key(&again)]);
         // Revoking the working one, then removing both that no longer work.
         assert!(db.revoke_api_key("gitlab", "uid 0", 107).unwrap());
         assert!(db.revoke_api_key("gitlab", "uid 0", 108).unwrap());
@@ -431,28 +468,37 @@ mod tests {
     #[test]
     fn bad_names_lifetimes_and_policies_are_refused() {
         let db = Db::open_memory().unwrap();
+        let is_refused = |name: &str, p: &KeyPolicy, ttl: Duration| {
+            db.create_api_key(name, p, ttl, "uid 0", 1)
+                .unwrap_err()
+                .is::<KeyRefused>()
+        };
         for name in ["", "-x", "a b", &"a".repeat(MAX_NAME + 1)] {
-            assert!(
-                db.create_api_key(name, &policy(), DAY, "uid 0", 1).is_err(),
-                "{name:?}"
-            );
+            assert!(is_refused(name, &policy(), DAY), "{name:?}");
         }
-        assert!(
-            db.create_api_key("k", &policy(), Duration::ZERO, "uid 0", 1)
-                .is_err()
-        );
-        assert!(
-            db.create_api_key("k", &policy(), MAX_KEY_TTL + DAY, "uid 0", 1)
-                .is_err()
-        );
+        assert!(is_refused("k", &policy(), Duration::ZERO));
+        assert!(is_refused("k", &policy(), MAX_KEY_TTL + DAY));
         let mut p = policy();
         p.pools = vec!["bad pool".into()];
-        assert!(db.create_api_key("k", &p, DAY, "uid 0", 1).is_err());
+        assert!(is_refused("k", &p, DAY));
         p.pools = vec![];
-        assert!(db.create_api_key("k", &p, DAY, "uid 0", 1).is_err());
+        assert!(is_refused("k", &p, DAY));
         let mut p = policy();
         p.scopes.clear();
-        assert!(db.create_api_key("k", &p, DAY, "uid 0", 1).is_err());
+        assert!(is_refused("k", &p, DAY));
         assert!(db.api_keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_hub_refuses_another_key() {
+        let db = Db::open_memory().unwrap();
+        for i in 0..MAX_KEYS {
+            db.create_api_key(&format!("k{i}"), &policy(), DAY, "uid 0", 1)
+                .unwrap();
+        }
+        let full = db
+            .create_api_key("one-more", &policy(), DAY, "uid 0", 1)
+            .unwrap_err();
+        assert!(full.is::<KeyRefused>(), "{full:#}");
     }
 }
