@@ -3662,6 +3662,146 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     );
 }
 
+/// `/jobs?key=` narrows the history, older pages and its stream to one API key's jobs. The
+/// form keeps the key; the results show it by name, or by its ID's start once the key is gone,
+/// with a link dropping it that follows the rest of the filter.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_history_is_filtered_by_api_key() {
+    use crate::store::{KeyPolicy, Scope};
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+    };
+    let now = crate::now_secs();
+    let ttl = Duration::from_secs(3600);
+    hub.db
+        .create_api_key("deploy", &policy, ttl, "uid 0", now)
+        .unwrap();
+    let keys = hub.db.api_keys_with_ids().unwrap();
+    let (key, _) = keys.iter().find(|(_, r)| r.name == "deploy").unwrap();
+    for n in 1..=3 {
+        let mut row = history_job(n, "acme/web");
+        if n != 2 {
+            row.key = key.clone();
+            row.key_name = "deploy".into();
+        }
+        hub.db
+            .submit_job(
+                &format!("{n:032x}"),
+                &row,
+                &n.to_string(),
+                b"{}",
+                "key deploy",
+                now,
+            )
+            .unwrap();
+    }
+    hub.jobs_changed();
+    let rows = |page: &str| page.matches("<tr><td title=").count();
+
+    let page = get(
+        addr,
+        &format!("/jobs?project=acme%2Fweb&key={key}"),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert_eq!(rows(&page), 2, "{page}");
+    assert!(!page.contains(">build-2<"), "{page}");
+    assert!(
+        page.contains(&format!(
+            "<input type=\"hidden\" name=\"key\" value=\"{key}\">"
+        )),
+        "{page}"
+    );
+    let results = |page: &str| {
+        page.split_once("<div id=\"jobs-results\">")
+            .unwrap()
+            .1
+            .to_string()
+    };
+    assert!(
+        results(&page).starts_with(
+            "<p><span class=\"badge\">Key: deploy <a href=\"/jobs?project=acme%2Fweb\" \
+             title=\"Every key's jobs\" aria-label=\"Every key's jobs\">×</a></span></p>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!(
+            "sse-connect=\"/events/jobs?key={key}&amp;project=acme%2Fweb\""
+        )),
+        "{page}"
+    );
+    let mut stream = Events::open(addr, &format!("/events/jobs?key={key}"), &viewer).await;
+    assert!(stream.head.starts_with("HTTP/1.1 200"), "{}", stream.head);
+    let first = stream.next().await.unwrap();
+    assert!(
+        first.contains("2 jobs") && !first.contains(">build-2<"),
+        "{first}"
+    );
+
+    // The form's request swaps in the results, the chip's link following the new filter.
+    let reply = request(
+        addr,
+        "GET",
+        &format!("/jobs?project=acme%2Fapi&key={key}"),
+        &[
+            &format!("Cookie: {viewer}"),
+            "HX-Request: true",
+            "HX-Target: jobs-results",
+        ],
+        "",
+    )
+    .await;
+    assert!(
+        results(&reply.body).starts_with(
+            "<p><span class=\"badge\">Key: deploy <a href=\"/jobs?project=acme%2Fapi\""
+        ),
+        "{}",
+        reply.body
+    );
+
+    // An older page keeps the key, in the chip and in its link to the newest.
+    let page = get(addr, &format!("/jobs?key={key}&before=99"), Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 2, "{page}");
+    assert!(
+        results(&page).starts_with("<p><span class=\"badge\">Key: deploy <a href=\"/jobs\""),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!("<a href=\"/jobs?key={key}\">the newest</a>")),
+        "{page}"
+    );
+
+    // A key no longer kept, by its ID's start.
+    let gone = "ab".repeat(32);
+    let page = get(addr, &format!("/jobs?key={gone}"), Some(&viewer))
+        .await
+        .body;
+    assert!(page.contains("none match"), "{page}");
+    assert!(
+        page.contains("<span class=\"badge\">Key: abababababab <a href=\"/jobs\""),
+        "{page}"
+    );
+    // What cannot be a key's ID is ignored by the page, refused by the stream.
+    let upper = key.to_ascii_uppercase();
+    for bad in ["zz", upper.as_str()] {
+        let page = get(addr, &format!("/jobs?key={bad}"), Some(&viewer))
+            .await
+            .body;
+        assert_eq!(rows(&page), 3, "{page}");
+        assert!(!page.contains("name=\"key\""), "{page}");
+        let reply = get(addr, &format!("/events/jobs?key={bad}"), Some(&viewer)).await;
+        assert_eq!(reply.status, 404, "{bad}");
+    }
+}
+
 /// Job `n` of `project`, as submitted.
 pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
     use vk_hub_proto::client::{JobState, Placement};

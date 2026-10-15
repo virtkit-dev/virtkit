@@ -12,6 +12,9 @@ All notable changes to virtkit will be documented in this file.
   GitLab URL, pool, labels), at start and every minute, so the hub can tell apart the daemons
   sharing one API key. Runner tokens and the API key are never sent, and a hub too old to take
   this is left alone.
+- **The hub's job history can be narrowed to one API key's jobs** with `/jobs?key=<key ID>`,
+  a key's ID being the SHA-256 of the key; the filter shows the key by name and can be dropped
+  with one click.
 
 ## [0.91.1] - 2026-10-15
 

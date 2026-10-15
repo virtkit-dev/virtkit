@@ -307,6 +307,8 @@ impl JobOutcome {
 /// Jobs matching every active filter. A missing field matches no filter value.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct JobFilter {
+    /// The ID of the key that submitted it ([`JobRow::key`]).
+    pub key: Option<String>,
     /// The node it was sent to.
     pub node: Option<String>,
     /// Its GitLab project, exactly.
@@ -328,9 +330,8 @@ impl JobFilter {
             want.as_deref()
                 .is_none_or(|w| have.as_deref().is_some_and(|h| contains_folded(h, w)))
         };
-        self.node
-            .as_ref()
-            .is_none_or(|n| row.node.as_ref() == Some(n))
+        self.key.as_ref().is_none_or(|k| row.key == *k)
+            && (self.node.as_ref()).is_none_or(|n| row.node.as_ref() == Some(n))
             && (self.project.as_ref()).is_none_or(|p| row.project.as_ref() == Some(p))
             && self.outcome.is_none_or(|o| row.outcome() == o)
             && holds(&self.name, &row.name)
@@ -1728,6 +1729,28 @@ mod tests {
         assert_eq!(ids(&JobFilter::default()).last(), Some(&id(1)));
         assert!(ids(&by(Some("b"), None, None)).iter().all(|j| *j != id(1)));
         assert!(contains_folded("é-Main", "MAIN") && !contains_folded("É", "é"));
+    }
+
+    /// The key filter matches the submitting key's ID exactly.
+    #[test]
+    fn a_history_page_is_filtered_by_key() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=4 {
+            let mut row = job(n, JobState::Finished, None);
+            row.key = if n.is_multiple_of(2) { "a" } else { "b" }.repeat(64);
+            submit(&db, n, &row);
+        }
+        let by = |key: &str| {
+            let filter = JobFilter {
+                key: Some(key.into()),
+                ..JobFilter::default()
+            };
+            let page = db.job_page(&filter, None, 10, 100).unwrap();
+            page.rows.into_iter().map(|r| r.1).collect::<Vec<_>>()
+        };
+        assert_eq!(by(&"a".repeat(64)), [4, 2].map(id));
+        assert_eq!(by(&"b".repeat(64)), [3, 1].map(id));
+        assert!(by(&"c".repeat(64)).is_empty());
     }
 
     /// A record from before jobs named their client instance still reads, naming none.

@@ -1,6 +1,6 @@
 //! The fleet's `/jobs`, for every session: the history of the jobs the hub placed, newest
-//! first, a page at a time, filtered by node, GitLab project, result, job name, branch and
-//! pipeline, with what each used on its node where the node reported it
+//! first, a page at a time, filtered by API key, node, GitLab project, result, job name, branch
+//! and pipeline, with what each used on its node where the node reported it
 //! ([`vk_hub_proto::job::JobUsage`]) and a line summing up every job the filter matches.
 //! Read only. Each job's result links to its page, `/jobs/<id>`: its record and its output as
 //! far as the hub holds or kept it, followed while it runs ([`super::job_output`]), for when
@@ -46,11 +46,11 @@ const JOBS_PAGE: usize = 100;
 const MAX_TEXT: usize = 1024;
 
 /// The filter's parameters, in the order a query carries them.
-const FIELDS: [&str; 7] = [
-    "node", "project", "result", "name", "ref", "pipeline", "events",
+const FIELDS: [&str; 8] = [
+    "key", "node", "project", "result", "name", "ref", "pipeline", "events",
 ];
 
-/// `GET /jobs[?node=…&project=…&result=…&name=…&ref=…&pipeline=…&events=1&before=…]`. A
+/// `GET /jobs[?key=…&node=…&project=…&result=…&name=…&ref=…&pipeline=…&events=1&before=…]`. A
 /// filter value that cannot be one is ignored, as the audit log ignores a node that is not an
 /// ID. `swap`: the filter's form asks for it ([`filter_swap`]).
 pub(super) async fn get(
@@ -73,26 +73,47 @@ pub(super) async fn get(
     let main = match before {
         None => {
             let renders = renders.clone();
-            let newest =
-                blocking(move || renders.page(&hub, &wanted, Instant::now(), swap)).await?;
+            let (newest, key_name) = blocking(move || {
+                let newest = renders.page(&hub, &wanted, Instant::now(), swap)?;
+                anyhow::Ok((newest, key_name(&hub, &wanted)?))
+            })
+            .await?;
             let Newest {
                 fragment,
                 projects,
                 names,
             } = &*newest;
-            history(&filter, false, fragment, projects, names)
+            history(
+                &filter,
+                false,
+                fragment,
+                projects,
+                names,
+                key_name.as_deref(),
+            )
         }
         Some(before) => {
-            let (jobs, names) = blocking(move || {
+            let (jobs, names, key_name) = blocking(move || {
                 let jobs = crate::jobs::history(&hub, &wanted, Some(before), JOBS_PAGE)?;
-                anyhow::Ok((jobs, hub.db.node_names()?))
+                anyhow::Ok((jobs, hub.db.node_names()?, key_name(&hub, &wanted)?))
             })
             .await?;
             let shown = fragment(&filter, true, &jobs, &names, crate::now_secs());
-            history(&filter, true, &shown, &jobs.projects, &names)
+            history(
+                &filter,
+                true,
+                &shown,
+                &jobs.projects,
+                &names,
+                key_name.as_deref(),
+            )
         }
     };
     Ok(page(fleet::layout("Jobs", PATH, auth, &main)))
+}
+
+fn key(value: &str) -> Option<String> {
+    vk_hub_proto::valid_sha256(value).then(|| value.to_string())
 }
 
 fn node(value: &str) -> Option<String> {
@@ -128,6 +149,7 @@ fn set(filter: &mut JobFilter, name: &str, value: &str) -> bool {
         return true;
     }
     match name {
+        "key" => key(value).map(|v| filter.key = Some(v)),
         "node" => node(value).map(|v| filter.node = Some(v)),
         "project" => project(value).map(|v| filter.project = Some(v)),
         "result" => JobOutcome::parse(value).map(|v| filter.outcome = Some(v)),
@@ -277,19 +299,30 @@ fn read(hub: &Hub, filter: &JobFilter) -> Result<Newest> {
     })
 }
 
+/// The name of the key `filter` narrows to; `None` for no key, or one no longer kept.
+fn key_name(hub: &Hub, filter: &JobFilter) -> Result<Option<String>> {
+    let Some(key) = &filter.key else {
+        return Ok(None);
+    };
+    let mut rows = hub.db.api_keys_with_ids()?.into_iter();
+    Ok(rows.find(|(id, _)| id == key).map(|(_, row)| row.name))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A map and a rendering, each replaced whole: nothing half-written for a panic to leave.
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Page body: the filter and `shown` jobs. The newest page stays live. With a cursor
-/// (`paged`), keep the page as loaded and link back to the newest.
+/// (`paged`), keep the page as loaded and link back to the newest. `key_name`: as for
+/// [`key_chip`].
 fn history(
     filter: &JobFilter,
     paged: bool,
     shown: &Html,
     projects: &[String],
     names: &[(String, String)],
+    key_name: Option<&str>,
 ) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Jobs</h1>");
@@ -298,6 +331,9 @@ fn history(
     // Replace this part with the new filter's results, including the live fragment,
     // so the old stream closes and the new one opens.
     h.raw("<div id=\"").raw(RESULTS).raw("\">");
+    // Here rather than in the form, which a filter request leaves as it is, so its link
+    // follows the filter.
+    key_chip(&mut h, filter, key_name);
     if paged {
         h.raw("<p class=\"sub\">Older jobs, as they stood when this page was loaded; <a href=\"");
         href(&mut h, filter, None);
@@ -428,8 +464,26 @@ fn job_table(
     h.raw("</tbody></table></section>");
 }
 
+/// The key `filter` narrows to, as a chip: by `key_name` or, for a key no longer kept, its
+/// ID's start; its link drops the key and keeps the rest of the filter.
+fn key_chip(h: &mut Html, filter: &JobFilter, key_name: Option<&str>) {
+    let Some(id) = &filter.key else {
+        return;
+    };
+    h.raw("<p><span class=\"badge\">Key: ")
+        .text(key_name.unwrap_or_else(|| crate::store::short(id)))
+        .raw(" <a href=\"");
+    let every_key = JobFilter {
+        key: None,
+        ..filter.clone()
+    };
+    href(h, &every_key, None);
+    h.raw("\" title=\"Every key's jobs\" aria-label=\"Every key's jobs\">×</a></span></p>");
+}
+
 /// The filter's form. Keep the selected node or project as an option even if the node was
-/// removed or the project is outside the scanned history.
+/// removed or the project is outside the scanned history. A key, set only by the URL, is kept
+/// hidden ([`key_chip`] shows it).
 ///
 /// With htmx, selections apply immediately and typing after a 300 ms pause. Each request
 /// replaces any pending request, fetches the filtered page, swaps in its jobs and updates
@@ -447,8 +501,13 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
         .raw(RESULTS)
         .raw("\" hx-select=\"#")
         .raw(RESULTS)
-        .raw("\" hx-swap=\"outerHTML\" hx-push-url=\"true\" hx-sync=\"this:replace\">")
-        .raw("<select name=\"node\" aria-label=\"Node\">")
+        .raw("\" hx-swap=\"outerHTML\" hx-push-url=\"true\" hx-sync=\"this:replace\">");
+    if let Some(id) = &filter.key {
+        h.raw("<input type=\"hidden\" name=\"key\" value=\"")
+            .text(id)
+            .raw("\">");
+    }
+    h.raw("<select name=\"node\" aria-label=\"Node\">")
         .raw("<option value=\"\">Every node</option>");
     if let Some(node) = &filter.node
         && !names.iter().any(|(id, _)| id == node)
@@ -544,6 +603,7 @@ fn query(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
     let events = filter.events.then_some("1");
     let before = before.map(|b| b.to_string());
     let fields = [
+        ("key", filter.key.as_deref()),
         ("node", filter.node.as_deref()),
         ("project", filter.project.as_deref()),
         ("result", filter.outcome.map(JobOutcome::name)),
@@ -1263,6 +1323,7 @@ mod tests {
     #[test]
     fn a_filter_s_query_reads_back_as_the_filter() {
         let filter = JobFilter {
+            key: Some("cd".repeat(32)),
             node: Some("ab".repeat(16)),
             project: Some("g/p q".into()),
             outcome: Some(JobOutcome::Running),
@@ -1277,9 +1338,10 @@ mod tests {
         assert_eq!(
             written,
             format!(
-                "?node={}&amp;project=g%2Fp%20q&amp;result=running\
+                "?key={}&amp;node={}&amp;project=g%2Fp%20q&amp;result=running\
                  &amp;name=test%3A%20%22e2e%22%20%3Cx%3E&amp;ref=feature%2F%C3%A9%26x%3D1\
                  &amp;pipeline=4012&amp;events=1",
+                "cd".repeat(32),
                 "ab".repeat(16)
             )
         );
@@ -1287,7 +1349,9 @@ mod tests {
         assert_eq!(stream_filter(Some(&unescaped)), Some(filter.clone()));
         // Trim surrounding whitespace from search text; empty fields mean "any".
         assert_eq!(
-            stream_filter(Some("name=+build+&ref=&pipeline=&node=&project=&result=")),
+            stream_filter(Some(
+                "name=+build+&ref=&pipeline=&key=&node=&project=&result="
+            )),
             Some(JobFilter {
                 name: Some("build".into()),
                 ..JobFilter::default()
