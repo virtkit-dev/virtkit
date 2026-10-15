@@ -745,6 +745,30 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
     assert_eq!(rows[1].runners[0].pool, "ci");
     assert_eq!(rows[0].hello_at, None);
 
+    // The clients page's view: each key with its instances, what they hold, and its jobs.
+    let id = crate::store::token_key(&key);
+    let work = crate::jobs::client_work(&hub);
+    let queued = crate::jobs::Work {
+        queued: 1,
+        ..Default::default()
+    };
+    assert_eq!(work.get(&(id.clone(), "s_1".into())), Some(&queued));
+    let views = crate::clients::views(&hub).unwrap();
+    let shown: Vec<(&str, u64, Vec<&str>)> = views
+        .iter()
+        .map(|v| {
+            let instances = v.instances.iter().map(|i| i.row.instance.as_str());
+            (v.row.name.as_str(), v.jobs, instances.collect())
+        })
+        .collect();
+    assert_eq!(shown.len(), 2);
+    assert!(shown.contains(&("watcher", 0, vec!["s_2"])), "{shown:?}");
+    let gitlab = views.iter().find(|v| v.id == id).unwrap();
+    assert_eq!(gitlab.jobs, 1);
+    let s_1 = gitlab.instances.iter().find(|i| i.row.instance == "s_1");
+    assert_eq!(s_1.map(|i| i.work), Some(queued));
+    assert_eq!(gitlab.instances.len(), 2);
+
     // A revoked key's requests are not recorded.
     assert!(
         hub.db

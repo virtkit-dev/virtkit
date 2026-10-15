@@ -636,6 +636,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 &actor,
                 crate::now_secs(),
             )?;
+            hub.clients_changed();
             // The key itself is never logged: it is the credential.
             eprintln!("vk-hub: admin: {actor} created API key {name}");
             serde_json::to_value(CreatedKey { key, row })?
@@ -644,6 +645,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::RevokeKey { name } => {
             let revoked = hub.db.revoke_api_key(&name, &actor, crate::now_secs())?;
             if revoked {
+                hub.clients_changed();
                 eprintln!("vk-hub: admin: {actor} revoked API key {name}");
             }
             serde_json::to_value(revoked)?

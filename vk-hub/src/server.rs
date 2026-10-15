@@ -147,6 +147,8 @@ pub struct Hub {
     pub(crate) client_conns: Arc<Semaphore>,
     /// The client instances heard from.
     pub(crate) instances: crate::clients::Instances,
+    /// Bumped by [`Hub::clients_changed`] alone, for the clients page.
+    client_changes: watch::Sender<u64>,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
 }
@@ -202,6 +204,7 @@ impl Hub {
             sessions: watch::Sender::new(0),
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             instances: crate::clients::Instances::default(),
+            client_changes: watch::Sender::new(0),
             dispatch: crate::jobs::Dispatch::new(
                 None,
                 crate::jobs::DEFAULT_LOST_AFTER,
@@ -291,6 +294,18 @@ impl Hub {
     /// history read at one count holds until the next.
     pub(crate) fn jobs_generation(&self) -> u64 {
         *self.jobs.borrow()
+    }
+
+    /// Note that an API key or the client instances using one may have changed: a key
+    /// created, revoked or removed, an instance heard from anew (first since the hub started,
+    /// or since memory forgot it), a hello recorded, or instances pruned.
+    pub(crate) fn clients_changed(&self) {
+        self.client_changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::clients_changed`] only.
+    pub(crate) fn subscribe_clients(&self) -> watch::Receiver<u64> {
+        self.client_changes.subscribe()
     }
 
     /// Wake on the next [`Hub::changed`] of any node, or [`Hub::touch`].

@@ -11,7 +11,7 @@
 //! every pending contact at once, in the background and at [`Durability::None`] — as
 //! `crate::store` writes heartbeats — while its key holds fewer than
 //! [`MAX_INSTANCES_PER_KEY`] instances in memory; past that it waits for the flush. A crash
-//! loses up to a minute of last contacts.
+//! loses up to a minute of last contacts. [`views`] is what the clients page shows of them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,8 +21,9 @@ use anyhow::{Context, Result};
 use redb::Durability;
 use vk_hub_proto::client::ClientHello;
 
+use crate::jobs::Work;
 use crate::server::Hub;
-use crate::store::{ApiPrincipal, MAX_INSTANCES_PER_KEY};
+use crate::store::{ApiPrincipal, ClientRow, KeyRow, MAX_INSTANCES_PER_KEY};
 
 /// How often the contacts noted in memory are written.
 pub const CLIENT_FLUSH_SECS: u64 = 60;
@@ -44,6 +45,8 @@ struct Seen {
     at: u64,
     /// The latest durable contact; `at > flushed` means a flush is pending.
     flushed: u64,
+    /// Written at all, and the clients page woken for it.
+    shown: bool,
 }
 
 impl Instances {
@@ -79,6 +82,7 @@ impl Instances {
             Seen {
                 at: now,
                 flushed: 0,
+                shown: false,
             },
         );
         room
@@ -91,6 +95,16 @@ impl Instances {
         }
     }
 
+    /// Mark `instance` of key `key` as written, durably or not. Return true on the first
+    /// write since it was noted in memory, so the clients page can be notified.
+    fn shown(&self, key: &str, instance: &str) -> bool {
+        let mut seen = self.lock();
+        let Some(s) = seen.get_mut(key).and_then(|m| m.get_mut(instance)) else {
+            return false;
+        };
+        !std::mem::replace(&mut s.shown, true)
+    }
+
     /// The contacts awaiting the flush.
     fn unflushed(&self) -> Vec<(String, String, u64)> {
         self.lock()
@@ -100,6 +114,14 @@ impl Instances {
                     .filter(|(_, s)| s.at > s.flushed)
                     .map(|(i, s)| (k.clone(), i.clone(), s.at))
             })
+            .collect()
+    }
+
+    /// Last contact times in memory, indexed by key ID and instance.
+    fn heard(&self) -> HashMap<(String, String), u64> {
+        self.lock()
+            .iter()
+            .flat_map(|(k, m)| m.iter().map(|(i, s)| ((k.clone(), i.clone()), s.at)))
             .collect()
     }
 
@@ -157,6 +179,8 @@ pub async fn hello(hub: &Hub, principal: &ApiPrincipal, hello: ClientHello) -> R
     .context("recording a client's hello")??;
     if written {
         hub.instances.flushed(&principal.id, &instance, now);
+        hub.instances.shown(&principal.id, &instance);
+        hub.clients_changed();
     }
     Ok(())
 }
@@ -178,7 +202,8 @@ pub async fn drive(hub: Arc<Hub>) {
             hub.instances.forget(now.saturating_sub(FORGET_SECS));
             let db = hub.db.clone();
             match tokio::task::spawn_blocking(move || db.prune_clients(now)).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(0)) => {}
+                Ok(Ok(_)) => hub.clients_changed(),
                 Ok(Err(e)) => eprintln!("vk-hub: pruning client instances: {e:#}"),
                 Err(e) => eprintln!("vk-hub: pruning client instances: {e}"),
             }
@@ -192,7 +217,7 @@ pub(crate) async fn flush(hub: &Hub) -> Result<()> {
 }
 
 /// Write every contact awaiting the flush, in one transaction at `durability`. Only a durable
-/// write settles them.
+/// write settles them. Wake the clients page for an instance written for the first time.
 async fn write(hub: &Hub, durability: Durability) -> Result<()> {
     let contacts = hub.instances.unflushed();
     if contacts.is_empty() {
@@ -203,17 +228,117 @@ async fn write(hub: &Hub, durability: Durability) -> Result<()> {
     tokio::task::spawn_blocking(move || db.flush_clients(&written, durability))
         .await
         .context("recording client contacts")??;
-    if matches!(durability, Durability::Immediate) {
-        for (key, instance, at) in &contacts {
+    let durable = matches!(durability, Durability::Immediate);
+    let mut first = false;
+    for (key, instance, at) in &contacts {
+        if durable {
             hub.instances.flushed(key, instance, *at);
         }
+        first |= hub.instances.shown(key, instance);
+    }
+    // An instance is first written by [`seen`]'s write while its key has room, by the flush
+    // past that: whichever comes first wakes the page, the other finds it shown.
+    if first {
+        hub.clients_changed();
     }
     Ok(())
+}
+
+/// An API key and the client instances using it, as the clients page shows them.
+#[derive(Debug)]
+pub struct KeyView {
+    /// Its ID ([`ApiPrincipal::id`]).
+    pub id: String,
+    pub row: KeyRow,
+    /// Its instances, the most recently heard from first.
+    pub instances: Vec<InstanceView>,
+    /// How many of its jobs the history holds.
+    pub jobs: u64,
+}
+
+impl KeyView {
+    /// When any of its instances was last heard from.
+    pub fn last_seen(&self) -> Option<u64> {
+        (self.instances.iter().map(|i| i.row.last_seen))
+            .filter(|&t| t > 0)
+            .max()
+    }
+}
+
+/// One instance of a key's client, and what it holds.
+#[derive(Debug)]
+pub struct InstanceView {
+    /// As recorded, its last contact the later of the row's and memory's; for an instance the
+    /// database holds no row of, empty but for that contact, 0 when memory holds none either.
+    pub row: ClientRow,
+    pub work: Work,
+}
+
+/// Every API key, oldest first, with its instances and how many of its jobs the history
+/// holds. Reads the database: call off the runtime.
+pub fn views(hub: &Hub) -> Result<Vec<KeyView>> {
+    let keys = hub.db.api_keys_with_ids()?;
+    let clients = hub.db.clients()?;
+    let counts = hub.db.job_counts_by_key()?;
+    let heard = hub.instances.heard();
+    let mut work = crate::jobs::client_work(hub);
+    let mut views: Vec<KeyView> = keys
+        .into_iter()
+        .map(|(id, row)| KeyView {
+            jobs: counts.get(&id).copied().unwrap_or_default(),
+            id,
+            row,
+            instances: Vec::new(),
+        })
+        .collect();
+    let at: HashMap<String, usize> = (views.iter().enumerate())
+        .map(|(i, v)| (v.id.clone(), i))
+        .collect();
+    for (key, mut row) in clients {
+        // A removed key's, until pruned.
+        let Some(view) = at.get(&key).and_then(|&i| views.get_mut(i)) else {
+            continue;
+        };
+        let id = (key, row.instance.clone());
+        if let Some(&t) = heard.get(&id) {
+            row.last_seen = row.last_seen.max(t);
+        }
+        let work = work.remove(&id).unwrap_or_default();
+        view.instances.push(InstanceView { row, work });
+    }
+    // Instances the database holds no row of, yet or any longer, shown for what they hold:
+    // one awaiting the flush, or one evicted or pruned with its jobs still live.
+    for ((key, instance), work) in work {
+        let Some(view) = at.get(&key).and_then(|&i| views.get_mut(i)) else {
+            continue;
+        };
+        let last_seen = heard.get(&(key, instance.clone())).copied().unwrap_or(0);
+        let row = ClientRow {
+            key_name: view.row.name.clone(),
+            instance,
+            first_seen: last_seen,
+            last_seen,
+            hello_at: None,
+            program: String::new(),
+            version: String::new(),
+            hostname: String::new(),
+            concurrent: None,
+            runners: Vec::new(),
+        };
+        view.instances.push(InstanceView { row, work });
+    }
+    for view in &mut views {
+        view.instances.sort_by(|a, b| {
+            (b.row.last_seen, &a.row.instance).cmp(&(a.row.last_seen, &b.row.instance))
+        });
+    }
+    Ok(views)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Db, KeyPolicy, Scope, token_key};
 
     #[test]
     fn a_key_holds_a_bounded_set_of_instances() {
@@ -265,5 +390,130 @@ mod tests {
         instances.note("k", "new", 100);
         let gone: Vec<String> = instances.unflushed().into_iter().map(|c| c.1).collect();
         assert!(!gone.contains(&"i00".to_string()) && gone.contains(&"i01".to_string()));
+    }
+
+    fn policy() -> KeyPolicy {
+        KeyPolicy {
+            scopes: vec![Scope::Jobs],
+            pools: vec!["ci".into()],
+            max_envelope: None,
+        }
+    }
+
+    /// A hub holding API key `gitlab`, and its ID.
+    fn hub_with_key() -> (Arc<Hub>, String, String) {
+        let db = Arc::new(Db::open_memory().unwrap());
+        let ttl = Duration::from_secs(3600);
+        let (key, _) =
+            (db.create_api_key("gitlab", &policy(), ttl, "uid 0", crate::now_secs())).unwrap();
+        let id = token_key(&key);
+        (Arc::new(Hub::new(db, None)), key, id)
+    }
+
+    /// An instance's last contact is the later of its row's and memory's; a removed key's
+    /// instances are left out; an instance the database has no row of shows for what it
+    /// holds; and the latest heard from come first, then by name.
+    #[test]
+    fn views_merge_memory_with_the_database() {
+        let (hub, _, id) = hub_with_key();
+        for (instance, at) in [("old", 150), ("b", 200), ("a", 200)] {
+            let written =
+                hub.db
+                    .record_client(&id, "gitlab", instance, None, at, Durability::Immediate);
+            assert!(written.unwrap());
+        }
+        let removed = "f".repeat(64);
+        let written = hub
+            .db
+            .record_client(&removed, "gone", "x", None, 300, Durability::Immediate);
+        assert!(written.unwrap());
+        hub.instances.note(&id, "old", 400);
+        hub.instances.note(&id, "a", 100);
+        // Awaiting the flush, and gone from memory and the database: rows for what they hold.
+        hub.instances.note(&id, "new", 250);
+        crate::jobs::testing::offer_for(&hub, &id, Some("new"));
+        crate::jobs::testing::offer_for(&hub, &id, Some("lost"));
+        crate::jobs::testing::offer_for(&hub, &removed, Some("x"));
+
+        let views = views(&hub).unwrap();
+        assert_eq!(views.len(), 1);
+        let shown: Vec<(&str, u64, usize)> = (views[0].instances.iter())
+            .map(|i| {
+                (
+                    i.row.instance.as_str(),
+                    i.row.last_seen,
+                    i.work.reservations,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("old", 400, 0),
+                ("new", 250, 1),
+                ("a", 200, 0),
+                ("b", 200, 0),
+                ("lost", 0, 1)
+            ]
+        );
+        assert_eq!(views[0].instances[1].row.key_name, "gitlab");
+        assert_eq!(views[0].last_seen(), Some(400));
+    }
+
+    /// The clients page is woken by a key created or revoked through `vk-hub keys`, an
+    /// instance's first contact, and instances pruned; not again by the flush of an instance
+    /// already shown.
+    #[tokio::test]
+    async fn the_clients_page_is_woken_by_what_it_shows() {
+        let (hub, key, id) = hub_with_key();
+        let mut changes = hub.subscribe_clients();
+        let woken = |changes: &mut tokio::sync::watch::Receiver<u64>| {
+            let woken = changes.has_changed().unwrap();
+            changes.mark_unchanged();
+            woken
+        };
+        let call = |call: serde_json::Value| {
+            let body = serde_json::json!({"v": 1, "call": call});
+            crate::admin::dispatch(&serde_json::to_vec(&body).unwrap(), &hub, 0).unwrap()
+        };
+        call(serde_json::json!({
+            "op": "create-key", "name": "other", "policy": policy(), "ttl_secs": 3600,
+        }));
+        assert!(woken(&mut changes));
+        let revoked = call(serde_json::json!({"op": "revoke-key", "name": "other"}));
+        assert_eq!(revoked, serde_json::json!(true));
+        assert!(woken(&mut changes));
+
+        let mut principal = hub.db.api_key(&key, crate::now_secs()).unwrap().unwrap();
+        principal.instance = Some("s_1".into());
+        seen(&hub, &principal, crate::now_secs());
+        tokio::time::timeout(Duration::from_secs(10), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        changes.mark_unchanged();
+        assert_eq!(hub.db.clients().unwrap().len(), 1);
+        // Made durable, it is not shown anew.
+        flush(&hub).await.unwrap();
+        assert!(!woken(&mut changes));
+        // Nor by a contact past the first.
+        seen(&hub, &principal, crate::now_secs());
+        flush(&hub).await.unwrap();
+        assert!(!woken(&mut changes));
+
+        // A removed key's instance goes at the first pass.
+        let removed = "f".repeat(64);
+        let now = crate::now_secs();
+        hub.db
+            .record_client(&removed, "gone", "x", None, now, Durability::Immediate)
+            .unwrap();
+        let driver = tokio::spawn(drive(hub.clone()));
+        tokio::time::timeout(Duration::from_secs(10), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        driver.abort();
+        let left: Vec<String> = hub.db.clients().unwrap().into_iter().map(|c| c.0).collect();
+        assert_eq!(left, [id]);
     }
 }

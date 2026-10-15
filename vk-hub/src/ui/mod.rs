@@ -63,6 +63,7 @@ use crate::store::{self, Role, UiSession};
 mod actions;
 mod assets;
 mod body;
+mod clients;
 mod dev;
 mod fleet;
 pub mod html;

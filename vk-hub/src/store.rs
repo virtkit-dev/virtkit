@@ -46,12 +46,14 @@ mod keys;
 mod registries;
 mod tools;
 
-pub use clients::MAX_INSTANCES_PER_KEY;
+pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, PREPARE_STAGE, RequestRow,
     SUMMARY_JOBS, Submitted,
 };
-pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
+pub use keys::{
+    ANY_POOL, ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name,
+};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     operation_name as registry_operation_name,
@@ -761,6 +763,7 @@ impl Db {
             .context("opening the job output lengths table")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
+        jobs::count_jobs(&txn).context("counting the job history by key")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,

@@ -12,9 +12,11 @@ All notable changes to virtkit will be documented in this file.
   GitLab URL, pool, labels), at start and every minute, so the hub can tell apart the daemons
   sharing one API key. Runner tokens and the API key are never sent, and a hub too old to take
   this is left alone.
-- **The hub's job history can be narrowed to one API key's jobs** with `/jobs?key=<key ID>`,
-  a key's ID being the SHA-256 of the key; the filter shows the key by name and can be dropped
-  with one click.
+- **The hub's web UI has a Clients page** listing every API key — scopes, pools, expiry,
+  when last heard from — and the vk-gitlab daemons using each: host, version, runners, whether
+  connected, and the reservations and jobs each holds. A key's job count opens the job history
+  filtered to that key (`/jobs?key=<key ID>`, the ID being the key's SHA-256); the filter shows
+  the key by name and drops with one click.
 - **The guest kernel supports `process_vm_readv` and `process_vm_writev`.**
 
 ## [0.91.1] - 2026-10-15

@@ -233,6 +233,8 @@ struct Link {
 
 struct Resv {
     key: String,
+    /// The client instance that asked for it ([`ApiPrincipal::instance`]).
+    instance: Option<String>,
     node: String,
     envelope: Envelope,
     phase: ResvPhase,
@@ -1370,6 +1372,57 @@ pub fn placed_on(hub: &Hub, node: &str) -> u64 {
     placed(&hub.dispatch.lock(), node)
 }
 
+/// A client instance's reservations and jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Reservations offered or held, not yet taken over by a job.
+    pub reservations: usize,
+    /// Jobs waiting to be placed.
+    pub queued: usize,
+    /// Jobs sent to a node and not finished.
+    pub running: usize,
+}
+
+/// What each client instance holds, by key ID and instance: the empty instance for requests
+/// that named none.
+pub fn client_work(hub: &Hub) -> HashMap<(String, String), Work> {
+    work_of(&hub.dispatch.lock())
+}
+
+/// [`client_work`] of `state`.
+fn work_of(state: &State) -> HashMap<(String, String), Work> {
+    fn of<'w>(
+        work: &'w mut HashMap<(String, String), Work>,
+        key: &str,
+        instance: &Option<String>,
+    ) -> &'w mut Work {
+        let instance = instance.clone().unwrap_or_default();
+        work.entry((key.to_string(), instance)).or_default()
+    }
+    let mut work = HashMap::new();
+    // A reservation a job was submitted on counts as that job alone.
+    let taken: HashSet<&str> = (state.jobs.values())
+        .filter_map(|j| j.reservation.as_deref())
+        .collect();
+    for (id, r) in &state.reservations {
+        if matches!(r.phase, ResvPhase::Offered | ResvPhase::Held { .. })
+            && !taken.contains(id.as_str())
+        {
+            of(&mut work, &r.key, &r.instance).reservations += 1;
+        }
+    }
+    for j in state.jobs.values() {
+        let (key, instance) = (&j.row.key, &j.row.instance);
+        match j.row.state {
+            JobState::Queued => of(&mut work, key, instance).queued += 1,
+            JobState::Starting | JobState::Running => of(&mut work, key, instance).running += 1,
+            // A state from a newer hub's record says nothing of where the job stands.
+            JobState::Finished | JobState::Other => {}
+        }
+    }
+    work
+}
+
 /// Wake on the next [`Hub::changed`] of `node`, or change to what the hub has placed on it
 /// ([`placed_on`]) or to why it refuses offers ([`last_refusal`]), which the hub notes only
 /// as a change to dispatch at large: a task compares them on each such change, so a node's
@@ -1776,6 +1829,7 @@ pub async fn reserve(
                     id.clone(),
                     Resv {
                         key: principal.id.clone(),
+                        instance: principal.instance.clone(),
                         node: node.clone(),
                         envelope: placement.envelope,
                         phase: ResvPhase::Offered,
@@ -3448,6 +3502,65 @@ mod tests {
         warm_first(found, &light).remove(0).0
     }
 
+    /// An instance holds the reservations offered or held, but not one a job took over, and
+    /// its jobs queued or sent; a refused or abandoned reservation, a finished job and one in
+    /// a state this hub does not know count for nothing. Requests naming no instance count
+    /// under the empty one.
+    #[test]
+    fn an_instance_holds_its_live_reservations_and_jobs() {
+        let mut state = State::default();
+        let resv = |instance: Option<&str>, phase: ResvPhase| Resv {
+            key: "k".into(),
+            instance: instance.map(str::to_string),
+            node: "n".into(),
+            envelope: Envelope::default(),
+            phase,
+            accepted_at: 0,
+            leases: 0,
+        };
+        let held = || ResvPhase::Held { lease_secs: 60 };
+        for (id, instance, phase) in [
+            ("offered", Some("a"), ResvPhase::Offered),
+            ("held", Some("a"), held()),
+            ("taken", Some("a"), held()),
+            ("refused", Some("a"), ResvPhase::Refused(Refusal::Cpus)),
+            ("abandoned", Some("a"), ResvPhase::Abandoned),
+            ("anonymous", None, ResvPhase::Offered),
+        ] {
+            state.reservations.insert(id.into(), resv(instance, phase));
+        }
+        for (id, instance, job_state, reservation) in [
+            ("q", Some("a"), JobState::Queued, Some("taken")),
+            ("s", Some("a"), JobState::Starting, None),
+            ("r", Some("a"), JobState::Running, None),
+            ("f", Some("a"), JobState::Finished, None),
+            ("o", Some("a"), JobState::Other, None),
+            ("anon", None, JobState::Running, None),
+        ] {
+            let mut job = sent("n", 1, None);
+            job.row.instance = instance.map(str::to_string);
+            job.row.state = job_state;
+            job.reservation = reservation.map(str::to_string);
+            state.jobs.insert(id.into(), job);
+        }
+        let work = work_of(&state);
+        let a = Work {
+            reservations: 2,
+            queued: 1,
+            running: 2,
+        };
+        let anonymous = Work {
+            reservations: 1,
+            queued: 0,
+            running: 1,
+        };
+        let want = HashMap::from([
+            (("k".to_string(), "a".to_string()), a),
+            (("k".to_string(), String::new()), anonymous),
+        ]);
+        assert_eq!(work, want);
+    }
+
     /// A node keeps its latest use of an image, in whatever order uses are noted: replayed in
     /// submission order, a job still running is followed by one submitted later and finished
     /// earlier. Pruned, a use past a day goes, and its key with it once no node holds it.
@@ -3669,6 +3782,7 @@ pub(crate) mod testing {
             id,
             Resv {
                 key: "k".into(),
+                instance: None,
                 node: node.to_string(),
                 envelope: Envelope::default(),
                 phase: ResvPhase::Offered,
@@ -3677,6 +3791,23 @@ pub(crate) mod testing {
             },
         );
         hub.dispatch.bump();
+    }
+
+    /// Offer a reservation asked for by instance `instance` of key `key`, unanswered.
+    pub fn offer_for(hub: &Hub, key: &str, instance: Option<&str>) {
+        let id = crate::random_hex(vk_hub_proto::ID_BYTES).unwrap();
+        hub.dispatch.lock().reservations.insert(
+            id,
+            Resv {
+                key: key.to_string(),
+                instance: instance.map(str::to_string),
+                node: "n".into(),
+                envelope: Envelope::default(),
+                phase: ResvPhase::Offered,
+                accepted_at: 0,
+                leases: 0,
+            },
+        );
     }
 
     /// How many placements' capacity revisions the hub keeps.

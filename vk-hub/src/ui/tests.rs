@@ -3322,7 +3322,7 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         assert!(
             page.contains(
                 "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
-                 <a href=\"/jobs\">Jobs</a>\
+                 <a href=\"/jobs\">Jobs</a><a href=\"/clients\">Clients</a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -3799,6 +3799,102 @@ async fn the_job_history_is_filtered_by_api_key() {
         assert!(!page.contains("name=\"key\""), "{page}");
         let reply = get(addr, &format!("/events/jobs?key={bad}"), Some(&viewer)).await;
         assert_eq!(reply.status, 404, "{bad}");
+    }
+}
+
+/// `/clients` shows viewers and operators alike, read only, each API key with its jobs linked
+/// to the history filtered by it, and the instances using it, what they said shown as text and
+/// a runner's URL without its credentials; a hello or a new instance reaches an open page.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_keys_and_their_clients_are_shown_live() {
+    use crate::store::{KeyPolicy, Scope};
+    use vk_hub_proto::client::{ClientHello, ClientRunner};
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("<code>vk-hub keys create</code>"),
+        "{}",
+        page.body
+    );
+
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+    };
+    let now = crate::now_secs();
+    let (key, _) = hub
+        .db
+        .create_api_key("gitlab", &policy, Duration::from_secs(3600), "uid 0", now)
+        .unwrap();
+    let id = crate::store::token_key(&key);
+    let mut row = history_job(1, "acme/web");
+    row.key = id.clone();
+    row.key_name = "gitlab".into();
+    hub.db
+        .submit_job(&format!("{:032x}", 1), &row, "1", b"{}", "key gitlab", now)
+        .unwrap();
+    let mut events = Events::open(addr, "/events/clients", &viewer).await;
+    assert!(events.head.starts_with("HTTP/1.1 200"), "{}", events.head);
+    let first = events.next().await.unwrap();
+    assert!(first.starts_with("event: clients\ndata: "), "{first}");
+    assert!(first.contains("no client has used a key yet"), "{first}");
+
+    let hostile = "<script>alert(1)</script>\"'><img src=x onerror=alert(2)>";
+    let runner = |name: &str, url: &str| ClientRunner {
+        name: name.into(),
+        url: url.into(),
+        pool: "ci".into(),
+        labels: vec![],
+        limit: None,
+    };
+    let hello = ClientHello {
+        instance: "s_1".into(),
+        program: "vk-gitlab".into(),
+        version: "0.91.1".into(),
+        hostname: format!("ci-1{hostile}"),
+        concurrent: Some(2),
+        runners: vec![
+            runner(&format!("docker{hostile}"), "https://gitlab.example.com/"),
+            runner("shell", "https://user:pass@gitlab.example.com/"),
+        ],
+    };
+    let principal = hub.db.api_key(&key, now).unwrap().unwrap();
+    crate::clients::hello(&hub, &principal, hello)
+        .await
+        .unwrap();
+    let event = next_with(&mut events, "vk-gitlab 0.91.1").await;
+    assert!(event.contains("<code>s_1</code>"), "{event}");
+    // A first contact of another instance reaches it too.
+    let mut other = principal.clone();
+    other.instance = Some("s_2".into());
+    crate::clients::seen(&hub, &other, crate::now_secs());
+    next_with(&mut events, "<code>s_2</code>").await;
+
+    for role in [Role::Viewer, Role::Operator] {
+        let (cookie, _) = sign_in(addr, &hub, role).await;
+        let page = get(addr, "/clients", Some(&cookie)).await.body;
+        for want in [
+            "<a href=\"/jobs\">Jobs</a><a href=\"/clients\" aria-current=\"page\">Clients</a>",
+            "sse-connect=\"/events/clients\"",
+            &format!("<a href=\"/jobs?key={id}\">1</a>"),
+            "ci-1&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;&lt;img",
+            "docker&lt;script&gt;",
+            "<a href=\"https://gitlab.example.com/\" target=\"_blank\" \
+             rel=\"noopener noreferrer\">https://gitlab.example.com/</a>",
+            "shell · pool ci · <a href=\"https://gitlab.example.com/\"",
+            "<span class=\"badge ok\">connected</span>",
+        ] {
+            assert!(page.contains(want), "{role:?}: {want}: {page}");
+        }
+        // Nothing to act on: the sign-out form above `<main>` is the page's only one.
+        let main = page.split_once("<main>").unwrap().1;
+        for not in ["<script>alert", "<img", "user:pass", "<form", "hx-post"] {
+            assert!(!main.contains(not), "{role:?}: {not}: {page}");
+        }
+        assert!(!page.contains("hx-headers"), "{role:?}: {page}");
     }
 }
 

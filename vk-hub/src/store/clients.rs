@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use redb::{Durability, ReadableTable, TableDefinition};
+use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::{
     ClientHello, ClientRunner, MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS,
@@ -28,6 +28,10 @@ pub const MAX_INSTANCES_PER_KEY: usize = 32;
 
 /// How stale a row may be before a contact that changes nothing else still rewrites it.
 const CLIENT_REFRESH_SECS: u64 = 60;
+
+/// How recently an instance must have been heard from to count as connected: three times
+/// the minute between a client's hellos.
+pub const CLIENT_ACTIVE_SECS: u64 = 180;
 
 /// One instance of a key's client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,9 +306,7 @@ impl Db {
     }
 
     /// Every instance, with its key's ID, by key and instance.
-    #[cfg(test)]
     pub fn clients(&self) -> Result<Vec<(String, ClientRow)>> {
-        use redb::ReadableDatabase;
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(CLIENTS)?;
         let mut out = Vec::new();

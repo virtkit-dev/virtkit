@@ -1192,36 +1192,37 @@ or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in th
 provider (see [Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
-heartbeat and workloads; the job history (`/jobs`, below); and the audit log (`/audit`,
-filterable by node, 100 lines a page; the hub keeps the newest 100,000 rows). A node's page
-shows what the hub asks of it beside what it reports — its state, acquisition, runner (`none:
-placed jobs only` for a node with none), concurrency, drain progress and what it cannot carry
-out — and its 20 latest commands with their outcomes. It opens with a steering panel describing
-the current state in plain language, grouped into *Job intake* — whether the node takes new
-jobs, the hub's concurrency ceiling and the node's current effective limit, and on a hub that
-places jobs, for a node at protocol version 3 or later, the jobs the hub has placed on it
-against that ceiling or the node's own limit, whichever is smaller (`Placed by the hub: 3 of
-4`), or why it takes none when it runs its own gitlab-runner; *Maintenance* — in service,
-draining, drained, under maintenance, checking itself or quarantined; and an operator-only
-*Danger zone*. Operators see applicable actions with short explanations: pause intake or resume
-it, set the limit or remove it, drain from ready or during maintenance (the node stays drained
-once it ends), undrain while draining or drained, quarantine unless quarantined, release only
-then, reset from ready, draining or drained; no reset when the runner is external; everything
-while the node has reported nothing. They are the admin socket's operations — ceiling set or
-lifted, acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
-`/node/<id>/action` as before, which still refuses what does not apply. A reset requires
-confirmation from the same session, once and within ten minutes, as local mode's stops do. The
-panel is part of the node's live fragment, rendered for an operator's stream with that session's
-CSRF token, so what it offers follows the node; the limit's number field is kept through updates
-(`hx-preserve`). Each action returns a status line through htmx, and also works as a plain form.
-Monitoring-only nodes are marked, offer no actions and reject steering posts. Viewers see where
-the node stands and no actions. Operators also issue enrollment tokens from the nodes page, like
-`vk-hub token create`, valid for an hour, ten minutes, a day or seven days. A plain POST to
-`/tokens` uses the same origin, CSRF and role checks and returns a page showing the token once.
-Issuance is audited as the session's principal; the token is never logged. Removing a node stays
-on the admin socket. Operators grant who signs in through the OIDC provider, and as what, from
-`/users` (see [Signing in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site`
-is `same-site` or `cross-site`.
+heartbeat and workloads; the job history (`/jobs`, below); the API keys and the clients using
+them (`/clients`, below); and the audit log (`/audit`, filterable by node, 100 lines a page; the
+hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it beside what it
+reports — its state, acquisition, runner (`none: placed jobs only` for a node with none),
+concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
+outcomes. It opens with a steering panel describing the current state in plain language, grouped
+into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
+node's current effective limit, and on a hub that places jobs, for a node at protocol version 3
+or later, the jobs the hub has placed on it against that ceiling or the node's own limit,
+whichever is smaller (`Placed by the hub: 3 of 4`), or why it takes none when it runs its own
+gitlab-runner; *Maintenance* — in service, draining, drained, under maintenance, checking itself
+or quarantined; and an operator-only *Danger zone*. Operators see applicable actions with short
+explanations: pause intake or resume it, set the limit or remove it, drain from ready or during
+maintenance (the node stays drained once it ends), undrain while draining or drained, quarantine
+unless quarantined, release only then, reset from ready, draining or drained; no reset when the
+runner is external; everything while the node has reported nothing. They are the admin socket's
+operations — ceiling set or lifted, acquisition stopped or resumed, drain, undrain, quarantine,
+release, reset — posted to `/node/<id>/action` as before, which still refuses what does not
+apply. A reset requires confirmation from the same session, once and within ten minutes, as
+local mode's stops do. The panel is part of the node's live fragment, rendered for an operator's
+stream with that session's CSRF token, so what it offers follows the node; the limit's number
+field is kept through updates (`hx-preserve`). Each action returns a status line through htmx,
+and also works as a plain form. Monitoring-only nodes are marked, offer no actions and reject
+steering posts. Viewers see where the node stands and no actions. Operators also issue
+enrollment tokens from the nodes page, like `vk-hub token create`, valid for an hour, ten
+minutes, a day or seven days. A plain POST to `/tokens` uses the same origin, CSRF and role
+checks and returns a page showing the token once. Issuance is audited as the session's
+principal; the token is never logged. Removing a node stays on the admin socket. Operators grant
+who signs in through the OIDC provider, and as what, from `/users` (see [Signing
+in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
+`cross-site`.
 
 `/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)), newest
 first, 100 jobs per page, with a link to older jobs. Each row shows the job's name, with a link
@@ -1246,18 +1247,22 @@ key's name, or the ID's first 12 characters once the key is gone, with `×` to d
 filter is a scan of the history from its newest job, a record decoded and matched at a time,
 until the page and the summary are complete: a rare value reads the whole history, `job_history`
 records (10,000 by default), on each load of the page and, for the live newest page, at most
-twice a heartbeat (below), so its cost grows with `job_history`. The summary covers the newest
-10,000 matching jobs: the count, the share of finished jobs that succeeded (without a result
-filter), and the median run time of finished jobs. The newest page of each filter updates live
-(below). Older pages stay as loaded, say so and link back to the newest. The filter form stays
-outside the live fragment so updates preserve selections in progress. Selections apply
-immediately; typing applies after a 300 ms pause. Each request replaces any pending request.
-htmx fetches the filtered page and replaces the jobs, including the live fragment, closing the
-old stream and opening the new one. The URL follows the filter for bookmarking or sharing. Each
-applied filter adds a history entry; Back and Forward reload that URL because htmx's history
-cache is disabled. *Show* or Enter applies the filter immediately and loads the page without
-JavaScript. Refused or failed requests, including expired sessions, trigger a full page load.
-Each node's page links to its jobs, and to its jobs with events.
+twice a heartbeat (below), so its cost grows with `job_history`. `/clients`' job counts read
+none of it: the hub keeps a count of each key's jobs beside the history, updated in the writes
+that record and trim jobs and counted from the history once on a database without it, so a
+rendering of `/clients` reads a row per key and per instance, however long the history. The
+summary covers the newest 10,000 matching jobs: the count, the share of finished jobs that
+succeeded (without a result filter), and the median run time of finished jobs. The newest page
+of each filter updates live (below). Older pages stay as loaded, say so and link back to the
+newest. The filter form stays outside the live fragment so updates preserve selections in
+progress. Selections apply immediately; typing applies after a 300 ms pause. Each request
+replaces any pending request. htmx fetches the filtered page and replaces the jobs, including
+the live fragment, closing the old stream and opening the new one. The URL follows the filter
+for bookmarking or sharing. Each applied filter adds a history entry; Back and Forward reload
+that URL because htmx's history cache is disabled. *Show* or Enter applies the filter
+immediately and loads the page without JavaScript. Refused or failed requests, including expired
+sessions, trigger a full page load. Each node's page links to its jobs, and to its jobs with
+events.
 
 `/jobs/<id>`, for viewers and operators alike, shows a job's record: its result, failure class,
 exit code and the node's message, an Event row for each event it reported with its first
@@ -1294,6 +1299,18 @@ finished and its output is read to its end, the stream sends its last line and i
 closes. The output stays scrolled to its end as it grows, unless scrolled up to read, and keeps its
 last 2 MiB of text or so, with a notice for omitted lines and the remaining line numbers intact.
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
+
+`/clients` shows viewers and operators alike the API keys (see [Placed jobs](#placed-jobs)) and
+the client instances using each, read only: `vk-hub keys` creates and revokes keys. Each key
+shows its name, first 8 characters, scopes, pools, largest envelope, when and by whom it was
+created, whether it is revoked, expired or when it expires, when any of its instances was last
+heard from, how many instances it has, and how many of its jobs the history holds, linked to
+`/jobs?key=<key ID>`. Each instance shows its key, the host, program and version and each
+runner's name, pool and GitLab URL its latest hello named, when it was last heard from —
+*connected* within the last 180 seconds — and the reservations it holds and its jobs queued and
+running. Requests that named no instance, as an older `vk-gitlab`'s, show as the key's *unknown
+instance*, with when it was last heard from and what it holds. What a client said is shown as
+text, and a runner's URL becomes a link only when it is a plain web URL without credentials.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
@@ -1339,34 +1356,36 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   filled in is kept until that changes. That copy, shared by every operator, has no CSRF field: it
   posts with the token the page sets through `hx-headers` around the forms and the fragment.
 
-The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page stay
-live over server-sent events. The hub notes every heartbeat, report, session, command outcome and
-desired-state change, by node; every release added or removed, rollout step and node enrolled,
-renamed or removed; every change to a placed job's record — submitted, placed, accepted, at a new
-stage, finished, canceled or settled — and each hourly trim of the history; and, by job, each piece
-of its output stored, which wakes that job's page alone, never `/jobs`. The nodes table
-is the same for everyone, so one task renders it on a change and every nodes page is sent that
-one rendering; `/operations` likewise, once for every viewer's page and once for every
-operator's. A node's page is woken by changes to that node alone, and `/jobs` by changes to
-jobs alone, never by a heartbeat. `/jobs`' stream carries the page's filter in its URL
-(`/events/jobs?project=acme%2Fweb&result=failed`), checked as the page's query is, except that
-a value the page would ignore — or an unknown or repeated field, or `before` — is refused
-(404). Each `/jobs` stream renders its own fragment, but as the summary reads the history, the
-streams of one filter share a rendering, renewed once a job has changed or it is half a
-heartbeat old, and a page loaded meanwhile starts from it: however many pages follow a filter,
-the history is read for it at most once per change and twice a heartbeat. A rendering is kept
-only while a stream, or the filter form's request for its page, has asked for it within two
-heartbeats; a plain page load keeps none.
-How long a running job has run moves in steps of a heartbeat, as ages do. The filter form's
-nodes and projects are those of when the page was loaded: a new one is offered on reload. A
-fragment is rendered at most once a second, and every heartbeat interval regardless — a node
-going quiet sends nothing — and sent only when it differs. Ages on the pages move in steps of a
-heartbeat, so a fleet with nothing new to report sends nothing but a keep-alive comment every
-15 seconds, and a node reporting faster than that changes nothing about the rate. When its
-session ends, a stream sends a fragment saying so and a `close` event, on which htmx's SSE
-extension (`sse-close`) stops reconnecting; a page asking for a stream with the cookie of a
-session that has ended is answered the same, rather than refused into retrying. A stream whose
-browser stops reading is given up on, and its connection dropped.
+The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/clients` and a running
+job's page stay live over server-sent events. The hub notes every heartbeat, report, session,
+command outcome and desired-state change, by node; every release added or removed, rollout step
+and node enrolled, renamed or removed; every change to a placed job's record — submitted,
+placed, accepted, at a new stage, finished, canceled or settled — and each hourly trim of the
+history; and, by job, each piece of its output stored, which wakes that job's page alone, never
+`/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
+nodes page is sent that one rendering; `/operations` likewise, once for every viewer's page and
+once for every operator's; `/clients` likewise, woken by a key created, revoked or removed, an
+instance heard from anew, a hello recorded or instances pruned, and rendered once a heartbeat
+interval regardless while a stream is open, which moves its ages and what its instances hold. A
+node's page is woken by changes to that node alone, and `/jobs` by changes to jobs alone, never
+by a heartbeat. `/jobs`' stream carries the page's filter in its URL
+(`/events/jobs?project=acme%2Fweb&result=failed`), checked as the page's query is, except that a
+value the page would ignore — or an unknown or repeated field, or `before` — is refused (404).
+Each `/jobs` stream renders its own fragment, but as the summary reads the history, the streams
+of one filter share a rendering, renewed once a job has changed or it is half a heartbeat old,
+and a page loaded meanwhile starts from it: however many pages follow a filter, the history is
+read for it at most once per change and twice a heartbeat. A rendering is kept only while a
+stream, or the filter form's request for its page, has asked for it within two heartbeats; a
+plain page load keeps none. How long a running job has run moves in steps of a heartbeat, as
+ages do. The filter form's nodes and projects are those of when the page was loaded: a new one
+is offered on reload. A fragment is rendered at most once a second, and every heartbeat interval
+regardless — a node going quiet sends nothing — and sent only when it differs. Ages on the pages
+move in steps of a heartbeat, so a fleet with nothing new to report sends nothing but a
+keep-alive comment every 15 seconds, and a node reporting faster than that changes nothing about
+the rate. When its session ends, a stream sends a fragment saying so and a `close` event, on
+which htmx's SSE extension (`sse-close`) stops reconnecting; a page asking for a stream with the
+cookie of a session that has ended is answered the same, rather than refused into retrying. A
+stream whose browser stops reading is given up on, and its connection dropped.
 
 Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
 so at most 96 of its 128 are streams and at most 4 belong to one session — below the six a

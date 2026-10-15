@@ -7,7 +7,8 @@
 //! controls.
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
 //! jobs placed through the client API are listed, read only, on `/jobs`, a failed one with a
-//! page of its own ([`super::jobs`]).
+//! page of its own ([`super::jobs`]); the API keys and the client instances using them, read
+//! only too, on `/clients` ([`super::clients`]).
 //! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
 //! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
@@ -71,6 +72,8 @@ pub(super) struct FleetSite {
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     /// `/jobs`' newest pages, by filter.
     jobs: Arc<super::jobs::Renders>,
+    /// `/clients`' fragment, the same for every page.
+    clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
 }
 
 impl FleetSite {
@@ -85,6 +88,7 @@ impl FleetSite {
                 operations_events(hub, true),
             ),
             jobs: Arc::default(),
+            clients_feed: sse::feed(hub.subscribe_clients(), super::clients::events(hub)),
         }
     }
 }
@@ -95,6 +99,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         "nodes" => Some("nodes"),
         "operations" => Some("operations"),
         super::jobs::EVENT => Some(super::jobs::EVENT),
+        super::clients::EVENT => Some(super::clients::EVENT),
         _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
             .strip_prefix("node/")
@@ -133,6 +138,13 @@ pub(super) fn source(
             return job_event(event)
                 .filter(|_| query.is_none())
                 .map(|id| job_output::source(hub, id));
+        }
+        super::clients::EVENT => {
+            return Some(Source::Shared {
+                name: super::clients::EVENT,
+                feed: site.clients_feed.subscribe(),
+                events: super::clients::events(hub),
+            });
         }
         "nodes" => {
             return Some(Source::Shared {
@@ -245,6 +257,9 @@ pub(super) async fn get(
     }
     if let Some(id) = super::registries::detail_target(path) {
         return super::registries::detail(id, auth, ui).await.map(Some);
+    }
+    if path == super::clients::PATH {
+        return super::clients::get(auth, ui).await.map(Some);
     }
     if path == super::jobs::PATH {
         return super::jobs::get(query, auth, &site.jobs, ui, swap)
@@ -707,6 +722,7 @@ const NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
+    (super::clients::PATH, "Clients"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
 ];
@@ -715,6 +731,7 @@ const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
+    (super::clients::PATH, "Clients"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
     (super::users::PATH, "Users"),
@@ -1307,7 +1324,7 @@ pub(super) fn age(now: u64, then: u64) -> String {
 }
 
 /// The instant `then` as a [`pages::time`], with its [`age`] at `now` as fallback text.
-fn time_ago(h: &mut Html, now: u64, then: u64) -> &mut Html {
+pub(super) fn time_ago(h: &mut Html, now: u64, then: u64) -> &mut Html {
     pages::time(h, then, &age(now, then))
 }
 

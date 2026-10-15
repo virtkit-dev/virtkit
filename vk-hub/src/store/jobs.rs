@@ -36,6 +36,9 @@ pub(super) const JOB_TAIL_LENS: TableDefinition<&str, u64> = TableDefinition::ne
 /// The cache of the ends kept of jobs that did not fail. Key: a sequence number, oldest kept
 /// first, the first evicted. Value: the job's ID. [`CACHED_BYTES`] is their total.
 pub(super) const JOB_CACHE: TableDefinition<u64, &str> = TableDefinition::new("job_cache");
+/// Key: a key's ID. Value: how many of its jobs [`JOBS`] holds, kept in the writes that add and
+/// drop records, so counting a key's jobs reads no record.
+pub(super) const JOB_COUNTS: TableDefinition<&str, u64> = TableDefinition::new("job_counts");
 /// The history's bookkeeping. Key: one of the names below. Value: as each says.
 const JOB_META: TableDefinition<&str, u64> = TableDefinition::new("job_meta");
 /// A [`JOB_ORDER`] sequence: every job placed below it has finished and expired past
@@ -449,7 +452,15 @@ impl Db {
                 answer: serde_json::Value::String(id.to_string()),
             };
             requests.insert(request.as_str(), encode(&answer)?.as_slice())?;
-            txn.open_table(JOBS)?.insert(id, encode(row)?.as_slice())?;
+            let replaced = txn
+                .open_table(JOBS)?
+                .insert(id, encode(row)?.as_slice())?
+                .is_some();
+            if !replaced {
+                let mut counts = txn.open_table(JOB_COUNTS)?;
+                let n = counts.get(row.key.as_str())?.map_or(0, |g| g.value());
+                counts.insert(row.key.as_str(), n.saturating_add(1))?;
+            }
             txn.open_table(JOB_SPECS)?.insert(id, redacted_spec)?;
             let mut order = txn.open_table(JOB_ORDER)?;
             let seq = next_seq(&order, &txn.open_table(JOB_META)?)?;
@@ -645,6 +656,18 @@ impl Db {
         Ok(out)
     }
 
+    /// How many jobs the history holds of each key, by key ID: one read of [`JOB_COUNTS`].
+    pub fn job_counts_by_key(&self) -> Result<HashMap<String, u64>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(JOB_COUNTS)?;
+        let mut counts = HashMap::new();
+        for entry in table.iter()? {
+            let (key, n) = entry?;
+            counts.insert(key.value().to_string(), n.value());
+        }
+        Ok(counts)
+    }
+
     /// Visit the latest `limit` jobs, newest first, retaining only jobs a node accepted
     /// that finished at or after `since` or remain unfinished. Pass each redacted spec to
     /// `visit`, holding one spec at a time. Skip jobs whose specs expired.
@@ -813,7 +836,7 @@ impl Db {
                     if holds_output(&row) {
                         outputs.push(id.clone());
                     }
-                    dropped.push(id);
+                    dropped.push((id, row.key));
                 }
             }
             for seq in unplaced {
@@ -822,12 +845,26 @@ impl Db {
             let mut tails = txn.open_table(JOB_TAILS)?;
             let mut lens = txn.open_table(JOB_TAIL_LENS)?;
             let mut uncached = HashMap::new();
-            for id in &dropped {
+            let mut uncounted: HashMap<&str, u64> = HashMap::new();
+            for (id, key) in &dropped {
                 table.remove(id.as_str())?;
+                let n = uncounted.entry(key.as_str()).or_default();
+                *n = n.saturating_add(1);
                 specs.remove(id.as_str())?;
                 tails.remove(id.as_str())?;
                 if let Some(len) = lens.remove(id.as_str())? {
                     uncached.insert(id.as_str(), len.value());
+                }
+            }
+            let mut counts = txn.open_table(JOB_COUNTS)?;
+            for (key, gone) in uncounted {
+                let left = (counts.get(key)?)
+                    .map_or(0, |g| g.value())
+                    .saturating_sub(gone);
+                if left == 0 {
+                    counts.remove(key)?;
+                } else {
+                    counts.insert(key, left)?;
                 }
             }
             if !uncached.is_empty() {
@@ -985,6 +1022,35 @@ fn fill_tail_lens(txn: &redb::WriteTransaction) -> Result<()> {
         lens.insert(id.value(), tail.value().len() as u64)?;
     }
     meta.insert(TAIL_LENS, 1)?;
+    Ok(())
+}
+
+/// Fill [`JOB_COUNTS`] in from [`JOBS`], inside `txn`, when it is empty and the history is not:
+/// a database a build without the counts wrote. Only each record's key is decoded; one that
+/// does not decode is not counted, as the history's pages leave it out. A build without the
+/// counts adding or dropping jobs later (a dev downgrade) leaves them off by as many.
+pub(super) fn count_jobs(txn: &redb::WriteTransaction) -> Result<()> {
+    /// A record's submitter alone: the rest is skipped, not decoded.
+    #[derive(Deserialize)]
+    struct Submitter {
+        key: String,
+    }
+    let mut counts = txn.open_table(JOB_COUNTS)?;
+    let table = txn.open_table(JOBS)?;
+    if !counts.is_empty()? || table.is_empty()? {
+        return Ok(());
+    }
+    let mut by_key: HashMap<String, u64> = HashMap::new();
+    for entry in table.iter()? {
+        let Ok(job) = decode::<Submitter>(entry?.1.value()) else {
+            continue;
+        };
+        let n = by_key.entry(job.key).or_default();
+        *n = n.saturating_add(1);
+    }
+    for (key, n) in &by_key {
+        counts.insert(key.as_str(), *n)?;
+    }
     Ok(())
 }
 
@@ -1751,6 +1817,51 @@ mod tests {
         assert_eq!(by(&"a".repeat(64)), [4, 2].map(id));
         assert_eq!(by(&"b".repeat(64)), [3, 1].map(id));
         assert!(by(&"c".repeat(64)).is_empty());
+    }
+
+    /// Each key's count of jobs follows the records submitted and trimmed, and a database
+    /// without the counts has them filled in from the records once.
+    #[test]
+    fn the_jobs_are_counted_by_key() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=5 {
+            let mut row = settled(n);
+            row.key = if n.is_multiple_of(2) { "a" } else { "b" }.repeat(64);
+            submit(&db, n, &row);
+        }
+        let counts = |db: &Db| {
+            let mut counts: Vec<_> = db.job_counts_by_key().unwrap().into_iter().collect();
+            counts.sort();
+            counts
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        assert_eq!(counts(&db), [(a.clone(), 2), (b.clone(), 3)]);
+        // Trimmed to its newest 2: 1, 2 and 3 go.
+        db.prune_jobs(6, 2).unwrap();
+        assert_eq!(counts(&db), [(a.clone(), 1), (b.clone(), 1)]);
+        db.prune_jobs(6, 1).unwrap();
+        assert_eq!(counts(&db), [(b.clone(), 1)]);
+
+        // An older hub's database: the records, without their counts.
+        submit(&db, 6, &settled(6));
+        let txn = db.db.begin_write().unwrap();
+        txn.delete_table(JOB_COUNTS).unwrap();
+        txn.open_table(JOBS)
+            .unwrap()
+            .insert(id(7).as_str(), b"not json".as_slice())
+            .unwrap();
+        count_jobs(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(counts(&db), [(b, 1), ("k".into(), 1)]);
+        // Filled in once: counts held are not recounted.
+        let txn = db.db.begin_write().unwrap();
+        txn.open_table(JOBS)
+            .unwrap()
+            .remove(id(6).as_str())
+            .unwrap();
+        count_jobs(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(counts(&db).len(), 2);
     }
 
     /// A record from before jobs named their client instance still reads, naming none.
