@@ -202,7 +202,8 @@ minutes where a scoped run takes seconds.
 boot. It reuses `target/` — its RUSTFLAGS match `build.sh`'s exactly, so it shares
 dependency artifacts with `./build.sh --fast` — and rejects optimized invocations. The
 VM powers itself off after half an hour with no cargo command or open shell, so a
-forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A
+forgotten one stops holding memory; `./dev.sh stop` ends it immediately. Starting a VM
+also deletes the stopped VMs of this repository's checkouts that no longer exist. A
 `vk` and a `flock` on `PATH` are required and there is deliberately no Docker fallback.
 `VK_DEV_CPUS` and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window
 (`0` keeps the VM until it is stopped). Use `./build.sh --fast` only when an executable

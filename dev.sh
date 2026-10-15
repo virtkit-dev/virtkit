@@ -25,7 +25,8 @@
 #
 # VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
 # long it survives with no cargo command or open shell (default: 1800, 0 = until
-# ./dev.sh stop).
+# ./dev.sh stop). Starting a VM also deletes the stopped VMs, disks included, of this
+# repository's checkouts that no longer exist.
 #
 # The VM boots with nested virtualization when the host allows it and the vk on PATH can ask
 # for it, so `./dev.sh shell` can run vk inside vk — build and boot microVMs, not just
@@ -84,16 +85,60 @@ VK=$(command -v vk)
 # over virtiofs. Keyed by checkout path so two checkouts get two VMs.
 STATE_DIR="${XDG_STATE_HOME:-${HOME:?set HOME or XDG_STATE_HOME so the VM has a state directory}/.local/state}/virtkit/dev-vm-$(printf %s "$ROOT" | sha256sum | cut -c1-16)"
 
+# A state dir's name is only a hash of its checkout's path, so it records the checkout and
+# its repository; the sweep below needs both. Empty outside git: no sweep.
+CHECKOUT_FILE=checkout
+GIT_COMMON=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+
+# Delete the state dirs of this repository's checkouts that are gone. dev.lock keeps out
+# dev.sh, and the flock on the dir itself, which a `vk run` holds for its whole life, keeps
+# out a VM that is running, building its image or wedged. The checkout is checked again
+# under both locks, and the record goes only once the rest is gone, so a failed delete is
+# retried next time. A checkout on an unmounted volume counts as gone. Another repository's
+# dirs, dirs from before the record and those of a deleted repository are left alone.
+sweep_gone_checkouts() {
+  local dir checkout common
+  [ -n "$GIT_COMMON" ] || return 0
+  for dir in "${STATE_DIR%/*}"/dev-vm-*; do
+    if [ "$dir" = "$STATE_DIR" ] || [ ! -f "$dir/$CHECKOUT_FILE" ]; then
+      continue
+    fi
+    { IFS= read -r checkout && IFS= read -r common; } <"$dir/$CHECKOUT_FILE" || continue
+    if [ "$common" != "$GIT_COMMON" ] || [ -z "$checkout" ] || [ -e "$checkout" ]; then
+      continue
+    fi
+    (
+      # Read-only, so a sweep that lost the race cannot recreate dev.lock in a dir being
+      # deleted. Every recorded dir has one: lock_state_dir runs before the record is written.
+      { exec 8<"$dir/dev.lock" 7<"$dir"; } 2>/dev/null || exit 0
+      flock -n 8 || exit 0
+      flock -n 7 || exit 0
+      [ -f "$dir/$CHECKOUT_FILE" ] || exit 0
+      [ ! -e "$checkout" ] || exit 0
+      find "$dir" -mindepth 1 -maxdepth 1 ! -name "$CHECKOUT_FILE" ! -name dev.lock \
+        -exec rm -rf -- {} + || exit 1
+      rm -f -- "$dir/$CHECKOUT_FILE" "$dir/dev.lock" || exit 1
+      rmdir -- "$dir" || exit 1
+      echo "dev.sh: deleted the development VM of $checkout, which is gone" >&2
+    ) || echo "dev.sh: warning: could not delete $dir" >&2
+  done
+}
+
 # Take the lock on fd 9 and hold it for the caller. It closes the window between probing
 # the VM and starting one, which vk's own state-dir lock turns into a hard failure rather
 # than a wait. The timeout keeps a wedged first boot from hanging every other terminal.
+# A lock won on a dev.lock that a sweep has since deleted guards nothing, so retry on the new
+# one.
 lock_state_dir() {
-  mkdir -p "$STATE_DIR"
-  exec 9>"$STATE_DIR/dev.lock"
-  flock -w 600 9 || {
-    echo "dev.sh: timed out waiting for another dev.sh to release the VM lock" >&2
-    exit 1
-  }
+  while :; do
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/dev.lock" || continue
+    flock -w 600 9 || {
+      echo "dev.sh: timed out waiting for another dev.sh to release the VM lock" >&2
+      exit 1
+    }
+    [ /dev/fd/9 -ef "$STATE_DIR/dev.lock" ] && return
+  done
 }
 
 MODE=${1:-}
@@ -299,6 +344,9 @@ lock_state_dir
 # would otherwise sit beside vm.stamp forever. Delete this line once no dev VM predating
 # the rename can still be around.
 rm -f "$STATE_DIR/image.stamp"
+checkout_record=$(printf '%s\n%s' "$ROOT" "$GIT_COMMON")
+[ "$(cat "$STATE_DIR/$CHECKOUT_FILE" 2>/dev/null)" = "$checkout_record" ] ||
+  printf '%s\n' "$checkout_record" >"$STATE_DIR/$CHECKOUT_FILE"
 agent_up=""
 "$VK" status "$STATE_DIR" >/dev/null 2>&1 && agent_up=1
 if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$vm_stamp" ]; then
@@ -308,6 +356,7 @@ if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$vm_stamp" ]; 
 fi
 
 if [ -z "$agent_up" ]; then
+  sweep_gone_checkouts
   echo "dev.sh: starting the development VM" >&2
   # The timeout owns the VM's lifetime, so the startup command only has to succeed quietly —
   # `true` says that outright instead of falling through to vk run's boot-info probe.
