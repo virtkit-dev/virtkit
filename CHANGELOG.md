@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.91.1] - 2026-10-15
+
 ### Changed
 
 - **The hub's audit log no longer records capacity reservations**, which an idle runner
@@ -4307,7 +4309,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.91.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.91.1...HEAD
+[0.91.1]: https://github.com/virtkit-dev/virtkit/compare/v0.91.0...v0.91.1
 [0.91.0]: https://github.com/virtkit-dev/virtkit/compare/v0.90.0...v0.91.0
 [0.90.0]: https://github.com/virtkit-dev/virtkit/compare/v0.89.0...v0.90.0
 [0.89.0]: https://github.com/virtkit-dev/virtkit/compare/v0.88.0...v0.89.0
