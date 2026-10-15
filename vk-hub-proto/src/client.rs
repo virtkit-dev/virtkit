@@ -10,6 +10,12 @@
 //! returns the original answer without creating another reservation or job, so the client
 //! can retry after losing an answer. Failed requests return [`ClientError`].
 //!
+//! A client may also name its instance in [`INSTANCE_HEADER`] on every request, and describe
+//! it with a [`ClientHello`] at start and about every minute, so the hub can tell apart the
+//! daemons sharing one key. Both are optional: a hub records a request without the header,
+//! or with a malformed one, under its key alone, and a hub that predates [`CLIENTS_PATH`]
+//! ignores the header and answers a hello with a plain 404.
+//!
 //! | Request | Body | Answer |
 //! |---|---|---|
 //! | `POST` [`CAPACITY_PATH`] | [`CapacityRequest`] | 200 [`Capacity`] |
@@ -21,6 +27,7 @@
 //! | `GET` [`JOBS_PATH`]`/<id>/output?offset=<n>&wait=<secs>` | — | 200 the output's bytes |
 //! | `POST` [`JOBS_PATH`]`/<id>/cancel` | [`CancelRequest`] | 202 [`JobView`] |
 //! | `POST` [`JOBS_PATH`]`/<id>/settle` | — | 204 |
+//! | `POST` [`CLIENTS_PATH`] | [`ClientHello`] | 204 |
 //!
 //! `wait` on the two `GET`s, and `wait_secs` in a [`CapacityRequest`], make a request
 //! long-poll for at most that many seconds, capped at [`MAX_WAIT_SECS`]: a job view returns
@@ -38,9 +45,22 @@ pub const CAPACITY_PATH: &str = "/v1/capacity";
 pub const RESERVATIONS_PATH: &str = "/v1/reservations";
 /// Followed by `/<id>` for one job.
 pub const JOBS_PATH: &str = "/v1/jobs";
+pub const CLIENTS_PATH: &str = "/v1/clients";
 
 /// The header an API key rides in, as `Bearer <key>`.
 pub const AUTHORIZATION: &str = "authorization";
+
+/// The header naming the client instance a request comes from ([`valid_instance`]).
+pub const INSTANCE_HEADER: &str = "vk-client-instance";
+
+/// The longest instance name, in bytes ([`valid_instance`]).
+pub const MAX_INSTANCE_LEN: usize = 64;
+
+/// The most runners one [`ClientHello`] lists.
+pub const MAX_CLIENT_RUNNERS: usize = 64;
+
+/// The most labels one [`ClientRunner`] lists.
+pub const MAX_CLIENT_RUNNER_LABELS: usize = 32;
 
 /// On an output answer: the offset of its first byte.
 pub const OUTPUT_OFFSET_HEADER: &str = "vk-output-offset";
@@ -177,6 +197,52 @@ pub struct CancelRequest {
     pub mode: CancelMode,
 }
 
+/// `POST` [`CLIENTS_PATH`]: what one instance of a client is. Informational: the hub shows
+/// it, and decides nothing on it. Its strings are shown cut to
+/// [`MAX_DISPLAY`](crate::MAX_DISPLAY); a longer one is not an error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHello {
+    /// The instance's name, as its requests carry it in [`INSTANCE_HEADER`]; a hello whose
+    /// name fails [`valid_instance`] is refused.
+    pub instance: String,
+    /// The client program, such as `vk-gitlab`.
+    pub program: String,
+    pub version: String,
+    pub hostname: String,
+    /// How many jobs the instance runs at once, when it has such a limit: gitlab-runner's
+    /// global `concurrent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<u32>,
+    /// At most [`MAX_CLIENT_RUNNERS`]; a hello with more is refused.
+    #[serde(default)]
+    pub runners: Vec<ClientRunner>,
+}
+
+/// One runner a [`ClientHello`] reports: where the instance takes jobs from and the pool it
+/// sends them to. Never a credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRunner {
+    pub name: String,
+    /// The server it takes jobs from, without credentials, query or fragment.
+    pub url: String,
+    pub pool: String,
+    /// At most [`MAX_CLIENT_RUNNER_LABELS`]; a hello with more is refused.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// How many of its jobs run at once, when limited: the runner's `limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Whether `s` may name a client instance: 1 to [`MAX_INSTANCE_LEN`] bytes, each an ASCII
+/// letter, digit, `.`, `_` or `-`, the first a letter or digit.
+pub fn valid_instance(s: &str) -> bool {
+    (1..=MAX_INSTANCE_LEN).contains(&s.len())
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Any failed client request's body: [`ErrorBody`](crate::ErrorBody)'s `error`, and a code.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientError {
@@ -250,6 +316,23 @@ mod tests {
         }
     }
 
+    fn hello() -> ClientHello {
+        ClientHello {
+            instance: "s_0123456789ab".into(),
+            program: "vk-gitlab".into(),
+            version: "0.91.1".into(),
+            hostname: "ci-1".into(),
+            concurrent: Some(4),
+            runners: vec![ClientRunner {
+                name: "docker".into(),
+                url: "https://gitlab.example.com".into(),
+                pool: "ci".into(),
+                labels: vec!["large-memory".into()],
+                limit: Some(2),
+            }],
+        }
+    }
+
     #[test]
     fn every_body_round_trips() {
         round_trip(&CapacityRequest {
@@ -302,6 +385,7 @@ mod tests {
         round_trip(&CancelRequest {
             mode: CancelMode::Graceful,
         });
+        round_trip(&hello());
         round_trip(&ClientError {
             error: "no node took it".into(),
             code: ErrorCode::NoCapacity,
@@ -360,6 +444,29 @@ mod tests {
             serde_json::to_value(error).unwrap(),
             json!({"error": "gone", "code": "reservation_gone"})
         );
+        assert_eq!(
+            serde_json::to_value(hello()).unwrap(),
+            json!({
+                "instance": "s_0123456789ab",
+                "program": "vk-gitlab",
+                "version": "0.91.1",
+                "hostname": "ci-1",
+                "concurrent": 4,
+                "runners": [{
+                    "name": "docker",
+                    "url": "https://gitlab.example.com",
+                    "pool": "ci",
+                    "labels": ["large-memory"],
+                    "limit": 2,
+                }],
+            })
+        );
+        let mut bare = hello();
+        bare.concurrent = None;
+        bare.runners[0].limit = None;
+        let bare = serde_json::to_value(bare).unwrap();
+        assert!(bare.get("concurrent").is_none(), "{bare}");
+        assert!(bare["runners"][0].get("limit").is_none(), "{bare}");
     }
 
     #[test]
@@ -384,5 +491,46 @@ mod tests {
         assert!(request.placement.labels.is_empty());
         let state: JobState = serde_json::from_value(json!("suspended")).unwrap();
         assert_eq!(state, JobState::Other);
+        let hello: ClientHello = serde_json::from_value(json!({
+            "instance": "s_0123456789ab",
+            "program": "vk-gitlab",
+            "version": "0.91.1",
+            "hostname": "ci-1",
+        }))
+        .unwrap();
+        assert_eq!(hello.concurrent, None);
+        assert!(hello.runners.is_empty());
+        let runner: ClientRunner = serde_json::from_value(json!({
+            "name": "docker", "url": "https://gitlab.example.com", "pool": "ci",
+        }))
+        .unwrap();
+        assert!(runner.labels.is_empty());
+        assert_eq!(runner.limit, None);
+    }
+
+    #[test]
+    fn instance_names_are_short_and_plain() {
+        for good in [
+            "s_0123456789ab",
+            "r_AbC",
+            "ci-1.example",
+            &"a".repeat(MAX_INSTANCE_LEN),
+        ] {
+            assert!(valid_instance(good), "{good}");
+        }
+        for bad in [
+            "",
+            &"a".repeat(MAX_INSTANCE_LEN + 1),
+            "a b",
+            "a/b",
+            "é",
+            "a\n",
+            ".",
+            "..",
+            "-x",
+            "_x",
+        ] {
+            assert!(!valid_instance(bad), "{bad:?}");
+        }
     }
 }
