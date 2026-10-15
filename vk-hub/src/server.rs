@@ -144,7 +144,7 @@ pub struct Hub {
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
     /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
-    pub(crate) clients: Arc<Semaphore>,
+    pub(crate) client_conns: Arc<Semaphore>,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
 }
@@ -198,7 +198,7 @@ impl Hub {
             touched: watch::Sender::new(0),
             jobs: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
-            clients: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
+            client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             dispatch: crate::jobs::Dispatch::new(
                 None,
                 crate::jobs::DEFAULT_LOST_AFTER,
@@ -623,7 +623,7 @@ impl ConnState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if client.is_none() {
-            let Ok(permit) = hub.clients.clone().try_acquire_owned() else {
+            let Ok(permit) = hub.client_conns.clone().try_acquire_owned() else {
                 return false;
             };
             *client = Some(permit);

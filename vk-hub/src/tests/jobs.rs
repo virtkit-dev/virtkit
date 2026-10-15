@@ -2304,7 +2304,11 @@ async fn client_connections_past_the_cap_are_told_to_retry() {
     let key = jobs_key(&hub);
     let ask = || Some(json!({"placement": placement()}));
     let all = u32::try_from(server::MAX_CLIENT_CONNS).unwrap();
-    let held = hub.clients.clone().try_acquire_many_owned(all).unwrap();
+    let held = hub
+        .client_conns
+        .clone()
+        .try_acquire_many_owned(all)
+        .unwrap();
     let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
     assert_eq!((resp.status, resp.code()), (503, ErrorCode::Unavailable));
     assert_eq!(
