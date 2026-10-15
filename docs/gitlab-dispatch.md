@@ -222,6 +222,22 @@ those unheard from for 30 days, and those of a key once it is removed. A hub tha
 `/v1/clients` answers a hello with a 404 without a `code` and ignores the header, so a
 client stops sending hellos on that 404 and goes on as before.
 
+**Presence.** `vk-gitlab run` names itself by its system ID in `vk-client-instance` on every
+request, and sends a hello at startup and every minute: `program` `vk-gitlab`, its
+version, the host's name, `concurrent`, and each runner's name, GitLab URL (without
+credentials, query or fragment), pool, labels and `limit` — the first 64 runners, the first
+32 labels of each. Runner tokens and the API key never go in it. A failed hello is logged
+and retried a minute later; jobs never wait on it. A hello answered with a 404 without a
+`code` stops the hellos until the daemon restarts: restart it after upgrading the hub. Two
+daemons on one host share a system ID unless `system_id` sets them apart, and so show as one
+instance, each hello overwriting the other's every minute: its runners flip between the two
+configs.
+
+| | Hub with `/v1/clients` | Hub without |
+|---|---|---|
+| **vk-gitlab that says hellos** | instance, host, version and runners shown | header ignored; the first hello's 404 is logged once and no more are sent until a restart |
+| **vk-gitlab without** | the key's unknown instance, last heard from by its requests | as before |
+
 **Idempotency and retries.** `request_id` — 16 random bytes, hex — makes a create
 idempotent for a day: the same ID with the same body answers the first answer again, or 410
 `not_found` once the hub has dropped that job from its history; with another body, 409

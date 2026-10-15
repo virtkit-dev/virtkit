@@ -10,16 +10,19 @@ use vk_gitlab::config::Config;
 use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
+use vk_gitlab::presence;
 use vk_gitlab::secret::Secret;
 use vk_gitlab::trace::TraceSettings;
 
 use super::fakehub::{FakeHub, TEST_API_KEY};
-use super::{FakeGitLab, Recorded, Reply};
+use super::{FakeGitLab, Recorded, Reply, TEST_SYSTEM_ID};
 
 /// The runner ID the fake GitLab's `/runners/verify` answers.
 pub const RUNNER_ID: i64 = 77;
 /// The token of the default runner, `r1`.
 pub const TOKEN: &str = "glrt-test-token";
+/// How often a daemon behind the fake hub's HTTP API says its hello.
+pub const HELLO_INTERVAL: Duration = Duration::from_millis(100);
 
 /// GitLab: jobs to hand out per runner token, the `Job-Status` of each job, and each job's
 /// log as the patches assembled it — a patch must start where the log ends (or at 0, a
@@ -359,9 +362,7 @@ impl Harness {
         let task = match self.via {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
-                rt.spawn(
-                    async move { poll::run(&cfg, "s_0123456789ab", d, options, shutdown).await },
-                )
+                rt.spawn(async move { poll::run(&cfg, TEST_SYSTEM_ID, d, options, shutdown).await })
             }
             Via::Http => {
                 let hub = cfg.hub.clone().unwrap();
@@ -374,12 +375,17 @@ impl Harness {
                         backoff_min: Duration::from_millis(50),
                         backoff_max: Duration::from_millis(200),
                     },
+                    instance: TEST_SYSTEM_ID.to_owned(),
                 })
                 .unwrap();
                 let d = Arc::new(client);
-                rt.spawn(
-                    async move { poll::run(&cfg, "s_0123456789ab", d, options, shutdown).await },
-                )
+                // As main.rs does; it ends with the runtime.
+                rt.spawn(presence::report(
+                    Arc::clone(&d),
+                    presence::hello_for(&cfg, TEST_SYSTEM_ID),
+                    HELLO_INTERVAL,
+                ));
+                rt.spawn(async move { poll::run(&cfg, TEST_SYSTEM_ID, d, options, shutdown).await })
             }
         };
         Daemon {

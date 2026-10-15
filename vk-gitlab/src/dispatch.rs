@@ -96,6 +96,10 @@ pub struct DispatchError {
     pub message: String,
     /// The hub's `retry_after_secs`.
     pub retry_after: Option<Duration>,
+    /// The status of the hub's answer, if one came.
+    pub status: Option<u16>,
+    /// Whether that answer's body carried a `code`.
+    pub coded: bool,
 }
 
 impl DispatchError {
@@ -104,6 +108,8 @@ impl DispatchError {
             kind,
             message: message.into(),
             retry_after: None,
+            status: None,
+            coded: false,
         }
     }
 }

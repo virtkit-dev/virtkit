@@ -8,6 +8,10 @@ All notable changes to virtkit will be documented in this file.
 
 - **CI jobs save a host-side thread snapshot when their VM stops** in `vmm-threads.txt`
   beside the job's statistics log, showing what each thread was blocked on when a job timed out.
+- **vk-gitlab tells the hub which host it runs on, its version and its runners** (name,
+  GitLab URL, pool, labels), at start and every minute, so the hub can tell apart the daemons
+  sharing one API key. Runner tokens and the API key are never sent, and a hub too old to take
+  this is left alone.
 
 ## [0.91.1] - 2026-10-15
 

@@ -9,6 +9,9 @@
 //! first answer: a submission is retried until its `place_within` is up. An answer whose
 //! body is cut short is retried as a request without one is. A renewal is tried once, and
 //! its caller retries it within the lease.
+//!
+//! Every request names this daemon's instance in `vk-client-instance`, and
+//! [`HubClient::hello`] says what the instance is (see [`crate::presence`]).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,10 +23,10 @@ use reqwest::{Method, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vk_hub_proto::client::{
-    CAPACITY_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError, ErrorCode,
-    JOBS_PATH, JobSubmission, JobView, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER,
-    OUTPUT_OFFSET_HEADER, Placement, RESERVATIONS_PATH, RenewRequest, ReservationGrant,
-    ReservationRequest,
+    CAPACITY_PATH, CLIENTS_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError,
+    ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobSubmission, JobView, MAX_INSTANCE_LEN,
+    MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement,
+    RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, valid_instance,
 };
 use vk_hub_proto::dispatch::MAX_LEASE_SECS;
 use vk_hub_proto::job::MAX_JOB_SPEC;
@@ -80,6 +83,8 @@ pub struct HubOptions {
     /// A PEM bundle the hub is verified against instead of the system roots.
     pub ca_file: Option<PathBuf>,
     pub retry: HubRetry,
+    /// The instance every request names in [`INSTANCE_HEADER`] ([`valid_instance`]).
+    pub instance: String,
 }
 
 /// Whether `key` has the shape of a hub API key.
@@ -127,8 +132,22 @@ impl HubClient {
                 "the hub API key is not `vkk_` and 64 hex digits".to_owned(),
             ));
         }
+        if !valid_instance(&opts.instance) {
+            return Err(SetupError::new(format!(
+                "instance {:?}: 1 to {MAX_INSTANCE_LEN} letters, digits, '.', '_' or '-', the first \
+                 a letter or digit",
+                opts.instance
+            )));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            INSTANCE_HEADER,
+            reqwest::header::HeaderValue::from_str(&opts.instance)
+                .map_err(|e| SetupError::new(format!("instance {:?}: {e}", opts.instance)))?,
+        );
         let mut builder = reqwest::Client::builder()
             .user_agent(format!("vk-gitlab {}", env!("CARGO_PKG_VERSION")))
+            .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .tls_version_min(reqwest::tls::Version::TLS_1_3);
@@ -227,16 +246,35 @@ impl HubClient {
     }
 
     /// A call whose answer body does not matter.
-    async fn call_empty(&self, method: Method, path: &str, tries: Tries) -> DispatchResult<()> {
+    async fn call_empty(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+        tries: Tries,
+    ) -> DispatchResult<()> {
         self.call(
             method,
             path,
             "",
-            None,
+            body,
             timeout_for(Duration::ZERO),
             true,
             tries,
             |resp| async move { resp.bytes().await.map(drop).map_err(transport) },
+        )
+        .await
+    }
+
+    /// Describes this instance to the hub. Tried once; the caller sends periodic hellos.
+    pub async fn hello(&self, hello: &ClientHello) -> DispatchResult<()> {
+        let body = serde_json::to_vec(hello)
+            .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?;
+        self.call_empty(
+            Method::POST,
+            CLIENTS_PATH,
+            Some(Bytes::from(body)),
+            Tries::Once,
         )
         .await
     }
@@ -312,12 +350,16 @@ async fn error_of(resp: Response) -> DispatchError {
     let body = resp.bytes().await.unwrap_or_default();
     let parsed = serde_json::from_slice::<ClientError>(&body).ok();
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        return DispatchError::new(
-            ErrorKind::OutputRange {
-                length: length.unwrap_or(0),
-            },
-            parsed.map_or_else(|| status.to_string(), |p| p.error),
-        );
+        return DispatchError {
+            status: Some(status.as_u16()),
+            coded: parsed.is_some(),
+            ..DispatchError::new(
+                ErrorKind::OutputRange {
+                    length: length.unwrap_or(0),
+                },
+                parsed.map_or_else(|| status.to_string(), |p| p.error),
+            )
+        };
     }
     let kind = match parsed.as_ref().map(|p| p.code) {
         Some(ErrorCode::Unauthorized) => ErrorKind::Unauthorized,
@@ -351,8 +393,10 @@ async fn error_of(resp: Response) -> DispatchError {
         .map(Duration::from_secs);
     DispatchError {
         kind,
+        coded: parsed.is_some(),
         message: parsed.map_or_else(|| status.to_string(), |p| p.error),
         retry_after,
+        status: Some(status.as_u16()),
     }
 }
 
@@ -454,7 +498,7 @@ impl Dispatcher for HubClient {
 
     async fn release(&self, reservation: &str) -> DispatchResult<()> {
         let path = format!("{RESERVATIONS_PATH}/{}", checked_id(reservation)?);
-        self.call_empty(Method::DELETE, &path, Tries::Attempts)
+        self.call_empty(Method::DELETE, &path, None, Tries::Attempts)
             .await
     }
 
@@ -556,7 +600,8 @@ impl Dispatcher for HubClient {
 
     async fn settle(&self, id: &str) -> DispatchResult<()> {
         let path = format!("{JOBS_PATH}/{}/settle", checked_id(id)?);
-        self.call_empty(Method::POST, &path, Tries::Attempts).await
+        self.call_empty(Method::POST, &path, None, Tries::Attempts)
+            .await
     }
 }
 
@@ -587,6 +632,7 @@ mod tests {
                 api_key: key.clone(),
                 ca_file: None,
                 retry: HubRetry::default(),
+                instance: "s_0123456789ab".to_owned(),
             })
         };
         assert!(mk("https://hub.example.com:8443").is_ok());
@@ -595,5 +641,24 @@ mod tests {
         assert!(mk("http://localhost:8443").is_ok());
         assert!(mk("http://hub.example.com").is_err());
         assert!(mk("ftp://hub").is_err());
+    }
+
+    #[test]
+    fn instances() {
+        let mk = |instance: &str| {
+            HubClient::new(HubOptions {
+                url: "https://hub.example.com:8443".to_owned(),
+                api_key: Secret::new(format!("vkk_{}", "0f".repeat(32))),
+                ca_file: None,
+                retry: HubRetry::default(),
+                instance: instance.to_owned(),
+            })
+        };
+        assert!(mk("s_0123456789ab").is_ok());
+        assert!(mk("").is_err());
+        assert!(mk("a b").is_err());
+        assert!(mk("-x").is_err());
+        assert!(mk(&"a".repeat(64)).is_ok());
+        assert!(mk(&"a".repeat(65)).is_err());
     }
 }

@@ -14,6 +14,7 @@ pub mod hub;
 pub mod job;
 pub mod logging;
 pub mod poll;
+pub mod presence;
 pub mod secret;
 pub mod spec;
 pub mod state;

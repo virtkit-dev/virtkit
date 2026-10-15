@@ -1,9 +1,12 @@
 //! vk-hub's client API over HTTP (`vk-hub/src/client.rs`: paths,
 //! statuses, error bodies, output headers), served from the in-memory `FakeDispatcher`, so
-//! the real hub client is tested on the wire.
+//! the real hub client is tested on the wire. Hellos are taken only once
+//! [`FakeHub::take_hellos`] is on; until then `/v1/clients` gets, before any key check, the
+//! bare 404 a hub that predates it answers an unknown path (`vk-hub/src/server.rs`).
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,14 +15,14 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{HeaderMap, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use vk_gitlab::dispatch::{DispatchError, Dispatcher, ErrorKind, FakeDispatcher, Submission};
 use vk_hub_proto::client::{
-    CancelRequest, CapacityRequest, ClientError, ErrorCode, JobSubmission, RenewRequest,
-    ReservationGrant, ReservationRequest,
+    CancelRequest, CapacityRequest, ClientError, ClientHello, ErrorCode, JobSubmission,
+    RenewRequest, ReservationGrant, ReservationRequest,
 };
 
 pub const TEST_API_KEY: &str =
@@ -34,9 +37,20 @@ pub struct Fault {
     pub retry_after_secs: Option<u32>,
 }
 
+/// A request as the fake hub received it.
+#[derive(Clone, Debug)]
+pub struct HubRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: HeaderMap,
+}
+
 pub struct FakeHub {
     pub url: String,
-    pub requests: Arc<Mutex<Vec<(String, String)>>>,
+    pub requests: Arc<Mutex<Vec<HubRequest>>>,
+    /// The hellos taken, in order.
+    pub hellos: Arc<Mutex<Vec<ClientHello>>>,
+    clients: Arc<AtomicBool>,
     faults: Arc<Mutex<VecDeque<Fault>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -231,29 +245,44 @@ impl FakeHub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let hellos = Arc::new(Mutex::new(Vec::new()));
+        let clients = Arc::new(AtomicBool::new(false));
         let faults: Arc<Mutex<VecDeque<Fault>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let (recs, flts) = (Arc::clone(&requests), Arc::clone(&faults));
+        let state = (
+            Arc::clone(&requests),
+            Arc::clone(&hellos),
+            Arc::clone(&clients),
+            Arc::clone(&faults),
+        );
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (hub, recs, flts) = (hub.clone(), Arc::clone(&recs), Arc::clone(&flts));
+                let (hub, state) = (hub.clone(), state.clone());
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let (hub, recs, flts) = (hub.clone(), Arc::clone(&recs), Arc::clone(&flts));
+                        let (hub, (recs, hels, clis, flts)) = (hub.clone(), state.clone());
                         async move {
                             let path = req.uri().path().to_owned();
-                            recs.lock()
-                                .unwrap()
-                                .push((req.method().to_string(), path.clone()));
+                            recs.lock().unwrap().push(HubRequest {
+                                method: req.method().to_string(),
+                                path: path.clone(),
+                                headers: req.headers().clone(),
+                            });
+                            if path == "/v1/clients" && !clis.load(Ordering::SeqCst) {
+                                return Ok::<_, Infallible>(json(
+                                    404,
+                                    &serde_json::json!({"error": "no such endpoint"}),
+                                ));
+                            }
                             let auth = req
                                 .headers()
                                 .get("authorization")
                                 .and_then(|v| v.to_str().ok())
                                 .unwrap_or("");
                             if auth != format!("Bearer {TEST_API_KEY}") {
-                                return Ok::<_, Infallible>(error(
+                                return Ok(error(
                                     401,
                                     ErrorCode::Unauthorized,
                                     "an API key the hub knows is required",
@@ -277,6 +306,16 @@ impl FakeHub {
                                 }
                                 return Ok(r);
                             }
+                            if req.method() == "POST" && path == "/v1/clients" {
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                return Ok(match serde_json::from_slice(&body) {
+                                    Ok(hello) => {
+                                        hels.lock().unwrap().push(hello);
+                                        empty(204)
+                                    }
+                                    Err(e) => error(400, ErrorCode::Invalid, &e.to_string(), None),
+                                });
+                            }
                             Ok(serve(hub, req).await)
                         }
                     });
@@ -289,9 +328,16 @@ impl FakeHub {
         FakeHub {
             url: format!("http://{addr}"),
             requests,
+            hellos,
+            clients,
             faults,
             task,
         }
+    }
+
+    /// Whether hellos are taken, or answered the bare 404 of a hub that predates them.
+    pub fn take_hellos(&self, on: bool) {
+        self.clients.store(on, Ordering::SeqCst);
     }
 
     /// Answers the next `n` requests under `path_prefix` with `status` and `code`.
@@ -324,7 +370,7 @@ impl FakeHub {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, p)| p.starts_with(prefix))
+            .filter(|r| r.path.starts_with(prefix))
             .count()
     }
 }

@@ -12,7 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vk_gitlab::config::Config;
 use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
-use vk_gitlab::{logging, system_id};
+use vk_gitlab::{logging, presence, system_id};
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -98,8 +98,10 @@ async fn run(config: PathBuf) -> Result<()> {
         api_key: hub.api_key().clone(),
         ca_file: hub.ca_file.clone(),
         retry: Default::default(),
+        instance: system_id.clone(),
     })
     .context("the [hub] section")?;
+    let dispatcher = Arc::new(dispatcher);
     let (handle, shutdown) = ShutdownHandle::new();
     let shutdown_timeout = cfg.shutdown_timeout();
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
@@ -127,14 +129,20 @@ async fn run(config: PathBuf) -> Result<()> {
         log::error!("Exiting now; the jobs still in the state files resume on the next start");
         std::process::exit(1);
     });
+    let hello = tokio::spawn(presence::report(
+        Arc::clone(&dispatcher),
+        presence::hello_for(&cfg, &system_id),
+        presence::HELLO_INTERVAL,
+    ));
     let result = poll::run(
         &cfg,
         &system_id,
-        Arc::new(dispatcher),
+        dispatcher,
         RunOptions::default(),
         shutdown,
     )
     .await;
+    hello.abort();
     signals.abort();
     result
 }
