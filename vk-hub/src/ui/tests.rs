@@ -3889,13 +3889,375 @@ async fn api_keys_and_their_clients_are_shown_live() {
         ] {
             assert!(page.contains(want), "{role:?}: {want}: {page}");
         }
-        // Nothing to act on: the sign-out form above `<main>` is the page's only one.
         let main = page.split_once("<main>").unwrap().1;
-        for not in ["<script>alert", "<img", "user:pass", "<form", "hx-post"] {
+        for not in ["<script>alert", "<img", "user:pass"] {
+            assert!(!main.contains(not), "{role:?}: {not}: {page}");
+        }
+        if role == Role::Operator {
+            assert!(
+                main.contains("<button class=\"danger\">Revoke</button>"),
+                "{page}"
+            );
+            continue;
+        }
+        // Nothing to act on: the sign-out form above `<main>` is the page's only one.
+        for not in ["<form", "hx-post"] {
             assert!(!main.contains(not), "{role:?}: {not}: {page}");
         }
         assert!(!page.contains("hx-headers"), "{role:?}: {page}");
     }
+}
+
+/// The key in a page showing one.
+fn shown_key(body: &str) -> String {
+    let at = body.find("vkk_").expect("the key");
+    body[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// An operator creates an API key from `/clients`: refused, with the reason, for a bad name or
+/// policy, and otherwise shown once with the vk-gitlab config using it, audited without it,
+/// and never in the live fragment or a later page. A viewer gets no form and is refused, as is
+/// a post from another site or without the session's CSRF token.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_creates_an_api_key_shown_once() {
+    use crate::store::Scope;
+    let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
+    let good = "op=create&name=gitlab&pools=ci%2C+build&scope=jobs&scope=capacity\
+                &max_mem=16G&max_cpus=8&max_disk=&ttl=30";
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await;
+    assert!(!page.body.contains("value=\"create\""), "{}", page.body);
+    let form = format!("_csrf={viewer_csrf}&{good}");
+    let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(reply.body.contains("operator role"), "{}", reply.body);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients", Some(&operator)).await;
+    for want in [
+        "<form class=\"wide\" method=\"post\" action=\"/clients\">",
+        "<input type=\"hidden\" name=\"op\" value=\"create\">",
+        "<option value=\"90\">90 days</option>",
+        "value=\"jobs\" checked>",
+        "none: create one below",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    // Outside the live fragment.
+    let fragment = page.body.split("id=\"clients\"").nth(1).unwrap();
+    let fragment = fragment.split("<h2>Create an API key").next().unwrap();
+    assert!(!fragment.contains("<form"), "{fragment}");
+    let mut live = Events::open(addr, "/events/clients", &operator).await;
+    live.next().await.unwrap();
+
+    let form = format!("_csrf={csrf}&{good}");
+    let reply = post_action(
+        addr,
+        "http://evil.example",
+        &operator,
+        "/clients",
+        &form,
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post_action(addr, &origin, &operator, "/clients", good, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(reply.body.contains("CSRF"), "{}", reply.body);
+    for (bad, said) in [
+        (
+            "name=..%2Fx&pools=ci&scope=jobs&ttl=90",
+            "a key&#39;s name is 1 to",
+        ),
+        (
+            "name=k&pools=&scope=jobs&ttl=90",
+            "a key needs at least one pool",
+        ),
+        (
+            "name=k&pools=ci%2C..&scope=jobs&ttl=90",
+            "is not a pool&#39;s name",
+        ),
+        ("name=k&pools=ci&ttl=90", "a key needs at least one scope"),
+        (
+            "name=k&pools=ci&scope=all&ttl=90",
+            "&quot;all&quot;: expected jobs or capacity",
+        ),
+        (
+            "name=k&pools=ci&scope=jobs&max_mem=lots&ttl=90",
+            "largest memory",
+        ),
+        (
+            "name=k&pools=ci&scope=jobs&max_mem=512K&ttl=90",
+            "expected at least 1M",
+        ),
+        (
+            "name=k&pools=ci&scope=jobs&max_cpus=-1&ttl=90",
+            "largest CPUs",
+        ),
+        (
+            "name=k&pools=ci&scope=jobs&max_disk=9&ttl=90",
+            "largest disk",
+        ),
+        (
+            "name=k&pools=ci&scope=jobs&ttl=5",
+            "not one of the form&#39;s lifetimes",
+        ),
+    ] {
+        let form = format!("_csrf={csrf}&op=create&{bad}");
+        let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+        assert!(reply.body.contains(said), "{bad}: {said}: {}", reply.body);
+    }
+    assert!(hub.db.api_keys().unwrap().is_empty());
+
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    assert!(
+        reply.body.contains(
+            "<pre>[hub]\nurl = \"https://hub.example.com:8443\"\n\
+             api_key_file = \"/etc/vk-gitlab/hub.key\"</pre>"
+        ),
+        "{}",
+        reply.body
+    );
+    let key = shown_key(&reply.body);
+    assert_eq!(key.len(), 4 + 64, "{key}");
+    let now = crate::now_secs();
+    let principal = hub.db.api_key(&key, now).unwrap().expect("a working key");
+    assert_eq!(principal.row.scopes, [Scope::Jobs, Scope::Capacity]);
+    assert_eq!(principal.row.pools, ["build", "ci"]);
+    assert_eq!(
+        principal.row.max_envelope,
+        Some(vk_hub_proto::job::Envelope {
+            mem_mib: 16 << 10,
+            cpus: 8,
+            disk_bytes: u64::MAX,
+        })
+    );
+    assert!(principal.row.expires_at.abs_diff(now + 30 * 86_400) < 60);
+    assert!(principal.row.created_by.contains("(operator)"));
+    let audit = audited(&hub, "created API key gitlab").await;
+    assert!(audit.iter().all(|e| !e.contains(&key)), "{audit:?}");
+
+    let event = next_with(&mut live, "<td>gitlab</td>").await;
+    assert!(!event.contains(&key), "{event}");
+    let page = get(addr, "/clients", Some(&operator)).await;
+    assert!(page.body.contains("<td>gitlab</td>"), "{}", page.body);
+    assert!(!page.body.contains(&key), "{}", page.body);
+
+    // A working key's name is taken.
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.body.contains("already works"), "{}", reply.body);
+}
+
+/// An operator revokes a working key, once asked first, saying its jobs under way are
+/// stranded, then removes it once it no longer works; each is audited and the live page
+/// follows. A viewer, an answer given twice and a button shown before the key changed are
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
+    use crate::store::{KeyPolicy, Scope};
+    let (addr, hub, origin) = start_fleet().await;
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+    };
+    let now = crate::now_secs();
+    let (key, _) = hub
+        .db
+        .create_api_key("gitlab", &policy, Duration::from_secs(3600), "uid 0", now)
+        .unwrap();
+    let id = crate::store::token_key(&key);
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let form = format!("_csrf={viewer_csrf}&op=revoke&name=gitlab");
+    let reply = post_action(addr, &origin, &viewer, "/clients", &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let mut viewing = Events::open(addr, "/events/clients", &viewer).await;
+    let first = viewing.next().await.unwrap();
+    assert!(!first.contains("hx-post"), "{first}");
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients", Some(&operator)).await;
+    for want in [
+        &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
+        "<div id=\"flash\"></div>",
+        "action=\"/clients\" hx-post=\"/clients\" hx-swap=\"none\"",
+        "<input type=\"hidden\" name=\"op\" value=\"revoke\">\
+         <input type=\"hidden\" name=\"name\" value=\"gitlab\">\
+         <button class=\"danger\">Revoke</button>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    // The fragment, shared by every operator's page, carries no session's token.
+    let fragment = page.body.split("id=\"clients\"").nth(1).unwrap();
+    let fragment = fragment.split("<h2>Create an API key").next().unwrap();
+    assert!(!fragment.contains(&csrf), "{fragment}");
+    let mut live = Events::open(addr, "/events/clients", &operator).await;
+    let first = live.next().await.unwrap();
+    assert!(
+        first.contains("<button class=\"danger\">Revoke</button>"),
+        "{first}"
+    );
+    assert!(!first.contains(&csrf), "{first}");
+
+    // Asked first; the key works until answered.
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients",
+        &format!("_csrf={csrf}&op=revoke&name=gitlab"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    for want in [
+        "vk-gitlab can no longer follow or settle its jobs under way",
+        "<button class=\"danger\">Yes, revoke</button>",
+        "0 reservation(s), 0 job(s) queued or running",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert_eq!(hidden(&reply.body, "keys"), id);
+    assert!(hub.db.api_key(&key, now).unwrap().is_some());
+    let answer = format!(
+        "_csrf={csrf}&op=revoke&name=gitlab&keys={id}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Revoked API key gitlab."),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.api_key(&key, crate::now_secs()).unwrap().is_none());
+    audited(&hub, "revoked API key gitlab").await;
+    let revoked = next_with(&mut live, "badge bad\">revoked").await;
+    assert!(
+        revoked.contains("<button class=\"danger\">Remove</button>"),
+        "{revoked}"
+    );
+    next_with(&mut viewing, "badge bad\">revoked").await;
+
+    // Answered once; and a revoke button shown before is now stale.
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=revoke&name=gitlab");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=revoke&name=other");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    // Removed, once asked, by a plain form back to the page.
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients",
+        &format!("_csrf={csrf}&op=remove&name=gitlab"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
+    let answer = format!(
+        "_csrf={csrf}&op=remove&name=gitlab&keys={id}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert!(hub.db.api_keys().unwrap().is_empty());
+    audited(&hub, "removed 1 revoked or expired API key(s) named gitlab").await;
+    next_with(&mut live, "none: create one below").await;
+}
+
+/// A revocation confirmed after the key was revoked and its name taken again is refused, the
+/// new key left working; so is a removal while a key of that name works, and an unknown
+/// action. The question counts what the key's instances hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_changed_since_confirmed_is_left_alone() {
+    use crate::store::{KeyPolicy, Scope};
+    use vk_hub_proto::client::JobState;
+    let scratch = Scratch::new("clients-changed");
+    let (addr, hub) = start_fleet_placing(&scratch.0).await;
+    let origin = format!("http://{addr}");
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+    };
+    let ttl = Duration::from_secs(3600);
+    let now = crate::now_secs();
+    let (old, _) = hub
+        .db
+        .create_api_key("gitlab", &policy, ttl, "uid 0", now)
+        .unwrap();
+    let old_id = crate::store::token_key(&old);
+    // A job of its running on a node, picked back up as a restarted hub would.
+    let mut row = history_job(1, "acme/web");
+    row.key = old_id.clone();
+    row.instance = Some("s_1".into());
+    row.state = JobState::Running;
+    row.node = Some("n1".into());
+    row.started_at = Some(now);
+    hub.db
+        .submit_job(&format!("{:032x}", 1), &row, "1", b"{}", "key gitlab", now)
+        .unwrap();
+    crate::jobs::recover(&hub).await.unwrap();
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients",
+        &format!("_csrf={csrf}&op=revoke&name=gitlab"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("0 reservation(s), 1 job(s) queued or running"),
+        "{}",
+        reply.body
+    );
+    let answer = format!(
+        "_csrf={csrf}&op=revoke&name=gitlab&keys={old_id}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    assert!(hub.db.revoke_api_key("gitlab", "uid 0", now).unwrap());
+    let (new, _) = hub
+        .db
+        .create_api_key("gitlab", &policy, ttl, "uid 0", now)
+        .unwrap();
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(hub.db.api_key(&new, crate::now_secs()).unwrap().is_some());
+
+    // The old key no longer works, but the new one holds the name.
+    let form = format!("_csrf={csrf}&op=remove&name=gitlab");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(hub.db.api_keys().unwrap().len(), 2);
+
+    let form = format!("_csrf={csrf}&op=delete&name=gitlab");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert_eq!(hub.db.api_keys().unwrap().len(), 2);
 }
 
 /// Job `n` of `project`, as submitted.

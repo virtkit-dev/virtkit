@@ -52,7 +52,8 @@ pub use jobs::{
     SUMMARY_JOBS, Submitted,
 };
 pub use keys::{
-    ANY_POOL, ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name,
+    ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
+    envelope_text, valid_name,
 };
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,

@@ -99,6 +99,58 @@ pub struct KeyPolicy {
     pub max_envelope: Option<Envelope>,
 }
 
+impl KeyPolicy {
+    /// Build a policy from limits in bytes and CPUs. With no limits, omit the envelope;
+    /// otherwise, use the type's maximum for each unset limit.
+    pub fn with_limits(
+        scopes: Vec<Scope>,
+        pools: Vec<String>,
+        max_mem: Option<u64>,
+        max_cpus: Option<u32>,
+        max_disk: Option<u64>,
+    ) -> Self {
+        let max_envelope =
+            (max_mem.is_some() || max_cpus.is_some() || max_disk.is_some()).then(|| Envelope {
+                mem_mib: max_mem.map_or(u64::MAX, |b| b >> 20),
+                cpus: max_cpus.unwrap_or(u32::MAX),
+                disk_bytes: max_disk.unwrap_or(u64::MAX),
+            });
+        KeyPolicy {
+            scopes,
+            pools,
+            max_envelope,
+        }
+    }
+}
+
+/// Revoke a name's working key, or remove its inactive keys when none works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyOp {
+    Revoke,
+    Remove,
+}
+
+impl KeyOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            KeyOp::Revoke => "revoke",
+            KeyOp::Remove => "remove",
+        }
+    }
+}
+
+/// [`Db::revoke_api_keys_as_seen`] refused because the keys or action changed.
+#[derive(Debug)]
+pub struct KeysChanged;
+
+impl std::fmt::Display for KeysChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the keys of that name changed")
+    }
+}
+
+impl std::error::Error for KeysChanged {}
+
 /// A refusal from [`Db::create_api_key`]: invalid name, lifetime or policy, a name taken
 /// by a live key, or no room for another key. Its message can be shown to the user.
 #[derive(Debug)]
@@ -333,6 +385,30 @@ impl Db {
     /// the keys of that name that no longer work, and their client instances, so their names
     /// and slots are free. Whether anything changed.
     pub fn revoke_api_key(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
+        self.revoke_keys(name, None, actor, now)
+    }
+
+    /// [`Db::revoke_api_key`], provided it would still `op` exactly the keys `ids` — checked in
+    /// the same transaction, so what was confirmed is what changes. [`KeysChanged`] if not;
+    /// `false` with no key of that name left.
+    pub fn revoke_api_keys_as_seen(
+        &self,
+        name: &str,
+        op: KeyOp,
+        ids: &[String],
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
+        self.revoke_keys(name, Some((op, ids)), actor, now)
+    }
+
+    fn revoke_keys(
+        &self,
+        name: &str,
+        seen: Option<(KeyOp, &[String])>,
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let event = {
             let mut table = txn.open_table(API_KEYS)?;
@@ -348,6 +424,18 @@ impl Db {
                     live = Some((key.value().to_string(), row));
                 } else {
                     dead.push(key.value().to_string());
+                }
+            }
+            if let Some((op, ids)) = seen {
+                let (want, mut found) = match &live {
+                    Some((id, _)) => (KeyOp::Revoke, vec![id.as_str()]),
+                    None => (KeyOp::Remove, dead.iter().map(String::as_str).collect()),
+                };
+                let mut asked: Vec<&str> = ids.iter().map(String::as_str).collect();
+                found.sort_unstable();
+                asked.sort_unstable();
+                if !found.is_empty() && (want != op || found != asked) {
+                    return Err(KeysChanged.into());
                 }
             }
             if let Some((id, mut row)) = live {
@@ -447,6 +535,54 @@ mod tests {
         assert_eq!(
             audit[4],
             "uid 0 removed 2 revoked or expired API key(s) named gitlab"
+        );
+    }
+
+    /// Revoking or removing keys as seen acts only when the keys of that name are still the
+    /// ones seen and would still be treated so; anything else is refused and changes nothing.
+    #[test]
+    fn keys_revoked_as_seen_must_be_as_seen() {
+        let db = Db::open_memory().unwrap();
+        let (old, _) = db
+            .create_api_key("gitlab", &policy(), DAY, "uid 0", 100)
+            .unwrap();
+        let old = [token_key(&old)];
+        let as_seen =
+            |op, ids: &[String], now| db.revoke_api_keys_as_seen("gitlab", op, ids, "uid 0", now);
+        let changed = |op, ids: &[String]| as_seen(op, ids, 200).unwrap_err().is::<KeysChanged>();
+        assert!(changed(KeyOp::Remove, &old));
+        assert!(changed(KeyOp::Revoke, &[]));
+        assert!(changed(KeyOp::Revoke, &["ab".repeat(32)]));
+        assert!(as_seen(KeyOp::Revoke, &old, 102).unwrap());
+        // Revoked and replaced since seen: the new key is not the one seen.
+        let (new, _) = db
+            .create_api_key("gitlab", &policy(), DAY, "uid 0", 103)
+            .unwrap();
+        assert!(changed(KeyOp::Revoke, &old));
+        // A working key under the name: none is removed.
+        assert!(changed(KeyOp::Remove, &old));
+        assert!(db.api_key(&new, 104).unwrap().is_some());
+        // Another key no longer working since seen: removing only the first is refused.
+        db.revoke_api_key("gitlab", "uid 0", 105).unwrap();
+        assert!(changed(KeyOp::Remove, &old));
+        assert_eq!(db.api_keys().unwrap().len(), 2);
+        let both = [token_key(&new), old[0].clone()];
+        assert!(as_seen(KeyOp::Remove, &both, 106).unwrap());
+        assert!(db.api_keys().unwrap().is_empty());
+        assert!(!as_seen(KeyOp::Remove, &both, 107).unwrap());
+    }
+
+    #[test]
+    fn a_policy_s_unset_limits_are_unbounded() {
+        let p = |mem, cpus, disk| KeyPolicy::with_limits(vec![], vec![], mem, cpus, disk);
+        assert_eq!(p(None, None, None).max_envelope, None);
+        assert_eq!(
+            p(Some(16 << 30), None, Some(1 << 30)).max_envelope,
+            Some(Envelope {
+                mem_mib: 16 << 10,
+                cpus: u32::MAX,
+                disk_bytes: 1 << 30,
+            })
         );
     }
 

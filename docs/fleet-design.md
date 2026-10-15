@@ -391,7 +391,7 @@ Pages, in order of priority:
    rollouts, with a node's drain and reset steered from its page;
 4. **audit** — every operator action and every command's outcome;
 5. **clients** — the API keys and the client instances using each: host, version, runners,
-   when last heard from and what each holds.
+   when last heard from and what each holds; operators create and revoke keys there.
 
 Built: the nodes table, node detail and audit pages, the operations page's releases and
 rollouts, and the clients page. Proposed: pressure and admission waits in the nodes table, and

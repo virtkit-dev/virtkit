@@ -16,7 +16,8 @@ All notable changes to virtkit will be documented in this file.
   when last heard from — and the vk-gitlab daemons using each: host, version, runners, whether
   connected, and the reservations and jobs each holds. A key's job count opens the job history
   filtered to that key (`/jobs?key=<key ID>`, the ID being the key's SHA-256); the filter shows
-  the key by name and drops with one click.
+  the key by name and drops with one click. Operators create keys there, each shown once with
+  the vk-gitlab config that uses it, and revoke or remove them once confirmed.
 - **The guest kernel supports `process_vm_readv` and `process_vm_writev`.**
 
 ### Fixed

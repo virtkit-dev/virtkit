@@ -1,65 +1,140 @@
 //! `/clients`: the API keys the client API takes and the client instances using each — the
 //! host, program and runners an instance's hello named, when it was last heard from and what
-//! it holds — for viewers and operators alike, read only: `vk-hub keys` creates and revokes
-//! keys. Its fragment is rendered once for all open pages ([`sse::feed`]), on a key created,
-//! revoked or removed, an instance heard from anew, a hello recorded or instances pruned
+//! it holds — for viewers and operators alike. Its fragment is rendered once for all open
+//! viewers' pages and once for all operators' ([`sse::feed`]), on a key created, revoked or
+//! removed, an instance heard from anew, a hello recorded or instances pruned
 //! ([`Hub::clients_changed`]), and, while a page is open, once a heartbeat interval, which
 //! moves the ages and what the instances hold.
+//!
+//! Operators create, revoke and remove keys here as `vk-hub keys create` and `vk-hub keys
+//! revoke` do, as their session's principal. A key is created by a plain form outside the
+//! fragment, whose answer is a page of its own showing the key this once: it is never in a
+//! fragment, a log or the audit log. The operator's fragment carries a revoke button on each
+//! working key, and a remove button on the newest of those that no longer work under a name no
+//! working key holds, removing them all; as on `/operations`, it posts with the CSRF token the
+//! page sets through `hx-headers`, and asks first ([`actions::ask_first`]). The store acts only
+//! on the keys the operator confirmed ([`crate::store::Db::revoke_api_keys_as_seen`]).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use hyper::Response;
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderValue};
+use hyper::{Request, Response, StatusCode};
 
+use super::fleet::{self, FleetSite};
 use super::html::Html;
-use super::pages;
+use super::pages::{self, csrf_field};
 use super::sse;
-use super::{Auth, Body, Ui, blocking, page};
+use super::{Auth, Body, Ui, actions, blocking, field, message, page};
 use crate::clients::{InstanceView, KeyView};
 use crate::server::Hub;
-use crate::store::{ANY_POOL, CLIENT_ACTIVE_SECS, KeyRow};
+use crate::store::{
+    ANY_POOL, CLIENT_ACTIVE_SECS, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, Role,
+};
 
-/// The page.
+/// The page, and where its forms post.
 pub(super) const PATH: &str = "/clients";
 
 /// The event its fragment is swapped in on, and its stream's name under `/events/`.
 pub(super) const EVENT: &str = "clients";
 
-/// `GET /clients`.
+/// Key lifetimes the form offers, in days. The first is the default, matching
+/// `vk-hub keys create`; the CLI takes any lifetime up to [`crate::store::MAX_KEY_TTL`].
+const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
+
+/// Where the key page suggests vk-gitlab keeps it.
+const KEY_FILE: &str = "/etc/vk-gitlab/hub.key";
+
+/// `GET /clients`. An operator's page sets the session's CSRF token as a header around the
+/// flash and the fragment, whose buttons post with it, and has the form that creates a key.
 pub(super) async fn get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    let steer = auth.session.role >= Role::Operator;
     let hub = ui.hub.clone();
     let views = blocking(move || crate::clients::views(&hub)).await?;
     let mut main = Html::new();
-    main.raw("<h1>Clients</h1><div id=\"clients\" hx-ext=\"sse\" ")
+    main.raw("<h1>Clients</h1>");
+    if steer {
+        // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
+        main.raw("<div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
+            .text(&auth.csrf)
+            .raw("&quot;}\"><div id=\"flash\"></div>");
+    }
+    main.raw("<div id=\"clients\" hx-ext=\"sse\" ")
         .raw("sse-connect=\"/events/clients\" sse-swap=\"clients\" sse-close=\"close\">")
-        .html(&fragment(&views, crate::now_secs()))
+        .html(&fragment(&views, crate::now_secs(), steer))
         .raw("</div>");
-    Ok(page(super::fleet::layout("Clients", PATH, auth, &main)))
+    if steer {
+        main.raw("</div>");
+        create_form(&mut main, auth);
+    }
+    Ok(page(fleet::layout("Clients", PATH, auth, &main)))
 }
 
-/// The fragment, as one rendering for every page showing it.
-pub(super) fn events(hub: &Arc<Hub>) -> sse::Events {
+/// The fragment, as one rendering for every page showing it: with the keys' buttons for an
+/// operator's, without for a viewer's.
+pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     let hub = hub.clone();
     let render: sse::Render = Arc::new(move || {
         let views = crate::clients::views(&hub)?;
-        Ok(fragment(&views, crate::now_secs()).into_string())
+        Ok(fragment(&views, crate::now_secs(), steer).into_string())
     });
     sse::Events::from([(EVENT, render)])
 }
 
-/// The keys, then their instances.
-fn fragment(views: &[KeyView], now: u64) -> Html {
+/// The keys, then their instances. With `steer`, a working key carries the button that
+/// revokes it; under a name [`target`] would remove keys of, the newest carries the button
+/// that removes them all.
+fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
+    let working: HashSet<&str> = views
+        .iter()
+        .filter(|v| v.row.live(now))
+        .map(|v| v.row.name.as_str())
+        .collect();
+    let mut removable: HashMap<&str, &KeyView> = HashMap::new();
+    for v in views
+        .iter()
+        .filter(|v| !working.contains(v.row.name.as_str()))
+    {
+        let newest = removable.entry(&v.row.name).or_insert(v);
+        if v.row.created_at >= newest.row.created_at {
+            *newest = v;
+        }
+    }
     let mut h = Html::new();
     h.raw("<section><h2>API keys</h2>");
     if views.is_empty() {
-        h.raw("<p class=\"empty\">none: <code>vk-hub keys create</code> creates one</p>");
+        h.raw(if steer {
+            "<p class=\"empty\">none: create one below or with <code>vk-hub keys create</code></p>"
+        } else {
+            "<p class=\"empty\">none: <code>vk-hub keys create</code> creates one</p>"
+        });
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>name</th><th>key</th><th>scopes</th>")
             .raw("<th>pools</th><th>largest</th><th>created</th><th>by</th><th>state</th>")
             .raw("<th>last heard</th><th class=\"num\">instances</th>")
-            .raw("<th class=\"num\">jobs</th></tr></thead><tbody>");
+            .raw("<th class=\"num\">jobs</th>");
+        if steer {
+            h.raw("<th>change</th>");
+        }
+        h.raw("</tr></thead><tbody>");
         for v in views {
             key_row(&mut h, v, now);
+            if steer {
+                h.raw("<td class=\"actions\">");
+                if v.row.live(now) {
+                    change_button(&mut h, KeyOp::Revoke, "Revoke", &v.row.name);
+                } else if removable
+                    .get(v.row.name.as_str())
+                    .is_some_and(|newest| std::ptr::eq(*newest, v))
+                {
+                    change_button(&mut h, KeyOp::Remove, "Remove", &v.row.name);
+                }
+                h.raw("</td>");
+            }
+            h.raw("</tr>");
         }
         h.raw("</tbody></table>");
     }
@@ -82,6 +157,7 @@ fn fragment(views: &[KeyView], now: u64) -> Html {
     h
 }
 
+/// Key `v`'s row, left open for an operator's button.
 fn key_row(h: &mut Html, v: &KeyView, now: u64) {
     let k = &v.row;
     let scopes: Vec<&str> = k.scopes.iter().map(|s| s.name()).collect();
@@ -136,7 +212,315 @@ fn key_row(h: &mut Html, v: &KeyView, now: u64) {
     } else {
         h.text(v.jobs);
     }
-    h.raw("</td></tr>");
+    h.raw("</td>");
+}
+
+/// A button posting `op` on the key named `name`. No CSRF field: the page around the fragment
+/// sets the token as a header.
+fn change_button(h: &mut Html, op: KeyOp, label: &'static str, name: &str) {
+    h.raw("<form method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\" hx-post=\"")
+        .raw(PATH)
+        .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"")
+        .raw(op.name())
+        .raw("\"><input type=\"hidden\" name=\"name\" value=\"")
+        .text(name)
+        .raw("\"><button class=\"danger\">")
+        .raw(label)
+        .raw("</button></form>");
+}
+
+/// An operator's form creating a key, outside the live fragment: a plain POST, answered by a
+/// page of its own showing the key, so it is never sent in a fragment shared by every page.
+fn create_form(h: &mut Html, auth: &Auth) {
+    h.raw("<section><h2>Create an API key</h2><form class=\"wide\" method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\">");
+    csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"create\">")
+        .raw("<label for=\"key-name\">Name</label>")
+        .raw("<input id=\"key-name\" type=\"text\" name=\"name\" autocomplete=\"off\" ")
+        .raw("spellcheck=\"false\" required placeholder=\"gitlab-ci\">")
+        .raw("<label for=\"key-pools\">Pools</label>")
+        .raw("<input id=\"key-pools\" type=\"text\" name=\"pools\" autocomplete=\"off\" ")
+        .raw("spellcheck=\"false\" required placeholder=\"ci, build or *\">")
+        .raw("<fieldset><legend>Scopes</legend><label><input type=\"checkbox\" name=\"scope\" ")
+        .raw("value=\"jobs\" checked> jobs</label><label><input type=\"checkbox\" ")
+        .raw("name=\"scope\" value=\"capacity\"> capacity</label></fieldset>")
+        .raw("<label for=\"key-mem\">Largest memory</label>")
+        .raw("<input id=\"key-mem\" type=\"text\" name=\"max_mem\" autocomplete=\"off\" ")
+        .raw("placeholder=\"any, or 16G\">")
+        .raw("<label for=\"key-cpus\">Largest CPUs</label>")
+        .raw("<input id=\"key-cpus\" type=\"text\" inputmode=\"numeric\" name=\"max_cpus\" ")
+        .raw("autocomplete=\"off\" placeholder=\"any, or 8\">")
+        .raw("<label for=\"key-disk\">Largest disk</label>")
+        .raw("<input id=\"key-disk\" type=\"text\" name=\"max_disk\" autocomplete=\"off\" ")
+        .raw("placeholder=\"any, or 64G\">")
+        .raw("<label for=\"key-ttl\">Valid for</label><select id=\"key-ttl\" name=\"ttl\">");
+    for days in KEY_TTLS {
+        h.raw("<option value=\"")
+            .text(days)
+            .raw("\">")
+            .text(days)
+            .raw(" days</option>");
+    }
+    h.raw("</select><button class=\"primary\">Create</button></form>")
+        .raw("<p class=\"sub\">As <code>vk-hub keys create</code>: scope <code>jobs</code> is ")
+        .raw("the whole client API, <code>capacity</code> only asks for room. Pools are ")
+        .raw("comma-separated, <code>*</code> for any. A job's largest memory and disk take ")
+        .raw("<code>&lt;n&gt;K|M|G|T</code>; memory at least <code>1M</code>. A limit left ")
+        .raw("empty is unbounded. The key is shown a single time.</p></section>");
+}
+
+/// `POST /clients`: create (`create`), revoke (`revoke`) or remove (`remove`) a key as the
+/// operator session's principal, as `vk-hub keys create` and `vk-hub keys revoke` do.
+pub(super) async fn action(
+    req: Request<Incoming>,
+    ui: &Ui,
+    site: &FleetSite,
+) -> Result<Response<Body>> {
+    let htmx = req.headers().contains_key("hx-request");
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(actions::refused(htmx, status, text)),
+    };
+    match field(&form, "op") {
+        Some("create") => create(ui, &auth, &form).await,
+        Some("revoke") => revoke(ui, site, htmx, &auth, &form, KeyOp::Revoke).await,
+        Some("remove") => revoke(ui, site, htmx, &auth, &form, KeyOp::Remove).await,
+        _ => Ok(actions::refused(
+            htmx,
+            StatusCode::BAD_REQUEST,
+            "No such action.",
+        )),
+    }
+}
+
+/// Create the key `form` asks for, and show it this once with the vk-gitlab config using it.
+/// Its policy is checked as the CLI's: by [`crate::store::Db::create_api_key`], which refuses
+/// a bad name, pool or lifetime, and its limits parsed as the CLI parses them.
+async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
+    let refused = |why: String| message(StatusCode::BAD_REQUEST, &format!("Refused: {why}."));
+    let mut scopes = Vec::new();
+    for (_, s) in form.iter().filter(|(k, _)| k == "scope") {
+        match crate::parse_scope(s) {
+            Ok(scope) => scopes.push(scope),
+            Err(why) => return Ok(refused(why)),
+        }
+    }
+    let pools: Vec<String> = field(form, "pools")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let limit = |name: &str| field(form, name).map(str::trim).filter(|v| !v.is_empty());
+    let max_mem = match limit("max_mem").map(crate::parse_mem_size).transpose() {
+        Ok(v) => v,
+        Err(why) => return Ok(refused(format!("largest memory {why}"))),
+    };
+    let max_cpus = match limit("max_cpus").map(str::parse::<u32>).transpose() {
+        Ok(v) => v,
+        Err(_) => return Ok(refused("largest CPUs: expected a whole number".into())),
+    };
+    let max_disk = match limit("max_disk").map(crate::parse_size).transpose() {
+        Ok(v) => v,
+        Err(why) => return Ok(refused(format!("largest disk {why}"))),
+    };
+    let Some(days) = field(form, "ttl")
+        .and_then(|t| t.parse::<u64>().ok())
+        .filter(|d| KEY_TTLS.contains(d))
+    else {
+        return Ok(refused("not one of the form's lifetimes".into()));
+    };
+    let policy = KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
+    let name = field(form, "name").unwrap_or("").to_string();
+    let ttl = Duration::from_secs(days.saturating_mul(86_400));
+    let (hub, principal, named) = (ui.hub.clone(), auth.session.principal(), name.clone());
+    let created = blocking(move || {
+        Ok(hub
+            .db
+            .create_api_key(&named, &policy, ttl, &principal, crate::now_secs()))
+    })
+    .await?;
+    let (key, row) = match created {
+        Ok(created) => created,
+        Err(e) if e.is::<KeyRefused>() => return Ok(refused(e.to_string())),
+        Err(e) => return Err(e),
+    };
+    ui.hub.clients_changed();
+    // The key itself is never logged: it is the credential.
+    eprintln!(
+        "vk-hub: ui: {} created API key {name}",
+        auth.session.principal()
+    );
+    let mut main = Html::new();
+    main.raw("<h1>API key</h1><p>Key <strong>")
+        .text(&row.name)
+        .raw("</strong> works until ");
+    pages::at(&mut main, row.expires_at)
+        .raw(". It is shown this once: copy it now.</p><pre>")
+        .text(&key)
+        .raw("</pre><p>Keep it in a file only vk-gitlab's user reads, such as <code>")
+        .raw(KEY_FILE)
+        .raw("</code>, and point vk-gitlab's config at it:</p><pre>[hub]\nurl = \"");
+    match &ui.hub.node_url {
+        Some(url) => main.text(url),
+        None => main.raw("&lt;hub-url&gt;"),
+    };
+    main.raw("\"\napi_key_file = \"")
+        .raw(KEY_FILE)
+        .raw("\"</pre><p class=\"sub\">Add <code>ca_file</code> when the hub's certificate ")
+        .raw("is not one the system's roots verify.</p><p><a href=\"")
+        .raw(PATH)
+        .raw("\">Back to the clients</a></p>");
+    Ok(page(fleet::layout("API key", PATH, auth, &main)))
+}
+
+/// What a revoke or remove of the keys named `name` acts on, as `vk-hub keys revoke <name>`:
+/// its working key, revoked (`revoke`), or with none working those that no longer work,
+/// removed (`remove`). The op, and those keys.
+fn target<'a>(views: &'a [KeyView], name: &str, now: u64) -> Option<(KeyOp, Vec<&'a KeyView>)> {
+    let named = views.iter().filter(|v| v.row.name == name);
+    let (working, dead): (Vec<&KeyView>, Vec<&KeyView>) = named.partition(|v| v.row.live(now));
+    match (working.is_empty(), dead.is_empty()) {
+        (false, _) => Some((KeyOp::Revoke, working)),
+        (true, false) => Some((KeyOp::Remove, dead)),
+        (true, true) => None,
+    }
+}
+
+/// Revoke or remove the keys named in `form` once confirmed, as [`target`] finds them; `op`
+/// must be what it would do, so a button shown before the keys changed acts on nothing, and the
+/// store acts only if, as it writes, it would still do so to the keys confirmed.
+async fn revoke(
+    ui: &Ui,
+    site: &FleetSite,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    op: KeyOp,
+) -> Result<Response<Body>> {
+    let name = field(form, "name").unwrap_or("").to_string();
+    let hub = ui.hub.clone();
+    let views = blocking(move || crate::clients::views(&hub)).await?;
+    let now = crate::now_secs();
+    let Some((wanted, keys)) = target(&views, &name, now) else {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such key.",
+        ));
+    };
+    if wanted != op {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::CONFLICT,
+            "Refused: it changed since you looked; look again.",
+        ));
+    }
+    let (reservations, jobs) =
+        keys.iter()
+            .flat_map(|v| &v.instances)
+            .fold((0usize, 0usize), |(r, j), i| {
+                (
+                    r.saturating_add(i.work.reservations),
+                    j.saturating_add(i.work.queued)
+                        .saturating_add(i.work.running),
+                )
+            });
+    let mut detail = Html::new();
+    detail.raw("<p><strong>").text(&name).raw("</strong>: ");
+    for (n, v) in keys.iter().enumerate() {
+        if n > 0 {
+            detail.raw(", ");
+        }
+        detail.raw("<code>vkk_").text(&v.row.prefix).raw("…</code>");
+    }
+    detail
+        .raw("; ")
+        .text(reservations)
+        .raw(" reservation(s), ")
+        .text(jobs)
+        .raw(" job(s) queued or running</p>");
+    let ids: Vec<String> = keys.iter().map(|v| v.id.clone()).collect();
+    let ask = actions::Ask {
+        path: PATH.to_string(),
+        back: PATH.to_string(),
+        op: op.name().to_string(),
+        what: match (op, keys.len()) {
+            (KeyOp::Revoke, _) => {
+                "Revoke this API key? It stops working at once: whatever holds it can reserve \
+                 and place nothing more, and vk-gitlab can no longer follow or settle its jobs \
+                 under way."
+            }
+            (KeyOp::Remove, 1) => {
+                "Remove this API key, which no longer works? Its client instances go with it \
+                 and its name is free again; its jobs stay in the history."
+            }
+            (KeyOp::Remove, _) => {
+                "Remove these API keys, which no longer work? Their client instances go with \
+                 them and their name is free again; their jobs stay in the history."
+            }
+        },
+        detail,
+        asked: vec![("name", name.clone()), ("keys", ids.join(","))],
+    };
+    if let Some(asked) = actions::ask_first(&site.questions, fleet::layout, htmx, auth, form, &ask)?
+    {
+        return Ok(asked);
+    }
+    let (hub, principal, named) = (ui.hub.clone(), auth.session.principal(), name.clone());
+    let done = blocking(move || {
+        Ok(hub
+            .db
+            .revoke_api_keys_as_seen(&named, op, &ids, &principal, crate::now_secs()))
+    })
+    .await?;
+    let done = match done {
+        Ok(done) => done,
+        Err(e) if e.is::<KeysChanged>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                "Refused: it changed since you were asked; look again.",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if !done {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such key.",
+        ));
+    }
+    ui.hub.clients_changed();
+    let (said, done) = match op {
+        KeyOp::Revoke => (format!("Revoked API key {name}."), "revoked"),
+        KeyOp::Remove => (
+            format!("Removed the API key(s) named {name} that no longer worked."),
+            "removed",
+        ),
+    };
+    eprintln!(
+        "vk-hub: ui: {} {done} API key {name}",
+        auth.session.principal()
+    );
+    if !htmx {
+        let mut resp = Response::new(Body::default());
+        *resp.status_mut() = StatusCode::SEE_OTHER;
+        resp.headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static(PATH));
+        return Ok(resp);
+    }
+    let mut h = Html::new();
+    h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
+        .text(&said)
+        .raw("</div>");
+    Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
 }
 
 /// Instance `i` of key `key`: all that it said made display-safe again ([`Html::node`]), a
@@ -295,7 +679,7 @@ mod tests {
                 jobs: 0,
             },
         ];
-        let page = fragment(&views, 1000).into_string();
+        let page = fragment(&views, 1000, false).into_string();
         for want in [
             "<td>gitlab</td><td><code>vkk_0123abcd…</code></td><td>jobs, capacity</td>",
             &format!("<a href=\"/jobs?key={}\">7</a>", "ab".repeat(32)),
@@ -320,8 +704,92 @@ mod tests {
         // Heard from just now: connected; 181 seconds ago: no longer.
         assert_eq!(page.matches("badge ok\">connected").count(), 2, "{page}");
 
-        let none = fragment(&[], 1000).into_string();
+        assert!(!page.contains("<form"), "{page}");
+
+        let none = fragment(&[], 1000, false).into_string();
         assert!(none.contains("<code>vk-hub keys create</code>"), "{none}");
         assert!(none.contains("no client has used a key yet"), "{none}");
+    }
+
+    /// An operator's fragment offers to revoke a working key, and to remove one that no
+    /// longer works only when no working key holds its name: removing acts on the name.
+    #[test]
+    fn an_operator_revokes_working_keys_and_removes_dead_ones() {
+        let view = |id: &str, row: KeyRow| KeyView {
+            id: id.repeat(32),
+            row,
+            instances: Vec::new(),
+            jobs: 0,
+        };
+        let views = [
+            view("ab", key("gitlab")),
+            view(
+                "cd",
+                KeyRow {
+                    revoked_at: Some(200),
+                    ..key("gitlab")
+                },
+            ),
+            view(
+                "ef",
+                KeyRow {
+                    expires_at: 1000,
+                    ..key("old")
+                },
+            ),
+        ];
+        let page = fragment(&views, 1000, true).into_string();
+        assert_eq!(page.matches(">Revoke</button>").count(), 1, "{page}");
+        assert_eq!(page.matches(">Remove</button>").count(), 1, "{page}");
+        assert!(
+            page.contains("name=\"name\" value=\"old\"><button class=\"danger\">Remove"),
+            "{page}"
+        );
+        assert!(!page.contains("_csrf"), "{page}");
+        assert_eq!(
+            target(&views, "gitlab", 1000).map(|(op, k)| (op, k.len())),
+            Some((KeyOp::Revoke, 1))
+        );
+        assert_eq!(
+            target(&views, "old", 1000).map(|(op, k)| (op, k.len())),
+            Some((KeyOp::Remove, 1))
+        );
+        assert!(target(&views, "none", 1000).is_none());
+
+        // Several that no longer work under one name: one button, on the newest, removing all.
+        let views = [
+            view(
+                "ab",
+                KeyRow {
+                    revoked_at: Some(200),
+                    ..key("gitlab")
+                },
+            ),
+            view(
+                "cd",
+                KeyRow {
+                    created_at: 300,
+                    expires_at: 1000,
+                    ..key("gitlab")
+                },
+            ),
+            view(
+                "ef",
+                KeyRow {
+                    created_at: 200,
+                    revoked_at: Some(250),
+                    ..key("gitlab")
+                },
+            ),
+        ];
+        let page = fragment(&views, 1000, true).into_string();
+        assert_eq!(page.matches(">Remove</button>").count(), 1, "{page}");
+        let newest = page.split("<td>gitlab</td>").nth(2).unwrap();
+        let newest = newest.split("</tr>").next().unwrap();
+        assert!(newest.contains(">Remove</button>"), "{page}");
+        assert_eq!(
+            target(&views, "gitlab", 1000).map(|(op, k)| (op, k.len())),
+            Some((KeyOp::Remove, 3))
+        );
     }
 }

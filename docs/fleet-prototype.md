@@ -1007,8 +1007,10 @@ largest envelope bound every placement it names: anything outside them is 403 `f
 list` shows each key's name, first 8 characters, scopes, pools, largest envelope, when and by
 whom it was created, and whether it works; `keys revoke <name>` revokes the working key of that
 name, or, with none working, removes those of that name that no longer do. The hub holds at most
-256 keys. Creating, revoking and removing are audited; a key is audited as `key <name>`, and its
-jobs and reservations are its own: another key's are 404.
+256 keys. Operators also create, revoke and remove keys on the web UI's `/clients` (see
+[Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
+`key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
+strands its jobs under way: their client can no longer follow or settle them with it.
 
 **Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>` sets the pools a node is in,
 audited. Labels come from the node's inventory. `vk-hub nodes` lists each node's pools and
@@ -1301,16 +1303,29 @@ last 2 MiB of text or so, with a notice for omitted lines and the remaining line
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
 `/clients` shows viewers and operators alike the API keys (see [Placed jobs](#placed-jobs)) and
-the client instances using each, read only: `vk-hub keys` creates and revokes keys. Each key
-shows its name, first 8 characters, scopes, pools, largest envelope, when and by whom it was
-created, whether it is revoked, expired or when it expires, when any of its instances was last
-heard from, how many instances it has, and how many of its jobs the history holds, linked to
-`/jobs?key=<key ID>`. Each instance shows its key, the host, program and version and each
-runner's name, pool and GitLab URL its latest hello named, when it was last heard from —
-*connected* within the last 180 seconds — and the reservations it holds and its jobs queued and
-running. Requests that named no instance, as an older `vk-gitlab`'s, show as the key's *unknown
-instance*, with when it was last heard from and what it holds. What a client said is shown as
-text, and a runner's URL becomes a link only when it is a plain web URL without credentials.
+the client instances using each. Each key shows its name, first 8 characters, scopes, pools,
+largest envelope, when and by whom it was created, whether it is revoked, expired or when it
+expires, when any of its instances was last heard from, how many instances it has, and how many
+of its jobs the history holds, linked to `/jobs?key=<key ID>`. Each instance shows its key, the
+host, program and version and each runner's name, pool and GitLab URL its latest hello named,
+when it was last heard from — *connected* within the last 180 seconds — and the reservations it
+holds and its jobs queued and running. Requests that named no instance, as an older
+`vk-gitlab`'s, show as the key's *unknown instance*, with when it was last heard from and what
+it holds. What a client said is shown as text, and a runner's URL becomes a link only when it is
+a plain web URL without credentials.
+
+Operators create keys there with the same validation as `vk-hub keys create`: a name,
+scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
+of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the CLI's reason.
+The form uses a plain POST outside the live fragment and returns a page showing the key once,
+with a `[hub]` table for `vk-gitlab`: `url` is the hub's node address, and `api_key_file`
+points to the key. The key never appears in live updates, logs or audit entries.
+
+Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
+has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
+confirmation; revocation warns that `vk-gitlab` can no longer follow or settle ongoing jobs.
+The actions apply only to the keys confirmed. As on `/operations`, the buttons post with
+the token set through `hx-headers` and need htmx; `vk-hub keys revoke` works without it.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

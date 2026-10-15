@@ -434,12 +434,12 @@ enum KeysCmd {
     Revoke { name: String },
 }
 
-fn parse_scope(s: &str) -> Result<store::Scope, String> {
+pub(crate) fn parse_scope(s: &str) -> Result<store::Scope, String> {
     store::Scope::parse(s).ok_or_else(|| format!("{s:?}: expected jobs or capacity"))
 }
 
 /// A size in bytes: a number with a binary unit, `K`, `M`, `G` or `T`.
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let bad = || format!("{s:?}: expected <n>K, <n>M, <n>G or <n>T");
     let (n, unit) = s
         .char_indices()
@@ -458,7 +458,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 /// A memory size, at least 1 MiB: envelopes count memory in MiB.
-fn parse_mem_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_mem_size(s: &str) -> Result<u64, String> {
     let bytes = parse_size(s)?;
     if bytes < 1 << 20 {
         return Err(format!("{s:?}: expected at least 1M"));
@@ -1568,17 +1568,7 @@ async fn keys_cmd(client: admin::Client, cmd: KeysCmd) -> Result<()> {
             max_disk,
             ttl,
         } => {
-            let max_envelope = (max_mem.is_some() || max_cpus.is_some() || max_disk.is_some())
-                .then(|| vk_hub_proto::job::Envelope {
-                    mem_mib: max_mem.map_or(u64::MAX, |b| b >> 20),
-                    cpus: max_cpus.unwrap_or(u32::MAX),
-                    disk_bytes: max_disk.unwrap_or(u64::MAX),
-                });
-            let policy = store::KeyPolicy {
-                scopes,
-                pools,
-                max_envelope,
-            };
+            let policy = store::KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
             let created =
                 tokio::task::spawn_blocking(move || client.create_key(&name, policy, ttl))
                     .await??;

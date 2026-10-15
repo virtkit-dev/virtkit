@@ -7,8 +7,8 @@
 //! controls.
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
 //! jobs placed through the client API are listed, read only, on `/jobs`, a failed one with a
-//! page of its own ([`super::jobs`]); the API keys and the client instances using them, read
-//! only too, on `/clients` ([`super::clients`]).
+//! page of its own ([`super::jobs`]); the API keys and the client instances using them on
+//! `/clients`, where operators also create and revoke keys ([`super::clients`]).
 //! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
 //! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
@@ -63,7 +63,7 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 /// that starts one; it follows [`Hub::touch`] alone — which also notes a node enrolled, renamed
 /// or removed — not every node's heartbeat.
 pub(super) struct FleetSite {
-    /// Pending reset and rollout confirmations.
+    /// Pending confirmations.
     pub(super) questions: actions::Questions,
     /// Whether a release is being uploaded.
     pub(super) uploading: operations::Uploading,
@@ -72,8 +72,9 @@ pub(super) struct FleetSite {
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     /// `/jobs`' newest pages, by filter.
     jobs: Arc<super::jobs::Renders>,
-    /// `/clients`' fragment, the same for every page.
+    /// `/clients`' fragment, once for every viewer's page and once for every operator's.
     clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    steered_clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
 }
 
 impl FleetSite {
@@ -88,7 +89,11 @@ impl FleetSite {
                 operations_events(hub, true),
             ),
             jobs: Arc::default(),
-            clients_feed: sse::feed(hub.subscribe_clients(), super::clients::events(hub)),
+            clients_feed: sse::feed(hub.subscribe_clients(), super::clients::events(hub, false)),
+            steered_clients_feed: sse::feed(
+                hub.subscribe_clients(),
+                super::clients::events(hub, true),
+            ),
         }
     }
 }
@@ -140,10 +145,15 @@ pub(super) fn source(
                 .map(|id| job_output::source(hub, id));
         }
         super::clients::EVENT => {
+            let feed = if steer {
+                &site.steered_clients_feed
+            } else {
+                &site.clients_feed
+            };
             return Some(Source::Shared {
                 name: super::clients::EVENT,
-                feed: site.clients_feed.subscribe(),
-                events: super::clients::events(hub),
+                feed: feed.subscribe(),
+                events: super::clients::events(hub, steer),
             });
         }
         "nodes" => {
