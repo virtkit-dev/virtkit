@@ -98,7 +98,8 @@ RUN export ARCH=x86_64 \
                   CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
                   CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD \
                   CONFIG_DEBUG_FS CONFIG_LRU_GEN CONFIG_STACKTRACE \
-                  CONFIG_BPF_UNPRIV_DEFAULT_OFF CONFIG_SECURITY_LANDLOCK; do \
+                  CONFIG_BPF_UNPRIV_DEFAULT_OFF CONFIG_SECURITY_LANDLOCK \
+                  CONFIG_CROSS_MEMORY_ATTACH; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
     && { grep -q '^CONFIG_LSM=".*landlock' .config || { echo "landlock missing from CONFIG_LSM"; exit 1; }; } \

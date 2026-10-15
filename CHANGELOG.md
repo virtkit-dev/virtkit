@@ -15,6 +15,7 @@ All notable changes to virtkit will be documented in this file.
 - **The hub's job history can be narrowed to one API key's jobs** with `/jobs?key=<key ID>`,
   a key's ID being the SHA-256 of the key; the filter shows the key by name and can be dropped
   with one click.
+- **The guest kernel supports `process_vm_readv` and `process_vm_writev`.**
 
 ## [0.91.1] - 2026-10-15
 
