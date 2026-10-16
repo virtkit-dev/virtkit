@@ -2783,6 +2783,9 @@ enum Cmd {
 /// "Cannot start a runtime from within a runtime". The CLI proper runs on the runtime
 /// [`on_runtime`] enters.
 fn main() -> ExitCode {
+    if let Some(code) = as_vk_agent() {
+        return code;
+    }
     // Raise this process's soft open-file limit toward its hard cap (≤1M) before anything
     // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
     // a host fd per accessed shared file — and this same binary re-execs as the libkrun
@@ -5270,6 +5273,17 @@ fn guest_service_exec(cmdline: &str) -> Option<bool> {
         return None;
     }
     Some(words.any(|w| w == "VIRTKIT_SERVICE_EXEC=1"))
+}
+
+/// Under the name `vk-agent` — a link to this vk, in an image or on a host — become the agent
+/// this vk embeds, with the same arguments; `None` under any other name.
+fn as_vk_agent() -> Option<ExitCode> {
+    let argv0 = std::env::args_os().next()?;
+    if Path::new(&argv0).file_name()? != "vk-agent" {
+        return None;
+    }
+    let e = embed::exec_agent(std::env::args_os().skip(1));
+    Some(fail(&e, 127))
 }
 
 /// Rebuild `vk exec --service` without a target for [`GUEST_AGENT`]'s `exec --service` from

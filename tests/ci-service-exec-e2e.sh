@@ -16,8 +16,8 @@
 #   4. a `vk run --compose` primary reaches its services the same way and the service manager
 #      with `vk-agent service`; --no-service-exec removes its channel, and a state dir the
 #      guest can write is refused;
-#   5. a full `vk` in the guest runs `vk exec --service` through the agent, and says why
-#      without service exec;
+#   5. a full `vk` in the guest runs `vk exec --service` through the agent, says why without
+#      service exec, and runs as its embedded agent when invoked as `vk-agent`;
 #   6. beside a --host-exec-wrapper (a `vk dev` environment's `[dev.host]`), the primary keeps
 #      its `vk-agent exec --service`, the wrapper runs every other command and never sees `vk`,
 #      and neither takes the other's form.
@@ -209,7 +209,9 @@ echo "== 5. a full vk in the guest =="
   -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c 'set -e
     [ "$(command -v vk)" = /usr/local/bin/vk ]
     [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]
-    vk service status db | grep "^db "' \
+    vk service status db | grep "^db "
+    ln -s /usr/local/bin/vk /tmp/vk-agent
+    /tmp/vk-agent --version | grep "^vk-agent "' \
   >"$root/stage.log" 2>&1 || fail "the guest's full vk did not reach the service"
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \
   -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c '

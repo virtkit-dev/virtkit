@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A full `vk` invoked as `vk-agent` runs the vk-agent it embeds**, with the same
+  arguments, so a link named `vk-agent` to a `vk` works wherever that `vk` does.
+
 ### Changed
 
 - **Guests reach their compose services with `vk-agent exec --service`; `vk` in a guest is

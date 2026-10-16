@@ -285,6 +285,42 @@ pub fn resolve(asset: Asset, explicit: Option<&Path>) -> Result<Resolved> {
     })
 }
 
+/// Become the vk-agent this vk embeds — else the on-disk default — run under the name
+/// `vk-agent` with `args`; what went wrong when that fails. The embedded copy runs from its
+/// memfd: its `CLOEXEC` closes only once the exec has opened it, which a static ELF needs no
+/// more of. An on-disk default that is this vk itself is refused rather than run in a loop.
+pub fn exec_agent(args: impl IntoIterator<Item = std::ffi::OsString>) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let (_held, path) = match Asset::Agent.embedded() {
+        Some(bytes) => match memfd(Asset::Agent.filename(), bytes) {
+            Ok((file, path)) => (Some(file), path),
+            Err(e) => return e,
+        },
+        None => {
+            let path = PathBuf::from(Asset::Agent.default_path());
+            let this = std::env::current_exe().and_then(std::fs::canonicalize);
+            if let (Ok(this), Ok(there)) = (this, std::fs::canonicalize(&path))
+                && this == there
+            {
+                return anyhow::anyhow!(
+                    "this vk embeds no vk-agent, and {} is this vk",
+                    path.display()
+                );
+            }
+            (None, path)
+        }
+    };
+    let e = std::process::Command::new(&path)
+        .arg0("vk-agent")
+        .args(args)
+        .exec();
+    anyhow::Error::new(e).context(if path.starts_with("/proc/self/fd") {
+        "running the vk-agent this vk embeds".to_string()
+    } else {
+        format!("this vk embeds no vk-agent; running {}", path.display())
+    })
+}
+
 /// Back `bytes` with an anonymous in-memory file and return it with its
 /// `/proc/self/fd/<n>` path. The fd is `CLOEXEC`, so idle helper children never inherit
 /// it; the kernel is handed to the VMM by clearing `CLOEXEC` on its fd only in that
