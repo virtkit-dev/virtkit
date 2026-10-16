@@ -18,7 +18,7 @@
 #      with `vk-agent service`; --no-service-exec removes its channel, as `vk-agent exec
 #      --service` says, and a state dir the guest can write is refused;
 #   5. a full `vk` in the guest keeps `vk exec --service` for the VMs it runs itself: it never
-#      reaches the run's services;
+#      reaches the run's services; a link named `vk-agent` to it is the agent;
 #   6. beside a --host-exec-wrapper (a `vk dev` environment's `[dev.host]`), the primary keeps
 #      its `vk-agent exec --service`, the wrapper runs every other command and never sees `vk`,
 #      and neither takes the other's form; with --no-service-exec the wrapper gets `vk` too,
@@ -219,10 +219,13 @@ echo "== 5. a full vk in the guest =="
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" \
   -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c 'set -e
     [ "$(command -v vk)" = /usr/local/bin/vk ]
+    ln -s /usr/local/bin/vk /tmp/vk-agent
+    /tmp/vk-agent --version | grep "^vk-agent "
+    [ "$(/tmp/vk-agent exec --service db -- cat /tmp/marker)" = served-by-db ]
     if vk exec --service db -- cat /tmp/marker 2>err; then exit 1; fi
     cat err
     grep -q "no running vk VM" err' \
-  >"$root/stage.log" 2>&1 || fail "the guest's full vk reached the run's service"
+  >"$root/stage.log" 2>&1 || fail "a full vk reached the run's service, or a vk-agent link to it did not"
 echo "ok"
 
 echo "== 6. service exec beside host commands =="

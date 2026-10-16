@@ -3235,7 +3235,8 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
 /// requested; SIGINT and the service-stop alarm use the same decision. A power-off request
 /// always powers off. A request first terminates the workloads (see [`start_stop_worker`]),
 /// then SIGTERMs any running service and waits up to [`SERVICE_STOP_GRACE_SECS`], so
-/// applications such as databases can flush state.
+/// applications such as databases can flush state. Then say so in
+/// [`crate::poweroff::INIT_SIGNALS`].
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
     // uses `sync`, atomic `DISK_MOUNTS`/`REBOOT_REQUESTED`/`POWEROFF_REQUESTED` reads, raw
@@ -3262,6 +3263,7 @@ fn install_term_handler() {
             handle_reboot_request as *const () as libc::sighandler_t,
         );
     }
+    crate::poweroff::announce_init_signals();
 }
 
 /// SIGINT (console interrupt) or SIGALRM (the service-stop grace elapsed): power off, or

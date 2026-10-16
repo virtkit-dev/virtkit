@@ -7,7 +7,8 @@
 //!   filesystems unmount.
 //! - `vk-agent init` gets the same signal: it terminates the workloads (see [`workloads`]) and
 //!   gives them a moment to exit, then stops its service, then ends the machine with every
-//!   filesystem frozen clean (`init`'s shutdown path).
+//!   filesystem frozen clean (`init`'s shutdown path). It says it handles the signal in
+//!   [`INIT_SIGNALS`], so any agent build can ask it, a memfd copy included.
 //! - Anything else — an entrypoint holding PID 1 — has no shutdown of its own, so it is done
 //!   from here: the other processes are terminated and given a moment to exit, then `sync`,
 //!   freeze every writable disk filesystem, and end the machine. An init that exits along with
@@ -87,7 +88,7 @@ pub fn main(action: Action, args: &[String]) -> i32 {
         eprintln!("shutdown: not root");
         return 1;
     }
-    if pid1_is_systemd() || pid1_is_this_agent() {
+    if pid1_is_systemd() || pid1_is_this_agent() || pid1_announced_signals() {
         // SAFETY: plain kill(2).
         if unsafe { libc::kill(1, action.signal()) } != 0 {
             eprintln!(
@@ -137,6 +138,9 @@ fn pid1_is_systemd() -> bool {
 
 /// Whether PID 1 is this binary (`vk-agent init`). Compare inode identity because initramfs
 /// `/init` and `/proc/self/exe` can name the same file differently or not at all after pivot.
+/// Not a name such as `/proc/1/comm`, which any program can bear: these signals kill a PID 1
+/// that does not handle them, panicking the kernel. An agent of another inode — the copy a
+/// `vk` invoked as `vk-agent` runs from a memfd — relies on [`pid1_announced_signals`].
 fn pid1_is_this_agent() -> bool {
     match (
         std::fs::metadata("/proc/1/exe"),
@@ -145,6 +149,61 @@ fn pid1_is_this_agent() -> bool {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
+}
+
+/// Where `vk-agent init` says, once its handlers are in, that it handles [`SIG_POWEROFF`] and
+/// [`SIG_REBOOT`]: this boot's `boot_id` and the `(dev, ino)` of its own executable. Only that
+/// pair binds the claim to the PID 1 of this boot: a `/run` that outlives the boot, or a PID 1
+/// that later execs something else, no longer matches.
+pub(crate) const INIT_SIGNALS: &str = "/run/vk/init-signals";
+
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
+
+/// Write [`INIT_SIGNALS`] for this process, PID 1. A failure only leaves `vk-agent poweroff`
+/// from another agent build shutting the guest down without init, so it is logged, not fatal.
+pub(crate) fn announce_init_signals() {
+    let written = (|| -> anyhow::Result<()> {
+        let boot_id = std::fs::read_to_string(BOOT_ID)?;
+        let exe = std::fs::metadata("/proc/self/exe")?;
+        std::fs::create_dir_all(crate::runenv::RUN_VK)?;
+        let text = init_signals_text(boot_id.trim(), exe.dev(), exe.ino());
+        vk_fs::write_atomic_unsynced(Path::new(INIT_SIGNALS), text.as_bytes(), 0o644)
+    })();
+    if let Err(e) = written {
+        log::warn!("vk-agent init: writing {INIT_SIGNALS}: {e:#}");
+    }
+}
+
+fn init_signals_text(boot_id: &str, dev: u64, ino: u64) -> String {
+    format!("{boot_id} {dev} {ino}\n")
+}
+
+/// Whether `text` claims the signals for the boot `boot_id` and the executable `(dev, ino)`.
+fn init_signals_match(text: &str, boot_id: &str, dev: u64, ino: u64) -> bool {
+    let mut words = text.split_ascii_whitespace();
+    words.next() == Some(boot_id)
+        && words.next().and_then(|w| w.parse().ok()) == Some(dev)
+        && words.next().and_then(|w| w.parse().ok()) == Some(ino)
+        && words.next().is_none()
+}
+
+/// Whether PID 1 said, this boot, that it handles the signals ([`INIT_SIGNALS`]). The file and
+/// its directory must be root's and writable by no one else: a forged claim would have these
+/// signals kill a PID 1 that does not handle them.
+fn pid1_announced_signals() -> bool {
+    let root_only =
+        |p: &str| std::fs::symlink_metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0);
+    if !root_only(crate::runenv::RUN_VK) || !root_only(INIT_SIGNALS) {
+        return false;
+    }
+    let (Ok(text), Ok(boot_id), Ok(pid1)) = (
+        std::fs::read_to_string(INIT_SIGNALS),
+        std::fs::read_to_string(BOOT_ID),
+        std::fs::metadata("/proc/1/exe"),
+    ) else {
+        return false;
+    };
+    init_signals_match(&text, boot_id.trim(), pid1.dev(), pid1.ino())
 }
 
 /// This process and its ancestors through PID 1, nearest first. Stop on unreadable status or
@@ -374,6 +433,19 @@ mod tests {
     fn action_maps_to_its_pid1_signal() {
         assert_eq!(Action::PowerOff.signal(), SIG_POWEROFF);
         assert_eq!(Action::Reboot.signal(), SIG_REBOOT);
+    }
+
+    /// The claim holds for its own boot and executable only, and nothing else parses as one.
+    #[test]
+    fn init_signals_match_their_boot_and_executable_only() {
+        let text = init_signals_text("b00t", 8, 42);
+        assert!(init_signals_match(&text, "b00t", 8, 42));
+        assert!(!init_signals_match(&text, "other", 8, 42));
+        assert!(!init_signals_match(&text, "b00t", 9, 42));
+        assert!(!init_signals_match(&text, "b00t", 8, 43));
+        assert!(!init_signals_match("b00t 8 42 extra", "b00t", 8, 42));
+        assert!(!init_signals_match("b00t 8", "b00t", 8, 42));
+        assert!(!init_signals_match("", "b00t", 8, 42));
     }
 
     #[test]

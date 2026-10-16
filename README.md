@@ -491,8 +491,8 @@ exec`'s flags. The primary needs no `vk` for either: its agent, `/run/vk/bin/vk-
 manager for `service`, and passes `exec --service` to the host over the primary's host
 command channel. The host runs that one form, into this run's services, and nothing else.
 The agent says why when the VM has no service exec. A full `vk` in the guest — the image's
-own, or one mounted there — keeps `vk exec --service` for the VMs it runs itself.
-`--no-service-exec` turns service exec off.
+own, or one mounted there — keeps `vk exec --service` for the VMs it runs itself, and runs
+as its embedded agent when invoked as `vk-agent`. `--no-service-exec` turns service exec off.
 With `--host-exec-wrapper` the channel serves both: a request named `vk` goes to service
 exec, every other to the wrapper. `--host-exec` without a wrapper replaces this restricted
 channel with the whole channel. While service exec is on, with or without a wrapper, the

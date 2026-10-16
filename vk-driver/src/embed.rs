@@ -18,7 +18,8 @@
 //! An embedded asset is materialised into an anonymous (CLOEXEC) memfd rather than a
 //! temp file, so nothing touches disk. The kernel is handed to the spawned VMM by
 //! clearing CLOEXEC on its fd for that one spawn (`run::spawn_vmm`), which then opens
-//! `/proc/self/fd/<n>`; the agent is only ever reopened in this process by the packer.
+//! `/proc/self/fd/<n>`; the packer reopens the agent in this process, and a vk run as
+//! `vk-agent` execs it ([`exec_agent`]).
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
@@ -273,7 +274,7 @@ pub fn resolve(asset: Asset, explicit: Option<&Path>) -> Result<Resolved> {
         });
     }
     if let Some(bytes) = asset.embedded() {
-        let (file, path) = memfd(asset.filename(), bytes)?;
+        let (file, path) = memfd(asset.filename(), bytes, false)?;
         return Ok(Resolved {
             path,
             fd: Some(file),
@@ -285,18 +286,82 @@ pub fn resolve(asset: Asset, explicit: Option<&Path>) -> Result<Resolved> {
     })
 }
 
+/// Exec the embedded agent or the on-disk default as `vk-agent` with `args`.
+/// Return the error if exec fails. The embedded copy runs from its
+/// memfd: its `CLOEXEC` closes only once the exec has opened it, which an ELF needs no more
+/// of. An on-disk default that is this vk itself, or that cannot be told apart from it,
+/// is refused rather than run in a loop.
+pub fn exec_agent(args: impl IntoIterator<Item = std::ffi::OsString>) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let (_held, path) = match Asset::Agent.embedded() {
+        Some(bytes) => match memfd(Asset::Agent.filename(), bytes, true) {
+            Ok((file, path)) => (Some(file), path),
+            Err(e) => return e.context("running the vk-agent this vk embeds"),
+        },
+        None => {
+            let path = PathBuf::from(Asset::Agent.default_path());
+            match is_same_file(Path::new("/proc/self/exe"), &path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return anyhow::anyhow!(
+                        "this vk embeds no vk-agent, and {} is this vk",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    return anyhow::Error::new(e).context(format!(
+                        "this vk embeds no vk-agent; checking {} is not this vk",
+                        path.display()
+                    ));
+                }
+            }
+            (None, path)
+        }
+    };
+    let e = std::process::Command::new(&path)
+        .arg0("vk-agent")
+        .args(args)
+        .exec();
+    anyhow::Error::new(e).context(if path.starts_with("/proc/self/fd") {
+        "running the vk-agent this vk embeds".to_string()
+    } else {
+        format!("this vk embeds no vk-agent; running {}", path.display())
+    })
+}
+
+/// Whether `a` and `b` resolve to the same inode, whatever links or mounts name them.
+fn is_same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
 /// Back `bytes` with an anonymous in-memory file and return it with its
 /// `/proc/self/fd/<n>` path. The fd is `CLOEXEC`, so idle helper children never inherit
 /// it; the kernel is handed to the VMM by clearing `CLOEXEC` on its fd only in that
-/// spawn (see `run::spawn_vmm`), and the agent is only ever reopened in-process. The
-/// caller holds the returned `File` to keep the fd open.
-fn memfd(name: &str, bytes: &[u8]) -> Result<(File, PathBuf)> {
+/// spawn (see `run::spawn_vmm`), and the packer reopens the agent in-process. `exec` asks
+/// for an executable memfd, which [`exec_agent`] runs. The caller holds the returned `File`
+/// to keep the fd open.
+fn memfd(name: &str, bytes: &[u8], exec: bool) -> Result<(File, PathBuf)> {
     let cname = std::ffi::CString::new(name).expect("asset name has no interior nul");
-    // SAFETY: `cname` is a valid C string; memfd_create returns an owned fd or -1/errno.
-    let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create");
+    let create = |flags| {
+        // SAFETY: `cname` is a valid C string; memfd_create returns an owned fd or -1/errno.
+        let fd = unsafe { libc::memfd_create(cname.as_ptr(), flags) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(fd)
+        }
+    };
+    // MFD_EXEC keeps the memfd executable under `vm.memfd_noexec=1` and spares the warning
+    // kernels since 6.3 log for a memfd created without MFD_EXEC or MFD_NOEXEC_SEAL; older
+    // kernels reject the flag with EINVAL, and their memfds are executable anyway.
+    // `vm.memfd_noexec=2` refuses it with EACCES.
+    let fd = match create(libc::MFD_CLOEXEC | if exec { libc::MFD_EXEC } else { 0 }) {
+        Err(e) if exec && e.raw_os_error() == Some(libc::EINVAL) => create(libc::MFD_CLOEXEC),
+        r => r,
     }
+    .context("memfd_create")?;
     // SAFETY: `fd` was just created and is owned by us.
     let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(bytes)
@@ -339,7 +404,39 @@ mod tests {
 
     #[test]
     fn memfd_round_trips_through_its_proc_path() {
-        let (_file, path) = memfd("blob", b"embedded bytes").unwrap();
+        let (_file, path) = memfd("blob", b"embedded bytes", false).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"embedded bytes");
+    }
+
+    /// Skipped where `vm.memfd_noexec=2` refuses executable memfds.
+    #[test]
+    fn executable_memfd_round_trips_through_its_proc_path() {
+        let (_file, path) = match memfd("blob", b"embedded bytes", true) {
+            Ok(made) => made,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(libc::EACCES) =>
+            {
+                return;
+            }
+            Err(e) => panic!("{e:#}"),
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"embedded bytes");
+    }
+
+    #[test]
+    fn same_file_sees_through_hardlinks_and_symlinks() {
+        let dir = crate::qga::tests::TempDir::new("embed-same-file");
+        let (file, other) = (dir.0.join("vk"), dir.0.join("other"));
+        std::fs::write(&file, b"vk").unwrap();
+        std::fs::write(&other, b"vk").unwrap();
+        let (hard, soft) = (dir.0.join("hard"), dir.0.join("soft"));
+        std::fs::hard_link(&file, &hard).unwrap();
+        std::os::unix::fs::symlink(&file, &soft).unwrap();
+        assert!(is_same_file(&file, &hard).unwrap());
+        assert!(is_same_file(&file, &soft).unwrap());
+        assert!(!is_same_file(&file, &other).unwrap());
+        assert!(is_same_file(&file, &dir.0.join("missing")).is_err());
     }
 }

@@ -2783,6 +2783,9 @@ enum Cmd {
 /// "Cannot start a runtime from within a runtime". The CLI proper runs on the runtime
 /// [`on_runtime`] enters.
 fn main() -> ExitCode {
+    if let Some(code) = as_vk_agent() {
+        return code;
+    }
     // Raise this process's soft open-file limit toward its hard cap (≤1M) before anything
     // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
     // a host fd per accessed shared file — and this same binary re-execs as the libkrun
@@ -5233,6 +5236,32 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             )
         ),
     }
+}
+
+/// Under the name `vk-agent` — a link to this vk, in an image or on a host — become the agent
+/// this vk embeds, with the same arguments; `None` under any other name. A libkrun boot child
+/// takes its argv0 from the user's `--vm-name`, so [`vmm::BOOT_SPEC_ENV`] rules it out.
+fn as_vk_agent() -> Option<ExitCode> {
+    if std::env::var_os(vmm::BOOT_SPEC_ENV).is_some()
+        || !names_vk_agent(&std::env::args_os().next()?)
+    {
+        return None;
+    }
+    let e = embed::exec_agent(std::env::args_os().skip(1));
+    // The shell's codes: found but not runnable, else not found.
+    let code = match e
+        .downcast_ref::<std::io::Error>()
+        .and_then(|e| e.raw_os_error())
+    {
+        Some(libc::EACCES | libc::ENOEXEC) => 126,
+        _ => 127,
+    };
+    Some(fail(&e, code))
+}
+
+/// Whether `argv0` runs this vk as `vk-agent`.
+fn names_vk_agent(argv0: &std::ffi::OsStr) -> bool {
+    Path::new(argv0).file_name() == Some("vk-agent".as_ref())
 }
 
 /// `vk host-policy <policy> --workspace DIR -- <argv…>`: decide, then become the command.
@@ -7749,5 +7778,18 @@ mod tests {
         let cli =
             Cli::try_parse_from(["vk", "cp", "--service", "win", "a.txt", ":C:/a.txt"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Cp { service: Some(s), .. } if s == "win"));
+    }
+
+    #[test]
+    fn only_the_name_vk_agent_runs_the_agent() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(names_vk_agent("vk-agent".as_ref()));
+        assert!(names_vk_agent("/x/vk-agent".as_ref()));
+        assert!(!names_vk_agent("vk-agent.old".as_ref()));
+        assert!(!names_vk_agent("vk".as_ref()));
+        assert!(!names_vk_agent(std::ffi::OsStr::from_bytes(
+            b"vk-agent\xff"
+        )));
+        assert!(!names_vk_agent("".as_ref()));
     }
 }

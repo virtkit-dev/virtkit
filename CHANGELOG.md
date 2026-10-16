@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   own program beside `--exec-wrapper`, with only the default environment and in the
   foreground only, so a restricted host command channel can also serve `vk` under its
   own policy.
+- **A full `vk` invoked as `vk-agent` runs the vk-agent it embeds**, with the same
+  arguments, so a link named `vk-agent` to a `vk` in an image or mounted into a guest is the
+  agent.
 
 ### Changed
 
