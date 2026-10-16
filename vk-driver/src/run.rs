@@ -4293,44 +4293,167 @@ pub(crate) fn is_host_state_entry(name: &OsStr) -> bool {
         || PREFIXES.iter().any(|p| name.starts_with(p.as_bytes()))
 }
 
-/// Refuse a state dir the guest can write, in whole or in part, when the primary's `vk exec
-/// --service` is on: the host's `vk` finds the run's services by their directories and
-/// sockets there, so a guest that could add or replace one would aim it at another VM.
+/// With service exec enabled, refuse guest writes to the state dir or its host-owned entries.
+/// The host finds services by their `svc-<name>` directories and sockets; replacing or adding
+/// one could redirect it to another VM. Shares below other entries, such as `vk dev`'s managed
+/// storage, cannot reach them and are allowed. A `socket` volume counts, as the guest connects
+/// through it: `${state}/vsock.sock` would hand it the VMM. Nothing checked may reach the state
+/// dir through a name below another writable share, nor pass through one inside it: the guest
+/// could swap that name for a symlink to an entry once booted, which a socket's forward or a
+/// later service's boot would follow. See [`is_host_state_entry`].
 fn check_service_exec_state_dir<'a>(
     work: &Path,
     volumes: impl IntoIterator<Item = &'a crate::compose::Volume> + Clone,
     workdir: Option<&'a Path>,
 ) -> Result<()> {
     const WAY_OUT: &str = "the primary's service exec needs a state dir the guest \
-                           cannot write: pass --no-service-exec, or a --state-dir outside \
-                           every writable share";
+                           cannot write: pass a --state-dir outside every writable share, \
+                           or --no-service-exec to `vk run`";
     crate::sshclient::check_state_dir_is_host_only(
         work,
         volumes.clone(),
         workdir.map(|d| (d, WORKDIR_MOUNT)),
     )
     .context(WAY_OUT)?;
-    // A share at or below the state dir: the check above allows those.
-    let dir =
-        std::fs::canonicalize(work).with_context(|| format!("resolving {}", work.display()))?;
-    let writable = volumes
+    // A share at or under one of vk's entries: the check above allows those. A `disk` volume
+    // counts, as the guest writes its backing file: `${state}/root.qcow2:/dev/vdb:disk`; so
+    // does a `socket` one.
+    let (dir, dir_way) = walk_to_be(work)?;
+    // Record each destination, every location on the way, and whether the guest can repoint
+    // names below it through a writable directory share. The boot and a socket's forward
+    // follow the path as given.
+    let checked = volumes
         .into_iter()
-        .filter(|v| !(v.read_only || v.overlay || v.disk || v.socket))
-        .map(|v| (v.host.as_path(), v.guest.as_str()))
-        .chain(workdir.map(|d| (d, WORKDIR_MOUNT)));
-    for (host, guest) in writable {
-        let host =
-            std::fs::canonicalize(host).with_context(|| format!("resolving {}", host.display()))?;
-        if host.starts_with(&dir) {
+        .filter(|v| v.socket || !(v.read_only || v.overlay))
+        .map(|v| (v.host.as_path(), v.guest.as_str(), !(v.socket || v.disk)))
+        .chain(workdir.map(|d| (d, WORKDIR_MOUNT, true)))
+        .map(|(given, guest, dir_share)| {
+            let (host, way) = walk_to_be(given)?;
+            Ok((given, host, way, guest, dir_share))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let below_a_share = |way: &[PathBuf], scope: &dyn Fn(&Path) -> bool| {
+        way.iter().find_map(|at| {
+            checked.iter().find(|(_, share, _, _, dir_share)| {
+                *dir_share && at != share && at.starts_with(share) && scope(share)
+            })
+        })
+    };
+    // The host reaches the services through the state dir by the path it was given.
+    if let Some((_, share, _, outer_guest, _)) = below_a_share(&dir_way, &|_| true) {
+        bail!(
+            "the state dir {} is reached through {}, which the guest writes through \
+             {outer_guest}: it could repoint a name on the way at a directory of its own; {WAY_OUT}",
+            work.display(),
+            share.display()
+        );
+    }
+    for (given, host, way, guest, _) in &checked {
+        let in_state = host.starts_with(&dir);
+        let mut way = way.clone();
+        way.push(host.clone());
+        if let Some((_, share, _, outer_guest, _)) =
+            below_a_share(&way, &|share| in_state || share.starts_with(&dir))
+        {
             bail!(
-                "{WAY_OUT}: {} is in the state dir {}, and the guest mounts it read-write at \
-                 {guest}",
-                host.display(),
-                dir.display()
+                "{}, in, into or through the state dir {}, passes through {}, which the guest writes \
+                 through {outer_guest}: it could swap a directory on the way for a symlink to an \
+                 entry vk keeps there, which {guest} would then reach; move one out of the \
+                 other, or pass --no-service-exec to `vk run`",
+                given.display(),
+                dir.display(),
+                share.display()
+            );
+        }
+        // At the state dir itself it is no entry; `check_state_dir_is_host_only` has it.
+        let Ok(rel) = host.strip_prefix(&dir) else {
+            continue;
+        };
+        let entry = rel
+            .components()
+            .next()
+            .map(|c| c.as_os_str())
+            .filter(|e| is_host_state_entry(e));
+        if let Some(entry) = entry {
+            bail!(
+                "{} in the state dir {} is what vk keeps there for the host, and the guest \
+                 could write {} through {guest}: share it read-only or not at all (a socket \
+                 not at all), or pass --no-service-exec to `vk run`",
+                Path::new(entry).display(),
+                dir.display(),
+                host.display()
             );
         }
     }
     Ok(())
+}
+
+/// Return `path`'s destination, including a disk backing and parents the boot has yet to
+/// create, and every location visited, including names in symlink targets. Walk one name
+/// at a time as the kernel would: follow symlink targets in place, resolve `..` from the
+/// current location, and append missing names as creation would. Reject dangling symlinks:
+/// what they would create is not the name read here.
+fn walk_to_be(path: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    /// Linux's `MAXSYMLINKS`: what one lookup follows before failing with `ELOOP`.
+    const MAX_LINKS: usize = 40;
+    let resolving = || format!("resolving {}", path.display());
+    let mut at = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir().with_context(resolving)?
+    };
+    let mut pending: VecDeque<_> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut visited = Vec::new();
+    let mut followed = 0;
+    // For each symlink whose target is being walked, how many names follow that target.
+    let mut in_targets: Vec<usize> = Vec::new();
+    while let Some(name) = pending.pop_front() {
+        in_targets.retain(|&after| pending.len() >= after);
+        if name == ".." {
+            at.pop();
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        let next = at.join(&name);
+        visited.push(next.clone());
+        // Every name is looked up, past a missing one too: a `..` can step back onto names
+        // that exist.
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                followed += 1;
+                if followed > MAX_LINKS {
+                    bail!("{}: too many levels of symbolic links", resolving());
+                }
+                let target = std::fs::read_link(&next).with_context(resolving)?;
+                if target.is_absolute() {
+                    at = PathBuf::from("/");
+                }
+                in_targets.push(pending.len());
+                for c in target.components().rev() {
+                    if !matches!(c, Component::RootDir | Component::Prefix(_)) {
+                        pending.push_front(c.as_os_str().to_owned());
+                    }
+                }
+            }
+            Ok(_) => at = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !in_targets.is_empty() {
+                    bail!("{}: a symlink on the way points nowhere", resolving());
+                }
+                at = next;
+            }
+            Err(e) => return Err(e).with_context(resolving),
+        }
+    }
+    Ok((at, visited))
 }
 
 /// Write the managed SSH client setup and return its public key.
@@ -7034,8 +7157,11 @@ mod tests {
         assert!(compose_build_selection(&units, &[], Some("nope")).is_err());
     }
 
-    /// The primary's service exec needs a state dir no guest share can write: one in
-    /// a read-write volume or under the `--workdir` is refused, with the way out named.
+    /// The primary's service exec needs a state dir no guest share can write: one in a
+    /// read-write volume or under the `--workdir` is refused, with the way out named, and so is
+    /// a share at or under an entry vk keeps there — a service's directory, the root image —
+    /// however it is spelled or reached. Any other share below it, such as `vk dev`'s managed
+    /// storage, is allowed.
     #[test]
     fn service_exec_refuses_a_guest_writable_state_dir() {
         let t = crate::qga::tests::TempDir::new("service-exec-state");
@@ -7067,6 +7193,235 @@ mod tests {
         assert!(format!("{err:#}").contains("/db"), "{err:#}");
         let svc = elsewhere.join("svc-db");
         assert!(check_service_exec_state_dir(&elsewhere, [], Some(svc.as_path())).is_err());
+        std::fs::create_dir_all(elsewhere.join("svc-db/data")).unwrap();
+        let deeper = elsewhere.join("svc-db/data");
+        assert!(check_service_exec_state_dir(&elsewhere, [], Some(deeper.as_path())).is_err());
+        let rw_at = |host: &Path| {
+            crate::compose::parse_volume(&format!("{}:/x:rw", host.display()), Path::new("/b"))
+                .unwrap()
+                .unwrap()
+        };
+        let in_svc = rw_at(&deeper);
+        let err = check_service_exec_state_dir(&elsewhere, [&in_svc], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-db in the state dir"),
+            "{err:#}"
+        );
+        // A name that resolves to a service's directory is that directory.
+        std::os::unix::fs::symlink("svc-db", elsewhere.join("link")).unwrap();
+        let alias = rw_at(&elsewhere.join("link"));
+        let err = check_service_exec_state_dir(&elsewhere, [&alias], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-db in the state dir"),
+            "{err:#}"
+        );
+        // What a case-insensitive filesystem would take for `svc-db`.
+        std::fs::create_dir_all(elsewhere.join("SVC-db")).unwrap();
+        let upper = rw_at(&elsewhere.join("SVC-db"));
+        let err = check_service_exec_state_dir(&elsewhere, [&upper], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SVC-db in the state dir"),
+            "{err:#}"
+        );
+        // A single file the host keeps there: the guest would rewrite the image it boots.
+        std::fs::write(elsewhere.join("root.qcow2"), "").unwrap();
+        let image = rw_at(&elsewhere.join("root.qcow2"));
+        let err = check_service_exec_state_dir(&elsewhere, [&image], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("share it read-only or not at all"),
+            "{err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("--state-dir outside"),
+            "{err:#}"
+        );
+        // …and so would a `disk` volume backed by it.
+        let disk = crate::compose::parse_volume(
+            &format!("{}:/dev/vdb:disk", elsewhere.join("root.qcow2").display()),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        let err = check_service_exec_state_dir(&elsewhere, [&disk], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("root.qcow2 in the state dir"),
+            "{err:#}"
+        );
+        // A backing file yet to be created is checked by the name it will have.
+        let fresh = |name: &str| {
+            crate::compose::parse_volume(
+                &format!("{}:/dev/vdc:disk", elsewhere.join(name).display()),
+                Path::new("/b"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("net.bytes")], None).is_err());
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("data.qcow2")], None).is_ok());
+        // …its parent directories too, as the boot creates them, a `..` in them included.
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("vols/pg.qcow2")], None).is_ok());
+        let err = check_service_exec_state_dir(&elsewhere, [&fresh("svc-x/new/pg.qcow2")], None)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-x in the state dir"),
+            "{err:#}"
+        );
+        // A `..` past a name the boot would create steps back onto what is there.
+        let mut back = fresh("vols/pg.qcow2");
+        back.host = elsewhere.join("new/../svc-y/pg.qcow2");
+        let err = check_service_exec_state_dir(&elsewhere, [&back], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-y in the state dir"),
+            "{err:#}"
+        );
+        // A dangling symlink names something other than what it would create.
+        std::os::unix::fs::symlink("nowhere", elsewhere.join("dangling.qcow2")).unwrap();
+        assert!(
+            check_service_exec_state_dir(&elsewhere, [&fresh("dangling.qcow2")], None).is_err()
+        );
+        // A socket hands the guest whatever listens there.
+        let socket = crate::compose::parse_volume(
+            &format!("{}:/g.sock:socket", elsewhere.join("vsock.sock").display()),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        let err = check_service_exec_state_dir(&elsewhere, [&socket], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("vsock.sock in the state dir"),
+            "{err:#}"
+        );
+        // `vk dev`'s own files there: the allowlist the switch follows, the wrapper it runs.
+        for name in ["egress.json", "host-exec-wrapper"] {
+            std::fs::write(elsewhere.join(name), "").unwrap();
+            let err =
+                check_service_exec_state_dir(&elsewhere, [&rw_at(&elsewhere.join(name))], None)
+                    .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!("{name} in the state dir")),
+                "{err:#}"
+            );
+        }
+        // Any other share below the state dir — `vk dev`'s managed storage, say — reaches no
+        // service: the guest cannot add or replace a `svc-*` entry through it.
+        std::fs::create_dir_all(elsewhere.join("editor/vscode-server")).unwrap();
+        let managed = crate::compose::parse_volume(
+            &format!(
+                "{}:/home/dev/.vscode-server:rw",
+                elsewhere.join("editor/vscode-server").display()
+            ),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(check_service_exec_state_dir(&elsewhere, [&managed], None).is_ok());
+        std::fs::create_dir_all(elsewhere.join("vscode-server")).unwrap();
+        let named_like = elsewhere.join("vscode-server");
+        assert!(check_service_exec_state_dir(&elsewhere, [], Some(named_like.as_path())).is_ok());
+        // A dangling symlink on the way is an error too, not a name to check.
+        std::os::unix::fs::symlink("nowhere", elsewhere.join("gone")).unwrap();
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("gone/pg.qcow2")], None).is_err());
+    }
+
+    /// Nothing checked may reach the state dir through a name below another writable share
+    /// there, nor may the state dir itself be reached through one: the boot and a socket's
+    /// forward follow the path as given, so the guest could repoint that name at `../svc-db`
+    /// once booted.
+    #[test]
+    fn service_exec_refuses_a_path_through_a_writable_share() {
+        let t = crate::qga::tests::TempDir::new("service-exec-through");
+        let state = t.0.join("state");
+        std::fs::create_dir_all(state.join("store/nested")).unwrap();
+        std::fs::create_dir_all(state.join("sockets")).unwrap();
+        let volume = |spec: String| {
+            crate::compose::parse_volume(&spec, Path::new("/b"))
+                .unwrap()
+                .unwrap()
+        };
+        let store = volume(format!("{}:/data:rw", state.join("store").display()));
+        let below = |spec: &str| volume(format!("{}{spec}", state.join("store").display()));
+        let refused = |volumes: &[&crate::compose::Volume], workdir: Option<&Path>| {
+            let err =
+                check_service_exec_state_dir(&state, volumes.iter().copied(), workdir).unwrap_err();
+            assert!(format!("{err:#}").contains("swap a directory"), "{err:#}");
+        };
+        for inner in [
+            below("/app.sock:/run/app.sock:socket"),
+            below("/vols/pg.qcow2:/dev/vdd:disk"),
+            below("/nested:/nested:rw"),
+        ] {
+            refused(&[&store, &inner], None);
+            assert!(check_service_exec_state_dir(&state, [&inner], None).is_ok());
+        }
+        refused(
+            &[&below("/app.sock:/run/app.sock:socket")],
+            Some(state.join("store").as_path()),
+        );
+        // A name below it that ends elsewhere: a link the guest planted in an earlier boot.
+        std::os::unix::fs::symlink("../sockets", state.join("store/run")).unwrap();
+        let via_link = below("/run/app.sock:/run/app.sock:socket");
+        assert!(check_service_exec_state_dir(&state, [&via_link], None).is_ok());
+        refused(&[&store, &via_link], None);
+        // …reached through a host symlink, which only its target's walk passes through.
+        let alias = t.0.join("alias");
+        std::os::unix::fs::symlink(state.join("store/run"), &alias).unwrap();
+        let via_alias = volume(format!("{}/app.sock:/run/app.sock:socket", alias.display()));
+        refused(&[&store, &via_alias], None);
+        // A read-only share of the outer directory gives the guest nothing to swap.
+        let store_ro = volume(format!("{}:/data:ro", state.join("store").display()));
+        let sock = below("/app.sock:/run/app.sock:socket");
+        assert!(check_service_exec_state_dir(&state, [&store_ro, &sock], None).is_ok());
+        // A `..` past a name the boot would create, back onto a link to a service.
+        std::fs::create_dir_all(state.join("svc-db")).unwrap();
+        std::os::unix::fs::symlink("svc-db", state.join("to-svc")).unwrap();
+        let mut back = below("/vols/pg.qcow2:/dev/vdd:disk");
+        back.host = state.join("new/../to-svc/x/pg.qcow2");
+        let err = check_service_exec_state_dir(&state, [&back], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-db in the state dir"),
+            "{err:#}"
+        );
+        // The state dir itself, given through a link in the --workdir: the host would follow
+        // it to `svc-*` wherever the guest repointed it.
+        let repo = t.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&t.0, repo.join("l")).unwrap();
+        let through = repo.join("l/state");
+        let err = check_service_exec_state_dir(&through, [], Some(repo.as_path())).unwrap_err();
+        assert!(format!("{err:#}").contains("repoint a name"), "{err:#}");
+        assert!(check_service_exec_state_dir(&through, [], None).is_ok());
+    }
+
+    /// `walk_to_be` ends where the kernel's lookup, or creating what is missing, would, and
+    /// records every location it passes, a symlink's target included.
+    #[test]
+    fn walk_to_be_follows_the_path_as_given() {
+        let t = crate::qga::tests::TempDir::new("walk-to-be");
+        let d = std::fs::canonicalize(&t.0).unwrap();
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::create_dir_all(d.join("svc-db")).unwrap();
+        let link = |target: &Path, name: &str| std::os::unix::fs::symlink(target, d.join(name));
+        link(Path::new("svc-db"), "to-svc").unwrap();
+        link(Path::new("a/b"), "inner").unwrap();
+        link(Path::new("inner/.."), "up").unwrap();
+        link(Path::new("to-svc"), "chain").unwrap();
+        link(&d.join("a"), "absolute").unwrap();
+        link(Path::new("nowhere"), "dangling").unwrap();
+        link(Path::new("loop"), "loop").unwrap();
+        let walk = |p: &str| walk_to_be(&d.join(p));
+        // Nested links, each hop recorded.
+        let (end, way) = walk("chain/x").unwrap();
+        assert_eq!(end, d.join("svc-db/x"));
+        assert!(way.contains(&d.join("to-svc")), "{way:?}");
+        // A target ending in `..` steps back from where the target led, not lexically.
+        assert_eq!(walk("up/b/new").unwrap().0, d.join("a/b/new"));
+        assert_eq!(walk("absolute/b").unwrap().0, d.join("a/b"));
+        // A missing tail after a link, and a `..` back out of a missing name onto a link.
+        assert_eq!(walk("inner/new/f").unwrap().0, d.join("a/b/new/f"));
+        assert_eq!(walk("new/../to-svc/x").unwrap().0, d.join("svc-db/x"));
+        assert!(walk("new/../dangling/x").is_err());
+        assert!(walk("dangling").is_err());
+        assert!(walk("loop/x").is_err());
     }
 
     #[test]

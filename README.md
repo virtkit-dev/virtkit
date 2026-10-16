@@ -497,7 +497,10 @@ With `--host-exec-wrapper` the channel serves both: a request named `vk` goes to
 exec, every other to the wrapper. `--host-exec` without a wrapper replaces this restricted
 channel with the whole channel. While service exec is on, with or without a wrapper, the
 run's `--state-dir` must be out of the guest's reach: not in a read-write volume nor under
-`--workdir`.
+`--workdir`. None of the entries vk keeps in it — the services' directories, the root
+image, the run's sockets and logs, `vk dev`'s control files — may be shared writable or
+back a `disk` or `socket` volume. No path vk follows there — the state dir's own, a share's,
+a volume's — may pass through a name below a writable share, which the guest could repoint.
 
 `vk run --ssh` enables SSH access for development VMs, including VS Code Remote-SSH
 workflows. In a CI fleet a service's `environment:` may also carry its own egress allowlist

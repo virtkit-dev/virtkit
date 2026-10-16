@@ -31,6 +31,18 @@ All notable changes to virtkit will be documented in this file.
   `${state}/atop`, `${state}/svc-*` and `${state}/root.qcow2`, regardless of ASCII case.
   It also rejects non-ASCII names. Rename such managed storage.
 
+### Fixed
+
+- **Compose environments boot with managed storage in their state directory**, such as
+  a persistent VS Code server, in both `vk dev` and `vk run --compose`. These shares no
+  longer trigger the check against accessing another VM's services. With service exec on,
+  `vk run` still refuses writable shares of its own state entries and `vk dev`'s: service
+  directories, the root image, sockets and logs, `egress.json`, the host-exec wrapper.
+- **Breaking:** with service exec on, `vk run` now refuses previously accepted `disk` or
+  `socket` volumes at those entries, and paths into the state directory, including its
+  own path, that pass through a name below a writable share: the guest could repoint
+  that name once booted.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed

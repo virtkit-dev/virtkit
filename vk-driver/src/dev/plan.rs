@@ -299,8 +299,8 @@ const EDITOR_MOUNT: &str = "vscode-server";
 /// `vk dev`'s own files in the state dir, which the host reads back or runs: a guest that
 /// could write the recorded identity, the host-exec wrapper or the allowlist would be steering
 /// the host. [`crate::run::is_host_state_entry`] counts them with what the `vk run` it drives
-/// keeps there (the SSH client setup, published ports, persistent backings), so a mount may
-/// not name them.
+/// keeps there (the SSH client setup, published ports, persistent backings), so neither a
+/// mount nor, with service exec, a compose volume may name them.
 pub(crate) const DEV_CONTROL_ENTRIES: &[&str] = &[
     "endpoints.json",
     "dev.json",
