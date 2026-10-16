@@ -27,6 +27,9 @@ All notable changes to virtkit will be documented in this file.
   `--state-dir` must be out of the guest's reach, as without host commands;
   `vk run --no-service-exec` keeps the old channel, and `vk dev` has no such switch. The
   `--host-exec` serve log now keeps its first 1 MiB, like service exec's.
+- **Breaking:** `vk dev` now rejects mounts naming `vk run`'s state entries, including
+  `${state}/atop`, `${state}/svc-*` and `${state}/root.qcow2`, regardless of ASCII case.
+  It also rejects non-ASCII names. Rename such managed storage.
 
 ## [0.92.1] - 2026-10-16
 

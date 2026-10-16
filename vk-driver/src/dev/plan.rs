@@ -296,22 +296,37 @@ pub(crate) const EGRESS_FILE: &str = "egress.json";
 /// configured mount cannot claim it.
 const EDITOR_MOUNT: &str = "vscode-server";
 
-/// What the state dir holds for the host's own use. A mount may not name these: a guest that
-/// could write the key, the client config or the recorded identity would be steering the
-/// host, and one that could read the key could reach the next boot too.
-pub(super) const RESERVED_STATE_ENTRIES: &[&str] = &[
-    "editor",
+/// `vk dev`'s own files in the state dir, which the host reads back or runs: a guest that
+/// could write the recorded identity, the host-exec wrapper or the allowlist would be steering
+/// the host. [`crate::run::is_host_state_entry`] counts them with what the `vk run` it drives
+/// keeps there (the SSH client setup, published ports, persistent backings), so a mount may
+/// not name them.
+pub(crate) const DEV_CONTROL_ENTRIES: &[&str] = &[
     "endpoints.json",
-    "id_ed25519",
-    "id_ed25519.pub",
-    "ssh-config",
-    "bin",
     "dev.json",
     "lifecycle",
     "host-exec-wrapper",
     "boot.log",
     // the allowlist the switch follows: a guest that could write it would choose its own
     EGRESS_FILE,
+    // the readying marker and its lock (`super::identity`)
+    "not-ready",
+    "not-ready.lock",
+    // the `[dev.ssh]` keys `vk run` lets through the agent forward (`super::boot`)
+    "ssh-agent-allow",
+];
+
+/// Reserved entries beside [`DEV_CONTROL_ENTRIES`]: the editor-server mount and `vk run`'s
+/// SSH client setup, published ports and persistent backings. Mounts also exclude the other
+/// entries matched by [`crate::run::is_host_state_entry`], but prune protects only these two
+/// lists: a declared backing may use another host-state name. Reading the SSH key could give
+/// a guest access to the next boot.
+pub(super) const RESERVED_STATE_ENTRIES: &[&str] = &[
+    "editor",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "ssh-config",
+    "bin",
     // `crate::publish`'s registry of what is published, which the host reads back
     "publish",
     // auto-managed persistent backings the boot keeps under the state dir: `persist_root`
@@ -652,10 +667,18 @@ fn managed_storage(mounts: &[Resolved], state_dir: &Path) -> Result<Vec<PathBuf>
                 let Some(first) = rel.components().next().map(|c| c.as_os_str()) else {
                     bail!("mount {name}: empty path under the state directory");
                 };
-                if RESERVED_STATE_ENTRIES
-                    .iter()
-                    .any(|e| first == std::ffi::OsStr::new(e))
-                    || first.as_bytes().starts_with(b".")
+                if !first.as_bytes().is_ascii() {
+                    bail!(
+                        "mount {name}: {} under the state directory is not ASCII, which a \
+                         case-folding filesystem could take for an entry the host keeps there; \
+                         managed storage needs an ASCII name",
+                        Path::new(first).display()
+                    );
+                }
+                if crate::run::is_host_state_entry(first)
+                    || RESERVED_STATE_ENTRIES
+                        .iter()
+                        .any(|e| first.as_bytes().eq_ignore_ascii_case(e.as_bytes()))
                 {
                     bail!(
                         "mount {name}: {} under the state directory is the host's own; \
@@ -2117,6 +2140,27 @@ extensions = ["ms-python.python"]
             msg.contains("host's own") && msg.contains("id_ed25519"),
             "{msg}"
         );
+        // Also reject the boot image, service directories and readying marker, including
+        // names a casefold directory could take for one of them.
+        for (i, source) in ["root.qcow2", "SVC-db/data", "not-ready"]
+            .into_iter()
+            .enumerate()
+        {
+            let f = wab_like(&format!("guest-run-entry-{i}"));
+            with_dev(
+                &f,
+                &format!("[dev.mounts.evil]\nsource = \"${{state}}/{source}\"\nto = \"/tmp/x\"\n"),
+            );
+            let msg = format!("{:#}", plan_of(&f.0, "dev").unwrap_err());
+            assert!(msg.contains("host's own"), "{source}: {msg}");
+        }
+        let f = wab_like("guest-run-entry-unicode");
+        with_dev(
+            &f,
+            "[dev.mounts.evil]\nsource = \"${state}/\u{17f}vc-db\"\nto = \"/tmp/x\"\n",
+        );
+        let msg = format!("{:#}", plan_of(&f.0, "dev").unwrap_err());
+        assert!(msg.contains("not ASCII"), "{msg}");
 
         // …including vk's own mount for the editor server, which is at a guest path a
         // config can name too.

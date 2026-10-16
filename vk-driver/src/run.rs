@@ -4218,6 +4218,81 @@ fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
     )
 }
 
+/// Whether `name` is a host-owned entry at the top of a run's state dir: boot images,
+/// listening sockets, logs and accounting read by the host, service directories, or the
+/// files `vk dev` keeps there ([`crate::dev::plan::DEV_CONTROL_ENTRIES`]). Guest writes to
+/// these entries could steer the host or another VM. Staging siblings with `.tmp` or
+/// `.raw.tmp` appended count too. Matching ignores ASCII case (`SVC-db` matches `svc-db`);
+/// a name outside ASCII counts as well, as a casefold directory's Unicode folding could
+/// take it for one (`ſvc-db`).
+pub(crate) fn is_host_state_entry(name: &OsStr) -> bool {
+    use crate::uefi::{
+        CONSOLE_SOCKET, CONTROL_SOCKET, GENERATION_ID, GUEST_AGENT_SOCKET, SYSTEM_UUID, TAP_SPEC,
+        TPM_STATE, UEFI_VARS,
+    };
+    const NAMES: &[&str] = &[
+        // the primary's image, with its config sidecar
+        "root.qcow2",
+        "root.qcow2.json",
+        CONSOLE_LOG,
+        "console.vmm.log",
+        "switch.log",
+        NET_BYTES,
+        AUDIT_LOG,
+        "atop",
+        "ssh-agent-forward.log",
+        "host-exec-serve.log",
+        "service-exec.log",
+        // `--ssh-client`
+        crate::sshclient::KEY,
+        "id_ed25519.pub",
+        crate::sshclient::CONFIG,
+        crate::sshclient::SHIM_DIR,
+        // compose `persist` backings, anchored here by a `--state-dir`
+        "roots",
+        "overlays",
+        // `vk publish --state-dir`
+        "publish",
+        // a UEFI bundle's machine
+        UEFI_VARS,
+        GENERATION_ID,
+        SYSTEM_UUID,
+        TPM_STATE,
+        TAP_SPEC,
+        GUEST_AGENT_SOCKET,
+        CONSOLE_SOCKET,
+        CONTROL_SOCKET,
+    ];
+    const PREFIXES: &[&str] = &[
+        "svc-",
+        // the VMM's socket and its per-port listeners, `vsock.sock_<port>`
+        "vsock.sock",
+        "socket-fwd-",
+        // staging names: `vk_fs::write_atomic`'s, the SSH key's
+        ".",
+    ];
+    if !name.as_encoded_bytes().is_ascii() {
+        return true;
+    }
+    let name = name.as_encoded_bytes().to_ascii_lowercase();
+    // `<entry>.tmp`, or the test build backend's `<entry>.raw.tmp`.
+    let name = name
+        .strip_suffix(b".tmp")
+        .map(|n| n.strip_suffix(b".raw").unwrap_or(n))
+        .unwrap_or(name.as_slice());
+    // A UEFI bundle's disk overlays, `disk<N>.qcow2`.
+    let uefi_disk = name
+        .strip_prefix(b"disk")
+        .and_then(|r| r.strip_suffix(b".qcow2"))
+        .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit));
+    uefi_disk
+        || NAMES
+            .iter()
+            .chain(crate::dev::plan::DEV_CONTROL_ENTRIES)
+            .any(|n| name == n.as_bytes())
+        || PREFIXES.iter().any(|p| name.starts_with(p.as_bytes()))
+}
+
 /// Refuse a state dir the guest can write, in whole or in part, when the primary's `vk exec
 /// --service` is on: the host's `vk` finds the run's services by their directories and
 /// sockets there, so a guest that could add or replace one would aim it at another VM.
@@ -6992,6 +7067,54 @@ mod tests {
         assert!(format!("{err:#}").contains("/db"), "{err:#}");
         let svc = elsewhere.join("svc-db");
         assert!(check_service_exec_state_dir(&elsewhere, [], Some(svc.as_path())).is_err());
+    }
+
+    #[test]
+    fn host_state_entries_are_named_whatever_the_case() {
+        for name in [
+            "svc-db",
+            "SVC-db",
+            "root.qcow2",
+            "Root.QCOW2.json",
+            "vsock.sock",
+            "vsock.sock_1024",
+            "socket-fwd-8080.log",
+            "disk0.qcow2",
+            "disk12.qcow2.tmp",
+            "egress-audit.log",
+            "ssh-config",
+            ".0123456789abcdef",
+            // staging siblings
+            "root.qcow2.tmp",
+            "root.qcow2.raw.tmp",
+            "vmgenid.tmp",
+            "System-UUID.TMP",
+            "net.bytes.tmp",
+            // `vk dev`'s own files
+            "dev.json",
+            "Egress.json",
+            "host-exec-wrapper",
+            "not-ready.lock",
+            "ssh-agent-allow",
+            // a casefold directory's Unicode folding could take it for `svc-db`
+            "\u{17f}vc-db",
+        ] {
+            assert!(is_host_state_entry(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "vscode-server",
+            "editor",
+            "data.qcow2",
+            "disk.qcow2",
+            "diskx.qcow2",
+            "disk0.raw",
+            "svc",
+            "editor.tmp",
+            "root.raw.tmp",
+            "vmgenid.raw",
+        ] {
+            assert!(!is_host_state_entry(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

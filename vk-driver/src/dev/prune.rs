@@ -224,7 +224,8 @@ fn select(env: &Env, opts: &Options) -> Result<Selection> {
                 ensure!(
                     !super::plan::RESERVED_STATE_ENTRIES
                         .iter()
-                        .any(|n| first == OsStr::new(n))
+                        .chain(super::plan::DEV_CONTROL_ENTRIES)
+                        .any(|n| first.as_bytes().eq_ignore_ascii_case(n.as_bytes()))
                         || STORAGE_DIRS.iter().any(|n| first == OsStr::new(n)),
                     "storage {} overlaps environment identity or control data; left alone",
                     backing.display()
@@ -751,7 +752,7 @@ mod tests {
     #[test]
     fn storage_cannot_select_identity_or_escape_above_state() {
         let mut f = fixture("protected");
-        for relative in ["", "id_ed25519", "lifecycle", "../repo"] {
+        for relative in ["", "id_ed25519", "Lifecycle", "not-ready", "../repo"] {
             f.plan.managed_dirs = vec![f.plan.state_dir.join(relative)];
             assert!(
                 run(
