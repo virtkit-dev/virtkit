@@ -294,15 +294,53 @@ fn audit_table(
             }
             h.raw("</td>");
         }
-        // The event holds what nodes or the host's `vk` said, made display-safe as the store
-        // wrote it.
-        h.raw("<td>")
-            .text(&row.actor)
-            .raw("</td><td>")
-            .node(&row.event)
-            .raw("</td></tr>");
+        h.raw("<td>").text(&row.actor).raw("</td><td>");
+        audit_event(h, &row.actor, &row.event, subjects);
+        h.raw("</td></tr>");
     }
     h.raw("</tbody></table>");
+}
+
+/// Show audit `event` without the leading `actor` already shown in the who column.
+/// Replace known node and registry IDs with names linked to their pages.
+fn audit_event(h: &mut Html, actor: &str, event: &str, subjects: &HashMap<&str, &Subject>) {
+    let event = event
+        .strip_prefix(actor)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .filter(|rest| !actor.is_empty() && !rest.is_empty())
+        .unwrap_or(event);
+    // The event holds what nodes or the host's `vk` said, made display-safe as the store
+    // wrote it.
+    let event = vk_hub_proto::display_safe(event);
+    let mut shown = 0;
+    let mut words = event.char_indices().peekable();
+    while let Some((start, c)) = words.next() {
+        if !c.is_ascii_alphanumeric() {
+            continue;
+        }
+        let mut end = start + 1;
+        while let Some(&(i, c)) = words.peek() {
+            if !c.is_ascii_alphanumeric() {
+                break;
+            }
+            end = i + 1;
+            words.next();
+        }
+        let word = &event[start..end];
+        if word.len() == 32
+            && let Some(s) = subjects.get(word).filter(|_| vk_hub_proto::valid_id(word))
+        {
+            h.text(&event[shown..start])
+                .raw("<a href=\"")
+                .raw(s.page)
+                .text(word)
+                .raw("\">")
+                .node(&s.name)
+                .raw("</a>");
+            shown = end;
+        }
+    }
+    h.text(&event[shown..]);
 }
 
 /// The instant `secs` as a `<time>` element for `time.js` to show in the browser's zone
@@ -574,5 +612,62 @@ mod tests {
              <time datetime=\"2026-09-30T08:01:19Z\" title=\"2026-09-30 08:01:19 UTC\">\
              5s ago</time>"
         );
+    }
+
+    /// An audit event drops the actor its row shows and names the nodes and registries it
+    /// knows, linked; another ID, an unknown node's or one inside a longer word, stays as
+    /// written.
+    #[test]
+    fn an_audit_event_names_known_subjects_without_repeating_its_actor() {
+        let (known, unknown) = ("ab".repeat(16), "cd".repeat(16));
+        let node = Subject {
+            id: known.clone(),
+            name: "runner-1".into(),
+            page: "/node/",
+        };
+        let registry_id = "ef".repeat(16);
+        let registry = Subject {
+            id: registry_id.clone(),
+            name: "mirror".into(),
+            page: crate::ui::registries::DETAIL_PREFIX,
+        };
+        let subjects = HashMap::from([(known.as_str(), &node), (registry_id.as_str(), &registry)]);
+        let shown = |actor: &str, event: &str| {
+            let mut h = Html::new();
+            audit_event(&mut h, actor, event, &subjects);
+            h.into_string()
+        };
+        assert_eq!(
+            shown(
+                "key gitlab",
+                &format!("key gitlab canceled job {unknown} immediately")
+            ),
+            format!("canceled job {unknown} immediately")
+        );
+        assert_eq!(
+            shown("hub", &format!("node {known} refused job {unknown}: busy")),
+            format!("node <a href=\"/node/{known}\">runner-1</a> refused job {unknown}: busy")
+        );
+        assert_eq!(
+            shown("hub", &format!("1 reservation(s) on node {known}")),
+            format!("1 reservation(s) on node <a href=\"/node/{known}\">runner-1</a>")
+        );
+        assert_eq!(
+            shown("hub", &format!("({known}) {known}: x")),
+            format!(
+                "(<a href=\"/node/{known}\">runner-1</a>) \
+                 <a href=\"/node/{known}\">runner-1</a>: x"
+            )
+        );
+        assert_eq!(
+            shown("uid 0", &format!("x{known} <b>")),
+            format!("x{known} &lt;b&gt;")
+        );
+        assert_eq!(
+            shown("hub", &format!("registry {registry_id} applied")),
+            format!("registry <a href=\"/registry/{registry_id}\">mirror</a> applied")
+        );
+        assert_eq!(shown("hub", "hub"), "hub");
+        assert_eq!(shown("hub", "hubs grew"), "hubs grew");
     }
 }

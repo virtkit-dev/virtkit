@@ -2654,7 +2654,8 @@ async fn node_streams_leave_nothing_followed_behind() {
     assert!(followed <= sse::MAX_SESSION_STREAMS + 1, "{followed}");
 }
 
-/// `/audit` lists the fleet's log, newest first, or one node's, chosen from the hub's nodes.
+/// `/audit` lists the fleet's log, newest first, or one node's, chosen from the hub's nodes;
+/// an event names a node by its name, linked.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
     let (addr, hub, _) = start_fleet().await;
@@ -2667,7 +2668,7 @@ async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
         "<select name=\"node\">",
         &format!("<option value=\"{node}\">ci-&lt;1&gt; ("),
         "issued an enrollment token",
-        &format!("node {node} enrolled as ci-&lt;1&gt;"),
+        &format!("node <a href=\"/node/{node}\">ci-&lt;1&gt;</a> enrolled as ci-&lt;1&gt;"),
         &format!("<a href=\"/node/{node}\">ci-&lt;1&gt;</a>"),
     ] {
         assert!(all.body.contains(want), "{want}: {}", all.body);

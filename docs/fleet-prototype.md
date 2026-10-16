@@ -1198,33 +1198,34 @@ provider (see [Signing in](#signing-in)).
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); the API keys and the clients using
 them (`/clients`, below); and the audit log (`/audit`, filterable by node, 100 lines a page; the
-hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it beside what it
-reports — its state, acquisition, runner (`none: placed jobs only` for a node with none),
-concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
-outcomes. It opens with a steering panel describing the current state in plain language, grouped
-into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
-node's current effective limit, and on a hub that places jobs, for a node at protocol version 3
-or later, the jobs the hub has placed on it against that ceiling or the node's own limit,
-whichever is smaller (`Placed by the hub: 3 of 4`), or why it takes none when it runs its own
-gitlab-runner; *Maintenance* — in service, draining, drained, under maintenance, checking itself
-or quarantined; and an operator-only *Danger zone*. Operators see applicable actions with short
-explanations: pause intake or resume it, set the limit or remove it, drain from ready or during
-maintenance (the node stays drained once it ends), undrain while draining or drained, quarantine
-unless quarantined, release only then, reset from ready, draining or drained; no reset when the
-runner is external; everything while the node has reported nothing. They are the admin socket's
-operations — ceiling set or lifted, acquisition stopped or resumed, drain, undrain, quarantine,
-release, reset — posted to `/node/<id>/action` as before, which still refuses what does not
-apply. A reset requires confirmation from the same session, once and within ten minutes, as
-local mode's stops do. The panel is part of the node's live fragment, rendered for an operator's
-stream with that session's CSRF token, so what it offers follows the node; the limit's number
-field is kept through updates (`hx-preserve`). Each action returns a status line through htmx,
-and also works as a plain form. Monitoring-only nodes are marked, offer no actions and reject
-steering posts. Viewers see where the node stands and no actions. Operators also issue
-enrollment tokens from the nodes page, like `vk-hub token create`, valid for an hour, ten
-minutes, a day or seven days. A plain POST to `/tokens` uses the same origin, CSRF and role
-checks and returns a page showing the token once. Issuance is audited as the session's
-principal; the token is never logged. Removing a node stays on the admin socket. Operators grant
-who signs in through the OIDC provider, and as what, from `/users` (see [Signing
+hub keeps the newest 100,000 rows), where an event drops the actor its who column shows and
+names each known node or registry, linked to its page. A node's page shows what the hub asks of
+it beside what it reports — its state, acquisition, runner (`none: placed jobs only` for a node
+with none), concurrency, drain progress and what it cannot carry out — and its 20 latest
+commands with their outcomes. It opens with a steering panel describing the current state in
+plain language, grouped into *Job intake* — whether the node takes new jobs, the hub's
+concurrency ceiling and the node's current effective limit, and on a hub that places jobs, for a
+node at protocol version 3 or later, the jobs the hub has placed on it against that ceiling or
+the node's own limit, whichever is smaller (`Placed by the hub: 3 of 4`), or why it takes none
+when it runs its own gitlab-runner; *Maintenance* — in service, draining, drained, under
+maintenance, checking itself or quarantined; and an operator-only *Danger zone*. Operators see
+applicable actions with short explanations: pause intake or resume it, set the limit or remove
+it, drain from ready or during maintenance (the node stays drained once it ends), undrain while
+draining or drained, quarantine unless quarantined, release only then, reset from ready,
+draining or drained; no reset when the runner is external; everything while the node has
+reported nothing. They are the admin socket's operations — ceiling set or lifted, acquisition
+stopped or resumed, drain, undrain, quarantine, release, reset — posted to `/node/<id>/action`
+as before, which still refuses what does not apply. A reset requires confirmation from the same
+session, once and within ten minutes, as local mode's stops do. The panel is part of the node's
+live fragment, rendered for an operator's stream with that session's CSRF token, so what it
+offers follows the node; the limit's number field is kept through updates (`hx-preserve`). Each
+action returns a status line through htmx, and also works as a plain form. Monitoring-only nodes
+are marked, offer no actions and reject steering posts. Viewers see where the node stands and no
+actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token create`,
+valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses the same
+origin, CSRF and role checks and returns a page showing the token once. Issuance is audited as
+the session's principal; the token is never logged. Removing a node stays on the admin socket.
+Operators grant who signs in through the OIDC provider, and as what, from `/users` (see [Signing
 in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
 `cross-site`.
 
