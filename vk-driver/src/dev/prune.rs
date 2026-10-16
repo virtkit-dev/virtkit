@@ -224,7 +224,7 @@ fn select(env: &Env, opts: &Options) -> Result<Selection> {
                 ensure!(
                     !super::plan::RESERVED_STATE_ENTRIES
                         .iter()
-                        .any(|n| first == OsStr::new(n))
+                        .any(|n| first.as_bytes().eq_ignore_ascii_case(n.as_bytes()))
                         || STORAGE_DIRS.iter().any(|n| first == OsStr::new(n)),
                     "storage {} overlaps environment identity or control data; left alone",
                     backing.display()

@@ -26,6 +26,15 @@ All notable changes to virtkit will be documented in this file.
   named `vk`, and such a run's `--state-dir` must be out of the guest's reach, as without
   host commands; `vk run --no-service-exec` keeps the old channel.
 
+### Fixed
+
+- **Compose environments boot with managed storage in their state directory**, such as
+  a persistent VS Code server, in both `vk dev` and `vk run --compose`. These shares are
+  no longer rejected as allowing access to another VM's services. With service exec on,
+  `vk run` still refuses writable shares of its own state entries — service directories,
+  the root image, sockets and logs — including `disk` backing files. `vk dev` always
+  refuses mounts naming reserved entries, such as `${state}/atop`.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed

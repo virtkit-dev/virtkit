@@ -4219,9 +4219,77 @@ fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
     )
 }
 
-/// Refuse a state dir the guest can write, in whole or in part, when the primary's `vk exec
-/// --service` is on: the host's `vk` finds the run's services by their directories and
-/// sockets there, so a guest that could add or replace one would aim it at another VM.
+/// Whether `name` is a host-owned entry at the top of a run's state dir: boot images,
+/// listening sockets, logs and accounting read by the host, or service directories.
+/// Guest writes to these entries could steer the host or another VM. Staging siblings
+/// with `.tmp` or `.raw.tmp` appended count too. Matching ignores ASCII case (`SVC-db`
+/// matches `svc-db`), but does not apply a filesystem's Unicode folding.
+pub(crate) fn is_host_state_entry(name: &OsStr) -> bool {
+    use crate::uefi::{
+        CONSOLE_SOCKET, CONTROL_SOCKET, GENERATION_ID, GUEST_AGENT_SOCKET, SYSTEM_UUID, TAP_SPEC,
+        TPM_STATE, UEFI_VARS,
+    };
+    const NAMES: &[&str] = &[
+        // the primary's image, with its config sidecar
+        "root.qcow2",
+        "root.qcow2.json",
+        CONSOLE_LOG,
+        "console.vmm.log",
+        "switch.log",
+        NET_BYTES,
+        AUDIT_LOG,
+        "atop",
+        "ssh-agent-forward.log",
+        "host-exec-serve.log",
+        "service-exec.log",
+        // `--ssh-client`
+        crate::sshclient::KEY,
+        "id_ed25519.pub",
+        crate::sshclient::CONFIG,
+        crate::sshclient::SHIM_DIR,
+        // compose `persist` backings, anchored here by a `--state-dir`
+        "roots",
+        "overlays",
+        // `vk publish --state-dir`
+        "publish",
+        // a UEFI bundle's machine
+        UEFI_VARS,
+        GENERATION_ID,
+        SYSTEM_UUID,
+        TPM_STATE,
+        TAP_SPEC,
+        GUEST_AGENT_SOCKET,
+        CONSOLE_SOCKET,
+        CONTROL_SOCKET,
+    ];
+    const PREFIXES: &[&str] = &[
+        "svc-",
+        // the VMM's socket and its per-port listeners, `vsock.sock_<port>`
+        "vsock.sock",
+        "socket-fwd-",
+        // staging names: `vk_fs::write_atomic`'s, the SSH key's
+        ".",
+    ];
+    let name = name.as_encoded_bytes().to_ascii_lowercase();
+    // `<entry>.tmp`, or the test build backend's `<entry>.raw.tmp`.
+    let name = name
+        .strip_suffix(b".tmp")
+        .map(|n| n.strip_suffix(b".raw").unwrap_or(n))
+        .unwrap_or(name.as_slice());
+    // A UEFI bundle's disk overlays, `disk<N>.qcow2`.
+    let uefi_disk = name
+        .strip_prefix(b"disk")
+        .and_then(|r| r.strip_suffix(b".qcow2"))
+        .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit));
+    uefi_disk
+        || NAMES.iter().any(|n| name == n.as_bytes())
+        || PREFIXES.iter().any(|p| name.starts_with(p.as_bytes()))
+}
+
+/// With service exec enabled, refuse guest writes to the state dir or its host-owned entries.
+/// The host finds services by their `svc-<name>` directories and sockets; replacing or adding
+/// one could redirect it to another VM. Shares below other entries, such as `vk dev`'s managed
+/// storage, cannot reach them and are allowed. See [`is_host_state_entry`].
 fn check_service_exec_state_dir<'a>(
     work: &Path,
     volumes: impl IntoIterator<Item = &'a crate::compose::Volume> + Clone,
@@ -4236,23 +4304,45 @@ fn check_service_exec_state_dir<'a>(
         workdir.map(|d| (d, WORKDIR_MOUNT)),
     )
     .context(WAY_OUT)?;
-    // A share at or below the state dir: the check above allows those.
+    // A share at or under one of vk's entries: the check above allows those. A `disk` volume
+    // counts, as the guest writes its backing file: `${state}/root.qcow2:/dev/vdb:disk`.
     let dir =
         std::fs::canonicalize(work).with_context(|| format!("resolving {}", work.display()))?;
     let writable = volumes
         .into_iter()
-        .filter(|v| !(v.read_only || v.overlay || v.disk || v.socket))
+        .filter(|v| !(v.read_only || v.overlay || v.socket))
         .map(|v| (v.host.as_path(), v.guest.as_str()))
         .chain(workdir.map(|d| (d, WORKDIR_MOUNT)));
     for (host, guest) in writable {
-        let host =
-            std::fs::canonicalize(host).with_context(|| format!("resolving {}", host.display()))?;
-        if host.starts_with(&dir) {
+        let host = match std::fs::canonicalize(host) {
+            // A `disk` volume's backing file the boot has yet to create: resolve where it will be.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(host).is_err() =>
+            {
+                let (Some(parent), Some(name)) = (host.parent(), host.file_name()) else {
+                    return Err(e).with_context(|| format!("resolving {}", host.display()));
+                };
+                std::fs::canonicalize(parent)
+                    .with_context(|| format!("resolving {}", parent.display()))?
+                    .join(name)
+            }
+            r => r.with_context(|| format!("resolving {}", host.display()))?,
+        };
+        let entry = host
+            .strip_prefix(&dir)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .map(|c| c.as_os_str())
+            .filter(|e| is_host_state_entry(e));
+        if let Some(entry) = entry {
             bail!(
-                "{WAY_OUT}: {} is in the state dir {}, and the guest mounts it read-write at \
-                 {guest}",
-                host.display(),
-                dir.display()
+                "{} in the state dir {} is what vk keeps there for the host, and the guest \
+                 could write {} through {guest}: share it read-only or not at all, or pass \
+                 --no-service-exec",
+                Path::new(entry).display(),
+                dir.display(),
+                host.display()
             );
         }
     }
@@ -6960,8 +7050,11 @@ mod tests {
         assert!(compose_build_selection(&units, &[], Some("nope")).is_err());
     }
 
-    /// The primary's service exec needs a state dir no guest share can write: one in
-    /// a read-write volume or under the `--workdir` is refused, with the way out named.
+    /// The primary's service exec needs a state dir no guest share can write: one in a
+    /// read-write volume or under the `--workdir` is refused, with the way out named, and so is
+    /// a share at or under an entry vk keeps there — a service's directory, the root image —
+    /// however it is spelled or reached. Any other share below it, such as `vk dev`'s managed
+    /// storage, is allowed.
     #[test]
     fn service_exec_refuses_a_guest_writable_state_dir() {
         let t = crate::qga::tests::TempDir::new("service-exec-state");
@@ -6993,6 +7086,127 @@ mod tests {
         assert!(format!("{err:#}").contains("/db"), "{err:#}");
         let svc = elsewhere.join("svc-db");
         assert!(check_service_exec_state_dir(&elsewhere, [], Some(svc.as_path())).is_err());
+        std::fs::create_dir_all(elsewhere.join("svc-db/data")).unwrap();
+        let deeper = elsewhere.join("svc-db/data");
+        assert!(check_service_exec_state_dir(&elsewhere, [], Some(deeper.as_path())).is_err());
+        let rw_at = |host: &Path| {
+            crate::compose::parse_volume(&format!("{}:/x:rw", host.display()), Path::new("/b"))
+                .unwrap()
+                .unwrap()
+        };
+        let in_svc = rw_at(&deeper);
+        let err = check_service_exec_state_dir(&elsewhere, [&in_svc], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-db in the state dir"),
+            "{err:#}"
+        );
+        // A name that resolves to a service's directory is that directory.
+        std::os::unix::fs::symlink("svc-db", elsewhere.join("link")).unwrap();
+        let alias = rw_at(&elsewhere.join("link"));
+        let err = check_service_exec_state_dir(&elsewhere, [&alias], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("svc-db in the state dir"),
+            "{err:#}"
+        );
+        // What a case-insensitive filesystem would take for `svc-db`.
+        std::fs::create_dir_all(elsewhere.join("SVC-db")).unwrap();
+        let upper = rw_at(&elsewhere.join("SVC-db"));
+        let err = check_service_exec_state_dir(&elsewhere, [&upper], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SVC-db in the state dir"),
+            "{err:#}"
+        );
+        // A single file the host keeps there: the guest would rewrite the image it boots.
+        std::fs::write(elsewhere.join("root.qcow2"), "").unwrap();
+        let image = rw_at(&elsewhere.join("root.qcow2"));
+        let err = check_service_exec_state_dir(&elsewhere, [&image], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("share it read-only or not at all"),
+            "{err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("--state-dir outside"),
+            "{err:#}"
+        );
+        // …and so would a `disk` volume backed by it.
+        let disk = crate::compose::parse_volume(
+            &format!("{}:/dev/vdb:disk", elsewhere.join("root.qcow2").display()),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        let err = check_service_exec_state_dir(&elsewhere, [&disk], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("root.qcow2 in the state dir"),
+            "{err:#}"
+        );
+        // A backing file yet to be created is checked by the name it will have.
+        let fresh = |name: &str| {
+            crate::compose::parse_volume(
+                &format!("{}:/dev/vdc:disk", elsewhere.join(name).display()),
+                Path::new("/b"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("net.bytes")], None).is_err());
+        assert!(check_service_exec_state_dir(&elsewhere, [&fresh("data.qcow2")], None).is_ok());
+        // Any other share below the state dir — `vk dev`'s managed storage, say — reaches no
+        // service: the guest cannot add or replace a `svc-*` entry through it.
+        std::fs::create_dir_all(elsewhere.join("editor/vscode-server")).unwrap();
+        let managed = crate::compose::parse_volume(
+            &format!(
+                "{}:/home/dev/.vscode-server:rw",
+                elsewhere.join("editor/vscode-server").display()
+            ),
+            Path::new("/b"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(check_service_exec_state_dir(&elsewhere, [&managed], None).is_ok());
+        std::fs::create_dir_all(elsewhere.join("vscode-server")).unwrap();
+        let named_like = elsewhere.join("vscode-server");
+        assert!(check_service_exec_state_dir(&elsewhere, [], Some(named_like.as_path())).is_ok());
+    }
+
+    #[test]
+    fn host_state_entries_are_named_whatever_the_case() {
+        for name in [
+            "svc-db",
+            "SVC-db",
+            "root.qcow2",
+            "Root.QCOW2.json",
+            "vsock.sock",
+            "vsock.sock_1024",
+            "socket-fwd-8080.log",
+            "disk0.qcow2",
+            "disk12.qcow2.tmp",
+            "egress-audit.log",
+            "ssh-config",
+            ".0123456789abcdef",
+            // staging siblings
+            "root.qcow2.tmp",
+            "root.qcow2.raw.tmp",
+            "vmgenid.tmp",
+            "System-UUID.TMP",
+            "net.bytes.tmp",
+        ] {
+            assert!(is_host_state_entry(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "vscode-server",
+            "editor",
+            "data.qcow2",
+            "disk.qcow2",
+            "diskx.qcow2",
+            "disk0.raw",
+            "svc",
+            "editor.tmp",
+            "root.raw.tmp",
+            "vmgenid.raw",
+        ] {
+            assert!(!is_host_state_entry(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

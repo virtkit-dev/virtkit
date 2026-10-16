@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 /// The managed private key; the public half is this plus `.pub`.
-const KEY: &str = "id_ed25519";
+pub(crate) const KEY: &str = "id_ed25519";
 /// The generated client config — what `ssh -F` (and `vk ssh`) reads.
 pub const CONFIG: &str = "ssh-config";
 /// Directory holding the client shims, meant to be prepended to PATH.
-const SHIM_DIR: &str = "bin";
+pub(crate) const SHIM_DIR: &str = "bin";
 /// The OpenSSH connection tools shimmed into [`SHIM_DIR`]. `sftp` takes the same `-F` as
 /// `ssh` and `scp`, so it is shimmed too; each shim points the system tool at this run's
 /// config, so provisioning requires all three on PATH.

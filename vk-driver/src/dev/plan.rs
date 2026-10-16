@@ -296,9 +296,12 @@ pub(crate) const EGRESS_FILE: &str = "egress.json";
 /// configured mount cannot claim it.
 const EDITOR_MOUNT: &str = "vscode-server";
 
-/// What the state dir holds for the host's own use. A mount may not name these: a guest that
-/// could write the key, the client config or the recorded identity would be steering the
-/// host, and one that could read the key could reach the next boot too.
+/// What the state dir holds for the host that a mount may not name and prune leaves alone:
+/// `vk dev`'s own files and what the `vk run` it drives keeps there for it (the SSH client
+/// setup, published ports, persistent backings). The rest of `vk run`'s entries are
+/// [`crate::run::is_host_state_entry`], which a mount may not name either. A guest that could
+/// write the key, the client config or the recorded identity would be steering the host, and
+/// one that could read the key could reach the next boot too.
 pub(super) const RESERVED_STATE_ENTRIES: &[&str] = &[
     "editor",
     "endpoints.json",
@@ -654,8 +657,8 @@ fn managed_storage(mounts: &[Resolved], state_dir: &Path) -> Result<Vec<PathBuf>
                 };
                 if RESERVED_STATE_ENTRIES
                     .iter()
-                    .any(|e| first == std::ffi::OsStr::new(e))
-                    || first.as_bytes().starts_with(b".")
+                    .any(|e| first.as_bytes().eq_ignore_ascii_case(e.as_bytes()))
+                    || crate::run::is_host_state_entry(first)
                 {
                     bail!(
                         "mount {name}: {} under the state directory is the host's own; \
@@ -2117,6 +2120,16 @@ extensions = ["ms-python.python"]
             msg.contains("host's own") && msg.contains("id_ed25519"),
             "{msg}"
         );
+        // So are the entries `vk run` keeps there: the image it boots, a service's directory.
+        for (i, source) in ["root.qcow2", "SVC-db/data"].into_iter().enumerate() {
+            let f = wab_like(&format!("guest-run-entry-{i}"));
+            with_dev(
+                &f,
+                &format!("[dev.mounts.evil]\nsource = \"${{state}}/{source}\"\nto = \"/tmp/x\"\n"),
+            );
+            let msg = format!("{:#}", plan_of(&f.0, "dev").unwrap_err());
+            assert!(msg.contains("host's own"), "{source}: {msg}");
+        }
 
         // …including vk's own mount for the editor server, which is at a guest path a
         // config can name too.

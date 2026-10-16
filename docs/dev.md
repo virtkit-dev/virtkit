@@ -482,7 +482,9 @@ A mount requires `source` and `to`. It is writable by default; `read-only = true
 prevents guest writes through that mount. `optional = true` skips an absent
 source. Directories under `${state}` are managed storage, created at boot and
 kept across refreshes. Use individual data directories there, not the entire
-state directory or its reserved control files.
+state directory. Mounts cannot name reserved entries, regardless of ASCII
+case: dot names, `svc-*`, `vsock.sock*`, `root.qcow2`, `bin`,
+`atop`, `publish`, the logs and SSH client files, among others.
 
 ### Data lifetime
 
