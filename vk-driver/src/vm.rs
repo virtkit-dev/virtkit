@@ -1653,7 +1653,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let mut net_info: Option<(String, u32, String, String)> = None;
     // The job VM's switch attach (`net.mode = switch`): its NICs or vsock bridge.
     let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
-    // The job's services, by name, for its `vk exec --service` ([`service_exec`]).
+    // The job's services, by name, for its `vk-agent exec --service` ([`service_exec`]).
     let mut service_names: Vec<String> = Vec::new();
     match cfg.net.mode.as_str() {
         "none" => {}
@@ -1803,12 +1803,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
 
-    // The guest's `vk exec --service`: its host command channel, served below.
+    // The guest's `vk-agent exec --service`: its host command channel, served below.
     let service_exec = cfg.executor.guest_service_exec && !service_names.is_empty();
     if service_exec {
         cmdline.push_str(&format!(
-            " VIRTKIT_HOST_EXEC_PORT={} VIRTKIT_VK_CMD=1",
-            crate::run::HOST_EXEC_PORT
+            " VIRTKIT_HOST_EXEC_PORT={} {}=1",
+            crate::run::HOST_EXEC_PORT,
+            vk_core::service_exec::CMDLINE_KEY
         ));
     }
 
@@ -1893,11 +1894,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 .context("spawning the ssh-agent forward")?,
         );
     }
-    // Without it the job still runs: its `vk` then finds no one serving the channel.
+    // Without it the job still runs: its `vk-agent exec --service` then finds no one serving
+    // the channel.
     if service_exec {
         match spawn_service_exec_serve(ctx, &agent.path) {
             Ok(child) => children.push(child),
-            Err(e) => eprintln!("virtkit: warning: the job's `vk exec --service` is off: {e:#}"),
+            Err(e) => {
+                eprintln!("virtkit: warning: the job's `vk-agent exec --service` is off: {e:#}")
+            }
         }
     }
     let vmm = crate::vmm::selected();
@@ -1987,8 +1991,8 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
     Ok(Some(fwd))
 }
 
-/// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk` dials — for
-/// its services' `vk exec` ([`spawn_service_exec_serve_at`]).
+/// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk-agent exec
+/// --service` dials — for its services ([`spawn_service_exec_serve_at`]).
 fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
     spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent)
 }
@@ -2092,20 +2096,21 @@ fn copy_capped(mut from: impl Read, mut to: impl std::io::Write, max: u64) -> st
     }
 }
 
-/// The command a VM's `vk` may run on the host: `vk exec --service`, with the host's `vk exec`
-/// flags that apply to a service.
+/// The command a VM's `vk-agent exec --service` may run on the host: `vk exec --service`,
+/// with the host's `vk exec` flags that apply to a service.
 #[derive(clap::Parser, Debug)]
 #[command(
-    name = "vk",
-    about = "vk inside a CI job or a compose run's primary: run commands in its services"
+    name = "vk-agent",
+    bin_name = "vk-agent",
+    about = "the `vk exec --service` request a VM's `vk-agent exec --service` sends"
 )]
-struct GuestVk {
+struct ServiceExecCli {
     #[command(subcommand)]
-    cmd: GuestVkCmd,
+    cmd: ServiceExecCmd,
 }
 
 #[derive(clap::Subcommand, Debug)]
-enum GuestVkCmd {
+enum ServiceExecCmd {
     /// Run a command in one of this VM's compose services
     Exec {
         /// The service, as the compose file names it
@@ -2135,7 +2140,7 @@ enum GuestVkCmd {
     },
 }
 
-/// What a VM's `vk` asked to run in one of its services ([`service_request`]).
+/// What a VM's `vk-agent exec --service` asked to run in a service ([`service_request`]).
 #[derive(Debug)]
 struct ServiceRequest {
     addr: vk_core::addr::SocketAddr,
@@ -2149,7 +2154,7 @@ struct ServiceRequest {
     args: Vec<String>,
 }
 
-/// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's `vk` asked, run
+/// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's agent asked, run
 /// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir, a
 /// compose run's) and refused with exit 2 otherwise.
 pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode {
@@ -2180,7 +2185,7 @@ pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode
     }
 }
 
-/// [`service_exec`]'s decision: the request when `argv` is the guest `vk`'s `exec --service`
+/// [`service_exec`]'s decision: the request when `argv` is the guest agent's `vk exec --service`
 /// into a service under `dir`, else the exit status, the reason already on stderr.
 fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::process::ExitCode> {
     use clap::Parser;
@@ -2188,13 +2193,15 @@ fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::p
         eprintln!("vk: {why}");
         std::process::ExitCode::from(2)
     };
-    // The guest's own `vk` names itself first; anything else is not that `vk`.
+    // A service exec request names `vk` first; anything else is not one.
     if argv.first().map(String::as_str) != Some("vk") {
         return Err(refuse(
-            "this VM runs only `vk exec --service NAME -- CMD` on its host".to_string(),
+            "this VM runs only `vk exec --service NAME -- CMD` on its host, \
+             `vk-agent exec --service NAME -- CMD` in the VM"
+                .to_string(),
         ));
     }
-    let parsed = match GuestVk::try_parse_from(argv) {
+    let parsed = match ServiceExecCli::try_parse_from(argv) {
         Ok(p) => p,
         Err(e) => {
             // Usage or help text, for the guest's stderr; the exit status says the rest.
@@ -2204,7 +2211,7 @@ fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::p
             ));
         }
     };
-    let GuestVkCmd::Exec {
+    let ServiceExecCmd::Exec {
         service,
         background,
         clear_env,
@@ -4064,12 +4071,13 @@ mod tests {
     use crate::config::Config;
     use crate::jobctx::JobCtx;
 
-    /// What a VM's `vk` may ask of its host: an exec into one of its own services, with the
-    /// host `vk exec`'s flags. Any other `vk` command, a service the VM does not have, a name
-    /// that would leave its dir, a flag where the name goes, a command not after `--`, and a
-    /// caller that is not the guest's `vk` are refused, before anything is dialed.
+    /// What a VM's `vk-agent exec --service` may ask of its host: an exec into one of its own
+    /// services, with the host `vk exec`'s flags. Any other `vk` command, a service the VM does
+    /// not have, a name that would leave its dir, a flag where the name goes, a command not
+    /// after `--`, and a caller that is not a service exec request are refused, before anything
+    /// is dialed.
     #[test]
-    fn a_vms_vk_reaches_only_its_own_services() {
+    fn a_vms_service_exec_reaches_only_its_own_services() {
         let job = crate::qga::tests::TempDir::new("service-exec");
         std::fs::create_dir_all(job.0.join("svc-db")).unwrap();
         std::fs::create_dir_all(job.0.join("other")).unwrap();

@@ -84,7 +84,7 @@ services:
       - ${VK_WORKSPACE}/.cache:/root/.cache:overlay,persist,size=10G   # writes kept on disk
       - ${VK_STATE_DIR}/artifacts:/out                 # rw: writes land on the host
 
-  # ---- a one-off tool, declared but down until `--profile tools` or `vk service up` ------
+  # ---- a one-off tool, declared but down until `--profile tools` or `vk-agent service up` --
   shell:
     image: alpine:3
     profiles: [tools]

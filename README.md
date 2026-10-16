@@ -249,7 +249,7 @@ services:
 ```
 
 Built images are content-addressed and reused; a `build:` sibling is built on its first
-start (`vk service up` streams the build), the `--primary` service up front.
+start (`vk-agent service up` streams the build), the `--primary` service up front.
 
 #### Environment and interpolation
 
@@ -291,7 +291,8 @@ none; `start_interval` is ignored. vk probes only for a dependent: once per star
 dependency, until it passes or fails `retries` times in a row, the start period running from
 when the dependent starts waiting. Services with
 `profiles:` stay declared but down unless a profile is activated (`--profile NAME`,
-repeatable) or an enabled service depends on them; `vk service up NAME` starts one anyway.
+repeatable) or an enabled service depends on them; `vk-agent service up NAME` starts one
+anyway.
 
 #### Guest size, init, kernel and NICs
 
@@ -458,8 +459,8 @@ services:
 ```
 
 Persistent state — a `persist_root` root, an `overlay,persist` layer — survives an in-guest
-reboot, `vk service down`/`up`, and stopping and later restarting the run. When the run pins a
-durable state directory — `vk dev`, or `vk run --state-dir` — it is kept there, out of the
+reboot, `vk-agent service down`/`up`, and stopping and later restarting the run. When the run
+pins a durable state directory — `vk dev`, or `vk run --state-dir` — it is kept there, out of the
 workspace and so out of the guest's view; otherwise it lives under `.virtkit/` beside the
 compose file (add that to `.gitignore`). Either way it is reset when what it
 was built on changes: a new image rebuilds a persistent root from scratch, and a new image
@@ -478,21 +479,25 @@ its `depends_on` chain boots alongside. With neither, `--compose` alone is compo
 services only, held until Ctrl-C.
 
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
-state, control, and logs through ordinary files. `vk service up|down|reboot|status` is the
-corresponding command interface: `up` starts a declared (or profiled-down) service, building
-it on first use, and returns once it answers; `down` powers it off; `reboot` restarts its
-guest in place on the same disks; `status` reports one or all.
+state, control, and logs through ordinary files. `vk-agent service up|down|reboot|status`
+(or `vk service`, with a `vk` in the guest) is the corresponding command interface: `up`
+starts a declared (or profiled-down) service, building it on first use, and returns once it
+answers; `down` powers it off; `reboot` restarts its guest in place on the same disks;
+`status` reports one or all.
 
-`vk exec --service NAME -- CMD` runs a command in one of them, with the host `vk exec`'s
-flags. The primary needs no `vk` of its own for either: `/run/vk/bin/vk`, last on its
-`PATH`, asks the service manager for `vk service`, and passes `vk exec --service` to the
-host over the primary's host command channel. The host runs that one form, into this run's
-services, and nothing else; an image's own `vk` hands off to it. `--no-service-exec` turns
-it off. With `--host-exec-wrapper` the channel serves both: a command named `vk` goes to
-service exec, every other to the wrapper. `--host-exec` without a wrapper replaces this
-restricted channel, and that `vk`, with the whole channel. While service exec is on, with or
-without a wrapper, the run's `--state-dir` must be out of the guest's reach: not in a
-read-write volume nor under `--workdir`.
+`vk-agent exec --service NAME -- CMD` runs a command in one of them, with the host `vk
+exec`'s flags. The primary needs no `vk` for either: its agent, `/run/vk/bin/vk-agent`
+(whose directory goes last on the `PATH`, behind the image's own commands), asks the service
+manager for `service`, and passes `exec --service` to the host over the primary's host
+command channel. The host runs that one form, into this run's services, and nothing else.
+The agent says why when the VM has no service exec. A full `vk` in the guest — the image's
+own, or one mounted there — keeps `vk exec --service` for the VMs it runs itself.
+`--no-service-exec` turns service exec off.
+With `--host-exec-wrapper` the channel serves both: a request named `vk` goes to service
+exec, every other to the wrapper. `--host-exec` without a wrapper replaces this restricted
+channel with the whole channel. While service exec is on, with or without a wrapper, the
+run's `--state-dir` must be out of the guest's reach: not in a read-write volume nor under
+`--workdir`.
 
 `vk run --ssh` enables SSH access for development VMs, including VS Code Remote-SSH
 workflows. In a CI fleet a service's `environment:` may also carry its own egress allowlist
@@ -913,7 +918,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk update` | Check for or install a digest-verified GitHub release. |
 | `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
 | `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
-| `vk service up\|down\|reboot\|status` | Control compose services from the primary guest. |
+| `vk-agent service up\|down\|reboot\|status` | Control compose services from the primary guest; a full `vk` there has `vk service`. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |
 | `vk gitlab ...` | Implement the GitLab custom-executor lifecycle. |
 | `vk export ...` | Package raw disks or staged files as VMDK, OVA, or ISO artifacts. |

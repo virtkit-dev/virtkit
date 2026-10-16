@@ -64,11 +64,12 @@ pub enum ServiceOp {
     Status(Option<String>),
 }
 
-/// Usage for `vk service` arguments parsed by [`ServiceOp::parse`].
-pub const SERVICE_USAGE: &str = "usage: vk service up|down|reboot NAME | vk service status [NAME]";
+/// Usage for `vk-agent service` arguments parsed by [`ServiceOp::parse`].
+pub const SERVICE_USAGE: &str =
+    "usage: vk-agent service up|down|reboot NAME | vk-agent service status [NAME]";
 
 impl ServiceOp {
-    /// Parse the arguments after `vk service`.
+    /// Parse the arguments after `vk service` or `vk-agent service`.
     pub fn parse(args: &[String]) -> Option<ServiceOp> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         Some(match args.as_slice() {

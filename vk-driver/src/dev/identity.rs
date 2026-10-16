@@ -17,9 +17,9 @@ pub(super) fn own_version() -> String {
 }
 
 /// The release that created a running environment, when it is older than this vk: the
-/// injected agent and guest vk are that release's, so a newer host vk may not open what
-/// they produce (image formats, protocols) until the environment is restarted. Unparsable
-/// or absent records — from a vk that did not write one — say nothing.
+/// injected agent is that release's, so a newer host vk may not open what it produces (image
+/// formats, protocols) until the environment is restarted. Unparsable or absent records — from
+/// a vk that did not write one — say nothing.
 fn older_creator(created_by: &str) -> Option<String> {
     let recorded: crate::check::Version = created_by.split_whitespace().nth(1)?.parse().ok()?;
     let own = crate::check::Version::own().ok()?;

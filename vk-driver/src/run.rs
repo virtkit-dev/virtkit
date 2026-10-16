@@ -130,9 +130,9 @@ const PRIMARY_VM: u32 = 0;
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
 pub(crate) const HOST_EXEC_PORT: u32 = 1100;
-/// Where a VM with a guest `vk` (`VIRTKIT_VK_CMD`) has it: the agent's own directory, on the
-/// guest's `/run` tmpfs.
-const GUEST_VK_DIR: &str = "/run/vk/bin";
+/// Where a VM with service exec (`VIRTKIT_SERVICE_EXEC`) has the `vk-agent` that reaches it:
+/// the agent's own directory, on the guest's `/run` tmpfs.
+const GUEST_AGENT_DIR: &str = "/run/vk/bin";
 /// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
 /// the guest agent's forwarder for that guest path and spliced host-side to the host socket
 /// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and
@@ -452,7 +452,7 @@ pub struct RunArgs {
     pub host_exec_wrapper: Option<PathBuf>,
     /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
     pub host_exec_env: Vec<String>,
-    /// give a compose run's primary no `vk exec --service` into its services
+    /// give a compose run's primary no `vk-agent exec --service` into its services
     pub no_service_exec: bool,
     /// a `-f`/`--primary`/compose build may restore stages from the instruction
     /// cache but must not execute anything; a cache miss aborts (exit 3 at the CLI)
@@ -1895,14 +1895,14 @@ async fn build_and_boot(
                 .chain(compose_units.iter().flat_map(|u| &u.volumes)),
             args.workdir.as_deref(),
         )?;
-        cmdline.push_str(" VIRTKIT_VK_CMD=1");
-        // The command re-exports the image's PATH: keep the guest `vk` on it, last, where the
+        cmdline.push_str(&format!(" {}=1", vk_core::service_exec::CMDLINE_KEY));
+        // The command re-exports the image's PATH: keep the agent on it, last, where the
         // agent puts it for everything else.
         if let Some((_, path)) = image_env.iter_mut().find(|(k, _)| k == "PATH")
-            && !path.split(':').any(|d| d == GUEST_VK_DIR)
+            && !path.split(':').any(|d| d == GUEST_AGENT_DIR)
         {
             path.push(':');
-            path.push_str(GUEST_VK_DIR);
+            path.push_str(GUEST_AGENT_DIR);
         }
     }
 
@@ -3946,8 +3946,8 @@ fn host_exec_serve_args(
     argv
 }
 
-/// Whether a compose run's primary gets a `vk` that runs `vk exec --service` into the run's
-/// services (`has_services`), over its host command channel confined to that form. Beside a
+/// Whether a compose run's primary gets `vk-agent exec --service` into the run's services
+/// (`has_services`), over its host command channel confined to that form. Beside a
 /// `--host-exec-wrapper` (a `vk dev` environment's host commands) the channel serves both,
 /// each confined to its own; `--host-exec` without a wrapper opens the channel whole, which
 /// already runs anything. Never with --no-service-exec, nor with an image init, which runs
@@ -4226,7 +4226,7 @@ fn check_service_exec_state_dir<'a>(
     volumes: impl IntoIterator<Item = &'a crate::compose::Volume> + Clone,
     workdir: Option<&'a Path>,
 ) -> Result<()> {
-    const WAY_OUT: &str = "the primary's `vk exec --service` needs a state dir the guest \
+    const WAY_OUT: &str = "the primary's service exec needs a state dir the guest \
                            cannot write: pass --no-service-exec, or a --state-dir outside \
                            every writable share";
     crate::sshclient::check_state_dir_is_host_only(
@@ -6959,7 +6959,7 @@ mod tests {
         assert!(compose_build_selection(&units, &[], Some("nope")).is_err());
     }
 
-    /// The primary's `vk exec --service` needs a state dir no guest share can write: one in
+    /// The primary's service exec needs a state dir no guest share can write: one in
     /// a read-write volume or under the `--workdir` is refused, with the way out named.
     #[test]
     fn service_exec_refuses_a_guest_writable_state_dir() {
