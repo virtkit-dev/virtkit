@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-agent serve --vk-wrapper PROGRAM`** forces a command named exactly `vk` through its
+  own program beside `--exec-wrapper`, with only the default environment and in the
+  foreground only, so a restricted host command channel can also serve `vk` under its
+  own policy.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed

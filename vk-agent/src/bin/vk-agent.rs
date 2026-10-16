@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::{Stdin, client_run_cmd, client_run_tty};
-use vk_core::exec::server::run_server;
+use vk_core::exec::server::{VkRoute, run_server_routed};
 use vk_core::messages::RunMode;
 use vk_core::messages::{CmdExec, CmdResult, Tty};
 use vk_core::net::connect;
@@ -110,6 +110,29 @@ enum Commands {
             allow_hyphen_values = true
         )]
         exec_wrapper_arg: Vec<String>,
+        /// Force a command named exactly `vk` through this program instead of --exec-wrapper
+        ///
+        /// It gets the default client environment allowlist only, never --exec-wrapper-env,
+        /// and runs in the foreground only. Every other command still goes through
+        /// --exec-wrapper; --max-concurrent counts both together.
+        #[arg(long, requires = "exec_wrapper", value_name = "PROGRAM")]
+        vk_wrapper: Option<PathBuf>,
+        /// Give --vk-wrapper this argument first, before the requested command line
+        ///
+        /// Repeatable, in order. Nothing the client sends comes before these; the requested
+        /// command line follows them, `vk` included.
+        #[arg(
+            long,
+            requires = "vk_wrapper",
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        vk_wrapper_arg: Vec<String>,
+        /// Run at most this many --vk-wrapper commands at once, within --max-concurrent
+        ///
+        /// One more is refused, not queued. Omitted = no cap of its own.
+        #[arg(long, requires = "vk_wrapper", value_name = "N")]
+        vk_wrapper_max_concurrent: Option<std::num::NonZeroUsize>,
         /// Run at most this many commands at once; one more is refused, not queued
         ///
         /// A background command counts until it exits. Status probes are never refused.
@@ -549,6 +572,9 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             exec_wrapper,
             exec_wrapper_env,
             exec_wrapper_arg,
+            vk_wrapper,
+            vk_wrapper_arg,
+            vk_wrapper_max_concurrent,
             max_concurrent,
             no_background,
         } => {
@@ -558,14 +584,19 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 LevelFilter::Info
             };
             install_console_logger(log_level);
-            // run_server reads a zero timeout as no timeout, so it needs no filtering here.
+            // run_server_routed reads a zero timeout as no timeout, so it needs no filtering here.
             let duration = inactivity_timeout.map(Duration::from_secs);
-            if let Err(e) = run_server(
+            if let Err(e) = run_server_routed(
                 &socket,
                 duration,
                 exec_wrapper,
                 exec_wrapper_env,
                 exec_wrapper_arg,
+                vk_wrapper.map(|path| VkRoute {
+                    path,
+                    args: vk_wrapper_arg,
+                    max_concurrent: vk_wrapper_max_concurrent,
+                }),
                 vk_core::exec::server::Limits {
                     max_concurrent,
                     background: !no_background,
@@ -574,7 +605,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             )
             .await
             {
-                error!("run_server: {e}");
+                error!("run_server_routed: {e}");
                 std::process::exit(1)
             };
         }

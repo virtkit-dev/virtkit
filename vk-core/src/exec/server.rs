@@ -113,6 +113,44 @@ pub async fn run_server(
     exec_wrapper_args: Vec<String>,
     limits: Limits,
 ) -> Result<(), anyhow::Error> {
+    run_server_routed(
+        socket,
+        inactivity_timeout,
+        exec_wrapper,
+        exec_wrapper_env,
+        exec_wrapper_args,
+        None,
+        limits,
+    )
+    .await
+}
+
+/// A separate wrapper for commands named exactly `vk` on a wrapped channel
+/// ([`run_server_routed`]).
+#[derive(Debug, Clone)]
+pub struct VkRoute {
+    /// The program such a command is forced through.
+    pub path: PathBuf,
+    /// Arguments it gets first, before the requested command line.
+    pub args: Vec<String>,
+    /// The commands it runs at once; `None` caps nothing beyond `Limits::max_concurrent`.
+    pub max_concurrent: Option<NonZeroUsize>,
+}
+
+/// [`run_server`], with a command named exactly `vk` forced through `vk_route` instead of
+/// `exec_wrapper`: with the default environment allowlist only, and never in the background.
+/// The route applies only beside an `exec_wrapper`; a channel without one runs everything
+/// directly. `limits.max_concurrent` counts the commands of both routes together;
+/// `vk_route.max_concurrent` caps the `vk` route's on top.
+pub async fn run_server_routed(
+    socket: &SocketAddr,
+    inactivity_timeout: Option<Duration>,
+    exec_wrapper: Option<PathBuf>,
+    exec_wrapper_env: Vec<String>,
+    exec_wrapper_args: Vec<String>,
+    vk_route: Option<VkRoute>,
+    limits: Limits,
+) -> Result<(), anyhow::Error> {
     // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
     // from reading it as a timeout that has always already elapsed, and hands a zero-timeout
     // caller the fallback watchdog below like any other caller that asked for no timeout.
@@ -121,15 +159,12 @@ pub async fn run_server(
     // Force every exec through this program (like SSH's ForceCommand): it receives
     // the requested command line as its arguments and decides what to run.
     // None = run requested commands directly (the default, unrestricted).
-    let exec_wrapper = Arc::new(
-        exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env, exec_wrapper_args)),
+    let wrappers = Arc::new(
+        exec_wrapper.map(|path| Wrappers::new(path, exec_wrapper_env, exec_wrapper_args, vk_route)),
     );
     let allow_background = limits.background;
     let first_message_timeout = limits.first_message_timeout;
-    let limit = limits.max_concurrent.map(|n| Limit {
-        max: n.get(),
-        permits: Arc::new(Semaphore::new(n.get())),
-    });
+    let limit = limits.max_concurrent.map(|n| Limit::new(n, "requests"));
 
     let listener = listen(socket)?;
 
@@ -168,7 +203,7 @@ pub async fn run_server(
                 Ok((stream, sink)) => {
                     let c_state = Arc::clone(&state);
                     let status = status.clone();
-                    let exec_wrapper = Arc::clone(&exec_wrapper);
+                    let wrappers = Arc::clone(&wrappers);
                     let limit = limit.clone();
                     {
                         let mut lock = c_state.lock().unwrap();
@@ -177,7 +212,7 @@ pub async fn run_server(
                     // A new task is spawned for each socket. The socket is moved to the new task and processed there.
                     tokio::spawn(async move {
                         let mut update_last = true;
-                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref(), limit.as_ref(), first_message_timeout, allow_background).await {
+                        match do_handle_conn(&status, stream, sink, (*wrappers).as_ref(), limit.as_ref(), first_message_timeout, allow_background).await {
                             // A connection that failed before naming itself counts as activity:
                             // only a completed status request is known not to be one.
                             Err(e) => info!("{e}"),
@@ -243,9 +278,19 @@ fn start_watchdog(status: Status, socket: SocketAddr) {
 struct Limit {
     max: usize,
     permits: Arc<Semaphore>,
+    /// Request kind named in the refusal message.
+    what: &'static str,
 }
 
 impl Limit {
+    fn new(max: NonZeroUsize, what: &'static str) -> Self {
+        Limit {
+            max: max.get(),
+            permits: Arc::new(Semaphore::new(max.get())),
+            what,
+        }
+    }
+
     /// A permit to run one request, held until it ends; `None` when `max` already run.
     fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.permits).try_acquire_owned().ok()
@@ -253,8 +298,8 @@ impl Limit {
 
     fn refusal(&self) -> String {
         format!(
-            "too many requests at once on this channel (at most {}); retry once one ends",
-            self.max
+            "too many {} at once on this channel (at most {}); retry once one ends",
+            self.what, self.max
         )
     }
 }
@@ -294,6 +339,63 @@ impl ExecWrapper {
 
     fn env_allowed(&self, name: &str) -> bool {
         self.env_allow.iter().any(|pat| glob_match(pat, name))
+    }
+}
+
+/// The main wrapper and an optional wrapper for commands named exactly `vk`, with its own cap.
+struct Wrappers {
+    main: ExecWrapper,
+    vk: Option<(ExecWrapper, Option<Limit>)>,
+}
+
+impl Wrappers {
+    /// Build the main wrapper from `path`, `env_allow` and `args`; the `vk` route
+    /// never receives `env_allow`.
+    fn new(
+        path: PathBuf,
+        env_allow: Vec<String>,
+        args: Vec<String>,
+        vk_route: Option<VkRoute>,
+    ) -> Self {
+        Self {
+            main: ExecWrapper::new(path, env_allow, args),
+            vk: vk_route.map(|r| {
+                let limit = r.max_concurrent.map(|n| Limit::new(n, "`vk` commands"));
+                (ExecWrapper::new(r.path, Vec::new(), r.args), limit)
+            }),
+        }
+    }
+}
+
+/// Select the wrapper, if any, the route's own cap, if any, and an optional background
+/// refusal reason. Commands named exactly `vk` use the `vk` route when configured, in the
+/// foreground only. All other names, including paths to `vk`, use the main wrapper.
+fn route<'a>(
+    cmd: &CmdExec,
+    wrappers: Option<&'a Wrappers>,
+    allow_background: bool,
+) -> (
+    Option<&'a ExecWrapper>,
+    Option<&'a Limit>,
+    Option<&'static str>,
+) {
+    const CHANNEL_REFUSAL: &str = "background commands are refused on this channel";
+    let channel_refusal = (!allow_background).then_some(CHANNEL_REFUSAL);
+    match wrappers {
+        None => (None, None, channel_refusal),
+        Some(Wrappers {
+            vk: Some((vk, limit)),
+            ..
+        }) if cmd.name == "vk" => (
+            Some(vk),
+            limit.as_ref(),
+            Some(if allow_background {
+                "background commands are refused for `vk` on this channel"
+            } else {
+                CHANNEL_REFUSAL
+            }),
+        ),
+        Some(w) => (Some(&w.main), None, channel_refusal),
     }
 }
 
@@ -370,7 +472,7 @@ async fn do_handle_conn(
     status: &Status,
     mut stream: SerStream,
     sink: DeSink,
-    exec_wrapper: Option<&ExecWrapper>,
+    wrappers: Option<&Wrappers>,
     limit: Option<&Limit>,
     first_message_timeout: Duration,
     allow_background: bool,
@@ -399,13 +501,31 @@ async fn do_handle_conn(
 
     match client_request {
         Message::CmdExec(cmd) => {
-            if cmd.mode == RunMode::Background && !allow_background {
-                let msg = "background commands are refused on this channel".to_string();
+            let (exec_wrapper, route_limit, background_refused) =
+                route(&cmd, wrappers, allow_background);
+            if let Some(refused) = background_refused
+                && cmd.mode == RunMode::Background
+            {
+                let msg = refused.to_string();
                 // The refusal is the session's only reply; a client already gone has nothing
                 // left to tell.
                 let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                 return Err(anyhow!(msg));
             }
+            // A route with a cap of its own runs only in the foreground, so its permit is held
+            // here, until the command ends.
+            let _route_permit = match route_limit {
+                Some(limit) => match limit.try_acquire() {
+                    Some(permit) => Some(permit),
+                    None => {
+                        let msg = limit.refusal();
+                        let _ =
+                            send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
+                        return Err(anyhow!(msg));
+                    }
+                },
+                None => None,
+            };
             let cmd = match exec_wrapper {
                 Some(w) => wrap_cmd(cmd, w),
                 None => cmd,
@@ -433,7 +553,7 @@ async fn do_handle_conn(
             // allowlist entirely instead of being subject to it. Refuse outright —
             // CmdConnect is only for a channel the dialing side already trusts fully
             // (the guest's own control port, as `vk exec`/`vk status` already use).
-            if exec_wrapper.is_some() {
+            if wrappers.is_some() {
                 let msg = "connect is refused on a wrapped (host-exec) channel".to_string();
                 let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                 return Err(anyhow!(msg));
@@ -1428,8 +1548,9 @@ async fn writer_task<S: Sink<Message, Error = std::io::Error> + Unpin + Send + '
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecWrapper, SessionUser, TaskState, apply_user, give_tty, glob_match,
-        inactivity_check_period, resolve_gid, resolve_user, run_as, split_user_group, wrap_cmd,
+        ExecWrapper, SessionUser, TaskState, VkRoute, Wrappers, apply_user, give_tty, glob_match,
+        inactivity_check_period, resolve_gid, resolve_user, route, run_as, split_user_group,
+        wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1605,6 +1726,93 @@ mod tests {
         assert_eq!(wrapped.name, "/run/host-dispatch");
         // the requested command line becomes the wrapper's argv
         assert_eq!(wrapped.args, vec!["git", "status"]);
+    }
+
+    /// A command named exactly `vk` takes the `vk` route, in the foreground only; every other
+    /// name, a path to a `vk` or a `vk` with other words around it included, takes the main
+    /// wrapper as before. Without a `vk` route, or without wrappers, nothing changes.
+    #[test]
+    fn route_sends_only_a_command_named_vk_to_the_vk_route() {
+        let vk_route = || VkRoute {
+            path: PathBuf::from("/usr/bin/vk"),
+            args: vec!["service-exec".into()],
+            max_concurrent: std::num::NonZeroUsize::new(2),
+        };
+        let wrappers = Wrappers::new(
+            PathBuf::from("/run/host-dispatch"),
+            vec![],
+            vec![],
+            Some(vk_route()),
+        );
+        let named = |name: &str| CmdExec {
+            name: name.into(),
+            ..sample_cmd()
+        };
+        let path_of = |w: Option<&ExecWrapper>| w.map(|w| w.path.clone());
+        let (w, limit, refused) = route(&named("vk"), Some(&wrappers), true);
+        assert_eq!(path_of(w), Some(PathBuf::from("/usr/bin/vk")));
+        assert_eq!(limit.map(|l| l.max), Some(2));
+        assert!(refused.is_some_and(|m| m.contains("`vk`")), "{refused:?}");
+        let (_, _, refused) = route(&named("vk"), Some(&wrappers), false);
+        assert_eq!(
+            refused,
+            Some("background commands are refused on this channel")
+        );
+        for other in ["git", "/usr/bin/vk", "./vk", "vk ", "VK", ""] {
+            let (w, limit, refused) = route(&named(other), Some(&wrappers), true);
+            assert_eq!(
+                path_of(w),
+                Some(PathBuf::from("/run/host-dispatch")),
+                "{other:?}"
+            );
+            assert!(limit.is_none(), "{other:?}");
+            assert_eq!(refused, None, "{other:?}");
+        }
+        let main_only = Wrappers::new(PathBuf::from("/run/host-dispatch"), vec![], vec![], None);
+        let (w, limit, refused) = route(&named("vk"), Some(&main_only), true);
+        assert_eq!(path_of(w), Some(PathBuf::from("/run/host-dispatch")));
+        assert!(limit.is_none());
+        assert_eq!(refused, None);
+        for allow_background in [true, false] {
+            let (w, limit, refused) = route(&named("vk"), None, allow_background);
+            assert!(w.is_none() && limit.is_none());
+            assert_eq!(refused.is_none(), allow_background);
+        }
+    }
+
+    /// The `vk` route lets through only the default client environment, whatever the main
+    /// wrapper's allowlist says.
+    #[test]
+    fn the_vk_route_takes_only_the_default_environment() {
+        let wrappers = Wrappers::new(
+            PathBuf::from("/run/host-dispatch"),
+            vec!["VIRTKIT_*".into(), "MYAPP_*".into()],
+            vec![],
+            Some(VkRoute {
+                path: PathBuf::from("/usr/bin/vk"),
+                args: vec![],
+                max_concurrent: None,
+            }),
+        );
+        let cmd = || CmdExec {
+            env: vec![
+                "VIRTKIT_BOOT_SPEC={}".into(),
+                "MYAPP_TOKEN=abc".into(),
+                "LANG=C".into(),
+            ],
+            ..sample_cmd()
+        };
+        let (vk, _) = wrappers.vk.as_ref().unwrap();
+        assert_eq!(wrap_cmd(cmd(), vk).env, ["LANG=C", "VK_EXEC_DIR=./sub"]);
+        assert_eq!(
+            wrap_cmd(cmd(), &wrappers.main).env,
+            [
+                "VIRTKIT_BOOT_SPEC={}",
+                "MYAPP_TOKEN=abc",
+                "LANG=C",
+                "VK_EXEC_DIR=./sub"
+            ]
+        );
     }
 
     /// Fixed wrapper arguments come first, so nothing the client sends lands before them.

@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::{Stdin, client_run_connect};
-use vk_core::exec::server::{Limits, run_server};
+use vk_core::exec::server::{Limits, VkRoute, run_server, run_server_routed};
 use vk_core::framing::{DeSink, SerStream};
 use vk_core::messages::{CmdExec, Fd, Message, RunMode, Tty};
 use vk_core::net::connect;
@@ -351,6 +351,128 @@ async fn a_wrapped_exec_ignores_the_client_user_and_dir() {
         String::from_utf8_lossy(&stdout),
         format!("{uid} {} [/nonexistent/vk-test] ls -l\n", cwd.display())
     );
+}
+
+/// On a routed channel a command named `vk` runs through the `vk` route, its arguments first,
+/// in the foreground only and within the route's own cap; any other name runs through the main
+/// wrapper, in the background too and outside that cap.
+#[tokio::test]
+async fn a_routed_channel_sends_only_vk_to_the_vk_route() {
+    let path = tmp_socket_path("vk-route");
+    let _ = std::fs::remove_file(&path);
+    let addr = SocketAddr::Unix(path.clone());
+    let server_addr = addr.clone();
+    // Each wrapper echoes its tag, then the requested command line; `hold` keeps it running.
+    let echo = |tag: &str| {
+        let script = format!("echo {tag} \"$@\"; [ \"$2\" != hold ] || sleep 5");
+        vec!["-c".into(), script, "sh".into()]
+    };
+    tokio::spawn(async move {
+        run_server_routed(
+            &server_addr,
+            Some(Duration::from_secs(60)),
+            Some(std::path::PathBuf::from("/bin/sh")),
+            vec![],
+            echo("MAIN"),
+            Some(VkRoute {
+                path: std::path::PathBuf::from("/bin/sh"),
+                args: echo("VKROUTE"),
+                max_concurrent: std::num::NonZeroUsize::new(1),
+            }),
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+    });
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let request = |name: &str, arg: &str, mode| {
+        Message::CmdExec(CmdExec {
+            name: name.into(),
+            args: vec![arg.into()],
+            env: vec![],
+            clear_env: false,
+            mode,
+            tty: None,
+            dir: None,
+            user: AMBIENT_USER,
+        })
+    };
+    for (name, expected) in [("vk", "VKROUTE vk exec\n"), ("git", "MAIN git exec\n")] {
+        let (mut stream, mut sink) = connect(&addr).await.unwrap();
+        sink.send(request(name, "exec", RunMode::Interactive))
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        let code = timeout(Duration::from_secs(10), async {
+            loop {
+                match stream.next().await.unwrap().unwrap() {
+                    Message::Data {
+                        fd: Fd::Stdout,
+                        msg,
+                    } => stdout.extend(msg),
+                    Message::ExecDone(result) => return result.code,
+                    Message::StartErr { msg } => panic!("{name} did not start: {msg}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(0), "{name}");
+        assert_eq!(String::from_utf8_lossy(&stdout), expected);
+    }
+
+    let first = |name: &'static str, mode| {
+        let addr = addr.clone();
+        async move {
+            let (mut stream, mut sink) = connect(&addr).await.unwrap();
+            sink.send(request(name, "exec", mode)).await.unwrap();
+            timeout(Duration::from_secs(10), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        }
+    };
+    match first("vk", RunMode::Background).await {
+        Message::StartErr { msg } => assert!(msg.contains("`vk`"), "got: {msg}"),
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+    assert!(matches!(
+        first("git", RunMode::Background).await,
+        Message::StartOK
+    ));
+
+    // One `vk` running fills the route's cap of one; other names still run.
+    let (mut held, mut held_sink) = connect(&addr).await.unwrap();
+    held_sink
+        .send(request("vk", "hold", RunMode::Interactive))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !matches!(
+            held.next().await.unwrap().unwrap(),
+            Message::Data { fd: Fd::Stdout, .. }
+        ) {}
+    })
+    .await
+    .unwrap();
+    match first("vk", RunMode::Interactive).await {
+        Message::StartErr { msg } => {
+            assert!(
+                msg.contains("`vk` commands") && msg.contains("at most 1"),
+                "got: {msg}"
+            )
+        }
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+    assert!(matches!(
+        first("git", RunMode::Interactive).await,
+        Message::StartOK
+    ));
 }
 
 /// `client_run_connect` end to end: a real local TCP connection (standing in for
