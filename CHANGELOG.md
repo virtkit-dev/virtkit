@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The hub's audit log records who changed what, not every step of a job.** A job's
+  submission, cancel, refusal by a node, an end the hub decided (lost, no capacity) and a
+  system or image pull failure are audited; its placement, start, other results and settling
+  are on its page in the job history.
+
 ### Fixed
 
 - **GitLab artifacts support sparse files.** Uploads fill holes with zeros, as

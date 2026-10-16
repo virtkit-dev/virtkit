@@ -479,6 +479,17 @@ async fn wait_until(mut cond: impl FnMut() -> bool) {
     panic!("condition never held");
 }
 
+/// The audit events naming job `id`, oldest first.
+fn job_audit(hub: &Hub, id: &str) -> Vec<String> {
+    hub.db
+        .audits(None, 50)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .filter(|e| e.contains(id))
+        .collect()
+}
+
 /// Job `id`'s view, once it satisfies `cond`.
 async fn view_until(
     addr: SocketAddr,
@@ -1556,21 +1567,13 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
         panic!("expected a refusal");
     };
     assert_eq!(code, RefusalCode::Protocol);
-    let events: Vec<String> = hub
-        .db
-        .audits(None, 50)
-        .unwrap()
-        .into_iter()
-        .map(|r| r.event)
-        .collect();
-    for want in [
-        format!("key gitlab submitted job {id}: GitLab job 2 of group/project (test)"),
-        format!("node {} accepted job {id}", node.id),
-        format!("job {id} finished on node {}: script failure", node.id),
-        format!("key gitlab settled job {id}"),
-    ] {
-        assert!(events.contains(&want), "{want} not in {events:?}");
-    }
+    // Its audit holds who submitted it; its record, where it ran and how it ended.
+    assert_eq!(
+        job_audit(&hub, &id),
+        [format!(
+            "key gitlab submitted job {id}: GitLab job 2 of group/project (test)"
+        )]
+    );
     // The UI links the job to its page on GitLab, and its history shows where it ran, when,
     // and what it used.
     let row = hub.db.job(&id).unwrap().unwrap();
@@ -1602,8 +1605,8 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
 }
 
 /// Events a node reports with a job's result are kept, held to their bounds and made
-/// displayable without losing the end of a long detail, named in the job's audit line, found by
-/// the events filter, and shown by `vk-hub jobs` and `vk-hub jobs show`.
+/// displayable without losing the end of a long detail, found by the events filter, and shown
+/// by `vk-hub jobs` and `vk-hub jobs show`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_s_events_are_kept_bounded_found_and_shown() {
     let dir = scratch("job-events");
@@ -1674,15 +1677,6 @@ async fn a_job_s_events_are_kept_bounded_found_and_shown() {
     let listed: Vec<(String, crate::store::JobRow)> = serde_json::from_value(listed).unwrap();
     let found: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(found, [stalled.as_str()]);
-
-    let node_id = node.id.clone();
-    wait_until(|| {
-        hub.db.audits(Some(&node_id), 50).unwrap().iter().any(|a| {
-            a.event.contains(&format!("job {stalled} finished"))
-                && a.event.contains("; events: virtio-fs stall ×2")
-        })
-    })
-    .await;
 
     let rows = crate::jobs::listing(&hub, 10).unwrap();
     let listed = crate::render_jobs(&rows, crate::now_secs());
@@ -1939,6 +1933,15 @@ async fn cancellation_ends_a_queued_job_and_reaches_a_running_one() {
     let view: JobView = resp.json();
     assert_eq!(view.state, JobState::Finished);
     assert_eq!(view.result.unwrap().failure, Some(FailureClass::Canceled));
+    // Its canceler's line stands for its ending.
+    let id = &queued.id;
+    assert_eq!(
+        job_audit(&hub, id),
+        [
+            format!("key gitlab submitted job {id}: GitLab job 1 of group/project (test)"),
+            format!("key gitlab canceled job {id} before it was placed"),
+        ]
+    );
 
     // Running: graceful, then immediate overriding it, then graceful again changing nothing.
     let mut node = ready_node(addr, &hub, 16384).await;
@@ -2008,6 +2011,15 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
         vk_hub_proto::job::gitlab_failure_reason(FailureClass::Lost, &[]),
         "runner_system_failure"
     );
+    // The hub ended it: audited.
+    wait_until(|| job_audit(&hub, &job).len() == 2).await;
+    assert_eq!(
+        job_audit(&hub, &job),
+        [
+            format!("key gitlab submitted job {job}: GitLab job 1 of group/project (test)"),
+            format!("job {job} ended: lost: node {id} was unreachable for 1s"),
+        ]
+    );
     // Back, still running it: canceled, its result recorded and ignored.
     let held = Held {
         reservations: vec![],
@@ -2075,6 +2087,15 @@ async fn a_job_is_placed_again_only_while_no_node_can_have_started_it() {
     assert_eq!(
         ended.result.unwrap().failure,
         Some(FailureClass::NoCapacity)
+    );
+    let id = &job.id;
+    wait_until(|| job_audit(&hub, id).len() == 2).await;
+    assert_eq!(
+        job_audit(&hub, id),
+        [
+            format!("key gitlab submitted job {id}: GitLab job 1 of group/project (test)"),
+            format!("job {id} ended: no capacity: no node took it within its placement window"),
+        ]
     );
 
     // On a reservation that is gone, placed afresh; refused by one node, sent to the other.
@@ -3028,14 +3049,6 @@ async fn a_job_goes_to_a_lightly_loaded_node_holding_its_image() {
         }
     );
     assert_eq!(crate::jobs::testing::reservations(&hub), 0);
-    wait_until(|| {
-        (hub.db.audits(Some(&warm.id), 50).unwrap().iter()).any(|a| {
-            a.event.contains("where its image is warm")
-                && a.event
-                    .contains(&format!("giving back reservation {}", grant.reservation))
-        })
-    })
-    .await;
     // Refused there, it starts on `cold` all the same, without the reservation it gave back.
     warm.send(NodeJobMsg::Job {
         job: second.id.clone(),
@@ -3876,6 +3889,40 @@ async fn a_settled_job_keeps_the_end_of_its_output() {
     let mut node = ready_node(addr, &hub, 16384).await;
     let ok = settled_job(addr, &key, &mut node, 1, out, None).await;
     assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A job its node failed, or whose image it could not pull, is audited with the node's
+/// message; one its script failed is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_system_or_image_pull_failure_is_audited() {
+    let dir = scratch("failaudit");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    for (n, failure, line) in [
+        (1, FailureClass::System, Some("system failure: the VM died")),
+        (
+            2,
+            FailureClass::ImagePull,
+            Some("image pull failure: the VM died"),
+        ),
+        (3, FailureClass::Script, None),
+    ] {
+        let id = running_job(addr, &key, &mut node, n).await;
+        let mut ended = result(Some(failure), 0);
+        ended.message = Some("the VM died".into());
+        node.send(NodeJobMsg::Result {
+            job: id.clone(),
+            result: ended,
+        });
+        assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+        let mut expected = vec![format!(
+            "key gitlab submitted job {id}: GitLab job {n} of group/project (test)"
+        )];
+        expected.extend(line.map(|l| format!("job {id} ended: {l}")));
+        assert_eq!(job_audit(&hub, &id), expected);
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

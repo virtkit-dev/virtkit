@@ -473,7 +473,8 @@ async fn persist_logged(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) {
 
 /// End `job` with `failure` and `message`, moving it from the live jobs to those finished
 /// until [`persist`] has written it, and giving back a reservation it was submitted on and
-/// never started on. The row to write and its audit line.
+/// never started on. Return the row to persist and an audit line for non-cancel failures;
+/// callers that do not audit the failure discard it.
 fn finish(
     state: &mut State,
     id: &str,
@@ -502,14 +503,12 @@ fn finish(
     row.finished_at = Some(crate::now_secs());
     row.activity = None;
     let output_len = row.output_len;
-    let how = match failure {
-        Some(f) => failure_name(f),
-        None => "success",
-    };
-    let event = match &message {
-        Some(m) => format!("job {id} ended: {how}: {m}"),
-        None => format!("job {id} ended: {how}"),
-    };
+    let event = failure
+        .filter(|f| *f != FailureClass::Canceled)
+        .map(|f| match &message {
+            Some(m) => format!("job {id} ended: {}: {m}", failure_name(f)),
+            None => format!("job {id} ended: {}", failure_name(f)),
+        });
     row.result = Some(JobResult {
         failure,
         exit_code: None,
@@ -519,7 +518,10 @@ fn finish(
         usage: None,
         events: Vec::new(),
     });
-    let events = vec![(row.node.clone(), HUB.to_string(), event)];
+    let events = event
+        .map(|e| (row.node.clone(), HUB.to_string(), e))
+        .into_iter()
+        .collect();
     state.finished.insert(id.to_string(), job.row.clone());
     Some((job.row, events))
 }
@@ -1018,11 +1020,6 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 row.started_at.get_or_insert_with(crate::now_secs);
                 job.spec = None;
                 job.reservation = None;
-                events.push((
-                    Some(node.to_string()),
-                    HUB.to_string(),
-                    format!("node {node} accepted job {id}"),
-                ));
             }
             RunState::Refused { reason, message } => {
                 if row.state != JobState::Starting {
@@ -1184,27 +1181,19 @@ async fn on_result(
                 ),
             );
         }
-        let noted = events_summary(&result.events)
-            .map(|s| format!("; events: {s}"))
-            .unwrap_or_default();
-        let failure = result.failure;
-        let Some((mut row, mut events)) = finish(&mut state, id, failure, None) else {
+        // Audited only when the node or its images failed it, for an operator to see; its
+        // record holds its node, result and events either way.
+        let audited = matches!(
+            result.failure,
+            Some(FailureClass::System | FailureClass::ImagePull)
+        );
+        let message = result.message.clone().filter(|_| audited);
+        let Some((mut row, events)) = finish(&mut state, id, result.failure, message) else {
             return Ok(recorded);
         };
         row.result = Some(result);
         state.finished.insert(id.to_string(), row.clone());
-        events = events
-            .into_iter()
-            .map(|(n, a, _)| {
-                let how = failure.map_or("success", failure_name);
-                (
-                    n,
-                    a,
-                    format!("job {id} finished on node {node}: {how}{noted}"),
-                )
-            })
-            .collect();
-        (row, events)
+        (row, if audited { events } else { Vec::new() })
     };
     // Outside the lock: whoever waits on it does not wait on stderr.
     for event in row.result.iter().flat_map(|r| &r.events) {
@@ -1214,8 +1203,8 @@ async fn on_result(
     Ok(recorded)
 }
 
-/// A job's events in short, `virtio-fs stall ×2`, for its row in a table and its audit line;
-/// `None` without any. An uncounted event (count 0, from a peer that sent none) shows as once.
+/// A job's events in short, `virtio-fs stall ×2`, for its row in a table; `None` without any.
+/// An uncounted event (count 0, from a peer that sent none) shows as once.
 pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> {
     if events.is_empty() {
         return None;
@@ -2167,17 +2156,11 @@ pub async fn cancel(
                 return Err(not_found(&format!("no job {id}")));
             }
             Some(_) if queued => {
-                let (row, mut events) = finish(&mut state, id, Some(FailureClass::Canceled), None)
+                // A cancel's ending is unaudited: the actor's line stands for it.
+                let (row, _) = finish(&mut state, id, Some(FailureClass::Canceled), None)
                     .ok_or_else(|| not_found(&format!("no job {id}")))?;
-                events.insert(
-                    0,
-                    (
-                        None,
-                        actor.clone(),
-                        format!("{actor} canceled job {id} before it was placed"),
-                    ),
-                );
-                Some((row, events))
+                let event = format!("{actor} canceled job {id} before it was placed");
+                Some((row, vec![(None, actor.clone(), event)]))
             }
             Some(job) => {
                 let stronger = matches!(
@@ -2275,9 +2258,8 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
     .map_err(|e| ApiError::from(anyhow!(e)))??;
     row.settled_at = Some(crate::now_secs());
     row.revision = row.revision.saturating_add(1);
-    let actor = principal.actor();
-    let event = format!("{actor} settled job {id}");
-    persist(hub, id, row, vec![(None, actor, event)]).await?;
+    // Unaudited: a producer settles every job it ran.
+    persist(hub, id, row, Vec::new()).await?;
     hub.dispatch.bump();
     Ok(())
 }
@@ -2648,37 +2630,19 @@ fn place(
     }
     let job = state.jobs.get_mut(id)?;
     // Kept until the node answers, to release it should the node refuse the job.
-    job.reservation = reservation.clone();
+    job.reservation = reservation;
     job.reservation_accepted_at = accepted_at;
     job.row.state = JobState::Starting;
     job.row.node = Some(node.clone());
     job.row.revision = job.row.revision.saturating_add(1);
     let row = job.row.clone();
-    let mut how = match &reservation {
-        Some(r) => format!("on reservation {r}"),
-        None => "without a reservation".to_string(),
-    };
-    if warm.contains(&node) {
-        how.push_str(", where its image is warm");
-    }
     if let Some(r) = given_up
         && let Some(x) = state.reservations.remove(&r)
     {
-        send(
-            state,
-            &x.node,
-            HubJobMsg::Release {
-                reservation: r.clone(),
-            },
-        );
-        how.push_str(&format!(", giving back reservation {r} on node {}", x.node));
+        send(state, &x.node, HubJobMsg::Release { reservation: r });
     }
-    let event = format!("hub sent job {id} to node {node} {how}");
-    Some((
-        id.to_string(),
-        row,
-        vec![(Some(node), HUB.to_string(), event)],
-    ))
+    // Unaudited: its record holds its node.
+    Some((id.to_string(), row, Vec::new()))
 }
 
 /// The latest `limit` jobs, newest first, those under way as the hub holds them now.

@@ -1081,10 +1081,9 @@ preferred, nor counted for the lowest. A job submitted on a reservation whose no
 hold the image starts on such a node instead, without a reservation, and its reservation is
 released at once; on a refusal it is placed as any job without one. Busier nodes, or none
 holding the image, leave the order above unchanged. Reservations are offered before the job is
-known, so they follow the order above alone. The audit says `where its image is warm`, and
-names the reservation given back. On restart, the hub restores image usage from the newest
-`job_history` records whose specs remain: jobs finished within a day and jobs still running.
-Running jobs count as using their image at the restart.
+known, so they follow the order above alone. On restart, the hub restores image usage from
+the newest `job_history` records whose specs remain: jobs finished within a day and jobs still
+running. Running jobs count as using their image at the restart.
 
 An offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
 every node with room has refused, the hub pauses 2 seconds and asks again until the request's
@@ -1105,8 +1104,11 @@ waits for the node's `held`, which either names the job — accepted — or not,
 placed again. A queued job is ended `no_capacity` when it cannot be placed by its
 `place_within_secs` (at most a day), and `canceled` at once when its producer cancels it; a
 reservation it named goes back to its node. A cancel mode the hub does not know is `immediate`.
-Every change of state is written durably and audited: submitted, sent to a node, accepted,
-refused, finished, canceled, settled, lost.
+Every change of state is written durably. The audit log records who did what: a submission,
+a cancel, a refusal, a job the hub ended (`lost`, `no_capacity`), a job its node failed with a
+`system` or `image_pull` failure, and reservations that ended other than by a release or a job
+taking them over, or with a node's session; the job's record holds where it ran, its result
+and its times.
 
 **Output** is kept in `<data_dir>/jobs/<id>.out`, written at the chunk's offset and synced — the
 directory too, for a file's first bytes — before the node is acked. A chunk overlapping what is
