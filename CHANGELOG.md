@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.92.1] - 2026-10-16
+
 ### Changed
 
 - **The hub's audit log records who changed what, not every step of a job.** A job's
@@ -4347,7 +4349,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.92.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.92.1...HEAD
+[0.92.1]: https://github.com/virtkit-dev/virtkit/compare/v0.92.0...v0.92.1
 [0.92.0]: https://github.com/virtkit-dev/virtkit/compare/v0.91.1...v0.92.0
 [0.91.1]: https://github.com/virtkit-dev/virtkit/compare/v0.91.0...v0.91.1
 [0.91.0]: https://github.com/virtkit-dev/virtkit/compare/v0.90.0...v0.91.0
