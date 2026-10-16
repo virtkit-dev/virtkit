@@ -3413,7 +3413,7 @@ async fn a_job_on_a_reservation_with_no_placement_window_starts() {
 fn keys_and_sizes_parse_on_the_command_line() {
     assert_eq!(parse_size("16G"), Ok(16 << 30));
     assert_eq!(parse_size("512M"), Ok(512 << 20));
-    for bad in ["16", "0G", "G", "-1G", "16X"] {
+    for bad in ["", "16", "0G", "G", "-1G", "16X", "1é", "é"] {
         assert!(parse_size(bad).is_err(), "{bad}");
     }
     let cli = Cli::try_parse_from([

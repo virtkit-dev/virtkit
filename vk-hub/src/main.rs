@@ -441,7 +441,11 @@ fn parse_scope(s: &str) -> Result<store::Scope, String> {
 /// A size in bytes: a number with a binary unit, `K`, `M`, `G` or `T`.
 fn parse_size(s: &str) -> Result<u64, String> {
     let bad = || format!("{s:?}: expected <n>K, <n>M, <n>G or <n>T");
-    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let (n, unit) = s
+        .char_indices()
+        .next_back()
+        .and_then(|(at, _)| s.split_at_checked(at))
+        .unwrap_or(("", ""));
     let shift = match unit {
         "K" | "k" => 10,
         "M" | "m" => 20,

@@ -19,6 +19,11 @@ All notable changes to virtkit will be documented in this file.
   the key by name and drops with one click.
 - **The guest kernel supports `process_vm_readv` and `process_vm_writev`.**
 
+### Fixed
+
+- **`vk-hub keys create` reports a size ending in a non-ASCII character as invalid** instead
+  of crashing.
+
 ## [0.91.1] - 2026-10-15
 
 ### Changed
