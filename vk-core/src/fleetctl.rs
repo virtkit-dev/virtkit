@@ -64,8 +64,9 @@ pub enum ServiceOp {
     Status(Option<String>),
 }
 
-/// Usage for `vk service` arguments parsed by [`ServiceOp::parse`].
-pub const SERVICE_USAGE: &str = "usage: vk service up|down|reboot NAME | vk service status [NAME]";
+/// Usage for `vk-agent service` arguments parsed by [`ServiceOp::parse`].
+pub const SERVICE_USAGE: &str =
+    "usage: vk-agent service up|down|reboot NAME | vk-agent service status [NAME]";
 
 impl ServiceOp {
     /// Parse the arguments after `vk service`.

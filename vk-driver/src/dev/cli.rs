@@ -213,7 +213,7 @@ enum DevAction {
     },
     /// Control the environment's compose services from the host
     ///
-    /// The same operations `vk service` offers inside the guest, addressed through the
+    /// The same operations `vk-agent service` offers inside the guest, addressed through the
     /// config instead of a state directory: bring a profiled service up (booting the
     /// environment first if it is down, building the service's image on first use with the
     /// build streamed here), take it down, reboot it, or ask where it stands. Only `up`
@@ -551,7 +551,7 @@ enum DevServiceAction {
     },
     /// Print a service's state and address, or every service's when no name is given
     ///
-    /// One line per service: `<name> <state> <address>`, as `vk service status` prints it.
+    /// One line per service, `<name> <state> <address>`, as from `vk-agent service status`.
     Status {
         /// the service; omit to list all
         name: Option<String>,
@@ -612,8 +612,8 @@ fn render_service_reply(reply: &vk_core::fleetctl::Reply) -> (String, Option<Str
     (out, note)
 }
 
-/// `vk dev service`: print the manager's answer as `vk service` prints it — the unit lines,
-/// then the message — and turn its verdict into the exit code.
+/// `vk dev service`: print the manager's answer as `vk-agent service` prints it — the unit
+/// lines, then the message — and turn its verdict into the exit code.
 fn service_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>) -> ExitCode {
     match reply {
         Ok(reply) => {

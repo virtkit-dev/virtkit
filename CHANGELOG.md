@@ -13,13 +13,18 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
-- **`vk exec --service` works in a `vk dev` environment with `[dev.host]` host commands**,
-  and in a `vk run --compose` primary with `--host-exec-wrapper`. The host command channel
-  serves both: a command named `vk` runs only `vk exec --service` into this environment's
-  services, and every other command goes to the host policy as before. The policy no
-  longer receives a command named `vk`, and such a run's `--state-dir` must be out of the
-  guest's reach, as without host commands; `vk run --no-service-exec` keeps the old
-  channel.
+- **Breaking:** guests reach their compose services with `vk-agent exec --service NAME --
+  CMD`, which takes `vk exec`'s flags, and with `vk-agent service`. A script that runs
+  `vk exec --service` or `vk service` in a guest with no `vk` of its own, such as a CI job's
+  or a compose primary's command, must call `vk-agent` now. A full `vk` in the guest, the
+  image's own or one mounted there, no longer hands `vk exec --service` to the run's
+  services: it reaches only the VMs that `vk` runs itself.
+- **Compose service exec works in a `vk dev` environment with `[dev.host]` host commands**,
+  and in a `vk run --compose` primary with `--host-exec-wrapper`: `vk-agent exec --service`
+  runs into this environment's services, and every
+  other command goes to the host policy as before. The policy no longer receives a request
+  named `vk`, and such a run's `--state-dir` must be out of the guest's reach, as without
+  host commands; `vk run --no-service-exec` keeps the old channel.
 
 ## [0.92.1] - 2026-10-16
 

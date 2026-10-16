@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
 # =====================================================================================
 # A CI job, or a `vk run --compose` primary, runs commands in its compose services with
-# `vk exec --service`, from its own VM.
+# `vk-agent exec --service`, from its own VM.
 # =====================================================================================
 # Drives `vk gitlab prepare|run|cleanup` directly, no GitLab needed, on a `compose:` job with a
 # `db` service:
-#   1. the job's script runs `vk exec --service db … -- …`: the command runs in the service,
-#      its output and exit status come back; --env, --dir, --user, -b, --clear-env and -t
-#      (under script(1), for a terminal) apply;
+#   1. the job's script runs `vk-agent exec --service db … -- …`: the command runs in the
+#      service, its output and exit status come back; --env, --dir, --user, -b, --clear-env and
+#      -t (under script(1), for a terminal) apply; the job VM has no `vk`;
 #   2. what the host does not allow is refused: another `vk` command, a service the job does
-#      not have, `vk service` (a job's services are fixed for it), a raw request putting a host
-#      `vk` flag first, a fifth request at once; a raw request's --dir and --user are ignored;
-#   3. with `[executor] guest_service_exec = false`, the job VM has no `vk` and no channel;
+#      not have, `vk-agent service` (a job's services are fixed for it), a raw request putting a
+#      host `vk` flag first, a fifth request at once; a raw request's --dir and --user are
+#      ignored;
+#   3. with `[executor] guest_service_exec = false`, the job VM has no channel, and
+#      `vk-agent exec --service` says why;
 #   4. a `vk run --compose` primary reaches its services the same way and the service manager
-#      with `vk service`; --no-service-exec removes its `vk` and channel, and a state dir the
-#      guest can write is refused;
-#   5. an image's own `vk` hands `vk exec --service` off to the guest one;
+#      with `vk-agent service`; --no-service-exec removes its channel, as `vk-agent exec
+#      --service` says, and a state dir the guest can write is refused;
+#   5. a full `vk` in the guest keeps `vk exec --service` for the VMs it runs itself: it never
+#      reaches the run's services;
 #   6. beside a --host-exec-wrapper (a `vk dev` environment's `[dev.host]`), the primary keeps
-#      its `vk exec --service`, the wrapper runs every other command and never sees `vk`, and
-#      neither takes the other's form; with --no-service-exec the wrapper gets `vk` too, and a
-#      state dir the guest can write is refused there as well.
+#      its `vk-agent exec --service`, the wrapper runs every other command and never sees `vk`,
+#      and neither takes the other's form; with --no-service-exec the wrapper gets `vk` too,
+#      and a state dir the guest can write is refused there as well.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
 # Needs: a `vk` with an embedded agent and kernel, KVM, and network to pull alpine and debian.
@@ -118,41 +121,42 @@ fail() {
 echo "== 1. the job runs commands in its service =="
 config true
 run_job 'set -e
-out=$(vk exec --service db -- cat /tmp/marker)
+if command -v vk; then exit 1; fi
+out=$(vk-agent exec --service db -- cat /tmp/marker)
 echo "got: $out"
 [ "$out" = served-by-db ]
-out=$(vk exec --service db --env FOO=bar --dir /tmp --user nobody -- sh -c "echo \$FOO \$(pwd) \$(id -un)")
+out=$(vk-agent exec --service db --env FOO=bar --dir /tmp --user nobody -- sh -c "echo \$FOO \$(pwd) \$(id -un)")
 echo "flags: $out"
 [ "$out" = "bar /tmp nobody" ]
-if vk exec --service db --clear-env -- /usr/bin/env | grep "^PATH="; then exit 1; fi
-vk exec --service db -b -- sh -c "echo from-background > /tmp/bg"
+if vk-agent exec --service db --clear-env -- /usr/bin/env | grep "^PATH="; then exit 1; fi
+vk-agent exec --service db -b -- sh -c "echo from-background > /tmp/bg"
 i=0
-until [ "$(vk exec --service db -- cat /tmp/bg 2>/dev/null)" = from-background ]; do
+until [ "$(vk-agent exec --service db -- cat /tmp/bg 2>/dev/null)" = from-background ]; do
   i=$((i + 1)); [ "$i" -lt 50 ]; sleep 0.1
 done
-out=$(script -qc "vk exec --service db -t -- tty" /dev/null)
+out=$(script -qc "vk-agent exec --service db -t -- tty" /dev/null)
 echo "tty: $out"
 case $out in */dev/pts/*) ;; *) exit 1 ;; esac
-rc=0; vk exec --service db -- sh -c "exit 7" || rc=$?
+rc=0; vk-agent exec --service db -- sh -c "exit 7" || rc=$?
 echo "status: $rc"
 [ "$rc" = 7 ]
-echo hello | vk exec --service db -- cat' || fail "the job could not run commands in its service"
+echo hello | vk-agent exec --service db -- cat' || fail "the job could not run commands in its service"
 grep -q "got: served-by-db" "$root/stage.log" || fail "the service's output did not come back"
 grep -q "^hello" "$root/stage.log" || fail "stdin did not reach the service"
 echo "ok"
 
 echo "== 2. what the host does not allow is refused =="
 run_job 'set -e
-if vk exec --service nope -- true 2>err; then exit 1; fi
+if vk-agent exec --service nope -- true 2>err; then exit 1; fi
 cat err
 grep -q "no service" err
-if vk version 2>err; then exit 1; fi
-cat err
-if vk service down db 2>err; then exit 1; fi
+if vk-agent service down db 2>err; then exit 1; fi
 cat err
 grep -q "fixed for the job" err
 # A raw request: a host `vk` flag first reaches no host `vk`, and its --dir is ignored.
 raw="/run/vk/bin/vk-agent -s /run/vk/host.sock exec"
+if $raw -- vk version 2>err; then exit 1; fi
+cat err
 if $raw -- --config=/etc/passwd vk exec --service db -- true 2>err; then exit 1; fi
 cat err
 grep -q "runs only" err
@@ -160,10 +164,10 @@ $raw --dir /nonexistent/vk-e2e --user root -- vk exec --service db -- true
 # The host runs four requests at once and refuses a fifth.
 # Each of four retries until it holds a slot; the fifth is polled until it is refused.
 for _ in 1 2 3 4; do
-  (until vk exec --service db -- sleep 5 2>/dev/null; do sleep 0.1; done) &
+  (until vk-agent exec --service db -- sleep 5 2>/dev/null; do sleep 0.1; done) &
 done
 i=0
-while vk exec --service db -- true 2>err; do
+while vk-agent exec --service db -- true 2>err; do
   i=$((i + 1)); [ "$i" -lt 100 ]; sleep 0.1
 done
 cat err
@@ -175,9 +179,13 @@ echo "ok"
 
 echo "== 3. guest_service_exec = false: no channel =="
 config false
-run_job 'if command -v vk; then exit 1; fi
+# The agent is PID 1, and on no PATH without service exec; running /proc/1/exe takes
+# root, as these images' scripts run.
+run_job 'if /proc/1/exe exec --service db -- true 2>err; then exit 1; fi
+cat err
+grep -q "this VM has no service exec" err
 [ ! -e /run/vk/host.sock ]' ||
-  fail "the job has a vk or a host channel with guest_service_exec = false"
+  fail "the job has a host channel with guest_service_exec = false, or does not say why not"
 echo "ok"
 
 echo "== 4. a vk run --compose primary =="
@@ -188,12 +196,17 @@ services:
     command: ["sh", "-c", "echo served-by-db > /tmp/marker; exec sleep 3600"]
 EOF
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" alpine:3.21 \
-  -- sh -c '[ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ] &&
-    vk service status db | grep "^db "' \
+  -- sh -c '[ "$(vk-agent exec --service db -- cat /tmp/marker)" = served-by-db ] &&
+    vk-agent service status db | grep "^db "' \
   >"$root/stage.log" 2>&1 || fail "the primary could not reach its service"
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \
-  alpine:3.21 -- sh -c 'if command -v vk; then exit 1; fi; [ ! -e /run/vk/host.sock ]' \
-  >"$root/stage.log" 2>&1 || fail "the primary has a vk or a host channel with --no-service-exec"
+  alpine:3.21 -- sh -c '
+    if /proc/1/exe exec --service db -- true 2>err; then exit 1; fi
+    cat err
+    grep -q "this VM has no service exec" err
+    [ ! -e /run/vk/host.sock ]' \
+  >"$root/stage.log" 2>&1 ||
+  fail "the primary has a host channel with --no-service-exec, or does not say why not"
 mkdir -p "$root/share"
 if "$VK" run --state-dir "$root/share/state" --workdir "$root/share" \
   --compose "$root/run.compose.yaml" alpine:3.21 -- true >"$root/stage.log" 2>&1; then
@@ -202,12 +215,14 @@ fi
 grep -q -- "--no-service-exec" "$root/stage.log" || fail "the refusal does not name the way out"
 echo "ok"
 
-echo "== 5. an image's own vk hands off =="
+echo "== 5. a full vk in the guest =="
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" \
-  -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c '
-    [ "$(command -v vk)" = /usr/local/bin/vk ] &&
-    [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]' \
-  >"$root/stage.log" 2>&1 || fail "the image's vk did not reach the service"
+  -v "$VK:/usr/local/bin/vk:ro" alpine:3.21 -- sh -c 'set -e
+    [ "$(command -v vk)" = /usr/local/bin/vk ]
+    if vk exec --service db -- cat /tmp/marker 2>err; then exit 1; fi
+    cat err
+    grep -q "no running vk VM" err' \
+  >"$root/stage.log" 2>&1 || fail "the guest's full vk reached the run's service"
 echo "ok"
 
 echo "== 6. service exec beside host commands =="
@@ -222,7 +237,7 @@ chmod 0700 "$root/policy"
 : >"$root/policy.log"
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" \
   --host-exec --host-exec-wrapper "$root/policy" alpine:3.21 -- sh -c 'set -e
-    [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]
+    [ "$(vk-agent exec --service db -- cat /tmp/marker)" = served-by-db ]
     raw="/run/vk/bin/vk-agent -s /run/vk/host.sock exec"
     [ "$($raw -- echo host-ok)" = host-ok ]
     # `vk` goes to service exec alone, which refuses another `vk` command or service.
@@ -236,7 +251,7 @@ chmod 0700 "$root/policy"
     if $raw -- env vk exec --service db -- true 2>err; then exit 1; fi
     grep -q "not allowed" err' \
   >"$root/stage.log" 2>&1 || fail "service exec and host commands did not both work"
-if grep -q "^vk " "$root/policy.log"; then fail "the policy saw the guest vk's request"; fi
+if grep -q "^vk " "$root/policy.log"; then fail "the policy saw a request named vk"; fi
 grep -q "^echo host-ok" "$root/policy.log" || fail "the policy did not run the host command"
 : >"$root/policy.log"
 "$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \

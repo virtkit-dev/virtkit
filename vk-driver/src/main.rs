@@ -1284,7 +1284,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// plumbing: what a guest's `vk` asks of its host, over the VM's host command channel
+    /// plumbing: a guest's `vk-agent exec --service`, over the VM's host command channel
     ///
     /// A CI job VM's or a `vk run --compose` primary's channel runs every request through
     /// this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
@@ -1293,7 +1293,7 @@ enum Cmd {
     ServiceExec {
         /// the job's or run's directory, whose `svc-<name>` dirs are its services
         dir: PathBuf,
-        /// what the guest's `vk` was given, `vk` first, after `--`
+        /// the guest's request, `vk` first, after `--`
         #[arg(last = true)]
         argv: Vec<String>,
     },
@@ -2355,11 +2355,12 @@ enum Cmd {
             help_heading = "Host access from the guest"
         )]
         host_exec_env: Vec<String>,
-        /// give a --compose primary no `vk exec --service` into its services
+        /// give a --compose primary no `vk-agent exec --service` into its services
         ///
-        /// By default its `vk` runs that one form, into this run's services, over the
-        /// primary's host command channel, beside a --host-exec-wrapper's commands when there
-        /// is one; --host-exec without a wrapper replaces it with the whole channel.
+        /// By default it runs that one form, `vk exec --service` on the host, into this run's
+        /// services, over the primary's host command channel, beside a --host-exec-wrapper's
+        /// commands when there is one; --host-exec without a wrapper replaces it with the whole
+        /// channel.
         #[arg(long = "no-service-exec", help_heading = "Host access from the guest")]
         no_service_exec: bool,
         /// the -f/--primary/compose builds may restore from cache but not build
@@ -3233,20 +3234,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
     {
         return host_policy_cmd(policy, workspace, argv);
     }
-    // Inside a VM whose host serves its services' `vk exec` (a CI job, a compose run's
-    // primary), `vk exec --service` goes through that channel's own `vk` — unless the current
-    // directory names a VM run inside this one, which is local. Before Config::load: this VM
-    // need not have a config, and the guest `vk` takes none.
-    if let Some(argv) = guest_vk_exec_argv(&cli.cmd)
-        && Path::new(GUEST_VK).exists()
-        && !vms::still_registered(None)
-    {
-        use std::os::unix::process::CommandExt;
-        let e = std::process::Command::new(GUEST_VK).args(argv).exec();
-        return fail(&anyhow::anyhow!("running {GUEST_VK}: {e}"), 1);
-    }
-    // What a guest's `vk` asks decides on its argv and the services under its dir alone —
-    // before Config::load, so nothing the guest sends reaches the config or its loading.
+    // What a guest's `vk-agent exec --service` asks decides on its argv and the services
+    // under its dir alone — before Config::load, so nothing the guest sends reaches the config
+    // or its loading.
     if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
         return vm::service_exec(dir, argv).await;
     }
@@ -5245,49 +5235,6 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// The guest `vk` of a VM whose host serves its services' `vk exec`.
-const GUEST_VK: &str = "/run/vk/bin/vk";
-
-/// Rebuild `vk exec --service` without a target for [`GUEST_VK`] from parsed flags,
-/// excluding this vk's global flags (`--config`).
-fn guest_vk_exec_argv(cmd: &Cmd) -> Option<Vec<String>> {
-    let Cmd::Exec {
-        target: None,
-        service: Some(service),
-        background,
-        clear_env,
-        env,
-        dir,
-        tty,
-        user,
-        command,
-    } = cmd
-    else {
-        return None;
-    };
-    let mut argv = vec!["exec".to_string(), "--service".to_string(), service.clone()];
-    for (set, flag) in [
-        (*background, "--background"),
-        (*tty, "--tty"),
-        (*clear_env, "--clear-env"),
-    ] {
-        if set {
-            argv.push(flag.to_string());
-        }
-    }
-    for (flag, value) in [("--user", user), ("--dir", dir)] {
-        if let Some(value) = value {
-            argv.extend([flag.to_string(), value.clone()]);
-        }
-    }
-    for e in env {
-        argv.extend(["--env".to_string(), e.clone()]);
-    }
-    argv.push("--".to_string());
-    argv.extend(command.iter().cloned());
-    Some(argv)
-}
-
 /// `vk host-policy <policy> --workspace DIR -- <argv…>`: decide, then become the command.
 ///
 /// 126 is the shell's "found but not executable" code, and what the guest sees for anything
@@ -6624,62 +6571,9 @@ mod tests {
         );
     }
 
-    /// An image's `vk exec --service` reaches the guest `vk` as the same request, rebuilt
-    /// without this vk's own flags; one with a target, or no service, stays here.
-    #[test]
-    fn the_guest_vk_gets_the_exec_rebuilt_without_global_flags() {
-        let argv = |a: &[&str]| guest_vk_exec_argv(&Cli::try_parse_from(a).unwrap().cmd);
-        assert_eq!(
-            argv(&[
-                "vk",
-                "--config",
-                "exec",
-                "exec",
-                "--service",
-                "db",
-                "-b",
-                "--user",
-                "pg",
-                "--env",
-                "A=1",
-                "--dir",
-                "/srv",
-                "--",
-                "sh",
-                "-c",
-                "--config=x",
-            ]),
-            Some(
-                [
-                    "exec",
-                    "--service",
-                    "db",
-                    "--background",
-                    "--user",
-                    "pg",
-                    "--dir",
-                    "/srv",
-                    "--env",
-                    "A=1",
-                    "--",
-                    "sh",
-                    "-c",
-                    "--config=x",
-                ]
-                .map(String::from)
-                .to_vec()
-            )
-        );
-        assert_eq!(argv(&["vk", "exec", "--", "true"]), None);
-        assert_eq!(
-            argv(&["vk", "exec", "/proj", "--service", "db", "--", "true"]),
-            None
-        );
-    }
-
     /// The service-exec wrapper puts the guest's argv after `--`, so a word the guest chose
     /// is never one of this vk's own flags: `--config=/x` in the program's slot stays the
-    /// guest's argv[0], reaches no config, and is refused as not the guest's `vk`.
+    /// guest's argv[0], reaches no config, and is refused as not a service exec request.
     #[tokio::test]
     async fn service_exec_keeps_the_guests_argv_away_from_vk_flags() {
         let cli = Cli::try_parse_from([

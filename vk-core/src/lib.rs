@@ -17,5 +17,6 @@ pub mod oomkills;
 pub mod pty;
 pub mod reclaim;
 pub mod runcfg;
+pub mod service_exec;
 pub mod status;
 pub mod unixpath;
