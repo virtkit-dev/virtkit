@@ -478,20 +478,22 @@ its `depends_on` chain boots alongside. With neither, `--compose` alone is compo
 services only, held until Ctrl-C.
 
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
-state, control, and logs through ordinary files. `vk service up|down|reboot|status` is the
-corresponding command interface: `up` starts a declared (or profiled-down) service, building
+state, control, and logs through ordinary files. `vk-agent service up|down|reboot|status`
+(or `vk service`, with a `vk` in the guest) is the corresponding command interface: `up` starts a declared (or profiled-down) service, building
 it on first use, and returns once it answers; `down` powers it off; `reboot` restarts its
 guest in place on the same disks; `status` reports one or all.
 
-`vk exec --service NAME -- CMD` runs a command in one of them, with the host `vk exec`'s
-flags. The primary needs no `vk` of its own for either: `/run/vk/bin/vk`, last on its
-`PATH`, asks the service manager for `vk service`, and passes `vk exec --service` to the
+`vk-agent exec --service NAME -- CMD` runs a command in one of them, with the host `vk
+exec`'s flags. The primary needs no `vk` for either: its agent, `/run/vk/bin/vk-agent`, last
+on its `PATH`, asks the service manager for `service`, and passes `exec --service` to the
 host over the primary's host command channel. The host runs that one form, into this run's
-services, and nothing else; an image's own `vk` hands off to it. `--no-service-exec` turns
-it off. With `--host-exec-wrapper` the channel serves both: a command named `vk` goes to
-service exec, every other to the wrapper. `--host-exec` without a wrapper replaces this
-restricted channel, and that `vk`, with the whole channel. The run's `--state-dir` must then be out of the guest's reach: not in a read-write
-volume nor under `--workdir`.
+services, and nothing else. A full `vk` in the guest — the image's own, or one mounted
+there — runs `vk exec --service` the same way, and says why when the VM has no service
+exec. `--no-service-exec` turns it off.
+With `--host-exec-wrapper` the channel serves both: a request named `vk` goes to service
+exec, every other to the wrapper. `--host-exec` without a wrapper replaces this restricted
+channel with the whole channel. The run's `--state-dir` must then be out of the guest's
+reach: not in a read-write volume nor under `--workdir`.
 
 `vk run --ssh` enables SSH access for development VMs, including VS Code Remote-SSH
 workflows. In a CI fleet a service's `environment:` may also carry its own egress allowlist

@@ -130,9 +130,9 @@ const PRIMARY_VM: u32 = 0;
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
 pub(crate) const HOST_EXEC_PORT: u32 = 1100;
-/// Where a VM with a guest `vk` (`VIRTKIT_VK_CMD`) has it: the agent's own directory, on the
-/// guest's `/run` tmpfs.
-const GUEST_VK_DIR: &str = "/run/vk/bin";
+/// Where a VM with service exec (`VIRTKIT_SERVICE_EXEC`) has the `vk-agent` that reaches it:
+/// the agent's own directory, on the guest's `/run` tmpfs.
+const GUEST_AGENT_DIR: &str = "/run/vk/bin";
 /// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
 /// the guest agent's forwarder for that guest path and spliced host-side to the host socket
 /// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and
@@ -1895,14 +1895,14 @@ async fn build_and_boot(
                 .chain(compose_units.iter().flat_map(|u| &u.volumes)),
             args.workdir.as_deref(),
         )?;
-        cmdline.push_str(" VIRTKIT_VK_CMD=1");
-        // The command re-exports the image's PATH: keep the guest `vk` on it, last, where the
+        cmdline.push_str(" VIRTKIT_SERVICE_EXEC=1");
+        // The command re-exports the image's PATH: keep the agent on it, last, where the
         // agent puts it for everything else.
         if let Some((_, path)) = image_env.iter_mut().find(|(k, _)| k == "PATH")
-            && !path.split(':').any(|d| d == GUEST_VK_DIR)
+            && !path.split(':').any(|d| d == GUEST_AGENT_DIR)
         {
             path.push(':');
-            path.push_str(GUEST_VK_DIR);
+            path.push_str(GUEST_AGENT_DIR);
         }
     }
 
@@ -3873,7 +3873,7 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
 /// `spawn_tied` reaps it if virtkit dies first.
 ///
 /// With `service_exec` (a wrapper is then given, [`wants_service_exec`]), a command named `vk`
-/// goes to `vk service-exec <work>` instead of the wrapper: the guest `vk`'s `vk exec
+/// goes to `vk service-exec <work>` instead of the wrapper: the guest's `vk exec
 /// --service` into this run's own services, as on a channel that serves nothing else.
 fn spawn_host_exec_serve(
     vsock: &Path,
@@ -3942,7 +3942,7 @@ fn host_exec_serve_args(
         if let Some((vk, dir)) = services {
             argv.push("--vk-wrapper".into());
             argv.push(vk.into());
-            // `--` ends this vk's own arguments: the guest's words are the guest `vk`'s argv.
+            // `--` ends this vk's own arguments: the guest's words are its service exec request.
             for arg in ["service-exec", dir, "--"] {
                 argv.push("--vk-wrapper-arg".into());
                 argv.push(arg.into());
@@ -3952,8 +3952,8 @@ fn host_exec_serve_args(
     argv
 }
 
-/// Whether a compose run's primary gets a `vk` that runs `vk exec --service` into the run's
-/// services (`has_services`), over its host command channel confined to that form. Beside a
+/// Whether a compose run's primary gets `vk-agent exec --service` into the run's services
+/// (`has_services`), over its host command channel confined to that form. Beside a
 /// `--host-exec-wrapper` (a `vk dev` environment's host commands) the channel serves both,
 /// each confined to its own; `--host-exec` without a wrapper opens the channel whole, which
 /// already runs anything. Never with --no-service-exec, nor with an image init, which runs

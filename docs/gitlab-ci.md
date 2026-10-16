@@ -179,11 +179,12 @@ job's plain GitLab `image:` is read the same way):
   the compose file, inside the checkout that every job starts by cleaning: it lasts
   for the job, across a service being stopped and started within it, and never from
   one job to the next.
-  The job's script runs commands in its services with `vk exec --service NAME [-b] [-t]
-  [--user U] [--dir D] [--env K=V] [--clear-env] -- CMD…`, as on a host: the job VM's
-  `vk` (`/run/vk/bin/vk`, last on its `PATH`; an image's own `vk` hands off to it) passes
-  it to the host over the VM's host command channel, which runs that one form, into the
+  The job's script runs commands in its services with `vk-agent exec --service NAME [-b]
+  [-t] [--user U] [--dir D] [--env K=V] [--clear-env] -- CMD…`, with `vk exec`'s flags:
+  the job VM's agent (`/run/vk/bin/vk-agent`, last on its `PATH`) passes it to the host
+  over the VM's host command channel, which runs `vk exec --service` with it, into the
   job's own services, and refuses anything else — no other host command, no other job.
+  An image's own full `vk` runs `vk exec --service` the same way.
   It does grant the job more than its network does: each request starts a host `vk`
   process (at most 4 at once), the command runs as any user of the service it names, root
   included, and a service's [egress](#per-service-egress) is the job's to use.
@@ -1170,7 +1171,7 @@ VM share that switch, each with its own address. By default they all share the r
 policy, but a service may narrow itself further with its own allowlist (see
 [per-service egress](#per-service-egress)) — the switch enforces the policy per
 source VM, so one VM cannot use another's network policy. A job that runs commands in a
-service with `vk exec --service` does reach what that service may; see
+service with `vk-agent exec --service` does reach what that service may; see
 [per-service egress](#per-service-egress).
 
 There are two independent phases, each with its own host cap:
@@ -1322,7 +1323,7 @@ packets — so a service cannot borrow another VM's (looser) policy. Requests ar
 validated at job prepare, so a per-service value outside the host cap fails the job
 with a visible error before anything boots.
 
-A job's script can still act through a service: `vk exec --service NAME` runs a command
+A job's script can still act through a service: `vk-agent exec --service NAME` runs a command
 in it (see [image selection](#image-selection)), under the service's policy. Giving a
 service wider egress than the job therefore gives it to the job's script too; narrow the
 job by narrowing its services, or set `[executor] guest_service_exec = false`.

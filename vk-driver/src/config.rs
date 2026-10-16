@@ -454,9 +454,9 @@ pub struct Executor {
     /// only jobs recorded today — and drops the log of a job still running from the day
     /// before out from under it. Any job outliving the window loses its log the same way.
     pub atop_retention_days: u64,
-    /// Give a job VM with compose services a `vk` command that runs commands in them:
-    /// `vk exec --service NAME [-b] [-t] [--user U] [--dir D] [--env K=V] [--clear-env] --
-    /// CMD…`, the host's `vk exec` reached over the guest's host command channel and confined
+    /// Let a job VM with compose services run commands in them: `vk-agent exec --service NAME
+    /// [-b] [-t] [--user U] [--dir D] [--env K=V] [--clear-env] -- CMD…`, the host's `vk exec
+    /// --service` reached over the guest's host command channel and confined
     /// to that one form and the job's own services — no other host command, no other job. Each
     /// request still starts a host `vk` process (at most 4 at once), and runs its command as
     /// whatever user it names in the service, root included; a service with wider egress than

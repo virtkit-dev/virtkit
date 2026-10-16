@@ -1284,7 +1284,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// plumbing: what a guest's `vk` asks of its host, over the VM's host command channel
+    /// plumbing: a guest's `vk-agent exec --service`, over the VM's host command channel
     ///
     /// A CI job VM's or a `vk run --compose` primary's channel runs every request through
     /// this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
@@ -1293,7 +1293,7 @@ enum Cmd {
     ServiceExec {
         /// the job's or run's directory, whose `svc-<name>` dirs are its services
         dir: PathBuf,
-        /// what the guest's `vk` was given, `vk` first, after `--`
+        /// the guest's request, `vk` first, after `--`
         #[arg(last = true)]
         argv: Vec<String>,
     },
@@ -2355,11 +2355,12 @@ enum Cmd {
             help_heading = "Host access from the guest"
         )]
         host_exec_env: Vec<String>,
-        /// give a --compose primary no `vk exec --service` into its services
+        /// give a --compose primary no `vk-agent exec --service` into its services
         ///
-        /// By default its `vk` runs that one form, into this run's services, over the
-        /// primary's host command channel, beside a --host-exec-wrapper's commands when there
-        /// is one; --host-exec without a wrapper replaces it with the whole channel.
+        /// By default it runs that one form, `vk exec --service` on the host, into this run's
+        /// services, over the primary's host command channel, beside a --host-exec-wrapper's
+        /// commands when there is one; --host-exec without a wrapper replaces it with the whole
+        /// channel.
         #[arg(long = "no-service-exec", help_heading = "Host access from the guest")]
         no_service_exec: bool,
         /// the -f/--primary/compose builds may restore from cache but not build
@@ -3233,19 +3234,24 @@ async fn cli_main(cli: Cli) -> ExitCode {
     {
         return host_policy_cmd(policy, workspace, argv);
     }
-    // Inside a VM whose host serves its services' `vk exec` (a CI job, a compose run's
-    // primary), `vk exec --service` goes through that channel's own `vk` — unless the current
+    // Inside a vk guest, `vk exec --service` is this VM's services, through the agent's
+    // `exec --service` when the host serves it, else refused with why — unless the current
     // directory names a VM run inside this one, which is local. Before Config::load: this VM
-    // need not have a config, and the guest `vk` takes none.
+    // need not have a config, and the agent takes none.
     if let Some(argv) = guest_vk_exec_argv(&cli.cmd)
-        && Path::new(GUEST_VK).exists()
+        && let Some(service_exec) = std::fs::read_to_string("/proc/cmdline")
+            .ok()
+            .and_then(|c| guest_service_exec(&c))
         && !vms::still_registered(None)
     {
+        if !service_exec {
+            return fail(&anyhow::anyhow!("{NO_GUEST_SERVICE_EXEC}"), 2);
+        }
         use std::os::unix::process::CommandExt;
-        let e = std::process::Command::new(GUEST_VK).args(argv).exec();
-        return fail(&anyhow::anyhow!("running {GUEST_VK}: {e}"), 1);
+        let e = std::process::Command::new(GUEST_AGENT).args(argv).exec();
+        return fail(&anyhow::anyhow!("running {GUEST_AGENT}: {e}"), 1);
     }
-    // What a guest's `vk` asks decides on its argv and the services under its dir alone —
+    // What a guest's `vk-agent exec --service` asks decides on its argv and the services under its dir alone —
     // before Config::load, so nothing the guest sends reaches the config or its loading.
     if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
         return vm::service_exec(dir, argv).await;
@@ -5245,11 +5251,29 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// The guest `vk` of a VM whose host serves its services' `vk exec`.
-const GUEST_VK: &str = "/run/vk/bin/vk";
+/// The agent of a vk guest, whose `exec --service` reaches the VM's services when its host
+/// serves them.
+const GUEST_AGENT: &str = "/run/vk/bin/vk-agent";
 
-/// Rebuild `vk exec --service` without a target for [`GUEST_VK`] from parsed flags,
-/// excluding this vk's global flags (`--config`).
+/// Why a vk guest's `vk exec --service` has nothing to reach.
+const NO_GUEST_SERVICE_EXEC: &str = "this VM has no service exec: its host turned it off \
+     (`vk run --no-service-exec`, `[executor] guest_service_exec = false`), opened the host \
+     command channel whole (`vk run --host-exec` without a wrapper), booted the image's own init, \
+     or gave it no compose services";
+
+/// Whether the guest whose kernel command line is `cmdline` has service exec, or `None` when
+/// it is not a vk guest: vk boots every guest with `VIRTKIT_*` settings, and
+/// `VIRTKIT_SERVICE_EXEC=1` when its host serves its services' `vk exec`.
+fn guest_service_exec(cmdline: &str) -> Option<bool> {
+    let mut words = cmdline.split_ascii_whitespace();
+    if !words.clone().any(|w| w.starts_with("VIRTKIT_")) {
+        return None;
+    }
+    Some(words.any(|w| w == "VIRTKIT_SERVICE_EXEC=1"))
+}
+
+/// Rebuild `vk exec --service` without a target for [`GUEST_AGENT`]'s `exec --service` from
+/// parsed flags, excluding this vk's global flags (`--config`).
 fn guest_vk_exec_argv(cmd: &Cmd) -> Option<Vec<String>> {
     let Cmd::Exec {
         target: None,
@@ -6624,7 +6648,30 @@ mod tests {
         );
     }
 
-    /// An image's `vk exec --service` reaches the guest `vk` as the same request, rebuilt
+    /// A vk guest is one booted with `VIRTKIT_*` settings; it has service exec with
+    /// `VIRTKIT_SERVICE_EXEC=1` exactly.
+    #[test]
+    fn a_vk_guest_has_service_exec_when_its_cmdline_says_so() {
+        assert_eq!(
+            guest_service_exec("BOOT_IMAGE=/vmlinuz root=/dev/sda1 quiet"),
+            None
+        );
+        assert_eq!(guest_service_exec(""), None);
+        assert_eq!(
+            guest_service_exec("console=ttyS0 VIRTKIT_VSOCK_PORT=4444\n"),
+            Some(false)
+        );
+        assert_eq!(
+            guest_service_exec("VIRTKIT_VSOCK_PORT=4444 VIRTKIT_SERVICE_EXEC=1\n"),
+            Some(true)
+        );
+        assert_eq!(
+            guest_service_exec("VIRTKIT_VSOCK_PORT=4444 VIRTKIT_SERVICE_EXEC=0"),
+            Some(false)
+        );
+    }
+
+    /// An image's `vk exec --service` reaches the guest agent as the same request, rebuilt
     /// without this vk's own flags; one with a target, or no service, stays here.
     #[test]
     fn the_guest_vk_gets_the_exec_rebuilt_without_global_flags() {
@@ -6679,7 +6726,7 @@ mod tests {
 
     /// The service-exec wrapper puts the guest's argv after `--`, so a word the guest chose
     /// is never one of this vk's own flags: `--config=/x` in the program's slot stays the
-    /// guest's argv[0], reaches no config, and is refused as not the guest's `vk`.
+    /// guest's argv[0], reaches no config, and is refused as not a service exec request.
     #[tokio::test]
     async fn service_exec_keeps_the_guests_argv_away_from_vk_flags() {
         let cli = Cli::try_parse_from([

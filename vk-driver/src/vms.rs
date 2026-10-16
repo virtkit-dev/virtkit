@@ -519,7 +519,7 @@ pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
 /// Whether a VM still answers to `dir`. Anything short of a definite "nothing matches" —
 /// an unreadable registry, two VMs matching — counts as still there: `vk logs -f` ends its
 /// stream on a `false` and must not do that over a transient, and an image's `vk exec
-/// --service` hands off to the guest `vk` only on a `false`, keeping anything unsure local.
+/// --service` hands off to the guest agent only on a `false`, keeping anything unsure local.
 pub fn still_registered(dir: Option<&Path>) -> bool {
     !matches!(matching(dir), Ok((_, m)) if m.is_empty())
 }

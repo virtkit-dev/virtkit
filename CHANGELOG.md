@@ -4,13 +4,26 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Guests reach their compose services with `vk-agent exec --service`; `vk` in a guest is
+  only ever a full `vk`.** The agent no longer answers as `/run/vk/bin/vk`. A CI job's script
+  or a compose primary's command with no `vk` of its own runs `vk-agent exec --service NAME
+  -- CMD` instead of `vk exec --service`, with the same flags, and `vk-agent service` instead
+  of `vk service`; `/run/vk/bin`, which holds the agent, stays last on the `PATH`. A full
+  `vk` in the guest, the image's own or one mounted there, still runs `vk exec --service`,
+  now through the agent.
+
 ### Fixed
 
 - **`vk exec --service` works in a `vk dev` environment with `[dev.host]` host commands**,
   and in a `vk run --compose` primary with `--host-exec-wrapper`. The host command channel
-  serves both: a command named `vk` runs only `vk exec --service` into this environment's
+  serves both: a request named `vk` runs only `vk exec --service` into this environment's
   services, and every other command goes to the host policy as before. The state dir must
   then be out of the guest's reach, as without host commands.
+- **Inside a vk guest without service exec, a full `vk`'s `vk exec --service` says why** —
+  turned off, a host command channel opened whole, an image init, no compose services —
+  instead of `no running vk VM for <dir>`.
 
 ## [0.92.1] - 2026-10-16
 

@@ -25,8 +25,9 @@ struct Cli {
     /// systemd:// is socket activation (serve only); vsock://[cid:]port; vsock-auto://path:port
     /// is a VMM's per-port socket for a guest port (connect only). tcp://host:port carries raw
     /// bytes only — a forward end, `connect` or `ssh-serve` — and the agent protocol refuses it.
+    /// Required, except by `exec --service`, which defaults to the host command channel.
     #[arg(short, long, value_name = "ADDR")]
-    socket: SocketAddr,
+    socket: Option<SocketAddr>,
 
     #[command(subcommand)]
     command: Commands,
@@ -34,12 +35,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run a command on the agent at --socket
+    /// Run a command on the agent at --socket, or in a compose service with --service
     #[command(arg_required_else_help = true)]
     Exec {
         /// Log this client's protocol activity to this file
         #[arg(long, value_name = "PATH")]
         debug_log: Option<PathBuf>,
+
+        /// Run it in this compose service of the VM, through its host
+        ///
+        /// The VM's host runs it with `vk exec --service NAME`, over the host command channel
+        /// (--socket, default /run/vk/host.sock), into this VM's own services only: a CI job
+        /// VM's, a `vk run --compose` primary's, a `vk dev` environment's.
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
 
         /// Background mode: no stdio, do not wait for the command to exit
         #[arg(short, long)]
@@ -187,21 +196,6 @@ enum Commands {
 }
 
 fn main() {
-    // Invoked as `vk` (init links it so in a CI job VM or a compose run's primary): `vk service`
-    // goes to the service manager; anything else, as is, to the host's `vk` over the host
-    // command channel, which runs `vk exec --service` into the VM's own services and nothing
-    // else. A terminal on both ends gets a pty.
-    if std::env::args_os()
-        .next()
-        .and_then(|a| {
-            std::path::Path::new(&a)
-                .file_name()
-                .map(|n| n == std::ffi::OsStr::new("vk"))
-        })
-        .unwrap_or(false)
-    {
-        std::process::exit(guest_vk());
-    }
     // The compose control filesystem (no --socket: it dials the manager over
     // vsock itself); handled before clap since init forks it with plain args.
     let args: Vec<String> = std::env::args().collect();
@@ -305,6 +299,12 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::tools::main(&rest));
     }
+    // The compose services of a `vk run --compose` primary or a `vk dev` environment (no
+    // socket): `vk-agent service up|down|reboot|status [NAME]`, answered by the service manager.
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(guest_service(&rest));
+    }
     // The run's environment (no socket), for login shells and anything else the agent did not
     // start: `vk-agent env --export|--print0|--exec`.
     if std::env::args().nth(1).as_deref() == Some("env") {
@@ -336,7 +336,23 @@ fn main() {
         return;
     }
     let cli_args = Cli::parse();
-    let socket = cli_args.socket;
+    if let Commands::Exec {
+        service: Some(service),
+        ..
+    } = &cli_args.command
+    {
+        let socket = cli_args.socket.clone();
+        let argv = service_exec_argv(service, &cli_args.command);
+        std::process::exit(service_exec(socket, argv, wants_tty(&cli_args.command)));
+    }
+    let Some(socket) = cli_args.socket else {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--socket is required",
+            )
+            .exit()
+    };
     // PID 1 init is synchronous (it forks + reaps): handle it before any tokio
     // runtime exists. Every other subcommand runs on a runtime.
     if let Commands::Init { inactivity_timeout } = cli_args.command {
@@ -350,45 +366,91 @@ fn main() {
         .block_on(async_main(socket, cli_args.command));
 }
 
-/// The guest's `vk`: `vk service` answered by the service manager, anything else run as
-/// `vk …` by the host through the host command channel at `/run/vk/host.sock`. Its exit
-/// status, or 1 when the host cannot be reached.
-fn guest_vk() -> i32 {
-    const HOST_SOCK: &str = "/run/vk/host.sock";
-    let Ok(args) = std::env::args_os()
-        .skip(1)
-        .map(std::ffi::OsString::into_string)
-        .collect::<Result<Vec<String>, _>>()
+/// The host command channel a guest reaches its host through.
+const HOST_SOCK: &str = "/run/vk/host.sock";
+
+/// What `vk-agent exec --service` asks the VM's host: `vk exec --service NAME … -- CMD…`,
+/// the one form a service exec channel runs, `vk` first — the name the host routes on.
+fn service_exec_argv(service: &str, exec: &Commands) -> Vec<String> {
+    let Commands::Exec {
+        background,
+        clear_env,
+        env,
+        dir,
+        tty,
+        user,
+        cmd,
+        args,
+        ..
+    } = exec
     else {
-        eprintln!("vk: an argument is not valid UTF-8");
-        return 2;
+        unreachable!("service_exec_argv of an exec");
     };
-    if args.first().map(String::as_str) == Some("service") {
-        return guest_vk_service(&args[1..]);
+    let mut argv = ["vk", "exec", "--service", service]
+        .map(String::from)
+        .to_vec();
+    for (set, flag) in [
+        (*background, "--background"),
+        (*tty, "--tty"),
+        (*clear_env, "--clear-env"),
+    ] {
+        if set {
+            argv.push(flag.to_string());
+        }
     }
-    let Ok(socket) = HOST_SOCK.parse::<SocketAddr>() else {
-        return 1;
+    for (flag, value) in [("--user", user), ("--dir", dir)] {
+        if let Some(value) = value {
+            argv.extend([flag.to_string(), value.clone()]);
+        }
+    }
+    for e in env {
+        argv.extend(["--env".to_string(), e.clone()]);
+    }
+    argv.push("--".to_string());
+    argv.push(cmd.clone());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// Whether `exec` asked for a pty.
+fn wants_tty(exec: &Commands) -> bool {
+    matches!(exec, Commands::Exec { tty: true, .. })
+}
+
+/// `vk-agent exec --service`: `argv` run by the VM's host over its host command channel at
+/// `socket` (default [`HOST_SOCK`]). Its exit status, or 1 when the host cannot be reached.
+fn service_exec(socket: Option<SocketAddr>, argv: Vec<String>, tty: bool) -> i32 {
+    let socket = match socket {
+        Some(socket) => socket,
+        None => {
+            if !std::path::Path::new(HOST_SOCK).exists() {
+                eprintln!(
+                    "vk-agent: this VM has no host command channel: `exec --service` is for CI \
+                     jobs, `vk run --compose` primaries and `vk dev` environments with compose \
+                     services"
+                );
+                return 1;
+            }
+            match HOST_SOCK.parse::<SocketAddr>() {
+                Ok(socket) => socket,
+                Err(_) => return 1,
+            }
+        }
     };
-    if !std::path::Path::new(HOST_SOCK).exists() {
-        eprintln!(
-            "vk: this VM has no host command channel: `vk exec --service` is for CI jobs and \
-             `vk run --compose` primaries with compose services"
-        );
-        return 1;
-    }
+    let mut argv = argv.into_iter();
+    let name = argv.next().unwrap_or_default();
     // A pty only when asked for (it merges stderr into stdout), and only on a terminal.
     // SAFETY: isatty on the inherited stdio fds.
-    let tty =
-        (asks_for_tty(&args) && unsafe { libc::isatty(0) } == 1 && unsafe { libc::isatty(1) } == 1)
-            .then(Tty::local);
+    let tty = (tty && unsafe { libc::isatty(0) } == 1 && unsafe { libc::isatty(1) } == 1)
+        .then(Tty::local);
     let ran = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("building the tokio runtime")
         .block_on(execute(
             socket,
-            "vk".into(),
-            args,
+            name,
+            argv.collect(),
             false,
             Vec::new(),
             RunMode::Interactive,
@@ -409,32 +471,20 @@ fn guest_vk() -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("vk: {e:#}");
+            eprintln!("vk-agent: {e:#}");
             1
         }
     }
 }
 
-/// Whether the guest `vk`'s `args` ask for a pty: `-t`/`--tty`, alone or among short flags,
-/// before the `--` that starts the command.
-fn asks_for_tty(args: &[String]) -> bool {
-    args.iter().take_while(|a| *a != "--").any(|a| {
-        a == "--tty"
-            || a.strip_prefix('-').is_some_and(|short| {
-                !short.starts_with('-')
-                    && !short.is_empty()
-                    && short.bytes().all(|b| b.is_ascii_alphabetic())
-                    && short.contains('t')
-            })
-    })
-}
-
-/// Run `vk service up|down|reboot|status` in a compose primary through the host's service
-/// manager over the VM's control plane, like `/run/vk/services`, without a host command.
-fn guest_vk_service(args: &[String]) -> i32 {
+/// `vk-agent service OP [NAME]`: the service manager's answer to `args`.
+fn guest_service(args: &[String]) -> i32 {
     use vk_core::fleetctl::{Client, NoManager, SERVICE_USAGE, ServiceOp};
     let Some(op) = ServiceOp::parse(args) else {
-        eprintln!("{SERVICE_USAGE}");
+        eprintln!(
+            "{}",
+            SERVICE_USAGE.replace("vk service", "vk-agent service")
+        );
         return 2;
     };
     let reply = tokio::runtime::Builder::new_current_thread()
@@ -449,13 +499,13 @@ fn guest_vk_service(args: &[String]) -> i32 {
         }
         Err(e) if e.downcast_ref::<NoManager>().is_some() => {
             eprintln!(
-                "vk: {e:#}\nvk: `vk service` needs a service manager, which a `vk run --compose` \
-                 primary has; a CI job's services are fixed for the job"
+                "vk-agent: {e:#}\nvk-agent: `service` needs a service manager, which a `vk run \
+                 --compose` primary has; a CI job's services are fixed for the job"
             );
             1
         }
         Err(e) => {
-            eprintln!("vk: {e:#}");
+            eprintln!("vk-agent: {e:#}");
             1
         }
     }
@@ -494,6 +544,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
     match command {
         Commands::Exec {
             debug_log,
+            service: _,
             cmd,
             args,
             clear_env,
@@ -677,25 +728,76 @@ async fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, asks_for_tty};
+    use super::{Cli, Commands, service_exec_argv, wants_tty};
 
-    /// The guest `vk` asks for a pty for `-t`/`--tty` before the command only.
+    /// `exec --service` asks the host for the service exec form, `vk exec --service`, `vk`
+    /// first, its flags before the `--` and the command after it, a `-t` in the command
+    /// left there.
     #[test]
-    fn the_guest_vk_asks_for_a_pty_only_with_tty() {
-        let asks = |a: &[&str]| asks_for_tty(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert!(asks(&["exec", "--service", "db", "-t", "--", "sh"]));
-        assert!(asks(&["exec", "--tty", "--service", "db", "--", "sh"]));
-        assert!(!asks(&["exec", "--service", "db", "--", "ls", "-t"]));
-        assert!(!asks(&[
+    fn exec_service_asks_the_host_for_the_service_exec_form() {
+        use clap::Parser;
+        let asked = |a: &[&str]| {
+            let cli = Cli::try_parse_from(a).unwrap();
+            let Commands::Exec {
+                service: Some(service),
+                ..
+            } = &cli.command
+            else {
+                panic!("expected exec --service: {a:?}")
+            };
+            (
+                service_exec_argv(service, &cli.command),
+                wants_tty(&cli.command),
+                cli.socket.is_none(),
+            )
+        };
+        let (argv, tty, default_socket) = asked(&[
+            "vk-agent",
             "exec",
             "--service",
             "db",
+            "-t",
+            "--user",
+            "pg",
             "--env",
-            "T=t",
+            "A=1",
             "--",
-            "sh"
-        ]));
-        assert!(!asks(&["exec", "--service=tty", "--", "sh"]));
+            "ls",
+            "-t",
+        ]);
+        assert_eq!(
+            argv,
+            [
+                "vk",
+                "exec",
+                "--service",
+                "db",
+                "--tty",
+                "--user",
+                "pg",
+                "--env",
+                "A=1",
+                "--",
+                "ls",
+                "-t"
+            ]
+        );
+        assert!(tty);
+        assert!(default_socket);
+        let (argv, tty, _) = asked(&["vk-agent", "exec", "--service", "db", "--", "-x"]);
+        assert_eq!(argv, ["vk", "exec", "--service", "db", "--", "-x"]);
+        assert!(!tty);
+        let (_, _, default_socket) = asked(&[
+            "vk-agent",
+            "-s",
+            "/tmp/h.sock",
+            "exec",
+            "--service",
+            "db",
+            "--",
+            "true",
+        ]);
+        assert!(!default_socket);
     }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with
