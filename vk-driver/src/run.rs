@@ -1882,16 +1882,10 @@ async fn build_and_boot(
 
     // --host-exec: the guest agent presents /run/vk/host.sock, relayed over vsock
     // to a host-side `vk-agent serve` (spawned after boot, below).
-    if args.host_exec {
+    let service_exec = wants_service_exec(args, !planned.units.is_empty());
+    if args.host_exec || service_exec {
         cmdline.push_str(&format!(" VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT}"));
     }
-    // A compose run's primary gets a `vk` that runs `vk exec --service` into the run's
-    // services, over the same channel confined to that form — unless --host-exec opened it
-    // whole, or --no-service-exec turned it off. An image init runs no agent init to give it.
-    let service_exec = !args.host_exec
-        && !args.no_service_exec
-        && !args.init.is_image()
-        && !planned.units.is_empty();
     if service_exec {
         check_service_exec_state_dir(
             work,
@@ -1901,9 +1895,7 @@ async fn build_and_boot(
                 .chain(compose_units.iter().flat_map(|u| &u.volumes)),
             args.workdir.as_deref(),
         )?;
-        cmdline.push_str(&format!(
-            " VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT} VIRTKIT_VK_CMD=1"
-        ));
+        cmdline.push_str(" VIRTKIT_VK_CMD=1");
         // The command re-exports the image's PATH: keep the guest `vk` on it, last, where the
         // agent puts it for everything else.
         if let Some((_, path)) = image_env.iter_mut().find(|(k, _)| k == "PATH")
@@ -2603,7 +2595,13 @@ async fn build_and_boot(
     // --workdir (else our own), so a relative `exec --dir` resolves against the
     // shared tree; the wrapper (if any) enforces what may run.
     let served = if args.host_exec {
-        Some(spawn_host_exec_serve(&vsock, agent, args, work))
+        Some(spawn_host_exec_serve(
+            &vsock,
+            agent,
+            args,
+            work,
+            service_exec,
+        ))
     } else if service_exec {
         Some(crate::vm::spawn_service_exec_serve_at(&vsock, work, agent))
     } else {
@@ -3872,16 +3870,35 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
 /// commands it runs (docker, a browser, …) have a working host PATH/HOME; the
 /// wrapper's own allowlist gates the *client* env on top.
 /// Long-lived for the VM's lifetime; the caller kills it on teardown, and
-/// `spawn_tied` reaps it if virtkit dies first.
-fn spawn_host_exec_serve(vsock: &Path, agent: &Path, args: &RunArgs, work: &Path) -> Result<Child> {
+/// `spawn_tied` reaps it if virtkit dies first. Its log is capped: the guest decides how
+/// much it says.
+///
+/// With `service_exec` (a wrapper is then given, [`wants_service_exec`]), a command named `vk`
+/// goes to `vk service-exec <work>` instead of the wrapper: the guest `vk`'s `vk exec
+/// --service` into this run's own services, at most as many at once as on a channel that
+/// serves nothing else.
+fn spawn_host_exec_serve(
+    vsock: &Path,
+    agent: &Path,
+    args: &RunArgs,
+    work: &Path,
+    service_exec: bool,
+) -> Result<Child> {
     let listen = crate::vmm::hybrid_socket(vsock, HOST_EXEC_PORT);
+    let services = service_exec
+        .then(|| crate::vm::service_exec_wrapper(work))
+        .transpose()?;
     let log = std::fs::File::create(work.join("host-exec-serve.log"))
         .context("creating the host-exec serve log")?;
+    let log = crate::vm::capped_log_pipe(log, crate::vm::SERVICE_EXEC_LOG_MAX)?;
     let mut cmd = Command::new(agent);
     cmd.args(host_exec_serve_args(
         &listen,
         args.host_exec_wrapper.as_deref(),
         &args.host_exec_env,
+        services
+            .as_ref()
+            .map(|(exe, wrapper_args)| (exe.as_path(), wrapper_args.as_slice())),
     ));
     if let Some(dir) = &args.workdir {
         cmd.current_dir(dir);
@@ -3896,10 +3913,17 @@ fn spawn_host_exec_serve(vsock: &Path, agent: &Path, args: &RunArgs, work: &Path
 /// allowlist wrapper (`--exec-wrapper`) and its client-env globs
 /// (`--exec-wrapper-env`) when a wrapper was given. Without a wrapper the serve
 /// runs commands unrestricted — the opt-in contract of `--host-exec`.
+///
+/// `services` — this vk and its arguments, [`crate::vm::service_exec_wrapper`] — routes a
+/// command named `vk` beside a wrapper to `vk service-exec <dir> -- …` (`--vk-wrapper`), which
+/// runs only `vk exec --service` into that dir's services, at most
+/// [`crate::vm::SERVICE_EXEC_MAX_CONCURRENT`] at once; without a wrapper there is nothing to
+/// route around.
 fn host_exec_serve_args(
     listen: &Path,
     wrapper: Option<&Path>,
     env_globs: &[String],
+    services: Option<(&Path, &[String])>,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec!["-s".into(), listen.into(), "serve".into()];
     if let Some(wrapper) = wrapper {
@@ -3909,8 +3933,31 @@ fn host_exec_serve_args(
             argv.push("--exec-wrapper-env".into());
             argv.push(glob.into());
         }
+        if let Some((vk, vk_args)) = services {
+            argv.push("--vk-wrapper".into());
+            argv.push(vk.into());
+            for arg in vk_args {
+                argv.push("--vk-wrapper-arg".into());
+                argv.push(arg.into());
+            }
+            argv.push("--vk-wrapper-max-concurrent".into());
+            argv.push(crate::vm::SERVICE_EXEC_MAX_CONCURRENT.to_string().into());
+        }
     }
     argv
+}
+
+/// Whether a compose run's primary gets a `vk` that runs `vk exec --service` into the run's
+/// services (`has_services`), over its host command channel confined to that form. Beside a
+/// `--host-exec-wrapper` (a `vk dev` environment's host commands) the channel serves both,
+/// each confined to its own; `--host-exec` without a wrapper opens the channel whole, which
+/// already runs anything. Never with --no-service-exec, nor with an image init, which runs
+/// no agent init to give it.
+fn wants_service_exec(args: &RunArgs, has_services: bool) -> bool {
+    (!args.host_exec || args.host_exec_wrapper.is_some())
+        && !args.no_service_exec
+        && !args.init.is_image()
+        && has_services
 }
 
 /// How `--ssh-agent`/`--ssh-host`/`[dev.ssh]` resolve for a launch: the host agent socket to
@@ -6953,7 +7000,7 @@ mod tests {
         let listen = Path::new("/run/vsock.sock_1100");
         // no wrapper: a bare unrestricted serve, no --exec-wrapper* flags
         assert_eq!(
-            host_exec_serve_args(listen, None, &["LC_*".into()]),
+            host_exec_serve_args(listen, None, &["LC_*".into()], None),
             ["-s", "/run/vsock.sock_1100", "serve"].map(OsString::from)
         );
         // a wrapper carries its client-env globs through; none without it
@@ -6961,7 +7008,8 @@ mod tests {
             host_exec_serve_args(
                 listen,
                 Some(Path::new("/opt/allow")),
-                &["LC_*".into(), "TERM".into()]
+                &["LC_*".into(), "TERM".into()],
+                None,
             ),
             [
                 "-s",
@@ -6976,6 +7024,66 @@ mod tests {
             ]
             .map(OsString::from)
         );
+        // Service exec beside the wrapper: a command named `vk` goes to `vk service-exec`,
+        // the guest's words after its `--`; nothing to route around without a wrapper.
+        let vk_args = ["service-exec".into(), "/state/run".into(), "--".into()];
+        let services = Some((Path::new("/usr/bin/vk"), vk_args.as_slice()));
+        assert_eq!(
+            host_exec_serve_args(listen, Some(Path::new("/opt/allow")), &[], services),
+            [
+                "-s",
+                "/run/vsock.sock_1100",
+                "serve",
+                "--exec-wrapper",
+                "/opt/allow",
+                "--vk-wrapper",
+                "/usr/bin/vk",
+                "--vk-wrapper-arg",
+                "service-exec",
+                "--vk-wrapper-arg",
+                "/state/run",
+                "--vk-wrapper-arg",
+                "--",
+                "--vk-wrapper-max-concurrent",
+                "4",
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            host_exec_serve_args(listen, None, &[], services),
+            ["-s", "/run/vsock.sock_1100", "serve"].map(OsString::from)
+        );
+    }
+
+    /// Service exec comes with services, beside restricted host commands too, and not with
+    /// a channel opened whole, --no-service-exec, or an image init.
+    #[test]
+    fn service_exec_comes_with_services_unless_the_channel_is_whole() {
+        let base = RunArgs::default();
+        assert!(wants_service_exec(&base, true));
+        assert!(!wants_service_exec(&base, false));
+        let restricted = RunArgs {
+            host_exec: true,
+            host_exec_wrapper: Some(PathBuf::from("/state/host-exec-wrapper")),
+            ..RunArgs::default()
+        };
+        assert!(wants_service_exec(&restricted, true));
+        assert!(!wants_service_exec(&restricted, false));
+        let whole = RunArgs {
+            host_exec: true,
+            ..RunArgs::default()
+        };
+        assert!(!wants_service_exec(&whole, true));
+        let off = RunArgs {
+            no_service_exec: true,
+            ..restricted
+        };
+        assert!(!wants_service_exec(&off, true));
+        let image_init = RunArgs {
+            init: InitSource::Image,
+            ..RunArgs::default()
+        };
+        assert!(!wants_service_exec(&image_init, true));
     }
 
     #[test]

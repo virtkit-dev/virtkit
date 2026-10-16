@@ -11,6 +11,16 @@ All notable changes to virtkit will be documented in this file.
   foreground only, so a restricted host command channel can also serve `vk` under its
   own policy.
 
+### Changed
+
+- **`vk exec --service` works in a `vk dev` environment with `[dev.host]` host commands**,
+  and in a `vk run --compose` primary with `--host-exec-wrapper`. The host command channel
+  serves both: a command named `vk` runs only `vk exec --service` into this environment's
+  services, and every other command goes to the host policy as before. The policy no
+  longer receives a command named `vk`, and such a run's `--state-dir` must be out of the
+  guest's reach, as without host commands; `vk run --no-service-exec` keeps the old
+  channel.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed

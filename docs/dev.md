@@ -369,8 +369,9 @@ start an application.
 
 Inside the primary, `vk exec --service NAME -- CMD` runs a command in one of its
 services, as in `vk run --compose`. The host allows only that form, into this
-environment's services. With `[dev.host]` host commands, the environment has
-the whole host command channel instead, without this `vk`.
+environment's services. With `[dev.host]` host commands the channel serves both:
+a command named `vk` goes to service exec, and every other command to the host
+policy, which never sees `vk`.
 
 ```sh
 vk dev service status
@@ -805,6 +806,9 @@ for it to check before entering it.
 can call `vk host-policy git-gui` itself. That reads `$VK_EXEC_DIR` relative to its own
 working directory, so call it before changing directory, or unset `VK_EXEC_DIR` once you
 have entered it.
+When the environment has compose services, a command named `vk` never reaches the
+policy or dispatcher: it is the primary's `vk exec --service`, which the host confines to
+this environment's services.
 
 These are explicit host capabilities. A strict config schema does not sandbox a
 host hook or custom dispatcher, and a writable host mount lets guest code modify

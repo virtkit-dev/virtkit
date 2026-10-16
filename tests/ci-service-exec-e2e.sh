@@ -15,7 +15,11 @@
 #   4. a `vk run --compose` primary reaches its services the same way and the service manager
 #      with `vk service`; --no-service-exec removes its `vk` and channel, and a state dir the
 #      guest can write is refused;
-#   5. an image's own `vk` hands `vk exec --service` off to the guest one.
+#   5. an image's own `vk` hands `vk exec --service` off to the guest one;
+#   6. beside a --host-exec-wrapper (a `vk dev` environment's `[dev.host]`), the primary keeps
+#      its `vk exec --service`, the wrapper runs every other command and never sees `vk`, and
+#      neither takes the other's form; with --no-service-exec the wrapper gets `vk` too, and a
+#      state dir the guest can write is refused there as well.
 #
 # Run:  VK=./dist/vk tests/ci-service-exec-e2e.sh
 # Needs: a `vk` with an embedded agent and kernel, KVM, and network to pull alpine and debian.
@@ -204,5 +208,49 @@ echo "== 5. an image's own vk hands off =="
     [ "$(command -v vk)" = /usr/local/bin/vk ] &&
     [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]' \
   >"$root/stage.log" 2>&1 || fail "the image's vk did not reach the service"
+echo "ok"
+
+echo "== 6. service exec beside host commands =="
+# The host policy: `echo` alone, and a record of every command that reached it.
+cat >"$root/policy" <<EOF
+#!/bin/sh
+echo "\$*" >>'$root/policy.log'
+[ "\$1" = echo ] || { echo "policy: \$1 is not allowed" >&2; exit 126; }
+exec "\$@"
+EOF
+chmod 0700 "$root/policy"
+: >"$root/policy.log"
+"$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" \
+  --host-exec --host-exec-wrapper "$root/policy" alpine:3.21 -- sh -c 'set -e
+    [ "$(vk exec --service db -- cat /tmp/marker)" = served-by-db ]
+    raw="/run/vk/bin/vk-agent -s /run/vk/host.sock exec"
+    [ "$($raw -- echo host-ok)" = host-ok ]
+    # `vk` goes to service exec alone, which refuses another `vk` command or service.
+    if $raw -- vk version 2>err; then exit 1; fi
+    grep -q "unrecognized subcommand" err
+    if $raw -- vk exec --service nope -- true 2>err; then exit 1; fi
+    grep -q "no service" err
+    # A path to a vk, or `vk` after another word, goes to the policy.
+    if $raw -- /usr/local/bin/vk exec --service db -- true 2>err; then exit 1; fi
+    grep -q "not allowed" err
+    if $raw -- env vk exec --service db -- true 2>err; then exit 1; fi
+    grep -q "not allowed" err' \
+  >"$root/stage.log" 2>&1 || fail "service exec and host commands did not both work"
+if grep -q "^vk " "$root/policy.log"; then fail "the policy saw the guest vk's request"; fi
+grep -q "^echo host-ok" "$root/policy.log" || fail "the policy did not run the host command"
+: >"$root/policy.log"
+"$VK" run --state-dir "$root/run-state" --compose "$root/run.compose.yaml" --no-service-exec \
+  --host-exec --host-exec-wrapper "$root/policy" alpine:3.21 -- sh -c '
+    raw="/run/vk/bin/vk-agent -s /run/vk/host.sock exec"
+    if $raw -- vk version 2>err; then exit 1; fi
+    grep -q "not allowed" err' \
+  >"$root/stage.log" 2>&1 || fail "the policy did not refuse vk with --no-service-exec"
+grep -q "^vk version" "$root/policy.log" || fail "the policy did not get vk with --no-service-exec"
+if "$VK" run --state-dir "$root/share/state" --workdir "$root/share" \
+  --compose "$root/run.compose.yaml" --host-exec --host-exec-wrapper "$root/policy" \
+  alpine:3.21 -- true >"$root/stage.log" 2>&1; then
+  fail "the primary booted beside host commands with a state dir the guest can write"
+fi
+grep -q -- "--no-service-exec" "$root/stage.log" || fail "the refusal does not name the way out"
 echo "ok"
 echo "PASS"
