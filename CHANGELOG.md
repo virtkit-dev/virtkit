@@ -11,6 +11,17 @@ All notable changes to virtkit will be documented in this file.
   the default environment allowlist and a separate concurrency cap
   (`--vk-wrapper-max-concurrent`).
 
+### Changed
+
+- **`vk exec --service` works in a `vk dev` environment with `[dev.host]` host commands**,
+  and in a `vk run --compose` primary with `--host-exec-wrapper`. The host command channel
+  serves both: a command named `vk` runs only `vk exec --service` into this environment's
+  services, and every other command goes to the host policy as before. The policy no
+  longer receives a command named `vk`, and such a run's `--state-dir` must be out of the
+  guest's reach, as without host commands; `vk run --no-service-exec` keeps the old
+  channel, and `vk dev` has no such switch. The `--host-exec` serve log now keeps its
+  first 1 MiB, like service exec's.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed

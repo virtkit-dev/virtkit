@@ -488,9 +488,11 @@ flags. The primary needs no `vk` of its own for either: `/run/vk/bin/vk`, last o
 `PATH`, asks the service manager for `vk service`, and passes `vk exec --service` to the
 host over the primary's host command channel. The host runs that one form, into this run's
 services, and nothing else; an image's own `vk` hands off to it. `--no-service-exec` turns
-it off, and `--host-exec` replaces this restricted channel, and that `vk`, with the whole
-channel. The run's `--state-dir` must then be out of the guest's reach: not in a read-write
-volume nor under `--workdir`.
+it off. With `--host-exec-wrapper` the channel serves both: a command named `vk` goes to
+service exec, every other to the wrapper. `--host-exec` without a wrapper replaces this
+restricted channel, and that `vk`, with the whole channel. While service exec is on, with or
+without a wrapper, the run's `--state-dir` must be out of the guest's reach: not in a
+read-write volume nor under `--workdir`.
 
 `vk run --ssh` enables SSH access for development VMs, including VS Code Remote-SSH
 workflows. In a CI fleet a service's `environment:` may also carry its own egress allowlist

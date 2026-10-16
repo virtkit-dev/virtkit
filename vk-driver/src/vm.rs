@@ -1995,11 +1995,36 @@ fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::
 
 /// How many of a VM's `vk exec --service` its host runs at once: each is a host `vk` (and a
 /// pty with `-t`), outside the VM's own limits. One past it is refused.
-const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
+pub(crate) const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
 
-/// The most of a service exec channel's log that is kept, the rest dropped: the guest decides
-/// how many requests it makes, so how much the log says.
-const SERVICE_EXEC_LOG_MAX: u64 = 1 << 20;
+/// Log bytes kept for service exec or --host-exec; the rest are dropped.
+/// The guest controls request volume and therefore log volume.
+pub(crate) const SERVE_LOG_MAX: u64 = 1 << 20;
+
+/// Build `vk service-exec <dir> --` to restrict host requests to `vk exec --service`
+/// into `svc-<name>` services under `dir`. Guest arguments follow `--`; `dir` is absolute
+/// because the serve may run elsewhere. Resolve this vk's path now: a `vk update` during
+/// the VM's lifetime replaces that binary, so later requests run the updated version.
+pub(crate) fn service_exec_command(dir: &Path) -> Result<(PathBuf, [String; 3])> {
+    let exe = std::env::current_exe().context("finding the vk binary")?;
+    let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let dir = dir
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
+    Ok((exe, ["service-exec".into(), dir.into(), "--".into()]))
+}
+
+/// Pipe serve output to a thread that keeps at most `max` bytes in `log`; the guest controls
+/// output volume. The thread ends when every write end closes.
+pub(crate) fn capped_log_pipe(log: std::fs::File, max: u64) -> Result<std::io::PipeWriter> {
+    let (log_read, log_write) = std::io::pipe().context("creating a log pipe")?;
+    std::thread::spawn(move || {
+        if let Err(e) = copy_capped(log_read, log, max) {
+            eprintln!("virtkit: a serve log: {e}");
+        }
+    });
+    Ok(log_write)
+}
 
 /// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
 /// serve`, every command forced through `vk service-exec <dir> -- …` (the guest's argv only
@@ -2007,30 +2032,30 @@ const SERVICE_EXEC_LOG_MAX: u64 = 1 << 20;
 /// `dir` — a CI job's dir, or a `vk run --compose`'s — and nothing else. It runs in `dir` as
 /// the serve's user, whatever directory or user the guest asks for, in the foreground of its
 /// session, at most [`SERVICE_EXEC_MAX_CONCURRENT`] at once. Its log is
-/// `dir/service-exec.log`, at most [`SERVICE_EXEC_LOG_MAX`] bytes of it.
+/// `dir/service-exec.log`, at most [`SERVE_LOG_MAX`] bytes of it.
 pub(crate) fn spawn_service_exec_serve_at(
     vsock: &Path,
     dir: &Path,
     agent: &Path,
 ) -> Result<std::process::Child> {
-    // This vk by its path, read now: a `vk update` while the VM runs puts a new binary there,
-    // which the requests from then on run.
-    let exe = std::env::current_exe().context("finding the vk binary")?;
-    let dir_arg = dir
-        .to_str()
-        .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
+    let (exe, wrapper_args) = service_exec_command(dir)?;
     let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
-    let (log_read, log_write) = std::io::pipe().context("creating the service exec log pipe")?;
     let mut cmd = Command::new(agent);
     cmd.arg("-s")
         .arg(&listen)
         .arg("serve")
         .arg("--exec-wrapper")
         .arg(&exe);
-    // `--` ends this vk's own arguments: the guest's words are the guest `vk`'s argv.
-    for arg in ["service-exec", dir_arg, "--"] {
+    for arg in wrapper_args {
         cmd.arg("--exec-wrapper-arg").arg(arg);
     }
+    let log_path = dir.join("service-exec.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let log_write = capped_log_pipe(log, SERVE_LOG_MAX)?;
     cmd.arg("--max-concurrent")
         .arg(SERVICE_EXEC_MAX_CONCURRENT.to_string())
         .arg("--no-background")
@@ -2038,21 +2063,7 @@ pub(crate) fn spawn_service_exec_serve_at(
         .stdin(Stdio::null())
         .stdout(log_write.try_clone()?)
         .stderr(log_write);
-    let log_path = dir.join("service-exec.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("opening {}", log_path.display()))?;
-    let child = crate::spawn::spawn_tied(cmd).context("spawning the service exec channel")?;
-    // Ends with the serve, whose exit closes the pipe; the command above holds the only other
-    // write end, so dropping it here is what lets that happen.
-    std::thread::spawn(move || {
-        if let Err(e) = copy_capped(log_read, log, SERVICE_EXEC_LOG_MAX) {
-            eprintln!("virtkit: the service exec log: {e}");
-        }
-    });
-    Ok(child)
+    crate::spawn::spawn_tied(cmd).context("spawning the service exec channel")
 }
 
 /// Copy `from` to `to` until end of file, keeping the first `max` bytes and a line saying the

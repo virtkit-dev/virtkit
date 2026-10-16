@@ -2332,11 +2332,12 @@ enum Cmd {
         /// allowlist program.
         #[arg(long = "host-exec", help_heading = "Host access from the guest")]
         host_exec: bool,
-        /// force every --host-exec command through this program
+        /// force --host-exec commands through this program
         ///
         /// It receives the requested command line as its arguments and decides what to run. It
         /// runs in the --workdir (else here), as this user; the guest's `exec --dir` reaches it
-        /// as $VK_EXEC_DIR, for it to check and enter.
+        /// as $VK_EXEC_DIR, for it to check and enter. In a --compose primary, a command named
+        /// `vk` goes to service exec instead (see --no-service-exec).
         #[arg(
             long = "host-exec-wrapper",
             value_name = "PROGRAM",
@@ -2357,7 +2358,8 @@ enum Cmd {
         /// give a --compose primary no `vk exec --service` into its services
         ///
         /// By default its `vk` runs that one form, into this run's services, over the
-        /// primary's host command channel; --host-exec replaces it with the whole channel.
+        /// primary's host command channel, beside a --host-exec-wrapper's commands when there
+        /// is one; --host-exec without a wrapper replaces it with the whole channel.
         #[arg(long = "no-service-exec", help_heading = "Host access from the guest")]
         no_service_exec: bool,
         /// the -f/--primary/compose builds may restore from cache but not build
