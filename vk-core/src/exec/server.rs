@@ -113,6 +113,41 @@ pub async fn run_server(
     exec_wrapper_args: Vec<String>,
     limits: Limits,
 ) -> Result<(), anyhow::Error> {
+    run_server_routed(
+        socket,
+        inactivity_timeout,
+        exec_wrapper,
+        exec_wrapper_env,
+        exec_wrapper_args,
+        None,
+        limits,
+    )
+    .await
+}
+
+/// Where a wrapped channel sends a command named exactly `vk` instead of its exec wrapper
+/// ([`run_server_routed`]).
+#[derive(Debug, Clone)]
+pub struct VkRoute {
+    /// The program such a command is forced through.
+    pub path: PathBuf,
+    /// Arguments it gets first, before the requested command line.
+    pub args: Vec<String>,
+}
+
+/// [`run_server`], with a command named exactly `vk` forced through `vk_route` instead of
+/// `exec_wrapper`: with the default environment allowlist only, and never in the background.
+/// The route applies only beside an `exec_wrapper`; a channel without one runs everything
+/// directly.
+pub async fn run_server_routed(
+    socket: &SocketAddr,
+    inactivity_timeout: Option<Duration>,
+    exec_wrapper: Option<PathBuf>,
+    exec_wrapper_env: Vec<String>,
+    exec_wrapper_args: Vec<String>,
+    vk_route: Option<VkRoute>,
+    limits: Limits,
+) -> Result<(), anyhow::Error> {
     // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
     // from reading it as a timeout that has always already elapsed, and hands a zero-timeout
     // caller the fallback watchdog below like any other caller that asked for no timeout.
@@ -121,9 +156,10 @@ pub async fn run_server(
     // Force every exec through this program (like SSH's ForceCommand): it receives
     // the requested command line as its arguments and decides what to run.
     // None = run requested commands directly (the default, unrestricted).
-    let exec_wrapper = Arc::new(
-        exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env, exec_wrapper_args)),
-    );
+    let exec_wrapper = Arc::new(exec_wrapper.map(|path| Wrappers {
+        main: ExecWrapper::new(path, exec_wrapper_env, exec_wrapper_args),
+        vk: vk_route.map(|r| ExecWrapper::new(r.path, Vec::new(), r.args)),
+    }));
     let allow_background = limits.background;
     let first_message_timeout = limits.first_message_timeout;
     let limit = limits.max_concurrent.map(|n| Limit {
@@ -297,6 +333,28 @@ impl ExecWrapper {
     }
 }
 
+/// What a wrapped channel forces its commands through: `main`, or `vk` for a command named
+/// exactly `vk` when there is one.
+struct Wrappers {
+    main: ExecWrapper,
+    vk: Option<ExecWrapper>,
+}
+
+/// The wrapper `cmd` goes through, if any, and whether it may run in the background: a
+/// command named exactly `vk` takes the `vk` route when there is one, in the foreground only;
+/// any other name, a path to a `vk` included, takes the main wrapper.
+fn route<'a>(
+    cmd: &CmdExec,
+    wrappers: Option<&'a Wrappers>,
+    allow_background: bool,
+) -> (Option<&'a ExecWrapper>, bool) {
+    match wrappers {
+        None => (None, allow_background),
+        Some(Wrappers { vk: Some(vk), .. }) if cmd.name == "vk" => (Some(vk), false),
+        Some(w) => (Some(&w.main), allow_background),
+    }
+}
+
 /// Minimal shell-style glob match supporting `*` (any run, incl. empty) and `?`
 /// (one char), used to match env var names against the wrapper allowlist (like
 /// SSH's `AcceptEnv`). No character classes — env var names don't need them.
@@ -370,7 +428,7 @@ async fn do_handle_conn(
     status: &Status,
     mut stream: SerStream,
     sink: DeSink,
-    exec_wrapper: Option<&ExecWrapper>,
+    exec_wrapper: Option<&Wrappers>,
     limit: Option<&Limit>,
     first_message_timeout: Duration,
     allow_background: bool,
@@ -399,6 +457,7 @@ async fn do_handle_conn(
 
     match client_request {
         Message::CmdExec(cmd) => {
+            let (exec_wrapper, allow_background) = route(&cmd, exec_wrapper, allow_background);
             if cmd.mode == RunMode::Background && !allow_background {
                 let msg = "background commands are refused on this channel".to_string();
                 // The refusal is the session's only reply; a client already gone has nothing
@@ -1428,8 +1487,9 @@ async fn writer_task<S: Sink<Message, Error = std::io::Error> + Unpin + Send + '
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecWrapper, SessionUser, TaskState, apply_user, give_tty, glob_match,
-        inactivity_check_period, resolve_gid, resolve_user, run_as, split_user_group, wrap_cmd,
+        ExecWrapper, SessionUser, TaskState, Wrappers, apply_user, give_tty, glob_match,
+        inactivity_check_period, resolve_gid, resolve_user, route, run_as, split_user_group,
+        wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1605,6 +1665,62 @@ mod tests {
         assert_eq!(wrapped.name, "/run/host-dispatch");
         // the requested command line becomes the wrapper's argv
         assert_eq!(wrapped.args, vec!["git", "status"]);
+    }
+
+    /// A command named exactly `vk` takes the `vk` route, in the foreground only; every other
+    /// name, a path to a `vk` or a `vk` with other words around it included, takes the main
+    /// wrapper as before. Without a `vk` route, or without wrappers, nothing changes.
+    #[test]
+    fn route_sends_only_a_command_named_vk_to_the_vk_route() {
+        let wrappers = Wrappers {
+            main: wrapper(vec![]),
+            vk: Some(ExecWrapper::new(
+                PathBuf::from("/usr/bin/vk"),
+                vec![],
+                vec!["service-exec".into()],
+            )),
+        };
+        let named = |name: &str| CmdExec {
+            name: name.into(),
+            ..sample_cmd()
+        };
+        let path_of = |w: Option<&ExecWrapper>| w.map(|w| w.path.clone());
+        let (w, bg) = route(&named("vk"), Some(&wrappers), true);
+        assert_eq!(path_of(w), Some(PathBuf::from("/usr/bin/vk")));
+        assert!(!bg);
+        for other in ["git", "/usr/bin/vk", "./vk", "vk ", "VK", ""] {
+            let (w, bg) = route(&named(other), Some(&wrappers), true);
+            assert_eq!(
+                path_of(w),
+                Some(PathBuf::from("/run/host-dispatch")),
+                "{other:?}"
+            );
+            assert!(bg, "{other:?}");
+        }
+        let main_only = Wrappers {
+            main: wrapper(vec![]),
+            vk: None,
+        };
+        let (w, bg) = route(&named("vk"), Some(&main_only), true);
+        assert_eq!(path_of(w), Some(PathBuf::from("/run/host-dispatch")));
+        assert!(bg);
+        let (w, bg) = route(&named("vk"), None, false);
+        assert!(w.is_none());
+        assert!(!bg);
+    }
+
+    /// The `vk` route lets through only the default client environment, whatever the main
+    /// wrapper's allowlist says.
+    #[test]
+    fn the_vk_route_takes_only_the_default_environment() {
+        let vk = ExecWrapper::new(PathBuf::from("/usr/bin/vk"), vec![], vec![]);
+        let mut cmd = sample_cmd();
+        cmd.env = vec![
+            "VIRTKIT_BOOT_SPEC={}".into(),
+            "MYAPP_TOKEN=abc".into(),
+            "LANG=C".into(),
+        ];
+        assert_eq!(wrap_cmd(cmd, &vk).env, ["LANG=C", "VK_EXEC_DIR=./sub"]);
     }
 
     /// Fixed wrapper arguments come first, so nothing the client sends lands before them.
