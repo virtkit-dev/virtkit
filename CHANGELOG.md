@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-agent serve --vk-wrapper PROGRAM`** gives commands named exactly `vk` a separate
+  program and policy alongside `--exec-wrapper`. They run only in the foreground, with
+  the default environment allowlist and a separate concurrency cap
+  (`--vk-wrapper-max-concurrent`).
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed
