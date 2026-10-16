@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk exec --service` works in a `vk dev` environment with `[dev.host]` host commands**,
+  and in a `vk run --compose` primary with `--host-exec-wrapper`. The host command channel
+  serves both: a command named `vk` runs only `vk exec --service` into this environment's
+  services, and every other command goes to the host policy as before. The state dir must
+  then be out of the guest's reach, as without host commands.
+
 ## [0.92.1] - 2026-10-16
 
 ### Changed
