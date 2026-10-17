@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.93.0] - 2026-10-17
+
 ### Added
 
 - **`vk-agent serve --vk-wrapper PROGRAM`** gives commands named exactly `vk` a separate
@@ -4388,7 +4390,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.92.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.93.0...HEAD
+[0.93.0]: https://github.com/virtkit-dev/virtkit/compare/v0.92.1...v0.93.0
 [0.92.1]: https://github.com/virtkit-dev/virtkit/compare/v0.92.0...v0.92.1
 [0.92.0]: https://github.com/virtkit-dev/virtkit/compare/v0.91.1...v0.92.0
 [0.91.1]: https://github.com/virtkit-dev/virtkit/compare/v0.91.0...v0.91.1
