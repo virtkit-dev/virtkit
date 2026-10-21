@@ -6,14 +6,15 @@ name: CI
 # matches branches, not tags), and release.yml's own pushes of `main` and the tag
 # are made with the workflow token, which triggers no workflow at all.
 #
-# A build job runs after quality — deliberately gated on lint, test and audit, so a push
-# that cannot pass them never spends a build — and uploads the binaries as a GitHub Actions
-# artifact (retention: 1 day). This lets you grab a build from any commit without waiting for
-# a release. Like a release, every run builds the guest kernel and the UEFI firmware from its
-# own commit, each in a job of its own beside the binaries', and embeds them.
+# A build job runs alongside quality, so the two take as long as the longer one, and
+# uploads the binaries as a GitHub Actions artifact (retention: 1 day). This lets you grab a
+# build from any commit without waiting for a release. Like a release, every run builds the
+# guest kernel and the UEFI firmware from its own commit, each in a job of its own beside the
+# binaries', and embeds them.
 #
 # fleet-e2e then runs the fleet's end-to-end tests (tests/fleet-*.sh) against that
-# build: a hub and its nodes booted as microVMs on the runner's KVM.
+# build once quality has passed too: a hub and its nodes booted as microVMs on the runner's
+# KVM.
 
 on:
   push:
@@ -31,7 +32,6 @@ jobs:
     uses: ./.github/workflows/quality.yml
 
   build:
-    needs: [quality]
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: ci
@@ -39,7 +39,7 @@ jobs:
 
   # The scripts also run before every release, with the rest of tests/ (release.yml).
   fleet-e2e:
-    needs: [build]
+    needs: [quality, build]
     runs-on: ubuntu-latest
     # Above the scripts' caps and cleanups combined (4 × (900 + 120 + 70)s), so the loop
     # always ends and reports. The mixed-version and update tests skip here without older or
