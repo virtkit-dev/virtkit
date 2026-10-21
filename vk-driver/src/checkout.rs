@@ -108,9 +108,14 @@ fn is_dir(sx: &Statx) -> bool {
 /// the musl target virtkit ships, which would leave [`tree_id`] nothing but a device and inode to
 /// go on — no discrimination at all on a filesystem that reuses them.
 fn statx(dest: &Path, mask: u32) -> std::io::Result<Statx> {
+    statx_at(dest, libc::AT_SYMLINK_NOFOLLOW, mask)
+}
+
+/// Call `statx(2)` on `path` with `AT_*` flags and the requested `mask`.
+pub(crate) fn statx_at(path: &Path, flags: libc::c_int, mask: u32) -> std::io::Result<Statx> {
     use std::os::unix::ffi::OsStrExt;
 
-    let path = std::ffi::CString::new(dest.as_os_str().as_bytes())
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut buf = std::mem::MaybeUninit::<Statx>::uninit();
     // SAFETY: the kernel writes one `struct statx` through `buf`, which is exactly that size and
@@ -120,7 +125,7 @@ fn statx(dest: &Path, mask: u32) -> std::io::Result<Statx> {
             libc::SYS_statx,
             libc::AT_FDCWD,
             path.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
+            flags,
             mask,
             buf.as_mut_ptr(),
         )
@@ -154,8 +159,8 @@ struct StatxTimestamp {
     dead_code,
     reason = "an ABI mirror: the kernel writes every field, this reads a handful"
 )]
-struct Statx {
-    stx_mask: u32,
+pub(crate) struct Statx {
+    pub(crate) stx_mask: u32,
     stx_blksize: u32,
     stx_attributes: u64,
     stx_nlink: u32,
@@ -173,9 +178,9 @@ struct Statx {
     stx_mtime: StatxTimestamp,
     stx_rdev_major: u32,
     stx_rdev_minor: u32,
-    stx_dev_major: u32,
-    stx_dev_minor: u32,
-    stx_mnt_id: u64,
+    pub(crate) stx_dev_major: u32,
+    pub(crate) stx_dev_minor: u32,
+    pub(crate) stx_mnt_id: u64,
     stx_dio_mem_align: u32,
     stx_dio_offset_align: u32,
     _spare3: [u64; 12],
