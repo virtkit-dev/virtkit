@@ -296,7 +296,9 @@ fn guest_kernel() -> &'static Option<String> {
     static RELEASE: OnceLock<Option<String>> = OnceLock::new();
     RELEASE.get_or_init(|| {
         let asset = crate::embed::Asset::Kernel;
-        match asset.embedded() {
+        // A damaged payload reports no release here; the VMs this node boots, and its
+        // `vk check`, fail on it with the reason.
+        match asset.embedded().ok()? {
             Some(image) => kernel_release(image),
             None => kernel_release(&std::fs::read(asset.default_path()).ok()?),
         }

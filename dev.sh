@@ -3,9 +3,7 @@
 # an interactive shell in a shared vk development VM that shuts down when idle. The
 # mold-linking RUSTFLAGS and shared target/ directory match every build.sh invocation,
 # and the dev profile matches build.sh --fast, so dependency artifacts are reused
-# between the two workflows. The VK_EMBED_* vars build.sh sets are deliberately absent
-# here (they must name an already built agent), so vk-driver's own build script reruns
-# when you alternate the two.
+# between the two workflows.
 #
 # Examples:
 #   ./dev.sh check
