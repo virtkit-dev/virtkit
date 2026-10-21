@@ -171,7 +171,10 @@ DWARF; dependencies get none at all. When you need a debugger, build with cargo'
 `--profile debugging` (`./dev.sh check|test` accept it too) — `build.sh` offers only the
 release and dev profiles.
 
-Both `./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
+`build.sh` compiles, then assembles: the compile leaves a bare `vk` in `dist/vk-bare`, and
+`assemble.sh` appends `dist/vk-agent`, `dist/vmlinux` and any `dist/CLOUDHV*.fd` to it as a
+payload, giving `dist/vk` (read back at runtime by `vk-driver/src/embed.rs`). Both
+`./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
 so `./build-kernel.sh` comes first in a fresh checkout; `--no-kernel` builds a `vk` without
 the embedded kernel instead (it then needs `--kernel` at runtime, and is not shippable).
 

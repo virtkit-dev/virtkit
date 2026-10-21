@@ -447,7 +447,7 @@ pub(crate) fn seed_secure_boot(work: &Path) -> Result<()> {
 /// A variable store template's bytes: embedded in `vk`, else installed beside the firmware's
 /// default path; None when neither is there.
 fn vars_template(asset: crate::embed::Asset) -> Result<Option<Vec<u8>>> {
-    if let Some(bytes) = asset.embedded() {
+    if let Some(bytes) = asset.embedded()? {
         return Ok(Some(bytes.to_vec()));
     }
     match std::fs::read(asset.default_path()) {

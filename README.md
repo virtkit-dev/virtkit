@@ -989,10 +989,11 @@ The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they
 Docker. Pass `--docker` to force Docker. `build.sh --use-virtkit=<dist>` selects a
 specific existing virtkit build.
 
-`vk` normally embeds `dist/vmlinux`, so `build.sh` refuses to proceed when the kernel is
-missing. `--no-kernel` produces a non-shippable binary that requires `--kernel` at
-runtime. The kernel changes less often than the Rust binaries, so one kernel build can be
-reused across normal edit/build cycles.
+`build.sh` compiles a bare `vk`, then appends `vk-agent`, `dist/vmlinux` and the firmware to
+it as the self-contained `dist/vk`; it refuses to proceed when the kernel is missing.
+`--no-kernel` produces a non-shippable binary that requires `--kernel` at runtime. The
+kernel changes less often than the Rust binaries, so one kernel build can be reused across
+normal edit/build cycles.
 
 For iteration, use the repository's development commands:
 
