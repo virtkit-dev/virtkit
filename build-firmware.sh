@@ -7,6 +7,8 @@
 # only on a lock bump or a firmware/ change. build.sh embeds dist/CLOUDHV*.fd into `vk` when
 # they are there.
 # --no-cache forces a clean Docker rebuild.
+# VK_BUILD_IMAGE_PREBUILT=1: the Docker path uses the virtkit-build image already loaded into
+# Docker instead of building it from .devcontainer/ (as build.sh does; CI sets it).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -35,8 +37,14 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
     /build/CLOUDHV.fd.storepath "$OUT/"
 else
   export DOCKER_BUILDKIT=1
-  echo "-- building the build image (virtkit-build) ..."
-  docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+  # Reuse the .devcontainer/ image CI builds through .github/actions/build-image.
+  if [ "${VK_BUILD_IMAGE_PREBUILT:-}" = 1 ]; then
+    docker image inspect virtkit-build >/dev/null 2>&1 ||
+      { echo "VK_BUILD_IMAGE_PREBUILT=1 but there is no virtkit-build image" >&2; exit 1; }
+  else
+    echo "-- building the build image (virtkit-build) ..."
+    docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+  fi
   echo "-- building the UEFI firmware (CLOUDHV.fd) ..."
   docker build ${NOCACHE:+$NOCACHE} --target artifact -o "type=local,dest=$OUT" firmware
 fi

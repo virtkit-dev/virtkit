@@ -48,6 +48,11 @@
 # combine with --bootstrap-check). The dev profile also trims debuginfo to line tables,
 # cutting the edit-rebuild loop further without touching the release profile.
 #
+# VK_BUILD_IMAGE_PREBUILT=1: the Docker backend uses the virtkit-build image already loaded
+# into Docker instead of building it from .devcontainer/ (CI builds it through its layer
+# cache first: .github/actions/build-image). It must have been built from this checkout's
+# .devcontainer/.
+#
 # --features=<list>: extra cargo features for vk-driver (comma-separated; repeats add up).
 # Such a vk is not the release artifact, so this cannot combine with --bootstrap-check, and
 # its manifest says so.
@@ -367,7 +372,13 @@ elif [ -n "$VK_BIN" ]; then
     -- "${exports}${BUILD_CMD}"
 else
   # ---- default backend: Docker ----
-  docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
+  # Reuse the .devcontainer/ image CI builds through .github/actions/build-image.
+  if [ "${VK_BUILD_IMAGE_PREBUILT:-}" = 1 ]; then
+    docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+      { echo "VK_BUILD_IMAGE_PREBUILT=1 but there is no $IMAGE image" >&2; exit 1; }
+  else
+    docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
+  fi
 
   # Build as the host user so target/ and the cargo cache stay writable and no
   # root-owned files leak onto the host. RUSTUP_HOME is read-only here — the
