@@ -1462,12 +1462,26 @@ async fn ask(
     path: &str,
     op: &str,
 ) -> String {
+    ask_with(addr, origin, cookie, csrf, path, op, &[]).await
+}
+
+/// [`ask`], with `fields` posted beside `op` in the question.
+async fn ask_with(
+    addr: SocketAddr,
+    origin: &str,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    op: &str,
+    fields: &[(&str, &str)],
+) -> String {
+    let fields: String = fields.iter().map(|(f, v)| format!("&{f}={v}")).collect();
     let reply = post_action(
         addr,
         origin,
         cookie,
         path,
-        &format!("_csrf={csrf}&op={op}"),
+        &format!("_csrf={csrf}&op={op}{fields}"),
         true,
     )
     .await;
@@ -1478,7 +1492,7 @@ async fn ask(
         "{}",
         reply.body
     );
-    let asked: String = ["pid", "started", "booted"]
+    let asked: String = ["pid", "started", "booted", "keep_images"]
         .into_iter()
         .filter(|f| reply.body.contains(&format!("name=\"{f}\"")))
         .map(|f| format!("&{f}={}", hidden(&reply.body, f)))
@@ -3122,25 +3136,50 @@ async fn a_reset_is_issued_only_once_confirmed() {
         "{}",
         page.body
     );
+    assert!(
+        page.body.contains(
+            "<input id=\"keep-images\" type=\"checkbox\" name=\"keep_images\" \
+             value=\"yes\" hx-preserve=\"true\"> Keep cached images</label>"
+        ),
+        "{}",
+        page.body
+    );
 
     let answer = ask(addr, &origin, &cookie, &csrf, &path, "reset").await;
+    assert!(answer.contains("&keep_images=no&"), "{answer}");
     assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    // An answer flipped to keep them is refused.
+    let kept = answer.replace("keep_images=no", "keep_images=yes");
+    let reply = post_action(addr, &origin, &cookie, &path, &kept, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed since"), "{}", reply.body);
+    // So is one that leaves the field out.
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "reset").await;
+    let stripped = answer.replace("&keep_images=no", "");
+    let reply = post_action(addr, &origin, &cookie, &path, &stripped, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed since"), "{}", reply.body);
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "reset").await;
     let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
-        reply.body.contains("Issued reset (command "),
+        reply
+            .body
+            .contains("Issued reset, images included (command "),
         "{}",
         reply.body
     );
     let commands = hub.db.pending_commands(&node, crate::now_secs()).unwrap();
     assert_eq!(
         commands.iter().map(|c| &c.op).collect::<Vec<_>>(),
-        [&vk_hub_proto::Operation::Reset { images: false }]
+        [&vk_hub_proto::Operation::Reset { images: true }]
     );
     assert!(
         node_audit(&hub, &node)
             .iter()
-            .any(|(actor, e)| *actor == principal && e.contains("issued reset (command ")),
+            .any(|(actor, e)| *actor == principal
+                && e.contains("issued reset, images included (command ")),
         "{:?}",
         node_audit(&hub, &node)
     );
@@ -3178,6 +3217,37 @@ async fn a_reset_is_issued_only_once_confirmed() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(reply.body.contains("update its vk"), "{}", reply.body);
     assert!(hub.db.node_commands(&old).unwrap().is_empty());
+}
+
+/// Checking "Keep cached images" preserves that choice through confirmation and reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_keeps_images_when_ticked() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let path = format!("/node/{node}/action");
+    let keep = [("keep_images", "yes")];
+    let answer = ask_with(addr, &origin, &cookie, &csrf, &path, "reset", &keep).await;
+    assert!(answer.contains("&keep_images=yes&"), "{answer}");
+    // An answer flipped to evict them is refused.
+    let evict = answer.replace("keep_images=yes", "keep_images=no");
+    let reply = post_action(addr, &origin, &cookie, &path, &evict, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed since"), "{}", reply.body);
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    let answer = ask_with(addr, &origin, &cookie, &csrf, &path, "reset", &keep).await;
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Issued reset, images kept (command "),
+        "{}",
+        reply.body
+    );
+    let commands = hub.db.pending_commands(&node, crate::now_secs()).unwrap();
+    assert_eq!(
+        commands.iter().map(|c| &c.op).collect::<Vec<_>>(),
+        [&vk_hub_proto::Operation::Reset { images: false }]
+    );
 }
 
 /// Rollout `ef…`, running, of release `ab…` (unsigned; `cd…`, signed, beside it): node

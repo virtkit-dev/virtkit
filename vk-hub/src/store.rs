@@ -2668,7 +2668,7 @@ pub(crate) fn operation_name(op: &Operation) -> String {
             vk_hub_proto::display_safe(version),
             vk_hub_proto::display_safe(short(sha256))
         ),
-        Operation::Reset { images: false } => "reset".into(),
+        Operation::Reset { images: false } => "reset, images kept".into(),
         Operation::Reset { images: true } => "reset, images included".into(),
         Operation::Tools {
             version, sha256, ..

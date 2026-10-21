@@ -525,6 +525,14 @@ impl From<LocalCmd> for UiCmd {
     }
 }
 
+/// The reset `vk-hub nodes reset` asks for: one that evicts the images unless told to keep
+/// them.
+fn reset_op(keep_images: bool) -> Operation {
+    Operation::Reset {
+        images: !keep_images,
+    }
+}
+
 #[derive(Subcommand)]
 enum NodesCmd {
     /// Remove a node: unpin its key and end its session
@@ -567,14 +575,17 @@ enum NodesCmd {
     Release { id: String },
     /// Drain the node, clear what its past jobs left, validate, and return it where it was
     ///
-    /// The node stops whatever its user still runs from past jobs and removes their job
-    /// directories and its idle host checkouts; the build cache's registry store is never
-    /// touched. A node that fails validation afterwards stays drained. Needs `[node] runner =
-    /// "managed"` on the node.
+    /// The node stops whatever its user still runs from past jobs, removes their job
+    /// directories and its idle host checkouts, and evicts its idle materialized images; the
+    /// build cache's registry store is never touched. A node that fails validation afterwards
+    /// stays drained. Needs `[node] runner = "managed"` on the node.
     Reset {
         id: String,
-        /// Evict the node's materialized images too
+        /// Keep the node's materialized images
         #[arg(long)]
+        keep_images: bool,
+        /// Evict the node's materialized images: the default, accepted for older callers
+        #[arg(long, hide = true, conflicts_with = "keep_images")]
         images: bool,
     },
     /// Put the node in the pools placed jobs name, replacing those it was in, or `none`
@@ -799,9 +810,9 @@ async fn run(cli: Cli) -> Result<()> {
                     command(client, id, Operation::Quarantine).await
                 }
                 Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
-                Some(NodesCmd::Reset { id, images }) => {
-                    command(client, id, Operation::Reset { images }).await
-                }
+                Some(NodesCmd::Reset {
+                    id, keep_images, ..
+                }) => command(client, id, reset_op(keep_images)).await,
                 Some(NodesCmd::Pools { id, pools }) => {
                     let pools: Vec<String> = match pools.as_str() {
                         "none" => Vec::new(),

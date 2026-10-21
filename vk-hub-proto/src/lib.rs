@@ -1138,6 +1138,8 @@ pub enum Operation {
     /// the materialized images too with `images` — validate, and return to the state the node
     /// was in. The build cache's registry store is never touched.
     Reset {
+        /// Evict the materialized images. Omitted means false, as from a hub that predates
+        /// it; `vk-hub nodes reset` and the web UI send true unless asked to keep them.
         #[serde(default)]
         images: bool,
     },

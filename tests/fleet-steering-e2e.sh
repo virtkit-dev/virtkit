@@ -139,8 +139,8 @@ wait_for 30 notes ||
 hub nodes undrain "$x"
 wait_for 60 cell_is "$x" STATE ready || fail "external is not ready once undrained"
 wait_for 60 eval '! notes' || { hub nodes; fail "the undrained external node still has a note"; }
-hub nodes reset "$x"
-wait_for 60 audit_says "$x" '\(reset\): refused: .*runner = "external"' ||
+hub nodes reset "$x" --keep-images
+wait_for 60 audit_says "$x" '\(reset, images kept\): refused: .*runner = "external"' ||
   { hub_audit "$x"; fail "the audit log does not show the external node refusing a reset"; }
 cell_is "$x" STATE ready || fail "external is $(node_cell "$x" STATE) after refusing a reset"
 hub_audit "$x"
@@ -176,7 +176,7 @@ wait_for 60 cell_is "$m" STATE 'validating*' ||
 in_node managed rm /tmp/reset-hold
 wait_for 120 cell_is "$m" STATE ready ||
   { hub_audit "$m"; fail "managed is $(node_cell "$m" STATE) after its reset"; }
-wait_for 30 audit_says "$m" '\(reset\): done' ||
+wait_for 30 audit_says "$m" '\(reset, images included\): done' ||
   { hub_audit "$m"; fail "the audit log misses the reset"; }
 ! alive leftover 2>/dev/null || fail "the reset left the leftover process running"
 alive bystander || fail "the reset stopped a process that runs no vk"

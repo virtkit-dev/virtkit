@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A node reset evicts the node's idle cached images by default**, so it frees the disk they
+  occupy. `vk-hub nodes reset --keep-images` and the node page's "Keep cached images" box opt
+  out; `--images` is still accepted. A reset that keeps them is audited as `reset, images kept`.
+
 ### Fixed
 
 - **A job or hub offer short of disk evicts pulled and built images nobody is using** on the

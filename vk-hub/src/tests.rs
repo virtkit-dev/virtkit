@@ -786,6 +786,10 @@ async fn a_reset_is_sent_and_audited_by_name() {
     ] {
         assert!(events.contains(&want), "{want}: {events:?}");
     }
+    assert_eq!(
+        crate::store::operation_name(&Operation::Reset { images: false }),
+        "reset, images kept"
+    );
 }
 
 /// A node that applied a generation past the hub's — the hub restored from a backup — is
@@ -2194,6 +2198,33 @@ fn accounts_arguments_parse() {
         parse(&["grant", "*", "--role", "viewer"]),
         Ok(Some(AccountsCmd::Grant { email, .. })) if email == "*"
     ));
+}
+
+/// `vk-hub nodes reset` evicts the node's images unless `--keep-images` says otherwise; the
+/// former `--images` is still accepted, and evicts.
+#[test]
+fn a_reset_keeps_images_only_when_asked() {
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["vk-hub", "nodes", "reset", "ab"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).map(|c| c.cmd) {
+            Ok(Cmd::Nodes {
+                cmd: Some(NodesCmd::Reset { keep_images, .. }),
+                ..
+            }) => Ok(reset_op(keep_images)),
+            Ok(_) => panic!("not a reset"),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let evict = Operation::Reset { images: true };
+    assert_eq!(parse(&[]), Ok(evict.clone()));
+    assert_eq!(
+        parse(&["--keep-images"]),
+        Ok(Operation::Reset { images: false })
+    );
+    assert_eq!(parse(&["--images"]), Ok(evict));
+    let err = parse(&["--images", "--keep-images"]).unwrap_err();
+    assert!(err.contains("cannot be used with"), "{err}");
 }
 
 /// The accounts table names each grant's address, role, and who made it when, and the

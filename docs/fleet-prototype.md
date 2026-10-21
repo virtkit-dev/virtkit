@@ -753,7 +753,7 @@ VM, which a node that requires signed releases would need to report versions.
 
 ## Resets
 
-`vk-hub nodes reset <id> [--images]`, or the reset button on an operator's node page — which
+`vk-hub nodes reset <id> [--keep-images]`, or the reset button on an operator's node page — which
 asks again, on a form of its own, before the reset is issued — drains the node like an update
 does, from `ready`, `draining` or `drained` and only with a managed runner or none (`[node]
 runner = "none"`), except that the drain is over once the runner has exited — with none, once
@@ -772,15 +772,17 @@ seconds after that, or a `/proc` the node cannot list, fails the reset before an
 removed. The node then gives back each job dir's network lease, removes the job dirs under
 `<state_dir>/jobs` and anything else there but its dot-entries, a symlink removed as itself and
 never followed, sweeps the host checkouts no job uses and the dead builds' staging dirs (see
-*Dead builds* below), and with `--images` evicts the materialized images under
-`<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does. The build cache's registry
-store is never touched. `validating` then runs what an update's trial does — `vk check`'s gate,
-`[node] validate`, and a session with the hub within ten minutes — and the node returns to the
+*Dead builds* below), and, unless `--keep-images` is given or "Keep cached images" is ticked, evicts
+the materialized images under `<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does:
+an image still in use stays, and later jobs pull or build the evicted ones again. The build cache's
+registry store is never touched. `validating` then runs what an update's trial does — `vk check`'s
+gate, `[node] validate`, and a session with the hub within ten minutes — and the node returns to the
 state it was in; a node that fails stays `drained`, with the reset `failed` and the reason,
 rather than take jobs on a host that does not pass. A reset clears the last update's progress
 from the node's report, and a reset and an update exclude each other; a `vk node run` stopped
-during either takes it up again at its next start. The command's audit lines name it `reset`, or
-`reset, images included`.
+during either takes it up again at its next start. The command's audit lines name it
+`reset, images included`, or `reset, images kept`; before 0.93.1, a reset that kept the images was
+audited as plain `reset`.
 
 ## Placed jobs on the node
 

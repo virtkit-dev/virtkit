@@ -427,7 +427,9 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
         "undrain" => Steer::Command(Operation::Undrain),
         "quarantine" => Steer::Command(Operation::Quarantine),
         "release" => Steer::Command(Operation::Release),
-        "reset" => Steer::Command(Operation::Reset { images: false }),
+        "reset" => Steer::Command(Operation::Reset {
+            images: field(form, "keep_images") != Some("yes"),
+        }),
         _ => return Err("No such action."),
     })
 }
@@ -450,7 +452,7 @@ pub(super) async fn node_action(
         Ok(steer) => steer,
         Err(why) => return Ok(actions::refused(htmx, StatusCode::BAD_REQUEST, why)),
     };
-    if matches!(steer, Steer::Command(Operation::Reset { .. })) {
+    if let Steer::Command(Operation::Reset { images }) = steer {
         // Asked only of a node it can be issued to.
         let hub = ui.hub.clone();
         let node = id.to_string();
@@ -474,10 +476,17 @@ pub(super) async fn node_action(
             path: format!("{back}/action"),
             back,
             op: "reset".into(),
-            what: "Reset this node? It drains, stops what its past jobs left running, and \
-                   deletes their job directories and its idle host checkouts.",
+            what: if images {
+                "Reset this node? It drains, stops what its past jobs left running, deletes \
+                 their job directories and its idle host checkouts, and evicts its idle cached \
+                 images, which later jobs pull or build again."
+            } else {
+                "Reset this node? It drains, stops what its past jobs left running, and \
+                 deletes their job directories and its idle host checkouts. Its cached images \
+                 are kept."
+            },
             detail: Html::new(),
-            asked: Vec::new(),
+            asked: vec![("keep_images", if images { "no" } else { "yes" }.into())],
         };
         if let Some(asked) = actions::ask_first(&site.questions, layout, htmx, &auth, &form, &ask)?
         {
@@ -1072,8 +1081,9 @@ const RELEASE: Act = Act {
 const RESET: Act = Act {
     op: "reset",
     label: "Reset",
-    does: "Drain, stop what past jobs left running, and delete their job directories and \
-           the idle checkouts. Asked again first.",
+    does: "Drain, stop what past jobs left running, delete their job directories and the \
+           idle checkouts, and evict the idle cached images unless \"Keep cached images\" is \
+           ticked. Asked again first.",
 };
 
 /// A node page's steering, by group: where the node stands on each thing an operator
@@ -1248,8 +1258,8 @@ impl Panel {
 
 /// Show the node's state and, given an operator's `csrf`, applicable actions with explanations.
 /// Viewers see only the state. The live fragment keeps actions current; `hx-preserve` keeps
-/// the limit input through updates, including edits in progress. Forms support htmx and plain
-/// submission.
+/// the limit input and the reset's "Keep cached images" box through updates, including edits
+/// in progress. Forms support htmx and plain submission.
 fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
     let p = Panel::of(v);
     let path = format!("/node/{}/action", v.id);
@@ -1262,7 +1272,12 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
             .raw(class)
             .raw(">")
             .raw(a.label)
-            .raw("</button><span class=\"does\">")
+            .raw("</button>");
+        if a.op == RESET.op {
+            h.raw("<label><input id=\"keep-images\" type=\"checkbox\" name=\"keep_images\" ")
+                .raw("value=\"yes\" hx-preserve=\"true\"> Keep cached images</label>");
+        }
+        h.raw("<span class=\"does\">")
             .raw(a.does)
             .raw("</span></form>");
     };
