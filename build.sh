@@ -25,9 +25,9 @@
 # this commit and need not reproduce these bytes.
 #
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
-# (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
-# are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk
-# can rebuild itself. It boots the vk it builds, so it cannot combine with --no-kernel.
+# (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert every binary is
+# byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk can rebuild
+# itself. It boots the vk it builds, so it cannot combine with --no-kernel.
 #
 # --fast (alias --debug): build the debug cargo profile instead of release — a much
 # faster compile for iteration, still static-musl and still embedding the kernel/agent,
@@ -391,7 +391,7 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   echo
   echo "bootstrap check: comparing sha256…"
   mismatch=""
-  for b in vk vk-agent; do
+  for b in vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
     docker_sha=$(sha256sum < "$OUT/$b" | cut -d' ' -f1)
     virtkit_sha=$(sha256sum < "$boot_tmp/$OUT/$b" | cut -d' ' -f1)
     if [ "$docker_sha" = "$virtkit_sha" ]; then
