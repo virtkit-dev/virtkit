@@ -1041,9 +1041,11 @@ job short of room: it evicts them, least recently used first and whatever
 `image_cache_idle_secs` says, until its shortfall is free, and checks again. The shortfall is
 what would admit its whole expectation: what the admitted jobs have yet to write plus what it
 expects, less what is free. Registry chunks no cached image references go before any image.
-Images used in the last 10 minutes (or `image_cache_idle_secs`, if shorter) stay, since a job
-may have resolved one without yet holding it. Past that grace, one job's admission can evict
-the images of a job admitted before it that has yet to resolve them. Eviction is all or nothing:
+Two kinds of image stay: those the job's last run booted, since a job is admitted before it
+resolves its image and those are what it is about to use, and those used in the last 10
+minutes (or `image_cache_idle_secs`, if shorter), which a job may have resolved without yet
+holding. Only a job's own images are kept: past the grace, one job's admission can evict the
+images of a job admitted before it that has yet to resolve them. Eviction is all or nothing:
 when what it could free falls short, nothing goes and the job waits as above, asking again once
 its shortfall is back within what could have been freed, and otherwise about once a minute.
 Its trace says what went; a job expecting 25.0 GiB, with

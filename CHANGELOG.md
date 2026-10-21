@@ -9,8 +9,9 @@ All notable changes to virtkit will be documented in this file.
 - **A job or hub offer short of disk evicts pulled and built images nobody is using** on the
   job dirs' filesystem, least recently used first and regardless of `image_cache_idle_secs`,
   when that frees enough for it to fit. Images used in the last 10 minutes (or
-  `image_cache_idle_secs`, if shorter) stay. Such images used to stay until idle for the whole
-  window, while the node refused the hub's offers or the job waited.
+  `image_cache_idle_secs`, if shorter) stay, and a job keeps the images its last run booted,
+  its services' included. Such images used to stay until idle for the whole window, while the
+  node refused the hub's offers or the job waited.
 
 ## [0.93.0] - 2026-10-17
 

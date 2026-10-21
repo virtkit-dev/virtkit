@@ -934,6 +934,63 @@ fn removable_bytes(base: &Path) -> u64 {
     total
 }
 
+/// Record the bases a job is about to boot under its usage `key` in `dir`, so its next
+/// admission excludes them from [`evict_for_room`]. Admission precedes image resolution,
+/// so the previous run is the best predictor of which bases it needs. Replace the note
+/// by rename; omit paths containing newlines because each line holds one path.
+/// Best-effort, like run history: losing the note costs a re-pull.
+pub(crate) fn remember_bases(dir: &Path, key: &Path, bases: &[PathBuf]) {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    let Some(path) = crate::admit::under(dir, key) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    // 0700 on create and on reuse, as the run history beside it; set through the directory
+    // itself, opened without following a symlink in its place.
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .is_err()
+    {
+        return;
+    }
+    for private in [dir, parent] {
+        let restricted = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(private)
+            .and_then(|d| d.set_permissions(std::fs::Permissions::from_mode(0o700)));
+        if restricted.is_err() {
+            return;
+        }
+    }
+    let mut text = Vec::new();
+    for base in bases.iter().map(|b| b.as_os_str().as_bytes()) {
+        if !base.contains(&b'\n') {
+            text.extend_from_slice(base);
+            text.push(b'\n');
+        }
+    }
+    // Separate staging files let concurrent runs publish whole notes; the last rename wins.
+    let _ = vk_fs::write_atomic_unsynced(&path, &text, 0o600);
+}
+
+/// What [`remember_bases`] last noted under `key`. Only ever a list of what to keep, so a note
+/// naming anything else costs nothing; only absolute paths are read back.
+pub(crate) fn remembered_bases(dir: &Path, key: &Path) -> Vec<PathBuf> {
+    let Some(text) = crate::admit::under(dir, key).and_then(|p| std::fs::read(p).ok()) else {
+        return Vec::new();
+    };
+    text.split(|&b| b == b'\n')
+        .map(|line| PathBuf::from(std::ffi::OsStr::from_bytes(line)))
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
 /// Every materialized base under `root`: a directory directly holding a `runner.ext4`. The
 /// name between `root` and the digest can be multi-level (a `team/img` docker repo), so walk
 /// down, treating any dir with a `runner.ext4` as a base and not descending into it. This
@@ -2150,8 +2207,8 @@ mod tests {
     // Under pressure: unreferenced chunks first, then unused bases oldest first, whatever the
     // idle window past a short grace, stopping as soon as the target is met, and nothing at all
     // for a target out of reach. A base in use stays, as does one just stamped used (resolved,
-    // not yet referenced), one never dated, and one kept; nothing on another filesystem than
-    // the job dirs' is touched.
+    // not yet referenced), one never dated, and one the asking job last booted; nothing on
+    // another filesystem than the job dirs' is touched.
     #[test]
     fn evict_for_room_takes_the_least_recently_used_until_the_target_is_met() {
         use std::time::{Duration, SystemTime};
@@ -2229,11 +2286,14 @@ mod tests {
         assert!(!chunks.join("dead").exists() && all.iter().all(|b| b.exists()));
 
         // Then the least recently used base nobody holds, and no more than the target needs —
-        // passing over one kept, reached here through a symlink. Retried for the reason
-        // `cachelock::reclaimed_eventually` documents.
+        // passing over the one the asking job last booted, as its note gives it, reached here
+        // through a symlink. Retried for the reason `cachelock::reclaimed_eventually` documents.
         let link = tmp.join("state-link");
         std::os::unix::fs::symlink(&state, &link).unwrap();
-        let keep = [link.join("docker").join("img").join("d1")];
+        let notes = tmp.join("job-images");
+        let key = Path::new("42-proj/build");
+        remember_bases(&notes, key, &[link.join("docker").join("img").join("d1")]);
+        let keep = remembered_bases(&notes, key);
         assert!(crate::cachelock::reclaimed_eventually(|| {
             let once = evict_for_room(&state, idle, &jobs, 1, &keep, EVICT_WAIT).evicted;
             if !older.exists() {
@@ -2241,7 +2301,7 @@ mod tests {
             }
             !older.exists()
         }));
-        assert!(oldest.exists(), "a kept base must stay");
+        assert!(oldest.exists(), "the asking job's own base must stay");
         assert!(stays());
 
         // What is left to take: the two dated, unused bases and the chunk only one of them
@@ -2325,6 +2385,31 @@ mod tests {
         let linked = removable_bytes(&base);
         assert!(linked + 64 * 1024 <= alone, "{linked} of {alone}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // What a job booted is read back by its next admission, replaced whole on each run; a key
+    // that would leave the store, or a line that is not an absolute path, reads as nothing.
+    #[test]
+    fn a_jobs_bases_are_remembered_for_its_next_admission() {
+        let dir = std::env::temp_dir().join(format!("vk-job-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = Path::new("42-proj/build");
+        assert!(remembered_bases(&dir, key).is_empty());
+        let first = [PathBuf::from("/s/build/a"), PathBuf::from("/s/docker/x/d")];
+        remember_bases(&dir, key, &first);
+        assert_eq!(remembered_bases(&dir, key), first);
+        remember_bases(&dir, key, &first[..1]);
+        assert_eq!(remembered_bases(&dir, key), first[..1]);
+        std::fs::write(dir.join(key), "relative\n/s/build/b\n").unwrap();
+        assert_eq!(remembered_bases(&dir, key), [PathBuf::from("/s/build/b")]);
+        // Bytes, not text: a name that is not UTF-8 comes back as it went, and one with a
+        // newline in it, which the note cannot hold, is left out.
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/s/build/\xff"));
+        remember_bases(&dir, key, &[odd.clone(), PathBuf::from("/s/a\nb")]);
+        assert_eq!(remembered_bases(&dir, key), [odd]);
+        remember_bases(&dir, Path::new("/abs"), &first);
+        assert!(remembered_bases(&dir, Path::new("/abs")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The image goes first: a removal that stops part-way leaves a cache miss, not a base that

@@ -882,10 +882,12 @@ later. The node evicts with its state lock released, but its session answers one
 at a time: the offer's reply and all other traffic on the session, heartbeats included, wait
 for the eviction, which waits at most 30 seconds for another eviction under the same state dir
 before giving up on this one. An offer names no image, so it can evict the one its job will
-pull; a job started without a live reservation evicts the same way. One line reports the
-images and chunk files evicted and the space freed. A job admitted on the node evicts the same
-way while it waits for disk. Past the grace, one job's admission can evict the images of a job
-admitted before it that has yet to resolve them.
+pull; a job started without a live reservation evicts the same way, keeping the images its
+last run on the node booted. One line reports the images and chunk files evicted and the space
+freed. A job admitted on the node evicts the same way while it waits for disk, keeping the
+images its last run booted, its services' included. Only a job's own images are kept: past the
+grace, one job's admission can evict the images of a job admitted before it that has yet to
+resolve them.
 
 **Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
 `get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),

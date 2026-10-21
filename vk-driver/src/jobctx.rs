@@ -89,6 +89,11 @@ pub struct JobCtx {
 /// executor commands. Job variables cannot override it.
 pub const JOB_SERVER_URL: &str = "VK_JOB_SERVER_URL";
 
+/// [`JobCtx::images_dir`] of any job run with `cfg`.
+pub fn images_dir(cfg: &Config) -> PathBuf {
+    cfg.state_dir().join("job-images")
+}
+
 impl JobCtx {
     pub fn new(cfg: Config) -> Result<JobCtx> {
         Self::from_lookup(cfg, &process_env)
@@ -103,6 +108,21 @@ impl JobCtx {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         })
+    }
+
+    /// [`JobCtx::usage_key`] of the job GitLab's `response` (the job response file's JSON)
+    /// describes, before the job has an environment of its own to build a context from.
+    pub fn usage_key_of(response: &serde_json::Value) -> Result<PathBuf> {
+        use serde::Deserialize;
+        let response = JobResponse::deserialize(response)?;
+        // The key is the job's identity alone; no setting plays a part in it.
+        let ctx = Self::with_response(
+            Config::default(),
+            response.id.to_string(),
+            Some(response),
+            &|_| None,
+        )?;
+        Ok(ctx.usage_key())
     }
 
     fn from_lookup(cfg: Config, env: &Lookup<'_>) -> Result<JobCtx> {
@@ -256,6 +276,14 @@ impl JobCtx {
             _ => self.project_slug.clone(),
         };
         path_component(&project, "repo")
+    }
+
+    /// Where this host remembers the cached images each job last booted, keyed by
+    /// [`JobCtx::usage_key`] like the run history: what its admission keeps out of an eviction
+    /// for its own room (see `image::evict_for_room`). Never pruned, like the run history: one
+    /// small file per job that ever ran here, rewritten on each run.
+    pub fn images_dir(&self) -> PathBuf {
+        images_dir(&self.cfg)
     }
 
     /// Where this host remembers what each job contacts, keyed by [`JobCtx::usage_key`] like

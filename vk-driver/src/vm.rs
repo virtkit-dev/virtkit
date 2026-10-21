@@ -425,6 +425,15 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build).
     let mut plan = resolve_media(ctx)?;
+    // The bases this job boots, for its next admission to keep (see `admit`); supervise notes
+    // them again with the services only it resolves.
+    let mut booted: Vec<PathBuf> = plan
+        .media
+        .rootfs
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
     // Every base this phase resolves or builds, held until prepare returns — same rationale as
     // `_checkout_use` above: nothing else protects a resolved base from the idle GC, and this
     // (possibly long, sequential) phase warms every service image before the supervisor, in
@@ -461,8 +470,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             if let Some(build) = &windows {
                 warm_guards.extend(build_windows_unit(ctx, &unit, build)?.1);
             } else if matches!(unit.source, crate::compose::Source::Build { .. }) {
-                let (_, _, guard) = build_compose_unit(ctx, &unit)
+                let (rootfs, _, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
+                booted.extend(rootfs.parent().map(Path::to_path_buf));
                 warm_guards.push(guard);
             }
             service_names.push((unit.name, windows.is_some()));
@@ -473,13 +483,16 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             if let crate::compose::Source::Image(image) = &unit.source
                 && let Some(spec) = image.strip_prefix("dockerfile:")
             {
-                let (_, _, guard) =
+                let (rootfs, _, guard) =
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                booted.extend(rootfs.parent().map(Path::to_path_buf));
                 warm_guards.push(guard);
             }
             service_names.push((unit.name, false));
         }
     }
+
+    crate::image::remember_bases(&ctx.images_dir(), &ctx.usage_key(), &booted);
 
     // ONE detached process owns the job from here (the runner protocol requires
     // this stage to exit — ready is signaled by exiting 0): the supervisor spawns
@@ -1690,6 +1703,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // service's fresh off `image::resolve_ref` — no gap either way.
             let mut windows = HashMap::new();
             let services = plan_services(ctx, gateway, prefix, &mut use_guards, &mut windows)?;
+            // Replaces prepare's note whole: `plan_services` returns every service, the ones
+            // prepare built included, and adds what only this process resolves (`image:`
+            // services, `services:` refs), so the next admission keeps them all.
+            let booted: Vec<PathBuf> = std::iter::once(&media.rootfs)
+                .chain(services.iter().map(|s| &s.ext4))
+                .filter_map(|p| p.parent())
+                .map(Path::to_path_buf)
+                .collect();
+            crate::image::remember_bases(&ctx.images_dir(), &ctx.usage_key(), &booted);
             service_names = services.iter().map(|s| s.name.clone()).collect();
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
@@ -3125,14 +3147,18 @@ fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::adm
             );
         }
     }
-    // Images nobody is using make way for a job short of disk, as they would once idle. The
-    // wait for another eviction counts against the job's own for admission.
+    // Images nobody is using make way for a job short of disk, as they would once idle — but
+    // not those it booted last time: it resolves its own only after admission, so nothing
+    // references them yet, and evicting them would only have it pull them back into the room
+    // it was admitted to. The wait for another eviction counts against the job's own for
+    // admission.
+    let keep = crate::image::remembered_bases(&ctx.images_dir(), &ctx.usage_key());
     let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
     let deadline = Instant::now() + timeout;
     let reclaim = |need| {
         let (state_dir, idle) = (ctx.cfg.state_dir(), ctx.cfg.image_cache_idle());
         let wait = crate::image::EVICT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
-        crate::image::evict_for_room(state_dir, idle, ctx.jobs_dir(), need, &[], wait).reclaimed()
+        crate::image::evict_for_room(state_dir, idle, ctx.jobs_dir(), need, &keep, wait).reclaimed()
     };
     let ask = crate::admit::Ask {
         mem: mem_ask,

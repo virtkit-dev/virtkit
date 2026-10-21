@@ -582,7 +582,9 @@ mod tests {
             "{beyond:?}"
         );
         assert!(base.join("runner.ext4").exists());
-        // Within it: the base goes, whatever its idle window.
+        // Within it: the base goes, whatever its idle window, unless it is kept.
+        assert_eq!(l.limits.reclaim(1, std::slice::from_ref(&base)).freed, 0);
+        assert!(base.exists());
         assert!(crate::cachelock::reclaimed_eventually(|| {
             l.limits.reclaim(1, &[]).freed > 0
         }));

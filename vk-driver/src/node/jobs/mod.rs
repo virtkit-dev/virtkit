@@ -139,8 +139,11 @@ struct State {
     jobs: BTreeMap<String, Track>,
     /// Why the last offer was refused, logged when it changes; `None` once one is granted.
     refused: Option<(Refusal, Option<String>)>,
-    /// When an ask short of disk may scan the caches again (see [`Jobs::handle`]).
-    reclaim: crate::admit::Backoff,
+    /// When an offer short of disk may scan the caches again (see [`Jobs::handle`]).
+    offer_reclaim: crate::admit::Backoff,
+    /// The same for a job started without a live reservation: apart, as it keeps the images
+    /// its last run booted, so what a scan for an offer found out of reach says nothing of it.
+    start_reclaim: crate::admit::Backoff,
 }
 
 impl State {
@@ -283,7 +286,8 @@ impl Jobs {
                 ledger: Ledger::new(limits),
                 jobs,
                 refused: None,
-                reclaim: crate::admit::Backoff::default(),
+                offer_reclaim: crate::admit::Backoff::default(),
+                start_reclaim: crate::admit::Backoff::default(),
             }),
             spawner,
             cleaner,
@@ -345,13 +349,13 @@ impl Jobs {
                     .ledger
                     .offer(&reservation, envelope, lease_secs, gate, now);
                 if let Some(need) = offered.reclaim
-                    && state.reclaim.due(need, Instant::now())
+                    && state.offer_reclaim.due(need, Instant::now())
                 {
                     let limits = state.ledger.limits().clone();
                     drop(state);
                     let done = limits.reclaim(need, &[]);
                     state = lock(&self.state);
-                    state.reclaim.record(need, done, Instant::now());
+                    state.offer_reclaim.record(need, done, Instant::now());
                     if done.freed > 0 {
                         let gate = state.gate(intake);
                         offered = state.ledger.offer(
@@ -383,13 +387,13 @@ impl Jobs {
             HubJobMsg::Start(start) => {
                 let (mut msgs, reclaim) = self.start(&mut state, &start, intake);
                 if let Some(need) = reclaim
-                    && state.reclaim.due(need, Instant::now())
+                    && state.start_reclaim.due(need, Instant::now())
                 {
                     let limits = state.ledger.limits().clone();
                     drop(state);
-                    let done = limits.reclaim(need, &[]);
+                    let done = limits.reclaim(need, &self.last_booted(&start.spec));
                     let mut state = lock(&self.state);
-                    state.reclaim.record(need, done, Instant::now());
+                    state.start_reclaim.record(need, done, Instant::now());
                     if done.freed > 0 {
                         msgs = self.start(&mut state, &start, intake).0;
                     }
@@ -610,6 +614,15 @@ impl Jobs {
             },
         );
         (msgs, None)
+    }
+
+    /// The bases the job `spec` names booted on its last run here, which an eviction for its own
+    /// room keeps (see `image::remember_bases`).
+    fn last_booted(&self, spec: &JobSpec) -> Vec<PathBuf> {
+        let JobSpec::GitlabCi(job) = spec;
+        crate::jobctx::JobCtx::usage_key_of(&env::job_response(job))
+            .map(|key| crate::image::remembered_bases(&crate::jobctx::images_dir(&self.cfg), &key))
+            .unwrap_or_default()
     }
 
     /// The lowest slots free among the jobs this node runs: overall, and within the project.
@@ -1326,10 +1339,18 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// So is a job started without a live reservation.
+    /// So is a job started without a live reservation, keeping the images its last run booted.
     #[test]
-    fn a_disk_short_start_evicts_and_is_accepted() {
+    fn a_disk_short_start_evicts_all_but_its_own_images() {
         let (jobs, dir, asked) = short_of_disk("evict-start", true);
+        let JobSpec::GitlabCi(job) = spec(4242);
+        let key = crate::jobctx::JobCtx::usage_key_of(&env::job_response(&job)).unwrap();
+        let own = dir.join("build").join("own");
+        crate::image::remember_bases(
+            &crate::jobctx::images_dir(&jobs.cfg),
+            &key,
+            std::slice::from_ref(&own),
+        );
         let msgs = jobs.handle(disk_start(), OPEN, Instant::now());
         assert!(
             matches!(
@@ -1341,7 +1362,11 @@ pub(crate) mod tests {
             ),
             "{msgs:?}"
         );
-        assert_eq!(asked.lock().unwrap().len(), 1);
+        let asked = asked.lock().unwrap();
+        assert!(
+            matches!(asked.as_slice(), [(_, keep)] if keep == std::slice::from_ref(&own)),
+            "{asked:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1367,6 +1392,9 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(asked.lock().unwrap().len(), 1);
+        // A job started meanwhile keeps its own images, and backs off on its own.
+        jobs.handle(disk_start(), OPEN, Instant::now());
+        assert_eq!(asked.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
