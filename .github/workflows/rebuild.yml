@@ -26,7 +26,7 @@ permissions:
 jobs:
   rebuild:
     name: rebuild (${{ matrix.bin }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Generous: a microVM image build plus a from-scratch release compile. Check the first
     # release run's rebuild durations against it.
     timeout-minutes: 90
