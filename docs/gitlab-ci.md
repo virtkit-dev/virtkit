@@ -1036,6 +1036,26 @@ virtkit: waiting for 25.0 GiB of room in /var/lib/virtkit/jobs (31.2 GiB free, 1
 virtkit: admitted after waiting 412s for disk space
 ```
 
+Pulled and built images on the same filesystem that no job, VM or service holds give way to a
+job short of room: it evicts them, least recently used first and whatever
+`image_cache_idle_secs` says, until its shortfall is free, and checks again. The shortfall is
+what would admit its whole expectation: what the admitted jobs have yet to write plus what it
+expects, less what is free. Registry chunks no cached image references go before any image.
+Images used in the last 10 minutes (or `image_cache_idle_secs`, if shorter) stay, since a job
+may have resolved one without yet holding it. Past that grace, one job's admission can evict
+the images of a job admitted before it that has yet to resolve them. Eviction is all or nothing:
+when what it could free falls short, nothing goes and the job waits as above, asking again once
+its shortfall is back within what could have been freed, and otherwise about once a minute.
+Its trace says what went; a job expecting 25.0 GiB, with
+31.2 GiB free and 18.5 GiB still to be written by the jobs admitted there, is 12.3 GiB short:
+
+```
+virtkit: evicted 3 unused image(s) and 41 unreferenced cache chunk file(s) under /var/lib/virtkit for room in /var/lib/virtkit/jobs: 12.9 GiB freed of the 12.3 GiB needed
+```
+
+Host checkouts and the Windows build cache are not evicted this way;
+`checkout_cache_idle_secs` and `windows_cache_idle_secs` alone bound them.
+
 A `disk_default` set larger than the filesystem can never be admitted, and fails every job
 without a history at once. Left unset it is capped at the filesystem's size, as an expectation
 from history is, so a host whose job dirs sit on a small filesystem runs its new jobs fewer at

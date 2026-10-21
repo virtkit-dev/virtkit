@@ -3125,14 +3125,22 @@ fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::adm
             );
         }
     }
+    // Images nobody is using make way for a job short of disk, as they would once idle. The
+    // wait for another eviction counts against the job's own for admission.
+    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
+    let deadline = Instant::now() + timeout;
+    let reclaim = |need| {
+        let (state_dir, idle) = (ctx.cfg.state_dir(), ctx.cfg.image_cache_idle());
+        let wait = crate::image::EVICT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+        crate::image::evict_for_room(state_dir, idle, ctx.jobs_dir(), need, &[], wait).reclaimed()
+    };
     let ask = crate::admit::Ask {
         mem: mem_ask,
-        disk: admit_disk(ctx, declared_mib)?,
+        disk: admit_disk(ctx, declared_mib, &reclaim)?,
     };
     if ask.mem.is_none() && ask.disk.is_none() {
         return Ok(None);
     }
-    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
     let reservation = crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, &ask, timeout)?;
     Ok(Some(reservation))
 }
@@ -3238,7 +3246,11 @@ fn admit_memory(
 
 /// What this job's dir is expected to grow to, for `[executor.schedule] disk_admission`: from
 /// its history where it has one, else `disk_default`. `None` when disk admission is off.
-fn admit_disk(ctx: &JobCtx, declared_mib: u64) -> Result<Option<crate::admit::DiskAsk<'_>>> {
+fn admit_disk<'a>(
+    ctx: &'a JobCtx,
+    declared_mib: u64,
+    reclaim: &'a dyn Fn(u64) -> crate::admit::Reclaimed,
+) -> Result<Option<crate::admit::DiskAsk<'a>>> {
     let schedule = &ctx.cfg.executor.schedule;
     if !schedule.disk_admission.unwrap_or(true) {
         return Ok(None);
@@ -3252,7 +3264,11 @@ fn admit_disk(ctx: &JobCtx, declared_mib: u64) -> Result<Option<crate::admit::Di
     let default = disk_default(schedule.disk_default.as_deref(), total)?;
     let want = crate::admit::expect_disk(&ctx.history_dir(), &ctx.usage_key(), declared_mib, total)
         .unwrap_or(default);
-    Ok(Some(crate::admit::DiskAsk { want, jobs }))
+    Ok(Some(crate::admit::DiskAsk {
+        want,
+        jobs,
+        reclaim: Some(reclaim),
+    }))
 }
 
 /// What a job with no history is expected to write into its job dir, on a filesystem of

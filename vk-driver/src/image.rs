@@ -585,10 +585,12 @@ pub(crate) fn acquire_use_lock_for(
     )?))
 }
 
-/// What [`gc_idle`] evicted.
+/// What [`gc_idle`] or [`evict_for_room`] evicted.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Evicted {
     pub(crate) bases: u64,
+    /// Unreferenced registry chunk files, which only [`evict_for_room`] counts.
+    pub(crate) chunks: u64,
     /// The disk space they held.
     pub(crate) bytes: u64,
 }
@@ -688,6 +690,248 @@ pub(crate) fn evict_idle_images(state_dir: &Path, idle: std::time::Duration) {
     for tier in ["docker", "build"] {
         gc_idle(&state_dir.join(tier), idle);
     }
+}
+
+/// The least time [`evict_for_room`] lets a base sit unused before taking it, unless
+/// `image_cache_idle_secs` is shorter still. A resolve stamps its base used and its caller only
+/// then takes the reference that protects it (`registry::resolve_async`, `dockerimg`, then
+/// `vm::prepare`, `vm::supervise`, `vm::plan_services`): moments apart in one process, but
+/// moments a host deep in swap can stretch, and a base caught in between must not go. Short
+/// against the hours an idle window runs to, so what pressure frees is still nearly everything.
+const EVICT_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The longest [`evict_for_room`] waits for the eviction ahead of it on the same state dir. On a
+/// node the wait holds up its session, heartbeats included, so it is short.
+pub(crate) const EVICT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A base [`evict_for_room`] may take, locked exclusively for as long as this lives: what was
+/// counted toward the room is what is still there to remove.
+struct Candidate {
+    used: std::time::SystemTime,
+    base: PathBuf,
+    bytes: u64,
+    _lock: crate::cachelock::Exclusive,
+}
+
+/// What [`evict_for_room`] did: what it evicted, and what taking everything it could would have
+/// freed. Below the need it was asked for, that is why it evicted nothing; `None` where it did
+/// not look, held up past its wait by the eviction ahead of it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ForRoom {
+    pub(crate) evicted: Evicted,
+    pub(crate) reach: Option<u64>,
+}
+
+impl ForRoom {
+    pub(crate) fn reclaimed(&self) -> crate::admit::Reclaimed {
+        crate::admit::Reclaimed {
+            freed: self.evicted.bytes,
+            reach: self.reach,
+        }
+    }
+}
+
+/// Make room for `need` bytes on the filesystem holding `on` (the job dirs) from the image
+/// tiers [`evict_idle_images`] sweeps, those of them on that filesystem only: unreferenced
+/// registry chunks first, then bases nobody holds, least recently used first and whatever their
+/// idle window past a short grace ([`EVICT_GRACE`], or `idle` where that is shorter), stopping
+/// once `need` has come free. A base in use is never touched, on [`crate::cachelock`]'s
+/// protocol, nor one in `keep`: the bases the asking job is about to boot, which nothing
+/// references yet. All or nothing: when everything it could take falls short of `need`, it
+/// takes nothing, since a partial eviction would cost re-pulls without admitting anyone. Says
+/// once what went; best-effort, like [`gc_idle`].
+///
+/// One at a time per state dir, behind `<state_dir>/.evict.lock`, waited for up to `wait`: two
+/// evictions scanning at once would each lock a share of the candidates, and each find its
+/// share short. [`gc_idle`] takes no part in that lock. It needs none: both take a base only
+/// under its exclusive lock, so a base one of them holds the other passes over, and one gone
+/// before this scan is simply not counted.
+pub(crate) fn evict_for_room(
+    state_dir: &Path,
+    idle: std::time::Duration,
+    on: &Path,
+    need: u64,
+    keep: &[PathBuf],
+    wait: std::time::Duration,
+) -> ForRoom {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut room = ForRoom {
+        evicted: Evicted::default(),
+        reach: Some(0),
+    };
+    let Some(on_fs) = crate::usage::fs_id(on) else {
+        return room;
+    };
+    // By identity, not spelling: a state dir reached through a symlink names one base two ways.
+    let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
+    let keep: Vec<_> = keep.iter().filter_map(|k| id(k)).collect();
+    let tiers: Vec<PathBuf> = cache_tiers(state_dir)
+        .into_iter()
+        .filter(|t| crate::usage::fs_id(t) == Some(on_fs))
+        .collect();
+    if tiers.is_empty() {
+        return room;
+    }
+    // Waited for, not just tried: the eviction ahead may be freeing what this one needs. Only
+    // for so long, as the caller may be a node's session with heartbeats to send.
+    let denied = |e: &anyhow::Error| {
+        e.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        })
+    };
+    let lock = state_dir.join(".evict.lock");
+    let _serial = match crate::cachelock::lock_exclusive_within(&lock, wait) {
+        Ok(Some(serial)) => Some(serial),
+        Ok(None) => {
+            println!(
+                "virtkit: not evicting for room in {}: another eviction under {} held {} for {}s",
+                on.display(),
+                state_dir.display(),
+                lock.display(),
+                wait.as_secs()
+            );
+            room.reach = None;
+            return room;
+        }
+        // Another user's lock, left 0600 by the runner that made it, is no reason to keep the
+        // caches: the lock only spares two evictions each finding a share of the candidates
+        // too short, and every base is still taken only under its own exclusive lock.
+        Err(e) if denied(&e) => None,
+        Err(e) => {
+            eprintln!("virtkit: evicting for room: {e:#}");
+            return room;
+        }
+    };
+    let registry = state_dir.join("registry");
+    let chunks = tiers.contains(&registry);
+    let grace = idle.min(EVICT_GRACE);
+    let now = std::time::SystemTime::now();
+    let mut candidates: Vec<Candidate> = tiers
+        .iter()
+        .flat_map(|t| base_dirs(t))
+        .filter(|b| id(b).is_none_or(|i| !keep.contains(&i)))
+        .filter_map(|base| {
+            let used = base.join(".used");
+            // An undated base is mid-setup and never a candidate, as `try_reclaim` would refuse
+            // it; checked before the lock, whose sidecar taking it would create.
+            std::fs::metadata(&used).ok()?;
+            let lock = crate::cachelock::try_exclusive(&base.join(".inuse"))?;
+            // Dated under the lock, as `cachelock::is_idle` dates them.
+            let at = std::fs::metadata(&used).and_then(|m| m.modified()).ok()?;
+            crate::cachelock::is_idle(&used, grace, now).then(|| Candidate {
+                used: at,
+                bytes: removable_bytes(&base),
+                base,
+                _lock: lock,
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| (a.used, &a.base).cmp(&(b.used, &b.base)));
+    let sum =
+        |chunks: &[(PathBuf, u64)]| chunks.iter().map(|(_, b)| *b).fold(0, u64::saturating_add);
+    // What taking every candidate would free: their bases, and the chunks no other bundle names.
+    let bases = candidates
+        .iter()
+        .map(|c| c.bytes)
+        .fold(0, u64::saturating_add);
+    let (dead_now, dead_after) = match chunks {
+        true => {
+            let taken = |b: &Path| candidates.iter().any(|c| c.base == b);
+            let after = sum(&dead_chunks(&registry, |b| !taken(b)));
+            (sum(&dead_chunks(&registry, |_| true)), after)
+        }
+        false => (0, 0),
+    };
+    // Counted short where it errs — a file another link keeps, a bundle's own chunks before it
+    // goes — so the gate may refuse what removal would have freed, never pass on what it won't.
+    let reach = bases.saturating_add(dead_after);
+    room.reach = Some(reach);
+    if reach < need {
+        return room;
+    }
+    // Only the least recently used candidates that cover `need` stay locked; the rest go back
+    // to their users now rather than wait out the removals. Counted on the bases and the chunks
+    // already dead alone, which a bundle's own chunks only add to: where that falls short,
+    // every candidate is kept.
+    let mut covered = dead_now;
+    if let Some(n) = candidates.iter().position(|c| {
+        covered = covered.saturating_add(c.bytes);
+        covered >= need
+    }) {
+        candidates.truncate(n + 1);
+    }
+    let evicted = &mut room.evicted;
+    let drop_chunks = |evicted: &mut Evicted| {
+        let (dropped, bytes) = drop_unreferenced_chunks(&registry);
+        evicted.chunks = evicted.chunks.saturating_add(dropped as u64);
+        evicted.bytes = evicted.bytes.saturating_add(bytes);
+    };
+    if chunks {
+        drop_chunks(evicted);
+    }
+    // Each candidate's lock drops with it, as it goes or once `need` is met.
+    for c in candidates {
+        if evicted.bytes >= need {
+            break;
+        }
+        // A registry bundle's chunks come free with the last bundle that used them.
+        if remove_counted(&c.base, evicted) && chunks && c.base.starts_with(&registry) {
+            drop_chunks(evicted);
+        }
+    }
+    let what: Vec<String> = [
+        (evicted.bases, "unused image(s)"),
+        (evicted.chunks, "unreferenced cache chunk file(s)"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if !what.is_empty() {
+        println!(
+            "virtkit: evicted {} under {} for room in {}: {} freed of the {} needed",
+            what.join(" and "),
+            state_dir.display(),
+            on.display(),
+            crate::usage::fmt_bytes(evicted.bytes),
+            crate::usage::fmt_bytes(need)
+        );
+    }
+    room
+}
+
+/// What removing `base` would free, counted as [`remove_base`] counts it: a file with another
+/// link keeps its space. Walked as [`crate::usage::allocated_bytes`] walks a job dir.
+fn removable_bytes(base: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(dev) = std::fs::metadata(base).map(|m| m.dev()) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    let mut dirs: Vec<_> = std::fs::read_dir(base).into_iter().collect();
+    while let Some(entries) = dirs.pop() {
+        for entry in entries.flatten() {
+            // `DirEntry::metadata` does not traverse a symlink.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.dev() != dev {
+                continue;
+            }
+            if meta.is_dir() || meta.nlink() <= 1 {
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+            }
+            if meta.is_dir()
+                && let Ok(sub) = std::fs::read_dir(entry.path())
+            {
+                dirs.push(sub);
+            }
+        }
+    }
+    total
 }
 
 /// Every materialized base under `root`: a directory directly holding a `runner.ext4`. The
@@ -1900,6 +2144,186 @@ mod tests {
         assert!(busy.exists(), "a base in use must stay");
         assert!(outside.exists(), "a base behind a symlink must stay");
         drop(guard);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Under pressure: unreferenced chunks first, then unused bases oldest first, whatever the
+    // idle window past a short grace, stopping as soon as the target is met, and nothing at all
+    // for a target out of reach. A base in use stays, as does one just stamped used (resolved,
+    // not yet referenced), one never dated, and one kept; nothing on another filesystem than
+    // the job dirs' is touched.
+    #[test]
+    fn evict_for_room_takes_the_least_recently_used_until_the_target_is_met() {
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join(format!("vk-evict-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state = tmp.join("state");
+        let jobs = state.join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        let idle = Duration::from_secs(4 * 3600);
+        let age = |dir: &Path, ago: Duration| {
+            std::fs::File::open(dir.join(".used"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - ago))
+                .unwrap();
+        };
+        let base = |dir: PathBuf, mins: u64| -> PathBuf {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("runner.ext4"), noise(64 * 1024)).unwrap();
+            mark_used(&dir);
+            age(&dir, Duration::from_secs(mins * 60));
+            dir
+        };
+        let busy = base(state.join("build").join("busy"), 0);
+        let guard = acquire_use_lock_for(&state, &busy.join("runner.ext4"))
+            .unwrap()
+            .unwrap();
+        age(&busy, Duration::from_secs(4 * 3600));
+        let oldest = base(state.join("docker").join("img").join("d1"), 180);
+        let older = base(state.join("build").join("fp"), 120);
+        let newest = base(state.join("registry").join("img").join("r1"), 60);
+        let fresh = base(state.join("docker").join("img").join("d2"), 0);
+        let undated = state.join("build").join("undated");
+        std::fs::create_dir_all(&undated).unwrap();
+        std::fs::write(undated.join("runner.ext4"), noise(64 * 1024)).unwrap();
+        std::fs::write(newest.join("chunks.list"), "live\n").unwrap();
+        let chunks = state.join("registry").join("chunks");
+        std::fs::create_dir_all(&chunks).unwrap();
+        std::fs::write(chunks.join("live"), noise(64 * 1024)).unwrap();
+        std::fs::write(chunks.join("dead"), noise(64 * 1024)).unwrap();
+        let all = [&busy, &oldest, &older, &newest, &fresh, &undated];
+        let stays = || busy.exists() && fresh.exists() && undated.join("runner.ext4").exists();
+
+        // Another filesystem than the one asked about is left alone.
+        let elsewhere = Path::new("/proc");
+        assert_ne!(crate::usage::fs_id(elsewhere), crate::usage::fs_id(&jobs));
+        assert_eq!(
+            evict_for_room(&state, idle, elsewhere, 1, &[], EVICT_WAIT),
+            ForRoom {
+                evicted: Evicted::default(),
+                reach: Some(0)
+            }
+        );
+        assert!(all.iter().all(|b| b.exists()) && chunks.join("dead").exists());
+
+        // Behind another eviction past its wait it does not look, and says so.
+        let lock = state.join(".evict.lock");
+        let ahead = crate::cachelock::lock_exclusive_within(&lock, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let held_up = evict_for_room(&state, idle, &jobs, 1, &[], Duration::from_millis(100));
+        assert_eq!(held_up, ForRoom::default());
+        drop(ahead);
+        assert!(all.iter().all(|b| b.exists()) && chunks.join("dead").exists());
+
+        // A target nothing could meet takes nothing, not even the dead chunk.
+        let none = evict_for_room(&state, idle, &jobs, u64::MAX, &[], EVICT_WAIT);
+        assert_eq!(none.evicted, Evicted::default());
+        assert!(none.reach.is_some_and(|r| r >= 4 * 64 * 1024), "{none:?}");
+        assert!(all.iter().all(|b| b.exists()) && chunks.join("dead").exists());
+
+        // The dead chunk alone meets a small target.
+        let once = evict_for_room(&state, idle, &jobs, 1, &[], EVICT_WAIT).evicted;
+        assert_eq!((once.bases, once.chunks), (0, 1), "{once:?}");
+        assert!(once.bytes >= 64 * 1024, "{once:?}");
+        assert!(!chunks.join("dead").exists() && all.iter().all(|b| b.exists()));
+
+        // Then the least recently used base nobody holds, and no more than the target needs —
+        // passing over one kept, reached here through a symlink. Retried for the reason
+        // `cachelock::reclaimed_eventually` documents.
+        let link = tmp.join("state-link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let keep = [link.join("docker").join("img").join("d1")];
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            let once = evict_for_room(&state, idle, &jobs, 1, &keep, EVICT_WAIT).evicted;
+            if !older.exists() {
+                assert_eq!(once.bases, 1, "{once:?}");
+            }
+            !older.exists()
+        }));
+        assert!(oldest.exists(), "a kept base must stay");
+        assert!(stays());
+
+        // What is left to take: the two dated, unused bases and the chunk only one of them
+        // names. A target a byte past that takes nothing — the fresh and undated bases do not
+        // count toward it — and one that matches it takes them all.
+        let blocks = |p: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(p).unwrap().blocks() * 512
+        };
+        let reach =
+            removable_bytes(&oldest) + removable_bytes(&newest) + blocks(&chunks.join("live"));
+        assert_eq!(
+            evict_for_room(&state, idle, &jobs, reach + 1, &[], EVICT_WAIT),
+            ForRoom {
+                evicted: Evicted::default(),
+                reach: Some(reach)
+            }
+        );
+        assert!(oldest.exists() && newest.exists() && stays());
+        let mut rest = Evicted::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            let once = evict_for_room(&state, idle, &jobs, reach, &[], EVICT_WAIT).evicted;
+            rest.bases += once.bases;
+            rest.chunks += once.chunks;
+            rest.bytes += once.bytes;
+            !oldest.exists() && !newest.exists()
+        }));
+        assert_eq!((rest.bases, rest.chunks), (2, 1), "{rest:?}");
+        assert!(rest.bytes >= reach, "{rest:?}");
+        assert!(!chunks.join("live").exists());
+        assert!(stays(), "a base in use, just stamped or undated must stay");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A lock file another user left 0600 does not stop an eviction: it goes ahead unserialized.
+    // Only observable unprivileged; as root the lock simply opens.
+    #[test]
+    fn evict_for_room_goes_ahead_past_a_lock_it_may_not_open() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join(format!("vk-evict-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let base = tmp.join("build").join("old");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("runner.ext4"), noise(64 * 1024)).unwrap();
+        mark_used(&base);
+        std::fs::File::open(base.join(".used"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+        let lock = tmp.join(".evict.lock");
+        std::fs::write(&lock, "").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let idle = Duration::from_secs(4 * 3600);
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            evict_for_room(&tmp, idle, &tmp, 1, &[], EVICT_WAIT)
+                .evicted
+                .bases
+                == 1
+        }));
+        assert!(!base.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A base counts for what removing it would free: a file with another link keeps its space.
+    #[test]
+    fn removable_bytes_leaves_out_what_another_link_keeps() {
+        let tmp = std::env::temp_dir().join(format!("vk-removable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let base = tmp.join("base");
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("runner.ext4"), noise(64 * 1024)).unwrap();
+        std::fs::write(base.join("sub").join("own"), noise(64 * 1024)).unwrap();
+        let alone = removable_bytes(&base);
+        assert!(alone >= 2 * 64 * 1024, "{alone}");
+        std::fs::hard_link(base.join("runner.ext4"), tmp.join("elsewhere")).unwrap();
+        let linked = removable_bytes(&base);
+        assert!(linked + 64 * 1024 <= alone, "{linked} of {alone}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

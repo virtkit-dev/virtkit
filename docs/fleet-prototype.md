@@ -871,6 +871,22 @@ the cache. A job, its VM and its services hold references to their images for as
 they run; the idle window starts when the last reference is released. One line per tier
 reports the number of evicted images and the space they held.
 
+**Images under disk pressure.** An offer short of disk has the node evict the pulled and built
+images no job holds on the job dirs' filesystem, least recently used first and regardless of
+`image_cache_idle_secs`, until the offer would fit, then decide it again: the node refuses with
+`disk` only when eviction cannot free enough. Unreferenced registry chunks go first, and an
+image used in the last 10 minutes (or `image_cache_idle_secs`, if shorter) stays. Eviction is
+all or nothing: what it cannot cover, it does not start on, and after an eviction that freed
+nothing the node tries again only for a shortfall within what it could have freed, or a minute
+later. The node evicts with its state lock released, but its session answers one hub message
+at a time: the offer's reply and all other traffic on the session, heartbeats included, wait
+for the eviction, which waits at most 30 seconds for another eviction under the same state dir
+before giving up on this one. An offer names no image, so it can evict the one its job will
+pull; a job started without a live reservation evicts the same way. One line reports the
+images and chunk files evicted and the space freed. A job admitted on the node evicts the same
+way while it waits for disk. Past the grace, one job's admission can evict the images of a job
+admitted before it that has yet to resolve them.
+
 **Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
 `get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),
 `download_artifacts` (`ARTIFACT_DOWNLOAD_ATTEMPTS`), each `step_<name>` (under

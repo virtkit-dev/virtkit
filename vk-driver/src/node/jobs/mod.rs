@@ -139,6 +139,8 @@ struct State {
     jobs: BTreeMap<String, Track>,
     /// Why the last offer was refused, logged when it changes; `None` once one is granted.
     refused: Option<(Refusal, Option<String>)>,
+    /// When an ask short of disk may scan the caches again (see [`Jobs::handle`]).
+    reclaim: crate::admit::Backoff,
 }
 
 impl State {
@@ -210,7 +212,12 @@ pub fn limits(cfg: &Config) -> Result<Limits> {
     let vm = &cfg.executor.vm;
     Ok(Limits {
         admit_dir: cfg.state_dir().join("admit"),
-        jobs_dir: ctx_jobs,
+        jobs_dir: ctx_jobs.clone(),
+        reclaim: Some(ledger::evicting(
+            cfg.state_dir().to_path_buf(),
+            cfg.image_cache_idle(),
+            ctx_jobs,
+        )),
         budget_mib: crate::vm::budget_mib(cfg).transpose()?,
         disk_admission: cfg.executor.schedule.disk_admission.unwrap_or(true),
         max_cpus: vm.max_cpus.unwrap_or(vm.cpus),
@@ -276,6 +283,7 @@ impl Jobs {
                 ledger: Ledger::new(limits),
                 jobs,
                 refused: None,
+                reclaim: crate::admit::Backoff::default(),
             }),
             spawner,
             cleaner,
@@ -316,6 +324,14 @@ impl Jobs {
     }
 
     /// The answers to a message from the hub, taking new work as `intake` says.
+    ///
+    /// An ask short of disk that evicting cached images could fit is refused under the state
+    /// lock, the lock dropped while [`Limits::reclaim`] evicts, and, once that has freed
+    /// anything, decided afresh on whatever the state has become, at the time it is decided
+    /// but on the `intake` the message arrived with. Dropping the lock frees the node's other
+    /// users of the state, not the session: it answers one message at a time, so this reply and
+    /// everything after it, heartbeats included, wait for the eviction. A scan that freed
+    /// nothing is repeated only when [`crate::admit::Backoff`] says so.
     pub fn handle(&self, msg: HubJobMsg, intake: Intake, now: Instant) -> Vec<NodeJobMsg> {
         let mut state = lock(&self.state);
         match msg {
@@ -325,9 +341,29 @@ impl Jobs {
                 lease_secs,
             } => {
                 let gate = state.gate(intake);
-                let reply = state
+                let mut offered = state
                     .ledger
                     .offer(&reservation, envelope, lease_secs, gate, now);
+                if let Some(need) = offered.reclaim
+                    && state.reclaim.due(need, Instant::now())
+                {
+                    let limits = state.ledger.limits().clone();
+                    drop(state);
+                    let done = limits.reclaim(need, &[]);
+                    state = lock(&self.state);
+                    state.reclaim.record(need, done, Instant::now());
+                    if done.freed > 0 {
+                        let gate = state.gate(intake);
+                        offered = state.ledger.offer(
+                            &reservation,
+                            envelope,
+                            lease_secs,
+                            gate,
+                            Instant::now(),
+                        );
+                    }
+                }
+                let reply = offered.reply;
                 if let Some(line) = refusal_change(&mut state.refused, &reply) {
                     say!("{line}");
                 }
@@ -344,7 +380,22 @@ impl Jobs {
                 let state = state.ledger.release(&reservation);
                 vec![NodeJobMsg::Lease { reservation, state }]
             }
-            HubJobMsg::Start(start) => self.start(&mut state, *start, intake),
+            HubJobMsg::Start(start) => {
+                let (mut msgs, reclaim) = self.start(&mut state, &start, intake);
+                if let Some(need) = reclaim
+                    && state.reclaim.due(need, Instant::now())
+                {
+                    let limits = state.ledger.limits().clone();
+                    drop(state);
+                    let done = limits.reclaim(need, &[]);
+                    let mut state = lock(&self.state);
+                    state.reclaim.record(need, done, Instant::now());
+                    if done.freed > 0 {
+                        msgs = self.start(&mut state, &start, intake).0;
+                    }
+                }
+                msgs
+            }
             HubJobMsg::OutputAck { job, offset } => {
                 if let Some(t) = state.jobs.get_mut(&job) {
                     let len = journal::output_len(&t.dir);
@@ -394,7 +445,16 @@ impl Jobs {
         }
     }
 
-    fn start(&self, state: &mut State, start: JobStart, intake: Intake) -> Vec<NodeJobMsg> {
+    /// Start `start`, or refuse it: the messages saying which, and where it was refused for
+    /// want of disk that evicting cached images might free, how much, for [`Jobs::handle`] to
+    /// free outside the state lock and start it again. Nothing is taken from `state` on that
+    /// refusal, so the second call decides it afresh.
+    fn start(
+        &self,
+        state: &mut State,
+        start: &JobStart,
+        intake: Intake,
+    ) -> (Vec<NodeJobMsg>, Option<u64>) {
         let job = start.job.clone();
         let refused = |reason: Refusal, message: String| {
             vec![NodeJobMsg::Job {
@@ -406,7 +466,7 @@ impl Jobs {
             }]
         };
         if !vk_hub_proto::valid_id(&job) {
-            return refused(Refusal::Invalid, "malformed job ID".into());
+            return (refused(Refusal::Invalid, "malformed job ID".into()), None);
         }
         // Redelivered: answered from the journal, never run twice.
         if let Some(t) = state.jobs.get(&job) {
@@ -419,16 +479,22 @@ impl Jobs {
                 },
                 (None, None) => RunState::Accepted,
             };
-            return vec![NodeJobMsg::Job { job, state: run }];
+            return (vec![NodeJobMsg::Job { job, state: run }], None);
         }
         let JobSpec::GitlabCi(spec) = &start.spec;
         let spec_len = serde_json::to_vec(&start.spec).map_or(usize::MAX, |b| b.len());
         if spec_len > MAX_JOB_SPEC {
-            return refused(Refusal::Invalid, "the spec is over 512 KiB".into());
+            return (
+                refused(Refusal::Invalid, "the spec is over 512 KiB".into()),
+                None,
+            );
         }
         let gitlab_id = spec.job.id;
         if gitlab_id == 0 || env::place(&self.cfg, spec, &meta_for(0, 0, spec)).is_err() {
-            return refused(Refusal::Invalid, "the spec names no runnable job".into());
+            return (
+                refused(Refusal::Invalid, "the spec names no runnable job".into()),
+                None,
+            );
         }
         let name = gitlab_id.to_string();
         // The ledger entry the job holds: its reservation's, renamed to the job, or a fresh
@@ -454,16 +520,16 @@ impl Jobs {
             (None, gate) => {
                 if let Some((reason, message)) = gate.refusal() {
                     let message = message.unwrap_or_else(|| "the node takes no new work".into());
-                    return refused(reason, message);
+                    return (refused(reason, message), None);
                 }
                 match state.ledger.admit(&name, &start.envelope) {
                     Ok(held) => held,
-                    Err((reason, message)) => {
+                    Err(r) => {
                         let reason = match start.reservation {
                             Some(_) => Refusal::NoReservation,
-                            None => reason,
+                            None => r.reason,
                         };
-                        return refused(reason, message);
+                        return (refused(reason, r.message), r.reclaim);
                     }
                 }
             }
@@ -488,15 +554,21 @@ impl Jobs {
         }) {
             None => None,
             Some(Ok(r)) => Some(r),
-            Some(Err(e)) => return refused_after(msgs, Refusal::Invalid, format!("{e:#}")),
+            Some(Err(e)) => {
+                return (
+                    refused_after(msgs, Refusal::Invalid, format!("{e:#}")),
+                    None,
+                );
+            }
         };
         let meta = self.slots(state, spec);
         let dir = self.dir.join(&job);
-        match self.journal(&dir, &start, &meta) {
+        match self.journal(&dir, start, &meta) {
             Ok(()) => {}
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
-                return refused_after(msgs, Refusal::Other, format!("journaling the job: {e:#}"));
+                let message = format!("journaling the job: {e:#}");
+                return (refused_after(msgs, Refusal::Other, message), None);
             }
         }
         if let Err(e) = (self.spawner)(self, &dir, held) {
@@ -537,7 +609,7 @@ impl Jobs {
                 state: RunState::Accepted,
             },
         );
-        msgs
+        (msgs, None)
     }
 
     /// The lowest slots free among the jobs this node runs: overall, and within the project.
@@ -909,6 +981,7 @@ pub(crate) fn for_test(node_dir: &Path, cfg: Config, budget_mib: Option<u64>) ->
     let limits = Limits {
         admit_dir: node_dir.join("admit"),
         jobs_dir: node_dir.join("vm-jobs"),
+        reclaim: None,
         budget_mib,
         disk_admission: false,
         max_cpus: 8,
@@ -1150,6 +1223,153 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// What a node's fake reclaimer was asked: each need, with the bases it was to keep.
+    type Asked = Arc<Mutex<Vec<(u64, Vec<PathBuf>)>>>;
+
+    /// A node whose job dirs' filesystem a granted claim leaves no room on, so any disk ask is
+    /// short, with a fake reclaimer that records what it is asked and, where it `frees`, makes
+    /// the room by letting that claim go, freeing a byte; otherwise it frees nothing.
+    fn short_of_disk(tag: &str, frees: bool) -> (Arc<Jobs>, PathBuf, Asked) {
+        let dir = scratch(tag);
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
+        let (admit_dir, jobs_dir) = (dir.join("admit"), dir.join("vm-jobs"));
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        // Alone on the filesystem a claim on all of it is granted.
+        let whole = crate::admit::Ask {
+            mem: None,
+            disk: Some(crate::admit::DiskAsk {
+                want: crate::usage::fs_space(&jobs_dir).unwrap().total,
+                jobs: &jobs_dir,
+                reclaim: None,
+            }),
+        };
+        let blocker = crate::admit::try_acquire(&admit_dir, "blocker", &whole)
+            .unwrap()
+            .unwrap();
+        let blocker = Mutex::new(Some(blocker));
+        let asked: Asked = Arc::default();
+        let reclaim: ledger::Reclaimer = {
+            let (asked, admit_dir) = (asked.clone(), admit_dir.clone());
+            Arc::new(move |need, keep: &[PathBuf]| {
+                asked.lock().unwrap().push((need, keep.to_vec()));
+                let freed = match frees.then(|| lock(&blocker).take()).flatten() {
+                    Some(claim) => {
+                        drop(claim);
+                        crate::admit::release(&admit_dir, "blocker");
+                        1
+                    }
+                    None => 0,
+                };
+                crate::admit::Reclaimed {
+                    freed,
+                    reach: Some(freed),
+                }
+            })
+        };
+        let limits = Limits {
+            admit_dir,
+            jobs_dir,
+            reclaim: Some(reclaim),
+            budget_mib: None,
+            disk_admission: true,
+            max_cpus: 8,
+        };
+        let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, fake_driver, fake_cleanup);
+        (jobs, dir, asked)
+    }
+
+    const DISK_ASK: Envelope = Envelope {
+        mem_mib: 1024,
+        cpus: 2,
+        disk_bytes: 1 << 20,
+    };
+
+    fn disk_offer() -> HubJobMsg {
+        HubJobMsg::Offer {
+            reservation: hex("a"),
+            envelope: DISK_ASK,
+            lease_secs: 90,
+        }
+    }
+
+    fn disk_start() -> HubJobMsg {
+        HubJobMsg::Start(Box::new(JobStart {
+            job: hex("b"),
+            reservation: None,
+            envelope: DISK_ASK,
+            spec: spec(4242),
+        }))
+    }
+
+    /// An offer short of disk that eviction covers is granted in the one reply, the reclaimer
+    /// asked once for at least the ask and told to keep nothing.
+    #[test]
+    fn a_disk_short_offer_evicts_and_is_granted() {
+        let (jobs, dir, asked) = short_of_disk("evict-offer", true);
+        let replies = jobs.handle(disk_offer(), OPEN, Instant::now());
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [NodeJobMsg::OfferReply {
+                    reply: OfferReply::Accepted { .. },
+                    ..
+                }]
+            ),
+            "{replies:?}"
+        );
+        let asked = asked.lock().unwrap();
+        assert!(
+            matches!(asked.as_slice(), [(need, keep)] if *need >= DISK_ASK.disk_bytes && keep.is_empty()),
+            "{asked:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// So is a job started without a live reservation.
+    #[test]
+    fn a_disk_short_start_evicts_and_is_accepted() {
+        let (jobs, dir, asked) = short_of_disk("evict-start", true);
+        let msgs = jobs.handle(disk_start(), OPEN, Instant::now());
+        assert!(
+            matches!(
+                msgs.first(),
+                Some(NodeJobMsg::Job {
+                    state: RunState::Accepted,
+                    ..
+                })
+            ),
+            "{msgs:?}"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An eviction that freed nothing is not tried again for a shortfall still beyond what it
+    /// could have freed: the next offer is refused without asking.
+    #[test]
+    fn a_fruitless_eviction_is_not_repeated_at_once() {
+        let (jobs, dir, asked) = short_of_disk("backoff", false);
+        for _ in 0..2 {
+            let replies = jobs.handle(disk_offer(), OPEN, Instant::now());
+            assert!(
+                matches!(
+                    replies.as_slice(),
+                    [NodeJobMsg::OfferReply {
+                        reply: OfferReply::Refused {
+                            reason: Refusal::Disk,
+                            ..
+                        },
+                        ..
+                    }]
+                ),
+                "{replies:?}"
+            );
+        }
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A driver that has started and not finished.
     fn running_driver(_: &Jobs, _: &Path, held: Option<crate::admit::Reservation>) -> Result<()> {
         drop(held);
@@ -1166,6 +1386,7 @@ pub(crate) mod tests {
         let limits = Limits {
             admit_dir: dir.join("admit"),
             jobs_dir: dir.join("vm-jobs"),
+            reclaim: None,
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,
@@ -1236,6 +1457,7 @@ pub(crate) mod tests {
         let limits = Limits {
             admit_dir: dir.join("admit"),
             jobs_dir: dir.join("vm-jobs"),
+            reclaim: None,
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,
@@ -1724,6 +1946,7 @@ pub(crate) mod tests {
         let limits = Limits {
             admit_dir: dir.join("admit"),
             jobs_dir: dir.join("vm-jobs"),
+            reclaim: None,
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,

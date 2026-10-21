@@ -46,6 +46,9 @@ use anyhow::{Context, Result, bail};
 const LOCK: &str = ".lock";
 /// How often a waiting job re-checks the ledger.
 const POLL: Duration = Duration::from_secs(2);
+/// Retry a fruitless reclaim after this interval even if the shortfall still exceeds its
+/// reach: completed jobs may have released images.
+const RECLAIM_AGAIN: Duration = Duration::from_secs(60);
 
 /// A job's granted reservation: the open, shared-locked ledger file. Dropping it (or the
 /// process exiting) releases the lock, which is what makes the reservation stop counting —
@@ -82,6 +85,52 @@ pub struct MemAsk {
 pub struct DiskAsk<'a> {
     pub want: u64,
     pub jobs: &'a Path,
+    /// Frees at least the bytes it is given on `jobs`' filesystem if it can, from caches
+    /// nobody is using, and returns what it freed: [`acquire`] runs it outside the directory
+    /// lock when the disk is what keeps the ask out, then tries again. [`try_acquire`] does not
+    /// run it, and reports the shortfall in [`Short::Disk`] for its caller to free outside locks
+    /// of its own.
+    pub reclaim: Option<&'a dyn Fn(u64) -> Reclaimed>,
+}
+
+/// What a reclaim did: the bytes it freed, and what taking everything it could would have
+/// freed. A reclaim that freed nothing either had a reach short of what it was asked to free
+/// or failed to remove what it took; one
+/// with no reach did not look at all (another eviction held it up past its wait), and says
+/// nothing of what the next would find.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub freed: u64,
+    pub reach: Option<u64>,
+}
+
+/// When a disk-short ask may have its reclaimer scan the caches again. A scan that freed nothing
+/// is repeated only once the shortfall is back within what it could have freed, or
+/// [`RECLAIM_AGAIN`] on: free space moves by a few KiB between any two passes, so a shortfall
+/// that merely changed says nothing about what another scan would find.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    /// What the last scan that freed nothing could have freed, held below the shortfall it was
+    /// asked for, and when it ran.
+    fruitless: Option<(u64, Instant)>,
+}
+
+impl Backoff {
+    pub fn due(&self, need: u64, now: Instant) -> bool {
+        self.fruitless.is_none_or(|(reach, at)| {
+            need <= reach || now.saturating_duration_since(at) >= RECLAIM_AGAIN
+        })
+    }
+
+    /// Note what a reclaim asked for `need` did at `now`. One that did not look changes nothing.
+    pub fn record(&mut self, need: u64, reclaimed: Reclaimed, now: Instant) {
+        let Some(reach) = reclaimed.reach else {
+            return;
+        };
+        // A reach that covered the need and still freed nothing (a removal that failed) must
+        // not make every later pass due.
+        self.fruitless = (reclaimed.freed == 0).then(|| (reach.min(need.saturating_sub(1)), now));
+    }
 }
 
 /// Reserve what `ask` names for `job_id`, waiting up to `timeout` for room. Prints its wait to
@@ -106,7 +155,7 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
              budget ([executor.schedule] mem_budget vs [executor.vm] mem) — it can never be admitted"
         );
     }
-    if let Some(DiskAsk { want, jobs }) = ask.disk {
+    if let Some(DiskAsk { want, jobs, .. }) = ask.disk {
         let total = crate::usage::fs_space(jobs)
             .with_context(|| format!("reading the free space of {}", jobs.display()))?
             .total;
@@ -170,11 +219,14 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
     let mut waited_since = None;
     // What held the job back on the last pass that did, which is what it ended up waiting for.
     let mut waited_for = Blocker::Queue;
+    // Whether this round has had its reclaim, whether it is the first, and when the next may run.
+    let mut reclaimed = false;
+    let mut first = true;
+    let mut backoff = Backoff::default();
     loop {
-        // Both are composed under the directory lock and reported outside it: prepare's stdout
-        // is a pipe gitlab-runner drains, and a stalled reader blocking on `write` must not
-        // block every other runner's admission on the host-wide lock.
-        let mut wait_note = None;
+        // Reported outside the directory lock: prepare's stdout is a pipe gitlab-runner
+        // drains, and a stalled reader blocking on `write` must not block every other runner's
+        // admission on the host-wide lock.
         let mut anomalies = Vec::new();
         // The block yields what held the job back, if anything, and nothing more, so no
         // reporting can sit inside the critical section even by accident.
@@ -204,14 +256,7 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
                     entry.write(&file, &path)?;
                     None
                 }
-                Some(blocker) => {
-                    if waited_since.is_none() {
-                        waited_since = Some(Instant::now());
-                        wait_note = Some(pass.note());
-                    }
-                    waited_for = blocker;
-                    Some(pass)
-                }
+                Some(_) => Some(pass),
             }
         };
         report(&anomalies);
@@ -228,9 +273,30 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
                 job_id: job_id.to_string(),
             });
         };
-        if let Some(note) = wait_note {
-            println!("{note}");
+        // One reclaim a round: one that frees anything earns a pass at once, ahead of the
+        // deadline, and the next round sleeps first. One that freed nothing is not asked again
+        // until [`Backoff`] says so. The first round reclaims whatever the timeout, so a job
+        // that may not wait at all still has its one pass and retry; later rounds only before
+        // the deadline, which would otherwise be overrun by a scan nothing then waits for.
+        if !reclaimed
+            && (first || Instant::now() < deadline)
+            && let Some(need) = pass.disk_shortfall()
+            && backoff.due(need, Instant::now())
+        {
+            reclaimed = true;
+            let done = pass.reclaim(need);
+            backoff.record(need, done, Instant::now());
+            if done.freed > 0 {
+                continue;
+            }
         }
+        reclaimed = false;
+        first = false;
+        if waited_since.is_none() {
+            waited_since = Some(Instant::now());
+            println!("{}", pass.note());
+        }
+        waited_for = pass.blocker().unwrap_or(Blocker::Queue);
         if Instant::now() >= deadline {
             // Best-effort: the entry stops counting the moment this process drops its lock,
             // and a scan that got there first has already removed it.
@@ -259,7 +325,11 @@ fn reserved_entry(path: &Path) -> Result<Option<u128>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Short {
     Memory,
-    Disk,
+    Disk {
+        /// The free space that would admit it, beyond what there is: what evicting caches would
+        /// have to free. `None` for an ask larger than the whole filesystem.
+        need: Option<u64>,
+    },
     /// Jobs that asked first are still waiting: granting this ask would jump them.
     Queue,
 }
@@ -274,14 +344,14 @@ pub fn try_acquire(
     if ask.mem.is_some_and(|m| m.want_mib > m.budget_mib) {
         return Ok(Err(Short::Memory));
     }
-    if let Some(DiskAsk { want, jobs }) = ask.disk {
+    if let Some(DiskAsk { want, jobs, .. }) = ask.disk {
         // A node asked before any job ran has no job dirs yet; made as prepare makes it.
         std::fs::create_dir_all(jobs).with_context(|| format!("creating {}", jobs.display()))?;
         let total = crate::usage::fs_space(jobs)
             .with_context(|| format!("reading the free space of {}", jobs.display()))?
             .total;
         if want > total {
-            return Ok(Err(Short::Disk));
+            return Ok(Err(Short::Disk { need: None }));
         }
     }
     std::fs::DirBuilder::new()
@@ -310,12 +380,8 @@ pub fn try_acquire(
                 .map(|d| DiskRoom::of(d.jobs, &held.disk))
                 .transpose()?;
         }
-        if let Some(blocker) = pass.blocker() {
-            return Ok(Err(match blocker {
-                Blocker::Memory => Short::Memory,
-                Blocker::Disk => Short::Disk,
-                Blocker::Queue => Short::Queue,
-            }));
+        if pass.blocker().is_some() {
+            return Ok(Err(pass.short()));
         }
         if reserved_entry(&path)?.is_some() {
             bail!("{} is already reserved", path.display());
@@ -388,6 +454,37 @@ impl<'a> Pass<'a> {
             Some(room) => want.min(room.avail.saturating_add(room.held)),
             None => want,
         })
+    }
+
+    /// How much more free space would admit this job, on a pass the disk keeps it out on:
+    /// enough for its full expectation, not its [`Self::disk_claim`]. The claim is capped by
+    /// what is free, so it grows with every byte an eviction frees, and a shortfall measured
+    /// against it is one eviction can never close.
+    fn disk_shortfall(&self) -> Option<u64> {
+        let (room, disk) = (self.room?, self.ask.disk?);
+        (self.blocker() == Some(Blocker::Disk)).then(|| {
+            room.pending
+                .saturating_add(disk.want)
+                .saturating_sub(room.avail)
+        })
+    }
+
+    /// Have the ask's reclaimer free `need`: nothing where the ask has none.
+    fn reclaim(&self, need: u64) -> Reclaimed {
+        self.ask
+            .disk
+            .and_then(|d| d.reclaim)
+            .map_or_else(Reclaimed::default, |reclaim| reclaim(need))
+    }
+
+    fn short(&self) -> Short {
+        match self.blocker() {
+            Some(Blocker::Memory) => Short::Memory,
+            Some(Blocker::Disk) => Short::Disk {
+                need: self.disk_shortfall(),
+            },
+            _ => Short::Queue,
+        }
     }
 
     fn disk_short(&self) -> bool {
@@ -3238,6 +3335,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 disk: Some(DiskAsk {
                     want: want * GIB,
                     jobs: Path::new("/jobs"),
+                    reclaim: None,
                 }),
             },
             used_mib: 0,
@@ -3299,6 +3397,31 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
              ([executor.schedule] wait_timeout_secs)"
         );
         assert_eq!(Blocker::Queue.what(), "the jobs that asked first");
+
+        // What a reclaim is asked to free: the shortfall, and only where disk is the blocker.
+        assert_eq!(short.disk_shortfall(), Some(GIB));
+        assert_eq!(disk_pass(50, 100, 50, None).disk_shortfall(), None);
+        assert_eq!(queued.disk_shortfall(), None);
+        // Measured against the full expectation, not the claim capped at what is free: 150 GiB
+        // more free admits it, where the 50 GiB the capped claim falls short by never would,
+        // the cap rising with each byte freed.
+        let capped = disk_pass(200, 100, 50, None);
+        assert_eq!(capped.disk_claim(), Some(100 * GIB));
+        assert_eq!(capped.disk_shortfall(), Some(150 * GIB));
+        assert_eq!(
+            capped.short(),
+            Short::Disk {
+                need: Some(150 * GIB)
+            }
+        );
+        let freed = Pass {
+            room: Some(DiskRoom {
+                avail: 250 * GIB,
+                ..capped.room.unwrap()
+            }),
+            ..disk_pass(200, 100, 50, None)
+        };
+        assert_eq!(freed.blocker(), None);
 
         // With memory asked for too, the wait is told as one for whichever is short — memory
         // where both are, since that is the figure a job is sized by.
@@ -3429,7 +3552,11 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let jobs = tmpdir("disk-ledger-jobs");
         let ask = |want| Ask {
             mem: None,
-            disk: Some(DiskAsk { want, jobs: &jobs }),
+            disk: Some(DiskAsk {
+                want,
+                jobs: &jobs,
+                reclaim: None,
+            }),
         };
         // A job already admitted that has yet to write more than the filesystem has free.
         let blocker = open_shared(&dir.join("running")).unwrap();
@@ -3483,6 +3610,163 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         assert!(err.to_string().contains("never be admitted"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&jobs);
+    }
+
+    /// A disk-short ask is told the free space that would admit it. `try_acquire` reports it and
+    /// frees nothing; `acquire` has its reclaimer free it outside the directory lock and tries
+    /// again at once, one reclaim a round: admitted once the room is there, refused once its
+    /// wait runs out with the reclaimer freeing nothing.
+    #[test]
+    fn a_disk_short_ask_reclaims_and_tries_again() {
+        let dir = tmpdir("disk-reclaim");
+        let jobs = tmpdir("disk-reclaim-jobs");
+        // A job admitted with more yet to write than the filesystem has free, standing in for
+        // the caches that fill it: the reclaimer frees it by letting it go.
+        const PENDING: u64 = u64::MAX / 2;
+        let block = || {
+            let file = open_shared(&dir.join("running")).unwrap();
+            Entry {
+                want_mib: 0,
+                asked: 1,
+                granted: true,
+                node: None,
+                disk: Some(PENDING),
+            }
+            .write(&file, &dir.join("running"))
+            .unwrap();
+            file
+        };
+        let running = std::cell::RefCell::new(Some(block()));
+        let asked = std::cell::RefCell::new(Vec::new());
+        // How many reclaims free a byte while leaving the block in place, before one lets it go.
+        let teasers = std::cell::Cell::new(0);
+        let reclaim = |need: u64| {
+            asked.borrow_mut().push(need);
+            // The directory lock is free while it runs.
+            drop(
+                try_lock_dir(&dir)
+                    .unwrap()
+                    .expect("reclaim runs outside the lock"),
+            );
+            let freed = |freed| Reclaimed {
+                freed,
+                reach: Some(freed),
+            };
+            if teasers.get() > 0 {
+                teasers.set(teasers.get() - 1);
+                return freed(1);
+            }
+            match running.borrow_mut().take() {
+                Some(file) => {
+                    drop(file);
+                    release(&dir, "running");
+                    freed(1)
+                }
+                None => freed(0),
+            }
+        };
+        let ask = Ask {
+            mem: None,
+            disk: Some(DiskAsk {
+                want: 1,
+                jobs: &jobs,
+                reclaim: Some(&reclaim),
+            }),
+        };
+
+        // The shortfall: what the running job has yet to write plus this ask, less what is
+        // free, which other tests move; the exact figure is `disk_pass`'s to check.
+        let total = crate::usage::fs_space(&jobs).unwrap().total;
+        let short = try_acquire(&dir, "offer", &ask).unwrap().unwrap_err();
+        let Short::Disk { need: Some(need) } = short else {
+            panic!("{short:?}");
+        };
+        let full = PENDING + 1;
+        assert!(need <= full && need >= full - total, "{need}");
+        assert!(asked.borrow().is_empty(), "try_acquire runs no reclaim");
+
+        // The waiting path: reclaimed and admitted at once, even with no time to wait.
+        let job = acquire(&dir, "job", &ask, Duration::ZERO).unwrap();
+        assert_eq!(asked.borrow().len(), 1);
+        drop(job);
+        release(&dir, "job");
+
+        // A reclaim that frees something but not enough earns a retry at once and no second
+        // reclaim until the next round, which frees the rest.
+        *running.borrow_mut() = Some(block());
+        asked.borrow_mut().clear();
+        teasers.set(1);
+        let started = Instant::now();
+        let job = acquire(&dir, "job", &ask, Duration::from_secs(60)).unwrap();
+        assert_eq!(asked.borrow().len(), 2);
+        assert!(
+            started.elapsed() >= POLL,
+            "the second reclaim waited for its round"
+        );
+        drop(job);
+        release(&dir, "job");
+
+        // Nothing to free: one reclaim, and the wait gives up at its deadline.
+        let held = block();
+        asked.borrow_mut().clear();
+        let err = acquire(&dir, "job", &ask, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().starts_with("no room in"), "{err}");
+        assert_eq!(asked.borrow().len(), 1);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&jobs);
+    }
+
+    /// A reclaim that freed nothing is asked again only for a shortfall back within its reach, or
+    /// a minute on; one that freed anything leaves the next due at once.
+    #[test]
+    fn a_fruitless_reclaim_backs_off() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        assert!(b.due(u64::MAX, t0));
+        b.record(
+            100,
+            Reclaimed {
+                freed: 0,
+                reach: Some(60),
+            },
+            t0,
+        );
+        assert!(!b.due(100, t0 + POLL), "the same shortfall, give or take");
+        assert!(!b.due(61, t0 + POLL));
+        assert!(b.due(60, t0 + POLL), "back within what the scan could free");
+        assert!(b.due(100, t0 + RECLAIM_AGAIN));
+        // A reach that covered the need yet freed nothing is held below it.
+        b.record(
+            100,
+            Reclaimed {
+                freed: 0,
+                reach: Some(500),
+            },
+            t0,
+        );
+        assert!(!b.due(100, t0 + POLL) && b.due(99, t0 + POLL));
+        b.record(
+            100,
+            Reclaimed {
+                freed: 1,
+                reach: Some(500),
+            },
+            t0,
+        );
+        assert!(b.due(u64::MAX, t0));
+        // One that did not look, held up behind another eviction, leaves the back-off as it was.
+        b.record(
+            100,
+            Reclaimed {
+                freed: 0,
+                reach: Some(0),
+            },
+            t0,
+        );
+        b.record(1, Reclaimed::default(), t0 + POLL);
+        assert!(!b.due(100, t0 + POLL));
+        assert!(b.due(100, t0 + RECLAIM_AGAIN));
     }
 
     /// The disk claim rides after the node, where a reader that knows only the node passes over

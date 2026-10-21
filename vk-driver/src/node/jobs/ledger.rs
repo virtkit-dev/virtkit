@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vk_hub_proto::dispatch::{
@@ -15,17 +16,67 @@ use vk_hub_proto::job::Envelope;
 use crate::admit::{self, Short};
 
 /// What the node admits against.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Limits {
     /// The ledger's directory.
     pub admit_dir: PathBuf,
     /// Where job dirs are made, which disk admission measures.
     pub jobs_dir: PathBuf,
+    /// What a disk shortage evicts from; `None` keeps everything.
+    pub reclaim: Option<Reclaimer>,
     /// `[executor.schedule] mem_budget`, MiB; `None` with memory admission off.
     pub budget_mib: Option<u64>,
     pub disk_admission: bool,
     /// The most vCPUs a job may have.
     pub max_cpus: u32,
+}
+
+/// Frees `need` more bytes of room on the job dirs' filesystem, keeping the bases it is given.
+pub type Reclaimer = Arc<dyn Fn(u64, &[PathBuf]) -> admit::Reclaimed + Send + Sync>;
+
+/// The node's [`Reclaimer`]: evict the cached images under `state_dir` nobody holds on the
+/// filesystem of `jobs_dir`, all or nothing (see `image::evict_for_room`), giving a base just
+/// resolved the grace `idle` (`image_cache_idle_secs`) bounds.
+pub fn evicting(state_dir: PathBuf, idle: Duration, jobs_dir: PathBuf) -> Reclaimer {
+    Arc::new(move |need, keep| {
+        crate::image::evict_for_room(
+            &state_dir,
+            idle,
+            &jobs_dir,
+            need,
+            keep,
+            crate::image::EVICT_WAIT,
+        )
+        .reclaimed()
+    })
+}
+
+impl Limits {
+    /// Have the [`Reclaimer`] free `need` bytes, keeping `keep`. Slow next to an admission pass,
+    /// so run outside the node's locks.
+    pub fn reclaim(&self, need: u64, keep: &[PathBuf]) -> admit::Reclaimed {
+        self.reclaim
+            .as_ref()
+            .map_or_else(admit::Reclaimed::default, |r| r(need, keep))
+    }
+}
+
+/// An ask the ledger refused: why, in the hub's words, and where the disk alone kept it out
+/// and this node evicts caches for room, the bytes [`Limits::reclaim`] would have to free for
+/// it to fit.
+#[derive(Debug)]
+pub struct Refused {
+    pub reason: Refusal,
+    pub message: String,
+    pub reclaim: Option<u64>,
+}
+
+/// What [`Ledger::offer`] answers, and where it refused for want of disk that eviction might
+/// free, how much: for the caller to free outside its locks and offer again.
+#[derive(Debug)]
+pub struct Offered {
+    pub reply: OfferReply,
+    pub reclaim: Option<u64>,
 }
 
 struct Entry {
@@ -104,7 +155,7 @@ pub fn refusal(short: Short, ask: &Envelope, limits: &Limits) -> (Refusal, Strin
                 limits.budget_mib.unwrap_or(0)
             ),
         ),
-        Short::Disk => (
+        Short::Disk { .. } => (
             Refusal::Disk,
             format!("{} bytes of job-dir disk do not fit", ask.disk_bytes),
         ),
@@ -130,20 +181,22 @@ impl Ledger {
         &self.limits
     }
 
-    /// Hold `envelope` under `name` in the admission ledger now, or say what is short.
+    /// Hold `envelope` under `name` in the admission ledger now, or say what is short. Evicts
+    /// nothing itself: a refusal for disk says what [`Limits::reclaim`] would have to free.
     pub fn admit(
         &self,
         name: &str,
         envelope: &Envelope,
-    ) -> Result<Option<admit::Reservation>, (Refusal, String)> {
+    ) -> Result<Option<admit::Reservation>, Refused> {
         if envelope.cpus > self.limits.max_cpus {
-            return Err((
-                Refusal::Cpus,
-                format!(
+            return Err(Refused {
+                reason: Refusal::Cpus,
+                message: format!(
                     "{} vCPUs is more than this node gives a job ({})",
                     envelope.cpus, self.limits.max_cpus
                 ),
-            ));
+                reclaim: None,
+            });
         }
         let ask = admit::Ask {
             mem: self.limits.budget_mib.map(|budget_mib| admit::MemAsk {
@@ -153,6 +206,7 @@ impl Ledger {
             disk: (self.limits.disk_admission && envelope.disk_bytes > 0).then(|| admit::DiskAsk {
                 want: envelope.disk_bytes,
                 jobs: &self.limits.jobs_dir,
+                reclaim: None,
             }),
         };
         if ask.mem.is_none() && ask.disk.is_none() {
@@ -160,8 +214,23 @@ impl Ledger {
         }
         match admit::try_acquire(&self.limits.admit_dir, name, &ask) {
             Ok(Ok(r)) => Ok(Some(r)),
-            Ok(Err(short)) => Err(refusal(short, envelope, &self.limits)),
-            Err(e) => Err((Refusal::Other, format!("{e:#}"))),
+            Ok(Err(short)) => {
+                let (reason, message) = refusal(short, envelope, &self.limits);
+                let reclaim = match short {
+                    Short::Disk { need } if self.limits.reclaim.is_some() => need,
+                    _ => None,
+                };
+                Err(Refused {
+                    reason,
+                    message,
+                    reclaim,
+                })
+            }
+            Err(e) => Err(Refused {
+                reason: Refusal::Other,
+                message: format!("{e:#}"),
+                reclaim: None,
+            }),
         }
     }
 
@@ -180,20 +249,24 @@ impl Ledger {
         lease_secs: u32,
         gate: Gate,
         now: Instant,
-    ) -> OfferReply {
+    ) -> Offered {
+        let reply = |reply| Offered {
+            reply,
+            reclaim: None,
+        };
         if !vk_hub_proto::valid_id(id) || lease_secs == 0 {
-            return OfferReply::Refused {
+            return reply(OfferReply::Refused {
                 reason: Refusal::Invalid,
                 message: None,
-            };
+            });
         }
         let lease = lease_secs.min(MAX_LEASE_SECS);
         if let Some(entry) = self.entries.get_mut(id) {
             entry.expires = now + Duration::from_secs(lease.into());
-            return OfferReply::Accepted { lease_secs: lease };
+            return reply(OfferReply::Accepted { lease_secs: lease });
         }
         if let Some((reason, message)) = gate.refusal() {
-            return OfferReply::Refused { reason, message };
+            return reply(OfferReply::Refused { reason, message });
         }
         match self.admit(&ledger_name(id), &envelope) {
             Ok(held) => {
@@ -205,11 +278,14 @@ impl Ledger {
                         held,
                     },
                 );
-                OfferReply::Accepted { lease_secs: lease }
+                reply(OfferReply::Accepted { lease_secs: lease })
             }
-            Err((reason, message)) => OfferReply::Refused {
-                reason,
-                message: Some(message),
+            Err(refused) => Offered {
+                reply: OfferReply::Refused {
+                    reason: refused.reason,
+                    message: Some(refused.message),
+                },
+                reclaim: refused.reclaim,
             },
         }
     }
@@ -308,6 +384,7 @@ mod tests {
         let limits = Limits {
             admit_dir: dir.join("admit"),
             jobs_dir: dir.join("jobs"),
+            reclaim: None,
             budget_mib: budget,
             disk_admission: false,
             max_cpus: 8,
@@ -328,12 +405,12 @@ mod tests {
         let (mut l, dir) = ledger("budget", Some(8192));
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(6144, 4), 90, Gate::Open, now),
+            l.offer(&id("a"), env(6144, 4), 90, Gate::Open, now).reply,
             OfferReply::Accepted { lease_secs: 90 }
         );
         // The first one's memory is held: a second does not fit, and says why.
         let OfferReply::Refused { reason, .. } =
-            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now)
+            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now).reply
         else {
             panic!("a second offer over the budget was granted");
         };
@@ -346,7 +423,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now),
+            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now).reply,
             OfferReply::Accepted { .. }
         ));
         let _ = std::fs::remove_dir_all(dir);
@@ -357,7 +434,7 @@ mod tests {
         let (mut l, dir) = ledger("lease", Some(8192));
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(1024, 1), 3600, Gate::Open, now),
+            l.offer(&id("a"), env(1024, 1), 3600, Gate::Open, now).reply,
             OfferReply::Accepted {
                 lease_secs: MAX_LEASE_SECS
             }
@@ -382,21 +459,21 @@ mod tests {
         let (mut l, dir) = ledger("refuse", None);
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(1, 1), 90, Gate::NotReady, now),
+            l.offer(&id("a"), env(1, 1), 90, Gate::NotReady, now).reply,
             OfferReply::Refused {
                 reason: Refusal::NotReady,
                 message: None
             }
         );
         assert!(matches!(
-            l.offer(&id("a"), env(1, 9), 90, Gate::Open, now),
+            l.offer(&id("a"), env(1, 9), 90, Gate::Open, now).reply,
             OfferReply::Refused {
                 reason: Refusal::Cpus,
                 ..
             }
         ));
         assert!(matches!(
-            l.offer("not-an-id", env(1, 1), 90, Gate::Open, now),
+            l.offer("not-an-id", env(1, 1), 90, Gate::Open, now).reply,
             OfferReply::Refused {
                 reason: Refusal::Invalid,
                 ..
@@ -404,7 +481,8 @@ mod tests {
         ));
         // Without admission there is nothing to hold, and the offer is granted.
         assert!(matches!(
-            l.offer(&id("a"), env(1 << 20, 1), 90, Gate::Open, now),
+            l.offer(&id("a"), env(1 << 20, 1), 90, Gate::Open, now)
+                .reply,
             OfferReply::Accepted { .. }
         ));
         let (envelope, held) = l.take(&id("a")).unwrap();
@@ -426,12 +504,90 @@ mod tests {
             ..env(1, 1)
         };
         assert_eq!(
-            l.offer(&id("a"), ask, 90, Gate::Open, now),
+            l.offer(&id("a"), ask, 90, Gate::Open, now).reply,
             OfferReply::Accepted { lease_secs: 90 }
         );
         assert!(l.limits.jobs_dir.is_dir());
         let (_, held) = l.take(&id("a")).unwrap();
         assert!(held.is_some(), "the disk claim is held in the ledger");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Short of disk, an offer evicts nothing itself: it says what eviction would have to free,
+    /// where the node evicts for room at all, for its caller to free outside its locks. That
+    /// eviction is all or nothing: a need the caches cannot cover takes nothing from them.
+    #[test]
+    fn a_disk_short_offer_says_what_eviction_must_free() {
+        let (mut l, dir) = ledger("reclaim", None);
+        l.limits.disk_admission = true;
+        // Alone on the filesystem a claim on all of it is granted, leaving no room for another.
+        let total = crate::usage::fs_space(&l.limits.jobs_dir).unwrap().total;
+        let whole = admit::Ask {
+            mem: None,
+            disk: Some(admit::DiskAsk {
+                want: total,
+                jobs: &l.limits.jobs_dir,
+                reclaim: None,
+            }),
+        };
+        let blocker = admit::try_acquire(&l.limits.admit_dir, "blocker", &whole)
+            .unwrap()
+            .unwrap();
+        let ask = Envelope {
+            disk_bytes: 1 << 20,
+            ..env(1, 1)
+        };
+        let now = Instant::now();
+        let kept = l.offer(&id("a"), ask, 90, Gate::Open, now);
+        assert!(matches!(
+            kept.reply,
+            OfferReply::Refused {
+                reason: Refusal::Disk,
+                ..
+            }
+        ));
+        assert_eq!(
+            kept.reclaim, None,
+            "a node that keeps its caches asks nothing of them"
+        );
+
+        // An unused base, idle past the grace, in the build tier beside the job dirs.
+        let state = dir.join("state");
+        let base = state.join("build").join("old");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("runner.ext4"), vec![0x5a; 64 * 1024]).unwrap();
+        crate::image::mark_used(&base);
+        std::fs::File::open(base.join(".used"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+        l.limits.reclaim = Some(evicting(
+            state,
+            Duration::from_secs(4 * 3600),
+            l.limits.jobs_dir.clone(),
+        ));
+        let short = l.offer(&id("a"), ask, 90, Gate::Open, now);
+        assert!(matches!(short.reply, OfferReply::Refused { .. }));
+        // At least the ask: the claim beside it already covers all there is free.
+        let need = short.reclaim.expect("what eviction must free");
+        assert!(need >= ask.disk_bytes, "{need}");
+        // Beyond what the caches hold: nothing goes, and it says what could have.
+        let beyond = l.limits.reclaim(need, &[]);
+        assert_eq!(beyond.freed, 0);
+        assert!(
+            beyond.reach.is_some_and(|r| r > 0 && r < need),
+            "{beyond:?}"
+        );
+        assert!(base.join("runner.ext4").exists());
+        // Within it: the base goes, whatever its idle window.
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            l.limits.reclaim(1, &[]).freed > 0
+        }));
+        assert!(!base.exists());
+        drop(blocker);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -442,7 +598,7 @@ mod tests {
         let (mut l, dir) = ledger("takeover", Some(8192));
         let now = Instant::now();
         assert!(matches!(
-            l.offer(&id("a"), env(6144, 2), 90, Gate::Open, now),
+            l.offer(&id("a"), env(6144, 2), 90, Gate::Open, now).reply,
             OfferReply::Accepted { .. }
         ));
         let (_, held) = l.take(&id("a")).unwrap();
@@ -458,7 +614,7 @@ mod tests {
         let own = admit::acquire(&l.limits.admit_dir, "4242", &ask, Duration::ZERO).unwrap();
         // What it gave back fits another.
         assert!(matches!(
-            l.offer(&id("b"), env(6144, 2), 90, Gate::Open, now),
+            l.offer(&id("b"), env(6144, 2), 90, Gate::Open, now).reply,
             OfferReply::Accepted { .. }
         ));
         drop((own, held));

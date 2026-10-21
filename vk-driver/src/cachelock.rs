@@ -184,6 +184,30 @@ pub(crate) fn try_exclusive(lock: &Path) -> Option<Exclusive> {
     lock_exclusive(&file, lock).then_some(Exclusive { _file: file })
 }
 
+/// Lock `lock` exclusively, waiting up to `wait` behind whoever holds it: for a step one
+/// process on the host takes at a time. `None` once `wait` is out. Polled rather than blocked
+/// on, so the wait has an end. Created 0600 as every sidecar here is.
+pub(crate) fn lock_exclusive_within(lock: &Path, wait: Duration) -> Result<Option<Exclusive>> {
+    let file = open_lock(lock)?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // SAFETY: the fd is owned by `file`, which outlives the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(Exclusive { _file: file }));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => {}
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(e).with_context(|| format!("locking {}", lock.display())),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn open_lock(lock: &Path) -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)

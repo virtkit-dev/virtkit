@@ -773,6 +773,38 @@ impl FsSpace {
     }
 }
 
+/// Which filesystem holds `path`, following a final symlink: the device of the superblock
+/// behind the mount `statx(2)` places it on, as `/proc/self/mountinfo` gives it. Not `st_dev`,
+/// which btrfs answers per subvolume, so two subvolumes drawing on one pool of space would read
+/// as two filesystems; nor `statvfs`'s `f_fsid`, which btrfs also mixes the subvolume into and an
+/// older kernel leaves zero for every tmpfs. Every mount of one superblock, a tmpfs bind-mounted
+/// twice say, reads as one. Falls back to `st_dev` where the kernel (before 5.8) names no mount
+/// or mountinfo does not list it.
+pub(crate) fn fs_id(path: &std::path::Path) -> Option<u64> {
+    const STATX_MNT_ID: u32 = 0x1000;
+    let sx = crate::checkout::statx_at(path, 0, STATX_MNT_ID).ok()?;
+    let st_dev = libc::makedev(sx.stx_dev_major, sx.stx_dev_minor);
+    if sx.stx_mask & STATX_MNT_ID == 0 {
+        return Some(st_dev);
+    }
+    let info = std::fs::read("/proc/self/mountinfo").unwrap_or_default();
+    Some(mount_dev(&info, sx.stx_mnt_id).unwrap_or(st_dev))
+}
+
+/// The superblock device mountinfo `info` lists for mount `id`: each line opens with the mount
+/// ID, its parent's, then `major:minor`.
+fn mount_dev(info: &[u8], id: u64) -> Option<u64> {
+    let num = |b: &[u8]| std::str::from_utf8(b).ok()?.parse::<u64>().ok();
+    info.split(|&b| b == b'\n').find_map(|line| {
+        let mut fields = line.split(|&b| b == b' ');
+        (num(fields.next()?)? == id).then_some(())?;
+        let mut dev = fields.nth(1)?.splitn(2, |&b| b == b':');
+        let major = u32::try_from(num(dev.next()?)?).ok()?;
+        let minor = u32::try_from(num(dev.next()?)?).ok()?;
+        Some(libc::makedev(major, minor))
+    })
+}
+
 /// [`FsSpace`] of the filesystem holding `path`.
 pub(crate) fn fs_space(path: &std::path::Path) -> std::io::Result<FsSpace> {
     use std::os::unix::ffi::OsStrExt;
@@ -1501,6 +1533,34 @@ mod tests {
                 .spawn()
                 .expect("spawning a shell whose children hold memory"),
         ))
+    }
+
+    /// A filesystem is named by its superblock: one path and another under it, or a symlink to
+    /// it, are one; procfs is another. Mountinfo is read by mount ID, whatever follows.
+    #[test]
+    fn fs_id_names_the_superblock() {
+        let dir = std::env::temp_dir().join(format!("vk-fs-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let link = dir.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let here = fs_id(&dir).unwrap();
+        assert_eq!(fs_id(&dir.join("sub")), Some(here));
+        assert_eq!(fs_id(&link), Some(here));
+        assert_ne!(fs_id(std::path::Path::new("/proc")), Some(here));
+        assert_eq!(fs_id(&dir.join("missing")), None);
+
+        let info = b"21 1 0:20 / /proc rw - proc proc rw\n\
+                     36 21 259:3 /@home /home rw - btrfs /dev/x rw\n\
+                     37 21 259:3 /@ / rw - btrfs /dev/x rw\n";
+        assert_eq!(mount_dev(info, 36), Some(libc::makedev(259, 3)));
+        assert_eq!(mount_dev(info, 37), mount_dev(info, 36));
+        assert_eq!(mount_dev(info, 21), Some(libc::makedev(0, 20)));
+        assert_eq!(mount_dev(info, 2), None);
+        assert_eq!(mount_dev(b"36 21 nonsense /\n", 36), None);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Blocks, not lengths: a sparse file counts for what was written into it, a nested dir is
