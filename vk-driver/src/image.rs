@@ -603,13 +603,7 @@ pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
     let mut evicted = Evicted::default();
     for base in base_dirs(root) {
         crate::cachelock::try_reclaim(&base.join(".inuse"), &base.join(".used"), idle, now, || {
-            match remove_base(&base) {
-                Ok(bytes) => {
-                    evicted.bases += 1;
-                    evicted.bytes = evicted.bytes.saturating_add(bytes);
-                }
-                Err(e) => eprintln!("virtkit: evicting {}: {e:#}", base.display()),
-            }
+            remove_counted(&base, &mut evicted);
         });
     }
     if evicted.bases > 0 {
@@ -621,6 +615,22 @@ pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
         );
     }
     evicted
+}
+
+/// Remove `base` under the caller's exclusive lock and add its space to `evicted`.
+/// Return whether removal succeeded.
+fn remove_counted(base: &Path, evicted: &mut Evicted) -> bool {
+    match remove_base(base) {
+        Ok(bytes) => {
+            evicted.bases += 1;
+            evicted.bytes = evicted.bytes.saturating_add(bytes);
+            true
+        }
+        Err(e) => {
+            eprintln!("virtkit: evicting {}: {e:#}", base.display());
+            false
+        }
+    }
 }
 
 /// Remove `base` and return the space it held. Remove its image first so interrupted removal
@@ -1105,11 +1115,35 @@ pub(crate) fn staging_writer_is_gone(name: &str) -> bool {
 /// is dead weight — this ties the deduped chunk store's lifetime to the idle-evicted bundles.
 /// Re-materializing a swept chunk just re-downloads it. Best-effort.
 pub(crate) fn sweep_chunks(registry_root: &Path) {
+    let (dropped, _) = drop_unreferenced_chunks(registry_root);
+    if dropped > 0 {
+        println!("virtkit: swept {dropped} unreferenced cache chunk file(s)");
+    }
+}
+
+/// Sweep chunks without reporting; return the number removed and the space they held.
+fn drop_unreferenced_chunks(registry_root: &Path) -> (usize, u64) {
+    let (mut dropped, mut bytes) = (0usize, 0u64);
+    for (p, held) in dead_chunks(registry_root, |_| true) {
+        if std::fs::remove_file(&p).is_ok() {
+            dropped += 1;
+            bytes = bytes.saturating_add(held);
+        }
+    }
+    (dropped, bytes)
+}
+
+/// Find files in `<registry_root>/chunks/` unreferenced by bundles accepted by `counts`,
+/// with the space each holds. These are what [`drop_unreferenced_chunks`] would remove
+/// if the other bundles were gone.
+fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(PathBuf, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
     let Ok(entries) = std::fs::read_dir(registry_root.join("chunks")) else {
-        return;
+        return Vec::new();
     };
     let mut live = std::collections::HashSet::new();
-    for base in base_dirs(registry_root) {
+    for base in base_dirs(registry_root).into_iter().filter(|b| counts(b)) {
         if let Ok(list) = std::fs::read_to_string(base.join("chunks.list")) {
             live.extend(
                 list.lines()
@@ -1119,7 +1153,7 @@ pub(crate) fn sweep_chunks(registry_root: &Path) {
             );
         }
     }
-    let mut dropped = 0usize;
+    let mut dead = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
@@ -1130,22 +1164,23 @@ pub(crate) fn sweep_chunks(registry_root: &Path) {
         // reclaimed, since nothing will ever rename it into place. An in-flight *bundle* is
         // instead kept live by its `chunks.list`, which `pull_into` writes into the staging
         // dir before fetching any chunk.
-        if name.ends_with(".tmp") {
-            if staging_writer_is_gone(name) && std::fs::remove_file(&p).is_ok() {
-                dropped += 1;
-            }
+        let is_dead = if name.ends_with(".tmp") {
+            staging_writer_is_gone(name)
+        } else {
+            !live.contains(name)
+        };
+        if !is_dead {
             continue;
         }
-        if live.contains(name) {
-            continue;
-        }
-        if std::fs::remove_file(&p).is_ok() {
-            dropped += 1;
-        }
+        // Read before the unlink; a file with another link keeps its space.
+        let held = e
+            .metadata()
+            .ok()
+            .filter(|m| m.nlink() <= 1)
+            .map_or(0, |m| m.blocks().saturating_mul(512));
+        dead.push((p, held));
     }
-    if dropped > 0 {
-        println!("virtkit: swept {dropped} unreferenced cache chunk file(s)");
-    }
+    dead
 }
 
 #[cfg(test)]
