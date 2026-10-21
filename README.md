@@ -1022,9 +1022,9 @@ those bytes is pinned to something that stays fetchable:
 
 `./build.sh --bootstrap-check` is the proof: it performs the Docker build, rebuilds a clean
 copy of the tree from scratch in a microVM booted by the `vk` it just produced, and fails
-unless the binaries are identical. Releases run this check in CI, so a published binary
-has been reproduced independently before it is published. `--fast` uses the unoptimized
-development profile and is not a release artifact.
+unless the binaries are identical. Releases run this check in CI, one binary per job, so a
+published binary has been reproduced independently before it is published. `--fast` uses
+the unoptimized development profile and is not a release artifact.
 
 ## Repository layout
 

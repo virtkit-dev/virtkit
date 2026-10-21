@@ -29,9 +29,9 @@
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
 #
-# --kernel-from=<tag>: embed release <tag>'s dist/vmlinux to skip CI's kernel build.
-# Record its provenance in the manifest: the release recipe builds the kernel from
-# this commit and need not reproduce these bytes.
+# --kernel-from=<tag>: dist/vmlinux is release <tag>'s, reused to skip the kernel build.
+# Record its provenance in the manifest, whose recipe fetches that kernel: it was built at
+# <tag>'s commit, so its own manifest is what rebuilds it.
 #
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert every binary,
@@ -411,9 +411,9 @@ elif [ -n "$NO_KERNEL" ]; then
 # Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
 elif [ -n "$KERNEL_FROM" ]; then
-  # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
-  # not git_commit's release build.
-  manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
+  # The kernel was built at an earlier release's commit, so the recipe fetches it; that
+  # release's kernel-build-info.txt is what rebuilds it.
+  manifest_header="# virtkit reproducible build manifest — embeds ${KERNEL_FROM}'s guest kernel
 # Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 kernel_from:     ${KERNEL_FROM}"

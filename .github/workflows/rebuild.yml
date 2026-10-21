@@ -1,0 +1,100 @@
+name: Rebuild
+
+# Reusable workflow: the reproducibility attestation of what build.yml built. Called by
+# release.yml once build.yml has assembled the release's vk, alongside the end-to-end suite.
+#
+# Each binary is rebuilt from scratch on a runner of its own, in a vk microVM booted by the
+# assembled vk — on the kernel embedded in it — and must come out byte-identical to the Docker
+# build of it: build.sh --bootstrap-check's proof, one binary per job. The bare vk is then
+# assembled again with the kernel, agent and firmware the release embeds, and must give the
+# released vk. Only the runner's KVM stands between the Docker build and that microVM, so each
+# job opens it to the runner user; no vk install is needed.
+#
+# Inputs
+#   artifact-prefix  — the prefix build.yml uploaded its artifacts under.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    name: rebuild (${{ matrix.bin }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - { bin: vk, file: vk-bare }
+          - { bin: vk-agent, file: vk-agent }
+          - { bin: vk-registry, file: vk-registry }
+          - { bin: vk-hub, file: vk-hub }
+          - { bin: vk-gitlab, file: vk-gitlab }
+          - { bin: vk-runnerctl, file: vk-runnerctl }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable KVM for the runner user
+        uses: ./.github/actions/enable-kvm
+
+      # Both outside the checkout: build.sh stamps the commit "(dirty)" when the tree has
+      # untracked files, and the bytes would differ.
+      - name: Download the assembled binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-prefix }}-binaries-${{ github.sha }}
+          path: ${{ runner.temp }}/assembled
+
+      - name: Download the Docker build of ${{ matrix.bin }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-prefix }}-bin-${{ matrix.bin }}-${{ github.sha }}
+          path: ${{ runner.temp }}/docker
+
+      # What the vk assembled again embeds: the parts the released vk embeds. The agent is
+      # attested by its own job here; the kernel and firmware by their build manifests' recipes.
+      - name: Download the agent vk embeds
+        if: matrix.bin == 'vk'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-prefix }}-bin-vk-agent-${{ github.sha }}
+          path: dist
+
+      - name: Download the kernel vk embeds
+        if: matrix.bin == 'vk'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-prefix }}-kernel-${{ github.sha }}
+          path: dist
+
+      - name: Download the firmware vk embeds
+        if: matrix.bin == 'vk'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-prefix }}-firmware-${{ github.sha }}
+          path: dist
+
+      # An artifact keeps no permission bits.
+      - name: Rebuild ${{ matrix.bin }} in a vk microVM
+        env:
+          ASSEMBLED: ${{ runner.temp }}/assembled
+        run: |
+          chmod +x "$ASSEMBLED/vk"
+          ./build.sh --use-virtkit="$ASSEMBLED" --only=${{ matrix.bin }} ${{ matrix.bin == 'vk' && '--assemble' || '' }}
+
+      - name: Compare with the Docker build
+        env:
+          DOCKER: ${{ runner.temp }}/docker
+          ASSEMBLED: ${{ runner.temp }}/assembled
+        run: |
+          cd dist
+          sha256sum -c "$DOCKER/${{ matrix.file }}.sha256"
+          if [ "${{ matrix.bin }}" = vk ]; then
+            sha256sum -c "$ASSEMBLED/vk.sha256"
+          fi
