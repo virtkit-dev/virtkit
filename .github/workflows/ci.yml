@@ -6,18 +6,11 @@ name: CI
 # matches branches, not tags), and release.yml's own pushes of `main` and the tag
 # are made with the workflow token, which triggers no workflow at all.
 #
-# A build job runs after quality — deliberately gated on lint, test and audit, so a
-# push that cannot pass them never spends a build — and uploads the binaries as a
-# GitHub Actions artifact (retention: 1 day). This lets you grab a build from any
-# commit without waiting for a release. The guest kernel is not built — it compiles
-# a full Linux kernel (tens of minutes) and changes infrequently: vk embeds the one of
-# the release the commit descends from, unless the kernel inputs changed since, when it
-# is built after all. The UEFI firmware is always built and embedded (mostly a
-# cache.nixos.org download).
-#
-# The kernel is built (and embedded into vk) when the workflow is triggered
-# manually (workflow_dispatch), for testing kernel config changes without cutting
-# a release.
+# A build job runs after quality — deliberately gated on lint, test and audit, so a push
+# that cannot pass them never spends a build — and uploads the binaries as a GitHub Actions
+# artifact (retention: 1 day). This lets you grab a build from any commit without waiting for
+# a release. Like a release, every run builds the guest kernel and the UEFI firmware from its
+# own commit, each in a job of its own beside the binaries', and embeds them.
 #
 # fleet-e2e then runs the fleet's end-to-end tests (tests/fleet-*.sh) against that
 # build: a hub and its nodes booted as microVMs on the runner's KVM.
@@ -42,8 +35,6 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: ci
-      build-kernel: ${{ github.event_name == 'workflow_dispatch' }}
-      release-kernel: true
       retention-days: 1
 
   # The scripts also run before every release, with the rest of tests/ (release.yml).

@@ -991,9 +991,9 @@ specific existing virtkit build.
 
 `build.sh` compiles a bare `vk`, then appends `vk-agent`, `dist/vmlinux` and the firmware to
 it as the self-contained `dist/vk`; it refuses to proceed when the kernel is missing.
-`--no-kernel` produces a non-shippable binary that requires `--kernel` at runtime. The
-kernel changes less often than the Rust binaries, so one kernel build can be reused across
-normal edit/build cycles. Do not strip or re-link `dist/vk`, which drops what was appended;
+`--no-kernel` produces a non-shippable binary that requires `--kernel` at runtime.
+`build.sh` embeds whatever `dist/vmlinux` holds, so run `./build-kernel.sh` again after
+changing `kernel/`, `build-kernel.sh` or the toolchain. Do not strip or re-link `dist/vk`, which drops what was appended;
 strip `dist/vk-bare` and assemble again instead.
 
 The two steps also run apart: `build.sh --only=vk,vk-agent` compiles just those binaries,
@@ -1027,9 +1027,9 @@ those bytes is pinned to something that stays fetchable:
 
 `./build.sh --bootstrap-check` is the proof: it performs the Docker build, rebuilds a clean
 copy of the tree from scratch in a microVM booted by the `vk` it just produced, and fails
-unless the binaries are identical. Releases run this check in CI, so a published binary
-has been reproduced independently before it is published. `--fast` uses the unoptimized
-development profile and is not a release artifact.
+unless the binaries are identical. Releases run this check in CI, one binary per job, so a
+published binary has been reproduced independently before it is published. `--fast` uses
+the unoptimized development profile and is not a release artifact.
 
 ## Repository layout
 

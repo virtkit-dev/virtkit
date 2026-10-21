@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Releases publish `vk-bare.sha256`**, the digest of `vk` before its payload is appended,
+  which the reproducible-build recipe in `build-info.txt` checks.
+
 ### Changed
 
 - **`vk` carries its guest kernel, vk-agent and UEFI firmware as a checksummed payload

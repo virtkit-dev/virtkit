@@ -20,14 +20,16 @@ name: Release
 #
 # prepare derives the tag from Cargo.toml and refuses a candidate that is already released,
 # has no CHANGELOG section, or does not contain main — in seconds, before anything compiles.
-# build runs in parallel with quality (lint + test + audit); the kernel and the firmware
-# are built in the binaries' job so the published vk has them embedded, and the build runs as
-# `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
-# scratch in a vk microVM and requiring an exact match. e2e then boots microVMs with the
-# vk that build produced (tests/release-e2e.sh). publish runs once all of them have
-# passed. Each binary ships with its own .sha256 sidecar (vk.sha256, vk-agent.sha256,
-# vk-registry.sha256, vk-hub.sha256, vk-gitlab.sha256, vk-runnerctl.sha256, vmlinux.sha256)
-# so users can verify just the file they downloaded without fetching a combined manifest.
+# build runs in parallel with quality (lint + test + audit): the kernel, the firmware and each
+# binary in a job of their own, then the job that embeds the kernel, agent and firmware into
+# vk. Two gates then run in parallel on what build assembled: rebuild attests the released
+# bytes by rebuilding every binary from scratch in a vk microVM booted by that vk and requiring
+# an exact match, and e2e boots microVMs with it (tests/release-e2e.sh). publish runs once all
+# of them have passed. Each binary ships with its own .sha256 sidecar (vk.sha256,
+# vk-agent.sha256, vk-registry.sha256, vk-hub.sha256, vk-gitlab.sha256, vk-runnerctl.sha256,
+# vmlinux.sha256) so users can verify just the file they downloaded without fetching a
+# combined manifest. vk-bare.sha256, the digest of vk before its kernel, agent and firmware
+# were appended, ships too (vk-bare itself does not): build-info.txt's recipe checks it.
 # The repository's install.sh is published alongside them — it is the documented bootstrap
 # for a host with no vk, so it has to be fetchable from the release itself. It is uploaded
 # from the checkout rather than from dist/, so unlike every other asset it is outside the
@@ -118,15 +120,20 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: release
-      build-kernel: true
-      bootstrap-check: true
       retention-days: 1
+
+  # Gate: the reproducibility attestation, build.sh --bootstrap-check split per binary.
+  rebuild:
+    needs: [build]
+    uses: ./.github/workflows/rebuild.yml
+    with:
+      artifact-prefix: release
 
   # Gate: the end-to-end suite, on the very binaries publish uploads. The artifact build
   # uploaded is downloaded rather than rebuilt, and the script checks them against their
   # sha256 sidecars and the tag's version before booting anything. The tests pull images
-  # and boot microVMs, so the job needs the runner's KVM like the bootstrap rebuild does,
-  # and network. E2E_BUDGET keeps the run inside timeout-minutes, so a suite that overruns
+  # and boot microVMs, so the job needs the runner's KVM like the rebuild does, and
+  # network. E2E_BUDGET keeps the run inside timeout-minutes, so a suite that overruns
   # still prints its results table instead of being killed mid-script.
   e2e:
     needs: [prepare, quality, build]
@@ -168,7 +175,7 @@ jobs:
   # release. A failure after the first write leaves main advanced with no release yet;
   # every step is idempotent, so re-running this job from the Actions UI finishes it.
   publish:
-    needs: [prepare, quality, build, e2e]
+    needs: [prepare, quality, build, rebuild, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # git push and gh release create need write access to the repo's refs and releases.
@@ -195,6 +202,14 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: release-kernel-${{ github.sha }}
+          path: dist
+
+      # For vk-bare.sha256, which build-info.txt's recipe checks; vk-bare itself is not
+      # published.
+      - name: Download the bare vk's artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-bin-vk-${{ github.sha }}
           path: dist
 
       # The CHANGELOG section for this version is the release body, plus the compare link
@@ -256,6 +271,7 @@ jobs:
           gh release create "$TAG" \
             dist/vk \
             dist/vk.sha256 \
+            dist/vk-bare.sha256 \
             dist/vk-agent \
             dist/vk-agent.sha256 \
             dist/vk-registry \
