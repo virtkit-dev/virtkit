@@ -59,6 +59,10 @@ jobs:
         with:
           fetch-depth: ${{ inputs.release-kernel && !inputs.build-kernel && '0' || '1' }}
 
+      # The pinned toolchain image every script below runs in, from the Actions cache.
+      - name: Build the toolchain image
+        uses: ./.github/actions/build-image
+
       # Build the kernel before the binaries so build.sh finds dist/vmlinux and
       # embeds it into vk. Skipped in ordinary CI — a full kernel build takes tens
       # of minutes and the kernel changes rarely.

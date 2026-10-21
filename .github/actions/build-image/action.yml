@@ -1,0 +1,56 @@
+name: Build the toolchain image
+description: Build virtkit-build from .devcontainer/ through the Actions cache and load it into Docker.
+
+# Every build.yml job that runs Docker needs the pinned toolchain image the scripts build as
+# virtkit-build, and building it takes minutes. BuildKit keys each layer on its instruction
+# and the files it copies from .devcontainer/, so the cached layers are reused only for the
+# same Dockerfile, flake and lock; any change there rebuilds what it touches. The image is
+# then loaded into Docker under the tag the scripts use, and VK_BUILD_IMAGE_PREBUILT=1 tells
+# build.sh, build-kernel.sh and build-firmware.sh to use it instead of building their own.
+#
+# Only pushes to main and release write the cache; every other run (branches, pull requests)
+# only reads it, so an untrusted branch cannot seed what a release build loads. A failed cache
+# write does not fail the build.
+#
+# The cache saves time only: the image's contents are pinned by .devcontainer/ (base image by
+# digest, toolchain by flake.lock), and the reproducibility rebuild builds its own image in a
+# vk microVM, so a cached image that differed would show up there as differing binaries.
+runs:
+  using: composite
+  steps:
+    # BuildKit itself pinned by digest, like every other build input.
+    - name: Set up a BuildKit builder
+      id: buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      with:
+        use: false
+        # Removed by the step after the build instead, once the image is loaded.
+        cleanup: false
+        driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+    # The Dockerfile has one stage, so the default cache mode already exports every layer.
+    - name: Build virtkit-build
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: false
+        DOCKER_BUILD_SUMMARY: false
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        context: .devcontainer
+        file: .devcontainer/Dockerfile
+        tags: virtkit-build
+        load: true
+        provenance: false
+        cache-from: type=gha,scope=virtkit-build
+        cache-to: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release') && 'type=gha,scope=virtkit-build,ignore-error=true' || '' }}
+
+    # The image is in Docker now; the builder's own copy of its layers would only take disk.
+    - name: Remove the builder
+      shell: bash
+      env:
+        BUILDER: ${{ steps.buildx.outputs.name }}
+      run: docker buildx rm "$BUILDER"
+
+    - name: Use it for the build scripts
+      shell: bash
+      run: echo "VK_BUILD_IMAGE_PREBUILT=1" >> "$GITHUB_ENV"

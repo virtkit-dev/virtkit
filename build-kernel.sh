@@ -10,6 +10,9 @@
 # rebuilt only on a pin bump. The docker layer cache makes an unchanged rerun a no-op;
 # --no-cache forces a clean rebuild. Output joins ./dist next to the binaries, so
 # consumers fetch dist/vmlinux the same way they fetch vk-driver / vk-agent.
+#
+# VK_BUILD_IMAGE_PREBUILT=1: the Docker path uses the virtkit-build image already loaded into
+# Docker instead of building it from .devcontainer/ (as build.sh does; CI sets it).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -47,8 +50,14 @@ else
   # The kernel builds in the same image as the binaries (kernel/Dockerfile is
   # `FROM virtkit-build`, the pinned Nix devcontainer) — build it first so the base + rust
   # toolchain + flake-locked inputs are shared and reproducible.
-  echo "-- building the build image (virtkit-build) ..."
-  docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+  # Reuse the .devcontainer/ image CI builds through .github/actions/build-image.
+  if [ "${VK_BUILD_IMAGE_PREBUILT:-}" = 1 ]; then
+    docker image inspect virtkit-build >/dev/null 2>&1 ||
+      { echo "VK_BUILD_IMAGE_PREBUILT=1 but there is no virtkit-build image" >&2; exit 1; }
+  else
+    echo "-- building the build image (virtkit-build) ..."
+    docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+  fi
 
   echo "-- building the guest kernel (vmlinux) ..."
   # the Dockerfile's `artifact` stage is just the vmlinux file; -o extracts it directly.
