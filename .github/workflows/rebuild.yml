@@ -46,13 +46,13 @@ jobs:
       # Both outside the checkout: build.sh stamps the commit "(dirty)" when the tree has
       # untracked files, and the bytes would differ.
       - name: Download the assembled binaries
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-binaries-${{ github.sha }}
           path: ${{ runner.temp }}/assembled
 
       - name: Download the Docker build of ${{ matrix.bin }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-bin-${{ matrix.bin }}-${{ github.sha }}
           path: ${{ runner.temp }}/docker
@@ -61,21 +61,21 @@ jobs:
       # attested by its own job here; the kernel and firmware by their build manifests' recipes.
       - name: Download the agent vk embeds
         if: matrix.bin == 'vk'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-bin-vk-agent-${{ github.sha }}
           path: dist
 
       - name: Download the kernel vk embeds
         if: matrix.bin == 'vk'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-kernel-${{ github.sha }}
           path: dist
 
       - name: Download the firmware vk embeds
         if: matrix.bin == 'vk'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-firmware-${{ github.sha }}
           path: dist
