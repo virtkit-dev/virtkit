@@ -13,9 +13,13 @@
 # Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
 # mount the repo at /work and pass identical flags, so the bytes match either way.
 #
-# Needs the guest kernel: `vk` embeds ./dist/vmlinux, so run ./build-kernel.sh first
-# (it changes rarely — one build serves every later build.sh run). `vk` also embeds the UEFI
-# firmware ./dist/CLOUDHV.fd when ./build-firmware.sh has made it (optional: UEFI guests only).
+# Two steps: compile, then assemble. The compile leaves a bare vk in ./dist/vk-bare;
+# assemble.sh then appends ./dist/vk-agent, ./dist/vmlinux and, when ./build-firmware.sh has
+# made them, the UEFI firmware ./dist/CLOUDHV*.fd (UEFI guests only) to make the
+# self-contained ./dist/vk, and build.sh writes its vk.sha256 and build-info.txt. So run
+# ./build-kernel.sh first (it changes rarely — one build serves every later build.sh run).
+# Never strip or re-link ./dist/vk: that drops the payload. Strip ./dist/vk-bare instead, then
+# assemble again.
 #
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
@@ -25,9 +29,10 @@
 # this commit and need not reproduce these bytes.
 #
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
-# (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert every binary is
-# byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk can rebuild
-# itself. It boots the vk it builds, so it cannot combine with --no-kernel.
+# (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert every binary,
+# the bare vk included, is byte-for-byte identical — proof the microVM backend reproduces
+# Docker, i.e. vk can rebuild itself. It boots the vk it builds, so it cannot combine with
+# --no-kernel.
 #
 # --fast (alias --debug): build the debug cargo profile instead of release — a much
 # faster compile for iteration, still static-musl and still embedding the kernel/agent,
@@ -100,8 +105,8 @@ if [ -n "$FAST" ] && [ -n "$KERNEL_FROM" ]; then
   echo "--kernel-from stamps a release-profile manifest; it cannot be combined with --fast" >&2
   exit 2
 fi
-# Cargo profile flag + its target/ subdir, threaded through the embed env, build command,
-# and artifact copy below so --fast changes all three consistently.
+# Cargo profile flag + its target/ subdir, threaded through the build command and artifact
+# copy below so --fast changes both consistently.
 CARGO_PROFILE_FLAG="--release"; PROFILE_DIR=release
 [ -n "$FAST" ] && { CARGO_PROFILE_FLAG=""; PROFILE_DIR=debug; }
 if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
@@ -173,19 +178,16 @@ BUILD_ENV=(
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
   "VK_GIT_COMMIT=$commit"
 )
-# `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
-# vk-agent first, then build vk with VK_EMBED_* pointing at that agent, the pinned
-# vmlinux and, when present, dist/CLOUDHV.fd (all under /work, where the repo is mounted in
-# either backend).
+# The assembled vk embeds the guest kernel, vk-agent and, when present, the UEFI firmware.
 # A missing kernel is an error rather than a quietly non-self-contained vk: it is the
 # shippable binary's defining property, and the build that drops it is the one nobody
 # notices until the vk fails to boot anything. --no-kernel asks for that vk explicitly.
 # Checked here, before the image build and compile, so the fix comes back in seconds.
-EMBED_ENV="VK_EMBED_AGENT=/work/target/$TARGET/$PROFILE_DIR/vk-agent"
+EMBED_ARGS=("vk-agent=$OUT/vk-agent")
 if [ -n "$NO_KERNEL" ]; then
   echo "build.sh: --no-kernel — the vk built here has no embedded kernel and needs --kernel at runtime" >&2
 elif [ -e "$OUT/vmlinux" ]; then
-  EMBED_ENV="$EMBED_ENV VK_EMBED_KERNEL=/work/$OUT/vmlinux"
+  EMBED_ARGS+=("vmlinux=$OUT/vmlinux")
 else
   echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
   exit 1
@@ -195,22 +197,18 @@ fi
 EMBED_FIRMWARE=""
 if [ -e "$OUT/CLOUDHV.fd" ]; then
   EMBED_FIRMWARE=1
-  EMBED_ENV="$EMBED_ENV VK_EMBED_FIRMWARE=/work/$OUT/CLOUDHV.fd"
+  EMBED_ARGS+=("CLOUDHV.fd=$OUT/CLOUDHV.fd")
   # Its variable store templates (empty, and with Microsoft's Secure Boot keys): without them a
   # UEFI guest's variables live in RAM and are lost at each boot.
-  for vars in CLOUDHV_VARS.fd:VK_EMBED_VARS CLOUDHV_VARS.ms.fd:VK_EMBED_VARS_MS; do
-    if [ -e "$OUT/${vars%%:*}" ]; then
-      EMBED_ENV="$EMBED_ENV ${vars##*:}=/work/$OUT/${vars%%:*}"
+  for vars in CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd; do
+    if [ -e "$OUT/$vars" ]; then
+      EMBED_ARGS+=("$vars=$OUT/$vars")
     fi
   done
 else
   echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
 fi
-# vk-registry (the standalone central server), vk-hub (the experimental fleet hub and local
-# web UI), vk-gitlab (the experimental GitLab runner for a vk-hub fleet) and vk-runnerctl (the
-# root-side setter for gitlab-runner's concurrent) embed nothing, so they build plainly (no
-# EMBED_ENV) alongside vk.
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-gitlab && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-gitlab && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -264,18 +262,25 @@ since "compile ($([ -n "$VK_BIN" ] && echo "libkrun microVM" || echo docker))" "
 mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
 # would fail "Text file busy" if the old $OUT/vk is still being executed (e.g. by a
-# previous --use-virtkit / --bootstrap-check run); rename never does.
+# previous --use-virtkit / --bootstrap-check run); rename never does. The compiled vk is the
+# bare one; $OUT/vk is only ever the assembled binary.
+# The sidecars name each binary without a directory, so a check runs from inside dist/.
 for b in vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
-  cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$b.tmp"
-  mv -f "$OUT/.$b.tmp" "$OUT/$b"
+  dest=$b
+  [ "$b" = vk ] && dest=vk-bare
+  cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$dest.tmp"
+  mv -f "$OUT/.$dest.tmp" "$OUT/$dest"
+  ( cd "$OUT" && sha256sum "$dest" > "$dest.sha256" )
 done
+
+# assemble.sh writes $OUT/vk by rename too.
+sh ./assemble.sh "$OUT/vk" "$OUT/vk-bare" "${EMBED_ARGS[@]}"
+( cd "$OUT" && sha256sum vk > vk.sha256 )
 
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
 #   git checkout <git_commit> && ./build-kernel.sh && ./build.sh &&
-#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
-# The sidecars name the binaries bare, so the check runs from inside dist/.
-( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-hub > vk-hub.sha256 && sha256sum vk-gitlab > vk-gitlab.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
+#     ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 # The inputs that fix the bytes: the base image digest (.devcontainer/Dockerfile's FROM) and
 # the flake.lock revs of nixpkgs / rust-overlay.
 # The rev flake.lock pins for one input: the first "rev" inside that input's node.
@@ -315,25 +320,25 @@ elif [ -n "$FEATURES" ]; then
   # Release-profile bytes, but of a vk with extra features: the release recipe rebuilds the
   # default feature set, so it would fail against these hashes.
   manifest_header="# virtkit build manifest (--features=${FEATURES}) — extra features, not a release artifact
-# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 features:        ${FEATURES}"
 elif [ -n "$NO_KERNEL" ]; then
   # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
   # so the release recipe — which embeds the kernel — rebuilds something else entirely.
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
-# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
 elif [ -n "$KERNEL_FROM" ]; then
   # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
   # not git_commit's release build.
   manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
-# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 kernel_from:     ${KERNEL_FROM}"
 else
   manifest_header="# virtkit reproducible build manifest
-# Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
 fi
 cat > "$OUT/build-info.txt" <<EOF
@@ -344,6 +349,7 @@ base_image:      ${base_image}
 ${nix_pins}
 
 $(cat "$OUT/vk.sha256")
+$(cat "$OUT/vk-bare.sha256")
 $(cat "$OUT/vk-agent.sha256")
 ${firmware_line}
 EOF
@@ -391,7 +397,7 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   echo
   echo "bootstrap check: comparing sha256…"
   mismatch=""
-  for b in vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
+  for b in vk-bare vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
     docker_sha=$(sha256sum < "$OUT/$b" | cut -d' ' -f1)
     virtkit_sha=$(sha256sum < "$boot_tmp/$OUT/$b" | cut -d' ' -f1)
     if [ "$docker_sha" = "$virtkit_sha" ]; then

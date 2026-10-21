@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 # The single shipped binary is `vk` — vk-driver with the guest kernel and vk-agent
-# embedded (see build.rs + src/embed.rs, the default `embed` feature).
+# appended after the link (see assemble.sh + src/embed.rs).
 [[bin]]
 name = "vk"
 path = "src/main.rs"
@@ -74,15 +74,6 @@ path = "../third_party/libkrun/src/libkrun"
 package = "libkrun"
 default-features = false
 features = ["blk", "net", "snapshot", "tpm", "uefi-vars"]
-
-[features]
-default = ["embed"]
-# Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
-# self-contained (no --kernel/--agent, no files under /usr/local/lib/vk). build.rs
-# reads VK_EMBED_KERNEL / VK_EMBED_AGENT at compile time; when unset (a plain dev
-# `cargo build`) it embeds nothing and the runtime falls back to those flags. See
-# src/embed.rs. build.sh sets the two vars for a real, shippable self-contained `vk`.
-embed = []
 
 [dev-dependencies]
 # `vk node`: ed25519 signatures its tests check.

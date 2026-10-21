@@ -1,21 +1,9 @@
-//! Embed the guest kernel, vk-agent, UEFI firmware and its variable store templates into the
-//! `vk` binary.
-//!
-//! With the `embed` feature (on by default), src/embed.rs pulls the blobs in
-//! via `.incbin "${env!(...)}"`. This script sets those env vars to the paths
-//! given by VK_EMBED_KERNEL / VK_EMBED_AGENT / VK_EMBED_FIRMWARE / VK_EMBED_VARS /
-//! VK_EMBED_VARS_MS (build.sh supplies them).
-//! When a var is unset — a plain dev `cargo build` — it points the include at an
-//! empty file, which the runtime treats as "not embedded" and falls back to
-//! --kernel/--agent.
+//! Stamp the source commit into the `vk` binary. The guest kernel, vk-agent and UEFI firmware
+//! are not part of the compile: build.sh appends them to the linked binary (assemble.sh, read
+//! back by src/embed.rs).
 use std::path::PathBuf;
 
 fn main() {
-    embed("VK_EMBED_KERNEL", "VK_EMBED_KERNEL_PATH");
-    embed("VK_EMBED_AGENT", "VK_EMBED_AGENT_PATH");
-    embed("VK_EMBED_FIRMWARE", "VK_EMBED_FIRMWARE_PATH");
-    embed("VK_EMBED_VARS", "VK_EMBED_VARS_PATH");
-    embed("VK_EMBED_VARS_MS", "VK_EMBED_VARS_MS_PATH");
     emit_git_hash();
 }
 
@@ -62,60 +50,4 @@ fn emit_git_hash() {
         .unwrap_or(false);
     let suffix = if dirty { "-dirty" } else { "" };
     println!("cargo::rustc-env=VK_GIT_HASH={hash}{suffix}");
-}
-
-fn embed(src_var: &str, path_var: &str) {
-    println!("cargo::rerun-if-env-changed={src_var}");
-    // Only the `embed` feature compiles the include; skip the work otherwise.
-    if std::env::var_os("CARGO_FEATURE_EMBED").is_none() {
-        return;
-    }
-    // A content stamp of the embedded blob, emitted as a rustc-env the `.incbin`
-    // module references. `.incbin` splices the file at assemble time, but cargo keys
-    // recompilation on the *path* env (stable here) and on source text — never on the
-    // included file's content. Without this stamp, rebuilding only the agent leaves
-    // `vk` embedding the previous blob (a silent stale-embed footgun). A changed stamp
-    // forces the embed module to recompile and re-run `.incbin`.
-    let (path, stamp) = match std::env::var_os(src_var) {
-        Some(p) if !p.is_empty() => {
-            let p = PathBuf::from(p);
-            // A set var naming a missing file is a build-system bug (typo, path drift),
-            // not a dev build — fail rather than silently ship a non-embedded `vk`.
-            assert!(
-                p.is_file(),
-                "{src_var} is set but {} is not a file — fix the path or unset it",
-                p.display()
-            );
-            println!("cargo::rerun-if-changed={}", p.display());
-            let stamp = content_stamp(&p);
-            (std::fs::canonicalize(&p).unwrap_or(p), stamp)
-        }
-        _ => {
-            // Only warn for a release build: a non-embedded release artifact is a
-            // shippable-binary footgun worth flagging. In debug (dev iteration, and
-            // `cargo check`/`clippy`) the fallback to --kernel/--agent is the norm, so
-            // the warning is pure noise — notably it cluttered every `./dev.sh clippy` run.
-            if std::env::var_os("PROFILE").as_deref() == Some(std::ffi::OsStr::new("release")) {
-                println!(
-                    "cargo::warning={src_var} unset — `vk` built without an embedded \
-                     blob; set it (see build.sh) for a self-contained binary"
-                );
-            }
-            let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-            let empty = out_dir.join(format!("{path_var}.empty"));
-            std::fs::write(&empty, []).expect("write empty embed placeholder");
-            (empty, 0)
-        }
-    };
-    println!("cargo::rustc-env={path_var}={}", path.display());
-    println!("cargo::rustc-env={src_var}_STAMP={stamp:016x}");
-}
-
-/// A 64-bit content hash of `p`, so the embed module recompiles when the blob changes.
-fn content_stamp(p: &std::path::Path) -> u64 {
-    use std::hash::Hasher;
-    let bytes = std::fs::read(p).unwrap_or_default();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(&bytes);
-    h.finish()
 }

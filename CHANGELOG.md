@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`vk` carries its guest kernel, vk-agent and UEFI firmware as a checksummed payload
+  appended after linking.** `vk check` reports a damaged or cut-short payload, and a damaged
+  blob fails the run instead of falling back to `/usr/local/lib/vk`. Strip `dist/vk-bare`,
+  never the assembled `dist/vk`, which would drop the payload.
+
 ## [0.93.1] - 2026-10-21
 
 ### Changed

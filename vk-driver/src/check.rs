@@ -523,11 +523,8 @@ fn entrypoint() -> Outcome {
         .collect::<Vec<_>>()
         .join(", ");
     match asset_source(Asset::Agent) {
-        Some(src) => ok(format!("--init {axes}; agent {src} execs it as PID 1")),
-        None => fail(format!(
-            "--init {axes}, but no agent to exec it: nothing embedded and {} missing",
-            Asset::Agent.default_path()
-        )),
+        Ok(src) => ok(format!("--init {axes}; agent {src} execs it as PID 1")),
+        Err(why) => fail(format!("--init {axes}, but no agent to exec it: {why}")),
     }
 }
 
@@ -541,11 +538,8 @@ fn entrypoint() -> Outcome {
 /// nothing to ask to dial out from a guest.
 fn publish() -> Outcome {
     match asset_source(Asset::Agent) {
-        Some(src) => ok(format!("agent {src} understands `vk publish` (CmdConnect)")),
-        None => fail(format!(
-            "no agent to ask: nothing embedded and {} missing",
-            Asset::Agent.default_path()
-        )),
+        Ok(src) => ok(format!("agent {src} understands `vk publish` (CmdConnect)")),
+        Err(why) => fail(format!("no agent to ask: {why}")),
     }
 }
 
@@ -559,14 +553,11 @@ fn publish() -> Outcome {
 /// agent.
 fn nics() -> Outcome {
     match asset_source(Asset::Agent) {
-        Some(src) => ok(format!(
+        Ok(src) => ok(format!(
             "up to {} NICs per guest; agent {src} addresses them",
             crate::units::MAX_NICS
         )),
-        None => fail(format!(
-            "no agent to bring the extra NICs up: nothing embedded and {} missing",
-            Asset::Agent.default_path()
-        )),
+        Err(why) => fail(format!("no agent to bring the extra NICs up: {why}")),
     }
 }
 
@@ -582,11 +573,8 @@ fn tap() -> Outcome {
         return fail(format!("opening /dev/net/tun read/write: {e}"));
     }
     match asset_source(Asset::Agent) {
-        Some(src) => ok(format!("eth0 on a host tap; agent {src} addresses it")),
-        None => fail(format!(
-            "no agent to bring the tap NIC up: nothing embedded and {} missing",
-            Asset::Agent.default_path()
-        )),
+        Ok(src) => ok(format!("eth0 on a host tap; agent {src} addresses it")),
+        Err(why) => fail(format!("no agent to bring the tap NIC up: {why}")),
     }
 }
 
@@ -895,14 +883,20 @@ fn vmm() -> Outcome {
     ok("libkrun (built into vk)")
 }
 
-/// Where an asset comes from — `embedded`, or the path it was found at — or `None` when it is
-/// neither embedded nor on disk.
-fn asset_source(asset: Asset) -> Option<String> {
-    if asset.embedded().is_some() {
-        return Some("embedded".to_string());
+/// Where an asset comes from — `embedded`, or the path it was found at — or why there is none:
+/// neither embedded nor on disk, or an embedded copy that is damaged.
+fn asset_source(asset: Asset) -> Result<String, String> {
+    match asset.embedded() {
+        Ok(Some(_)) => return Ok("embedded".to_string()),
+        Ok(None) => {}
+        Err(e) => return Err(format!("{e:#}")),
     }
     let p = Path::new(asset.default_path());
-    p.is_file().then(|| p.display().to_string())
+    if p.is_file() {
+        Ok(p.display().to_string())
+    } else {
+        Err(format!("nothing embedded and {} missing", p.display()))
+    }
 }
 
 fn kernel() -> Outcome {
@@ -910,11 +904,8 @@ fn kernel() -> Outcome {
     let mut missing = Vec::new();
     for (name, asset) in [("kernel", Asset::Kernel), ("agent", Asset::Agent)] {
         match asset_source(asset) {
-            Some(src) => have.push(format!("{name} {src}")),
-            None => missing.push(format!(
-                "{name}: nothing embedded and {} missing",
-                asset.default_path()
-            )),
+            Ok(src) => have.push(format!("{name} {src}")),
+            Err(why) => missing.push(format!("{name}: {why}")),
         }
     }
     if missing.is_empty() {
