@@ -9,6 +9,7 @@ All notable changes to virtkit will be documented in this file.
 - **A node reset evicts the node's idle cached images by default**, so it frees the disk they
   occupy. `vk-hub nodes reset --keep-images` and the node page's "Keep cached images" box opt
   out; `--images` is still accepted. A reset that keeps them is audited as `reset, images kept`.
+- Rust toolchain upgraded to 1.99.1.
 
 ### Fixed
 
