@@ -145,6 +145,8 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./build-firmware.sh [--docker|--no-cache]  # UEFI firmware CLOUDHV.fd -> dist/ (optional; embedded by build.sh)
 ./build.sh                          # static-musl binaries -> dist/ (vk or Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
+./build.sh --only=vk-hub            # compile just these binaries (comma list), not assembled
+./build.sh --assemble               # embed dist/{vk-agent,vmlinux,CLOUDHV*.fd} into dist/vk-bare -> dist/vk
 ./dev.sh check                      # type/borrow checking, whole workspace, every target
 ./dev.sh clippy                     # the lints CI gates on, same scope
 ./dev.sh fmt [--check]              # rustfmt the workspace with the pinned toolchain
@@ -177,6 +179,7 @@ payload, giving `dist/vk` (read back at runtime by `vk-driver/src/embed.rs`). Bo
 `./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
 so `./build-kernel.sh` comes first in a fresh checkout; `--no-kernel` builds a `vk` without
 the embedded kernel instead (it then needs `--kernel` at runtime, and is not shippable).
+Only the assembling needs the kernel: `./build.sh --only=vk,vk-agent` compiles without it.
 
 ### Fast edit/check/test loop
 

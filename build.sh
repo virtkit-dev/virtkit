@@ -16,8 +16,15 @@
 # Two steps: compile, then assemble. The compile leaves a bare vk in ./dist/vk-bare; the
 # assemble step (assemble.sh) appends ./dist/vk-agent, ./dist/vmlinux and, when
 # ./build-firmware.sh has made them, the UEFI firmware ./dist/CLOUDHV*.fd (UEFI guests only)
-# to make the self-contained ./dist/vk, its vk.sha256 and build-info.txt. So run
-# ./build-kernel.sh first (it changes rarely — one build serves every later build.sh run).
+# to make the self-contained ./dist/vk, its vk.sha256 and build-info.txt. So the guest kernel
+# is needed for assembling only: run ./build-kernel.sh first (it changes rarely — one build
+# serves every later build.sh run).
+#
+# --only=<bin>[,<bin>...]: compile just these binaries (vk, vk-agent, vk-registry, vk-hub,
+# vk-gitlab, vk-runnerctl; repeats add up) and do not assemble, so each can build on a
+# machine of its own. --assemble: assemble from the parts already in ./dist; alone it compiles nothing,
+# with --only it assembles after compiling those. Pass it the --fast/--features/--no-kernel/
+# --kernel-from of the compile, which the manifest records.
 #
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
@@ -62,6 +69,10 @@ FAST=""              # --fast/--debug: build the debug profile (much faster to c
 NO_KERNEL=""         # --no-kernel: build vk without embedding dist/vmlinux
 KERNEL_FROM=""       # --kernel-from=<tag>: dist/vmlinux is that release's kernel
 FEATURES=""          # --features=<list>: extra vk-driver cargo features
+ONLY=""              # --only=<list>: compile just these binaries, unassembled
+ASSEMBLE=""          # --assemble: assemble dist/vk (alone: from the parts in dist/)
+# Every binary, in compile order.
+ALL_BINS="vk-agent vk vk-registry vk-hub vk-gitlab vk-runnerctl"
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
@@ -71,9 +82,50 @@ for arg in "$@"; do
     --no-kernel) NO_KERNEL=1 ;;
     --kernel-from=?*) KERNEL_FROM="${arg#*=}" ;;
     --features=?*) FEATURES="${FEATURES:+$FEATURES,}${arg#*=}" ;;
+    --only=?*) ONLY="${ONLY:+$ONLY,}${arg#*=}" ;;
+    --assemble) ASSEMBLE=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+# What to compile and whether to assemble: everything and yes by default; --only narrows the
+# compile and skips the assembling unless --assemble asks for it; --assemble alone compiles
+# nothing.
+if [ -n "$ONLY" ]; then
+  case "$ONLY" in *[!a-z,-]*) echo "--only takes a comma-separated list of binaries" >&2; exit 2 ;; esac
+  for b in ${ONLY//,/ }; do
+    case " $ALL_BINS " in
+      *" $b "*) ;;
+      *) echo "--only takes binaries among: $ALL_BINS (not '$b')" >&2; exit 2 ;;
+    esac
+  done
+  COMPILE=""
+  for b in $ALL_BINS; do
+    case ",$ONLY," in *",$b,"*) COMPILE="$COMPILE $b" ;; esac
+  done
+  COMPILE=${COMPILE# }
+  DO_ASSEMBLE=$ASSEMBLE
+elif [ -n "$ASSEMBLE" ]; then
+  COMPILE=""
+  DO_ASSEMBLE=1
+else
+  COMPILE=$ALL_BINS
+  DO_ASSEMBLE=1
+fi
+compiles() { case " $COMPILE " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+# The local reproducibility check is the whole build twice; CI splits it per binary instead.
+if [ -n "$BOOTSTRAP_CHECK" ] && { [ -n "$ONLY" ] || [ -n "$ASSEMBLE" ]; }; then
+  echo "--bootstrap-check builds and assembles everything; it cannot be combined with --only or --assemble" >&2
+  exit 2
+fi
+# These describe the assembled vk.
+if [ -z "$DO_ASSEMBLE" ] && { [ -n "$NO_KERNEL" ] || [ -n "$KERNEL_FROM" ]; }; then
+  echo "--no-kernel and --kernel-from describe the assembled vk; add --assemble to --only" >&2
+  exit 2
+fi
+if [ -n "$FEATURES" ] && [ -z "$DO_ASSEMBLE" ] && ! compiles vk; then
+  echo "--features applies to vk, which this build neither compiles nor assembles" >&2
+  exit 2
+fi
 # The debug profile is unoptimized and unstripped, so its bytes are neither the release
 # artifact nor reproducible — it cannot back the reproducibility check.
 if [ -n "$FAST" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
@@ -120,7 +172,9 @@ fi
 # is one — unless --docker forces Docker, or this is the --bootstrap-check baseline (which
 # must be the Docker build the vk rebuild compares against). Else Docker.
 VK_BIN=""
-if [ -n "$USE_VIRTKIT" ]; then
+if [ -z "$COMPILE" ]; then
+  :
+elif [ -n "$USE_VIRTKIT" ]; then
   VK_BIN="$USE_VIRTKIT/vk"
 elif [ -z "$FORCE_DOCKER" ] && [ -z "$BOOTSTRAP_CHECK" ] && command -v vk >/dev/null 2>&1; then
   VK_BIN=$(command -v vk)
@@ -181,35 +235,56 @@ BUILD_ENV=(
 # shippable binary's defining property, and the build that drops it is the one nobody
 # notices until the vk fails to boot anything. --no-kernel asks for that vk explicitly.
 # Checked here, before the image build and compile, so the fix comes back in seconds.
-EMBED_ARGS=("vk-agent=$OUT/vk-agent")
-if [ -n "$NO_KERNEL" ]; then
-  echo "build.sh: --no-kernel — the vk built here has no embedded kernel and needs --kernel at runtime" >&2
-elif [ -e "$OUT/vmlinux" ]; then
-  EMBED_ARGS+=("vmlinux=$OUT/vmlinux")
-else
-  echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
-  exit 1
-fi
-# The UEFI firmware for UEFI (Windows) guests, when ./build-firmware.sh has produced it. A vk
-# without it still boots every Linux guest; a UEFI guest then needs VIRTKIT_UEFI_FIRMWARE.
+EMBED_ARGS=()
 EMBED_FIRMWARE=""
-if [ -e "$OUT/CLOUDHV.fd" ]; then
-  EMBED_FIRMWARE=1
-  EMBED_ARGS+=("CLOUDHV.fd=$OUT/CLOUDHV.fd")
-  # Its variable store templates (empty, and with Microsoft's Secure Boot keys): without them a
-  # UEFI guest's variables live in RAM and are lost at each boot.
-  for vars in CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd; do
-    if [ -e "$OUT/$vars" ]; then
-      EMBED_ARGS+=("$vars=$OUT/$vars")
+if [ -n "$DO_ASSEMBLE" ]; then
+  for part in vk-bare:vk vk-agent:vk-agent; do
+    if ! compiles "${part##*:}" && [ ! -e "$OUT/${part%%:*}" ]; then
+      echo "missing $OUT/${part%%:*} to assemble — build it (--only=${part##*:}) first" >&2
+      exit 1
     fi
   done
-else
-  echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
+  EMBED_ARGS+=("vk-agent=$OUT/vk-agent")
+  if [ -n "$NO_KERNEL" ]; then
+    echo "build.sh: --no-kernel — the vk built here has no embedded kernel and needs --kernel at runtime" >&2
+  elif [ -e "$OUT/vmlinux" ]; then
+    EMBED_ARGS+=("vmlinux=$OUT/vmlinux")
+  else
+    echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
+    exit 1
+  fi
+  # The UEFI firmware for UEFI (Windows) guests, when ./build-firmware.sh has produced it. A
+  # vk without it still boots every Linux guest; a UEFI guest then needs VIRTKIT_UEFI_FIRMWARE.
+  if [ -e "$OUT/CLOUDHV.fd" ]; then
+    EMBED_FIRMWARE=1
+    EMBED_ARGS+=("CLOUDHV.fd=$OUT/CLOUDHV.fd")
+    # Its variable store templates (empty, and with Microsoft's Secure Boot keys): without
+    # them a UEFI guest's variables live in RAM and are lost at each boot.
+    for vars in CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd; do
+      if [ -e "$OUT/$vars" ]; then
+        EMBED_ARGS+=("$vars=$OUT/$vars")
+      fi
+    done
+  else
+    echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
+  fi
 fi
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-gitlab && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
+# One cargo build per binary: cargo resolves features per invocation, so a binary's bytes do
+# not depend on which others this run builds, and each can be built alone. vk is
+# vk-driver's binary; the others are their packages'.
+BUILD_CMD=""
+for b in $COMPILE; do
+  case $b in
+    vk) cmd="cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES}" ;;
+    *) cmd="cargo build $CARGO_PROFILE_FLAG -p $b" ;;
+  esac
+  BUILD_CMD="${BUILD_CMD:+$BUILD_CMD && }$cmd"
+done
 
 compile_start=$SECONDS
-if [ -n "$VK_BIN" ]; then
+if [ -z "$COMPILE" ]; then
+  :
+elif [ -n "$VK_BIN" ]; then
   # ---- dogfood backend: vk builds the env image + compiles in a microVM ----
   # vk is self-contained (embedded kernel + agent), so it needs no external base.
   VK="$VK_BIN"
@@ -255,7 +330,7 @@ else
     "$IMAGE" \
     sh -c "$BUILD_CMD"
 fi
-since "compile ($([ -n "$VK_BIN" ] && echo "libkrun microVM" || echo docker))" "$compile_start"
+[ -z "$COMPILE" ] || since "compile ($([ -n "$VK_BIN" ] && echo "libkrun microVM" || echo docker))" "$compile_start"
 
 mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
@@ -263,13 +338,21 @@ mkdir -p "$OUT"
 # previous --use-virtkit / --bootstrap-check run); rename never does. The compiled vk is the
 # bare one; $OUT/vk is only ever the assembled binary.
 # The sidecars name the binaries bare, so a check runs from inside dist/.
-for b in vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
+for b in $COMPILE; do
   dest=$b
   [ "$b" = vk ] && dest=vk-bare
   cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$dest.tmp"
   mv -f "$OUT/.$dest.tmp" "$OUT/$dest"
   ( cd "$OUT" && sha256sum "$dest" > "$dest.sha256" )
 done
+
+if [ -z "$DO_ASSEMBLE" ]; then
+  echo
+  echo "built into $OUT/ (unassembled):"
+  for b in $COMPILE; do cat "$OUT/$([ "$b" = vk ] && echo vk-bare || echo "$b").sha256"; done
+  since "total" 0
+  exit 0
+fi
 
 # assemble.sh writes $OUT/vk by rename too.
 sh ./assemble.sh "$OUT/vk" "$OUT/vk-bare" "${EMBED_ARGS[@]}"
