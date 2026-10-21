@@ -996,6 +996,10 @@ kernel changes less often than the Rust binaries, so one kernel build can be reu
 normal edit/build cycles. Do not strip or re-link `dist/vk`, which drops what was appended;
 strip `dist/vk-bare` and assemble again instead.
 
+The two steps also run apart: `build.sh --only=vk,vk-agent` compiles just those binaries,
+and `build.sh --assemble` makes `dist/vk` from the parts already in `dist/`, refusing any
+that were compiled with other flags or at another commit.
+
 For iteration, use the repository's development commands:
 
 ```sh
