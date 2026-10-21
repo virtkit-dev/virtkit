@@ -34,7 +34,7 @@ permissions:
 jobs:
   # Every run builds the guest kernel from its own commit, in parallel with the binaries.
   kernel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,7 +57,7 @@ jobs:
           retention-days: ${{ inputs.retention-days }}
 
   firmware:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,7 +86,7 @@ jobs:
   # `file` is what build.sh leaves in dist/: the vk it compiles is the bare one.
   binary:
     name: binary (${{ matrix.bin }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -123,7 +123,7 @@ jobs:
   # build-info.txt; no compile, so no toolchain image.
   assemble:
     needs: [kernel, firmware, binary]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

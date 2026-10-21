@@ -59,7 +59,7 @@ jobs:
   # long jobs start. The tag is derived from the version the binaries are built as, which
   # is what `vk update` compares a release's tag against.
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.candidate.outputs.tag }}
@@ -137,7 +137,7 @@ jobs:
   # still prints its results table instead of being killed mid-script.
   e2e:
     needs: [prepare, quality, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -176,7 +176,7 @@ jobs:
   # every step is idempotent, so re-running this job from the Actions UI finishes it.
   publish:
     needs: [prepare, quality, build, rebuild, e2e]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     # git push and gh release create need write access to the repo's refs and releases.
     permissions:
