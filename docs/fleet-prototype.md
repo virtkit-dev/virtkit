@@ -1677,9 +1677,8 @@ recorded. A browser shell is not built.
 
 `tests/fleet-*.sh` test the hub and its nodes end to end: in CI on GitHub's hosted runners
 (`ci.yml`'s `fleet-e2e`, for pushes outside `release`, pull requests and manual runs), and with
-the rest of `tests/` before a release. CI's build embeds the guest kernel of the release the
-commit descends from (`build.sh --kernel-from`), or builds one when the kernel inputs changed
-since or the run is manual.
+the rest of `tests/` before a release. CI's build, like a release's, builds the guest kernel
+from its own commit.
 They cover enrollment (single-use and expired tokens, re-enrollment with the same key,
 removal), the session, inventory, heartbeats, workloads, and reconnecting after a hub restart,
 a node restart and a partition (`fleet-enrollment`, `fleet-monitoring`, `fleet-resilience`);

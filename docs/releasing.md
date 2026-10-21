@@ -36,17 +36,19 @@ that first: a new push to `release` cancels the re-run in turn.
 
 ## What the pipeline checks
 
-In `release.yml`, prepare runs first, then quality and build run in parallel.
-e2e follows both, and publish waits on all of them:
+In `release.yml`, prepare runs first, then quality and build run in parallel. rebuild
+follows build, e2e follows both quality and build, and publish waits on all of them:
 
 - **prepare** (seconds): the tag `v<Cargo.toml version>` does not exist yet, the
   CHANGELOG has a dated `## [X.Y.Z]` section and it is not empty, and `origin/main` is an
   ancestor of the candidate. A stale or unbumped candidate fails here, before anything
   compiles.
 - **quality**: rustfmt, clippy, the test suite, cargo-audit — the same jobs CI runs.
-- **build**: the kernel and UEFI firmware, then `build.sh --bootstrap-check` for the
-  binaries. The check rebuilds them from scratch in a vk microVM with the same embedded
-  kernel and firmware before accepting them.
+- **build**: the guest kernel, the UEFI firmware and each binary in parallel jobs, then
+  the assembled `vk` that embeds the kernel, agent and firmware.
+- **rebuild**: every binary rebuilt from scratch in a vk microVM booted by the assembled
+  `vk`, one job each, and compared byte for byte with the Docker build; the bare `vk` is
+  assembled again and must give the same `vk`.
 - **e2e**: `tests/release-e2e.sh` on the built `vk` — the sha256 sidecars of every binary,
   the version against the tag, `vk check`, a plain boot, then every end-to-end script in
   `tests/`.

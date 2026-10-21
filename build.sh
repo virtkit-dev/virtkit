@@ -17,8 +17,8 @@
 # assemble.sh then appends ./dist/vk-agent, ./dist/vmlinux and, when ./build-firmware.sh has
 # made them, the UEFI firmware ./dist/CLOUDHV*.fd (UEFI guests only) to make the
 # self-contained ./dist/vk, and build.sh writes its vk.sha256 and build-info.txt. So the guest
-# kernel is needed for assembling only: run ./build-kernel.sh first (it changes rarely — one
-# build serves every later build.sh run). Never strip or re-link ./dist/vk: that drops the
+# kernel is needed for assembling only: run ./build-kernel.sh first, and again after changing
+# kernel/, build-kernel.sh or the toolchain. Never strip or re-link ./dist/vk: that drops the
 # payload. Strip ./dist/vk-bare instead, then assemble again.
 #
 # --only=<bin>[,<bin>...]: compile just these binaries (vk, vk-agent, vk-registry, vk-hub,
@@ -26,15 +26,11 @@
 # on a separate machine. --assemble uses existing ./dist parts without compiling; combined
 # with --only, it assembles after compiling the selected binaries. Use the same --fast and
 # --features options as when compiling: assembly rejects parts with a different profile,
-# features or commit, which the manifest records. --no-kernel/--kernel-from apply only to
-# assembly. Each part's ./dist/<part>.build records its build settings.
+# features or commit, which the manifest records. --no-kernel applies only to assembly. Each
+# part's ./dist/<part>.build records its build settings.
 #
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
-#
-# --kernel-from=<tag>: embed release <tag>'s dist/vmlinux to skip CI's kernel build.
-# Record its provenance in the manifest: the release recipe builds the kernel from
-# this commit and need not reproduce these bytes.
 #
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert every binary,
@@ -75,7 +71,6 @@ FORCE_DOCKER=""
 FAST=""              # --fast/--debug: build the debug profile (much faster to compile,
                      # unoptimized + unstripped) for iteration — NOT a release artifact
 NO_KERNEL=""         # --no-kernel: build vk without embedding dist/vmlinux
-KERNEL_FROM=""       # --kernel-from=<tag>: dist/vmlinux is that release's kernel
 FEATURES=""          # --features=<list>: extra vk-driver cargo features
 ONLY=""              # --only=<list>: compile just these binaries, unassembled
 ASSEMBLE=""          # --assemble: assemble dist/vk (alone: from the parts in dist/)
@@ -87,7 +82,6 @@ for arg in "$@"; do
     --docker) FORCE_DOCKER=1 ;;
     --fast|--debug) FAST=1 ;;
     --no-kernel) NO_KERNEL=1 ;;
-    --kernel-from=?*) KERNEL_FROM="${arg#*=}" ;;
     --features=?*) FEATURES="${FEATURES:+$FEATURES,}${arg#*=}" ;;
     --only=?*) ONLY="${ONLY:+$ONLY,}${arg#*=}" ;;
     --assemble) ASSEMBLE=1 ;;
@@ -124,9 +118,9 @@ if [ -n "$BOOTSTRAP_CHECK" ] && { [ -n "$ONLY" ] || [ -n "$ASSEMBLE" ]; }; then
   echo "--bootstrap-check builds and assembles everything; it cannot be combined with --only or --assemble" >&2
   exit 2
 fi
-# --no-kernel and --kernel-from apply only to assembly.
-if [ -z "$DO_ASSEMBLE" ] && { [ -n "$NO_KERNEL" ] || [ -n "$KERNEL_FROM" ]; }; then
-  echo "--no-kernel and --kernel-from describe the assembled vk; add --assemble to --only" >&2
+# --no-kernel applies only to assembly.
+if [ -z "$DO_ASSEMBLE" ] && [ -n "$NO_KERNEL" ]; then
+  echo "--no-kernel describes the assembled vk; add --assemble to --only" >&2
   exit 2
 fi
 if [ -n "$FEATURES" ] && [ -z "$DO_ASSEMBLE" ] && ! compiles vk; then
@@ -158,15 +152,6 @@ fi
 # the one embedded in it — so a kernel-less build cannot back the check either.
 if [ -n "$NO_KERNEL" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--bootstrap-check boots the vk it builds; it cannot be combined with --no-kernel" >&2
-  exit 2
-fi
-if [ -n "$NO_KERNEL" ] && [ -n "$KERNEL_FROM" ]; then
-  echo "--kernel-from names the kernel embedded; it cannot be combined with --no-kernel" >&2
-  exit 2
-fi
-# The debug manifest has no room for the release kernel's provenance.
-if [ -n "$FAST" ] && [ -n "$KERNEL_FROM" ]; then
-  echo "--kernel-from stamps a release-profile manifest; it cannot be combined with --fast" >&2
   exit 2
 fi
 # Cargo profile flag + its target/ subdir, threaded through the build command and artifact
@@ -478,7 +463,7 @@ elif [ -n "$FEATURES" ]; then
   # Release-profile bytes, but of a vk with extra features: the release recipe rebuilds the
   # default feature set, so it would fail against these hashes.
   manifest_header="# virtkit build manifest (--features=${FEATURES}) — extra features, not a release artifact
-# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel} && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 features:        ${FEATURES}"
 elif [ -n "$NO_KERNEL" ]; then
@@ -487,13 +472,6 @@ elif [ -n "$NO_KERNEL" ]; then
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
 # Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
-elif [ -n "$KERNEL_FROM" ]; then
-  # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
-  # not git_commit's release build.
-  manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
-# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
-profile:         release
-kernel_from:     ${KERNEL_FROM}"
 else
   manifest_header="# virtkit reproducible build manifest
 # Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-bare.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )

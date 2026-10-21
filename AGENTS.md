@@ -254,8 +254,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
   against the built `vk`, then fast-forward `main`, push the `v*` tag and publish
   the GitHub release; see
   [`docs/releasing.md`](docs/releasing.md)), with reusable `quality.yml` (lint + test +
-  audit) and `build.yml`. A release is attested by rebuilding it from scratch in a `vk`
-  microVM and checking it matches the Docker build byte for byte (`build.sh --bootstrap-check`).
+  audit), `build.yml` (the kernel, the firmware and each binary in parallel jobs, then the
+  job that assembles `vk`) and `rebuild.yml`. A release is attested by rebuilding each binary
+  from scratch in a `vk` microVM and checking it matches the Docker build byte for byte (the
+  per-binary form of `build.sh --bootstrap-check`).
 - **End-to-end suite** (`tests/`): `VK=./dist/vk tests/release-e2e.sh` runs it against a
   local build — it needs KVM, e2fsprogs and network — and naming scripts narrows the run.
   Every other `tests/*.sh` is picked up by its glob, so adding one gates the next release
