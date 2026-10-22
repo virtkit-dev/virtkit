@@ -154,8 +154,13 @@ pub(crate) fn pull(
         let view = staging.join(PULLED_DISK);
         let label = format!("Windows layer {}", &key[..12]);
         let reference = digest.map_or_else(|| tag(key), str::to_string);
-        let Some(digest) =
-            crate::registry::try_pull_ext4_lazy(rg, CACHE_REPO, &reference, &view, &label, None)?
+        // The view outlives this process, so it takes no lease: over a local store, what keeps
+        // its chunks is the layer's `win-` tag, which `vk gc` never drops, but which a store gc
+        // that does not keep that prefix — `vk registry gc`, `vk-registry gc`, a hub-run gc —
+        // drops past its retention like any other.
+        let Some(crate::registry::LazyView { digest, .. }) = crate::registry::try_pull_ext4_lazy(
+            rg, CACHE_REPO, &reference, &view, &label, None, None,
+        )?
         else {
             return Ok(None);
         };

@@ -546,6 +546,10 @@ pub struct MicroVm {
     /// image, so two stages reading the same `--from=<image>` must not race — the loser would
     /// rewrite an ext4 the winner already has attached to a booted guest.
     image_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// The lease on the store blobs the build's lazy views read by path, shared across workers
+    /// like `images` (a fork reads its parent's view): held until the last worker is dropped,
+    /// past every guest that reads one.
+    lease: Arc<crate::registry::BuildLease>,
     /// the current stage's long-lived guest (booted on its first RUN, reused for the
     /// rest, committed + torn down by `stage_end`). `None` between stages.
     session: Option<crate::run::VmSession>,
@@ -1214,6 +1218,7 @@ impl MicroVm {
             cache,
             images: Arc::new(Mutex::new(HashMap::new())),
             image_locks: Arc::new(Mutex::new(HashMap::new())),
+            lease: Arc::default(),
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
@@ -1338,6 +1343,7 @@ impl MicroVm {
             cache: self.cache.clone(),
             images: Arc::clone(&self.images),
             image_locks: Arc::clone(&self.image_locks),
+            lease: Arc::clone(&self.lease),
             stage_last_digest: Arc::clone(&self.stage_last_digest),
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
@@ -1690,6 +1696,40 @@ impl MicroVm {
         self.scratch
             .join(format!("{}.vk_ro_img", label_slug(stage)))
     }
+    /// Restore `key` from the cache for `label`: a lazy view whose chunks the build leases
+    /// ([`Self::lazy_image_path`]), or — where they could not be leased, so a gc of the store
+    /// could take them from under the guest — the image reassembled in full at its
+    /// [`Self::image_path`], with no view to check. The path, its digest, and whether it is a
+    /// view; `None` when the cache does not have it.
+    fn restore_cached(
+        &self,
+        rg: &crate::config::Registry,
+        key: &str,
+        label: &str,
+        context: &str,
+    ) -> Result<Option<(PathBuf, String, bool)>> {
+        let lazy = self.lazy_image_path(label);
+        let Some(view) = crate::registry::try_pull_ext4_lazy(
+            rg,
+            CACHE_REPO,
+            key,
+            &lazy,
+            context,
+            self.meter.as_deref(),
+            Some(&self.lease),
+        )?
+        else {
+            return Ok(None);
+        };
+        if view.protected {
+            return Ok(Some((lazy, view.digest, true)));
+        }
+        let _ = std::fs::remove_file(&lazy);
+        let ext4 = self.image_path(label);
+        // By digest: the tag may have moved since.
+        let digest = crate::registry::try_pull_ext4(rg, CACHE_REPO, &view.digest, &ext4, context)?;
+        Ok(digest.map(|d| (ext4, d, false)))
+    }
     fn stage_image(&self, fs: &Rootfs) -> Result<PathBuf> {
         self.images
             .lock()
@@ -1727,19 +1767,13 @@ impl MicroVm {
         let base_key = base_cache_key(&base_id);
         if let Some(rg) = self.cache.clone()
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
+            && let Some((restored, digest, lazy)) =
+                self.restore_cached(&rg, &base_key, label, image)?
         {
-            let lazy = self.lazy_image_path(label);
-            if let Some(digest) = crate::registry::try_pull_ext4_lazy(
-                &rg,
-                CACHE_REPO,
-                &base_key,
-                &lazy,
-                image,
-                self.meter.as_deref(),
-            )? {
-                self.verify_lazy_view(&lazy, &format!("cached image {image} (after load)"))?;
-                return Ok((lazy, Some(digest)));
+            if lazy {
+                self.verify_lazy_view(&restored, &format!("cached image {image} (after load)"))?;
             }
+            return Ok((restored, Some(digest)));
         }
         // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
         let tar = self.scratch.join(format!("{}.tar", label_slug(label)));
@@ -2691,20 +2725,14 @@ impl Executor for MicroVm {
         // pull a `.vk_ro_img` view over the snapshot's ext4 (chunk-cached, byte-exact), then
         // wrap it in a rw qcow2 so any remaining instructions can boot it directly and write
         // into the overlay.
-        let lazy = self.lazy_image_path(&fs.label);
-        let Some(digest) = crate::registry::try_pull_ext4_lazy(
-            &rg,
-            CACHE_REPO,
-            key,
-            &lazy,
-            &fs.label,
-            self.meter.as_deref(),
-        )?
+        let Some((restored, digest, lazy)) = self.restore_cached(&rg, key, &fs.label, &fs.label)?
         else {
             bail!("cached instruction {key} vanished from the registry");
         };
-        self.verify_lazy_view(&lazy, &format!("cached instruction {key} (after load)"))?;
-        self.wrap_base(&fs.label, &lazy)?;
+        if lazy {
+            self.verify_lazy_view(&restored, &format!("cached instruction {key} (after load)"))?;
+        }
+        self.wrap_base(&fs.label, &restored)?;
         // Record the restored digest under the stage label; `parent_for_push` only checks this
         // map. Restores are byte-exact and forks write to their own overlays, so these chunks
         // exactly back the child's first diff.
@@ -3249,6 +3277,51 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    /// A restore through a worker adds to the build's one lease, which outlives the worker and
+    /// goes with the last of the build's backends.
+    #[test]
+    fn the_build_lease_outlives_its_workers() {
+        let dir = tmpdir("build-lease");
+        let root = dir.join("store");
+        let registry = crate::config::Registry::for_share(
+            root.display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let ext4 = dir.join("base.ext4");
+        std::fs::write(&ext4, vec![0x5au8; 1 << 20]).unwrap();
+        crate::registry::push_ext4(&registry, CACHE_REPO, "lease-t1", &ext4, "generic").unwrap();
+        let ex = MicroVm::new(
+            PathBuf::new(),
+            PathBuf::new(),
+            dir.clone(),
+            BuildCpus::Fixed(1),
+            "1G".into(),
+            Some(registry.clone()),
+            crate::build::BuildNet::None,
+            false,
+            false,
+            None,
+            Arc::new(Timings::new()),
+        );
+        let worker = ex.worker();
+        let (view, _, lazy) = worker
+            .restore_cached(&registry, "lease-t1", "s", "s")
+            .unwrap()
+            .expect("cached");
+        assert!(lazy && view.extension().is_some_and(|e| e == "vk_ro_img"));
+        let leases = || std::fs::read_dir(root.join("leases")).unwrap().count();
+        assert_eq!(leases(), 1);
+        drop(worker);
+        assert_eq!(leases(), 1, "the build still holds it");
+        drop(ex);
+        assert_eq!(leases(), 0);
+    }
 
     #[test]
     fn completed_stages_are_recorded_after_restore_or_successful_upload() {

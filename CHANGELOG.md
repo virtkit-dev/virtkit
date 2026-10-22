@@ -10,6 +10,12 @@ All notable changes to virtkit will be documented in this file.
   `vk gc` now prints one summary in place of its per-cache lines: the space each kind of
   cache freed, what it kept and why, and the free space before and after.
 
+### Fixed
+
+- **A registry gc no longer deletes the cached stages a running build is reading** from the
+  local build cache, however long the build runs; it used to take them once their tags were
+  dropped and a day had passed. Builds by older `vk` releases are not covered.
+
 ## [0.93.2] - 2026-10-21
 
 ### Added

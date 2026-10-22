@@ -518,13 +518,68 @@ async fn try_pull_ext4_async(
     Ok(Some(digest))
 }
 
+/// The lease a build holds on the store blobs its lazy views read by path: one lease, which
+/// every restore from a local store adds to, held for as long as the build (see
+/// [`vk_registry::Lease`]). Without it, a gc of the store may sweep a view's chunks from under
+/// the guest reading them once their tag is gone.
+#[derive(Default)]
+pub struct BuildLease {
+    lease: std::sync::Mutex<Option<vk_registry::Lease>>,
+    /// A failure to lease is said once per build.
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl BuildLease {
+    /// Lease `hexes` from `store` under the shared lock used to resolve them. Return success.
+    fn add<'a>(
+        &self,
+        store: &vk_registry::Store,
+        held: &vk_registry::LockGuard,
+        hexes: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let mut slot = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let added = (|| -> Result<()> {
+            let lease = match &mut *slot {
+                Some(lease) => lease,
+                None => slot.insert(store.lease(held)?),
+            };
+            lease.add(held, hexes)
+        })();
+        match added {
+            Ok(()) => true,
+            Err(e) => {
+                if !self.warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "virtkit: build cache: cannot lease the chunks of a restore ({e:#}); \
+                         restoring in full instead"
+                    );
+                }
+                false
+            }
+        }
+    }
+}
+
+/// What [`try_pull_ext4_lazy`] wrote a view of.
+pub struct LazyView {
+    /// The manifest digest of the bundle.
+    pub digest: String,
+    /// `false` for a view over a local store whose chunks were not leased — none was asked for,
+    /// or it could not be had — which a gc of the store may break: read it in full instead.
+    pub protected: bool,
+}
+
 /// Lazy counterpart of [`try_pull_ext4`]: ensure every chunk of the cached bundle is
 /// present in the local chunk cache (fetching over the network on a miss, exactly like a
 /// normal restore would), then write a `.vk_ro_img` manifest at `dest` instead of
 /// reassembling a raw ext4 — the decompress-and-write of each chunk's bytes happens lazily,
 /// only for the ranges a guest boot actually reads. Returns `None` if the tag is absent,
 /// exactly like `try_pull_ext4`. `meter`, when set, counts the chunks in as they land; a
-/// local store reads no chunk here, so it leaves the meter alone.
+/// local store reads no chunk here, so it leaves the meter alone. A view over a local store
+/// adds its chunks to `lease`.
 pub fn try_pull_ext4_lazy(
     rg: &Registry,
     name: &str,
@@ -532,11 +587,16 @@ pub fn try_pull_ext4_lazy(
     dest: &Path,
     label: &str,
     meter: Option<&TransferMeter>,
-) -> Result<Option<String>> {
+    lease: Option<&BuildLease>,
+) -> Result<Option<LazyView>> {
     if let Some(root) = rg.local_root() {
-        return local::try_pull_ext4_lazy(&root, name, tag, dest);
+        return local::try_pull_ext4_lazy(&root, name, tag, dest, lease);
     }
-    block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label, meter))
+    let digest = block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label, meter))?;
+    Ok(digest.map(|digest| LazyView {
+        digest,
+        protected: true,
+    }))
 }
 
 /// How far a pull has got, in the compressed bytes its manifest lists — read by the build's
@@ -3395,14 +3455,16 @@ mod local {
     /// own blob directories instead of reassembling a raw ext4 — no decompression, no
     /// full-size sparse file. `root` doubles as the `.vk_ro_img`'s `cache_dir` (layout
     /// `store_root`), so no data is read or copied here at all, only the manifest is parsed.
+    /// The view's chunks are added to `lease` under the same store lock they were found under.
     pub(super) fn try_pull_ext4_lazy(
         root: &Path,
         name: &str,
         tag: &str,
         dest: &Path,
-    ) -> Result<Option<String>> {
+        lease: Option<&super::BuildLease>,
+    ) -> Result<Option<super::LazyView>> {
         let store = Store::new(root.to_path_buf())?;
-        let _lock = store.lock_shared()?;
+        let lock = store.lock_shared()?;
         let Some((digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
             return Ok(None);
         };
@@ -3434,6 +3496,11 @@ mod local {
             });
         }
         sort_lazy_chunks(&mut chunks).with_context(|| format!("{name}@{digest}"))?;
+        let hexes = manifest
+            .layers
+            .iter()
+            .map(|l| l.digest.trim_start_matches("sha256:"));
+        let protected = lease.is_some_and(|l| l.add(&store, &lock, hexes));
         write_vk_ro_img(
             dest,
             config.total_size,
@@ -3441,7 +3508,7 @@ mod local {
             root,
             &chunks,
         )?;
-        Ok(Some(digest))
+        Ok(Some(super::LazyView { digest, protected }))
     }
 
     pub(super) fn push_ext4(
@@ -4017,10 +4084,26 @@ mod local {
 
             local::push_ext4(&root, "img", "t1", &ext4, "generic").unwrap();
             let lazy = dir.join("runner.vk_ro_img");
-            let digest = local::try_pull_ext4_lazy(&root, "img", "t1", &lazy)
+            // Without a lease to add to, as a Windows layer pull asks: none is taken.
+            let unleased = local::try_pull_ext4_lazy(&root, "img", "t1", &lazy, None)
                 .unwrap()
                 .expect("tag present");
-            assert!(digest.starts_with("sha256:"));
+            assert!(!unleased.protected);
+            assert!(!root.join("leases").exists(), "no lease without a build's");
+            let lease = super::super::BuildLease::default();
+            let view = local::try_pull_ext4_lazy(&root, "img", "t1", &lazy, Some(&lease))
+                .unwrap()
+                .expect("tag present");
+            assert!(view.digest.starts_with("sha256:"));
+            assert!(view.protected, "a view over a local store is leased");
+            // A second restore adds to the build's one lease.
+            local::try_pull_ext4_lazy(&root, "img", "t1", &lazy, Some(&lease)).unwrap();
+            let leases: Vec<_> = std::fs::read_dir(root.join("leases"))
+                .unwrap()
+                .flatten()
+                .collect();
+            assert_eq!(leases.len(), 1);
+            let leased = std::fs::read_to_string(leases[0].path()).unwrap();
 
             let bytes = std::fs::read(&lazy).unwrap();
             let mut p = 0usize;
@@ -4042,6 +4125,13 @@ mod local {
                 chunk_count >= 2,
                 "expected several chunks, got {chunk_count}"
             );
+            assert_eq!(
+                leased.lines().filter(|l| !l.is_empty()).count(),
+                2 * chunk_count,
+                "every chunk is leased, by each restore"
+            );
+            drop(lease);
+            assert_eq!(std::fs::read_dir(root.join("leases")).unwrap().count(), 0);
 
             let mut expect_offset = 0u64;
             for _ in 0..chunk_count {
