@@ -600,6 +600,21 @@ retention; the tag counts include them. Existing snapshots do not record stage b
 so the total covers stages built or restored with this tracking in place. With no stage
 tags in an existing cache, status reports the stage data size as unknown.
 
+`gc` holds the store lock exclusive only in short spells, so pushes and pulls wait for one spell
+at most, not for a whole pass over a large store. One gc runs at a time, serialized by
+`.gc.lock` in the store root. It reads every tag and manifest, decides what to drop and marks
+what stays under the shared lock, alongside pushes and pulls. It then works in exclusive
+spells: the tag drops, the blob sweep, and last the sidecars, membership markers and uploads.
+Each spell first brings the mark up to date with whatever was tagged or pushed since, then
+re-checks every item it works: a tag is dropped only if its bytes and mtime are as read, a
+blob only if still unmarked, unleased and idle. That refresh is the primary safeguard; a
+push's touch of the blobs it references, which puts them inside the grace window, is the
+backup. A spell works at least 64 items, then more until half a second is spent, so how long
+it holds the lock depends on the store's disk and on what was written since the last spell.
+Unless the gc waits for good, a spell that cannot have the lock within its wait (about a second
+and a half under `Wait::Try`) ends the pass partway: what it had not reached, stale sidecars
+and markers included, waits for the next complete pass.
+
 `gc` applies two windows:
 
 - retention controls when idle tags stop being roots; and

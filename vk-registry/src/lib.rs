@@ -22,13 +22,14 @@
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -1450,7 +1451,35 @@ impl Store {
     /// [`Store::lock_exclusive`] without waiting: `Ok(None)` while another holder has the
     /// lock, shared or exclusive.
     pub(crate) fn try_lock_exclusive(&self) -> Result<Option<LockGuard>> {
-        match self.flock(libc::LOCK_EX | libc::LOCK_NB) {
+        self.try_flock(libc::LOCK_EX)
+    }
+
+    /// Lock the store's file `name` with `op` (`LOCK_SH` or `LOCK_EX`), waiting indefinitely or
+    /// up to `wait`'s timeout. Return `None` on timeout.
+    fn lock_for(&self, name: &str, op: libc::c_int, wait: Wait) -> Result<Option<LockGuard>> {
+        let patience = match wait {
+            Wait::Block => return self.flock_at(name, op).map(Some),
+            Wait::Try => TRY_PATIENCE,
+            Wait::Within(d) => d,
+        };
+        let deadline = Instant::now() + patience;
+        loop {
+            match self.flock_at(name, op | libc::LOCK_NB) {
+                Ok(lock) => return Ok(Some(lock)),
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {}
+                Err(e) => return Err(e),
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn try_flock(&self, op: libc::c_int) -> Result<Option<LockGuard>> {
+        match self.flock(op | libc::LOCK_NB) {
             Ok(lock) => Ok(Some(lock)),
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
@@ -1463,8 +1492,12 @@ impl Store {
     }
 
     fn flock(&self, op: libc::c_int) -> Result<LockGuard> {
+        self.flock_at(".lock", op)
+    }
+
+    fn flock_at(&self, name: &str, op: libc::c_int) -> Result<LockGuard> {
         use std::os::unix::io::AsRawFd;
-        let path = self.root.join(".lock");
+        let path = self.root.join(name);
         let f =
             std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         // SAFETY: the fd is owned by `f`, which the guard keeps alive; flock returns
@@ -1607,8 +1640,8 @@ impl Store {
         Ok(leased)
     }
 
-    /// Garbage-collect the store, holding the lock exclusive (pushers briefly
-    /// block; see [`Store::lock_shared`]). Tags idle past `retention` are dropped
+    /// Garbage-collect the store, holding the lock exclusive in short spells only (pushers
+    /// briefly block; see [`Store::lock_shared`] and [`Store::gc_with`]). Tags idle past `retention` are dropped
     /// (tag mtime = last use), unless their manifest sets a [`Retention`] of its
     /// own — read for every tag, so the mark reads each surviving manifest again.
     /// The surviving tags' manifests — plus digest-pinned manifests (a sidecar with
@@ -1632,22 +1665,67 @@ impl Store {
     /// [`Store::gc`] under `policy`: tags dropped only in its repository and never one with a
     /// kept prefix, by age only when it sets a retention, then by size (see
     /// [`Store::cap_tags`]); every other repository's manifests root the mark, tagged or not.
-    /// Under [`Wait::Try`], [`GcOutcome::Busy`] while anyone holds the store lock, a push or a
-    /// pull by a build, say.
+    /// [`GcOutcome::Busy`] when, within what `policy.wait` allows, the pass cannot have the gc
+    /// lock (another gc runs), the shared store lock, or its first exclusive spell: it has done
+    /// nothing. A later spell it cannot have leaves the report
+    /// [`incomplete`](GcReport::incomplete).
+    ///
+    /// The store lock is held exclusive only in short spells, so the pushes and pulls of the
+    /// builds sharing it wait for one spell at most, not for the whole pass. Everything slow —
+    /// reading every tag and manifest, the size phase, the mark, listing the blobs — is done
+    /// under the shared lock, which they share. Each spell first brings the mark up to date
+    /// with whatever was tagged or pushed since, and works at least 64 items, then more until
+    /// half a second is spent; how long a spell holds the lock thus depends on the store: its
+    /// disk, and the tags and manifests written since the last spell. A tag the pass would
+    /// drop is dropped in a spell where its bytes and mtime still match what was read; a use
+    /// between that comparison and the removal, by a get that touches the tag without the
+    /// lock, is lost, which is harmless: the content stays inside the grace window, and the
+    /// build pushes the tag again. The blobs are then swept in spells that check each is still
+    /// unmarked, unleased and idle past the grace window — a push that references a blob has
+    /// touched it, so it is fresh — and the sidecars, markers and uploads last, each checked
+    /// again too. The report gives the longest spell.
     pub fn gc_with(&self, policy: &GcPolicy) -> Result<GcOutcome> {
-        let _lock = match policy.wait {
-            Wait::Block => self.lock_exclusive()?,
-            Wait::Try => match self.try_lock_exclusive()? {
-                Some(lock) => lock,
-                None => return Ok(GcOutcome::Busy),
-            },
-        };
+        self.gc_between(policy, &|_| {})
+    }
+
+    /// [`Store::gc_with`], running `between` before every exclusive spell, outside every lock:
+    /// where pushes and builds come in, for a test to come in too.
+    fn gc_between(&self, policy: &GcPolicy, between: &dyn Fn(Phase)) -> Result<GcOutcome> {
         if let Some(r) = &policy.repository
             && !valid_name(r)
         {
             bail!("{r:?} names no repository");
         }
-        let (grace, dry_run) = (policy.grace, policy.dry_run);
+        // One gc at a time, so two do not read the whole store side by side.
+        let Some(_gc) = self.lock_for(GC_LOCK, libc::LOCK_EX, policy.wait)? else {
+            return Ok(GcOutcome::Busy);
+        };
+        let mut report = GcReport::default();
+        let longest = Cell::new(Duration::ZERO);
+        let mut plan = {
+            let Some(_shared) = self.lock_for(".lock", libc::LOCK_SH, policy.wait)? else {
+                return Ok(GcOutcome::Busy);
+            };
+            // On a thread of its own, which `lower_planning` may slow without slowing the
+            // exclusive spells after it: the lowering of a thread's priority is one-way.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        if let Some(lower) = policy.lower_planning {
+                            lower();
+                        }
+                        let mut planned = GcReport::default();
+                        self.gc_plan(policy, &mut planned)
+                            .map(|plan| (plan, planned))
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the gc's planning panicked")))
+            })
+            .map(|(plan, planned)| {
+                report.bytes_before = planned.bytes_before;
+                plan
+            })?
+        };
         let now = SystemTime::now();
         // Idle = mtime older than the window. An unreadable mtime — or one in the
         // future — reads as fresh: never delete on uncertain evidence.
@@ -1658,6 +1736,7 @@ impl Store {
                 .and_then(|m| now.duration_since(m).ok())
                 .is_some_and(|age| age > window)
         };
+        let dry_run = policy.dry_run;
         let remove = |path: &Path| -> Result<()> {
             if !dry_run {
                 std::fs::remove_file(path)
@@ -1665,51 +1744,255 @@ impl Store {
             }
             Ok(())
         };
-        let mut report = GcReport::default();
+        let mut spells = Spells {
+            store: self,
+            policy,
+            longest: &longest,
+            between,
+            taken: 0,
+        };
 
-        // Everything the mark phase roots in is read strictly, and nothing is deleted
-        // before all of it is: a root this pass fails to see is a blob it goes on to sweep
-        // out from under a live tag. Same reason a manifest that will not parse aborts
-        // below — only here the omission would be silent.
-        let (tags_dirs, tags_unseen) = self.repo_dirs("tags");
-        let (man_dirs, man_unseen) = self.repo_dirs("manifests");
-        if let Some(p) = tags_unseen.or(man_unseen) {
-            bail!(
-                "{} is a symlink, unreadable, or nested deeper than {MAX_NAME_SEGMENTS} \
-                 repository name components; refusing to sweep on marks that would be \
-                 incomplete. Remove it from the store, then run the gc again",
-                p.display()
-            );
+        // The drops, each only if the tag is still what it was read as.
+        let drops = std::mem::take(&mut plan.drops);
+        plan.dropping = drops
+            .iter()
+            .map(|(seen, _)| (seen.path.clone(), (seen.bytes.clone(), seen.mtime)))
+            .collect();
+        let drops_done = spells.run(
+            Phase::Drops,
+            &mut plan,
+            &idle,
+            drops,
+            |plan, _, (seen, capped)| {
+                plan.dropping.remove(&seen.path);
+                if !seen.unchanged() {
+                    return Ok(());
+                }
+                remove(&seen.path)?;
+                // On a dry run the tag is still there, and must still read as gone.
+                if dry_run {
+                    plan.gone_tags.insert(seen.path);
+                }
+                if capped {
+                    report.tags_capped += 1;
+                } else {
+                    report.tags_dropped += 1;
+                }
+                Ok(())
+            },
+        )?;
+        if drops_done == Done::Short {
+            return Ok(spells.short(report));
         }
 
-        let leased = self.leased_blobs(dry_run)?;
+        // Sweep unmarked blobs idle past the grace window, in both storage forms, noting every
+        // hex that keeps at least one form: that — not what is still on disk — is what the
+        // membership sweeps below consult on a dry run, since `remove` then removes nothing.
+        let mut survivors: HashSet<String> = HashSet::new();
+        let mut swept: HashSet<String> = HashSet::new();
+        let candidates = std::mem::take(&mut plan.candidates);
+        let swept_all = spells.run(
+            Phase::Sweep,
+            &mut plan,
+            &idle,
+            candidates,
+            |plan, leased, (blob, hex)| {
+                if plan.marked.contains(&hex) || !idle(&blob, policy.grace) {
+                    survivors.insert(hex);
+                } else if leased.contains(&hex) {
+                    report.bytes_leased += disk_bytes(&blob);
+                    // One blob, however many storage forms it has.
+                    if survivors.insert(hex) {
+                        report.blobs_leased += 1;
+                    }
+                } else {
+                    let bytes = disk_bytes(&blob);
+                    match remove(&blob) {
+                        Ok(()) => {
+                            report.bytes_freed += bytes;
+                            report.blobs_dropped += 1;
+                            swept.insert(hex);
+                        }
+                        // Gone since the listing: another pass took it.
+                        Err(_) if !blob.exists() => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if swept_all == Done::Short {
+            return Ok(spells.short(report));
+        }
+        // Whether `hex` has no stored form left, or on a dry run would have none.
+        let gone = |hex: &str| {
+            if dry_run {
+                (swept.contains(hex) && !survivors.contains(hex)) || self.find_blob(hex).is_none()
+            } else {
+                self.find_blob(hex).is_none()
+            }
+        };
+
+        // Then the sidecars, the membership markers and the uploads. A sidecar is a manifest's
+        // membership record: one goes exactly when its manifest blob is gone and nothing marks
+        // it. Markers are never roots either: one goes when its blob is gone. Each is listed
+        // first, outside every lock, and checked again in its spell.
+        let mut last: Vec<Last> = plan
+            .sidecars
+            .iter()
+            .filter(|(_, (hex, rooted))| !rooted && !plan.marked.contains(hex) && gone(hex))
+            .map(|(path, _)| Last::Sidecar(path.clone()))
+            .collect();
+        last.extend(
+            self.repo_dirs("blobs")
+                .0
+                .into_iter()
+                .flat_map(|dir| dir_files(&dir))
+                .filter_map(|marker| {
+                    let hex = marker.file_name()?.to_str()?.to_string();
+                    // Anything not named like a blob is not a marker; leave it alone.
+                    (is_blob_hex(&hex) && !plan.marked.contains(&hex) && gone(&hex))
+                        .then_some(Last::Marker(marker, hex))
+                }),
+        );
+        last.extend(
+            dir_files(&self.root.join("uploads"))
+                .into_iter()
+                .map(Last::Upload),
+        );
+        last.extend(
+            dir_files(&self.root.join("uploads").join("owners"))
+                .into_iter()
+                .map(Last::Owner),
+        );
+        let last_done = spells.run(Phase::Last, &mut plan, &idle, last, |plan, _, item| {
+            match item {
+                Last::Sidecar(sidecar) => {
+                    let Some((hex, rooted)) = plan.sidecars.get(&sidecar) else {
+                        return Ok(());
+                    };
+                    if *rooted || plan.marked.contains(hex) || !gone(hex) || !sidecar.exists() {
+                        return Ok(());
+                    }
+                    remove(&sidecar)?;
+                    report.manifests_dropped += 1;
+                }
+                Last::Marker(marker, hex) => {
+                    if plan.marked.contains(&hex) || !gone(&hex) {
+                        return Ok(());
+                    }
+                    if !dry_run {
+                        remove_if_present(&marker)?;
+                    }
+                    report.blob_markers_dropped += 1;
+                }
+                Last::Upload(upload) => {
+                    if !upload.is_file() || !idle(&upload, policy.grace) {
+                        return Ok(());
+                    }
+                    if let Some(id) = upload.file_name().and_then(|n| n.to_str())
+                        && !dry_run
+                    {
+                        // One syscall, not `exists()` then `remove`: the same path resolved
+                        // twice is a race, and a binding already gone is success here.
+                        remove_if_present(&self.upload_owner_path(id))?;
+                    }
+                    remove(&upload)?;
+                    report.uploads_dropped += 1;
+                }
+                // An owner record whose session is already gone (dropped by an earlier sweep,
+                // or by a finish that could not clean up) is not an upload and is not counted
+                // as one. Gated on `grace` like every other removal here: `start_upload` writes
+                // the binding *before* the session, so a binding with no session may simply be
+                // a push that started moments ago, and deleting it would leave a session
+                // nothing can finish.
+                Last::Owner(owner) => {
+                    let orphaned = owner
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_none_or(|id| !self.upload_path(id).is_file());
+                    if orphaned && owner.is_file() && idle(&owner, policy.grace) {
+                        remove(&owner)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if last_done == Done::Short {
+            return Ok(spells.short(report));
+        }
+        Ok(GcOutcome::Done(finish_report(report, &longest)))
+    }
+
+    /// Take the store lock exclusive for one spell of [`Store::gc_with`], waiting as `wait`
+    /// says, `longest` keeping the longest spell. `None` once that wait is out.
+    fn hold_exclusive<'a>(
+        &self,
+        wait: Wait,
+        longest: &'a Cell<Duration>,
+    ) -> Result<Option<Spell<'a>>> {
+        let Some(lock) = self.lock_for(".lock", libc::LOCK_EX, wait)? else {
+            return Ok(None);
+        };
+        Ok(Some(Spell {
+            _lock: lock,
+            started: Instant::now(),
+            longest,
+        }))
+    }
+
+    /// The first, slow part of [`Store::gc_with`], under the shared lock: read every tag and
+    /// decide which go, by age and then by size; read every sidecar; mark what the roots left
+    /// reach; list the blobs nothing marks.
+    fn gc_plan(&self, policy: &GcPolicy, report: &mut GcReport) -> Result<GcPlan> {
+        let grace = policy.grace;
+        let now = SystemTime::now();
+        let idle = |path: &Path, window: Duration| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age > window)
+        };
+        // Everything the mark roots in is read strictly, and nothing is deleted before all of
+        // it is: a root this pass fails to see is a blob it goes on to sweep out from under a
+        // live tag. Same reason a manifest that will not parse aborts below — only here the
+        // omission would be silent.
+        let (tags_dirs, man_dirs) = self.gc_dirs()?;
+        // Read only: dead leases are removed under the exclusive lock.
+        let leased = self.leased_blobs(true)?;
         // Not idle past the retention window, when there is one.
         let retained = |tag: &Path| policy.retention.is_none_or(|r| !idle(tag, r));
 
-        // drop tags whose retention has run out (see `Retention`); the survivors'
-        // manifest hexes root the mark phase.
+        let mut plan = GcPlan::default();
         let mut kept_tags: Vec<KeptTag> = Vec::new();
         for tags_dir in tags_dirs {
+            // Stamped as read, for the spells to tell whether to read it again.
+            plan.unchanged(&tags_dir);
             let scoped = self.in_scope(policy, &tags_dir, "tags");
             for tag in root_dir_files(&tags_dir)? {
                 // Every tag is read, even an idle one: only its manifest can say it is
                 // kept, and a kept tag left unrooted would have its blobs swept.
-                let d = std::fs::read(&tag)
-                    .with_context(|| format!("reading the tag {}", tag.display()))?;
+                let seen = SeenTag::read(tag)?;
+                let d = &seen.bytes;
                 let hex =
-                    std::str::from_utf8(&d).map_or("", |d| d.trim().trim_start_matches("sha256:"));
+                    std::str::from_utf8(d).map_or("", |d| d.trim().trim_start_matches("sha256:"));
                 let protected = !scoped
-                    || tag.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                        policy
-                            .keep_prefixes
-                            .iter()
-                            .any(|p| n.starts_with(p.as_str()))
-                    });
+                    || seen
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| {
+                            policy
+                                .keep_prefixes
+                                .iter()
+                                .any(|p| n.starts_with(p.as_str()))
+                        });
                 let mut by_age = false;
                 let kept = if protected {
                     true
                 } else if !is_blob_hex(hex) {
-                    retained(&tag)
+                    retained(&seen.path)
                 } else {
                     // A dangling or oversized manifest has no retention to honour; one
                     // that fails to read aborts, as the mark does on an unreadable root,
@@ -1721,7 +2004,7 @@ impl Store {
                                 "reading the manifest of the tag {}; refusing to drop a tag \
                                  it might keep. Remove the tag or the blob sha256:{hex}, \
                                  then run the gc again",
-                                tag.display()
+                                seen.path.display()
                             )
                         })?;
                     match manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m)) {
@@ -1729,43 +2012,46 @@ impl Store {
                         Retention::Until(t) => now < t,
                         Retention::Idle => {
                             by_age = true;
-                            retained(&tag)
+                            retained(&seen.path)
                         }
                     }
                 };
                 if !kept {
-                    remove(&tag)?;
-                    report.tags_dropped += 1;
+                    plan.drops.push((seen, false));
                 } else if is_blob_hex(hex) {
-                    let used = std::fs::metadata(&tag).and_then(|m| m.modified()).ok();
                     kept_tags.push(KeptTag {
                         hex: hex.to_string(),
                         cappable: by_age,
-                        used,
-                        path: tag,
+                        used: seen.mtime,
                         dropped: false,
+                        seen: Some(seen),
                     });
                 }
             }
         }
         if policy.max_bytes.is_some() || policy.free_bytes.is_some() {
-            self.cap_tags(policy, now, &man_dirs, &mut kept_tags, &leased, &mut report)?;
+            self.cap_tags(policy, now, &man_dirs, &mut kept_tags, &leased, report)?;
         }
-        let mut roots: HashSet<String> = kept_tags
-            .into_iter()
-            .filter(|t| !t.dropped)
-            .map(|t| t.hex)
-            .collect();
+        let mut roots: HashSet<String> = HashSet::new();
+        for t in kept_tags {
+            match (t.dropped, t.seen) {
+                (true, Some(seen)) => plan.drops.push((seen, true)),
+                _ => {
+                    roots.insert(t.hex);
+                }
+            }
+        }
 
         // manifest sidecars: rooted by a surviving tag, or by their own freshness
-        // (digest-pinned). The rest are *candidates*, not casualties — the removal waits
-        // until after the blob sweep below, because a sidecar is a manifest's membership
-        // record: dropping one whose blob the same pass then decides to keep would make a
-        // live manifest permanently unreadable through its repository, with nothing left to
-        // rebuild it from. (An index child is exactly that: no tag roots it, so its sidecar is a
-        // candidate here, and only the mark below finds it live.)
-        let mut sidecar_candidates: Vec<(PathBuf, String)> = Vec::new();
+        // (digest-pinned), or by being another repository's. The rest are *candidates*, not
+        // casualties — the removal waits until after the blob sweep, because a sidecar is a
+        // manifest's membership record: dropping one whose blob the same pass then decides to
+        // keep would make a live manifest permanently unreadable through its repository, with
+        // nothing left to rebuild it from. (An index child is exactly that: no tag roots it, so
+        // its sidecar is a candidate here, and only the mark finds it live.)
         for man_dir in &man_dirs {
+            plan.unchanged(man_dir);
+            let scoped = self.in_scope(policy, man_dir, "manifests");
             for sidecar in root_dir_files(man_dir)? {
                 let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
                     bail!(
@@ -1774,22 +2060,18 @@ impl Store {
                         sidecar.display()
                     );
                 };
-                if roots.contains(hex) {
-                    continue;
-                }
-                // Another repository's manifest is none of this pass's to drop, however long
-                // it has gone untagged: a push by digest alone leaves just that.
-                if !self.in_scope(policy, man_dir, "manifests") {
+                let rooted = roots.contains(hex)
+                    // Another repository's manifest is none of this pass's to drop, however
+                    // long it has gone untagged: a push by digest alone leaves just that.
+                    || !scoped
+                    || self
+                        .find_blob(hex)
+                        .is_some_and(|(blob, _)| !idle(&blob, grace));
+                if rooted {
                     roots.insert(hex.to_string());
-                    continue;
                 }
-                if let Some((blob, _)) = self.find_blob(hex)
-                    && !idle(&blob, grace)
-                {
-                    roots.insert(hex.to_string());
-                    continue;
-                }
-                sidecar_candidates.push((sidecar.clone(), hex.to_string()));
+                let hex = hex.to_string();
+                plan.sidecars.insert(sidecar, (hex, rooted));
             }
         }
 
@@ -1797,112 +2079,146 @@ impl Store {
         // too. A root that does not parse aborts: sweeping with incomplete marks would delete
         // live data. A child that does not read as a manifest is kept and references nothing
         // (see `walk_manifests`).
-        let mut marked: HashSet<String> = HashSet::new();
-        self.walk_manifests(&roots, true, |hex, manifest| {
-            marked.insert(hex.to_string());
-            if let Some((_, refs)) = manifest {
-                marked.extend(refs.blobs.iter().map(|(h, _)| h.clone()));
-            }
-        })
-        .context("walking the manifests the gc mark keeps")?;
+        self.mark(&roots, &mut plan)?;
 
-        // sweep unmarked blobs idle past the grace window, in both storage forms, noting
-        // every hex that keeps at least one form: that — not what is still on disk — is
-        // what the membership sweep below has to consult, since `remove` is a no-op on a
-        // dry run and would otherwise make it report nothing.
-        //
-        // Read strictly, like the tag and manifest listings above. This listing used to be
-        // lenient because a missed entry only left a blob unswept; it is now what the two
-        // sweeps below *delete* against, so an unreadable blob directory would produce an
-        // empty `survivors` and take every membership record and every held-back sidecar
-        // with it — while keeping the blobs, leaving live content unreachable and nothing
-        // to rebuild the records from.
-        let mut survivors: HashSet<String> = HashSet::new();
+        // Read strictly, like the tag and manifest listings above: this listing is what the
+        // sweeps delete against, so an unreadable blob directory would leave the membership
+        // records without their survivors.
         for sub in ["blobs/sha256", "blobs/zstd"] {
             for blob in root_dir_files_opt(&self.root.join(sub))? {
                 let Some(hex) = blob.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if marked.contains(hex) || !idle(&blob, grace) {
-                    survivors.insert(hex.to_string());
-                    continue;
+                if !plan.marked.contains(hex) {
+                    let hex = hex.to_string();
+                    plan.candidates.push((blob, hex));
                 }
-                if leased.contains(hex) {
-                    // One blob, however many storage forms it has.
-                    if survivors.insert(hex.to_string()) {
-                        report.blobs_leased += 1;
-                    }
-                    report.bytes_leased += disk_bytes(&blob);
-                    continue;
-                }
-                report.bytes_freed += disk_bytes(&blob);
-                remove(&blob)?;
-                report.blobs_dropped += 1;
             }
         }
+        Ok(plan)
+    }
 
-        // Now the sidecars held back above: drop one exactly when its manifest blob is
-        // gone. A candidate whose blob survived — an index child the mark kept — keeps the
-        // record that makes it readable.
-        for (sidecar, hex) in &sidecar_candidates {
-            if survivors.contains(hex) {
+    /// The `tags` and `manifests` directories of every repository, refusing a store whose
+    /// repositories cannot all be seen.
+    fn gc_dirs(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let (tags_dirs, tags_unseen) = self.repo_dirs("tags");
+        let (man_dirs, man_unseen) = self.repo_dirs("manifests");
+        if let Some(p) = tags_unseen.or(man_unseen) {
+            bail!(
+                "{} is a symlink, unreadable, or nested deeper than {MAX_NAME_SEGMENTS} \
+                 repository name components; refusing to sweep on marks that would be \
+                 incomplete. Remove it from the store, then run the gc again",
+                p.display()
+            );
+        }
+        Ok((tags_dirs, man_dirs))
+    }
+
+    /// Mark what `roots` reach, those not yet walked, into `plan`.
+    fn mark(&self, roots: &HashSet<String>, plan: &mut GcPlan) -> Result<()> {
+        let fresh: HashSet<String> = roots.difference(&plan.walked).cloned().collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let marked = &mut plan.marked;
+        // Walked only once read: a root whose manifest is missing now — a dangling tag, a
+        // sidecar whose blob is gone — is walked again once it is pushed.
+        let mut read: Vec<String> = Vec::new();
+        self.walk_manifests(&fresh, true, |hex, manifest| {
+            marked.insert(hex.to_string());
+            if let Some((_, refs)) = manifest {
+                marked.extend(refs.blobs.iter().map(|(h, _)| h.clone()));
+                if fresh.contains(hex) {
+                    read.push(hex.to_string());
+                }
+            }
+        })
+        .context("walking the manifests the gc mark keeps")?;
+        for hex in fresh {
+            if read.contains(&hex) {
+                plan.unread.remove(&hex);
+            } else {
+                plan.unread.insert(hex);
+            }
+        }
+        plan.walked.extend(read);
+        Ok(())
+    }
+
+    /// Under the exclusive lock, bring `plan`'s mark up to date with what changed since it was
+    /// made: a tag that is new, or names another manifest now, roots what it names; so does a
+    /// sidecar that is new, or whose manifest was pushed again and is fresh. A tag the pass
+    /// dropped is gone, or, on a dry run, counted as gone while it is still as it was read.
+    fn refresh_mark(
+        &self,
+        policy: &GcPolicy,
+        plan: &mut GcPlan,
+        idle: &dyn Fn(&Path, Duration) -> bool,
+    ) -> Result<()> {
+        let (tags_dirs, man_dirs) = self.gc_dirs()?;
+        let mut roots: HashSet<String> = plan.unread.clone();
+        for tags_dir in tags_dirs {
+            if plan.unchanged(&tags_dir) {
                 continue;
             }
-            remove(sidecar)?;
-            report.manifests_dropped += 1;
-        }
-
-        // Membership markers whose blob is gone — including the ones this run just
-        // orphaned, which is why it runs after the blob sweep and reads `survivors`. A
-        // marker is never a gc *root*: what keeps a blob alive is a tag or a fresh
-        // manifest, not a record of which repo may read it.
-        // The walk's completeness answer is discarded here only because it does not depend
-        // on `kind`: the `bail!` above already refused this pass if any of `repos/` was
-        // unreadable, so by now there is nothing left for it to report.
-        for blobs_dir in self.repo_dirs("blobs").0 {
-            for marker in dir_files(&blobs_dir) {
-                let Some(hex) = marker.file_name().and_then(|n| n.to_str()) else {
+            for tag in root_dir_files(&tags_dir)? {
+                if plan.gone_tags.contains(&tag) {
                     continue;
+                }
+                // Still as read, a tag yet to be dropped roots nothing; changed, it is kept.
+                if let Some((bytes, mtime)) = plan.dropping.get(&tag)
+                    && std::fs::metadata(&tag).and_then(|m| m.modified()).ok() == *mtime
+                    && std::fs::read(&tag).is_ok_and(|b| b == *bytes)
+                {
+                    continue;
+                }
+                let bytes = match std::fs::read(&tag) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("reading the tag {}", tag.display()));
+                    }
                 };
-                // Anything not named like a blob is not a marker; leave it alone.
-                if !is_blob_hex(hex) || survivors.contains(hex) {
+                let hex = std::str::from_utf8(&bytes)
+                    .map_or("", |d| d.trim().trim_start_matches("sha256:"));
+                if is_blob_hex(hex) && !plan.walked.contains(hex) {
+                    roots.insert(hex.to_string());
+                }
+            }
+        }
+        for man_dir in &man_dirs {
+            if plan.unchanged(man_dir) {
+                continue;
+            }
+            let scoped = self.in_scope(policy, man_dir, "manifests");
+            for sidecar in root_dir_files(man_dir)? {
+                let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
+                    bail!(
+                        "{} is not named for a manifest digest; refusing to sweep on marks \
+                         that would be incomplete",
+                        sidecar.display()
+                    );
+                };
+                let hex = hex.to_string();
+                let entry = plan
+                    .sidecars
+                    .entry(sidecar)
+                    .or_insert_with(|| (hex.clone(), false));
+                if entry.1 {
                     continue;
                 }
-                remove(&marker)?;
-                report.blob_markers_dropped += 1;
-            }
-        }
-
-        for upload in dir_files(&self.root.join("uploads")) {
-            if idle(&upload, grace) {
-                if let Some(id) = upload.file_name().and_then(|n| n.to_str()) {
-                    // One syscall, not `exists()` then `remove`: the same path resolved
-                    // twice is a race, and a binding already gone is success here.
-                    remove_if_present(&self.upload_owner_path(id))?;
+                let rooted = !scoped
+                    || self
+                        .find_blob(&hex)
+                        .is_some_and(|(blob, _)| !idle(&blob, policy.grace));
+                if rooted {
+                    entry.1 = true;
+                    roots.insert(hex);
                 }
-                remove(&upload)?;
-                report.uploads_dropped += 1;
             }
         }
-        // An owner record whose session is already gone (dropped by an earlier sweep, or by
-        // a finish that could not clean up) is not an upload and is not counted as one.
-        // Gated on `grace` like every other removal here: `start_upload` writes the binding
-        // *before* the session, so a binding with no session may simply be a push that
-        // started moments ago, and deleting it would leave a session nothing can finish.
-        for owner in dir_files(&self.root.join("uploads").join("owners")) {
-            let orphaned = owner
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_none_or(|id| !self.upload_path(id).is_file());
-            if orphaned && idle(&owner, grace) {
-                remove(&owner)?;
-            }
-        }
-        // What the sweep removed, not what the size phase expected it to.
-        report.bytes_after = report
-            .bytes_before
-            .map(|b| b.saturating_sub(report.bytes_freed));
-        Ok(GcOutcome::Done(report))
+        self.mark(&roots, plan)
     }
 
     /// Whether `dir`, a repository's `kind` directory (`tags`, `manifests`), is in the
@@ -2082,12 +2398,7 @@ impl Store {
                     left = left.saturating_sub(removable[id]);
                 }
             }
-            if !policy.dry_run {
-                std::fs::remove_file(&kept[i].path)
-                    .with_context(|| format!("removing {}", kept[i].path.display()))?;
-            }
             kept[i].dropped = true;
-            report.tags_capped += 1;
         }
         report.bytes_before = Some(total);
         Ok(())
@@ -2550,6 +2861,11 @@ pub struct GcReport {
     /// leaves by its own count
     pub bytes_before: Option<u64>,
     pub bytes_after: Option<u64>,
+    /// the longest the pass held the store lock exclusive, blocking every push and pull
+    pub longest_hold: Duration,
+    /// a spell could not be had within the policy's wait: what the pass had not reached is
+    /// left for the next, stale sidecars and markers included, which only a complete pass removes
+    pub incomplete: bool,
 }
 
 /// How [`Store::gc_with`] takes the store lock.
@@ -2557,8 +2873,10 @@ pub struct GcReport {
 pub enum Wait {
     /// Wait for every holder to let it go.
     Block,
-    /// Give up at once if anyone holds it.
+    /// Give up if it stays held for a few spells' worth, under a second or two.
     Try,
+    /// Give up if it stays held this long.
+    Within(Duration),
 }
 
 /// What a [`Store::gc_with`] pass may drop. [`GcPolicy::new`] is [`Store::gc`]'s: every
@@ -2584,6 +2902,11 @@ pub struct GcPolicy {
     pub min_age: Duration,
     pub dry_run: bool,
     pub wait: Wait,
+    /// Run first by the thread that reads the store under the shared lock, the slow part of a
+    /// pass: lowering its priority there leaves the exclusive spells after it at the caller's.
+    /// The shared lock is then held longer, which delays only those who take it exclusive,
+    /// such as the removal of an emptied repository.
+    pub lower_planning: Option<fn()>,
 }
 
 impl GcPolicy {
@@ -2598,6 +2921,7 @@ impl GcPolicy {
             min_age: Duration::ZERO,
             dry_run,
             wait: Wait::Block,
+            lower_planning: None,
         }
     }
 }
@@ -2605,13 +2929,13 @@ impl GcPolicy {
 /// What [`Store::gc_with`] did.
 pub enum GcOutcome {
     Done(GcReport),
-    /// Under [`Wait::Try`], the store lock was held: nothing was done.
+    /// A lock could not be had within the policy's wait before anything was done; see
+    /// [`Store::gc_with`].
     Busy,
 }
 
 /// A tag a [`Store::gc_with`] pass has kept so far.
 struct KeptTag {
-    path: PathBuf,
     /// The manifest it names.
     hex: String,
     /// Kept for its age alone, so the size phase may drop it.
@@ -2619,6 +2943,213 @@ struct KeptTag {
     /// Its last use; `None` when it cannot be read, which the size phase takes as recent.
     used: Option<SystemTime>,
     dropped: bool,
+    /// As it was read, for the drop to check it still is.
+    seen: Option<SeenTag>,
+}
+
+/// A tag as [`Store::gc_plan`] read it: what the drop checks it still is — not used since,
+/// pushed again, nor pointed at another manifest.
+struct SeenTag {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    mtime: Option<SystemTime>,
+}
+
+impl SeenTag {
+    fn read(path: PathBuf) -> Result<SeenTag> {
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("reading the tag {}", path.display()))?;
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        Ok(SeenTag { path, bytes, mtime })
+    }
+
+    fn unchanged(&self) -> bool {
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        mtime.is_some()
+            && mtime == self.mtime
+            && std::fs::read(&self.path).is_ok_and(|b| b == self.bytes)
+    }
+}
+
+/// What [`Store::gc_plan`] decided and found, for the exclusive spells of [`Store::gc_with`] to
+/// act on and keep up to date.
+#[derive(Default)]
+struct GcPlan {
+    /// The tags to drop, each as read, and whether by size rather than age.
+    drops: Vec<(SeenTag, bool)>,
+    /// On a dry run, the tags dropped, which are still there.
+    gone_tags: HashSet<PathBuf>,
+    /// The tags yet to be dropped, as read: no root while they are still so.
+    dropping: HashMap<PathBuf, (Vec<u8>, Option<SystemTime>)>,
+    /// Every sidecar seen, its manifest, and whether something roots it.
+    sidecars: HashMap<PathBuf, (String, bool)>,
+    /// The manifests walked, and every blob they reach.
+    walked: HashSet<String>,
+    /// Roots whose manifest was missing when walked, tried again by every spell.
+    unread: HashSet<String>,
+    marked: HashSet<String>,
+    /// The blob files nothing marked when they were listed.
+    candidates: Vec<(PathBuf, String)>,
+    /// Each `tags` and `manifests` dir read, by its mtime then and when it was read.
+    dirs: HashMap<PathBuf, (SystemTime, SystemTime)>,
+}
+
+impl GcPlan {
+    /// Whether the `tags` or `manifests` dir `dir` is as it was when last read, so reading it
+    /// again would find nothing new — and if not, stamp it as read now. Every tag and sidecar
+    /// is written by a rename into its dir, which changes the dir's mtime: an mtime unchanged
+    /// since a read that came over a second after it, beyond any timestamp's coarseness, is a
+    /// dir nothing was written into since.
+    fn unchanged(&mut self, dir: &Path) -> bool {
+        let read_at = SystemTime::now();
+        let Ok(mtime) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
+            return false;
+        };
+        if let Some(&(was, at)) = self.dirs.get(dir)
+            && was == mtime
+            && was + Duration::from_secs(1) < at
+        {
+            return true;
+        }
+        self.dirs.insert(dir.to_path_buf(), (mtime, read_at));
+        false
+    }
+}
+
+/// What a spell of [`Store::gc_with`] is for, as a test's hook is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Dropping the tags the plan decided on.
+    Drops,
+    /// Sweeping the blobs nothing marks.
+    Sweep,
+    /// Removing the sidecars, markers and uploads left without their content.
+    Last,
+}
+
+/// How far [`Spells::run`] got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Done {
+    All,
+    /// A spell could not be had: what it had not reached is left.
+    Short,
+}
+
+/// An item of the last spells of [`Store::gc_with`].
+enum Last {
+    Sidecar(PathBuf),
+    Marker(PathBuf, String),
+    Upload(PathBuf),
+    Owner(PathBuf),
+}
+
+/// The exclusive spells of one [`Store::gc_with`] pass.
+struct Spells<'a> {
+    store: &'a Store,
+    policy: &'a GcPolicy,
+    longest: &'a Cell<Duration>,
+    between: &'a dyn Fn(Phase),
+    /// How many it has had so far.
+    taken: usize,
+}
+
+impl Spells<'_> {
+    /// Do `work` on each of `items`, in exclusive spells: before each, a pause for the builds
+    /// waiting on the lock (flock queues nobody fairly), the mark brought up to date and the
+    /// leases read again; in each, at least [`GC_BATCH`] items, then as many as [`GC_SPELL`]
+    /// allows. [`Done::Short`] once a spell cannot be had within the policy's wait.
+    fn run<T>(
+        &mut self,
+        phase: Phase,
+        plan: &mut GcPlan,
+        idle: &dyn Fn(&Path, Duration) -> bool,
+        items: Vec<T>,
+        mut work: impl FnMut(&mut GcPlan, &HashSet<String>, T) -> Result<()>,
+    ) -> Result<Done> {
+        let mut items = items.into_iter();
+        while items.len() > 0 {
+            if self.taken > 0 {
+                std::thread::sleep(GC_YIELD);
+            }
+            (self.between)(phase);
+            let Some(_spell) = self.store.hold_exclusive(self.policy.wait, self.longest)? else {
+                return Ok(Done::Short);
+            };
+            self.taken += 1;
+            self.store.refresh_mark(self.policy, plan, idle)?;
+            let leased = self.store.leased_blobs(self.policy.dry_run)?;
+            // Timed from here: what the refresh took does not shorten the batch.
+            let started = Instant::now();
+            let mut done = 0;
+            for item in items.by_ref() {
+                work(plan, &leased, item)?;
+                done += 1;
+                if done >= GC_BATCH && started.elapsed() >= GC_SPELL {
+                    break;
+                }
+            }
+        }
+        Ok(Done::All)
+    }
+
+    /// The outcome of a pass cut short at a spell it could not have: [`GcOutcome::Busy`] if it
+    /// never had one, so did nothing; else `report`, [`incomplete`](GcReport::incomplete).
+    fn short(&self, mut report: GcReport) -> GcOutcome {
+        if self.taken == 0 {
+            return GcOutcome::Busy;
+        }
+        report.incomplete = true;
+        GcOutcome::Done(finish_report(report, self.longest))
+    }
+}
+
+/// One exclusive spell of [`Store::gc_with`]: the lock, and how long it has been held.
+struct Spell<'a> {
+    _lock: LockGuard,
+    started: Instant,
+    longest: &'a Cell<Duration>,
+}
+
+impl Drop for Spell<'_> {
+    fn drop(&mut self) {
+        self.longest
+            .set(self.longest.get().max(self.started.elapsed()));
+    }
+}
+
+/// How long [`Store::gc_with`] works in one exclusive spell, past bringing its mark up to
+/// date, before it lets the builds waiting on the lock in.
+#[cfg(not(test))]
+const GC_SPELL: Duration = Duration::from_millis(500);
+/// A spell of one item each, for the tests to come in between.
+#[cfg(test)]
+const GC_SPELL: Duration = Duration::ZERO;
+/// The least it does in a spell.
+#[cfg(not(test))]
+const GC_BATCH: usize = 64;
+#[cfg(test)]
+const GC_BATCH: usize = 1;
+/// How long it leaves the lock between two spells.
+const GC_YIELD: Duration = Duration::from_millis(20);
+/// How long [`Wait::Try`] keeps trying for a lock: a few spells' worth.
+#[cfg(not(test))]
+const TRY_PATIENCE: Duration = Duration::from_millis(1500);
+#[cfg(test)]
+const TRY_PATIENCE: Duration = Duration::from_millis(50);
+/// Held by the [`Store::gc_with`] pass that runs, so a second one waits or gives up rather than
+/// read the whole store alongside it.
+const GC_LOCK: &str = ".gc.lock";
+
+/// `report` with its last figures: what the sweep removed, not what the size phase expected
+/// to, and the longest exclusive spell.
+fn finish_report(mut report: GcReport, longest: &Cell<Duration>) -> GcReport {
+    report.bytes_after = report
+        .bytes_before
+        .map(|b| b.saturating_sub(report.bytes_freed));
+    report.longest_hold = longest.get();
+    report
 }
 
 /// Where a store keeps its [`Lease`]s, one file each.
@@ -3274,7 +3805,7 @@ async fn serve_refusing(
             Ok(slot) => slot,
             Err(_) => {
                 if full_logged.is_none_or(|t| t.elapsed() >= CAP_LOG_EVERY) {
-                    full_logged = Some(std::time::Instant::now());
+                    full_logged = Some(Instant::now());
                     eprintln!(
                         "vk-registry: {} connections open (max_connections), new ones wait",
                         limits.connections
@@ -3300,7 +3831,7 @@ async fn serve_refusing(
         let Some(peer_slot) = PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) else {
             drop(slot);
             let key = peer_key(peer.ip());
-            if let Some(unlogged) = refused.refused(key, std::time::Instant::now()) {
+            if let Some(unlogged) = refused.refused(key, Instant::now()) {
                 let since = match unlogged {
                     0 => String::new(),
                     n => format!(" ({n} turned away since the last notice)"),
@@ -5060,6 +5591,12 @@ fn gc_to(
         r.uploads_dropped,
         r.blob_markers_dropped,
     )?;
+    writeln!(
+        out,
+        "{cmd}: gc {}: held the store lock exclusive for {} ms at most",
+        store.root.display(),
+        r.longest_hold.as_millis()
+    )?;
     if r.blobs_leased > 0 {
         writeln!(
             out,
@@ -5771,7 +6308,7 @@ mod tests {
             ClientAuth::None,
             reqwest::Client::new(),
         );
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let acquire = client.acquire("k", Duration::from_secs(30), Duration::ZERO, "me");
         let free = async {
             // Well before the `Retry-After` is up, free the address's slot.
@@ -5810,7 +6347,7 @@ mod tests {
     /// not refused for that long is forgotten.
     #[test]
     fn refusals_are_logged_at_most_once_a_period() {
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
         let mut log = RefusalLog::default();
@@ -7066,6 +7603,7 @@ mod tests {
             min_age: DAY,
             dry_run,
             wait: Wait::Block,
+            lower_planning: None,
         }
     }
 
@@ -7321,6 +7859,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What changes while the pass plans, with no exclusive lock held, is honoured when it acts:
+    /// a tag used since keeps the drop it was planned for from happening, and a tag pointed at a
+    /// manifest the plan did not mark keeps that manifest's chunks. The longest exclusive spell
+    /// is reported.
+    #[test]
+    fn gc_honours_what_changes_while_it_plans() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-regserve-gcbetween-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let used = store.put_blob(&[21u8; 4096]).unwrap();
+        let repointed = store.put_blob(&[22u8; 4096]).unwrap();
+        let orphan = store.put_blob(&[23u8; 4096]).unwrap();
+        store
+            .put_manifest(
+                "repo",
+                "used",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&used, &[&used]),
+            )
+            .unwrap();
+        // A manifest nothing tags: the plan marks nothing of it.
+        let body = manifest_body(&repointed, &[&repointed]);
+        let pin = format!("sha256:{}", sha256_hex_raw(&body));
+        store
+            .put_manifest("repo", &pin, DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+        store
+            .put_manifest(
+                "repo",
+                "moving",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&orphan, &[&orphan]),
+            )
+            .unwrap();
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+
+        let once = Cell::new(false);
+        let between = |_: Phase| {
+            if once.replace(true) {
+                return;
+            }
+            // Used since the plan read it.
+            touch(&store.tag_path("repo", "used"));
+            // Pointed at the old, unmarked manifest, which a tag write alone does not touch.
+            let tag = store.tag_path("repo", "moving");
+            std::fs::write(&tag, &pin).unwrap();
+            std::fs::File::open(&tag)
+                .unwrap()
+                .set_modified(SystemTime::now() - DAY * 100)
+                .unwrap();
+        };
+        let GcOutcome::Done(r) = store
+            .gc_between(&GcPolicy::new(DAY * 30, DAY, false), &between)
+            .unwrap()
+        else {
+            panic!("the lock was free");
+        };
+        assert!(
+            store.tag_path("repo", "used").exists(),
+            "a tag used meanwhile stays"
+        );
+        assert!(store.find_blob(&hex(&used)).is_some());
+        assert!(
+            store.find_blob(&hex(&repointed)).is_some(),
+            "what a tag names now is kept, though the plan never marked it"
+        );
+        assert!(
+            store.find_blob(&hex(&orphan)).is_none(),
+            "what it named before goes"
+        );
+        assert!(r.longest_hold > Duration::ZERO);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store for the size-phase cases: manifests over incompressible chunks, everything dated
     /// far past any window but what a case dates again.
     struct CapStore {
@@ -7369,6 +7982,170 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// What changes between the spells of a pass, one item each under test, is honoured: a
+    /// dangling tag's manifest pushed meanwhile keeps its chunk; a tag re-pointed, a manifest
+    /// pushed by digest alone and a lease taken before the sweep keep theirs; and what the last
+    /// spell would remove, sidecar or marker, is checked again in it.
+    #[test]
+    fn gc_honours_what_changes_between_its_spells() {
+        let c = CapStore::new("gcspells");
+        let (dangling, repointed, pinned, leased, gone, redone) = (
+            c.chunk(1),
+            c.chunk(2),
+            c.chunk(3),
+            c.chunk(4),
+            c.chunk(5),
+            c.chunk(6),
+        );
+        // A tag naming a manifest the store does not have yet.
+        let body = manifest_body(&dangling, &[&dangling]);
+        let missing = format!("sha256:{}", sha256_hex_raw(&body));
+        let tag = c.store.tag_path("repo", "dangling");
+        std::fs::create_dir_all(tag.parent().unwrap()).unwrap();
+        std::fs::write(&tag, &missing).unwrap();
+        // Manifests no tag names, over chunks nothing marks.
+        let repointed_body = manifest_body(&repointed, &[&repointed]);
+        let repointed_manifest = format!("sha256:{}", sha256_hex_raw(&repointed_body));
+        c.store.put_blob(&repointed_body).unwrap();
+        let pinned_body = manifest_body(&pinned, &[&pinned]);
+        // An idle tag the pass drops, whose manifest the last spell finds pushed again.
+        let redone_manifest = c.tag("repo", "redone", &[&redone]);
+        // Its membership in another repository, which the pass would drop with the blob.
+        let marker = c.store.repo_blob_path("other", &hex(&redone_manifest));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        c.tag("repo", "moving", &[&gone]);
+        c.age_all();
+        c.used("repo", "dangling", Duration::ZERO);
+        c.used("repo", "moving", Duration::ZERO);
+
+        let lease = std::cell::RefCell::new(None);
+        let between = |phase: Phase| match phase {
+            Phase::Drops => {
+                // Pushed now, as a blob alone: no sidecar, no tag write.
+                c.store.put_blob(&body).unwrap();
+            }
+            Phase::Sweep if lease.borrow().is_none() => {
+                let tag = c.store.tag_path("repo", "moving");
+                std::fs::write(&tag, &repointed_manifest).unwrap();
+                c.store
+                    .put_manifest(
+                        "repo",
+                        &format!("sha256:{}", sha256_hex_raw(&pinned_body)),
+                        DEFAULT_MANIFEST_TYPE,
+                        &pinned_body,
+                    )
+                    .unwrap();
+                let held = c.store.lock_shared().unwrap();
+                let mut l = c.store.lease(&held).unwrap();
+                l.add(&held, [hex(&leased).as_str()]).unwrap();
+                *lease.borrow_mut() = Some(l);
+            }
+            Phase::Sweep => {}
+            Phase::Last => {
+                if c.store.find_blob(&hex(&redone_manifest)).is_none() {
+                    c.tag("repo", "@", &[&redone]);
+                }
+            }
+        };
+        let policy = GcPolicy::new(DAY * 30, DAY, false);
+        let GcOutcome::Done(r) = c.store.gc_between(&policy, &between).unwrap() else {
+            panic!("the lock was free");
+        };
+        assert!(!r.incomplete);
+        assert!(
+            c.has(&dangling),
+            "a dangling tag's manifest, pushed meanwhile"
+        );
+        assert!(c.has(&repointed), "what a tag re-pointed meanwhile names");
+        assert!(
+            c.has(&pinned),
+            "what a manifest pushed by digest meanwhile names"
+        );
+        assert!(
+            c.has(&leased) && r.blobs_leased == 1,
+            "what a lease taken meanwhile names"
+        );
+        // A mark only grows within a pass: what the tag named when planned is left to the next.
+        assert!(c.has(&gone));
+        assert!(
+            c.store.find_blob(&hex(&redone_manifest)).is_some()
+                && std::fs::read_dir(c.dir.join("repos/repo/manifests"))
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name() == hex(&redone_manifest).as_str()),
+            "a manifest pushed again before the last spell keeps its sidecar"
+        );
+        assert!(
+            marker.exists(),
+            "a blob pushed again before the last spell keeps its markers"
+        );
+        drop(lease);
+    }
+
+    /// A dry run counts a tag it drops as gone in every later spell, though the tag is still
+    /// there and its dir is read again; so it counts the blobs that only that tag named.
+    #[test]
+    fn a_dry_run_counts_its_dropped_tags_as_gone_throughout() {
+        let c = CapStore::new("gcdrygone");
+        let old = c.chunk(1);
+        c.tag("repo", "old", &[&old]);
+        c.age_all();
+        let other = c.chunk(2);
+        let between = |phase: Phase| {
+            if phase == Phase::Sweep {
+                // Another tag written: the dir is read again in the next spell.
+                c.tag("repo", "new", &[&other]);
+            }
+        };
+        let GcOutcome::Done(r) = c
+            .store
+            .gc_between(&GcPolicy::new(DAY * 30, DAY, true), &between)
+            .unwrap()
+        else {
+            panic!("the lock was free");
+        };
+        assert_eq!(r.tags_dropped, 1);
+        assert_eq!(r.blobs_dropped, 2, "the dropped tag's manifest and chunk");
+        assert!(c.has(&old), "a dry run removes nothing");
+    }
+
+    /// Under [`Wait::Try`], a spell that cannot be had within its patience ends the pass
+    /// partway: what was done stays done, the rest is left, and the report says so.
+    #[test]
+    fn a_try_pass_finishes_partway_when_the_lock_stays_held() {
+        let c = CapStore::new("gctry");
+        let chunks: Vec<String> = (1..=4).map(|seed| c.chunk(seed)).collect();
+        for (n, chunk) in chunks.iter().enumerate() {
+            c.tag("repo", &format!("t{n}"), &[chunk]);
+        }
+        c.age_all();
+        let held = std::cell::RefCell::new(None);
+        let sweeps = Cell::new(0);
+        let between = |phase: Phase| {
+            if phase == Phase::Sweep {
+                sweeps.set(sweeps.get() + 1);
+                if sweeps.get() == 2 {
+                    *held.borrow_mut() = Some(c.store.lock_shared().unwrap());
+                }
+            }
+        };
+        let policy = GcPolicy {
+            wait: Wait::Try,
+            ..GcPolicy::new(DAY * 30, DAY, false)
+        };
+        let GcOutcome::Done(r) = c.store.gc_between(&policy, &between).unwrap() else {
+            panic!("the first spells were free");
+        };
+        assert!(r.incomplete);
+        assert_eq!(r.tags_dropped, 4);
+        assert_eq!(
+            r.blobs_dropped, 1,
+            "one spell of one blob before the lock was held"
+        );
+        drop(held);
     }
 
     /// What the size phase drops a tag for and what it frees: nothing a fresh sidecar, another

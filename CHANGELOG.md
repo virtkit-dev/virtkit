@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
 
 - **`vk registry gc`, `vk-registry gc` and a hub-run gc report the space they free as the
   space it took on disk**, its allocated blocks, rather than the files' lengths.
+- **Pushes and pulls no longer wait for a whole registry gc.** A gc holds the store to
+  itself only in short spells, under a second on a large store where it used to take over
+  half a minute; `vk registry gc` and `vk-registry gc` print the longest of them.
 
 ### Fixed
 
