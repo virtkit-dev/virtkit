@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.94.1] - 2026-10-22
+
 ### Fixed
 
 - **`vk dev` detects compose changes since boot**: added, removed or changed services and
@@ -4488,7 +4490,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.94.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.94.1...HEAD
+[0.94.1]: https://github.com/virtkit-dev/virtkit/compare/v0.94.0...v0.94.1
 [0.94.0]: https://github.com/virtkit-dev/virtkit/compare/v0.93.2...v0.94.0
 [0.93.2]: https://github.com/virtkit-dev/virtkit/compare/v0.93.1...v0.93.2
 [0.93.1]: https://github.com/virtkit-dev/virtkit/compare/v0.93.0...v0.93.1
