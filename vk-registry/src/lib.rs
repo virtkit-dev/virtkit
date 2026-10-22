@@ -1620,9 +1620,33 @@ impl Store {
     /// its session file stays fresh). Orphaned `.tmp.*` files from a crashed
     /// `atomic_write` age out with the blob sweep. A blob a live [`Lease`] names is
     /// kept however long it has sat unreferenced. `dry_run` reports without removing
-    /// anything.
+    /// anything. [`Store::gc_with`] takes a fuller policy.
     pub fn gc(&self, retention: Duration, grace: Duration, dry_run: bool) -> Result<GcReport> {
-        let _lock = self.lock_exclusive()?;
+        match self.gc_with(&GcPolicy::new(retention, grace, dry_run))? {
+            GcOutcome::Done(report) => Ok(report),
+            // The policy waits for the lock, so it never finds it busy.
+            GcOutcome::Busy => bail!("the store lock is held"),
+        }
+    }
+
+    /// [`Store::gc`] under `policy`: tags dropped only in its repository and never one with a
+    /// kept prefix, and by age only when it sets a retention; every other repository's
+    /// manifests root the mark, tagged or not. Under [`Wait::Try`], [`GcOutcome::Busy`] while
+    /// anyone holds the store lock, a push or a pull by a build, say.
+    pub fn gc_with(&self, policy: &GcPolicy) -> Result<GcOutcome> {
+        let _lock = match policy.wait {
+            Wait::Block => self.lock_exclusive()?,
+            Wait::Try => match self.try_lock_exclusive()? {
+                Some(lock) => lock,
+                None => return Ok(GcOutcome::Busy),
+            },
+        };
+        if let Some(r) = &policy.repository
+            && !valid_name(r)
+        {
+            bail!("{r:?} names no repository");
+        }
+        let (grace, dry_run) = (policy.grace, policy.dry_run);
         let now = SystemTime::now();
         // Idle = mtime older than the window. An unreadable mtime — or one in the
         // future — reads as fresh: never delete on uncertain evidence.
@@ -1657,10 +1681,15 @@ impl Store {
             );
         }
 
+        let leased = self.leased_blobs(dry_run)?;
+        // Not idle past the retention window, when there is one.
+        let retained = |tag: &Path| policy.retention.is_none_or(|r| !idle(tag, r));
+
         // drop tags whose retention has run out (see `Retention`); the survivors'
         // manifest hexes root the mark phase.
         let mut roots: HashSet<String> = HashSet::new();
         for tags_dir in tags_dirs {
+            let scoped = self.in_scope(policy, &tags_dir, "tags");
             for tag in root_dir_files(&tags_dir)? {
                 // Every tag is read, even an idle one: only its manifest can say it is
                 // kept, and a kept tag left unrooted would have its blobs swept.
@@ -1668,8 +1697,17 @@ impl Store {
                     .with_context(|| format!("reading the tag {}", tag.display()))?;
                 let hex =
                     std::str::from_utf8(&d).map_or("", |d| d.trim().trim_start_matches("sha256:"));
-                let kept = if !is_blob_hex(hex) {
-                    !idle(&tag, retention)
+                let protected = !scoped
+                    || tag.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        policy
+                            .keep_prefixes
+                            .iter()
+                            .any(|p| n.starts_with(p.as_str()))
+                    });
+                let kept = if protected {
+                    true
+                } else if !is_blob_hex(hex) {
+                    retained(&tag)
                 } else {
                     // A dangling or oversized manifest has no retention to honour; one
                     // that fails to read aborts, as the mark does on an unreadable root,
@@ -1687,7 +1725,7 @@ impl Store {
                     match manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m)) {
                         Retention::Keep => true,
                         Retention::Until(t) => now < t,
-                        Retention::Idle => !idle(&tag, retention),
+                        Retention::Idle => retained(&tag),
                     }
                 };
                 if !kept {
@@ -1707,8 +1745,8 @@ impl Store {
         // rebuild it from. (An index child is exactly that: no tag roots it, so its sidecar is a
         // candidate here, and only the mark below finds it live.)
         let mut sidecar_candidates: Vec<(PathBuf, String)> = Vec::new();
-        for man_dir in man_dirs {
-            for sidecar in root_dir_files(&man_dir)? {
+        for man_dir in &man_dirs {
+            for sidecar in root_dir_files(man_dir)? {
                 let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
                     bail!(
                         "{} is not named for a manifest digest; refusing to sweep on marks \
@@ -1717,6 +1755,12 @@ impl Store {
                     );
                 };
                 if roots.contains(hex) {
+                    continue;
+                }
+                // Another repository's manifest is none of this pass's to drop, however long
+                // it has gone untagged: a push by digest alone leaves just that.
+                if !self.in_scope(policy, man_dir, "manifests") {
+                    roots.insert(hex.to_string());
                     continue;
                 }
                 if let Some((blob, _)) = self.find_blob(hex)
@@ -1741,7 +1785,6 @@ impl Store {
             }
         })
         .context("walking the manifests the gc mark keeps")?;
-        let leased = self.leased_blobs(dry_run)?;
 
         // sweep unmarked blobs idle past the grace window, in both storage forms, noting
         // every hex that keeps at least one form: that — not what is still on disk — is
@@ -1835,7 +1878,16 @@ impl Store {
                 remove(&owner)?;
             }
         }
-        Ok(report)
+        Ok(GcOutcome::Done(report))
+    }
+
+    /// Whether `dir`, a repository's `kind` directory (`tags`, `manifests`), is in the
+    /// repository `policy` confines the pass to; every one is when it names none.
+    fn in_scope(&self, policy: &GcPolicy, dir: &Path, kind: &str) -> bool {
+        policy
+            .repository
+            .as_ref()
+            .is_none_or(|r| dir == self.root.join("repos").join(r).join(kind))
     }
 
     /// Walk manifests reachable from `roots`, including nested image indexes, once each.
@@ -2289,6 +2341,53 @@ pub struct GcReport {
     pub blobs_leased: usize,
     /// their stored (on-disk) bytes
     pub bytes_leased: u64,
+}
+
+/// How [`Store::gc_with`] takes the store lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// Wait for every holder to let it go.
+    Block,
+    /// Give up at once if anyone holds it.
+    Try,
+}
+
+/// What a [`Store::gc_with`] pass may drop. [`GcPolicy::new`] is [`Store::gc`]'s: every
+/// repository, no size phase, waiting for the lock.
+#[derive(Clone, Debug)]
+pub struct GcPolicy {
+    /// Drop tags idle this long; `None` drops none for their age.
+    pub retention: Option<Duration>,
+    /// Keep unreferenced blobs, digest-pinned manifests and uploads this long past their
+    /// last use.
+    pub grace: Duration,
+    /// Drop only this repository's tags; every other repository's root the mark. `None`:
+    /// every repository's.
+    pub repository: Option<String>,
+    /// Never drop a tag whose name starts with one of these; it roots the mark.
+    pub keep_prefixes: Vec<String>,
+    pub dry_run: bool,
+    pub wait: Wait,
+}
+
+impl GcPolicy {
+    pub fn new(retention: Duration, grace: Duration, dry_run: bool) -> GcPolicy {
+        GcPolicy {
+            retention: Some(retention),
+            grace,
+            repository: None,
+            keep_prefixes: Vec::new(),
+            dry_run,
+            wait: Wait::Block,
+        }
+    }
+}
+
+/// What [`Store::gc_with`] did.
+pub enum GcOutcome {
+    Done(GcReport),
+    /// Under [`Wait::Try`], the store lock was held: nothing was done.
+    Busy,
 }
 
 /// Where a store keeps its [`Lease`]s, one file each.
@@ -6700,6 +6799,101 @@ mod tests {
                 present,
                 "{tag}"
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pass confined to one repository drops only its tags, keeps every other repository's
+    /// manifests whether tagged or pushed by digest alone, still honours an annotated expiry
+    /// with no retention of its own, refuses a scope that names no repository, and gives up
+    /// on a lock a reader holds when told not to wait.
+    #[test]
+    fn gc_with_confines_its_drops_to_one_repository() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let put = |repo: &str, tag: &str, seed: u8, annotations: Option<serde_json::Value>| {
+            let chunk = store.put_blob(&[seed; 4096]).unwrap();
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&manifest_body(&chunk, &[&chunk])).unwrap();
+            if let Some(a) = annotations {
+                body["annotations"] = a;
+            }
+            let body = serde_json::to_vec(&body).unwrap();
+            let tag = if tag == "@" {
+                format!("sha256:{}", sha256_hex_raw(&body))
+            } else {
+                tag.to_string()
+            };
+            store
+                .put_manifest(repo, &tag, DEFAULT_MANIFEST_TYPE, &body)
+                .unwrap();
+            chunk
+        };
+        let idle = put("build-cache", "idle", 1, None);
+        let expired = put(
+            "build-cache",
+            "expired",
+            2,
+            Some(serde_json::json!({ EXPIRES_ANNOTATION: "1" })),
+        );
+        let other = put("mine", "t", 3, None);
+        let pinned = put("mine", "@", 4, None);
+        let nested = put("build-cache/x", "t", 5, None);
+        let kept = put("build-cache", "win-layer", 6, None);
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        let policy = GcPolicy {
+            retention: None,
+            grace: Duration::ZERO,
+            repository: Some("build-cache".into()),
+            keep_prefixes: vec!["win-".into()],
+            ..GcPolicy::new(Duration::ZERO, Duration::ZERO, false)
+        };
+
+        let held = store.lock_shared().unwrap();
+        let busy = store.gc_with(&GcPolicy {
+            wait: Wait::Try,
+            ..policy.clone()
+        });
+        assert!(matches!(busy, Ok(GcOutcome::Busy)));
+        drop(held);
+        for bad in ["./build-cache", "build-cache/", ""] {
+            let r = store.gc_with(&GcPolicy {
+                repository: Some(bad.into()),
+                ..policy.clone()
+            });
+            assert!(r.is_err(), "{bad:?}");
+        }
+
+        let GcOutcome::Done(r) = store.gc_with(&policy).unwrap() else {
+            panic!("the lock was free");
+        };
+        assert_eq!(r.tags_dropped, 1, "only the expired tag, with no retention");
+        assert!(store.find_blob(&hex(&expired)).is_none());
+        for (what, d) in [
+            ("an idle tag with no retention", &idle),
+            ("another repository's tag", &other),
+            ("another repository's digest push", &pinned),
+            ("a nested repository's tag", &nested),
+            ("a kept prefix", &kept),
+        ] {
+            assert!(store.find_blob(&hex(d)).is_some(), "{what} was swept");
+        }
+
+        // With a retention, the idle tag goes too, and nothing outside the scope.
+        let GcOutcome::Done(r) = store
+            .gc_with(&GcPolicy {
+                retention: Some(DAY),
+                ..policy
+            })
+            .unwrap()
+        else {
+            panic!("the lock was free");
+        };
+        assert_eq!(r.tags_dropped, 1);
+        assert!(store.find_blob(&hex(&idle)).is_none());
+        for d in [&other, &pinned, &nested, &kept] {
+            assert!(store.find_blob(&hex(d)).is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
