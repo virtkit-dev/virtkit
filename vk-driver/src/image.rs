@@ -725,7 +725,7 @@ pub(crate) fn evict_idle_images(state_dir: &Path, idle: std::time::Duration) {
 /// `vm::prepare`, `vm::supervise`, `vm::plan_services`): moments apart in one process, but
 /// moments a host deep in swap can stretch, and a base caught in between must not go. Short
 /// against the hours an idle window runs to, so what pressure frees is still nearly everything.
-const EVICT_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+pub(crate) const EVICT_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The longest [`evict_for_room`] waits for the eviction ahead of it on the same state dir. On a
 /// node the wait holds up its session, heartbeats included, so it is short.

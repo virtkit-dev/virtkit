@@ -833,11 +833,18 @@ enum Cmd {
         ///
         /// Applies to images and checkouts alike, overriding both of their settings. Default:
         /// the config's `image_cache_idle_secs` and `checkout_cache_idle_secs` (30 min each).
-        #[arg(long, value_name = "SECS")]
+        #[arg(long, value_name = "SECS", conflicts_with = "all_unused")]
         idle_secs: Option<u64>,
         /// Report what would be reclaimed without removing anything
         #[arg(long)]
         dry_run: bool,
+        /// Ignore the configured retention and idle windows
+        ///
+        /// Everything above that nothing uses now goes. What keeps an entry safe still holds:
+        /// a lock or a reference held by a VM, job or build, the 10 minutes an image or a
+        /// checkout is left after its last use, and the hour a build-cache entry is.
+        #[arg(long)]
+        all_unused: bool,
     },
     /// Print the effective host paths and where each comes from
     ///
@@ -3423,8 +3430,17 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
         return act_on_vms(target.as_deref(), |sel| vms::pause_cmd(sel, *all, req));
     }
-    if let Cmd::Gc { idle_secs, dry_run } = &cli.cmd {
-        let override_idle = idle_secs.map(std::time::Duration::from_secs);
+    if let Cmd::Gc {
+        idle_secs,
+        dry_run,
+        all_unused,
+    } = &cli.cmd
+    {
+        let override_idle = if *all_unused {
+            Some(image::EVICT_GRACE)
+        } else {
+            idle_secs.map(std::time::Duration::from_secs)
+        };
         // Sweep the same state dir `vk run`/the executor cache under.
         let state_dir = match effective_state_dir(&cfg) {
             Ok(d) => d,
@@ -3432,6 +3448,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
         let req = gc::Request {
             dry_run: *dry_run,
+            all_unused: *all_unused,
             image_idle: override_idle.unwrap_or_else(|| cfg.image_cache_idle()),
             checkout_idle: override_idle.unwrap_or_else(|| cfg.checkout_cache_idle()),
         };

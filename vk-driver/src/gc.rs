@@ -11,6 +11,9 @@ use crate::usage::fmt_bytes;
 /// takes it, and an unreferenced store blob after it was written: a build may have pushed it
 /// moments ago and be about to name it, which no lock covers.
 const BUILD_CACHE_FLOOR: Duration = Duration::from_secs(86_400);
+/// The least time `--all-unused` leaves a build-cache entry after its last use, and an
+/// unreferenced blob after it was written.
+const ALL_UNUSED_FLOOR: Duration = Duration::from_secs(3600);
 /// The longest a manual pass waits for each lock on the build cache's store.
 const STORE_WAIT: Duration = Duration::from_secs(60);
 
@@ -18,6 +21,8 @@ const STORE_WAIT: Duration = Duration::from_secs(60);
 pub(crate) struct Request {
     /// Count what would go and remove nothing.
     pub(crate) dry_run: bool,
+    /// Ignore the configured retention and idle windows; the floors above still hold.
+    pub(crate) all_unused: bool,
     /// How long a materialized base must sit unused.
     pub(crate) image_idle: Duration,
     /// How long a host checkout must sit unused.
@@ -160,7 +165,11 @@ fn build_cache(
             None
         }
     };
-    let (retention, floor) = (cfg.gc.build_cache_retention(), BUILD_CACHE_FLOOR);
+    let (retention, floor) = if req.all_unused {
+        (Some(ALL_UNUSED_FLOOR), ALL_UNUSED_FLOOR)
+    } else {
+        (cfg.gc.build_cache_retention(), BUILD_CACHE_FLOOR)
+    };
     let policy = vk_registry::GcPolicy {
         retention,
         grace: floor,

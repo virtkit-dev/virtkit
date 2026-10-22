@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
   rest to the next pass. `vk gc` also reports what the toolchain cache holds.
 - **`vk gc` removes the scratch dirs of runs killed by a signal**, once they have sat
   unchanged for an hour.
+- **`vk gc --all-unused`** ignores the configured retention and idle windows, taking
+  everything nothing uses now, short of what was used in the last 10 minutes or, in the
+  build cache, the last hour.
 
 ### Changed
 
