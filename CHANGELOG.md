@@ -18,6 +18,15 @@ All notable changes to virtkit will be documented in this file.
   rest to the next pass. `vk gc` also reports what the toolchain cache holds.
 - **`vk gc` removes the scratch dirs of runs killed by a signal**, once they have sat
   unchanged for an hour.
+- **`vk run` (but not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a
+  booting `vk dev` start a `vk gc` pass in the background** at most once a day, logging to
+  `gc.log` in the data dir; it reads the build cache at the lowest priority, and keeps the
+  command's wherever builds or boots may wait on it. When that disk has less than 10% free
+  (at most 20 GiB) they start one at once and say so; it then also takes images unused for
+  10 minutes, the least recently used build-cache entries and run images unused for a day,
+  until the space is back, and backs off for an hour when it cannot get there. `[gc] auto`,
+  `interval_hours` and `min_free` change that; `VK_GC_AUTO=0` turns it off for one command.
+  A manual `vk gc` waits up to a minute for a background pass to finish.
 - **`vk gc --all-unused`** ignores the configured retention and idle windows, taking
   everything nothing uses now, short of what was used in the last 10 minutes or, in the
   build cache, dev environments and run state dirs, the last hour.

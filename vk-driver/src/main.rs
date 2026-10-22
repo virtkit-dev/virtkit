@@ -22,6 +22,7 @@ mod atop_attach;
 mod atop_report;
 mod atop_view;
 mod atoplog;
+mod autogc;
 mod blockrt;
 mod build;
 mod cachelock;
@@ -828,8 +829,11 @@ enum Cmd {
     /// build_cache_max`, never one a running build reads. Removes the boot images of `vk dev`
     /// environments stopped past `[gc] dev_image_idle_days`, the root images `vk run
     /// --state-dir` built into dirs unused past `[gc] run_image_idle_days`, and the scratch dirs
-    /// of runs killed by a signal. Then prints one summary: what each category freed, what was kept and
-    /// why, and the free space before and after.
+    /// of runs killed by a signal. `vk run` (not of a UEFI bundle), `vk build`, `vk export`,
+    /// `vk registry pull` and a booting `vk dev` start a pass in the background once
+    /// `[gc] interval_hours` have passed, and sooner under `[gc] min_free`. Then prints one
+    /// summary: what each category freed, what was kept and why, and the free space before and
+    /// after.
     #[command(display_order = 4)]
     Gc {
         /// Idle threshold in seconds; `0` reclaims every entry not currently in use
@@ -849,6 +853,12 @@ enum Cmd {
         /// environment's images or a run state dir's root image is.
         #[arg(long)]
         all_unused: bool,
+        /// Run as the background pass a command starts (`[gc] auto`)
+        ///
+        /// Waits for no lock another holds, and goes past the idle windows while the data
+        /// dir's filesystem is under `[gc] min_free`.
+        #[arg(long, hide = true, conflicts_with_all = ["dry_run", "all_unused", "idle_secs"])]
+        auto: bool,
     },
     /// Print the effective host paths and where each comes from
     ///
@@ -3346,6 +3356,20 @@ async fn cli_main(cli: Cli) -> ExitCode {
     build::set_tuning(&cfg.build);
     vmm::warn_if_cloud_hypervisor_requested(cfg.vmm);
     numa::set_policy(cfg.numa.mode);
+    // The commands that fill the caches start a background `vk gc` when one is due. `vk run`
+    // and a booting `vk dev` start theirs from the run, once it holds its state dir, so a pass
+    // never finds the environment being booted unclaimed.
+    let fills = matches!(
+        &cli.cmd,
+        Cmd::Build { .. }
+            | Cmd::Export { .. }
+            | Cmd::Registry {
+                cmd: RegistryCmd::Pull { .. },
+            }
+    );
+    if fills && let Ok(state_dir) = effective_state_dir(&cfg) {
+        autogc::maybe_start(&cfg, &state_dir);
+    }
     if let Cmd::Config {
         example: false,
         path,
@@ -3438,6 +3462,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         idle_secs,
         dry_run,
         all_unused,
+        auto,
     } = &cli.cmd
     {
         let override_idle = if *all_unused {
@@ -3453,10 +3478,37 @@ async fn cli_main(cli: Cli) -> ExitCode {
         let req = gc::Request {
             dry_run: *dry_run,
             all_unused: *all_unused,
+            auto: *auto,
             image_idle: override_idle.unwrap_or_else(|| cfg.image_cache_idle()),
             checkout_idle: override_idle.unwrap_or_else(|| cfg.checkout_cache_idle()),
         };
-        print!("{}", gc::run(&cfg, &state_dir, &req).render());
+        // One pass at a time: a manual one waits a while for a background one to finish.
+        let wait = if *auto {
+            std::time::Duration::ZERO
+        } else {
+            autogc::MANUAL_WAIT
+        };
+        let pass = autogc::lock(&state_dir, wait);
+        if let autogc::Pass::Busy = pass {
+            if *auto {
+                println!("virtkit: gc: another pass is running");
+                return ExitCode::SUCCESS;
+            }
+            eprintln!(
+                "virtkit: gc: a background pass is running (log {}); try again once it is done",
+                autogc::log_path(&state_dir).display()
+            );
+            return exit_code(1);
+        }
+        if *auto {
+            println!("virtkit: background gc at {} (unix time)", vms::unix_now());
+        }
+        let sum = gc::run(&cfg, &state_dir, &req);
+        print!("{}", sum.render());
+        if !*dry_run {
+            autogc::finished(&state_dir, sum.complete, sum.still_short);
+        }
+        drop(pass);
         return ExitCode::SUCCESS;
     }
     // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).

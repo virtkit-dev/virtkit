@@ -918,7 +918,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
-| `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, and scratch left by killed builds and runs, then summarize what went and what stayed; `--dry-run` only reports. |
+| `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, the images of long-unused dev environments and run state dirs, and scratch left by killed builds and runs, then summarize what went and what stayed; `--dry-run` only reports. `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a booting `vk dev` start a pass in the background once a day, and sooner when the disk runs low. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
 | `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
 | `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
@@ -961,6 +961,7 @@ The small environment-variable surface is:
 | `VIRTKIT_TIMING=1` | Print per-phase build and boot timing. |
 | `VIRTKIT_PROGRESS=plain` | Use line-oriented build progress suitable for CI logs (also the default off a terminal); a long step, cache restore or wait reports that it is still running every 10 s. |
 | `VIRTKIT_NO_TITLE` | Disable terminal-title updates without disabling the dashboard. |
+| `VK_GC_AUTO=0` | Start no background `vk gc` pass (see `[gc] auto`). |
 
 Two configuration values can point at the same content-addressed store:
 

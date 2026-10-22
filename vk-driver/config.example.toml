@@ -125,6 +125,16 @@
 # [gc]                   # what `vk gc` reclaims beyond unused images and checkouts. A `vk`
 #                        # release older than this table refuses a config that has it:
 #                        # leave it out of a config older releases also read.
+# auto = true            # `vk run` (not of a UEFI bundle), `vk build`, `vk export`,
+#                        # `vk registry pull` and a booting `vk dev` start a pass in the
+#                        # background (log: <data dir>/gc.log) at most every interval_hours,
+#                        # and sooner under min_free. VK_GC_AUTO=0 also turns it off
+# interval_hours = 24    # 0 = only under min_free
+# min_free = "20G"       # below this much free space on the data dir's filesystem, a pass
+#                        # goes past the idle windows — images unused 10 min, the build
+#                        # cache's least recently used entries, run images unused a day —
+#                        # until it is free again: a size, a share ("10%"), or "none".
+#                        # Default: 10%, at most 20G; a share set here has no ceiling
 # build_cache_retention_days = 14  # drop a build-cache entry unused this many days; 0 = never
 #                                  # for its age
 # build_cache_max = "50G"  # then drop the least recently used entries until the build

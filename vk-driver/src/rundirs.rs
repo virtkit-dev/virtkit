@@ -238,7 +238,16 @@ fn collect_in(
             }
             continue;
         }
-        if only_on.is_some_and(|dev| dev != meta.dev()) || running.iter().any(|r| r == dir) {
+        let quiet = || {
+            crate::run::last_active(dir)
+                .is_some_and(|t| now.duration_since(t).unwrap_or_default() >= idle)
+        };
+        // Looked at unlocked first, so a dir in use is never locked: only one that looks idle
+        // is, and read again then.
+        if only_on.is_some_and(|dev| dev != meta.dev())
+            || running.iter().any(|r| r == dir)
+            || !quiet()
+        {
             continue;
         }
         let Ok(held) = open_dir(dir) else {
@@ -251,9 +260,7 @@ fn collect_in(
         if !same || unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
-        let quiet = crate::run::last_active(dir)
-            .is_some_and(|t| now.duration_since(t).unwrap_or_default() >= idle);
-        if !quiet {
+        if !quiet() {
             continue;
         }
         match remove_artifacts(&held, &mut entry, &note, dry_run) {

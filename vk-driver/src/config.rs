@@ -236,11 +236,25 @@ pub struct Schedule {
     pub disk_default: Option<String>,
 }
 
-/// What `vk gc` collects beyond the image and checkout caches. Every key has a default, so a
-/// host needs none of them; an older `vk` refuses a config that has the table at all.
+/// What `vk gc` collects beyond the image and checkout caches, and when the commands that fill
+/// them run it in the background. Every key has a default, so a host needs none of them; an
+/// older `vk` refuses a config that has the table at all.
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Gc {
+    /// Let `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a
+    /// booting `vk dev` start a `vk gc` pass in the background, at most every
+    /// `interval_hours`, and sooner when the data dir's filesystem has less than `min_free`
+    /// left. Default on; `VK_GC_AUTO=0` also turns it off.
+    pub auto: Option<bool>,
+    /// Hours between background passes; `0`: only under `min_free`. Default 24.
+    pub interval_hours: Option<u64>,
+    /// Free space below which a background pass starts whatever the interval, and goes on
+    /// past the idle windows to images unused for 10 minutes, the build cache's least recently
+    /// used entries and run images unused for a day, until this much is free again: a share
+    /// of the filesystem (`"10%"`), a size (`"20G"`), or `"none"`. Default: 10% of the
+    /// filesystem, at most 20G. A category turned off stays off.
+    pub min_free: Option<Limit>,
     /// Drop a build-cache entry unused for this many days; `0` drops none for its age.
     /// Default 14.
     pub build_cache_retention_days: Option<u64>,
@@ -262,6 +276,10 @@ pub struct Gc {
     pub run_image_idle_days: Option<u64>,
 }
 
+/// The default of [`Gc::interval_hours`].
+const GC_INTERVAL_HOURS: u64 = 24;
+/// The ceiling of [`Gc::min_free`]'s default, 10% of the filesystem.
+const MIN_FREE_DEFAULT_CEILING: u64 = 20 << 30;
 /// The default of [`Gc::build_cache_retention_days`].
 const BUILD_CACHE_RETENTION_DAYS: u64 = 14;
 /// The default of [`Gc::dev_image_idle_days`] and [`Gc::run_image_idle_days`].
@@ -272,6 +290,27 @@ const BUILD_CACHE_MAX_DEFAULT_CEILING: u64 = 50 << 30;
 impl Gc {
     fn is_default(&self) -> bool {
         *self == Gc::default()
+    }
+
+    /// Whether commands start a background pass.
+    pub fn auto(&self) -> bool {
+        self.auto.unwrap_or(true)
+    }
+
+    /// The time between background passes; `None` for none but under `min_free`.
+    pub fn interval(&self) -> Option<std::time::Duration> {
+        let hours = self.interval_hours.unwrap_or(GC_INTERVAL_HOURS);
+        (hours > 0).then(|| std::time::Duration::from_secs(hours.saturating_mul(3600)))
+    }
+
+    /// The free space a filesystem of `fs_total` bytes is kept above; `None`: no floor.
+    pub fn min_free(&self, fs_total: u64) -> Option<u64> {
+        match self.min_free {
+            Some(limit) => limit.of(fs_total),
+            None => Limit::Percent(10)
+                .of(fs_total)
+                .map(|floor| floor.min(MIN_FREE_DEFAULT_CEILING)),
+        }
     }
 
     /// How long an unused build-cache entry stays; `None` while its age drops none.
@@ -1507,6 +1546,13 @@ mod tests {
         );
         assert_eq!(cfg.gc.build_cache_max(100 * gib), Some(10 * gib));
         assert_eq!(cfg.gc.build_cache_max(2000 * gib), Some(50 * gib));
+        assert!(cfg.gc.auto());
+        assert_eq!(
+            cfg.gc.interval(),
+            Some(std::time::Duration::from_secs(24 * 3600))
+        );
+        assert_eq!(cfg.gc.min_free(100 * gib), Some(10 * gib));
+        assert_eq!(cfg.gc.min_free(1000 * gib), Some(20 * gib));
         assert_eq!(
             cfg.gc.dev_image_idle(),
             Some(std::time::Duration::from_secs(14 * 86_400))
@@ -1522,7 +1568,8 @@ mod tests {
             let cfg: Config = toml::from_str(&format!(
                 "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n\
                  dev_image_idle_days = 0\nrun_image_idle_days = 0\n\
-                 dev_images_with_create_hook = true\n"
+                 dev_images_with_create_hook = true\nauto = false\ninterval_hours = 0\n\
+                 min_free = {text}\n"
             ))
             .unwrap();
             assert_eq!(cfg.gc.build_cache_max(fs), want, "{text}");
@@ -1530,6 +1577,9 @@ mod tests {
             assert_eq!(cfg.gc.dev_image_idle(), None);
             assert_eq!(cfg.gc.run_image_idle(), None);
             assert!(cfg.gc.dev_images_with_create_hook());
+            assert!(!cfg.gc.auto());
+            assert_eq!(cfg.gc.interval(), None);
+            assert_eq!(cfg.gc.min_free(fs), want, "{text}");
             let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
             assert_eq!(back.gc, cfg.gc, "{text}");
         }

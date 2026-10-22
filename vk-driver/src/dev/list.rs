@@ -482,6 +482,23 @@ pub fn state(sizes: bool) -> Result<Vec<Row>> {
     ))
 }
 
+/// [`state`] without sizes or flags: no workspace is looked at, so a hung share or an
+/// automount cannot stall the caller — a background `vk gc`, which holds its lock meanwhile.
+pub fn state_unflagged() -> Result<Vec<Row>> {
+    let base = crate::dev::plan::dev_state_base()?;
+    let running = running_vms();
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Ok(Vec::new());
+    };
+    let mut rows: Vec<Row> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| row(&e.path(), &running, false, false))
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
 /// The rows as `--json` prints them.
 pub fn json(rows: &[Row]) -> Result<String> {
     Ok(format!("{}\n", serde_json::to_string_pretty(rows)?))

@@ -668,6 +668,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         Some(dir) => dir.clone(),
         None => default_data_base()?,
     };
+    // Started once this run holds its work dir — its state dir, for a `vk dev` boot — so the
+    // pass finds it in use rather than an environment to reclaim.
+    crate::autogc::maybe_start(cfg, &state_dir);
 
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.

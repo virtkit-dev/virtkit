@@ -18,6 +18,8 @@ const ALL_UNUSED_FLOOR: Duration = Duration::from_secs(3600);
 /// `vk run --state-dir` dir's root image, after it was last in use: one stopped moments ago
 /// may be about to start again.
 const DEV_IMAGE_FLOOR: Duration = Duration::from_secs(3600);
+/// The longest a background pass waits for each lock on the build cache's store.
+const AUTO_STORE_WAIT: Duration = Duration::from_secs(5);
 /// The longest a manual pass waits for each lock on the build cache's store.
 const STORE_WAIT: Duration = Duration::from_secs(60);
 
@@ -27,6 +29,10 @@ pub(crate) struct Request {
     pub(crate) dry_run: bool,
     /// Ignore the configured retention and idle windows; the floors above still hold.
     pub(crate) all_unused: bool,
+    /// A background pass ([`crate::autogc`]): looks at no workspace, waits at most
+    /// [`AUTO_STORE_WAIT`] for each store lock, and goes on past the idle windows while the data
+    /// dir's filesystem is under `[gc] min_free`.
+    pub(crate) auto: bool,
     /// How long a materialized base must sit unused.
     pub(crate) image_idle: Duration,
     /// How long a host checkout must sit unused.
@@ -51,9 +57,16 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     if let Ok(base) = &dev_base {
         roots.push(base);
     }
-    let noted = crate::rundirs::noted_dirs();
+    // A background pass reads no noted dir's filesystem up front: those it frees nothing on
+    // cost it nothing, and it shows no space for the others.
+    let noted = if req.auto {
+        Vec::new()
+    } else {
+        crate::rundirs::noted_dirs()
+    };
     roots.extend(noted.iter().map(PathBuf::as_path));
     let mut sum = Summary::new(req.dry_run, &roots);
+    sum.lazy = req.auto;
 
     let mut images = crate::image::Evicted::default();
     for tier in ["registry", "docker", "build"] {
@@ -106,7 +119,7 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
         unused_for(req.checkout_idle),
     );
     sum.kept.extend(trees.left);
-    build_cache(cfg, store, req, &mut sum);
+    build_cache(cfg, &store, req, None, &mut sum);
     if let Ok(base) = &dev_base {
         dev_images(cfg, req, base, &mut sum);
     }
@@ -131,8 +144,87 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
             dir.display()
         ));
     }
+    if req.auto {
+        pressure(cfg, state_dir, &store, req, &mut sum);
+    }
     sum.finish();
     sum
+}
+
+const DAY: Duration = Duration::from_secs(86_400);
+
+/// What a background pass does while `state_dir`'s filesystem stays under `[gc] min_free`, on
+/// that filesystem only: past the idle windows, cheapest to recreate first, stopping once
+/// enough is free — images unused for the eviction grace, then the build cache's least recently
+/// used entries, then the root images of run state dirs unused for a day. A category turned off
+/// in `[gc]` stays off; dev environments' images keep their own window, as rebuilding them can
+/// run their create hooks again.
+fn pressure(
+    cfg: &Config,
+    state_dir: &Path,
+    store: &anyhow::Result<crate::build::CacheStore>,
+    req: &Request,
+    sum: &mut Summary,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let short = || {
+        let space = crate::usage::fs_space(state_dir).ok()?;
+        let floor = cfg.gc.min_free(space.total)?;
+        floor.checked_sub(space.avail).filter(|&need| need > 0)
+    };
+    if short().is_none() {
+        return;
+    }
+    let grace = crate::image::EVICT_GRACE;
+    let mut images = crate::image::Evicted::default();
+    for tier in ["registry", "docker", "build"] {
+        let got = crate::image::collect_idle(&state_dir.join(tier), grace, req.dry_run);
+        images.bases += got.bases;
+        images.bytes = images.bytes.saturating_add(got.bytes);
+    }
+    sum.row(
+        "images",
+        images.bases,
+        images.bytes,
+        state_dir,
+        format!("short of space: {}", unused_for(grace)),
+    );
+    let fs = crate::usage::fs_id(state_dir);
+    if let Some(need) = short()
+        && let Ok(crate::build::CacheStore::Dir(dir)) = store
+        && fs.is_some()
+        && crate::usage::fs_id(dir) == fs
+        && (cfg.gc.build_cache_retention().is_some() || cfg.gc.build_cache_max(u64::MAX).is_some())
+    {
+        build_cache(cfg, store, req, Some(need), sum);
+    }
+    if short().is_some()
+        && cfg.gc.run_image_idle().is_some()
+        && let Ok(dev) = std::fs::metadata(state_dir).map(|m| m.dev())
+    {
+        let done = crate::rundirs::collect(DAY, Some(dev), req.dry_run);
+        let parts: Vec<(&Path, u64)> = done
+            .dirs
+            .iter()
+            .map(|(dir, bytes)| (dir.as_path(), *bytes))
+            .collect();
+        sum.row_on(
+            "run images",
+            u64::try_from(parts.len()).unwrap_or(u64::MAX),
+            &parts,
+            format!("short of space: state dirs unused for {}", fmt_secs(DAY)),
+        );
+        sum.kept.extend(done.kept);
+    }
+    let still = short().is_some();
+    if still {
+        sum.keep(format!(
+            "{} is still short of space: what is left is in use, recent, turned off in [gc], \
+             or not virtkit's to remove",
+            state_dir.display()
+        ));
+    }
+    sum.still_short = Some(still);
 }
 
 /// Remove the boot images of the `vk dev` environments under `base` stopped longer than
@@ -147,7 +239,12 @@ fn dev_images(cfg: &Config, req: &Request, base: &Path, sum: &mut Summary) {
     }) else {
         return;
     };
-    let Ok(rows) = crate::dev::list::state(false) else {
+    let rows = if req.auto {
+        crate::dev::list::state_unflagged()
+    } else {
+        crate::dev::list::state(false)
+    };
+    let Ok(rows) = rows else {
         return;
     };
     let now = std::time::SystemTime::now();
@@ -253,12 +350,13 @@ fn cache_store(cfg: &Config) -> anyhow::Result<crate::build::CacheStore> {
 /// on the store the builds using it hold, then leaves what it has not reached for the next.
 fn build_cache(
     cfg: &Config,
-    store: anyhow::Result<crate::build::CacheStore>,
+    store: &anyhow::Result<crate::build::CacheStore>,
     req: &Request,
+    free_bytes: Option<u64>,
     sum: &mut Summary,
 ) {
     let dir = match store {
-        Ok(crate::build::CacheStore::Dir(dir)) => dir,
+        Ok(crate::build::CacheStore::Dir(dir)) => dir.clone(),
         Ok(crate::build::CacheStore::Server(repo)) => {
             sum.keep(format!("build cache: {repo} is collected on its own host"));
             return;
@@ -291,6 +389,12 @@ fn build_cache(
     } else {
         (cfg.gc.build_cache_retention(), BUILD_CACHE_FLOOR)
     };
+    // A background pass waits for nobody long: the next one will find the store free.
+    let wait = if req.auto {
+        AUTO_STORE_WAIT
+    } else {
+        STORE_WAIT
+    };
     let policy = vk_registry::GcPolicy {
         retention,
         grace: floor,
@@ -298,19 +402,20 @@ fn build_cache(
         // A Windows layer's view outlives the build that pulled it, reading the store by path.
         keep_prefixes: vec![crate::wincache::TAG_PREFIX.into()],
         max_bytes: max,
-        free_bytes: None,
+        free_bytes,
         min_age: floor,
         dry_run: req.dry_run,
-        wait: vk_registry::Wait::Within(STORE_WAIT),
-        lower_planning: None,
+        wait: vk_registry::Wait::Within(wait),
+        lower_planning: req.auto.then_some(crate::autogc::lower_planning as fn()),
     };
     let r = match store.gc_with(&policy) {
         Ok(vk_registry::GcOutcome::Done(r)) => r,
         Ok(vk_registry::GcOutcome::Busy) => {
             sum.keep(format!(
                 "build cache: in use for {}, left for the next pass",
-                fmt_secs(STORE_WAIT)
+                fmt_secs(wait)
             ));
+            sum.complete = false;
             return;
         }
         Err(e) => {
@@ -319,6 +424,7 @@ fn build_cache(
         }
     };
     let why = match (retention, max) {
+        _ if free_bytes.is_some() => "short of space: least recently used".into(),
         (Some(r), Some(m)) => format!("unused for {}, then over {}", fmt_secs(r), fmt_bytes(m)),
         (Some(r), None) => format!("unused for {}", fmt_secs(r)),
         (None, Some(m)) => format!("over {}", fmt_bytes(m)),
@@ -333,6 +439,7 @@ fn build_cache(
     );
     if r.incomplete {
         sum.keep("build cache: builds held it part-way, the rest is left for the next pass".into());
+        sum.complete = false;
     }
     if let (Some(after), Some(max)) = (r.bytes_after, max)
         && after > max
@@ -394,6 +501,12 @@ pub(crate) struct Summary {
     kept: Vec<String>,
     /// The filesystems the pass reclaimed on.
     space: Vec<Space>,
+    /// Whether every category was collected: not when one was left for the next pass.
+    pub(crate) complete: bool,
+    /// After a pass short of space went past the idle windows, whether it still is.
+    pub(crate) still_short: Option<bool>,
+    /// Filesystems may first be named by a row, and then show no space.
+    lazy: bool,
 }
 
 #[derive(Debug)]
@@ -422,6 +535,7 @@ impl Summary {
     fn new(dry_run: bool, roots: &[&Path]) -> Summary {
         let mut sum = Summary {
             dry_run,
+            complete: true,
             ..Summary::default()
         };
         for root in roots {
@@ -485,9 +599,17 @@ impl Summary {
             .map(|&(path, bytes)| (self.register(path, false), bytes))
             .collect();
         debug_assert!(
-            self.space.len() == known,
+            self.lazy || self.space.len() == known,
             "{category}: on a filesystem the pass did not read up front"
         );
+        // A category the pass came back to, short of space, stays one row.
+        if let Some(row) = self.rows.iter_mut().find(|r| r.category == category) {
+            row.count = row.count.saturating_add(count);
+            row.bytes = on.iter().fold(row.bytes, |t, (_, b)| t.saturating_add(*b));
+            row.on.extend(on);
+            row.why = format!("{}; then {why}", row.why);
+            return;
+        }
         self.rows.push(Row {
             category,
             count,
@@ -497,8 +619,11 @@ impl Summary {
         });
     }
 
+    /// Note what the pass found but left, once.
     pub(crate) fn keep(&mut self, what: String) {
-        self.kept.push(what);
+        if !self.kept.contains(&what) {
+            self.kept.push(what);
+        }
     }
 
     /// Read the space each filesystem has after a real pass; a dry run estimates it.
