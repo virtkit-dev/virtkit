@@ -241,6 +241,12 @@ fn steering(h: &mut Html, v: &RegistryView, auth: &Auth) {
             Some(c) => text.push_str(&format!(" (at {}, command {c})", crate::utc(gc.at))),
             None => text.push_str(&format!(" (at {}, scheduled)", crate::utc(gc.at))),
         }
+        if gc.blobs_leased > 0 {
+            text.push_str(&format!(
+                "; {} blobs kept, read by running builds",
+                gc.blobs_leased
+            ));
+        }
         kv_node(h, "Last gc", &text);
     }
     if let Some(u) = report.and_then(|r| r.update.as_ref()) {

@@ -1473,7 +1473,138 @@ impl Store {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("locking {}", path.display()));
         }
-        Ok(LockGuard { _file: f })
+        Ok(LockGuard {
+            _file: f,
+            root: self.root.clone(),
+        })
+    }
+
+    /// Take a [`Lease`] on blobs of this store, for a reader that goes on reading them by path
+    /// after it lets the store lock go: a lazy disk view over the blob files, which a VM reads
+    /// chunk by chunk for as long as it runs. `_held` is the shared lock the reader resolved the
+    /// blobs under, and [`Lease::add`] wants it too: a [`Store::gc`] reads the leases under the
+    /// exclusive lock, so it sees every blob a reader resolved before it, and a reader that
+    /// resolves after it finds the blobs the pass left.
+    ///
+    /// The directory and the files are as open as the umask lets them be: on a store shared by
+    /// a group, every member's gc has to read every member's leases. The directory is sticky,
+    /// so none removes another's lease.
+    pub fn lease(&self, held: &LockGuard) -> Result<Lease> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        debug_assert_eq!(
+            held.root, self.root,
+            "a lease taken under another store's lock"
+        );
+        let dir = self.root.join(LEASES_DIR);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o1777)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        // The clock as well as the pid: a process of another pid namespace may share the store.
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = dir.join(format!(
+            "{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        // SAFETY: the fd is owned by `file`, which the lease keeps open; the file is new, so
+        // nothing else holds it and the call does not wait.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(Lease {
+            file,
+            path,
+            root: self.root.clone(),
+        })
+    }
+
+    /// The blobs the live leases of this store name (see [`Store::lease`]). A lease whose
+    /// holder is gone — nobody holds its lock — is removed, but not on a `dry_run`. Read under
+    /// the exclusive store lock, and strictly: a lease this misses is a blob a live reader loses.
+    fn leased_blobs(&self, dry_run: bool) -> Result<HashSet<String>> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = self.root.join(LEASES_DIR);
+        let mut leased = HashSet::new();
+        let entries = match dir_entries_strict(&dir) {
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(leased);
+            }
+            r => r.context("reading the leases of live readers; refusing to sweep without them")?,
+        };
+        for (name, ft) in entries {
+            let path = dir.join(&name);
+            if !ft.is_file() {
+                bail!(
+                    "{} is not a plain file; refusing to sweep on leases that would be incomplete",
+                    path.display()
+                );
+            }
+            // Non-blocking, so a FIFO put in its place cannot hang the pass, and checked to be a
+            // plain file once open.
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(f) => f,
+                // Released since the listing.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+            };
+            // SAFETY: the fd is owned by `file`, open for the call; LOCK_NB never waits.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+                // Nobody holds it: its reader is gone. One this user may not remove (another's,
+                // in a store shared by a group) is left for its owner's gc.
+                if !dry_run && let Err(e) = remove_if_present(&path) {
+                    eprintln!("vk-registry: gc: leaving a dead lease: {e:#}");
+                }
+                continue;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+            if !file.metadata().is_ok_and(|m| m.is_file()) {
+                bail!(
+                    "{} is not a plain file; refusing to sweep on leases that would be incomplete",
+                    path.display()
+                );
+            }
+            let mut text = String::new();
+            file.take(MAX_LEASE_BYTES + 1)
+                .read_to_string(&mut text)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if text.len() as u64 > MAX_LEASE_BYTES {
+                bail!(
+                    "{} is larger than a lease may be; refusing to sweep on a lease cut short",
+                    path.display()
+                );
+            }
+            leased.extend(text.lines().filter(|h| is_blob_hex(h)).map(str::to_string));
+        }
+        Ok(leased)
     }
 
     /// Garbage-collect the store, holding the lock exclusive (pushers briefly
@@ -1487,8 +1618,9 @@ impl Store {
     /// HEAD hits bump blob mtimes but which hold no lock across requests), unrooted
     /// manifest sidecars, and stale `uploads/` (an alive push keeps appending, so
     /// its session file stays fresh). Orphaned `.tmp.*` files from a crashed
-    /// `atomic_write` age out with the blob sweep. `dry_run` reports without
-    /// removing anything.
+    /// `atomic_write` age out with the blob sweep. A blob a live [`Lease`] names is
+    /// kept however long it has sat unreferenced. `dry_run` reports without removing
+    /// anything.
     pub fn gc(&self, retention: Duration, grace: Duration, dry_run: bool) -> Result<GcReport> {
         let _lock = self.lock_exclusive()?;
         let now = SystemTime::now();
@@ -1609,6 +1741,7 @@ impl Store {
             }
         })
         .context("walking the manifests the gc mark keeps")?;
+        let leased = self.leased_blobs(dry_run)?;
 
         // sweep unmarked blobs idle past the grace window, in both storage forms, noting
         // every hex that keeps at least one form: that — not what is still on disk — is
@@ -1629,6 +1762,14 @@ impl Store {
                 };
                 if marked.contains(hex) || !idle(&blob, grace) {
                     survivors.insert(hex.to_string());
+                    continue;
+                }
+                if leased.contains(hex) {
+                    // One blob, however many storage forms it has.
+                    if survivors.insert(hex.to_string()) {
+                        report.blobs_leased += 1;
+                    }
+                    report.bytes_leased += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
                     continue;
                 }
                 report.bytes_freed += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
@@ -2144,6 +2285,60 @@ pub struct GcReport {
     pub uploads_dropped: usize,
     /// membership markers removed because the blob they named is gone
     pub blob_markers_dropped: usize,
+    /// unreferenced blobs past the grace window kept because a live [`Lease`] names them
+    pub blobs_leased: usize,
+    /// their stored (on-disk) bytes
+    pub bytes_leased: u64,
+}
+
+/// Where a store keeps its [`Lease`]s, one file each.
+const LEASES_DIR: &str = "leases";
+/// The most a lease may hold, about a million blobs: what a gc reads of one at most.
+const MAX_LEASE_BYTES: u64 = 64 << 20;
+
+/// A reader's claim on blobs it reads by path (see [`Store::lease`]): a file under the store's
+/// `leases/` naming one blob per line, locked for as long as this lives. The lock is what a
+/// [`Store::gc`] reads, so a reader killed without a destructor releases its lease with its
+/// last descriptor, and the next pass removes the file. Dropping it unlinks the file.
+pub struct Lease {
+    file: std::fs::File,
+    path: PathBuf,
+    /// The store it leases from.
+    root: PathBuf,
+}
+
+impl Lease {
+    /// Add `blobs` (hex digests) to the lease, under the shared store lock they were resolved
+    /// under (see [`Store::lease`]). A name that is not a blob digest is skipped.
+    pub fn add<'a>(
+        &mut self,
+        held: &LockGuard,
+        blobs: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        use std::io::Write;
+        debug_assert_eq!(
+            held.root, self.root,
+            "a lease added to under another store's lock"
+        );
+        // Opened by a newline, so a digest an earlier add wrote only part of stays a fragment
+        // of its own line, which names no blob, rather than running into this add's first.
+        let mut lines = String::from("\n");
+        for hex in blobs.into_iter().filter(|h| is_blob_hex(h)) {
+            lines.push_str(hex);
+            lines.push('\n');
+        }
+        self.file
+            .write_all(lines.as_bytes())
+            .with_context(|| format!("writing {}", self.path.display()))
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Unlinked while still locked, so a gc never reads it as dead first. Best-effort: a
+        // file left behind is unlocked once this closes, and the next gc removes it.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// A [`Store::stats`] snapshot: on-disk totals plus a per-repo breakdown.
@@ -2396,6 +2591,8 @@ fn dir_files(dir: &Path) -> Vec<PathBuf> {
 /// releases on the last close of the fd).
 pub struct LockGuard {
     _file: std::fs::File,
+    /// The store it locks, for a [`Lease`] to check it is added to under its own store's lock.
+    root: PathBuf,
 }
 
 /// Bump a file's mtime to now — the usage record [`Store::gc`] reads (blob: last
@@ -4526,6 +4723,15 @@ fn gc_to(
         r.uploads_dropped,
         r.blob_markers_dropped,
     )?;
+    if r.blobs_leased > 0 {
+        writeln!(
+            out,
+            "{cmd}: gc {}: kept {} leased blob(s) ({:.1} MiB) that running builds read",
+            store.root.display(),
+            r.blobs_leased,
+            r.bytes_leased as f64 / f64::from(1u32 << 20),
+        )?;
+    }
     Ok(())
 }
 
@@ -6200,6 +6406,185 @@ mod tests {
         for d in [&cfg_dead, &only_dead, &dead_manifest] {
             assert!(!store.has_blob(&hex(d)), "dead data must sweep: {d}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blob a live lease names outlives its tag and the grace window; once the lease is
+    /// released, or its holder is gone, the next pass sweeps it. A dry run removes no lease.
+    #[test]
+    fn gc_keeps_what_a_live_lease_names() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gclease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let chunk = store.put_blob(&[7u8; 4096]).unwrap();
+        let cfg = store.put_blob(b"cfg-leased").unwrap();
+        store
+            .put_manifest(
+                "repo",
+                "t",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&cfg, &[&chunk]),
+            )
+            .unwrap();
+        let lease = {
+            let held = store.lock_shared().unwrap();
+            let mut lease = store.lease(&held).unwrap();
+            lease
+                .add(&held, [hex(&chunk).as_str(), "not-a-digest"])
+                .unwrap();
+            lease
+        };
+        // What a reader killed without a destructor leaves: a lease nobody holds.
+        let dead = dir.join(LEASES_DIR).join("1-0-0");
+        std::fs::write(&dead, format!("{}\n", hex(&cfg))).unwrap();
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+
+        let dry = store.gc(DAY * 30, DAY, true).unwrap();
+        assert_eq!(dry.blobs_leased, 1);
+        assert!(dead.exists(), "a dry run removes no lease");
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.tags_dropped, 1);
+        assert_eq!(report.blobs_leased, 1);
+        assert!(report.bytes_leased > 0);
+        assert!(!dead.exists(), "a dead lease goes");
+        assert!(store.has_blob(&hex(&chunk)), "a leased blob stays");
+        assert!(!store.has_blob(&hex(&cfg)), "a dead lease protects nothing");
+
+        drop(lease);
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.blobs_leased, 0);
+        assert!(
+            !store.has_blob(&hex(&chunk)),
+            "a released lease protects nothing"
+        );
+        assert_eq!(std::fs::read_dir(dir.join(LEASES_DIR)).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A digest an add wrote only part of, before failing, does not run into the next add's
+    /// first: that one is still leased.
+    #[test]
+    fn a_torn_add_leaves_the_next_add_whole() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vk-regserve-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let chunk = store.put_blob(&[11u8; 4096]).unwrap();
+        let held = store.lock_shared().unwrap();
+        let mut lease = store.lease(&held).unwrap();
+        lease.file.write_all(&hex(&chunk).as_bytes()[..20]).unwrap();
+        lease.add(&held, [hex(&chunk).as_str()]).unwrap();
+        drop(held);
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        let report = store.gc(DAY, DAY, true).unwrap();
+        assert_eq!(report.blobs_leased, 1);
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lease is live while any process holds its lock: one a forked child still holds after
+    /// the parent let its own descriptor go keeps its blob, and the child's exit frees it.
+    #[test]
+    fn a_lease_lives_as_long_as_any_holder_of_its_lock() {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcfork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let chunk = store.put_blob(&[8u8; 4096]).unwrap();
+        std::fs::create_dir_all(dir.join(LEASES_DIR)).unwrap();
+        let path = dir.join(LEASES_DIR).join("forked");
+        std::fs::write(&path, format!("{}\n", hex(&chunk))).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: plain syscalls on descriptors this test owns; the child runs only
+        // async-signal-safe calls (read, _exit) before it exits.
+        let pid = unsafe {
+            assert_eq!(
+                libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                0
+            );
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::close(fds[1]);
+                let mut b = 0u8;
+                libc::read(fds[0], (&mut b as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+            libc::close(fds[0]);
+            pid
+        };
+        assert!(pid > 0);
+        // The parent's descriptor goes; the child's copy of it still holds the lock.
+        drop(file);
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.blobs_leased, 1);
+        assert!(store.find_blob(&hex(&chunk)).is_some());
+        assert!(path.exists(), "a live lease stays");
+
+        // SAFETY: closing the pipe's write end lets the child exit; it is then reaped.
+        unsafe {
+            libc::close(fds[1]);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.blobs_leased, 0);
+        assert!(store.find_blob(&hex(&chunk)).is_none());
+        assert!(!path.exists(), "a dead lease goes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leases are read strictly: an entry that is not a plain file, or a lease that cannot
+    /// be read, stops the pass before anything is removed. A lease protects its blob even with
+    /// no grace at all.
+    #[test]
+    fn gc_refuses_leases_it_cannot_read_and_honours_one_without_grace() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-regserve-gcbadlease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let chunk = store.put_blob(&[9u8; 4096]).unwrap();
+        let other = store.put_blob(&[10u8; 4096]).unwrap();
+        let lease = {
+            let held = store.lock_shared().unwrap();
+            let mut lease = store.lease(&held).unwrap();
+            lease.add(&held, [hex(&chunk).as_str()]).unwrap();
+            lease
+        };
+
+        let odd = dir.join(LEASES_DIR).join("a-dir");
+        std::fs::create_dir(&odd).unwrap();
+        assert!(store.gc(Duration::ZERO, Duration::ZERO, false).is_err());
+        assert!(
+            store.find_blob(&hex(&other)).is_some(),
+            "nothing was removed"
+        );
+        std::fs::remove_dir(&odd).unwrap();
+
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = dir.join(LEASES_DIR).join("unreadable");
+            std::fs::write(&unreadable, b"").unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(store.gc(Duration::ZERO, Duration::ZERO, false).is_err());
+            assert!(
+                store.find_blob(&hex(&other)).is_some(),
+                "nothing was removed"
+            );
+            std::fs::remove_file(&unreadable).unwrap();
+        }
+
+        let report = store.gc(Duration::ZERO, Duration::ZERO, false).unwrap();
+        assert_eq!(report.blobs_leased, 1);
+        assert!(
+            store.find_blob(&hex(&chunk)).is_some(),
+            "a leased blob stays"
+        );
+        assert!(store.find_blob(&hex(&other)).is_none());
+        drop(lease);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

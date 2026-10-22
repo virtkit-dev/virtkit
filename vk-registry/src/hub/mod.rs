@@ -542,6 +542,7 @@ impl Link {
                 blobs_dropped: r.blobs_dropped as u64,
                 bytes_freed: r.bytes_freed,
                 uploads_dropped: r.uploads_dropped as u64,
+                blobs_leased: r.blobs_leased as u64,
                 error: None,
             },
             Err(e) => GcRun {

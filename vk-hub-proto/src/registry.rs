@@ -285,9 +285,16 @@ pub struct GcRun {
     pub blobs_dropped: u64,
     pub bytes_freed: u64,
     pub uploads_dropped: u64,
+    /// Unreferenced blobs it kept because a running build still reads them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blobs_leased: u64,
     /// Why it failed, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A command to a registry. Its ID is one [`valid_id`] takes.
@@ -478,6 +485,7 @@ mod tests {
                     blobs_dropped: 3,
                     bytes_freed: 4,
                     uploads_dropped: 5,
+                    blobs_leased: 0,
                     error: Some("e".into()),
                 }),
                 refused: vec!["gc".into()],

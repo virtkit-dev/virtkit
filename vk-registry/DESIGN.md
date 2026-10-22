@@ -615,6 +615,17 @@ follows the manifest, so every tag on it shares it, and re-tagging a manifest wh
 annotations differ is how a pusher changes it (`vk registry put --keep|--ttl` does). An
 expired tag's blobs go as any unreferenced blob does, after the grace window.
 
+A reader that goes on reading blobs by path after it lets the store lock go — the lazy disk
+views `vk build` boots its cached stages from — leases them: a file under `leases/` naming one
+blob per line, written under the shared lock it found them under and locked for as long as the
+reader lives. `gc` reads the leases under its exclusive lock and keeps every blob a live one
+names, however long it has sat unreferenced; a lease nobody holds is its dead reader's, and
+`gc` removes it. A `vk` older than leases takes none, so its builds are protected by the grace
+window alone. Leases are as open as the umask allows, so on a store a group shares each member's
+`gc` reads the others'. Like the store lock, they rest on `flock`: a store on a filesystem whose
+locks do not reach every reader and collector (NFS, some FUSE and virtiofs setups) is not
+protected by them.
+
 Membership markers are not roots. After sweeping blobs, `gc` removes markers and manifest
 sidecars whose content no longer exists. Repository traversal does not follow symlinks and
 is bounded by the same repository-depth limit enforced on writes.
