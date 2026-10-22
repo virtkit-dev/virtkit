@@ -824,7 +824,8 @@ enum Cmd {
     /// chunks and the staging dirs of builds that died — the bases and checkouts once idle
     /// past the threshold. Collects the local build cache: entries unused past `[gc]
     /// build_cache_retention_days`, then the least recently used until it fits `[gc]
-    /// build_cache_max`, never one a running build reads. Removes the scratch dirs of runs
+    /// build_cache_max`, never one a running build reads. Removes the boot images of `vk dev`
+    /// environments stopped past `[gc] dev_image_idle_days`, and the scratch dirs of runs
     /// killed by a signal. Then prints one summary: what each category freed, what was kept and
     /// why, and the free space before and after.
     #[command(display_order = 4)]
@@ -842,7 +843,8 @@ enum Cmd {
         ///
         /// Everything above that nothing uses now goes. What keeps an entry safe still holds:
         /// a lock or a reference held by a VM, job or build, the 10 minutes an image or a
-        /// checkout is left after its last use, and the hour a build-cache entry is.
+        /// checkout is left after its last use, and the hour a build-cache entry or a dev
+        /// environment's images are.
         #[arg(long)]
         all_unused: bool,
     },

@@ -14,6 +14,9 @@ const BUILD_CACHE_FLOOR: Duration = Duration::from_secs(86_400);
 /// The least time `--all-unused` leaves a build-cache entry after its last use, and an
 /// unreferenced blob after it was written.
 const ALL_UNUSED_FLOOR: Duration = Duration::from_secs(3600);
+/// The least time `--all-unused` leaves a stopped dev environment's boot images after it was
+/// last in use: one stopped moments ago may be about to start again.
+const DEV_IMAGE_FLOOR: Duration = Duration::from_secs(3600);
 /// The longest a manual pass waits for each lock on the build cache's store.
 const STORE_WAIT: Duration = Duration::from_secs(60);
 
@@ -41,6 +44,10 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     }
     let scratch = crate::run::default_scratch_base();
     if let Ok(base) = &scratch {
+        roots.push(base);
+    }
+    let dev_base = crate::dev::plan::dev_state_base();
+    if let Ok(base) = &dev_base {
         roots.push(base);
     }
     let mut sum = Summary::new(req.dry_run, &roots);
@@ -97,6 +104,9 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     );
     sum.kept.extend(trees.left);
     build_cache(cfg, store, req, &mut sum);
+    if let Ok(base) = &dev_base {
+        dev_images(cfg, req, base, &mut sum);
+    }
     let launches = crate::run::collect_dead_launch_dirs(req.dry_run);
     if let Ok(base) = &scratch {
         sum.row(
@@ -119,6 +129,87 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     }
     sum.finish();
     sum
+}
+
+/// Remove the boot images of the `vk dev` environments under `base` stopped longer than
+/// `[gc] dev_image_idle_days`, by when their run last held the state dir. One no run of this
+/// `vk` held is left, as when it stopped is not known; so is one whose config has a
+/// `hooks.create`, unless `[gc] dev_images_with_create_hook`.
+fn dev_images(cfg: &Config, req: &Request, base: &Path, sum: &mut Summary) {
+    let Some(idle) = (if req.all_unused {
+        Some(DEV_IMAGE_FLOOR)
+    } else {
+        cfg.gc.dev_image_idle()
+    }) else {
+        return;
+    };
+    let Ok(rows) = crate::dev::list::state(false) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let (mut envs, mut bytes, mut stale) = (0u64, 0u64, 0usize);
+    let (mut undated, mut hooked) = (Vec::new(), Vec::new());
+    for row in rows {
+        if row
+            .flags
+            .contains(&crate::dev::list::Flag::WorkspaceMissing)
+        {
+            stale += 1;
+        }
+        if row.status != crate::dev::list::Status::Stopped {
+            continue;
+        }
+        // Read again under the environment's locks before anything goes.
+        let Some(last) = crate::run::last_active(&row.dir) else {
+            undated.push(row.name);
+            continue;
+        };
+        if now.duration_since(last).unwrap_or_default() < idle {
+            continue;
+        }
+        let with_hook = cfg.gc.dev_images_with_create_hook();
+        match crate::dev::prune::reclaim_images(&row.dir, idle, with_hook, req.dry_run) {
+            Ok(crate::dev::prune::Reclaimed::Images { files, bytes: b }) => {
+                if files > 0 {
+                    envs += 1;
+                    bytes = bytes.saturating_add(b);
+                }
+            }
+            Ok(crate::dev::prune::Reclaimed::Unrecorded) => sum.keep(format!(
+                "dev images: {}: its storage was never recorded — `vk dev prune {}` previews \
+                 what it would take",
+                row.name, row.name
+            )),
+            Ok(crate::dev::prune::Reclaimed::CreateHook) => hooked.push(row.name),
+            Ok(crate::dev::prune::Reclaimed::Recent) => {}
+            Err(e) => sum.keep(format!("dev images: {}: {e:#}", row.name)),
+        }
+    }
+    sum.row(
+        "dev images",
+        envs,
+        bytes,
+        base,
+        format!("environments stopped for {}", fmt_secs(idle)),
+    );
+    for name in hooked {
+        sum.keep(format!(
+            "dev images: {name} has hooks.create; reclaim with `vk dev prune {name}`"
+        ));
+    }
+    if !undated.is_empty() {
+        sum.keep(format!(
+            "dev images: last run by an older vk, so not known to be idle: {} — \
+             `vk dev prune NAME` reclaims their images",
+            undated.join(", ")
+        ));
+    }
+    if stale > 0 {
+        sum.keep(format!(
+            "dev environments: {stale} whose workspace is gone — `vk dev gc --all-stale` \
+             removes them, persistent storage included"
+        ));
+    }
 }
 
 /// Where the build cache keeps what it caches, as `vk registry gc` resolves it.

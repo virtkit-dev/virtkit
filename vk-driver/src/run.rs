@@ -757,6 +757,16 @@ fn mark_active(dir: &Path) {
     }
 }
 
+/// When the pinned state dir `dir` was last in use, by its [`ACTIVE_STAMP`]; `None` when a run
+/// of this `vk` never held it.
+pub(crate) fn last_active(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(dir.join(ACTIVE_STAMP))
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
+        .modified()
+        .ok()
+}
+
 /// How long a dead run's `launch-<pid>` dir must have sat unchanged before `vk gc` removes it.
 const DEAD_LAUNCH_GRACE: Duration = Duration::from_secs(3600);
 
@@ -1009,6 +1019,54 @@ impl WorkDir {
     }
 }
 
+/// `<state-dir>/.virtkit-gc`: the pid of a `vk gc` holding the dir's lock while it removes
+/// what it reclaims there, for a run starting on the dir to wait it out rather than fail.
+pub(crate) const GC_HOLDER: &str = ".virtkit-gc";
+/// How long [`lock_state_dir`] waits for a `vk gc` that holds the dir.
+const GC_HOLD_WAIT: Duration = Duration::from_secs(10);
+
+/// A `vk gc`'s [`GC_HOLDER`] note in a state dir it holds locked, removed when dropped — before
+/// the lock is let go.
+pub(crate) struct GcHolder(PathBuf);
+
+impl GcHolder {
+    /// Write the note into the open, locked state dir `dir`. Best-effort: without it a run
+    /// starting meanwhile fails as on any other holder.
+    pub(crate) fn mark(dir: &std::fs::File) -> Option<GcHolder> {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(GC_HOLDER);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .ok()?;
+        f.write_all(std::process::id().to_string().as_bytes())
+            .ok()?;
+        // The real path: the descriptor's stops naming it once the dir is closed.
+        let real = std::fs::read_link(path.parent()?).ok()?.join(GC_HOLDER);
+        Some(GcHolder(real))
+    }
+}
+
+impl Drop for GcHolder {
+    fn drop(&mut self) {
+        // Best-effort: a stale note names a pid that holds nothing, which is never waited on.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether the holder of `f`'s lock, a state dir at `dir`, is the `vk gc` its note names.
+fn gc_holds(dir: &Path, f: &std::fs::File) -> bool {
+    let named = std::fs::read_to_string(dir.join(GC_HOLDER))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    named.is_some() && flock_holder_pid(f) == named
+}
+
 /// How long [`lock_state_dir`] keeps retrying a refused lock before calling the dir in use.
 /// Anything that tells a live run from a stale state dir by taking this lock for an instant —
 /// `vk list` and `vk stop` do, through [`crate::vms::alive`] — must not read as a live run to
@@ -1037,7 +1095,8 @@ fn lock_state_dir_within(
 ) -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
-    let deadline = Instant::now() + grace;
+    let mut deadline = Instant::now() + grace;
+    let mut waited_for_gc = false;
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; flock
     // returns 0 or -1/errno and does not block under LOCK_NB.
     while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -1045,6 +1104,12 @@ fn lock_state_dir_within(
         if err.kind() == std::io::ErrorKind::WouldBlock {
             if Instant::now() < deadline {
                 after_refusal();
+                continue;
+            }
+            // A `vk gc` holds the dir only to rename what it reclaims: wait for it, once.
+            if !waited_for_gc && gc_holds(dir, &f) {
+                waited_for_gc = true;
+                deadline = Instant::now() + GC_HOLD_WAIT;
                 continue;
             }
             // The owning run prints its progress to the terminal that started it, not
@@ -5975,6 +6040,35 @@ mod tests {
         drop(other);
         drop(held);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A run that finds its state dir held by a `vk gc` — the holder its note names — waits for
+    /// it rather than failing at once; held by anything else, it fails as before.
+    #[test]
+    fn a_run_waits_out_a_gc_holding_its_state_dir() {
+        let dir = std::env::temp_dir().join(format!("vk-gcholder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::cell::RefCell::new(Some(lock_state_dir(&dir).unwrap()));
+        // Without the note: refused once the grace is out.
+        assert!(lock_state_dir_within(&dir, Duration::ZERO, || {}).is_err());
+
+        let note = GcHolder::mark(held.borrow().as_ref().unwrap()).unwrap();
+        // `/proc/locks` must name this process for the note to count, which a btrfs `TMPDIR`
+        // defeats (see the test above); there the run fails as on any holder.
+        if flock_holder_pid(held.borrow().as_ref().unwrap()) == Some(std::process::id() as i32) {
+            let refusals = std::cell::Cell::new(0);
+            let got = lock_state_dir_within(&dir, Duration::ZERO, || {
+                refusals.set(refusals.get() + 1);
+                if refusals.get() == 3 {
+                    held.borrow_mut().take();
+                }
+            });
+            assert!(got.is_ok(), "the run waits for the gc: {got:?}");
+        }
+        drop(note);
+        assert!(!dir.join(GC_HOLDER).exists(), "the note goes with the gc");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A pinned dir is dated by its stamp alone, which is never written through a symlink.

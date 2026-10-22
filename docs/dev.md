@@ -558,6 +558,13 @@ environment's lock while selecting and removing data, so a concurrent start cann
 use the selected files. The next start recreates the missing data and reruns the
 creation hook if one is configured.
 
+`vk gc` does the images part on its own for environments stopped for 14 days
+(`[gc] dev_image_idle_days`; `0` turns it off), dated by when their VM last ran. It skips an
+environment whose storage was not recorded or that an older `vk` last ran, and one whose
+config has a creation hook, since its next start runs that hook again on its persistent
+storage; it names them all. `[gc] dev_images_with_create_hook = true` takes those too, for
+hooks that are idempotent. The next `up` rebuilds the images and says why.
+
 Prune retains the environment identity, SSH keys, endpoint allocations and logs.
 External backings and ordinary host bind mounts are retained, as are the shared
 image/build caches. Use `vk gc` for unused shared caches and `vk dev storage reset`

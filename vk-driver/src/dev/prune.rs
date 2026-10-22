@@ -121,6 +121,22 @@ struct Selection {
     _locks: Vec<File>,
 }
 
+impl Selection {
+    /// The state dir itself, which the selection locks last.
+    fn root_dir(&self) -> Result<&File> {
+        self._locks.last().context("no state directory selected")
+    }
+}
+
+/// A descriptor of its own on the dir `dir` holds open: the same inode, through the descriptor's
+/// magic link, which outlives `dir` and the lock on it.
+fn reopen(dir: &File) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(fd_path(dir))
+}
+
 fn fd_path(dir: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
 }
@@ -409,6 +425,197 @@ pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
         bail!("no dev environment state named {name} (`vk dev list` names them)");
     };
     run_env(&env_of_state(&row.dir), opts, default_confirm)
+}
+
+/// What [`reclaim_images`] did with an environment's boot images.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reclaimed {
+    /// Removed, or on a dry run would remove, these many files holding these many bytes.
+    Images { files: u64, bytes: u64 },
+    /// Left: its declared storage was never recorded, so a disk backing that took a boot-media
+    /// name could not be told from one.
+    Unrecorded,
+    /// Left: its config has a `hooks.create`, which the next boot would run again on its
+    /// persistent storage.
+    CreateHook,
+    /// Left: a run held it within the window after all, by its stamp read under its locks.
+    Recent,
+}
+
+/// `<state-dir>/.virtkit-reclaimed`: left by [`reclaim_images`] for the next boot to say why it
+/// rebuilds and runs `hooks.create` again.
+pub(crate) const RECLAIMED: &str = ".virtkit-reclaimed";
+
+/// What [`reclaim_images`] renames an image to under the environment's locks, to unlink once
+/// it has let them go, so it holds them for renames only, not for the unlink of a disk image
+/// gigabytes long. One a reclaim cut short left is unlinked by the next.
+const TRASH: &str = ".virtkit-trash-";
+
+/// Whether the plan `manifest` recorded declares a `hooks.create`. An older record that does not
+/// say counts as one that does.
+fn has_create_hook(manifest: &serde_json::Value) -> bool {
+    manifest
+        .get("hooks")
+        .is_none_or(|hooks| hooks.get("create").is_some_and(|c| !c.is_null()))
+}
+
+/// Remove the boot images of the stopped environment whose state is `dir`, without asking: the
+/// selection `vk dev prune NAME --images` previews, under the same locks and running check,
+/// with `hooks.create` invalidated the same way. For `vk gc`, once no run has held the dir for
+/// `idle` — read again under its locks, so a run that took it since the caller looked keeps it.
+/// An environment whose storage was never recorded is left, and one whose config has a
+/// `hooks.create` unless `with_create_hook`. Fails, removing nothing, on one in use.
+pub(crate) fn reclaim_images(
+    dir: &Path,
+    idle: std::time::Duration,
+    with_create_hook: bool,
+    dry_run: bool,
+) -> Result<Reclaimed> {
+    let identity = std::fs::read(dir.join("dev.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<super::Identity>(&b).ok());
+    let env = env_of_state(dir);
+    if env.backings.is_none() {
+        return Ok(Reclaimed::Unrecorded);
+    }
+    if !with_create_hook && identity.is_none_or(|i| has_create_hook(&i.manifest)) {
+        return Ok(Reclaimed::CreateHook);
+    }
+    let opts = Options {
+        images: true,
+        ..Options::default()
+    };
+    let selected = select(&env, &opts)?;
+    let now = std::time::SystemTime::now();
+    let quiet = crate::run::last_active(dir)
+        .is_some_and(|t| now.duration_since(t).unwrap_or_default() >= idle);
+    if !quiet {
+        return Ok(Reclaimed::Recent);
+    }
+    let images: Vec<&Target> = selected
+        .targets
+        .iter()
+        .filter(|t| t.category == "images")
+        .collect();
+    let files = u64::try_from(images.len()).unwrap_or(u64::MAX);
+    let bytes = images.iter().fold(0u64, |total, t| {
+        total.saturating_add(t.metadata.blocks().saturating_mul(512))
+    });
+    let trash = leftover_trash(&selected)?;
+    let leftover_bytes = trash.iter().fold(0u64, |t, (_, _, b)| t.saturating_add(*b));
+    let (files, bytes) = (
+        files + trash.len() as u64,
+        bytes.saturating_add(leftover_bytes),
+    );
+    if dry_run || files == 0 {
+        return Ok(Reclaimed::Images { files, bytes });
+    }
+    // Said while the locks are held, so a boot that finds them held waits out the renames.
+    let _holder = crate::run::GcHolder::mark(selected.root_dir()?);
+    let mut trash: Vec<(std::rc::Rc<File>, std::ffi::OsString)> = trash
+        .into_iter()
+        .map(|(dir, name, _)| (dir, name))
+        .collect();
+    for target in &selected.targets {
+        target.unchanged()?;
+    }
+    let mut dirs: Vec<(PathBuf, std::rc::Rc<File>)> = Vec::new();
+    for target in &selected.targets {
+        let path = target.path()?;
+        if target.category != "images" {
+            // The create stamp, first: the next boot runs the hook again even if the rest fails.
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            continue;
+        }
+        let name = target.relative.file_name().context("empty prune target")?;
+        let mut away = std::ffi::OsString::from(format!("{TRASH}{}-", std::process::id()));
+        away.push(name);
+        let parent = fd_path(&target.parent);
+        std::fs::rename(&path, parent.join(&away)).with_context(|| {
+            format!(
+                "removing {}",
+                env.state_dir.join(&target.relative).display()
+            )
+        })?;
+        // A directory descriptor of its own, which outlives the selection's locks.
+        let key = target
+            .relative
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let dir = match dirs.iter().find(|(k, _)| *k == key) {
+            Some((_, d)) => d.clone(),
+            None => {
+                let d = std::rc::Rc::new(reopen(&target.parent)?);
+                dirs.push((key, d.clone()));
+                d
+            }
+        };
+        trash.push((dir, away));
+    }
+    // Best-effort, and never through a link: the note is all it carries.
+    let _ = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir.join(RECLAIMED));
+    drop(_holder);
+    drop(selected);
+    for (dir, name) in trash {
+        if let Ok(name) = std::ffi::CString::new(name.as_bytes()) {
+            // SAFETY: the descriptor is open and the name NUL-terminated.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+    Ok(Reclaimed::Images { files, bytes })
+}
+
+/// The images an earlier reclaim renamed away and did not get to unlink — `.virtkit-trash-<pid>-`
+/// before a boot media name, or a service's overlay name — in the state dir and the service
+/// dirs the selection holds: each with a descriptor of its own on its dir, its name, and the
+/// space it holds.
+#[allow(clippy::type_complexity)]
+fn leftover_trash(
+    selected: &Selection,
+) -> Result<Vec<(std::rc::Rc<File>, std::ffi::OsString, u64)>> {
+    let mut out = Vec::new();
+    for dir in &selected._locks {
+        let at = fd_path(dir);
+        let overlay = at
+            .canonicalize()
+            .ok()
+            .and_then(|p| Some(p.file_name()?.as_bytes().strip_prefix(b"svc-")?.to_vec()))
+            .map(|svc| [svc.as_slice(), b"-overlay.qcow2"].concat());
+        let mut own: Option<std::rc::Rc<File>> = None;
+        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name.as_bytes().strip_prefix(TRASH.as_bytes()) else {
+                continue;
+            };
+            let Some(dash) = rest.iter().position(|&b| b == b'-') else {
+                continue;
+            };
+            let (pid, media) = (&rest[..dash], &rest[dash + 1..]);
+            let named =
+                MEDIA.iter().any(|m| m.as_bytes() == media) || overlay.as_deref() == Some(media);
+            let meta = entry.metadata();
+            if pid.is_empty()
+                || !pid.iter().all(u8::is_ascii_digit)
+                || !named
+                || !meta.as_ref().is_ok_and(Metadata::is_file)
+            {
+                continue;
+            }
+            let held = meta.map_or(0, |m| m.blocks().saturating_mul(512));
+            let dir = match &own {
+                Some(d) => d.clone(),
+                None => own.insert(std::rc::Rc::new(reopen(dir)?)).clone(),
+            };
+            out.push((dir, name, held));
+        }
+    }
+    Ok(out)
 }
 
 fn default_confirm() -> Result<bool> {
@@ -953,6 +1160,110 @@ mod tests {
         assert_eq!(e.state_dir, f.plan.state_dir);
         assert_eq!(e.environment, "web"); // the manifest's label, not the state-dir name
         assert_eq!(e.backings, Some(vec![f.plan.state_dir.join("data.qcow2")]));
+    }
+
+    /// What `vk gc` takes from a stopped environment: the images selection, without asking, the
+    /// create hook rearmed and the next boot told; nothing from one whose storage was never
+    /// recorded, nor from one in use; nothing at all on a dry run.
+    #[test]
+    fn reclaim_takes_the_images_of_a_recorded_environment_only() {
+        let f = fixture("reclaim");
+        let dir = &f.plan.state_dir;
+        let hour = std::time::Duration::from_secs(3600);
+        let stamp = |ago: std::time::Duration| {
+            let stamp = dir.join(crate::run::ACTIVE_STAMP);
+            std::fs::write(&stamp, b"").unwrap();
+            File::open(&stamp)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - ago)
+                .unwrap();
+        };
+        stamp(hour * 48);
+        // `fixture` writes a placeholder `dev.json`: an environment booted by an older `vk`.
+        assert_eq!(
+            reclaim_images(dir, hour, false, false).unwrap(),
+            Reclaimed::Unrecorded
+        );
+        assert!(dir.join("root.qcow2").exists());
+
+        let record = |manifest: serde_json::Value| {
+            let identity = super::super::Identity {
+                digest: "d".into(),
+                booted_secs: 0,
+                created_by: String::new(),
+                generation: String::new(),
+                manifest,
+                storage_backings: Some(vec![dir.join("data.qcow2")]),
+                readied_by_its_boot: true,
+            };
+            std::fs::write(dir.join("dev.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
+        };
+        // A create hook, or a record that does not say, keeps it unless asked.
+        for manifest in [
+            serde_json::json!({ "environment": "dev", "hooks": { "create": { "run": "x" } } }),
+            serde_json::json!({ "environment": "dev" }),
+        ] {
+            record(manifest);
+            assert_eq!(
+                reclaim_images(dir, hour, false, false).unwrap(),
+                Reclaimed::CreateHook
+            );
+        }
+        record(serde_json::json!({ "environment": "dev", "hooks": { "create": null } }));
+        let held = open_dir(dir).unwrap();
+        lock(&held).unwrap();
+        let busy = reclaim_images(dir, hour, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(busy.contains(IN_USE), "{busy}");
+        drop(held);
+
+        // Used again since the caller looked: the stamp read under the locks keeps it.
+        stamp(std::time::Duration::ZERO);
+        assert_eq!(
+            once_released(IN_USE, || reclaim_images(dir, hour, false, false)).unwrap(),
+            Reclaimed::Recent
+        );
+        stamp(hour * 48);
+        // A leftover of a reclaim cut short goes with the next, and counts; a file merely
+        // named like one does not.
+        std::fs::write(dir.join(format!("{TRASH}1-root.qcow2")), b"old").unwrap();
+        std::fs::write(dir.join(format!("{TRASH}x-notes.txt")), b"mine").unwrap();
+
+        let Reclaimed::Images { files, bytes } =
+            once_released(IN_USE, || reclaim_images(dir, hour, false, true)).unwrap()
+        else {
+            panic!("a recorded environment is reclaimed");
+        };
+        assert!(files >= 4 && bytes > 0, "{files} {bytes}");
+        assert!(dir.join("root.qcow2").exists(), "a dry run removes nothing");
+        assert!(!dir.join(RECLAIMED).exists());
+
+        let real = once_released(IN_USE, || reclaim_images(dir, hour, false, false)).unwrap();
+        assert_eq!(real, Reclaimed::Images { files, bytes });
+        for name in ["root.qcow2", "svc-db/db-overlay.qcow2", "lifecycle/create"] {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        for name in [
+            "roots/devcontainer.qcow2",
+            "data.qcow2",
+            "cache/nested/data",
+            "dev.json",
+        ] {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        assert!(dir.join(RECLAIMED).exists());
+        let trash: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .chain(std::fs::read_dir(dir.join("svc-db")).unwrap())
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.as_bytes().starts_with(TRASH.as_bytes()))
+            .collect();
+        assert_eq!(
+            trash,
+            vec![std::ffi::OsString::from(format!("{TRASH}x-notes.txt"))]
+        );
     }
 
     #[test]

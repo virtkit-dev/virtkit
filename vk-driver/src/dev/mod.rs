@@ -26,7 +26,7 @@ mod identity;
 pub mod init;
 pub mod list;
 pub mod plan;
-mod prune;
+pub(crate) mod prune;
 pub mod schema;
 mod session;
 pub mod sshsetup;

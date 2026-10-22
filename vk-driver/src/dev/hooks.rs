@@ -172,6 +172,18 @@ async fn run_in_guest(
 /// only once this returns, an environment whose start hook failed records nothing and is
 /// driven through the whole sequence again by the next `up` rather than reported as a match.
 pub(super) async fn run_start_hooks(plan: &Plan, generation: Option<&str>) -> Result<()> {
+    let reclaimed = plan.state_dir.join(super::prune::RECLAIMED);
+    if std::fs::remove_file(&reclaimed).is_ok() {
+        eprintln!(
+            "virtkit: `vk gc` reclaimed this environment's boot images while it was stopped; \
+             they were rebuilt{}",
+            if plan.hooks.create.is_some() {
+                ", and hooks.create runs again"
+            } else {
+                ""
+            }
+        );
+    }
     if let Some(hook) = &plan.hooks.create
         && !generation.is_some_and(|g| stamped(plan, "create", g))
     {

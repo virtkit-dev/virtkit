@@ -248,10 +248,20 @@ pub struct Gc {
     /// a share of its filesystem (`"10%"`), a size (`"50G"`), or `"none"`. Default: 10% of its
     /// filesystem, at most 50G. Entries used within the last day stay regardless.
     pub build_cache_max: Option<Limit>,
+    /// Remove the boot images of a `vk dev` environment stopped this many days, as
+    /// `vk dev prune --images` does; its next `up` rebuilds them. One whose config has a
+    /// `hooks.create` is left unless `dev_images_with_create_hook`. `0` removes none. Default 14.
+    pub dev_image_idle_days: Option<u64>,
+    /// Also reclaim the images of an environment whose config has a `hooks.create`, which its
+    /// next boot runs again on its persistent storage — so only for hooks that are idempotent.
+    /// Default false: such environments are reported and left to `vk dev prune`.
+    pub dev_images_with_create_hook: Option<bool>,
 }
 
 /// The default of [`Gc::build_cache_retention_days`].
 const BUILD_CACHE_RETENTION_DAYS: u64 = 14;
+/// The default of [`Gc::dev_image_idle_days`].
+const DEV_IMAGE_IDLE_DAYS: u64 = 14;
 /// The ceiling of [`Gc::build_cache_max`]'s default, 10% of the filesystem.
 const BUILD_CACHE_MAX_DEFAULT_CEILING: u64 = 50 << 30;
 
@@ -269,6 +279,19 @@ impl Gc {
             0 => None,
             days => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
         }
+    }
+
+    /// How long a stopped dev environment keeps its boot images; `None`: for good.
+    pub fn dev_image_idle(&self) -> Option<std::time::Duration> {
+        match self.dev_image_idle_days.unwrap_or(DEV_IMAGE_IDLE_DAYS) {
+            0 => None,
+            days => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+        }
+    }
+
+    /// Whether environments with a `hooks.create` have their images reclaimed too.
+    pub fn dev_images_with_create_hook(&self) -> bool {
+        self.dev_images_with_create_hook.unwrap_or(false)
     }
 
     /// The most the build cache may take on a filesystem of `fs_total` bytes; `None`: uncapped.
@@ -1473,6 +1496,10 @@ mod tests {
         );
         assert_eq!(cfg.gc.build_cache_max(100 * gib), Some(10 * gib));
         assert_eq!(cfg.gc.build_cache_max(2000 * gib), Some(50 * gib));
+        assert_eq!(
+            cfg.gc.dev_image_idle(),
+            Some(std::time::Duration::from_secs(14 * 86_400))
+        );
         assert!(!toml::to_string(&cfg).unwrap().contains("[gc]"));
 
         for (text, fs, want) in [
@@ -1482,11 +1509,13 @@ mod tests {
             ("\"none\"", 100 * gib, None),
         ] {
             let cfg: Config = toml::from_str(&format!(
-                "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n"
+                "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n\
+                 dev_image_idle_days = 0\n"
             ))
             .unwrap();
             assert_eq!(cfg.gc.build_cache_max(fs), want, "{text}");
             assert_eq!(cfg.gc.build_cache_retention(), None);
+            assert_eq!(cfg.gc.dev_image_idle(), None);
             let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
             assert_eq!(back.gc, cfg.gc, "{text}");
         }

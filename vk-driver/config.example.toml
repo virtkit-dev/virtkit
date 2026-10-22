@@ -132,6 +132,12 @@
 #                          # "none". Default: 10% of its filesystem, at most 50G; a share
 #                          # set here has no ceiling. Entries used within the last day
 #                          # stay regardless.
+# dev_image_idle_days = 14 # remove the boot images of a `vk dev` environment stopped this
+#                          # many days, as `vk dev prune --images` does; its next `up`
+#                          # rebuilds them. One with a hooks.create is left. 0 = never
+# dev_images_with_create_hook = false  # also an environment whose config has a
+#                          # hooks.create, which then runs again on its persistent
+#                          # storage: only for an idempotent hook
 
 # [node]                    # what `vk node` (experimental fleet membership) declares to its
 #                           # hub about this host, beyond what it measures, and the runner
