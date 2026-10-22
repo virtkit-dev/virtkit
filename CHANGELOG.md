@@ -20,7 +20,7 @@ All notable changes to virtkit will be documented in this file.
   unchanged for an hour.
 - **`vk gc --all-unused`** ignores the configured retention and idle windows, taking
   everything nothing uses now, short of what was used in the last 10 minutes or, in the
-  build cache and dev environments, the last hour.
+  build cache, dev environments and run state dirs, the last hour.
 - **`vk gc` removes the boot images of `vk dev` environments stopped for 14 days**, as
   `vk dev prune --images` would; their persistent storage, identity and keys stay, and the
   next `vk dev up` rebuilds the images and says why. An environment whose config has a
@@ -28,6 +28,11 @@ All notable changes to virtkit will be documented in this file.
   storage, unless `[gc] dev_images_with_create_hook = true`. `[gc] dev_image_idle_days`
   changes the window, `0` turns it off. An environment last run by an older `vk` is left
   until it runs once more.
+- **`vk gc` removes the root image a `vk run -f … --state-dir` built** once no run has used
+  that state dir for 14 days (`[gc] run_image_idle_days`, `0` turns it off), and only while
+  it is still the file that run built. Nothing else in the directory is touched, and the next
+  run there builds the image again. Only dirs a run of this release built into are known to
+  it.
 
 ### Changed
 

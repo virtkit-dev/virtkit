@@ -256,12 +256,16 @@ pub struct Gc {
     /// next boot runs again on its persistent storage — so only for hooks that are idempotent.
     /// Default false: such environments are reported and left to `vk dev prune`.
     pub dev_images_with_create_hook: Option<bool>,
+    /// Remove the root image a `vk run --state-dir` built into its state dir once no run has
+    /// held the dir for this many days; the next run there builds it again. `0` removes none.
+    /// Default 14.
+    pub run_image_idle_days: Option<u64>,
 }
 
 /// The default of [`Gc::build_cache_retention_days`].
 const BUILD_CACHE_RETENTION_DAYS: u64 = 14;
-/// The default of [`Gc::dev_image_idle_days`].
-const DEV_IMAGE_IDLE_DAYS: u64 = 14;
+/// The default of [`Gc::dev_image_idle_days`] and [`Gc::run_image_idle_days`].
+const IMAGE_IDLE_DAYS: u64 = 14;
 /// The ceiling of [`Gc::build_cache_max`]'s default, 10% of the filesystem.
 const BUILD_CACHE_MAX_DEFAULT_CEILING: u64 = 50 << 30;
 
@@ -283,10 +287,12 @@ impl Gc {
 
     /// How long a stopped dev environment keeps its boot images; `None`: for good.
     pub fn dev_image_idle(&self) -> Option<std::time::Duration> {
-        match self.dev_image_idle_days.unwrap_or(DEV_IMAGE_IDLE_DAYS) {
-            0 => None,
-            days => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
-        }
+        days(self.dev_image_idle_days.unwrap_or(IMAGE_IDLE_DAYS))
+    }
+
+    /// How long a `vk run --state-dir` dir keeps its root image unused; `None`: for good.
+    pub fn run_image_idle(&self) -> Option<std::time::Duration> {
+        days(self.run_image_idle_days.unwrap_or(IMAGE_IDLE_DAYS))
     }
 
     /// Whether environments with a `hooks.create` have their images reclaimed too.
@@ -303,6 +309,11 @@ impl Gc {
                 .map(|cap| cap.min(BUILD_CACHE_MAX_DEFAULT_CEILING)),
         }
     }
+}
+
+/// `n` days; `None` for `0`, the spelling of never.
+fn days(n: u64) -> Option<std::time::Duration> {
+    (n > 0).then(|| std::time::Duration::from_secs(n.saturating_mul(86_400)))
 }
 
 /// A size limit: a share of the filesystem it applies to (`"10%"`), a size with a binary
@@ -1510,12 +1521,15 @@ mod tests {
         ] {
             let cfg: Config = toml::from_str(&format!(
                 "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n\
-                 dev_image_idle_days = 0\n"
+                 dev_image_idle_days = 0\nrun_image_idle_days = 0\n\
+                 dev_images_with_create_hook = true\n"
             ))
             .unwrap();
             assert_eq!(cfg.gc.build_cache_max(fs), want, "{text}");
             assert_eq!(cfg.gc.build_cache_retention(), None);
             assert_eq!(cfg.gc.dev_image_idle(), None);
+            assert_eq!(cfg.gc.run_image_idle(), None);
+            assert!(cfg.gc.dev_images_with_create_hook());
             let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
             assert_eq!(back.gc, cfg.gc, "{text}");
         }

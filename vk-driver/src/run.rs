@@ -1606,6 +1606,10 @@ async fn build_and_boot(
         image_workdir = built.config.workdir;
         Some(out)
     };
+    if args.state_dir.is_some() && dockerfile_ext4.is_some() {
+        // Best-effort: a dir left unnoted only keeps its root image until removed by hand.
+        let _ = crate::rundirs::record(work);
+    }
 
     // What this run costs the host, reported with the breakdown below (see `usage`). Started
     // here, after any `-f`/`--primary` build: that build reports its own line, and a window

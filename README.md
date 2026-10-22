@@ -544,7 +544,8 @@ that registry, dropping entries whose run has died, and is what `vk exec`, `vk s
 `vk logs`, `vk stop` and `vk reboot` resolve a directory against — `vk logs` also reads the
 console of a VM the registry has already dropped, since DIR keeps it. A run without
 `--state-dir` is not listed, unless it boots a UEFI bundle; pair `--state-dir` with
-`--detach` for a background VM.
+`--detach` for a background VM. The root image a `-f` run builds into DIR is removed by
+`vk gc` once no run has used DIR for 14 days, and built again by the next.
 
 ```sh
 vk run --state-dir "$PWD/.vk" --detach --ssh -f Dockerfile --target dev

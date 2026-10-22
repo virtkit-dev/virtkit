@@ -14,8 +14,9 @@ const BUILD_CACHE_FLOOR: Duration = Duration::from_secs(86_400);
 /// The least time `--all-unused` leaves a build-cache entry after its last use, and an
 /// unreferenced blob after it was written.
 const ALL_UNUSED_FLOOR: Duration = Duration::from_secs(3600);
-/// The least time `--all-unused` leaves a stopped dev environment's boot images after it was
-/// last in use: one stopped moments ago may be about to start again.
+/// The least time `--all-unused` leaves a stopped dev environment's boot images, or a
+/// `vk run --state-dir` dir's root image, after it was last in use: one stopped moments ago
+/// may be about to start again.
 const DEV_IMAGE_FLOOR: Duration = Duration::from_secs(3600);
 /// The longest a manual pass waits for each lock on the build cache's store.
 const STORE_WAIT: Duration = Duration::from_secs(60);
@@ -50,6 +51,8 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     if let Ok(base) = &dev_base {
         roots.push(base);
     }
+    let noted = crate::rundirs::noted_dirs();
+    roots.extend(noted.iter().map(PathBuf::as_path));
     let mut sum = Summary::new(req.dry_run, &roots);
 
     let mut images = crate::image::Evicted::default();
@@ -107,6 +110,7 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     if let Ok(base) = &dev_base {
         dev_images(cfg, req, base, &mut sum);
     }
+    run_images(cfg, req, &mut sum);
     let launches = crate::run::collect_dead_launch_dirs(req.dry_run);
     if let Ok(base) = &scratch {
         sum.row(
@@ -210,6 +214,32 @@ fn dev_images(cfg: &Config, req: &Request, base: &Path, sum: &mut Summary) {
              removes them, persistent storage included"
         ));
     }
+}
+
+/// Remove the root images `vk run --state-dir` built into state dirs no run has held for
+/// `[gc] run_image_idle_days`, each charged to its own filesystem.
+fn run_images(cfg: &Config, req: &Request, sum: &mut Summary) {
+    let idle = if req.all_unused {
+        Some(DEV_IMAGE_FLOOR)
+    } else {
+        cfg.gc.run_image_idle()
+    };
+    let Some(idle) = idle else {
+        return;
+    };
+    let done = crate::rundirs::collect(idle, None, req.dry_run);
+    let parts: Vec<(&Path, u64)> = done
+        .dirs
+        .iter()
+        .map(|(dir, bytes)| (dir.as_path(), *bytes))
+        .collect();
+    sum.row_on(
+        "run images",
+        u64::try_from(parts.len()).unwrap_or(u64::MAX),
+        &parts,
+        format!("state dirs unused for {}", fmt_secs(idle)),
+    );
+    sum.kept.extend(done.kept);
 }
 
 /// Where the build cache keeps what it caches, as `vk registry gc` resolves it.
@@ -371,8 +401,8 @@ struct Row {
     category: &'static str,
     count: u64,
     bytes: u64,
-    /// Which of [`Summary::space`] the bytes came from.
-    fs: Option<usize>,
+    /// Which of [`Summary::space`] the bytes came from, and how many from each.
+    on: Vec<(Option<usize>, u64)>,
     why: String,
 }
 
@@ -437,18 +467,32 @@ impl Summary {
         if count == 0 && bytes == 0 && !on.exists() {
             return;
         }
+        self.row_on(category, count, &[(on, bytes)], why);
+    }
+
+    /// Add a category's row whose bytes came off several filesystems: `parts`, each a path on
+    /// one and the bytes freed there.
+    pub(crate) fn row_on(
+        &mut self,
+        category: &'static str,
+        count: u64,
+        parts: &[(&Path, u64)],
+        why: String,
+    ) {
         let known = self.space.len();
-        let fs = self.register(on, false);
+        let on: Vec<_> = parts
+            .iter()
+            .map(|&(path, bytes)| (self.register(path, false), bytes))
+            .collect();
         debug_assert!(
             self.space.len() == known,
-            "{} is on a filesystem the pass did not read up front",
-            on.display()
+            "{category}: on a filesystem the pass did not read up front"
         );
         self.rows.push(Row {
             category,
             count,
-            bytes,
-            fs,
+            bytes: on.iter().fold(0u64, |t, (_, b)| t.saturating_add(*b)),
+            on,
             why,
         });
     }
@@ -459,21 +503,28 @@ impl Summary {
 
     /// Read the space each filesystem has after a real pass; a dry run estimates it.
     fn finish(&mut self) {
-        for (i, s) in self.space.iter_mut().enumerate() {
-            let Some(before) = s.before else {
+        for i in 0..self.space.len() {
+            let Some(before) = self.space[i].before else {
                 continue;
             };
-            s.after = if self.dry_run {
-                let freed = self
-                    .rows
-                    .iter()
-                    .filter(|r| r.fs == Some(i))
-                    .fold(0u64, |t, r| t.saturating_add(r.bytes));
-                Some(before.saturating_add(freed))
+            let after = if self.dry_run {
+                Some(before.saturating_add(self.freed_on(i)))
             } else {
-                crate::usage::fs_space(&s.path).ok().map(|sp| sp.avail)
+                crate::usage::fs_space(&self.space[i].path)
+                    .ok()
+                    .map(|sp| sp.avail)
             };
+            self.space[i].after = after;
         }
+    }
+
+    /// What the rows freed on [`Self::space`] `i`.
+    fn freed_on(&self, i: usize) -> u64 {
+        self.rows
+            .iter()
+            .flat_map(|r| &r.on)
+            .filter(|(fs, _)| *fs == Some(i))
+            .fold(0u64, |t, (_, b)| t.saturating_add(*b))
     }
 
     pub(crate) fn total(&self) -> u64 {
@@ -507,7 +558,7 @@ impl Summary {
             }
         }
         // The filesystems something came off, else the first: the data dir's.
-        let freed = |i: usize| self.rows.iter().any(|r| r.fs == Some(i) && r.bytes > 0);
+        let freed = |i: usize| self.freed_on(i) > 0;
         let any = (0..self.space.len()).any(freed);
         for (i, s) in self.space.iter().enumerate() {
             if !(freed(i) || (!any && i == 0)) {
@@ -548,14 +599,14 @@ mod tests {
             category: "images",
             count: 2,
             bytes: 3 << 30,
-            fs: Some(0),
+            on: vec![(Some(0), 3 << 30)],
             why: "unused for 30m".into(),
         });
         sum.rows.push(Row {
             category: "checkouts",
             count: 0,
             bytes: 0,
-            fs: Some(0),
+            on: vec![(Some(0), 0)],
             why: "unused for 30m".into(),
         });
         sum.keep("/data/virtkit/build/x.tmp: another user's".into());
@@ -592,7 +643,7 @@ mod tests {
             category: "launch dirs",
             count: 0,
             bytes: 0,
-            fs: Some(1),
+            on: vec![(Some(1), 0)],
             why: "left by runs killed by a signal".into(),
         });
         sum.space[0].after = Some(13 << 30);

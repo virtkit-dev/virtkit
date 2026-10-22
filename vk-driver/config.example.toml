@@ -138,6 +138,9 @@
 # dev_images_with_create_hook = false  # also an environment whose config has a
 #                          # hooks.create, which then runs again on its persistent
 #                          # storage: only for an idempotent hook
+# run_image_idle_days = 14 # remove the root image `vk run --state-dir` built into a state
+#                          # dir no run has held this many days; the next run there builds
+#                          # it again. 0 = never
 
 # [node]                    # what `vk node` (experimental fleet membership) declares to its
 #                           # hub about this host, beyond what it measures, and the runner
