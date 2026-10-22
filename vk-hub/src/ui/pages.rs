@@ -149,16 +149,17 @@ pub fn sign_in(token: &str) -> Html {
 }
 
 /// A page saying `text` to someone not signed in, with a button to sign in through the OIDC
-/// provider at `provider`.
+/// provider at `provider`. The button is a link, not a form: `/auth/login` redirects to the
+/// provider, and Chromium holds a form's redirects to `form-action 'self'` and blocks it.
 pub fn sign_in_with(text: &str, provider: &str) -> Html {
     let mut h = Html::new();
     head(&mut h, "Sign in");
-    h.raw("<body><main><form class=\"message\" method=\"get\" action=\"/auth/login\"><p>")
+    h.raw("<body><main><div class=\"message\"><p>")
         .text(text)
-        .raw("</p><button>Sign in with ")
+        .raw("</p><a class=\"button\" href=\"/auth/login\">Sign in with ")
         .text(provider)
-        .raw("</button><p>Or, on the hub's host, <code>vk-hub ui login</code> prints a link ")
-        .raw("that signs you in.</p></form></main></body></html>");
+        .raw("</a><p>Or, on the hub's host, <code>vk-hub ui login</code> prints a link ")
+        .raw("that signs you in.</p></div></main></body></html>");
     h
 }
 

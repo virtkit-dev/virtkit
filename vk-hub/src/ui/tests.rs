@@ -5790,7 +5790,9 @@ async fn an_oidc_sign_in_opens_a_session_for_whom_a_grant_lets_in() {
     let page = get(addr, "/login", None).await;
     assert_eq!(page.status, 200);
     assert!(
-        page.body.contains("action=\"/auth/login\""),
+        page.body
+            .contains("<a class=\"button\" href=\"/auth/login\">")
+            && !page.body.contains("<form"),
         "{}",
         page.body
     );

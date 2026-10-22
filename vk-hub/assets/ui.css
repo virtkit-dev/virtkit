@@ -115,7 +115,7 @@ main > section, main > div > section, #detail > section, #operations > section,
   border-radius: var(--radius);
   font-size: 1rem;
 }
-.message button { margin-top: var(--s2); }
+.message button, .message a.button { margin-top: var(--s2); }
 
 /* Status badges: colour says how it stands, the word says what. */
 .badge, .rollout .state {
@@ -320,7 +320,7 @@ pre.log .cut { display: block; color: var(--log-muted); padding-left: calc(4.5em
 
 /* Controls. */
 button, input, select { font: inherit; color: inherit; }
-button {
+button, a.button {
   padding: 0.3rem 0.85rem;
   border-radius: 6px;
   border: 1px solid var(--line);
@@ -330,7 +330,8 @@ button {
   cursor: pointer;
   white-space: nowrap;
 }
-button:hover { background: var(--raised); }
+button:hover, a.button:hover { background: var(--raised); }
+a.button { display: inline-block; text-decoration: none; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 button.primary:hover { filter: brightness(1.08); }
 button.secondary { background: transparent; }

@@ -56,6 +56,10 @@ All notable changes to virtkit will be documented in this file.
 - **A registry gc no longer deletes the cached stages a running build is reading** from the
   local build cache, however long the build runs; it used to take them once their tags were
   dropped and a day had passed. Builds by older `vk` releases are not covered.
+- **Signing in to vk-hub's web UI through an OIDC provider works in Chromium.** The "Sign in
+  with" button was a form that `/auth/login` redirects to the provider, and Chromium's
+  `form-action 'self'` check blocked that redirect; it is now a link.
+
 
 ## [0.93.2] - 2026-10-21
 
