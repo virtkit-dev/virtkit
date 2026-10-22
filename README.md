@@ -917,7 +917,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
-| `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, and staging directories left by killed builds, then summarize what went and what stayed; `--dry-run` only reports. |
+| `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, and staging directories left by killed builds, then summarize what went and what stayed; `--dry-run` only reports. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
 | `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
 | `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
@@ -968,8 +968,11 @@ Two configuration values can point at the same content-addressed store:
 
 Each accepts either a registry endpoint or a local absolute path/`file://` URL. Pointing
 both local settings at one directory enables chunk deduplication across build cache and
-guest bundles. `cache_registry = "none"` disables future build-cache writes. Use
-`vk registry status` and `vk registry gc` to inspect and reclaim a local store.
+guest bundles. `cache_registry = "none"` disables future build-cache writes. `vk gc`
+collects a local store's `build-cache` entries: those unused for 14 days, then the least
+recently used until the build cache fits 10% of its filesystem, at most 50 GiB (`[gc]
+build_cache_retention_days` and `build_cache_max`). Use `vk registry status` and
+`vk registry gc` to inspect and reclaim a whole local store.
 
 `vk-registry` has a separate configuration namespace. Its store-oriented subcommands
 recognize `VK_REGISTRY_CONFIG`, `VK_REGISTRY_ROOT`, and

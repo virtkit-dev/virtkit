@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # =====================================================================================
-# `vk gc` on a private home: the summary and what it takes.
+# `vk gc` on a private home: the summary, what it takes, and the config it reads.
 # =====================================================================================
 # Everything happens under a scratch $HOME with its own XDG dirs, so no cache, state or
 # config of the user running it is read or touched.
 #
 # Done means every step below holds:
 #   1. `vk gc --dry-run` on empty caches prints one summary, every category at zero.
+#   2. a `[gc]` size that is not one is refused when the config loads.
 #
 # Run:  VK=./dist/vk tests/gc-e2e.sh
 # Needs: a `vk` binary. No network, no KVM, no image.
@@ -35,6 +36,17 @@ echo "== 1. an empty host: one summary, nothing to take =="
 out=$("$VK" gc --dry-run 2>&1) || { bad "vk gc --dry-run failed"; echo "$out"; exit 1; }
 grep -q '^virtkit: gc would reclaim 0 B$' <<<"$out" && ok "the summary heads the output" || { bad "no summary line"; echo "$out"; }
 grep -qE '^  images +0 ' <<<"$out" && ok "each category has its row" || { bad "no images row"; echo "$out"; }
+
+echo
+echo "== 2. a [gc] size that is not one =="
+mkdir -p "$XDG_CONFIG_HOME/virtkit"
+printf '[gc]\nbuild_cache_max = "lots"\n' > "$XDG_CONFIG_HOME/virtkit/config.toml"
+if out=$("$VK" gc --dry-run 2>&1); then
+  bad "a bad build_cache_max was accepted"
+else
+  grep -q 'is not a size' <<<"$out" && ok "a bad build_cache_max is refused" || { bad "refused for another reason"; echo "$out"; }
+fi
+rm "$XDG_CONFIG_HOME/virtkit/config.toml"
 
 echo
 echo "== $pass passed, $fail failed =="

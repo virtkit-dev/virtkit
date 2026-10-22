@@ -7,6 +7,13 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::usage::fmt_bytes;
 
+/// The least time a pass leaves a build-cache entry after its last use before its size cap
+/// takes it, and an unreferenced store blob after it was written: a build may have pushed it
+/// moments ago and be about to name it, which no lock covers.
+const BUILD_CACHE_FLOOR: Duration = Duration::from_secs(86_400);
+/// The longest a manual pass waits for each lock on the build cache's store.
+const STORE_WAIT: Duration = Duration::from_secs(60);
+
 /// What a `vk gc` pass may take.
 pub(crate) struct Request {
     /// Count what would go and remove nothing.
@@ -21,7 +28,13 @@ pub(crate) struct Request {
 /// executor's checkouts.
 pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     let checkout_root = cfg.checkout_root();
-    let mut sum = Summary::new(req.dry_run, &[state_dir, &checkout_root]);
+    let store = cache_store(cfg);
+    // Every filesystem the pass may free space on, its space read before anything goes.
+    let mut roots = vec![state_dir, checkout_root.as_path()];
+    if let Ok(crate::build::CacheStore::Dir(dir)) = &store {
+        roots.push(dir);
+    }
+    let mut sum = Summary::new(req.dry_run, &roots);
 
     let mut images = crate::image::Evicted::default();
     for tier in ["registry", "docker", "build"] {
@@ -74,8 +87,136 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
         unused_for(req.checkout_idle),
     );
     sum.kept.extend(trees.left);
+    build_cache(cfg, store, req, &mut sum);
+    if let Some((dir, releases, bytes)) = crate::toolchain::cache_usage()
+        && releases > 0
+    {
+        sum.keep(format!(
+            "toolchains: {releases} release(s), {} in {} — a project may pin any of them",
+            fmt_bytes(bytes),
+            dir.display()
+        ));
+    }
     sum.finish();
     sum
+}
+
+/// Where the build cache keeps what it caches, as `vk registry gc` resolves it.
+fn cache_store(cfg: &Config) -> anyhow::Result<crate::build::CacheStore> {
+    crate::build::cache_store(cfg.build.cache_registry.as_deref())
+}
+
+/// Collect the build cache's `store`, when it is in this filesystem: tags of its build-cache
+/// repository unused past the retention, then the least recently used until it fits its cap,
+/// then the blobs nothing references any more. A pass waits up to [`STORE_WAIT`] for each lock
+/// on the store the builds using it hold, then leaves what it has not reached for the next.
+fn build_cache(
+    cfg: &Config,
+    store: anyhow::Result<crate::build::CacheStore>,
+    req: &Request,
+    sum: &mut Summary,
+) {
+    let dir = match store {
+        Ok(crate::build::CacheStore::Dir(dir)) => dir,
+        Ok(crate::build::CacheStore::Server(repo)) => {
+            sum.keep(format!("build cache: {repo} is collected on its own host"));
+            return;
+        }
+        Err(e) => {
+            sum.keep(format!("build cache: {e:#}"));
+            return;
+        }
+    };
+    let store = match vk_registry::Store::open(&dir) {
+        Ok(Some(store)) => store,
+        Ok(None) => return,
+        Err(e) => {
+            sum.keep(format!("build cache: {e:#}"));
+            return;
+        }
+    };
+    // A cap that cannot be sized is no cap, never one of nothing.
+    let max = match crate::usage::fs_space(&dir) {
+        Ok(space) => cfg.gc.build_cache_max(space.total),
+        Err(e) => {
+            sum.keep(format!(
+                "build cache: not capped, its filesystem cannot be read: {e}"
+            ));
+            None
+        }
+    };
+    let (retention, floor) = (cfg.gc.build_cache_retention(), BUILD_CACHE_FLOOR);
+    let policy = vk_registry::GcPolicy {
+        retention,
+        grace: floor,
+        repository: Some(vk_registry::BUILD_CACHE_REPO.into()),
+        // A Windows layer's view outlives the build that pulled it, reading the store by path.
+        keep_prefixes: vec![crate::wincache::TAG_PREFIX.into()],
+        max_bytes: max,
+        free_bytes: None,
+        min_age: floor,
+        dry_run: req.dry_run,
+        wait: vk_registry::Wait::Within(STORE_WAIT),
+        lower_planning: None,
+    };
+    let r = match store.gc_with(&policy) {
+        Ok(vk_registry::GcOutcome::Done(r)) => r,
+        Ok(vk_registry::GcOutcome::Busy) => {
+            sum.keep(format!(
+                "build cache: in use for {}, left for the next pass",
+                fmt_secs(STORE_WAIT)
+            ));
+            return;
+        }
+        Err(e) => {
+            sum.keep(format!("build cache: {e:#}"));
+            return;
+        }
+    };
+    let why = match (retention, max) {
+        (Some(r), Some(m)) => format!("unused for {}, then over {}", fmt_secs(r), fmt_bytes(m)),
+        (Some(r), None) => format!("unused for {}", fmt_secs(r)),
+        (None, Some(m)) => format!("over {}", fmt_bytes(m)),
+        (None, None) => "no longer referenced".into(),
+    };
+    sum.row(
+        "build cache",
+        u64::try_from(r.tags_dropped + r.tags_capped).unwrap_or(u64::MAX),
+        r.bytes_freed,
+        &dir,
+        format!("{why}; builds waited {} at most", fmt_hold(r.longest_hold)),
+    );
+    if r.incomplete {
+        sum.keep("build cache: builds held it part-way, the rest is left for the next pass".into());
+    }
+    if let (Some(after), Some(max)) = (r.bytes_after, max)
+        && after > max
+    {
+        sum.keep(format!(
+            "build cache: {} in {}, over its {} cap — the rest was used within {}, is kept by \
+             its manifest or its name, or is read by running builds",
+            fmt_bytes(after),
+            dir.display(),
+            fmt_bytes(max),
+            fmt_secs(floor)
+        ));
+    }
+    if r.blobs_leased > 0 {
+        sum.keep(format!(
+            "build cache: {} chunk(s), {}, read by running builds",
+            r.blobs_leased,
+            fmt_bytes(r.bytes_leased)
+        ));
+    }
+}
+
+/// A lock hold: `120 ms`, `2.4 s`.
+fn fmt_hold(d: Duration) -> String {
+    if d < Duration::from_secs(1) {
+        format!("{} ms", d.as_millis())
+    } else {
+        format!("{:.1} s", d.as_secs_f64())
+    }
 }
 
 /// Why an idle-windowed entry went: unused for at least `idle`.

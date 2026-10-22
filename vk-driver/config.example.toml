@@ -122,6 +122,17 @@
 #                        # above one node's CPU count interleaves every build stage instead of
 #                        # placing it. The default (2-4 vCPUs a stage) fits any node.
 
+# [gc]                   # what `vk gc` reclaims beyond unused images and checkouts. A `vk`
+#                        # release older than this table refuses a config that has it:
+#                        # leave it out of a config older releases also read.
+# build_cache_retention_days = 14  # drop a build-cache entry unused this many days; 0 = never
+#                                  # for its age
+# build_cache_max = "50G"  # then drop the least recently used entries until the build
+#                          # cache fits: a size, a share of its filesystem ("10%"), or
+#                          # "none". Default: 10% of its filesystem, at most 50G; a share
+#                          # set here has no ceiling. Entries used within the last day
+#                          # stay regardless.
+
 # [node]                    # what `vk node` (experimental fleet membership) declares to its
 #                           # hub about this host, beyond what it measures, and the runner
 #                           # config `vk tune` edits.

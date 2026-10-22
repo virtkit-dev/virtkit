@@ -108,6 +108,11 @@ this are removed — which is what keeps a tmpfs `checkout_dir` from filling wit
 repositories of jobs that have moved on. Unset, checkouts inherit `image_cache_idle_secs`
 (30 minutes by default). A tree a prepare or a running guest is using is never removed.
 
+`vk gc` also collects the host's local build cache: entries unused for 14 days, then the
+least recently used until it fits 10% of its filesystem, at most 50 GiB. A runner that relies
+on a large local build cache sets `[gc] build_cache_retention_days = 0` and
+`build_cache_max = "none"` to keep it whole.
+
 Under an explicit `checkout_dir`, virtkit keeps its trees in
 `<checkout_dir>/vk/<slot>/<project>`, so the sweep walks only its own — a sibling tree from
 another GitLab executor is outside the root it reads, and only trees virtkit created are

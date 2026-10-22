@@ -9,6 +9,13 @@ All notable changes to virtkit will be documented in this file.
 - **`vk gc --dry-run`** reports what a pass would reclaim without removing anything, and
   `vk gc` now prints one summary in place of its per-cache lines: the space each kind of
   cache freed, what it kept and why, and the free space before and after.
+- **`vk gc` collects the local build cache**: entries unused for 14 days, then the least
+  recently used until it fits 10% of its filesystem, at most 50 GiB, never one used in the
+  last day or read by a running build. `[gc] build_cache_retention_days` and
+  `build_cache_max` (`"20%"`, `"80G"`, `"none"`) change that; a `vk` release older than the
+  `[gc]` table refuses a config that has it. A CI host that wants its local build cache kept
+  whole sets both to `0` and `"none"`. Builds that keep the cache busy for a minute leave the
+  rest to the next pass. `vk gc` also reports what the toolchain cache holds.
 
 ### Changed
 

@@ -55,6 +55,10 @@ pub struct Config {
     /// Which memory node each VM this host boots is placed on; see [`Numa`]. On by default,
     /// and a no-op on the single-node hosts most machines are.
     pub numa: Numa,
+    /// What `vk gc` collects beyond the image and checkout caches, and when; see [`Gc`].
+    /// `vk config` omits it while untouched.
+    #[serde(skip_serializing_if = "Gc::is_default")]
+    pub gc: Gc,
     /// What `vk node` declares about this host to a fleet hub; see [`Node`]. `vk config`
     /// omits it while untouched.
     #[serde(skip_serializing_if = "Node::is_default")]
@@ -230,6 +234,123 @@ pub struct Schedule {
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
     /// capped at the filesystem's size.
     pub disk_default: Option<String>,
+}
+
+/// What `vk gc` collects beyond the image and checkout caches. Every key has a default, so a
+/// host needs none of them; an older `vk` refuses a config that has the table at all.
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Gc {
+    /// Drop a build-cache entry unused for this many days; `0` drops none for its age.
+    /// Default 14.
+    pub build_cache_retention_days: Option<u64>,
+    /// Then drop the least recently used build-cache entries until the build cache fits:
+    /// a share of its filesystem (`"10%"`), a size (`"50G"`), or `"none"`. Default: 10% of its
+    /// filesystem, at most 50G. Entries used within the last day stay regardless.
+    pub build_cache_max: Option<Limit>,
+}
+
+/// The default of [`Gc::build_cache_retention_days`].
+const BUILD_CACHE_RETENTION_DAYS: u64 = 14;
+/// The ceiling of [`Gc::build_cache_max`]'s default, 10% of the filesystem.
+const BUILD_CACHE_MAX_DEFAULT_CEILING: u64 = 50 << 30;
+
+impl Gc {
+    fn is_default(&self) -> bool {
+        *self == Gc::default()
+    }
+
+    /// How long an unused build-cache entry stays; `None` while its age drops none.
+    pub fn build_cache_retention(&self) -> Option<std::time::Duration> {
+        match self
+            .build_cache_retention_days
+            .unwrap_or(BUILD_CACHE_RETENTION_DAYS)
+        {
+            0 => None,
+            days => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+        }
+    }
+
+    /// The most the build cache may take on a filesystem of `fs_total` bytes; `None`: uncapped.
+    pub fn build_cache_max(&self, fs_total: u64) -> Option<u64> {
+        match self.build_cache_max {
+            Some(limit) => limit.of(fs_total),
+            None => Limit::Percent(10)
+                .of(fs_total)
+                .map(|cap| cap.min(BUILD_CACHE_MAX_DEFAULT_CEILING)),
+        }
+    }
+}
+
+/// A size limit: a share of the filesystem it applies to (`"10%"`), a size with a binary
+/// suffix (`"50G"`, `"512M"`, `"2T"`), or `"none"`. Its own parser rather than another of the
+/// size parsers here (`vmm`'s, the schedule's), which take neither a share nor `"none"`, and read
+/// a bare number as MiB where a cap of a bare number is more likely a mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Limit {
+    None,
+    Percent(u8),
+    Bytes(u64),
+}
+
+impl Limit {
+    /// The limit on a filesystem of `fs_total` bytes; `None` for no limit.
+    pub fn of(self, fs_total: u64) -> Option<u64> {
+        match self {
+            Limit::None => None,
+            Limit::Percent(p) => Some(fs_total / 100 * u64::from(p)),
+            Limit::Bytes(b) => Some(b),
+        }
+    }
+}
+
+impl TryFrom<String> for Limit {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Limit, String> {
+        let bad = || format!("{s:?} is not a size: write \"10%\", \"50G\" or \"none\"");
+        let t = s.trim();
+        if t == "none" {
+            return Ok(Limit::None);
+        }
+        if let Some(p) = t.strip_suffix('%') {
+            return match p.parse::<u8>() {
+                Ok(p @ 1..=100) => Ok(Limit::Percent(p)),
+                _ => Err(bad()),
+            };
+        }
+        let (digits, shift) = match t.char_indices().last() {
+            Some((i, 'K' | 'k')) => (&t[..i], 10),
+            Some((i, 'M' | 'm')) => (&t[..i], 20),
+            Some((i, 'G' | 'g')) => (&t[..i], 30),
+            Some((i, 'T' | 't')) => (&t[..i], 40),
+            _ => return Err(bad()),
+        };
+        digits
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .and_then(|n| n.checked_mul(1u64 << shift))
+            .map(Limit::Bytes)
+            .ok_or_else(bad)
+    }
+}
+
+impl From<Limit> for String {
+    fn from(l: Limit) -> String {
+        match l {
+            Limit::None => "none".into(),
+            Limit::Percent(p) => format!("{p}%"),
+            Limit::Bytes(b) => {
+                let (n, unit) = [(40, 'T'), (30, 'G'), (20, 'M'), (10, 'K')]
+                    .into_iter()
+                    .find(|&(shift, _)| b.is_multiple_of(1u64 << shift))
+                    .map_or((b, ' '), |(shift, unit)| (b >> shift, unit));
+                format!("{n}{unit}").trim_end().to_string()
+            }
+        }
+    }
 }
 
 /// `[numa]` — NUMA placement for every VM this host boots. On a multi-socket host a VM whose
@@ -1338,6 +1459,52 @@ mod tests {
         let off: Config =
             toml::from_str("[executor]\nhost_checkout = true\ncheckout_overlay = false\n").unwrap();
         assert!(!off.executor.checkout_overlay);
+    }
+
+    /// `[gc]`: the defaults, each spelling of a limit, `0` retention as none, a refused size,
+    /// and a round trip through `vk config`.
+    #[test]
+    fn gc_table_parses_its_limits_and_round_trips() {
+        let gib = 1u64 << 30;
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.gc.build_cache_retention(),
+            Some(std::time::Duration::from_secs(14 * 86_400))
+        );
+        assert_eq!(cfg.gc.build_cache_max(100 * gib), Some(10 * gib));
+        assert_eq!(cfg.gc.build_cache_max(2000 * gib), Some(50 * gib));
+        assert!(!toml::to_string(&cfg).unwrap().contains("[gc]"));
+
+        for (text, fs, want) in [
+            ("\"20%\"", 100 * gib, Some(20 * gib)),
+            ("\"80G\"", 100 * gib, Some(80 * gib)),
+            ("\"512M\"", 100 * gib, Some(512 << 20)),
+            ("\"none\"", 100 * gib, None),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.gc.build_cache_max(fs), want, "{text}");
+            assert_eq!(cfg.gc.build_cache_retention(), None);
+            let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(back.gc, cfg.gc, "{text}");
+        }
+        for bad in [
+            "\"0\"", "\"0G\"", "\"10\"", "\"101%\"", "\"0%\"", "\"lots\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("[gc]\nbuild_cache_max = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(toml::from_str::<Config>("[gc]\nbogus = 1\n").is_err());
+    }
+
+    /// `vk config --example` prints a config this `vk` loads.
+    #[test]
+    fn the_example_config_parses() {
+        toml::from_str::<Config>(include_str!("../config.example.toml")).unwrap();
     }
 
     /// The nested tables parse under `[executor.*]` and round-trip through `vk config`.

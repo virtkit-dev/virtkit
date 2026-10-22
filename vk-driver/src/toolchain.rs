@@ -346,6 +346,20 @@ fn cache_root_from(
     Ok(PathBuf::from(home).join(".cache/virtkit/toolchain"))
 }
 
+/// The toolchain cache, how many releases it holds and the space they take: what `vk gc`
+/// reports and leaves, since a project's lock may pin any of them and reinstalling one takes
+/// the network. `None` when there is none.
+pub(crate) fn cache_usage() -> Option<(PathBuf, usize, u64)> {
+    let root = cache_root().ok()?;
+    let releases = std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .count();
+    let bytes = crate::usage::allocated_bytes(&root).unwrap_or(0);
+    Some((root, releases, bytes))
+}
+
 /// The mode an artifact is published with: the binaries are meant to be run, the kernel is
 /// meant to be read.
 fn mode_of(name: &str) -> u32 {

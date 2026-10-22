@@ -53,9 +53,12 @@ impl<T> Lookup<T> {
     }
 }
 
+/// What every layer's registry tag starts with.
+pub(crate) const TAG_PREFIX: &str = "win-";
+
 /// The registry tag of layer `key`.
 fn tag(key: &str) -> String {
-    format!("win-{key}")
+    format!("{TAG_PREFIX}{key}")
 }
 
 /// The disk of the layer whose directory is `dir`, built here or pulled.
