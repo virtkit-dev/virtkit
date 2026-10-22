@@ -616,6 +616,16 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // by a signal leaves its `launch-<pid>` behind for a recycled pid to find. Cleared here so
     // this run reports its own traffic rather than every earlier run's on top of it.
     let _ = std::fs::remove_file(work.path.join(NET_BYTES));
+    let _alive = work.pinned.then(|| {
+        let dir = work.path.clone();
+        crate::task::AbortOnDrop(tokio::spawn(async move {
+            let mut every = tokio::time::interval(ACTIVE_EVERY);
+            loop {
+                every.tick().await;
+                mark_active(&dir);
+            }
+        }))
+    });
     // A local bundle directory (`vm.json` + disks) boots a UEFI guest: no agent, no kernel.
     // Its run is registered with or without `--state-dir`, its sockets being in its directory
     // either way, so `vk list`, `vk stop` and the rest find it; a temporary directory has to
@@ -724,6 +734,27 @@ fn launch_dir(base: &Path) -> Result<WorkDir> {
     let mut work = WorkDir::create(base.join(format!("launch-{pid}-{nonce}")))?;
     work.lock()?;
     Ok(work)
+}
+
+/// A pinned state dir's sign of life, `<state-dir>/.virtkit-active`: touched when a run takes
+/// the dir, every [`ACTIVE_EVERY`] while it holds it, and when it lets it go, so its mtime
+/// tells when the dir was last in use to within that period, however the run ended. Dot-named,
+/// so a guest share never writes it (see [`is_host_state_entry`]).
+pub(crate) const ACTIVE_STAMP: &str = ".virtkit-active";
+const ACTIVE_EVERY: Duration = Duration::from_secs(600);
+
+/// Date `dir`'s [`ACTIVE_STAMP`] to now. Best-effort: a stamp that cannot be written leaves the
+/// dir looking idle since the last one, or never used, which `vk gc` keeps.
+fn mark_active(dir: &Path) {
+    let stamp = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir.join(ACTIVE_STAMP));
+    if let Ok(f) = stamp {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// How long a dead run's `launch-<pid>` dir must have sat unchanged before `vk gc` removes it.
@@ -961,6 +992,7 @@ impl WorkDir {
             .with_context(|| format!("restricting {} to 0700", path.display()))?;
         let lock = lock_state_dir(&path)?;
         remove_stale_sockets(&path)?;
+        mark_active(&path);
         Ok(WorkDir {
             path,
             pinned: true,
@@ -1113,7 +1145,9 @@ fn holder_pid(locks: &str, want: &str) -> Option<i32> {
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        if !self.pinned {
+        if self.pinned {
+            mark_active(&self.path);
+        } else {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -5941,6 +5975,34 @@ mod tests {
         drop(other);
         drop(held);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pinned dir is dated by its stamp alone, which is never written through a symlink.
+    #[test]
+    fn the_activity_stamp_dates_a_state_dir() {
+        let dir = std::env::temp_dir().join(format!("vk-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamped = |dir: &Path| {
+            std::fs::symlink_metadata(dir.join(ACTIVE_STAMP))
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|m| m.modified().ok())
+        };
+        let before = std::time::SystemTime::now() - Duration::from_secs(1);
+        mark_active(&dir);
+        assert!(stamped(&dir).is_some_and(|t| t >= before));
+        mark_active(&dir);
+        assert!(stamped(&dir).is_some_and(|t| t >= before), "marked again");
+
+        let other = dir.join("elsewhere");
+        let linked = dir.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&other, linked.join(ACTIVE_STAMP)).unwrap();
+        mark_active(&linked);
+        assert!(!other.exists(), "a symlinked stamp is not followed");
+        assert_eq!(stamped(&linked), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A dead run's launch dir goes; one whose pid lives, whose lock is held, that changed

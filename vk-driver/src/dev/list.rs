@@ -235,7 +235,8 @@ pub fn contents(dir: &Path) -> Vec<Entry> {
         .filter(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let socket = e.file_type().is_ok_and(|t| t.is_socket());
-            !socket && !name.ends_with(".log")
+            // `vk`'s own bookkeeping (`.virtkit-active` and the like) is not data.
+            !socket && !name.ends_with(".log") && !name.starts_with(".virtkit-")
         })
         .map(|e| Entry {
             name: e.file_name().to_string_lossy().into(),
