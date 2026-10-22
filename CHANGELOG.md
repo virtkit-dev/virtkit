@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
   `[gc]` table refuses a config that has it. A CI host that wants its local build cache kept
   whole sets both to `0` and `"none"`. Builds that keep the cache busy for a minute leave the
   rest to the next pass. `vk gc` also reports what the toolchain cache holds.
+- **`vk gc` removes the scratch dirs of runs killed by a signal**, once they have sat
+  unchanged for an hour.
 
 ### Changed
 

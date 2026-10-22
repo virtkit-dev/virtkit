@@ -1412,7 +1412,7 @@ fn stat_in(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::OsStr) -> Option<l
 
 /// When the open dir `dir` or an entry directly in it last changed: a build writing its image
 /// changes that file, not the dir. `None` when it cannot be read.
-fn last_changed(dir: &std::fs::File) -> Option<std::time::SystemTime> {
+pub(crate) fn last_changed(dir: &std::fs::File) -> Option<std::time::SystemTime> {
     use std::os::fd::AsFd;
 
     let at = |st: &libc::stat| {

@@ -609,9 +609,7 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     crate::vmm::set_vm_name_template(args.vm_name.clone());
     let mut work = match &args.state_dir {
         Some(dir) => WorkDir::pinned(dir.clone())?,
-        None => {
-            WorkDir::create(default_scratch_base()?.join(format!("launch-{}", std::process::id())))?
-        }
+        None => launch_dir(&default_scratch_base()?)?,
     };
     // The byte channel is a sum over everything appended to it, and a work dir can outlive the
     // run that made it: `--state-dir` is created-or-reused and never removed, and a run killed
@@ -620,8 +618,8 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     let _ = std::fs::remove_file(work.path.join(NET_BYTES));
     // A local bundle directory (`vm.json` + disks) boots a UEFI guest: no agent, no kernel.
     // Its run is registered with or without `--state-dir`, its sockets being in its directory
-    // either way, so `vk list`, `vk stop` and the rest find it; a temporary directory is
-    // locked here as a pinned one already is.
+    // either way, so `vk list`, `vk stop` and the rest find it; a temporary directory has to
+    // hold its lock here as a pinned one already does.
     if let Some(bundle) = crate::uefi::Bundle::detect(&args.image)? {
         work.lock()?;
         return crate::uefi::run(args, cfg, &work.path, bundle).await;
@@ -694,6 +692,133 @@ pub(crate) fn default_data_base() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").context("neither XDG_DATA_HOME nor HOME is set")?;
     Ok(PathBuf::from(home).join(".local/share/virtkit"))
+}
+
+/// This run's launch dir under `base`, `launch-<pid>`, holding its lock — what `vk gc` tells
+/// it from one a run killed by a signal left behind. On a filesystem without `flock` the run
+/// goes on unlocked, and `vk gc` judges the dir by its pid. Found held — a `vk gc` removing a
+/// dead run's dir this recycled pid is named for — the run takes `launch-<pid>-<nonce>` instead.
+fn launch_dir(base: &Path) -> Result<WorkDir> {
+    let pid = std::process::id();
+    let mut work = WorkDir::create(base.join(format!("launch-{pid}")))?;
+    let Err(e) = work.lock() else {
+        return Ok(work);
+    };
+    let unsupported = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.raw_os_error(),
+                Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
+            )
+        })
+    });
+    if unsupported {
+        eprintln!("virtkit: warning: cannot lock the launch dir: {e:#}");
+        return Ok(work);
+    }
+    // Not this run's to remove: whoever holds it does.
+    std::mem::forget(work);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut work = WorkDir::create(base.join(format!("launch-{pid}-{nonce}")))?;
+    work.lock()?;
+    Ok(work)
+}
+
+/// How long a dead run's `launch-<pid>` dir must have sat unchanged before `vk gc` removes it.
+const DEAD_LAUNCH_GRACE: Duration = Duration::from_secs(3600);
+
+/// What [`collect_dead_launch_dirs`] reclaimed and left.
+#[derive(Debug, Default)]
+pub(crate) struct DeadLaunches {
+    pub(crate) dirs: u64,
+    pub(crate) bytes: u64,
+    /// What a removal left in place or failed on.
+    pub(crate) left: Vec<String>,
+}
+
+/// Remove the `launch-<pid>` dirs under the scratch base that runs killed by a signal left
+/// behind (any other end removes its own). A dir is dead when its pid is gone, nobody holds its
+/// lock, nothing in it changed for [`DEAD_LAUNCH_GRACE`], and it is this user's: the pid alone
+/// misjudges a run in another pid namespace or a recycled pid, and a run of a `vk` that took no
+/// lock is told only by the other two. The lock is held through the removal, which goes through
+/// descriptors (see [`vk_fs::remove_tree_in`]). With `dry_run`, what it would remove.
+pub(crate) fn collect_dead_launch_dirs(dry_run: bool) -> DeadLaunches {
+    match default_scratch_base() {
+        Ok(base) => dead_launch_dirs_in(&base, DEAD_LAUNCH_GRACE, dry_run),
+        Err(_) => DeadLaunches::default(),
+    }
+}
+
+fn dead_launch_dirs_in(base: &Path, grace: Duration, dry_run: bool) -> DeadLaunches {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut done = DeadLaunches::default();
+    let Ok(top) = vk_fs::open_dir(base) else {
+        return done;
+    };
+    let Ok(names) = vk_fs::dir_names(top.as_fd()) else {
+        return done;
+    };
+    let now = std::time::SystemTime::now();
+    for name in names {
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("launch-"))
+            // `launch-<pid>`, or `launch-<pid>-<nonce>` for a run that found the first held.
+            .and_then(|p| p.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if crate::spawn::pid_alive(pid) {
+            continue;
+        }
+        // Refuses a symlink and anything but a directory.
+        let Ok(dir) = vk_fs::open_dir_in(top.as_fd(), &name) else {
+            continue;
+        };
+        let Ok(lock) = vk_fs::reopen_dir(dir.as_fd()).map(std::fs::File::from) else {
+            continue;
+        };
+        // SAFETY: the fd is owned by `lock`, open across the call; LOCK_NB never waits.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        let mine = lock
+            .metadata()
+            .is_ok_and(|m| m.uid() == unsafe { libc::geteuid() });
+        let quiet = crate::image::last_changed(&lock)
+            .is_some_and(|t| now.duration_since(t).unwrap_or_default() >= grace);
+        if !mine || !quiet {
+            continue;
+        }
+        let at = base.join(&name);
+        if dry_run {
+            done.dirs += 1;
+            let held = crate::usage::allocated_bytes(&at).unwrap_or(0);
+            done.bytes = done.bytes.saturating_add(held);
+            continue;
+        }
+        match vk_fs::remove_tree_in(top.as_fd(), &name, dir.as_fd()) {
+            Ok(removed) => {
+                done.bytes = done.bytes.saturating_add(removed.bytes);
+                if removed.skipped.is_empty() {
+                    done.dirs += 1;
+                } else {
+                    done.left.push(format!(
+                        "{}: left in place (a mount, another filesystem or another user's)",
+                        at.display()
+                    ));
+                }
+            }
+            Err(e) => done.left.push(format!("{}: {e:#}", at.display())),
+        }
+    }
+    done
 }
 
 /// Default base for a run's launch scratch: `$XDG_CACHE_HOME/virtkit`, else
@@ -5779,6 +5904,105 @@ mod tests {
 
     fn compose_units(yaml: &str) -> Vec<crate::compose::Unit> {
         crate::compose::parse(yaml, Path::new("/proj"), &|_| None, None).unwrap()
+    }
+
+    /// A run takes `launch-<pid>`, locked; finding it held — a gc removing a dead run's dir of
+    /// a recycled pid — it takes a dir of its own name beside it, which the gc tells by its pid.
+    #[test]
+    fn a_held_launch_dir_is_left_to_its_holder() {
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("vk-launch-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let first = launch_dir(&base).unwrap();
+        let own = base.join(format!("launch-{}", std::process::id()));
+        assert_eq!(first.path, own);
+        drop(first);
+        std::fs::create_dir_all(&own).unwrap();
+        let held = std::fs::File::open(&own).unwrap();
+        // SAFETY: the fd is owned by `held`, open for the test.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let other = launch_dir(&base).unwrap();
+        let name = other
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            name.starts_with(&format!("launch-{}-", std::process::id())),
+            "{name}"
+        );
+        assert!(own.is_dir(), "the held dir is its holder's");
+        drop(other);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dead run's launch dir goes; one whose pid lives, whose lock is held, that changed
+    /// within the grace, or that is a symlink stays, as does a name that is not a launch dir.
+    #[test]
+    fn only_dead_launch_dirs_are_collected() {
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("vk-launch-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Pids that are gone: children already reaped.
+        let dead_pid = || {
+            let mut child = Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        let launch = |pid: u32| {
+            let dir = base.join(format!("launch-{pid}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("root.qcow2.tmp"), vec![1u8; 8192]).unwrap();
+            std::fs::File::open(dir.join("root.qcow2.tmp"))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            std::fs::File::open(&dir)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            dir
+        };
+        let dead = launch(dead_pid());
+        let live = launch(std::process::id());
+        let held = launch(dead_pid());
+        let holder = std::fs::File::open(&held).unwrap();
+        // SAFETY: the fd is owned by `holder`, open for the test.
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let fresh = base.join(format!("launch-{}", dead_pid()));
+        std::fs::create_dir_all(&fresh).unwrap();
+        let other = base.join("launch-notapid");
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let linked = base.join(format!("launch-{}", dead_pid()));
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        let dry = dead_launch_dirs_in(&base, DEAD_LAUNCH_GRACE, true);
+        assert_eq!(dry.dirs, 1);
+        assert!(dry.bytes >= 8192, "{}", dry.bytes);
+        assert!(dead.is_dir(), "a dry run removes nothing");
+        let real = dead_launch_dirs_in(&base, DEAD_LAUNCH_GRACE, false);
+        assert_eq!((real.dirs, real.left.len()), (1, 0));
+        assert!(!dead.exists());
+        for kept in [&live, &held, &fresh, &other, &linked] {
+            assert!(kept.symlink_metadata().is_ok(), "{}", kept.display());
+        }
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A value with newlines, tabs or any UTF-8 goes to the guest whole, in the boot config

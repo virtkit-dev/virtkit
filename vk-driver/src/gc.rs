@@ -34,6 +34,10 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     if let Ok(crate::build::CacheStore::Dir(dir)) = &store {
         roots.push(dir);
     }
+    let scratch = crate::run::default_scratch_base();
+    if let Ok(base) = &scratch {
+        roots.push(base);
+    }
     let mut sum = Summary::new(req.dry_run, &roots);
 
     let mut images = crate::image::Evicted::default();
@@ -88,6 +92,17 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     );
     sum.kept.extend(trees.left);
     build_cache(cfg, store, req, &mut sum);
+    let launches = crate::run::collect_dead_launch_dirs(req.dry_run);
+    if let Ok(base) = &scratch {
+        sum.row(
+            "launch dirs",
+            launches.dirs,
+            launches.bytes,
+            base,
+            "left by runs killed by a signal".into(),
+        );
+    }
+    sum.kept.extend(launches.left);
     if let Some((dir, releases, bytes)) = crate::toolchain::cache_usage()
         && releases > 0
     {

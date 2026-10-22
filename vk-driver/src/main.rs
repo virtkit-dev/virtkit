@@ -824,8 +824,9 @@ enum Cmd {
     /// chunks and the staging dirs of builds that died — the bases and checkouts once idle
     /// past the threshold. Collects the local build cache: entries unused past `[gc]
     /// build_cache_retention_days`, then the least recently used until it fits `[gc]
-    /// build_cache_max`, never one a running build reads. Then prints one summary: what each
-    /// category freed, what was kept and why, and the free space before and after.
+    /// build_cache_max`, never one a running build reads. Removes the scratch dirs of runs
+    /// killed by a signal. Then prints one summary: what each category freed, what was kept and
+    /// why, and the free space before and after.
     #[command(display_order = 4)]
     Gc {
         /// Idle threshold in seconds; `0` reclaims every entry not currently in use
