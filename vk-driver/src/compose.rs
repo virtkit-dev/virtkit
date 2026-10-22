@@ -564,12 +564,18 @@ pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
 /// committed file. `builtins` additionally answers the reserved `${VK_*}` names (see
 /// [`Builtins`]); `None` makes any reference to one an error.
 pub fn load(path: &Path, builtins: Option<&Builtins>) -> Result<Vec<Unit>> {
-    let mut units = load_with_env(path, &|name| std::env::var(name).ok(), builtins)?;
+    Ok(load_text(path, builtins)?.0)
+}
+
+/// Like [`load`], also returning the text it parsed, for a caller that records what it read.
+pub fn load_text(path: &Path, builtins: Option<&Builtins>) -> Result<(Vec<Unit>, String)> {
+    let raw = read_compose(path)?;
+    let mut units = parse_with_env(&raw, path, &|name| std::env::var(name).ok(), builtins)?;
     // The file is the caller's own, so its `env_file` paths need no vetting.
     for unit in &mut units {
         resolve_env_files(unit)?;
     }
-    Ok(units)
+    Ok((units, raw))
 }
 
 /// Like `load`, but the caller supplies how a `${VAR}` name resolves against the *ambient*
@@ -585,8 +591,20 @@ pub fn load_with_env(
     ambient: &dyn Fn(&str) -> Option<String>,
     builtins: Option<&Builtins>,
 ) -> Result<Vec<Unit>> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_with_env(&read_compose(path)?, path, ambient, builtins)
+}
+
+fn read_compose(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// [`load_with_env`] over `raw`, the text of the compose file at `path`.
+fn parse_with_env(
+    raw: &str,
+    path: &Path,
+    ambient: &dyn Fn(&str) -> Option<String>,
+    builtins: Option<&Builtins>,
+) -> Result<Vec<Unit>> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let dotenv = load_dotenv(base)?;
     // Reject collisions instead of silently ignoring the user's value or letting it redirect
@@ -617,7 +635,7 @@ pub fn load_with_env(
                 .map(|(_, v)| v.clone())
         })
     };
-    parse(&raw, base, &resolve, builtins).with_context(|| format!("in {}", path.display()))
+    parse(raw, base, &resolve, builtins).with_context(|| format!("in {}", path.display()))
 }
 
 /// Load `KEY=VALUE` pairs from a `.env` beside the compose file — docker-compose's
@@ -928,7 +946,7 @@ fn plain_error(e: serde_saphyr::Error) -> anyhow::Error {
 /// A YAML value tree. Numbers with a leading zero or an `_`, or too large for 64 bits,
 /// keep their source text as strings, so `UMASK: 0022` keeps its zeros. So does a boolean
 /// in a case YAML 1.2 does not define (`tRuE`).
-fn yaml_value(yaml: &str) -> Result<serde_json::Value> {
+pub(crate) fn yaml_value(yaml: &str) -> Result<serde_json::Value> {
     Ok(yaml_node(yaml)?.into_json(yaml, None))
 }
 
@@ -5071,6 +5089,20 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(u2.volumes.len(), 1);
+    }
+
+    #[test]
+    fn load_text_returns_the_text_it_parsed() {
+        let dir = std::env::temp_dir().join(format!("vk-loadtext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = "# kept as written\nservices:\n  app:\n    image: debian\n";
+        std::fs::write(dir.join("compose.yml"), text).unwrap();
+        let (units, read) = load_text(&dir.join("compose.yml"), None).unwrap();
+        assert_eq!(read, text);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "app");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

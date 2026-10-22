@@ -227,7 +227,9 @@ pub(super) fn left_behind(
     if running != Some(left.vm) {
         return None;
     }
-    if left.digest == digest || applied_on_attach(&drift(&left.manifest, manifest)) {
+    if same_config(&left.digest, &left.manifest, digest, manifest)
+        || applied_on_attach(&drift(&left.manifest, manifest))
+    {
         Some(LeftBehind::Claim)
     } else {
         Some(LeftBehind::Drifted)
@@ -317,6 +319,41 @@ pub(super) fn try_read_identity(plan: &Plan) -> Result<Option<Identity>> {
 /// environment, a mount source, embedded in a larger string or not — is fingerprinted in
 /// place, so it takes part in drift detection but never reaches a file.
 pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<(String, serde_json::Value)> {
+    let compose = compose_source(plan).map(|file| {
+        std::fs::read_to_string(file)
+            .map_or(serde_json::Value::Null, |text| compose_fingerprints(&text))
+    });
+    identity_with(plan, wrapper, compose)
+}
+
+/// Build the boot identity from its wrapper and compose snapshots. Edits after `vk run`
+/// loaded the compose file, including during guest startup, remain drift. If an earlier vk
+/// left no compose snapshot, record none (see [`same_config`]); do not read the current file.
+pub(super) fn booted_identity_of(plan: &Plan) -> Result<(String, serde_json::Value)> {
+    let compose = compose_source(plan).and_then(|_| read_compose_snapshot(plan));
+    identity_with(plan, booted_wrapper_digest(plan).as_deref(), compose)
+}
+
+/// Replace `manifest`'s compose fingerprints with `from`'s (or remove them if absent) and
+/// recompute its digest. A takeover records the boot described by the marker it claims.
+pub(super) fn with_compose_of(
+    mut manifest: serde_json::Value,
+    from: &serde_json::Value,
+) -> Result<(String, serde_json::Value)> {
+    if let Some(obj) = manifest.as_object_mut() {
+        match from.get("compose") {
+            Some(compose) => obj.insert("compose".into(), compose.clone()),
+            None => obj.remove("compose"),
+        };
+    }
+    Ok((digest_of(&manifest)?, manifest))
+}
+
+fn identity_with(
+    plan: &Plan,
+    wrapper: Option<&str>,
+    compose: Option<serde_json::Value>,
+) -> Result<(String, serde_json::Value)> {
     let mut manifest = serde_json::to_value(plan).context("serializing the plan")?;
     for scope in ["container_env", "exec_env"] {
         let Some(list) = manifest.get_mut(scope).and_then(|v| v.as_array_mut()) else {
@@ -334,6 +371,12 @@ pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<(String, serde_
         }
     }
     fingerprint_secrets(&mut manifest, &plan.secrets);
+    // `vk run --compose` reads the compose file once, at the boot: its services and top-level
+    // entries are part of what booted, though the plan names only the file. Added after the
+    // secrets are scrubbed, which have nothing to find in a fingerprint.
+    if let Some(compose) = compose {
+        manifest["compose"] = compose;
+    }
     // The host-command allowlist is policy the guest runs against, so a changed one is a
     // changed environment even though nothing in the config moved.
     if let Some(digest) = wrapper {
@@ -343,8 +386,108 @@ pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<(String, serde_
     // map in the plan is a `BTreeMap`: no crate in the graph enables
     // `serde_json/preserve_order`, which would reorder them under feature unification and
     // change every digest at once.
-    let canonical = serde_json::to_vec(&manifest).context("serializing the manifest")?;
-    Ok((sha256_hex(&canonical), manifest))
+    Ok((digest_of(&manifest)?, manifest))
+}
+
+pub(super) fn digest_of(manifest: &serde_json::Value) -> Result<String> {
+    let canonical = serde_json::to_vec(manifest).context("serializing the manifest")?;
+    Ok(sha256_hex(&canonical))
+}
+
+/// Whether the recorded identity matches `digest` and `manifest`. Ignore compose fingerprints
+/// when the recorded identity predates them, so upgrading vk does not restart every compose
+/// environment. Compose edits remain undetected until the next boot records fingerprints.
+pub(super) fn same_config(
+    recorded_digest: &str,
+    recorded: &serde_json::Value,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> bool {
+    if recorded_digest == digest {
+        return true;
+    }
+    if recorded.get("compose").is_some() {
+        return false;
+    }
+    let mut without = manifest.clone();
+    let removed = without
+        .as_object_mut()
+        .and_then(|obj| obj.remove("compose"))
+        .is_some();
+    removed && digest_of(&without).is_ok_and(|d| d == recorded_digest)
+}
+
+fn compose_source(plan: &Plan) -> Option<&Path> {
+    match &plan.source {
+        Source::Compose { file, .. } => Some(file),
+        _ => None,
+    }
+}
+
+/// `<state-dir>/compose-booted.json`: the compose fingerprints of the text a boot's `vk run`
+/// loaded (see [`write_compose_snapshot`]).
+pub(super) const COMPOSE_SNAPSHOT: &str = "compose-booted.json";
+
+/// Record the fingerprints of `text`, the compose file `vk run` has just loaded under the
+/// state dir's lock, for the boot's readying to put in the identity.
+pub(crate) fn write_compose_snapshot(path: &Path, text: &str) -> Result<()> {
+    let json = serde_json::to_vec(&compose_fingerprints(text)).context("serializing")?;
+    vk_fs::write_atomic(path, &json, 0o600)
+}
+
+/// The snapshot a boot's `vk run` left, `None` when it left none. One that cannot be read or
+/// parsed is reported and taken as none, as a boot by an earlier vk: readying still completes,
+/// and the environment's compose edits go unseen until its next boot.
+fn read_compose_snapshot(plan: &Plan) -> Option<serde_json::Value> {
+    let path = plan.state_dir.join(COMPOSE_SNAPSHOT);
+    let read = match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        read => read.map_err(anyhow::Error::from),
+    };
+    match read.and_then(|bytes| Ok(serde_json::from_slice(&bytes)?)) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            eprintln!(
+                "virtkit: warning: could not read {} ({e:#}); the environment records no \
+                 compose fingerprints, so its compose edits go unseen until its next boot",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The compose file as the identity records it: an opaque fingerprint of each top-level entry,
+/// and of each service under `services`, over the parsed, uninterpolated document. A comment,
+/// a reformat or the obsolete top-level `version` is no change; a reordered argument or an
+/// emptied list is one; no value the file holds reaches the manifest or a diff. Interpolated
+/// values (`.env`, the environment) and `env_file` contents are not part of it. Best effort: a
+/// file that cannot be read or parsed is `null`, a difference from any document — and the
+/// boot reports why.
+fn compose_fingerprints(text: &str) -> serde_json::Value {
+    let Ok(serde_json::Value::Object(doc)) = crate::compose::yaml_value(text) else {
+        return serde_json::Value::Null;
+    };
+    let print = |v: &serde_json::Value| {
+        serde_json::Value::String(sha256_hex(v.to_string())[..16].to_string())
+    };
+    doc.iter()
+        // Compose ignores it, so it says nothing about what booted.
+        .filter(|(key, _)| key.as_str() != "version")
+        .map(|(key, value)| {
+            let entry = match (key.as_str(), value) {
+                ("services", serde_json::Value::Object(services)) => serde_json::Value::Object(
+                    services
+                        .iter()
+                        .map(|(n, s)| (n.clone(), print(s)))
+                        .collect(),
+                ),
+                _ => print(value),
+            };
+            (key.clone(), entry)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 /// The environment as *materialized*, rather than as configured: the root image it booted,
@@ -524,9 +667,15 @@ pub fn plan_diff(plan: &Plan) -> Result<Option<String>> {
     let pending = "create hook will run again on the next boot\n";
     let mut out = String::new();
     if groups.is_empty() && !stale {
+        // Matched without compose fingerprints (see [`same_config`]): the digest that boot
+        // recorded is the one `vk dev status` reports, not this plan's.
+        let shown = match (recorded.manifest.get("compose"), current.get("compose")) {
+            (None, Some(_)) => &recorded.digest,
+            _ => &digest,
+        };
         out.push_str(&format!(
             "the running environment matches the plan ({})\n",
-            &digest[..12]
+            shown.chars().take(12).collect::<String>()
         ));
         if create_pending {
             out.push_str(pending);
@@ -568,18 +717,35 @@ pub(super) fn drift(
     flatten(recorded, "", &mut before);
     let mut after = std::collections::BTreeMap::new();
     flatten(current, "", &mut after);
+    // A manifest recorded before the compose fingerprints took part has none to compare (see
+    // [`same_config`]).
+    let unrecorded_compose = recorded.get("compose").is_none();
+    // A compose file that cannot be read or parsed fingerprints to `null`: that is the change,
+    // not each entry it no longer shows.
+    let unreadable = after.get("compose").is_some_and(|v| v == "null");
     let mut groups: std::collections::BTreeMap<Effect, Vec<String>> = Default::default();
     for key in before
         .keys()
         .chain(after.keys())
         .collect::<std::collections::BTreeSet<_>>()
     {
+        if unrecorded_compose && top_key(key) == "compose" {
+            continue;
+        }
         // A fingerprint stands for a value this host supplied, so the key is all a diff
         // says about it: printing the digests would say no more and read like a secret.
         let hidden =
             |v: Option<&String>| v.is_some_and(|v| v.starts_with(&format!("\"{FINGERPRINT}")));
+        // A compose fingerprint stands for a definition the manifest does not hold: which
+        // entry moved is all a diff can say.
+        let opaque = top_key(key) == "compose";
         let line = match (before.get(key), after.get(key)) {
             (Some(a), Some(b)) if a == b => continue,
+            _ if unreadable && opaque && key != "compose" => continue,
+            _ if unreadable && opaque => format!("{key}: cannot be read or parsed"),
+            (Some(_), Some(_)) if opaque => format!("{key}: changed"),
+            (Some(_), None) if opaque => format!("{key}: (removed)"),
+            (None, Some(_)) if opaque => format!("{key}: (added)"),
             _ if hidden(before.get(key)) || hidden(after.get(key)) => {
                 format!("{key}: changed (a value this host supplies)")
             }
@@ -625,13 +791,12 @@ impl Effect {
 /// Which effect a manifest key has. The manifest is the plan's JSON, so the keys are the
 /// plan's fields. Endpoints are republished and requirements rechecked on every attach;
 /// hooks run at a start and managed directories are mounted at a boot, so those two need
-/// the restart they are classified under. What only a build reads — the cache it is aimed
-/// at, the target it falls back to — is a rebuild, not a restart, and an `${localEnv:…}`
-/// that has become available since the boot is picked up by the next session along with the
-/// value it fills in.
+/// the restart they are classified under, as is the compose document, read at the boot. What
+/// only a build reads — the cache it is aimed at, the target it falls back to — is a
+/// rebuild, not a restart, and an `${localEnv:…}` that has become available since the boot
+/// is picked up by the next session along with the value it fills in.
 fn effect_of(key: &str) -> Effect {
-    let top = key.split(['.', '[']).next().unwrap_or(key);
-    match top {
+    match top_key(key) {
         "exec_env" | "vscode" | "freshness" | "config" | "environment" | "tasks" | "unresolved" => {
             Effect::Session
         }
@@ -645,6 +810,11 @@ fn effect_of(key: &str) -> Effect {
     }
 }
 
+/// The plan field a flattened manifest key belongs to.
+fn top_key(key: &str) -> &str {
+    key.split(['.', '[']).next().unwrap_or(key)
+}
+
 /// The manifest as `path -> value` leaves, so two of them compare entry by entry. Arrays of
 /// named objects (the environment scopes, the endpoints) are keyed by name, arrays of
 /// scalars (the mounts) by their value, so a reordering is not a change and an addition
@@ -655,6 +825,11 @@ fn flatten(
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match v {
+        // An empty compose `services` is a definition, as its absence is another: kept as a
+        // leaf, so the two do not compare equal.
+        serde_json::Value::Object(map) if map.is_empty() && top_key(path) == "compose" => {
+            out.insert(path.to_string(), "{}".into());
+        }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
                 let p = match path.is_empty() {
@@ -975,6 +1150,244 @@ mod tests {
             );
             assert!(applied_on_attach(&groups));
         }
+    }
+
+    /// `plan_in`'s compose file, written as `yaml`.
+    fn write_compose(plan: &Plan, yaml: &str) {
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!()
+        };
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, yaml).unwrap();
+    }
+
+    #[test]
+    fn the_compose_file_is_restart_drift_and_its_formatting_is_not() {
+        let t = scratch("compose-drift");
+        let plan = plan_in(&t.0);
+        let identity = |yaml: &str| {
+            write_compose(&plan, yaml);
+            identity_of(&plan, None).unwrap()
+        };
+        let base = "services:\n  devcontainer:\n    image: debian\n    command: [echo, a, b]\n";
+        let (digest, booted) = identity(base);
+
+        // A comment, a reformat or the obsolete `version` is the same document.
+        let (same, _) = identity(
+            "# the dev VM\nservices: {devcontainer: {command: [echo, a, b], image: debian}}\n",
+        );
+        assert_eq!(same, digest);
+        let (same, _) = identity(&format!("version: \"3.8\"\n{base}"));
+        assert_eq!(same, digest);
+
+        let restart = |after: &serde_json::Value, line: &str| {
+            let groups = drift(&booted, after);
+            assert_eq!(
+                groups.keys().collect::<Vec<_>>(),
+                [&Effect::Restart],
+                "{groups:?}"
+            );
+            assert!(
+                groups[&Effect::Restart].iter().any(|l| l == line),
+                "{groups:?}"
+            );
+        };
+        // A sibling added since the boot is unknown to the running VM's manager.
+        let (_, added) = identity(&format!("{base}  runner:\n    image: appliance\n"));
+        restart(&added, "compose.services.runner: (added)");
+        // Order, repetition and emptiness are part of a definition.
+        for edited in [
+            "command: [echo, b, a]",
+            "command: [echo, a, a, b]",
+            "command: []",
+        ] {
+            let (_, after) = identity(&base.replace("command: [echo, a, b]", edited));
+            restart(&after, "compose.services.devcontainer: changed");
+        }
+        // A new top-level entry, and a file that no longer parses.
+        let (_, volumes) = identity(&format!("{base}volumes: {{}}\n"));
+        restart(&volumes, "compose.volumes: (added)");
+        let (_, broken) = identity("services: [");
+        let groups = drift(&booted, &broken);
+        assert_eq!(
+            groups.into_iter().collect::<Vec<_>>(),
+            [(
+                Effect::Restart,
+                vec!["compose: cannot be read or parsed".to_string()]
+            )]
+        );
+        // An emptied `services` is not the same as none.
+        let (_, none) = identity("volumes: {}\n");
+        let (_, empty) = identity("volumes: {}\nservices: {}\n");
+        let lines: Vec<String> = drift(&none, &empty).into_values().flatten().collect();
+        assert_eq!(lines, ["compose.services: (added)"]);
+    }
+
+    #[test]
+    fn an_edited_anchor_is_drift_for_the_service_that_merges_it() {
+        let t = scratch("compose-anchor");
+        let plan = plan_in(&t.0);
+        let identity = |image: &str| {
+            write_compose(
+                &plan,
+                &format!(
+                    "x-base: &b\n  image: {image}\nservices:\n  app:\n    <<: *b\n    \
+                     command: [true]\n"
+                ),
+            );
+            identity_of(&plan, None).unwrap().1
+        };
+        let lines: Vec<String> = drift(&identity("debian"), &identity("ubuntu"))
+            .into_values()
+            .flatten()
+            .collect();
+        assert_eq!(
+            lines,
+            ["compose.services.app: changed", "compose.x-base: changed"]
+        );
+    }
+
+    #[test]
+    fn the_compose_fingerprints_record_no_value_of_the_file() {
+        let t = scratch("compose-secret");
+        let plan = plan_in(&t.0);
+        write_compose(
+            &plan,
+            "services:\n  db:\n    environment:\n      PASSWORD: s3cret\n      TOKEN: ${TOKEN:-d3fault}\n",
+        );
+        let (_, manifest) = identity_of(&plan, None).unwrap();
+        let text = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !text.contains("s3cret") && !text.contains("d3fault"),
+            "{text}"
+        );
+        assert!(manifest["compose"]["services"]["db"].is_string(), "{text}");
+    }
+
+    #[test]
+    fn readying_records_the_compose_text_the_boot_loaded_not_the_file_now() {
+        let t = scratch("compose-snapshot");
+        let plan = plan_in(&t.0);
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let loaded = "services:\n  devcontainer:\n    image: debian\n";
+        write_compose(&plan, loaded);
+        let (booted, _) = identity_of(&plan, None).unwrap();
+        // What `vk run` writes from the text it loaded.
+        write_compose_snapshot(&plan.state_dir.join(COMPOSE_SNAPSHOT), loaded).unwrap();
+        // Edited while the guest was coming up.
+        write_compose(&plan, "services:\n  devcontainer:\n    image: ubuntu\n");
+        let (recorded, manifest) = booted_identity_of(&plan).unwrap();
+        assert_eq!(recorded, booted);
+        let (now, current) = identity_of(&plan, None).unwrap();
+        assert!(!same_config(&recorded, &manifest, &now, &current));
+
+        // A boot that left no snapshot — an earlier vk's — records none, not the file now;
+        // nor does one whose snapshot is unreadable.
+        std::fs::write(plan.state_dir.join(COMPOSE_SNAPSHOT), "{").unwrap();
+        let (_, corrupt) = booted_identity_of(&plan).unwrap();
+        assert!(corrupt.get("compose").is_none(), "{corrupt}");
+        std::fs::remove_file(plan.state_dir.join(COMPOSE_SNAPSHOT)).unwrap();
+        let (_, unknown) = booted_identity_of(&plan).unwrap();
+        assert!(unknown.get("compose").is_none(), "{unknown}");
+    }
+
+    #[test]
+    fn a_takeover_records_the_compose_baseline_of_the_boot_it_claims() {
+        let t = scratch("compose-claim");
+        let plan = plan_in(&t.0);
+        write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
+        let (_, claimed) = identity_of(&plan, None).unwrap();
+        write_compose(&plan, "services:\n  devcontainer:\n    image: ubuntu\n");
+        let (_, now) = identity_of(&plan, None).unwrap();
+        let (digest, manifest) = with_compose_of(now.clone(), &claimed).unwrap();
+        assert_eq!(manifest["compose"], claimed["compose"]);
+        assert_eq!(digest, digest_of(&manifest).unwrap());
+        // A marker from an earlier vk says nothing about it: neither does the takeover.
+        let mut legacy = claimed.clone();
+        legacy.as_object_mut().unwrap().remove("compose");
+        let (_, manifest) = with_compose_of(now, &legacy).unwrap();
+        assert!(manifest.get("compose").is_none(), "{manifest}");
+    }
+
+    #[test]
+    fn an_identity_recorded_without_compose_fingerprints_is_not_drift_for_them() {
+        let t = scratch("compose-unrecorded");
+        let plan = plan_in(&t.0);
+        write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
+        let (digest, current) = identity_of(&plan, None).unwrap();
+        // What a vk from before the compose fingerprints took part recorded for this config.
+        let mut older = current.clone();
+        older.as_object_mut().unwrap().remove("compose");
+        let older_digest = digest_of(&older).unwrap();
+        assert!(same_config(&older_digest, &older, &digest, &current));
+        assert!(drift(&older, &current).is_empty());
+        // Anything else that moved still counts.
+        let mut restart = plan.clone();
+        restart.mem = Some("16G".into());
+        let (moved_digest, moved) = identity_of(&restart, None).unwrap();
+        assert!(!same_config(&older_digest, &older, &moved_digest, &moved));
+        assert_eq!(
+            drift(&older, &moved).keys().collect::<Vec<_>>(),
+            [&Effect::Restart]
+        );
+        // A manifest that does record them is held to its digest.
+        assert!(!same_config(&"x".repeat(64), &current, &digest, &current));
+        // A marker an earlier vk left is taken over as one recording them would be.
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let left = NotReady {
+            digest: older_digest,
+            manifest: older,
+            ..left_for(&plan, vm)
+        };
+        assert_eq!(
+            left_behind(&left, Some(vm), &digest, &current),
+            Some(LeftBehind::Claim)
+        );
+    }
+
+    /// A diff against an identity an earlier vk recorded names the digest that boot recorded,
+    /// as `vk dev status` does, not this plan's.
+    #[test]
+    fn a_diff_against_an_identity_without_compose_fingerprints_names_its_digest() {
+        const CHILD: &str = "VK_TEST_DIFF_UNRECORDED_COMPOSE";
+        let Some(tmp) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let tmp = scratch("diff-unrecorded-compose");
+            crate::dev::testutil::in_child(
+                "dev::identity::tests::\
+                 a_diff_against_an_identity_without_compose_fingerprints_names_its_digest",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let (digest, mut manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        manifest.as_object_mut().unwrap().remove("compose");
+        let older = digest_of(&manifest).unwrap();
+        assert_ne!(older, digest);
+        let identity = Identity {
+            digest: older.clone(),
+            booted_secs: 1000,
+            created_by: String::new(),
+            generation: String::new(),
+            manifest,
+            storage_backings: None,
+            readied_by_its_boot: true,
+        };
+        write_identity(&plan, &identity).unwrap();
+        let out = plan_diff(&plan).unwrap().unwrap();
+        assert!(
+            out.starts_with(&format!(
+                "the running environment matches the plan ({})\n",
+                &older[..12]
+            )),
+            "{out}"
+        );
     }
 
     #[test]

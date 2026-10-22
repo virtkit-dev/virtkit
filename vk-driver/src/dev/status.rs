@@ -12,7 +12,7 @@ use super::boot::{alias, worktree_git_dir};
 use super::hooks::{check_requirements, stamped};
 use super::identity::{
     LeftBehind, NotReady, VmTie, applied_on_attach, drift, generation_of, identity_of, left_behind,
-    read_identity, read_not_ready, root_identity, wrapper_digest,
+    read_identity, read_not_ready, root_identity, same_config, wrapper_digest,
 };
 use super::session::running_vm;
 
@@ -137,7 +137,9 @@ pub fn status(plan: &Plan) -> Result<Status> {
             .as_ref()
             .map(|(left, _)| (&left.digest, &left.manifest)));
     let config_state = vm.as_ref().map(|_| match booted {
-        Some((digest, _)) if *digest == current_digest => ConfigState::Matches,
+        Some((digest, booted)) if same_config(digest, booted, &current_digest, &manifest) => {
+            ConfigState::Matches
+        }
         // What `up` applies to a running environment is not drift worth a restart.
         Some((_, booted)) if applied_on_attach(&drift(booted, &manifest)) => {
             ConfigState::SessionOnly
@@ -764,6 +766,48 @@ mod tests {
         let s = status(&plan).unwrap();
         assert_eq!(s.config_state, Some(ConfigState::Drifted));
         assert!(s.render().contains("DRIFTED: booted from aaaaaaaaaaaa"));
+    }
+
+    /// An identity an earlier vk recorded, without compose fingerprints, matches the config it
+    /// was booted from, and the compose edits it cannot see do not change that.
+    #[test]
+    fn an_identity_without_compose_fingerprints_matches_its_config() {
+        const CHILD: &str = "VK_TEST_STATUS_UNRECORDED_COMPOSE";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("status-unrecorded-compose");
+            crate::dev::testutil::in_child(
+                "dev::status::tests::an_identity_without_compose_fingerprints_matches_its_config",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!()
+        };
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "services:\n  devcontainer:\n    image: debian\n").unwrap();
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let (_, mut manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        manifest.as_object_mut().unwrap().remove("compose");
+        let digest = crate::dev::identity::digest_of(&manifest).unwrap();
+        let identity = crate::dev::Identity {
+            digest: digest.clone(),
+            booted_secs: 1000,
+            created_by: String::new(),
+            generation: String::new(),
+            manifest,
+            storage_backings: None,
+            readied_by_its_boot: true,
+        };
+        crate::dev::identity::write_identity(&plan, &identity).unwrap();
+        for compose in ["image: debian", "image: ubuntu"] {
+            std::fs::write(file, format!("services:\n  devcontainer:\n    {compose}\n")).unwrap();
+            let s = status(&plan).unwrap();
+            assert_eq!(s.config_state, Some(ConfigState::Matches), "{compose}");
+            assert_eq!(s.booted_digest.as_deref(), Some(digest.as_str()));
+        }
     }
 
     #[test]

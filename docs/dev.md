@@ -291,7 +291,12 @@ vk dev refresh
 
 The diff classifies changes as requiring a new session, a host-side step, a
 restart or an image rebuild. It compares the resolved plan with the boot record;
-it is not a watcher of every file in the build context. Use `refresh` after
+it is not a watcher of every file in the build context. For a compose source, the
+record fingerprints each service and top-level entry as read at boot, before
+interpolation. Adding, removing or editing one requires a restart: the running
+services use the definitions read at boot. Comments, formatting, the obsolete
+top-level `version` and values supplied only by `.env`, the environment or an
+`env_file` do not count. Use `refresh` after
 changing Dockerfile contents or when you explicitly want a rebuild even though
 the configuration still matches.
 

@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk dev` detects compose changes since boot**: added, removed or changed services and
+  top-level entries now require a restart in `vk dev status` and `vk dev plan --diff`.
+  The next `vk dev up`, `exec`, `shell` or `code` applies its freshness policy. Comments,
+  formatting and the top-level `version` do not count. Environments booted by an earlier
+  vk gain this check on their next boot.
+
 ## [0.94.0] - 2026-10-22
 
 ### Added

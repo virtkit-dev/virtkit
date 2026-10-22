@@ -450,6 +450,10 @@ pub struct RunArgs {
     /// force every host-exec command through this program (`serve --exec-wrapper`),
     /// e.g. an allowlist dispatcher
     pub host_exec_wrapper: Option<PathBuf>,
+    /// write the compose file's identity fingerprints here, from the text this run loads,
+    /// once it holds the state dir (`vk dev`'s boot record; see `dev::identity`). Only a run
+    /// with a primary writes it: a services-only compose run is no `vk dev` boot
+    pub compose_snapshot: Option<PathBuf>,
     /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
     pub host_exec_env: Vec<String>,
     /// give a compose run's primary no `vk-agent exec --service` into its services
@@ -543,6 +547,7 @@ impl Default for RunArgs {
             env: Vec::new(),
             host_exec: false,
             host_exec_wrapper: None,
+            compose_snapshot: None,
             host_exec_env: Vec::new(),
             no_service_exec: false,
             require_cached: false,
@@ -1505,11 +1510,7 @@ async fn build_and_boot(
     // rendered when the run finishes. A `-f` Dockerfile build reports its own breakdown
     // separately (via the build pipeline).
     let timings = Timings::new();
-    // Supply run-specific `${VK_*}` values without storing host paths in the compose file.
-    let mut compose_units: Vec<crate::compose::Unit> = match &args.compose {
-        Some(p) => crate::compose::load(p, Some(&compose_builtins(args, work)?))?,
-        None => Vec::new(),
-    };
+    let mut compose_units = load_compose(args, work)?;
     apply_service_overrides(
         &mut compose_units,
         &args.service_cpus,
@@ -3744,6 +3745,20 @@ fn compose_builtins(args: &RunArgs, work: &Path) -> Result<crate::compose::Built
         builtins.persist_anchor = Some(work.to_path_buf());
     }
     Ok(builtins)
+}
+
+/// The services of a run's compose file, none without one, writing the snapshot
+/// [`RunArgs::compose_snapshot`] asks for from the text loaded.
+fn load_compose(args: &RunArgs, work: &Path) -> Result<Vec<crate::compose::Unit>> {
+    let Some(p) = &args.compose else {
+        return Ok(Vec::new());
+    };
+    // Supply run-specific `${VK_*}` values without storing host paths in the compose file.
+    let (units, text) = crate::compose::load_text(p, Some(&compose_builtins(args, work)?))?;
+    if let Some(snapshot) = &args.compose_snapshot {
+        crate::dev::write_compose_snapshot(snapshot, &text)?;
+    }
+    Ok(units)
 }
 
 /// `vk run --compose` with no primary — compose up: boot the enabled services
@@ -6248,6 +6263,29 @@ mod tests {
     }
 
     #[test]
+    fn a_compose_load_writes_the_snapshot_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let compose = dir.join("compose.yml");
+        std::fs::write(&compose, "services:\n  app:\n    image: debian\n").unwrap();
+        let snapshot = dir.join("snapshot.json");
+        let mut args = RunArgs {
+            compose: Some(compose),
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        assert_eq!(load_compose(&args, &dir).unwrap().len(), 1);
+        assert!(!snapshot.exists());
+        args.compose_snapshot = Some(snapshot.clone());
+        assert_eq!(load_compose(&args, &dir).unwrap().len(), 1);
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+        assert!(written["services"]["app"].is_string(), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn compose_up_registers_no_primary() {
         let units = compose_units("services:\n  web:\n    image: b\n");
         let hosts = primary_hosts(&units, None, &[("web", "192.168.127.254")], None);
@@ -7836,6 +7874,7 @@ mod tests {
             "dev.json",
             "Egress.json",
             "host-exec-wrapper",
+            "compose-booted.json",
             "not-ready.lock",
             "ssh-agent-allow",
             // a casefold directory's Unicode folding could take it for `svc-db`

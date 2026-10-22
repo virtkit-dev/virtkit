@@ -3803,6 +3803,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             env: extra_env,
             host_exec: *host_exec,
             host_exec_wrapper: host_exec_wrapper.clone(),
+            compose_snapshot: None,
             host_exec_env: host_exec_env.clone(),
             no_service_exec: *no_service_exec,
             require_cached: *require_cached,

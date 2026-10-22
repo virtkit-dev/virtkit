@@ -306,6 +306,8 @@ pub(crate) const DEV_CONTROL_ENTRIES: &[&str] = &[
     "dev.json",
     "lifecycle",
     "host-exec-wrapper",
+    // the compose fingerprints the identity records
+    super::identity::COMPOSE_SNAPSHOT,
     "boot.log",
     // the allowlist the switch follows: a guest that could write it would choose its own
     EGRESS_FILE,

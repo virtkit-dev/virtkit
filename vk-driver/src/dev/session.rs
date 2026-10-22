@@ -11,8 +11,8 @@ use crate::dev::plan::{Plan, Source};
 use super::boot::{alias, take_transition};
 use super::hooks::run_start_hooks;
 use super::identity::{
-    NotReady, Readier, VmTie, booted_wrapper_digest, claimed_for_me, drop_own_not_ready,
-    generation_of, identity_of, mark_own_not_ready, own_version, read_identity, root_identity,
+    NotReady, Readier, VmTie, booted_identity_of, claimed_for_me, drop_own_not_ready,
+    generation_of, mark_own_not_ready, own_version, read_identity, root_identity, with_compose_of,
     write_identity,
 };
 use super::{Identity, Transition};
@@ -112,7 +112,7 @@ struct Readying {
 /// than take over a readying still under way.
 fn begin_readying(plan: &Plan) -> Result<Readying> {
     let booted = running_vm(plan).map(|vm| VmTie::of(&vm));
-    let (digest, manifest) = identity_of(plan, booted_wrapper_digest(plan).as_deref())?;
+    let (digest, manifest) = booted_identity_of(plan)?;
     let mut readying = Readying {
         booted,
         booted_secs: crate::vms::unix_now(),
@@ -125,6 +125,16 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
         if let Some(claimed) = own.filter(|l| l.vm == vm) {
             readying.booted_secs = claimed.booted_secs;
             readying.claimed = true;
+            // The boot is the claimed one: record the compose file it read, or that its
+            // marker does not say, rather than this parent's snapshot. Only serializing a
+            // `Value` can fail here, which it does not; were it to, the snapshot read above,
+            // which that boot's `vk run` left in the same state dir, stands.
+            if let Ok((digest, manifest)) =
+                with_compose_of(readying.manifest.clone(), &claimed.manifest)
+            {
+                readying.digest = digest;
+                readying.manifest = manifest;
+            }
         }
         Some(NotReady {
             vm,
@@ -956,7 +966,7 @@ fn vm_at(state_dir: &Path) -> Option<crate::vms::VmEntry> {
 mod tests {
     use super::*;
     use crate::dev::boot::ensure_state_dir;
-    use crate::dev::identity::{mark_not_ready, read_not_ready};
+    use crate::dev::identity::{COMPOSE_SNAPSHOT, identity_of, mark_not_ready, read_not_ready};
     use crate::dev::plan::EnvVar;
     use crate::dev::testutil::{env_guard, plan_in, scratch};
 
@@ -1206,6 +1216,14 @@ mod tests {
             .state_dir
             .join(format!(".transition.{}", std::process::id()));
         let booted = format!("booted 31337 {}\n", crate::detach::boot_nonce());
+        // The compose file the boot's `vk run` loaded, and the fingerprints it left.
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!()
+        };
+        let text = "services:\n  devcontainer:\n    image: debian\n";
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+        crate::dev::write_compose_snapshot(&plan.state_dir.join(COMPOSE_SNAPSHOT), text).unwrap();
 
         // No note: whatever is running was not booted by this invocation, so its recorded
         // identity is left exactly as it is.

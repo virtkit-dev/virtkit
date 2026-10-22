@@ -12,9 +12,9 @@ use crate::dev::plan::{Plan, Source};
 
 use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
-    LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready, clear_not_ready, drift,
-    identity_of, identity_path, left_behind, live_identity, note_older_creator, read_not_ready,
-    sha256_hex, try_read_identity,
+    COMPOSE_SNAPSHOT, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
+    clear_not_ready, drift, identity_of, identity_path, left_behind, live_identity,
+    note_older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
@@ -792,6 +792,14 @@ fn short(digest: &str) -> String {
     digest.chars().take(12).collect()
 }
 
+/// Where a boot's `vk run` records the compose file it loads, for a compose source only.
+/// Fingerprinted by `vk run` from the text it loads, once it holds the state dir, so neither
+/// an edit racing the boot nor a competing boot that loses the lock decides what readying
+/// records. A snapshot it cannot write aborts the boot.
+fn compose_snapshot(plan: &Plan) -> Option<PathBuf> {
+    matches!(plan.source, Source::Compose { .. }).then(|| plan.state_dir.join(COMPOSE_SNAPSHOT))
+}
+
 /// Config identity from [`identity_of`], used to judge running or left-behind environments.
 #[derive(Debug, Clone, Copy)]
 struct Wanted<'a> {
@@ -814,7 +822,12 @@ enum Serves {
 
 /// Whether `running` serves `wanted` without a restart.
 fn serves(running: &Identity, wanted: Wanted<'_>) -> Serves {
-    if running.digest == wanted.digest {
+    if same_config(
+        &running.digest,
+        &running.manifest,
+        wanted.digest,
+        wanted.manifest,
+    ) {
         Serves::Same
     } else if applied_on_attach(&drift(&running.manifest, wanted.manifest)) {
         Serves::OnAttach
@@ -872,6 +885,10 @@ fn live_decision(
 ) -> Result<Live> {
     match refresh {
         Refresh::No => {}
+        // The digest itself, not [`same_config`]: a boot by this vk records the compose
+        // fingerprints of what it loaded, so a file edited since reads as another config, and
+        // one by an earlier vk records none, which says nothing of what it read — either way
+        // the refresh restarts it.
         Refresh::Joined
             if running.readied_by_its_boot
                 && running.digest == wanted.digest
@@ -1111,6 +1128,9 @@ pub async fn boot(
     // joiner takes for this one.
     let _ = std::fs::remove_file(identity_path(plan));
     clear_not_ready(plan);
+    // Remove the previous boot's compose snapshot too: this boot's `vk run` writes its own,
+    // and a leftover one would speak for a boot that wrote none.
+    let _ = std::fs::remove_file(plan.state_dir.join(COMPOSE_SNAPSHOT));
     // Remove any previous boot's allowlist on an unrestricted boot. A leftover file is
     // harmless: attaching rewrites it only when the recorded identity is restricted.
     if plan.egress.is_none() {
@@ -1123,6 +1143,7 @@ pub async fn boot(
         cfg,
         CheckoutMode::Shared,
     )?;
+    args.compose_snapshot = compose_snapshot(plan);
     // Resolve `[dev.ssh]` here using the host agent and $HOME: forward the whole agent or
     // whitelisted keys and inject a matching guest ~/.ssh/config. Keep `run_args` pure so
     // builds and tasks that reuse it neither enumerate the agent nor write files.
@@ -1947,6 +1968,15 @@ mod tests {
         assert_eq!(serves(&same, wanted), Serves::Same);
         assert_eq!(serves(&session_only, wanted), Serves::OnAttach);
         assert_eq!(serves(&drifted, wanted), Serves::NeedsRestart);
+        // An identity a vk recorded before the compose fingerprints took part, as running
+        // environments carry it across an upgrade: another digest, but the same config.
+        let mut older = manifest.clone();
+        older.as_object_mut().unwrap().remove("compose");
+        let older_digest = crate::dev::identity::digest_of(&older).unwrap();
+        assert_eq!(
+            serves(&recorded(&older_digest, older), wanted),
+            Serves::Same
+        );
         assert_eq!(
             live_decision(&same, wanted, Refresh::No, unasked, never).unwrap(),
             Live::Current {
@@ -2017,6 +2047,60 @@ mod tests {
         }
         let refusal = readied_elsewhere(&drifted, &digest);
         assert!(refusal.contains("booted aaaaaaaaaaaa, now "), "{refusal}");
+    }
+
+    #[test]
+    fn only_a_compose_source_snapshots_its_compose_file() {
+        let t = scratch("compose-snapshot-arg");
+        let mut plan = plan_in(&t.0);
+        assert_eq!(
+            compose_snapshot(&plan),
+            Some(plan.state_dir.join(COMPOSE_SNAPSHOT))
+        );
+        plan.source = Source::Image {
+            reference: "debian:13".into(),
+        };
+        assert_eq!(compose_snapshot(&plan), None);
+    }
+
+    #[test]
+    fn a_refresh_restarts_a_joined_boot_that_loaded_another_compose_file() {
+        let t = scratch("live-joined-compose");
+        let plan = plan_in(&t.0);
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!()
+        };
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "services:\n  devcontainer:\n    image: debian\n").unwrap();
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let joined = recorded(&digest, manifest);
+        // Edited after the joined boot's `vk run` loaded it.
+        std::fs::write(file, "services:\n  devcontainer:\n    image: ubuntu\n").unwrap();
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
+        let never = || -> Result<Drifted> { panic!("the policy was consulted") };
+        assert_eq!(
+            live_decision(&joined, wanted, Refresh::Joined, || true, never).unwrap(),
+            Live::Decided(Drifted::Restart)
+        );
+        // A boot by an earlier vk recorded no fingerprints: `up` attaches to it, but a
+        // refresh cannot know it booted this file.
+        let mut older = manifest.clone();
+        older.as_object_mut().unwrap().remove("compose");
+        let older = recorded(&crate::dev::identity::digest_of(&older).unwrap(), older);
+        assert_eq!(
+            live_decision(&older, wanted, Refresh::Joined, || true, never).unwrap(),
+            Live::Decided(Drifted::Restart)
+        );
+        assert_eq!(
+            live_decision(&older, wanted, Refresh::No, || true, never).unwrap(),
+            Live::Current {
+                session_only: false
+            }
+        );
     }
 
     /// Waiting for another boot gives the same decision as finding it ready on arrival, except
