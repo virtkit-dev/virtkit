@@ -45,6 +45,7 @@ mod ext4;
 mod ext4_read;
 mod files;
 mod fullvm;
+mod gc;
 mod health;
 mod hostpolicy;
 mod image;
@@ -816,12 +817,13 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
-    /// Reclaim the host caches — a cron or manual sweep
+    /// Reclaim what virtkit can recreate and nothing is using
     ///
     /// Evicts materialized bases (`<state_dir>/{registry, docker, build}`) no VM is using,
     /// removes GitLab host checkouts no job is using, and drops unreferenced registry
-    /// chunks — all of them idle past the threshold. Reclaim otherwise happens as those
-    /// caches are used, so this is for an otherwise-idle runner.
+    /// chunks and the staging dirs of builds that died — the bases and checkouts once idle
+    /// past the threshold. Then prints one summary: what each category freed, what was kept
+    /// and why, and the free space before and after.
     #[command(display_order = 4)]
     Gc {
         /// Idle threshold in seconds; `0` reclaims every entry not currently in use
@@ -830,6 +832,9 @@ enum Cmd {
         /// the config's `image_cache_idle_secs` and `checkout_cache_idle_secs` (30 min each).
         #[arg(long, value_name = "SECS")]
         idle_secs: Option<u64>,
+        /// Report what would be reclaimed without removing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print the effective host paths and where each comes from
     ///
@@ -3415,31 +3420,19 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
         return act_on_vms(target.as_deref(), |sel| vms::pause_cmd(sel, *all, req));
     }
-    if let Cmd::Gc { idle_secs } = &cli.cmd {
+    if let Cmd::Gc { idle_secs, dry_run } = &cli.cmd {
         let override_idle = idle_secs.map(std::time::Duration::from_secs);
-        let image_idle = override_idle.unwrap_or_else(|| cfg.image_cache_idle());
-        let checkout_idle = override_idle.unwrap_or_else(|| cfg.checkout_cache_idle());
         // Sweep the same state dir `vk run`/the executor cache under.
         let state_dir = match effective_state_dir(&cfg) {
             Ok(d) => d,
             Err(e) => return fail(&e, 2),
         };
-        let registry = state_dir.join("registry");
-        image::gc_idle(&registry, image_idle);
-        image::sweep_chunks(&registry);
-        image::gc_idle(&state_dir.join("docker"), image_idle);
-        image::gc_idle(&state_dir.join("build"), image_idle);
-        image::sweep_orphaned_staging(&state_dir, image::Leftovers::Name);
-        // Checkouts are the executor's alone, and the executor roots its state at
-        // `Config::state_dir()` — never the dev default `vk run` caches under, which is what
-        // `effective_state_dir` may resolve to here. Sweeping that instead would walk a tree
-        // nothing ever checks out into and silently reclaim nothing.
-        checkout::gc_idle(&cfg.checkout_root(), checkout_idle);
-        println!(
-            "virtkit: gc done (idle threshold {}s for images, {}s for checkouts)",
-            image_idle.as_secs(),
-            checkout_idle.as_secs()
-        );
+        let req = gc::Request {
+            dry_run: *dry_run,
+            image_idle: override_idle.unwrap_or_else(|| cfg.image_cache_idle()),
+            checkout_idle: override_idle.unwrap_or_else(|| cfg.checkout_cache_idle()),
+        };
+        print!("{}", gc::run(&cfg, &state_dir, &req).render());
         return ExitCode::SUCCESS;
     }
     // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).

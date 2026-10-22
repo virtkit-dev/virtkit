@@ -221,8 +221,48 @@ fn tree_at(dest: &Path, id: &Path) -> Tree {
 /// `checkout_dir` also puts this whole root in a private namespace, outside sibling trees
 /// belonging to another GitLab executor.
 pub(crate) fn gc_idle(root: &Path, idle: Duration) {
+    sweep(root, idle, Sweep::Evict);
+}
+
+/// What [`collect_idle`] reclaimed: trees and the disk space they held.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reclaimed {
+    pub(crate) trees: u64,
+    pub(crate) bytes: u64,
+    /// What a removal left in place: a mount, another filesystem, another user's entry.
+    pub(crate) left: Vec<String>,
+}
+
+/// [`gc_idle`] without naming each tree, measuring what each held instead. With `dry_run`,
+/// what it would remove, judged under the same locks and left in place.
+pub(crate) fn collect_idle(root: &Path, idle: Duration, dry_run: bool) -> Reclaimed {
+    sweep(
+        root,
+        idle,
+        if dry_run {
+            Sweep::Count
+        } else {
+            Sweep::Collect
+        },
+    )
+}
+
+/// What [`sweep`] does with a tree it may reclaim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    /// Name it and remove it.
+    Evict,
+    /// Measure it and remove it.
+    Collect,
+    /// Measure it and leave it.
+    Count,
+}
+
+fn sweep(root: &Path, idle: Duration, how: Sweep) -> Reclaimed {
     let now = SystemTime::now();
+    let mut done = Reclaimed::default();
     for (dest, s) in checkouts(root) {
+        let mut counted = false;
         crate::cachelock::try_reclaim(&s.lock, &s.used, idle, now, || {
             match tree_at(&dest, &s.id) {
                 // Not the tree this bookkeeping dates, so removing it is not ours to do — and
@@ -233,15 +273,32 @@ pub(crate) fn gc_idle(root: &Path, idle: Duration) {
                 // the same race the `NotFound` arm below covers on the far side of the check.
                 // Nothing is left to protect, so retire the markers as our own removal would.
                 Tree::Gone => {
-                    retire(&s);
+                    if how != Sweep::Count {
+                        retire(&s);
+                    }
                     return;
                 }
                 Tree::Same => {}
             }
-            println!("virtkit: evicting idle host checkout {}", dest.display());
-            let removed = match remove_tree(&dest) {
-                Ok(()) => true,
-                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            // Measured once the lock is let go.
+            if how == Sweep::Count {
+                counted = true;
+                return;
+            }
+            if how == Sweep::Evict {
+                println!("virtkit: evicting idle host checkout {}", dest.display());
+            }
+            let (removed, held) = match remove_tree_counted(&dest) {
+                Ok(Removal::Done(held)) => (true, held),
+                Ok(Removal::Left(what)) => {
+                    let what = format!("{}: left in place: {what}", dest.display());
+                    if how == Sweep::Evict {
+                        eprintln!("virtkit: evicting idle host checkout {what}");
+                    }
+                    done.left.push(what);
+                    (false, 0)
+                }
+                Err(e) => (e.kind() == std::io::ErrorKind::NotFound, 0),
             };
             // Retire the markers with the tree they date, so a slot's metadata does not
             // accumulate one file per project the runner has ever built — but only once the tree
@@ -251,8 +308,57 @@ pub(crate) fn gc_idle(root: &Path, idle: Duration) {
             // destination blocks on.
             if removed {
                 retire(&s);
+                done.trees += 1;
+                done.bytes = done.bytes.saturating_add(held);
             }
         });
+        if counted {
+            done.trees += 1;
+            // A tree that cannot be read counts as nothing.
+            let held = crate::usage::removable_bytes(&dest).unwrap_or(0);
+            done.bytes = done.bytes.saturating_add(held);
+        }
+    }
+    done
+}
+
+/// What [`remove_tree_counted`] did with a tree.
+enum Removal {
+    /// Removed it whole, freeing this much.
+    Done(u64),
+    /// Removed what it could and left these, named relative to the tree's parent: mounts,
+    /// entries on another filesystem, another user's. The tree stays a candidate.
+    Left(String),
+}
+
+/// [`remove_tree`], with what it freed: through [`vk_fs::remove_tree_in`], which counts it and
+/// enters no mount, nor another filesystem; what that leaves is reported, not removed. Only
+/// when it cannot work at all (a tree a guest left unreadable, say) does the plain removal
+/// take over, which enters mounts as it always did.
+fn remove_tree_counted(dest: &Path) -> std::io::Result<Removal> {
+    use std::os::fd::AsFd;
+    let counted = (|| -> Result<vk_fs::RemoveTree> {
+        let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+            anyhow::bail!("{} names no entry", dest.display());
+        };
+        let parent = vk_fs::open_dir(parent)?;
+        let dir = vk_fs::open_dir_in(parent.as_fd(), name)?;
+        vk_fs::remove_tree_in(parent.as_fd(), name, dir.as_fd())
+    })();
+    match counted {
+        Ok(done) if done.skipped.is_empty() => Ok(Removal::Done(done.bytes)),
+        Ok(done) => {
+            let kept: Vec<_> = done
+                .skipped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            Ok(Removal::Left(kept.join(", ")))
+        }
+        Err(_) => match std::fs::symlink_metadata(dest) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removal::Done(0)),
+            _ => remove_tree(dest).map(|()| Removal::Done(0)),
+        },
     }
 }
 
@@ -1006,6 +1112,40 @@ mod tests {
             "a shared checkout root may hold another executor's trees"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_dry_run_counts_an_idle_checkout_and_leaves_it() {
+        let root = root("dry");
+        let dest = root.join("0").join("project");
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(dest.join("file"), vec![7u8; 16 * 1024]).unwrap();
+        drop(acquire_use_lock(&dest).unwrap());
+        claim(&dest).unwrap();
+
+        // Retried, as the real pass below is, for the reason `reclaimed_eventually` documents.
+        let mut dry = Reclaimed::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            dry = collect_idle(&root, Duration::ZERO, true);
+            dry.trees == 1
+        }));
+        assert!(dry.bytes >= 16 * 1024, "{}", dry.bytes);
+        assert!(dest.join("file").is_file(), "a dry run removes nothing");
+        let mut real = Reclaimed::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            let once = collect_idle(&root, Duration::ZERO, false);
+            real.trees += once.trees;
+            real.bytes += once.bytes;
+            !dest.exists()
+        }));
+        assert_eq!(real.trees, 1);
+        assert!(
+            real.bytes.abs_diff(dry.bytes) <= 8192,
+            "{} {}",
+            real.bytes,
+            dry.bytes
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

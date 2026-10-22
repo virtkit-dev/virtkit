@@ -859,8 +859,9 @@ kernel drops both however that build ends; on a filesystem without `flock` the p
 holds. The node removes those neither lock holds and in which neither the dir nor an entry
 directly in it changed for a minute: when `vk node run` starts, every ten minutes after, at each
 `vk gitlab cleanup`, on a reset, and on `vk gc`. It logs, per tier, how many it removed and the
-space they held; it follows no symlink, enters no mount, and leaves what another user owns,
-naming such dirs on `vk gc`, a reset and the node's first sweep. The locks are local to the
+space they held (`vk gc` gives them a row of its summary); it follows no symlink, enters no
+mount, and leaves what another user owns, naming such dirs on a reset and the node's first
+sweep, and among what `vk gc` kept. The locks are local to the
 host, so a `state_dir` must not be shared between hosts. A build or pull stopped with `SIGTERM`
 (a cancelled job) while that signal is at its default action removes its staging dir itself
 before it exits.

@@ -593,6 +593,9 @@ pub(crate) struct Evicted {
     pub(crate) chunks: u64,
     /// The disk space they held.
     pub(crate) bytes: u64,
+    /// On a dry run of [`collect_idle`], the bases it would evict, for [`collect_chunks`] to
+    /// count the chunks only they reference.
+    pub(crate) would_evict: Vec<PathBuf>,
 }
 
 /// Evict every materialized base under `root` that no process is overlaying and that has
@@ -601,13 +604,7 @@ pub(crate) struct Evicted {
 /// removed through descriptors (see [`vk_fs::remove_tree_in`]): no symlink inside followed,
 /// nothing mounted inside entered, nothing another user owns removed. Best-effort.
 pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
-    let now = std::time::SystemTime::now();
-    let mut evicted = Evicted::default();
-    for base in base_dirs(root) {
-        crate::cachelock::try_reclaim(&base.join(".inuse"), &base.join(".used"), idle, now, || {
-            remove_counted(&base, &mut evicted);
-        });
-    }
+    let evicted = collect_idle(root, idle, false);
     if evicted.bases > 0 {
         println!(
             "virtkit: evicted {} idle image(s) under {}, {}",
@@ -615,6 +612,36 @@ pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
             root.display(),
             crate::usage::fmt_bytes(evicted.bytes)
         );
+    }
+    evicted
+}
+
+/// [`gc_idle`] without the report. With `dry_run`, count what it would evict and leave it: a
+/// base is judged under the same exclusive lock, then measured once the lock is let go, by the
+/// rule its removal counts by. Like a real pass, a dry one creates the `.inuse` sidecar of a
+/// base that has none, to lock it.
+pub(crate) fn collect_idle(root: &Path, idle: std::time::Duration, dry_run: bool) -> Evicted {
+    let now = std::time::SystemTime::now();
+    let mut evicted = Evicted::default();
+    for base in base_dirs(root) {
+        let judged = crate::cachelock::try_reclaim(
+            &base.join(".inuse"),
+            &base.join(".used"),
+            idle,
+            now,
+            || {
+                if !dry_run {
+                    remove_counted(&base, &mut evicted);
+                }
+            },
+        );
+        if judged && dry_run {
+            evicted.bases += 1;
+            // A tree that cannot be read counts as nothing, as its removal would fail.
+            let held = crate::usage::removable_bytes(&base).unwrap_or(0);
+            evicted.bytes = evicted.bytes.saturating_add(held);
+            evicted.would_evict.push(base);
+        }
     }
     evicted
 }
@@ -1135,8 +1162,8 @@ const TMP_SWEEP_DEPTH: usize = 64;
 
 /// Whether a sweep also names the dead dirs it left: another user's, and those a removal
 /// could not finish. They stay until someone acts on them, so only the sweeps an operator
-/// starts or reads — `vk gc`, a node reset, the node's first — name them, not every build's
-/// and job's.
+/// starts or reads — a node reset, the node's first — name them, not every build's and job's.
+/// `vk gc` lists them in its summary instead ([`collect_orphaned_staging`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leftovers {
     Name,
@@ -1209,7 +1236,7 @@ impl Swept {
 /// followed, whether to a staging dir or out of one, and nothing mounted inside one is
 /// entered. Best-effort: what cannot be read is left for the next sweep.
 pub(crate) fn sweep_orphaned_build_tmp(root: &Path, leftovers: Leftovers) -> Swept {
-    let swept = sweep_dead_tmp(root, DEAD_TMP_GRACE);
+    let swept = sweep_dead_tmp(root, DEAD_TMP_GRACE, false);
     swept.report(root, leftovers);
     swept
 }
@@ -1222,10 +1249,25 @@ pub(crate) fn sweep_orphaned_staging(state_dir: &Path, leftovers: Leftovers) {
     }
 }
 
+/// [`sweep_orphaned_build_tmp`] on both staging tiers under `state_dir`, without the report.
+/// With `dry_run`, count the dead dirs it would remove and leave them.
+pub(crate) fn collect_orphaned_staging(state_dir: &Path, dry_run: bool) -> Swept {
+    let mut all = Swept::default();
+    for tier in ["build", "docker"] {
+        let swept = sweep_dead_tmp(&state_dir.join(tier), DEAD_TMP_GRACE, dry_run);
+        all.dirs += swept.dirs;
+        all.bytes = all.bytes.saturating_add(swept.bytes);
+        all.foreign.extend(swept.foreign);
+        all.left.extend(swept.left);
+    }
+    all
+}
+
 /// [`sweep_orphaned_build_tmp`] with the grace spelled out, without the report.
-fn sweep_dead_tmp(root: &Path, grace: std::time::Duration) -> Swept {
+fn sweep_dead_tmp(root: &Path, grace: std::time::Duration, dry_run: bool) -> Swept {
     let mut sweep = TmpSweep {
         grace,
+        dry_run,
         now: std::time::SystemTime::now(),
         swept: Swept::default(),
     };
@@ -1239,6 +1281,8 @@ fn sweep_dead_tmp(root: &Path, grace: std::time::Duration) -> Swept {
 /// [`sweep_dead_tmp`]'s state across the walk.
 struct TmpSweep {
     grace: std::time::Duration,
+    /// Count the dead dirs instead of removing them.
+    dry_run: bool,
     now: std::time::SystemTime,
     swept: Swept,
 }
@@ -1281,7 +1325,7 @@ impl TmpSweep {
         name: &std::ffi::OsStr,
         at: &Path,
     ) {
-        use std::os::fd::AsFd;
+        use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::fs::MetadataExt;
 
         let Ok(dir) = vk_fs::open_dir_in(parent.as_fd(), name) else {
@@ -1315,6 +1359,15 @@ impl TmpSweep {
             return;
         }
         let swept = &mut self.swept;
+        if self.dry_run {
+            swept.dirs += 1;
+            // Through the descriptor judged, not the name; a tree that cannot be read counts as
+            // nothing, as its removal would fail.
+            let held = format!("/proc/self/fd/{}", claim.as_raw_fd());
+            let held = crate::usage::removable_bytes(Path::new(&held)).unwrap_or(0);
+            swept.bytes = swept.bytes.saturating_add(held);
+            return;
+        }
         match vk_fs::remove_tree_in(parent.as_fd(), name, dir.as_fd()) {
             Ok(done) => {
                 swept.bytes = swept.bytes.saturating_add(done.bytes);
@@ -1425,6 +1478,23 @@ pub(crate) fn sweep_chunks(registry_root: &Path) {
     if dropped > 0 {
         println!("virtkit: swept {dropped} unreferenced cache chunk file(s)");
     }
+}
+
+/// [`sweep_chunks`] without the report: the number of chunk files removed and the space they
+/// held. With `dry_run`, what it would remove, left in place, once the bases a dry
+/// [`collect_idle`] of the registry tier would evict (`would_evict`) are gone.
+pub(crate) fn collect_chunks(
+    registry_root: &Path,
+    dry_run: bool,
+    would_evict: &[PathBuf],
+) -> (u64, u64) {
+    if !dry_run {
+        let (dropped, bytes) = drop_unreferenced_chunks(registry_root);
+        return (u64::try_from(dropped).unwrap_or(u64::MAX), bytes);
+    }
+    dead_chunks(registry_root, |b| !would_evict.iter().any(|w| w == b))
+        .into_iter()
+        .fold((0, 0), |(n, b), (_, held)| (n + 1, b.saturating_add(held)))
 }
 
 /// Sweep chunks without reporting; return the number removed and the space they held.
@@ -1882,7 +1952,7 @@ mod tests {
         std::fs::write(writing.join("runner.ext4"), b"x").unwrap();
         age(&writing);
 
-        let swept = sweep_dead_tmp(&root, DEAD_TMP_GRACE);
+        let swept = sweep_dead_tmp(&root, DEAD_TMP_GRACE, false);
         assert!(!dead.exists(), "a dead staging dir must be reclaimed");
         assert_eq!(swept.dirs, 1);
         assert!(swept.bytes >= 64 * 1024, "{}", swept.bytes);
@@ -1903,7 +1973,7 @@ mod tests {
 
         drop((pull, claim));
         age(&pulling);
-        sweep_dead_tmp(&root, DEAD_TMP_GRACE);
+        sweep_dead_tmp(&root, DEAD_TMP_GRACE, false);
         assert!(!pulling.exists(), "released, the dir is dead");
         assert!(!claimed.exists(), "a dropped guard removes its own dir");
         let _ = std::fs::remove_dir_all(&root);
@@ -1930,7 +2000,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dead.join("out")).unwrap();
         age(&dead);
 
-        let swept = sweep_dead_tmp(&root, std::time::Duration::ZERO);
+        let swept = sweep_dead_tmp(&root, std::time::Duration::ZERO, false);
         assert_eq!(swept.dirs, 1);
         assert!(
             !dead.exists(),
@@ -1957,7 +2027,7 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
         std::fs::create_dir_all(&promoted).unwrap();
         std::fs::write(promoted.join("runner.ext4"), b"").unwrap();
-        sweep_dead_tmp(&root, std::time::Duration::ZERO);
+        sweep_dead_tmp(&root, std::time::Duration::ZERO, false);
         assert!(
             !orphan.exists(),
             "a nested, unlocked .tmp orphan must be reclaimed"
@@ -2467,6 +2537,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // A dry run judges a base as a real pass does and counts it the same, but leaves it; a base
+    // in use is counted by neither. Dead staging dirs likewise.
+    #[test]
+    fn dry_runs_count_what_a_real_pass_removes() {
+        use std::time::Duration;
+        let tmp = std::env::temp_dir().join(format!("vk-gc-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state = tmp.join("state");
+        let root = state.join("build");
+        let idle = root.join("idle");
+        std::fs::create_dir_all(&idle).unwrap();
+        std::fs::write(idle.join("runner.ext4"), noise(64 * 1024)).unwrap();
+        mark_used(&idle);
+        let busy = root.join("busy");
+        std::fs::create_dir_all(&busy).unwrap();
+        std::fs::write(busy.join("runner.ext4"), b"x").unwrap();
+        let _guard = acquire_use_lock_for(&state, &busy.join("runner.ext4"))
+            .unwrap()
+            .unwrap();
+        let dead = root.join("dead.tmp");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("partial"), noise(32 * 1024)).unwrap();
+        age(&dead);
+        std::fs::File::open(dead.join("partial"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+
+        // A file linked from outside the base keeps its space: counted by neither pass.
+        std::fs::write(tmp.join("outside"), noise(64 * 1024)).unwrap();
+        std::fs::hard_link(tmp.join("outside"), idle.join("linked")).unwrap();
+
+        // Retried, as the real passes below are, for the reason `reclaimed_eventually`
+        // documents: a held lock reads as a base in use.
+        let mut dry = Evicted::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            dry = collect_idle(&root, Duration::ZERO, true);
+            dry.bases == 1
+        }));
+        assert!(
+            dry.bytes >= 64 * 1024 && dry.bytes < 128 * 1024,
+            "{}",
+            dry.bytes
+        );
+        assert_eq!(dry.would_evict, vec![idle.clone()]);
+        assert!(
+            idle.join("runner.ext4").is_file(),
+            "a dry run removes nothing"
+        );
+        let mut dry_tmp = Swept::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            dry_tmp = collect_orphaned_staging(&state, true);
+            dry_tmp.dirs == 1
+        }));
+        assert!(dry_tmp.bytes >= 32 * 1024, "{}", dry_tmp.bytes);
+        assert!(dead.is_dir(), "a dry run removes nothing");
+
+        let mut real = Evicted::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            let once = collect_idle(&root, Duration::ZERO, false);
+            real.bases += once.bases;
+            real.bytes += once.bytes;
+            !idle.exists()
+        }));
+        assert_eq!(real.bases, dry.bases);
+        assert!(
+            real.bytes.abs_diff(dry.bytes) <= 8192,
+            "{} {}",
+            real.bytes,
+            dry.bytes
+        );
+        assert!(busy.is_dir(), "a base in use stays");
+        let real_tmp = collect_orphaned_staging(&state, false);
+        assert_eq!(real_tmp.dirs, dry_tmp.dirs);
+        assert!(!dead.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn gc_idle_tolerates_a_used_marker_in_the_future() {
         // The filesystem stamps `.used` from a coarse clock while `gc_idle` reads a precise
@@ -2500,6 +2652,52 @@ mod tests {
         let evict = base("evict");
         evict_eventually(&root, &evict);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A dry run counts the chunks only the bases it would evict reference, as a real pass
+    /// that evicts them and then sweeps does.
+    #[test]
+    fn a_dry_run_counts_the_chunks_of_the_bases_it_would_evict() {
+        use std::time::Duration;
+        let tmp = std::env::temp_dir().join(format!("vk-dry-chunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("registry");
+        let base = |name: &str, chunks: &str| {
+            let d = root.join(name).join("deadbeef");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("runner.ext4"), b"x").unwrap();
+            std::fs::write(d.join("chunks.list"), chunks).unwrap();
+            d
+        };
+        let idle = base("idle", "aaa\nbbb\n");
+        mark_used(&idle);
+        let busy = base("busy", "bbb\n");
+        let _guard = acquire_use_lock_for(&tmp, &busy.join("runner.ext4"))
+            .unwrap()
+            .unwrap();
+        let chunks = root.join("chunks");
+        std::fs::create_dir_all(&chunks).unwrap();
+        for c in ["aaa", "bbb"] {
+            std::fs::write(chunks.join(c), noise(8192)).unwrap();
+        }
+
+        let mut dry = Evicted::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            dry = collect_idle(&root, Duration::ZERO, true);
+            dry.bases == 1
+        }));
+        let (dry_chunks, _) = collect_chunks(&root, true, &dry.would_evict);
+        assert_eq!(dry_chunks, 1, "only the chunk no other base references");
+        assert!(chunks.join("aaa").exists());
+
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            collect_idle(&root, Duration::ZERO, false);
+            !idle.exists()
+        }));
+        let (real_chunks, _) = collect_chunks(&root, false, &[]);
+        assert_eq!(real_chunks, dry_chunks);
+        assert!(!chunks.join("aaa").exists() && chunks.join("bbb").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

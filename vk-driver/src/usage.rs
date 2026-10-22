@@ -699,6 +699,39 @@ pub(crate) fn allocated_bytes(dir: &std::path::Path) -> Option<u64> {
     Some(total)
 }
 
+/// What removing the tree at `dir` through [`vk_fs::remove_tree_in`] would free, in bytes, by
+/// its rule: every directory, `dir` itself included, and every other entry with no link left
+/// elsewhere. Symlinks are not followed, nor another device entered — what is mounted inside
+/// is neither removed nor counted. `None` when `dir` cannot be read; anything under it that
+/// goes away or cannot be read during the walk counts as nothing.
+pub(crate) fn removable_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let top = std::fs::metadata(dir).ok()?;
+    let dev = top.dev();
+    let mut total = top.blocks().saturating_mul(512);
+    let mut dirs = vec![std::fs::read_dir(dir).ok()?];
+    while let Some(entries) = dirs.pop() {
+        for entry in entries.flatten() {
+            // `DirEntry::metadata` does not traverse a symlink.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.dev() != dev {
+                continue;
+            }
+            if meta.is_dir() {
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+                if let Ok(sub) = std::fs::read_dir(entry.path()) {
+                    dirs.push(sub);
+                }
+            } else if meta.nlink() <= 1 {
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Some(total)
+}
+
 /// The memory a process tree holds *now*, in bytes — `root` and every process descending
 /// from it, which for a VM is the guest, its compose service VMs, the switch, the
 /// forwards. The live figure [`Usage::peak_rss`] deliberately is not:
