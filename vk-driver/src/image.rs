@@ -1020,8 +1020,13 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
             continue;
         };
         for e in entries.flatten() {
-            // The entry itself: a symlink is not walked into, nor another filesystem.
-            if e.metadata().is_ok_and(|m| m.is_dir() && m.dev() == dev) {
+            // The entry itself: a symlink is not walked into, nor another filesystem. The type
+            // comes from the directory listing, so the files of a tier that shares its root with
+            // the build-cache store (its blobs, by the hundred thousand) cost no stat each.
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if e.metadata().is_ok_and(|m| m.dev() == dev) {
                 stack.push(e.path());
             }
         }
@@ -2433,6 +2438,32 @@ mod tests {
         } else {
             assert!(result.unwrap() >= 64 * 1024);
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A tier root shared with the build-cache store: bases are found beside the store's
+    // files and directories, and neither a file nor a symlinked directory is taken for one.
+    #[test]
+    fn base_dirs_finds_bases_beside_store_files() {
+        let tmp = std::env::temp_dir().join(format!("vk-base-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("registry");
+        let base = root.join("img").join("d1");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("runner.ext4"), b"x").unwrap();
+        let blobs = root.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        for i in 0..8 {
+            std::fs::write(blobs.join(format!("{i:064x}")), b"blob").unwrap();
+        }
+        std::fs::write(root.join("runner.ext4.not-a-dir"), b"x").unwrap();
+        let outside = tmp.join("outside").join("d2");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("runner.ext4"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("outside"), root.join("link")).unwrap();
+
+        assert_eq!(base_dirs(&root), vec![base]);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
