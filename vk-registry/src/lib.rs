@@ -1630,9 +1630,10 @@ impl Store {
     }
 
     /// [`Store::gc`] under `policy`: tags dropped only in its repository and never one with a
-    /// kept prefix, and by age only when it sets a retention; every other repository's
-    /// manifests root the mark, tagged or not. Under [`Wait::Try`], [`GcOutcome::Busy`] while
-    /// anyone holds the store lock, a push or a pull by a build, say.
+    /// kept prefix, by age only when it sets a retention, then by size (see
+    /// [`Store::cap_tags`]); every other repository's manifests root the mark, tagged or not.
+    /// Under [`Wait::Try`], [`GcOutcome::Busy`] while anyone holds the store lock, a push or a
+    /// pull by a build, say.
     pub fn gc_with(&self, policy: &GcPolicy) -> Result<GcOutcome> {
         let _lock = match policy.wait {
             Wait::Block => self.lock_exclusive()?,
@@ -1687,7 +1688,7 @@ impl Store {
 
         // drop tags whose retention has run out (see `Retention`); the survivors'
         // manifest hexes root the mark phase.
-        let mut roots: HashSet<String> = HashSet::new();
+        let mut kept_tags: Vec<KeptTag> = Vec::new();
         for tags_dir in tags_dirs {
             let scoped = self.in_scope(policy, &tags_dir, "tags");
             for tag in root_dir_files(&tags_dir)? {
@@ -1704,6 +1705,7 @@ impl Store {
                             .iter()
                             .any(|p| n.starts_with(p.as_str()))
                     });
+                let mut by_age = false;
                 let kept = if protected {
                     true
                 } else if !is_blob_hex(hex) {
@@ -1725,17 +1727,35 @@ impl Store {
                     match manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m)) {
                         Retention::Keep => true,
                         Retention::Until(t) => now < t,
-                        Retention::Idle => retained(&tag),
+                        Retention::Idle => {
+                            by_age = true;
+                            retained(&tag)
+                        }
                     }
                 };
                 if !kept {
                     remove(&tag)?;
                     report.tags_dropped += 1;
                 } else if is_blob_hex(hex) {
-                    roots.insert(hex.to_string());
+                    let used = std::fs::metadata(&tag).and_then(|m| m.modified()).ok();
+                    kept_tags.push(KeptTag {
+                        hex: hex.to_string(),
+                        cappable: by_age,
+                        used,
+                        path: tag,
+                        dropped: false,
+                    });
                 }
             }
         }
+        if policy.max_bytes.is_some() || policy.free_bytes.is_some() {
+            self.cap_tags(policy, now, &man_dirs, &mut kept_tags, &leased, &mut report)?;
+        }
+        let mut roots: HashSet<String> = kept_tags
+            .into_iter()
+            .filter(|t| !t.dropped)
+            .map(|t| t.hex)
+            .collect();
 
         // manifest sidecars: rooted by a surviving tag, or by their own freshness
         // (digest-pinned). The rest are *candidates*, not casualties — the removal waits
@@ -1812,10 +1832,10 @@ impl Store {
                     if survivors.insert(hex.to_string()) {
                         report.blobs_leased += 1;
                     }
-                    report.bytes_leased += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+                    report.bytes_leased += disk_bytes(&blob);
                     continue;
                 }
-                report.bytes_freed += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+                report.bytes_freed += disk_bytes(&blob);
                 remove(&blob)?;
                 report.blobs_dropped += 1;
             }
@@ -1878,6 +1898,10 @@ impl Store {
                 remove(&owner)?;
             }
         }
+        // What the sweep removed, not what the size phase expected it to.
+        report.bytes_after = report
+            .bytes_before
+            .map(|b| b.saturating_sub(report.bytes_freed));
         Ok(GcOutcome::Done(report))
     }
 
@@ -1888,6 +1912,185 @@ impl Store {
             .repository
             .as_ref()
             .is_none_or(|r| dir == self.root.join("repos").join(r).join(kind))
+    }
+
+    /// The size phase of [`Store::gc_with`], after the age phase and before the mark: drop the
+    /// tags among `kept` that only age could have dropped, least recently used first, until
+    /// the blobs the pass leaves come to at most `policy.max_bytes` and the pass frees at least
+    /// `policy.free_bytes`, but never one used within `policy.min_age`. The figures are the
+    /// blob files' allocated space on disk, both storage forms. What stays whatever this drops is
+    /// counted as staying: the closure of every other tag and of the digest-pinned manifests
+    /// the mark roots, leased blobs, and unreferenced blobs still inside the grace window. A
+    /// blob shared by several dropped tags frees its bytes only with the last of them. So the
+    /// target is one the pass may fall short of; `report` says where it ended. Each manifest is
+    /// read once here, whichever tags reach it.
+    fn cap_tags(
+        &self,
+        policy: &GcPolicy,
+        now: SystemTime,
+        man_dirs: &[PathBuf],
+        kept: &mut [KeptTag],
+        leased: &HashSet<String>,
+        report: &mut GcReport,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let fresh = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_none_or(|age| age <= policy.grace)
+        };
+        // hex → (bytes on disk, of them the bytes this pass may remove once nothing marks it)
+        let mut sizes: HashMap<String, (u64, u64)> = HashMap::new();
+        for sub in ["blobs/sha256", "blobs/zstd"] {
+            for blob in root_dir_files_opt(&self.root.join(sub))? {
+                let Some(hex) = blob.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let len = std::fs::metadata(&blob)
+                    .with_context(|| format!("stat-ing {}", blob.display()))?
+                    .blocks()
+                    .saturating_mul(512);
+                let e = sizes.entry(hex.to_string()).or_default();
+                e.0 = e.0.saturating_add(len);
+                if !fresh(&blob) {
+                    e.1 = e.1.saturating_add(len);
+                }
+            }
+        }
+        let total = sizes.values().fold(0u64, |t, s| t.saturating_add(s.0));
+
+        // What stays whatever this drops: every tag it may not drop, and every manifest the
+        // mark roots by its sidecar — a fresh one, the manifest of a tag dropped here included,
+        // and another repository's.
+        let mut fixed_roots: HashSet<String> = kept
+            .iter()
+            .filter(|t| !t.cappable)
+            .map(|t| t.hex.clone())
+            .collect();
+        for man_dir in man_dirs {
+            let scoped = self.in_scope(policy, man_dir, "manifests");
+            for sidecar in root_dir_files(man_dir)? {
+                let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !scoped || self.find_blob(hex).is_some_and(|(blob, _)| fresh(&blob)) {
+                    fixed_roots.insert(hex.to_string());
+                }
+            }
+        }
+        // Every manifest any of them reaches, read once: a manifest's blobs and the manifests
+        // it lists (an index's children).
+        let mut roots = fixed_roots.clone();
+        roots.extend(kept.iter().filter(|t| t.cappable).map(|t| t.hex.clone()));
+        let mut graph: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        self.walk_manifests(&roots, true, |hex, manifest| {
+            let edges = manifest.map_or_else(Default::default, |(_, r)| {
+                (
+                    r.blobs.iter().map(|(h, _)| h.clone()).collect(),
+                    r.manifests.clone(),
+                )
+            });
+            graph.insert(hex.to_string(), edges);
+        })
+        .context("walking the manifests the size cap weighs")?;
+        let closure_of = |root: &str, into: &mut dyn FnMut(&str)| {
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut pending = vec![root];
+            while let Some(hex) = pending.pop() {
+                if !seen.insert(hex) {
+                    continue;
+                }
+                into(hex);
+                if let Some((blobs, children)) = graph.get(hex) {
+                    for b in blobs {
+                        into(b);
+                    }
+                    pending.extend(children.iter().map(String::as_str));
+                }
+            }
+        };
+        let mut fixed: HashSet<String> = leased.clone();
+        for root in &fixed_roots {
+            closure_of(root, &mut |h| {
+                fixed.insert(h.to_string());
+            });
+        }
+
+        // Each droppable tag's closure beyond `fixed`, its blobs numbered so thousands of tags
+        // over thousands of chunks each stay small; and how many tags reference each blob.
+        let mut ids: HashMap<String, usize> = HashMap::new();
+        let mut removable: Vec<u64> = Vec::new();
+        let mut refs: Vec<u32> = Vec::new();
+        let mut order: Vec<usize> = (0..kept.len()).filter(|&i| kept[i].cappable).collect();
+        // Least recently used first; an unreadable date last, as the most recent.
+        order.sort_by_key(|&i| (kept[i].used.is_none(), kept[i].used));
+        let mut closures: Vec<Vec<usize>> = Vec::with_capacity(order.len());
+        for &i in &order {
+            let mut closure = Vec::new();
+            closure_of(&kept[i].hex, &mut |h| {
+                if fixed.contains(h) {
+                    return;
+                }
+                let id = *ids.entry(h.to_string()).or_insert_with(|| {
+                    removable.push(sizes.get(h).map_or(0, |s| s.1));
+                    refs.push(0);
+                    removable.len() - 1
+                });
+                closure.push(id);
+            });
+            closure.sort_unstable();
+            closure.dedup();
+            for &id in &closure {
+                refs[id] = refs[id].saturating_add(1);
+            }
+            closures.push(closure);
+        }
+
+        // What the pass leaves before dropping anything here: unreferenced blobs past the grace
+        // window go anyway.
+        let mut left = total;
+        for (hex, &(_, gone)) in &sizes {
+            if !fixed.contains(hex) && !ids.contains_key(hex) {
+                left = left.saturating_sub(gone);
+            }
+        }
+        // Never a tag used within the grace window either: its manifest's sidecar would root
+        // it anyway, freeing nothing.
+        let min_age = policy.min_age.max(policy.grace);
+        let met = |left: u64| {
+            policy.max_bytes.is_none_or(|max| left <= max)
+                && policy
+                    .free_bytes
+                    .is_none_or(|need| total.saturating_sub(left) >= need)
+        };
+        for (n, &i) in order.iter().enumerate() {
+            if met(left) {
+                break;
+            }
+            let recent = kept[i]
+                .used
+                .is_none_or(|t| now.duration_since(t).unwrap_or_default() < min_age);
+            if recent {
+                // In use order: every tag after this one is as recent.
+                break;
+            }
+            for &id in &closures[n] {
+                refs[id] -= 1;
+                if refs[id] == 0 {
+                    left = left.saturating_sub(removable[id]);
+                }
+            }
+            if !policy.dry_run {
+                std::fs::remove_file(&kept[i].path)
+                    .with_context(|| format!("removing {}", kept[i].path.display()))?;
+            }
+            kept[i].dropped = true;
+            report.tags_capped += 1;
+        }
+        report.bytes_before = Some(total);
+        Ok(())
     }
 
     /// Walk manifests reachable from `roots`, including nested image indexes, once each.
@@ -2332,15 +2535,21 @@ pub struct GcReport {
     pub tags_dropped: usize,
     pub manifests_dropped: usize,
     pub blobs_dropped: usize,
-    /// stored (on-disk) bytes of the dropped blobs
+    /// the space the dropped blobs took on disk (allocated blocks)
     pub bytes_freed: u64,
     pub uploads_dropped: usize,
     /// membership markers removed because the blob they named is gone
     pub blob_markers_dropped: usize,
     /// unreferenced blobs past the grace window kept because a live [`Lease`] names them
     pub blobs_leased: usize,
-    /// their stored (on-disk) bytes
+    /// the space they take on disk (allocated blocks)
     pub bytes_leased: u64,
+    /// tags dropped by the size phase (see [`GcPolicy::max_bytes`]); not in `tags_dropped`
+    pub tags_capped: usize,
+    /// with a size phase: the stored bytes of every blob before the pass, and what the pass
+    /// leaves by its own count
+    pub bytes_before: Option<u64>,
+    pub bytes_after: Option<u64>,
 }
 
 /// How [`Store::gc_with`] takes the store lock.
@@ -2366,6 +2575,13 @@ pub struct GcPolicy {
     pub repository: Option<String>,
     /// Never drop a tag whose name starts with one of these; it roots the mark.
     pub keep_prefixes: Vec<String>,
+    /// Then drop tags by size, least recently used first, until the blobs left take at most
+    /// this many bytes on disk...
+    pub max_bytes: Option<u64>,
+    /// ... and the pass frees at least this many.
+    pub free_bytes: Option<u64>,
+    /// The size phase drops no tag used more recently than this, nor than `grace`.
+    pub min_age: Duration,
     pub dry_run: bool,
     pub wait: Wait,
 }
@@ -2377,6 +2593,9 @@ impl GcPolicy {
             grace,
             repository: None,
             keep_prefixes: Vec::new(),
+            max_bytes: None,
+            free_bytes: None,
+            min_age: Duration::ZERO,
             dry_run,
             wait: Wait::Block,
         }
@@ -2388,6 +2607,18 @@ pub enum GcOutcome {
     Done(GcReport),
     /// Under [`Wait::Try`], the store lock was held: nothing was done.
     Busy,
+}
+
+/// A tag a [`Store::gc_with`] pass has kept so far.
+struct KeptTag {
+    path: PathBuf,
+    /// The manifest it names.
+    hex: String,
+    /// Kept for its age alone, so the size phase may drop it.
+    cappable: bool,
+    /// Its last use; `None` when it cannot be read, which the size phase takes as recent.
+    used: Option<SystemTime>,
+    dropped: bool,
 }
 
 /// Where a store keeps its [`Lease`]s, one file each.
@@ -2692,6 +2923,13 @@ pub struct LockGuard {
     _file: std::fs::File,
     /// The store it locks, for a [`Lease`] to check it is added to under its own store's lock.
     root: PathBuf,
+}
+
+/// The space the file at `path` takes on disk, in bytes: its allocated blocks, the figure the
+/// gc frees and its size phase weighs. 0 when it cannot be read.
+fn disk_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |m| m.blocks().saturating_mul(512))
 }
 
 /// Bump a file's mtime to now — the usage record [`Store::gc`] reads (blob: last
@@ -6803,6 +7041,191 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Incompressible bytes, so a blob's stored size is its length.
+    fn noise(seed: u8, len: usize) -> Vec<u8> {
+        let mut x = (u64::from(seed) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// A size-capped policy over `build-cache` that never ages a tag out and keeps `win-` tags.
+    fn cap_policy(max_bytes: Option<u64>, dry_run: bool) -> GcPolicy {
+        GcPolicy {
+            retention: None,
+            grace: DAY,
+            repository: Some("build-cache".into()),
+            keep_prefixes: vec!["win-".into()],
+            max_bytes,
+            free_bytes: None,
+            min_age: DAY,
+            dry_run,
+            wait: Wait::Block,
+        }
+    }
+
+    fn done(outcome: GcOutcome) -> GcReport {
+        match outcome {
+            GcOutcome::Done(report) => report,
+            GcOutcome::Busy => panic!("the store lock was busy"),
+        }
+    }
+
+    /// The size phase drops the least recently used tags of its repository first, frees a chunk
+    /// two tags share only with the last of them, and never drops a tag used within its floor,
+    /// one a manifest keeps, a kept prefix, or another repository's. A dry run counts what a
+    /// real pass does.
+    #[test]
+    fn gc_caps_the_cache_least_recently_used_first() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gccap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let chunk = |seed: u8| store.put_blob(&noise(seed, 64 * 1024)).unwrap();
+        let shared = chunk(0);
+        let mut chunks = HashMap::new();
+        let now = SystemTime::now();
+        for (seed, repo, tag, days, keep) in [
+            (1, "build-cache", "old", 10, false),
+            (2, "build-cache", "mid", 5, false),
+            (3, "build-cache", "new", 2, false),
+            (4, "build-cache", "recent", 0, false),
+            (5, "build-cache", "win-layer", 20, false),
+            (6, "build-cache", "kept", 20, true),
+            (7, "mine", "x", 30, false),
+        ] {
+            let c = chunk(seed);
+            let layers: Vec<&str> = if seed <= 2 {
+                vec![&c, &shared]
+            } else {
+                vec![&c]
+            };
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&manifest_body(&c, &layers)).unwrap();
+            if keep {
+                body["annotations"] = serde_json::json!({ RETENTION_ANNOTATION: RETENTION_KEEP });
+            }
+            store
+                .put_manifest(
+                    repo,
+                    tag,
+                    DEFAULT_MANIFEST_TYPE,
+                    &serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+            chunks.insert(tag, (repo, c, days));
+        }
+        backdate_all(&dir, now - DAY * 100);
+        for (tag, (repo, _, days)) in &chunks {
+            let used = now - DAY * *days - Duration::from_secs(3600);
+            let used = if *days == 0 { now } else { used };
+            std::fs::File::open(store.tag_path(repo, tag))
+                .unwrap()
+                .set_modified(used)
+                .unwrap();
+        }
+        let present = |tag: &str| {
+            let (repo, c, _) = &chunks[tag];
+            (
+                store.tag_path(repo, tag).exists(),
+                store.find_blob(&hex(c)).is_some(),
+            )
+        };
+
+        // Everything it may drop: the three tags older than the floor.
+        let all = done(store.gc_with(&cap_policy(Some(0), true)).unwrap());
+        assert_eq!(all.tags_capped, 3);
+        assert_eq!(all.tags_dropped, 0, "no retention, nothing by age");
+        let before = all.bytes_before.unwrap();
+        assert!(
+            all.bytes_after.unwrap() > 0,
+            "what it may not drop stays counted"
+        );
+
+        // Just under the current size: the oldest goes, and the chunk it shares stays.
+        let dry = done(store.gc_with(&cap_policy(Some(before - 1), true)).unwrap());
+        let real = done(store.gc_with(&cap_policy(Some(before - 1), false)).unwrap());
+        assert_eq!((dry.tags_capped, real.tags_capped), (1, 1));
+        assert_eq!(dry.bytes_after, real.bytes_after);
+        assert_eq!(real.bytes_freed, before - real.bytes_after.unwrap());
+        assert_eq!(present("old"), (false, false));
+        assert_eq!(present("mid"), (true, true));
+        assert!(store.find_blob(&hex(&shared)).is_some());
+
+        // Nothing fits: the shared chunk goes with the last tag that held it; the rest stays.
+        let real = done(store.gc_with(&cap_policy(Some(0), false)).unwrap());
+        assert_eq!(real.tags_capped, 2);
+        assert!(store.find_blob(&hex(&shared)).is_none());
+        for tag in ["mid", "new"] {
+            assert_eq!(present(tag), (false, false), "{tag}");
+        }
+        for tag in ["recent", "win-layer", "kept", "x"] {
+            assert_eq!(present(tag), (true, true), "{tag}");
+        }
+        assert_eq!(
+            real.bytes_after,
+            Some(real.bytes_before.unwrap() - real.bytes_freed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pass asked to free some space stops once it has; one that may not wait for the lock
+    /// finds it held by a reader and does nothing.
+    #[test]
+    fn gc_frees_what_it_is_asked_for_and_can_give_up_on_the_lock() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcfree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let now = SystemTime::now();
+        let mut chunks = Vec::new();
+        for (seed, tag, days) in [(1, "a", 9), (2, "b", 8), (3, "c", 7)] {
+            let c = store.put_blob(&noise(seed, 64 * 1024)).unwrap();
+            store
+                .put_manifest(
+                    "build-cache",
+                    tag,
+                    DEFAULT_MANIFEST_TYPE,
+                    &manifest_body(&c, &[&c]),
+                )
+                .unwrap();
+            chunks.push((tag, c, days));
+        }
+        backdate_all(&dir, now - DAY * 100);
+        for (tag, _, days) in &chunks {
+            std::fs::File::open(store.tag_path("build-cache", tag))
+                .unwrap()
+                .set_modified(now - DAY * *days)
+                .unwrap();
+        }
+        let policy = GcPolicy {
+            max_bytes: None,
+            free_bytes: Some(1),
+            ..cap_policy(None, false)
+        };
+
+        let held = store.lock_shared().unwrap();
+        let busy = store.gc_with(&GcPolicy {
+            wait: Wait::Try,
+            ..policy.clone()
+        });
+        assert!(matches!(busy, Ok(GcOutcome::Busy)));
+        drop(held);
+
+        let report = done(store.gc_with(&policy).unwrap());
+        assert_eq!(report.tags_capped, 1);
+        assert!(report.bytes_freed >= 64 * 1024);
+        for (tag, c, _) in &chunks {
+            let kept = *tag != "a";
+            assert_eq!(store.tag_path("build-cache", tag).exists(), kept, "{tag}");
+            assert_eq!(store.find_blob(&hex(c)).is_some(), kept, "{tag}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A pass confined to one repository drops only its tags, keeps every other repository's
     /// manifests whether tagged or pushed by digest alone, still honours an annotated expiry
     /// with no retention of its own, refuses a scope that names no repository, and gives up
@@ -6896,6 +7319,212 @@ mod tests {
             assert!(store.find_blob(&hex(d)).is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store for the size-phase cases: manifests over incompressible chunks, everything dated
+    /// far past any window but what a case dates again.
+    struct CapStore {
+        dir: PathBuf,
+        store: Store,
+    }
+
+    impl CapStore {
+        fn new(name: &str) -> CapStore {
+            let dir =
+                std::env::temp_dir().join(format!("vk-regserve-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::new(dir.clone()).unwrap();
+            CapStore { dir, store }
+        }
+        fn chunk(&self, seed: u8) -> String {
+            self.store.put_blob(&noise(seed, 64 * 1024)).unwrap()
+        }
+        /// Tag `repo:tag` (a `sha256:` tag pushes by digest) over `layers`, the first its config.
+        fn tag(&self, repo: &str, tag: &str, layers: &[&str]) -> String {
+            let body = manifest_body(layers[0], layers);
+            let tag = if tag == "@" {
+                format!("sha256:{}", sha256_hex_raw(&body))
+            } else {
+                tag.to_string()
+            };
+            self.store
+                .put_manifest(repo, &tag, DEFAULT_MANIFEST_TYPE, &body)
+                .unwrap()
+        }
+        fn age_all(&self) {
+            backdate_all(&self.dir, SystemTime::now() - DAY * 100);
+        }
+        fn used(&self, repo: &str, tag: &str, ago: Duration) {
+            std::fs::File::open(self.store.tag_path(repo, tag))
+                .unwrap()
+                .set_modified(SystemTime::now() - ago)
+                .unwrap();
+        }
+        fn has(&self, digest: &str) -> bool {
+            self.store.find_blob(&hex(digest)).is_some()
+        }
+    }
+
+    impl Drop for CapStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// What the size phase drops a tag for and what it frees: nothing a fresh sidecar, another
+    /// repository's manifest — tagged or pushed by digest alone — or a lease keeps, and a chunk
+    /// two dropped tags name only once both are gone.
+    #[test]
+    fn gc_caps_around_what_other_roots_keep() {
+        let c = CapStore::new("gccaproots");
+        let (fresh, pin, shared, leased, twin) =
+            (c.chunk(1), c.chunk(2), c.chunk(3), c.chunk(4), c.chunk(5));
+        let fresh_manifest = c.tag("build-cache", "fresh", &[&fresh]);
+        c.tag("mine", "@", &[&pin]);
+        let child = c.tag("build-cache", "@", &[&shared]);
+        c.tag("mine", "m", &[&shared]);
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{ "mediaType": DEFAULT_MANIFEST_TYPE, "digest": child, "size": 1 }],
+        })
+        .to_string()
+        .into_bytes();
+        c.store
+            .put_manifest(
+                "build-cache",
+                "idx",
+                "application/vnd.oci.image.index.v1+json",
+                &index,
+            )
+            .unwrap();
+        c.tag("build-cache", "leased", &[&leased]);
+        c.tag("build-cache", "twin-a", &[&twin]);
+        c.tag("build-cache", "twin-b", &[&twin]);
+        let lease = {
+            let held = c.store.lock_shared().unwrap();
+            let mut lease = c.store.lease(&held).unwrap();
+            lease.add(&held, [hex(&leased).as_str()]).unwrap();
+            lease
+        };
+        c.age_all();
+        touch(&c.store.find_blob(&hex(&fresh_manifest)).unwrap().0);
+
+        let policy = GcPolicy {
+            grace: Duration::from_secs(3600),
+            min_age: Duration::from_secs(3600),
+            ..cap_policy(Some(0), false)
+        };
+        let r = done(c.store.gc_with(&policy).unwrap());
+        assert_eq!(r.tags_capped, 5, "fresh, idx, leased, twin-a, twin-b");
+        assert!(c.has(&fresh), "a fresh manifest's sidecar keeps it");
+        assert!(c.has(&pin), "another repository's digest push is kept");
+        assert!(
+            c.has(&shared),
+            "an index child another repository tags is kept"
+        );
+        assert!(
+            c.has(&leased) && r.blobs_leased == 1,
+            "a leased chunk is kept"
+        );
+        assert!(
+            !c.has(&twin),
+            "a chunk two dropped tags named goes with both"
+        );
+        assert_eq!(
+            r.bytes_after,
+            Some(r.bytes_before.unwrap() - r.bytes_freed),
+            "the sweep says what is left"
+        );
+        drop(lease);
+    }
+
+    /// The edges of the size phase: both storage forms of a blob freed and counted, a tag aged
+    /// out counted as dropped and not capped, the floor's boundary, an annotated expiry with no
+    /// retention, a byte cap and a free target together, and the scope's repository exactly.
+    #[test]
+    fn gc_size_phase_edges() {
+        let c = CapStore::new("gccapedges");
+        let (old, both, mid, young, expiring, nested) = (
+            c.chunk(1),
+            c.chunk(2),
+            c.chunk(3),
+            c.chunk(4),
+            c.chunk(5),
+            c.chunk(6),
+        );
+        c.tag("build-cache", "old", &[&old]);
+        c.tag("build-cache", "both", &[&both]);
+        c.tag("build-cache", "mid", &[&mid]);
+        c.tag("build-cache", "young", &[&young]);
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&manifest_body(&expiring, &[&expiring])).unwrap();
+        body["annotations"] = serde_json::json!({ EXPIRES_ANNOTATION: "1" });
+        c.store
+            .put_manifest(
+                "build-cache",
+                "expiring",
+                DEFAULT_MANIFEST_TYPE,
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+        c.tag("build-cache/x", "nested", &[&nested]);
+        // `both` stored in both forms as well.
+        std::fs::write(c.dir.join("blobs/zstd").join(hex(&both)), vec![1u8; 1000]).unwrap();
+        c.age_all();
+        c.used("build-cache", "old", DAY * 40);
+        c.used("build-cache", "both", DAY * 9);
+        c.used("build-cache", "mid", DAY + Duration::from_secs(60));
+        c.used("build-cache", "young", DAY - Duration::from_secs(60));
+
+        assert!(
+            c.store
+                .gc_with(&GcPolicy {
+                    repository: Some("./build-cache".into()),
+                    ..cap_policy(None, true)
+                })
+                .is_err(),
+            "a scope that names no repository is refused"
+        );
+
+        // No retention: only the annotated expiry goes.
+        let r = done(c.store.gc_with(&cap_policy(None, false)).unwrap());
+        assert_eq!((r.tags_dropped, r.tags_capped), (1, 0));
+        assert!(!c.has(&expiring) && c.has(&old));
+
+        // Retention takes `old`; a free target the age phase alone does not meet then takes
+        // `both`, whose two forms it counts, and stops before `mid`.
+        let r = done(
+            c.store
+                .gc_with(&GcPolicy {
+                    retention: Some(DAY * 30),
+                    free_bytes: Some(2 * 64 * 1024),
+                    ..cap_policy(None, false)
+                })
+                .unwrap(),
+        );
+        assert_eq!(
+            (r.tags_dropped, r.tags_capped),
+            (1, 1),
+            "old by age, both by size"
+        );
+        assert!(!c.has(&old) && !c.has(&both) && c.has(&mid));
+        assert!(!c.dir.join("blobs/zstd").join(hex(&both)).exists());
+        assert!(r.bytes_freed >= 2 * 64 * 1024 + 1000, "{}", r.bytes_freed);
+
+        // A cap with a free target already met still caps: `mid`, but not `young`, just inside
+        // the floor.
+        let r = done(
+            c.store
+                .gc_with(&GcPolicy {
+                    free_bytes: Some(1),
+                    ..cap_policy(Some(0), false)
+                })
+                .unwrap(),
+        );
+        assert_eq!(r.tags_capped, 1);
+        assert!(!c.has(&mid));
+        assert!(c.has(&young), "a tag used just inside the floor stays");
+        assert!(c.has(&nested), "build-cache/x is another repository");
     }
 
     /// Idle tags with dangling or oversized manifests, or non-UTF-8 tag files,

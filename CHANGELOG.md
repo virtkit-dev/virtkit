@@ -10,6 +10,11 @@ All notable changes to virtkit will be documented in this file.
   `vk gc` now prints one summary in place of its per-cache lines: the space each kind of
   cache freed, what it kept and why, and the free space before and after.
 
+### Changed
+
+- **`vk registry gc`, `vk-registry gc` and a hub-run gc report the space they free as the
+  space it took on disk**, its allocated blocks, rather than the files' lengths.
+
 ### Fixed
 
 - **A registry gc no longer deletes the cached stages a running build is reading** from the
