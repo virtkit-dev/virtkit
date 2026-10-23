@@ -1,6 +1,6 @@
 //! Registry namespaces: per registry, a path prefix, who may read, write or lock under it, and
 //! how long its idle tags are kept. A job's registry token carries what the namespaces that
-//! select it grant; the registry enforces the token and never sees this policy.
+//! select it grant ([`resolve`]); the registry enforces the token and never sees this policy.
 //!
 //! A path is a template: `{gitlab}` (the hub's name for the job's GitLab instance),
 //! `{project_id}`, `{pipeline_id}` and `{protection}` (`protected` or `unprotected`) are
@@ -11,11 +11,11 @@ use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::registry::PrefixRetention;
-use vk_hub_proto::token::valid_prefix;
+use vk_hub_proto::token::{Grant, valid_prefix};
 
 use super::registries::REGISTRIES;
 use super::{Db, NotEnrolled, append_audit, decode, encode};
-use crate::subject::{Projects, Subject};
+use crate::subject::{JobClaims, Projects, Subject};
 
 /// Key: `<registry ID>/<name>`. Value: JSON [`NamespaceRow`].
 pub(super) const NAMESPACES: TableDefinition<&str, &[u8]> = TableDefinition::new("namespaces");
@@ -207,6 +207,80 @@ fn sample_path(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// `path` filled from `c`; `None` when a component holds anything but one whole placeholder
+/// or none, or a value is missing (no pipeline) or does not fit a repository name.
+pub fn render(path: &str, c: &JobClaims) -> Option<String> {
+    let mut out = Vec::new();
+    for component in path.split('/') {
+        let value = match component {
+            "{gitlab}" => c.gitlab.clone(),
+            "{project_id}" => c.project_id.to_string(),
+            "{pipeline_id}" if c.pipeline_id > 0 => c.pipeline_id.to_string(),
+            "{pipeline_id}" => return None,
+            "{protection}" => if c.protected {
+                "protected"
+            } else {
+                "unprotected"
+            }
+            .to_string(),
+            other if other.contains(['{', '}']) => return None,
+            other => other.to_string(),
+        };
+        out.push(value);
+    }
+    let path = out.join("/");
+    valid_prefix(&path).then_some(path)
+}
+
+/// What a job's token carries, from the namespaces of its registry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    pub grants: Vec<Grant>,
+    /// [`CI_CACHE`]'s path for the job, when it selects the job.
+    pub cache_repo: Option<String>,
+    /// [`CI_PIPELINE`]'s path for the job, when it selects the job.
+    pub pipeline_prefix: Option<String>,
+}
+
+/// The grants the namespaces `ns` give the job claiming `c`: per namespace whose path fills,
+/// the rights of every grant line selecting it, merged by prefix.
+pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
+    let mut out = Resolved::default();
+    for n in ns {
+        let Some(prefix) = render(&n.path, c) else {
+            continue;
+        };
+        let mut grant = Grant {
+            prefix: prefix.clone(),
+            ..Grant::default()
+        };
+        for g in n.grants.iter().filter(|g| g.subject.matches(c)) {
+            grant.read |= g.read;
+            grant.write |= g.write;
+            grant.lock |= g.lock;
+        }
+        if !(grant.read || grant.write || grant.lock) {
+            continue;
+        }
+        match n.name.as_str() {
+            CI_CACHE => out.cache_repo = Some(prefix.clone()),
+            CI_PIPELINE => out.pipeline_prefix = Some(prefix.clone()),
+            _ => {}
+        }
+        match out.grants.iter_mut().find(|g| g.prefix == prefix) {
+            Some(g) => {
+                g.read |= grant.read;
+                g.write |= grant.write;
+                g.lock |= grant.lock;
+            }
+            None => out.grants.push(grant),
+        }
+    }
+    // One grant per namespace at most, and a registry holds at most a token's worth.
+    debug_assert!(out.grants.len() <= vk_hub_proto::token::MAX_GRANTS);
+    out
+}
+
 /// The retention windows `ns` set, by static prefix: the longest where several share one.
 pub fn prefix_retention(ns: &[NamespaceRow]) -> Vec<PrefixRetention> {
     let mut out: Vec<PrefixRetention> = Vec::new();
@@ -386,6 +460,17 @@ pub(super) fn remove_namespaces_of(txn: &redb::WriteTransaction, registry: &str)
 mod tests {
     use super::*;
 
+    fn claims(protected: bool, pipeline_id: u64) -> JobClaims {
+        JobClaims {
+            gitlab: "gl".into(),
+            project_id: 42,
+            project_path: "wab/core".into(),
+            git_ref: "main".into(),
+            protected,
+            pipeline_id,
+        }
+    }
+
     fn ns(name: &str, path: &str, grants: &[&str], retention_days: Option<u64>) -> NamespaceRow {
         NamespaceRow {
             name: name.into(),
@@ -395,6 +480,84 @@ mod tests {
             created_at: 0,
             created_by: "t".into(),
         }
+    }
+
+    #[test]
+    fn paths_fill_from_identifiers_only() {
+        let c = claims(true, 7);
+        assert_eq!(
+            render("ci-cache/{gitlab}/{project_id}/{protection}", &c).as_deref(),
+            Some("ci-cache/gl/42/protected")
+        );
+        assert_eq!(render("p/{pipeline_id}", &claims(false, 0)), None);
+        assert_eq!(render("p/x{project_id}", &c), None);
+        assert_eq!(render("p/{project_path}", &c), None);
+        assert_eq!(render("images", &c).as_deref(), Some("images"));
+    }
+
+    #[test]
+    fn defaults_resolve_to_the_cache_and_pipeline() {
+        let r = resolve(&defaults(0), &claims(false, 7));
+        assert_eq!(r.cache_repo.as_deref(), Some("ci-cache/gl/42/unprotected"));
+        assert_eq!(r.pipeline_prefix.as_deref(), Some("ci-pipeline/gl/42/7"));
+        assert_eq!(r.grants.len(), 2);
+        assert_eq!(r.grants[0].rights(), "rw");
+        assert_eq!(r.grants[1].rights(), "rwl");
+        let no_pipeline = resolve(&defaults(0), &claims(true, 0));
+        assert_eq!(no_pipeline.pipeline_prefix, None);
+        assert_eq!(no_pipeline.grants.len(), 1);
+        for d in defaults(0) {
+            d.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn grants_add_up_and_select_by_subject() {
+        let all = [
+            ns(
+                "images",
+                "images",
+                &["r:*", "w:gitlab gl, projects infra/images, protected"],
+                None,
+            ),
+            ns(
+                "wab",
+                "wab",
+                &[
+                    "rwl:gitlab gl, projects wab/**, protected",
+                    "r:gitlab gl, projects wab/**",
+                ],
+                None,
+            ),
+            ns("wab-ro", "wab", &["r:*"], None),
+        ];
+        let r = resolve(&all, &claims(false, 7));
+        let got: Vec<(String, String)> = r
+            .grants
+            .iter()
+            .map(|g| (g.prefix.clone(), g.rights()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("images".into(), "r".into()), ("wab".into(), "r".into())]
+        );
+        let r = resolve(&all, &claims(true, 7));
+        assert_eq!(r.grants[1].rights(), "rwl");
+        // Another instance's project of the same path gets what any job gets, no more.
+        let other = JobClaims {
+            gitlab: "gl2".into(),
+            ..claims(true, 7)
+        };
+        let r = resolve(&all, &other);
+        let got: Vec<(String, String)> = r
+            .grants
+            .iter()
+            .map(|g| (g.prefix.clone(), g.rights()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("images".into(), "r".into()), ("wab".into(), "r".into())]
+        );
     }
 
     #[test]

@@ -578,3 +578,28 @@ fn a_url_taken_since_the_token_was_issued_is_not_bound() {
         "{audit:?}"
     );
 }
+
+#[test]
+fn only_working_bound_keys_have_their_jobs_minted_for() {
+    let db = Db::open_memory().unwrap();
+    db.add_gitlab("gl", "https://gitlab.example.com", "u", 1)
+        .unwrap();
+    let ttl = Duration::from_secs(3600);
+    let now = now_secs();
+    db.create_api_key("bound", &policy(Some("gl"), Vec::new()), ttl, "u", now)
+        .unwrap();
+    db.create_api_key("plain", &policy(None, Vec::new()), ttl, "u", now)
+        .unwrap();
+    db.create_api_key("gone", &policy(Some("gl"), Vec::new()), ttl, "u", now)
+        .unwrap();
+    db.revoke_api_key("gone", "u", now).unwrap();
+    let ids: std::collections::BTreeMap<String, String> = db
+        .api_keys_with_ids()
+        .unwrap()
+        .into_iter()
+        .map(|(id, row)| (row.name, id))
+        .collect();
+    let bound = db.mint_snapshot(now).unwrap().bound;
+    assert_eq!(bound.len(), 1);
+    assert_eq!(bound.get(&ids["bound"]).map(String::as_str), Some("gl"));
+}

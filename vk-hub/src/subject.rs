@@ -20,6 +20,33 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What a job claims to be, as its jobs key may submit it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobClaims {
+    /// The name the hub gave the job's GitLab instance.
+    pub gitlab: String,
+    pub project_id: u64,
+    pub project_path: String,
+    pub git_ref: String,
+    pub protected: bool,
+    /// 0 when the job names none.
+    pub pipeline_id: u64,
+}
+
+impl JobClaims {
+    /// A placed GitLab job's claims, as submitted under a key bound to the instance `gitlab`.
+    pub fn of(gitlab: &str, ci: &vk_hub_proto::job::CiJob) -> Self {
+        JobClaims {
+            gitlab: gitlab.to_string(),
+            project_id: ci.job.project_id,
+            project_path: ci.job.project_path.clone(),
+            git_ref: ci.sources.git_ref.clone(),
+            protected: ci.sources.protected == Some(true),
+            pipeline_id: ci.job.pipeline_id,
+        }
+    }
+}
+
 /// Which projects a subject selects.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +138,22 @@ impl Subject {
         Ok(s)
     }
 
+    /// Whether the subject selects the job claiming `c`.
+    pub fn matches(&self, c: &JobClaims) -> bool {
+        let project = match &self.projects {
+            Projects::Any | Projects::Own => true,
+            Projects::Path(glob) => glob_match(glob, &c.project_path),
+            Projects::Id(id) => *id == c.project_id,
+        };
+        project
+            && self.gitlab.as_ref().is_none_or(|g| *g == c.gitlab)
+            && self
+                .git_ref
+                .as_ref()
+                .is_none_or(|g| glob_match(g, &c.git_ref))
+            && self.protected.is_none_or(|p| p == c.protected)
+    }
+
     /// Why the subject may not be granted writes or locks, if it may not: selecting by ref
     /// name without `protected`.
     pub fn check_grant(&self, write_or_lock: bool) -> Result<(), String> {
@@ -162,9 +205,140 @@ fn check_glob(glob: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `text` matches `glob`: `**` matches anything, `*` anything but `/`, every other
+/// byte itself. It runs in time proportional to their lengths' product, whatever the glob:
+/// the text is a submitter's claim, matched while jobs are placed.
+pub fn glob_match(glob: &str, text: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Any,
+        Seg,
+        Byte(u8),
+    }
+    let g = glob.as_bytes();
+    let mut toks = Vec::with_capacity(g.len());
+    let mut i = 0;
+    while let Some(&b) = g.get(i) {
+        if b == b'*' && g.get(i + 1) == Some(&b'*') {
+            toks.push(Tok::Any);
+            i += 2;
+        } else {
+            toks.push(if b == b'*' { Tok::Seg } else { Tok::Byte(b) });
+            i += 1;
+        }
+    }
+    let t = text.as_bytes();
+    // `at[j]`: whether the tokens so far match `t[..j]`.
+    let mut at = vec![false; t.len() + 1];
+    at[0] = true;
+    for tok in toks {
+        let mut next = vec![false; t.len() + 1];
+        match tok {
+            Tok::Any => {
+                let mut reached = false;
+                for j in 0..=t.len() {
+                    reached |= at[j];
+                    next[j] = reached;
+                }
+            }
+            Tok::Seg => {
+                let mut reached = false;
+                for j in 0..=t.len() {
+                    reached |= at[j];
+                    next[j] = reached;
+                    if t.get(j) == Some(&b'/') {
+                        reached = false;
+                    }
+                }
+            }
+            Tok::Byte(b) => {
+                for j in 0..t.len() {
+                    next[j + 1] = at[j] && t[j] == b;
+                }
+            }
+        }
+        at = next;
+    }
+    at[t.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claims() -> JobClaims {
+        JobClaims {
+            gitlab: "gl".into(),
+            project_id: 42,
+            project_path: "wab/core/bastion".into(),
+            git_ref: "release/10.0".into(),
+            protected: true,
+            pipeline_id: 7,
+        }
+    }
+
+    #[test]
+    fn globs_cross_components_only_with_a_double_star() {
+        assert!(glob_match("wab/**", "wab/core/bastion"));
+        assert!(!glob_match("wab/*", "wab/core/bastion"));
+        assert!(glob_match("wab/*/bastion", "wab/core/bastion"));
+        assert!(glob_match("release/*", "release/10.0"));
+        assert!(!glob_match("release/*", "release"));
+        assert!(glob_match("**", ""));
+        assert!(glob_match("main", "main"));
+        assert!(!glob_match("main", "mainx"));
+        assert!(glob_match("a/*/c/**", "a/b/c/d/e"));
+        assert!(!glob_match("*", "a/b"));
+        assert!(glob_match("*/**", "a/b/c"));
+        assert!(glob_match("**/c", "a/b/c"));
+        assert!(!glob_match("**/d", "a/b/c"));
+    }
+
+    #[test]
+    fn many_double_stars_match_in_bounded_time() {
+        let glob = "**a".repeat(40);
+        let text = "a".repeat(39) + "b";
+        assert!(!glob_match(&glob, &text));
+        assert!(glob_match(&glob, &"a".repeat(40)));
+    }
+
+    #[test]
+    fn subjects_parse_print_and_match() {
+        for (text, matches) in [
+            ("*", true),
+            ("own project", true),
+            ("own pipeline", true),
+            ("gitlab gl", true),
+            ("gitlab gl2", false),
+            ("gitlab gl, projects wab/**, protected", true),
+            ("gitlab gl2, projects wab/**, protected", false),
+            ("gitlab gl, projects wab/*", false),
+            ("gitlab gl, project-id 42", true),
+            ("gitlab gl2, project-id 42", false),
+            ("gitlab gl, project-id 43", false),
+            ("gitlab gl, projects wab/**, ref release/*, protected", true),
+            ("unprotected", false),
+            ("ref main", false),
+        ] {
+            let s = Subject::parse(text).unwrap();
+            assert_eq!(s.to_string(), text);
+            assert_eq!(s.matches(&claims()), matches, "{text}");
+        }
+        for bad in [
+            "",
+            "project",
+            "projects a b",
+            "protected, unprotected",
+            "*, own project",
+            "projects wab/**",
+            "project-id 42",
+            "gitlab gl, gitlab gl2",
+            "gitlab G L",
+            "gitlab -x",
+        ] {
+            assert!(Subject::parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn writes_by_ref_name_need_protected() {

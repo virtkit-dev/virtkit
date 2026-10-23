@@ -7,6 +7,11 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::token::TokenKey;
 
+use std::collections::BTreeMap;
+
+use super::keys::{API_KEYS, KeyRow};
+use super::namespaces::{NAMESPACES, NamespaceRow};
+use super::registries::{REGISTRIES, RegistryRow};
 use super::{Db, append_audit, decode, encode};
 
 /// Key: the key's ID. Value: JSON [`TokenKeyRow`].
@@ -27,7 +32,66 @@ pub struct TokenKeyRow {
     pub superseded_at: Option<u64>,
 }
 
+/// What minting reads, in one snapshot: the registries that take tokens and are bound to a
+/// URL, with their namespaces; the signing keys, oldest first; and, per jobs key bound to a
+/// GitLab instance and still working, that instance's name. Registries bound to a URL that
+/// take no tokens are kept by URL, to say why a job got none.
+pub struct MintSnapshot {
+    pub registries: Vec<(String, RegistryRow, Vec<NamespaceRow>)>,
+    pub keys: Vec<TokenKeyRow>,
+    pub bound: BTreeMap<String, String>,
+    pub untokened: BTreeMap<String, String>,
+}
+
 impl Db {
+    /// [`MintSnapshot`] as of one read, at `now`.
+    pub fn mint_snapshot(&self, now: u64) -> Result<MintSnapshot> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let namespaces = txn.open_table(NAMESPACES)?;
+        let mut registries = Vec::new();
+        let mut untokened = BTreeMap::new();
+        for entry in txn.open_table(REGISTRIES)?.iter()? {
+            let (id, value) = entry?;
+            let id = id.value().to_string();
+            let row = decode::<RegistryRow>(value.value())?;
+            let Some(url) = &row.url else {
+                continue;
+            };
+            if !row.takes_tokens() {
+                untokened.insert(url.clone(), id);
+                continue;
+            }
+            let (start, end) = (format!("{id}/"), format!("{id}0"));
+            let mut ns = Vec::new();
+            for entry in namespaces.range(start.as_str()..end.as_str())? {
+                ns.push(decode::<NamespaceRow>(entry?.1.value())?);
+            }
+            registries.push((id, row, ns));
+        }
+        let mut keys = Vec::new();
+        for entry in txn.open_table(TOKEN_KEYS)?.iter()? {
+            keys.push(decode::<TokenKeyRow>(entry?.1.value())?);
+        }
+        keys.sort_by_key(|r| r.seq);
+        let mut bound = BTreeMap::new();
+        for entry in txn.open_table(API_KEYS)?.iter()? {
+            let (id, value) = entry?;
+            let row = decode::<KeyRow>(value.value())?;
+            if let Some(gitlab) = row
+                .gitlab
+                .filter(|_| row.revoked_at.is_none() && row.expires_at > now)
+            {
+                bound.insert(id.value().to_string(), gitlab);
+            }
+        }
+        Ok(MintSnapshot {
+            registries,
+            keys,
+            bound,
+            untokened,
+        })
+    }
+
     /// Every token-signing key, oldest first.
     pub fn token_keys(&self) -> Result<Vec<TokenKeyRow>> {
         let txn = self.db.begin_read().context("starting a read")?;

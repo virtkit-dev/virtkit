@@ -565,6 +565,7 @@ async fn submit(
         activity: None,
         prepared_at: None,
         guest: None,
+        registry_access: None,
         gitlab: principal.row.gitlab.clone(),
         project_id: match &ask.spec {
             JobSpec::GitlabCi(ci) => Some(ci.job.project_id).filter(|&p| p > 0),
@@ -588,7 +589,15 @@ async fn submit(
             let place_within =
                 Duration::from_secs(u64::from(ask.place_within_secs.min(MAX_PLACE_WITHIN_SECS)));
             let view = row.view(&id, 0);
-            jobs::admit(hub, &id, row, ask.spec, ask.reservation, place_within);
+            jobs::admit(
+                hub,
+                &id,
+                row,
+                ask.spec,
+                ask.reservation,
+                place_within,
+                principal.row.gitlab.is_some().then(|| principal.id.clone()),
+            );
             hub.touch();
             Ok(json(StatusCode::CREATED, &view))
         }

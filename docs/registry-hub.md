@@ -444,10 +444,14 @@ a key superseded for longer than any token lives (7 days and the skew) is retire
 removed, at the next sync or the hourly sweep. `max_job_token_secs` in `hub.toml` (60 to
 604800, 86400 by default) caps a token's lifetime.
 
-**Minting.** `vk-hub registries token <id> --grant <prefix>=<rights> [--grant …] [--pipeline
-<gitlab>/<id>] [--ttl 1h]` mints a token for automation and tests, living at most
-`max_job_token_secs`. Each issue is audited under the registry by jti, never the token, which
-the hub stores nowhere.
+**Minting.** A job of a working bound key, placed on a node whose inventory names a registry
+URL the hub binds and says it uses job tokens, on a registry that takes tokens and applied a
+key, gets a token: its grants from that registry's namespaces, `sub` `job:<id>`, `pipeline`
+`<gitlab>/<pipeline id>` when the job names a pipeline, living its timeout plus 15 minutes up
+to `max_job_token_secs`. Anything missing, the job goes without. Each issue is audited under
+the registry by jti, job and node, never the token, which the hub stores nowhere. `vk-hub
+registries token <id> --grant <prefix>=<rights> [--grant …] [--pipeline <gitlab>/<id>] [--ttl
+1h]` mints one for automation and tests, audited the same way.
 
 ## Open questions
 

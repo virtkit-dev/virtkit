@@ -1,5 +1,5 @@
 //! Registry tokens: the keys the hub signs them with, what it sends registries to check them,
-//! and minting one for an operator ([`mint`]).
+//! and minting one for a placed job ([`for_job`]) or for an operator ([`mint`]).
 //!
 //! The keys live in `<data_dir>/token-keys/`, one file each, created on first need. A
 //! registry that takes tokens gets the public halves in its desired state, with its
@@ -15,14 +15,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use vk_hub_proto::dispatch::JobRegistry;
+use vk_hub_proto::job::JobSpec;
 use vk_hub_proto::token::{Claims, Grant, MAX_LABEL_LEN, MAX_TTL_SECS, SKEW_SECS, TokenKey};
 use vk_peer::token::Signer;
 
 use crate::server::Hub;
-use crate::store::{Db, RegistryRow, TokenKeyRow};
+use crate::store::{
+    Db, NamespaceRow, NoAccess, NodeRow, RegistryAccess, RegistryRow, TokenKeyRow,
+    normalize_registry_url,
+};
+use crate::subject::JobClaims;
 
 /// The longest a job's token lives, by default: a day.
 pub const DEFAULT_MAX_JOB_TOKEN: Duration = Duration::from_secs(86_400);
+
+/// What a job's token lives past its timeout: the caches and artifacts stored after its last
+/// step.
+pub const JOB_TOKEN_MARGIN: u64 = 900;
 
 /// How often superseded keys are looked at for retirement, besides every sync.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(3600);
@@ -249,6 +259,55 @@ pub async fn sweep(hub: Arc<Hub>) {
     }
 }
 
+/// A minted job token: the access to send, and its audit event, indexed under the registry.
+pub type Minted = (JobRegistry, (Option<String>, String));
+
+/// Minting inputs, read and signing keys loaded before taking the dispatch lock:
+/// registries that take tokens, their namespaces, signing keys, and jobs keys bound to
+/// a GitLab instance.
+#[derive(Default)]
+pub struct MintCtx {
+    registries: Vec<(String, RegistryRow, Vec<NamespaceRow>)>,
+    keys: Vec<TokenKeyRow>,
+    signers: BTreeMap<String, Arc<Signer>>,
+    bound: BTreeMap<String, String>,
+    untokened: BTreeMap<String, String>,
+}
+
+impl MintCtx {
+    /// Read from `db` in one snapshot, and load the signing keys from `keys`: a key that does
+    /// not load is logged and signs nothing.
+    pub fn read(db: &Db, keys: &Keys) -> Result<Self> {
+        let snap = db.mint_snapshot(crate::now_secs())?;
+        let mut signers = BTreeMap::new();
+        if !snap.registries.is_empty() {
+            for row in &snap.keys {
+                match keys.signer(row) {
+                    Ok(s) => {
+                        signers.insert(row.public.kid.clone(), s);
+                    }
+                    Err(e) => eprintln!("vk-hub: token-signing key {}: {e:#}", row.public.kid),
+                }
+            }
+        }
+        Ok(MintCtx {
+            registries: snap.registries,
+            keys: snap.keys,
+            signers,
+            bound: snap.bound,
+            untokened: snap.untokened,
+        })
+    }
+
+    /// The registry bound to `url`, which takes tokens.
+    fn registry_at(&self, url: &str) -> Option<&(String, RegistryRow, Vec<NamespaceRow>)> {
+        let url = normalize_registry_url(url)?;
+        self.registries
+            .iter()
+            .find(|(_, r, _)| r.url.as_ref() == Some(&url))
+    }
+}
+
 /// The key to sign registry `row`'s tokens with: the newest whose generation it has applied.
 /// This takes a registry that applied a generation to hold its keys; one that pins a fleet
 /// root may refuse a key the root did not certify, which the trust model makes the hub check.
@@ -262,6 +321,136 @@ pub(crate) fn signing_key<'a>(
             .get(&key.public.kid)
             .is_some_and(|g| *g <= applied)
     })
+}
+
+/// The token for placed job `job`, sent to `node`, when everything it needs holds: the node
+/// uses job tokens and names a registry the hub binds, that registry takes tokens and has a
+/// key it applied, and the job's jobs key (`key`) is still working and bound to a GitLab
+/// instance. The access to send, the audit event, indexed under the registry, and what the
+/// job's record shows; else what it shows of why there is none, nothing on a hub where no
+/// registry takes tokens or is bound to an address, whose jobs are not meant to get any.
+/// Never fails a placement: what cannot be minted is logged and the job goes without.
+pub fn for_job(
+    hub: &Hub,
+    ctx: &MintCtx,
+    node: (&str, &NodeRow),
+    job: &str,
+    spec: &JobSpec,
+    key: Option<&str>,
+) -> Result<(Minted, RegistryAccess), Option<RegistryAccess>> {
+    if ctx.registries.is_empty() && ctx.untokened.is_empty() {
+        return Err(None);
+    }
+    let none = |reason, registry: Option<&String>, url: Option<&String>| {
+        Some(RegistryAccess::None {
+            reason,
+            registry: registry.cloned(),
+            url: url.cloned(),
+        })
+    };
+    let Some(gitlab) = key.and_then(|k| ctx.bound.get(k)) else {
+        return Err(none(NoAccess::UnboundKey, None, None));
+    };
+    let inventory = node.1.inventory.as_ref();
+    if !inventory.is_some_and(|i| i.job_tokens) {
+        return Err(none(NoAccess::NodeWithoutJobTokens, None, None));
+    }
+    let Some(url) = inventory.and_then(|i| i.registry.as_ref()) else {
+        return Err(none(NoAccess::UnknownRegistry, None, None));
+    };
+    let Some((registry, row, namespaces)) = ctx.registry_at(url) else {
+        let untokened = normalize_registry_url(url).and_then(|u| ctx.untokened.get(&u));
+        return Err(match untokened {
+            Some(id) => none(NoAccess::RegistryTakesNoTokens, Some(id), Some(url)),
+            None => none(NoAccess::UnknownRegistry, None, Some(url)),
+        });
+    };
+    let Some(key) = signing_key(&ctx.keys, row) else {
+        return Err(none(NoAccess::NoAppliedKey, Some(registry), None));
+    };
+    let target = MintTarget {
+        registry,
+        namespaces,
+        key,
+        gitlab,
+    };
+    match mint_for_job(hub, ctx, &target, (node.0, job), spec) {
+        Ok(minted) => {
+            let access = RegistryAccess::Issued {
+                registry: minted.0.registry_id.clone(),
+                grants: minted.0.grants.clone(),
+                expires_at: minted.0.expires_at,
+                jti: minted.2,
+            };
+            Ok(((minted.0, minted.1), access))
+        }
+        Err(e) => {
+            eprintln!("vk-hub: job {job}: no registry token: {e:#}");
+            Err(none(NoAccess::MintFailed, Some(registry), None))
+        }
+    }
+}
+
+struct MintTarget<'a> {
+    registry: &'a String,
+    namespaces: &'a [NamespaceRow],
+    key: &'a TokenKeyRow,
+    gitlab: &'a str,
+}
+
+fn mint_for_job(
+    hub: &Hub,
+    ctx: &MintCtx,
+    target: &MintTarget<'_>,
+    (node, job): (&str, &str),
+    spec: &JobSpec,
+) -> Result<(JobRegistry, (Option<String>, String), String)> {
+    let MintTarget {
+        registry,
+        namespaces,
+        key,
+        gitlab,
+    } = *target;
+    let Some(signer) = ctx.signers.get(&key.public.kid) else {
+        bail!("token-signing key {} is not loaded", key.public.kid);
+    };
+    let registry = registry.clone();
+    let JobSpec::GitlabCi(ci) = spec;
+    let claims = JobClaims::of(gitlab, ci);
+    let resolved = crate::store::resolve(namespaces, &claims);
+    let now = crate::now_secs();
+    let ttl = ci
+        .timeout_secs
+        .saturating_add(JOB_TOKEN_MARGIN)
+        .min(hub.token_keys.max_token.as_secs())
+        .max(1);
+    let claims = Claims {
+        kid: signer.public().kid.clone(),
+        aud: registry.clone(),
+        sub: format!("job:{job}"),
+        jti: vk_peer::token::new_jti()?,
+        pipeline: (claims.pipeline_id > 0).then(|| format!("{gitlab}/{}", claims.pipeline_id)),
+        iat: now,
+        exp: now.saturating_add(ttl),
+        grants: resolved.grants,
+    };
+    let event = format!(
+        "issued registry token {} for job {job} on node {node}: {}",
+        claims.jti,
+        grants_text(&claims.grants)
+    );
+    // The audit row is written once the start is sent; this line stands in should that fail.
+    eprintln!("vk-hub: registry {registry}: {event}");
+    let jti = claims.jti.clone();
+    let access = JobRegistry {
+        registry_id: registry.clone(),
+        expires_at: claims.exp,
+        grants: claims.grants.clone(),
+        cache_repo: resolved.cache_repo,
+        pipeline_prefix: resolved.pipeline_prefix,
+        token: signer.sign(claims)?,
+    };
+    Ok((access, (Some(registry), event), jti))
 }
 
 /// Grants as the audit log and the CLI print them: `prefix=rwl`, comma-separated.
@@ -384,6 +573,35 @@ pub fn mint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why a job gets no token, in the order they are checked: a hub with no registry for
+    /// tokens says nothing; then the key, then the node.
+    #[test]
+    fn a_job_gets_the_first_reason_it_has_no_token() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let spec = JobSpec::GitlabCi(Default::default());
+        let bare = NodeRow::default();
+        let mut ctx = MintCtx::default();
+        let none = |ctx: &MintCtx, key| {
+            for_job(&hub, ctx, ("n", &bare), "j", &spec, key)
+                .err()
+                .unwrap()
+        };
+        assert_eq!(none(&ctx, None), None);
+        ctx.untokened
+            .insert("https://reg.example.com".into(), "r".into());
+        let reason = |access: Option<RegistryAccess>| match access {
+            Some(RegistryAccess::None { reason, .. }) => reason,
+            other => panic!("{other:?}"),
+        };
+        // An unbound key wins over a node with no inventory at all.
+        assert_eq!(reason(none(&ctx, None)), NoAccess::UnboundKey);
+        ctx.bound.insert("k".into(), "gl".into());
+        assert_eq!(
+            reason(none(&ctx, Some("k"))),
+            NoAccess::NodeWithoutJobTokens
+        );
+    }
 
     #[test]
     fn an_operator_sub_fits_a_token() {

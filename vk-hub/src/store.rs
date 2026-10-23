@@ -52,17 +52,17 @@ mod tools;
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};
 pub use jobs::{
-    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, PREPARE_STAGE, RequestRow,
-    SUMMARY_JOBS, Submitted,
+    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, NoAccess, PREPARE_STAGE,
+    RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
     envelope_text, valid_name,
 };
-pub use namespaces::{NamespaceRow, NsGrant, prefix_retention};
+pub use namespaces::{NamespaceRow, NsGrant, prefix_retention, resolve};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
-    operation_name as registry_operation_name,
+    normalize_registry_url, operation_name as registry_operation_name,
 };
 pub use token_keys::TokenKeyRow;
 pub use tools::{Tools, ToolsRow};

@@ -146,6 +146,10 @@ pub struct JobRow {
     /// When expiry past [`JOB_KEEP`] removed its redacted spec and any unsettled output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expired_at: Option<u64>,
+    /// Registry access recorded at placement, never the token itself.
+    /// `None` before placement and for jobs placed by older hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_access: Option<RegistryAccess>,
     /// The GitLab instance its key was bound to at submission, by name: the instance the hub
     /// checked its project against. `None` for a key bound to none, or an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +161,52 @@ pub struct JobRow {
     /// `None` when GitLab did not say, or for an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected: Option<bool>,
+}
+
+/// What registry access a placed job got: its token's display data, or why it got none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegistryAccess {
+    Issued {
+        registry: String,
+        grants: Vec<vk_hub_proto::token::Grant>,
+        expires_at: u64,
+        /// The token's ID, as audited.
+        jti: String,
+    },
+    None {
+        reason: NoAccess,
+        /// The registry it concerns, when one is known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry: Option<String>,
+        /// The registry URL the node reported, when it concerns that.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// A kind from a later hub.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a placed job got no registry token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoAccess {
+    /// Its jobs key is bound to no GitLab instance, or no longer works.
+    UnboundKey,
+    /// Its node does not announce job tokens: an older `vk`.
+    NodeWithoutJobTokens,
+    /// Its node reports no registry, or one bound to no registry the hub knows.
+    UnknownRegistry,
+    /// The registry it reaches does not take tokens (`[hub] tokens`).
+    RegistryTakesNoTokens,
+    /// The registry has applied no signing key yet.
+    NoAppliedKey,
+    /// Minting failed: the hub's log says why.
+    MintFailed,
+    /// A reason from a later hub.
+    #[serde(other)]
+    Other,
 }
 
 impl JobRow {
@@ -1153,6 +1203,29 @@ fn sweep_requests(db: &Db, requests: &mut redb::Table<'_, &str, &[u8]>, now: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Older records decode without registry access; unknown kinds and reasons from later
+    /// hubs decode to fallback variants.
+    #[test]
+    fn registry_access_decodes_from_older_and_later_hubs() {
+        let mut row = serde_json::to_value(row(1)).unwrap();
+        row.as_object_mut().unwrap().remove("registry_access");
+        let old: JobRow = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(old.registry_access, None);
+        row["registry_access"] = serde_json::json!({"kind": "delegated", "to": "x"});
+        let later: JobRow = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(later.registry_access, Some(RegistryAccess::Unknown));
+        row["registry_access"] = serde_json::json!({"kind": "none", "reason": "quota"});
+        let later: JobRow = serde_json::from_value(row).unwrap();
+        assert_eq!(
+            later.registry_access,
+            Some(RegistryAccess::None {
+                reason: NoAccess::Other,
+                registry: None,
+                url: None,
+            })
+        );
+    }
     use vk_hub_proto::job::{Envelope, FailureClass};
 
     fn row(revision: u64) -> JobRow {
@@ -1188,6 +1261,7 @@ mod tests {
             activity: None,
             prepared_at: None,
             guest: None,
+            registry_access: None,
             gitlab: None,
             project_id: None,
             protected: None,

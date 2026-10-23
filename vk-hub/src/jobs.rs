@@ -276,6 +276,10 @@ struct LiveJob {
     /// Its [`image_key`], from its spec; `None` for a job recovered after a restart whose
     /// spec expired.
     image_key: Option<String>,
+    /// Its jobs key's [`ApiPrincipal::id`] when that key is bound to a GitLab instance: what
+    /// its registry token is minted for, while the key still works. `None` for a key bound to
+    /// none, whose jobs get no token, and for a job recovered after a restart.
+    mint_key: Option<String>,
 }
 
 impl LiveJob {
@@ -862,6 +866,7 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
             if let Some(job) = state.jobs.get_mut(&id).filter(|_| requeue) {
                 job.row.state = JobState::Queued;
                 job.row.node = None;
+                job.row.registry_access = None;
                 job.row.revision = job.row.revision.saturating_add(1);
                 job.reservation = None;
                 writes.push((id, job.row.clone(), Vec::new()));
@@ -1029,6 +1034,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 // sent on goes back.
                 row.state = JobState::Queued;
                 row.node = None;
+                row.registry_access = None;
                 if let Some(reservation) = job.reservation.take() {
                     answers.push(HubJobMsg::Release { reservation });
                 }
@@ -2008,7 +2014,8 @@ pub fn release(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(), ApiE
 }
 
 /// Take job `id`, recorded as `row`, with its `spec`, to start on `reservation` or be placed
-/// within `place_within`. The caller has recorded it.
+/// within `place_within`; `mint_key` is its jobs key's ID when that key is bound to a GitLab
+/// instance. The caller has recorded it.
 pub fn admit(
     hub: &Hub,
     id: &str,
@@ -2016,6 +2023,7 @@ pub fn admit(
     spec: JobSpec,
     reservation: Option<String>,
     place_within: Duration,
+    mint_key: Option<String>,
 ) {
     let limit = match &spec {
         JobSpec::GitlabCi(ci) => ci.trace.limit_bytes,
@@ -2045,6 +2053,7 @@ pub fn admit(
             output_cap: limit.saturating_add(OUTPUT_SLACK).min(MAX_OUTPUT),
             reservation_accepted_at: 0,
             image_key,
+            mint_key,
         },
     );
     drop(state);
@@ -2294,6 +2303,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     output_cap: limit.saturating_add(DEFAULT_OUTPUT_LIMIT).min(MAX_OUTPUT),
                     reservation_accepted_at: 0,
                     image_key: None,
+                    mint_key: None,
                 },
             );
             continue;
@@ -2311,6 +2321,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 output_cap: 0,
                 reservation_accepted_at: 0,
                 image_key: None,
+                mint_key: None,
             },
         );
         if let Some((row, events)) = finish(
@@ -2455,10 +2466,14 @@ async fn step(hub: &Hub) -> Result<()> {
         let state = hub.dispatch.lock();
         state.jobs.values().any(|j| j.row.state == JobState::Queued)
     };
-    let nodes = if queued {
-        blocking(hub, |db| db.nodes()).await?
+    let (nodes, mint) = if queued {
+        let keys = hub.token_keys.clone();
+        blocking(hub, move |db| {
+            Ok((db.nodes()?, crate::tokens::MintCtx::read(db, &keys)?))
+        })
+        .await?
     } else {
-        Vec::new()
+        (Vec::new(), crate::tokens::MintCtx::default())
     };
     let mut writes = Vec::new();
     {
@@ -2517,7 +2532,11 @@ async fn step(hub: &Hub) -> Result<()> {
                 continue;
             }
             // Placed if it can be, even at its deadline: a window of 0 takes a node now.
-            if let Some(w) = place(hub, &mut state, &nodes, &id, now) {
+            let ctx = PlaceCtx {
+                nodes: &nodes,
+                mint: &mint,
+            };
+            if let Some(w) = place(hub, &mut state, &ctx, &id, now) {
                 writes.push(w);
                 continue;
             }
@@ -2544,6 +2563,12 @@ async fn step(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
+/// What [`place`] reads of the database, once per pass of [`step`].
+struct PlaceCtx<'a> {
+    nodes: &'a [(String, NodeRow)],
+    mint: &'a crate::tokens::MintCtx,
+}
+
 /// Send queued job `id` to its reservation's node while the reservation holds, else the
 /// least loaded candidate that has not refused it ([`candidates`]). Prefer a lightly loaded
 /// candidate holding its image unless the reservation's node also holds it ([`warm_nodes`]).
@@ -2551,12 +2576,14 @@ async fn step(hub: &Hub) -> Result<()> {
 fn place(
     hub: &Hub,
     state: &mut State,
-    nodes: &[(String, NodeRow)],
+    ctx: &PlaceCtx<'_>,
     id: &str,
     now: Instant,
 ) -> Option<(String, JobRow, Vec<Event>)> {
+    let PlaceCtx { nodes, mint } = *ctx;
     let job = state.jobs.get(id)?;
     let spec = job.spec.clone()?;
+    let mint_key = job.mint_key.clone();
     let placement = job.row.placement.clone();
     let mut tried = job.tried.clone();
     let affinity = hub.dispatch.affinity;
@@ -2615,12 +2642,24 @@ fn place(
             (node, None, placement.envelope)
         }
     };
+    let minted = nodes.iter().find(|(n, _)| *n == node).map(|(n, row)| {
+        crate::tokens::for_job(hub, mint, (n, row), id, &spec, mint_key.as_deref())
+    });
+    let (registry, events, shown) = match minted {
+        Some(Ok(((access, (index, event)), shown))) => (
+            Some(access),
+            vec![(index, HUB.to_string(), event)],
+            Some(shown),
+        ),
+        Some(Err(shown)) => (None, Vec::new(), shown),
+        None => (None, Vec::new(), None),
+    };
     let start = HubJobMsg::Start(Box::new(JobStart {
         job: id.to_string(),
         reservation: reservation.clone(),
         envelope,
         spec: (*spec).clone(),
-        registry: None,
+        registry,
     }));
     if !send(state, &node, start) {
         return None;
@@ -2635,6 +2674,7 @@ fn place(
     job.reservation_accepted_at = accepted_at;
     job.row.state = JobState::Starting;
     job.row.node = Some(node.clone());
+    job.row.registry_access = shown;
     job.row.revision = job.row.revision.saturating_add(1);
     let row = job.row.clone();
     if let Some(r) = given_up
@@ -2642,8 +2682,8 @@ fn place(
     {
         send(state, &x.node, HubJobMsg::Release { reservation: r });
     }
-    // Unaudited: its record holds its node.
-    Some((id.to_string(), row, Vec::new()))
+    // Its node is in its record; only a registry token issued is audited.
+    Some((id.to_string(), row, events))
 }
 
 /// The latest `limit` jobs, newest first, those under way as the hub holds them now.
@@ -3444,6 +3484,7 @@ mod tests {
             output_cap: 0,
             reservation_accepted_at: 0,
             image_key: None,
+            mint_key: None,
         }
     }
 

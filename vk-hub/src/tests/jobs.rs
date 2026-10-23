@@ -28,7 +28,7 @@ use vk_hub_proto::{
 };
 
 use super::*;
-use crate::store::{KeyPolicy, Scope};
+use crate::store::{KeyPolicy, NoAccess, RegistryAccess, Scope};
 
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };
@@ -67,6 +67,7 @@ async fn serve_undriven(
     let addr = listener.local_addr().unwrap();
     let hub = Arc::new(
         Hub::new(db, None)
+            .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
             .with_jobs(
                 dir.join("jobs"),
                 lost_after,
@@ -3565,6 +3566,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         activity: None,
         prepared_at: None,
         guest: None,
+        registry_access: None,
         gitlab: None,
         project_id: None,
         protected: None,
@@ -3670,6 +3672,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         activity: None,
         prepared_at: None,
         guest: None,
+        registry_access: None,
         gitlab: None,
         project_id: None,
         protected: None,
@@ -4075,6 +4078,7 @@ fn a_job_is_shown_on_the_command_line() {
             cpus: 2,
             mem_mib: 4096,
         }),
+        registry_access: None,
         gitlab: None,
         project_id: None,
         protected: None,
@@ -4119,4 +4123,322 @@ fn a_commit_is_hex_or_nothing() {
     for bad in ["", "abc\"><x", "0123456789 ", &"f".repeat(65)] {
         assert_eq!(commit(bad), None, "{bad:?}");
     }
+}
+
+/// A job body of project `id` at `path`, from the instance the bound keys name, which runs
+/// for `timeout_secs`.
+fn bound_body(n: u8, id: u64, path: &str, timeout_secs: u64) -> Value {
+    let mut body = job_body(n, None, 30);
+    let JobSpec::GitlabCi(mut ci) = spec(u64::from(n));
+    ci.job.project_id = id;
+    ci.job.project_path = path.into();
+    ci.timeout_secs = timeout_secs;
+    body["spec"] = json!(JobSpec::GitlabCi(ci));
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
+    let dir = scratch("token");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let now = now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
+        .unwrap();
+    let bound = |projects: Vec<crate::store::ProjectCeiling>| KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+        gitlab: Some("gl".into()),
+        projects,
+    };
+    let (key, _) = hub
+        .db
+        .create_api_key(
+            "bound",
+            &bound(Vec::new()),
+            Duration::from_secs(3600),
+            "uid 0",
+            now,
+        )
+        .unwrap();
+    let listed = vec![crate::store::ProjectCeiling::parse("42:wab/core").unwrap()];
+    let (listed_key, _) = hub
+        .db
+        .create_api_key(
+            "listed",
+            &bound(listed),
+            Duration::from_secs(3600),
+            "uid 0",
+            now,
+        )
+        .unwrap();
+    let registry = super::tokens::token_registry(&hub, super::tokens::REGISTRY_URL, "cc");
+    // Room for every job below at once: none of them ends.
+    let mut node = ready_node(addr, &hub, 16384 * 8).await;
+    let node_id = node.id.clone();
+    let set_inventory = |registry: Option<&str>, job_tokens: bool| {
+        let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
+        inventory.registry = registry.map(str::to_string);
+        inventory.job_tokens = job_tokens;
+        hub.db
+            .record_inventory(&node_id, inventory, true, now_secs())
+            .unwrap();
+    };
+    set_inventory(Some("https://REG.example.com"), true);
+    let submit = |key: String, body: Value| async move {
+        api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await
+    };
+    // What the key's ceiling does not cover is refused before it is queued: another
+    // instance's job, a project the list does not hold by ID and path, and a job naming no
+    // project.
+    let mut foreign = bound_body(1, 42, "wab/core", 600);
+    foreign["spec"]["server_url"] = json!("https://evil.example.com");
+    for (k, body) in [
+        (&key, foreign),
+        (&listed_key, bound_body(1, 42, "wab/other", 600)),
+        (&listed_key, bound_body(1, 43, "wab/core", 600)),
+        (&key, bound_body(1, 0, "wab/core", 600)),
+    ] {
+        let resp = submit(k.clone(), body).await;
+        assert_eq!(resp.status, 403, "{resp:?}");
+        assert_eq!(resp.code(), ErrorCode::Forbidden);
+    }
+    let resp = submit(listed_key.clone(), bound_body(2, 42, "wab/core", 600)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let view: JobView = resp.json();
+    // Its record keeps the claims its key's ceiling held it to, and the protection reported.
+    let row = hub.db.job(&view.id).unwrap().unwrap();
+    assert_eq!(
+        (row.gitlab.as_deref(), row.project_id, row.protected),
+        (Some("gl"), Some(42), None)
+    );
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    let access = start.registry.expect("a registry token");
+    assert_eq!(access.registry_id, registry);
+    assert_eq!(
+        access.cache_repo.as_deref(),
+        Some("ci-cache/gl/42/unprotected")
+    );
+    assert_eq!(
+        access.pipeline_prefix.as_deref(),
+        Some("ci-pipeline/gl/42/902")
+    );
+    let keys = hub
+        .db
+        .registry(&registry)
+        .unwrap()
+        .unwrap()
+        .desired
+        .unwrap()
+        .token_keys
+        .unwrap();
+    let claims = vk_peer::token::verify(&access.token, &keys, &registry, now_secs()).unwrap();
+    assert_eq!(claims.sub, format!("job:{}", view.id));
+    assert_eq!(claims.pipeline.as_deref(), Some("gl/902"));
+    assert_eq!(claims.grants, access.grants);
+    assert_eq!(claims.exp, access.expires_at);
+    // Its timeout, and what is stored after its last step.
+    assert_eq!(
+        claims.exp - claims.iat,
+        600 + crate::tokens::JOB_TOKEN_MARGIN
+    );
+    let rights: Vec<(String, String)> = claims
+        .grants
+        .iter()
+        .map(|g| (g.prefix.clone(), g.rights()))
+        .collect();
+    assert_eq!(
+        rights,
+        [
+            ("ci-cache/gl/42/unprotected".to_string(), "rw".to_string()),
+            ("ci-pipeline/gl/42/902".to_string(), "rwl".to_string())
+        ]
+    );
+    assert!(format!("{access:?}").contains("[redacted]"));
+    // The issue is audited beside the start, under the registry, naming the node.
+    wait_until(|| {
+        hub.db
+            .audits(Some(&registry), 200)
+            .unwrap()
+            .iter()
+            .any(|a| a.event.contains(&claims.jti) && a.event.contains(&node_id))
+    })
+    .await;
+    let audit = hub.db.audits(None, 200).unwrap();
+    assert!(audit.iter().all(|a| !a.event.contains("vkt_")));
+    // The job's record shows what it got, never the token.
+    let shown = |id: &str| {
+        crate::jobs::detail(&hub, id)
+            .unwrap()
+            .unwrap()
+            .0
+            .registry_access
+    };
+    assert_eq!(
+        shown(&view.id),
+        Some(RegistryAccess::Issued {
+            registry: registry.clone(),
+            grants: claims.grants.clone(),
+            expires_at: claims.exp,
+            jti: claims.jti.clone(),
+        })
+    );
+    // A token lives no longer than max_job_token_secs, whatever the job's timeout.
+    let resp = submit(key.clone(), bound_body(3, 42, "wab/core", 30 * 86_400)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    let access = start.registry.expect("a registry token");
+    let claims = vk_peer::token::verify(&access.token, &keys, &registry, now_secs()).unwrap();
+    assert_eq!(
+        claims.exp - claims.iat,
+        crate::tokens::DEFAULT_MAX_JOB_TOKEN.as_secs()
+    );
+    // Jobs go without when anything a token needs is missing: an unbound key, a node that
+    // uses none or names no registry the hub binds.
+    let plain = jobs_key(&hub);
+    let mut n = 4;
+    let mut goes_without = |key: String| {
+        n += 1;
+        let body = bound_body(n, 42, "wab/core", 600);
+        async move { (key, body) }
+    };
+    let none = |reason, registry: Option<&str>, url: Option<&str>| {
+        Some(RegistryAccess::None {
+            reason,
+            registry: registry.map(str::to_string),
+            url: url.map(str::to_string),
+        })
+    };
+    let (k, body) = goes_without(plain).await;
+    let resp = submit(k, body).await;
+    assert_eq!(resp.status, 201);
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    assert!(start.registry.is_none(), "an unbound key");
+    assert_eq!(
+        shown(&resp.json::<JobView>().id),
+        none(NoAccess::UnboundKey, None, None)
+    );
+    // A registry bound to the URL but taking no tokens.
+    let untokened = super::tokens::token_registry(&hub, "https://plain.example.com", "dd");
+    let inventory = vk_hub_proto::registry::Inventory::default();
+    hub.db
+        .record_registry(
+            &untokened,
+            crate::store::RegistryWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+    for (url, job_tokens, why, want) in [
+        (
+            Some("https://reg.example.com"),
+            false,
+            "a node not using tokens",
+            none(NoAccess::NodeWithoutJobTokens, None, None),
+        ),
+        (
+            Some("https://other.example.com"),
+            true,
+            "a registry the hub does not bind",
+            none(
+                NoAccess::UnknownRegistry,
+                None,
+                Some("https://other.example.com"),
+            ),
+        ),
+        (
+            Some("https://plain.example.com"),
+            true,
+            "a registry taking no tokens",
+            none(
+                NoAccess::RegistryTakesNoTokens,
+                Some(&untokened),
+                Some("https://plain.example.com"),
+            ),
+        ),
+        (
+            None,
+            true,
+            "a node naming no registry",
+            none(NoAccess::UnknownRegistry, None, None),
+        ),
+    ] {
+        set_inventory(url, job_tokens);
+        let (k, body) = goes_without(key.clone()).await;
+        let resp = submit(k, body).await;
+        assert_eq!(resp.status, 201);
+        let HubJobMsg::Start(start) = node.job().await else {
+            panic!("expected a start");
+        };
+        assert!(start.registry.is_none(), "{why}");
+        assert_eq!(shown(&resp.json::<JobView>().id), want, "{why}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Requeued jobs clear their registry access; the next placement records its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_start_forgets_the_registry_access_it_was_given() {
+    let dir = scratch("token-refused");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let now = now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
+        .unwrap();
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+        gitlab: Some("gl".into()),
+        projects: Vec::new(),
+    };
+    let (key, _) = hub
+        .db
+        .create_api_key("bound", &policy, Duration::from_secs(3600), "uid 0", now)
+        .unwrap();
+    super::tokens::token_registry(&hub, super::tokens::REGISTRY_URL, "cc");
+    let node = ready_node(addr, &hub, 16384 * 8).await;
+    let mut inventory = hub.db.node(&node.id).unwrap().unwrap().inventory.unwrap();
+    inventory.registry = Some(super::tokens::REGISTRY_URL.into());
+    inventory.job_tokens = true;
+    hub.db
+        .record_inventory(&node.id, inventory, true, now_secs())
+        .unwrap();
+    let mut node = node;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(bound_body(1, 42, "wab/core", 600)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let view: JobView = resp.json();
+    let HubJobMsg::Start(_) = node.job().await else {
+        panic!("expected a start");
+    };
+    let shown = || {
+        crate::jobs::detail(&hub, &view.id)
+            .unwrap()
+            .unwrap()
+            .0
+            .registry_access
+    };
+    assert!(matches!(shown(), Some(RegistryAccess::Issued { .. })));
+    node.send(NodeJobMsg::Job {
+        job: view.id.clone(),
+        state: RunState::Refused {
+            reason: Refusal::Memory,
+            message: None,
+        },
+    });
+    wait_until(|| shown().is_none()).await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }

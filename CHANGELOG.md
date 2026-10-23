@@ -26,7 +26,11 @@ All notable changes to virtkit will be documented in this file.
 - **Registries with `[hub] tokens = true` get the hub's token-signing keys**, and `vk-hub
   token-keys rotate` rolls them without breaking tokens in flight. `max_job_token_secs` in
   `hub.toml` caps a token's lifetime.
-- **`vk-hub registries token` mints a registry token for automation and tests.**
+- **Jobs from a bound key get a registry token scoped to their namespaces**, on nodes whose
+  registry the hub knows; `vk-hub registries token` mints one for automation and tests.
+- **Fleet jobs keep their caches in the registry repository the hub assigns**, with a token
+  scoped to the job, so an unprotected job's caches can no longer overwrite a protected
+  job's. Their existing caches miss once.
 - **`[registry] guest_credential = "job"`** makes `registry.vk` lend each fleet job its own
   scoped token instead of the node's credential. A job without one, a gitlab-runner job on
   that node included, gets no registry access through it.
