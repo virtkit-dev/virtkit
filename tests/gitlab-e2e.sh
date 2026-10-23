@@ -19,7 +19,7 @@
 #   --vk PATH            the vk under test: the node runs it (default: $VK, else dist/vk)
 #   --vk-hub PATH        the vk-hub under test (default: beside --vk)
 #   --vk-registry PATH   vk-registry for the node's [registry] (default: beside --vk-hub);
-#                        without one the cache scenario is skipped
+#                        without one the cache and registry scenarios are skipped
 #   --vk-gitlab PATH     the vk-gitlab under test (default: beside --vk-hub)
 #   --vk-boot PATH       the vk that boots GitLab (default: vk on PATH, else --vk)
 #   --scenario NAME      run only these (repeatable, or comma-separated); default: all
@@ -30,7 +30,9 @@
 #                        which `cargo clean` deletes, live VM sockets included)
 #
 # Environment: VK_GITLAB_E2E_CACHE (default ~/.cache/vk-gitlab-e2e) holds the GitLab
-# instance; GL_MEM (6G) and GL_CPUS (4) size its VM; GL_BOOT_TIMEOUT (1500 s).
+# instance; GL_MEM (6G) and GL_CPUS (4) size its VM; GL_BOOT_TIMEOUT (1500 s). E2E_TOKENS=0
+# runs the fleet without hub registry tokens: the registry not enrolled, the node's own
+# credential for caches, and the `registry` scenario skipped.
 #
 # Needs: KVM, curl, jq, git, openssl, ss, ip, shuf, network to Docker Hub; about 9 GiB of free RAM
 # (GitLab 6 GiB, job VMs 1 GiB each) and 15 GiB of disk for the GitLab image and its state.
@@ -49,7 +51,8 @@ REPO=$(cd "$E2E/../.." && pwd)
 # shellcheck source=gitlab/scenarios.sh
 . "$E2E/scenarios.sh"
 
-ALL_SCENARIOS=(basic scripts variables exit_codes artifacts cache services timeout cancel restart)
+ALL_SCENARIOS=(basic scripts variables exit_codes artifacts cache registry services timeout cancel
+  restart)
 
 usage() {
   sed -n '/^# Usage:/,/^# Needs:/p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -63,6 +66,7 @@ abs() {
   echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
 }
 
+E2E_TOKENS=${E2E_TOKENS:-1}
 VK=${VK:-$REPO/dist/vk} VK_HUB='' VK_REGISTRY='' VK_BOOT='' VK_GITLAB='' KEEP='' RESET='' STOP_ONLY='' RUN=''
 SCENARIOS=()
 while [ $# -gt 0 ]; do
@@ -170,10 +174,10 @@ gl_up
 gl_seed
 T_GL=$(($(date +%s) - T_GL))
 
+hub_up
 if [ -n "$VK_REGISTRY" ]; then
   registry_up
 fi
-hub_up
 node_up
 vk_gitlab_config
 "$VK_GITLAB" verify --config "$RUN/vk-gitlab/config.toml" >"$LOGS/vk-gitlab-verify.log" 2>&1 ||
@@ -205,6 +209,14 @@ pids=()
 for s in "${SCENARIOS[@]}"; do
   case $s in
     restart) ;;
+    registry)
+      if [ -z "$VK_REGISTRY" ] || [ "$E2E_TOKENS" = 0 ]; then
+        echo "SKIP|needs a vk-registry taking hub tokens" >"$RUN/results/registry"
+      else
+        run_scenario registry &
+        pids+=($!)
+      fi
+      ;;
     cache)
       if [ -z "$VK_REGISTRY" ]; then
         echo "SKIP|no vk-registry: the node keeps caches only in a remote [registry]" \

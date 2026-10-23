@@ -1,10 +1,13 @@
 # GitLab end to end
 
-`tests/gitlab-e2e.sh` tests `vk-gitlab` against a real GitLab CE and fleet on one host:
-GitLab in a vk microVM, then `vk-hub` (TLS, with a CA made for the run), a
-`vk-registry` for caches, one `vk node run` enrolled in pool `e2e` with label `e2e`, and
-`vk-gitlab run`. Each scenario pushes a branch with its own `.gitlab-ci.yml` and checks the
-outcome through GitLab's API.
+`tests/gitlab-e2e.sh` tests `vk-gitlab` against a real GitLab CE and fleet on one host: GitLab
+in a vk microVM, then `vk-hub` (TLS, with a CA made for the run), a `vk-registry` for caches,
+one `vk node run` enrolled in pool `e2e` with label `e2e`, and `vk-gitlab run`. The registry
+joins the hub with `[hub] tokens = true`, the jobs key is bound to the GitLab instance as
+`e2e`, and the node gives each job its own registry token (`guest_credential = "job"`);
+`E2E_TOKENS=0` runs the fleet without tokens instead, the node's own credential carrying the
+caches. Each scenario pushes a branch with its own `.gitlab-ci.yml` and checks the outcome
+through GitLab's API.
 
 It is not part of the release gate: `tests/release-e2e.sh` lists it as not run unless
 `E2E_GITLAB=1` is set or the script is named on its command line.
@@ -16,15 +19,17 @@ tests/gitlab-e2e.sh --scenario cache,cancel --keep
 tests/gitlab-e2e.sh --stop-gitlab                 # stop a GitLab left up by --keep
 ```
 
-- **Binaries.** The node runs `--vk` (default `$VK`, else `dist/vk`); `vk-hub`,
-  `vk-registry` and `vk-gitlab` default to the ones beside it, and `--vk-hub`,
-  `--vk-registry` and `--vk-gitlab` override each. Without a `vk-registry` the `cache`
-  scenario is skipped. GitLab boots with the `vk` on `PATH`, else `--vk` (`--vk-boot`).
+- **Binaries.** The node runs `--vk` (default `$VK`, else `dist/vk`); `vk-hub`, `vk-registry`
+  and `vk-gitlab` default to the ones beside it, and `--vk-hub`, `--vk-registry` and
+  `--vk-gitlab` override each. Without a `vk-registry` the `cache` and `registry` scenarios are
+  skipped, and with `E2E_TOKENS=0` the `registry` one. GitLab boots with the `vk` on `PATH`,
+  else `--vk` (`--vk-boot`).
 - **Scenarios.** `basic`, `scripts` (before/after_script), `variables` (masked, file),
   `exit_codes` (`allow_failure: exit_codes`), `artifacts` (upload, exclude, dependency
-  download), `cache` (miss then hit across two pipelines), `services`, `timeout`, `cancel`,
-  `restart` (vk-gitlab killed with SIGKILL mid-job, then resumed). All but `restart` run
-  concurrently; `restart` runs alone after them.
+  download), `cache` (miss then hit across two pipelines), `registry` (a job's token through
+  `registry.vk`: its pipeline's namespace takes a push and a lock, `images` refuses both),
+  `services`, `timeout`, `cancel`, `restart` (vk-gitlab killed with SIGKILL mid-job, then
+  resumed). All but `restart` run concurrently; `restart` runs alone after them.
 - **GitLab.** `gitlab/gitlab-ce`, pinned by digest in `tests/gitlab/images.env` (which says
   how to bump it), boots with its own `/assets/init-container` as the command of a detached
   `vk run` under vk-agent. Its three volumes are `:disk` qcow2 files under

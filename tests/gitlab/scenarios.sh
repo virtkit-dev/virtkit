@@ -264,6 +264,39 @@ EOF
   SC_DETAIL="miss in $p1, hit in $p2"
 }
 
+# A job uses its hub-minted token through the guest registry proxy: pushes and locks succeed
+# in its pipeline's namespace and fail under other prefixes. The token stays out of the trace.
+# HTTP statuses computed at runtime keep echoed command lines from satisfying the checks.
+sc_registry() {
+  local ci p j
+  ci=$({
+    ci_header
+    cat <<'EOF'
+scoped:
+  script:
+    - echo "registry=$VK_REGISTRY"
+    - echo "namespaces=$VK_REGISTRY_NAMESPACES"
+    - P=ci-pipeline/e2e/$CI_PROJECT_ID/$CI_PIPELINE_ID
+    - code() { wget -S -q -O /dev/null --post-data= "$VK_REGISTRY$1" 2>&1 | awk '/^ *HTTP\//{c=$2} END{print c}'; }
+    - echo "push-own=$(code /v2/$P/probe/blobs/uploads/)"
+    - echo "push-other=$(code /v2/images/probe/blobs/uploads/)"
+    - echo "lock-own=$(code "/lock/acquire?name=$P:k&ttl=30&wait=0")"
+    - echo "lock-other=$(code "/lock/acquire?name=images:k&ttl=30&wait=0")"
+EOF
+  })
+  p=$(push_scenario registry <<<"$ci") || return 1
+  wait_pipeline "$p" success || return 1
+  j=$(job "$p" scoped)
+  keep_job "$j"
+  local want
+  for want in "registry=http://registry.vk" "namespaces=.*ci-pipeline/e2e/$GL_PROJECT_ID/$p=rwl" \
+    push-own=202 push-other=403 lock-own=200 lock-other=403; do
+    grep -qE "${LINE}${want}\$" "$RUN/jobs/$j.log" || bad "job $j's trace lacks a line '$want'"
+  done
+  trace_lacks "$j" vkt_
+  SC_DETAIL="pipeline $p: own namespace writable and lockable, others refused"
+}
+
 sc_services() {
   local p j
   p=$({

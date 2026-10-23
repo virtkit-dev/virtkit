@@ -47,14 +47,40 @@ fleet_certs() {
     -CAcreateserial -days 2 -extfile "$d/hub.ext" -out "$d/hub.pem" 2>/dev/null
 }
 
-# A plain-HTTP vk-registry on loopback: the node's [registry], where caches go.
+# A plain-HTTP vk-registry on loopback: the node's [registry], where caches go. Enrolled with
+# the hub, which mints job tokens for it ([hub] tokens = true), unless E2E_TOKENS=0.
 registry_up() {
   REG_PORT=$(free_port)
-  mkdir -p "$RUN/registry"
-  bg registry "$VK_REGISTRY" serve --addr "127.0.0.1:$REG_PORT" --root "$RUN/registry"
+  mkdir -p "$RUN/registry/store"
+  {
+    printf 'addr = "127.0.0.1:%s"\nroot = "%s"\n' "$REG_PORT" "$RUN/registry/store"
+    [ "$E2E_TOKENS" = 0 ] || printf '\n[hub]\ntokens = true\n'
+  } >"$RUN/registry/registry.toml"
+  if [ "$E2E_TOKENS" != 0 ]; then
+    hub token create --kind registry --url "http://127.0.0.1:$REG_PORT" 2>>"$LOGS/hub-cli.log" |
+      "$VK_REGISTRY" join "https://127.0.0.1:$HUB_PORT" --token - --ca "$RUN/pki/ca.pem" \
+        --config "$RUN/registry/registry.toml" >"$RUN/registry/id" 2>>"$LOGS/registry-join.log" ||
+      { cat "$LOGS/registry-join.log" >&2; die "vk-registry join failed"; }
+    REG_ID=$(cat "$RUN/registry/id")
+  fi
+  bg registry "$VK_REGISTRY" serve --config "$RUN/registry/registry.toml"
   wait_for 30 curl -fsS -o /dev/null "http://127.0.0.1:$REG_PORT/v2/" 2>/dev/null ||
     die "vk-registry did not come up (see $LOGS/registry.log)"
-  log "registry: 127.0.0.1:$REG_PORT"
+  if [ "$E2E_TOKENS" != 0 ]; then
+    # Wait for the registry to apply the hub's keys by testing a hub-minted token.
+    wait_for 60 registry_takes_tokens ||
+      die "the registry does not take the hub's tokens (see $LOGS/registry.log, $LOGS/hub.log)"
+    log "registry: 127.0.0.1:$REG_PORT, $REG_ID, taking hub tokens"
+  else
+    log "registry: 127.0.0.1:$REG_PORT"
+  fi
+}
+
+registry_takes_tokens() {
+  local t
+  t=$(hub registries token "$REG_ID" --grant e2e-probe=r --ttl 60s 2>>"$LOGS/hub-cli.log") || return 1
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" \
+    "http://127.0.0.1:$REG_PORT/v2/e2e-probe/tags/list")" = 200 ]
 }
 
 hub() { "$VK_HUB" "$@" --config "$RUN/hub/hub.toml"; }
@@ -72,10 +98,16 @@ data_dir = "$RUN/hub/data"
 EOF
   bg hub "$VK_HUB" serve --config "$RUN/hub/hub.toml"
   wait_for 30 eval 'hub nodes >/dev/null 2>&1' || die "vk-hub did not come up (see $LOGS/hub.log)"
+  # The key is bound to the GitLab instance, which job tokens need ({gitlab} = e2e).
+  local bind=()
+  if [ "$E2E_TOKENS" != 0 ]; then
+    hub gitlabs add e2e "$GL_URL" >>"$LOGS/hub-cli.log" 2>&1 || die "vk-hub gitlabs add failed"
+    bind=(--gitlab e2e)
+  fi
   (
     umask 077
     hub keys create --name vk-gitlab-e2e --pool e2e --max-mem 4G --max-cpus 2 --max-disk 16G \
-      --ttl 1d >"$RUN/hub.key" 2>>"$LOGS/hub-cli.log"
+      --ttl 1d "${bind[@]}" >"$RUN/hub.key" 2>>"$LOGS/hub-cli.log"
   )
   grep -q '^vkk_' "$RUN/hub.key" || die "vk-hub keys create printed no key"
   log "hub: https://127.0.0.1:$HUB_PORT"
@@ -99,6 +131,7 @@ node_up() {
     printf '[node]\nlabels = ["e2e"]\n'
     if [ -n "${REG_PORT:-}" ]; then
       printf '\n[registry]\nrepo = "127.0.0.1:%s/vk"\ninsecure = true\n' "$REG_PORT"
+      [ "$E2E_TOKENS" = 0 ] || printf 'guest_credential = "job"\n'
     fi
   } >"$RUN/node/config.toml"
   hub token create 2>>"$LOGS/hub-cli.log" | node_vk node join "https://127.0.0.1:$HUB_PORT" --token - \
