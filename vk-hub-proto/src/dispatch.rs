@@ -82,6 +82,45 @@ pub struct JobStart {
     /// less hands the difference back.
     pub envelope: Envelope,
     pub spec: JobSpec,
+    /// The job's registry access, when the hub minted a token for the node's registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<JobRegistry>,
+}
+
+/// A job's registry access: a token for one registry, and what the node needs to route
+/// the job's content, since the token is opaque to it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRegistry {
+    /// The registry's ID, the token's `aud`.
+    pub registry_id: String,
+    /// The token, `vkt_…`: a secret, never logged nor shown to the guest.
+    pub token: String,
+    /// The token's `exp`, seconds since the epoch.
+    pub expires_at: u64,
+    /// The token's grants, for the job's `VK_REGISTRY_NAMESPACES`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<crate::token::Grant>,
+    /// The repository the job's CI caches go to, the `ci-cache` namespace's for it: an
+    /// absolute path on the registry. `None` when no such namespace selects the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_repo: Option<String>,
+    /// The prefix of the job's pipeline namespace (`ci-pipeline`), when one selects it.
+    /// Reserved for pipeline caches and captures: nodes do not read it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_prefix: Option<String>,
+}
+
+impl std::fmt::Debug for JobRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobRegistry")
+            .field("registry_id", &self.registry_id)
+            .field("token", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .field("grants", &self.grants)
+            .field("cache_repo", &self.cache_repo)
+            .field("pipeline_prefix", &self.pipeline_prefix)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +350,7 @@ mod tests {
                 reservation: Some(id("a")),
                 envelope: envelope(),
                 spec: JobSpec::GitlabCi(crate::job::tests::ci_job()),
+                registry: None,
             })),
             HubJobMsg::OutputAck {
                 job: id("b"),
@@ -463,6 +503,34 @@ mod tests {
         let start = serde_json::to_value(HubMsg::Job(hub_messages().remove(3))).unwrap();
         assert_eq!(start["kind"], "start");
         assert_eq!(start["spec"]["kind"], "gitlab_ci");
+        assert!(start.get("registry").is_none());
+        let access = JobRegistry {
+            registry_id: id("r"),
+            token: "vkt_x.y".into(),
+            expires_at: 1_700_000_000,
+            grants: vec![crate::token::Grant {
+                prefix: "ci-cache/gl/42/protected".into(),
+                read: true,
+                write: true,
+                lock: false,
+            }],
+            cache_repo: Some("ci-cache/gl/42/protected".into()),
+            pipeline_prefix: Some("ci-pipeline/gl/42/7".into()),
+        };
+        let wire = json!({
+            "registry_id": id("r"),
+            "token": "vkt_x.y",
+            "expires_at": 1_700_000_000,
+            "grants": [{"prefix": "ci-cache/gl/42/protected", "read": true, "write": true}],
+            "cache_repo": "ci-cache/gl/42/protected",
+            "pipeline_prefix": "ci-pipeline/gl/42/7",
+        });
+        assert_eq!(serde_json::to_value(&access).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<JobRegistry>(wire).unwrap(), access);
+        let bare = json!({"registry_id": id("r"), "token": "t", "expires_at": 1});
+        let read: JobRegistry = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&read).unwrap(), bare);
+        assert!(!format!("{access:?}").contains("vkt_"));
     }
 
     #[test]

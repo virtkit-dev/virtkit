@@ -861,6 +861,10 @@ impl Jobs {
         // Written before it is reported, so the next node to read this journal agrees; tried
         // again at the next poll when it cannot be.
         journal::write_json(&t.dir.join(journal::RESULT), &result).ok()?;
+        // As the driver would have once its result was written: the cleanup no longer needs it.
+        if let Err(e) = journal::forget_registry(&t.dir) {
+            say!("dropping the registry token of {}: {e:#}", t.dir.display());
+        }
         Some(result)
     }
 }
@@ -1099,6 +1103,7 @@ pub(crate) mod tests {
             reservation,
             envelope: envelope(4096),
             spec: spec(id),
+            registry: None,
         }))
     }
 
@@ -1312,6 +1317,7 @@ pub(crate) mod tests {
             reservation: None,
             envelope: DISK_ASK,
             spec: spec(4242),
+            registry: None,
         }))
     }
 
@@ -1969,6 +1975,16 @@ pub(crate) mod tests {
     fn a_lost_drivers_result_waits_for_the_nodes_cleanup() {
         let (_, dir) = jobs("lost-slow", None);
         let job_dir = journaled(&dir, &hex("b"), 2);
+        let mut start = journal::read_start(&job_dir).unwrap();
+        start.registry = Some(vk_hub_proto::dispatch::JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_x.y".into(),
+            expires_at: u64::MAX,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+        });
+        journal::write_json(&job_dir.join(journal::START), &start).unwrap();
         let cfg: Config =
             toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
         let limits = Limits {
@@ -1994,6 +2010,8 @@ pub(crate) mod tests {
         assert!(jobs.poll(later, false).is_empty(), "cleaning up");
         assert!(jobs.poll(later, false).is_empty(), "still");
         assert!(journal::read_result(&job_dir).is_none());
+        let token = |dir: &Path| journal::read_start(dir).unwrap().registry.is_some();
+        assert!(token(&job_dir), "the cleanup still has the job's token");
         let done = lock(&SLOW_CLEANUP).take().expect("one cleanup started");
         done.store(true, Ordering::Release);
         let msgs = jobs.poll(later, false);
@@ -2002,6 +2020,7 @@ pub(crate) mod tests {
             "{msgs:?}"
         );
         assert!(journal::read_result(&job_dir).is_some());
+        assert!(!token(&job_dir), "the token is gone with the result");
         assert!(lock(&SLOW_CLEANUP).is_none(), "started once");
         let _ = std::fs::remove_dir_all(dir);
     }

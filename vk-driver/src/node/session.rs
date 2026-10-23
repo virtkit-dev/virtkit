@@ -1427,6 +1427,7 @@ mod tests {
                     reservation: Some(hex("a")),
                     envelope: envelope(4096),
                     spec: spec(4242),
+                    registry: None,
                 }))),
             )
             .await;

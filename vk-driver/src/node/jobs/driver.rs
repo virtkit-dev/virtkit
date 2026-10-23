@@ -42,6 +42,7 @@ use super::vars::Vars;
 use super::{StageCtx, artifacts, cache, env, script};
 use crate::config::Config;
 use crate::jobctx::JobCtx;
+use vk_hub_proto::dispatch::{JobRegistry, JobStart};
 
 /// The trace limit when GitLab's runner gave none: gitlab-runner's `output_limit` default.
 const DEFAULT_TRACE_LIMIT: u64 = 4 << 20;
@@ -150,17 +151,44 @@ pub async fn run(cfg: Config, dir: &Path, ledger_fd: Option<i32>) -> Result<()> 
                 events: Vec::new(),
             };
             journal::write_json(&dir.join(journal::RESULT), &result)?;
+            // The setup's error is the one to report; this one only goes to the log.
+            if let Err(forget) = journal::forget_registry(dir) {
+                say!(
+                    "dropping the registry token of {}: {forget:#}",
+                    dir.display()
+                );
+            }
             return Err(e);
         }
     };
     let result = driver.run_job(&mut vars, &settings, &place, &meta).await;
-    journal::write_json(&dir.join(journal::RESULT), &result)
+    journal::write_json(&dir.join(journal::RESULT), &result)?;
+    // Nothing of the job needs its registry token past its result; the journal can outlive
+    // the job until the hub records it.
+    journal::forget_registry(dir)
+}
+
+/// What the job's trace masks: its masked variables, and the credentials it was given.
+fn masked_phrases(vars: &Vars, job: &CiJob, registry: Option<&JobRegistry>) -> Vec<String> {
+    let mut phrases = vars.masked();
+    phrases.extend(registry.map(|r| r.token.clone()));
+    // Credentials shorter than GitLab's shortest masked value would mask every occurrence of
+    // some common word instead.
+    let credentials = std::iter::once(&job.token)
+        .chain(job.dependencies.iter().map(|d| &d.token))
+        .chain(job.registry_credentials.iter().map(|c| &c.password));
+    phrases.extend(credentials.filter(|c| c.len() >= MIN_MASKED_LEN).cloned());
+    phrases
 }
 
 fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
     let start = journal::read_start(dir)?;
     let meta = journal::read_meta(dir)?;
-    let JobSpec::GitlabCi(job) = start.spec;
+    let JobStart {
+        spec: JobSpec::GitlabCi(job),
+        registry,
+        ..
+    } = start;
     let limit = match job.trace.limit_bytes {
         0 => DEFAULT_TRACE_LIMIT,
         n => n,
@@ -169,13 +197,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
     let vars = Vars::of(&job, &place);
     let settings = Settings::of(&job, &vars);
     let child_env = env::child_env(&job, &vars, &place, dir)?;
-    let mut phrases = vars.masked();
-    // Credentials shorter than GitLab's shortest masked value would mask every occurrence of
-    // some common word instead.
-    let credentials = std::iter::once(&job.token)
-        .chain(job.dependencies.iter().map(|d| &d.token))
-        .chain(job.registry_credentials.iter().map(|c| &c.password));
-    phrases.extend(credentials.filter(|c| c.len() >= MIN_MASKED_LEN).cloned());
+    let phrases = masked_phrases(&vars, &job, registry.as_ref());
     let trace = Arc::new(Trace::open(
         &dir.join(journal::OUTPUT),
         &phrases,
@@ -990,6 +1012,27 @@ fn say_log(dir: &Path, line: &str) {
 mod tests {
     use super::*;
     use crate::node::jobs::testkit::Fixture;
+
+    /// The job's registry token is masked in its trace, as its other credentials are.
+    #[test]
+    fn the_registry_token_is_masked() {
+        let registry = JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_eyJraWQiOiJ4In0.c2lnbmF0dXJl".into(),
+            expires_at: 99,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+        };
+        let job = CiJob::default();
+        let phrases = masked_phrases(&Vars::default(), &job, Some(&registry));
+        assert!(phrases.contains(&registry.token));
+        assert!(
+            !masked_phrases(&Vars::default(), &job, None)
+                .iter()
+                .any(|p| p.starts_with("vkt_"))
+        );
+    }
 
     #[tokio::test]
     async fn stamped_stdout_and_stderr_are_streams_of_their_own() {

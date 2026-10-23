@@ -57,6 +57,16 @@ pub fn read_start(dir: &Path) -> Result<JobStart> {
     read_json(&dir.join(START))
 }
 
+/// Drop the registry access from the start journaled in `dir`, once the job is over: its
+/// token is a secret no later reader of the journal needs.
+pub fn forget_registry(dir: &Path) -> Result<()> {
+    let mut start = read_start(dir)?;
+    if start.registry.take().is_some() {
+        write_json(&dir.join(START), &start)?;
+    }
+    Ok(())
+}
+
 pub fn read_meta(dir: &Path) -> Result<Meta> {
     read_json(&dir.join(META))
 }
@@ -195,6 +205,41 @@ mod tests {
         write_cancel(&dir, CancelMode::Immediate).unwrap();
         write_cancel(&dir, CancelMode::Graceful).unwrap();
         assert_eq!(read_cancel(&dir), Some(CancelMode::Immediate));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finished job's journal keeps its start, but not the registry token in it.
+    #[test]
+    fn a_finished_jobs_start_forgets_its_registry_token() {
+        use vk_hub_proto::dispatch::JobRegistry;
+        let dir = std::env::temp_dir().join(format!("vk-journal-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = JobStart {
+            job: "j".into(),
+            reservation: None,
+            envelope: Default::default(),
+            spec: vk_hub_proto::job::JobSpec::GitlabCi(Default::default()),
+            registry: Some(JobRegistry {
+                registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+                token: "vkt_x.y".into(),
+                expires_at: 99,
+                grants: Vec::new(),
+                cache_repo: None,
+                pipeline_prefix: None,
+            }),
+        };
+        write_json(&dir.join(START), &start).unwrap();
+        forget_registry(&dir).unwrap();
+        let kept = read_start(&dir).unwrap();
+        assert_eq!(kept.registry, None);
+        assert_eq!(kept.job, "j");
+        assert!(
+            !std::fs::read_to_string(dir.join(START))
+                .unwrap()
+                .contains("vkt_")
+        );
+        forget_registry(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2620,6 +2620,7 @@ fn place(
         reservation: reservation.clone(),
         envelope,
         spec: (*spec).clone(),
+        registry: None,
     }));
     if !send(state, &node, start) {
         return None;
