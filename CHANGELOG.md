@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed build recorded by one pipeline no longer clears another pipeline's record** of
+  the same build, so its jobs still fail fast. The registry keeps at most 10,000 such
+  records, dropping the oldest first.
+
 ## [0.94.1] - 2026-10-22
 
 ### Fixed

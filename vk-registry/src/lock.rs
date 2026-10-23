@@ -45,6 +45,9 @@ const MAX_LEASE_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Longest `/lock/acquire` long-polls, whatever `?wait=` asks; past it the client gets the
 /// blockers and asks again.
 const MAX_WAIT: Duration = Duration::from_secs(24 * 3600);
+/// Cap failure records by evicting the oldest, so fresh names and pipelines cannot grow
+/// the table without bound within a ttl.
+const MAX_FAIL_RECORDS: usize = 10_000;
 /// `/lock/fail`'s reason body is free text for a log/error message, not a payload; cap it
 /// well above anything reasonable so a client can't park an unbounded buffer server-side.
 const MAX_FAIL_REASON: usize = 4096;
@@ -73,10 +76,19 @@ pub struct Blocker {
 /// A recorded build failure for one content-key, scoped to the pipeline that hit it — see
 /// [`LockManager::record_failure`].
 struct FailRecord {
-    pipeline: String,
+    /// Order of recording, for evicting the oldest past [`MAX_FAIL_RECORDS`].
+    seq: u64,
     reason: String,
     recorded_at: Instant,
     ttl: Duration,
+}
+
+/// Failure memos keyed by name and pipeline so one pipeline's record never replaces
+/// another's.
+#[derive(Default)]
+struct FailTable {
+    records: HashMap<(String, String), FailRecord>,
+    next_seq: u64,
 }
 
 /// A recent failure matching the querying pipeline, as reported to a caller.
@@ -93,7 +105,7 @@ pub struct LockManager {
     /// build-failure memos, independent of `held` — a domain-specific negative cache, not a
     /// mutual-exclusion primitive, so it never entangles with `task`'s reuse of `/lock/*` for
     /// its own (unrelated) locking. See [`LockManager::record_failure`].
-    failed: Mutex<HashMap<String, FailRecord>>,
+    failed: Mutex<FailTable>,
 }
 
 impl Default for LockManager {
@@ -112,7 +124,7 @@ impl LockManager {
         LockManager {
             held: Mutex::new(HashMap::new()),
             freed: Notify::new(),
-            failed: Mutex::new(HashMap::new()),
+            failed: Mutex::new(FailTable::default()),
         }
     }
 
@@ -121,16 +133,33 @@ impl LockManager {
     /// key, or this job's own runner-level retry — can fail fast instead of repeating a
     /// doomed, expensive build. Scoped to `pipeline`: a different pipeline id (a restart)
     /// always gets a fresh attempt, so there is no separate "clear" operation. Upserts (a
-    /// later failure replaces an earlier one) and prunes every lapsed record while it's at
-    /// it, so the table can't grow without bound.
+    /// later failure under the same pipeline replaces an earlier one; another pipeline's is
+    /// left alone) and prunes every lapsed record while it's at it; past
+    /// [`MAX_FAIL_RECORDS`] live ones, the oldest is evicted.
     pub fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
-        let mut map = self.failed.lock().unwrap();
+        let mut table = self.failed.lock().unwrap();
+        let FailTable {
+            records: map,
+            next_seq,
+        } = &mut *table;
         let now = Instant::now();
         map.retain(|_, r| now.duration_since(r.recorded_at) < r.ttl);
+        let key = (name.to_string(), pipeline.to_string());
+        if map.len() >= MAX_FAIL_RECORDS
+            && !map.contains_key(&key)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, r)| r.seq)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+        let seq = *next_seq;
+        *next_seq += 1;
         map.insert(
-            name.to_string(),
+            key,
             FailRecord {
-                pipeline: pipeline.to_string(),
+                seq,
                 reason: reason.to_string(),
                 recorded_at: now,
                 ttl,
@@ -142,12 +171,11 @@ impl LockManager {
     /// none, it was recorded under a different pipeline, or its ttl has lapsed.
     pub fn recent_failure(&self, name: &str, pipeline: &str) -> Option<FailInfo> {
         let now = Instant::now();
-        self.failed.lock().unwrap().get(name).and_then(|r| {
-            (r.pipeline == pipeline && now.duration_since(r.recorded_at) < r.ttl).then(|| {
-                FailInfo {
-                    reason: r.reason.clone(),
-                    age: now.duration_since(r.recorded_at),
-                }
+        let key = (name.to_string(), pipeline.to_string());
+        self.failed.lock().unwrap().records.get(&key).and_then(|r| {
+            (now.duration_since(r.recorded_at) < r.ttl).then(|| FailInfo {
+                reason: r.reason.clone(),
+                age: now.duration_since(r.recorded_at),
             })
         })
     }
@@ -865,6 +893,37 @@ mod tests {
         m.record_failure("k", "p", "first reason", Duration::from_secs(60));
         m.record_failure("k", "p", "second reason", Duration::from_secs(60));
         assert_eq!(m.recent_failure("k", "p").unwrap().reason, "second reason");
+    }
+
+    /// Another pipeline's record for the same key neither replaces nor clears this one's.
+    #[test]
+    fn a_record_under_another_pipeline_leaves_this_ones() {
+        let m = LockManager::new();
+        m.record_failure("k", "a", "ENOSPC", Duration::from_secs(60));
+        m.record_failure("k", "b", "other", Duration::from_secs(60));
+        assert_eq!(m.recent_failure("k", "a").unwrap().reason, "ENOSPC");
+        assert_eq!(m.recent_failure("k", "b").unwrap().reason, "other");
+    }
+
+    /// Past [`MAX_FAIL_RECORDS`] live records, the oldest gives way to the newest.
+    #[test]
+    fn the_failure_table_evicts_its_oldest_record_past_the_cap() {
+        let m = LockManager::new();
+        let ttl = Duration::from_secs(60);
+        for i in 0..=MAX_FAIL_RECORDS {
+            m.record_failure(&format!("k{i}"), "p", "r", ttl);
+        }
+        assert_eq!(m.failed.lock().unwrap().records.len(), MAX_FAIL_RECORDS);
+        assert!(m.recent_failure("k0", "p").is_none(), "the oldest went");
+        assert!(m.recent_failure("k1", "p").is_some());
+        assert!(
+            m.recent_failure(&format!("k{MAX_FAIL_RECORDS}"), "p")
+                .is_some()
+        );
+        // Replacing a record already held evicts nothing.
+        m.record_failure("k1", "p", "again", ttl);
+        assert_eq!(m.failed.lock().unwrap().records.len(), MAX_FAIL_RECORDS);
+        assert!(m.recent_failure("k2", "p").is_some());
     }
 
     #[test]

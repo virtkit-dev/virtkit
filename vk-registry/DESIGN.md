@@ -369,9 +369,10 @@ deadlock through inconsistent client lock ordering, and all names share one owne
 Contended acquisition long-polls until the names become available or the wait expires.
 
 Failure records are separate from mutual exclusion. They let jobs in the same pipeline avoid
-repeating an expensive build that a peer has already shown to fail. Records are scoped by
-pipeline ID, default to six hours, are capped at 24 hours, and hold at most 4 KiB of reason
-text. A new pipeline ID always gets a fresh build attempt.
+repeating an expensive build that a peer has already shown to fail. Records are keyed by
+name and pipeline ID, so one pipeline's record never replaces another's. They default to six
+hours, are capped at 24 hours, and hold at most 4 KiB of reason text. Beyond 10,000 records,
+the oldest is evicted first. A new pipeline ID always gets a fresh build attempt.
 
 ## Batched manifest probe
 
