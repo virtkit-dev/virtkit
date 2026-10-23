@@ -592,16 +592,7 @@ pub const COLUMNS: [&str; 9] = [
 pub fn cells(r: &RegistryView, now: u64) -> [String; 9] {
     let inventory = r.row.inventory.as_ref();
     let report = r.row.report.as_ref();
-    let free = match (
-        r.row.heartbeat.as_ref().map(|h| h.store_free_bytes),
-        inventory,
-    ) {
-        (Some(free), Some(i)) if i.store_size_bytes > 0 => {
-            format!("{} of {}", gib(free), gib(i.store_size_bytes))
-        }
-        (Some(free), _) => gib(free),
-        _ => "-".to_string(),
-    };
+    let free = free(r);
     [
         r.id.clone(),
         r.row.hostname.clone(),
@@ -632,6 +623,20 @@ pub fn cells(r: &RegistryView, now: u64) -> [String; 9] {
             )
         }),
     ]
+}
+
+/// `STORE FREE`: free storage, including the total store size when reported.
+pub fn free(r: &RegistryView) -> String {
+    match (
+        r.row.heartbeat.as_ref().map(|h| h.store_free_bytes),
+        r.row.inventory.as_ref(),
+    ) {
+        (Some(free), Some(i)) if i.store_size_bytes > 0 => {
+            format!("{} of {}", gib(free), gib(i.store_size_bytes))
+        }
+        (Some(free), _) => gib(free),
+        _ => "-".to_string(),
+    }
 }
 
 /// Lines to print under the table: what each registry is doing or did that a column cannot

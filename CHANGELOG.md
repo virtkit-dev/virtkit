@@ -37,6 +37,10 @@ All notable changes to virtkit will be documented in this file.
 - **Fleet jobs under `guest_credential = "job"` take build locks and share files through
   `registry.vk`**, within their namespaces. `VK_REGISTRY` and `VK_REGISTRY_NAMESPACES` tell a
   job where the registry is and what it may do there.
+
+- **The hub's Registries page says whether jobs get access to each registry**: off, set up
+  with its count of storage areas, setup needed and why, or between signing keys. Each
+  registry shows its address; version, mode and ID move to its own page.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

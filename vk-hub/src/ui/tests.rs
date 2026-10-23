@@ -2166,6 +2166,33 @@ async fn start_fleet_with(scheme: &str, node_url: Option<&str>) -> (SocketAddr, 
     (addr, hub, origin)
 }
 
+/// A test's token-signing directory, removed on drop.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0); // gone already, or never made: nothing left
+    }
+}
+
+/// [`start_fleet`] with keys for minting registry tokens in a fresh directory.
+/// The returned guard removes the directory on drop.
+async fn start_fleet_keys(tag: &str) -> (SocketAddr, Arc<Hub>, TempDir) {
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let keys =
+        TempDir(std::env::temp_dir().join(format!("vk-hub-ui-keys-{tag}-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&keys.0); // a leftover of an earlier run, if any
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_token_keys(keys.0.clone(), crate::tokens::DEFAULT_MAX_JOB_TOKEN),
+    );
+    let ui = Arc::new(Ui::new(hub.clone(), &origin));
+    tokio::spawn(serve(listener, None, ui));
+    (addr, hub, keys)
+}
+
 /// Operators receive a redeemable token once in the POST response, audited as their session.
 /// Viewers see no form and cannot request a token.
 #[tokio::test(flavor = "multi_thread")]
@@ -7584,4 +7611,62 @@ async fn registries_are_shown_to_all_and_steered_by_operators() {
         audit.contains(&format!("<option value=\"{id}\"")),
         "{audit}"
     );
+}
+
+/// The registries' list names each registry with its address, and says whether jobs get
+/// access to it: off, set up, needing setup, or between signing keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_registries_list_says_whether_jobs_get_access() {
+    use crate::store::RegistryWrite;
+    use crate::tests::tokens::{apply, enrolled_registry, token_registry, url_registry};
+    let (addr, hub, _keys) = start_fleet_keys("list").await;
+    url_registry(&hub, "https://off.example.com", "a1");
+    token_registry(&hub, "https://ok.example.com", "a2");
+    let unbound = enrolled_registry(&hub, "a3");
+    let inventory = vk_hub_proto::registry::Inventory {
+        tokens: true,
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(
+            &unbound,
+            RegistryWrite::Inventory(inventory),
+            crate::now_secs(),
+        )
+        .unwrap();
+    crate::tokens::sync_registry(&hub, &unbound).unwrap();
+    apply(&hub, &unbound);
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let body = get(addr, "/registries", Some(&viewer)).await.body;
+    for want in [
+        "<th>JOB ACCESS</th>",
+        "https://off.example.com",
+        "<span class=\"sub\">off</span>",
+        "https://ok.example.com",
+        "<span class=\"badge ok\">Configured</span><div class=\"sub\">2 storage areas</div>",
+        "no address",
+        "Setup needed</span><div class=\"sub\">no address bound",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    // A new signing key: the registry is between keys until it applies it.
+    crate::tokens::rotate(&hub, "uid 0").unwrap();
+    let body = get(addr, "/registries", Some(&viewer)).await.body;
+    assert!(body.contains("Updating signing keys"), "{body}");
+    // What a registry reports, and the address it is bound to, are escaped.
+    let hostile = url_registry(&hub, "https://<script>.example.com", "a4");
+    let inventory = vk_hub_proto::registry::Inventory {
+        hostname: "<script>alert(1)</script>".into(),
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(
+            &hostile,
+            RegistryWrite::Inventory(inventory),
+            crate::now_secs(),
+        )
+        .unwrap();
+    let body = get(addr, "/registries", Some(&viewer)).await.body;
+    assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
+    assert!(!body.contains("<script>"), "{body}");
 }

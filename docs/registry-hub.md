@@ -453,6 +453,12 @@ the registry by jti, job and node, never the token, which the hub stores nowhere
 registries token <id> --grant <prefix>=<rights> [--grant …] [--pipeline <gitlab>/<id>] [--ttl
 1h]` mints one for automation and tests, audited the same way.
 
+**Web UI.** `/registries` lists each registry's name, bound address, connection status, free
+storage and job access: *off* (no `[hub] tokens`), *Setup needed* (no bound address or applied
+signing key), *Updating signing keys* (a newer key exists; the applied key still signs), or
+*Configured* with a storage-area count. The UI calls namespaces storage areas. Version, mode
+and ID are on the registry's page.
+
 ## Open questions
 
 - **Key table size.** Bounded by the hub's 256 keys today; a fleet with per-project keys in the

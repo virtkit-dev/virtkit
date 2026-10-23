@@ -13,7 +13,7 @@ use super::html::Html;
 use super::pages::{self, end_section, header_cells, kv, kv_node, section};
 use super::{Auth, Body, Ui, blocking, field, message, page};
 use crate::registries::{self as ops, RegistryView};
-use crate::store::{NotEnrolled, RegistryCommandRow, Role};
+use crate::store::{NotEnrolled, RegistryCommandRow, RegistryRow, Role, TokenKeyRow};
 
 /// The registries' list.
 pub(super) const PATH: &str = "/registries";
@@ -34,10 +34,84 @@ pub(super) fn detail_target(path: &str) -> Option<&str> {
         .filter(|id| vk_hub_proto::valid_id(id))
 }
 
-/// `/registries`.
+/// A registry's job access, as its row and its page say it.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum JobAccess {
+    /// It does not take the hub's tokens (`[hub] tokens`).
+    Off,
+    /// It takes tokens, but jobs cannot get one yet: why.
+    SetupNeeded(&'static str),
+    /// A newer signing key is out; the one it applied still signs.
+    Updating,
+    /// Jobs get tokens; it has this many storage areas.
+    Configured(usize),
+}
+
+impl JobAccess {
+    /// Job access for `row`, with signing `keys` oldest first and `areas` storage areas.
+    pub(super) fn of(row: &RegistryRow, keys: &[TokenKeyRow], areas: usize) -> Self {
+        if !row.takes_tokens() {
+            return JobAccess::Off;
+        }
+        if row.url.is_none() {
+            return JobAccess::SetupNeeded("no address bound: nodes cannot name it");
+        }
+        let Some(signing) = crate::tokens::signing_key(keys, row) else {
+            return JobAccess::SetupNeeded("it has applied no signing key yet");
+        };
+        if keys
+            .last()
+            .is_some_and(|k| k.public.kid != signing.public.kid)
+        {
+            return JobAccess::Updating;
+        }
+        JobAccess::Configured(areas)
+    }
+
+    fn render(&self, h: &mut Html) {
+        match self {
+            JobAccess::Off => {
+                h.raw("<span class=\"sub\">off</span>");
+            }
+            JobAccess::SetupNeeded(why) => {
+                h.raw("<span class=\"badge warn\">Setup needed</span><div class=\"sub\">")
+                    .text(why)
+                    .raw("</div>");
+            }
+            JobAccess::Updating => {
+                h.raw("<span class=\"badge busy\">Updating signing keys</span>")
+                    .raw("<div class=\"sub\">the current key still works</div>");
+            }
+            JobAccess::Configured(n) => {
+                h.raw("<span class=\"badge ok\">Configured</span><div class=\"sub\">")
+                    .text(format!(
+                        "{n} storage area{}",
+                        if *n == 1 { "" } else { "s" }
+                    ))
+                    .raw("</div>");
+            }
+        }
+    }
+}
+
+/// `/registries`: each registry's name and address, whether it is connected, whether jobs
+/// get access to it, and its free storage. Version, mode and ID are on its page.
 pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let hub = ui.hub.clone();
-    let views = blocking(move || ops::views(&hub)).await?;
+    let (views, access) = blocking(move || {
+        let views = ops::views(&hub)?;
+        let keys = hub.db.token_keys()?;
+        let mut access = Vec::with_capacity(views.len());
+        for v in &views {
+            access.push(JobAccess::of(
+                &v.row,
+                &keys,
+                hub.db.namespaces(&v.id)?.len(),
+            ));
+        }
+        Ok::<_, anyhow::Error>((views, access))
+    })
+    .await?;
     let now = crate::now_secs();
     let mut main = Html::new();
     main.raw("<h1>Registries</h1>");
@@ -47,34 +121,45 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
             .raw("for <code>vk-registry join</code> on the registry's host.</p>");
     } else {
         main.raw("<table class=\"grid\"><thead><tr>");
-        header_cells(&mut main, &ops::COLUMNS);
+        header_cells(
+            &mut main,
+            &["REGISTRY", "CONNECTION", "JOB ACCESS", "FREE STORAGE"],
+        );
         main.raw("</tr></thead><tbody>");
-        for r in &views {
-            let cells = ops::cells(r, now);
+        for (r, access) in views.iter().zip(&access) {
             main.raw("<tr class=\"")
                 .raw(if r.connected { "up" } else { "down" })
-                .raw("\">");
-            for (i, cell) in cells.iter().enumerate() {
-                main.raw("<td>");
-                if i <= 1 {
-                    main.raw("<a href=\"")
-                        .raw(DETAIL_PREFIX)
-                        .text(&r.id)
-                        .raw("\">");
-                    if i == 0 {
-                        main.raw("<code>")
-                            .text(r.id.get(..8).unwrap_or(&r.id))
-                            .raw("</code>");
-                    } else {
-                        main.node(cell);
+                .raw("\"><td><a href=\"")
+                .raw(DETAIL_PREFIX)
+                .text(&r.id)
+                .raw("\">")
+                .node(&r.row.hostname)
+                .raw("</a><div class=\"sub\">");
+            match &r.row.url {
+                Some(url) => main.text(url),
+                None => main.raw("no address"),
+            };
+            main.raw("</div></td><td>");
+            if r.connected {
+                main.raw("<span class=\"badge ok\">Online</span>");
+            } else {
+                main.raw("<span class=\"badge bad\">Offline</span><div class=\"sub\">");
+                match r.row.last_seen {
+                    Some(t) => {
+                        main.raw("last seen ");
+                        pages::time(&mut main, t, &super::fleet::age(now, t));
                     }
-                    main.raw("</a>");
-                } else {
-                    main.node(cell);
+                    None => {
+                        main.raw("never seen");
+                    }
                 }
-                main.raw("</td>");
+                main.raw("</div>");
             }
-            main.raw("</tr>");
+            main.raw("</td><td>");
+            access.render(&mut main);
+            main.raw("</td><td>");
+            main.text(ops::free(r));
+            main.raw("</td></tr>");
         }
         main.raw("</tbody></table>");
         for r in &views {
