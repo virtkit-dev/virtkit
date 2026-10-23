@@ -2732,7 +2732,7 @@ async fn handle_dns(
                     if let Some(e) = &a.degraded {
                         egress.log_dns_upstream(primary, &question(), e);
                     }
-                    let (ips, ttl) = parse_a_records(a.pin_source());
+                    let (ips, ttl) = parse_a_records(a.pin_source(), upstream_query, &name);
                     // `--egress-file` can change the policy while awaiting the upstream: a
                     // name it no longer allows is refused, and its addresses not pinned.
                     if !egress.record_if_allowed(client_ip, &name, &ips, ttl) && !egress.dry_run {
@@ -3325,56 +3325,145 @@ fn dns_servfail(query: &[u8], qend: usize) -> Vec<u8> {
     dns_error(query, qend, RCODE_SERVFAIL)
 }
 
-/// Advance past a DNS name at `i`, returning the offset just after it. A compression
-/// pointer (0xc0) ends the name in two bytes. Bounds-safe: returns msg.len() if it
-/// runs off the end.
-fn skip_name(msg: &[u8], mut i: usize) -> usize {
-    while let Some(&len) = msg.get(i) {
-        if len == 0 {
-            return i + 1;
+/// The longest CNAME chain followed from a question name to its A records; a longer one pins
+/// nothing past it.
+const MAX_CNAME_HOPS: usize = 16;
+
+/// The DNS name at `i` in `msg`, compression pointers followed, as lowercased uncompressed
+/// wire bytes, and the offset just past where it is stored. `None` for a name that runs off
+/// the message, loops, uses an extended label type, or exceeds [`MAX_DNS_NAME`].
+fn read_name(msg: &[u8], mut i: usize) -> Option<(Vec<u8>, usize)> {
+    let mut name = Vec::new();
+    let mut end = None;
+    // Each pointer leads to at least one label or the root, and a name holds at most this
+    // many of either, so more jumps than this is a loop.
+    for _ in 0..MAX_DNS_NAME {
+        let len = *msg.get(i)?;
+        match len & 0xc0 {
+            0 if len == 0 => {
+                name.push(0);
+                return Some((name, end.unwrap_or(i + 1)));
+            }
+            0 => {
+                let label = msg.get(i + 1..i + 1 + usize::from(len))?;
+                name.push(len);
+                name.extend(label.iter().map(u8::to_ascii_lowercase));
+                if name.len() >= MAX_DNS_NAME {
+                    return None;
+                }
+                i += 1 + usize::from(len);
+            }
+            0xc0 => {
+                let lo = *msg.get(i + 1)?;
+                end.get_or_insert(i + 2);
+                i = (usize::from(len & 0x3f) << 8) | usize::from(lo);
+            }
+            _ => return None,
         }
-        if len & 0xc0 == 0xc0 {
-            return i + 2; // compression pointer: name ends here
-        }
-        i += 1 + len as usize;
     }
-    msg.len()
+    None
 }
 
-/// Extract the A-record IPs (and the smallest TTL) from a DNS response, for pinning.
-/// Best-effort + bounds-safe: stops at the first truncated/malformed record.
-fn parse_a_records(msg: &[u8]) -> (Vec<Ipv4Addr>, u32) {
+/// Extract the A-record IPs (and the smallest TTL among them and the aliases leading to them)
+/// that answer `qname` in `msg`, the upstream's response to the guest's `query`, for pinning.
+/// Only a NOERROR response to that query, echoing that question, counts; and of its answers
+/// only the A records owned by `qname` or by a name its CNAME chain reaches, so a record the
+/// upstream passed along for an unrelated owner never becomes a pin. The chain's targets need
+/// not be allowed names themselves: an allowed name's zone may as well answer the address
+/// directly, and a CDN's alias names are its own to change. Bounds-safe: stops at the first
+/// truncated or malformed record, keeping what came before it.
+fn parse_a_records(msg: &[u8], query: &[u8], qname: &str) -> (Vec<Ipv4Addr>, u32) {
     const TYPE_A: u16 = 1;
+    const TYPE_CNAME: u16 = 5;
     const CLASS_IN: u16 = 1;
-    let mut ips = Vec::new();
-    let mut min_ttl = u32::MAX;
-    if msg.len() < 12 {
-        return (ips, 60);
+    let none = (Vec::new(), 60);
+    let (Some(hdr), Some(qwire)) = (msg.get(..12), encode_name(qname)) else {
+        return none;
+    };
+    let qwire = qwire.to_ascii_lowercase();
+    // The query's id, a response (QR), NOERROR, one question.
+    if query.get(..2) != Some(&hdr[..2]) || hdr[2] & 0x80 == 0 || hdr[3] & 0x0f != 0 {
+        return none;
     }
-    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
-    let mut i = 12;
-    for _ in 0..qd {
-        i = skip_name(msg, i) + 4; // qtype(2) + qclass(2)
+    if u16::from_be_bytes([hdr[4], hdr[5]]) != 1 {
+        return none;
     }
+    let Some((asked, qend)) = read_name(msg, 12) else {
+        return none;
+    };
+    if asked != qwire {
+        return none;
+    }
+    let an = u16::from_be_bytes([hdr[6], hdr[7]]);
+    let mut i = qend + 4; // qtype(2) + qclass(2)
+    enum Data {
+        A(Ipv4Addr),
+        Cname(Vec<u8>),
+    }
+    // (owner, data, TTL)
+    let mut records: Vec<(Vec<u8>, Data, u32)> = Vec::new();
     for _ in 0..an {
-        i = skip_name(msg, i);
-        let Some(hdr) = msg.get(i..i + 10) else { break };
-        let rtype = u16::from_be_bytes([hdr[0], hdr[1]]);
-        let class = u16::from_be_bytes([hdr[2], hdr[3]]);
-        let ttl = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-        let rdlen = u16::from_be_bytes([hdr[8], hdr[9]]) as usize;
-        let rdata_at = i + 10;
-        let Some(rdata) = msg.get(rdata_at..rdata_at + rdlen) else {
+        let Some((owner, at)) = read_name(msg, i) else {
             break;
         };
-        if rtype == TYPE_A && class == CLASS_IN && rdlen == 4 {
-            ips.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
-            min_ttl = min_ttl.min(ttl);
+        let Some(rr) = msg.get(at..at + 10) else {
+            break;
+        };
+        let rtype = u16::from_be_bytes([rr[0], rr[1]]);
+        let class = u16::from_be_bytes([rr[2], rr[3]]);
+        let ttl = u32::from_be_bytes([rr[4], rr[5], rr[6], rr[7]]);
+        let rdata_at = at + 10;
+        let rdata_end = rdata_at + usize::from(u16::from_be_bytes([rr[8], rr[9]]));
+        let Some(rdata) = msg.get(rdata_at..rdata_end) else {
+            break;
+        };
+        match (rtype, class, rdata) {
+            (TYPE_A, CLASS_IN, &[a, b, c, d]) => {
+                records.push((owner, Data::A(Ipv4Addr::new(a, b, c, d)), ttl));
+            }
+            (TYPE_CNAME, CLASS_IN, _) => match read_name(msg, rdata_at) {
+                Some((target, target_end)) if target_end <= rdata_end => {
+                    records.push((owner, Data::Cname(target), ttl));
+                }
+                _ => break,
+            },
+            _ => {}
         }
-        i = rdata_at + rdlen;
+        i = rdata_end;
     }
-    (ips, if min_ttl == u32::MAX { 60 } else { min_ttl })
+    // Follow the chain from the question. A name with two different aliases is no chain to
+    // follow: nothing is pinned past it.
+    let mut chain = vec![qwire];
+    let mut ttl = u32::MAX;
+    for _ in 0..MAX_CNAME_HOPS {
+        let Some(current) = chain.last() else { break };
+        let mut targets = records.iter().filter_map(|(owner, data, ttl)| match data {
+            Data::Cname(target) if owner == current => Some((target, *ttl)),
+            _ => None,
+        });
+        let Some((target, alias_ttl)) = targets.next() else {
+            break;
+        };
+        if targets.any(|(other, _)| other != target) || chain.contains(target) {
+            break;
+        }
+        ttl = ttl.min(alias_ttl);
+        chain.push(target.clone());
+    }
+    let mut ips = Vec::new();
+    let mut a_ttl = u32::MAX;
+    for (owner, data, rr_ttl) in &records {
+        if let Data::A(ip) = data
+            && chain.contains(owner)
+        {
+            ips.push(*ip);
+            a_ttl = a_ttl.min(*rr_ttl);
+        }
+    }
+    if ips.is_empty() {
+        return none;
+    }
+    (ips, ttl.min(a_ttl))
 }
 
 /// Wrap a DNS response payload as gateway:53 -> client:port over UDP/IPv4/ethernet.
@@ -5272,7 +5361,12 @@ mod tests {
         let ip = Ipv4Addr::new(93, 184, 216, 34);
         let (reply, guard, denied_log, audit_log) = dns_outside_allowlist("dry", true, ip).await;
         assert_eq!(reply[3] & 0x0f, 0, "NOERROR, not NXDOMAIN");
-        assert_eq!(parse_a_records(&reply).0, vec![ip], "the upstream answer");
+        let query = dns_question(9, "blocked.example", 1);
+        assert_eq!(
+            parse_a_records(&reply, &query, "blocked.example").0,
+            vec![ip],
+            "the upstream answer"
+        );
         assert_eq!(
             crate::egress_report::read_since(&denied_log, 0).0,
             vec![crate::egress_report::Denial {
@@ -6288,10 +6382,117 @@ mod tests {
             1, b'a', 0, 0, 1, 0, 1, // question "a" A IN
             0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 93, 184, 216, 34, // answer
         ];
-        let (ips, ttl) = parse_a_records(&msg);
+        let query = &msg[..19];
+        let (ips, ttl) = parse_a_records(&msg, query, "a");
         assert_eq!(ips, vec![Ipv4Addr::new(93, 184, 216, 34)]);
         assert_eq!(ttl, 300);
-        assert!(parse_a_records(&[0u8; 12]).0.is_empty()); // no answers
+        assert!(parse_a_records(&[0u8; 12], query, "a").0.is_empty()); // no answers
+        // Not the question asked, not the query's id, not a NOERROR response: nothing.
+        assert!(parse_a_records(&msg, query, "b").0.is_empty());
+        let mut other_id = msg.clone();
+        other_id[1] = 1;
+        assert!(parse_a_records(&other_id, query, "a").0.is_empty());
+        let mut servfail = msg.clone();
+        servfail[3] |= RCODE_SERVFAIL;
+        assert!(parse_a_records(&servfail, query, "a").0.is_empty());
+    }
+
+    /// A response holding `records`, each `(owner, type, ttl, rdata)` with names uncompressed,
+    /// to the A query `dns_question(7, qname, 1)`.
+    fn answer_of(qname: &str, records: &[(&str, u16, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut msg = dns_question(7, qname, 1);
+        msg[2] |= 0x80;
+        msg[7] = records.len() as u8;
+        for (owner, rtype, ttl, rdata) in records {
+            msg.extend(encode_name(owner).unwrap());
+            msg.extend(rtype.to_be_bytes());
+            msg.extend([0, 1]);
+            msg.extend(ttl.to_be_bytes());
+            msg.extend((rdata.len() as u16).to_be_bytes());
+            msg.extend(rdata);
+        }
+        msg
+    }
+
+    /// Only the A records the question's CNAME chain reaches are pinned, whatever order they
+    /// come in and however their names are compressed; the chain's aliases need not be
+    /// allowed names, and their TTLs bound the pin's.
+    #[test]
+    fn parse_a_records_follows_the_cname_chain_only() {
+        let q = "github.com";
+        let query = dns_question(7, q, 1);
+        let cname = |target: &str| encode_name(target).unwrap();
+        let a = |o: [u8; 4]| o.to_vec();
+        let msg = answer_of(
+            q,
+            &[
+                ("cdn.fastly.example", 1, 300, a([151, 101, 1, 1])),
+                ("evil.example", 1, 300, a([6, 6, 6, 6])),
+                ("GitHub.com", 5, 120, cname("edge.github.example")),
+                ("edge.github.example", 5, 600, cname("cdn.fastly.example")),
+                ("cdn.fastly.example", 1, 300, a([151, 101, 2, 1])),
+            ],
+        );
+        let (ips, ttl) = parse_a_records(&msg, &query, q);
+        assert_eq!(
+            ips,
+            vec![Ipv4Addr::new(151, 101, 1, 1), Ipv4Addr::new(151, 101, 2, 1)]
+        );
+        assert_eq!(ttl, 120, "the shortest of the chain's TTLs");
+
+        // A record owned by no name the question leads to is not pinned.
+        let msg = answer_of(q, &[("evil.example", 1, 300, a([6, 6, 6, 6]))]);
+        assert!(parse_a_records(&msg, &query, q).0.is_empty());
+
+        // Compression pointers into the question and into an earlier record are followed.
+        let mut msg = dns_question(7, q, 1);
+        msg[2] |= 0x80;
+        msg[7] = 2;
+        msg.extend([
+            0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, 6, 4, b'e', b'd', b'g', b'e',
+        ]);
+        let edge = msg.len() - 5; // the target's first label
+        msg.extend([0xc0, 0x0c]); // ... ".github.com": edge.github.com
+        let fix = msg.len() - 8;
+        msg[fix] = 7; // RDLENGTH counts the pointer too
+        msg.extend([
+            0xc0, edge as u8, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 140, 82, 1, 1,
+        ]);
+        assert_eq!(
+            parse_a_records(&msg, &query, q).0,
+            vec![Ipv4Addr::new(140, 82, 1, 1)]
+        );
+
+        // A loop, or a name aliased two ways, pins nothing past it.
+        let msg = answer_of(
+            q,
+            &[
+                (q, 5, 60, cname("x.example")),
+                ("x.example", 5, 60, cname(q)),
+                ("x.example", 1, 60, a([1, 2, 3, 4])),
+            ],
+        );
+        assert_eq!(
+            parse_a_records(&msg, &query, q).0,
+            vec![Ipv4Addr::new(1, 2, 3, 4)]
+        );
+        let msg = answer_of(
+            q,
+            &[
+                (q, 5, 60, cname("x.example")),
+                (q, 5, 60, cname("y.example")),
+                ("x.example", 1, 60, a([1, 2, 3, 4])),
+                ("y.example", 1, 60, a([5, 6, 7, 8])),
+            ],
+        );
+        assert!(parse_a_records(&msg, &query, q).0.is_empty());
+        // A pointer loop in a name ends the parse.
+        let mut msg = dns_question(7, q, 1);
+        msg[2] |= 0x80;
+        msg[7] = 1;
+        let at = msg.len();
+        msg.extend([0xc0, at as u8, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert!(parse_a_records(&msg, &query, q).0.is_empty());
     }
 
     #[test]

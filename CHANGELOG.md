@@ -14,6 +14,8 @@ All notable changes to virtkit will be documented in this file.
 - **A job resolving ever more allowed names no longer grows its switch's memory without
   bound.** The addresses its lookups opened are capped, the soonest to expire closed first;
   a closed one is refused until resolved again.
+- **Under an egress allowlist, an allowed name's lookup opens only the addresses it resolves
+  to**, directly or through its aliases, not every address a DNS answer carries.
 
 ## [0.94.1] - 2026-10-22
 

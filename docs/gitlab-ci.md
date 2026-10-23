@@ -1247,8 +1247,9 @@ keeping only the id, RD, AD and CD flags and a bare EDNS record. Queries it cann
 are `REFUSED`, or `NOTIMP` for a DNS update or notify.
 
 An allowed name is reached by address: resolving it through the gateway opens, to that VM
-alone, the IPv4 addresses its answer gives for it, for the answer's TTL (at least 30 s) plus
-60 s. Filtering is by address, not by name, so the limits are those of the address:
+alone, the IPv4 addresses its answer gives for it (directly or through its CNAME aliases,
+which need not be allowed names), for the answer's TTL (at least 30 s) plus 60 s. Filtering
+is by address, not by name, so the limits are those of the address:
 
 - an opened address is reachable on **any port** but DNS's 53, and for every site it serves:
   on shared hosting or a CDN, the other sites behind it too;
