@@ -7622,15 +7622,17 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "no reply in 150ms");
 
-        // Nothing bound: the ICMP port-unreachable surfaces on the connected socket's recv.
-        let closed = {
-            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            s.local_addr().unwrap()
-        };
+        // No socket takes the datagram: the ICMP port-unreachable surfaces on the connected
+        // socket's recv. The port stays held, so no parallel bind can take it, and its holder
+        // is connected elsewhere, so a datagram from another source finds no socket.
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        holder.connect("127.0.0.1:9").unwrap();
+        let closed = holder.local_addr().unwrap();
         let err = forward_upstream_with(&query, closed, Duration::from_secs(2))
             .await
             .expect_err("a closed port is refused");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+        drop(holder);
 
         // A reply shorter than a DNS header is not a reply the switch can relay.
         let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
