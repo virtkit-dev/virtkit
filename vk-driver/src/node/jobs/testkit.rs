@@ -101,6 +101,7 @@ pub struct Fixture {
     pub vars: Vars,
     pub trace: Arc<Trace>,
     pub cancel: CancellationToken,
+    pub registry: Option<vk_hub_proto::dispatch::JobRegistry>,
 }
 
 impl Fixture {
@@ -138,6 +139,7 @@ impl Fixture {
             trace,
             cancel: CancellationToken::new(),
             dir,
+            registry: None,
         }
     }
 
@@ -152,6 +154,7 @@ impl Fixture {
             trace: &self.trace,
             scratch: &self.dir,
             cancel: &self.cancel,
+            registry: self.registry.as_ref(),
         }
     }
 

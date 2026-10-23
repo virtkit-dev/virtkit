@@ -59,6 +59,8 @@ pub struct StageCtx<'a> {
     pub scratch: &'a Path,
     /// Raised when the job is canceled or times out: a transfer under way stops.
     pub cancel: &'a CancellationToken,
+    /// The registry access the hub gave the job, if any.
+    pub registry: Option<&'a vk_hub_proto::dispatch::JobRegistry>,
 }
 
 impl StageCtx<'_> {

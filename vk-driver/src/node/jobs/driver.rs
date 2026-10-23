@@ -108,6 +108,8 @@ struct Driver {
     stopped: CancellationToken,
     /// Executor preparation duration, once preparation ends.
     prepared_in: Option<Duration>,
+    /// The registry access the hub gave the job, from its start.
+    registry: Option<JobRegistry>,
 }
 
 /// What the driver works from, read from the journal.
@@ -219,6 +221,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         timeout,
         stopped: CancellationToken::new(),
         prepared_in: None,
+        registry,
     };
     Ok(Setup {
         driver,
@@ -606,6 +609,7 @@ impl Driver {
             trace: &self.trace,
             scratch,
             cancel: &self.stopped,
+            registry: self.registry.as_ref(),
         }
     }
 
@@ -1068,6 +1072,7 @@ mod tests {
             timeout,
             stopped: CancellationToken::new(),
             prepared_in: None,
+            registry: f.registry.clone(),
         }
     }
 

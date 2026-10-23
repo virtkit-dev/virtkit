@@ -2800,6 +2800,7 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     }
     clean(&mut inventory.hostname);
     clean_opt(&mut inventory.hardware.cpu_model);
+    clean_opt(&mut inventory.registry);
     for check in &mut inventory.hardware.checks {
         clean(&mut check.name);
         clean(&mut check.detail);

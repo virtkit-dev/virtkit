@@ -693,6 +693,14 @@ pub struct Inventory {
     /// ([`client::Placement::labels`]). Older inventories omit labels and default to none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// The base URL of the node's `[registry]` (`https://host[:port]`), which the hub matches
+    /// against the URLs bound to its registries to mint a job's token for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    /// Whether the node uses a job's registry token ([`dispatch::JobRegistry`]): one that
+    /// does not would run the job with its own credential.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job_tokens: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1403,6 +1411,8 @@ mod tests {
                 runners: vec!["ci-7".into()],
             }),
             labels: Vec::new(),
+            registry: None,
+            job_tokens: false,
         }
     }
 
@@ -2128,6 +2138,17 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Operation>(json!({"kind": "reset"})).unwrap(),
             Operation::Reset { images: false }
+        );
+        let mut tokens = serde_json::to_value(inventory()).unwrap();
+        tokens["registry"] = json!("https://reg.example.com");
+        tokens["job_tokens"] = json!(true);
+        pinned(
+            &Inventory {
+                registry: Some("https://reg.example.com".into()),
+                job_tokens: true,
+                ..inventory()
+            },
+            tokens,
         );
         let mut labelled = serde_json::to_value(inventory()).unwrap();
         labelled["labels"] = json!(["large-memory"]);

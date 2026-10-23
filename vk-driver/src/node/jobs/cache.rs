@@ -1,13 +1,15 @@
 //! A placed job's caches, kept in the registry the node uses: one OCI artifact per key, with
 //! one `tar+zstd` layer, in repository `ci-cache/<gitlab host>/<project id>`, tagged with the
-//! sha256 of the key and the protection of the job's ref. See `docs/gitlab-dispatch.md`,
-//! "Artifacts and caches".
+//! sha256 of the key and the protection of the job's ref. A job the hub gave a cache
+//! repository ([`JobRegistry::cache_repo`]) keeps them there instead, with its own token,
+//! tagged with the sha256 of the key alone: the repository already names the protection. See
+//! `docs/gitlab-dispatch.md`, "Artifacts and caches".
 //!
 //! Which caches a stage restores or saves, and what it says about each, follow gitlab-runner
 //! v19.5's `shells/abstract.go` (`cacheExtractor`, `extractCacheOrFallbackCachesWrapper`,
 //! `archiveCache`; MIT, see [`super::mask`] for the notice). The archive itself is made and
 //! unpacked by `vk-agent` in the guest ([`super::guest`]); the node compresses it and moves it,
-//! with its own registry credential.
+//! with its own registry credential or the job's token.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -16,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use vk_hub_proto::dispatch::JobRegistry;
 use vk_hub_proto::job::{CachePolicy, CacheSpec};
 
 use super::StageCtx;
@@ -99,6 +102,12 @@ pub fn repository(server_url: &str, project_id: u64) -> Result<String> {
         bail!("GitLab's URL {server_url:?} cannot name a repository");
     }
     Ok(format!("ci-cache/{}/{project_id}", name.join("/")))
+}
+
+/// The tag a cache is kept under in a repository the hub named: the sha256 of its key, the
+/// repository being the protection's own.
+pub fn key_tag(key: &str) -> String {
+    hex(&Sha256::digest(key.as_bytes()))
 }
 
 /// The tag a cache is kept under: the sha256 of its key and its ref's protection, so a
@@ -197,9 +206,19 @@ struct Store {
     cred: crate::registry::Cred,
     /// `<scheme>://<registry>/v2/<repository>`.
     base: String,
+    /// Whether the repository is the hub's for the job's protection, so tags leave it out.
+    hub_repo: bool,
 }
 
 impl Store {
+    /// The tag `key`'s cache is kept under.
+    fn tag(&self, key: &str, protected: bool) -> String {
+        match self.hub_repo {
+            true => key_tag(key),
+            false => tag(key, protected),
+        }
+    }
+
     fn req(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         self.cred.apply(self.http.request(method, url))
     }
@@ -210,6 +229,68 @@ impl Store {
             .find("/v2/")
             .map_or(self.base.as_str(), |at| &self.base[..at])
     }
+}
+
+/// Where a job's caches go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access<'a> {
+    /// The repository the hub named, an absolute path on the registry, reached with the
+    /// job's token.
+    Hub { repo: &'a str, token: &'a str },
+    /// `ci-cache/…` under the node's `[registry]` prefix, with the node's credential.
+    Node,
+}
+
+/// Where the caches of a job given `registry` go under `rg`, at `now`; `Err` says why they go
+/// nowhere. A hub's repository is used whatever `guest_credential` says; without one, a node
+/// lending job tokens never falls back to its own credential.
+fn access<'a>(
+    rg: &crate::config::Registry,
+    registry: Option<&'a JobRegistry>,
+    now: u64,
+) -> Result<Access<'a>, String> {
+    match registry.and_then(|r| Some((r.cache_repo.as_deref()?, r))) {
+        // The hub is not trusted with the URL beyond the registry's own paths.
+        Some((repo, _)) if !vk_hub_proto::token::valid_prefix(repo) => Err(format!(
+            "the hub named {repo:?} for the job's caches, not a repository name; skipping"
+        )),
+        Some((_, r)) if now >= r.expires_at => {
+            Err("the job's registry token has expired; skipping caches".to_string())
+        }
+        Some((repo, r)) => Ok(Access::Hub {
+            repo,
+            token: &r.token,
+        }),
+        None if rg.lends_job_token() => Err(
+            "caches need a cache repository from the hub under [registry] guest_credential \
+             = \"job\"; skipping"
+                .to_string(),
+        ),
+        None => Ok(Access::Node),
+    }
+}
+
+/// `<scheme>://<registry>/v2/<repository>` for a job of `project_id` from `server_url`, its
+/// caches going where `access` says.
+fn cache_base(
+    rg: &crate::config::Registry,
+    access: &Access<'_>,
+    server_url: &str,
+    project_id: u64,
+) -> Result<String> {
+    let (base, prefix) = rg.base_url().context("the [registry] repo names no host")?;
+    let path = match access {
+        // The hub's repository is a path on the registry, beside the node's own prefix.
+        Access::Hub { repo, .. } => repo.to_string(),
+        Access::Node => {
+            let repo = repository(server_url, project_id)?;
+            match prefix {
+                "" => repo,
+                prefix => format!("{prefix}/{repo}"),
+            }
+        }
+    };
+    Ok(format!("{base}/v2/{path}"))
 }
 
 /// Where the caches go, or `None` (said in the trace) when they cannot go anywhere.
@@ -224,22 +305,29 @@ fn store(ctx: &StageCtx<'_>) -> Option<Store> {
             .warning("caches need a remote [registry] on this node; skipping");
         return None;
     }
+    let access = match access(rg, ctx.registry, vk_peer::now_secs()) {
+        Ok(access) => access,
+        Err(why) => {
+            ctx.trace.warning(&why);
+            return None;
+        }
+    };
     let made = (|| {
-        let repo = repository(&ctx.job.server_url, ctx.job.job.project_id)?;
-        let (host, prefix) = rg.repo.split_once('/').unwrap_or((rg.repo.as_str(), ""));
-        let path = match prefix.trim_matches('/') {
-            "" => repo,
-            prefix => format!("{prefix}/{repo}"),
+        let cred = match &access {
+            Access::Hub { token, .. } => crate::registry::Cred::Bearer {
+                token: token.to_string(),
+            },
+            Access::Node => crate::registry::cred(rg)?,
         };
-        let scheme = if rg.insecure { "http" } else { "https" };
         Ok::<_, anyhow::Error>(Store {
             http: crate::registry::http_client_builder(rg)?
                 .connect_timeout(Duration::from_secs(30))
                 .timeout(request_timeout(&ctx.vars.value("CACHE_REQUEST_TIMEOUT")))
                 .build()
                 .context("building the registry's client")?,
-            cred: crate::registry::cred(rg)?,
-            base: format!("{scheme}://{host}/v2/{path}"),
+            cred,
+            base: cache_base(rg, &access, &ctx.job.server_url, ctx.job.job.project_id)?,
+            hub_repo: matches!(access, Access::Hub { .. }),
         })
     })();
     match made {
@@ -281,7 +369,7 @@ pub async fn restore(ctx: &StageCtx<'_>) -> Result<()> {
         };
         for key in keys {
             ctx.trace.notice(&format!("Checking cache for {key}..."));
-            let tag = tag(&key, protected);
+            let tag = store.tag(&key, protected);
             let fetched = tokio::select! {
                 r = fetch(ctx, &store, &tag) => r,
                 () = ctx.cancel.cancelled() => bail!("canceled"),
@@ -327,7 +415,7 @@ pub async fn archive(ctx: &StageCtx<'_>, succeeded: bool) -> Result<()> {
             exclude: Vec::new(),
             untracked: c.untracked,
         };
-        let tag = tag(&key, protected);
+        let tag = store.tag(&key, protected);
         let saved = tokio::select! {
             r = save(ctx, &store, &sel, &key, &tag) => r,
             () = ctx.cancel.cancelled() => bail!("canceled"),
@@ -691,6 +779,79 @@ mod tests {
         assert_eq!(p, hex(&Sha256::digest(b"deps-main\nprotected")));
     }
 
+    /// In a repository the hub named, the protection is in the path: the tag is the key's.
+    #[test]
+    fn a_cache_in_the_hubs_repository_is_tagged_by_key_alone() {
+        let mut store = test_store("http://reg.example");
+        assert_eq!(store.tag("deps-main", true), tag("deps-main", true));
+        store.hub_repo = true;
+        assert_eq!(store.tag("deps-main", true), store.tag("deps-main", false));
+        assert_eq!(
+            store.tag("deps-main", true),
+            hex(&Sha256::digest(b"deps-main"))
+        );
+    }
+
+    fn rg(toml: &str) -> crate::config::Registry {
+        let cfg: crate::config::Config = toml::from_str(&format!("[registry]\n{toml}")).unwrap();
+        cfg.registry.unwrap()
+    }
+
+    fn job_registry(cache_repo: Option<&str>) -> JobRegistry {
+        JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_x.y".into(),
+            expires_at: 100,
+            grants: Vec::new(),
+            cache_repo: cache_repo.map(str::to_string),
+            pipeline_prefix: None,
+        }
+    }
+
+    /// A hub's repository goes with the job's token, whatever `guest_credential` says; without
+    /// one, only a node lending its own credential keeps caches.
+    #[test]
+    fn caches_go_where_the_hub_says_or_nowhere_under_job() {
+        let node = rg("repo = \"reg.example:5000/team\"\n");
+        let job = rg("repo = \"reg.example:5000/team\"\nguest_credential = \"job\"\n");
+        let named = job_registry(Some("ci-cache/gl/42/protected"));
+        let hub = Access::Hub {
+            repo: "ci-cache/gl/42/protected",
+            token: "vkt_x.y",
+        };
+        assert_eq!(access(&node, Some(&named), 50), Ok(hub));
+        assert_eq!(access(&job, Some(&named), 50), Ok(hub));
+        let unnamed = job_registry(None);
+        assert_eq!(access(&node, Some(&unnamed), 50), Ok(Access::Node));
+        assert_eq!(access(&node, None, 50), Ok(Access::Node));
+        assert!(access(&job, Some(&unnamed), 50).is_err());
+        assert!(access(&job, None, 50).is_err());
+        // Expired: skipped, not a run of 401s.
+        assert!(access(&node, Some(&named), 100).is_err());
+        for bad in ["/abs", "a/../b", "a?x=1", "a#f", "a%2fb", "", "UP"] {
+            let bad_repo = job_registry(Some(bad));
+            assert!(access(&node, Some(&bad_repo), 50).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The hub's repository is absolute on the registry; the node's own goes under its prefix.
+    #[test]
+    fn the_hubs_repository_ignores_the_nodes_prefix() {
+        let rg = rg("repo = \"https://Reg.Example:5000/team/\"\n");
+        let hub = Access::Hub {
+            repo: "ci-cache/gl/42/protected",
+            token: "t",
+        };
+        assert_eq!(
+            cache_base(&rg, &hub, "https://gitlab.example", 42).unwrap(),
+            "https://reg.example:5000/v2/ci-cache/gl/42/protected"
+        );
+        assert_eq!(
+            cache_base(&rg, &Access::Node, "https://gitlab.example", 42).unwrap(),
+            "https://reg.example:5000/v2/team/ci-cache/gitlab.example/42"
+        );
+    }
+
     /// An upload the registry sends elsewhere does not get the credential.
     #[tokio::test]
     async fn a_blob_is_not_sent_outside_the_registry() {
@@ -799,6 +960,7 @@ mod tests {
             http: reqwest::Client::new(),
             cred: crate::registry::Cred::None,
             base: format!("{url}/v2/ci-cache/h/1"),
+            hub_repo: false,
         }
     }
 

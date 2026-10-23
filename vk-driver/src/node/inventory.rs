@@ -81,7 +81,17 @@ pub fn inventory(cfg: &Config) -> Inventory {
         runner: runner_config(cfg),
         // Checked when `vk node run` starts; one gone wrong since is left out.
         labels: labels(cfg).unwrap_or_default(),
+        registry: registry_url(cfg),
+        // This node uses a job's registry token wherever the hub sends one: its caches and,
+        // under `guest_credential = "job"`, its guest's proxy.
+        job_tokens: true,
     }
+}
+
+/// The base URL of the node's `[registry]`, `<scheme>://<host>[:<port>]`; `None` for a local
+/// store or none.
+pub fn registry_url(cfg: &Config) -> Option<String> {
+    Some(cfg.registry.as_ref()?.base_url()?.0)
 }
 
 /// Maximum label count and length.
@@ -383,6 +393,27 @@ mod tests {
         for bad in ["", "3 2 1", "x.07 1 1", "3.0", "3.-7 1 1"] {
             assert_eq!(load1_hundredths(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_registry_is_reported_by_its_base_url() {
+        let cfg = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        assert_eq!(
+            registry_url(&cfg("[registry]\nrepo = \"Reg.Example:5000/team/ci\"\n")).as_deref(),
+            Some("https://reg.example:5000")
+        );
+        assert_eq!(
+            registry_url(&cfg(
+                "[registry]\nrepo = \"http://10.0.0.5:5000\"\ninsecure = true\n"
+            ))
+            .as_deref(),
+            Some("http://10.0.0.5:5000")
+        );
+        assert_eq!(
+            registry_url(&cfg("[registry]\nrepo = \"/srv/store\"\n")),
+            None
+        );
+        assert_eq!(registry_url(&cfg("")), None);
     }
 
     #[test]

@@ -467,6 +467,20 @@ unprotected job never share one, as with gitlab-runner. The last archive written
 makes an unchanged cache's upload a blob probe. Caches are not shared with gitlab-runner's
 `cache.zip`s: a project moving to the fleet starts cold.
 
+**A job with a registry token.** When the hub mints a token for the job's registry
+([step 4](registry-hub.md#step-4-reference)), the job's start carries it,
+with the repository its `ci-cache` namespace resolves to. The node then keeps the job's
+caches in exactly that repository, an absolute path on the registry beside the node's own
+`[registry] repo` prefix, with the job's token, each tagged with the sha256 of its key alone:
+the repository names the protection. It skips the caches, with a warning, when the
+repository is not a repository name or the token has expired. A job whose start names no
+cache repository keeps today's caches with the node's credential, except under `[registry]
+guest_credential = "job"`, where it runs without caches, with a warning in its trace,
+rather than fall back to the node's credential. The token is masked in the job's trace, and
+dropped from its journaled start once its result is written. The node reports its
+`[registry]` base URL in its inventory, which the hub matches against its registries to
+mint the token for it.
+
 Under `guest_credential = "job"` the guest's registry proxy (`registry.vk`) runs for every
 job and injects the job's token, never the node's credential. A job with no token gets a
 proxy that refuses everything; so does every job a local gitlab-runner gives the node, which
