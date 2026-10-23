@@ -5032,9 +5032,14 @@ pub(crate) enum Authz<'a> {
 impl Authz<'_> {
     /// Whether this caller may read `repo`.
     fn may_read(&self, repo: &str) -> bool {
+        self.may(accounts::Action::Read, repo)
+    }
+
+    /// Whether this caller may do `action` on `repo`.
+    fn may(&self, action: accounts::Action, repo: &str) -> bool {
         match self {
             Authz::NoScopes => true,
-            Authz::Accounts(p) => accounts::authorize(p, accounts::Action::Read, repo),
+            Authz::Accounts(p) => accounts::authorize(p, action, repo),
         }
     }
 }
@@ -5167,7 +5172,7 @@ fn authorize_or_forbidden(
 ) -> Option<Response<Body>> {
     match authz {
         Authz::NoScopes => None,
-        Authz::Accounts(p) if accounts::authorize(p, action, name) => None,
+        _ if authz.may(action, name) => None,
         Authz::Accounts(_) => Some(accounts::forbidden()),
     }
 }
