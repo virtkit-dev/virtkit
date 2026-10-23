@@ -76,6 +76,9 @@ enum Call {
         /// What it enrolls; a node when absent, as before registries.
         #[serde(default)]
         kind: TokenKind,
+        /// The enrolling registry's bound URL.
+        #[serde(default)]
+        url: Option<String>,
     },
     ListNodes,
     /// Every node's workloads, or one node's: by ID, or by a hostname only it has.
@@ -141,6 +144,11 @@ enum Call {
     UpdateRegistry {
         id: String,
         release: String,
+    },
+    /// `None` unbinds it.
+    SetRegistryUrl {
+        id: String,
+        url: Option<String>,
     },
     ListGitlabs,
     AddGitlab {
@@ -459,10 +467,15 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
     )?;
     let actor = format!("uid {uid}");
     let value = match envelope.call {
-        Call::CreateToken { ttl_secs, kind } => {
+        Call::CreateToken {
+            ttl_secs,
+            kind,
+            url,
+        } => {
             let (token, expires_at) = hub.db.create_token_for(
                 kind,
                 Duration::from_secs(ttl_secs),
+                url.as_deref(),
                 &actor,
                 crate::now_secs(),
             )?;
@@ -538,6 +551,18 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         )?)?,
         Call::UpdateRegistry { id, release } => {
             serde_json::to_value(crate::registries::update(hub, &actor, &id, &release)?)?
+        }
+        Call::SetRegistryUrl { id, url } => {
+            let changed = crate::registries::set_url(hub, &actor, &id, url.as_deref())?;
+            if changed {
+                eprintln!(
+                    "vk-hub: admin: {actor} bound registry {} to {}",
+                    vk_hub_proto::display_safe(&id),
+                    url.as_deref()
+                        .map_or("no URL".to_string(), vk_hub_proto::display_safe)
+                );
+            }
+            serde_json::to_value(changed)?
         }
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
         Call::AddGitlab { name, url } => {
@@ -752,10 +777,30 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
     pub fn create_token_for(&self, kind: TokenKind, ttl: Duration) -> Result<CreatedToken> {
+        self.create_token_bound(kind, ttl, None)
+    }
+
+    /// [`Client::create_token_for`], binding the registry it enrolls to `url`.
+    pub fn create_token_bound(
+        &self,
+        kind: TokenKind,
+        ttl: Duration,
+        url: Option<String>,
+    ) -> Result<CreatedToken> {
         self.call(Call::CreateToken {
             ttl_secs: ttl.as_secs(),
             kind,
+            url,
+        })
+    }
+
+    /// Whether it changed.
+    pub fn set_registry_url(&self, id: &str, url: Option<String>) -> Result<bool> {
+        self.call(Call::SetRegistryUrl {
+            id: id.to_string(),
+            url,
         })
     }
 

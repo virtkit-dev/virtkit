@@ -1,7 +1,86 @@
-//! Registry tokens: GitLab instances and keys' ceilings.
+//! Registry tokens: GitLab instances and keys' ceilings, a registry's URL.
 
 use super::*;
-use crate::store::{KeyPolicy, ProjectCeiling, Scope};
+use crate::store::{KeyPolicy, ProjectCeiling, RegistryEnrollment, Scope, TokenKind};
+
+pub(super) const REGISTRY_URL: &str = "https://reg.example.com";
+
+fn test_hub() -> Hub {
+    Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+}
+
+/// A registry enrolled at `url` with key `key`.
+pub(crate) fn url_registry(hub: &Hub, url: &str, key: &str) -> String {
+    let now = now_secs();
+    let (token, _) = hub
+        .db
+        .create_token_for(
+            TokenKind::Registry,
+            Duration::from_secs(60),
+            Some(url),
+            "uid 0",
+            now,
+        )
+        .unwrap();
+    let RegistryEnrollment::Enrolled { id } = hub
+        .db
+        .enroll_registry(&token, key, "reg-1", "peer p", now)
+        .unwrap()
+    else {
+        panic!("not enrolled");
+    };
+    id
+}
+
+#[test]
+fn a_registry_url_is_bound_once() {
+    let hub = test_hub();
+    let a = url_registry(&hub, REGISTRY_URL, "aa");
+    let err = hub
+        .db
+        .create_token_for(
+            TokenKind::Registry,
+            Duration::from_secs(60),
+            Some("https://REG.example.com:443"),
+            "u",
+            1,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains(&a), "{err:#}");
+    assert!(
+        hub.db
+            .create_token_for(
+                TokenKind::Node,
+                Duration::from_secs(60),
+                Some(REGISTRY_URL),
+                "u",
+                1
+            )
+            .is_err()
+    );
+    let b = url_registry(&hub, "https://reg-2.example.com", "bb");
+    for taken in [REGISTRY_URL, "http://reg.example.com:443"] {
+        assert!(
+            hub.db.set_registry_url(&b, Some(taken), "u", 1).is_err(),
+            "{taken}"
+        );
+    }
+    assert!(
+        hub.db
+            .set_registry_url(&b, Some("https://x/path"), "u", 1)
+            .is_err()
+    );
+    assert!(
+        hub.db
+            .set_registry_url(&b, Some("https://reg-3.example.com/"), "u", 1)
+            .unwrap()
+    );
+    assert_eq!(
+        hub.db.registry(&b).unwrap().unwrap().url.as_deref(),
+        Some("https://reg-3.example.com")
+    );
+    assert!(hub.db.set_registry_url(&a, None, "u", 1).unwrap());
+}
 
 fn policy(gitlab: Option<&str>, projects: Vec<ProjectCeiling>) -> KeyPolicy {
     KeyPolicy {
@@ -76,6 +155,17 @@ fn the_token_commands_parse() {
             "gl",
             "https://gitlab.example.com",
         ],
+        &["vk-hub", "registries", "set-url", "r", "https://reg"],
+        &["vk-hub", "registries", "set-url", "r", "--none"],
+        &[
+            "vk-hub",
+            "token",
+            "create",
+            "--kind",
+            "registry",
+            "--url",
+            "https://reg",
+        ],
         &[
             "vk-hub",
             "keys",
@@ -92,16 +182,58 @@ fn the_token_commands_parse() {
     ] {
         crate::Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
     }
-    let bad = [
-        "vk-hub",
-        "keys",
-        "create",
-        "--name",
-        "k",
-        "--pool",
-        "ci",
-        "--projects",
-        "1:a",
-    ];
-    assert!(crate::Cli::try_parse_from(bad).is_err(), "{bad:?}");
+    for bad in [
+        &["vk-hub", "registries", "set-url", "r"][..],
+        &[
+            "vk-hub",
+            "keys",
+            "create",
+            "--name",
+            "k",
+            "--pool",
+            "ci",
+            "--projects",
+            "1:a",
+        ],
+    ] {
+        assert!(crate::Cli::try_parse_from(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_url_taken_since_the_token_was_issued_is_not_bound() {
+    let hub = test_hub();
+    let a = url_registry(&hub, REGISTRY_URL, "aa");
+    // A token issued for a URL, which another registry takes before it is spent.
+    let (token, _) = hub
+        .db
+        .create_token_for(
+            TokenKind::Registry,
+            Duration::from_secs(60),
+            Some("https://reg-2.example.com"),
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    let b = url_registry(&hub, "https://reg-3.example.com", "bb");
+    hub.db
+        .set_registry_url(&b, Some("http://reg-2.example.com:443"), "u", 1)
+        .unwrap();
+    let RegistryEnrollment::Reenrolled { id } = hub
+        .db
+        .enroll_registry(&token, "aa", "reg", "p", now_secs())
+        .unwrap()
+    else {
+        panic!("not enrolled again");
+    };
+    assert_eq!(id, a);
+    assert_eq!(
+        hub.db.registry(&a).unwrap().unwrap().url.as_deref(),
+        Some(REGISTRY_URL)
+    );
+    let audit = hub.db.audits(Some(&a), 20).unwrap();
+    assert!(
+        audit.iter().any(|e| e.event.contains("so it is not bound")),
+        "{audit:?}"
+    );
 }

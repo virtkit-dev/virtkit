@@ -821,6 +821,7 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
         hub.db.create_token_for(
             kind,
             std::time::Duration::from_secs(ttl),
+            None,
             &principal,
             crate::now_secs(),
         )

@@ -459,6 +459,9 @@ struct TokenRow {
     /// What it enrolls; tokens from before registries enroll nodes.
     #[serde(default)]
     kind: TokenKind,
+    /// The bound URL of the registry enrolled with this token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 /// What an enrollment token enrolls: a node or a registry, never either.
@@ -781,16 +784,17 @@ impl Db {
     /// [`Db::create_token_for`] a node.
     #[cfg(test)]
     pub fn create_token(&self, ttl: Duration, actor: &str, now: u64) -> Result<(String, u64)> {
-        self.create_token_for(TokenKind::Node, ttl, actor, now)
+        self.create_token_for(TokenKind::Node, ttl, None, actor, now)
     }
 
-    /// Issue a single-use token enrolling `kind`, valid for `ttl`, audited as `actor`'s.
-    /// Returns the token — shown once, never stored — and when it expires. Expired tokens are
-    /// swept in the same write.
+    /// Issue a single-use token enrolling `kind`, valid for `ttl`, audited as `actor`'s; a
+    /// registry's may bind it to `url`. Returns the token — shown once, never stored — and
+    /// when it expires. Expired tokens are swept in the same write.
     pub fn create_token_for(
         &self,
         kind: TokenKind,
         ttl: Duration,
+        url: Option<&str>,
         actor: &str,
         now: u64,
     ) -> Result<(String, u64)> {
@@ -800,6 +804,22 @@ impl Db {
                 MAX_TOKEN_TTL.as_secs() / 86_400
             );
         }
+        let url = match url {
+            None => None,
+            Some(_) if kind != TokenKind::Registry => bail!("only a registry is bound to a URL"),
+            Some(u) => {
+                let normal = registries::normalize_registry_url(u)
+                    .with_context(|| format!("{u:?} is not an http(s) URL with no path"))?;
+                if let Some((id, _)) = self.registries()?.into_iter().find(|(_, r)| {
+                    r.url
+                        .as_deref()
+                        .is_some_and(|u| registries::same_registry_url(u, &normal))
+                }) {
+                    bail!("{normal} is registry {id}'s");
+                }
+                Some(normal)
+            }
+        };
         let token = format!("{TOKEN_PREFIX}{}", crate::random_hex(32)?);
         let expires_at = now.saturating_add(ttl.as_secs());
         let txn = self.db.begin_write().context("starting a write")?;
@@ -819,6 +839,7 @@ impl Db {
                 created_at: now,
                 expires_at,
                 kind,
+                url: url.clone(),
             };
             table.insert(token_key(&token).as_str(), encode(&row)?.as_slice())?;
         }
@@ -2729,6 +2750,16 @@ fn spend_token(txn: &redb::WriteTransaction, key: &str, kind: TokenKind, now: u6
         }
         _ => Ok(false),
     }
+}
+
+/// The URL the token hashed to `key` binds a registry to, if any.
+fn token_url(txn: &redb::WriteTransaction, key: &str) -> Result<Option<String>> {
+    Ok(txn
+        .open_table(TOKENS)?
+        .get(key)?
+        .map(|g| decode::<TokenRow>(g.value()))
+        .transpose()?
+        .and_then(|row| row.url))
 }
 
 /// A token's key in [`TOKENS`], and a sign-in token's or session secret's in its table.

@@ -7400,6 +7400,7 @@ async fn registries_are_shown_to_all_and_steered_by_operators() {
         .create_token_for(
             TokenKind::Registry,
             Duration::from_secs(60),
+            None,
             "uid 0",
             crate::now_secs(),
         )

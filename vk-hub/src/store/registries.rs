@@ -50,6 +50,39 @@ pub struct RegistryRow {
     /// What the hub wants of it; `None` until an operator sets anything.
     #[serde(default)]
     pub desired: Option<DesiredState>,
+    /// The URL clients reach it at, `https://host[:port]` ([`normalize_registry_url`]): bound
+    /// by the operator at enrollment or later, never claimed by the registry. Nodes whose
+    /// `[registry]` is this URL get tokens for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Whether two bound URLs name one registry: the same host and port, whatever the scheme, so
+/// `http://reg` and `https://reg:80` never go to two registries.
+pub fn same_registry_url(a: &str, b: &str) -> bool {
+    let authority = |u: &str| {
+        let (scheme, rest) = u.split_once("://").unwrap_or(("", u));
+        let port = if scheme == "https" { "443" } else { "80" };
+        // An IPv6 literal's own colons are not a port: only one after its `]` is.
+        let has_port = match rest.rsplit_once(']') {
+            Some((_, after)) => after.starts_with(':'),
+            None => rest.contains(':'),
+        };
+        if has_port {
+            rest.to_string()
+        } else {
+            format!("{rest}:{port}")
+        }
+    };
+    authority(a) == authority(b)
+}
+
+/// `url` as the hub binds a registry's: `http` or `https`, lowercase scheme and host, no
+/// default port, no path but `/`. `None` for anything else.
+pub fn normalize_registry_url(url: &str) -> Option<String> {
+    let normal = super::gitlabs::normalize_gitlab_url(url)?;
+    let (_, rest) = normal.split_once("://")?;
+    (!rest.contains('/')).then_some(normal)
 }
 
 /// A command issued to a registry, and what the registry last said it came to.
@@ -175,6 +208,7 @@ impl Db {
             return Ok(RegistryEnrollment::BadToken);
         }
         let txn = self.db.begin_write().context("starting a write")?;
+        let url = super::token_url(&txn, &key)?;
         let outcome = if spend_token(&txn, &key, TokenKind::Registry, now)? {
             let mut table = txn.open_table(REGISTRIES)?;
             let mut pinned = None;
@@ -185,8 +219,42 @@ impl Db {
                     break;
                 }
             }
+            // A URL another registry took since the token was issued is not bound twice.
+            let mut url = url;
+            let mut taken = None;
+            if let Some(u) = &url {
+                for entry in table.iter()? {
+                    let (other, value) = entry?;
+                    if Some(other.value()) != pinned.as_deref()
+                        && decode::<RegistryRow>(value.value())?
+                            .url
+                            .as_deref()
+                            .is_some_and(|o| same_registry_url(o, u))
+                    {
+                        taken = Some((u.clone(), other.value().to_string()));
+                        url = None;
+                        break;
+                    }
+                }
+            }
+            let not_bound = |(u, other): &(String, String)| {
+                format!("; {u} is registry {other}'s, so it is not bound")
+            };
             if let Some(id) = pinned {
-                let event = format!("registry {id} enrolled again with its pinned key");
+                let bound = match url {
+                    Some(u) => {
+                        let mut row = table
+                            .get(id.as_str())?
+                            .map(|g| decode::<RegistryRow>(g.value()))
+                            .transpose()?
+                            .ok_or_else(|| NotEnrolled(id.clone()))?;
+                        row.url = Some(u.clone());
+                        table.insert(id.as_str(), encode(&row)?.as_slice())?;
+                        format!(", at {u}")
+                    }
+                    None => taken.as_ref().map(not_bound).unwrap_or_default(),
+                };
+                let event = format!("registry {id} enrolled again with its pinned key{bound}");
                 append_audit(&txn, Some(&id), actor, &event, now)?;
                 RegistryEnrollment::Reenrolled { id }
             } else {
@@ -195,10 +263,14 @@ impl Db {
                     public_key: public_key.to_string(),
                     hostname: vk_hub_proto::display_safe(hostname),
                     enrolled_at: now,
+                    url,
                     ..RegistryRow::default()
                 };
                 table.insert(id.as_str(), encode(&row)?.as_slice())?;
-                let event = format!("registry {id} enrolled as {}", row.hostname);
+                let event = match &row.url {
+                    Some(u) => format!("registry {id} enrolled as {} at {u}", row.hostname),
+                    None => format!("registry {id} enrolled as {}", row.hostname),
+                };
                 append_audit(&txn, Some(&id), actor, &event, now)?;
                 RegistryEnrollment::Enrolled { id }
             }
@@ -354,6 +426,55 @@ impl Db {
             );
             Ok((Some(desired), vec![(actor.to_string(), event)]))
         })
+    }
+
+    /// Bind registry `id` to `url` ([`normalize_registry_url`]), or unbind it (`None`),
+    /// audited as `actor`'s; refused when another registry holds the URL. Whether it changed.
+    pub fn set_registry_url(
+        &self,
+        id: &str,
+        url: Option<&str>,
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
+        let url = match url {
+            Some(u) => Some(
+                normalize_registry_url(u)
+                    .with_context(|| format!("{u:?} is not an http(s) URL with no path"))?,
+            ),
+            None => None,
+        };
+        let txn = self.db.begin_write().context("starting a write")?;
+        let changed = {
+            let mut table = txn.open_table(REGISTRIES)?;
+            let mut row = None;
+            for entry in table.iter()? {
+                let (other, value) = entry?;
+                let other_row = decode::<RegistryRow>(value.value())?;
+                if other.value() == id {
+                    row = Some(other_row);
+                } else if let (Some(u), Some(o)) = (&url, &other_row.url)
+                    && same_registry_url(o, u)
+                {
+                    bail!("{u} is registry {}'s, at {o}", other.value());
+                }
+            }
+            let mut row = row.ok_or_else(|| NotEnrolled(id.to_string()))?;
+            if row.url == url {
+                false
+            } else {
+                row.url.clone_from(&url);
+                table.insert(id, encode(&row)?.as_slice())?;
+                let event = match &url {
+                    Some(u) => format!("{actor} bound registry {id} to {u}"),
+                    None => format!("{actor} unbound registry {id} from its URL"),
+                };
+                append_audit(&txn, Some(id), actor, &event, now)?;
+                true
+            }
+        };
+        txn.commit().context("binding a registry's URL")?;
+        Ok(changed)
     }
 
     /// Issue `op` to registry `id`, valid for `ttl`, audited as `actor`'s. Settled commands
@@ -565,5 +686,20 @@ impl Db {
             .context("setting a write's durability")?;
         txn.commit().context("updating a registry")?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_registry_url;
+
+    /// One host and port is one registry whatever the scheme, an IPv6 literal's included.
+    #[test]
+    fn a_registry_url_names_a_host_and_port() {
+        assert!(same_registry_url("http://reg", "https://reg:80"));
+        assert!(!same_registry_url("http://reg", "https://reg"));
+        assert!(same_registry_url("http://[::1]", "https://[::1]:80"));
+        assert!(!same_registry_url("http://[::1]", "https://[::1]"));
+        assert!(!same_registry_url("http://[::1]:8080", "http://[::1]"));
     }
 }

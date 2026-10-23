@@ -501,6 +501,15 @@ fn issue(hub: &Hub, actor: &str, id: &str, op: Operation) -> Result<Command> {
     Ok(command)
 }
 
+/// Bind registry `id` to `url`, or unbind it, as `actor`; whether it changed.
+pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bool> {
+    let changed = hub.db.set_registry_url(id, url, actor, crate::now_secs())?;
+    if changed {
+        hub.changed(id);
+    }
+    Ok(changed)
+}
+
 /// Remove registry `id` as `actor` and end its session; whether there was one.
 pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
     let removed = hub.db.remove_registry(id, actor, crate::now_secs())?;

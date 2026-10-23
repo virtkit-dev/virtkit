@@ -685,6 +685,10 @@ enum TokenCmd {
         /// What it enrolls: a node (`vk node join`) or a registry (`vk-registry join`)
         #[arg(long, default_value = "node", value_parser = parse_token_kind)]
         kind: store::TokenKind,
+        /// The URL clients reach the registry it enrolls at, https://host[:port]: nodes whose
+        /// [registry] is this URL get registry tokens for it
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
     },
 }
 
@@ -757,6 +761,16 @@ enum RegistriesCmd {
         #[arg(long)]
         release: String,
     },
+    /// Bind the registry to the URL clients reach it at, or unbind it
+    SetUrl {
+        id: String,
+        /// https://host[:port]
+        #[arg(required_unless_present = "none")]
+        url: Option<String>,
+        /// Unbind it: nodes get no tokens for it
+        #[arg(long, conflicts_with = "url")]
+        none: bool,
+    },
 }
 
 fn parse_gc_every(s: &str) -> Result<Duration, String> {
@@ -790,11 +804,18 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Serve { config } => serve(HubConfig::load(config.config.as_deref())?).await,
         Cmd::Token {
-            cmd: TokenCmd::Create { config, ttl, kind },
+            cmd:
+                TokenCmd::Create {
+                    config,
+                    ttl,
+                    kind,
+                    url,
+                },
         } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             let created =
-                tokio::task::spawn_blocking(move || client.create_token_for(kind, ttl)).await??;
+                tokio::task::spawn_blocking(move || client.create_token_bound(kind, ttl, url))
+                    .await??;
             // The token alone on stdout, so `$(vk-hub token create)` captures just it.
             println!("{}", created.token);
             eprintln!(
@@ -2282,6 +2303,14 @@ fn registries_blocking(client: &admin::Client, cmd: Option<RegistriesCmd>) -> Re
             let command = client.update_registry(&id, &release)?;
             eprintln!("vk-hub: registry {id}: issued command {}", command.id);
         }
+        Some(RegistriesCmd::SetUrl { id, url, none: _ }) => {
+            // `--none` conflicts with a URL, so it leaves `url` unset.
+            if client.set_registry_url(&id, url)? {
+                eprintln!("vk-hub: registry {id}: URL changed");
+            } else {
+                eprintln!("vk-hub: already so; nothing changed");
+            }
+        }
     }
     Ok(())
 }
@@ -2324,6 +2353,13 @@ fn render_registry(
         );
         field("signed updates only", i.requires_signed.to_string());
     }
+    field(
+        "url",
+        r.row
+            .url
+            .clone()
+            .unwrap_or_else(|| "none bound (vk-hub registries set-url)".to_string()),
+    );
     if let Some(u) = &r.row.usage {
         field(
             "usage",

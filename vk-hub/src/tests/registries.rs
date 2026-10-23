@@ -15,6 +15,7 @@ fn registry_token(hub: &Hub) -> String {
         .create_token_for(
             TokenKind::Registry,
             Duration::from_secs(60),
+            None,
             "uid 0",
             now_secs(),
         )

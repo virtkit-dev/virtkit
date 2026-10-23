@@ -403,6 +403,12 @@ instance's, naming a project (ID not 0), and with `--projects` only those projec
 path both; anything else is 403. Keys bound to none submit as before, and their jobs get no
 token.
 
+**Registry URLs.** `vk-hub token create --kind registry --url <url>` binds the enrolling
+registry to the URL its clients reach it at; `vk-hub registries set-url <id> <url>|--none`
+changes it, and `registries show` prints it. A URL is `http(s)://host[:port]`, and one host
+and port belong to one registry whatever the scheme. A URL another registry took before the
+token was spent is not bound, and the audit log says so.
+
 ## Open questions
 
 - **Key table size.** Bounded by the hub's 256 keys today; a fleet with per-project keys in the
