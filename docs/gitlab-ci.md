@@ -1246,6 +1246,19 @@ data out in the names queried. The gateway rebuilds forwarded queries from their
 keeping only the id, RD, AD and CD flags and a bare EDNS record. Queries it cannot rebuild
 are `REFUSED`, or `NOTIMP` for a DNS update or notify.
 
+An allowed name is reached by address: resolving it through the gateway opens, to that VM
+alone, the IPv4 addresses its answer gives for it, for the answer's TTL (at least 30 s) plus
+60 s. Filtering is by address, not by name, so the limits are those of the address:
+
+- an opened address is reachable on **any port** but DNS's 53, and for every site it serves:
+  on shared hosting or a CDN, the other sites behind it too;
+- a DNS-over-HTTPS or DNS-over-TLS resolver behind an opened address resolves names past the
+  allowlist, though only listed ranges and addresses opened by allowed names can be reached;
+- an address stays open for that whole time, even if the name's records change meanwhile;
+- a job resolving very many names keeps only part of them open: past 64 names on one address
+  of one VM, or 16384 (VM, address, name) entries across the job's VMs, the entries soonest to
+  expire close, and their addresses are refused until resolved again.
+
 ### Narrowing from a job
 
 A job may **narrow** its egress to a subset of the host cap, never widen it. Each

@@ -508,9 +508,119 @@ impl NamePin {
         let t = self.names.entry(name.to_string()).or_insert(until);
         *t = (*t).max(until);
     }
-    /// Whether any of its names still holds it at `now`.
-    fn live(&self, now: Instant) -> bool {
-        self.names.values().any(|&until| until > now)
+    /// The name whose pin expires first.
+    fn soonest(&self) -> Option<String> {
+        self.names
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(name, _)| name.clone())
+    }
+}
+
+/// The most names one address stays pinned under for one source. Past it the name expiring
+/// soonest is dropped: a guest resolving ever more names that one address serves (a CDN, a
+/// wildcard zone) holds no more than this of them.
+const PIN_NAMES_PER_ADDR: usize = 64;
+/// The most `(source, address, name)` pins one switch holds, so a guest flooding its resolver
+/// with distinct allowed names cannot grow them without bound: past it the expired ones go, then
+/// the eighth expiring soonest, so shedding costs one pass per many pins taken. Far past what a
+/// build or a test suite resolves within a TTL.
+const MAX_PINS: usize = 16384;
+/// The most `(source, address)` pairs the audit remembers resolving, so a guest whose lookups
+/// return ever more addresses cannot grow the set without bound.
+const MAX_DNS_IPS: usize = 65536;
+/// Expired pins are swept from the whole set every this many pins taken, not only when the
+/// address they hold is next checked.
+const PIN_SWEEP_EVERY: usize = 1024;
+
+/// The pins of one switch, by `(source, address)`, with the bounds above. Every eviction
+/// removes a name, so it can only shorten or revoke what a pin admits, never admit more: the
+/// flow it would have carried is denied as though its name had never resolved there.
+#[derive(Default)]
+struct Pins {
+    by_addr: HashMap<(Ipv4Addr, Ipv4Addr), NamePin>,
+    /// The names held across `by_addr`.
+    len: usize,
+    /// Pins taken since the last sweep.
+    since_sweep: usize,
+}
+
+impl Pins {
+    /// Pin `key` for `name` until `until`, as [`NamePin::extend`] does, within the bounds.
+    fn pin(&mut self, key: (Ipv4Addr, Ipv4Addr), name: &str, until: Instant, now: Instant) {
+        self.since_sweep += 1;
+        if self.since_sweep >= PIN_SWEEP_EVERY {
+            self.drop_through(now);
+        }
+        let pin = self.by_addr.entry(key).or_default();
+        let before = pin.names.len();
+        pin.names.retain(|_, t| *t > now);
+        if !pin.names.contains_key(name)
+            && pin.names.len() >= PIN_NAMES_PER_ADDR
+            && let Some(soonest) = pin.soonest()
+        {
+            pin.names.remove(&soonest);
+        }
+        pin.extend(name, until);
+        self.len = self.len - before + pin.names.len();
+        if self.len > MAX_PINS {
+            self.shed(now);
+        }
+    }
+    /// Whether `key` is held, at `now`, by a name `f` accepts. Its expired names go, and the
+    /// entry with them once none is left.
+    fn holds(
+        &mut self,
+        key: (Ipv4Addr, Ipv4Addr),
+        now: Instant,
+        mut f: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let Some(pin) = self.by_addr.get_mut(&key) else {
+            return false;
+        };
+        let before = pin.names.len();
+        pin.names.retain(|_, t| *t > now);
+        let after = pin.names.len();
+        let held = pin.names.keys().any(|name| f(name));
+        if after == 0 {
+            self.by_addr.remove(&key);
+        }
+        self.len = self.len - before + after;
+        held
+    }
+    /// Keep only the names `f` accepts, given with their address and expiry, dropping the
+    /// entries left with none.
+    fn retain(&mut self, mut f: impl FnMut(&(Ipv4Addr, Ipv4Addr), &str, Instant) -> bool) {
+        self.by_addr.retain(|key, pin| {
+            pin.names.retain(|name, t| f(key, name, *t));
+            !pin.names.is_empty()
+        });
+        self.len = self.by_addr.values().map(|p| p.names.len()).sum();
+    }
+    /// Drop every name expiring at or before `cutoff` (expired, for `now`).
+    fn drop_through(&mut self, cutoff: Instant) {
+        self.since_sweep = 0;
+        self.retain(|_, _, t| t > cutoff);
+    }
+    /// Back within [`MAX_PINS`]: drop the expired names, then the eighth expiring soonest (ties
+    /// with the last of them too).
+    fn shed(&mut self, now: Instant) {
+        self.drop_through(now);
+        let target = MAX_PINS - MAX_PINS / 8;
+        if self.len <= target {
+            return;
+        }
+        let mut expiries: Vec<Instant> = self
+            .by_addr
+            .values()
+            .flat_map(|pin| pin.names.values().copied())
+            .collect();
+        let (_, &mut cutoff, _) = expiries.select_nth_unstable(self.len - target - 1);
+        self.retain(|_, _, t| t > cutoff);
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_addr.is_empty()
     }
 }
 
@@ -547,7 +657,8 @@ struct EgressGuard {
     dry_run: bool,
     /// DNS-pinned A-records, keyed by `(source, resolved_ip)` so one VM's resolution never
     /// admits a connection from another VM with a different policy (per-source isolation).
-    pinned: Mutex<HashMap<(Ipv4Addr, Ipv4Addr), NamePin>>,
+    /// Bounded, as [`Pins`] says.
+    pinned: Mutex<Pins>,
     /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -594,7 +705,7 @@ impl EgressGuard {
             per_source: HashMap::new(),
             gateway,
             dry_run: false,
-            pinned: Mutex::new(HashMap::new()),
+            pinned: Mutex::default(),
             registry_proxy: None,
             denied_log: None,
             audit_log: None,
@@ -806,14 +917,20 @@ impl EgressGuard {
     }
     /// Remember the A-record IPs the switch just handed `src` for an allowed name, so a
     /// connection from that VM to one of them is not re-logged as a direct-IP contact. No-op
-    /// where there is no channel. Bounded by the answers the switch handed out, so a job's
-    /// worth of resolutions, and paid by every CI job now that the channel is always open.
+    /// where there is no channel. Paid by every CI job now that the channel is always open, and
+    /// held to [`MAX_DNS_IPS`]: an address resolved past it is logged as a direct-IP contact if
+    /// dialed, which the channel's own bound holds.
     fn record_dns_ips(&self, src: Ipv4Addr, ips: &[Ipv4Addr]) {
         if self.audit_log.is_none() {
             return;
         }
         let mut dns_ips = self.dns_ips.lock().unwrap();
-        dns_ips.extend(ips.iter().map(|ip| (src, *ip)));
+        for ip in ips {
+            if dns_ips.len() >= MAX_DNS_IPS {
+                break;
+            }
+            dns_ips.insert((src, *ip));
+        }
     }
     /// Record an allowed external `ip:port` that `src` dialed to the audit channel — but only
     /// when the switch never resolved that IP for that same VM, so the "IPs/ports contacted"
@@ -845,12 +962,8 @@ impl EgressGuard {
     /// policy before this pruning, or waits and checks the new policy.
     fn replace_policy(&self, policy: Egress) {
         let mut current = self.policy.write().unwrap();
-        self.pinned.lock().unwrap().retain(|(src, _), pin| {
-            if self.per_source.contains_key(src) {
-                return true;
-            }
-            pin.names.retain(|name, _| policy.allows_host(name));
-            !pin.names.is_empty()
+        self.pinned.lock().unwrap().retain(|(src, _), name, _| {
+            self.per_source.contains_key(src) || policy.allows_host(name)
         });
         *current = Arc::new(policy);
     }
@@ -881,10 +994,11 @@ impl EgressGuard {
         if (!allowed && !self.dry_run) || matches!(**policy, Egress::AllowAll) || ips.is_empty() {
             return allowed;
         }
-        let until = Instant::now() + Duration::from_secs(u64::from(ttl).max(30) + 60);
+        let now = Instant::now();
+        let until = now + Duration::from_secs(u64::from(ttl).max(30) + 60);
         let mut pinned = self.pinned.lock().unwrap();
         for ip in ips.iter().filter(|ip| !unroutable(**ip)) {
-            pinned.entry((src, *ip)).or_default().extend(name, until);
+            pinned.pin((src, *ip), name, until, now);
         }
         allowed
     }
@@ -905,15 +1019,10 @@ impl EgressGuard {
         let IpAddr::V4(v4) = dst.ip() else {
             return false;
         };
-        let mut pinned = self.pinned.lock().unwrap();
-        match pinned.get(&(src, v4)) {
-            Some(pin) if pin.live(Instant::now()) => true,
-            Some(_) => {
-                pinned.remove(&(src, v4));
-                false
-            }
-            None => false,
-        }
+        self.pinned
+            .lock()
+            .unwrap()
+            .holds((src, v4), Instant::now(), |_| true)
     }
     /// What to do with a direct flow from `src` to `dst`: [`Self::allows`], softened to
     /// [`Verdict::WouldDeny`] in dry-run. A `None` source (not IPv4) is denied.
@@ -6334,17 +6443,102 @@ mod tests {
     #[test]
     fn a_pin_lasts_until_the_latest_of_its_names_expiries() {
         let now = Instant::now();
-        let mut pin = NamePin::default();
-        pin.extend("a.com", now + Duration::from_secs(600));
+        let at = |secs| now + Duration::from_secs(secs);
+        let key = (
+            Ipv4Addr::new(192, 168, 231, 2),
+            Ipv4Addr::new(93, 184, 216, 7),
+        );
+        let mut pins = Pins::default();
+        pins.pin(key, "a.com", at(600), now);
         // A shorter answer later, for the same name or another, does not cut it short.
-        pin.extend("a.com", now + Duration::from_secs(60));
-        pin.extend("b.com", now + Duration::from_secs(90));
-        assert!(pin.live(now + Duration::from_secs(300)));
-        assert!(!pin.live(now + Duration::from_secs(601)));
+        pins.pin(key, "a.com", at(60), now);
+        pins.pin(key, "b.com", at(90), now);
+        assert!(pins.holds(key, at(300), |name| name == "a.com"));
+        assert!(!pins.holds(key, at(601), |_| true));
+        assert!(
+            pins.is_empty() && pins.len == 0,
+            "an expired entry goes on touch"
+        );
         // Once the longer name is gone, the shorter one is all that holds it.
-        pin.names.remove("a.com");
-        assert!(pin.live(now + Duration::from_secs(80)));
-        assert!(!pin.live(now + Duration::from_secs(91)));
+        pins.pin(key, "a.com", at(600), now);
+        pins.pin(key, "b.com", at(90), now);
+        pins.retain(|_, name, _| name != "a.com");
+        assert!(pins.holds(key, at(80), |_| true));
+        assert!(!pins.holds(key, at(91), |_| true));
+    }
+
+    /// A guest resolving ever more names, all to one address or each to its own, holds no more
+    /// pins than the bounds allow, and what expired is swept without the address being checked.
+    #[test]
+    fn pins_stay_bounded_under_a_flood_of_names() {
+        let now = Instant::now();
+        let at = |secs| now + Duration::from_secs(secs);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let shared = (src, Ipv4Addr::new(93, 184, 216, 7));
+        let mut pins = Pins::default();
+        for i in 0..10_000u64 {
+            pins.pin(shared, &format!("n{i}.cdn.example"), at(300 + i), now);
+        }
+        assert_eq!(pins.by_addr[&shared].names.len(), PIN_NAMES_PER_ADDR);
+        // The names kept are those expiring last; the newest is among them.
+        assert!(
+            pins.by_addr[&shared]
+                .names
+                .contains_key("n9999.cdn.example")
+        );
+        assert!(!pins.by_addr[&shared].names.contains_key("n0.cdn.example"));
+
+        for i in 0..(3 * MAX_PINS as u32) {
+            let ip = Ipv4Addr::from(0x0a00_0000 + i);
+            pins.pin((src, ip), &format!("h{i}.example"), at(300), now);
+            assert!(pins.len <= MAX_PINS);
+        }
+        let counted: usize = pins.by_addr.values().map(|p| p.names.len()).sum();
+        assert_eq!(pins.len, counted);
+        assert!(pins.by_addr.len() <= MAX_PINS);
+
+        // Expired names go in the periodic sweep, though nothing checks their addresses.
+        let mut pins = Pins::default();
+        let stale = (src, Ipv4Addr::new(10, 0, 0, 1));
+        pins.pin(stale, "old.example", at(10), now);
+        for i in 0..PIN_SWEEP_EVERY as u32 {
+            pins.pin(
+                (src, Ipv4Addr::from(0x0b00_0000 + i)),
+                "new.example",
+                at(400),
+                at(20),
+            );
+        }
+        assert!(!pins.by_addr.contains_key(&stale));
+        assert_eq!(pins.len, pins.by_addr.len());
+    }
+
+    /// Shedding pins past the bounds only ever revokes: every address still reachable is one
+    /// the guest resolved an allowed name to, and an evicted one is refused again.
+    #[test]
+    fn an_evicted_pin_only_denies() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let g = EgressGuard::new(
+            Egress::restricted(&[], &["example.com".into()]).unwrap(),
+            gw,
+        );
+        let ip = |i: u32| Ipv4Addr::from(0x0a00_0000 + i);
+        let flood = 2 * MAX_PINS as u32;
+        for i in 0..flood {
+            let name = format!("h{i}.example.com");
+            // Each lookup's TTL longer than the last, so the earliest lookups expire first.
+            assert!(g.record_if_allowed(src, &name, &[ip(i)], 300 + i));
+        }
+        let reachable = |i: u32| g.allows(src, SocketAddr::new(ip(i).into(), 443));
+        assert!(g.pinned.lock().unwrap().len <= MAX_PINS);
+        // The latest lookup holds, the earliest was shed and is refused once more.
+        assert!(reachable(flood - 1));
+        assert!(!reachable(0));
+        // Nothing never resolved is reachable, and the count of those that are fits the bound.
+        assert!(!reachable(flood));
+        let live = (0..flood).filter(|&i| reachable(i)).count();
+        assert!(live > 0 && live <= MAX_PINS, "{live}");
     }
 
     #[test]
@@ -6494,6 +6688,20 @@ mod tests {
         g.record_dns_ips(vm_a, &[resolved]);
         g.record_ip_contact(vm_a, SocketAddrV4::new(direct, 443));
         assert!(!off.exists());
+    }
+
+    #[test]
+    fn the_audit_remembers_a_bounded_set_of_resolved_addresses() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let path = std::env::temp_dir().join("vk-switch-audit-bound-never-written.log");
+        let g = EgressGuard::new(Egress::AllowAll, gw).with_audit_log(Some(path));
+        let ips: Vec<Ipv4Addr> = (0..MAX_DNS_IPS as u32 + 100)
+            .map(|i| Ipv4Addr::from(0x0a00_0000 + i))
+            .collect();
+        g.record_dns_ips(src, &ips);
+        g.record_dns_ips(src, &ips[..10]);
+        assert_eq!(g.dns_ips.lock().unwrap().len(), MAX_DNS_IPS);
     }
 
     #[test]

@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   records, dropping the oldest first.
 - **A fleet job's cache upload no longer follows a `Location` on another origin**, which would
   have sent the node's registry credential there.
+- **A job resolving ever more allowed names no longer grows its switch's memory without
+  bound.** The addresses its lookups opened are capped, the soonest to expire closed first;
+  a closed one is refused until resolved again.
 
 ## [0.94.1] - 2026-10-22
 
