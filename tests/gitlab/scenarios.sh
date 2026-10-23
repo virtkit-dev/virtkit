@@ -16,6 +16,10 @@ default:
 EOF
 }
 
+# A trace line's start: GitLab's own lines start with the text, a placed job's output with
+# its timestamp and stream prefix (`2026-10-22T07:10:50.139347Z 01O `).
+LINE="^([0-9TZ:.-]+ [0-9]{2}[OE]\\+? )?"
+
 SC_ERRORS=0
 bad() {
   log "  assertion: $*"
@@ -131,9 +135,9 @@ EOF
   trace_has "$ok" before-marker script-marker "after-marker status=success"
   # Order: before_script, script, after_script.
   local b s a
-  b=$(grep -n '^before-marker' "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
-  s=$(grep -n '^script-marker' "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
-  a=$(grep -n '^after-marker' "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
+  b=$(grep -nE "${LINE}before-marker" "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
+  s=$(grep -nE "${LINE}script-marker" "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
+  a=$(grep -nE "${LINE}after-marker" "$RUN/jobs/$ok.log" | head -1 | cut -d: -f1)
   [ -n "$b" ] && [ -n "$s" ] && [ -n "$a" ] && [ "$b" -lt "$s" ] && [ "$s" -lt "$a" ] ||
     bad "job $ok: before/script/after out of order ($b/$s/$a)"
   trace_has "$fail" "after-marker status=failed"
@@ -312,7 +316,7 @@ canceled:
 EOF
   } | push_scenario cancel) || return 1
   j=$(job "$p" canceled)
-  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -q '^cancel-start'" || {
+  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -qE '${LINE}cancel-start'" || {
     bad "job $j never printed cancel-start"
     return 1
   }
@@ -337,7 +341,7 @@ survives:
 EOF
   } | push_scenario restart) || return 1
   j=$(job "$p" survives)
-  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -q '^restart-start'" || {
+  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -qE '${LINE}restart-start'" || {
     bad "job $j never printed restart-start"
     return 1
   }
@@ -348,7 +352,7 @@ EOF
   wait_pipeline "$p" success 600 || return 1
   trace_has "$j" restart-done "Job succeeded"
   local n
-  n=$(grep -c '^restart-start' "$RUN/jobs/$j.log")
+  n=$(grep -cE "${LINE}restart-start" "$RUN/jobs/$j.log")
   [ "$n" = 1 ] || bad "restart-start appears $n times in job $j's trace"
   SC_DETAIL="resumed after SIGKILL"
 }
