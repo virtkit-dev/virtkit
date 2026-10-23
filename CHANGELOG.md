@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
   a closed one is refused until resolved again.
 - **Under an egress allowlist, an allowed name's lookup opens only the addresses it resolves
   to**, directly or through its aliases, not every address a DNS answer carries.
+- **`vk-hub`'s audit log no longer loses how a fleet job ended**, or who canceled it, when
+  the job is settled or changes again before the hub has recorded it.
 
 ## [0.94.1] - 2026-10-22
 

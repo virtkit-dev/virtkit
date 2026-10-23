@@ -1748,6 +1748,32 @@ async fn a_job_read_while_its_end_is_written_is_not_older_than_before() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A job settled before the hub has written how it ended keeps that ending's audit line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_settled_before_its_end_is_written_keeps_its_audit() {
+    let dir = scratch("settle-race");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let id = running_job(addr, &key, &mut node, 1).await;
+    let (row, events) =
+        crate::jobs::testing::fail_unwritten(&hub, &id, FailureClass::System, "disk gone");
+    let settle = format!("/v1/jobs/{id}/settle");
+    assert_eq!(
+        api(addr, "POST", &settle, Some(&key), None).await.status,
+        204
+    );
+    crate::jobs::testing::persist(&hub, &id, row, events).await;
+    let stored = hub.db.job(&id).unwrap().unwrap();
+    assert!(stored.settled_at.is_some());
+    assert!(
+        job_audit(&hub, &id).contains(&format!("job {id} ended: system failure: disk gone")),
+        "{:?}",
+        job_audit(&hub, &id)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_hub_keeps_running_jobs_and_their_output_and_loses_the_rest() {
     let dir = scratch("restart");

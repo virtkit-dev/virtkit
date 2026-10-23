@@ -509,9 +509,10 @@ impl Db {
             .transpose()
     }
 
-    /// Write `row` for job `id` and audit each `(node, actor, event)` in `events`, unless
-    /// a later revision is already stored or the job is gone from the history: only
-    /// [`Db::submit_job`] adds a job. Racing writes keep the newer revision.
+    /// Write `row` for job `id`, unless a later revision is already stored or the job is
+    /// gone from the history: only [`Db::submit_job`] adds a job. Racing writes keep the
+    /// newer revision. Audit each `(node, actor, event)` in `events` either way: they tell
+    /// of changes already made, which a newer revision carries if this one loses.
     /// Return whether the row was written.
     pub fn put_job(
         &self,
@@ -521,25 +522,31 @@ impl Db {
         now: u64,
     ) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
-        {
+        let written = {
             let mut table = txn.open_table(JOBS)?;
             let stored = table
                 .get(id)?
                 .map(|g| decode::<JobRow>(g.value()))
                 .transpose()?;
-            let Some(stored) = stored.filter(|s| s.revision <= row.revision) else {
-                return Ok(false);
-            };
-            // A write prepared before the job expired keeps it expired.
-            let mut row = row.clone();
-            row.expired_at = row.expired_at.or(stored.expired_at);
-            table.insert(id, encode(&row)?.as_slice())?;
+            match stored.filter(|s| s.revision <= row.revision) {
+                None => false,
+                Some(stored) => {
+                    // A write prepared before the job expired keeps it expired.
+                    let mut row = row.clone();
+                    row.expired_at = row.expired_at.or(stored.expired_at);
+                    table.insert(id, encode(&row)?.as_slice())?;
+                    true
+                }
+            }
+        };
+        if !written && events.is_empty() {
+            return Ok(false);
         }
         for (node, actor, event) in events {
             append_audit(&txn, node.as_deref(), actor, event, now)?;
         }
         txn.commit().context("updating a job")?;
-        Ok(true)
+        Ok(written)
     }
 
     /// Keep job `id`'s output `tail` for as long as its record. Return false without storing
@@ -1217,8 +1224,33 @@ mod tests {
         db.submit_job(&id, &row(1), "d", b"{}", "key gitlab", 10)
             .unwrap();
         assert!(db.put_job(&id, &row(3), &[], 11).unwrap());
-        assert!(!db.put_job(&id, &row(2), &[], 12).unwrap());
+        // Overtaken, it still audits what it carries.
+        let event = (None, "hub".to_string(), format!("job {id} ended"));
+        assert!(
+            !db.put_job(&id, &row(2), std::slice::from_ref(&event), 12)
+                .unwrap()
+        );
         assert_eq!(db.job(&id).unwrap().unwrap().revision, 3);
+        let audit = db.audits(None, 10).unwrap();
+        assert_eq!(
+            audit.iter().filter(|r| r.event == event.2).count(),
+            1,
+            "{audit:?}"
+        );
+        // Gone from the history, as well.
+        let gone = "b".repeat(32);
+        let event = (None, "hub".to_string(), format!("job {gone} ended"));
+        assert!(
+            !db.put_job(&gone, &row(2), std::slice::from_ref(&event), 13)
+                .unwrap()
+        );
+        assert!(db.job(&gone).unwrap().is_none());
+        assert!(
+            db.audits(None, 10)
+                .unwrap()
+                .iter()
+                .any(|r| r.event == event.2)
+        );
         let mut finished = row(4);
         finished.state = JobState::Finished;
         finished.finished_at = Some(20);

@@ -3723,6 +3723,27 @@ pub(crate) mod testing {
         assert!(ended.is_some(), "job {id} is not live");
     }
 
+    /// End job `id` with `failure` in memory only: the row and audit events to write.
+    pub fn fail_unwritten(
+        hub: &Hub,
+        id: &str,
+        failure: FailureClass,
+        message: &str,
+    ) -> (JobRow, Vec<Event>) {
+        let ended = finish(
+            &mut hub.dispatch.lock(),
+            id,
+            Some(failure),
+            Some(message.into()),
+        );
+        ended.unwrap_or_else(|| panic!("job {id} is not live"))
+    }
+
+    /// [`persist`], for tests.
+    pub async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) {
+        super::persist(hub, id, row, events).await.unwrap();
+    }
+
     /// The most output the hub stores for live job `id`.
     pub fn output_cap(hub: &Hub, id: &str) -> u64 {
         hub.dispatch
