@@ -468,7 +468,7 @@ makes an unchanged cache's upload a blob probe. Caches are not shared with gitla
 `cache.zip`s: a project moving to the fleet starts cold.
 
 **A job with a registry token.** When the hub mints a token for the job's registry
-([step 4](registry-hub.md#step-4-reference)), the job's start carries it,
+([step 4](registry-hub.md#step-4-namespaces-and-job-tokens)), the job's start carries it,
 with the repository its `ci-cache` namespace resolves to. The node then keeps the job's
 caches in exactly that repository, an absolute path on the registry beside the node's own
 `[registry] repo` prefix, with the job's token, each tagged with the sha256 of its key alone:

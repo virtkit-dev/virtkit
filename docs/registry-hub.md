@@ -2,9 +2,10 @@
 
 Status: **in progress**. Implemented: migration steps 1 (registration and monitoring), 2 in
 part (gc schedule and windows, read-only, the `gc` command; not WebDAV steering, nor the
-`delete-tag` and `delete-repo` commands) and 3 in part (an update on trial to a release the
-hub holds, one registry at a time; rollouts do not cover registries yet). The rest is
-proposed. Builds on [the fleet design](fleet-design.md).
+`delete-tag` and `delete-repo` commands) and 3 in part (an update on trial to a release the hub
+holds, one registry at a time; rollouts do not cover registries yet) and 4 in part (namespaces
+and job tokens, 4a and 4b; see [its own section](#step-4-namespaces-and-job-tokens)). The rest
+is proposed. Builds on [the fleet design](fleet-design.md).
 
 A `vk-registry` enrolls with the hub as a node does and keeps a session open for monitoring
 and control. In **managed** mode it keeps no database: besides content it stores only its enrollment and a
@@ -20,13 +21,21 @@ hub.
   and the registry to share identities; this makes the hub the owner.
 - **A registry is content and nothing else.** Losing its disk loses blobs, which a rebuild
   or a re-push restores. Nothing on it is the only copy of a decision.
-- **No trust in the hub beyond what the registry's config grants.** The hub mints no registry
-  credential today: a job's `registry_credentials` are GitLab's, passed through, and
-  `fleet-design.md` only intends per-job tokens. In managed mode the hub issues every registry
-  credential, which the registry's operator opts into by choosing the mode; every other
-  operation is typed and bounded by the registry's own config.
+- **Jobs are isolated by the hub.** The registry is one deduplicated store holding
+  compartmented references. Which projects and refs may read, write or lock under which
+  namespace is the hub's policy; the registry enforces the result and knows nothing of
+  projects.
+- **No trust in the hub beyond what the registry's config grants.** With hub tokens off,
+  every registry request a job causes, the guest's through the credential proxy included,
+  carries the node's own `[registry]` credential, and a job's `registry_credentials` from
+  GitLab only mask its output. With hub tokens on, the hub mints each placed job a scoped
+  token beside the registry's own credentials; in managed mode it issues every one. The
+  registry's operator opts into either in its config; every other operation is typed and
+  bounded by the registry's own config.
 
-Out of scope: replicas, or a registry serving several hubs.
+Out of scope: replicas, or a registry serving several hubs. Which content is trusted, and who
+may sign it, belongs to [the trust model](trust-model.md): a namespace's write grant never
+makes an image trusted.
 
 ## Modes
 
@@ -55,7 +64,7 @@ vk-hub token create --kind registry | ssh reg-1 vk-registry join https://hub.exa
 - Its public URL, which tokens and sign-in need, is not the registry's to claim: the operator
   binds it to the token (`vk-hub token create --kind registry --url
   https://reg-1.example.com`), and the hub refuses a URL another registry holds. Both come
-  with hub tokens (migration step 4); enrollment today takes no URL.
+  with hub tokens (migration step 4).
 - The hub pins the key and answers with the registry's ID, which tokens name as `aud`. The
   registry gets the hub's **token-signing public keys** (several, for rotation) over the
   authenticated session, not at enrollment: they are what it checks tokens against, and a
@@ -92,7 +101,9 @@ has no jobs, runner or admission.
 
 - desired state, with a generation: the registry applies the newest one, and again after a
   restart, as nodes do:
-  - retention and grace windows, and when gc runs (a schedule, or never);
+  - retention and grace windows, and when gc runs (a schedule, or never); later (step 4),
+    a retention per namespace prefix, within what the registry's config allows, sent only
+    to a registry whose `[hub] allow` lists `gc`, which takes it only then;
   - whether writes are accepted (read-only for maintenance: a client's pushes, uploads and
     deletions are refused, but the pull-through relay still caches what a read fetches);
     later, whether WebDAV is on;
@@ -143,7 +154,7 @@ node signing its token request is new code on both sides.
 
 | Client | Presents to the hub | Gets |
 |---|---|---|
-| a placed job | nothing: its node gets the job's token with the job; the guest reaches the registry through the credential proxy, which injects that token, never the node's own | the job's scopes, until the job's timeout |
+| a placed job | nothing: its node gets the job's token with the job; the guest reaches the registry through the credential proxy, which injects that token, never the node's own | the job's namespaces, until the job's timeout plus a margin (see [step 4](#step-4-namespaces-and-job-tokens)) |
 | a node outside a job (`vk build` warm-up, image pulls) | its node identity, signing the request | the node's scopes, 1 hour |
 | automation (task-rs outside the fleet, release scripts) | a hub API key, as Basic | the key's scopes, 15 minutes |
 | a person's CLI (`docker login`, `vk registry push`) | a hub session token (`vk hub login`, proposed in `fleet-design.md`) | the person's scopes, 15 minutes |
@@ -180,15 +191,23 @@ links to the hub to create or revoke one.
 
 ### Scopes
 
-One rule set, on the hub: a person's grants, an API key's scopes, a job's scopes. The
-registry enforces `read`/`write` on repository globs, as it does for API keys today, now for
-every credential; it never decides who gets which.
+One rule set, on the hub: a person's grants, an API key's scopes, a job's namespaces. The
+registry enforces them, now for every credential; it never decides who gets which.
 
-`/lock/*` needs a grant of its own, `lock`: OCI scopes name repositories only, and today any
-authenticated principal may use the lock API. The registry challenges a lock request with
-`scope="registry:lock:*"`, and a client asks for that scope. The hub grants it in node and
-job tokens, in tokens minted for an API key given `lock` (automation takes locks), and in the
-key table for such keys.
+Credentials that exist today keep their semantics: an API key's scope is still an exact
+repository or an explicit `prefix/*` subtree, and `write` implies `read`. A hub token
+carries prefix grants instead, cut at a path component as `prefix/*` is: `images` covers
+`images/app` but not `images2`. A prefix grant covers every kind of reference under its
+prefix alike: repositories, plain files under `/dav/files/` (as `files/<dir>`, as today),
+and locks and failure memos, whose names take the form `<prefix>:<key>` (see
+[step 4](#step-4-namespaces-and-job-tokens)). Converting existing keys to prefix grants, if
+ever, belongs to the import into managed mode.
+
+Today any authenticated principal may use the lock API on any name; a token principal may
+lock only under a prefix it holds `lock` on. The registry challenges a lock request with
+`scope="registry:lock:<prefix>"`, and a client asks for that scope. The hub grants it in job
+tokens from their namespaces, in node tokens, in tokens minted for an API key given `lock`
+(automation takes locks), and in the key table for such keys.
 
 A browser session lasts eight hours from sign-in, as today's do, and keeps the scopes it was
 signed in with: a grant changed on the hub applies at the next sign-in, and only the
@@ -243,9 +262,9 @@ db is as of the import: users, keys and captions created on the hub since are no
 
 The hub becomes a dependency of registry *authentication*, not of registry *serving*:
 
-- tokens already issued work until they expire: a placed job's at its timeout, so a running
-  job survives a partition as it does today; a node's own after an hour; others after 15
-  minutes;
+- tokens already issued work until they expire: a placed job's until its timeout plus a
+  margin, at most `max_job_token_secs`, so a running job survives a partition as it does
+  today; a node's own after an hour; others after 15 minutes;
 - API keys presented directly keep working from the cached key table;
 - browser sessions already open keep working until they expire or the registry restarts;
 - new tokens and new sign-ins wait for the hub.
@@ -255,12 +274,12 @@ nothing; a longer one stops builds that use tokens for the build cache until the
 
 ## Security
 
-- In managed mode the hub mints every registry credential: whoever holds its token-signing
-  key reads and writes every repository. That is the trust the mode asks for, and nothing
-  more follows from it: deletion (gc today; `delete-tag` and `delete-repo` once they exist)
-  and updates are off unless `[hub] allow` lists them, gc's windows never go below the
-  registry's floors, and, when `[hub] release_keys` names any key, updates install only
-  releases signed by a key the hub does not hold. The hub's own refusal of 0-day windows
+- With hub tokens on (and in managed mode, for every credential), whoever holds the hub's
+  token-signing key reads and writes every repository. That is the trust the mode asks for,
+  and nothing more follows from it: deletion (gc today; `delete-tag` and `delete-repo` once
+  they exist) and updates are off unless `[hub] allow` lists them, gc's windows never go
+  below the registry's floors, and, when `[hub] release_keys` names any key, updates install
+  only releases signed by a key the hub does not hold. The hub's own refusal of 0-day windows
   does not count here: a compromised hub skips it.
 - The registry takes the hub's token-signing keys, first ones and rotated ones, only from the
   authenticated session; a stolen enrollment token is useless after first use.
@@ -282,18 +301,20 @@ alone. Client changes are listed below.
 | 1. Registration and monitoring | `vk-hub token create --kind registry`, then `vk-registry join` on the registry host | nothing: same URL, same mode, same keys, same UI | `vk-registry leave`, then restart `serve`; the registry runs as before. `vk-hub registries remove <id>` drops it from the hub |
 | 2. Steering | list `read-only` and `gc` in `[hub] allow`; set a gc schedule on the hub, and drop `vk-registry gc` from cron | nothing, unless the hub makes the registry read-only | drop them from `[hub] allow`, restart `serve`, and put the cron entry back; what the hub asked is no longer applied |
 | 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (either of `install-service`'s units: the `--system` one lets its account write the binary's directory when it owns it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry restarts on the new version, dropping open connections, as after a manual upgrade | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
-| 4. Hub tokens | `[hub] tokens = true` | clients may also get tokens from the hub; `vkr_` keys and sessions keep working | `tokens = false` |
+| 4. Hub tokens | define namespaces on the hub; `[hub] tokens = true` on the registry, `gc` in its `[hub] allow` for the hub's per-prefix windows, and `[[gc.prefix]] path = "ci-pipeline", retention_days = 2`, a window below `min_retention_days` the hub cannot set; `[registry] guest_credential = "job"` on nodes | jobs reach the registry with tokens scoped to their namespaces, guests through `registry.vk` including locks and files; other clients and their credentials keep working | `tokens = false`; nodes back to `guest_credential = "node"` |
 | 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; imported `vkr_` keys keep working, and new keys come from the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted, but holds nothing created on the hub since the import |
 | 6. Locks on the hub | to be designed | — | — |
 
 Steps 1 to 3 are partly implemented; the reference below covers them. WebDAV steering,
 `delete-tag` and `delete-repo` (step 2), and rollouts across registries (step 3) remain
-proposed. Steps 4 to 6 are also proposed; steps 1 to 3 do not depend on them, so a registry
-may stay at step 3.
+proposed. Step 4 is partly implemented ([its own
+section](#step-4-namespaces-and-job-tokens)), steps 5 and 6 are proposed; steps 1 to 3 do not
+depend on them, so a registry may stay at step 3.
 
-Step 4 runs in `accounts` mode next to `vkr_` keys. The registry keeps its `Basic` challenge,
-so `docker login` goes on with a `vkr_` key; nodes and jobs present their hub token as a
-bearer unprompted. The challenge naming the hub comes with step 5.
+Step 4 runs in `accounts` or `shared-secret` mode, next to that mode's credentials. The
+registry keeps its `Basic` challenge, so `docker login` goes on with a `vkr_` key; a job's
+token, and one an admin mints, is presented unprompted, as a bearer or as a Basic password.
+The challenge naming the hub comes with step 5.
 
 In step 5, `vk-hub registries import 9c2f4e1a7b3d5e60f1a2b3c4d5e6f708 accounts.db` turns users
 into hub users (matched on OIDC issuer and subject), keeps API keys working by importing their
@@ -388,6 +409,332 @@ release that crashes or hangs is restarted as the
 previous binary, which hands over again up to three starts, then takes the registry back and
 reports the update rolled back.
 
+## Step 4: namespaces and job tokens
+
+Status: 4a and 4b are implemented (see *Step 4: reference*); 4c is proposed. This step covers
+GitLab jobs, and tokens an admin mints for automation and tests. Node tokens, tokens for API keys and people's tokens come later on
+the same keys, format and checks.
+
+### Namespaces
+
+The registry is one deduplicated store of blobs with compartmented references on top. A
+**namespace** is a path prefix on one registry together with who may read, write or lock
+under it. The hub holds namespaces per registry, in its database, and manages them with
+`vk-hub namespaces` and on the Registries page. Every change goes in the audit log.
+
+```text
+namespace images       path = "images"                                    retention = default
+  read        *
+  write       gitlab gl, projects "infra/images", protected
+namespace project      path = "p/{gitlab}/{project_id}"
+  read write lock      own project, protected
+  read                 own project, unprotected
+namespace project-dev  path = "p/{gitlab}/{project_id}/dev"
+  read write lock      own project
+namespace wab          path = "wab"
+  read write lock      gitlab gl, projects "wab/**", protected
+  read                 gitlab gl, projects "wab/**"
+namespace ci-cache     path = "ci-cache/{gitlab}/{project_id}/{protection}"
+  read write           own project
+namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}"  retention = 2d
+  read write lock      own project, own pipeline
+```
+
+- **What a prefix covers.** A namespace's path covers every kind of reference beneath it,
+  cut at a path component (`images` does not cover `images2`):
+  - repositories `<path>` and `<path>/…`;
+  - plain files `/dav/files/<path>/…`, which the registry already treats as the
+    repositories `files/<path>/…`;
+  - lock and failure-memo names `<path>:<key>`.
+- **Subjects** select a job by project (`*`, `projects <path glob>`, or `project-id <n>`),
+  by ref (a glob), or by protection (`protected`, `unprotected`). Project paths and IDs
+  repeat across GitLab instances, so `projects` and `project-id` need `gitlab <name>` too.
+  `own project` and `own pipeline` match any job: the path's template does the scoping, so
+  a namespace granting either must have `{gitlab}` and `{project_id}` or `{pipeline_id}` in
+  its path, which the hub checks when it stores the namespace. Granting `write` or `lock` by
+  ref name requires `protected` as well: anyone who can push to a project can create a
+  branch with any name.
+- **Templates** are filled from the job's claims when its token is minted, from identifiers
+  only, so two namespaces never collide:
+  - `{gitlab}`, the name the hub gave the job's GitLab instance (see *Trust*);
+  - `{project_id}` and `{pipeline_id}`, GitLab's numeric IDs;
+  - `{protection}`, which is `protected` or `unprotected`.
+
+  Project paths select jobs but never name a namespace: they are not unique across GitLab
+  instances, and a project's path changes when it is renamed or moved.
+- **Grants add up.** A namespace nested in another adds grants on its subtree and never
+  removes any. A job's grants are the union of every namespace that selects it.
+- **There is no catch-all.** A token reaches only declared namespaces. A path outside every
+  namespace is reachable only by the registry's own credentials and the hub's admins.
+- **Deduplication stays global.** The same content pushed into two namespaces is stored once.
+  A blob is served only through a repository the caller may read (`readable_through`).
+  vk-registry has no `?mount=` blob mount. The manifest-reference mount requires read on
+  another repository holding the blob; `shared-secret` mode records no membership, so it
+  mounts nothing. That mount looks for the blob in the whole store before it walks the
+  repositories the caller may read (`lib.rs`, `authorize_and_mount_manifest_blobs`). Both
+  refusals look the same but take different times, which tells a caller whether the store
+  holds a digest. For a token principal the registry skips the whole-store
+  lookup, so the answer and its timing depend only on what the token may read; a token
+  guessing digests then pays a walk per guess, bounded by `MAX_MANIFEST_REFERENCES` per
+  manifest.
+- **Sharing is explicit.** Build-once works between the jobs that share a namespace: a lock
+  and the image it guards live in the same namespace. Two projects share builds only through
+  a namespace both may write and lock in. The same content built in two namespaces is built
+  twice and stored once.
+- **Retention.** A namespace with a `retention` has its tags dropped once they sit idle that
+  long; a pull or a re-push counts as use, as it does for every tag. The window is a gc
+  window on the static part of the namespace's path, before its first placeholder, which
+  the registry also knows on its own (see *Retention by prefix* below), and the hub sends it
+  in desired state. The hub refuses a retention on a path with a fixed component after a
+  placeholder, or whose static part reaches another namespace asking for a different window.
+  Under a window the registry's own config sets, a manifest's `org.virtkit.retention=keep` is
+  ignored and an `org.virtkit.expires` later than the window is cut to it, since any job with
+  write access chooses those annotations. Under a window the hub sets, both hold, so a hub
+  cannot drop pinned tags.
+- **The default set.** The hub starts with `ci-cache` and `ci-pipeline` as above; the
+  operator may change both paths and grants, and declares the rest. These two names are
+  roles: the node stores a job's caches in the repositories they resolve to (see 4a).
+
+**Trust.** A job's claims (project ID and path, ref, protection, pipeline) are vk-gitlab's,
+sent with the `vkk_` jobs key that submits it, and the hub does not check them with GitLab.
+Each of them is a separate field of the job, so the hub bounds the key, not the fields one
+by one:
+
+- The hub knows each GitLab instance it takes jobs from, by URL, under a short name it gives
+  it (`vk-hub gitlabs add|list|remove`). A jobs key may be bound to one instance
+  (`vk-hub keys create --gitlab <name> [--projects id:path,…]`), and the hub refuses a job of
+  that key whose `server_url` is not that instance's.
+- A bound key's ceiling is either the whole instance, or a list of projects, each by ID with
+  its path. The hub refuses a job whose project ID is not on the list, or whose path is not
+  the one listed for that ID; a rename on GitLab means updating the list.
+- A key bound to no instance behaves as today, and its jobs never get a token.
+- Protection and pipeline ID are trusted as vk-gitlab asserts them. A key whose ceiling is
+  the whole instance is trusted for the whole instance.
+
+A leaked or compromised bound key thus reaches only the namespaces its ceiling selects,
+though within them it can claim protection.
+
+### Tokens
+
+- **Format.** A token is `vkt_<claims>.<signature>`: both parts base64url, the claims JSON,
+  the signature ed25519 over the claims. There is no JWT library and no algorithm choice, and
+  clients treat the token as opaque. The claims:
+  - `kid`, the signing key;
+  - `aud`, the registry ID;
+  - `sub`, `job:<hub job id>`, or the admin who minted it;
+  - `jti`;
+  - `pipeline`, optional, as `<gitlab>/<pipeline id>`, with the instance's hub-given name;
+  - `iat` and `exp`;
+  - `grants`, a list of prefixes, each with its subset of `read`, `write` and `lock`.
+- **Signing keys.** The hub keeps them under `<data_dir>/token-keys/`, each with a `kid`.
+  `vk-hub token-keys rotate` adds a new key and publishes it; with a fleet root pinned, a
+  registry accepts the new key only once it has a root certificate
+  ([the trust model](trust-model.md)). The hub signs a registry's tokens with the new key
+  only once that registry reports a generation that includes it, and with the old key until
+  then. The old key stays published until the longest token it signed has expired, then goes.
+- **Distribution.** The public keys reach registries as an optional `token_keys` field of
+  desired state, which the hub fills in when it sends. A rotation bumps every registry's
+  generation. The registry keeps the keys with the rest of its applied state in
+  `<root>/hub/state.json` and restores them before it serves, so a restart does not wait for
+  the hub.
+- **Checks.** The registry checks a token against those keys in memory, with no request to
+  the hub:
+  - its `kid` is known and its signature verifies;
+  - `aud` is the registry's own ID;
+  - `exp` has not passed, allowing 60 seconds of skew;
+  - the request falls under a grant.
+
+  A revocation list comes later; until then a token is valid until it expires.
+- **Opting in.** The registry turns tokens on with `[hub] tokens = true` and announces it in
+  its inventory; the hub mints tokens only for registries that do. The registry takes a
+  `vkt_` token as a bearer or as a Basic password. In `accounts` mode it is checked as a
+  token, before `vkr_` keys; in `shared-secret` mode, beside the shared secret.
+- **Which registry.** A node reports its `[registry]` URL in its inventory. The hub matches it
+  against the URL bound to each registry at enrollment
+  (`vk-hub token create --kind registry --url …`; `vk-hub registries set-url` for registries
+  already enrolled). A node whose registry is unknown, or does not take tokens, gets jobs
+  without a token.
+- **Minted by an admin.** `vk-hub registries token <id> --grant <prefix>=<rwl> [--pipeline
+  <p>] [--ttl <d>]` mints a token for automation and tests. Its `sub` names the admin, not a
+  job, and it carries a `pipeline` claim only when given one.
+- **Audit.** The hub logs every token it issues, by `jti`, job or admin, registry and grants,
+  never the token itself. The token is not stored with the job: the spec on the hub stays
+  redacted.
+
+### 4a: tokens for placed jobs
+
+- **Minting.** `place()` mints the token when it places a job and sends it in `JobStart` as
+  an optional field. The token is opaque to the node, so the field also carries what the node
+  needs to route:
+  - the registry ID, the token and its expiry;
+  - the grants, as in the token, for discovery (4b);
+  - the repositories the `ci-cache` and `ci-pipeline` namespaces resolve to for this job,
+    when they select it.
+
+  Namespace paths are absolute paths on the registry: the repository prefix of the node's
+  `[registry] repo` does not apply to them.
+- **Lifetime.** It lasts the job's timeout plus 15 minutes, for the caches and artifacts
+  stored after the last step, up to the hub config's `max_job_token_secs` (86400, 24 hours,
+  by default). A job allowed to run longer loses registry access once the cap passes.
+  - There is no renewal, so a running job survives a hub partition as it does today.
+  - The guest never sees the token, and the node drops it when the job ends. A copy taken
+    from the node stays valid until it expires.
+- **On the node.**
+  - `[registry] guest_credential = "job" | "node"` chooses what the guest's credential
+    proxy injects. The default is `"node"`, which is today's behaviour.
+  - With `"job"`, the guest proxy runs for every job, whatever `proxy_guests` says. A job
+    that arrives without a token gets a proxy that answers every request with 403. It never
+    falls back to the node's credential.
+- **The CI cache.** It moves to the repository `JobStart` names for `ci-cache` and is stored
+  with the job's token, under `"node"` too. Protection becomes part of the repository path,
+  so an unprotected job cannot overwrite a protected cache. The tag is the sha256 of the key
+  alone. Existing caches miss once. A start without a token names no cache repository. A
+  job whose start names none keeps today's caches (`ci-cache/<host>/<project>`, with the
+  node's credential); only under `"job"` does it run without caches, with a warning in its
+  trace.
+- **Unchanged in this step.** These keep the node's credential: image pulls and relays,
+  `vk build`'s build cache, and the build-once locks and failure memos `vk` takes around a
+  build. Pulling a job's image with a read token for its namespace (`images` for most) is
+  the next step, as `fleet-design.md` intends.
+
+### 4b: registry access from inside a job
+
+- **The proxy.** When it injects a job token, the credential proxy forwards `/lock/` and
+  `/dav/files/` as well as `/v2/`. With the node's credential it keeps refusing anything
+  outside `/v2/`, since that credential is not scoped. The proxy filters no namespace
+  itself: the registry enforces the token.
+  - It sets no response timeout of its own: `/lock/acquire` long-polls for up to an hour by
+    default, and a blob or file transfer takes as long as it takes.
+- **Locks for a token principal.**
+  - Every name in a request to any `/lock/` endpoint must be `<prefix>:<key>` under a
+    prefix the token holds `lock` on.
+  - `x-vk-lock-pipeline` must be absent or equal the token's `pipeline` claim; when absent,
+    the registry takes the claim. A token without the claim may take locks, but
+    `/lock/fail` and `/lock/fail-status` answer it 403.
+  - In-job tools leave `x-vk-lock-pipeline` out. The claim is `<gitlab>/<pipeline id>`,
+    while today's clients send a bare `CI_PIPELINE_ID` (`jobctx::pipeline_identity`), so a
+    header they set would be refused.
+  - Failure memos are keyed by name and pipeline, for every caller: a record under pipeline
+    B leaves pipeline A's. With both checks a job neither records nor clears another
+    pipeline's memos.
+  - The tokens of one subject (a job) hold at most 256 live locks together. An acquire that
+    would take more is answered 429 at once rather than waiting, so a job cannot grow the
+    lock table every acquire scans.
+  - Nothing a token starts outlives it: the registry cuts an acquire's wait, a lease and a
+    memo's TTL to the token's remaining lifetime, and checks the token's expiry again before
+    it grants a lock someone waited for. Without a token, a wait or a lease can run up to 24
+    hours.
+  - Releasing and renewing still need the owner token the registry minted, as today.
+- **Discovery.** The node gives every job using `"job"` two variables:
+  - `VK_REGISTRY=http://registry.vk`;
+  - `VK_REGISTRY_NAMESPACES`, the job's prefixes with their rights, e.g.
+    `p/gl/42=rwl images=r ci-pipeline/gl/42/1234=rwl`.
+- **In-job tools.** task-rs points its lock backend at `$VK_REGISTRY/lock/` and prefixes its
+  lock names with a namespace it may lock in. sccache uses
+  `$VK_REGISTRY/dav/files/<prefix>/…` under a namespace it may write. Neither holds a
+  credential.
+
+### 4c: pipeline caches and captures
+
+- **The namespace.** `ci-pipeline` gives every job of a pipeline read, write and lock on its
+  own prefix. Jobs of the pipeline pass content to one another through it, and the first job
+  to need something builds it once while the others wait for it. Inside it, the layout is
+  fixed, so the node finds its way without asking the hub:
+  - `<prefix>/cache`, the pipeline's caches, one tag per key;
+  - `<prefix>/services/<name>`, the service captures of
+    [the disk images design](disk-images-design.md) (§3), each tagged `job-<job id>` by the
+    job that captured it and `current` for the last one published.
+- **Caches from `.gitlab-ci.yml`.** A cache whose key starts with `vk-pipeline/` goes to
+  `<prefix>/cache` instead of `ci-cache`, tagged with the sha256 of the rest of the key.
+  `policy`, `when` and `fallback_keys` behave as for other caches, and a job may mix both
+  kinds. Under gitlab-runner, off the fleet, the same entry is an ordinary cache, so a
+  pipeline keeps working there.
+- **Captures.** `vk-agent service commit <service> --as <name>` pushes to
+  `<prefix>/services/<name>` with the job's token, and `pipeline/<name>` names the `current`
+  capture in a later job's images. The disk images design covers capture and publication;
+  this step gives them a namespace and a credential.
+- **From inside the guest.** The same namespace is reachable through `$VK_REGISTRY`, as OCI
+  content, files or locks, for tools that want more than one archive per key.
+- **Compared with GitLab artifacts.**
+  - Content is deduplicated against everything in the registry.
+  - It travels between the fleet and its registry, not through GitLab.
+  - GitLab's artifact size limit does not apply.
+  - Locks come with it.
+  - Its use does not follow `needs:` or `dependencies:`.
+
+  Artifacts stay for what GitLab must hold: reports, downloads, `expire_in`.
+- **Lifetime.** The hub does not see when a pipeline ends, so expiry is by time: the
+  namespace's retention, 2 days idle by default. A job that uses a capture or a cache keeps
+  it alive. The hub cannot set that window: `[hub] min_retention_days` (7 by default) bounds
+  what it sets, and it may only lengthen a window. The registry sets it, with
+  `[[gc.prefix]] path = "ci-pipeline", retention_days = 2`, and that prefix must follow the
+  namespace's path if the operator changes it.
+- **Without the hub.** A node run by gitlab-runner, with no hub, keeps the same layout for
+  captures under its own `[registry] repo`: `ci-pipeline/<gitlab>/<project id>/<pipeline
+  id>`. It pushes with its own credential: there is no job token, so the registry enforces
+  no namespace and the isolation is the node's alone. Where the node takes the job's
+  identity, and the resolver rules that keep a job inside its pipeline, are in
+  [the disk images design](disk-images-design.md) (§3).
+
+### Retention by prefix
+
+A gc window on a prefix is the registry's own setting first, so it works with or without a
+hub:
+
+```toml
+[[gc.prefix]]
+path = "ci-pipeline"
+retention_days = 2
+```
+
+- A prefix's window applies to every tag under it. A window the config sets on a prefix may
+  be below `[hub] min_retention_days`, which bounds only what the hub sets.
+- The hub may set a window on a prefix from a namespace's `retention`, and sends it only to
+  a registry whose `[hub] allow` lists `gc`; the registry takes hub windows only then. The
+  hub may lengthen a window the config sets, never shorten it, and on any other prefix it
+  stays within the store-wide floors and above the config's window covering that prefix. A compromised hub thus cannot expire the `images`
+  namespace in a day.
+- Without a window of its own, a prefix takes the store-wide one.
+
+### Implementation order
+
+1. Failure memos keyed by name and pipeline. It stands alone and fixes today's API too.
+2. The token codec in a crate shared by the hub and the registry: claims, grants, minting
+   and checking. It reuses the ed25519 verification vk-registry already links through
+   vk-peer.
+3. The hub:
+   - GitLab instances, and jobs keys bound to one with their ceilings, refusing a bound
+     key's jobs outside them;
+   - signing keys, with rotation that waits for registries;
+   - namespaces: store, templates, CLI and page;
+   - the admin mint, and the audit of issued tokens.
+4. The protocol:
+   - `token_keys` and per-prefix retention in `DesiredState`;
+   - `tokens` in the registry's inventory;
+   - the `[registry]` URL in the node's inventory;
+   - the URL bound at registry enrollment, and `set-url`.
+5. The registry's checks:
+   - `[hub] tokens` and the token principal;
+   - grants on `/v2/`, `/dav/files/` and `/lock/`;
+   - the pipeline check, and locks and memos bounded by the token's lifetime;
+   - no whole-store lookup when mounting for a token;
+   - retention by prefix in gc, from `[[gc.prefix]]`, and from the hub when `[hub] allow`
+     lists `gc`, within the floors.
+6. Minting in `place()`, and `JobStart`'s field: token, grants and cache repositories.
+7. The node: `guest_credential`, and the CI cache in the repository `JobStart` names, with
+   the job's token.
+8. The proxy forwarding `/lock/` and `/dav/files/` under a job token, and the two variables
+   (4b).
+9. `vk-pipeline/` cache keys, and captures under `services/` with the job's token (4c).
+10. End-to-end tests in `tests/gitlab/fleet.sh`:
+    - a guest push outside its grants is refused;
+    - a lock outside its prefixes is refused;
+    - a failure memo for another pipeline is refused, and does not clear that pipeline's;
+    - a proxy holding the node's credential still refuses `/lock/`;
+    - a pipeline cache is shared between two jobs of one pipeline and not with another
+      pipeline;
+    - a job whose project ID and path disagree with its key's ceiling is refused.
+
 ## Step 4: reference
 
 The hub's side of step 4; the registry's is in
@@ -475,6 +822,9 @@ awaits being applied, or was replaced and is kept while its tokens may be live.
   thousands would rather have the registry ask the hub per unknown key and cache the answer.
 - **Several registries.** A pull-through cache per site would want the same management; does
   one hub token name several registries (`aud` a list), or one per registry as proposed?
+- **Child pipelines.** A child pipeline has its own pipeline ID, and a job's payload does not
+  name the parent, so a child cannot reach its parent's `ci-pipeline` namespace. Granting it
+  needs a parent claim; what GitLab sends a child pipeline's jobs is unchecked.
 - **Locks on the hub.** Decided in principle, not designed: the build-once lock service moves to
   the hub after managed mode, which would let a lock span registries. The open part is how a
   lock outlives a hub restart.
