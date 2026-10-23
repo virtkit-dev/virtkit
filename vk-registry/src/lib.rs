@@ -54,6 +54,7 @@ pub(crate) mod dav;
 pub(crate) mod forms;
 pub(crate) mod html;
 pub mod hub;
+pub mod hubtoken;
 pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
@@ -104,6 +105,8 @@ pub struct ServerState {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// Enable WebDAV routes.
     pub webdav: bool,
+    /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
+    pub tokens: hubtoken::TokenGate,
 }
 
 impl ServerState {
@@ -4197,6 +4200,14 @@ fn with_hsts(mut resp: Response<Body>, tls: bool) -> Response<Body> {
     resp
 }
 
+/// The answer to a refused hub token: the mode's own challenge, as for any bad credential.
+fn token_challenge(auth: &Authenticator) -> Response<Body> {
+    match auth {
+        Authenticator::Accounts { .. } => accounts::challenge(),
+        Authenticator::Shared(auth) => auth.challenge(),
+    }
+}
+
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
     let path = req.uri().path().to_string();
 
@@ -4235,7 +4246,23 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         ));
     }
 
+    // A hub token is checked before the mode's own credentials, in either mode: it carries
+    // the hub's grants, of which the mode knows nothing. With tokens off it is left to the
+    // mode, which refuses it as any credential it does not know.
+    let token = match hubtoken::presented(req.headers()) {
+        Some(t) => match state.tokens.check(&t, vk_peer::now_secs()) {
+            Some(Ok(claims)) => Some(claims),
+            Some(Err(why)) => {
+                state.tokens.log_refusal(&why);
+                return Ok(token_challenge(&state.auth));
+            }
+            None => None,
+        },
+        None => None,
+    };
+
     let principal = match &state.auth {
+        _ if token.is_some() => None,
         Authenticator::Accounts { db, .. } => {
             let resolved = match accounts::resolve_principal(db, &req, state.cookies_are_secure()) {
                 Ok(p) => p,
@@ -4305,11 +4332,20 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // Derived from `state.auth`, not from whether a principal happens to be present: in
     // accounts mode a missing one is refused above, and reading its absence as `NoScopes`
     // here would be a path that silently skips every per-repo check.
-    let authz = match (&state.auth, &principal) {
-        (Authenticator::Accounts { .. }, Some(p)) => Authz::Accounts(p),
-        (Authenticator::Accounts { .. }, None) => return Ok(accounts::challenge()),
-        (Authenticator::Shared(_), _) => Authz::NoScopes,
+    let authz = match (&token, &state.auth, &principal) {
+        (Some(claims), _, _) => Authz::Token(claims),
+        (None, Authenticator::Accounts { .. }, Some(p)) => Authz::Accounts(p),
+        (None, Authenticator::Accounts { .. }, None) => return Ok(accounts::challenge()),
+        (None, Authenticator::Shared(_), _) => Authz::NoScopes,
     };
+    // A token is for machines: the pages are a person's.
+    if token.is_some() && is_human {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "a hub token reaches no page of this registry",
+        ));
+    }
 
     if is_browse {
         // `/browse` is part of accounts mode and nothing else. It is the only surface
@@ -4393,7 +4429,12 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
     // `/v2/` OCI namespace; names are `?name=` params.
     if path.starts_with("/lock/") {
-        return lock::route(&state.locks, req).await;
+        // After `exp`, a token has no lifetime left for a lease or memo.
+        // Reject it as expired even within the allowed clock skew.
+        if token.as_ref().is_some_and(|c| c.exp <= vk_peer::now_secs()) {
+            return Ok(token_challenge(&state.auth));
+        }
+        return lock::route(&state.locks, req, token.as_ref()).await;
     }
     // The batched manifest probe, also outside `/v2/`: `vk build` asks about every step
     // of a stage in one request instead of a `HEAD` per step.
@@ -5027,6 +5068,8 @@ pub(crate) enum Authz<'a> {
     /// authorization model, and there is nothing per-repo to check.
     NoScopes,
     Accounts(&'a accounts::Principal),
+    /// A hub token, in either mode: its grants are the whole of what it may do.
+    Token(&'a vk_hub_proto::token::Claims),
 }
 
 impl Authz<'_> {
@@ -5040,6 +5083,13 @@ impl Authz<'_> {
         match self {
             Authz::NoScopes => true,
             Authz::Accounts(p) => accounts::authorize(p, action, repo),
+            Authz::Token(claims) => claims.allows_repo(
+                repo,
+                match action {
+                    accounts::Action::Read => vk_hub_proto::token::RepoRight::Read,
+                    accounts::Action::Write => vk_hub_proto::token::RepoRight::Write,
+                },
+            ),
         }
     }
 }
@@ -5136,6 +5186,8 @@ fn authorize_and_mount_manifest_blobs(
         return Ok(Mount::Done);
     }
     let elsewhere = readable_repos(authz, store, name);
+    // See the shortcut below: not taken for a hub token.
+    let shortcut = !matches!(authz, Authz::Token(_));
     let mut to_mount = Vec::new();
     for hex in references {
         if store.repo_has_blob(name, &hex) || store.repo_has_manifest(name, &hex) {
@@ -5150,8 +5202,11 @@ fn authorize_and_mount_manifest_blobs(
         // all" costs two `stat`s where "here but not yours" costs a walk. That is a noisy
         // timing probe for "this store holds D", which is a weaker leak than the ordering
         // is worth — a caller guessing digests would otherwise walk every readable
-        // repository per guess.
-        if store.find_blob(&hex).is_none() || !store.any_holds(&elsewhere, &hex) {
+        // repository per guess. Not for a hub token: it confines a job to its namespaces,
+        // and the store's holdings outside them are none of its business, by timing or
+        // otherwise. It pays the walk over the repositories its grants make readable for
+        // every reference, and `readable_repos` lists every repository once per manifest.
+        if (shortcut && store.find_blob(&hex).is_none()) || !store.any_holds(&elsewhere, &hex) {
             return Ok(Mount::Unreadable(hex));
         }
         // Readable elsewhere, so mounting it here grants nothing new.
@@ -5173,6 +5228,11 @@ fn authorize_or_forbidden(
     match authz {
         Authz::NoScopes => None,
         _ if authz.may(action, name) => None,
+        Authz::Token(_) => Some(error_response(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "the hub token grants nothing for this repository/action",
+        )),
         Authz::Accounts(_) => Some(accounts::forbidden()),
     }
 }
@@ -6129,6 +6189,7 @@ mod tests {
             auth: Authenticator::Shared(auth),
             tls,
             webdav: false,
+            tokens: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6566,6 +6627,7 @@ mod tests {
                 auth: Authenticator::Shared(auth::Auth::None),
                 tls: acceptor,
                 webdav: false,
+                tokens: Default::default(),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -9580,6 +9642,63 @@ mod tests {
         // Its own bytes, and only those.
         assert!(store.repo_has_manifest("team-a/app", digest.trim_start_matches("sha256:")));
         assert!(!store.repo_has_blob("team-a/app", &hex));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn claims(grants: &[(&str, &str)]) -> vk_hub_proto::token::Claims {
+        vk_hub_proto::token::Claims {
+            kid: "00112233445566778899aabbccddeeff".into(),
+            aud: "00112233445566778899aabbccddeeff".into(),
+            sub: "job:j".into(),
+            jti: "00112233445566778899aabbccddeeff".into(),
+            pipeline: None,
+            iat: 1,
+            exp: 2,
+            grants: grants
+                .iter()
+                .map(|(prefix, rights)| vk_hub_proto::token::Grant {
+                    prefix: (*prefix).into(),
+                    read: rights.contains('r'),
+                    write: rights.contains('w'),
+                    lock: rights.contains('l'),
+                })
+                .collect(),
+        }
+    }
+
+    /// A token reads and writes only under its grants, plain files included, and mounts
+    /// only what it could already read there.
+    #[test]
+    fn a_token_reaches_only_its_grants() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let c = claims(&[("p/gl/42", "rw"), ("images", "r")]);
+        let authz = Authz::Token(&c);
+        assert!(authz.may(accounts::Action::Write, "p/gl/42/app"));
+        assert!(authz.may(accounts::Action::Read, "files/p/gl/42/x"));
+        assert!(authz.may(accounts::Action::Read, "images/debian"));
+        assert!(!authz.may(accounts::Action::Write, "images/debian"));
+        assert!(!authz.may(accounts::Action::Read, "p/gl/43"));
+        assert!(authorize_or_forbidden(&authz, accounts::Action::Write, "other").is_some());
+
+        let layer = store.put_blob(b"another project's layer").unwrap();
+        let hex = layer.trim_start_matches("sha256:").to_string();
+        store.record_blob("p/gl/43/app", &hex).unwrap();
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{layer}","size":23}},"layers":[]}}"#
+        );
+        let outcome =
+            authorize_and_mount_manifest_blobs(&authz, &store, "p/gl/42/app", manifest.as_bytes())
+                .unwrap();
+        assert!(matches!(outcome, Mount::Unreadable(h) if h == hex));
+        store.record_blob("images/debian", &hex).unwrap();
+        let outcome =
+            authorize_and_mount_manifest_blobs(&authz, &store, "p/gl/42/app", manifest.as_bytes())
+                .unwrap();
+        assert!(matches!(outcome, Mount::Done));
+        assert!(store.repo_has_blob("p/gl/42/app", &hex));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

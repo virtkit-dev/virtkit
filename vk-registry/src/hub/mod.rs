@@ -250,6 +250,7 @@ pub(crate) struct Link {
 pub fn start(state: Arc<ServerState>, ctx: Facts) {
     restore_read_only(&dir(&state.store.root), &state, &ctx.settings);
     restore_prefix_windows(&dir(&state.store.root), &state, &ctx);
+    restore_token_keys(&dir(&state.store.root), &state, &ctx);
     tokio::spawn(async move {
         let root = state.store.root.clone();
         let dir = dir(&root);
@@ -323,6 +324,23 @@ fn restore_prefix_windows(dir: &Path, state: &ServerState, ctx: &Facts) {
     state
         .store
         .set_prefix_windows(prefix_windows(ctx, applied.as_ref()).0);
+}
+
+/// Restore the hub's verification keys before `serve` accepts connections,
+/// whether or not the connection to the hub succeeds.
+fn restore_token_keys(dir: &Path, state: &ServerState, ctx: &Facts) {
+    if !ctx.settings.tokens {
+        return;
+    }
+    let Some((enrollment, applied)) = last_asked(dir) else {
+        eprintln!(
+            "vk-registry: hub: [hub] tokens = true, but this registry is not enrolled; \
+             no hub token is taken until it is"
+        );
+        return;
+    };
+    let keys = applied.and_then(|d| d.token_keys).unwrap_or_default();
+    state.tokens.open(&enrollment.registry_id, keys);
 }
 
 /// The retention windows under prefixes: the config's `[[gc.prefix]]`, lengthened by what
@@ -491,17 +509,26 @@ impl Link {
             );
         }
         self.state.store.set_prefix_windows(windows);
+        if self.ctx.settings.tokens {
+            self.state.tokens.open(
+                &self.enrollment.registry_id,
+                desired.token_keys.clone().unwrap_or_default(),
+            );
+        }
     }
 
     /// Apply desired state the hub sent, if newer than what was applied.
-    fn apply_desired(&self, desired: DesiredState) -> Result<()> {
-        let newer = self
-            .persisted()
-            .applied
+    fn apply_desired(&self, mut desired: DesiredState) -> Result<()> {
+        let previous = self.persisted().applied.clone();
+        let newer = previous
             .as_ref()
             .is_none_or(|a| a.generation < desired.generation);
         if !newer {
             return Ok(());
+        }
+        // No keys sent leaves the keys as they were: tokens already handed out stay good.
+        if desired.token_keys.is_none() {
+            desired.token_keys = previous.and_then(|a| a.token_keys);
         }
         // Kept first, so what takes effect is what a restart applies again.
         self.update(|p| p.applied = Some(desired.clone()))?;
@@ -666,6 +693,28 @@ impl Link {
         }
     }
 
+    /// Whether `vk-registry leave` removed the enrollment under the running `serve`.
+    fn left(&self) -> bool {
+        matches!(read_enrollment(&self.dir), Err(e) if vk_peer::net::is_not_found(&e))
+    }
+
+    /// Take no more hub tokens: the hub no longer knows this registry, or it left the hub.
+    /// The keys also go from the persisted state, so a restart takes none either; after a
+    /// `leave` there is no state left to change.
+    fn close_tokens(&self) {
+        self.state.tokens.close();
+        if self.left() {
+            return;
+        }
+        if let Err(e) = self.update(|p| {
+            if let Some(d) = &mut p.applied {
+                d.token_keys = None;
+            }
+        }) {
+            eprintln!("vk-registry: hub: {e:#}");
+        }
+    }
+
     fn usage(&self) -> Option<Usage> {
         self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -685,6 +734,7 @@ impl Link {
             config_hash: self.ctx.config_hash.clone(),
             allow: self.ctx.settings.allow.clone(),
             requires_signed: self.policy.required(),
+            tokens: self.ctx.settings.tokens,
         }
     }
 
@@ -819,6 +869,7 @@ mod tests {
             auth: crate::Authenticator::Shared(crate::auth::Auth::None),
             tls: None,
             webdav: false,
+            tokens: Default::default(),
         })
     }
 
@@ -858,6 +909,7 @@ mod tests {
                 retention_days,
                 grace_days,
             }),
+            token_keys: None,
             prefix_retention: None,
         }
     }
@@ -940,6 +992,7 @@ mod tests {
                 generation: 1,
                 read_only: Some(true),
                 gc: None,
+                token_keys: None,
                 prefix_retention: None,
             })
             .unwrap();
@@ -970,6 +1023,7 @@ mod tests {
             generation,
             read_only: Some(read_only),
             gc: None,
+            token_keys: None,
             prefix_retention: None,
         };
         link.apply_desired(read_only(1, false)).unwrap();
@@ -1052,6 +1106,7 @@ mod tests {
                 generation: 1,
                 read_only: Some(true),
                 gc: None,
+                token_keys: None,
                 prefix_retention: None,
             })
             .unwrap();
@@ -1081,6 +1136,7 @@ mod tests {
             generation: 1,
             read_only: Some(true),
             gc: None,
+            token_keys: None,
             prefix_retention: None,
         };
         assert!(link.apply_desired(desired).is_err());
@@ -1265,5 +1321,115 @@ mod tests {
         let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("ci-pipeline", 5)])));
         assert_eq!((days(&w[0]), refused), (2, true), "gc is not allowed");
         assert_eq!(prefix_windows(&ctx, None), (w, false));
+    }
+
+    /// With `[hub] tokens = true` the registry takes tokens signed by the keys the hub sent,
+    /// keeps them when a later desired state sends none, and takes them again on restart.
+    #[test]
+    fn token_keys_are_applied_kept_and_restored() {
+        let root = enrolled("tokens");
+        let settings = HubSettings {
+            tokens: true,
+            ..HubSettings::default()
+        };
+        let link = open_link(&root, settings.clone());
+        assert_eq!(
+            link.state.tokens.keys(),
+            None,
+            "no keys until the hub sends some"
+        );
+        let key = vk_hub_proto::token::TokenKey {
+            kid: "1".repeat(32),
+            public_key: vk_hub_proto::to_base64(&[1; 32]),
+        };
+        link.apply_desired(DesiredState {
+            generation: 1,
+            token_keys: Some(vec![key.clone()]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.keys(), Some(vec![key.clone()]));
+        link.apply_desired(DesiredState {
+            generation: 2,
+            read_only: Some(false),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.keys(), Some(vec![key.clone()]));
+
+        let state = server_state(&root);
+        restore_token_keys(&dir(&root), &state, &facts(settings.clone(), Vec::new()));
+        assert_eq!(state.tokens.keys(), Some(vec![key]));
+        let state = server_state(&root);
+        restore_token_keys(
+            &dir(&root),
+            &state,
+            &facts(HubSettings::default(), Vec::new()),
+        );
+        assert_eq!(state.tokens.keys(), None, "tokens = false takes none");
+        assert!(link.inventory().tokens);
+
+        // Enrolled with another hub since: what the first one sent is not taken.
+        let enrollment = Enrollment {
+            hub: "https://other-hub.invalid".into(),
+            registry_id: "1".repeat(32),
+            ca: false,
+        };
+        std::fs::write(
+            dir(&root).join(ENROLLMENT_FILE),
+            serde_json::to_vec(&enrollment).unwrap(),
+        )
+        .unwrap();
+        let state = server_state(&root);
+        restore_token_keys(&dir(&root), &state, &facts(settings, Vec::new()));
+        assert_eq!(
+            state.tokens.keys(),
+            Some(Vec::new()),
+            "no keys from another hub"
+        );
+    }
+
+    /// A hub that no longer knows the registry closes its tokens, now and across a restart,
+    /// and so does `vk-registry leave` under a running `serve`.
+    #[test]
+    fn tokens_close_when_the_hub_no_longer_knows_the_registry_or_it_leaves() {
+        use vk_hub_proto::RefusalCode;
+        let settings = HubSettings {
+            tokens: true,
+            ..HubSettings::default()
+        };
+        let key = vk_hub_proto::token::TokenKey {
+            kid: "1".repeat(32),
+            public_key: vk_hub_proto::to_base64(&[1; 32]),
+        };
+        let with_key = DesiredState {
+            generation: 1,
+            token_keys: Some(vec![key.clone()]),
+            ..DesiredState::default()
+        };
+        let root = enrolled("tokens-revoked");
+        let link = open_link(&root, settings.clone());
+        link.apply_desired(with_key.clone()).unwrap();
+        let _ = session::refused(&link, RefusalCode::Superseded, "another session");
+        assert_eq!(link.state.tokens.keys(), Some(vec![key.clone()]));
+        let e = session::refused(&link, RefusalCode::Revoked, "revoked");
+        assert!(e.is::<vk_peer::session::Permanent>());
+        assert_eq!(link.state.tokens.keys(), Some(Vec::new()));
+        assert!(
+            matches!(link.state.tokens.check("vkt_a.b", 0), Some(Err(_))),
+            "a token is refused, not taken for another credential"
+        );
+        let state = server_state(&root);
+        restore_token_keys(&dir(&root), &state, &facts(settings.clone(), Vec::new()));
+        assert_eq!(state.tokens.keys(), Some(Vec::new()), "nor after a restart");
+
+        let root = enrolled("tokens-left");
+        let link = open_link(&root, settings);
+        link.apply_desired(with_key).unwrap();
+        assert!(!link.left());
+        assert!(leave(&root).unwrap());
+        assert!(link.left());
+        link.close_tokens();
+        assert_eq!(link.state.tokens.keys(), Some(Vec::new()));
     }
 }

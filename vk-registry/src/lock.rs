@@ -22,6 +22,8 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
+use vk_hub_proto::token::Claims;
+
 use crate::{Body, body_of};
 use tokio::sync::Notify;
 
@@ -52,6 +54,11 @@ const MAX_FAIL_RECORDS: usize = 10_000;
 /// well above anything reasonable so a client can't park an unbounded buffer server-side.
 const MAX_FAIL_REASON: usize = 4096;
 
+/// Most live locks one token principal (a token's `sub`, a job) may hold at once: far more than
+/// a job's builds take together, and a bound on the table a job's token can grow, which every
+/// acquisition scans. A request with no token is the registry's own credential's, unbounded.
+pub const MAX_TOKEN_LOCKS: usize = 256;
+
 /// Longest a single `acquire` call parks between contention re-checks — also the ceiling
 /// on how late a lapsed lease is reclaimed if a release notification is missed.
 const MAX_POLL: Duration = Duration::from_secs(5);
@@ -64,6 +71,8 @@ struct Held {
     holder: String,
     /// lease deadline; once passed the lock is free (the holder stopped heartbeating)
     expires: Instant,
+    /// the token principal that took it, counted against [`MAX_TOKEN_LOCKS`]
+    principal: Option<String>,
 }
 
 /// A name in a batch acquire that a live lease already holds, with that holder's identity
@@ -71,6 +80,14 @@ struct Held {
 pub struct Blocker {
     pub name: String,
     pub holder: String,
+}
+
+/// Why an acquisition was not granted.
+pub enum Refusal {
+    /// Names a live lease holds, with their holders: the caller may wait for them.
+    Held(Vec<Blocker>),
+    /// The principal would hold more than [`MAX_TOKEN_LOCKS`] live locks: waiting does not help.
+    TooMany,
 }
 
 /// A recorded build failure for one content-key, scoped to the pipeline that hit it — see
@@ -188,7 +205,8 @@ impl LockManager {
 
     /// Atomically take ALL `names` for `ttl`, ending no later than `not_after`, or none
     /// (reaping lapsed leases first). Returns the shared batch owner token, or the live
-    /// blockers if any name is held. All-or-nothing under one lock, so acquiring a set never
+    /// blockers if any name is held, or [`Refusal::TooMany`] if `principal` would then hold
+    /// more than [`MAX_TOKEN_LOCKS`]. All-or-nothing under one lock, so acquiring a set never
     /// deadlocks against another batch regardless of order.
     fn try_take_all(
         &self,
@@ -196,12 +214,24 @@ impl LockManager {
         ttl: Duration,
         holder: &str,
         not_after: Option<Instant>,
-    ) -> Result<String, Vec<Blocker>> {
+        principal: Option<&str>,
+    ) -> Result<String, Refusal> {
         let mut map = self.held.lock().unwrap();
         let now = Instant::now();
         // drop every lapsed lease so the table can't grow without bound from names whose
         // holder died and never reacquired (release is otherwise the only path that prunes).
         map.retain(|_, h| h.expires > now);
+        // Each of `names` adds a lock once granted, and the principal's others stay: a batch past
+        // the bound is refused at once, waiting for its blockers would not make it fit.
+        if let Some(p) = principal {
+            let others = map
+                .iter()
+                .filter(|(n, h)| h.principal.as_deref() == Some(p) && !names.contains(n))
+                .count();
+            if others.saturating_add(names.len()) > MAX_TOKEN_LOCKS {
+                return Err(Refusal::TooMany);
+            }
+        }
         let blockers: Vec<Blocker> = names
             .iter()
             .filter_map(|n| {
@@ -212,7 +242,7 @@ impl LockManager {
             })
             .collect();
         if !blockers.is_empty() {
-            return Err(blockers);
+            return Err(Refusal::Held(blockers));
         }
         let owner = Self::mint_owner();
         for n in names {
@@ -222,6 +252,7 @@ impl LockManager {
                     owner: owner.clone(),
                     holder: holder.to_string(),
                     expires: lease_end(now, ttl, not_after),
+                    principal: principal.map(str::to_string),
                 },
             );
         }
@@ -233,7 +264,7 @@ impl LockManager {
     /// lease runs `ttl` from the grant, cut at `not_after`. The batch shares one owner
     /// token; renew/release act on the set. Wakes on a release, and at worst every
     /// [`MAX_POLL`] so a lapsed lease is reclaimed even if its release notification was
-    /// missed.
+    /// missed. A `principal` past [`MAX_TOKEN_LOCKS`] is refused at once.
     pub async fn acquire_all(
         &self,
         names: &[String],
@@ -241,14 +272,16 @@ impl LockManager {
         holder: &str,
         deadline: Instant,
         not_after: Option<Instant>,
-    ) -> Result<String, Vec<Blocker>> {
+        principal: Option<&str>,
+    ) -> Result<String, Refusal> {
         loop {
-            match self.try_take_all(names, ttl, holder, not_after) {
+            match self.try_take_all(names, ttl, holder, not_after, principal) {
                 Ok(owner) => return Ok(owner),
-                Err(blockers) => {
+                Err(Refusal::TooMany) => return Err(Refusal::TooMany),
+                Err(Refusal::Held(blockers)) => {
                     let now = Instant::now();
                     if now >= deadline {
-                        return Err(blockers);
+                        return Err(Refusal::Held(blockers));
                     }
                     // wake at the soonest blocker's lease expiry (clamped), so a lapsed
                     // lease is reclaimed even without a release notification.
@@ -329,7 +362,7 @@ impl LockManager {
         deadline: Instant,
     ) -> Option<String> {
         let names = [name.to_string()];
-        self.acquire_all(&names, ttl, holder, deadline, None)
+        self.acquire_all(&names, ttl, holder, deadline, None, None)
             .await
             .ok()
     }
@@ -373,12 +406,22 @@ impl LockManager {
 /// - `POST /lock/fail?name=…&ttl=` (`X-Vk-Lock-Pipeline`, body = reason text) → `{recorded:true}`
 /// - `POST /lock/fail-status?name=…` (`X-Vk-Lock-Pipeline`) → `{failed:false}` |
 ///   `{failed:true, reason, age_secs}`
-pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response<Body>> {
+///
+/// A request with a hub token (`token`) may name only locks its grants cover, acts as the
+/// token's own pipeline, starts nothing that outlives the token, and holds at most
+/// [`MAX_TOKEN_LOCKS`] locks at once with the other tokens of its `sub`: past that, acquire
+/// answers 429. The caller refuses a
+/// token past its `exp`, which [`Claims::live_at`]'s skew still lets through.
+pub async fn route(
+    mgr: &LockManager,
+    req: Request<Incoming>,
+    token: Option<&Claims>,
+) -> Result<Response<Body>> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let owner = header(&req, "x-vk-lock-owner");
     let holder = header(&req, "x-vk-lock-holder").unwrap_or_default();
-    let pipeline = header(&req, "x-vk-lock-pipeline");
+    let mut pipeline = header(&req, "x-vk-lock-pipeline");
 
     if req.method() != Method::POST {
         return Ok(json(
@@ -393,22 +436,62 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
             r#"{"error":"no lock names (use ?name=…)"}"#,
         ));
     }
+    let mut limit = Limit::default();
+    if let Some(claims) = token {
+        if let Some(name) = names.iter().find(|n| !claims.allows_lock(n)) {
+            let body = serde_json::json!({
+                "error": "lock name outside the token's grants", "name": name,
+            });
+            return Ok(json(StatusCode::FORBIDDEN, &body.to_string()));
+        }
+        match (&pipeline, &claims.pipeline) {
+            (Some(asked), Some(own)) if asked != own => {
+                return Ok(json(
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"X-Vk-Lock-Pipeline is not the token's pipeline"}"#,
+                ));
+            }
+            (_, Some(own)) => pipeline = Some(own.clone()),
+            (_, None) if path.starts_with("/lock/fail") => {
+                return Ok(json(
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"the token names no pipeline"}"#,
+                ));
+            }
+            (_, None) => {}
+        }
+        let remaining = claims.exp.saturating_sub(vk_peer::now_secs());
+        limit = Limit(Some(Instant::now() + Duration::from_secs(remaining)));
+    }
 
     match path.as_str() {
         // acquire the whole set atomically (all-or-nothing), long-polling until free.
         "/lock/acquire" => {
             let ttl = Duration::from_secs(qparam(&query, "ttl").unwrap_or(DEFAULT_TTL));
+            // A grant happens only before the deadline, and its lease ends by the token's
+            // expiry however long it waited: a lock is never held on an expired token.
+            let deadline = limit.deadline(acquire_deadline(&query));
+            let principal = token.map(|c| c.sub.as_str());
             match mgr
-                .acquire_all(&names, ttl, &holder, acquire_deadline(&query), None)
+                .acquire_all(&names, ttl, &holder, deadline, limit.0, principal)
                 .await
             {
                 Ok(owner) => {
                     let body = serde_json::json!({
-                        "owner": owner, "names": names, "ttl": lease(ttl).as_secs(),
+                        "owner": owner, "names": names, "ttl": limit.cut(lease(ttl)).as_secs(),
                     });
                     Ok(json(StatusCode::OK, &body.to_string()))
                 }
-                Err(blockers) => {
+                Err(Refusal::TooMany) => {
+                    let body = serde_json::json!({
+                        "error": format!(
+                            "the token's principal would hold more than {MAX_TOKEN_LOCKS} locks"
+                        ),
+                        "limit": MAX_TOKEN_LOCKS,
+                    });
+                    Ok(json(StatusCode::TOO_MANY_REQUESTS, &body.to_string()))
+                }
+                Err(Refusal::Held(blockers)) => {
                     let blockers: Vec<_> = blockers
                         .iter()
                         .map(|b| serde_json::json!({"name": b.name, "holder": b.holder}))
@@ -427,9 +510,9 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                     r#"{"error":"missing owner"}"#,
                 ));
             };
-            let n = mgr.renew_all(&names, &owner, ttl, None);
+            let n = mgr.renew_all(&names, &owner, ttl, limit.0);
             let body = serde_json::json!({
-                "renewed": n, "of": names.len(), "ttl": lease(ttl).as_secs(),
+                "renewed": n, "of": names.len(), "ttl": limit.cut(lease(ttl)).as_secs(),
             });
             let status = if n == names.len() {
                 StatusCode::OK
@@ -475,7 +558,6 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                     r#"{"error":"missing X-Vk-Lock-Pipeline"}"#,
                 ));
             };
-            let ttl = fail_ttl(&query);
             let reason = match read_body_capped(req.into_body(), MAX_FAIL_REASON).await {
                 Ok(b) => String::from_utf8_lossy(&b).into_owned(),
                 Err(e) => {
@@ -485,6 +567,8 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                     ));
                 }
             };
+            // Cut once the body is in, so a slow one cannot stretch it past the token.
+            let ttl = limit.cut(fail_ttl(&query));
             for name in &names {
                 mgr.record_failure(name, &pipeline, &reason, ttl);
             }
@@ -559,6 +643,23 @@ fn names_param(query: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The request's expiry bound: the token's expiry, or none.
+#[derive(Clone, Copy, Default)]
+struct Limit(Option<Instant>);
+
+impl Limit {
+    /// `d` from now, cut at the limit.
+    fn cut(self, d: Duration) -> Duration {
+        self.0.map_or(d, |end| {
+            d.min(end.saturating_duration_since(Instant::now()))
+        })
+    }
+
+    fn deadline(self, deadline: Instant) -> Instant {
+        self.0.map_or(deadline, |end| deadline.min(end))
+    }
 }
 
 fn header(req: &Request<Incoming>, name: &str) -> Option<String> {
@@ -639,7 +740,7 @@ mod tests {
         let names = ["k".to_string()];
         let huge = Duration::from_secs(u64::MAX);
         let Ok(owner) = m
-            .acquire_all(&names, huge, "a", now_plus(Duration::ZERO), None)
+            .acquire_all(&names, huge, "a", now_plus(Duration::ZERO), None, None)
             .await
         else {
             panic!("a free name must be granted");
@@ -652,6 +753,7 @@ mod tests {
                 Duration::from_secs(30),
                 "b",
                 now_plus(Duration::ZERO),
+                None,
                 None,
             )
             .await;
@@ -860,6 +962,7 @@ mod tests {
                 "a",
                 now_plus(Duration::from_millis(150)),
                 None,
+                None,
             )
             .await
         });
@@ -870,6 +973,7 @@ mod tests {
                 Duration::from_secs(30),
                 "b",
                 now_plus(Duration::from_millis(150)),
+                None,
                 None,
             )
             .await
@@ -927,6 +1031,19 @@ mod tests {
         assert_eq!(m.recent_failure("k", "b").unwrap().reason, "other");
     }
 
+    #[test]
+    fn a_limit_cuts_durations_and_deadlines() {
+        let none = Limit::default();
+        assert_eq!(none.cut(Duration::from_secs(90)), Duration::from_secs(90));
+        let far = now_plus(Duration::from_secs(3600));
+        assert_eq!(none.deadline(far), far);
+        let end = now_plus(Duration::from_secs(30));
+        let some = Limit(Some(end));
+        assert!(some.cut(Duration::from_secs(90)) <= Duration::from_secs(30));
+        assert_eq!(some.cut(Duration::from_secs(10)), Duration::from_secs(10));
+        assert_eq!(some.deadline(far), end);
+    }
+
     /// A lease granted after a wait still ends at `not_after`, not a full ttl past the
     /// grant: a token's lock never outlives the token.
     #[tokio::test]
@@ -940,6 +1057,7 @@ mod tests {
                 "a",
                 now_plus(Duration::ZERO),
                 None,
+                None,
             )
             .await;
         assert!(blocker.is_ok());
@@ -951,6 +1069,7 @@ mod tests {
                 "b",
                 now_plus(Duration::from_secs(5)),
                 Some(not_after),
+                None,
             )
             .await
             .ok()
@@ -963,6 +1082,62 @@ mod tests {
         );
         tokio::time::sleep(not_after.saturating_duration_since(Instant::now())).await;
         assert_eq!(m.holder("k"), None, "the lease ended at not_after");
+    }
+
+    /// A token principal holds at most [`MAX_TOKEN_LOCKS`] live locks, refused at once past
+    /// them whatever the wait; another principal, a request with no token and the principal
+    /// once it releases one are not.
+    #[tokio::test]
+    async fn a_token_principal_holds_at_most_max_token_locks() {
+        let m = LockManager::new();
+        let ttl = Duration::from_secs(30);
+        let take = |name: String, principal: Option<&'static str>| {
+            let m = &m;
+            async move {
+                m.acquire_all(
+                    &[name],
+                    ttl,
+                    "h",
+                    now_plus(Duration::from_secs(60)),
+                    None,
+                    principal,
+                )
+                .await
+            }
+        };
+        let mut owners = Vec::new();
+        for i in 0..MAX_TOKEN_LOCKS {
+            let Ok(owner) = take(format!("k{i}"), Some("job:1")).await else {
+                panic!("lock {i} is within the bound");
+            };
+            owners.push(owner);
+        }
+        assert!(matches!(
+            take("over".into(), Some("job:1")).await,
+            Err(Refusal::TooMany)
+        ));
+        assert!(take("other".into(), Some("job:2")).await.is_ok());
+        assert!(take("over".into(), None).await.is_ok());
+        // One released, a batch still counts every name it takes.
+        assert!(m.release("k0", &owners[0]));
+        let pair = ["x".to_string(), "y".to_string()];
+        let far = now_plus(Duration::from_secs(60));
+        assert!(matches!(
+            m.acquire_all(&pair, ttl, "h", far, None, Some("job:1"))
+                .await,
+            Err(Refusal::TooMany)
+        ));
+        assert!(take("again".into(), Some("job:1")).await.is_ok());
+        // A batch past the bound is refused at once, a held name in it or not.
+        let mut big: Vec<String> = (0..MAX_TOKEN_LOCKS).map(|i| format!("b{i}")).collect();
+        big.push("other".into());
+        let started = Instant::now();
+        assert!(matches!(
+            m.acquire_all(&big, ttl, "h", far, None, Some("job:3"))
+                .await,
+            Err(Refusal::TooMany)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// Past [`MAX_FAIL_RECORDS`] live records, the oldest gives way to the newest.

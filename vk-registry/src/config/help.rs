@@ -217,6 +217,13 @@ const KEYS: &[Key] = &[
         help: "the same floor for gc's grace window [default: 1]",
     },
     Key {
+        table: Table::Hub,
+        name: "tokens",
+        help: "also take the registry tokens the hub signs for its\n\
+               jobs, each limited to its grants; on a registry\n\
+               with no secret they confine nothing [default: false]",
+    },
+    Key {
         table: Table::GcPrefix,
         name: "path",
         help: "a repository prefix: its repositories, path/…, and\n\

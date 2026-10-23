@@ -31,6 +31,11 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 pub(super) async fn hold(link: Arc<Link>) {
     let mut backoff = BACKOFF.0;
     loop {
+        if link.left() {
+            link.close_tokens();
+            eprintln!("vk-registry: hub: this registry left its hub; no longer reporting to it");
+            return;
+        }
         let started = tokio::time::Instant::now();
         match run(&link).await {
             Ok(()) => {}
@@ -70,6 +75,14 @@ fn refusal(code: RefusalCode, reason: &str, dir: &std::path::Path) -> anyhow::Er
     }
 }
 
+/// [`refusal`], with the hub tokens closed first when the hub no longer knows the registry.
+pub(super) fn refused(link: &Link, code: RefusalCode, reason: &str) -> anyhow::Error {
+    if matches!(code, RefusalCode::NotEnrolled | RefusalCode::Revoked) {
+        link.close_tokens();
+    }
+    refusal(code, reason, &link.dir)
+}
+
 /// One session, from dial to its end.
 async fn run(link: &Arc<Link>) -> Result<()> {
     let hub = &link.enrollment.hub;
@@ -91,7 +104,7 @@ async fn run(link: &Arc<Link>) -> Result<()> {
         &hello,
         exported.as_ref(),
         CONNECT_TIMEOUT,
-        |code, reason| refusal(code, reason, &link.dir),
+        |code, reason| refused(link, code, reason),
     )
     .await?;
     // In session with the hub: an update on trial has passed.
@@ -120,6 +133,10 @@ async fn run(link: &Arc<Link>) -> Result<()> {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                if link.left() {
+                    link.close_tokens();
+                    return Err(Permanent("this registry left its hub".into()).into());
+                }
                 send(&mut ws, &RegistryMsg::Heartbeat(link.heartbeat()), beat).await?;
             }
             _ = inventory.tick() => {
@@ -179,7 +196,7 @@ async fn run(link: &Arc<Link>) -> Result<()> {
                         link.update(|p| p.recorded(&ack))?;
                     }
                     HubRegistryMsg::Refused { code, reason } => {
-                        return Err(refusal(code, &reason, &link.dir));
+                        return Err(refused(link, code, &reason));
                     }
                 }
             }

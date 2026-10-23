@@ -119,6 +119,10 @@ pub struct Inventory {
     /// Whether an update must be signed by one of its own `[hub] release_keys`.
     #[serde(default)]
     pub requires_signed: bool,
+    /// Whether it checks hub tokens (`[hub] tokens = true`): the hub mints tokens only for
+    /// a registry that does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tokens: bool,
 }
 
 impl Inventory {
@@ -264,6 +268,10 @@ pub struct DesiredState {
     /// Run gc on this schedule; `None` schedules none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc: Option<GcPolicy>,
+    /// The keys hub tokens are signed with, the current signer and those whose tokens may
+    /// still be live; `None` leaves the registry's keys as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_keys: Option<Vec<crate::token::TokenKey>>,
     /// Retention windows on prefixes, from the hub's namespaces: each may lengthen the
     /// registry's own window on that prefix, never shorten it, and stays within its floors
     /// elsewhere. `None` leaves only the registry's own.
@@ -440,8 +448,22 @@ mod tests {
                 config_hash: "c".into(),
                 allow: vec![ALLOW_GC.into()],
                 requires_signed: true,
+                tokens: false,
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.89.0","sha256":"s","listen":"0.0.0.0:5000","tls":true,"mode":"accounts","webdav":false,"upstreams":["docker.io"],"store":"/srv","store_size_bytes":100,"config_hash":"c","allow":["gc"],"requires_signed":true}"#,
+        );
+        pinned(
+            &RegistryMsg::Inventory(Inventory {
+                hostname: "h".into(),
+                version: "0.93.0".into(),
+                listen: "l".into(),
+                mode: "accounts".into(),
+                store: "/srv".into(),
+                config_hash: "c".into(),
+                tokens: true,
+                ..Inventory::default()
+            }),
+            r#"{"type":"inventory","hostname":"h","version":"0.93.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"tokens":true}"#,
         );
         pinned(
             &RegistryMsg::Heartbeat(Heartbeat {
@@ -521,6 +543,7 @@ mod tests {
                 generation: 2,
                 read_only: Some(false),
                 gc: None,
+                token_keys: None,
                 prefix_retention: None,
             }),
             r#"{"type":"desired","generation":2,"read_only":false}"#,
@@ -530,12 +553,16 @@ mod tests {
                 generation: 3,
                 read_only: None,
                 gc: None,
+                token_keys: Some(vec![crate::token::TokenKey {
+                    kid: "k".into(),
+                    public_key: "p".into(),
+                }]),
                 prefix_retention: Some(vec![PrefixRetention {
                     prefix: "team/a".into(),
                     retention_days: 90,
                 }]),
             }),
-            r#"{"type":"desired","generation":3,"prefix_retention":[{"prefix":"team/a","retention_days":90}]}"#,
+            r#"{"type":"desired","generation":3,"token_keys":[{"kid":"k","public_key":"p"}],"prefix_retention":[{"prefix":"team/a","retention_days":90}]}"#,
         );
         pinned(
             &HubRegistryMsg::Command(Command {

@@ -374,6 +374,16 @@ name and pipeline ID, so one pipeline's record never replaces another's. They de
 hours, are capped at 24 hours, and hold at most 4 KiB of reason text. Beyond 10,000 records,
 the oldest is evicted first. A new pipeline ID always gets a fresh build attempt.
 
+A [hub token](#hub-tokens) may name only locks its grants cover with `lock`, as
+`<prefix>:<key>`; one name outside them refuses the request. It acts as the token's own
+pipeline: an `X-Vk-Lock-Pipeline` naming another is refused, an absent one is the token's,
+and a token naming no pipeline records and reads no failure. Nothing it starts outlives it:
+the wait and a record's ttl are cut to the token's remaining lifetime, and a lease, granted
+after a wait or renewed, ends by the token's expiry. The tokens of one subject (a job) hold
+at most 256 live locks together: an acquire that would take more is answered 429 at once,
+without waiting. A token past its expiry, though within the skew it is otherwise taken with,
+is refused here with the mode's challenge.
+
 ## Batched manifest probe
 
 `POST /vk/manifests/exists?name=<repo>` with body `{"tags": [...]}` answers
@@ -669,6 +679,33 @@ which live in the accounts database, and the lock service go on. The pull-throug
 the exception: a read it relays still caches the digest-addressed blob or manifest it
 fetched, so a read-only store still grows by what clients pull through it. See
 [`docs/registry-hub.md`](../docs/registry-hub.md).
+
+### Hub tokens
+
+With `[hub] tokens = true`, an enrolled registry also takes the tokens its hub signs for
+placed jobs, in either mode, beside the mode's own credentials. A token comes as a bearer,
+or as the password of a Basic pair, and is told apart by its `vkt_` prefix. The registry
+checks it in memory against the keys the hub last sent in its desired state, kept in
+`<root>/hub/state.json` and taken again at start before the first connection: signed by a
+known key, for this registry's ID, not expired beyond a minute of skew. A desired state that
+sends no keys keeps the previous ones. A bad token is a 401 with the mode's challenge, and
+its refusal is logged, a line a minute at most. With tokens on, a shared secret starting with
+`vkt_` is refused at start, since it would be taken for a token.
+
+Once the hub answers that it no longer knows the registry (revoked, or not enrolled), the
+registry drops the keys, in memory and in `state.json`, and refuses every token. A `vk-registry
+leave` under a running `serve` does the same, noticed at the next heartbeat or redial: within
+five minutes.
+
+A token is answered by its grants alone: path prefixes with read, write and lock rights. A
+prefix covers the repositories at and under it and the plain files under
+`/dav/files/<prefix>/`; the pages, uploads and settings are refused to a token. Mounting a
+manifest's references for a token skips the store-wide existence check, so neither the
+answer nor its timing says whether the store holds a digest outside the token's grants.
+
+Tokens confine only on a registry that refuses requests without credentials. On an open one
+(shared-secret mode with no secret), a token's grants limit nothing more than sending no
+credential does.
 
 ### Retention by prefix
 

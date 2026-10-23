@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   own window, and set windows on other prefixes no shorter than `min_retention_days` nor than
   the registry's own window covering it. `keep` and `expires` annotations hold under a window
   the hub sets on another prefix.
+- **`[hub] tokens = true` lets a registry accept the tokens its hub signs**, as a bearer or a
+  Basic password. A token reaches only the repositories, files and locks its grants cover,
+  and none of the web pages; a job's tokens hold at most 256 locks at once.
 
 ### Fixed
 

@@ -125,14 +125,21 @@ where
     F: FnOnce(&Store, &Authz<'_>) -> Result<Response<Body>> + Send + 'static,
 {
     let store = Arc::clone(&state.store);
-    let principal = match authz {
-        Authz::NoScopes => None,
-        Authz::Accounts(p) => Some((*p).clone()),
+    enum Owned {
+        NoScopes,
+        Accounts(crate::accounts::Principal),
+        Token(vk_hub_proto::token::Claims),
+    }
+    let owned = match authz {
+        Authz::NoScopes => Owned::NoScopes,
+        Authz::Accounts(p) => Owned::Accounts((*p).clone()),
+        Authz::Token(c) => Owned::Token((*c).clone()),
     };
     tokio::task::spawn_blocking(move || {
-        let authz = match &principal {
-            None => Authz::NoScopes,
-            Some(p) => Authz::Accounts(p),
+        let authz = match &owned {
+            Owned::NoScopes => Authz::NoScopes,
+            Owned::Accounts(p) => Authz::Accounts(p),
+            Owned::Token(c) => Authz::Token(c),
         };
         f(&store, &authz)
     })

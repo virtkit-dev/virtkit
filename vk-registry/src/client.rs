@@ -124,6 +124,17 @@ impl LockClient {
         if resp.status() == reqwest::StatusCode::CONFLICT {
             return Ok(None);
         }
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            #[derive(serde::Deserialize)]
+            struct Refused {
+                error: String,
+            }
+            let why = resp.json::<Refused>().await.map(|r| r.error);
+            anyhow::bail!(
+                "acquiring lock(s): {}",
+                why.as_deref().unwrap_or("too many locks held")
+            );
+        }
         if !resp.status().is_success() {
             anyhow::bail!("acquiring lock(s): status {}", resp.status());
         }

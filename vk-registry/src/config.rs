@@ -125,6 +125,8 @@ pub struct HubSettings {
     /// them, never shorten them.
     pub min_retention_days: u64,
     pub min_grace_days: u64,
+    /// Take the tokens the hub signs, as well as the mode's own credentials.
+    pub tokens: bool,
 }
 
 /// `[hub] min_retention_days`'s default.
@@ -139,6 +141,7 @@ impl Default for HubSettings {
             allow_downgrade: false,
             min_retention_days: DEFAULT_MIN_RETENTION_DAYS,
             min_grace_days: crate::DEFAULT_GC_GRACE_DAYS,
+            tokens: false,
         }
     }
 }
@@ -271,6 +274,8 @@ struct FileHub {
     allow_downgrade: bool,
     min_retention_days: Option<u64>,
     min_grace_days: Option<u64>,
+    #[serde(default)]
+    tokens: bool,
 }
 
 /// What `admin_socket` accepts: a bool (`false` = bind none, `true` = the default path)
@@ -409,10 +414,27 @@ impl ServerConfig {
         let upstreams: Vec<String> = self.upstreams.iter().map(|u| u.prefix.clone()).collect();
         let tls = self.tls_cert.is_some() && self.tls_key.is_some();
         // What would make two registries that should match differ: not paths or secrets.
+        // `[hub]` as it read before `tokens`, which follows only when on, so a registry that
+        // leaves it off keeps the hash it had.
+        let HubSettings {
+            allow,
+            release_keys,
+            require_signed,
+            allow_downgrade,
+            min_retention_days,
+            min_grace_days,
+            tokens,
+        } = &self.hub;
         let mut described = format!(
-            "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub={:?}",
-            self.webdav, self.max_connections, self.max_connections_per_client, self.hub
+            "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub=HubSettings {{ \
+             allow: {allow:?}, release_keys: {release_keys:?}, require_signed: \
+             {require_signed:?}, allow_downgrade: {allow_downgrade:?}, min_retention_days: \
+             {min_retention_days:?}, min_grace_days: {min_grace_days:?} }}",
+            self.webdav, self.max_connections, self.max_connections_per_client
         );
+        if *tokens {
+            described.push_str(" tokens=true");
+        }
         // Only when set, so a registry with no `[[gc.prefix]]` keeps the hash it had.
         if !self.gc_prefixes.is_empty() {
             described.push_str(&format!(" gc={:?}", self.gc_prefixes));
@@ -631,6 +653,7 @@ impl ServerConfig {
                 allow_downgrade: h.allow_downgrade,
                 min_retention_days: h.min_retention_days.unwrap_or(DEFAULT_MIN_RETENTION_DAYS),
                 min_grace_days: h.min_grace_days.unwrap_or(crate::DEFAULT_GC_GRACE_DAYS),
+                tokens: h.tokens,
             }),
             gc_prefixes: f.gc.map(|g| g.prefix).unwrap_or_default(),
         };
@@ -818,6 +841,7 @@ impl ServerConfig {
             if token.is_empty() {
                 bail!("token file {} is empty", tf.display());
             }
+            self.check_not_a_hub_token(&token, tf)?;
             return Ok(Auth::Bearer { token });
         }
         if let Some(user) = self.username.as_ref().filter(|u| !u.is_empty()) {
@@ -829,12 +853,27 @@ impl ServerConfig {
                 .with_context(|| format!("reading {}", pf.display()))?
                 .trim_end()
                 .to_string();
+            self.check_not_a_hub_token(&pass, pf)?;
             return Ok(Auth::Basic {
                 user: user.clone(),
                 pass,
             });
         }
         Ok(Auth::None)
+    }
+
+    /// With `[hub] tokens = true`, reject shared secrets starting with `vkt_`:
+    /// they would be mistaken for hub tokens and fail every request.
+    fn check_not_a_hub_token(&self, secret: &str, file: &Path) -> Result<()> {
+        if self.hub.tokens && secret.starts_with(vk_hub_proto::token::TOKEN_PREFIX) {
+            bail!(
+                "{}: a shared secret starting with {:?} would be taken for a hub token \
+                 under [hub] tokens = true; choose another",
+                file.display(),
+                vk_hub_proto::token::TOKEN_PREFIX
+            );
+        }
+        Ok(())
     }
 
     /// Build the shared runtime state: open the store, build each upstream's HTTP client
@@ -883,6 +922,7 @@ impl ServerConfig {
             auth,
             tls: None,
             webdav: self.webdav,
+            tokens: Default::default(),
         })
     }
 }
@@ -1691,9 +1731,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `[[gc.prefix]]` takes repository prefixes, each once, with a window of a day or more.
+    /// `[[gc.prefix]]` takes repository prefixes, each once, with a window of a day or more;
+    /// `[hub] tokens` defaults off.
     #[test]
-    fn gc_prefixes_load() {
+    fn gc_prefixes_and_hub_tokens_load() {
         let dir = std::env::temp_dir().join(format!("vk-regserve-gcpfx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1702,7 +1743,11 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             ServerConfig::load(&p, None, None)
         };
-        let cfg = load("[[gc.prefix]]\npath = \"ci-pipeline\"\nretention_days = 2\n").unwrap();
+        let cfg = load(
+            "[hub]\ntokens = true\n\n[[gc.prefix]]\npath = \"ci-pipeline\"\nretention_days = 2\n",
+        )
+        .unwrap();
+        assert!(cfg.hub.tokens);
         assert_eq!(
             cfg.gc_prefixes,
             vec![GcPrefix {
@@ -1710,6 +1755,7 @@ mod tests {
                 retention_days: 2
             }]
         );
+        assert!(!load("").unwrap().hub.tokens);
         for bad in [
             "[[gc.prefix]]\npath = \"Bad\"\nretention_days = 2\n",
             "[[gc.prefix]]\npath = \"files/x\"\nretention_days = 2\n",
@@ -1764,6 +1810,39 @@ mod tests {
         assert!(ServerConfig::gc_store_of(Some(&path), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A registry leaving `[hub] tokens` off keeps the config hash it had before the setting
+    /// existed; turning it on changes the hash.
+    #[test]
+    fn hub_tokens_change_the_config_hash_only_when_on() {
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
+        assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        cfg.hub.tokens = true;
+        assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+    }
+
+    /// With `[hub] tokens = true`, a shared secret that reads as a hub token is refused.
+    #[test]
+    fn a_shared_secret_that_reads_as_a_hub_token_is_refused_with_tokens_on() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-vkt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "vkt_shared\n").unwrap();
+        let mut bearer = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("s"));
+        bearer.token_file = Some(secret.clone());
+        let mut basic = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("s"));
+        basic.username = Some("ci".into());
+        basic.password_file = Some(secret);
+        for mut cfg in [bearer, basic] {
+            assert!(cfg.build_auth().is_ok(), "tokens off: any secret");
+            cfg.hub.tokens = true;
+            let err = cfg.build_auth().err().unwrap().to_string();
+            assert!(err.contains("hub token"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `[hub] release_keys` check a release signed as `vk-registry`'s, not as `vk`'s.
     #[test]
     fn hub_release_keys_take_a_registry_release_only() {
