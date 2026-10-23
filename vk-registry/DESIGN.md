@@ -670,6 +670,16 @@ the exception: a read it relays still caches the digest-addressed blob or manife
 fetched, so a read-only store still grows by what clients pull through it. See
 [`docs/registry-hub.md`](../docs/registry-hub.md).
 
+### Retention by prefix
+
+`[[gc.prefix]]` gives the tags under a prefix (`path`, `path/…` and `files/path/…`) an idle
+window of their own, `retention_days`, below the hub's floors if need be, since the operator
+set it; the most specific prefix wins. Under such a window `org.virtkit.retention=keep` is
+ignored and `org.virtkit.expires` holds only within it, since whoever may push there chose
+them. `vk-registry gc --config` applies the configured windows to the store that config
+names. A window replaces the store-wide retention while a pass removes tags by age at all,
+and a tag it governs is one the size limit may drop, as any tag only age keeps.
+
 ## Guest credential proxy
 
 With `vk run --registry-proxy` or `[registry] proxy_guests = true`, the host starts a

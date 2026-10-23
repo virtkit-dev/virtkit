@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`[[gc.prefix]]` sets an idle retention window per repository prefix** (repositories and
+  the files under `/dav/files/<prefix>/`). `keep` and `expires` annotations hold only within
+  it. `vk-registry gc --config` applies it too.
+
 ### Fixed
 
 - **A failed build recorded by one pipeline no longer clears another pipeline's record** of

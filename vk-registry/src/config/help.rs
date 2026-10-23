@@ -22,6 +22,8 @@ enum Table {
     Upstream,
     /// `[hub]`
     Hub,
+    /// `[[gc.prefix]]`, repeatable
+    GcPrefix,
 }
 
 /// One config-file key: where it lives, what it is called, and what it does. The order
@@ -124,6 +126,12 @@ const KEYS: &[Key] = &[
                joined (`vk-registry join`) may do to it",
     },
     Key {
+        table: Table::Top,
+        name: "gc",
+        help: "the [[gc.prefix]] tables below; none = one store-wide\n\
+               retention window",
+    },
+    Key {
         table: Table::Oidc,
         name: "issuer",
         help: "the provider's issuer URL; discovery is fetched from it",
@@ -208,6 +216,19 @@ const KEYS: &[Key] = &[
         name: "min_grace_days",
         help: "the same floor for gc's grace window [default: 1]",
     },
+    Key {
+        table: Table::GcPrefix,
+        name: "path",
+        help: "a repository prefix: its repositories, path/…, and\n\
+               the files under /dav/files/path/",
+    },
+    Key {
+        table: Table::GcPrefix,
+        name: "retention_days",
+        help: "drop their tags once idle this long, below the hub's\n\
+               floors if need be; keep and expires annotations\n\
+               hold only within it",
+    },
 ];
 
 /// A shared-secret deployment, TLS terminated here, relaying what it does not hold.
@@ -280,6 +301,10 @@ fn render() -> String {
             Table::Hub,
             "[hub] — what a vk-hub managing this registry may do:",
         ),
+        (
+            Table::GcPrefix,
+            "[[gc.prefix]] — a retention window of its own under a prefix:",
+        ),
     ] {
         let _ = writeln!(out, "\n{heading}");
         for key in KEYS.iter().filter(|k| k.table == table) {
@@ -304,7 +329,7 @@ fn render() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FileConfig, FileHub, FileOidc, FileUpstream};
+    use super::super::{FileConfig, FileHub, FileOidc, FileUpstream, GcPrefix};
     use super::*;
 
     /// The field names a table will accept, taken from the parser itself: with
@@ -312,10 +337,18 @@ mod tests {
     /// Reading them out of the error rather than repeating them here is the point — a
     /// list repeated in the test would drift with the documentation, not against it.
     fn accepted(err: &str) -> Vec<String> {
-        let (_, list) = err.split_once("expected one of ").unwrap_or_else(|| {
-            panic!("no field list in the unknown-field error, so this test proves nothing: {err}")
-        });
-        list.split(',')
+        // Two fields read "expected `a` or `b`", more "expected one of `a`, `b`, …".
+        let (_, list) = err
+            .split_once("expected one of ")
+            .or_else(|| err.split_once("expected "))
+            .filter(|(_, list)| list.contains('`'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no field list in the unknown-field error, so this test proves nothing: {err}"
+                )
+            });
+        list.replace(" or ", ",")
+            .split(',')
             .map(|f| f.trim().trim_matches('`').to_string())
             .filter(|f| !f.is_empty())
             .collect()
@@ -337,11 +370,13 @@ mod tests {
         let oidc = toml::from_str::<FileOidc>("nope = 1\n").map(|_| ());
         let upstream = toml::from_str::<FileUpstream>("nope = 1\n").map(|_| ());
         let hub = toml::from_str::<FileHub>("nope = 1\n").map(|_| ());
+        let gc_prefix = toml::from_str::<GcPrefix>("nope = 1\n").map(|_| ());
         for (table, err) in [
             (Table::Top, top.unwrap_err()),
             (Table::Oidc, oidc.unwrap_err()),
             (Table::Upstream, upstream.unwrap_err()),
             (Table::Hub, hub.unwrap_err()),
+            (Table::GcPrefix, gc_prefix.unwrap_err()),
         ] {
             let mut accepted = accepted(&err.to_string());
             let mut documented = documented(table);

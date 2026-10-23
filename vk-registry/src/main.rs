@@ -737,18 +737,30 @@ async fn run(cli: Cli) -> Result<()> {
             grace_days,
             dry_run,
         } => {
-            let root = store_root(root, config, |name| std::env::var_os(name))?;
+            let (root, config) = selectors_with_env(root, config, |name| std::env::var_os(name));
+            // The config's `[[gc.prefix]]` windows apply as they do under `serve`, on the
+            // store that config names.
+            let (root, windows, unapplied) =
+                vk_registry::ServerConfig::gc_store_of(config.as_deref(), root)?;
+            if let (Some(config), 1..) = (&config, unapplied) {
+                eprintln!(
+                    "vk-registry gc: note: the {unapplied} [[gc.prefix]] window(s) of {} are \
+                     not applied: --root (or VK_REGISTRY_ROOT) names another store",
+                    config.display()
+                );
+            }
             let days = |d: u64| Duration::from_secs(d * 86_400);
             // On stderr and before the sweep, the way `accounts` names its store: the
             // result line names it too, but by then the blobs are gone, and the store can
             // now come from a variable the operator did not type on this command.
             eprintln!("vk-registry gc: on the store at {}", root.display());
-            vk_registry::gc(
+            vk_registry::gc_windows(
                 "vk-registry",
                 root,
                 days(retention_days),
                 days(grace_days),
                 dry_run,
+                windows,
             )
         }
         // handled in `main`, before this dispatch

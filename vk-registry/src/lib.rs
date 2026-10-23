@@ -352,6 +352,49 @@ pub struct Store {
     read_only: std::sync::atomic::AtomicBool,
     /// Connections a server on this store is serving now.
     connections: std::sync::atomic::AtomicUsize,
+    /// Retention windows of their own for the tags under prefixes ([`Store::gc`]).
+    prefix_windows: std::sync::Mutex<Vec<PrefixWindow>>,
+}
+
+/// A retention window for the tags under a prefix: those of the repositories `prefix` and
+/// `prefix/…`, and of the plain files stored as `files/prefix/…`. Under it, a tag is dropped
+/// once idle past `window`. A manifest's `org.virtkit.retention=keep` and
+/// `org.virtkit.expires` hold as under the store-wide policy when `keep_holds`, and
+/// otherwise `keep` never holds and `expires` holds only within the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixWindow {
+    pub prefix: String,
+    pub window: Duration,
+    /// Whether `keep` and `expires` still hold under it: not under a window the registry's
+    /// own config sets, since whoever may push there chose the annotations; under one the
+    /// hub added, so a hub cannot drop a pinned tag, nor one before its date.
+    pub keep_holds: bool,
+}
+
+impl From<&config::GcPrefix> for PrefixWindow {
+    fn from(p: &config::GcPrefix) -> Self {
+        PrefixWindow {
+            prefix: p.path.clone(),
+            window: Duration::from_secs(p.retention_days.saturating_mul(86_400)),
+            keep_holds: false,
+        }
+    }
+}
+
+/// The most specific prefix window in `windows` covering the repository `name`.
+pub(crate) fn prefix_window<'a>(
+    windows: &'a [PrefixWindow],
+    name: &str,
+) -> Option<&'a PrefixWindow> {
+    use vk_hub_proto::token::under;
+    let name = name
+        .strip_prefix(vk_hub_proto::token::FILES_REPO)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(name);
+    windows
+        .iter()
+        .filter(|w| under(&w.prefix, name))
+        .max_by_key(|w| w.prefix.len())
 }
 
 /// A connection counted in [`Store::connections`] until dropped.
@@ -445,6 +488,7 @@ impl Store {
             next_upload: AtomicU64::new(0),
             read_only: std::sync::atomic::AtomicBool::new(false),
             connections: std::sync::atomic::AtomicUsize::new(0),
+            prefix_windows: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -932,6 +976,23 @@ impl Store {
     /// Whether writes are refused.
     pub fn read_only(&self) -> bool {
         self.read_only.load(Ordering::Relaxed)
+    }
+
+    /// The retention windows [`Store::gc`] applies under prefixes, replacing the previous
+    /// ones.
+    pub fn set_prefix_windows(&self, windows: Vec<PrefixWindow>) {
+        *self
+            .prefix_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = windows;
+    }
+
+    /// The retention windows under prefixes now.
+    pub fn prefix_windows(&self) -> Vec<PrefixWindow> {
+        self.prefix_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Connections a server on this store serves now.
@@ -1962,7 +2023,16 @@ impl Store {
         // Read only: dead leases are removed under the exclusive lock.
         let leased = self.leased_blobs(true)?;
         // Not idle past the retention window, when there is one.
-        let retained = |tag: &Path| policy.retention.is_none_or(|r| !idle(tag, r));
+        // Not idle past the window — a prefix's own when one covers the tag, else the policy's
+        // retention — while age removal is on at all.
+        let retained = |tag: &Path, window: Option<&PrefixWindow>| match (policy.retention, window)
+        {
+            (None, _) => true,
+            (Some(_), Some(w)) => !idle(tag, w.window),
+            (Some(r), None) => !idle(tag, r),
+        };
+        let windows = self.prefix_windows();
+        let repos = self.root.join("repos");
 
         let mut plan = GcPlan::default();
         let mut kept_tags: Vec<KeptTag> = Vec::new();
@@ -1970,6 +2040,12 @@ impl Store {
             // Stamped as read, for the spells to tell whether to read it again.
             plan.unchanged(&tags_dir);
             let scoped = self.in_scope(policy, &tags_dir, "tags");
+            // A prefix's own window, when one covers this repository.
+            let window = tags_dir
+                .parent()
+                .and_then(|r| r.strip_prefix(&repos).ok())
+                .and_then(Path::to_str)
+                .and_then(|name| prefix_window(&windows, name));
             for tag in root_dir_files(&tags_dir)? {
                 // Every tag is read, even an idle one: only its manifest can say it is
                 // kept, and a kept tag left unrooted would have its blobs swept.
@@ -1992,7 +2068,7 @@ impl Store {
                 let kept = if protected {
                     true
                 } else if !is_blob_hex(hex) {
-                    retained(&seen.path)
+                    retained(&seen.path, window)
                 } else {
                     // A dangling or oversized manifest has no retention to honour; one
                     // that fails to read aborts, as the mark does on an unreadable root,
@@ -2007,12 +2083,27 @@ impl Store {
                                 seen.path.display()
                             )
                         })?;
-                    match manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m)) {
-                        Retention::Keep => true,
-                        Retention::Until(t) => now < t,
-                        Retention::Idle => {
+                    let asked = manifest.map_or(Retention::Idle, |m| Retention::of_manifest(&m));
+                    match (window, asked) {
+                        // Under a prefix's window, `keep` and `expires` hold as store-wide
+                        // where the window says so, from age and size alike; elsewhere
+                        // `expires` holds only within it, `keep` not at all, and the size phase
+                        // may drop the tag as it may any tag only age keeps.
+                        (Some(w), Retention::Until(t)) if w.keep_holds => now < t,
+                        (Some(w), Retention::Until(t)) => {
                             by_age = true;
-                            retained(&seen.path)
+                            now < t && retained(&seen.path, Some(w))
+                        }
+                        (Some(w), Retention::Keep) if w.keep_holds => true,
+                        (Some(w), _) => {
+                            by_age = true;
+                            retained(&seen.path, Some(w))
+                        }
+                        (None, Retention::Keep) => true,
+                        (None, Retention::Until(t)) => now < t,
+                        (None, Retention::Idle) => {
+                            by_age = true;
+                            retained(&seen.path, None)
                         }
                     }
                 };
@@ -5550,24 +5641,35 @@ pub fn gc(
     grace: Duration,
     dry_run: bool,
 ) -> Result<()> {
-    gc_to(
-        &mut std::io::stdout().lock(),
-        cmd,
-        root,
-        retention,
-        grace,
-        dry_run,
-    )
+    gc_windows(cmd, root, retention, grace, dry_run, Vec::new())
 }
 
-/// [`gc`] writing its summary to `out` rather than stdout, so a test can read it back.
-fn gc_to(
-    out: &mut impl std::io::Write,
+/// [`gc`], with retention windows of their own under prefixes (`[[gc.prefix]]`).
+pub fn gc_windows(
     cmd: &str,
     root: PathBuf,
     retention: Duration,
     grace: Duration,
     dry_run: bool,
+    windows: Vec<PrefixWindow>,
+) -> Result<()> {
+    gc_to(
+        &mut std::io::stdout().lock(),
+        cmd,
+        root,
+        (retention, grace, dry_run),
+        windows,
+    )
+}
+
+/// [`gc_windows`] writing its summary to `out` rather than stdout, so a test can read it
+/// back.
+fn gc_to(
+    out: &mut impl std::io::Write,
+    cmd: &str,
+    root: PathBuf,
+    (retention, grace, dry_run): (Duration, Duration, bool),
+    windows: Vec<PrefixWindow>,
 ) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
         writeln!(
@@ -5577,6 +5679,7 @@ fn gc_to(
         )?;
         return Ok(());
     };
+    store.set_prefix_windows(windows);
     let r = store.gc(retention, grace, dry_run)?;
     writeln!(
         out,
@@ -6758,7 +6861,7 @@ mod tests {
             let mut s = Vec::new();
             status_to(&mut s, cmd, dir.clone()).unwrap();
             let mut g = Vec::new();
-            gc_to(&mut g, cmd, dir.clone(), zero, zero, true).unwrap();
+            gc_to(&mut g, cmd, dir.clone(), (zero, zero, true), Vec::new()).unwrap();
             (String::from_utf8(s).unwrap(), String::from_utf8(g).unwrap())
         };
 
@@ -9474,6 +9577,181 @@ mod tests {
         assert!(!store.repo_has_blob("team-a/app", &hex));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prefix's window drops its idle tags well inside the store-wide one, and holds a far
+    /// `expires` annotation to itself, and a `keep` too under a window the config sets; under
+    /// one the hub added, `keep` and a far `expires` hold, and a past `expires` does not.
+    /// Tags elsewhere keep the store's rules.
+    #[test]
+    fn gc_applies_a_prefix_window() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcprefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let keep =
+            format!(r#"{{"schemaVersion":2,"annotations":{{"{RETENTION_ANNOTATION}":"keep"}}}}"#);
+        let far = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 365 * 86_400;
+        let expires =
+            format!(r#"{{"schemaVersion":2,"annotations":{{"{EXPIRES_ANNOTATION}":"{far}"}}}}"#);
+        let expired =
+            format!(r#"{{"schemaVersion":2,"annotations":{{"{EXPIRES_ANNOTATION}":"1"}}}}"#);
+        let plain = r#"{"schemaVersion":2}"#;
+        for (repo, body) in [
+            ("ci-pipeline/gl/1/7/cache", plain),
+            ("ci-pipeline/gl/1/7/kept", keep.as_str()),
+            ("ci-pipeline/gl/1/7/expires", expires.as_str()),
+            ("files/ci-pipeline/gl/1/7/f", plain),
+            ("team/cache", plain),
+            ("team/kept", keep.as_str()),
+            ("team/expires", expires.as_str()),
+            ("team/expired", expired.as_str()),
+            ("images/debian", plain),
+            ("images/kept", keep.as_str()),
+        ] {
+            store
+                .put_manifest(repo, "t", DEFAULT_MANIFEST_TYPE, body.as_bytes())
+                .unwrap();
+            let tag = dir.join("repos").join(repo).join("tags").join("t");
+            let old = SystemTime::now() - Duration::from_secs(3 * 86_400);
+            std::fs::File::options()
+                .write(true)
+                .open(&tag)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let window = |prefix: &str, keep_holds| PrefixWindow {
+            prefix: prefix.into(),
+            window: Duration::from_secs(2 * 86_400),
+            keep_holds,
+        };
+        store.set_prefix_windows(vec![window("ci-pipeline", false), window("team", true)]);
+        let report = store
+            .gc(
+                Duration::from_secs(30 * 86_400),
+                Duration::from_secs(86_400),
+                false,
+            )
+            .unwrap();
+        assert_eq!(report.tags_dropped, 6);
+        let tag = |repo: &str| dir.join("repos").join(repo).join("tags/t").exists();
+        assert!(!tag("ci-pipeline/gl/1/7/cache"));
+        assert!(
+            !tag("ci-pipeline/gl/1/7/kept"),
+            "keep holds only within the config's window"
+        );
+        assert!(
+            !tag("ci-pipeline/gl/1/7/expires"),
+            "expires holds only within the window"
+        );
+        assert!(!tag("files/ci-pipeline/gl/1/7/f"));
+        assert!(!tag("team/cache"));
+        assert!(tag("team/kept"), "keep holds under the hub's window");
+        assert!(tag("team/expires"), "so does a far expires");
+        assert!(!tag("team/expired"), "but not a past one");
+        assert!(tag("images/debian"));
+        assert!(tag("images/kept"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under a [`GcPolicy`], a prefix's window replaces the policy's retention while age
+    /// removal is on, and does nothing when it is off; the size phase may drop a tag a window
+    /// governs, `keep` or not, as it may any tag only age keeps, but never one kept elsewhere
+    /// or under a window the hub set, where `keep` holds.
+    #[test]
+    fn a_prefix_window_applies_under_a_gc_policy_and_its_size_phase() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-regserve-gcprefixpol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let keep =
+            format!(r#"{{"schemaVersion":2,"annotations":{{"{RETENTION_ANNOTATION}":"keep"}}}}"#);
+        let plain = r#"{"schemaVersion":2}"#;
+        let put = |repo: &str, body: &str, days: u64| {
+            store
+                .put_manifest(repo, "t", DEFAULT_MANIFEST_TYPE, body.as_bytes())
+                .unwrap();
+            let tag = dir.join("repos").join(repo).join("tags").join("t");
+            let old = SystemTime::now() - Duration::from_secs(days * 86_400);
+            std::fs::File::options()
+                .write(true)
+                .open(&tag)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        let tag = |repo: &str| dir.join("repos").join(repo).join("tags/t").exists();
+        store.set_prefix_windows(vec![
+            PrefixWindow {
+                prefix: "ci-pipeline".into(),
+                window: Duration::from_secs(2 * 86_400),
+                keep_holds: false,
+            },
+            PrefixWindow {
+                prefix: "hubbed".into(),
+                window: Duration::from_secs(2 * 86_400),
+                keep_holds: true,
+            },
+        ]);
+        let policy = |retention: Option<Duration>, max_bytes: Option<u64>| GcPolicy {
+            retention,
+            grace: Duration::from_secs(86_400),
+            repository: None,
+            keep_prefixes: Vec::new(),
+            max_bytes,
+            free_bytes: None,
+            min_age: Duration::from_secs(86_400),
+            dry_run: false,
+            wait: Wait::Block,
+            lower_planning: None,
+        };
+
+        put("ci-pipeline/gl/1/7/aged", plain, 3);
+        // Age removal off: the window drops nothing.
+        let report = done(store.gc_with(&policy(None, None)).unwrap());
+        assert_eq!(report.tags_dropped, 0);
+        assert!(tag("ci-pipeline/gl/1/7/aged"));
+        // On: the window, not the policy's 30 days, decides.
+        let report = done(
+            store
+                .gc_with(&policy(Some(Duration::from_secs(30 * 86_400)), None))
+                .unwrap(),
+        );
+        assert_eq!(report.tags_dropped, 1);
+        assert!(!tag("ci-pipeline/gl/1/7/aged"));
+
+        // The size phase: a `keep` under the config's window may go; one under the hub's
+        // window, or outside any, stays.
+        put("ci-pipeline/gl/1/8/kept", keep.as_str(), 3);
+        put("hubbed/kept", keep.as_str(), 3);
+        put("images/kept", keep.as_str(), 3);
+        let report = done(store.gc_with(&policy(None, Some(0))).unwrap());
+        assert_eq!(report.tags_capped, 1);
+        assert!(!tag("ci-pipeline/gl/1/8/kept"));
+        assert!(tag("hubbed/kept"));
+        assert!(tag("images/kept"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_most_specific_prefix_window_wins() {
+        let w = |prefix: &str, days: u64| PrefixWindow {
+            prefix: prefix.into(),
+            window: Duration::from_secs(days),
+            keep_holds: false,
+        };
+        let windows = [w("p", 1), w("p/gl/42", 9)];
+        let found = |name: &str| prefix_window(&windows, name).map(|w| w.window.as_secs());
+        assert_eq!(found("p/gl/42/app"), Some(9));
+        assert_eq!(found("p/gl/4"), Some(1));
+        assert_eq!(found("files/p/x"), Some(1));
+        assert_eq!(found("px"), None);
     }
 
     /// A read that fails part-way ends the body as an error, naming the blob — not as a

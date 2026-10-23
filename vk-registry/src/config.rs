@@ -94,6 +94,18 @@ pub struct ServerConfig {
     pub max_connections_per_client: usize,
     /// `[hub]`: what a hub this registry is enrolled with may do to it.
     pub hub: HubSettings,
+    /// `[[gc.prefix]]`: retention windows of their own for the tags under a prefix.
+    pub gc_prefixes: Vec<GcPrefix>,
+}
+
+/// A `[[gc.prefix]]` entry: tags under `path` (or `files/<path>`) are dropped once idle
+/// for `retention_days`, whatever the store-wide window and its floors, since the
+/// operator chose it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcPrefix {
+    pub path: String,
+    pub retention_days: u64,
 }
 
 /// The `[hub]` table: what the hub may do to a registry enrolled with it. Nothing, by
@@ -234,6 +246,15 @@ struct FileConfig {
     #[serde(default)]
     upstream: Vec<FileUpstream>,
     hub: Option<FileHub>,
+    gc: Option<FileGc>,
+}
+
+/// `[gc]`: only its `[[gc.prefix]]` entries, for now.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGc {
+    #[serde(default)]
+    prefix: Vec<GcPrefix>,
 }
 
 /// `deny_unknown_fields`: a misspelt `allow` would leave the hub steering nothing, or a
@@ -339,7 +360,43 @@ impl ServerConfig {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
             hub: HubSettings::default(),
+            gc_prefixes: Vec::new(),
         }
+    }
+
+    /// The store `vk-registry gc` sweeps, as [`ServerConfig::root_of`] resolves it, and the
+    /// `[[gc.prefix]]` windows of the config at `config` when the root comes through it: an
+    /// explicit `root` is another store, which that config's windows say nothing of. Only
+    /// `[gc]` is checked, as `root_of` reads only the root. The third value counts the
+    /// config's windows left unapplied because of an explicit `root`.
+    pub fn gc_store_of(
+        config: Option<&Path>,
+        root: Option<PathBuf>,
+    ) -> Result<(PathBuf, Vec<crate::PrefixWindow>, usize)> {
+        let Some(path) = config else {
+            return Ok((Self::root_of(None, root)?, Vec::new(), 0));
+        };
+        if let Some(root) = root {
+            // Read only to say what is left out: an explicit root never needed the file, so
+            // one that does not read leaves nothing to say rather than failing the sweep.
+            let unapplied = read_file(path)
+                .ok()
+                .and_then(|f| f.gc)
+                .map_or(0, |g| g.prefix.len());
+            return Ok((root, Vec::new(), unapplied));
+        }
+        let f = read_file(path)?;
+        let prefixes = f.gc.map(|g| g.prefix).unwrap_or_default();
+        check_gc_prefixes(&prefixes)?;
+        let root = match f.root {
+            Some(r) => r,
+            None => crate::default_root()?,
+        };
+        Ok((
+            root,
+            prefixes.iter().map(crate::PrefixWindow::from).collect(),
+            0,
+        ))
     }
 
     /// What a hub managing the registry is told it is, and may do to it.
@@ -352,10 +409,14 @@ impl ServerConfig {
         let upstreams: Vec<String> = self.upstreams.iter().map(|u| u.prefix.clone()).collect();
         let tls = self.tls_cert.is_some() && self.tls_key.is_some();
         // What would make two registries that should match differ: not paths or secrets.
-        let described = format!(
+        let mut described = format!(
             "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub={:?}",
             self.webdav, self.max_connections, self.max_connections_per_client, self.hub
         );
+        // Only when set, so a registry with no `[[gc.prefix]]` keeps the hash it had.
+        if !self.gc_prefixes.is_empty() {
+            described.push_str(&format!(" gc={:?}", self.gc_prefixes));
+        }
         crate::hub::Facts {
             listen: self.addr.to_string(),
             tls,
@@ -570,9 +631,11 @@ impl ServerConfig {
                 min_retention_days: h.min_retention_days.unwrap_or(DEFAULT_MIN_RETENTION_DAYS),
                 min_grace_days: h.min_grace_days.unwrap_or(crate::DEFAULT_GC_GRACE_DAYS),
             }),
+            gc_prefixes: f.gc.map(|g| g.prefix).unwrap_or_default(),
         };
         cfg.check_connection_limits()?;
         cfg.check_hub()?;
+        check_gc_prefixes(&cfg.gc_prefixes)?;
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
         // a contradictory file is refused by parsing it at all, not only by the path that
         // goes on to build the auth scheme. The serve path does both, so no message an
@@ -792,6 +855,12 @@ impl ServerConfig {
         // making room for the db file under it.
         let db_path = self.resolved_accounts_db();
         let store = Arc::new(Store::new(self.root)?);
+        store.set_prefix_windows(
+            self.gc_prefixes
+                .iter()
+                .map(crate::PrefixWindow::from)
+                .collect(),
+        );
         // `resolve_oidc` yields `Some` exactly in accounts mode, so it selects the arm as
         // well as supplying the provider.
         let auth = match oidc_cfg {
@@ -862,6 +931,30 @@ impl UpstreamSpec {
 fn parse_addr(addr: Option<String>) -> Result<Option<SocketAddr>> {
     addr.map(|a| a.parse().with_context(|| format!("parsing addr {a:?}")))
         .transpose()
+}
+
+/// Each `[[gc.prefix]]` names a repository prefix, once, with a window of a day or more.
+fn check_gc_prefixes(prefixes: &[GcPrefix]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for p in prefixes {
+        if !vk_hub_proto::token::valid_prefix(&p.path) {
+            bail!(
+                "[[gc.prefix]] path = {:?} is not a repository prefix (lowercase \
+                 components, not under files/)",
+                p.path
+            );
+        }
+        if p.retention_days == 0 {
+            bail!(
+                "[[gc.prefix]] path = {:?} has a retention of 0 days",
+                p.path
+            );
+        }
+        if !seen.insert(p.path.as_str()) {
+            bail!("[[gc.prefix]] path = {:?} is listed twice", p.path);
+        }
+    }
+    Ok(())
 }
 
 /// Read + parse a config file, named in the error whichever way it fails. Shared by
@@ -1597,6 +1690,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `[[gc.prefix]]` takes repository prefixes, each once, with a window of a day or more.
+    #[test]
+    fn gc_prefixes_load() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcpfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None)
+        };
+        let cfg = load("[[gc.prefix]]\npath = \"ci-pipeline\"\nretention_days = 2\n").unwrap();
+        assert_eq!(
+            cfg.gc_prefixes,
+            vec![GcPrefix {
+                path: "ci-pipeline".into(),
+                retention_days: 2
+            }]
+        );
+        for bad in [
+            "[[gc.prefix]]\npath = \"Bad\"\nretention_days = 2\n",
+            "[[gc.prefix]]\npath = \"files/x\"\nretention_days = 2\n",
+            "[[gc.prefix]]\npath = \"a\"\nretention_days = 0\n",
+            "[[gc.prefix]]\npath = \"a\"\nretention_days = 1\n[[gc.prefix]]\npath = \"a\"\nretention_days = 2\n",
+            "[[gc.prefix]]\npath = \"a\"\nretention_days = 1\nnope = 1\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vk-registry gc` reads `[[gc.prefix]]` from a file `serve` would refuse for other
+    /// keys, and applies them only to the store that file names.
+    #[test]
+    fn gc_store_of_takes_the_windows_of_the_config_naming_the_store() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        let store = dir.join("store");
+        let write = |gc: &str| {
+            std::fs::write(
+                &path,
+                format!("root = {store:?}\nmax_connections = 0\n\n{gc}"),
+            )
+            .unwrap();
+        };
+        write("[[gc.prefix]]\npath = \"ci\"\nretention_days = 2\n");
+        assert!(ServerConfig::load(&path, None, None).is_err());
+        let (root, windows, unapplied) = ServerConfig::gc_store_of(Some(&path), None).unwrap();
+        assert_eq!(unapplied, 0);
+        assert_eq!(root, store);
+        assert_eq!(
+            windows,
+            vec![crate::PrefixWindow::from(&GcPrefix {
+                path: "ci".into(),
+                retention_days: 2
+            })]
+        );
+        let other = dir.join("other");
+        assert_eq!(
+            ServerConfig::gc_store_of(Some(&path), Some(other.clone())).unwrap(),
+            (other.clone(), Vec::new(), 1),
+            "an explicit root is another store"
+        );
+        assert_eq!(
+            ServerConfig::gc_store_of(None, Some(other.clone())).unwrap(),
+            (other, Vec::new(), 0)
+        );
+        write("[[gc.prefix]]\npath = \"ci\"\nretention_days = 0\n");
+        assert!(ServerConfig::gc_store_of(Some(&path), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// `[hub] release_keys` check a release signed as `vk-registry`'s, not as `vk`'s.
     #[test]
     fn hub_release_keys_take_a_registry_release_only() {
