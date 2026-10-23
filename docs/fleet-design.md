@@ -648,6 +648,173 @@ implements, so GitLab does not hand it a job that relies on another. gitlab-runn
 ported as compatibility tests, and each release of `vk-gitlab` names the gitlab-runner
 version it matches.
 
+## Job egress from the hub
+
+Without hub rules a job's egress is bounded by its node's `[egress]` and `[egress.build]` caps,
+and a job or one of its services may narrow them ([Egress
+control](gitlab-ci.md#egress-control)). The hub adds one more layer, chosen by project and ref,
+so that what a project's jobs may reach is decided in one place, and reports what each job was
+refused or reached, so that refusals are caught and rules are written from evidence. Reporting
+comes first and needs no hub rule.
+
+**Layers.** A destination is reachable only if every layer allows it, in each phase, run and
+build:
+
+1. the node's cap, `[egress]` and `[egress.build]`: what this host may ever reach;
+2. the hub's rule for the job, by project and ref (below);
+3. the job's own narrowing, `MICROVM_EGRESS_*` and `MICROVM_BUILD_EGRESS_*`, for every VM of
+   the job;
+4. a service's own run-phase narrowing, for that service's VM, on top of the job's.
+
+Every layer is checked at run time, on its own: the switch checks a destination against each
+in turn, so no intersection of suffix lists or CIDRs is ever computed, nor is any layer
+validated against another. Each reads its lists as a cap does — both absent restrict nothing,
+one listed and the other absent denies the other — and an address a lookup opened passes a layer
+only if that layer allows the name. An entry outside a layer above is reported, never fatal: the
+node warns of it at prepare and reports it as unreachable; only an invalid entry fails the job.
+The job's trace names the hub rules applied, and each layer's lists.
+
+**Reporting.** Independent of hub rules and of `[jobs] egress_rules`: layers 1, 3 and 4 block
+without them. Beside the trace lines, which say a protocol, a target and a count, the node keeps a
+bounded, structured report per placed job and sends it to the hub, a field of `JobResult`
+absent from older nodes:
+
+- **Entries**: `blocked`, `would_block` (dry-run) and `observed`, each with its protocol (dns,
+  tcp, udp), its destination, typed as a domain or an IPv4 address and port, the phase, the
+  source VM (the job's or a named service's), first and last seen, the stage at first sight
+  when known, a count, and for a denial the layer that decided it: `node_cap`, `hub_rule`,
+  `job`, `service` or `unknown`. The switch records the layer when it decides; nothing infers
+  it afterwards. An observed DNS entry is a lookup, not proof of a connection.
+- **Declaration refusals**: a job's or service's `MICROVM_*EGRESS_ALLOW_*` entry found at fault
+  at validation: the variable, the entry, its dimension, phase and VM, the layer it falls
+  outside, and the reason — `invalid_entry`, which fails the job, or `unreachable`, an entry
+  kept that a layer above leaves nothing of (`outside_cap`, which failed the job, comes only
+  from an older node). No count: nothing was attempted.
+- **Coverage** per phase: `complete`, `partial` or `unavailable`, with the counts omitted, so
+  that no reports never reads as no traffic. Build-phase contacts and denials are recorded
+  whether or not audit is on, as run-phase contacts are; audit stays a trace option.
+- **Bytes** forwarded per phase, from the switch's existing totals. Volume per destination is
+  not measured.
+
+At most 512 denials, 512 contacts and 256 KiB per job; what exceeds them is counted per outcome
+and phase, and the entries already kept stay. Guest-controlled strings are bounded and their
+control characters replaced on the node, and escaped on the page; a destination that parses as
+neither form is kept as text and never seeds an allow action. A report is a cumulative snapshot
+with a revision, and the hub keeps the highest, so a replay replaces counts rather than adding
+to them: sent during the job, at stage boundaries and every few seconds when it changed, and
+with the result, the highest; kept by the node across a reconnect. A job its hub ends, or whose
+node loses its driver, keeps the last report sent, its phases partial. A node announces
+reporting in its inventory, a capability apart from enforcing hub rules (Resolution, below); a
+job on a node without it shows *Reporting unavailable*. Jobs run by gitlab-runner keep the trace
+lines only.
+
+**Egress page.** Tabs **Blocked** (the landing tab), **Observed traffic**, **Rules** and
+**Test a job**. Viewers read; operators triage and edit.
+
+- **Blocked** groups denials by destination (protocol and port kept, domains never merged into
+  a suffix) and project: jobs, attempts, latest, deciding layer. A row expands to ref and
+  protection, phase, VM, and the jobs with their outcome, which says the denial's effect on it
+  is unknown. *Blocked*, *Would block* and *Declaration issues* are separate views with
+  separate counts; an invalid declaration is the job's failure cause and says so, an unreachable
+  one a warning the job ran with.
+- **Triage**, per destination and project: *New*, *Acknowledged*, *Allow saved, awaiting
+  confirmation*, *Allowed by current policy*. A denial later than the state reopens it. A mute
+  per project carries a reason and an expiry and can be undone; it takes rows out of the inbox
+  and its count, never out of the job page, Observed traffic or the muted filter. Triage and
+  mutes go to the audit log, observations to the report store.
+- **Actions follow the deciding layer.** Node cap: the node and the exact key, such as
+  `[egress.build] allow_name`. Job or service narrowing: the variable, and *change this job's
+  CI configuration*. Hub rule: a proposal prefilled with the project, phase and exact
+  destination, saved only through Preview → Save; nothing widens access in one click. Unknown:
+  the evidence, no action.
+- **Elsewhere**: the count of *New* items on the Egress link; a Network column in the job list;
+  a Network access section on every job's page — blocked and would-block destinations,
+  refusals, contacts and bytes per phase and VM, coverage, a link into Blocked. Counts and
+  sections update over SSE; forms stay out of the swapped fragments.
+- **Observed traffic**: each project's destinations over time, by ref, protection and phase,
+  each compared with the current rules (allowed by which, or outside them). A rule entry no
+  contact matched shows *No observed use in 30 days*, with its last use and its coverage (*84
+  of 100 applicable builds reported*). A contact counts toward every entry of every layer that
+  allows it, so a broad entry never looks idle beside a narrow one, and only jobs that ran the
+  phase count; a contact a dry-run allowlist would have blocked counts too, as the switch
+  carried it. So each job's contacts are kept by exact destination, phase, protection, ref and
+  day, with the job history. Node cap entries get the same, the caps reported versioned and
+  each job's recorded at placement, scoped to jobs the hub saw. Every such entry carries the caution that no reported use does not prove
+  it unnecessary; nothing is removed automatically.
+
+**Rules.** The hub holds egress rules in its database, manages them with `vk-hub egress` and
+on an Egress page, and records every change in the audit log:
+
+```text
+egress default                                     # jobs no other rule selects
+  run    names = []                    ips = []
+  build  names = ["debian.org"]
+egress wab                 projects "wab/**", protected
+  run    names = ["corp.example.com"]  ips = ["10.10.140.49/32"]
+  build  names = ["debian.org", "crates.io", "pypi.org"]
+egress wab-branches        projects "wab/**", unprotected
+  run    names = ["corp.example.com"]
+  build  names = ["debian.org", "crates.io"]
+egress wab-release         projects "wab/**", ref "release/*", protected     mode = dry-run
+  run    names = ["partner.example.net"]
+```
+
+- A rule selects jobs as a [registry namespace](registry-hub.md#namespaces) does: by project
+  (`projects <path glob>` or `project-id <n>`), by ref glob, by protection. A rule that
+  selects by ref name also requires `protected`: anyone who can push to a project can name a
+  branch `release/x`.
+- A phase's lists read as the node's do: an absent list is unrestricted, an empty one denies,
+  and once one dimension is listed the other, absent, denies.
+- Rules that select a job add up, per phase and dimension. `default` applies only to a job
+  no other rule selects.
+- `mode = dry-run` reports what a rule would deny, in the job's trace and on the hub, and
+  blocks nothing, so a rule is rolled out by watching it first. The node's cap still blocks.
+  The hub sends each dry-run rule as the layer the job would have were it enforced, and the
+  node records what that layer refuses of what it carries, in both phases: node dry-run covers
+  the run phase only ([Dry-run](gitlab-ci.md#dry-run)), and never relaxes the hub's layer.
+- Until `[jobs] egress_rules = true` the hub imposes nothing, which is today's behaviour; once
+  set, a job no rule selects and no `default` covers gets no egress at all. A rule in dry-run
+  does not count as selecting a job, so `default` still applies to it.
+
+**Rules on the page.** Operators edit them on the Rules tab as with `vk-hub egress`. Each phase
+is an explicit choice — *Unrestricted by this rule*, *Allow listed destinations* (domains and
+IP ranges, one per line, an empty dimension reading *None*), *Allow none* — never an absent
+list beside an empty one. Subjects read as the namespaces page words them, and `default` is
+*Fallback*, listed apart. A change goes through Preview → Save: Preview shows recent jobs the
+rule selects with their permissions before and after, including where it replaces the
+Fallback, and the observed destinations it would block, or *insufficient evidence* without
+reports. **Test a job** takes a recent job, or a GitLab instance, project, ref and protection,
+and optionally a node, and shows each layer apart — the rules selected, dry-run candidates,
+whether the Fallback applies, the node's cap, the job's and services' narrowing when known —
+then the result per phase and VM, each layer evaluated on its own and the result allowing only
+what every one allows, never one flattened list.
+
+**Rollout.** With rules off the page says that saved rules restrict nothing. In order: collect
+reports for both phases; save an enforced Fallback that is explicitly *Unrestricted*; set
+`[jobs] egress_rules = true`; add project rules in dry-run; enforce each once its reports are
+clean and its preview reviewed; narrow the Fallback last. Enabling rules with no enforced
+Fallback warns that every job no rule selects loses egress.
+
+**Resolution.**
+
+- **Placed jobs.** The hub resolves the rules at placement, from the job's claims (project ID
+  and path, ref, protection), and sends the result in `JobStart`: the lists per phase, and the
+  rules' names. Those claims are bounded by the jobs key's ceiling
+  ([trust](registry-hub.md#namespaces)); a job submitted with a key bound to no GitLab
+  instance gets only the `default` rule. A node announces in its inventory that it enforces
+  the field; the hub never places a job whose rules it must enforce on a node that does not,
+  since an older node would ignore the field and run the job under its cap alone.
+- **Jobs run by gitlab-runner.** The executor sees the job's identity only as variables.
+  GitLab's documented precedence puts predefined variables last, below a pipeline's own
+  `variables:`, so a job can claim another `CI_PROJECT_PATH` or `CI_COMMIT_REF_PROTECTED`
+  (untested). A gitlab-runner job therefore gets only the `default` rule, which the hub
+  sends to the node in desired state; rules by project or ref apply to placed jobs only,
+  whose identity comes from the job response, not from variables.
+
+**Trust.** The node's caps stay the bound: a compromised hub can widen a job's egress up to
+its node's cap, never past it. Under [the trust model](trust-model.md) the caps are sensitive
+settings and the rules are routine.
+
 ## Managed nodes
 
 Proposed, not built: for hosts the hub owns end to end, a node OS image, offered but never
