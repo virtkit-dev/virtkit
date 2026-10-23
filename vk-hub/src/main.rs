@@ -40,6 +40,7 @@ mod server;
 mod session;
 mod store;
 mod subject;
+mod tokens;
 mod tools;
 mod ui;
 mod workloads;
@@ -68,7 +69,7 @@ struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
     /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
     /// kept_output, kept_output_total, image_affinity_max_load, image_affinity_max_extra_load,
-    /// [oidc] [default: built-in defaults]
+    /// max_job_token_secs, [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -189,6 +190,13 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: NamespacesCmd,
+    },
+    /// List the keys registry tokens are signed with, or make a new one the signer
+    TokenKeys {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<TokenKeysCmd>,
     },
     /// Issue, list and revoke the API keys automation such as vk-gitlab places jobs with
     Keys {
@@ -511,6 +519,14 @@ enum NamespacesCmd {
     Remove { registry: String, name: String },
 }
 
+#[derive(Subcommand)]
+enum TokenKeysCmd {
+    /// List the keys (the default)
+    List,
+    /// Make a new key the signer; registries get it before it signs their tokens
+    Rotate,
+}
+
 pub(crate) fn parse_scope(s: &str) -> Result<store::Scope, String> {
     store::Scope::parse(s).ok_or_else(|| format!("{s:?}: expected jobs or capacity"))
 }
@@ -815,6 +831,27 @@ enum RegistriesCmd {
         #[arg(long, conflicts_with = "url")]
         none: bool,
     },
+    /// Mint a token for the registry, printed once: for automation or a test
+    Token {
+        id: String,
+        /// A grant, <prefix>=<rights>, rights some of r, w and l; repeat for several
+        #[arg(long = "grant", value_name = "PREFIX=RIGHTS", required = true)]
+        grants: Vec<String>,
+        /// The pipeline its lock requests speak for, <gitlab>/<pipeline id>
+        #[arg(long)]
+        pipeline: Option<String>,
+        /// How long it lives: <n>s, <n>m, <n>h or <n>d (at most max_job_token_secs)
+        #[arg(long, default_value = "1h", value_parser = parse_mint_ttl)]
+        ttl: Duration,
+    },
+}
+
+fn parse_mint_ttl(s: &str) -> Result<Duration, String> {
+    parse_ttl(
+        s,
+        Duration::from_secs(vk_hub_proto::token::MAX_TTL_SECS),
+        "a token's lifetime",
+    )
 }
 
 fn parse_gc_every(s: &str) -> Result<Duration, String> {
@@ -1129,6 +1166,10 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Namespaces { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || namespaces_blocking(&client, cmd)).await?
+        }
+        Cmd::TokenKeys { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || token_keys_blocking(&client, cmd)).await?
         }
         Cmd::Keys { config, cmd } => {
             keys_cmd(
@@ -1502,7 +1543,8 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         .with_node_url(cfg.node_url())
         .with_releases(cfg.releases_dir())
         .with_tools(cfg.tools_dir())
-        .with_release_source(cfg.release_source.clone());
+        .with_release_source(cfg.release_source.clone())
+        .with_token_keys(cfg.token_keys_dir(), cfg.max_job_token);
     if oidc.is_some() {
         if let Some(role) = default_role {
             eprintln!(
@@ -1525,6 +1567,15 @@ async fn serve(cfg: HubConfig) -> Result<()> {
             .preferring_warm_images(cfg.image_affinity),
     );
     jobs::recover(&hub).await?;
+    // Retires keys no token can need any more, and resends what changed while stopped; then
+    // again every hour. A failure is logged: registries go on without the hub's keys.
+    let h = hub.clone();
+    match tokio::task::spawn_blocking(move || tokens::sync_all(&h)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("vk-hub: syncing registry tokens: {e:#}"),
+        Err(e) => eprintln!("vk-hub: syncing registry tokens: {e}"),
+    }
+    tokio::spawn(tokens::sweep(hub.clone()));
     tokio::spawn(jobs::drive(hub.clone()));
     tokio::spawn(clients::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
@@ -1833,6 +1884,37 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
                 bail!("registry {registry} has no namespace {name}");
             }
             eprintln!("vk-hub: removed namespace {name}");
+        }
+    }
+    Ok(())
+}
+
+/// `vk-hub token-keys` and its subcommands, which block on the admin socket.
+fn token_keys_blocking(client: &admin::Client, cmd: Option<TokenKeysCmd>) -> Result<()> {
+    match cmd.unwrap_or(TokenKeysCmd::List) {
+        TokenKeysCmd::List => {
+            let rows: Vec<[String; 3]> = client
+                .token_keys()?
+                .into_iter()
+                .map(|k| {
+                    [
+                        k.public.kid,
+                        utc(k.created_at),
+                        k.superseded_at.map_or_else(
+                            || "signing".to_string(),
+                            |at| format!("superseded {}", utc(at)),
+                        ),
+                    ]
+                })
+                .collect();
+            print!("{}", table(&["KEY", "CREATED", "STATE"], &rows));
+        }
+        TokenKeysCmd::Rotate => {
+            let row = client.rotate_token_keys()?;
+            eprintln!(
+                "vk-hub: token-signing key {} signs each registry's tokens once it has applied it",
+                row.public.kid
+            );
         }
     }
     Ok(())
@@ -2408,6 +2490,20 @@ fn registries_blocking(client: &admin::Client, cmd: Option<RegistriesCmd>) -> Re
                 eprintln!("vk-hub: already so; nothing changed");
             }
         }
+        Some(RegistriesCmd::Token {
+            id,
+            grants,
+            pipeline,
+            ttl,
+        }) => {
+            let token = client.mint_registry_token(&id, grants, pipeline, ttl)?;
+            // The token alone on stdout, so `$(vk-hub registries token …)` captures just it.
+            println!("{token}");
+            eprintln!(
+                "vk-hub: registry token for {id}, valid for {}",
+                human_duration(ttl)
+            );
+        }
     }
     Ok(())
 }
@@ -2449,6 +2545,7 @@ fn render_registry(
             },
         );
         field("signed updates only", i.requires_signed.to_string());
+        field("takes tokens", i.tokens.to_string());
     }
     field(
         "url",

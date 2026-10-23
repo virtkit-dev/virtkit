@@ -4210,6 +4210,7 @@ dependencies = [
  "vk-fs",
  "vk-hub-proto",
  "vk-oidc",
+ "vk-peer",
  "vk-selfupdate",
 ]
 

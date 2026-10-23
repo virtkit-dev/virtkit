@@ -211,7 +211,8 @@ system unit when run as root), preserving enrollment.
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
 web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
 `kept_failure_output`, `kept_output`, `kept_output_total`, `image_affinity_max_load` and
-`image_affinity_max_extra_load` (see [Placed jobs](#placed-jobs)). Every key is optional and an
+`image_affinity_max_extra_load` (see [Placed jobs](#placed-jobs)), and `max_job_token_secs`
+(see [the registry hub design](registry-hub.md)). Every key is optional and an
 unknown one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both
 the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
 `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the

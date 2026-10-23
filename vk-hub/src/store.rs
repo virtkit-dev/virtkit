@@ -46,6 +46,7 @@ mod jobs;
 mod keys;
 mod namespaces;
 mod registries;
+mod token_keys;
 mod tools;
 
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
@@ -58,11 +59,12 @@ pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
     envelope_text, valid_name,
 };
-pub use namespaces::{NamespaceRow, NsGrant};
+pub use namespaces::{NamespaceRow, NsGrant, prefix_retention};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     operation_name as registry_operation_name,
 };
+pub use token_keys::TokenKeyRow;
 pub use tools::{Tools, ToolsRow};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
@@ -773,6 +775,8 @@ impl Db {
             .context("opening the GitLab instances table")?;
         txn.open_table(namespaces::NAMESPACES)
             .context("opening the namespaces table")?;
+        txn.open_table(token_keys::TOKEN_KEYS)
+            .context("opening the token keys table")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;

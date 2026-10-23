@@ -422,13 +422,32 @@ terms that must all hold:
 
 A retention (1 to 3650 days) covers the path's leading fixed components, so the path has no
 fixed component after a placeholder, and it is refused where it would reach into another
-namespace asking for another window.
+namespace asking for another window. A registry that first takes tokens gets `ci-cache`
+(`ci-cache/{gitlab}/{project_id}/{protection}`, `rw:own project`) and `ci-pipeline`
+(`ci-pipeline/{gitlab}/{project_id}/{pipeline_id}`, `rwl:own project, own pipeline`, 2 days),
+once; their names are the roles that name a job's cache repository and pipeline prefix. The
+2-day window takes effect only on a registry whose `[[gc.prefix]]` allows it: the hub may only
+lengthen a registry's own window, and stays within `min_retention_days` elsewhere.
 
 **Registry URLs.** `vk-hub token create --kind registry --url <url>` binds the enrolling
 registry to the URL its clients reach it at; `vk-hub registries set-url <id> <url>|--none`
-changes it, and `registries show` prints it. A URL is `http(s)://host[:port]`, and one host
-and port belong to one registry whatever the scheme. A URL another registry took before the
-token was spent is not bound, and the audit log says so.
+changes it, and `registries show` prints it with whether the registry takes tokens. A URL is
+`http(s)://host[:port]`, and one host and port belong to one registry whatever the scheme. A
+URL another registry took before the token was spent is not bound, and the audit log says so.
+
+**Signing keys.** The hub keeps them in `<data_dir>/token-keys/` (`0700`, each key `0600`),
+creating the first when a registry first takes tokens. `vk-hub token-keys list` and
+`token-keys rotate`. A registry with `[hub] tokens = true` gets every key in its desired
+state, and its namespaces' retention windows when gc is in its `[hub] allow`. A new key signs
+a registry's tokens once the registry reports applying the generation that first carried it;
+a key superseded for longer than any token lives (7 days and the skew) is retired, its file
+removed, at the next sync or the hourly sweep. `max_job_token_secs` in `hub.toml` (60 to
+604800, 86400 by default) caps a token's lifetime.
+
+**Minting.** `vk-hub registries token <id> --grant <prefix>=<rights> [--grant …] [--pipeline
+<gitlab>/<id>] [--ttl 1h]` mints a token for automation and tests, living at most
+`max_job_token_secs`. Each issue is audited under the registry by jti, never the token, which
+the hub stores nowhere.
 
 ## Open questions
 

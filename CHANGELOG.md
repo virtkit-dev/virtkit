@@ -23,6 +23,10 @@ All notable changes to virtkit will be documented in this file.
   path prefix**, by GitLab instance, project, ref and protection.
 - **`vk-hub registries set-url` and `vk-hub token create --kind registry --url` tell the hub
   which URL nodes reach a registry at.**
+- **Registries with `[hub] tokens = true` get the hub's token-signing keys**, and `vk-hub
+  token-keys rotate` rolls them without breaking tokens in flight. `max_job_token_secs` in
+  `hub.toml` caps a token's lifetime.
+- **`vk-hub registries token` mints a registry token for automation and tests.**
 
 ### Fixed
 

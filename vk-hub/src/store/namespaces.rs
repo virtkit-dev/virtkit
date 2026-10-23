@@ -10,6 +10,7 @@
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use vk_hub_proto::registry::PrefixRetention;
 use vk_hub_proto::token::valid_prefix;
 
 use super::registries::REGISTRIES;
@@ -18,6 +19,11 @@ use crate::subject::{Projects, Subject};
 
 /// Key: `<registry ID>/<name>`. Value: JSON [`NamespaceRow`].
 pub(super) const NAMESPACES: TableDefinition<&str, &[u8]> = TableDefinition::new("namespaces");
+
+/// The namespace a job's CI caches go to: its path is the job's cache repository.
+pub const CI_CACHE: &str = "ci-cache";
+/// The namespace a pipeline's jobs share: its path is the job's pipeline prefix.
+pub const CI_PIPELINE: &str = "ci-pipeline";
 
 /// The most namespaces a registry has: a job's token carries at most one grant per
 /// namespace, and a token holds [`vk_hub_proto::token::MAX_GRANTS`].
@@ -201,6 +207,48 @@ fn sample_path(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// The retention windows `ns` set, by static prefix: the longest where several share one.
+pub fn prefix_retention(ns: &[NamespaceRow]) -> Vec<PrefixRetention> {
+    let mut out: Vec<PrefixRetention> = Vec::new();
+    for n in ns {
+        let (Some(days), Some(prefix)) = (n.retention_days, n.static_prefix()) else {
+            continue;
+        };
+        match out.iter_mut().find(|r| r.prefix == prefix) {
+            Some(r) => r.retention_days = r.retention_days.max(days),
+            None => out.push(PrefixRetention {
+                prefix,
+                retention_days: days,
+            }),
+        }
+    }
+    out.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    out
+}
+
+/// The namespaces a registry starts with when it first takes tokens.
+pub fn defaults(now: u64) -> Vec<NamespaceRow> {
+    let grant = |line: &str| NsGrant::parse(line).unwrap_or_else(|e| unreachable!("{e}"));
+    vec![
+        NamespaceRow {
+            name: CI_CACHE.into(),
+            path: "ci-cache/{gitlab}/{project_id}/{protection}".into(),
+            retention_days: None,
+            grants: vec![grant("rw:own project")],
+            created_at: now,
+            created_by: "hub".into(),
+        },
+        NamespaceRow {
+            name: CI_PIPELINE.into(),
+            path: "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}".into(),
+            retention_days: Some(2),
+            grants: vec![grant("rwl:own project, own pipeline")],
+            created_at: now,
+            created_by: "hub".into(),
+        },
+    ]
+}
+
 fn ns_range(registry: &str) -> (String, String) {
     (format!("{registry}/"), format!("{registry}0"))
 }
@@ -289,6 +337,41 @@ impl Db {
         txn.commit().context("removing a namespace")?;
         Ok(removed)
     }
+
+    /// Give registry `registry` the [`defaults`] it lacks, once: whether it got them now.
+    pub fn seed_namespaces(&self, registry: &str, now: u64) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let seeded = {
+            let mut registries = txn.open_table(REGISTRIES)?;
+            let Some(mut row) = registries
+                .get(registry)?
+                .map(|g| decode::<super::RegistryRow>(g.value()))
+                .transpose()?
+            else {
+                return Err(NotEnrolled(registry.to_string()).into());
+            };
+            if row.namespaces_seeded {
+                false
+            } else {
+                row.namespaces_seeded = true;
+                registries.insert(registry, encode(&row)?.as_slice())?;
+                let mut table = txn.open_table(NAMESPACES)?;
+                for ns in defaults(now) {
+                    let key = format!("{registry}/{}", ns.name);
+                    if table.get(key.as_str())?.is_none() {
+                        table.insert(key.as_str(), encode(&ns)?.as_slice())?;
+                    }
+                }
+                true
+            }
+        };
+        if seeded {
+            let event = format!("namespaces {CI_CACHE} and {CI_PIPELINE} added by default");
+            append_audit(&txn, Some(registry), "hub", &event, now)?;
+        }
+        txn.commit().context("seeding namespaces")?;
+        Ok(seeded)
+    }
 }
 
 /// Remove every namespace of registry `registry` in `txn`, as its removal does.
@@ -352,5 +435,28 @@ mod tests {
         assert!(check_retention_overlap(&pipelines, std::slice::from_ref(&apart)).is_ok());
         let narrower = ns("deep", "p/x", &["r:*"], Some(9));
         assert!(check_retention_overlap(&pipelines, std::slice::from_ref(&narrower)).is_err());
+    }
+
+    #[test]
+    fn retention_covers_the_static_prefix() {
+        let all = [
+            ns("a", "ci-pipeline/{gitlab}/{project_id}", &["r:*"], Some(2)),
+            ns("b", "ci-pipeline/x", &["r:*"], Some(5)),
+            ns("c", "x/{gitlab}", &["r:*"], None),
+            ns("d", "images", &["r:*"], None),
+        ];
+        assert_eq!(
+            prefix_retention(&all),
+            vec![
+                PrefixRetention {
+                    prefix: "ci-pipeline".into(),
+                    retention_days: 2
+                },
+                PrefixRetention {
+                    prefix: "ci-pipeline/x".into(),
+                    retention_days: 5
+                },
+            ]
+        );
     }
 }

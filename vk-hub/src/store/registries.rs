@@ -2,14 +2,17 @@
 //! Separate tables and token kinds prevent confusion with nodes. Audit rows are indexed
 //! by registry ID, as node audit rows are by node ID.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::registry::{
-    Command, DesiredState, GcPolicy, Heartbeat, Inventory, Operation, Report, Usage,
+    Command, DesiredState, GcPolicy, Heartbeat, Inventory, Operation, PrefixRetention, Report,
+    Usage,
 };
+use vk_hub_proto::token::TokenKey;
 use vk_hub_proto::{CommandAck, Outcome, UpdatePhase};
 
 use super::{
@@ -55,6 +58,25 @@ pub struct RegistryRow {
     /// `[registry]` is this URL get tokens for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The generation of the desired state each token-signing key was first sent in: the hub
+    /// signs its tokens with a key only once it reports applying that generation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_generations: BTreeMap<String, u64>,
+    /// Whether it got the default namespaces, which it does once, when it first takes tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub namespaces_seeded: bool,
+}
+
+impl RegistryRow {
+    /// Whether it says it checks hub tokens.
+    pub fn takes_tokens(&self) -> bool {
+        self.inventory.as_ref().is_some_and(|i| i.tokens)
+    }
+
+    /// The generation it last reported applying.
+    pub fn applied(&self) -> u64 {
+        self.report.as_ref().and_then(|r| r.applied).unwrap_or(0)
+    }
 }
 
 /// Whether two bound URLs name one registry: the same host and port, whatever the scheme, so
@@ -476,6 +498,57 @@ impl Db {
         };
         txn.commit().context("binding a registry's URL")?;
         Ok(changed)
+    }
+
+    /// Have registry `id`'s desired state carry the token-signing `keys` and the namespaces'
+    /// `retention`, recording in which generation each key was first sent. Only for a
+    /// registry that takes tokens; the new state when it changed.
+    pub fn sync_registry_tokens(
+        &self,
+        id: &str,
+        keys: &[TokenKey],
+        retention: &[PrefixRetention],
+        now: u64,
+    ) -> Result<Option<DesiredState>> {
+        self.update_registry(now, id, Durability::Immediate, |row| {
+            if !row.takes_tokens() {
+                return Ok((None, Vec::new()));
+            }
+            let before = row.desired.clone().unwrap_or_default();
+            let mut desired = before.clone();
+            desired.token_keys = Some(keys.to_vec());
+            // A registry takes windows only with gc in its `[hub] allow`; one that does not
+            // keeps its own, and is not sent what it would refuse.
+            desired.prefix_retention = row
+                .inventory
+                .as_ref()
+                .is_some_and(|i| {
+                    i.allow
+                        .iter()
+                        .any(|a| a == vk_hub_proto::registry::ALLOW_GC)
+                })
+                .then(|| retention.to_vec());
+            if desired == before {
+                return Ok((None, Vec::new()));
+            }
+            desired.generation = before.generation.max(row.applied()).saturating_add(1);
+            row.key_generations
+                .retain(|kid, _| keys.iter().any(|k| &k.kid == kid));
+            for k in keys {
+                row.key_generations
+                    .entry(k.kid.clone())
+                    .or_insert(desired.generation);
+            }
+            row.desired = Some(desired.clone());
+            let kids: Vec<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
+            let event = format!(
+                "token keys {} and {} retention window(s) sent (generation {})",
+                kids.join(", "),
+                retention.len(),
+                desired.generation
+            );
+            Ok((Some(desired), vec![("hub".to_string(), event)]))
+        })
     }
 
     /// Issue `op` to registry `id`, valid for `ttl`, audited as `actor`'s. Settled commands

@@ -39,6 +39,8 @@ libc.workspace = true
 # the admin socket's private bind
 vk-fs = { path = "../vk-fs" }
 vk-hub-proto = { path = "../vk-hub-proto" }
+# registry tokens, signed as vk-registry checks them
+vk-peer = { path = "../vk-peer" }
 # the web UI's OIDC sign-in, shared with vk-registry
 vk-oidc = { path = "../vk-oidc" }
 # `release fetch`: GitHub releases resolved and checked as `vk update` checks them

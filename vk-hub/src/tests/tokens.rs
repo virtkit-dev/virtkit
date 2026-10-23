@@ -1,12 +1,33 @@
-//! Registry tokens: GitLab instances and keys' ceilings, a registry's URL.
+//! Registry tokens: GitLab instances and keys' ceilings, a registry's URL, its token keys and
+//! their rotation barrier, operator-minted tokens.
+
+use vk_hub_proto::registry::{Inventory as RegistryInventory, Report as RegistryReport};
+use vk_hub_proto::token::Grant;
 
 use super::*;
-use crate::store::{KeyPolicy, ProjectCeiling, RegistryEnrollment, Scope, TokenKind};
+use crate::store::{
+    KeyPolicy, ProjectCeiling, RegistryEnrollment, RegistryWrite, Scope, TokenKind,
+};
+use crate::tokens::Keys;
 
 pub(super) const REGISTRY_URL: &str = "https://reg.example.com";
 
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("vk-hub-tokens-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn test_hub() -> Hub {
     Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+}
+
+fn hub_with_keys(tag: &str) -> Hub {
+    Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_token_keys(
+        scratch(tag).join("token-keys"),
+        crate::tokens::DEFAULT_MAX_JOB_TOKEN,
+    )
 }
 
 /// A registry enrolled with key `key`, bound to no URL.
@@ -47,6 +68,150 @@ pub(crate) fn url_registry(hub: &Hub, url: &str, key: &str) -> String {
         panic!("not enrolled");
     };
     id
+}
+
+/// A registry enrolled at `url`, taking tokens, that applied what the hub sent it.
+pub(crate) fn token_registry(hub: &Hub, url: &str, key: &str) -> String {
+    let now = now_secs();
+    let id = url_registry(hub, url, key);
+    let inventory = RegistryInventory {
+        hostname: "reg-1".into(),
+        tokens: true,
+        allow: vec![vk_hub_proto::registry::ALLOW_GC.into()],
+        ..RegistryInventory::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Inventory(inventory), now)
+        .unwrap();
+    crate::tokens::sync_registry(hub, &id).unwrap();
+    apply(hub, &id);
+    id
+}
+
+/// Have registry `id` report applying the hub's desired state.
+pub(crate) fn apply(hub: &Hub, id: &str) {
+    let generation = hub
+        .db
+        .registry(id)
+        .unwrap()
+        .unwrap()
+        .desired
+        .unwrap()
+        .generation;
+    let report = RegistryReport {
+        applied: Some(generation),
+        ..RegistryReport::default()
+    };
+    hub.db
+        .record_registry(id, RegistryWrite::Report(report), now_secs())
+        .unwrap();
+}
+
+fn kid(token: &str) -> String {
+    vk_hub_proto::token::parse(token).unwrap().claims.kid
+}
+
+#[test]
+fn a_registry_taking_tokens_gets_keys_namespaces_and_retention() {
+    let hub = hub_with_keys("sync");
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    let row = hub.db.registry(&id).unwrap().unwrap();
+    assert_eq!(row.url.as_deref(), Some(REGISTRY_URL));
+    let desired = row.desired.unwrap();
+    let keys = desired.token_keys.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        desired.prefix_retention.unwrap(),
+        vec![vk_hub_proto::registry::PrefixRetention {
+            prefix: "ci-pipeline".into(),
+            retention_days: 2
+        }]
+    );
+    let names: Vec<String> = hub
+        .db
+        .namespaces(&id)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["ci-cache", "ci-pipeline"]);
+    // Removing the defaults does not bring them back.
+    hub.db
+        .remove_namespace(&id, "ci-cache", "uid 0", 1)
+        .unwrap();
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    assert_eq!(hub.db.namespaces(&id).unwrap().len(), 1);
+}
+
+#[test]
+fn a_new_key_signs_only_once_the_registry_applied_it() {
+    let hub = hub_with_keys("rotate");
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    let grants = || {
+        vec![Grant {
+            prefix: "images".into(),
+            read: true,
+            ..Grant::default()
+        }]
+    };
+    let mint = |hub: &Hub| {
+        crate::tokens::mint(hub, "uid 0", &id, grants(), None, Duration::from_secs(60)).unwrap()
+    };
+    let first = mint(&hub);
+    let k1 = kid(&first);
+    let keys = hub
+        .db
+        .registry(&id)
+        .unwrap()
+        .unwrap()
+        .desired
+        .unwrap()
+        .token_keys
+        .unwrap();
+    let claims = vk_peer::token::verify(&first, &keys, &id, now_secs()).unwrap();
+    assert_eq!(claims.grants, grants());
+    assert!(claims.sub.starts_with("operator:"));
+    let k2 = crate::tokens::rotate(&hub, "uid 0").unwrap().public.kid;
+    assert_ne!(k1, k2);
+    let desired = hub.db.registry(&id).unwrap().unwrap().desired.unwrap();
+    assert_eq!(desired.token_keys.unwrap().len(), 2);
+    assert_eq!(
+        kid(&mint(&hub)),
+        k1,
+        "signed before the registry applied the new key"
+    );
+    apply(&hub, &id);
+    assert_eq!(kid(&mint(&hub)), k2);
+    let audit = hub.db.audits(Some(&id), 50).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.event.contains("minted registry token"))
+    );
+    assert!(
+        audit.iter().all(|a| !a.event.contains("vkt_")),
+        "a token reached the audit log"
+    );
+}
+
+#[test]
+fn a_registry_not_taking_tokens_gets_none() {
+    let hub = hub_with_keys("none");
+    let (token, _) = hub
+        .db
+        .create_token_for(TokenKind::Registry, Duration::from_secs(60), None, "u", 1)
+        .unwrap();
+    let RegistryEnrollment::Enrolled { id } =
+        hub.db.enroll_registry(&token, "bb", "reg", "p", 1).unwrap()
+    else {
+        panic!("not enrolled");
+    };
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    assert!(hub.db.registry(&id).unwrap().unwrap().desired.is_none());
+    assert!(hub.db.namespaces(&id).unwrap().is_empty());
+    let err =
+        crate::tokens::mint(&hub, "u", &id, Vec::new(), None, Duration::from_secs(60)).unwrap_err();
+    assert!(err.to_string().contains("does not take tokens"), "{err:#}");
 }
 
 #[test]
@@ -172,6 +337,7 @@ fn the_token_commands_parse() {
             "gl",
             "https://gitlab.example.com",
         ],
+        &["vk-hub", "token-keys", "rotate"],
         &["vk-hub", "namespaces", "list", "r"],
         &[
             "vk-hub",
@@ -186,6 +352,16 @@ fn the_token_commands_parse() {
         ],
         &["vk-hub", "registries", "set-url", "r", "https://reg"],
         &["vk-hub", "registries", "set-url", "r", "--none"],
+        &[
+            "vk-hub",
+            "registries",
+            "token",
+            "r",
+            "--grant",
+            "images=r",
+            "--ttl",
+            "10m",
+        ],
         &[
             "vk-hub",
             "token",
@@ -228,6 +404,123 @@ fn the_token_commands_parse() {
     ] {
         assert!(crate::Cli::try_parse_from(bad).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn a_key_retires_once_no_token_it_signed_can_live() {
+    let dir = scratch("retire");
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+        .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN);
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    let old = hub.db.token_keys().unwrap().remove(0);
+    // A newer key took over longer ago than any token lives.
+    let long_ago =
+        now_secs() - vk_hub_proto::token::MAX_TTL_SECS - vk_hub_proto::token::SKEW_SECS - 10;
+    let new = hub.token_keys.generate().unwrap();
+    hub.db.add_token_key(&new, "uid 0", long_ago).unwrap();
+    let file = dir.join("token-keys").join(&old.file);
+    assert!(file.exists());
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    let kids: Vec<String> = hub
+        .db
+        .token_keys()
+        .unwrap()
+        .into_iter()
+        .map(|k| k.public.kid)
+        .collect();
+    assert_eq!(kids, std::slice::from_ref(&new.public.kid));
+    assert!(!file.exists(), "the retired key's file is still there");
+    let sent = hub
+        .db
+        .registry(&id)
+        .unwrap()
+        .unwrap()
+        .desired
+        .unwrap()
+        .token_keys
+        .unwrap();
+    assert_eq!(sent, [new.public]);
+}
+
+#[test]
+fn a_key_file_must_hold_its_row_s_key() {
+    let dir = scratch("swap").join("token-keys");
+    let keys = Keys::new(Some(dir.clone()), crate::tokens::DEFAULT_MAX_JOB_TOKEN);
+    let a = keys.generate().unwrap();
+    let b = keys.generate().unwrap();
+    // Another hub process reads them from disk, with b's file under a's row.
+    let fresh = Keys::new(Some(dir.clone()), crate::tokens::DEFAULT_MAX_JOB_TOKEN);
+    let swapped = crate::store::TokenKeyRow {
+        file: b.file.clone(),
+        ..a.clone()
+    };
+    let err = fresh.signer(&swapped).err().expect("a mismatched file");
+    assert!(
+        err.to_string().contains("is not token-signing key"),
+        "{err:#}"
+    );
+    assert!(fresh.signer(&a).is_ok());
+}
+
+#[test]
+fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
+    let hub = hub_with_keys("retention");
+    let (token, _) = hub
+        .db
+        .create_token_for(
+            TokenKind::Registry,
+            Duration::from_secs(60),
+            Some(REGISTRY_URL),
+            "u",
+            1,
+        )
+        .unwrap();
+    let RegistryEnrollment::Enrolled { id } =
+        hub.db.enroll_registry(&token, "dd", "reg", "p", 1).unwrap()
+    else {
+        panic!("not enrolled");
+    };
+    let inventory = |allow: Vec<String>| RegistryInventory {
+        tokens: true,
+        allow,
+        ..RegistryInventory::default()
+    };
+    hub.db
+        .record_registry(
+            &id,
+            RegistryWrite::Inventory(inventory(Vec::new())),
+            now_secs(),
+        )
+        .unwrap();
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    let desired = || hub.db.registry(&id).unwrap().unwrap().desired.unwrap();
+    assert!(desired().token_keys.is_some());
+    assert_eq!(desired().prefix_retention, None, "gc is not allowed");
+    hub.db
+        .record_registry(
+            &id,
+            RegistryWrite::Inventory(inventory(vec![vk_hub_proto::registry::ALLOW_GC.into()])),
+            now_secs(),
+        )
+        .unwrap();
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    assert_eq!(desired().prefix_retention.unwrap().len(), 1);
+    let images = crate::store::NamespaceRow {
+        name: "images".into(),
+        path: "images".into(),
+        retention_days: Some(30),
+        grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
+        created_at: 1,
+        created_by: "u".into(),
+    };
+    crate::registries::put_namespace(&hub, "u", &id, &images).unwrap();
+    let windows: Vec<String> = desired()
+        .prefix_retention
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{}={}", r.prefix, r.retention_days))
+        .collect();
+    assert_eq!(windows, ["ci-pipeline=2", "images=30"]);
 }
 
 #[test]

@@ -151,6 +151,8 @@ pub struct Hub {
     client_changes: watch::Sender<u64>,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
+    /// The keys registry tokens are signed with.
+    pub(crate) token_keys: Arc<crate::tokens::Keys>,
 }
 
 /// One node's open session.
@@ -210,7 +212,17 @@ impl Hub {
                 crate::jobs::DEFAULT_LOST_AFTER,
                 crate::store::DEFAULT_JOB_HISTORY,
             ),
+            token_keys: Arc::new(crate::tokens::Keys::new(
+                None,
+                crate::tokens::DEFAULT_MAX_JOB_TOKEN,
+            )),
         }
+    }
+
+    /// Keep registry-token signing keys in `dir` and cap token lifetimes at `max_token`.
+    pub fn with_token_keys(mut self, dir: std::path::PathBuf, max_token: Duration) -> Self {
+        self.token_keys = Arc::new(crate::tokens::Keys::new(Some(dir), max_token));
+        self
     }
 
     /// This hub, placing jobs and keeping their output in `dir`, losing a job whose node has

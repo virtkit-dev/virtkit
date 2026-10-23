@@ -118,7 +118,7 @@ async fn welcome(
 /// heartbeat, and end when it goes quiet. `Ok` carries why the session ended normally.
 async fn serve(
     ws: &mut Ws,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     registry: &Peer,
     session: u64,
     ending: &Ending,
@@ -171,9 +171,11 @@ async fn serve(
                 let msg: RegistryMsg = serde_json::from_str(text.as_str())
                     .context("the registry sent a message this hub does not understand")?;
                 let mut report = None;
+                let mut inventory = false;
                 let write = match msg {
                     RegistryMsg::Inventory(mut i) => {
                         i.make_display_safe();
+                        inventory = true;
                         RegistryWrite::Inventory(i)
                     }
                     RegistryMsg::Heartbeat(h) => RegistryWrite::Heartbeat(h),
@@ -194,6 +196,17 @@ async fn serve(
                 };
                 if let Some(why) = store(ws, hub, registry, write).await? {
                     return Ok(why);
+                }
+                if inventory {
+                    // A key that cannot be read or written must not cost the registry its
+                    // session: it is still steered, and takes tokens once the hub can sync.
+                    if let Err(e) = sync_tokens(hub, registry).await {
+                        eprintln!(
+                            "vk-hub: registry {}: syncing its token keys: {e:#}",
+                            registry.id
+                        );
+                    }
+                    steer.sync(ws, hub, registry).await?;
                 }
                 if let Some(first) = report {
                     if let Some(r) = first {
@@ -243,6 +256,14 @@ impl Steer {
         }
         Ok(())
     }
+}
+
+/// Bring the registry's token state up to date after its inventory: one that announces it
+/// takes tokens gets its default namespaces and the signing keys.
+async fn sync_tokens(hub: &Arc<Hub>, registry: &Peer) -> Result<()> {
+    let hub = hub.clone();
+    let id = registry.id.clone();
+    tokio::task::spawn_blocking(move || crate::tokens::sync_registry(&hub, &id)).await?
 }
 
 /// Settle the accepted updates `report`, the session's first, does not name.
@@ -510,7 +531,7 @@ pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bo
     Ok(changed)
 }
 
-/// Store namespace `ns` on registry `id` as `actor`.
+/// Store namespace `ns` on registry `id` as `actor`, and send the retention it sets.
 pub fn put_namespace(
     hub: &Hub,
     actor: &str,
@@ -518,6 +539,7 @@ pub fn put_namespace(
     ns: &crate::store::NamespaceRow,
 ) -> Result<()> {
     hub.db.put_namespace(id, ns, actor, crate::now_secs())?;
+    sync_after_namespaces(hub, id);
     hub.changed(id);
     Ok(())
 }
@@ -528,9 +550,18 @@ pub fn remove_namespace(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<
         .db
         .remove_namespace(id, name, actor, crate::now_secs())?;
     if removed {
+        sync_after_namespaces(hub, id);
         hub.changed(id);
     }
     Ok(removed)
+}
+
+/// Send registry `id` the retention its namespaces now set. The namespaces are stored
+/// whatever happens here; a failure is logged, and the next sync sends them.
+fn sync_after_namespaces(hub: &Hub, id: &str) {
+    if let Err(e) = crate::tokens::sync_registry(hub, id) {
+        eprintln!("vk-hub: registry {id}: syncing after a namespace change: {e:#}");
+    }
 }
 
 /// Remove registry `id` as `actor` and end its session; whether there was one.

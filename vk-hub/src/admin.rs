@@ -150,6 +150,13 @@ enum Call {
         id: String,
         url: Option<String>,
     },
+    /// A token for a registry, for automation or a test.
+    MintRegistryToken {
+        id: String,
+        grants: Vec<String>,
+        pipeline: Option<String>,
+        ttl_secs: u64,
+    },
     ListNamespaces {
         id: String,
     },
@@ -173,6 +180,8 @@ enum Call {
     RemoveGitlab {
         name: String,
     },
+    ListTokenKeys,
+    RotateTokenKeys,
     /// Download a release's `vk` from the configured repository: `None` for the latest.
     FetchRelease {
         version: Option<String>,
@@ -579,6 +588,28 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             }
             serde_json::to_value(changed)?
         }
+        Call::MintRegistryToken {
+            id,
+            grants,
+            pipeline,
+            ttl_secs,
+        } => {
+            let grants = grants
+                .iter()
+                .map(|g| crate::tokens::parse_grant(g))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!(e))?;
+            let token = crate::tokens::mint(
+                hub,
+                &actor,
+                &id,
+                grants,
+                pipeline,
+                Duration::from_secs(ttl_secs),
+            )?;
+            // `mint` logs it by jti; the token itself is never logged: it is the credential.
+            serde_json::to_value(token)?
+        }
         Call::ListNamespaces { id } => serde_json::to_value(hub.db.namespaces(&id)?)?,
         Call::PutNamespace {
             id,
@@ -637,6 +668,15 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 );
             }
             serde_json::to_value(removed)?
+        }
+        Call::ListTokenKeys => serde_json::to_value(hub.db.token_keys()?)?,
+        Call::RotateTokenKeys => {
+            let row = crate::tokens::rotate(hub, &actor)?;
+            eprintln!(
+                "vk-hub: admin: {actor} made token-signing key {} the signer",
+                row.public.kid
+            );
+            serde_json::to_value(row)?
         }
         Call::FetchRelease { .. } | Call::LatestRelease => {
             bail!("a fetch is served on its own path")
@@ -859,6 +899,21 @@ impl Client {
         })
     }
 
+    pub fn mint_registry_token(
+        &self,
+        id: &str,
+        grants: Vec<String>,
+        pipeline: Option<String>,
+        ttl: Duration,
+    ) -> Result<String> {
+        self.call(Call::MintRegistryToken {
+            id: id.to_string(),
+            grants,
+            pipeline,
+            ttl_secs: ttl.as_secs(),
+        })
+    }
+
     pub fn namespaces(&self, id: &str) -> Result<Vec<crate::store::NamespaceRow>> {
         self.call(Call::ListNamespaces { id: id.to_string() })
     }
@@ -904,6 +959,14 @@ impl Client {
         self.call(Call::RemoveGitlab {
             name: name.to_string(),
         })
+    }
+
+    pub fn token_keys(&self) -> Result<Vec<crate::store::TokenKeyRow>> {
+        self.call(Call::ListTokenKeys)
+    }
+
+    pub fn rotate_token_keys(&self) -> Result<crate::store::TokenKeyRow> {
+        self.call(Call::RotateTokenKeys)
     }
 
     pub fn list_registries(&self) -> Result<Vec<RegistryView>> {

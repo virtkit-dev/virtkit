@@ -30,6 +30,9 @@
 //! # node's.
 //! image_affinity_max_load = 0.7
 //! image_affinity_max_extra_load = 0.25
+//! # The longest a placed job's registry token lives, whatever its timeout: 60 to 604800, the
+//! # most a registry token may live.
+//! max_job_token_secs = 86400
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -104,6 +107,8 @@ pub struct HubConfig {
     pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub image_affinity: crate::jobs::Affinity,
+    /// The longest a registry token the hub mints lives.
+    pub max_job_token: std::time::Duration,
 }
 
 /// The web UI's listener.
@@ -153,6 +158,7 @@ struct FileConfig {
     kept_output_total: Option<String>,
     image_affinity_max_load: Option<f64>,
     image_affinity_max_extra_load: Option<f64>,
+    max_job_token_secs: Option<u64>,
     oidc: Option<FileOidc>,
 }
 
@@ -338,6 +344,14 @@ impl HubConfig {
                 default.max_extra_load,
             )?,
         };
+        let max_job_token = match f.max_job_token_secs {
+            None => crate::tokens::DEFAULT_MAX_JOB_TOKEN,
+            Some(n @ 60..=vk_hub_proto::token::MAX_TTL_SECS) => std::time::Duration::from_secs(n),
+            Some(n) => bail!(
+                "max_job_token_secs = {n}: expected 60 to {}",
+                vk_hub_proto::token::MAX_TTL_SECS
+            ),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -351,6 +365,7 @@ impl HubConfig {
             kept_output,
             kept_output_total,
             image_affinity,
+            max_job_token,
         })
     }
 
@@ -367,6 +382,11 @@ impl HubConfig {
     /// Where tools definitions are kept.
     pub fn tools_dir(&self) -> PathBuf {
         self.data_dir.join("tools")
+    }
+
+    /// Where the keys registry tokens are signed with are kept.
+    pub fn token_keys_dir(&self) -> PathBuf {
+        self.data_dir.join("token-keys")
     }
 
     /// Where placed jobs' output is kept.
@@ -783,6 +803,21 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_job_token_lives_60_seconds_to_7_days() {
+        let max = |extra: &str| {
+            parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.max_job_token.as_secs())
+        };
+        assert_eq!(
+            max("").unwrap(),
+            crate::tokens::DEFAULT_MAX_JOB_TOKEN.as_secs()
+        );
+        assert_eq!(max("max_job_token_secs = 60\n").unwrap(), 60);
+        assert_eq!(max("max_job_token_secs = 604800\n").unwrap(), 604_800);
+        assert!(max("max_job_token_secs = 59\n").is_err());
+        assert!(max("max_job_token_secs = 604801\n").is_err());
     }
 
     #[test]
