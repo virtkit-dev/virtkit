@@ -19,6 +19,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-hub gitlabs` names the GitLab instances the hub takes jobs from**; `vk-hub keys create
   --gitlab NAME [--projects ID:PATH,…]` limits a jobs key to that instance's jobs and those
   projects.
+- **`vk-hub namespaces` declares, per registry, which jobs may read, write or lock under which
+  path prefix**, by GitLab instance, project, ref and protection.
 - **`vk-hub registries set-url` and `vk-hub token create --kind registry --url` tell the hub
   which URL nodes reach a registry at.**
 

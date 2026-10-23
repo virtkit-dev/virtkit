@@ -403,6 +403,27 @@ instance's, naming a project (ID not 0), and with `--projects` only those projec
 path both; anything else is 403. Keys bound to none submit as before, and their jobs get no
 token.
 
+**Namespaces.** `vk-hub namespaces list|show <registry> [<name>]`, `namespaces add <registry>
+<name> --path <template> [--retention-days <n>] --grant <rights>:<subject> [--grant …]` (adding
+an existing name replaces it) and `namespaces remove <registry> <name>`, audited under the
+registry. A registry holds at most 64 namespaces, a token's grants. A path is a repository name
+whose components may be `{gitlab}`, `{project_id}`, `{pipeline_id}` or `{protection}` whole; it
+starts with a fixed component. Rights are some of `r`, `w`, `l`. A subject is comma-separated
+terms that must all hold:
+
+| Term | Selects |
+|---|---|
+| `*` | any job |
+| `own project`, `own pipeline` | any job, the path naming its own through `{gitlab}` and `{project_id}` or `{pipeline_id}`, which the hub checks |
+| `gitlab <name>` | jobs from that instance |
+| `projects <glob>`, `project-id <n>` | that project, beside `gitlab <name>`: `*` stays within a path component, `**` crosses them |
+| `ref <glob>` | that ref; with `w` or `l`, only beside `protected` |
+| `protected`, `unprotected` | that protection |
+
+A retention (1 to 3650 days) covers the path's leading fixed components, so the path has no
+fixed component after a placeholder, and it is refused where it would reach into another
+namespace asking for another window.
+
 **Registry URLs.** `vk-hub token create --kind registry --url <url>` binds the enrolling
 registry to the URL its clients reach it at; `vk-hub registries set-url <id> <url>|--none`
 changes it, and `registries show` prints it. A URL is `http(s)://host[:port]`, and one host

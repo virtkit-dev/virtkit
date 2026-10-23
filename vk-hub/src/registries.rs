@@ -510,6 +510,29 @@ pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bo
     Ok(changed)
 }
 
+/// Store namespace `ns` on registry `id` as `actor`.
+pub fn put_namespace(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    ns: &crate::store::NamespaceRow,
+) -> Result<()> {
+    hub.db.put_namespace(id, ns, actor, crate::now_secs())?;
+    hub.changed(id);
+    Ok(())
+}
+
+/// Remove namespace `name` of registry `id` as `actor`; whether there was one.
+pub fn remove_namespace(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<bool> {
+    let removed = hub
+        .db
+        .remove_namespace(id, name, actor, crate::now_secs())?;
+    if removed {
+        hub.changed(id);
+    }
+    Ok(removed)
+}
+
 /// Remove registry `id` as `actor` and end its session; whether there was one.
 pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
     let removed = hub.db.remove_registry(id, actor, crate::now_secs())?;

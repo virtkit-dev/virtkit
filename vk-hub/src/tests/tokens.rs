@@ -9,6 +9,23 @@ fn test_hub() -> Hub {
     Hub::new(Arc::new(Db::open_memory().unwrap()), None)
 }
 
+/// A registry enrolled with key `key`, bound to no URL.
+pub(crate) fn enrolled_registry(hub: &Hub, key: &str) -> String {
+    let now = now_secs();
+    let (token, _) = hub
+        .db
+        .create_token_for(TokenKind::Registry, Duration::from_secs(60), None, "u", now)
+        .unwrap();
+    let RegistryEnrollment::Enrolled { id } = hub
+        .db
+        .enroll_registry(&token, key, "reg", "p", now)
+        .unwrap()
+    else {
+        panic!("not enrolled");
+    };
+    id
+}
+
 /// A registry enrolled at `url` with key `key`.
 pub(crate) fn url_registry(hub: &Hub, url: &str, key: &str) -> String {
     let now = now_secs();
@@ -155,6 +172,18 @@ fn the_token_commands_parse() {
             "gl",
             "https://gitlab.example.com",
         ],
+        &["vk-hub", "namespaces", "list", "r"],
+        &[
+            "vk-hub",
+            "namespaces",
+            "add",
+            "r",
+            "images",
+            "--path",
+            "images",
+            "--grant",
+            "r:*",
+        ],
         &["vk-hub", "registries", "set-url", "r", "https://reg"],
         &["vk-hub", "registries", "set-url", "r", "--none"],
         &[
@@ -195,9 +224,28 @@ fn the_token_commands_parse() {
             "--projects",
             "1:a",
         ],
+        &["vk-hub", "namespaces", "add", "r", "n", "--path", "p"],
     ] {
         assert!(crate::Cli::try_parse_from(bad).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn a_removed_registry_takes_its_namespaces() {
+    let hub = test_hub();
+    let a = enrolled_registry(&hub, "aa");
+    let images = crate::store::NamespaceRow {
+        name: "images".into(),
+        path: "images".into(),
+        retention_days: None,
+        grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
+        created_at: 1,
+        created_by: "u".into(),
+    };
+    hub.db.put_namespace(&a, &images, "u", 1).unwrap();
+    assert!(!hub.db.namespaces(&a).unwrap().is_empty());
+    assert!(hub.db.remove_registry(&a, "u", now_secs()).unwrap());
+    assert!(hub.db.namespaces(&a).unwrap().is_empty());
 }
 
 #[test]

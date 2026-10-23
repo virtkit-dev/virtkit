@@ -39,6 +39,7 @@ mod rollout;
 mod server;
 mod session;
 mod store;
+mod subject;
 mod tools;
 mod ui;
 mod workloads;
@@ -173,6 +174,21 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: Option<GitlabsCmd>,
+    },
+    /// List, add and remove a registry's namespaces: who may read, write or lock under which
+    /// path prefix
+    ///
+    /// A placed job's registry token carries what the namespaces selecting it grant. A path
+    /// is a repository name whose components may be {gitlab}, {project_id}, {pipeline_id} or
+    /// {protection}; a grant is <rights>:<subject>, rights some of r, w and l, the subject
+    /// comma-separated terms among *, own project, own pipeline, gitlab <name>,
+    /// projects <glob>, project-id <n>, ref <glob>, protected and unprotected. Projects and
+    /// project IDs go with gitlab <name>: they repeat across GitLab instances.
+    Namespaces {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: NamespacesCmd,
     },
     /// Issue, list and revoke the API keys automation such as vk-gitlab places jobs with
     Keys {
@@ -465,6 +481,34 @@ enum GitlabsCmd {
     Add { name: String, url: String },
     /// Remove an instance no working key is bound to
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum NamespacesCmd {
+    /// List a registry's namespaces
+    List {
+        /// The registry's ID
+        registry: String,
+    },
+    /// Show one namespace
+    Show { registry: String, name: String },
+    /// Add a namespace, or replace one of that name
+    Add {
+        registry: String,
+        name: String,
+        /// The path template, as ci-pipeline/{gitlab}/{project_id}/{pipeline_id}
+        #[arg(long)]
+        path: String,
+        /// Drop tags idle under the path's leading fixed components for this many days, 1 to
+        /// 3650; the registry applies it only with gc in its [hub] allow, within its own floors
+        #[arg(long, value_name = "DAYS")]
+        retention_days: Option<u64>,
+        /// A grant line, <rights>:<subject>, as 'rw:own project' or 'r:*'; repeat for several
+        #[arg(long = "grant", value_name = "LINE", required = true)]
+        grants: Vec<String>,
+    },
+    /// Remove a namespace
+    Remove { registry: String, name: String },
 }
 
 pub(crate) fn parse_scope(s: &str) -> Result<store::Scope, String> {
@@ -1081,6 +1125,10 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Gitlabs { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || gitlabs_blocking(&client, cmd)).await?
+        }
+        Cmd::Namespaces { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || namespaces_blocking(&client, cmd)).await?
         }
         Cmd::Keys { config, cmd } => {
             keys_cmd(
@@ -1736,6 +1784,55 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
                 bail!("there is no GitLab instance {name}");
             }
             eprintln!("vk-hub: removed GitLab instance {name}");
+        }
+    }
+    Ok(())
+}
+
+/// `vk-hub namespaces` and its subcommands, which block on the admin socket.
+fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()> {
+    let show = |ns: &store::NamespaceRow| {
+        let mut out = format!("{} {}", ns.name, ns.path);
+        if let Some(d) = ns.retention_days {
+            out.push_str(&format!(" (retention {d} days)"));
+        }
+        out.push('\n');
+        for g in &ns.grants {
+            out.push_str(&format!("  {g}\n"));
+        }
+        out
+    };
+    match cmd {
+        NamespacesCmd::List { registry } => {
+            for ns in client.namespaces(&registry)? {
+                print!("{}", show(&ns));
+            }
+        }
+        NamespacesCmd::Show { registry, name } => {
+            let Some(ns) = client
+                .namespaces(&registry)?
+                .into_iter()
+                .find(|n| n.name == name)
+            else {
+                bail!("registry {registry} has no namespace {name}");
+            };
+            print!("{}", show(&ns));
+        }
+        NamespacesCmd::Add {
+            registry,
+            name,
+            path,
+            retention_days,
+            grants,
+        } => {
+            let ns = client.put_namespace(&registry, &name, &path, retention_days, grants)?;
+            print!("{}", show(&ns));
+        }
+        NamespacesCmd::Remove { registry, name } => {
+            if !client.remove_namespace(&registry, &name)? {
+                bail!("registry {registry} has no namespace {name}");
+            }
+            eprintln!("vk-hub: removed namespace {name}");
         }
     }
     Ok(())

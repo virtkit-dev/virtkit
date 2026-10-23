@@ -150,6 +150,21 @@ enum Call {
         id: String,
         url: Option<String>,
     },
+    ListNamespaces {
+        id: String,
+    },
+    /// Add a namespace, or replace one of that name.
+    PutNamespace {
+        id: String,
+        name: String,
+        path: String,
+        retention_days: Option<u64>,
+        grants: Vec<String>,
+    },
+    RemoveNamespace {
+        id: String,
+        name: String,
+    },
     ListGitlabs,
     AddGitlab {
         name: String,
@@ -564,6 +579,46 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             }
             serde_json::to_value(changed)?
         }
+        Call::ListNamespaces { id } => serde_json::to_value(hub.db.namespaces(&id)?)?,
+        Call::PutNamespace {
+            id,
+            name,
+            path,
+            retention_days,
+            grants,
+        } => {
+            let grants = grants
+                .iter()
+                .map(|g| crate::store::NsGrant::parse(g))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!(e))?;
+            let ns = crate::store::NamespaceRow {
+                name,
+                path,
+                retention_days,
+                grants,
+                created_at: crate::now_secs(),
+                created_by: actor.clone(),
+            };
+            crate::registries::put_namespace(hub, &actor, &id, &ns)?;
+            eprintln!(
+                "vk-hub: admin: {actor} set namespace {} of registry {}",
+                vk_hub_proto::display_safe(&ns.name),
+                vk_hub_proto::display_safe(&id)
+            );
+            serde_json::to_value(ns)?
+        }
+        Call::RemoveNamespace { id, name } => {
+            let removed = crate::registries::remove_namespace(hub, &actor, &id, &name)?;
+            if removed {
+                eprintln!(
+                    "vk-hub: admin: {actor} removed namespace {} of registry {}",
+                    vk_hub_proto::display_safe(&name),
+                    vk_hub_proto::display_safe(&id)
+                );
+            }
+            serde_json::to_value(removed)?
+        }
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
         Call::AddGitlab { name, url } => {
             let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
@@ -801,6 +856,35 @@ impl Client {
         self.call(Call::SetRegistryUrl {
             id: id.to_string(),
             url,
+        })
+    }
+
+    pub fn namespaces(&self, id: &str) -> Result<Vec<crate::store::NamespaceRow>> {
+        self.call(Call::ListNamespaces { id: id.to_string() })
+    }
+
+    pub fn put_namespace(
+        &self,
+        id: &str,
+        name: &str,
+        path: &str,
+        retention_days: Option<u64>,
+        grants: Vec<String>,
+    ) -> Result<crate::store::NamespaceRow> {
+        self.call(Call::PutNamespace {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            retention_days,
+            grants,
+        })
+    }
+
+    /// Whether there was one.
+    pub fn remove_namespace(&self, id: &str, name: &str) -> Result<bool> {
+        self.call(Call::RemoveNamespace {
+            id: id.to_string(),
+            name: name.to_string(),
         })
     }
 

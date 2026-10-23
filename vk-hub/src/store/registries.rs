@@ -307,6 +307,7 @@ impl Db {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(REGISTRIES)?.remove(id)?.is_some();
         if removed {
+            super::namespaces::remove_namespaces_of(&txn, id)?;
             let (start, end) = command_range(id);
             txn.open_table(REGISTRY_COMMANDS)?
                 .retain_in(start.as_str()..end.as_str(), |_, _| false)?;
