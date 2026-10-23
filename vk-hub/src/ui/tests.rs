@@ -3485,7 +3485,7 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         assert!(
             page.contains(
                 "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
-                 <a href=\"/jobs\">Jobs</a><a href=\"/clients\">Clients</a>\
+                 <a href=\"/jobs\">Jobs</a><a href=\"/clients\">Connections</a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -3980,7 +3980,7 @@ async fn api_keys_and_their_clients_are_shown_live() {
     use vk_hub_proto::client::{ClientHello, ClientRunner};
     let (addr, hub, _) = start_fleet().await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await;
+    let page = get(addr, "/clients?tab=other", Some(&viewer)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body.contains("<code>vk-hub keys create</code>"),
@@ -4046,9 +4046,9 @@ async fn api_keys_and_their_clients_are_shown_live() {
 
     for role in [Role::Viewer, Role::Operator] {
         let (cookie, _) = sign_in(addr, &hub, role).await;
-        let page = get(addr, "/clients", Some(&cookie)).await.body;
+        let page = get(addr, "/clients?tab=other", Some(&cookie)).await.body;
         for want in [
-            "<a href=\"/jobs\">Jobs</a><a href=\"/clients\" aria-current=\"page\">Clients</a>",
+            "<a href=\"/jobs\">Jobs</a><a href=\"/clients\" aria-current=\"page\">Connections</a>",
             "sse-connect=\"/events/clients\"",
             &format!("<a href=\"/jobs?key={id}\">1</a>"),
             "ci-1&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;&lt;img",
@@ -4100,7 +4100,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
                 &max_mem=16G&max_cpus=8&max_disk=&ttl=30";
 
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await;
+    let page = get(addr, "/clients?tab=other", Some(&viewer)).await;
     assert!(!page.body.contains("value=\"create\""), "{}", page.body);
     let form = format!("_csrf={viewer_csrf}&{good}");
     let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
@@ -4108,7 +4108,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
     assert!(reply.body.contains("operator role"), "{}", reply.body);
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await;
+    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
     for want in [
         "<form class=\"wide\" method=\"post\" action=\"/clients\">",
         "<input type=\"hidden\" name=\"op\" value=\"create\">",
@@ -4217,7 +4217,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
 
     let event = next_with(&mut live, "<td>gitlab</td>").await;
     assert!(!event.contains(&key), "{event}");
-    let page = get(addr, "/clients", Some(&operator)).await;
+    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
     assert!(page.body.contains("<td>gitlab</td>"), "{}", page.body);
     assert!(!page.body.contains(&key), "{}", page.body);
 
@@ -4258,7 +4258,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     assert!(!first.contains("hx-post"), "{first}");
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await;
+    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
     for want in [
         &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
         "<div id=\"flash\"></div>",
@@ -4350,7 +4350,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     );
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/clients?tab=other"));
     assert!(hub.db.api_keys().unwrap().is_empty());
     audited(&hub, "removed 1 revoked or expired API key(s) named gitlab").await;
     next_with(&mut live, "none: create one below").await;
@@ -7774,4 +7774,109 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
         );
         assert!(!body.contains("<script>"), "{query}: {body}");
     }
+}
+
+/// Connections defaults to GitLab servers, showing runner keys, allowed projects and nearest
+/// expiry, with warnings under two weeks and for unbound working jobs keys. Other API clients
+/// have a separate tab.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_list_gitlab_servers_and_their_runner_keys() {
+    use crate::store::{KeyPolicy, ProjectCeiling, Scope};
+    let (addr, hub, _) = start_fleet().await;
+    let now = crate::now_secs();
+    for (name, url) in [
+        ("gl", "https://gitlab.example.com"),
+        ("partner", "https://gitlab.partner.example"),
+        ("idle", "https://gitlab.idle.example"),
+    ] {
+        hub.db.add_gitlab(name, url, "uid 0", now).unwrap();
+    }
+    let key = |name: &str, gitlab: Option<&str>, projects: &[&str], days: u64| {
+        let policy = KeyPolicy {
+            scopes: vec![Scope::Jobs],
+            pools: vec!["*".into()],
+            max_envelope: None,
+            gitlab: gitlab.map(str::to_string),
+            projects: projects
+                .iter()
+                .map(|p| ProjectCeiling::parse(p).unwrap())
+                .collect(),
+        };
+        hub.db
+            .create_api_key(
+                name,
+                &policy,
+                Duration::from_secs(days * 86_400),
+                "uid 0",
+                now,
+            )
+            .unwrap();
+    };
+    key("main-runner", Some("gl"), &[], 180);
+    key(
+        "partner-runner",
+        Some("partner"),
+        &["412:acme/build", "418:acme/release"],
+        9,
+    );
+    key("legacy-runner", None, &[], 30);
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    // While no registry takes the hub's tokens, a key bound to no server misses nothing.
+    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(
+        !body.contains("legacy-runner</strong> submits jobs"),
+        "{body}"
+    );
+    let registry = crate::tests::tokens::url_registry(&hub, "https://reg.example.com", "e1");
+    let inventory = vk_hub_proto::registry::Inventory {
+        tokens: true,
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(
+            &registry,
+            crate::store::RegistryWrite::Inventory(inventory),
+            now,
+        )
+        .unwrap();
+    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    for want in [
+        "<h1>Connections</h1>",
+        "aria-current=\"page\">GitLab</a>",
+        "<strong>gl</strong><div class=\"sub\">https://gitlab.example.com</div>",
+        "main-runner</td><td>All projects</td>",
+        "partner-runner</td><td>acme/build, acme/release</td><td><span class=\"badge warn\">",
+        "<strong>idle</strong>",
+        "<strong>legacy-runner</strong> submits jobs but is connected to no GitLab server",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    assert!(!body.contains("<h2>API keys</h2>"), "{body}");
+    // Unknown tab values select GitLab and are not reflected in the page.
+    for query in ["?tab=bogus", "?tab=%3Cscript%3E"] {
+        let body = get(addr, &format!("/clients{query}"), Some(&viewer))
+            .await
+            .body;
+        assert!(
+            body.contains("aria-current=\"page\">GitLab</a>"),
+            "{query}: {body}"
+        );
+        assert!(!body.contains("<script>"), "{query}: {body}");
+    }
+    // A server's URL is escaped.
+    hub.db
+        .add_gitlab("odd", "https://<script>.example.com", "uid 0", now)
+        .unwrap();
+    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(
+        body.contains("https://&lt;script&gt;.example.com"),
+        "{body}"
+    );
+    assert!(!body.contains("<script>"), "{body}");
+    let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
+    assert!(
+        other.contains("aria-current=\"page\">Other API clients</a>")
+            && other.contains("<h2>API keys</h2>"),
+        "{other}"
+    );
 }

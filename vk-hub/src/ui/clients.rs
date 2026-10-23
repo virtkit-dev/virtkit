@@ -28,7 +28,7 @@ use super::fleet::{self, FleetSite};
 use super::html::Html;
 use super::pages::{self, csrf_field};
 use super::sse;
-use super::{Auth, Body, Ui, actions, blocking, field, message, page};
+use super::{Auth, Body, Ui, actions, blocking, field, page};
 use crate::clients::{InstanceView, KeyView};
 use crate::server::Hub;
 use crate::store::{
@@ -48,14 +48,37 @@ const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
 /// Where the key page suggests vk-gitlab keeps it.
 const KEY_FILE: &str = "/etc/vk-gitlab/hub.key";
 
-/// `GET /clients`. An operator's page sets the session's CSRF token as a header around the
-/// flash and the fragment, whose buttons post with it, and has the form that creates a key.
-pub(super) async fn get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    let steer = auth.session.role >= Role::Operator;
+/// The other API clients' tab: the keys and their instances.
+pub(super) const OTHER: &str = "/clients?tab=other";
+
+/// `GET /clients[?tab=other]`: Connections. Its GitLab tab, the default, lists the GitLab
+/// servers the hub takes jobs from and the runner keys bound to each; its other tab is the
+/// API keys and the client instances using them.
+pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    let form = super::decode_form(query.unwrap_or("").as_bytes());
+    let other = field(&form, "tab") == Some("other");
     let hub = ui.hub.clone();
-    let views = blocking(move || crate::clients::views(&hub)).await?;
+    let (views, gitlabs, tokens) = blocking(move || {
+        let tokens = hub.db.registries()?.iter().any(|(_, r)| r.takes_tokens());
+        Ok::<_, anyhow::Error>((crate::clients::views(&hub)?, hub.db.gitlabs()?, tokens))
+    })
+    .await?;
     let mut main = Html::new();
-    main.raw("<h1>Clients</h1>");
+    main.raw("<h1>Connections</h1><nav class=\"tabs\" aria-label=\"Connection kinds\">")
+        .raw("<a href=\"")
+        .raw(PATH)
+        .raw("\"")
+        .raw(if other { "" } else { " aria-current=\"page\"" })
+        .raw(">GitLab</a><a href=\"")
+        .raw(OTHER)
+        .raw("\"")
+        .raw(if other { " aria-current=\"page\"" } else { "" })
+        .raw(">Other API clients</a></nav>");
+    if !other {
+        gitlab_tab(&mut main, &gitlabs, &views, tokens, crate::now_secs());
+        return Ok(page(fleet::layout("Connections", PATH, auth, &main)));
+    }
+    let steer = auth.session.role >= Role::Operator;
     if steer {
         // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
         main.raw("<div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
@@ -70,7 +93,114 @@ pub(super) async fn get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
         main.raw("</div>");
         create_form(&mut main, auth);
     }
-    Ok(page(fleet::layout("Clients", PATH, auth, &main)))
+    Ok(page(fleet::layout("Connections", PATH, auth, &main)))
+}
+
+/// A runner key's expiry this close draws a warning.
+const EXPIRY_WARNING: u64 = 14 * 86_400;
+
+/// Each GitLab server's working runner keys, allowed projects and nearest expiry.
+/// Warn about working jobs keys bound to unknown servers. When a registry takes hub tokens
+/// (`tokens`), also warn about unbound jobs keys: their jobs get no registry access.
+fn gitlab_tab(
+    h: &mut Html,
+    gitlabs: &[(String, crate::store::GitlabRow)],
+    views: &[KeyView],
+    tokens: bool,
+    now: u64,
+) {
+    let runners: Vec<&KeyView> = views
+        .iter()
+        .filter(|v| v.row.live(now) && v.row.scopes.contains(&crate::store::Scope::Jobs))
+        .collect();
+    for v in &runners {
+        match &v.row.gitlab {
+            None if tokens => {
+                h.raw("<p class=\"callout warn\"><strong>")
+                    .text(&v.row.name)
+                    .raw("</strong> submits jobs but is connected to no GitLab server: its jobs ")
+                    .raw(
+                        "get no registry access. <code>vk-hub keys create --gitlab</code> makes a ",
+                    )
+                    .raw("key bound to one.</p>");
+            }
+            Some(g) if !gitlabs.iter().any(|(name, _)| name == g) => {
+                h.raw("<p class=\"callout warn\"><strong>")
+                    .text(&v.row.name)
+                    .raw("</strong> is bound to <strong>")
+                    .text(g)
+                    .raw("</strong>, a GitLab server the hub no longer knows.</p>");
+            }
+            _ => {}
+        }
+    }
+    h.raw("<section><h2>GitLab servers</h2>");
+    if gitlabs.is_empty() {
+        h.raw("<p class=\"empty\">None yet: <code>vk-hub gitlabs add &lt;name&gt; &lt;url&gt;</code> ")
+            .raw("adds one, and <code>vk-hub keys create --gitlab &lt;name&gt;</code> binds a ")
+            .raw("runner key to it.</p></section>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>runner keys</th>")
+        .raw("<th>allowed projects</th><th>key expires</th></tr></thead><tbody>");
+    for (name, row) in gitlabs {
+        let keys: Vec<&&KeyView> = runners
+            .iter()
+            .filter(|v| v.row.gitlab.as_deref() == Some(name.as_str()))
+            .collect();
+        h.raw("<tr><td><strong>")
+            .text(name)
+            .raw("</strong><div class=\"sub\">")
+            .text(&row.url)
+            .raw("</div></td><td>");
+        if keys.is_empty() {
+            h.raw("<span class=\"sub\">none</span>");
+        }
+        for (i, v) in keys.iter().enumerate() {
+            if i > 0 {
+                h.raw("<br>");
+            }
+            h.text(&v.row.name);
+        }
+        h.raw("</td><td>");
+        if keys.iter().any(|v| v.row.projects.is_empty()) {
+            h.raw("All projects");
+        } else {
+            let mut paths: Vec<&str> = keys
+                .iter()
+                .flat_map(|v| v.row.projects.iter().map(|p| p.path.as_str()))
+                .collect();
+            paths.sort_unstable();
+            paths.dedup();
+            if paths.is_empty() {
+                h.raw("<span class=\"sub\">none</span>");
+            } else {
+                h.text(paths.join(", "));
+            }
+        }
+        h.raw("</td><td>");
+        let within = |at: u64| {
+            format!(
+                "in {}",
+                crate::human_duration(Duration::from_secs(at.saturating_sub(now))).trim_end()
+            )
+        };
+        match keys.iter().map(|v| v.row.expires_at).min() {
+            Some(at) if at.saturating_sub(now) < EXPIRY_WARNING => {
+                h.raw("<span class=\"badge warn\">");
+                pages::time(h, at, &within(at));
+                h.raw("</span>");
+            }
+            Some(at) => {
+                pages::time(h, at, &within(at));
+            }
+            None => {
+                h.raw("<span class=\"sub\">-</span>");
+            }
+        }
+        h.raw("</td></tr>");
+    }
+    h.raw("</tbody></table></section>");
 }
 
 /// The fragment, as one rendering for every page showing it: with the keys' buttons for an
@@ -301,7 +431,17 @@ pub(super) async fn action(
 /// Its policy is checked as the CLI's: by [`crate::store::Db::create_api_key`], which refuses
 /// a bad name, pool or lifetime, and its limits parsed as the CLI parses them.
 async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
-    let refused = |why: String| message(StatusCode::BAD_REQUEST, &format!("Refused: {why}."));
+    let refused = |why: String| {
+        let mut main = Html::new();
+        main.raw("<p class=\"message\">")
+            .text(format!("Refused: {why}."))
+            .raw("</p><p><a href=\"")
+            .raw(OTHER)
+            .raw("\">Back to the API clients</a></p>");
+        let mut resp = page(fleet::layout("API key", PATH, auth, &main));
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        resp
+    };
     let mut scopes = Vec::new();
     for (_, s) in form.iter().filter(|(k, _)| k == "scope") {
         match crate::parse_scope(s) {
@@ -374,8 +514,8 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
         .raw(KEY_FILE)
         .raw("\"</pre><p class=\"sub\">Add <code>ca_file</code> when the hub's certificate ")
         .raw("is not one the system's roots verify.</p><p><a href=\"")
-        .raw(PATH)
-        .raw("\">Back to the clients</a></p>");
+        .raw(OTHER)
+        .raw("\">Back to the API clients</a></p>");
     Ok(page(fleet::layout("API key", PATH, auth, &main)))
 }
 
@@ -448,7 +588,7 @@ async fn revoke(
     let ids: Vec<String> = keys.iter().map(|v| v.id.clone()).collect();
     let ask = actions::Ask {
         path: PATH.to_string(),
-        back: PATH.to_string(),
+        back: OTHER.to_string(),
         op: op.name().to_string(),
         what: match (op, keys.len()) {
             (KeyOp::Revoke, _) => {
@@ -513,7 +653,7 @@ async fn revoke(
         let mut resp = Response::new(Body::default());
         *resp.status_mut() = StatusCode::SEE_OTHER;
         resp.headers_mut()
-            .insert(header::LOCATION, HeaderValue::from_static(PATH));
+            .insert(header::LOCATION, HeaderValue::from_static(OTHER));
         return Ok(resp);
     }
     let mut h = Html::new();

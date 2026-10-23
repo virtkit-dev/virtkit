@@ -270,7 +270,7 @@ pub(super) async fn get(
             .map(Some);
     }
     if path == super::clients::PATH {
-        return super::clients::get(auth, ui).await.map(Some);
+        return super::clients::get(query, auth, ui).await.map(Some);
     }
     if path == super::jobs::PATH {
         return super::jobs::get(query, auth, &site.jobs, ui, swap)
@@ -742,7 +742,7 @@ const NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
-    (super::clients::PATH, "Clients"),
+    (super::clients::PATH, "Connections"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
 ];
@@ -751,7 +751,7 @@ const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
-    (super::clients::PATH, "Clients"),
+    (super::clients::PATH, "Connections"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
     (super::users::PATH, "Users"),

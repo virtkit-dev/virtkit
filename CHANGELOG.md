@@ -44,6 +44,10 @@ All notable changes to virtkit will be documented in this file.
 - **A registry's page in the hub has Job access and Settings tabs**: its storage areas with
   who may read and publish there in plain words, what keeps their cleanup from applying, and
   its address and signing keys.
+- **The hub's Clients page is now Connections, opening on the GitLab servers**: each one's
+  runner keys, the projects they may submit and the nearest key expiry, and a warning for a
+  jobs key bound to no server, whose jobs get no registry access. The API keys and their
+  instances are its Other API clients tab.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

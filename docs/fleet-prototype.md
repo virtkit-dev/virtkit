@@ -1223,7 +1223,7 @@ provider (see [Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); the API keys and the clients using
-them (`/clients`, below); and the audit log (`/audit`, 100 lines a page; the
+them (`/clients`, *Connections*, below); and the audit log (`/audit`, 100 lines a page; the
 hub keeps the newest 100,000 rows), where an event drops the actor its who column shows and
 names each known node or registry, linked to its page. The log leaves jobs out unless asked:
 its filter, a query string so each view is a link, takes a category (`category=people` for
@@ -1341,17 +1341,22 @@ closes. The output stays scrolled to its end as it grows, unless scrolled up to 
 last 2 MiB of text or so, with a notice for omitted lines and the remaining line numbers intact.
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
-`/clients` shows viewers and operators alike the API keys (see [Placed jobs](#placed-jobs)) and
-the client instances using each. Each key shows its name, first 8 characters, scopes, pools,
-largest envelope, when and by whom it was created, whether it is revoked, expired or when it
-expires, when any of its instances was last heard from, how many instances it has, and how many
-of its jobs the history holds, linked to `/jobs?key=<key ID>`. Each instance shows its key, the
-host, program and version and each runner's name, pool and GitLab URL its latest hello named,
-when it was last heard from — *connected* within the last 180 seconds — and the reservations it
-holds and its jobs queued and running. Requests that named no instance, as an older
-`vk-gitlab`'s, show as the key's *unknown instance*, with when it was last heard from and what
-it holds. What a client said is shown as text, and a runner's URL becomes a link only when it is
-a plain web URL without credentials.
+`/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
+hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,
+the projects they may submit jobs of (*All projects* when one key's ceiling is the whole
+server), and the nearest of their expiries, warned about under 14 days. A working jobs key
+bound to no server is called out above: its jobs get no registry access. Its *Other API
+clients* tab (`/clients?tab=other`) shows viewers and operators alike the API keys (see [Placed
+jobs](#placed-jobs)) and the client instances using each. Each key shows its name, first 8
+characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
+revoked, expired or when it expires, when any of its instances was last heard from, how many
+instances it has, and how many of its jobs the history holds, linked to `/jobs?key=<key ID>`.
+Each instance shows its key, the host, program and version and each runner's name, pool and
+GitLab URL its latest hello named, when it was last heard from — *connected* within the last
+180 seconds — and the reservations it holds and its jobs queued and running. Requests that
+named no instance, as an older `vk-gitlab`'s, show as the key's *unknown instance*, with when
+it was last heard from and what it holds. What a client said is shown as text, and a runner's
+URL becomes a link only when it is a plain web URL without credentials.
 
 Operators create keys there with the same validation as `vk-hub keys create`: a name,
 scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
