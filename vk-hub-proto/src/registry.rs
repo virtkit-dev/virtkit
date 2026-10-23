@@ -155,6 +155,10 @@ pub const ALLOW_GC: &str = "gc";
 /// `[hub] allow`'s value letting the hub update the registry.
 pub const ALLOW_UPDATE: &str = "update";
 
+/// The field a [`Report`] lists among those refused when the registry refused the hub's
+/// retention windows on prefixes.
+pub const REFUSED_PREFIX_RETENTION: &str = "prefix-retention";
+
 /// A registry's load, every heartbeat.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
@@ -260,6 +264,18 @@ pub struct DesiredState {
     /// Run gc on this schedule; `None` schedules none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc: Option<GcPolicy>,
+    /// Retention windows on prefixes, from the hub's namespaces: each may lengthen the
+    /// registry's own window on that prefix, never shorten it, and stays within its floors
+    /// elsewhere. `None` leaves only the registry's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_retention: Option<Vec<PrefixRetention>>,
+}
+
+/// A retention window on the tags under a prefix ([`crate::token::under`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixRetention {
+    pub prefix: String,
+    pub retention_days: u64,
 }
 
 /// A gc schedule: every `every_secs`, with `vk-registry gc`'s windows. A registry refuses an
@@ -505,8 +521,21 @@ mod tests {
                 generation: 2,
                 read_only: Some(false),
                 gc: None,
+                prefix_retention: None,
             }),
             r#"{"type":"desired","generation":2,"read_only":false}"#,
+        );
+        pinned(
+            &HubRegistryMsg::Desired(DesiredState {
+                generation: 3,
+                read_only: None,
+                gc: None,
+                prefix_retention: Some(vec![PrefixRetention {
+                    prefix: "team/a".into(),
+                    retention_days: 90,
+                }]),
+            }),
+            r#"{"type":"desired","generation":3,"prefix_retention":[{"prefix":"team/a","retention_days":90}]}"#,
         );
         pinned(
             &HubRegistryMsg::Command(Command {

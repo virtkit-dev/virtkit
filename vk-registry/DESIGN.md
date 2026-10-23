@@ -678,7 +678,12 @@ set it; the most specific prefix wins. Under such a window `org.virtkit.retentio
 ignored and `org.virtkit.expires` holds only within it, since whoever may push there chose
 them. `vk-registry gc --config` applies the configured windows to the store that config
 names. A window replaces the store-wide retention while a pass removes tags by age at all,
-and a tag it governs is one the size limit may drop, as any tag only age keeps.
+and a tag it governs is one the size limit may drop, as any tag only age keeps. With gc in
+`[hub] allow`, the hub may lengthen a configured window, and set windows on other prefixes no
+shorter than `[hub] min_retention_days` nor than a configured window covering them; anything
+else it asks is refused and reported as `prefix-retention`. Under a window the hub set, `keep`
+and `expires` hold as they do store-wide, against the size limit too: a hub cannot drop a tag
+pinned there, nor one before its date.
 
 ## Guest credential proxy
 

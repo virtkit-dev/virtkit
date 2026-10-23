@@ -9,6 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - **`[[gc.prefix]]` sets an idle retention window per repository prefix** (repositories and
   the files under `/dav/files/<prefix>/`). `keep` and `expires` annotations hold only within
   it. `vk-registry gc --config` applies it too.
+- **A hub allowed `gc` may set retention windows on prefixes**: it may lengthen a registry's
+  own window, and set windows on other prefixes no shorter than `min_retention_days` nor than
+  the registry's own window covering it. `keep` and `expires` annotations hold under a window
+  the hub sets on another prefix.
 
 ### Fixed
 

@@ -227,7 +227,8 @@ const KEYS: &[Key] = &[
         name: "retention_days",
         help: "drop their tags once idle this long, below the hub's\n\
                floors if need be; keep and expires annotations\n\
-               hold only within it",
+               hold only within it (a window the hub sets on\n\
+               another prefix leaves them holding)",
     },
 ];
 

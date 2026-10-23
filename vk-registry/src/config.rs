@@ -425,6 +425,7 @@ impl ServerConfig {
             upstreams,
             max_connections: self.max_connections,
             settings: self.hub.clone(),
+            gc_prefixes: self.gc_prefixes.clone(),
             config_hash: vk_hub_proto::to_hex(&Sha256::digest(described.as_bytes()))[..16]
                 .to_string(),
         }

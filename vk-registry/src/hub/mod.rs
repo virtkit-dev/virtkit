@@ -27,13 +27,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use vk_hub_proto::registry::{
     ALLOW_GC, ALLOW_READ_ONLY, Command, DesiredState, GcPolicy, GcRun, Heartbeat, Inventory,
-    Operation, Report, Usage,
+    Operation, REFUSED_PREFIX_RETENTION, Report, Usage,
 };
 use vk_hub_proto::{CommandAck, EnrollRequest, Outcome};
 use vk_peer::identity::Identity;
 
-use crate::ServerState;
-use crate::config::HubSettings;
+use crate::config::{GcPrefix, HubSettings};
+use crate::{PrefixWindow, ServerState};
 pub use state::Persisted;
 pub use update::{Start, on_start};
 
@@ -221,6 +221,8 @@ pub struct Facts {
     pub upstreams: Vec<String>,
     pub max_connections: usize,
     pub settings: HubSettings,
+    /// `[[gc.prefix]]`: the windows the hub may lengthen, never shorten.
+    pub gc_prefixes: Vec<GcPrefix>,
     pub config_hash: String,
 }
 
@@ -247,6 +249,7 @@ pub(crate) struct Link {
 /// then apply what the hub last asked and keep a session with it.
 pub fn start(state: Arc<ServerState>, ctx: Facts) {
     restore_read_only(&dir(&state.store.root), &state, &ctx.settings);
+    restore_prefix_windows(&dir(&state.store.root), &state, &ctx);
     tokio::spawn(async move {
         let root = state.store.root.clone();
         let dir = dir(&root);
@@ -311,6 +314,64 @@ fn last_asked(dir: &Path) -> Option<(Enrollment, Option<DesiredState>)> {
         }
     };
     Some((enrollment, applied))
+}
+
+/// Apply the retention windows the hub last set, before `serve` takes a connection, whether
+/// or not its link to the hub opens.
+fn restore_prefix_windows(dir: &Path, state: &ServerState, ctx: &Facts) {
+    let applied = last_asked(dir).and_then(|(_, applied)| applied);
+    state
+        .store
+        .set_prefix_windows(prefix_windows(ctx, applied.as_ref()).0);
+}
+
+/// The retention windows under prefixes: the config's `[[gc.prefix]]`, lengthened by what
+/// `desired` asks when `[hub] allow` lists gc, and the hub's own on other prefixes when no
+/// shorter than the store-wide floor and than the config's window covering them. Whether
+/// anything the hub asked was refused.
+fn prefix_windows(ctx: &Facts, desired: Option<&DesiredState>) -> (Vec<PrefixWindow>, bool) {
+    let own: Vec<PrefixWindow> = ctx.gc_prefixes.iter().map(PrefixWindow::from).collect();
+    let mut windows = own.clone();
+    let asked = desired
+        .and_then(|d| d.prefix_retention.as_deref())
+        .unwrap_or_default();
+    if asked.is_empty() {
+        return (windows, false);
+    }
+    if !ctx.settings.allows(ALLOW_GC) {
+        return (windows, true);
+    }
+    let days = |d: u64| Duration::from_secs(d.saturating_mul(86_400));
+    let mut refused = false;
+    for r in asked {
+        let window = days(r.retention_days);
+        let own_prefix = ctx.gc_prefixes.iter().any(|p| p.path == r.prefix);
+        // Below its floor otherwise: the store-wide one, and the config's own window on a
+        // prefix covering this one, which a sub-prefix must not shorten.
+        let floor = crate::prefix_window(&own, &r.prefix)
+            .map_or(Duration::ZERO, |w| w.window)
+            .max(days(ctx.settings.min_retention_days));
+        if !vk_hub_proto::token::valid_prefix(&r.prefix) || r.retention_days == 0 {
+            refused = true;
+        } else if own_prefix {
+            // Lengthened, never shortened, and still the config's own.
+            if let Some(w) = windows.iter_mut().find(|w| w.prefix == r.prefix) {
+                w.window = w.window.max(window);
+            }
+        } else if window < floor {
+            refused = true;
+        } else if let Some(w) = windows.iter_mut().find(|w| w.prefix == r.prefix) {
+            // Listed twice by the hub: the longer one.
+            w.window = w.window.max(window);
+        } else {
+            windows.push(PrefixWindow {
+                prefix: r.prefix.clone(),
+                window,
+                keep_holds: true,
+            });
+        }
+    }
+    (windows, refused)
 }
 
 /// The link for an enrolled registry, with what the hub last asked applied; `None` when it
@@ -421,6 +482,15 @@ impl Link {
             );
         }
         self.state.store.set_read_only(read_only);
+        let (windows, refused) = prefix_windows(&self.ctx, Some(desired));
+        if refused {
+            eprintln!(
+                "vk-registry: hub: a retention window on a prefix refused: gc is not in \
+                 [hub] allow, or the window is below [hub] min_retention_days or the \
+                 [[gc.prefix]] window covering it"
+            );
+        }
+        self.state.store.set_prefix_windows(windows);
     }
 
     /// Apply desired state the hub sent, if newer than what was applied.
@@ -449,6 +519,9 @@ impl Link {
             }
             if d.gc.is_some() && self.taken_gc(d).is_none() {
                 refused.push(ALLOW_GC.to_string());
+            }
+            if prefix_windows(&self.ctx, Some(d)).1 {
+                refused.push(REFUSED_PREFIX_RETENTION.to_string());
             }
         }
         Report {
@@ -759,6 +832,7 @@ mod tests {
             upstreams: Vec::new(),
             max_connections: 1,
             settings,
+            gc_prefixes: Vec::new(),
             config_hash: String::new(),
         };
         Arc::new(open(&dir(root), &state, &facts).unwrap().unwrap())
@@ -784,6 +858,7 @@ mod tests {
                 retention_days,
                 grace_days,
             }),
+            prefix_retention: None,
         }
     }
 
@@ -865,6 +940,7 @@ mod tests {
                 generation: 1,
                 read_only: Some(true),
                 gc: None,
+                prefix_retention: None,
             })
             .unwrap();
         assert!(first.state.store.read_only());
@@ -894,6 +970,7 @@ mod tests {
             generation,
             read_only: Some(read_only),
             gc: None,
+            prefix_retention: None,
         };
         link.apply_desired(read_only(1, false)).unwrap();
         assert!(link.report().refused.is_empty());
@@ -975,6 +1052,7 @@ mod tests {
                 generation: 1,
                 read_only: Some(true),
                 gc: None,
+                prefix_retention: None,
             })
             .unwrap();
         let state = server_state(&root);
@@ -1003,6 +1081,7 @@ mod tests {
             generation: 1,
             read_only: Some(true),
             gc: None,
+            prefix_retention: None,
         };
         assert!(link.apply_desired(desired).is_err());
         mode(0o700).unwrap();
@@ -1058,5 +1137,133 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(kept, vec![std::ffi::OsString::from("1".repeat(64))]);
+    }
+
+    /// The windows the hub sets take effect, a refused one is reported, and on restart they
+    /// are restored from what that hub last asked, never from what another hub did.
+    #[test]
+    fn prefix_windows_are_applied_reported_and_restored() {
+        let root = enrolled("prefix-windows");
+        let ctx = facts(allowing_gc(), Vec::new());
+        let state = server_state(&root);
+        let link = open(&dir(&root), &state, &ctx).unwrap().unwrap();
+        let windows = |state: &ServerState| -> Vec<(String, u64)> {
+            state
+                .store
+                .prefix_windows()
+                .into_iter()
+                .map(|w| (w.prefix, w.window.as_secs() / 86_400))
+                .collect()
+        };
+        let images = vec![("images".to_string(), 10)];
+        link.apply_desired(retention(&[("images", 10)])).unwrap();
+        assert_eq!(windows(&state), images);
+        assert!(link.report().refused.is_empty());
+        link.apply_desired(DesiredState {
+            generation: 2,
+            ..retention(&[("images", 10), ("ci", 1)])
+        })
+        .unwrap();
+        assert_eq!(
+            windows(&state),
+            images,
+            "the window below the floor is left out"
+        );
+        assert_eq!(
+            link.report().refused,
+            vec![REFUSED_PREFIX_RETENTION.to_string()]
+        );
+
+        let state = server_state(&root);
+        restore_prefix_windows(&dir(&root), &state, &ctx);
+        assert_eq!(windows(&state), images);
+
+        // Enrolled with another hub since: what the first one set is not restored.
+        let enrollment = Enrollment {
+            hub: "https://other-hub.invalid".into(),
+            registry_id: "1".repeat(32),
+            ca: false,
+        };
+        std::fs::write(
+            dir(&root).join(ENROLLMENT_FILE),
+            serde_json::to_vec(&enrollment).unwrap(),
+        )
+        .unwrap();
+        let state = server_state(&root);
+        restore_prefix_windows(&dir(&root), &state, &ctx);
+        assert!(windows(&state).is_empty(), "no windows from another hub");
+    }
+
+    fn facts(settings: HubSettings, gc_prefixes: Vec<GcPrefix>) -> Facts {
+        Facts {
+            listen: String::new(),
+            tls: false,
+            mode: "shared-secret",
+            webdav: false,
+            upstreams: Vec::new(),
+            max_connections: 1,
+            settings,
+            gc_prefixes,
+            config_hash: String::new(),
+        }
+    }
+
+    fn retention(pairs: &[(&str, u64)]) -> DesiredState {
+        DesiredState {
+            generation: 1,
+            prefix_retention: Some(
+                pairs
+                    .iter()
+                    .map(|(p, d)| vk_hub_proto::registry::PrefixRetention {
+                        prefix: (*p).into(),
+                        retention_days: *d,
+                    })
+                    .collect(),
+            ),
+            ..DesiredState::default()
+        }
+    }
+
+    /// The hub lengthens the config's prefix windows, never shortens them, directly or
+    /// through a sub-prefix, and adds its own only within the store-wide floor, and only with
+    /// gc in `[hub] allow`.
+    #[test]
+    fn the_hub_lengthens_prefix_windows_within_the_floors() {
+        let own = vec![GcPrefix {
+            path: "ci-pipeline".into(),
+            retention_days: 2,
+        }];
+        let days = |w: &PrefixWindow| w.window.as_secs() / 86_400;
+        let ctx = facts(allowing_gc(), own.clone());
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("ci-pipeline", 1)])));
+        assert_eq!((w.len(), days(&w[0]), refused), (1, 2, false));
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("ci-pipeline", 5)])));
+        assert_eq!((days(&w[0]), refused), (5, false));
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("images", 3)])));
+        assert_eq!((w.len(), refused), (1, true), "below min_retention_days");
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("images", 10)])));
+        assert_eq!((w.len(), days(&w[1]), refused), (2, 10, false));
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("Bad", 10)])));
+        assert_eq!((w.len(), refused), (1, true));
+        // A sub-prefix of the config's own window is held to it, not only to the floor.
+        let images = vec![GcPrefix {
+            path: "images".into(),
+            retention_days: 90,
+        }];
+        let ctx90 = facts(allowing_gc(), images);
+        let (w, refused) = prefix_windows(&ctx90, Some(&retention(&[("images/x", 7)])));
+        assert_eq!(
+            (w.len(), refused),
+            (1, true),
+            "below the config's images window"
+        );
+        let (w, refused) = prefix_windows(&ctx90, Some(&retention(&[("images/x", 120)])));
+        assert_eq!((w.len(), days(&w[1]), refused), (2, 120, false));
+        assert!(w[1].keep_holds, "keep holds under a window the hub added");
+        assert!(!w[0].keep_holds, "and not under the config's own");
+        let ctx = facts(HubSettings::default(), own);
+        let (w, refused) = prefix_windows(&ctx, Some(&retention(&[("ci-pipeline", 5)])));
+        assert_eq!((days(&w[0]), refused), (2, true), "gc is not allowed");
+        assert_eq!(prefix_windows(&ctx, None), (w, false));
     }
 }
