@@ -1185,13 +1185,13 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
         (resp.status, resp.code()),
         (410, ErrorCode::ReservationGone)
     );
-    let audit = hub.db.audits(Some(&small.id), 20).unwrap();
-    assert!(
-        audit
-            .iter()
-            .any(|r| r.event == format!("reservation {reservation} on node {} expired", small.id)),
-        "{audit:?}"
-    );
+    // Gone from memory before its audit is written.
+    let expired = format!("reservation {reservation} on node {} expired", small.id);
+    wait_until(|| {
+        let audit = hub.db.audits(Some(&small.id), 20).unwrap();
+        audit.iter().any(|r| r.event == expired)
+    })
+    .await;
 
     // Released: the node is told, and a release of one gone is 204 too.
     let grant = reserve_on(addr, &key, &mut big, 2).await;
