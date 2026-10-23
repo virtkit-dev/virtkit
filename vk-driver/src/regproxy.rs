@@ -57,14 +57,14 @@ impl ProxyCfg {
     /// registry's base URL, and the credential every other `[registry]` client resolves —
     /// a bearer token when one is configured, else the Basic pair.
     pub fn from_registry(rg: &crate::config::Registry) -> Result<Self> {
-        let repo = rg
-            .repo
-            .strip_prefix("http://")
-            .or_else(|| rg.repo.strip_prefix("https://"))
-            .unwrap_or(&rg.repo);
-        let authority = repo.split('/').next().unwrap_or(repo);
-        let scheme = if rg.insecure { "http" } else { "https" };
-        Self::build(format!("{scheme}://{authority}"), Creds::from_registry(rg)?)
+        Self::build(Self::upstream_of(rg)?, Creds::from_registry(rg)?)
+    }
+
+    fn upstream_of(rg: &crate::config::Registry) -> Result<String> {
+        Ok(rg
+            .base_url()
+            .context("the registry proxy needs a remote [registry]")?
+            .0)
     }
 
     fn build(upstream: String, creds: Creds) -> Result<Self> {

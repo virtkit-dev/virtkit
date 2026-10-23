@@ -993,6 +993,29 @@ impl Registry {
         Self::local_root_of(&self.repo)
     }
 
+    /// The remote registry's base URL, `<scheme>://<host>[:<port>]` with the host lowercased,
+    /// and the repository prefix `repo` names below it (no leading or trailing `/`); `None`
+    /// for a local store or a `repo` naming no host.
+    pub fn base_url(&self) -> Option<(String, &str)> {
+        if self.local_root().is_some() {
+            return None;
+        }
+        let repo = self
+            .repo
+            .strip_prefix("https://")
+            .or_else(|| self.repo.strip_prefix("http://"))
+            .unwrap_or(&self.repo);
+        let (authority, prefix) = repo.split_once('/').unwrap_or((repo, ""));
+        if authority.is_empty() {
+            return None;
+        }
+        let scheme = if self.insecure { "http" } else { "https" };
+        Some((
+            format!("{scheme}://{}", authority.to_ascii_lowercase()),
+            prefix.trim_matches('/'),
+        ))
+    }
+
     /// [`Registry::local_root`]'s test applied to a repo string that is not (yet) a
     /// configured registry — the instruction cache's destination, which reaches this from
     /// `[build] cache_registry` or `--cache-registry` and is a store or a server by the
@@ -1257,6 +1280,29 @@ const DEFAULT_WINDOWS_CACHE_IDLE_SECS: u64 = 7 * 24 * 3600;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry(toml: &str) -> Registry {
+        let cfg: Config = toml::from_str(&format!("[registry]\n{toml}")).unwrap();
+        cfg.registry.unwrap()
+    }
+
+    /// One reading of `repo` for every client: the base URL, its host lowercased and its
+    /// scheme from `insecure`, and the repository prefix below it.
+    #[test]
+    fn a_registry_has_one_base_url_and_prefix() {
+        let rg = registry("repo = \"Reg.Example:5000/team/ci/\"\n");
+        assert_eq!(
+            rg.base_url(),
+            Some(("https://reg.example:5000".to_string(), "team/ci"))
+        );
+        let rg = registry("repo = \"http://10.0.0.5:5000\"\ninsecure = true\n");
+        assert_eq!(
+            rg.base_url(),
+            Some(("http://10.0.0.5:5000".to_string(), ""))
+        );
+        assert_eq!(registry("repo = \"/srv/store\"\n").base_url(), None);
+        assert_eq!(registry("repo = \"https:///x\"\n").base_url(), None);
+    }
 
     /// A scratch dir of config files for the load_resolved tests; removed on drop.
     struct Dir(PathBuf);
