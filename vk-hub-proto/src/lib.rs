@@ -2,7 +2,8 @@
 //! `vk-hub` in fleet mode. Shared message types and signing payloads prevent format drift;
 //! each side handles its own transport, storage and crypto.
 //!
-//! Five exchanges exist, and [`registry`] adds a sixth for a registry the hub manages:
+//! Five exchanges exist, and [`registry`] adds a sixth for a registry the hub manages, with
+//! [`token`]'s tokens:
 //!
 //! - **Workloads**: `vk workloads` prints the VMs running on its host for its user as a
 //!   [`WorkloadList`], one JSON document per line, for a local UI or any other reader on the
@@ -25,6 +26,10 @@
 //!   is the definition's tar.
 //! - **The client API** ([`client`]): a job producer holding an API key reserves capacity,
 //!   submits [`job::JobSpec`]s and follows their output and results over HTTP.
+//!
+//! A registry token ([`token`]) grants access to path prefixes on one registry: the hub signs
+//! it, and the registry verifies it against the token keys the hub sends in its desired state,
+//! without calling the hub back.
 //!
 //! **Versioning.** Each side of a session speaks a [`VersionRange`], and the hub picks the
 //! highest version both ranges contain ([`VersionRange::negotiate`]); every message after the
@@ -80,7 +85,8 @@
 //! run` starts, and the ID the hub gives each [`Command`]. Keys, signatures and nonces are
 //! lowercase hex too, read with [`from_hex_lower`], except a release key's and its signature,
 //! which are base64 ([`to_base64`]) in configuration, beside a binary and in
-//! [`Operation::Update`].
+//! [`Operation::Update`]. A token key ([`token::TokenKey`]) is base64 too, and a token
+//! base64url ([`token::to_base64url`]).
 //! Timestamps are seconds since the Unix epoch.
 
 use std::collections::BTreeMap;
@@ -92,6 +98,7 @@ pub mod dispatch;
 pub mod job;
 pub mod registry;
 pub mod stamp;
+pub mod token;
 
 /// Where a node enrolls.
 pub const ENROLL_PATH: &str = "/v1/enroll";
