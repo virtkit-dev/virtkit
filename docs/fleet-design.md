@@ -130,6 +130,10 @@ sets which operations the hub may run.
 The node reports a hash of its effective configuration, and its node page shows it, so drift
 between nodes that should match is visible.
 
+Proposed for the long term: the hub holds the configuration as signed bundles, with an
+offline fleet root signing what the hub may not grant itself. See
+[the trust model](trust-model.md).
+
 ## Inventory
 
 Every node reports, keeping hard facts, measured load and operator policy apart:
@@ -449,6 +453,7 @@ model, commands and process handling.
 - CI tools definitions are not signed: a compromised hub can put binaries of its choosing into
   job VMs, which see the job's token, sources and secrets. It cannot have them run on a node's
   host where the node requires signed releases: such a node never runs them outside a VM.
+  Proposed: they become signed recipes ([the trust model](trust-model.md#recipes)).
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list). With
   [GitLab jobs](#gitlab-jobs), runner tokens are `vk-gitlab`'s alone and leave no node.
