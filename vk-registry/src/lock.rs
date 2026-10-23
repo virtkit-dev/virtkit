@@ -186,15 +186,16 @@ impl LockManager {
         crate::accounts::random_token(16)
     }
 
-    /// Atomically take ALL `names` for `ttl`, or none (reaping lapsed leases first).
-    /// Returns the shared batch owner token, or the live blockers if any name is held.
-    /// All-or-nothing under one lock, so acquiring a set never deadlocks against another
-    /// batch regardless of order.
+    /// Atomically take ALL `names` for `ttl`, ending no later than `not_after`, or none
+    /// (reaping lapsed leases first). Returns the shared batch owner token, or the live
+    /// blockers if any name is held. All-or-nothing under one lock, so acquiring a set never
+    /// deadlocks against another batch regardless of order.
     fn try_take_all(
         &self,
         names: &[String],
         ttl: Duration,
         holder: &str,
+        not_after: Option<Instant>,
     ) -> Result<String, Vec<Blocker>> {
         let mut map = self.held.lock().unwrap();
         let now = Instant::now();
@@ -220,7 +221,7 @@ impl LockManager {
                 Held {
                     owner: owner.clone(),
                     holder: holder.to_string(),
-                    expires: now + lease(ttl),
+                    expires: lease_end(now, ttl, not_after),
                 },
             );
         }
@@ -229,18 +230,20 @@ impl LockManager {
 
     /// Acquire ALL `names` atomically, long-polling until the whole set is free or
     /// `deadline`. On timeout nothing is taken and the current blockers are returned. The
-    /// batch shares one owner token; renew/release act on the set. Wakes on a release, and
-    /// at worst every [`MAX_POLL`] so a lapsed lease is reclaimed even if its release
-    /// notification was missed.
+    /// lease runs `ttl` from the grant, cut at `not_after`. The batch shares one owner
+    /// token; renew/release act on the set. Wakes on a release, and at worst every
+    /// [`MAX_POLL`] so a lapsed lease is reclaimed even if its release notification was
+    /// missed.
     pub async fn acquire_all(
         &self,
         names: &[String],
         ttl: Duration,
         holder: &str,
         deadline: Instant,
+        not_after: Option<Instant>,
     ) -> Result<String, Vec<Blocker>> {
         loop {
-            match self.try_take_all(names, ttl, holder) {
+            match self.try_take_all(names, ttl, holder, not_after) {
                 Ok(owner) => return Ok(owner),
                 Err(blockers) => {
                     let now = Instant::now();
@@ -270,9 +273,16 @@ impl LockManager {
         }
     }
 
-    /// Renew every name in the batch still held by `owner`; returns the count renewed
-    /// (a heartbeat treats fewer than the batch size as "lost the batch").
-    pub fn renew_all(&self, names: &[String], owner: &str, ttl: Duration) -> usize {
+    /// Renew every name in the batch still held by `owner`, for `ttl` cut at `not_after`;
+    /// returns the count renewed (a heartbeat treats fewer than the batch size as "lost the
+    /// batch").
+    pub fn renew_all(
+        &self,
+        names: &[String],
+        owner: &str,
+        ttl: Duration,
+        not_after: Option<Instant>,
+    ) -> usize {
         let mut map = self.held.lock().unwrap();
         let now = Instant::now();
         let mut n = 0;
@@ -281,7 +291,7 @@ impl LockManager {
                 && crate::auth::constant_eq(h.owner.as_bytes(), owner.as_bytes())
                 && h.expires > now
             {
-                h.expires = now + lease(ttl);
+                h.expires = lease_end(now, ttl, not_after);
                 n += 1;
             }
         }
@@ -319,12 +329,14 @@ impl LockManager {
         deadline: Instant,
     ) -> Option<String> {
         let names = [name.to_string()];
-        self.acquire_all(&names, ttl, holder, deadline).await.ok()
+        self.acquire_all(&names, ttl, holder, deadline, None)
+            .await
+            .ok()
     }
 
     /// Extend the lease if `owner` still holds a live lease on `name`.
     pub fn renew(&self, name: &str, owner: &str, ttl: Duration) -> bool {
-        self.renew_all(&[name.to_string()], owner, ttl) == 1
+        self.renew_all(&[name.to_string()], owner, ttl, None) == 1
     }
 
     /// Release `name` if `owner` holds it. `false` if `owner` is not the current holder.
@@ -387,7 +399,7 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
         "/lock/acquire" => {
             let ttl = Duration::from_secs(qparam(&query, "ttl").unwrap_or(DEFAULT_TTL));
             match mgr
-                .acquire_all(&names, ttl, &holder, acquire_deadline(&query))
+                .acquire_all(&names, ttl, &holder, acquire_deadline(&query), None)
                 .await
             {
                 Ok(owner) => {
@@ -415,7 +427,7 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                     r#"{"error":"missing owner"}"#,
                 ));
             };
-            let n = mgr.renew_all(&names, &owner, ttl);
+            let n = mgr.renew_all(&names, &owner, ttl, None);
             let body = serde_json::json!({
                 "renewed": n, "of": names.len(), "ttl": lease(ttl).as_secs(),
             });
@@ -570,6 +582,13 @@ fn lease(ttl: Duration) -> Duration {
     ttl.min(MAX_LEASE_TTL)
 }
 
+/// End of a lease granted or renewed at `now`, with `ttl` capped by [`lease`] and
+/// `not_after`.
+fn lease_end(now: Instant, ttl: Duration, not_after: Option<Instant>) -> Instant {
+    let end = now + lease(ttl);
+    not_after.map_or(end, |n| end.min(n))
+}
+
 /// `/lock/acquire`'s long-poll deadline: now plus the client's `?wait=` (or
 /// [`DEFAULT_WAIT`]), clamped to [`MAX_WAIT`] so a huge wait can't overflow the `Instant`.
 fn acquire_deadline(query: &str) -> Instant {
@@ -620,12 +639,12 @@ mod tests {
         let names = ["k".to_string()];
         let huge = Duration::from_secs(u64::MAX);
         let Ok(owner) = m
-            .acquire_all(&names, huge, "a", now_plus(Duration::ZERO))
+            .acquire_all(&names, huge, "a", now_plus(Duration::ZERO), None)
             .await
         else {
             panic!("a free name must be granted");
         };
-        assert_eq!(m.renew_all(&names, &owner, huge), 1);
+        assert_eq!(m.renew_all(&names, &owner, huge, None), 1);
         assert_eq!(m.release_all(&names, &owner), 1);
         let again = m
             .acquire_all(
@@ -633,6 +652,7 @@ mod tests {
                 Duration::from_secs(30),
                 "b",
                 now_plus(Duration::ZERO),
+                None,
             )
             .await;
         assert!(again.is_ok());
@@ -839,6 +859,7 @@ mod tests {
                 Duration::from_secs(30),
                 "a",
                 now_plus(Duration::from_millis(150)),
+                None,
             )
             .await
         });
@@ -849,6 +870,7 @@ mod tests {
                 Duration::from_secs(30),
                 "b",
                 now_plus(Duration::from_millis(150)),
+                None,
             )
             .await
         });
@@ -903,6 +925,44 @@ mod tests {
         m.record_failure("k", "b", "other", Duration::from_secs(60));
         assert_eq!(m.recent_failure("k", "a").unwrap().reason, "ENOSPC");
         assert_eq!(m.recent_failure("k", "b").unwrap().reason, "other");
+    }
+
+    /// A lease granted after a wait still ends at `not_after`, not a full ttl past the
+    /// grant: a token's lock never outlives the token.
+    #[tokio::test]
+    async fn a_lease_granted_after_a_wait_ends_at_not_after() {
+        let m = LockManager::new();
+        let names = ["k".to_string()];
+        let blocker = m
+            .acquire_all(
+                &names,
+                Duration::from_millis(300),
+                "a",
+                now_plus(Duration::ZERO),
+                None,
+            )
+            .await;
+        assert!(blocker.is_ok());
+        let not_after = now_plus(Duration::from_millis(700));
+        let owner = m
+            .acquire_all(
+                &names,
+                Duration::from_secs(30),
+                "b",
+                now_plus(Duration::from_secs(5)),
+                Some(not_after),
+            )
+            .await
+            .ok()
+            .expect("granted once the blocker's lease lapses");
+        assert_eq!(m.holder("k").as_deref(), Some("b"));
+        // A renewal does not push it past `not_after` either.
+        assert_eq!(
+            m.renew_all(&names, &owner, Duration::from_secs(30), Some(not_after)),
+            1
+        );
+        tokio::time::sleep(not_after.saturating_duration_since(Instant::now())).await;
+        assert_eq!(m.holder("k"), None, "the lease ended at not_after");
     }
 
     /// Past [`MAX_FAIL_RECORDS`] live records, the oldest gives way to the newest.
