@@ -48,6 +48,8 @@ All notable changes to virtkit will be documented in this file.
   runner keys, the projects they may submit and the nearest key expiry, and a warning for a
   jobs key bound to no server, whose jobs get no registry access. The API keys and their
   instances are its Other API clients tab.
+- **A fleet job's page shows its registry access**: rights per storage area in plain words,
+  with token details folded away, or the reason it got none and where to fix it.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

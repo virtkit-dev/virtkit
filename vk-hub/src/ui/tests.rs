@@ -7880,3 +7880,147 @@ async fn connections_list_gitlab_servers_and_their_runner_keys() {
         "{other}"
     );
 }
+
+/// A placed job's page shows rights per storage area in plain words, with token details
+/// folded away and never the token; or the reason it got no access.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_page_says_what_registry_access_the_job_got() {
+    use crate::store::{NoAccess, RegistryAccess};
+    use crate::tests::tokens::token_registry;
+    use vk_hub_proto::client::JobState;
+    use vk_hub_proto::token::Grant;
+    let (addr, hub, _keys) = start_fleet_keys("job").await;
+    let registry = token_registry(&hub, "https://reg.example.com", "c1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let now = crate::now_secs();
+    let grant = |prefix: &str, rights: &str| Grant {
+        prefix: prefix.into(),
+        read: rights.contains('r'),
+        write: rights.contains('w'),
+        lock: rights.contains('l'),
+    };
+    let job = |n: u64, access| {
+        let mut row = history_job(n, "wab/core");
+        row.state = JobState::Running;
+        row.registry_access = Some(access);
+        let id = format!("{n:032x}");
+        hub.db
+            .submit_job(&id, &row, &n.to_string(), b"{}", "key gitlab", now)
+            .unwrap();
+        id
+    };
+    let issued = job(
+        1,
+        RegistryAccess::Issued {
+            registry: registry.clone(),
+            grants: vec![
+                grant("ci-cache/gl/42/protected", "rw"),
+                grant("ci-pipeline/gl/42/7", "rwl"),
+                grant("gone", "r"),
+            ],
+            expires_at: now + 3600,
+            jti: "0b6e5d00000000000000000000001a7".into(),
+        },
+    );
+    let body = get(addr, &format!("/jobs/{issued}"), Some(&viewer))
+        .await
+        .body;
+    for want in [
+        "<h2>Registry access</h2>",
+        &format!(
+            "<span class=\"badge ok\">Issued</span> for <a href=\"/registry/{registry}?tab=access\">reg-1</a>"
+        ),
+        "<li>CI caches: <strong>Read, Publish</strong></li>",
+        "<li>Pipeline storage: <strong>Read, Publish, Coordinate builds</strong></li>",
+        "<li>gone: <strong>Read</strong></li>",
+        "<summary>Technical details</summary>",
+        "<code>ci-pipeline/gl/42/7</code> rwl",
+        "0b6e5d00000000000000000000001a7",
+        "never stored or shown",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    assert!(!body.contains("vkt_"), "{body}");
+    let none = |n, reason, registry: Option<&str>, url: Option<&str>| {
+        job(
+            n,
+            RegistryAccess::None {
+                reason,
+                registry: registry.map(str::to_string),
+                url: url.map(str::to_string),
+            },
+        )
+    };
+    for (id, want) in [
+        (
+            none(2, NoAccess::UnboundKey, None, None),
+            "connected to no GitLab server. <a href=\"/clients\">Connections</a>",
+        ),
+        (
+            none(3, NoAccess::NodeWithoutJobTokens, None, None),
+            "does not announce job tokens",
+        ),
+        (
+            none(
+                4,
+                NoAccess::UnknownRegistry,
+                None,
+                Some("http://10.0.0.9:5000"),
+            ),
+            "<code>http://10.0.0.9:5000</code>, an address no registry is bound to",
+        ),
+        (
+            none(5, NoAccess::RegistryTakesNoTokens, Some(&registry), None),
+            "reg-1</a> does not take the hub's tokens",
+        ),
+        (
+            none(6, NoAccess::NoAppliedKey, Some(&registry), None),
+            "?tab=settings\">reg-1</a> had applied no signing key yet",
+        ),
+        (
+            none(7, NoAccess::MintFailed, None, None),
+            "Minting its token failed",
+        ),
+    ] {
+        let body = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+        assert!(
+            body.contains("<span class=\"badge warn\">Unavailable</span>") && body.contains(want),
+            "{want}: {body}"
+        );
+    }
+    // What a registry reports, and the address a node reported, are escaped.
+    let inventory = vk_hub_proto::registry::Inventory {
+        hostname: "<script>alert(1)</script>".into(),
+        tokens: true,
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(
+            &registry,
+            crate::store::RegistryWrite::Inventory(inventory),
+            now,
+        )
+        .unwrap();
+    for id in [
+        issued.clone(),
+        none(
+            9,
+            NoAccess::UnknownRegistry,
+            None,
+            Some("http://<script>alert(1)</script>"),
+        ),
+    ] {
+        let body = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+        assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
+        assert!(!body.contains("<script>"), "{body}");
+    }
+    // A job placed by an older hub, or not yet, has no such section.
+    let mut row = history_job(8, "wab/core");
+    row.state = JobState::Queued;
+    let old = format!("{:032x}", 8);
+    hub.db
+        .submit_job(&old, &row, "8", b"{}", "key gitlab", now)
+        .unwrap();
+    let body = get(addr, &format!("/jobs/{old}"), Some(&viewer)).await.body;
+    assert!(!body.contains("Registry access"), "{body}");
+}

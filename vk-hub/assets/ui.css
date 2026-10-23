@@ -486,3 +486,8 @@ form.wide details > div { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s
     overflow: visible; flex-shrink: 0;
   }
 }
+
+/* A job's registry access, ending its record. */
+.job-access { margin-top: var(--s4); }
+ul.access { margin: 0 0 var(--s3); padding-left: 1.2rem; }
+ul.access li + li { margin-top: var(--s1); }

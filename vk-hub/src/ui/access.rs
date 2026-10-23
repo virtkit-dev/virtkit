@@ -2,8 +2,31 @@
 //! reading a page, in the UI's vocabulary. A namespace is a storage area, a grant an access
 //! rule; `read`, `write` and `lock` are Read, Publish and Coordinate builds.
 
+use vk_hub_proto::token::Grant;
+
 use crate::store::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant};
 use crate::subject::{Projects, Subject};
+
+/// The placeholders a namespace's path may hold.
+const PLACEHOLDERS: [&str; 4] = ["{gitlab}", "{project_id}", "{pipeline_id}", "{protection}"];
+
+/// Rights in plain words: `Read, Publish, Coordinate builds`, or `No access`.
+pub(super) fn rights(read: bool, write: bool, lock: bool) -> String {
+    let words: Vec<&str> = [
+        (read, "Read"),
+        (write, "Publish"),
+        (lock, "Coordinate builds"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, w)| *w)
+    .collect();
+    if words.is_empty() {
+        "No access".to_string()
+    } else {
+        words.join(", ")
+    }
+}
 
 /// The jobs a subject selects, in plain words: `Every job`, `Each project from gl, its own`,
 /// `Projects under wab/ on gl, protected branches and tags only`. The GitLab instance is named
@@ -91,12 +114,37 @@ pub(super) fn area(ns: &NamespaceRow) -> Area {
     }
 }
 
+/// The grant's source namespace, matched by its path with placeholders filled.
+/// `None` if no namespace matches, for example after a namespace change.
+pub(super) fn source<'a>(
+    namespaces: &'a [NamespaceRow],
+    grant: &Grant,
+) -> Option<&'a NamespaceRow> {
+    namespaces.iter().find(|ns| {
+        let template: Vec<&str> = ns.path.split('/').collect();
+        let prefix: Vec<&str> = grant.prefix.split('/').collect();
+        template.len() == prefix.len()
+            && template
+                .iter()
+                .zip(&prefix)
+                .all(|(t, p)| t == p || PLACEHOLDERS.contains(t))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn subject(text: &str) -> Subject {
         Subject::parse(text).unwrap()
+    }
+
+    #[test]
+    fn rights_read_as_words() {
+        assert_eq!(rights(true, false, false), "Read");
+        assert_eq!(rights(true, true, true), "Read, Publish, Coordinate builds");
+        assert_eq!(rights(false, false, true), "Coordinate builds");
+        assert_eq!(rights(false, false, false), "No access");
     }
 
     #[test]
@@ -195,5 +243,33 @@ mod tests {
         ));
         assert_eq!(cache.label, "CI caches");
         assert!(cache.managed);
+    }
+
+    #[test]
+    fn a_grant_is_traced_to_the_namespace_it_came_from() {
+        let all = [
+            ns("images", "images", &["r:*"]),
+            ns(
+                "project",
+                "p/{gitlab}/{project_id}",
+                &["rw:gitlab gl, own project"],
+            ),
+            ns(
+                CI_PIPELINE,
+                "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}",
+                &["rwl:own project, own pipeline"],
+            ),
+        ];
+        let grant = |prefix: &str| Grant {
+            prefix: prefix.into(),
+            read: true,
+            ..Grant::default()
+        };
+        let name = |prefix| source(&all, &grant(prefix)).map(|n| n.name.as_str());
+        assert_eq!(name("images"), Some("images"));
+        assert_eq!(name("p/gl/1172"), Some("project"));
+        assert_eq!(name("ci-pipeline/gl/1172/30551"), Some(CI_PIPELINE));
+        assert_eq!(name("p/gl"), None);
+        assert_eq!(name("other"), None);
     }
 }

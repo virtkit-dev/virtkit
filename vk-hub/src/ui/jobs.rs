@@ -28,7 +28,9 @@ use super::pages::{self, bytes, mib};
 use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::server::{HEARTBEAT, Hub};
-use crate::store::{JobFilter, JobOutcome, JobPage, JobRow, SUMMARY_JOBS};
+use crate::store::{
+    JobFilter, JobOutcome, JobPage, JobRow, NamespaceRow, NoAccess, RegistryAccess, SUMMARY_JOBS,
+};
 
 /// The page.
 pub(super) const PATH: &str = "/jobs";
@@ -871,18 +873,165 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
                 None => Output::Gone,
             },
         };
-        anyhow::Ok(Some((row, output, hub.db.node_names()?)))
+        let registry = access_registry(&hub, &row)?;
+        anyhow::Ok(Some((row, output, hub.db.node_names()?, registry)))
     })
     .await?;
-    let Some((row, output, names)) = found else {
+    let Some((row, output, names, registry)) = found else {
         return Ok(message(StatusCode::NOT_FOUND, "There is no such job."));
     };
-    let main = job_page(id, &row, &output, &names, crate::now_secs());
+    let main = job_page(
+        id,
+        &row,
+        &output,
+        &names,
+        registry.as_ref(),
+        crate::now_secs(),
+    );
     Ok(page(fleet::layout("Job", PATH, auth, &main)))
 }
 
+/// The job's registry name and namespaces, if still known to the hub.
+/// Namespaces name the job's storage areas.
+pub(super) type AccessRegistry = (String, Vec<NamespaceRow>);
+
+/// [`AccessRegistry`] for job `row`.
+pub(super) fn access_registry(hub: &Hub, row: &JobRow) -> Result<Option<AccessRegistry>> {
+    let (Some(RegistryAccess::Issued { registry, .. })
+    | Some(RegistryAccess::None {
+        registry: Some(registry),
+        ..
+    })) = &row.registry_access
+    else {
+        return Ok(None);
+    };
+    Ok(match hub.db.registry(registry)? {
+        Some(r) => Some((r.hostname, hub.db.namespaces(registry)?)),
+        None => None,
+    })
+}
+
+/// The registry access the job got at its latest placement, ending its record, which follows
+/// a re-placement: per storage area, its rights in plain words, with the token's prefixes,
+/// expiry and ID under *Technical details*; or the one reason it got none, with where to fix
+/// it. `registry` is the registry's name and namespaces, when the hub still knows it.
+fn registry_access(
+    h: &mut Html,
+    access: &RegistryAccess,
+    registry: Option<&(String, Vec<NamespaceRow>)>,
+) {
+    let registry_link = |h: &mut Html, id: &str, suffix: &'static str| {
+        h.raw("<a href=\"")
+            .raw(super::registries::DETAIL_PREFIX)
+            .text(id)
+            .raw(suffix)
+            .raw("\">");
+        match registry {
+            Some((name, _)) if !name.is_empty() => h.node(name),
+            _ => h.text(id.get(..8).unwrap_or(id)),
+        };
+        h.raw("</a>");
+    };
+    h.raw("<section class=\"job-access\"><h2>Registry access</h2>");
+    match access {
+        RegistryAccess::Issued {
+            registry: id,
+            grants,
+            expires_at,
+            jti,
+        } => {
+            h.raw("<p><span class=\"badge ok\">Issued</span> for ");
+            registry_link(h, id, "?tab=access");
+            h.raw("</p><ul class=\"access\">");
+            let namespaces = registry.map(|(_, ns)| ns.as_slice()).unwrap_or(&[]);
+            for g in grants {
+                let label = super::access::source(namespaces, g)
+                    .map(|ns| super::access::label(&ns.name))
+                    .unwrap_or_else(|| g.prefix.clone());
+                h.raw("<li>")
+                    .text(&label)
+                    .raw(": <strong>")
+                    .text(super::access::rights(g.read, g.write, g.lock))
+                    .raw("</strong></li>");
+            }
+            h.raw("</ul><details class=\"fold\"><summary>Technical details</summary><p>");
+            for (i, g) in grants.iter().enumerate() {
+                if i > 0 {
+                    h.raw(" · ");
+                }
+                h.raw("<code>")
+                    .text(&g.prefix)
+                    .raw("</code> ")
+                    .text(g.rights());
+            }
+            h.raw("</p><p class=\"sub\">Expires ");
+            pages::time(h, *expires_at, &crate::utc(*expires_at));
+            h.raw(" · token ID <code>")
+                .text(jti)
+                .raw("</code> · the token itself is never stored or shown.</p></details>");
+        }
+        RegistryAccess::None {
+            reason,
+            registry: id,
+            url,
+        } => {
+            h.raw("<p><span class=\"badge warn\">Unavailable</span></p><p>");
+            match (reason, id) {
+                (NoAccess::UnboundKey, _) => {
+                    h.raw("Its runner key is connected to no GitLab server. <a href=\"")
+                        .raw(super::clients::PATH)
+                        .raw("\">Connections</a>");
+                }
+                (NoAccess::NodeWithoutJobTokens, _) => {
+                    h.raw("Its node does not announce job tokens: it runs an older ")
+                        .raw("<code>vk</code>, or has sent no inventory yet.");
+                }
+                (NoAccess::UnknownRegistry, _) => match url {
+                    Some(url) => {
+                        h.raw("Its node reaches its registry at <code>")
+                            .node(url)
+                            .raw("</code>, an address no registry is bound to. <a href=\"")
+                            .raw(super::registries::PATH)
+                            .raw("\">Registries</a>");
+                    }
+                    None => {
+                        h.raw("Its node names no registry.");
+                    }
+                },
+                (NoAccess::RegistryTakesNoTokens, Some(id)) => {
+                    registry_link(h, id, "?tab=access");
+                    h.raw(" does not take the hub's tokens: <code>[hub] tokens = true</code> ")
+                        .raw("in its config turns it on.");
+                }
+                (NoAccess::NoAppliedKey, Some(id)) => {
+                    registry_link(h, id, "?tab=settings");
+                    h.raw(" had applied no signing key yet.");
+                }
+                (NoAccess::MintFailed, _) => {
+                    h.raw("Minting its token failed: the hub's log says why.");
+                }
+                _ => {
+                    h.raw("The hub gave it none.");
+                }
+            }
+            h.raw("</p>");
+        }
+        RegistryAccess::Unknown => {
+            h.raw("<p>The hub gave it none.</p>");
+        }
+    }
+    h.raw("</section>");
+}
+
 /// A job's page: its record, then its output. While the job runs, both follow it.
-fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], now: u64) -> Html {
+fn job_page(
+    id: &str,
+    j: &JobRow,
+    output: &Output,
+    names: &[(String, String)],
+    registry: Option<&AccessRegistry>,
+    now: u64,
+) -> Html {
     let names: HashMap<&str, &str> = names
         .iter()
         .map(|(id, name)| (id.as_str(), name.as_str()))
@@ -909,13 +1058,13 @@ fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], n
         h.raw("</div><aside id=\"job-record\" sse-swap=\"")
             .raw(job_output::RECORD)
             .raw("\">");
-        record(&mut h, j, &names, now);
+        record(&mut h, j, &names, registry, now);
         h.raw("</aside></div>");
     } else {
         h.raw("<div class=\"job-page\"><div class=\"job-output\">");
         job_output::section(&mut h, j, output, false);
         h.raw("</div><aside id=\"job-record\">");
-        record(&mut h, j, &names, now);
+        record(&mut h, j, &names, registry, now);
         h.raw("</aside></div>");
     }
     h
@@ -950,8 +1099,15 @@ fn ran(h: &mut Html, j: &JobRow, now: u64) {
     };
 }
 
-/// A job's record, as its page shows it.
-pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now: u64) {
+/// A job's displayed record, ending with registry access if recorded. `registry` comes from
+/// [`access_registry`].
+pub(super) fn record(
+    h: &mut Html,
+    j: &JobRow,
+    names: &HashMap<&str, &str>,
+    registry: Option<&AccessRegistry>,
+    now: u64,
+) {
     let result = j.result.as_ref();
     let usage = result.and_then(|r| r.usage);
     pages::section(h, "Job");
@@ -1029,6 +1185,9 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
     pages::kv(h, "Size", &dash_or(size_text(j)));
     pages::kv(h, "Output", &bytes(j.output_len));
     pages::end_section(h);
+    if let Some(access) = &j.registry_access {
+        registry_access(h, access, registry);
+    }
 }
 
 /// What the job's preparation does, whole: the image, and who builds or pulls it when the job
@@ -1167,7 +1326,7 @@ mod tests {
             events: vec![JobEvent::new(JobEventKind::VirtioFsStall, 2, &detail)],
         });
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), 1030);
+        record(&mut h, &j, &HashMap::new(), None, 1030);
         let page = h.into_string();
         let escaped = format!("{}&lt;b&gt;: suspected lost interrupt", "x".repeat(300));
         assert!(
@@ -1195,7 +1354,7 @@ mod tests {
         events_badge(&mut h, &j);
         assert_eq!(h.into_string(), "");
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), 1030);
+        record(&mut h, &j, &HashMap::new(), None, 1030);
         assert!(!h.into_string().contains("<th>Event</th>"));
     }
 
@@ -1210,7 +1369,7 @@ mod tests {
         j.stage = Some(crate::store::PREPARE_STAGE.into());
         let page = |j: &JobRow| {
             let mut h = Html::new();
-            record(&mut h, j, &HashMap::new(), 1030);
+            record(&mut h, j, &HashMap::new(), None, 1030);
             h.into_string()
         };
         // Nothing said yet: preparing, for 30 seconds so far.
@@ -1551,5 +1710,27 @@ mod tests {
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(10_000), "10,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    /// Registry access ends the record, so record updates carry it after each placement.
+    #[test]
+    fn a_record_ends_with_the_job_s_registry_access() {
+        use crate::store::{NoAccess, RegistryAccess};
+        let mut j = super::super::tests::history_job(1, "acme/web");
+        let mut h = Html::new();
+        record(&mut h, &j, &HashMap::new(), None, 1030);
+        assert!(!h.into_string().contains("Registry access"));
+        j.registry_access = Some(RegistryAccess::None {
+            reason: NoAccess::MintFailed,
+            registry: None,
+            url: None,
+        });
+        let mut h = Html::new();
+        record(&mut h, &j, &HashMap::new(), None, 1030);
+        let html = h.into_string();
+        assert!(
+            html.contains("<h2>Registry access</h2>") && html.contains("Minting its token failed"),
+            "{html}"
+        );
     }
 }

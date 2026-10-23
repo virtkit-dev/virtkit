@@ -1326,6 +1326,15 @@ saying how much precedes it; once settled, a failed job's page shows the end the
 past that, it says its output is gone, linking to the job on GitLab when its spec names a plain
 web URL.
 
+The record of a job placed by a hub that mints registry tokens ends with a *Registry access*
+section, as recorded at its latest placement, which the record's live updates carry: the
+registry it was issued for, linked to its Job access tab, and per storage area its rights in
+plain words (*CI caches: Read, Publish*), the token's prefixes, expiry and ID folded under
+*Technical details*, never the token; or, when it got none, the one reason why: its runner key
+bound to no GitLab server, its node on an older `vk` or naming no registry the hub binds, a
+registry that takes no tokens or had applied no signing key, or a failed mint, each linking to
+where it is fixed.
+
 While the job runs, its page follows it over `/events/job/<id>`, a stream like the others
 (below): the hub notes each piece of output it stores and each change to the job's record, by
 job, and the stream reads what the output gained from where it last stopped — at most 1 MiB,
