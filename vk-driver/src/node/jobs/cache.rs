@@ -529,6 +529,14 @@ async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
         true => format!("{}{location}", store.origin()),
         false => location.to_string(),
     };
+    // Keep the upload on the registry's origin to avoid leaking its credential.
+    let same_origin = reqwest::Url::parse(&location)
+        .ok()
+        .zip(reqwest::Url::parse(store.origin()).ok())
+        .is_some_and(|(to, registry)| to.origin() == registry.origin());
+    if !same_origin {
+        bail!("the registry sent the cache's upload to {location}, outside itself");
+    }
     let req = store
         .req(reqwest::Method::PUT, &location)
         .query(&[("digest", digest)])
@@ -681,6 +689,26 @@ mod tests {
         assert_ne!(p, tag("deps-main2", true));
         // What `printf 'deps-main\nprotected' | sha256sum` prints.
         assert_eq!(p, hex(&Sha256::digest(b"deps-main\nprotected")));
+    }
+
+    /// An upload the registry sends elsewhere does not get the credential.
+    #[tokio::test]
+    async fn a_blob_is_not_sent_outside_the_registry() {
+        let (url, seen) = gitlab(vec![
+            answer("404 Not Found", &[], b""),
+            answer(
+                "202 Accepted",
+                &[("Location", "http://elsewhere.example/v2/x/blobs/uploads/u1")],
+                b"",
+            ),
+        ])
+        .await;
+        let _f = Fixture::new("cache-put-elsewhere", "https://gitlab.example");
+        let err = put_blob(&test_store(&url), EMPTY_DIGEST, Body::Bytes(b"{}".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("outside itself"), "{err:#}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "no PUT went out");
     }
 
     #[test]
