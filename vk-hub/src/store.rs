@@ -41,12 +41,14 @@ use crate::rollout::{
 };
 
 mod clients;
+mod gitlabs;
 mod jobs;
 mod keys;
 mod registries;
 mod tools;
 
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
+pub use gitlabs::{GitlabRow, ProjectCeiling};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, PREPARE_STAGE, RequestRow,
     SUMMARY_JOBS, Submitted,
@@ -762,6 +764,8 @@ impl Db {
             .context("opening the job output cache table")?;
         txn.open_table(jobs::JOB_TAIL_LENS)
             .context("opening the job output lengths table")?;
+        txn.open_table(gitlabs::GITLABS)
+            .context("opening the GitLab instances table")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;

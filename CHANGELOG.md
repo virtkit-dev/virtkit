@@ -16,6 +16,9 @@ All notable changes to virtkit will be documented in this file.
 - **`[hub] tokens = true` lets a registry accept the tokens its hub signs**, as a bearer or a
   Basic password. A token reaches only the repositories, files and locks its grants cover,
   and none of the web pages; a job's tokens hold at most 256 locks at once.
+- **`vk-hub gitlabs` names the GitLab instances the hub takes jobs from**; `vk-hub keys create
+  --gitlab NAME [--projects ID:PATH,…]` limits a jobs key to that instance's jobs and those
+  projects.
 
 ### Fixed
 

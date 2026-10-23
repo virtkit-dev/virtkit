@@ -105,6 +105,8 @@ fn api_key(hub: &Hub, name: &str, scopes: &[Scope], at: u64, ttl: Duration) -> S
             cpus: 4,
             disk_bytes: 8 << 30,
         }),
+        gitlab: None,
+        projects: Vec::new(),
     };
     hub.db
         .create_api_key(name, &policy, ttl, "uid 0", at)
@@ -3485,6 +3487,7 @@ fn keys_and_sizes_parse_on_the_command_line() {
                 max_cpus,
                 max_disk,
                 ttl,
+                ..
             }),
         ..
     } = cli.cmd
@@ -3562,6 +3565,9 @@ fn the_jobs_table_says_how_each_job_stands() {
         activity: None,
         prepared_at: None,
         guest: None,
+        gitlab: None,
+        project_id: None,
+        protected: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3664,6 +3670,9 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         activity: None,
         prepared_at: None,
         guest: None,
+        gitlab: None,
+        project_id: None,
+        protected: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -4066,6 +4075,9 @@ fn a_job_is_shown_on_the_command_line() {
             cpus: 2,
             mem_mib: 4096,
         }),
+        gitlab: None,
+        project_id: None,
+        protected: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);

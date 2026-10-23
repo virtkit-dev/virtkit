@@ -146,6 +146,17 @@ pub struct JobRow {
     /// When expiry past [`JOB_KEEP`] removed its redacted spec and any unsettled output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expired_at: Option<u64>,
+    /// The GitLab instance its key was bound to at submission, by name: the instance the hub
+    /// checked its project against. `None` for a key bound to none, or an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gitlab: Option<String>,
+    /// GitLab's ID of its project; `None` when the spec has none or for an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<u64>,
+    /// Whether GitLab said its ref is protected, as the spec reports it: no ceiling checks it.
+    /// `None` when GitLab did not say, or for an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected: Option<bool>,
 }
 
 impl JobRow {
@@ -1177,6 +1188,9 @@ mod tests {
             activity: None,
             prepared_at: None,
             guest: None,
+            gitlab: None,
+            project_id: None,
+            protected: None,
         }
     }
 

@@ -1020,15 +1020,19 @@ directory its workspace is at. Nothing acts on a node's workloads; local mode ac
 The hub implements its side of [GitLab dispatch](gitlab-dispatch.md).
 
 **API keys.** `vk-hub keys create --name <name> --pool <pool> [--pool …] [--scope jobs|capacity]
-[--max-mem <size>] [--max-cpus <n>] [--max-disk <size>] [--ttl 90d]` prints a key, `vkk_` and
+[--max-mem <size>] [--max-cpus <n>] [--max-disk <size>] [--gitlab <instance> [--projects
+<id>:<path>,…]] [--ttl 90d]` prints a key, `vkk_` and
 64 hex digits, once; the hub keeps its sha256 only. A key lives at most 365 days and works
 until it expires or is revoked. Its name is unique among the keys that work. Scope `jobs` is
 the whole client API; `capacity` is `POST /v1/capacity` alone. Its pools — `*` for any — and
 largest envelope bound every placement it names: anything outside them is 403 `forbidden`. `keys
 list` shows each key's name, first 8 characters, scopes, pools, largest envelope, when and by
-whom it was created, and whether it works; `keys revoke <name>` revokes the working key of that
+whom it was created, the GitLab instance and projects it is bound to, and whether it works; `keys revoke <name>` revokes the working key of that
 name, or, with none working, removes those of that name that no longer do. The hub holds at most
-256 keys. Operators also create, revoke and remove keys on the web UI's `/clients` (see
+256 keys. A key bound to a GitLab instance (`vk-hub gitlabs add <name> <url>`, `gitlabs list`,
+`gitlabs remove <name>`) submits only that instance's jobs, and with `--projects` only those
+projects', by ID and path both: anything else is 403 `forbidden`. Only a bound key's jobs get
+registry tokens. Operators also create, revoke and remove keys on the web UI's `/clients` (see
 [Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.

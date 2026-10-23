@@ -13,6 +13,7 @@ use vk_hub_proto::client::Placement;
 use vk_hub_proto::job::Envelope;
 
 use super::clients::remove_clients_of;
+use super::gitlabs::{GITLABS, ProjectCeiling, normalize_gitlab_url};
 use super::{Db, append_audit, decode, encode, token_key};
 
 /// Key: `sha256(key)`, hex. Value: JSON [`KeyRow`].
@@ -82,6 +83,13 @@ pub struct KeyRow {
     pub expires_at: u64,
     #[serde(default)]
     pub revoked_at: Option<u64>,
+    /// The GitLab instance whose jobs it submits, by the hub's name for it: its jobs must come
+    /// from that instance, and only a bound key's jobs get registry tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gitlab: Option<String>,
+    /// The projects of [`KeyRow::gitlab`] it may submit jobs of; empty for the whole instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectCeiling>,
 }
 
 impl KeyRow {
@@ -97,6 +105,10 @@ pub struct KeyPolicy {
     pub scopes: Vec<Scope>,
     pub pools: Vec<String>,
     pub max_envelope: Option<Envelope>,
+    #[serde(default)]
+    pub gitlab: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<ProjectCeiling>,
 }
 
 impl KeyPolicy {
@@ -119,6 +131,8 @@ impl KeyPolicy {
             scopes,
             pools,
             max_envelope,
+            gitlab: None,
+            projects: Vec::new(),
         }
     }
 }
@@ -214,6 +228,44 @@ impl ApiPrincipal {
         }
         None
     }
+
+    /// Why this key refuses `ci`, or `None`. Bound keys submit only their instance's jobs,
+    /// restricted by both ID and path when projects are listed. `instance_url` must be in
+    /// [`normalize_gitlab_url`]'s form.
+    pub fn refuses_job(
+        &self,
+        ci: &vk_hub_proto::job::CiJob,
+        instance_url: Option<&str>,
+    ) -> Option<String> {
+        let name = self.row.gitlab.as_deref()?;
+        let from = normalize_gitlab_url(&ci.server_url);
+        if instance_url.is_none() || from.as_deref() != instance_url {
+            return Some(format!(
+                "this key submits the jobs of GitLab instance {name} only, not of {:?}",
+                vk_hub_proto::display_safe(&ci.server_url)
+            ));
+        }
+        if ci.job.project_id == 0 {
+            return Some(
+                "a job from a bound key names its project: its ID is what its namespaces use"
+                    .to_string(),
+            );
+        }
+        if !self.row.projects.is_empty()
+            && !self
+                .row
+                .projects
+                .iter()
+                .any(|p| p.id == ci.job.project_id && p.path == ci.job.project_path)
+        {
+            return Some(format!(
+                "this key may not submit jobs of project {} ({})",
+                ci.job.project_id,
+                vk_hub_proto::display_safe(&ci.job.project_path)
+            ));
+        }
+        None
+    }
 }
 
 /// An envelope as the CLI and the audit log print it. A key's limit left unset is the
@@ -282,6 +334,19 @@ impl Db {
         {
             return Err(refused(format!("{bad:?} is not a pool's name")));
         }
+        if policy.gitlab.is_none() && !policy.projects.is_empty() {
+            return Err(refused(
+                "a key's projects are those of the GitLab instance it is bound to",
+            ));
+        }
+        if let Some(dup) = policy
+            .projects
+            .iter()
+            .enumerate()
+            .find(|(i, p)| policy.projects.iter().skip(i + 1).any(|q| q.id == p.id))
+        {
+            return Err(refused(format!("project {} is listed twice", dup.1.id)));
+        }
         let mut scopes = policy.scopes.clone();
         scopes.sort();
         scopes.dedup();
@@ -300,8 +365,15 @@ impl Db {
             created_by: actor.to_string(),
             expires_at: now.saturating_add(ttl.as_secs()),
             revoked_at: None,
+            gitlab: policy.gitlab.clone(),
+            projects: policy.projects.clone(),
         };
         let txn = self.db.begin_write().context("starting a write")?;
+        if let Some(gitlab) = &row.gitlab
+            && txn.open_table(GITLABS)?.get(gitlab.as_str())?.is_none()
+        {
+            return Err(refused(format!("there is no GitLab instance {gitlab}")));
+        }
         {
             let mut table = txn.open_table(API_KEYS)?;
             let mut count = 0usize;
@@ -324,8 +396,21 @@ impl Db {
         let limit = row
             .max_envelope
             .map_or_else(|| "no limit".to_string(), envelope_text);
+        let bound = match &row.gitlab {
+            None => String::new(),
+            Some(g) if row.projects.is_empty() => format!("; GitLab {g}"),
+            Some(g) => format!(
+                "; GitLab {g}, projects {}",
+                row.projects
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         let event = format!(
-            "{actor} created API key {name} ({}; pools {}; envelope {limit}), valid for {}s",
+            "{actor} created API key {name} ({}; pools {}; envelope {limit}{bound}), valid for \
+             {}s",
             scopes.join(", "),
             row.pools.join(", "),
             ttl.as_secs()
@@ -479,6 +564,8 @@ mod tests {
                 cpus: 8,
                 disk_bytes: 16 << 30,
             }),
+            gitlab: None,
+            projects: Vec::new(),
         }
     }
 

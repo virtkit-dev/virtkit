@@ -3470,6 +3470,9 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         activity: None,
         prepared_at: None,
         guest: None,
+        gitlab: None,
+        project_id: None,
+        protected: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
         let id = format!("{n:032x}");
@@ -3745,6 +3748,8 @@ async fn the_job_history_is_filtered_by_api_key() {
         scopes: vec![Scope::Jobs],
         pools: vec!["ci".into()],
         max_envelope: None,
+        gitlab: None,
+        projects: Vec::new(),
     };
     let now = crate::now_secs();
     let ttl = Duration::from_secs(3600);
@@ -3894,6 +3899,8 @@ async fn api_keys_and_their_clients_are_shown_live() {
         scopes: vec![Scope::Jobs],
         pools: vec!["ci".into()],
         max_envelope: None,
+        gitlab: None,
+        projects: Vec::new(),
     };
     let now = crate::now_secs();
     let (key, _) = hub
@@ -4139,6 +4146,8 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
         scopes: vec![Scope::Jobs],
         pools: vec!["ci".into()],
         max_envelope: None,
+        gitlab: None,
+        projects: Vec::new(),
     };
     let now = crate::now_secs();
     let (key, _) = hub
@@ -4268,6 +4277,8 @@ async fn a_key_changed_since_confirmed_is_left_alone() {
         scopes: vec![Scope::Jobs],
         pools: vec!["ci".into()],
         max_envelope: None,
+        gitlab: None,
+        projects: Vec::new(),
     };
     let ttl = Duration::from_secs(3600);
     let now = crate::now_secs();
@@ -4366,6 +4377,9 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         activity: None,
         prepared_at: None,
         guest: None,
+        gitlab: None,
+        project_id: None,
+        protected: None,
     }
 }
 

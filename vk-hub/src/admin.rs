@@ -142,6 +142,14 @@ enum Call {
         id: String,
         release: String,
     },
+    ListGitlabs,
+    AddGitlab {
+        name: String,
+        url: String,
+    },
+    RemoveGitlab {
+        name: String,
+    },
     /// Download a release's `vk` from the configured repository: `None` for the latest.
     FetchRelease {
         version: Option<String>,
@@ -531,6 +539,25 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::UpdateRegistry { id, release } => {
             serde_json::to_value(crate::registries::update(hub, &actor, &id, &release)?)?
         }
+        Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
+        Call::AddGitlab { name, url } => {
+            let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
+            eprintln!(
+                "vk-hub: admin: {actor} added GitLab instance {name} at {}",
+                row.url
+            );
+            serde_json::to_value(row)?
+        }
+        Call::RemoveGitlab { name } => {
+            let removed = hub.db.remove_gitlab(&name, &actor, crate::now_secs())?;
+            if removed {
+                eprintln!(
+                    "vk-hub: admin: {actor} removed GitLab instance {}",
+                    vk_hub_proto::display_safe(&name)
+                );
+            }
+            serde_json::to_value(removed)?
+        }
         Call::FetchRelease { .. } | Call::LatestRelease => {
             bail!("a fetch is served on its own path")
         }
@@ -729,6 +756,24 @@ impl Client {
         self.call(Call::CreateToken {
             ttl_secs: ttl.as_secs(),
             kind,
+        })
+    }
+
+    pub fn gitlabs(&self) -> Result<Vec<(String, crate::store::GitlabRow)>> {
+        self.call(Call::ListGitlabs)
+    }
+
+    pub fn add_gitlab(&self, name: &str, url: &str) -> Result<crate::store::GitlabRow> {
+        self.call(Call::AddGitlab {
+            name: name.to_string(),
+            url: url.to_string(),
+        })
+    }
+
+    /// Whether there was one.
+    pub fn remove_gitlab(&self, name: &str) -> Result<bool> {
+        self.call(Call::RemoveGitlab {
+            name: name.to_string(),
         })
     }
 

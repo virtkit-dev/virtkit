@@ -602,6 +602,8 @@ mod tests {
             created_by: "uid 0".into(),
             expires_at: 10_000,
             revoked_at: None,
+            gitlab: None,
+            projects: Vec::new(),
         }
     }
 

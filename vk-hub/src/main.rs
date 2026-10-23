@@ -163,6 +163,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
     },
+    /// Add, list and remove the GitLab instances the hub takes jobs from
+    ///
+    /// A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
+    /// instance's jobs only, and only its jobs get registry tokens; the name is what registry
+    /// namespaces call {gitlab}.
+    Gitlabs {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<GitlabsCmd>,
+    },
     /// Issue, list and revoke the API keys automation such as vk-gitlab places jobs with
     Keys {
         #[command(flatten)]
@@ -428,10 +439,32 @@ enum KeysCmd {
         /// How long the key works: <n>s, <n>m, <n>h or <n>d (at most 365d)
         #[arg(long, default_value = "90d", value_parser = parse_key_ttl)]
         ttl: Duration,
+        /// The GitLab instance whose jobs it submits (`vk-hub gitlabs`): its jobs must come
+        /// from there, and only a bound key's jobs get registry tokens
+        #[arg(long, value_name = "NAME")]
+        gitlab: Option<String>,
+        /// The projects of that instance it may submit jobs of, as <id>:<path>, comma-separated
+        /// or repeated [default: the whole instance]
+        #[arg(long = "projects", value_name = "ID:PATH", value_delimiter = ',', value_parser = parse_project, requires = "gitlab")]
+        projects: Vec<store::ProjectCeiling>,
     },
     /// Revoke the working key of that name; with none working, remove those that no longer
     /// work
     Revoke { name: String },
+}
+
+fn parse_project(s: &str) -> Result<store::ProjectCeiling, String> {
+    store::ProjectCeiling::parse(s)
+}
+
+#[derive(Subcommand)]
+enum GitlabsCmd {
+    /// List the instances (the default)
+    List,
+    /// Add an instance under a name: lowercase letters, digits and '-'
+    Add { name: String, url: String },
+    /// Remove an instance no working key is bound to
+    Remove { name: String },
 }
 
 pub(crate) fn parse_scope(s: &str) -> Result<store::Scope, String> {
@@ -1024,6 +1057,10 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Cmd::Gitlabs { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || gitlabs_blocking(&client, cmd)).await?
+        }
         Cmd::Keys { config, cmd } => {
             keys_cmd(
                 admin_client(&HubConfig::load(config.config.as_deref())?)?,
@@ -1578,8 +1615,13 @@ async fn keys_cmd(client: admin::Client, cmd: KeysCmd) -> Result<()> {
             max_cpus,
             max_disk,
             ttl,
+            gitlab,
+            projects,
         } => {
-            let policy = store::KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
+            let mut policy =
+                store::KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
+            policy.gitlab = gitlab;
+            policy.projects = projects;
             let created =
                 tokio::task::spawn_blocking(move || client.create_key(&name, policy, ttl))
                     .await??;
@@ -1631,12 +1673,51 @@ fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
             ]
         })
         .collect();
-    table(
+    let mut out = table(
         &[
             "NAME", "KEY", "SCOPES", "POOLS", "LARGEST", "CREATED", "BY", "STATE",
         ],
         &rows,
-    )
+    );
+    for k in keys {
+        let Some(g) = &k.gitlab else { continue };
+        let projects: Vec<String> = k.projects.iter().map(ToString::to_string).collect();
+        out.push_str(&format!(
+            "{}: GitLab {g}, {}\n",
+            k.name,
+            if projects.is_empty() {
+                "every project".to_string()
+            } else {
+                format!("projects {}", projects.join(", "))
+            }
+        ));
+    }
+    out
+}
+
+/// `vk-hub gitlabs` and its subcommands, which block on the admin socket.
+fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<()> {
+    match cmd.unwrap_or(GitlabsCmd::List) {
+        GitlabsCmd::List => {
+            let rows: Vec<[String; 4]> = client
+                .gitlabs()?
+                .into_iter()
+                .map(|(name, g)| [name, g.url, utc(g.created_at), g.created_by])
+                .collect();
+            print!("{}", table(&["NAME", "URL", "ADDED", "BY"], &rows));
+        }
+        GitlabsCmd::Add { name, url } => {
+            let row = client.add_gitlab(&name, &url)?;
+            eprintln!("vk-hub: GitLab instance {name} is {}", row.url);
+        }
+        GitlabsCmd::Remove { name } => {
+            if !client.remove_gitlab(&name)? {
+                bail!("there is no GitLab instance {name}");
+            }
+            eprintln!("vk-hub: removed GitLab instance {name}");
+        }
+    }
+    Ok(())
 }
 
 /// `vk-hub jobs`' table: how long each job prepared and ran, or has so far, and the most memory

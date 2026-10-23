@@ -388,6 +388,21 @@ release that crashes or hangs is restarted as the
 previous binary, which hands over again up to three starts, then takes the registry back and
 reports the update rolled back.
 
+## Step 4: reference
+
+The hub's side of step 4; the registry's is in
+[vk-registry's design](../vk-registry/DESIGN.md).
+
+**GitLab instances and bound keys.** `vk-hub gitlabs add <name> <url>`, `gitlabs list` and
+`gitlabs remove <name>` keep the instances the hub takes jobs from, by a name of lowercase
+letters, digits and `-`, which namespaces call `{gitlab}`. A URL is normalized (lowercase
+scheme and host, no default port, no trailing `/`) and names one instance; an instance a
+working key is bound to is not removed. `vk-hub keys create … --gitlab <name> [--projects
+<id>:<path>,…]` binds a jobs key. A bound key submits only jobs whose `server_url` is its
+instance's, naming a project (ID not 0), and with `--projects` only those projects, by ID and
+path both; anything else is 403. Keys bound to none submit as before, and their jobs get no
+token.
+
 ## Open questions
 
 - **Key table size.** Bounded by the hub's 256 keys today; a fleet with per-project keys in the

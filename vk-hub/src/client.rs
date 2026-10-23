@@ -499,6 +499,7 @@ async fn submit(
         return Err(ApiError::invalid("reservation is not an ID"));
     }
     check_placement(&ask.placement, principal)?;
+    check_ceiling(hub, &ask.spec, principal).await?;
     let spec_len = serde_json::to_vec(&ask.spec)
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
         .len();
@@ -564,6 +565,13 @@ async fn submit(
         activity: None,
         prepared_at: None,
         guest: None,
+        gitlab: principal.row.gitlab.clone(),
+        project_id: match &ask.spec {
+            JobSpec::GitlabCi(ci) => Some(ci.job.project_id).filter(|&p| p > 0),
+        },
+        protected: match &ask.spec {
+            JobSpec::GitlabCi(ci) => ci.sources.protected,
+        },
     };
     let redacted = match &ask.spec {
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),
@@ -595,6 +603,31 @@ async fn submit(
             Err(e) => Err(e),
         },
         Submitted::Conflict => Err(conflict()),
+    }
+}
+
+/// Refuse a job its key's ceiling does not cover: another GitLab instance's, or a project the
+/// key does not list ([`ApiPrincipal::refuses_job`]).
+async fn check_ceiling(
+    hub: &Hub,
+    spec: &JobSpec,
+    principal: &ApiPrincipal,
+) -> Result<(), ApiError> {
+    let Some(gitlab) = principal.row.gitlab.clone() else {
+        return Ok(());
+    };
+    let db = hub.db.clone();
+    let instance = tokio::task::spawn_blocking(move || db.gitlab(&gitlab))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let JobSpec::GitlabCi(ci) = spec;
+    match principal.refuses_job(ci, instance.as_ref().map(|i| i.url.as_str())) {
+        Some(why) => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            why,
+        )),
+        None => Ok(()),
     }
 }
 
