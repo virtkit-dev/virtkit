@@ -2679,7 +2679,7 @@ async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
     assert_eq!(all.status, 200, "{}", all.body);
     for want in [
         "<a href=\"/audit\" aria-current=\"page\">Audit</a>",
-        "<select name=\"node\">",
+        "<select name=\"node\" aria-label=\"Node or registry\">",
         &format!("<option value=\"{node}\">ci-&lt;1&gt; ("),
         "issued an enrollment token",
         &format!("node <a href=\"/node/{node}\">ci-&lt;1&gt;</a> enrolled as ci-&lt;1&gt;"),
@@ -2702,6 +2702,71 @@ async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
         bad.body.contains("issued an enrollment token"),
         "{}",
         bad.body
+    );
+}
+
+/// `/audit` leaves jobs out unless asked for, narrows to one person across their sessions
+/// from a select or their name in a line, and keeps the filter in its links.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_s_audit_log_leaves_jobs_out_and_is_filtered_by_person() {
+    let (addr, hub, _) = start_fleet().await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let job = "ab".repeat(16);
+    let ann = "ui session 1a (admin, ann@example.com)";
+    for (actor, event) in [
+        (
+            "key gitlab",
+            format!("key gitlab submitted job {job}: build"),
+        ),
+        ("hub", format!("job {job} ended: lost")),
+        (ann, "granted bob@example.com operator".to_string()),
+        (
+            "ui session 2b (operator, ann@example.com)",
+            "drained a node".to_string(),
+        ),
+    ] {
+        hub.db.audit(actor, &event, 10).unwrap();
+    }
+    let all = get(addr, "/audit", Some(&cookie)).await.body;
+    for want in [
+        "<option value=\"\" selected>Everything but jobs</option>",
+        "<option value=\"ann@example.com\">ann@example.com</option>",
+        "<a href=\"/audit?who=ann%40example.com\" title=\"Only theirs\">\
+         ui session 1a (admin, ann@example.com)</a>",
+        "drained a node",
+    ] {
+        assert!(all.contains(want), "{want}: {all}");
+    }
+    assert!(!all.contains(&job), "{all}");
+    let jobs = get(addr, "/audit?category=jobs", Some(&cookie)).await.body;
+    assert!(jobs.contains("<option value=\"jobs\" selected>Jobs</option>"));
+    assert!(jobs.contains(&format!("job {job} ended: lost")), "{jobs}");
+    assert!(!jobs.contains("drained a node"), "{jobs}");
+    assert!(
+        jobs.contains("<a href=\"/audit?category=jobs&amp;who=hub\""),
+        "{jobs}"
+    );
+    let theirs = get(addr, "/audit?who=ann%40example.com", Some(&cookie))
+        .await
+        .body;
+    assert!(
+        theirs.contains("<option value=\"ann@example.com\" selected>"),
+        "{theirs}"
+    );
+    assert!(
+        theirs.contains("granted bob@example.com operator") && theirs.contains("drained a node"),
+        "{theirs}"
+    );
+    assert!(!theirs.contains("enrollment token"), "{theirs}");
+    let text = get(addr, "/audit?category=all&q=BUILD", Some(&cookie))
+        .await
+        .body;
+    assert!(text.contains("submitted job"), "{text}");
+    assert!(!text.contains("ended: lost"), "{text}");
+    let none = get(addr, "/audit?who=key+gitlab", Some(&cookie)).await.body;
+    assert!(
+        none.contains("none match; jobs are left out unless Jobs or Everything is chosen"),
+        "{none}"
     );
 }
 

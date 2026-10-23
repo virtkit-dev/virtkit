@@ -40,6 +40,7 @@ use crate::rollout::{
     DeleteRule, Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState,
 };
 
+mod audit;
 mod clients;
 mod gitlabs;
 mod jobs;
@@ -49,6 +50,7 @@ mod registries;
 mod token_keys;
 mod tools;
 
+pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};
 pub use jobs::{
@@ -739,6 +741,8 @@ impl Db {
         txn.open_table(AUDIT).context("opening the audit table")?;
         txn.open_table(AUDIT_BY_NODE)
             .context("opening the audit index")?;
+        txn.open_table(audit::AUDIT_BY_WHO)
+            .context("opening the audit index by who")?;
         txn.open_table(UI_LOGINS)
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
@@ -780,6 +784,7 @@ impl Db {
         jobs::order_jobs(&txn).context("ordering the job history")?;
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;
+        audit::index_audit_by_who(&txn).context("indexing the audit log by who")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,
@@ -2569,6 +2574,7 @@ fn append_audit(
     };
     let mut table = txn.open_table(AUDIT)?;
     let mut index = txn.open_table(AUDIT_BY_NODE)?;
+    let mut by_who = txn.open_table(audit::AUDIT_BY_WHO)?;
     let seq = table
         .last()?
         .map_or(0, |(k, _)| k.value().saturating_add(1));
@@ -2576,19 +2582,21 @@ fn append_audit(
     if let Some(node) = node {
         index.insert((node, seq), ())?;
     }
+    by_who.insert((audit::who(actor), seq), ())?;
     let first = table.first()?.map_or(seq, |(k, _)| k.value());
     if seq.saturating_sub(first) >= AUDIT_MAX {
         let cut = first.saturating_add(AUDIT_PRUNE);
         let mut dropped = Vec::new();
         for entry in table.range(first..cut)? {
             let (k, v) = entry?;
-            dropped.push((k.value(), decode::<AuditRow>(v.value())?.node));
+            dropped.push((k.value(), decode::<AuditRow>(v.value())?));
         }
-        for (seq, node) in dropped {
+        for (seq, row) in dropped {
             table.remove(seq)?;
-            if let Some(node) = node {
+            if let Some(node) = row.node {
                 index.remove((node.as_str(), seq))?;
             }
+            by_who.remove((audit::who(&row.actor), seq))?;
         }
     }
     Ok(())
@@ -4363,6 +4371,10 @@ mod tests {
             "{rows}"
         );
         assert_eq!(rows, indexed);
+        let by_who =
+            redb::ReadableTableMetadata::len(&txn.open_table(audit::AUDIT_BY_WHO).unwrap())
+                .unwrap();
+        assert_eq!(rows, by_who);
         drop(txn);
         assert_eq!(
             db.audits(Some("n"), 1).unwrap()[0].event,

@@ -4,20 +4,52 @@
 
 use std::collections::HashMap;
 
-use super::Auth;
 use super::assets;
 use super::html::Html;
-use crate::store::AuditRow;
+use super::jobs::{percent_encode, thousands};
+use super::{Auth, decode_form, field};
+use crate::store::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, AuditRow, audit_who};
 
 /// Audit lines per page of `/audit`.
 pub const AUDIT_PAGE: usize = 100;
 
+/// The longest person or actor the audit filter takes; a session's identity is far shorter.
+const MAX_WHO: usize = 1024;
+
+/// The ID of the part of `/audit` its filter's form replaces.
+const AUDIT_RESULTS: &str = "audit-results";
+
 /// One page of `/audit`.
 pub struct AuditPage {
-    /// The node it is filtered to, if any.
-    pub node: Option<String>,
-    /// Newest first, with their sequence numbers.
-    pub rows: Vec<(u64, AuditRow)>,
+    pub filter: AuditFilter,
+    pub found: AuditFound,
+    /// The filter's choice of people and actors ([`crate::store::Db::audit_actors`]).
+    pub actors: Vec<String>,
+    /// The cursor it was read from: an older page.
+    pub before: Option<u64>,
+}
+
+/// The filter and cursor of `/audit[?category=…&node=…&who=…&q=…&before=…]`. A value that
+/// cannot be one is ignored.
+pub fn audit_query(query: Option<&str>) -> (AuditFilter, Option<u64>) {
+    let query = decode_form(query.unwrap_or("").as_bytes());
+    let text = field(&query, "q")
+        .map(str::trim)
+        .filter(|q| !q.is_empty() && q.chars().count() <= vk_hub_proto::MAX_DISPLAY);
+    let filter = AuditFilter {
+        node: field(&query, "node")
+            .filter(|n| vk_hub_proto::valid_id(n))
+            .map(str::to_string),
+        who: field(&query, "who")
+            .filter(|w| !w.is_empty() && w.len() <= MAX_WHO)
+            .map(str::to_string),
+        category: field(&query, "category")
+            .and_then(AuditCategory::parse)
+            .unwrap_or_default(),
+        text: text.map(str::to_string),
+    };
+    let before = field(&query, "before").and_then(|b| b.parse().ok());
+    (filter, before)
 }
 
 /// A site's navigation: each entry's path and label, in order.
@@ -207,60 +239,174 @@ pub struct Subject {
     pub page: &'static str,
 }
 
-/// `/audit`: the paginated log, newest first, optionally filtered by node or registry.
+/// `/audit`: the log, newest first, a page at a time, filtered by category, node or registry,
+/// person or actor, and text. Jobs are left out unless asked for.
 ///
 /// `subjects` names the nodes and registries for the filter and their column; local mode has
-/// none and passes `None`. `nav` is the site's navigation.
+/// none, nor jobs, and passes `None`. `nav` is the site's navigation.
+///
+/// With htmx, a choice applies at once and typing after a 300 ms pause, as on the Jobs page:
+/// the results are swapped in and the URL updated for Back and bookmarking.
 pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: Nav) -> Html {
     let with_node = subjects.is_some();
     let subjects = subjects.unwrap_or_default();
+    let filter = &page.filter;
     let mut main = Html::new();
     main.raw("<h1>Audit</h1>");
-    if with_node {
-        main.raw("<form class=\"filter\" method=\"get\" action=\"/audit\">")
-            .raw("<select name=\"node\"><option value=\"\">Every node and registry</option>");
+    audit_form(
+        &mut main,
+        filter,
+        &page.actors,
+        with_node.then_some(subjects),
+    );
+    main.raw("<div id=\"").raw(AUDIT_RESULTS).raw("\">");
+    let subjects: HashMap<&str, &Subject> = subjects.iter().map(|s| (s.id.as_str(), s)).collect();
+    let found = &page.found;
+    if found.cut {
+        main.raw("<p class=\"sub\" role=\"status\">")
+            .text(thousands(AUDIT_SCAN))
+            .raw(" lines read back");
+        if !found.rows.is_empty() {
+            main.raw(", ").text(found.rows.len()).raw(" matching");
+        }
+        main.raw("; there are older ones.</p>");
+    }
+    if found.rows.is_empty() {
+        let unfiltered = *filter == AuditFilter::default() && page.before.is_none();
+        main.raw(match () {
+            _ if found.cut => "",
+            _ if unfiltered && !with_node => "<p class=\"empty\">nothing yet</p>",
+            _ if page.before.is_some() => "<p class=\"empty\">no older lines match</p>",
+            _ if with_node && filter.category == AuditCategory::NotJobs => {
+                "<p class=\"empty\" role=\"status\">none match; jobs are left out unless \
+                 Jobs or Everything is chosen</p>"
+            }
+            _ => "<p class=\"empty\" role=\"status\">none match</p>",
+        });
+    } else {
+        audit_table(&mut main, filter, &found.rows, &subjects, with_node);
+    }
+    if let Some(older) = found.older {
+        main.raw("<p><a href=\"");
+        audit_href(&mut main, filter, Some(older));
+        main.raw("\">")
+            .raw(if found.cut {
+                "Read further back"
+            } else {
+                "Older"
+            })
+            .raw("</a></p>");
+    }
+    main.raw("</div>");
+    frame("Audit", "/audit", auth, nav, &main)
+}
+
+/// The filter's form: in a fleet, with its `subjects`, the category and node or registry
+/// too. A choice no longer offered — a node removed, an actor past those listed — is kept.
+fn audit_form(h: &mut Html, filter: &AuditFilter, actors: &[String], subjects: Option<&[Subject]>) {
+    h.raw("<form id=\"audit-filter\" class=\"filter\" method=\"get\" action=\"/audit\" ")
+        .raw("hx-get=\"/audit\" hx-trigger=\"submit, change from:(#audit-filter select), ")
+        .raw("input changed delay:300ms from:(#audit-filter input)\" hx-target=\"#")
+        .raw(AUDIT_RESULTS)
+        .raw("\" hx-select=\"#")
+        .raw(AUDIT_RESULTS)
+        .raw("\" hx-swap=\"outerHTML\" hx-push-url=\"true\" hx-sync=\"this:replace\">");
+    if let Some(subjects) = subjects {
+        h.raw("<select name=\"category\" aria-label=\"Category\">");
+        for category in AuditCategory::ALL {
+            h.raw("<option value=\"").raw(category.name()).raw("\"");
+            if filter.category == category {
+                h.raw(" selected");
+            }
+            h.raw(">").raw(category.label()).raw("</option>");
+        }
+        h.raw("</select><select name=\"node\" aria-label=\"Node or registry\">")
+            .raw("<option value=\"\">Every node and registry</option>");
+        if let Some(node) = &filter.node
+            && !subjects.iter().any(|s| s.id == *node)
+        {
+            h.raw("<option value=\"")
+                .text(node)
+                .raw("\" selected>")
+                .text(node.get(..8).unwrap_or(node))
+                .raw("</option>");
+        }
         let mut sorted: Vec<(&str, &str)> = subjects
             .iter()
             .map(|s| (s.id.as_str(), s.name.as_str()))
             .collect();
         sorted.sort_by_key(|&(id, name)| (name, id));
         for (id, name) in sorted {
-            main.raw("<option value=\"").text(id).raw("\"");
-            if page.node.as_deref() == Some(id) {
-                main.raw(" selected");
+            h.raw("<option value=\"").text(id).raw("\"");
+            if filter.node.as_deref() == Some(id) {
+                h.raw(" selected");
             }
-            main.raw(">")
+            h.raw(">")
                 .node(name)
                 .raw(" (")
                 .text(id.get(..8).unwrap_or(id))
                 .raw(")</option>");
         }
-        main.raw("</select> <button>Show</button></form>");
+        h.raw("</select>");
     }
-    let subjects: HashMap<&str, &Subject> = subjects.iter().map(|s| (s.id.as_str(), s)).collect();
-    audit_table(&mut main, &page.rows, &subjects, with_node);
-    if page.rows.len() == AUDIT_PAGE
-        && let Some((oldest, _)) = page.rows.last()
+    h.raw("<select name=\"who\" aria-label=\"Who\"><option value=\"\">Everyone</option>");
+    if let Some(who) = &filter.who
+        && !actors.contains(who)
     {
-        main.raw("<p><a href=\"/audit?");
-        if let Some(node) = &page.node {
-            main.raw("node=").text(node).raw("&amp;");
-        }
-        main.raw("before=").text(oldest).raw("\">Older</a></p>");
+        h.raw("<option value=\"")
+            .text(who)
+            .raw("\" selected>")
+            .text(who)
+            .raw("</option>");
     }
-    frame("Audit", "/audit", auth, nav, &main)
+    for who in actors {
+        h.raw("<option value=\"").text(who).raw("\"");
+        if filter.who.as_ref() == Some(who) {
+            h.raw(" selected");
+        }
+        h.raw(">").text(who).raw("</option>");
+    }
+    h.raw("</select><input type=\"search\" name=\"q\" placeholder=\"Text, as a job ID\" ")
+        .raw("aria-label=\"Text\" value=\"")
+        .text(filter.text.as_deref().unwrap_or(""))
+        .raw("\" maxlength=\"")
+        .text(vk_hub_proto::MAX_DISPLAY)
+        .raw("\"> <button>Show</button></form>");
 }
 
+/// `/audit` with `filter`, and `before` if given, as its query. Values are percent-encoded,
+/// so an identity or a text cannot end the attribute or add a parameter.
+fn audit_href(h: &mut Html, filter: &AuditFilter, before: Option<u64>) {
+    let before = before.map(|b| b.to_string());
+    let category = Some(filter.category.name()).filter(|c| !c.is_empty());
+    let fields = [
+        ("category", category),
+        ("node", filter.node.as_deref()),
+        ("who", filter.who.as_deref()),
+        ("q", filter.text.as_deref()),
+        ("before", before.as_deref()),
+    ];
+    h.raw("/audit");
+    let mut separator = "?";
+    for (name, value) in fields {
+        if let Some(value) = value {
+            h.raw(separator)
+                .raw(name)
+                .raw("=")
+                .text(percent_encode(value));
+            separator = "&amp;";
+        }
+    }
+}
+
+/// The page's lines, one row each. Who did one links to the same filter narrowed to them.
 fn audit_table(
     h: &mut Html,
+    filter: &AuditFilter,
     rows: &[(u64, AuditRow)],
     subjects: &HashMap<&str, &Subject>,
     with_node: bool,
 ) {
-    if rows.is_empty() {
-        h.raw("<p class=\"empty\">nothing yet</p>");
-        return;
-    }
     h.raw("<table class=\"grid\"><thead><tr><th>when</th>");
     if with_node {
         h.raw("<th>node or registry</th>");
@@ -295,7 +441,15 @@ fn audit_table(
             }
             h.raw("</td>");
         }
-        h.raw("<td>").text(&row.actor).raw("</td><td>");
+        let theirs = AuditFilter {
+            who: Some(audit_who(&row.actor).to_string()),
+            ..filter.clone()
+        };
+        h.raw("<td><a href=\"");
+        audit_href(h, &theirs, None);
+        h.raw("\" title=\"Only theirs\">")
+            .text(&row.actor)
+            .raw("</a></td><td>");
         audit_event(h, &row.actor, &row.event, subjects);
         h.raw("</td></tr>");
     }

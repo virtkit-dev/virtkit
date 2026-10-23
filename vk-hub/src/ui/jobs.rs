@@ -625,7 +625,7 @@ fn query(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
     }
 }
 
-fn percent_encode(s: &str) -> String {
+pub(super) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
@@ -1129,7 +1129,7 @@ fn tail(s: &str, max: usize) -> String {
 }
 
 /// `n` with a comma between thousands: `10,000`.
-fn thousands(n: usize) -> String {
+pub(super) fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {

@@ -28,9 +28,7 @@ use super::pages::{
     open_cell, rough_bytes, rough_count, section, started,
 };
 use super::sse::{self, Source};
-use super::{
-    Auth, Body, Ui, actions, blocking, decode_form, field, job_output, message, operations, page,
-};
+use super::{Auth, Body, Ui, actions, blocking, field, job_output, message, operations, page};
 use crate::ops::{self, NodeView};
 use crate::rollout::{DeleteRule, NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
@@ -221,15 +219,10 @@ pub(super) async fn get(
         return Ok(Some(page(operations(auth, &ops, &nodes, now))));
     }
     if path == "/audit" {
-        let query = decode_form(query.unwrap_or("").as_bytes());
-        let node = field(&query, "node")
-            .filter(|n| vk_hub_proto::valid_id(n))
-            .map(str::to_string);
-        let before = field(&query, "before").and_then(|b| b.parse().ok());
+        let (filter, before) = pages::audit_query(query);
         let (audit, subjects) = blocking(move || {
-            let rows = hub
-                .db
-                .audit_page(node.as_deref(), before, pages::AUDIT_PAGE)?;
+            let found = hub.db.audit_search(&filter, before, pages::AUDIT_PAGE)?;
+            let actors = hub.db.audit_actors()?;
             let nodes = hub
                 .db
                 .node_names()?
@@ -249,7 +242,13 @@ pub(super) async fn get(
                     page: super::registries::DETAIL_PREFIX,
                 });
             let subjects: Vec<pages::Subject> = nodes.chain(registries).collect();
-            anyhow::Ok((pages::AuditPage { node, rows }, subjects))
+            let page = pages::AuditPage {
+                filter,
+                found,
+                actors,
+                before,
+            };
+            anyhow::Ok((page, subjects))
         })
         .await?;
         return Ok(Some(page(pages::audit(

@@ -1223,9 +1223,19 @@ provider (see [Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); the API keys and the clients using
-them (`/clients`, below); and the audit log (`/audit`, filterable by node, 100 lines a page; the
+them (`/clients`, below); and the audit log (`/audit`, 100 lines a page; the
 hub keeps the newest 100,000 rows), where an event drops the actor its who column shows and
-names each known node or registry, linked to its page. A node's page shows what the hub asks of
+names each known node or registry, linked to its page. The log leaves jobs out unless asked:
+its filter, a query string so each view is a link, takes a category (`category=people` for
+what people did on the admin socket or in the UI, `system` for the hub, nodes, registries,
+rollouts and enrollments, `jobs` for what API keys submitted and canceled and what the hub did
+with their jobs and reservations, `all`; none for everything but jobs), a node or registry
+(`node=`), whom (`who=`: `uid <n>`, a key, `hub`, every rollout as `rollout`, every
+enrollment as `peer`, a link's session, or an OIDC identity, whose every session it gathers;
+picked among the 200 who acted last) and a text (`q=`, ignoring
+ASCII case). The actor in a line links to the same view narrowed to them. A page reads at most
+20,000 lines back, then says so and links to the next stretch. A node's page shows
+what the hub asks of
 it beside what it reports — its state, acquisition, runner (`none: placed jobs only` for a node
 with none), concurrency, drain progress and what it cannot carry out — and its 20 latest
 commands with their outcomes. It opens with a steering panel describing the current state in

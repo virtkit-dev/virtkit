@@ -145,12 +145,17 @@ pub(super) async fn get(
         return Ok(Some(super::dev::page(auth, ui, site).await));
     }
     if path == "/audit" {
-        let query = super::decode_form(query.unwrap_or("").as_bytes());
-        let before = super::field(&query, "before").and_then(|b| b.parse().ok());
+        let (filter, before) = pages::audit_query(query);
         let hub = ui.hub.clone();
-        let rows =
-            super::blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
-        let audit = pages::AuditPage { node: None, rows };
+        let audit = super::blocking(move || {
+            Ok(pages::AuditPage {
+                found: hub.db.audit_search(&filter, before, pages::AUDIT_PAGE)?,
+                actors: hub.db.audit_actors()?,
+                filter,
+                before,
+            })
+        })
+        .await?;
         return Ok(Some(super::page(pages::audit(auth, &audit, None, NAV))));
     }
     let Some(id) = path.strip_prefix("/vm/").filter(|id| valid_id(id)) else {

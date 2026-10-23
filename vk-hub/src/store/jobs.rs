@@ -407,7 +407,7 @@ impl JobFilter {
 
 /// Whether `haystack` contains `needle`, ignoring ASCII case. Avoid allocations because
 /// this runs on every record a page of history reads.
-fn contains_folded(haystack: &str, needle: &str) -> bool {
+pub(super) fn contains_folded(haystack: &str, needle: &str) -> bool {
     let (h, n) = (haystack.as_bytes(), needle.as_bytes());
     n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
