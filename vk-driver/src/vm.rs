@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::config::GuestCredential;
 use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
 
@@ -2541,6 +2542,33 @@ fn plan_services(
 /// The alias GitLab's docker executor gives the job container on a per-build network.
 const JOB_ALIAS: &str = "build";
 
+/// What the guest's registry proxy lends a job's VM.
+#[derive(Debug, PartialEq, Eq)]
+enum GuestProxy<'a> {
+    /// No proxy.
+    None,
+    /// The node's own `[registry]` credential (`proxy_guests`).
+    Node,
+    /// The job's token, or nothing at all when it has none (`guest_credential = "job"`).
+    Job(Option<&'a str>),
+}
+
+/// The proxy a job given `job` registry access gets under the node's `rg`. Under `"job"` the
+/// node's credential is never lent, whatever `proxy_guests` says, and a local store gets none.
+fn guest_proxy<'a>(
+    rg: Option<&crate::config::Registry>,
+    job: Option<&'a vk_hub_proto::dispatch::JobRegistry>,
+) -> GuestProxy<'a> {
+    match rg {
+        Some(rg) if rg.guest_credential == GuestCredential::Job => match rg.lends_job_token() {
+            true => GuestProxy::Job(job.map(|r| r.token.as_str())),
+            false => GuestProxy::None,
+        },
+        Some(rg) if rg.proxy_guests => GuestProxy::Node,
+        _ => GuestProxy::None,
+    }
+}
+
 /// The per-job userspace switch (net.mode = "switch"): a tied supervisor child
 /// on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) plus each
 /// service's, with the `[egress]` allowlist, the service aliases and the job's
@@ -2593,16 +2621,28 @@ fn spawn_switch(
     // `registry.vk`, injecting its credentials, so the job stays credential-free. The
     // switch redirects the sentinel (an unroutable class-E address) to the host-local
     // proxy; see regproxy.rs / switch.rs.
-    let registry_proxy = match &cfg.registry {
-        Some(rg) if rg.proxy_guests => {
+    // Under `guest_credential = "job"` the proxy lends the token the hub minted for this job
+    // instead, and runs for every job: one without a token gets a proxy that refuses all.
+    let proxy_cfg = match (
+        guest_proxy(cfg.registry.as_ref(), ctx.job_registry.as_ref()),
+        &cfg.registry,
+    ) {
+        (GuestProxy::Job(token), Some(rg)) => Some(crate::regproxy::ProxyCfg::for_job(rg, token)?),
+        (GuestProxy::Node, Some(rg)) => Some(crate::regproxy::ProxyCfg::from_registry(rg)?),
+        _ => None,
+    };
+    let registry_proxy = match proxy_cfg {
+        Some(proxy_cfg) => {
             const SENTINEL: Ipv4Addr = Ipv4Addr::new(240, 0, 0, 1);
-            let addr =
-                crate::regproxy::spawn_blocking(crate::regproxy::ProxyCfg::from_registry(rg)?)
-                    .context("starting the job registry proxy")?;
-            hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
+            let addr = crate::regproxy::spawn_blocking(proxy_cfg)
+                .context("starting the job registry proxy")?;
+            hosts.push((
+                crate::regproxy::GUEST_HOST.to_string(),
+                SENTINEL.to_string(),
+            ));
             Some((SENTINEL, addr))
         }
-        _ => None,
+        None => None,
     };
     let (allow_ip, allow_name, restrict) = effective_run_egress(cfg, ctx)?;
     let per_source = service_per_source(cfg, services)?;
@@ -4112,6 +4152,39 @@ mod tests {
 
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    /// Under `"job"` the guest gets the job's token or nothing, never the node's credential,
+    /// whatever `proxy_guests` says; under `"node"` it gets the node's only with `proxy_guests`.
+    #[test]
+    fn the_guest_proxy_lends_the_job_token_or_nothing_under_job() {
+        let rg = |toml: &str| -> crate::config::Registry {
+            let cfg: Config = toml::from_str(&format!("[registry]\n{toml}")).unwrap();
+            cfg.registry.unwrap()
+        };
+        let job = vk_hub_proto::dispatch::JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_x.y".into(),
+            expires_at: 99,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+        };
+        let remote_job =
+            rg("repo = \"reg.example/t\"\nguest_credential = \"job\"\nproxy_guests = true\n");
+        assert_eq!(
+            guest_proxy(Some(&remote_job), Some(&job)),
+            GuestProxy::Job(Some("vkt_x.y"))
+        );
+        assert_eq!(guest_proxy(Some(&remote_job), None), GuestProxy::Job(None));
+        let local_job =
+            rg("repo = \"/srv/store\"\nguest_credential = \"job\"\nproxy_guests = true\n");
+        assert_eq!(guest_proxy(Some(&local_job), Some(&job)), GuestProxy::None);
+        let node = rg("repo = \"reg.example/t\"\nproxy_guests = true\n");
+        assert_eq!(guest_proxy(Some(&node), Some(&job)), GuestProxy::Node);
+        let plain = rg("repo = \"reg.example/t\"\n");
+        assert_eq!(guest_proxy(Some(&plain), Some(&job)), GuestProxy::None);
+        assert_eq!(guest_proxy(None, Some(&job)), GuestProxy::None);
+    }
 
     /// What a VM's `vk-agent exec --service` may ask of its host: an exec into one of its own
     /// services, with the host `vk exec`'s flags. Any other `vk` command, a service the VM does

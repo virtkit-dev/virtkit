@@ -734,6 +734,13 @@ The proxy never binds a network interface, and request and response bodies strea
 directions. This keeps registry credentials out of guest jobs without buffering large
 layers. The feature is opt-in and requires guest networking.
 
+The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
+`[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose
+grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/` and
+`/dav/files/` too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and
+OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`. A job without a token,
+a gitlab-runner job included, gets a proxy that refuses everything.
+
 ## Connection limits
 
 Every limit below applies before authentication, so a client that connects and sends

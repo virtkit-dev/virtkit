@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 
@@ -83,11 +83,28 @@ pub struct JobCtx {
     /// Whether a hub placed the job: its driver names the GitLab ([`JOB_SERVER_URL`]). The
     /// node transfers such a job's artifacts and caches, so it needs no gitlab-runner.
     pub hub_placed: bool,
+    /// The registry access the hub gave a placed job, read from its journaled start
+    /// ([`JOB_START`]): the token its guest's registry proxy injects under
+    /// `[registry] guest_credential = "job"`.
+    pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
 }
 
 /// The GitLab URL the runner took the job from, passed by a placed job's driver to its
 /// executor commands. Job variables cannot override it.
 pub const JOB_SERVER_URL: &str = "VK_JOB_SERVER_URL";
+
+/// The path of a placed job's journaled start, passed by its driver to its executor commands,
+/// which read the job's registry access from it. Job variables cannot override it either:
+/// they arrive prefixed.
+pub const JOB_START: &str = "VK_JOB_START";
+
+/// The journaled start at `path`.
+fn read_job_start(path: &Path) -> Result<vk_hub_proto::dispatch::JobStart> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading the job's start {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("reading the job's start {}", path.display()))
+}
 
 /// [`JobCtx::images_dir`] of any job run with `cfg`.
 pub fn images_dir(cfg: &Config) -> PathBuf {
@@ -181,6 +198,12 @@ impl JobCtx {
             let server = server?;
             vk_hub_proto::gitlab_job_url(&server, &r.job_info.project_full_path, &r.id.to_string())
         });
+        // A placed job's driver journals its start before any executor command runs, so one
+        // it cannot read is an error, whatever `guest_credential` says.
+        let job_registry = match env(JOB_START).filter(|_| hub_placed) {
+            Some(path) => read_job_start(Path::new(&path))?.registry,
+            None => None,
+        };
         Ok(JobCtx {
             cfg,
             job_id,
@@ -234,6 +257,7 @@ impl JobCtx {
             },
             job_url,
             hub_placed,
+            job_registry,
         })
     }
 
@@ -740,6 +764,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A placed job's registry access comes from the start its driver names, and only for a
+    /// placed job: anywhere else the variable is not the driver's.
+    #[test]
+    fn a_placed_job_reads_its_registry_access_from_its_start() {
+        use vk_hub_proto::dispatch::{JobRegistry, JobStart};
+        let dir = std::env::temp_dir().join(format!("vk-jobctx-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = dir.join("start.json");
+        let registry = JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_x.y".into(),
+            expires_at: 99,
+            grants: Vec::new(),
+            cache_repo: Some("ci-cache/gl/42/protected".into()),
+            pipeline_prefix: None,
+        };
+        let job = JobStart {
+            job: "j".into(),
+            reservation: None,
+            envelope: Default::default(),
+            spec: vk_hub_proto::job::JobSpec::GitlabCi(Default::default()),
+            registry: Some(registry.clone()),
+        };
+        std::fs::write(&start, serde_json::to_vec(&job).unwrap()).unwrap();
+        let env = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let path = start.display().to_string();
+        let placed = JobCtx::for_env(
+            Config::default(),
+            &[
+                env("CUSTOM_ENV_CI_JOB_ID", "5"),
+                env(JOB_SERVER_URL, "https://gitlab.example"),
+                env(JOB_START, &path),
+            ],
+        )
+        .unwrap();
+        assert_eq!(placed.job_registry, Some(registry));
+        let unplaced = JobCtx::for_env(
+            Config::default(),
+            &[env("CUSTOM_ENV_CI_JOB_ID", "5"), env(JOB_START, &path)],
+        )
+        .unwrap();
+        assert_eq!(unplaced.job_registry, None);
+        let missing = JobCtx::for_env(
+            Config::default(),
+            &[
+                env("CUSTOM_ENV_CI_JOB_ID", "5"),
+                env(JOB_SERVER_URL, "https://gitlab.example"),
+                env(JOB_START, &dir.join("nope").display().to_string()),
+            ],
+        );
+        assert!(missing.is_err(), "a start it cannot read is an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The identity a job keys its stored state on comes from the runner's account of the
     /// job, not from the variables beside it — which a job sets itself, as it sets the
     /// `MICROVM_*` knobs. A forged `CI_PROJECT_ID` in the payload's own variable list must
@@ -938,6 +1017,7 @@ mod tests {
             project_path: None,
             job_url: None,
             hub_placed: false,
+            job_registry: None,
         }
     }
 

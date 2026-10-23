@@ -9,7 +9,15 @@
 //! interface — only reachable through the switch's per-VM redirect.
 //!
 //! Bodies stream both ways (`bytes_stream`), so pushing/pulling multi-GB layers through
-//! the proxy never buffers a whole blob in memory.
+//! the proxy never buffers a whole blob in memory, and no response has a deadline: a lock
+//! acquire long-polls for as long as the registry holds it.
+//!
+//! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
+//! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
+//! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
+//! lock API (`/lock/`) and plain files (`/dav/files/`): the registry enforces the token's
+//! grants on each. A job meant to have a token and given none gets a proxy that forwards
+//! nothing.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -32,14 +40,47 @@ use crate::oci::Creds;
 /// The streaming response body the proxy returns.
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
+/// The name the guest reaches the proxy at.
+pub const GUEST_HOST: &str = "registry.vk";
+
+/// The plain files' path, and the methods forwarded under it: vk-registry's for `/dav/files/`.
+const DAV_FILES: &str = "/dav/files/";
+const DAV_FILES_METHODS: &[&str] = &[
+    "GET", "HEAD", "PROPFIND", "PUT", "MKCOL", "DELETE", "OPTIONS",
+];
+
+/// Which of the registry's paths the proxy forwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The OCI API only, `/v2/`: what an unscoped credential may be lent for.
+    Oci,
+    /// `/v2/`, `/lock/` and `/dav/files/`: a job token's, whose grants the registry enforces.
+    Job,
+    /// Nothing: a job that should have had a token and has none.
+    Deny,
+}
+
+impl Scope {
+    /// The path prefixes forwarded, below the upstream's own path.
+    fn paths(self) -> &'static [&'static str] {
+        match self {
+            Scope::Oci => &["/v2/"],
+            Scope::Job => &["/v2/", "/lock/", DAV_FILES],
+            Scope::Deny => &[],
+        }
+    }
+}
+
 /// What the proxy forwards to and injects.
 pub struct ProxyCfg {
     /// The upstream's base URL, optionally with a path prefix (no trailing slash).
     upstream: String,
     /// The parsed upstream, whose origin every forwarded request must keep
     base: reqwest::Url,
-    /// `base`'s path followed by `/v2/`: the prefix every forwarded path must start with
-    api: String,
+    /// `base`'s path, without a trailing `/`: what every forwarded path starts with, before
+    /// one of the scope's paths
+    root: String,
+    scope: Scope,
     /// The credential injected into every forwarded request, so the job stays
     /// credential-free — and the trust anchor `client` was built against.
     pub creds: Creds,
@@ -67,6 +108,27 @@ impl ProxyCfg {
             .0)
     }
 
+    /// Build for a placed job under `[registry] guest_credential = "job"`: the runner's
+    /// `[registry]` as upstream and trust anchor, injecting the job's `token` and nothing of
+    /// the section's own credential; with no token, a proxy that forwards nothing.
+    pub fn for_job(rg: &crate::config::Registry, token: Option<&str>) -> Result<Self> {
+        // Built field by field, so no credential the section holds, now or later, is lent.
+        let creds = Creds {
+            username: None,
+            password: None,
+            token: token.map(str::to_string),
+            ca_pem: None,
+            insecure: rg.insecure,
+        }
+        .with_ca_file(rg.ca_file.as_deref())?;
+        let mut cfg = Self::build(Self::upstream_of(rg)?, creds)?;
+        cfg.scope = match token {
+            Some(_) => Scope::Job,
+            None => Scope::Deny,
+        };
+        Ok(cfg)
+    }
+
     fn build(upstream: String, creds: Creds) -> Result<Self> {
         let base = reqwest::Url::parse(&upstream)
             .with_context(|| format!("parsing the registry proxy upstream {upstream:?}"))?;
@@ -87,7 +149,7 @@ impl ProxyCfg {
                  private CA"
             );
         }
-        let api = format!("{}/v2/", base.path().trim_end_matches('/'));
+        let root = base.path().trim_end_matches('/').to_string();
         let mut b = reqwest::Client::builder();
         if let Some(pem) = &creds.ca_pem {
             b = b.add_root_certificate(
@@ -97,7 +159,8 @@ impl ProxyCfg {
         Ok(ProxyCfg {
             upstream,
             base,
-            api,
+            root,
+            scope: Scope::Oci,
             creds,
             client: b.build().context("building the registry proxy client")?,
         })
@@ -118,6 +181,8 @@ pub async fn spawn(cfg: ProxyCfg) -> Result<SocketAddr> {
 /// Like [`spawn`], but from a synchronous context (the executor's `spawn_switch`): binds
 /// synchronously and serves on a dedicated thread + runtime for the process's lifetime.
 pub fn spawn_blocking(cfg: ProxyCfg) -> Result<SocketAddr> {
+    // A loopback TCP port: any process on the host can use the credential through it, as it
+    // could the node's own. A 0600 unix socket would confine it to this user.
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("binding the registry proxy")?;
     listener.set_nonblocking(true)?;
@@ -170,13 +235,19 @@ async fn handle(
 }
 
 /// The upstream URL a guest's request target names, or `None` when, once resolved, it is not
-/// under the upstream's own `/v2/`. Checked after resolving, not on the text: the URL parser
-/// resolves `..` and its percent-encoded spellings (`%2e%2e`), so `/v2/../lock/acquire` starts
-/// with `/v2/` and still reaches `/lock/acquire`, carrying the credential.
+/// under one of the scope's paths below the upstream's own. Checked after resolving, not on
+/// the text: the URL parser resolves `..` and its percent-encoded spellings (`%2e%2e`), so
+/// `/v2/../lock/acquire` starts with `/v2/` and still reaches `/lock/acquire`, carrying the
+/// credential.
 fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
-    if !path_and_query.starts_with("/v2/") {
-        return None;
-    }
+    let scoped = |p: &str| {
+        cfg.scope
+            .paths()
+            .iter()
+            .find(|s| p.starts_with(*s))
+            .copied()
+    };
+    let prefix = scoped(path_and_query)?;
     // An encoded separator stays encoded through the parser, so `/v2/..%2Flock` passes the
     // check below — and reaches `/lock` through a front proxy that decodes `%2F`/`%5C` once
     // before normalizing. No repository or reference has one, so the path may not carry it.
@@ -190,7 +261,8 @@ fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
         return None;
     }
     let url = reqwest::Url::parse(&format!("{}{path_and_query}", cfg.upstream)).ok()?;
-    (url.origin() == cfg.base.origin() && url.path().starts_with(&cfg.api)).then_some(url)
+    let resolved = url.path().strip_prefix(cfg.root.as_str())?;
+    (url.origin() == cfg.base.origin() && resolved.starts_with(prefix)).then_some(url)
 }
 
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
@@ -215,14 +287,17 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         .map(|p| p.as_str())
         .unwrap_or("/")
         .to_string();
-    // The proxy signs requests with the host's registry credential, so confine it to the
-    // OCI distribution API surface (`/v2/…`). A guest-chosen path outside it — a foreign
-    // authority smuggled via `//host`, or the `/lock/` control plane — is refused rather
-    // than authenticated on the guest's behalf.
+    // The proxy signs requests with a credential, so confine it to the paths its scope lends
+    // that credential for: the OCI distribution API surface (`/v2/…`) for the host's own,
+    // the lock API and plain files too for a job's token. A guest-chosen path outside them —
+    // a foreign authority smuggled via `//host`, or the `/lock/` control plane under the
+    // host's credential — is refused rather than authenticated on the guest's behalf.
     let Some(url) = upstream_url(cfg, &path_and_query) else {
-        let body = Full::new(Bytes::from_static(
-            b"registry proxy: only /v2/ registry paths are proxied",
-        ))
+        let body = Full::new(Bytes::from_static(match cfg.scope {
+            Scope::Oci => b"registry proxy: only /v2/ registry paths are proxied",
+            Scope::Job => b"registry proxy: only /v2/, /lock/ and /dav/files/ are proxied",
+            Scope::Deny => b"registry proxy: this job has no registry credential",
+        }))
         .map_err(|never| match never {})
         .boxed();
         return Ok(Response::builder()
@@ -230,7 +305,21 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             .body(body)?);
     };
     let method = req.method().clone();
-    let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH);
+    // Plain files take the verbs vk-registry serves there, and no MOVE or COPY, whose
+    // `Destination` names the proxy rather than the registry.
+    if path_and_query.starts_with(DAV_FILES) && !DAV_FILES_METHODS.contains(&method.as_str()) {
+        let body = Full::new(Bytes::from_static(
+            b"registry proxy: this method is not proxied under /dav/files/",
+        ))
+        .map_err(|never| match never {})
+        .boxed();
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(body)?);
+    }
+    // WebDAV's PROPFIND carries a body as the OCI writes do.
+    let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
+        || method.as_str() == "PROPFIND";
     let (parts, incoming) = req.into_parts();
 
     let mut rb = cfg.client.request(method, url);
@@ -420,6 +509,90 @@ mod tests {
         );
     }
 
+    fn registry(up_addr: SocketAddr) -> crate::config::Registry {
+        crate::config::Registry {
+            repo: format!("{up_addr}/team"),
+            username: "robot".into(),
+            password_file: Some("/nonexistent/password".into()),
+            insecure: true,
+            ..crate::config::Registry::for_share(
+                String::new(),
+                true,
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+            )
+        }
+    }
+
+    async fn status_and_auth(
+        proxy: SocketAddr,
+        method: &str,
+        target: &str,
+        seen: &std::sync::Mutex<(String, String)>,
+    ) -> (u16, String, String) {
+        *seen.lock().unwrap() = (String::new(), String::new());
+        let r = reqwest::Client::new()
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("http://{proxy}{target}"),
+            )
+            .header("authorization", "Bearer guest-forged")
+            .send()
+            .await
+            .unwrap();
+        let (auth, path) = seen.lock().unwrap().clone();
+        (r.status().as_u16(), auth, path)
+    }
+
+    /// A job's token reaches the lock API and plain files as well as `/v2/`, injected in
+    /// place of whatever the guest sent; the section's own credential is never read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_token_reaches_locks_and_files_too() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap();
+        assert_eq!(cfg.scope, Scope::Job);
+        let proxy = spawn_blocking(cfg).unwrap();
+        for (method, target) in [
+            ("GET", "/v2/p/gl/42/app/manifests/latest"),
+            ("POST", "/lock/acquire?name=p/gl/42:k"),
+            ("PROPFIND", "/dav/files/p/gl/42/x"),
+            ("PUT", "/dav/files/p/gl/42/x"),
+        ] {
+            let (status, auth, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 200, "{method} {target}");
+            assert_eq!(auth, "Bearer vkt_job", "{method} {target}");
+            assert_eq!(path, target.split('?').next().unwrap());
+        }
+        for target in [
+            "/dav/repos/p",
+            "/settings/keys",
+            "/dav/files/../../settings/keys",
+            "/dav/files/%2e%2e/%2e%2e/browse",
+        ] {
+            let (status, _, path) = status_and_auth(proxy, "GET", target, &seen).await;
+            assert_eq!(status, 403, "{target}");
+            assert_eq!(path, "", "{target} must not be forwarded");
+        }
+    }
+
+    /// A job meant to have a token and given none gets a proxy that lends nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_without_a_token_gets_nothing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg::for_job(&registry(up_addr), None).unwrap();
+        assert_eq!(cfg.scope, Scope::Deny);
+        let proxy = spawn_blocking(cfg).unwrap();
+        let (status, _, path) =
+            status_and_auth(proxy, "GET", "/v2/app/manifests/latest", &seen).await;
+        assert_eq!(status, 403);
+        assert_eq!(path, "");
+    }
+
     #[test]
     fn a_target_is_checked_once_resolved() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -449,6 +622,29 @@ mod tests {
         let prefixed = |t: &str| upstream_url(&reg, t);
         assert!(prefixed("/v2/app/tags/list").is_some());
         assert!(prefixed("/v2/../admin").is_none());
+        // The node's credential reaches neither the locks nor the files.
+        assert_eq!(ok("/dav/files/x"), None);
+        // A job token's paths are checked once resolved as well, each against its own.
+        let mut job = cfg("http://reg.example:5000");
+        job.scope = Scope::Job;
+        let ok = |t: &str| upstream_url(&job, t).map(|u| u.to_string());
+        for fine in [
+            "/lock/acquire?name=p:k",
+            "/dav/files/p/x",
+            "/v2/p/tags/list",
+        ] {
+            assert!(ok(fine).is_some(), "{fine}");
+        }
+        for escape in [
+            "/lock/../settings",
+            "/dav/files/..%2fx",
+            "/v2/../dav/repos/x",
+            "/dav/files/../../x",
+            "/dav/files/../repos/x",
+            "/lock/%2e%2e/browse",
+        ] {
+            assert_eq!(ok(escape), None, "{escape}");
+        }
     }
 
     #[test]
@@ -499,6 +695,111 @@ mod tests {
             "",
             "a target resolving outside /v2/ must not be forwarded upstream"
         );
+    }
+
+    /// Raw request targets cannot escape their scope through URL resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_token_refuses_a_raw_target_resolving_elsewhere() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let proxy = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap())
+            .unwrap();
+        for target in [
+            "/lock/../settings/keys",
+            "/dav/files/../../browse",
+            "/dav/files/%2e%2e/%2e%2e/browse",
+            "/v2/../dav/repos/x",
+        ] {
+            let mut conn = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            conn.write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            assert!(
+                reply.starts_with(b"HTTP/1.1 403"),
+                "{target}: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        assert_eq!(seen.lock().unwrap().0, "", "nothing forwarded");
+    }
+
+    /// Under /dav/files/ only the verbs the registry serves there pass, and a PROPFIND's body
+    /// reaches the registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_files_take_the_registrys_verbs_and_their_bodies() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = body_upstream();
+        let proxy = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap())
+            .unwrap();
+        let client = reqwest::Client::new();
+        for method in ["MOVE", "COPY", "PROPPATCH", "LOCK", "POST"] {
+            let r = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("http://{proxy}/dav/files/p/x"),
+                )
+                .header("destination", "http://registry.vk/dav/files/p/y")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 405, "{method}");
+        }
+        assert_eq!(*seen.lock().unwrap(), Vec::<u8>::new(), "nothing forwarded");
+        let r = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("http://{proxy}/dav/files/p/x"),
+            )
+            .header("depth", "1")
+            .body("<propfind/>")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(*seen.lock().unwrap(), b"<propfind/>".to_vec());
+    }
+
+    /// An upstream that records the body of the last request it took.
+    fn body_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let s = s.clone();
+                            async move {
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                *s.lock().unwrap() = body.to_vec();
+                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                    b"ok",
+                                ))))
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), svc)
+                            .await;
+                    });
+                }
+            });
+        });
+        (addr, seen)
     }
 
     /// `--insecure` is plain HTTP, as everywhere else: it never turns certificate checks off.

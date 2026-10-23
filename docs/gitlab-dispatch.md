@@ -467,6 +467,19 @@ unprotected job never share one, as with gitlab-runner. The last archive written
 makes an unchanged cache's upload a blob probe. Caches are not shared with gitlab-runner's
 `cache.zip`s: a project moving to the fleet starts cold.
 
+Under `guest_credential = "job"` the guest's registry proxy (`registry.vk`) runs for every
+job and injects the job's token, never the node's credential. A job with no token gets a
+proxy that refuses everything; so does every job a local gitlab-runner gives the node, which
+under `"job"` reaches the registry only by its own means.
+
+With a token, the proxy forwards the lock API (`/lock/`) and plain files (`/dav/files/`) as
+well as `/v2/`; the registry enforces the token's grants. Under `/dav/files/` only GET,
+HEAD, PROPFIND, PUT, MKCOL, DELETE and OPTIONS pass: MOVE and COPY would name the proxy in
+their `Destination`. The job's steps find the proxy in `VK_REGISTRY` (`http://registry.vk`)
+and their grants in `VK_REGISTRY_NAMESPACES`, space-separated `<prefix>=<rights>` with `r`,
+`w` and `l` for read, write and lock. The proxy needs `net.mode = "switch"`, the only network
+that serves `registry.vk`; under any other, a job gets neither the proxy nor these variables.
+
 Archiving and extracting run in the guest, in `vk-agent`, on the job's tree as the job left
 it, with the bytes streamed over vsock; the node does the network transfers. No archiver
 needs to be in the job's image. On the node, an archive is converted as it streams; only

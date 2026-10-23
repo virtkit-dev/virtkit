@@ -981,6 +981,25 @@ pub struct Registry {
     /// pushes/pulls without ever holding the secret. Off by default.
     #[serde(default)]
     pub proxy_guests: bool,
+    /// What the guest's registry proxy injects. `"node"` (the default): this section's own
+    /// credential, and only when `proxy_guests` is on. `"job"`: the registry token the hub
+    /// minted for the job, scoped to its namespaces, with the lock API and `/dav/files/`
+    /// proxied too; the proxy then runs for every job, and one without a token gets a proxy
+    /// that refuses everything, never this section's credential. That includes every job a
+    /// local gitlab-runner gives this node: under `"job"`, only jobs the hub placed reach the
+    /// registry through `registry.vk`. Either way the proxy needs `net.mode = "switch"`, the
+    /// only network that serves `registry.vk`.
+    #[serde(default)]
+    pub guest_credential: GuestCredential,
+}
+
+/// `[registry] guest_credential`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestCredential {
+    #[default]
+    Node,
+    Job,
 }
 
 impl Registry {
@@ -1016,6 +1035,12 @@ impl Registry {
         ))
     }
 
+    /// Whether the guest's proxy lends a job's token rather than this section's credential:
+    /// `guest_credential = "job"` on a remote registry.
+    pub fn lends_job_token(&self) -> bool {
+        self.guest_credential == GuestCredential::Job && self.local_root().is_none()
+    }
+
     /// [`Registry::local_root`]'s test applied to a repo string that is not (yet) a
     /// configured registry — the instruction cache's destination, which reaches this from
     /// `[build] cache_registry` or `--cache-registry` and is a store or a server by the
@@ -1047,6 +1072,7 @@ impl Registry {
             insecure,
             transparent_zstd,
             proxy_guests: false,
+            guest_credential: GuestCredential::Node,
         }
     }
 }
@@ -1149,6 +1175,9 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
     let mut cfg: Config = table
         .try_into()
         .with_context(|| format!("parsing {}", path.display()))?;
+    for warning in ineffective_settings(&cfg) {
+        eprintln!("virtkit: warning: {}: {warning}", path.display());
+    }
     cfg.source = Some(path);
     Ok(cfg)
 }
@@ -1194,6 +1223,27 @@ fn strip_removed_keys(table: &mut toml::Table) -> Vec<&'static str> {
         removed.push("build.cloud_hypervisor");
     }
     removed
+}
+
+/// What `cfg` sets that has no effect, for the caller to warn about.
+fn ineffective_settings(cfg: &Config) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    if let Some(rg) = &cfg.registry
+        && rg.guest_credential == GuestCredential::Job
+        && !rg.lends_job_token()
+    {
+        found.push(
+            "`[registry] guest_credential = \"job\"` needs a remote registry: on a local store, \
+             jobs get no registry proxy",
+        );
+    }
+    if cfg.registry.as_ref().is_some_and(Registry::lends_job_token) && cfg.net.mode != "switch" {
+        found.push(
+            "`[registry] guest_credential = \"job\"` needs `[net] mode = \"switch\"`, the only \
+             network that serves registry.vk: under another, jobs get no registry proxy",
+        );
+    }
+    found
 }
 
 impl Config {
@@ -1302,6 +1352,32 @@ mod tests {
         );
         assert_eq!(registry("repo = \"/srv/store\"\n").base_url(), None);
         assert_eq!(registry("repo = \"https:///x\"\n").base_url(), None);
+    }
+
+    /// Only a remote registry under `"job"` lends a job's token.
+    #[test]
+    fn only_a_remote_registry_under_job_lends_the_token() {
+        assert!(
+            registry("repo = \"reg.example/t\"\nguest_credential = \"job\"\n").lends_job_token()
+        );
+        assert!(!registry("repo = \"reg.example/t\"\n").lends_job_token());
+        assert!(!registry("repo = \"/srv/store\"\nguest_credential = \"job\"\n").lends_job_token());
+    }
+
+    /// `"job"` on a local store, or off the switch network, lends nothing: the load warns.
+    #[test]
+    fn job_credential_on_a_local_store_is_warned_about() {
+        let cfg = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let local = cfg("[registry]\nrepo = \"/srv/store\"\nguest_credential = \"job\"\n");
+        assert_eq!(ineffective_settings(&local).len(), 1);
+        let job = "[registry]\nrepo = \"reg.example/t\"\nguest_credential = \"job\"\n";
+        let remote = cfg(&format!("{job}[net]\nmode = \"switch\"\n"));
+        assert!(ineffective_settings(&remote).is_empty());
+        let tap = cfg(&format!("{job}[net]\nmode = \"tap\"\n"));
+        assert_eq!(ineffective_settings(&tap).len(), 1);
+        let node = cfg("[registry]\nrepo = \"/srv/store\"\n");
+        assert!(ineffective_settings(&node).is_empty());
+        assert!(ineffective_settings(&Config::default()).is_empty());
     }
 
     /// A scratch dir of config files for the load_resolved tests; removed on drop.

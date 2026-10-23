@@ -163,6 +163,10 @@ pub fn child_env(
         dir.join(JOB_RESPONSE).display().to_string(),
     );
     set(crate::jobctx::JOB_SERVER_URL, job.server_url.clone());
+    set(
+        crate::jobctx::JOB_START,
+        dir.join(super::journal::START).display().to_string(),
+    );
     Ok(env)
 }
 
@@ -173,7 +177,7 @@ pub fn of_journal(cfg: &Config, dir: &Path) -> Result<Vec<(String, String)>> {
     let meta = super::journal::read_meta(dir)?;
     let vk_hub_proto::job::JobSpec::GitlabCi(job) = start.spec;
     let place = place(cfg, &job, &meta)?;
-    let vars = Vars::of(&job, &place);
+    let vars = Vars::of_placed(cfg, &job, start.registry.as_ref(), &place);
     child_env(&job, &vars, &place, dir)
 }
 
@@ -186,6 +190,7 @@ pub fn apply(cmd: &mut std::process::Command, env: &[(String, String)]) {
             || [
                 &b"JOB_RESPONSE_FILE"[..],
                 crate::jobctx::JOB_SERVER_URL.as_bytes(),
+                crate::jobctx::JOB_START.as_bytes(),
                 b"BUILD_EXIT_CODE_FILE",
                 b"BUILD_FAILURE_EXIT_CODE",
                 b"SYSTEM_FAILURE_EXIT_CODE",
@@ -305,6 +310,10 @@ mod tests {
         assert_eq!(
             get(crate::jobctx::JOB_SERVER_URL).as_deref(),
             Some("https://gitlab.example.com")
+        );
+        assert_eq!(
+            get(crate::jobctx::JOB_START).as_deref(),
+            Some("/n/j/start.json")
         );
         let services: serde_json::Value =
             serde_json::from_str(&get("CUSTOM_ENV_CI_JOB_SERVICES").unwrap()).unwrap();

@@ -194,7 +194,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         n => n,
     };
     let place = env::place(&cfg, &job, &meta)?;
-    let vars = Vars::of(&job, &place);
+    let vars = Vars::of_placed(&cfg, &job, registry.as_ref(), &place);
     let settings = Settings::of(&job, &vars);
     let child_env = env::child_env(&job, &vars, &place, dir)?;
     let phrases = masked_phrases(&vars, &job, registry.as_ref());
