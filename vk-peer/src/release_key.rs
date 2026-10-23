@@ -64,7 +64,8 @@ pub fn sign(key: &Path, binary: &Path, version: &str, program: Program) -> Resul
     Ok(vk_hub_proto::to_base64(signature.as_ref()))
 }
 
-fn load(path: &Path) -> Result<Ed25519KeyPair> {
+/// The ed25519 key at `path`: a regular file, readable by its owner only, PKCS#8 v2.
+pub(crate) fn load(path: &Path) -> Result<Ed25519KeyPair> {
     // `O_NOFOLLOW` and the mode judged off the descriptor, as for the peer's own key;
     // `O_NONBLOCK` so a FIFO there is refused rather than waited on.
     let mut file = std::fs::File::options()
@@ -81,7 +82,7 @@ fn load(path: &Path) -> Result<Ed25519KeyPair> {
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
         bail!(
-            "{} has mode {:o}: a release key must be readable by its owner only (chmod 600)",
+            "{} has mode {:o}: a signing key must be readable by its owner only (chmod 600)",
             path.display(),
             mode & 0o7777
         );
@@ -93,7 +94,8 @@ fn load(path: &Path) -> Result<Ed25519KeyPair> {
         .with_context(|| format!("reading {}", path.display()))?;
     Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
         anyhow!(
-            "{} is not an ed25519 key as `vk release-key generate` writes one (PKCS#8 v2)",
+            "{} is not an ed25519 key in PKCS#8 v2, as `vk release-key generate` and the hub \
+             write one",
             path.display()
         )
     })

@@ -8,6 +8,7 @@ pub mod identity;
 pub mod net;
 pub mod release_key;
 pub mod session;
+pub mod token;
 pub mod update;
 
 use std::time::Duration;
