@@ -279,15 +279,38 @@ pub fn start(state: Arc<ServerState>, ctx: Facts) {
 /// Make the registry read-only again if the hub last asked so, before `serve` takes a
 /// connection, whether or not its link to the hub opens.
 fn restore_read_only(dir: &Path, state: &ServerState, settings: &HubSettings) {
-    let (Ok(enrollment), Ok(p)) = (read_enrollment(dir), Persisted::load(dir)) else {
-        return;
-    };
-    let asked = p.issuer == Some((enrollment.hub, enrollment.registry_id))
-        && p.applied.is_some_and(|d| d.read_only == Some(true));
+    let asked = last_asked(dir)
+        .and_then(|(_, applied)| applied)
+        .is_some_and(|d| d.read_only == Some(true));
     if asked && settings.allows(ALLOW_READ_ONLY) {
         eprintln!("vk-registry: hub: read-only, as the hub asked");
         state.store.set_read_only(true);
     }
+}
+
+/// The enrollment, and what its hub last asked when the state on disk is that hub's; `None`
+/// when the registry is not enrolled. A read that fails otherwise is logged, and taken as
+/// not enrolled, or as nothing asked.
+fn last_asked(dir: &Path) -> Option<(Enrollment, Option<DesiredState>)> {
+    let enrollment = match read_enrollment(dir) {
+        Ok(e) => e,
+        Err(e) if vk_peer::net::is_not_found(&e) => return None,
+        Err(e) => {
+            eprintln!("vk-registry: hub: {e:#}");
+            return None;
+        }
+    };
+    let applied = match Persisted::load(dir) {
+        Ok(p) => p
+            .issuer
+            .filter(|i| *i == (enrollment.hub.clone(), enrollment.registry_id.clone()))
+            .and(p.applied),
+        Err(e) => {
+            eprintln!("vk-registry: hub: {e:#}");
+            None
+        }
+    };
+    Some((enrollment, applied))
 }
 
 /// The link for an enrolled registry, with what the hub last asked applied; `None` when it
