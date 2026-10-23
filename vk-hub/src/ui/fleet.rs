@@ -265,7 +265,9 @@ pub(super) async fn get(
         return super::registries::list(auth, ui).await.map(Some);
     }
     if let Some(id) = super::registries::detail_target(path) {
-        return super::registries::detail(id, auth, ui).await.map(Some);
+        return super::registries::detail(id, query, auth, ui)
+            .await
+            .map(Some);
     }
     if path == super::clients::PATH {
         return super::clients::get(auth, ui).await.map(Some);

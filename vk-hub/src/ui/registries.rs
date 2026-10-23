@@ -13,7 +13,7 @@ use super::html::Html;
 use super::pages::{self, end_section, header_cells, kv, kv_node, section};
 use super::{Auth, Body, Ui, blocking, field, message, page};
 use crate::registries::{self as ops, RegistryView};
-use crate::store::{NotEnrolled, RegistryCommandRow, RegistryRow, Role, TokenKeyRow};
+use crate::store::{NamespaceRow, NotEnrolled, RegistryCommandRow, RegistryRow, Role, TokenKeyRow};
 
 /// The registries' list.
 pub(super) const PATH: &str = "/registries";
@@ -184,26 +184,221 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     Ok(page(super::fleet::layout("Registries", PATH, auth, &main)))
 }
 
-/// `/registry/<id>`.
-pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+/// A registry page's views: `/registry/<id>`, `?tab=access` and `?tab=settings`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    /// What it reports, what the hub asks of it, its usage and commands.
+    Overview,
+    /// Its storage areas: who may read, publish and coordinate builds there.
+    Access,
+    /// Its address and signing keys.
+    Settings,
+}
+
+impl Tab {
+    const ALL: [(Tab, &'static str, &'static str); 3] = [
+        (Tab::Overview, "", "Overview"),
+        (Tab::Access, "?tab=access", "Job access"),
+        (Tab::Settings, "?tab=settings", "Settings"),
+    ];
+
+    fn of(query: Option<&str>) -> Self {
+        let form = super::decode_form(query.unwrap_or("").as_bytes());
+        match field(&form, "tab") {
+            Some("access") => Tab::Access,
+            Some("settings") => Tab::Settings,
+            _ => Tab::Overview,
+        }
+    }
+}
+
+/// `/registry/<id>[?tab=…]`.
+pub(super) async fn detail(
+    id: &str,
+    query: Option<&str>,
+    auth: &Auth,
+    ui: &Ui,
+) -> Result<Response<Body>> {
+    let tab = Tab::of(query);
     let hub = ui.hub.clone();
     let wanted = id.to_string();
-    let Some((view, commands)) = blocking(move || ops::detail(&hub, &wanted)).await? else {
+    let Some((view, commands, namespaces, keys)) = blocking(move || {
+        let Some((view, commands)) = ops::detail(&hub, &wanted)? else {
+            return Ok(None);
+        };
+        let namespaces = hub.db.namespaces(&wanted)?;
+        let keys = hub.db.token_keys()?;
+        Ok::<_, anyhow::Error>(Some((view, commands, namespaces, keys)))
+    })
+    .await?
+    else {
         return Ok(message(StatusCode::NOT_FOUND, "There is no such registry."));
     };
     let now = crate::now_secs();
     let mut main = Html::new();
     main.raw("<h1>").node(&view.row.hostname).raw("</h1>");
-    status(&mut main, &view, now);
-    steering(&mut main, &view, auth);
-    usage(&mut main, &view);
-    commands_table(&mut main, &view, &commands, now);
+    main.raw("<nav class=\"tabs\" aria-label=\"Registry views\">");
+    for (t, suffix, label) in Tab::ALL {
+        main.raw("<a href=\"")
+            .raw(DETAIL_PREFIX)
+            .text(&view.id)
+            .raw(suffix)
+            .raw("\"")
+            .raw(if t == tab {
+                " aria-current=\"page\""
+            } else {
+                ""
+            })
+            .raw(">")
+            .raw(label)
+            .raw("</a>");
+    }
+    main.raw("</nav>");
+    match tab {
+        Tab::Overview => {
+            status(&mut main, &view, now);
+            steering(&mut main, &view, auth);
+            usage(&mut main, &view);
+            commands_table(&mut main, &view, &commands, now);
+        }
+        Tab::Access => access(&mut main, &view, &namespaces),
+        Tab::Settings => settings(&mut main, &view, &keys, now),
+    }
     Ok(page(super::fleet::layout(
         &view.row.hostname,
         PATH,
         auth,
         &main,
     )))
+}
+
+/// The Job access tab: the registry's storage areas, those the hub keeps for CI folded away,
+/// and what keeps jobs from getting access, when something does.
+fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow]) {
+    if !v.row.takes_tokens() {
+        h.raw("<p class=\"callout\">Jobs get no access here: the registry does not take the ")
+            .raw("hub's tokens. <code>[hub] tokens = true</code> in its config turns it on.</p>");
+    }
+    let cleanup = namespaces.iter().any(|n| n.retention_days.is_some());
+    // Only a registry that reported its inventory says what its `[hub] allow` lists.
+    let lacks_gc = v.row.inventory.as_ref().is_some_and(|i| {
+        !i.allow
+            .iter()
+            .any(|a| a == vk_hub_proto::registry::ALLOW_GC)
+    });
+    let refused = v.row.report.as_ref().is_some_and(|r| {
+        r.refused
+            .iter()
+            .any(|f| f == vk_hub_proto::registry::REFUSED_PREFIX_RETENTION)
+    });
+    if cleanup && lacks_gc {
+        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is not applied:")
+            .raw(
+                "</strong> the registry's <code>[hub] allow</code> does not list <code>gc</code>, ",
+            )
+            .raw("so it keeps its own windows. List it there, or set <code>[[gc.prefix]]</code> ")
+            .raw("in its config.</p>");
+    } else if refused {
+        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is not applied:")
+            .raw("</strong> the registry refused a cleanup window (shorter than its floor, or ")
+            .raw("invalid). A shorter one needs <code>[[gc.prefix]]</code> in its own config.</p>");
+    }
+    let areas: Vec<_> = namespaces.iter().map(super::access::area).collect();
+    let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
+    h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
+        .raw("Jobs get access only where an access rule allows it.</p>");
+    if own.is_empty() {
+        h.raw("<p class=\"empty\">None besides the ones kept for CI. ")
+            .raw("<code>vk-hub namespaces add</code> declares one.</p>");
+    } else {
+        areas_table(h, &own);
+    }
+    if !managed.is_empty() {
+        h.raw("<details class=\"fold\"><summary>Managed by CI <span class=\"sub\">· caches and ")
+            .raw("per-pipeline storage</span></summary>");
+        areas_table(h, &managed);
+        h.raw("</details>");
+    }
+    h.raw("</section><p><a href=\"/audit?category=all&amp;node=")
+        .text(&v.id)
+        .raw("\">Access history in the audit log</a></p>");
+}
+
+fn areas_table(h: &mut Html, areas: &[&super::access::Area]) {
+    h.raw("<table class=\"grid\"><thead><tr>");
+    header_cells(h, &["AREA", "WHO CAN READ", "WHO CAN PUBLISH"]);
+    h.raw("</tr></thead><tbody>");
+    for a in areas {
+        h.raw("<tr><td><strong>")
+            .text(&a.label)
+            .raw("</strong><div class=\"sub\"><code>")
+            .text(&a.path)
+            .raw("</code></div></td><td>");
+        lines(h, &a.readers);
+        h.raw("</td><td>");
+        lines(h, &a.publishers);
+        h.raw("</td></tr>");
+    }
+    h.raw("</tbody></table>");
+}
+
+fn lines(h: &mut Html, lines: &[String]) {
+    if lines.is_empty() {
+        h.raw("<span class=\"sub\">nobody</span>");
+    }
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            h.raw("<br>");
+        }
+        h.text(l);
+    }
+}
+
+/// The Settings tab: the address the registry is bound to, and the signing keys it holds.
+fn settings(h: &mut Html, v: &RegistryView, keys: &[TokenKeyRow], now: u64) {
+    section(h, "Address");
+    match &v.row.url {
+        Some(url) => kv(h, "Bound to", url),
+        None => kv(
+            h,
+            "Bound to",
+            "none: nodes cannot name it, so their jobs get no access",
+        ),
+    }
+    end_section(h);
+    h.raw("<section><h2>Signing keys</h2>");
+    if !v.row.takes_tokens() {
+        h.raw("<p class=\"empty\">The registry does not take the hub's tokens.</p></section>");
+        return;
+    }
+    let applied = v.row.applied();
+    let signing = crate::tokens::signing_key(keys, &v.row);
+    h.raw("<table class=\"grid\"><thead><tr>");
+    header_cells(h, &["KEY", "STATE HERE"]);
+    h.raw("</tr></thead><tbody>");
+    for k in keys.iter().rev() {
+        let Some(first) = v.row.key_generations.get(&k.public.kid) else {
+            continue;
+        };
+        h.raw("<tr><td><code>")
+            .text(k.public.kid.get(..12).unwrap_or(&k.public.kid))
+            .raw("</code></td><td>");
+        if signing.is_some_and(|s| s.public.kid == k.public.kid) {
+            h.raw("<span class=\"badge ok\">Signs its tokens</span>");
+        } else if *first > applied {
+            h.raw("<span class=\"badge busy\">Sent, not applied yet</span>");
+        } else if let Some(at) = k.superseded_at {
+            h.raw("Replaced ");
+            pages::time(h, at, &super::fleet::age(now, at));
+            h.raw("; kept while tokens it signed may be live");
+        } else {
+            h.raw("Applied");
+        }
+        h.raw("</td></tr>");
+    }
+    h.raw("</tbody></table><p class=\"sub\">")
+        .text(format!("Applied generation {applied}"))
+        .raw(". <code>vk-hub token-keys rotate</code> replaces the signing key.</p></section>");
 }
 
 fn status(h: &mut Html, v: &RegistryView, now: u64) {

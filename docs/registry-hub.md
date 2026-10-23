@@ -459,6 +459,16 @@ signing key), *Updating signing keys* (a newer key exists; the applied key still
 *Configured* with a storage-area count. The UI calls namespaces storage areas. Version, mode
 and ID are on the registry's page.
 
+A registry's page has three tabs. *Overview* (`/registry/<id>`) is what it reports and what
+the hub asks of it. *Job access* (`?tab=access`) lists its storage areas, each with who may
+read and who may publish there in plain words ("Projects under wab/ on gl, protected
+branches and tags only · can coordinate builds"); the two the hub keeps for CI, `ci-cache`
+and `ci-pipeline`, are folded under *Managed by CI*. It says when cleanup after inactivity
+does not apply, because the registry's `[hub] allow` lacks `gc` or the registry refused a
+window, and links to the registry's audit log. *Settings* (`?tab=settings`) shows the bound
+address and, per signing key the registry was sent, whether it signs the registry's tokens,
+awaits being applied, or was replaced and is kept while its tokens may be live.
+
 ## Open questions
 
 - **Key table size.** Bounded by the hub's 256 keys today; a fleet with per-project keys in the

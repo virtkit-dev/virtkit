@@ -7670,3 +7670,108 @@ async fn the_registries_list_says_whether_jobs_get_access() {
     assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
     assert!(!body.contains("<script>"), "{body}");
 }
+
+/// A registry's page has three tabs: what it reports, its storage areas in plain words with
+/// what keeps their cleanup from applying, and its address and signing keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
+    use crate::store::{NamespaceRow, NsGrant, RegistryWrite};
+    use crate::tests::tokens::{token_registry, url_registry};
+    let (addr, hub, _keys) = start_fleet_keys("detail").await;
+    let id = token_registry(&hub, "https://ok.example.com", "b1");
+    hub.db
+        .add_gitlab(
+            "gl",
+            "https://gitlab.example.com",
+            "uid 0",
+            crate::now_secs(),
+        )
+        .unwrap();
+    let wab = NamespaceRow {
+        name: "wab".into(),
+        path: "wab".into(),
+        retention_days: None,
+        grants: vec![
+            NsGrant::parse("rwl:gitlab gl, projects wab/**, protected").unwrap(),
+            NsGrant::parse("r:gitlab gl, projects wab/**").unwrap(),
+        ],
+        created_at: 0,
+        created_by: "uid 0".into(),
+    };
+    hub.db
+        .put_namespace(&id, &wab, "uid 0", crate::now_secs())
+        .unwrap();
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = |path: String| {
+        let viewer = viewer.clone();
+        async move { get(addr, &path, Some(&viewer)).await.body }
+    };
+    let overview = page(format!("/registry/{id}")).await;
+    assert!(
+        overview.contains(&format!(
+            "<a href=\"/registry/{id}\" aria-current=\"page\">Overview</a>"
+        )),
+        "{overview}"
+    );
+    assert!(overview.contains("Store size"), "{overview}");
+    let access = page(format!("/registry/{id}?tab=access")).await;
+    for want in [
+        "aria-current=\"page\">Job access</a>",
+        "<h2>Storage areas</h2>",
+        "<strong>wab</strong>",
+        "Projects under wab/ on gl, protected branches and tags only · can coordinate builds",
+        "Projects under wab/ on gl</td>",
+        "<summary>Managed by CI",
+        "<strong>CI caches</strong>",
+        "<strong>Pipeline storage</strong>",
+        "Each pipeline, its own",
+        &format!("<a href=\"/audit?category=all&amp;node={id}\">"),
+    ] {
+        assert!(access.contains(want), "{want}: {access}");
+    }
+    assert!(!access.contains("callout"), "{access}");
+    // The registry refused the hub's cleanup window: the tab says what it needs.
+    let report = vk_hub_proto::registry::Report {
+        applied: hub
+            .db
+            .registry(&id)
+            .unwrap()
+            .unwrap()
+            .report
+            .unwrap()
+            .applied,
+        refused: vec![vk_hub_proto::registry::REFUSED_PREFIX_RETENTION.into()],
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Report(report), crate::now_secs())
+        .unwrap();
+    let access = page(format!("/registry/{id}?tab=access")).await;
+    assert!(
+        access.contains("callout warn") && access.contains("[[gc.prefix]]"),
+        "{access}"
+    );
+    let settings = page(format!("/registry/{id}?tab=settings")).await;
+    for want in [
+        "https://ok.example.com",
+        "Signs its tokens",
+        "vk-hub token-keys rotate",
+    ] {
+        assert!(settings.contains(want), "{want}: {settings}");
+    }
+    // A registry that takes no tokens says so on both.
+    let off = url_registry(&hub, "https://off.example.com", "b2");
+    let access = page(format!("/registry/{off}?tab=access")).await;
+    assert!(access.contains("Jobs get no access here"), "{access}");
+    let settings = page(format!("/registry/{off}?tab=settings")).await;
+    assert!(settings.contains("does not take the hub"), "{settings}");
+    // A tab it does not know is the overview, and nothing of it comes back on the page.
+    for query in ["?tab=bogus", "?tab=%3Cscript%3E"] {
+        let body = page(format!("/registry/{id}{query}")).await;
+        assert!(
+            body.contains("aria-current=\"page\">Overview</a>") && body.contains("Store size"),
+            "{query}: {body}"
+        );
+        assert!(!body.contains("<script>"), "{query}: {body}");
+    }
+}

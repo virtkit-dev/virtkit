@@ -61,6 +61,7 @@ use crate::local::Local;
 use crate::server::{Hub, Io, PRE_AUTH_TIMEOUT};
 use crate::store::{self, Role, UiSession};
 
+mod access;
 mod actions;
 mod assets;
 mod body;

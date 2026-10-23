@@ -61,7 +61,7 @@ pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
     envelope_text, valid_name,
 };
-pub use namespaces::{NamespaceRow, NsGrant, prefix_retention, resolve};
+pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retention, resolve};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
