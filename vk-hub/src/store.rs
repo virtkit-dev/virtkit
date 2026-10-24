@@ -1136,6 +1136,15 @@ impl Db {
         txn.commit().context("writing an audit line")
     }
 
+    /// Record `events`, each its node, actor and text, in the audit log, all or none.
+    pub fn audit_all(&self, events: &[(Option<String>, String, String)], now: u64) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        for (node, actor, event) in events {
+            append_audit(&txn, node.as_deref(), actor, event, now)?;
+        }
+        txn.commit().context("writing audit lines")
+    }
+
     /// Node `id`'s workloads, with their memory readings; `None` until a report listed them.
     #[cfg(test)]
     pub fn workloads(&self, id: &str) -> Result<Option<Workloads>> {
@@ -3147,6 +3156,25 @@ mod tests {
             panic!("expected a new enrollment");
         };
         assert_ne!(again, node_id);
+    }
+
+    #[test]
+    fn audit_lines_are_written_together() {
+        let db = Db::open_memory().unwrap();
+        let events = [
+            (Some("n1".to_string()), "hub".to_string(), "a".to_string()),
+            (None, "hub".to_string(), "b".to_string()),
+        ];
+        db.audit_all(&events, 5).unwrap();
+        let node: Vec<String> = db
+            .audits(Some("n1"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(node, ["a"]);
+        let all = db.audit_search(&AuditFilter::default(), None, 10).unwrap();
+        assert_eq!(all.rows.len(), 2);
     }
 
     #[test]

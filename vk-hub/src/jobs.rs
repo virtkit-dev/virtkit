@@ -512,10 +512,24 @@ async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) -> Result
 }
 
 /// Write `row`, logging rather than failing: the change is made in memory, and the next
-/// write of the job carries it.
+/// write of the job carries it. Its `events` are not carried, so they are written on their
+/// own, and logged whole should that fail too.
 async fn persist_logged(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) {
-    if let Err(e) = persist(hub, id, row, events).await {
-        eprintln!("vk-hub: recording job {id}: {e:#}");
+    let Err(e) = persist(hub, id, row, events.clone()).await else {
+        return;
+    };
+    eprintln!("vk-hub: recording job {id}: {e:#}");
+    if events.is_empty() {
+        return;
+    }
+    let lines = events.clone();
+    let audited = blocking(hub, move |db| db.audit_all(&lines, crate::now_secs())).await;
+    if let Err(e) = audited {
+        eprintln!("vk-hub: auditing job {id}: {e:#}");
+        for (node, actor, event) in events {
+            let node = node.map_or(String::new(), |n| format!(" (node {n})"));
+            eprintln!("vk-hub: audit line not recorded{node}: {actor}: {event}");
+        }
     }
 }
 
