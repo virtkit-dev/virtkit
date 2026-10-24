@@ -1607,9 +1607,15 @@ declares one dimension allows none of the other, whatever the cap allows of it.
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,
 the projects they may submit jobs of (*All projects* when one key's ceiling is the whole
 server), and the nearest of their expiries, warned about under 14 days. A working jobs key
-bound to no server is called out above: its jobs get no registry access. Its *Other API
-clients* tab (`/clients?tab=other`) shows viewers and operators alike the API keys (see [Placed
-jobs](#placed-jobs)) and the client instances using each. Each key shows its name, first 8
+bound to no server is called out above: its jobs get no registry access. Below, *Runner keys*
+lists every key bound to a server, working or not, and *Instances* the client instances using
+them, each with a *server* column — a server the hub no longer knows marked *unknown* — and each
+key with the projects it may submit jobs of. Runner keys are made with `vk-hub keys create
+--gitlab`; one is replaced by creating its successor under another name, pointing `vk-gitlab` at
+it and revoking the old one. Its *Other API clients* tab (`/clients?tab=other`) shows the API
+keys bound to no server (see [Placed jobs](#placed-jobs)) and the client instances using each,
+saying so when there are none but runner keys. Both tabs show viewers and operators alike the
+same things of a key and an instance. Each key shows its name, first 8
 characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
 revoked, expired or when it expires, when any of its instances was last heard from, how many
 instances it has, and how many of its jobs the history holds, linked to `/jobs?key=<key ID>`.
@@ -1623,8 +1629,8 @@ of the same GitLab server, or of none, shows too is left out while it holds noth
 same client, now using that key. What a client said is shown as text, and a runner's
 URL becomes a link only when it is a plain web URL without credentials.
 
-Operators create keys there with the same validation as `vk-hub keys create`: a name,
-scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
+Operators create keys on the *Other API clients* tab with the same validation as `vk-hub keys
+create`: a name, scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
 of 90 days (the default), 7, 30 or 365 days. Binding a key to a GitLab instance and projects
 currently requires the CLI. Invalid names and policies get the CLI's reason.
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
@@ -1689,8 +1695,9 @@ placed, accepted, at a new stage, finished, canceled or settled — and each hou
 history; and, by job, each piece of its output stored, which wakes that job's page alone, never
 `/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
 nodes page is sent that one rendering; `/operations` likewise, once for every viewer's page and
-once for every operator's; `/clients` likewise, woken by a key created, revoked or removed, an
-instance heard from anew, a hello recorded or instances pruned, and rendered once a heartbeat
+once for every operator's; `/clients` likewise, both its tabs' fragments in one rendering, woken
+by a key created, revoked or removed, a GitLab server added or removed, an instance heard from
+anew, a hello recorded or instances pruned, and rendered once a heartbeat
 interval regardless while a stream is open, which moves its ages and what its instances hold. A
 node's page is woken by changes to that node alone, and `/jobs` by changes to jobs alone, never
 by a heartbeat. `/jobs`' stream carries the page's filter in its URL

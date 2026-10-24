@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **The hub's Connections page shows a GitLab server's runner keys and the instances using
+  them on its GitLab tab**, with their state, last contact, jobs and revoke button, revoked
+  keys included; its Other API clients tab shows only the keys bound to no server.
 - **An instance seen through a revoked or expired key no longer looks live on the hub's
   Connections page**: it is marked with its key's state, and left out once the same client
   shows under the key that replaced it.

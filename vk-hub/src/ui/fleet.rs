@@ -112,6 +112,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         "operations" => Some("operations"),
         super::jobs::EVENT => Some(super::jobs::EVENT),
         super::clients::EVENT => Some(super::clients::EVENT),
+        super::clients::GITLAB_EVENT => Some(super::clients::GITLAB_EVENT),
         super::egress::EVENT => Some(super::egress::EVENT),
         _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
@@ -161,14 +162,19 @@ pub(super) fn source(
                 super::egress::source(hub, &site.egress, query, steer),
             ));
         }
-        super::clients::EVENT => {
+        // Either tab's: one rendering of both, each tab told of its session's end in its own.
+        super::clients::EVENT | super::clients::GITLAB_EVENT => {
             let feed = if steer {
                 &site.steered_clients_feed
             } else {
                 &site.clients_feed
             };
             return Some(Source::Shared {
-                name: super::clients::EVENT,
+                name: if event == super::clients::EVENT {
+                    super::clients::EVENT
+                } else {
+                    super::clients::GITLAB_EVENT
+                },
                 feed: feed.subscribe(),
                 events: counted_events(hub, super::clients::events(hub, steer)),
             });

@@ -111,7 +111,7 @@ p { margin: var(--s2) 0; }
 
 main { padding: var(--s5); max-width: 110rem; margin: 0 auto; }
 main > section, main > div > section, #detail > section, #operations > section,
-#clients > section, .rollout {
+#clients > section, #gitlab-servers > section, .rollout {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);

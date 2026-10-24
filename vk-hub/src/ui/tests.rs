@@ -7887,6 +7887,8 @@ async fn connections_list_gitlab_servers_and_their_runner_keys() {
         assert!(body.contains(want), "{want}: {body}");
     }
     assert!(!body.contains("<h2>API keys</h2>"), "{body}");
+    // Bound to no server, it is listed on the other tab only.
+    assert!(!body.contains("<td>legacy-runner</td>"), "{body}");
     // Unknown tab values select GitLab and are not reflected in the page.
     for query in ["?tab=bogus", "?tab=%3Cscript%3E"] {
         let body = get(addr, &format!("/clients{query}"), Some(&viewer))
@@ -7911,9 +7913,168 @@ async fn connections_list_gitlab_servers_and_their_runner_keys() {
     let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
     assert!(
         other.contains("aria-current=\"page\">Other API clients</a>")
-            && other.contains("<h2>API keys</h2>"),
+            && other.contains("<h2>API keys</h2>")
+            && other.contains("<td>legacy-runner</td>")
+            && !other.contains("main-runner"),
         "{other}"
     );
+}
+
+/// A key bound to a GitLab server, the instances using it and its revoked predecessor are on
+/// the GitLab tab only, live, an instance that moved to the new key shown once; the other tab
+/// shows the keys bound to none, or says the runner keys are on the GitLab tab. An operator
+/// revokes a runner key there and comes back to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn runner_keys_and_their_instances_are_on_the_gitlab_tab() {
+    use crate::store::{KeyPolicy, Scope};
+    use vk_hub_proto::client::ClientHello;
+    let (addr, hub, origin) = start_fleet().await;
+    let now = crate::now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
+        .unwrap();
+    let key = |name: &str, gitlab: Option<&str>| {
+        let policy = KeyPolicy {
+            scopes: vec![Scope::Jobs],
+            pools: vec!["*".into()],
+            max_envelope: None,
+            gitlab: gitlab.map(str::to_string),
+            projects: Vec::new(),
+        };
+        let (key, _) = hub
+            .db
+            .create_api_key(name, &policy, Duration::from_secs(3600), "uid 0", now)
+            .unwrap();
+        hub.db.api_key(&key, now).unwrap().unwrap()
+    };
+    let hello = |instance: &str, host: &str| ClientHello {
+        instance: instance.into(),
+        program: "vk-gitlab".into(),
+        version: "0.95.0".into(),
+        hostname: host.into(),
+        concurrent: Some(2),
+        runners: vec![],
+    };
+    // The runner's first key, revoked once its successor took over under the same name.
+    let old = key("vk-gitlab", Some("gl"));
+    crate::clients::hello(&hub, &old, hello("s_1", "ci-1"))
+        .await
+        .unwrap();
+    assert!(hub.db.revoke_api_key("vk-gitlab", "uid 0", now).unwrap());
+    let new = key("vk-gitlab", Some("gl"));
+    crate::clients::hello(&hub, &new, hello("s_1", "ci-1"))
+        .await
+        .unwrap();
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
+    assert!(
+        other.contains("GitLab runner keys are on the <a href=\"/clients\">GitLab</a> tab"),
+        "{other}"
+    );
+    assert!(!other.contains("vk-gitlab</td>"), "{other}");
+
+    let unbound = key("deploy", None);
+    crate::clients::hello(&hub, &unbound, hello("s_9", "deployer"))
+        .await
+        .unwrap();
+    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    for want in [
+        "id=\"gitlab-servers\" hx-ext=\"sse\" sse-connect=\"/events/gitlab\" \
+         sse-swap=\"gitlab\"",
+        "<h2>Runner keys</h2>",
+        "<th>server</th><th>name</th>",
+        "<tr><td>gl</td><td>vk-gitlab</td><td><code>vkk_",
+        "<span class=\"badge bad\">revoked</span>",
+        "<td>-</td><td>All projects</td><td><time",
+        "<h2>Instances</h2>",
+        "<tr><td>gl</td><td>vk-gitlab</td><td>ci-1</td><td><code>s_1</code></td>\
+         <td>vk-gitlab 0.95.0</td>",
+        "--gitlab &lt;name&gt; [--projects",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    // The client that moved to the new key is shown once, under it.
+    assert_eq!(body.matches("<code>s_1</code>").count(), 1, "{body}");
+    assert_eq!(
+        body.matches("<tr><td>gl</td><td>vk-gitlab</td><td><code>vkk_")
+            .count(),
+        2
+    );
+    for not in [
+        "<td>deploy</td>",
+        "s_9",
+        "<h2>API keys</h2>",
+        "Create an API key",
+    ] {
+        assert!(!body.contains(not), "{not}: {body}");
+    }
+    let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
+    for want in [
+        "<tr><td>deploy</td>",
+        "<td>deploy</td><td>deployer</td><td><code>s_9",
+    ] {
+        assert!(other.contains(want), "{want}: {other}");
+    }
+    for not in [
+        "vk-gitlab</td>",
+        "s_1",
+        "<h2>Runner keys</h2>",
+        "GitLab runner keys are",
+    ] {
+        assert!(!other.contains(not), "{not}: {other}");
+    }
+
+    // A new instance of the runner reaches the GitLab tab live.
+    let mut events = Events::open(addr, "/events/gitlab", &viewer).await;
+    next_with(&mut events, "event: gitlab\n").await;
+    let mut second = new.clone();
+    second.instance = Some("s_2".into());
+    crate::clients::seen(&hub, &second, crate::now_secs());
+    let event = next_with(&mut events, "<code>s_2</code>").await;
+    assert!(event.starts_with("event: gitlab\n"), "{event}");
+
+    // An operator revokes the runner key on the GitLab tab, and is sent back to it.
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let body = get(addr, "/clients", Some(&operator)).await.body;
+    for want in [
+        &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
+        "<input type=\"hidden\" name=\"name\" value=\"vk-gitlab\">\
+         <button class=\"danger\">Revoke</button>",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    assert!(!body.contains("Create an API key"), "{body}");
+    let form = format!("_csrf={csrf}&op=revoke&name=vk-gitlab");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
+    let answer = format!(
+        "{form}&keys={}&nonce={}&confirm=yes",
+        hidden(&reply.body, "keys"),
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+
+    // Signed out, the GitLab tab is told so in its own region, and its stream closes.
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[&format!("Cookie: {viewer}"), &format!("Origin: {origin}")],
+        &format!("_csrf={viewer_csrf}"),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let last = next_with(&mut events, "Signed out").await;
+    assert!(last.starts_with("event: gitlab\n"), "{last}");
+    assert_eq!(
+        events.next().await.as_deref(),
+        Some("event: close\ndata: \n\n")
+    );
+    let again = get(addr, "/events/gitlab", Some(&viewer)).await.body;
+    assert!(again.starts_with("event: gitlab\ndata: "), "{again}");
 }
 
 /// A placed job's page shows rights per storage area in plain words, with token details

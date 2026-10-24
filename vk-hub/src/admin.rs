@@ -691,6 +691,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
         Call::AddGitlab { name, url } => {
             let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
+            hub.clients_changed();
             eprintln!(
                 "vk-hub: admin: {actor} added GitLab instance {name} at {}",
                 row.url
@@ -700,6 +701,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::RemoveGitlab { name } => {
             let removed = hub.db.remove_gitlab(&name, &actor, crate::now_secs())?;
             if removed {
+                hub.clients_changed();
                 eprintln!(
                     "vk-hub: admin: {actor} removed GitLab instance {}",
                     vk_hub_proto::display_safe(&name)
