@@ -31,7 +31,7 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use vk_hub_proto::egress::{EgressLayer, EgressOutcome};
+use vk_hub_proto::egress::{EgressLayer, EgressOutcome, EgressPhase, HubEgress, HubPhase};
 
 use crate::egress_report::Attrs;
 
@@ -717,6 +717,10 @@ struct EgressGuard {
     /// The services' VMs, by each of their addresses, which a record names its source by; an
     /// address not here is the job's own VM.
     vm_names: HashMap<Ipv4Addr, String>,
+    /// The hub's layer for this phase, checked after the node's cap and before the policies
+    /// above, for every source alike: what it refuses is refused, dry-run or not. `None` where
+    /// the hub restricts nothing.
+    hub: Option<Arc<Egress>>,
     /// How long the denial and audit channels may grow, in bytes: past it a record is dropped
     /// and only counted, and the counts are written out as `omitted` records. `None` =
     /// unbounded. A guest that loops on its lookups fills a channel for as long as it runs.
@@ -748,6 +752,7 @@ impl EgressGuard {
             dns_denied: Mutex::new(HashMap::new()),
             cap: None,
             vm_names: HashMap::new(),
+            hub: None,
             record_limit: None,
             dropped: Mutex::new(HashMap::new()),
             flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
@@ -792,6 +797,12 @@ impl EgressGuard {
         self
     }
 
+    /// See the `hub` field. An unrestricted layer is no layer.
+    fn with_hub(mut self, hub: Option<Egress>) -> Self {
+        self.hub = hub.filter(|h| !matches!(h, Egress::AllowAll)).map(Arc::new);
+        self
+    }
+
     /// See the `record_limit` field.
     fn with_record_limit(mut self, limit: Option<u64>) -> Self {
         self.record_limit = limit;
@@ -827,16 +838,27 @@ impl EgressGuard {
     }
 
     /// The layer that decides a denial of `src`: the first that `refuses` it, in the order they
-    /// are checked — the node's cap, the job's policy, then the service's own where `src` has
-    /// one. A destination is reachable only if every layer allows it. Where none refuses it — a
-    /// policy edited since — the narrowest of `src`'s own; [`EgressLayer::Unknown`] without a
-    /// cap.
-    fn layer(&self, src: Option<Ipv4Addr>, refuses: impl Fn(&Egress) -> bool) -> EgressLayer {
+    /// are checked — the node's cap, the hub's layer (refusing it unless `hub_allows`), the
+    /// job's policy, then the service's own where `src` has one. A destination is reachable
+    /// only if every layer allows it. Where none refuses it — a policy edited since — the
+    /// narrowest of `src`'s own; [`EgressLayer::Unknown`] without a cap. A denial `blocked`
+    /// under dry-run, rather than carried, is the hub's layer's: dry-run softens every other.
+    fn layer(
+        &self,
+        src: Option<Ipv4Addr>,
+        refuses: impl Fn(&Egress) -> bool,
+        hub_allows: bool,
+        blocked: bool,
+    ) -> EgressLayer {
         let Some(cap) = &self.cap else {
             return EgressLayer::Unknown;
         };
-        if refuses(cap) {
+        if self.dry_run && blocked && !hub_allows {
+            EgressLayer::HubRule
+        } else if refuses(cap) {
             EgressLayer::NodeCap
+        } else if !hub_allows {
+            EgressLayer::HubRule
         } else if refuses(&self.default_policy()) {
             EgressLayer::Job
         } else if src.is_some_and(|s| self.per_source.contains_key(&s)) {
@@ -847,14 +869,23 @@ impl EgressGuard {
     }
     /// [`Self::layer`] of a direct flow to `dst`, each layer held to its own decision, pins
     /// included ([`Self::layer_allows`]).
-    fn flow_layer(&self, src: Option<Ipv4Addr>, dst: SocketAddr) -> EgressLayer {
-        self.layer(src, |layer| {
-            src.is_none_or(|s| !self.layer_allows(layer, s, dst))
-        })
+    fn flow_layer(&self, src: Option<Ipv4Addr>, dst: SocketAddr, blocked: bool) -> EgressLayer {
+        let hub_allows = src.is_some_and(|s| self.hub_allows(s, dst));
+        self.layer(
+            src,
+            |layer| src.is_none_or(|s| !self.layer_allows(layer, s, dst)),
+            hub_allows,
+            blocked,
+        )
     }
     /// [`Self::layer`] of a lookup of `name`.
-    fn name_layer(&self, src: Ipv4Addr, name: &str) -> EgressLayer {
-        self.layer(Some(src), |layer| !layer.allows_host(name))
+    fn name_layer(&self, src: Ipv4Addr, name: &str, blocked: bool) -> EgressLayer {
+        self.layer(
+            Some(src),
+            |layer| !layer.allows_host(name),
+            self.hub_allows_host(name),
+            blocked,
+        )
     }
     /// What a record from `src` says beyond itself: its VM, when it is a service's, and the
     /// time.
@@ -952,7 +983,7 @@ impl EgressGuard {
             && self.admit_record(path, outcome, 1)
         {
             let attrs = Attrs {
-                layer: Some(self.flow_layer(src, dst)),
+                layer: Some(self.flow_layer(src, dst, outcome == EgressOutcome::Blocked)),
                 would_block,
                 ..self.attrs(src)
             };
@@ -999,7 +1030,7 @@ impl EgressGuard {
                         None
                     }
                     None => {
-                        let layer = self.name_layer(src, target);
+                        let layer = self.name_layer(src, target, !would_block);
                         let repeats = DnsRepeats {
                             count: 0,
                             layer,
@@ -1155,26 +1186,34 @@ impl EgressGuard {
         };
         crate::egress_report::append_ip_contact(path, &dst.to_string(), &attrs);
     }
-    /// Any restriction at all — the node's cap, the default policy or any service's. Drives
-    /// the startup log summary.
+    /// Any restriction at all — the node's cap, the default policy, any service's or the
+    /// hub's layer. Drives the startup log summary.
     fn restricted(&self) -> bool {
         self.cap.as_deref().is_some_and(Egress::restricts)
             || self.default_policy().restricts()
             || !self.per_source.is_empty()
+            || self.hub.is_some()
     }
-    /// Whether `src`'s lookups are held to an allowlist: one of the node's layers'.
+    /// Whether `src`'s lookups are held to an allowlist: one of the node's layers', or the
+    /// hub's.
     fn restricted_for(&self, src: Ipv4Addr) -> bool {
         let job = self.default_policy();
-        self.node_layers(&job, src).any(Egress::restricts)
+        self.node_layers(&job, src).any(Egress::restricts) || self.hub.is_some()
+    }
+    /// Whether what the policies cannot check — a lookup the switch cannot read or rebuild —
+    /// is carried under dry-run: only where the hub restricts nothing, since dry-run softens the
+    /// node's layers, never the hub's.
+    fn soft(&self) -> bool {
+        self.dry_run && self.hub.is_none()
     }
     fn default_policy(&self) -> Arc<Egress> {
         self.policy.read().unwrap().clone()
     }
     /// The node's layers that hold `src`, given the job's policy `job`, in the order they are
     /// checked: the node's cap, the job's, then the service's own where `src` has one. Each is
-    /// checked alone, and dry-run softens them all. `src` is authenticated by `handle_frame`
-    /// against the address bound to its port, so a guest cannot forge a sibling's source to
-    /// select its layers.
+    /// checked alone, and dry-run softens them all; the hub's layer is apart. `src` is
+    /// authenticated by `handle_frame` against the address bound to its port, so a guest
+    /// cannot forge a sibling's source to select its layers.
     fn node_layers<'a>(
         &'a self,
         job: &'a Egress,
@@ -1200,10 +1239,22 @@ impl EgressGuard {
         *current = Arc::new(policy);
     }
     /// May `src`'s resolver answer this name? (allowed names get forwarded + pinned.) Every
-    /// node layer of `src` must allow it, which dry-run softens.
+    /// node layer of `src` must allow it, which dry-run softens; the hub's layer is
+    /// [`Self::hub_allows_host`].
     fn name_allowed(&self, src: Ipv4Addr, host: &str) -> bool {
         let job = self.default_policy();
         self.node_layers(&job, src).all(|l| l.allows_host(host))
+    }
+    /// Does the hub's layer allow this name? Yes where it restricts nothing.
+    fn hub_allows_host(&self, host: &str) -> bool {
+        self.hub.as_ref().is_none_or(|h| h.allows_host(host))
+    }
+    /// Does the hub's layer allow a direct flow from `src` to `dst`? As [`Self::layer_allows`]
+    /// decides for every layer; yes where it restricts nothing.
+    fn hub_allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
+        self.hub
+            .as_ref()
+            .is_none_or(|hub| self.layer_allows(hub, src, dst))
     }
     /// Does `layer` alone admit a direct flow from `src` to `dst`? Unrestricted, yes. Otherwise
     /// DNS must go to our resolver (so pinning holds), and `dst` must be in a range `layer`
@@ -1227,11 +1278,15 @@ impl EgressGuard {
     /// too, whose addresses then pass only the layers that allow it ([`Self::layer_allows`]).
     /// Never pin [`unroutable`] answers: an allowed name's zone must not add loopback or
     /// link-local addresses to the policy, even though the proxies refuse them before
-    /// dialling. Nothing is pinned where no layer restricts `src`.
+    /// dialling. A name the hub's layer refuses is never pinned, dry-run or not; nor is
+    /// anything where no layer restricts `src`.
     fn record_if_allowed(&self, src: Ipv4Addr, name: &str, ips: &[Ipv4Addr], ttl: u32) -> bool {
         let job = self.policy.read().unwrap();
         let allowed = self.node_layers(&job, src).all(|l| l.allows_host(name));
-        let restricted = self.node_layers(&job, src).any(Egress::restricts);
+        if !self.hub_allows_host(name) {
+            return false;
+        }
+        let restricted = self.node_layers(&job, src).any(Egress::restricts) || self.hub.is_some();
         if (!allowed && !self.dry_run) || !restricted || ips.is_empty() {
             return allowed;
         }
@@ -1244,16 +1299,19 @@ impl EgressGuard {
         allowed
     }
     /// May `src` open a direct flow to `dst` under the node's layers? Each of them must allow
-    /// it ([`Self::layer_allows`]).
+    /// it ([`Self::layer_allows`]); the hub's layer is [`Self::hub_allows`].
     fn allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
         let job = self.default_policy();
         self.node_layers(&job, src)
             .all(|l| self.layer_allows(l, src, dst))
     }
-    /// What to do with a direct flow from `src` to `dst`: [`Self::allows`], softened to
+    /// What to do with a direct flow from `src` to `dst`: refused if the hub's layer refuses it
+    /// ([`Self::hub_allows`]), whatever dry-run says; then [`Self::allows`], softened to
     /// [`Verdict::WouldDeny`] in dry-run. A `None` source (not IPv4) is denied.
     fn verdict(&self, src: Option<Ipv4Addr>, dst: SocketAddr) -> Verdict {
-        if src.is_some_and(|s| self.allows(s, dst)) {
+        if src.is_some_and(|s| !self.hub_allows(s, dst)) {
+            Verdict::Deny
+        } else if src.is_some_and(|s| self.allows(s, dst)) {
             Verdict::Allow
         } else if self.dry_run && src.is_some() {
             // Only soften denials for guest flows: no IPv4 source means no policy.
@@ -1589,20 +1647,25 @@ pub struct Spawn {
     pub restrict: bool,
     /// Dry-run the allowlist: evaluate the policy and record would-be denials for the
     /// job trace, but carry the flow instead of blocking it (see `EgressGuard::dry_run`).
-    /// Covers the cap and the default and per-source policies alike; no effect on an
-    /// unrestricted one.
+    /// Covers the cap and the default and per-source policies alike, never the hub's layer;
+    /// no effect on an unrestricted one.
     pub dry_run: bool,
     /// Per-source egress filters — a service that set its own `MICROVM_EGRESS_ALLOW_*`
     /// (see vm.rs). Each entry `(source-ip, allow_ip, allow_name)` is always a restricted
     /// allowlist (empty = deny), checked for that source after the default policy, which
     /// holds every source.
     pub per_source: Vec<(Ipv4Addr, Vec<String>, Vec<String>)>,
-    /// The node's cap, checked for every source before the policies above. `None` = no cap
-    /// (dev `vk run`).
+    /// The node's cap, checked for every source before the policies above, and the layer a
+    /// denial is attributed to first (see vk_hub_proto::egress). `None` = no cap, nor layers to
+    /// tell apart (dev `vk run`).
     pub cap: Option<Cap>,
     /// The service each VM address belongs to, which records name their source by; an address
     /// not listed is the job's own VM.
     pub vm_names: Vec<(Ipv4Addr, String)>,
+    /// The hub's layer for this phase, enforced for every source on top of the policies above
+    /// and never softened by `dry_run`. Written to [`HUB_EGRESS`] beside `log` for the switch to
+    /// read. `None` = no hub layer.
+    pub hub: Option<HubLayer>,
     /// How long the denial and audit channels may grow, in bytes; past it records are only
     /// counted (see egress_report). `None` = unbounded.
     pub record_limit: Option<u64>,
@@ -1626,6 +1689,75 @@ pub struct Spawn {
     /// Whether this switch serves a build stage, and so starts at the build's scheduling
     /// priority: it proxies everything the stage downloads (see [`crate::prio`]).
     pub prio: crate::prio::Prio,
+}
+
+/// The file beside a switch's log that [`Spawn::hub`] is written to.
+pub const HUB_EGRESS: &str = "hub-egress.json";
+
+/// The hub's layer for one phase, as a switch takes it ([`Spawn::hub`]): the allowlist it
+/// enforces, `None` where it restricts nothing. Entries read as `[egress]`'s, an empty list
+/// denying.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubLayer {
+    #[serde(default)]
+    pub enforce: Option<HubList>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubList {
+    pub ips: Vec<String>,
+    pub names: Vec<String>,
+}
+
+impl HubList {
+    /// `phase` as a list; `None` where it is unrestricted. A kind this node does not know
+    /// allows nothing, though [`HubEgress::check`] refuses it before any switch starts.
+    fn of(phase: &HubPhase) -> Option<HubList> {
+        match phase {
+            HubPhase::Unrestricted => None,
+            HubPhase::Allow { names, ips } => Some(HubList {
+                ips: ips.clone(),
+                names: names.clone(),
+            }),
+            HubPhase::Other => Some(HubList::default()),
+        }
+    }
+}
+
+impl HubLayer {
+    /// The `phase` of `egress` as a switch takes it; `None` where the layer does not restrict
+    /// it, and the switch has nothing to check.
+    pub fn of(egress: &HubEgress, phase: EgressPhase) -> Option<HubLayer> {
+        let phase_of = |run: &HubPhase, build: &HubPhase| match phase {
+            EgressPhase::Build => HubList::of(build),
+            _ => HubList::of(run),
+        };
+        let layer = HubLayer {
+            enforce: phase_of(&egress.run, &egress.build),
+        };
+        layer.enforce.is_some().then_some(layer)
+    }
+
+    /// Whether every list holds entries a switch takes, as [`spawn`] would find out too late.
+    pub fn check(&self) -> Result<()> {
+        self.policies().map(|_| ())
+    }
+
+    /// The layer's policy, the one enforced, with the checks every allowlist gets.
+    fn policies(&self) -> Result<Option<Egress>> {
+        self.enforce
+            .as_ref()
+            .map(|l| Egress::restricted(&l.ips, &l.names).context("the hub's egress"))
+            .transpose()
+    }
+
+    /// Read the layer from `path`, as [`spawn`] writes it.
+    pub fn read(path: &Path) -> Result<HubLayer> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
+    }
 }
 
 /// A node's egress cap, as [`Spawn::cap`] passes it.
@@ -1718,6 +1850,23 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     if let Some(limit) = opts.record_limit {
         cmd.arg("--record-limit").arg(limit.to_string());
     }
+    if let Some(hub) = &opts.hub {
+        // A file rather than flags: a layer can be hundreds of entries. Written whole before
+        // the switch starts, which reads it once.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = opts.log.with_file_name(HUB_EGRESS);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(&serde_json::to_vec(hub)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        cmd.arg("--hub-egress").arg(&path);
+    }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
             .arg(format!("{sentinel}={host}"));
@@ -1803,6 +1952,8 @@ pub async fn run(
     // The node's cap, and each service VM's name by address (see `Spawn`).
     cap: Option<Egress>,
     vm_names: HashMap<Ipv4Addr, String>,
+    // The hub's layer for this phase (see `Spawn::hub`).
+    hub: Option<HubLayer>,
     record_limit: Option<u64>,
     // An `--egress-file` to follow, with the bytes `egress` was loaded from.
     egress_file: Option<(PathBuf, Vec<u8>)>,
@@ -1810,6 +1961,10 @@ pub async fn run(
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
     }
+    let hub = match &hub {
+        Some(layer) => layer.policies()?,
+        None => None,
+    };
     install_logger();
     // One shared ipstack for egress: it reads the off-subnet IPv4 packets the
     // switch forwards and writes reply packets back, which we route to the owning
@@ -1834,6 +1989,7 @@ pub async fn run(
             .with_dry_run(dry_run)
             .with_cap(cap)
             .with_vm_names(vm_names)
+            .with_hub(hub)
             .with_record_limit(record_limit),
     );
     let restricted = guard.restricted();
@@ -2951,6 +3107,8 @@ async fn handle_dns(
         .copied()
         .unwrap_or_else(|| SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT));
     let restricted = egress.restricted_for(client_ip);
+    // Dry-run carries what no layer can check only where the hub restricts nothing.
+    let soft = egress.soft();
     let parsed = parse_question(&query);
     // Under an allowlist the upstream is sent a query rebuilt from the checked question, not
     // the guest's bytes; `None` where the query has no shape it can be rebuilt from.
@@ -2965,7 +3123,7 @@ async fn handle_dns(
     } else if let Some((name, _, qend)) = &parsed
         && restricted
         && minimal.is_none()
-        && !egress.dry_run
+        && !soft
     {
         egress.deny_dns(client_ip, NONSTANDARD_QUERY, false, || {
             format!("dns refused (egress allowlist): {NONSTANDARD_QUERY} for {name}")
@@ -2981,7 +3139,7 @@ async fn handle_dns(
         }
         // Dry-run forwards the guest's own query, so the job runs unchanged.
         let upstream_query = match &minimal {
-            Some(minimal) if !egress.dry_run => minimal,
+            Some(minimal) if !soft => minimal,
             _ => &query,
         };
         // Format the lookup only when reporting a failure.
@@ -2989,7 +3147,8 @@ async fn handle_dns(
         // Other reverse (PTR) names are held to the allowlist like any other: forwarding
         // them would carry whatever labels the guest chose to the upstream resolver.
         let name_allowed = egress.name_allowed(client_ip, &name);
-        if name_allowed || egress.dry_run {
+        // The hub's layer refuses what it refuses under dry-run too.
+        if egress.hub_allows_host(&name) && (name_allowed || egress.dry_run) {
             if name_allowed {
                 // Audit: count the guest's A-record lookups as its external contacts (egress
                 // is IPv4, so an A query is what precedes a connection); the paired AAAA query
@@ -3052,7 +3211,7 @@ async fn handle_dns(
         // could be a name the switch answers itself.
         let several =
             matches!(query.get(4..6), Some(&[hi, lo]) if u16::from_be_bytes([hi, lo]) > 1);
-        let refuse = several || (restricted && !egress.dry_run);
+        let refuse = several || (restricted && !soft);
         if restricted {
             egress.deny_dns(client_ip, UNPARSABLE_QUERY, !refuse, || match refuse {
                 true => format!("dns refused (egress allowlist): {UNPARSABLE_QUERY}"),
@@ -5804,6 +5963,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(denied_log.parent().unwrap());
     }
 
+    /// The hub's layer on an unrestricted node: what it refuses is refused even under the
+    /// node's dry-run, a name it refuses resolves to nothing and is never pinned, a name it
+    /// allows is pinned for the connection, and DNS still goes through the switch. Each denial
+    /// names the first layer that refuses it, the hub's for what dry-run does not carry. The
+    /// registry proxy stays the host's own service.
+    #[test]
+    fn the_hub_layer_refuses_whatever_dry_run_says() {
+        use crate::egress_report::Proto;
+        let dir = std::env::temp_dir().join(format!("vk-hub-layer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("denied.log");
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let sentinel = Ipv4Addr::new(240, 0, 0, 1);
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let hub = Egress::restricted(&names(&["1.2.3.0/24"]), &names(&["crates.io"])).unwrap();
+        let cap = Egress::restricted(
+            &names(&["1.2.3.0/24", "9.9.9.0/24"]),
+            &names(&["crates.io"]),
+        )
+        .unwrap();
+        let guard = EgressGuard::new(Egress::AllowAll, gw)
+            .with_dry_run(true)
+            .with_cap(Some(cap))
+            .with_hub(Some(hub))
+            .with_denied_log(Some(log.clone()))
+            .with_registry_proxy(Some((sentinel, "127.0.0.1:5000".parse().unwrap())));
+        assert!(guard.restricted() && guard.restricted_for(guest) && !guard.soft());
+        let at = |ip: [u8; 4], port| SocketAddr::from((ip, port));
+        assert_eq!(
+            guard.verdict(Some(guest), at([1, 2, 3, 4], 443)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            guard.verdict(Some(guest), at([9, 9, 9, 9], 443)),
+            Verdict::Deny
+        );
+        assert_eq!(
+            guard.verdict(Some(guest), at([1, 2, 3, 4], 53)),
+            Verdict::Deny
+        );
+        assert!(
+            guard.hub_allows_host("static.crates.io") && !guard.hub_allows_host("evil.example")
+        );
+
+        let resolved = Ipv4Addr::new(5, 6, 7, 8);
+        assert!(!guard.record_if_allowed(guest, "evil.example", &[resolved], 60));
+        assert_eq!(
+            guard.verdict(Some(guest), at([5, 6, 7, 8], 443)),
+            Verdict::Deny
+        );
+        assert!(guard.record_if_allowed(guest, "crates.io", &[resolved], 60));
+        assert_eq!(
+            guard.verdict(Some(guest), at([5, 6, 7, 8], 443)),
+            Verdict::Allow
+        );
+
+        let client_mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(guest, sentinel), client_mac)
+                .is_none()
+        );
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(guest, Ipv4Addr::new(9, 9, 9, 9)), client_mac)
+                .is_some()
+        );
+        assert!(!guard.admit_flow(Proto::Udp, Some(guest), at([8, 8, 8, 8], 443)));
+        guard.deny_dns(guest, "evil.example", false, String::new);
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| l.rsplit_once("\tt=").unwrap().0.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                // Within the cap, refused by the hub.
+                "tcp\t9.9.9.9:443\t1\tlayer=hub_rule",
+                // Outside both: the hub's, as dry-run carries what the cap alone refuses.
+                "udp\t8.8.8.8:443\t1\tlayer=hub_rule",
+                "dns\tevil.example\t1\tlayer=hub_rule",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hub's layer reaches the switch as a file, whose entries get every allowlist's checks.
+    #[test]
+    fn a_hub_layer_file_reads_back_with_its_checks() {
+        let dir = std::env::temp_dir().join(format!("vk-hub-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(HUB_EGRESS);
+        let layer = HubLayer {
+            enforce: Some(HubList {
+                ips: vec!["10.0.0.0/8".into()],
+                names: vec![],
+            }),
+        };
+        std::fs::write(&path, serde_json::to_vec(&layer).unwrap()).unwrap();
+        let read = HubLayer::read(&path).unwrap();
+        assert_eq!(read, layer);
+        let enforce = read.policies().unwrap();
+        assert!(enforce.unwrap().allows_ip("10.1.2.3".parse().unwrap(), 443));
+        let bad = HubLayer {
+            enforce: Some(HubList {
+                ips: vec!["not-a-cidr".into()],
+                names: vec![],
+            }),
+        };
+        let Err(e) = bad.policies() else {
+            panic!("a bad entry passed")
+        };
+        assert!(format!("{e:#}").contains("the hub's egress"), "{e:#}");
+        std::fs::write(&path, br#"{"enforce": null, "widen": true}"#).unwrap();
+        assert!(HubLayer::read(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name the hub's layer refuses is NXDOMAIN under the node's dry-run, and a forwarded one
+    /// goes upstream rebuilt from its question, as under an enforced allowlist.
+    #[tokio::test]
+    async fn dns_under_the_hub_layer_ignores_the_nodes_dry_run() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let guard = Arc::new(
+            EgressGuard::new(Egress::AllowAll, DNS_TEST_LAN.gateway)
+                .with_dry_run(true)
+                .with_hub(Some(
+                    Egress::restricted(&[], &["corp.example.com".into()]).unwrap(),
+                )),
+        );
+        let (rcode, forwarded) = lookup(&guard, guest, dns_question(9, "blocked.example", 1)).await;
+        assert_eq!((rcode, forwarded), (Some(RCODE_NXDOMAIN), false));
+        let ip = Ipv4Addr::new(10, 20, 30, 40);
+        let (reply, forwarded) = exchange(
+            &guard,
+            guest,
+            dns_question(9, "git.corp.example.com", 1),
+            HashMap::new(),
+            ip,
+            || {},
+        )
+        .await;
+        assert_eq!(reply.unwrap()[3] & 0x0f, 0);
+        assert!(forwarded.is_some());
+        // Pinned for the connection, which the hub's layer checks.
+        assert_eq!(
+            guard.verdict(Some(guest), SocketAddr::new(ip.into(), 443)),
+            Verdict::Allow
+        );
+    }
+
     #[tokio::test]
     async fn dns_refuses_a_name_the_policy_dropped_while_it_was_resolving() {
         let guest = Ipv4Addr::new(192, 168, 231, 2);
@@ -6993,12 +7307,12 @@ mod tests {
         assert!(!g.name_allowed(job, "crates.io") && !g.name_allowed(job, "pypi.org"));
         // A service is held to the job's policy as well as its own.
         assert!(g.name_allowed(svc, "debian.org") && !g.name_allowed(svc, "crates.io"));
-        assert_eq!(g.name_layer(svc, "crates.io"), EgressLayer::Job);
-        assert_eq!(g.name_layer(job, "pypi.org"), EgressLayer::NodeCap);
+        assert_eq!(g.name_layer(svc, "crates.io", true), EgressLayer::Job);
+        assert_eq!(g.name_layer(job, "pypi.org", true), EgressLayer::NodeCap);
         // The cap's range is no use to a job whose policy lists no ranges.
         let listed: SocketAddr = "1.2.3.4:443".parse().unwrap();
         assert!(!g.allows(job, listed));
-        assert_eq!(g.flow_layer(Some(job), listed), EgressLayer::Job);
+        assert_eq!(g.flow_layer(Some(job), listed, true), EgressLayer::Job);
 
         let (both, pypi) = (Ipv4Addr::new(7, 7, 7, 7), Ipv4Addr::new(5, 6, 7, 8));
         assert!(g.record_if_allowed(job, "debian.org", &[both], 60));
@@ -7013,10 +7327,37 @@ mod tests {
         let to_pypi = SocketAddr::new(pypi.into(), 443);
         assert!(g.layer_allows(&g.default_policy(), job, to_pypi));
         assert_eq!(g.verdict(Some(job), to_pypi), Verdict::WouldDeny);
-        assert_eq!(g.flow_layer(Some(job), to_pypi), EgressLayer::NodeCap);
+        assert_eq!(
+            g.flow_layer(Some(job), to_pypi, false),
+            EgressLayer::NodeCap
+        );
         // The same address pinned for a name every layer allows is reachable.
         assert!(g.record_if_allowed(job, "debian.org", &[pypi], 60));
         assert_eq!(g.verdict(Some(job), to_pypi), Verdict::Allow);
+    }
+
+    /// The hub's layer too admits a pinned address only through a name it allows.
+    #[test]
+    fn the_hub_layer_admits_a_pin_only_through_its_own_names() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let job = Egress::restricted(&[], &["crates.io".into()]).unwrap();
+        let hub = Egress::restricted(&[], &["crates.io".into(), "debian.org".into()]).unwrap();
+        let g = EgressGuard::new(job, gw)
+            .with_cap(Some(Egress::AllowAll))
+            .with_hub(Some(hub))
+            .with_dry_run(true);
+        let ip = Ipv4Addr::new(5, 6, 7, 8);
+        let to = SocketAddr::new(ip.into(), 443);
+        // The hub refuses the name: never pinned, refused whatever dry-run says.
+        assert!(!g.record_if_allowed(guest, "evil.example", &[ip], 60));
+        assert_eq!(g.verdict(Some(guest), to), Verdict::Deny);
+        // The hub allows it, the job does not: pinned under dry-run, and carried as the job's
+        // would-be denial.
+        assert!(!g.record_if_allowed(guest, "debian.org", &[ip], 60));
+        assert!(g.hub_allows(guest, to));
+        assert_eq!(g.verdict(Some(guest), to), Verdict::WouldDeny);
+        assert_eq!(g.flow_layer(Some(guest), to, false), EgressLayer::Job);
     }
 
     #[test]
@@ -8182,6 +8523,7 @@ mod tests {
                 false,
                 None,
                 HashMap::new(),
+                None,
                 None,
                 None,
             )

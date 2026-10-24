@@ -21,9 +21,9 @@ pub struct JobCtx {
     /// that default.
     pub user_req: Option<String>,
     /// MICROVM_EGRESS_ALLOW_IP / _ALLOW_NAME job variables (space/comma separated): this job's
-    /// own run-phase filter, which the switch checks beside the host `[egress]` cap, each
-    /// apart, so a job can restrict but never widen its egress. None = no filter of its own;
-    /// once either is set, the other's dimension allows none.
+    /// own run-phase filter, which the switch checks beside the host `[egress]` cap and the
+    /// hub's layer, each apart, so a job can restrict but never widen its egress. None = no
+    /// filter of its own; once either is set, the other's dimension allows none.
     pub egress_allow_ip_req: Option<String>,
     pub egress_allow_name_req: Option<String>,
     /// MICROVM_BUILD_EGRESS_ALLOW_IP / _ALLOW_NAME: the same, for the build phase (git-defined
@@ -86,6 +86,9 @@ pub struct JobCtx {
     /// ([`JOB_START`]): the token its guest's registry proxy injects under
     /// `[registry] guest_credential = "job"`.
     pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
+    /// The hub's egress layer for a placed job, from the same start: what the rules that select
+    /// it allow, enforced below the node's cap.
+    pub hub_egress: Option<vk_hub_proto::egress::HubEgress>,
     /// Where a placed job's executor commands keep what its node reports of its egress
     /// ([`JOB_EGRESS`]): its builds' records, its refused declarations, and at cleanup the run
     /// phase's, which would otherwise go with the job dir.
@@ -208,9 +211,12 @@ impl JobCtx {
         });
         // A placed job's driver journals its start before any executor command runs, so one
         // it cannot read is an error, whatever `guest_credential` says.
-        let job_registry = match env(JOB_START).filter(|_| hub_placed) {
-            Some(path) => read_job_start(Path::new(&path))?.registry,
-            None => None,
+        let (job_registry, hub_egress) = match env(JOB_START).filter(|_| hub_placed) {
+            Some(path) => {
+                let start = read_job_start(Path::new(&path))?;
+                (start.registry, start.egress)
+            }
+            None => (None, None),
         };
         let egress_record = env(JOB_EGRESS)
             .filter(|_| hub_placed)
@@ -270,6 +276,7 @@ impl JobCtx {
             job_url,
             hub_placed,
             job_registry,
+            hub_egress,
             egress_record,
         })
     }
@@ -777,8 +784,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A placed job's registry access and egress record come from what its driver names, and
-    /// only for a placed job: anywhere else the variables are not the driver's.
+    /// A placed job's registry access and egress layer come from the start its driver names,
+    /// and only for a placed job: anywhere else the variable is not the driver's.
     #[test]
     fn a_placed_job_reads_its_registry_access_and_egress_from_its_start() {
         use vk_hub_proto::dispatch::{JobRegistry, JobStart};
@@ -800,7 +807,12 @@ mod tests {
             envelope: Default::default(),
             spec: vk_hub_proto::job::JobSpec::GitlabCi(Default::default()),
             registry: Some(registry.clone()),
-            egress: None,
+            egress: Some(vk_hub_proto::egress::HubEgress {
+                rules: vec!["default".into()],
+                run: vk_hub_proto::egress::HubPhase::Unrestricted,
+                build: vk_hub_proto::egress::HubPhase::Unrestricted,
+                dry_run: Vec::new(),
+            }),
         };
         std::fs::write(&start, serde_json::to_vec(&job).unwrap()).unwrap();
         let env = |k: &str, v: &str| (k.to_string(), v.to_string());
@@ -816,6 +828,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(placed.job_registry, Some(registry));
+        assert_eq!(placed.hub_egress, job.egress);
         assert_eq!(placed.egress_record, Some(PathBuf::from("/n/j/egress")));
         // A job no hub placed records nothing for a report, whatever its environment says.
         let unplaced = JobCtx::for_env(
@@ -828,6 +841,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unplaced.job_registry, None);
+        assert_eq!(unplaced.hub_egress, None);
         assert_eq!(unplaced.egress_record, None);
         let missing = JobCtx::for_env(
             Config::default(),
@@ -1040,6 +1054,7 @@ mod tests {
             job_url: None,
             hub_placed: false,
             job_registry: None,
+            hub_egress: None,
             egress_record: None,
         }
     }

@@ -814,6 +814,8 @@ pub struct JobRecord {
     run_count: PhaseCount,
     /// A run-phase switch was seen: it opens its byte channel as it starts.
     watched: bool,
+    /// The hub's enforced rules the job runs under, which its report names.
+    hub_rules: Vec<String>,
 }
 
 impl JobRecord {
@@ -827,7 +829,14 @@ impl JobRecord {
             run: Channels::default(),
             run_count: PhaseCount::default(),
             watched: false,
+            hub_rules: Vec::new(),
         }
+    }
+
+    /// The record of a job run under the hub's enforced `rules`.
+    pub fn with_hub_rules(mut self, rules: &[String]) -> Self {
+        self.hub_rules = rules.to_vec();
+        self
     }
 
     /// Read the run phase's channels from `dir` from now on, where they read as far as before:
@@ -927,7 +936,7 @@ impl JobRecord {
             refusals,
             refusals_omitted: 0,
             phases,
-            hub_rules: Vec::new(),
+            hub_rules: self.hub_rules.clone(),
         }
         .bounded()
     }

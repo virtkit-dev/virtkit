@@ -1208,6 +1208,9 @@ There are two independent phases, each with its own host cap:
   image (`image: dockerfile:…`) or a compose `build:` service. Absent by default,
   meaning the build runs unrestricted, like `docker build`.
 
+A job a hub placed on a `vk node` may also be held to the hub's egress rules, chosen by project
+and ref; see [The hub's rules](#the-hubs-rules).
+
 ### Host caps
 
 Each phase has two dimensions — `allow_ip` (direct, non-DNS egress) and
@@ -1263,8 +1266,8 @@ is by address, not by name, so the limits are those of the address:
 ### Narrowing from a job
 
 A job may **narrow** its egress with lists of its own, never widen it: the switch checks
-them on their own when the job runs, after the host cap, so a destination is reachable only if
-each allows it. Each variable is a **list** — one or more entries separated by spaces, commas, tabs, or
+them on their own when the job runs, after the host cap (and the [hub's rules](#the-hubs-rules)),
+so a destination is reachable only if each allows it. Each variable is a **list** — one or more entries separated by spaces, commas, tabs, or
 newlines (empty entries are ignored). A `#` begins an end-of-line comment, so a
 block-scalar list can document each entry inline:
 
@@ -1332,13 +1335,47 @@ rust-job:
 The same applies to the build phase via `MICROVM_BUILD_EGRESS_ALLOW_IP` /
 `_ALLOW_NAME`.
 
+### The hub's rules
+
+A hub that has egress rules ([Job egress from the hub](fleet-design.md#job-egress-from-the-hub))
+sends a placed job, with its start, the lists its rules allow in each phase. They are one more
+layer, checked after the node's cap and before the job's own narrowing:
+
+1. the node's `[egress]` or `[egress.build]`;
+2. the hub's rules for the job;
+3. the job's `MICROVM_EGRESS_*` or `MICROVM_BUILD_EGRESS_*`;
+4. a service's own `MICROVM_EGRESS_ALLOW_*`, for that service's VM, on top of the job's.
+
+A destination must pass each in turn; the switch never merges them into one list, nor checks
+one layer's lists against another's. Each reads its own lists as the host cap's read, and an
+address a lookup opened passes a layer only if that layer allows the name looked up. A phase the
+hub's rules leave unrestricted is the node's alone, as without a hub. A job's or a service's
+`MICROVM_*EGRESS_ALLOW_*` entry outside the hub's lists is kept, and the trace warns of it naming
+the rules (`outside the hub's egress rules (wab, wab-branches), its lookups will be refused`).
+The hub can only narrow what the node's cap allows, never widen it.
+
+The node's own dry-run, `[egress] dry_run` or `MICROVM_EGRESS_DRY_RUN`, never relaxes the hub's
+rules: what they refuse is refused, its names resolve to `NXDOMAIN`, and queries the gateway
+cannot rebuild are refused, dry-run or not. Only the per-job switch enforces the hub's rules, so
+a node whose `[net] mode` is `tap` or `pool` takes no job they restrict, and fails one whose run
+phase they restrict. A Windows image does not build under rules that restrict the build phase,
+since its build steps cannot be held to them.
+
+The trace names the rules and each phase's lists, layer by layer:
+
+```
+virtkit: egress under the hub's rules: wab, wab-branches
+virtkit:   run: node cap unrestricted; hub names corp.example.com, ips 10.10.140.49/32; job not narrowed
+virtkit:   build: node cap names debian.org crates.io, ips none; hub names debian.org, ips none; job not narrowed
+```
+
 ### Per-service egress
 
 A `services:` entry can carry its own `MICROVM_EGRESS_ALLOW_IP` /
 `MICROVM_EGRESS_ALLOW_NAME` in its `variables:` to narrow its own VM further: the switch
 holds it to its own lists **and** the job's, each checked on its own, so it reaches only what
-both allow, within the host cap. The rules are those of a job's lists, with one addition: for a
-service, a *present-but-empty* value denies that dimension (e.g.
+both allow, within the host cap and the hub's rules. The rules are those of a job's lists,
+with one addition: for a service, a *present-but-empty* value denies that dimension (e.g.
 `MICROVM_EGRESS_ALLOW_NAME: ""` gives the service no external DNS egress). A service that
 sets neither variable is held to the job's lists alone.
 
@@ -1370,7 +1407,8 @@ The switch enforces each policy against the flow's **source VM** — authenticat
 the per-VM socket it arrives on, not by any address the guest writes into its
 packets — so a service cannot borrow another VM's (looser) policy. Requests are
 checked at job prepare: an invalid entry fails the job with a visible error before anything
-boots, and one the host cap or the job's own lists leave nothing of is kept, and warned of.
+boots, and one the host cap, the hub's rules or the job's own lists leave nothing of is kept,
+and warned of.
 
 A job's script can still act through a service: `vk-agent exec --service NAME` runs a command
 in it (see [image selection](#image-selection)), under the service's policy — the job's lists
@@ -1436,7 +1474,7 @@ still resolves, so the job runs unchanged. To roll an allowlist out, turn it on,
 pipelines, and add whatever the trace flags before enforcement bites.
 
 Dry-run covers the service VMs on the job's LAN too, including a service's own
-`MICROVM_EGRESS_ALLOW_*` lists.
+`MICROVM_EGRESS_ALLOW_*` lists. It never relaxes the [hub's rules](#the-hubs-rules).
 
 ```toml
 [egress]
@@ -1469,16 +1507,16 @@ alone denies it all. Dry-run is CI-only.
 
 A job a hub placed on a `vk node` also reports its egress to the hub, while it runs and with its
 result: each destination refused, or flagged under dry-run, in both phases, with the VM it came
-from, the layer that decided it (the node's cap, the job's variables or a service's) and when;
-what the job's guests reached; the `MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a
-layer above leaves nothing of; and the bytes of each phase. The build phase is recorded whether
-or not audit is on, which only adds the summaries above to the trace. Once a build's or the
-run's log of denials or of contacts reaches 8 MiB, the switch only counts what else it sees, for
-the trace's lines and summaries too. While the job runs, the node sends what it recorded so far
-at each stage's start and every few seconds when it changed, and again after a reconnect; a hub
-older than the node gets the report with the result alone. Jobs run by gitlab-runner report
-nothing. See [Job egress from the
-hub](fleet-design.md#job-egress-from-the-hub).
+from, the layer that decided it (the node's cap, the hub's rules, the job's variables or a
+service's) and when; the hub rules the job ran under; what the job's guests reached; the
+`MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a layer above leaves nothing of; and
+the bytes of each phase. The build phase is recorded whether or not audit is on, which only adds
+the summaries above to the trace. Once a build's or the run's log of denials or of contacts
+reaches 8 MiB, the switch only counts what else it sees, for the trace's lines and summaries
+too. While the job runs, the node sends what it recorded so far at each stage's start and every
+few seconds when it changed, and again after a reconnect; a hub older than the node gets the
+report with the result alone. Jobs run by gitlab-runner report nothing. See
+[Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
 
 ## Services
 

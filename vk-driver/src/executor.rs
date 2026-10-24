@@ -289,6 +289,14 @@ fn report_contacted_names(ctx: &JobCtx) {
         let job = crate::sites::fingerprint(&ips, &names, true);
         policy = format!("{policy}+job:{job}");
     }
+    // The hub's layer holds the job as much as the node's: what a job reached without it
+    // says nothing of what it needs under it.
+    if let Ok(Some(hub)) = crate::vm::hub_layer(ctx, vk_hub_proto::egress::EgressPhase::Run)
+        && let Some(list) = hub.enforce
+    {
+        let hub = crate::sites::fingerprint(&list.ips, &list.names, true);
+        policy = format!("{policy}+hub:{hub}");
+    }
     let contacted: Vec<String> = crate::egress_report::read_contacts(&ctx.egress_audit_log())
         .into_iter()
         .map(|(name, _)| name)

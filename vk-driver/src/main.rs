@@ -1700,6 +1700,12 @@ enum Cmd {
         /// executor.
         #[arg(long = "vm-name", value_name = "IP=NAME")]
         vm_name: Vec<String>,
+        /// the hub's egress layer for this phase, a JSON file read once at start
+        ///
+        /// Enforced for every source on top of the allowlists, dry-run or not. Set internally
+        /// for a placed job's switches.
+        #[arg(long = "hub-egress", value_name = "FILE")]
+        hub_egress: Option<PathBuf>,
         /// stop recording denials and contacts once their log reaches this size, counting them
         ///
         /// What is dropped is counted, and the counts are recorded instead. Set internally for a
@@ -4551,6 +4557,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         source_egress,
         egress_cap,
         vm_name,
+        hub_egress,
         record_limit,
         registry_proxy,
         denied_log,
@@ -4652,6 +4659,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(m) => m,
             Err(e) => return fail(&e, 2),
         };
+        let hub = match hub_egress
+            .as_deref()
+            .map(switch::HubLayer::read)
+            .transpose()
+        {
+            Ok(h) => h,
+            Err(e) => return fail(&e, 2),
+        };
         // The switch logs into a file (a CI job's job dir, a run's work dir): a full
         // filesystem must not make a line a panic (see outrelay).
         let _relay = outrelay::relay();
@@ -4671,6 +4686,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             *egress_dry_run,
             cap,
             vm_names,
+            hub,
             *record_limit,
             followed,
         )

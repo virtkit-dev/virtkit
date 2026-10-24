@@ -57,6 +57,12 @@ All notable changes to virtkit will be documented in this file.
   A job's build-phase contacts and refusals are recorded whether or not audit is on.
 - **Nodes report a placed job's egress while it runs, not only with its result**, to a hub at
   this version; an older hub still gets it once the job ends.
+- **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
+  phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
+  services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never
+  relaxes the hub's rules. The trace names the rules applied and each phase's lists, setting
+  by setting. A node whose `[net] mode` is `tap` or `pool` takes no job the rules restrict,
+  and a Windows image does not build under rules that restrict the build phase.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

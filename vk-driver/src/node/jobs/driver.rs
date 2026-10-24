@@ -137,13 +137,14 @@ struct Egress {
 }
 
 impl Egress {
-    /// The egress recorded in `record`, the run phase's channels in `run_dir` while the job runs.
-    fn new(record: &Path, run_dir: &Path) -> Self {
+    /// The egress recorded in `record`, the run phase's channels in `run_dir` while the job runs,
+    /// under the hub's enforced `hub_rules`, which each report names.
+    fn new(record: &Path, run_dir: &Path, hub_rules: &[String]) -> Self {
         Egress {
             timeline: Default::default(),
             prepared: Default::default(),
             read: std::sync::Mutex::new((
-                crate::egress_report::JobRecord::new(record, run_dir),
+                crate::egress_report::JobRecord::new(record, run_dir).with_hub_rules(hub_rules),
                 None,
             )),
             stage: tokio::sync::Notify::new(),
@@ -322,7 +323,12 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
     )?);
     let timeout = Duration::from_secs(job.timeout_secs.max(1));
     let ctx = JobCtx::for_env(cfg, &child_env)?;
-    let egress = Arc::new(Egress::new(&dir.join(journal::EGRESS), &ctx.job_dir));
+    let hub_rules = ctx.hub_egress.as_ref().map(|e| e.rules.as_slice());
+    let egress = Arc::new(Egress::new(
+        &dir.join(journal::EGRESS),
+        &ctx.job_dir,
+        hub_rules.unwrap_or_default(),
+    ));
     let driver = Driver {
         ctx,
         env: child_env,
@@ -1215,7 +1221,7 @@ mod tests {
             stopped: CancellationToken::new(),
             prepared_in: None,
             registry: f.registry.clone(),
-            egress: Arc::new(Egress::new(&f.dir.join(journal::EGRESS), &f.dir)),
+            egress: Arc::new(Egress::new(&f.dir.join(journal::EGRESS), &f.dir, &[])),
         }
     }
 
@@ -1392,10 +1398,13 @@ mod tests {
         let (record, run) = (f.dir.join(journal::EGRESS), f.dir.join("run-channels"));
         std::fs::create_dir_all(&record).unwrap();
         std::fs::create_dir_all(&run).unwrap();
-        let egress = Egress::new(&record, &run);
+        let egress = Egress::new(&record, &run, &["wab".to_string()]);
         egress.journal(&f.dir);
         let first = journal::read_egress(&f.dir).unwrap();
-        assert_eq!(first.revision, 1);
+        assert_eq!(
+            (first.revision, first.hub_rules),
+            (1, vec!["wab".to_string()])
+        );
         let stamp = journal::egress_stamp(&f.dir);
         egress.journal(&f.dir);
         assert_eq!(

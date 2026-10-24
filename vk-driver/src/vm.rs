@@ -352,10 +352,24 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     // detached supervisor, whose log the job never sees. (The build phase checks its own in
     // build_git_image / build_compose_unit, also in prepare.)
     run_job_filter(cfg, ctx)?;
+    for line in hub_egress_lines(ctx)? {
+        println!("{line}");
+    }
     // An entry a layer above leaves nothing of is kept, every layer being checked when the job
     // runs, and said here, once per phase.
     warn_unreachable_job(ctx, EgressPhase::Run);
     warn_unreachable_job(ctx, EgressPhase::Build);
+    // Only the per-job switch holds a job to the hub's layer: a tap reaches the host's network.
+    if !matches!(cfg.net.mode.as_str(), "switch" | "none")
+        && hub_bound(ctx, EgressPhase::Run)?.is_some()
+    {
+        bail!(
+            "{} restrict the run phase, which only [net] mode = \"switch\" holds a job to \
+             (got {:?})",
+            hub_rules_label(ctx),
+            cfg.net.mode
+        );
+    }
     if ctx.egress_dry_run_req && !ctx.egress_run_dry_run() {
         eprintln!(
             "virtkit: MICROVM_EGRESS_DRY_RUN ignored: the host enforces a run-phase allowlist"
@@ -1259,6 +1273,15 @@ fn build_windows_unit(
     }
     let cfg = &ctx.cfg;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
+    // A Windows build's steps are on a switch of their own that takes no layer but its own.
+    if hub_bound(ctx, EgressPhase::Build)?.is_some() {
+        bail!(
+            "service {}: a Windows image's build steps cannot be held to {}; build it where \
+             the hub's rules leave the build phase unrestricted",
+            unit.name,
+            hub_rules_label(ctx)
+        );
+    }
     if audit {
         println!(
             "virtkit: warning: service {}: [egress.build] audit does not cover a Windows build's \
@@ -2711,6 +2734,7 @@ fn spawn_switch(
             cfg.egress.allow_name.as_deref(),
         )),
         vm_names,
+        hub: hub_layer(ctx, EgressPhase::Run)?,
         // A placed job's switch records within a bound, for its report: its guests choose how
         // much. The trace's lines and summaries read what is recorded.
         record_limit: ctx
@@ -2771,7 +2795,7 @@ fn switch_lists(filter: crate::switch::Cap) -> (Vec<String>, Vec<String>, bool) 
 
 /// This job's own run-phase filter, its `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME`
 /// ([`declared_filter`]), with the `[egress]` cap checked by its keys. The switch checks it on
-/// its own, after the cap: it narrows nothing and is narrowed by nothing.
+/// its own, after the cap and the hub's layer: it narrows nothing and is narrowed by nothing.
 pub(crate) fn run_job_filter(
     cfg: &crate::config::Config,
     ctx: &JobCtx,
@@ -2839,21 +2863,29 @@ fn service_per_source(
 }
 
 /// Where a placed job's build of `service`'s image (`None`: the job's own) records its egress
-/// for the job's report; `None` for a job no hub placed.
+/// for the job's report, with the hub's build-phase layer its stage switches enforce; `None`
+/// for a job no hub placed. A hub layer with nowhere to go fails the build rather than run its
+/// steps without it.
 fn build_record(ctx: &JobCtx, service: Option<&str>) -> Result<Option<crate::build::EgressRecord>> {
+    let hub = hub_layer(ctx, EgressPhase::Build)?;
     let Some(dir) = &ctx.egress_record else {
+        if hub.is_some() {
+            bail!("the hub's build-phase egress rules need the job's egress record");
+        }
         return Ok(None);
     };
     Ok(Some(crate::build::EgressRecord {
         dir: dir.clone(),
         source: service.map(str::to_string),
+        hub,
     }))
 }
 
 /// This job's build-phase egress ([`crate::build::BuildNet`]) plus its build-audit flag: the
 /// `[egress.build]` cap and the job's own `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME`, each
 /// checked on its own by the stage switches (`BuildNet::Filtered`), both unrestricted by default,
-/// as `docker build`.
+/// as `docker build`. Always filtered, even so: the switch then still tells the hub's layer's
+/// denials from the others.
 fn effective_build_egress(
     cfg: &crate::config::Config,
     ctx: &JobCtx,
@@ -3050,7 +3082,7 @@ struct Above<'a> {
 }
 
 /// The layers above a job's declaration of `phase`, in the order the switch checks them: the
-/// node's cap.
+/// node's cap, then the hub's layer where it restricts the phase.
 fn layers_above(ctx: &JobCtx, phase: EgressPhase) -> Result<Vec<Above<'_>>> {
     let cfg = &ctx.cfg;
     let (section, cap) = match phase {
@@ -3071,14 +3103,25 @@ fn layers_above(ctx: &JobCtx, phase: EgressPhase) -> Result<Vec<Above<'_>>> {
             )?,
         ),
     };
-    Ok(vec![Above {
+    let mut above = vec![Above {
         layer: EgressLayer::NodeCap,
         filter: cap,
         within: Box::new(move |d| match d {
             EgressDimension::Ip => format!("the node's {section} allow_ip"),
             _ => format!("the node's {section} allow_name"),
         }),
-    }])
+    }];
+    if let Some(hub) = hub_bound(ctx, phase)? {
+        above.push(Above {
+            layer: EgressLayer::HubRule,
+            filter: crate::switch::Cap::Allow {
+                ips: hub.list.ips,
+                names: hub.list.names,
+            },
+            within: Box::new(move |_| hub.rules.clone()),
+        });
+    }
+    Ok(above)
 }
 
 /// Warn of each entry of `declared`, `declarer`'s filter, that a layer `above` leaves nothing
@@ -3170,6 +3213,130 @@ fn warn_unreachable_job(ctx: &JobCtx, phase: EgressPhase) {
     };
     if let Ok(above) = layers_above(ctx, phase) {
         warn_unreachable(ctx, declarer, &declared, &above);
+    }
+}
+
+/// What a phase's filters are checked against beyond the node's cap: the hub's layer for it,
+/// a restricted one, and how a message names its rules.
+struct HubBound {
+    list: crate::switch::HubList,
+    rules: String,
+}
+
+/// The hub's layer for `phase` of a placed job, as its switches take it: held to its bounds,
+/// every entry checked as a switch checks it. `None` where the hub sends none, or sets nothing
+/// for the phase. A layer that fails the checks fails the job: it would otherwise run under
+/// less than the hub's rules.
+pub(crate) fn hub_layer(
+    ctx: &JobCtx,
+    phase: EgressPhase,
+) -> Result<Option<crate::switch::HubLayer>> {
+    let Some(egress) = &ctx.hub_egress else {
+        return Ok(None);
+    };
+    egress
+        .check()
+        .map_err(|e| anyhow!("the hub's egress rules for this job: {e}"))?;
+    let layer = crate::switch::HubLayer::of(egress, phase);
+    if let Some(layer) = &layer {
+        layer
+            .check()
+            .context("the hub's egress rules for this job")?;
+    }
+    Ok(layer)
+}
+
+/// [`hub_layer`]'s enforced lists for `phase`, as a job's and its services' declarations are
+/// warned against ([`warn_unreachable`]); `None` where the hub's layer restricts nothing.
+fn hub_bound(ctx: &JobCtx, phase: EgressPhase) -> Result<Option<HubBound>> {
+    let Some(list) = hub_layer(ctx, phase)?.and_then(|l| l.enforce) else {
+        return Ok(None);
+    };
+    Ok(Some(HubBound {
+        list,
+        rules: hub_rules_label(ctx),
+    }))
+}
+
+/// What a job's trace says of the hub's layer: the rules applied, then each phase's
+/// lists layer by layer — the node's cap, the hub's, the job's own — never one list
+/// flattened from them. Nothing without a hub layer.
+fn hub_egress_lines(ctx: &JobCtx) -> Result<Vec<String>> {
+    let Some(egress) = &ctx.hub_egress else {
+        return Ok(Vec::new());
+    };
+    let names = |rules: &mut dyn Iterator<Item = &String>| {
+        let rules: Vec<&str> = rules.map(String::as_str).collect();
+        match rules.is_empty() {
+            true => "none".to_string(),
+            false => rules.join(", "),
+        }
+    };
+    let head = format!(
+        "virtkit: egress under the hub's rules: {}",
+        names(&mut egress.rules.iter())
+    );
+    let mut lines = vec![head];
+    let cfg = &ctx.cfg;
+    for (phase, cap_ip, cap_name, job_ip, job_name) in [
+        (
+            EgressPhase::Run,
+            &cfg.egress.allow_ip,
+            &cfg.egress.allow_name,
+            &ctx.egress_allow_ip_req,
+            &ctx.egress_allow_name_req,
+        ),
+        (
+            EgressPhase::Build,
+            &cfg.egress.build.allow_ip,
+            &cfg.egress.build.allow_name,
+            &ctx.egress_build_allow_ip_req,
+            &ctx.egress_build_allow_name_req,
+        ),
+    ] {
+        let hub = match hub_layer(ctx, phase)?.and_then(|l| l.enforce) {
+            Some(l) => lists(Some(&l.ips), Some(&l.names)),
+            None => "unrestricted".to_string(),
+        };
+        // Once the job lists one dimension, the one it does not list allows none.
+        let narrowed = |req: &Option<String>| match req.as_deref().map(split_req) {
+            Some(l) if !l.is_empty() => l.join(" "),
+            _ => "none".to_string(),
+        };
+        let job = match (job_ip, job_name) {
+            (None, None) => "not narrowed".to_string(),
+            (ip, name) => format!("names {}, ips {}", narrowed(name), narrowed(ip)),
+        };
+        let phase = match phase {
+            EgressPhase::Build => "build",
+            _ => "run",
+        };
+        lines.push(format!(
+            "virtkit:   {phase}: node cap {}; hub {hub}; job {job}",
+            lists(cap_ip.as_deref(), cap_name.as_deref())
+        ));
+    }
+    Ok(lines)
+}
+
+/// A phase's lists as the trace names them: unrestricted where neither is listed, else each
+/// dimension's entries, an unlisted or empty one allowing none.
+fn lists(ips: Option<&[String]>, names: Option<&[String]>) -> String {
+    if ips.is_none() && names.is_none() {
+        return "unrestricted".to_string();
+    }
+    let one = |l: Option<&[String]>| match l.unwrap_or_default() {
+        [] => "none".to_string(),
+        l => l.join(" "),
+    };
+    format!("names {}, ips {}", one(names), one(ips))
+}
+
+/// How a message names the hub's rules for a placed job.
+pub(crate) fn hub_rules_label(ctx: &JobCtx) -> String {
+    match ctx.hub_egress.as_ref().map(|e| e.rules.as_slice()) {
+        None | Some([]) => "the hub's egress rules (none selects this job)".to_string(),
+        Some(rules) => format!("the hub's egress rules ({})", rules.join(", ")),
     }
 }
 
@@ -5447,6 +5614,55 @@ mod tests {
         assert!(msg.starts_with("[egress] allow_name "), "{msg}");
     }
 
+    /// A placed job's hub layer reaches its switches by phase; one the node cannot hold to its
+    /// checks fails the job rather than run it under less.
+    #[test]
+    fn the_hubs_layer_is_taken_by_phase_and_checked() {
+        use vk_hub_proto::egress::{HubEgress, HubPhase};
+        let allow = |names: &[&str]| HubPhase::Allow {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            ips: Vec::new(),
+        };
+        let mut c = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
+        assert!(hub_layer(&c, EgressPhase::Run).unwrap().is_none());
+        c.hub_egress = Some(HubEgress {
+            rules: vec!["wab".into(), "default".into()],
+            run: allow(&["corp.example.com"]),
+            build: HubPhase::Unrestricted,
+            dry_run: Vec::new(),
+        });
+        let run = hub_layer(&c, EgressPhase::Run).unwrap().unwrap();
+        assert_eq!(
+            run.enforce.as_ref().map(|l| l.names.clone()),
+            Some(vec!["corp.example.com".to_string()])
+        );
+        assert!(hub_layer(&c, EgressPhase::Build).unwrap().is_none());
+        assert!(hub_bound(&c, EgressPhase::Build).unwrap().is_none());
+        assert_eq!(
+            hub_bound(&c, EgressPhase::Run).unwrap().unwrap().rules,
+            "the hub's egress rules (wab, default)"
+        );
+        // The trace names the rules, then each phase layer by layer.
+        c.cfg.egress.build.allow_name = Some(vec!["debian.org".into()]);
+        c.egress_allow_name_req = Some("api.corp.example.com".into());
+        assert_eq!(
+            hub_egress_lines(&c).unwrap(),
+            [
+                "virtkit: egress under the hub's rules: wab, default",
+                "virtkit:   run: node cap unrestricted; hub names corp.example.com, ips none; job \
+                 names api.corp.example.com, ips none",
+                "virtkit:   build: node cap names debian.org, ips none; hub unrestricted; job not \
+                 narrowed",
+            ]
+        );
+        for bad in [allow(&["https://x.example"]), HubPhase::Other] {
+            c.hub_egress.as_mut().unwrap().run = bad;
+            assert!(hub_layer(&c, EgressPhase::Run).is_err());
+        }
+        c.hub_egress = None;
+        assert!(hub_egress_lines(&c).unwrap().is_empty());
+    }
+
     /// A declaration with invalid entries fails with the error it always did, the first IP's, and
     /// lists every invalid entry, in both dimensions, as the job's report names them; a placed
     /// job records them through the error's chain.
@@ -5613,7 +5829,8 @@ mod tests {
     }
 
     /// An entry a layer above leaves nothing of is kept, warned of, and recorded as unreachable
-    /// with the first such layer: the node's cap, then for a service the job's own lists. One sharing anything with them, wider or narrower, says nothing.
+    /// with the first such layer: the node's cap, the hub's rules, then for a service the job's
+    /// own lists. One sharing anything with them, wider or narrower, says nothing.
     #[test]
     fn an_entry_a_layer_above_leaves_nothing_of_is_kept_and_reported() {
         let dir = std::env::temp_dir().join(format!("vk-unreachable-{}", std::process::id()));
@@ -5624,6 +5841,15 @@ mod tests {
         cfg.egress.allow_ip = Some(vec!["10.0.0.0/8".into()]);
         let mut c = JobCtx::new_for_job(cfg, "1".into()).unwrap();
         c.egress_record = Some(dir.clone());
+        c.hub_egress = Some(vk_hub_proto::egress::HubEgress {
+            rules: vec!["wab".into()],
+            run: vk_hub_proto::egress::HubPhase::Allow {
+                names: vec!["corp.example.com".into()],
+                ips: vec!["10.0.0.0/8".into()],
+            },
+            build: vk_hub_proto::egress::HubPhase::Unrestricted,
+            dry_run: Vec::new(),
+        });
         c.egress_allow_name_req = Some("pypi.org crates.io example.com".into());
         c.egress_allow_ip_req = Some("192.168.0.0/16 10.1.0.0/16".into());
         warn_unreachable_job(&c, EgressPhase::Run);
@@ -5653,6 +5879,13 @@ mod tests {
                     "pypi.org",
                     EgressDimension::Name,
                     EgressLayer::NodeCap,
+                    EgressSource::Job
+                ),
+                unreachable(
+                    NAME,
+                    "crates.io",
+                    EgressDimension::Name,
+                    EgressLayer::HubRule,
                     EgressSource::Job
                 ),
             ]
@@ -5691,9 +5924,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A placed job's build records into its egress record, with whose image it is.
+    /// A placed job's build records into its egress record, with whose image it is and the hub's
+    /// build-phase layer.
     #[test]
-    fn a_placed_jobs_build_records_into_its_egress_record() {
+    fn a_placed_jobs_build_records_with_the_hubs_layer() {
         let mut c = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
         assert_eq!(build_record(&c, None).unwrap(), None);
         c.egress_record = Some(PathBuf::from("/n/j/egress"));
@@ -5702,8 +5936,31 @@ mod tests {
             Some(crate::build::EgressRecord {
                 dir: PathBuf::from("/n/j/egress"),
                 source: Some("db".into()),
+                hub: None,
             })
         );
+        // The hub's build-phase layer rides with it, and never goes without it.
+        let names = vec!["debian.org".to_string()];
+        c.hub_egress = Some(vk_hub_proto::egress::HubEgress {
+            rules: vec!["default".into()],
+            run: vk_hub_proto::egress::HubPhase::Unrestricted,
+            build: vk_hub_proto::egress::HubPhase::Allow {
+                names: names.clone(),
+                ips: Vec::new(),
+            },
+            dry_run: Vec::new(),
+        });
+        assert_eq!(
+            build_record(&c, None).unwrap().and_then(|r| r.hub),
+            Some(crate::switch::HubLayer {
+                enforce: Some(crate::switch::HubList {
+                    ips: Vec::new(),
+                    names,
+                }),
+            })
+        );
+        c.egress_record = None;
+        assert!(build_record(&c, None).is_err());
     }
 
     // pack_checkout_seed builds a portable tar (the `tar` crate, no host `tar` binary): it drops

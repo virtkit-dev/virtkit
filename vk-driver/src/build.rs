@@ -397,13 +397,17 @@ pub fn not_cached(e: &anyhow::Error) -> bool {
 }
 
 /// Where a placed job's build records its egress for the node's report, and what its stage
-/// switches need to say which layer refused a flow and whose image was being built.
+/// switches need to say which layer refused a flow and whose image was being built — and to
+/// enforce the hub's layer, which only a placed job has.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EgressRecord {
     /// The job's record dir; each build keeps its channels in a dir of its own there.
     pub dir: PathBuf,
     /// The service whose image this is; `None` for the job's own.
     pub source: Option<String>,
+    /// The hub's build-phase layer, enforced by every stage switch beside `net`; `None` where
+    /// the hub sets none.
+    pub hub: Option<crate::switch::HubLayer>,
 }
 
 /// Egress policy for the microVM build's `RUN` guests.
@@ -850,6 +854,7 @@ fn make_microvm(
     let record = opts.record.as_ref().map(|r| crate::run::StageRecord {
         denied_log: crate::jobctx::JobCtx::egress_denied_log_in(channels),
         source: r.source.clone(),
+        hub: r.hub.clone(),
     });
     Ok(MicroVm::new(
         kernel.to_path_buf(),
@@ -6976,6 +6981,7 @@ ENTRYPOINT run me
             record: Some(EgressRecord {
                 dir: record.clone(),
                 source: None,
+                hub: None,
             }),
             require_cached: false,
             build_jobs: None,

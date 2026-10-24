@@ -5441,6 +5441,8 @@ pub(crate) async fn spawn_vm_switch(
         // has no cap. A placed job's names the service whose image it builds.
         cap: cap.cloned(),
         vm_names,
+        // A placed job's build stage enforces the hub's build-phase layer too.
+        hub: record.and_then(|r| r.hub.clone()),
         // A placed job's build stage records within a bound: its guest chooses how much.
         record_limit: record.map(|_| crate::egress_report::RECORD_LIMIT),
         registry_proxy,
@@ -5466,11 +5468,12 @@ pub(crate) async fn spawn_vm_switch(
 
 /// What a placed job's build-stage switch needs to record the denials it makes for the job's
 /// report (see `build::EgressRecord`): where, and the service whose image it builds (`None`
-/// for the job's own).
+/// for the job's own); and the hub's layer it enforces.
 #[derive(Clone, Debug)]
 pub(crate) struct StageRecord {
     pub denied_log: PathBuf,
     pub source: Option<String>,
+    pub hub: Option<crate::switch::HubLayer>,
 }
 
 /// The disk format of a stage image, by extension: forked stages are `.qcow2` (a
