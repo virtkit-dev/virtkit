@@ -221,19 +221,73 @@ fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let (denials, new_offset) = crate::egress_report::read_since(&ctx.egress_denied_log(), start);
+    let (records, new_offset) =
+        crate::egress_report::read_records_since(&ctx.egress_denied_log(), start);
     if new_offset == start {
         return; // nothing new (and no offset to persist)
     }
 
-    let lines = crate::egress_report::denial_lines(&denials);
-    if !lines.is_empty() {
-        eprintln!("{}", blocked_header(ctx.egress_run_dry_run(), stage));
-        for line in &lines {
-            eprintln!("  {line}");
+    for (header, denials) in denial_groups(ctx, stage, records) {
+        let lines = crate::egress_report::denial_lines(&denials);
+        if !lines.is_empty() {
+            eprintln!("{header}");
+            for line in &lines {
+                eprintln!("  {line}");
+            }
         }
     }
     let _ = std::fs::write(&pos_file, new_offset.to_string());
+}
+
+/// `records` grouped under the header of what decided them, in this order: blocked by the
+/// node's layers, blocked by the hub's rules, flagged by the node's dry-run, then flagged by
+/// each of the hub's dry-run rules. A record that does not say — an older switch's — falls in
+/// with the run's own dry-run setting, as all of them once did.
+fn denial_groups(
+    ctx: &JobCtx,
+    stage: Option<&str>,
+    records: Vec<(crate::egress_report::Denial, crate::egress_report::Attrs)>,
+) -> Vec<(String, Vec<crate::egress_report::Denial>)> {
+    use vk_hub_proto::egress::EgressLayer;
+    let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
+    let mut groups = vec![
+        (blocked_header(false, stage), Vec::new()),
+        (
+            format!(
+                "virtkit: egress blocked by {}{label}:",
+                crate::vm::hub_rules_label(ctx)
+            ),
+            Vec::new(),
+        ),
+        (blocked_header(true, stage), Vec::new()),
+    ];
+    for (denial, attrs) in records {
+        let at = match (&attrs.rule, attrs.would_block, attrs.layer) {
+            (Some(rule), _, _) => {
+                let header = format!(
+                    "virtkit: egress the hub's dry-run rule {rule} would block (not enforced){label}:"
+                );
+                match groups.iter().position(|(h, _)| *h == header) {
+                    Some(at) => at,
+                    None => {
+                        groups.push((header, Vec::new()));
+                        groups.len() - 1
+                    }
+                }
+            }
+            (None, true, _) => 2,
+            (None, false, Some(EgressLayer::HubRule)) => 1,
+            (None, false, Some(_)) => 0,
+            (None, false, None) => match ctx.egress_run_dry_run() {
+                true => 2,
+                false => 0,
+            },
+        };
+        if let Some((_, denials)) = groups.get_mut(at) {
+            denials.push(denial);
+        }
+    }
+    groups
 }
 
 /// Print the per-job egress audit summary into the job trace: every external domain the switch
@@ -678,6 +732,74 @@ mod tests {
         assert_eq!(
             blocked_header(true, Some("step_script")),
             "virtkit: egress the allowlist would block (dry-run, not enforced) [step_script]:"
+        );
+    }
+
+    /// A stage's denials go under what decided them: a hub dry-run rule's apart, by rule, and
+    /// a bare record — an older switch's — with the run's own dry-run setting.
+    #[test]
+    fn denials_are_grouped_by_what_decided_them() {
+        use super::denial_groups;
+        use crate::config::Config;
+        use crate::egress_report::{Attrs, Denial, Proto};
+        use crate::jobctx::JobCtx;
+        use vk_hub_proto::egress::EgressLayer;
+        let mut ctx = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
+        ctx.hub_egress = Some(vk_hub_proto::egress::HubEgress {
+            rules: vec!["wab".into()],
+            run: vk_hub_proto::egress::HubPhase::Unrestricted,
+            build: vk_hub_proto::egress::HubPhase::Unrestricted,
+            dry_run: Vec::new(),
+        });
+        let denial = |target: &str| Denial {
+            proto: Proto::Dns,
+            target: target.into(),
+            count: 1,
+        };
+        let attrs = |layer, would_block, rule: Option<&str>| Attrs {
+            layer,
+            would_block,
+            rule: rule.map(str::to_string),
+            ..Attrs::default()
+        };
+        let groups = denial_groups(
+            &ctx,
+            Some("step_script"),
+            vec![
+                (denial("a"), attrs(Some(EgressLayer::NodeCap), false, None)),
+                (denial("b"), attrs(Some(EgressLayer::HubRule), false, None)),
+                (denial("c"), attrs(Some(EgressLayer::Job), true, None)),
+                (
+                    denial("d"),
+                    attrs(Some(EgressLayer::HubRule), true, Some("trial")),
+                ),
+                (denial("e"), Attrs::default()),
+            ],
+        );
+        let got: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(h, d)| (h.as_str(), d.iter().map(|d| d.target.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "virtkit: egress blocked by the allowlist [step_script]:",
+                    vec!["a", "e"]
+                ),
+                (
+                    "virtkit: egress blocked by the hub's egress rules (wab) [step_script]:",
+                    vec!["b"]
+                ),
+                (
+                    "virtkit: egress the allowlist would block (dry-run, not enforced) [step_script]:",
+                    vec!["c"]
+                ),
+                (
+                    "virtkit: egress the hub's dry-run rule trial would block (not enforced) [step_script]:",
+                    vec!["d"]
+                ),
+            ]
         );
     }
 

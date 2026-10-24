@@ -469,6 +469,7 @@ fn sum_net_bytes(text: &str) -> (u64, u64) {
 /// `offset` was truncated (e.g. removed and recreated) and is re-read from the start; the
 /// per-job log is otherwise append-only and never rotated. A missing file (the job had no
 /// egress restriction, so the switch wrote none) yields no denials.
+#[cfg(test)]
 pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
     let (records, offset) = read_records_since(path, offset);
     (records.into_iter().map(|(d, _)| d).collect(), offset)

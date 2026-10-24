@@ -1371,6 +1371,11 @@ virtkit:   run: node cap unrestricted; hub names corp.example.com, ips 10.10.140
 virtkit:   build: node cap names debian.org crates.io, ips none; hub names debian.org, ips none; job not narrowed
 ```
 
+and each stage's denials under what decided them: `egress blocked by the allowlist` (the node's
+cap, the job's or a service's), `egress blocked by the hub's egress rules (…)`, `egress the
+allowlist would block (dry-run, not enforced)`, and `egress the hub's dry-run rule … would block
+(not enforced)`.
+
 ### Per-service egress
 
 A `services:` entry can carry its own `MICROVM_EGRESS_ALLOW_IP` /
