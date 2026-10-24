@@ -189,6 +189,8 @@ All notable changes to virtkit will be documented in this file.
   a closed one is refused until resolved again.
 - **Under an egress allowlist, an allowed name's lookup opens only the addresses it resolves
   to**, directly or through its aliases, not every address a DNS answer carries.
+- **A guest's DNS lookups through the switch no longer get a reply meant for another
+  query**: one carrying the wrong id is dropped, and the answer waited for.
 - **`vk-hub`'s audit log no longer loses how a fleet job ended**, or who canceled it, when
   the job is settled or changes again before the hub has recorded it.
 

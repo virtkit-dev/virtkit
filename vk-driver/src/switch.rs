@@ -3438,6 +3438,8 @@ enum UpstreamError {
     Timeout(Duration),
     /// A reply too short to be a DNS message (the header alone is 12 bytes).
     Short(usize),
+    /// A reply over TCP carrying another query's id.
+    Mismatched,
 }
 
 impl UpstreamError {
@@ -3448,7 +3450,7 @@ impl UpstreamError {
         match self {
             UpstreamError::Io(e) => e.kind(),
             UpstreamError::Timeout(_) => std::io::ErrorKind::TimedOut,
-            UpstreamError::Short(_) => std::io::ErrorKind::InvalidData,
+            UpstreamError::Short(_) | UpstreamError::Mismatched => std::io::ErrorKind::InvalidData,
         }
     }
 }
@@ -3465,6 +3467,7 @@ impl std::fmt::Display for UpstreamError {
             UpstreamError::Io(e) => write!(f, "{e}"),
             UpstreamError::Timeout(d) => write!(f, "no reply in {d:?}"),
             UpstreamError::Short(n) => write!(f, "reply too short ({n} bytes)"),
+            UpstreamError::Mismatched => write!(f, "reply to another query"),
         }
     }
 }
@@ -3638,11 +3641,21 @@ async fn forward_upstream_tcp(
     if resp.len() < 12 {
         return Err(UpstreamError::Short(resp.len()));
     }
+    if !same_id(query, &resp) {
+        return Err(UpstreamError::Mismatched);
+    }
     Ok(resp)
 }
 
+/// Whether `reply` carries `query`'s transaction id.
+fn same_id(query: &[u8], reply: &[u8]) -> bool {
+    query.get(..2).is_some_and(|id| reply.get(..2) == Some(id))
+}
+
 /// Send a raw DNS query to a single upstream over UDP and return its raw response, with a
-/// configurable reply deadline.
+/// configurable reply deadline. A datagram carrying another id is no answer to the query and
+/// is dropped, as a stub resolver drops it (RFC 5452 §9.1), so the guest is never handed one:
+/// the wait goes on for the answer, within the same deadline.
 async fn forward_upstream_with(
     query: &[u8],
     upstream: SocketAddr,
@@ -3659,14 +3672,19 @@ async fn forward_upstream_with(
     sock.connect(upstream).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; MAX_FRAME];
-    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
-        .await
-        .map_err(|_| UpstreamError::Timeout(timeout))??;
-    if n < 12 {
-        return Err(UpstreamError::Short(n));
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf))
+            .await
+            .map_err(|_| UpstreamError::Timeout(timeout))??;
+        if n < 12 {
+            return Err(UpstreamError::Short(n));
+        }
+        if same_id(query, &buf[..n]) {
+            buf.truncate(n);
+            return Ok(buf);
+        }
     }
-    buf.truncate(n);
-    Ok(buf)
 }
 
 /// A query type as its mnemonic where the guest resolvers use one, else the number —
@@ -9215,6 +9233,37 @@ mod tests {
             .expect_err("a truncated reply is rejected");
         assert!(matches!(err, UpstreamError::Short(4)), "{err}");
         assert_eq!(err.to_string(), "reply too short (4 bytes)");
+
+        // A reply to another query is dropped, and the answer waited for; none, a timeout.
+        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stub_addr = stub.local_addr().unwrap();
+        let answer = {
+            let mut a = query.clone();
+            a[2] |= 0x80;
+            a
+        };
+        let stray = {
+            let mut s = answer.clone();
+            s[0] ^= 0xff;
+            s
+        };
+        let (stray2, answer2) = (stray.clone(), answer.clone());
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, from) = stub.recv_from(&mut buf).await.unwrap();
+            stub.send_to(&stray2, from).await.unwrap();
+            stub.send_to(&answer2, from).await.unwrap();
+            let (_, from) = stub.recv_from(&mut buf).await.unwrap();
+            stub.send_to(&stray2, from).await.unwrap();
+        });
+        let got = forward_upstream_with(&query, stub_addr, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(got, answer);
+        let err = forward_upstream_with(&query, stub_addr, Duration::from_millis(300))
+            .await
+            .expect_err("only a stray came back");
+        assert!(matches!(err, UpstreamError::Timeout(_)), "{err}");
     }
 
     /// Whole-lookup budget for an expected answer. These tests exercise the short probes;
