@@ -826,6 +826,27 @@ pub fn hub_ceiling(cfg: &Config) -> Result<Option<u32>> {
     })
 }
 
+/// The hub's Fallback egress layer for the jobs this host's gitlab-runner runs, as last
+/// applied: `None` without a fleet enrollment, when the state belongs to another enrollment,
+/// or when the hub set none.
+pub fn hub_fallback(cfg: &Config) -> Result<Option<vk_hub_proto::egress::HubEgress>> {
+    let dir = dir(cfg);
+    let enrollment = match read_enrollment(&dir) {
+        Ok(e) => e,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let persisted = state::Persisted::load(&dir)?;
+    let issuer = state::Issuer {
+        hub: enrollment.hub,
+        node_id: enrollment.node_id,
+    };
+    Ok(match persisted.issuer.as_ref() == Some(&issuer) {
+        true => persisted.hub_fallback().cloned(),
+        false => None,
+    })
+}
+
 type Flag = tokio::sync::watch::Receiver<bool>;
 
 /// Hold `<dir>/lock` for as long as the returned file lives: one `vk node` process per state
@@ -1021,6 +1042,86 @@ concurrent = 4
         drop(held);
         crate::testutil::once_released("another `vk node`", || lock(&dir)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job no hub placed takes the Fallback its node applied at prepare, keeps it in its job
+    /// dir for its run stages, and its builds' layer an egress record to ride on.
+    #[test]
+    fn a_gitlab_runner_job_runs_under_the_fallback_its_prepare_took() {
+        use vk_hub_proto::egress::{HubEgress, HubPhase};
+        let root = scratch("fallback");
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", root.display().to_string())).unwrap();
+        let job = |cfg: &Config| {
+            let cfg: Config = toml::from_str(&format!(
+                "state_dir = {:?}\n",
+                cfg.state_dir().display().to_string()
+            ))
+            .unwrap();
+            crate::jobctx::JobCtx::for_env(
+                cfg,
+                &[("CUSTOM_ENV_CI_JOB_ID".to_string(), "77".to_string())],
+            )
+            .unwrap()
+        };
+        let mut ctx = job(&cfg);
+        ctx.take_fallback().unwrap();
+        assert_eq!((&ctx.hub_egress, &ctx.egress_record), (&None, &None));
+        let node = dir(&cfg);
+        create_dir(&node).unwrap();
+        let enrollment = Enrollment {
+            hub: "https://hub".into(),
+            node_id: "ab".repeat(16),
+            ca: false,
+        };
+        std::fs::write(
+            node.join(ENROLLMENT_FILE),
+            serde_json::to_vec(&enrollment).unwrap(),
+        )
+        .unwrap();
+        let fallback = HubEgress {
+            rules: vec!["default".into()],
+            run: HubPhase::Unrestricted,
+            build: HubPhase::Allow {
+                names: vec!["debian.org".into()],
+                ips: Vec::new(),
+            },
+            dry_run: Vec::new(),
+        };
+        let applying = |egress: Option<HubEgress>, generation| {
+            let mut persisted = state::Persisted::load(&node).unwrap();
+            persisted.adopt_issuer(state::Issuer {
+                hub: "https://hub".into(),
+                node_id: enrollment.node_id.clone(),
+            });
+            persisted.apply_desired(vk_hub_proto::DesiredState {
+                generation,
+                ceiling: None,
+                acquisition: vk_hub_proto::Acquisition::Run,
+                egress,
+            });
+            persisted.save(&node).unwrap();
+        };
+        applying(Some(fallback.clone()), 1);
+        assert_eq!(hub_fallback(&cfg).unwrap(), Some(fallback.clone()));
+        let mut ctx = job(&cfg);
+        ctx.take_fallback().unwrap();
+        assert_eq!(ctx.hub_egress, Some(fallback.clone()));
+        std::fs::create_dir_all(&ctx.job_dir).unwrap();
+        ctx.keep_fallback().unwrap();
+        let record = ctx.egress_record.clone().unwrap();
+        assert!(record.is_dir() && record.starts_with(&ctx.job_dir));
+        // A later run stage reads it back, whatever the node applied since; a cleanup does not.
+        applying(None, 2);
+        let mut later = job(&cfg);
+        assert_eq!(later.hub_egress, None);
+        later.load_fallback().unwrap();
+        assert_eq!(later.hub_egress, Some(fallback));
+        assert_eq!(later.egress_record, Some(record));
+        // One it cannot read is an error of the stage that reads it alone.
+        std::fs::write(ctx.job_dir.join("hub-fallback.json"), b"{").unwrap();
+        assert!(job(&cfg).load_fallback().is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

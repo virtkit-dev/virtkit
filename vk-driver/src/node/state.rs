@@ -257,6 +257,11 @@ impl Persisted {
         self.applied.as_ref().and_then(|d| d.ceiling)
     }
 
+    /// The hub's Fallback egress layer for the runner's jobs, from the applied desired state.
+    pub fn hub_fallback(&self) -> Option<&vk_hub_proto::egress::HubEgress> {
+        self.applied.as_ref().and_then(|d| d.egress.as_ref())
+    }
+
     /// Adopt `issuer`, clearing the applied generation and journal if the hub or enrollment
     /// changed: both belong to the previous issuer. Preserve node state because a drain or
     /// quarantine belongs to the host, whoever requested it. Return whether anything was

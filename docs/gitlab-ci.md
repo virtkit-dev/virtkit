@@ -1209,7 +1209,8 @@ There are two independent phases, each with its own host cap:
   meaning the build runs unrestricted, like `docker build`.
 
 A job a hub placed on a `vk node` may also be held to the hub's egress rules, chosen by project
-and ref; see [The hub's rules](#the-hubs-rules).
+and ref, and a job a node's gitlab-runner runs to the hub's Fallback rule; see [The hub's
+rules](#the-hubs-rules).
 
 ### Host caps
 
@@ -1375,6 +1376,14 @@ and each stage's denials under what decided them: `egress blocked by the allowli
 cap, the job's or a service's), `egress blocked by the hub's egress rules (…)`, `egress the
 allowlist would block (dry-run, not enforced)`, and `egress the hub's dry-run rule … would block
 (not enforced)`.
+
+A job run by the node's own gitlab-runner gets the hub's Fallback rule alone, `default`: its
+project and ref come from variables the job can set, so no rule by project or ref may apply to
+it. The node keeps the Fallback the hub last sent in its desired state, across hub outages; a
+job takes it at prepare and keeps it to the end, whatever the hub sends meanwhile, and is held
+to it as a placed job is to its rules. Its trace names the rule the same way. Only the per-job
+switch enforces it, so under `tap` or `pool` networking the node does not tell the hub it can,
+and the hub sends it none.
 
 ### Per-service egress
 

@@ -87,11 +87,15 @@ pub struct JobCtx {
     /// `[registry] guest_credential = "job"`.
     pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
     /// The hub's egress layer for a placed job, from the same start: what the rules that select
-    /// it allow, enforced below the node's cap, and what its dry-run rules would.
+    /// it allow, enforced below the node's cap, and what its dry-run rules would. For any other
+    /// job, the hub's Fallback its node applied, as its prepare took it
+    /// ([`JobCtx::take_fallback`]) and its supervisor and run stages read it back
+    /// ([`JobCtx::load_fallback`]).
     pub hub_egress: Option<vk_hub_proto::egress::HubEgress>,
     /// Where a placed job's executor commands keep what its node reports of its egress
     /// ([`JOB_EGRESS`]): its builds' records, its refused declarations, and at cleanup the run
-    /// phase's, which would otherwise go with the job dir.
+    /// phase's, which would otherwise go with the job dir. For a job under the Fallback, a
+    /// directory in its job dir, which no report reads.
     pub egress_record: Option<PathBuf>,
 }
 
@@ -108,6 +112,24 @@ pub const JOB_START: &str = "VK_JOB_START";
 /// in the job's journal: passed by its driver like [`JOB_START`], and as far from the job's
 /// reach.
 pub const JOB_EGRESS: &str = "VK_JOB_EGRESS";
+
+/// Where a job no hub placed keeps the hub's Fallback its prepare took, in its job dir.
+const HUB_FALLBACK: &str = "hub-fallback.json";
+
+/// Where such a job's switches record what the Fallback refuses, in its job dir: its build
+/// phase's layer rides on it.
+const FALLBACK_RECORD: &str = "hub-fallback-egress";
+
+/// The Fallback kept at `path`; `None` when there is none.
+fn read_fallback(path: &Path) -> Result<Option<vk_hub_proto::egress::HubEgress>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("reading the hub's Fallback {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading the hub's Fallback {}", path.display())),
+    }
+}
 
 /// The journaled start at `path`.
 fn read_job_start(path: &Path) -> Result<vk_hub_proto::dispatch::JobStart> {
@@ -279,6 +301,53 @@ impl JobCtx {
             hub_egress,
             egress_record,
         })
+    }
+
+    /// Take the hub's Fallback for a job no hub placed, from what its node last applied
+    /// ([`crate::node::hub_fallback`]): its prepare does, and [`JobCtx::keep_fallback`] keeps it
+    /// for the job's later commands, so that a change to it never reaches a job under way. A job
+    /// a hub placed keeps the layer its start carries.
+    pub fn take_fallback(&mut self) -> Result<()> {
+        if self.hub_placed {
+            return Ok(());
+        }
+        self.hub_egress = crate::node::hub_fallback(&self.cfg)?;
+        self.egress_record = self
+            .hub_egress
+            .as_ref()
+            .map(|_| self.job_dir.join(FALLBACK_RECORD));
+        Ok(())
+    }
+
+    /// Read back the Fallback [`JobCtx::take_fallback`] took for a job no hub placed, as its
+    /// prepare kept it ([`JobCtx::keep_fallback`]): its supervisor does, for the run phase's
+    /// switch, and a run stage for its trace. Only its commands that need it read it, so that
+    /// one it cannot read never stands in the way of another's, its cleanup's least of all.
+    pub fn load_fallback(&mut self) -> Result<()> {
+        if self.hub_placed {
+            return Ok(());
+        }
+        self.hub_egress = read_fallback(&self.job_dir.join(HUB_FALLBACK))?;
+        self.egress_record = self
+            .hub_egress
+            .as_ref()
+            .map(|_| self.job_dir.join(FALLBACK_RECORD));
+        Ok(())
+    }
+
+    /// Keep the Fallback [`JobCtx::take_fallback`] took in the job dir, with the egress record
+    /// its builds' layer rides on, once prepare has made the dir.
+    pub fn keep_fallback(&self) -> Result<()> {
+        let Some(egress) = self.hub_egress.as_ref().filter(|_| !self.hub_placed) else {
+            return Ok(());
+        };
+        if let Some(record) = &self.egress_record {
+            std::fs::create_dir_all(record)
+                .with_context(|| format!("creating {}", record.display()))?;
+        }
+        let path = self.job_dir.join(HUB_FALLBACK);
+        vk_fs::write_atomic(&path, &serde_json::to_vec(egress)?, 0o600)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     /// The root every `[executor] host_checkout` tree on this host lives under — the unit the idle

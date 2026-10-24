@@ -4809,11 +4809,25 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 println!("{info}");
                 ExitCode::SUCCESS
             }
-            GitlabCmd::Prepare => match vm::prepare(&ctx).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e, ctx.system_failure),
-            },
+            GitlabCmd::Prepare => {
+                // The job runs under the hub's Fallback as it stands now, whatever it becomes.
+                let mut ctx = ctx;
+                let prepared = match ctx.take_fallback() {
+                    Ok(()) => vm::prepare(&ctx).await,
+                    Err(e) => Err(e),
+                };
+                match prepared {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, ctx.system_failure),
+                }
+            }
             GitlabCmd::Run { script, stage } => {
+                // The Fallback the switch enforces since prepare, for the trace to name: one
+                // that cannot be read leaves the trace without it, and the switch as it is.
+                let mut ctx = ctx;
+                if let Err(e) = ctx.load_fallback() {
+                    eprintln!("virtkit: warning: {e:#}");
+                }
                 match executor::run_stage(&ctx, &script, stage.as_deref()).await {
                     Ok(result) => match (result.code, result.signal) {
                         (Some(0), _) => ExitCode::SUCCESS,
@@ -4835,7 +4849,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 // Its stdout and stderr are a log in the job dir, so a full filesystem must
                 // not make its every line a panic. Held past `fail`, whose line it drains.
                 let _relay = outrelay::relay();
-                match vm::supervise(&ctx, &job_dir).await {
+                // The Fallback its prepare kept, which the run phase's switch enforces: one that
+                // cannot be read fails the job rather than run it without.
+                let mut ctx = ctx;
+                let supervised = match ctx.load_fallback() {
+                    Ok(()) => vm::supervise(&ctx, &job_dir).await,
+                    Err(e) => Err(e),
+                };
+                match supervised {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }

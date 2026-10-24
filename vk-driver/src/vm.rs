@@ -397,6 +397,7 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))
         .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
+    ctx.keep_fallback()?;
 
     // Admission (`[executor.schedule]`) reserves guest and service RAM and job-dir growth,
     // waiting for both before boot. Reserve after stale-job teardown frees the previous claim,
@@ -3229,7 +3230,8 @@ struct HubBound {
     rules: String,
 }
 
-/// The hub's layer for `phase` of a placed job, as its switches take it: held to its bounds,
+/// The hub's layer for `phase` of a job — a placed job's, or the Fallback a job its node's
+/// gitlab-runner runs took at prepare — as its switches take it: held to its bounds,
 /// every entry checked as a switch checks it. `None` where the hub sends none, or sets nothing
 /// for the phase and has no dry-run rule for it. A layer that fails the checks fails the job:
 /// it would otherwise run under less than the hub's rules.

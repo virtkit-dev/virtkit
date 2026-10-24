@@ -719,6 +719,11 @@ pub struct Inventory {
     /// layer and runs the job under its cap alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub egress_rules: bool,
+    /// Whether the node enforces the hub's Fallback egress layer for the jobs its gitlab-runner
+    /// runs ([`DesiredState::egress`]): apart from [`Inventory::egress_rules`], which covers
+    /// placed jobs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress_fallback: bool,
     /// The node's own egress caps, `[egress]` and `[egress.build]`, versioned by their
     /// fingerprint; `None` from an older node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,8 +1062,8 @@ pub struct DesiredState {
     pub acquisition: Acquisition,
     /// The hub's egress layer for the jobs the node's gitlab-runner runs: the Fallback
     /// (`default`) rule's alone, since such a job's project and ref come from variables the job
-    /// can set. `None` imposes none, as before. Sent only to a node that enforces it: an older
-    /// one would ignore it.
+    /// can set. `None` imposes none, as before. Sent only to a node announcing
+    /// [`Inventory::egress_fallback`]: an older one would ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<egress::HubEgress>,
 }
@@ -1443,6 +1448,7 @@ mod tests {
             job_tokens: false,
             egress_reports: false,
             egress_rules: false,
+            egress_fallback: false,
             egress_caps: None,
         }
     }
@@ -2200,12 +2206,14 @@ mod tests {
         tokens["job_tokens"] = json!(true);
         tokens["egress_reports"] = json!(true);
         tokens["egress_rules"] = json!(true);
+        tokens["egress_fallback"] = json!(true);
         pinned(
             &Inventory {
                 registry: Some("https://reg.example.com".into()),
                 job_tokens: true,
                 egress_reports: true,
                 egress_rules: true,
+                egress_fallback: true,
                 ..inventory()
             },
             tokens,

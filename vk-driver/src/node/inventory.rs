@@ -95,6 +95,9 @@ pub fn inventory(cfg: &Config) -> Inventory {
         // A placed job's start may carry the hub's egress layer, which its switches enforce in
         // both phases, with its dry-run rules — a tap's job has no switch to enforce it.
         egress_rules: matches!(cfg.net.mode.as_str(), "switch" | "none"),
+        // Its gitlab-runner's jobs take the hub's Fallback at prepare and enforce it as a placed
+        // job's layer, with the same switch.
+        egress_fallback: matches!(cfg.net.mode.as_str(), "switch" | "none"),
         egress_caps: Some(match egress_caps(cfg) {
             // Said once: the inventory is read again on every recheck, from the same config.
             NodeEgressCaps::TooLarge => {
