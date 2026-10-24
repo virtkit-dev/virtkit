@@ -8280,6 +8280,153 @@ async fn the_egress_page_s_rows_follow_the_jobs_reports() {
     assert!(event.contains(&count(1)), "{event}");
 }
 
+/// The Egress page's Observed traffic tab lists each project with how completely its jobs
+/// reported, and one project's destinations by phase, with their refs, latest job and the
+/// Blocked rows of the same destination; filtered by phase and protection, and following the
+/// jobs' reports over SSE.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() {
+    use vk_hub_proto::egress::*;
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let empty = get(addr, "/egress?tab=observed", Some(&viewer)).await;
+    assert_eq!(empty.status, 200, "{}", empty.body);
+    assert!(
+        empty.body.contains("nothing observed yet"),
+        "{}",
+        empty.body
+    );
+    assert!(
+        empty.body.contains(
+            "<a href=\"/egress?tab=observed\" aria-current=\"page\">Observed traffic</a>"
+        ),
+        "{}",
+        empty.body
+    );
+
+    let reached = |dest: &str| EgressEntry {
+        count: 2,
+        ..crate::egress::testing::entry(
+            EgressOutcome::Observed,
+            EgressProtocol::Dns,
+            EgressDestination::domain(dest),
+            None,
+        )
+    };
+    let mut report = blocked_report("crates.io", 1);
+    report.entries.push(reached("crates.io"));
+    report.entries.push(EgressEntry {
+        phase: EgressPhase::Build,
+        ..reached("<b>.example")
+    });
+    report.phases = vec![
+        crate::egress::testing::phase(EgressPhase::Run, EgressCoverage::Complete),
+        crate::egress::testing::phase(EgressPhase::Build, EgressCoverage::Partial),
+    ];
+    let a = egress_job(&hub, 1, 42, &node, report);
+    let mut later = EgressReport {
+        entries: vec![reached("crates.io")],
+        phases: vec![crate::egress::testing::phase(
+            EgressPhase::Run,
+            EgressCoverage::Complete,
+        )],
+        ..EgressReport::default()
+    };
+    later.entries[0].last_seen_ms = 2_000_000;
+    let b = egress_job(&hub, 2, 42, &node, later);
+
+    let list = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
+    assert!(
+        list.contains(
+            "<a href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">acme/p42 on gl</a>"
+        ),
+        "{list}"
+    );
+    assert!(
+        list.contains("Run: 2 of 2 jobs reported this phase completely · Build: 0 of 1 job"),
+        "{list}"
+    );
+
+    let p42 = "/egress?tab=observed&project=gitlab%3Agl%3A42";
+    let page = get(addr, p42, Some(&viewer)).await.body;
+    assert!(
+        page.contains("<code>DNS crates.io</code> <span class=\"sub\">lookup</span>"),
+        "{page}"
+    );
+    assert!(page.contains("main (protected) ×2"), "{page}");
+    // The latest job of the destination, by its last attempt.
+    assert!(page.contains(&format!("<a href=\"/jobs/{b}\">")), "{page}");
+    // Refused too, in another job: the Blocked row.
+    let blocked = crate::egress::blocked::row_id(
+        &crate::egress::blocked::Subject::Gitlab {
+            instance: "gl".into(),
+            project_id: 42,
+        },
+        &crate::egress::blocked::Finding::Denial {
+            view: crate::egress::blocked::View::Blocked,
+            protocol: EgressProtocol::Dns,
+            destination: EgressDestination::domain("crates.io"),
+        },
+    );
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/egress/rows/{blocked}\">Blocked</a> (1 job)"
+        )),
+        "{page}"
+    );
+    assert!(page.contains("A DNS entry is a lookup, not proof of a connection."));
+    assert!(!page.contains("<b>"), "escaped: {page}");
+    let run = get(addr, &format!("{p42}&phase=run"), Some(&viewer))
+        .await
+        .body;
+    assert!(
+        run.contains("crates.io") && !run.contains(".example"),
+        "{run}"
+    );
+    let unprotected = get(
+        addr,
+        &format!("{p42}&protection=unprotected"),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(unprotected.contains("none match"), "{unprotected}");
+    // The row's page links to its project's observed traffic.
+    let row = get(addr, &format!("/egress/rows/{blocked}"), Some(&viewer))
+        .await
+        .body;
+    assert!(
+        row.contains("<a href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">"),
+        "{row}"
+    );
+
+    // Live: a third job's destination appears.
+    let mut stream = live(
+        addr,
+        "/events/egress?tab=observed&project=gitlab%3Agl%3A42",
+        &viewer,
+    )
+    .await;
+    egress_job(
+        &hub,
+        3,
+        42,
+        &node,
+        EgressReport {
+            entries: vec![reached("pypi.org")],
+            ..EgressReport::default()
+        },
+    );
+    hub.jobs_changed();
+    let event = next_with(&mut stream, "pypi.org").await;
+    assert!(event.starts_with("event: egress\n"), "{event}");
+    assert!(
+        event.contains(&a[..8]) || event.contains(&b[..8]),
+        "{event}"
+    );
+}
+
 /// An operator acknowledges a row and mutes its project from the row's page, each audited as a
 /// person's action; the inbox and the navigation's count follow, a later job reopens the row,
 /// and a muted project's rows stay listed under Muted. A viewer gets no form and is refused.

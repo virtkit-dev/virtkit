@@ -1439,7 +1439,8 @@ last 2 MiB of text or so, with a notice for omitted lines and the remaining line
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
 `/egress`, *Egress* in the navigation, opens on the Blocked tab of the [Egress
-page](fleet-design.md#job-egress-from-the-hub). The Blocked tab lists what the jobs of the
+page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic
+(below). The Blocked tab lists what the jobs of the
 history were refused, from their nodes' reports, a row per destination (protocol, and a port,
 kept; a domain never merged into a suffix) or refused declaration (variable and entry) and per
 project — a project of the GitLab instance its jobs' key is bound to, by GitLab's ID, or for a
@@ -1476,6 +1477,26 @@ force, each undone there or from a row's page. The state filter
 not muted, which the navigation counts. Each acknowledgement, reopening, mute and unmute is
 audited as the operator's session, among people's actions; viewers see no form, and their
 posts are refused.
+
+`/egress?tab=observed`, the *Observed traffic* tab, lists what the jobs of the history reached,
+from their nodes' reports: each project, the latest first, with its jobs reported, its
+destinations, and per phase how many of its jobs that ran it reported it completely (*Run: 84
+of 100 jobs reported this phase completely*) and how many sent no report. A project
+(`project=`, as on the Blocked tab) lists its destinations, the latest used first: a contact
+allowed, or one a dry-run allowlist would have blocked and the switch carried, marked *would
+block* — a DNS entry marked a lookup, not proof of a connection — with its phase, jobs and
+attempts, the day first seen and the time last seen on its nodes' clocks, the days in the last
+30 a job first used it on, its refs with their protection, its latest job, and the project's Blocked rows
+of the same destination. Phase (`phase=run|build|other`) and protection
+(`protection=protected|unprotected|unknown`) filter it, coverage included — and, for every
+project, the coverage alone — applied at once as on the Blocked tab, and it follows the jobs' reports over `/events/egress?tab=observed…`. The store
+keeps each job's part by project, phase, exact destination (a domain, or an address and port),
+protection, ref and day, so that a hub rule's entries can later be matched against every contact
+they allow, and with the job history, as the Blocked rows: written again it adds nothing, and a
+job leaving the history takes its part back. A project keeps at most 1000 destinations, phase by
+phase; a contact past them is counted, shown as not listed, and taken back with its job, and a
+destination no job reaches any more frees its place for the next job written. A hub upgraded
+from a version without it builds it from the history on start.
 
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,

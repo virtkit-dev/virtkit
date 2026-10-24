@@ -48,9 +48,11 @@ pub(super) const EGRESS_TOTALS: TableDefinition<(&str, &str), u64> =
 /// says them ([`BlockedRow::who`]).
 pub(super) const EGRESS_SUBJECTS: TableDefinition<&str, (u64, &str)> =
     TableDefinition::new("egress_subjects");
-/// Key: [`BUILT`]. Value: 1 once the rows hold every job of the history.
+/// Key: [`BUILT`], [`OBSERVED_BUILT`]. Value: 1 once the rows, and Observed traffic, hold every
+/// job of the history.
 const EGRESS_META: TableDefinition<&str, u64> = TableDefinition::new("egress_meta");
 const BUILT: &str = "built";
+const OBSERVED_BUILT: &str = "observed";
 
 /// The longest reason a mute takes.
 pub const MAX_MUTE_REASON: usize = vk_hub_proto::MAX_DISPLAY;
@@ -432,14 +434,17 @@ fn view_text(v: View) -> &'static str {
     }
 }
 
-/// Fill the rows from the history once: the jobs a build without them recorded. A job's
-/// record is decoded at a time.
+/// Fill the rows and Observed traffic from the history once each: the jobs a build without
+/// them recorded. A job's record is decoded at a time.
 pub(super) fn share_history(txn: &redb::WriteTransaction) -> Result<()> {
     let mut meta = txn.open_table(EGRESS_META)?;
     // Created for the reads to find, rows or not.
     drop(Tables::open(txn)?);
     txn.open_table(EGRESS_MUTES)?;
-    if meta.get(BUILT)?.is_none() {
+    super::observed::create(txn)?;
+    let rows = meta.get(BUILT)?.is_none();
+    let observed = meta.get(OBSERVED_BUILT)?.is_none();
+    if rows || observed {
         let jobs = txn.open_table(JOBS)?;
         for entry in jobs.iter()? {
             let (id, row) = entry?;
@@ -450,10 +455,16 @@ pub(super) fn share_history(txn: &redb::WriteTransaction) -> Result<()> {
             if row.started_at.is_none() {
                 continue;
             }
-            reshare(txn, id.value(), None, Some(&row))?;
+            if rows {
+                reshare(txn, id.value(), None, Some(&row))?;
+            }
+            if observed {
+                super::observed::reshare(txn, id.value(), None, Some(&row))?;
+            }
         }
     }
     meta.insert(BUILT, 1)?;
+    meta.insert(OBSERVED_BUILT, 1)?;
     Ok(())
 }
 

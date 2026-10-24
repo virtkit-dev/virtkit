@@ -547,6 +547,7 @@ impl Db {
             if !replaced {
                 // A job submitted has no report; a record restored with one shares it.
                 super::egress::reshare(&txn, id, None, Some(row))?;
+                super::observed::reshare(&txn, id, None, Some(row))?;
                 let mut counts = txn.open_table(JOB_COUNTS)?;
                 let n = counts.get(row.key.as_str())?.map_or(0, |g| g.value());
                 counts.insert(row.key.as_str(), n.saturating_add(1))?;
@@ -626,6 +627,7 @@ impl Db {
                     row.expired_at = row.expired_at.or(stored.expired_at);
                     table.insert(id, encode(&row)?.as_slice())?;
                     super::egress::reshare(&txn, id, Some(&stored), Some(&row))?;
+                    super::observed::reshare(&txn, id, Some(&stored), Some(&row))?;
                     true
                 }
             }
@@ -947,6 +949,7 @@ impl Db {
             for (id, row) in &dropped {
                 table.remove(id.as_str())?;
                 super::egress::reshare(&txn, id, Some(row), None)?;
+                super::observed::reshare(&txn, id, Some(row), None)?;
                 let n = uncounted.entry(row.key.as_str()).or_default();
                 *n = n.saturating_add(1);
                 specs.remove(id.as_str())?;

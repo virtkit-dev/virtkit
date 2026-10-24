@@ -4,11 +4,12 @@
 //! to look to allow it, by the layer that decided it. *Blocked*, *Would block* and
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
-//! from its page, as their session's principal. The rows and the views' counts follow the jobs'
-//! reports, a running job's as its record is written with them, and the rows' triage, over
-//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
-//! reads the view's rows from the store's indexes, the latest first, and at most
-//! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
+//! from its page, as their session's principal. The *Observed traffic* tab is [`observed`]'s.
+//! The rows and the views' counts follow the jobs' reports, a running job's as its record is
+//! written with them, and the rows' triage, over `/events/egress`; the filter's form and the
+//! mutes' stay out of what is swapped. A rendering reads the view's rows from the store's
+//! indexes, the latest first, and at most [`ROW_BUDGET`] of them in all; streams of one filter
+//! share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
@@ -33,6 +34,8 @@ use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label
 use crate::egress::{self, Check};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
+
+mod observed;
 
 /// The page.
 pub(super) const PATH: &str = "/egress";
@@ -514,6 +517,9 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
 /// What `/events/egress[?…]` streams: the rows of the filter in `query` ([`Filter::of`]), with
 /// the views' counts, as the jobs' reports and the rows' triage change.
 pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) -> Source {
+    if let Some(q) = observed::Query::of(query) {
+        return observed::source(hub, q);
+    }
     let filter = Filter::of(query);
     let changes = hub.subscribe_egress();
     let (hub, caches) = (hub.clone(), caches.clone());
@@ -532,6 +538,9 @@ pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) 
 
 /// `GET /egress[?…]` ([`Filter::of`]).
 pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    if let Some(q) = observed::Query::of(query) {
+        return observed::get(q, auth, ui).await;
+    }
     let filter = Filter::of(query);
     let (hub, wanted) = (ui.hub.clone(), filter.clone());
     let (listing, subjects) =
@@ -543,6 +552,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
 fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)], auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
+    tabs(&mut h, Tab::Blocked, filter.subject.as_ref());
     unreported_callout(&mut h, &l.unreported);
     h.raw("<p class=\"sub\">What the jobs of the history were refused, by destination and ")
         .raw("project, as their nodes reported it.</p>");
@@ -636,6 +646,48 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
         }
         _ => {}
     }
+}
+
+/// The page's tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Blocked,
+    Observed,
+}
+
+/// The page's tabs, `here` the current one; Blocked's and Observed traffic's for `subject` when
+/// one is chosen.
+fn tabs(h: &mut Html, here: Tab, subject: Option<&Subject>) {
+    let blocked_href = match subject {
+        Some(s) => Filter {
+            subject: Some(s.clone()),
+            ..Filter::default()
+        }
+        .href(View::Blocked),
+        None => PATH.to_string(),
+    };
+    let observed_href = match subject {
+        Some(s) => observed::subject_href(s),
+        None => format!("{PATH}?tab=observed"),
+    };
+    h.raw("<nav class=\"tabs\" aria-label=\"Egress tabs\">");
+    for (href, label, tab) in [
+        (blocked_href, "Blocked", Tab::Blocked),
+        (observed_href, "Observed traffic", Tab::Observed),
+    ] {
+        h.raw("<a href=\"")
+            .text(href)
+            .raw("\"")
+            .raw(if tab == here {
+                " aria-current=\"page\""
+            } else {
+                ""
+            })
+            .raw(">")
+            .raw(label)
+            .raw("</a>");
+    }
+    h.raw("</nav>");
 }
 
 /// The nodes whose jobs cannot appear here, when there are any.
@@ -988,6 +1040,8 @@ fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
         .raw("\">")
         .node(&row.who())
         .raw("</a> · <a href=\"")
+        .text(observed::subject_href(&row.subject))
+        .raw("\">Its observed traffic</a> · <a href=\"")
         .raw(PATH)
         .raw("\">All of Egress</a></p>");
     // Its jobs' records, as kept, with what each reported of it.

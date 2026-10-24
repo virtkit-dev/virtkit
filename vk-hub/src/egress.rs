@@ -15,6 +15,7 @@ use vk_hub_proto::egress::{
 use crate::store::JobRow;
 
 pub mod blocked;
+pub mod observed;
 pub mod rules;
 
 /// The report to keep of `stored` and `incoming`: the one with the higher revision, `incoming`

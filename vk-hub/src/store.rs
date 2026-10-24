@@ -49,6 +49,7 @@ mod gitlabs;
 mod jobs;
 mod keys;
 mod namespaces;
+mod observed;
 mod registries;
 mod token_keys;
 mod tools;
@@ -70,6 +71,9 @@ pub use keys::{
     envelope_text, valid_name,
 };
 pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retention, resolve};
+pub use observed::{
+    Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,
+};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,

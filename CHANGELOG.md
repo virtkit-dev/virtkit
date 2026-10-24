@@ -95,6 +95,12 @@ All notable changes to virtkit will be documented in this file.
 - **The Egress page and its navigation count update live**: rows and counts follow what jobs
   report, a running job's within 30 seconds, and other operators' triage, without resetting
   the filter.
+- **The Egress page has an Observed traffic tab**: what each project's jobs reached, and what
+  they reached that a dry-run allowlist would have blocked, by destination and phase, with how
+  many jobs, the days and refs it was used on and its latest job, filtered by phase and by
+  protected or unprotected refs, beside the project's blocked rows for the same destination.
+  Each project says how many of its jobs reported each phase completely, and how many sent no
+  report; it updates live.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never
