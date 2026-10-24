@@ -6,7 +6,9 @@
 //! entries and each one's use; there operators change or remove it, and on
 //! `/egress?tab=rules&new=rule` add one, through Preview → Save ([`super::editor`]). Below the
 //! rules, each node's own caps as it reports them, with the entries of them the hub's jobs
-//! placed under them show no use of ([`crate::egress::cap_use`]).
+//! placed under them show no use of ([`crate::egress::cap_use`]). The list, and a rule's page
+//! but its forms, follow the rules, the jobs' reports and the nodes' caps over
+//! `/events/egress?tab=rules[&rule=…]`.
 //!
 //! Rule names and entries are operators' to choose, checked as a node checks its own lists;
 //! they are escaped as any text.
@@ -20,6 +22,7 @@ use vk_hub_proto::egress::{HubPhase, NodeEgressCaps};
 use super::super::html::Html;
 use super::super::jobs::percent_encode;
 use super::super::pages;
+use super::super::sse::Source;
 use super::super::{Auth, Body, Ui, access, blocking, decode_form, field, fleet, message, page};
 use super::{Caches, PATH as EGRESS, Tab, capital};
 use crate::egress::aggregates::Aggregates;
@@ -93,6 +96,51 @@ fn listing(hub: &Hub, caches: &Caches) -> Result<Listing> {
         rules,
         gitlabs: hub.db.gitlabs()?.into_iter().map(|(n, _)| n).collect(),
     })
+}
+
+/// What `/events/egress?tab=rules[&rule=…]` streams: the tab's list, or a rule's page but its
+/// forms, as the rules, the jobs' reports and the nodes' caps change.
+pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query) -> Source {
+    let changes = hub.subscribe_egress();
+    let (hub, caches) = (hub.clone(), caches.clone());
+    Source::Own {
+        name: super::EVENT,
+        changes,
+        render: Arc::new(move || {
+            let l = listing(&hub, &caches)?;
+            let mut h = Html::new();
+            match &q.rule {
+                Some(name) => match l.rules.rules.iter().find(|r| r.name == *name) {
+                    Some(r) => rule_results(&mut h, &l, r),
+                    None => {
+                        h.raw("<p class=\"empty\" role=\"status\">There is no such rule: it ")
+                            .raw("may have been removed.</p>");
+                    }
+                },
+                None => tab_results(&mut h, &l),
+            }
+            Ok(h.into_string())
+        }),
+    }
+}
+
+/// The part of a page that follows `/events/egress?tab=rules[&rule=<rule>]`, its content left
+/// to the caller to close with [`live_end`].
+fn live_start(h: &mut Html, rule: Option<&str>) {
+    h.raw("<div hx-ext=\"sse\" sse-connect=\"/events/")
+        .raw(super::EVENT)
+        .raw("?tab=")
+        .raw(TAB);
+    if let Some(r) = rule {
+        h.raw("&amp;rule=").text(percent_encode(r));
+    }
+    h.raw("\" sse-swap=\"")
+        .raw(super::EVENT)
+        .raw("\" sse-close=\"close\">");
+}
+
+fn live_end(h: &mut Html) {
+    h.raw("</div>");
 }
 
 /// `GET /egress?tab=rules…` ([`Query::of`]).
@@ -175,11 +223,14 @@ fn tab_page(l: &Listing, auth: &Auth) -> Html {
         }
         h.raw("</p>");
     }
+    live_start(&mut h, None);
     tab_results(&mut h, l);
+    live_end(&mut h);
     h
 }
 
-/// The tab's list: how the rules stand, the rules, the Fallback and the nodes' caps.
+/// The tab's list: how the rules stand, the rules, the Fallback and the nodes' caps. No form:
+/// what is being typed elsewhere on the page is never reset by an update.
 fn tab_results(h: &mut Html, l: &Listing) {
     state_callout(h, &l.rules);
     let (fallback, rules): (Vec<&EgressRuleRow>, Vec<&EgressRuleRow>) =
@@ -453,7 +504,9 @@ fn rule_page(l: &Listing, r: &EgressRuleRow, auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, Tab::Rules, None);
+    live_start(&mut h, Some(&r.name));
     rule_results(&mut h, l, r);
+    live_end(&mut h);
     if auth.session.role >= Role::Operator {
         super::editor::rule_forms(&mut h, r, &l.gitlabs, auth);
     }

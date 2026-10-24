@@ -527,6 +527,9 @@ pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) 
     if let Some(q) = observed::Query::of(query) {
         return observed::source(hub, caches, q);
     }
+    if let Some(q) = rules::Query::of(query) {
+        return rules::source(hub, caches, q);
+    }
     let filter = Filter::of(query);
     let changes = hub.subscribe_egress();
     let (hub, caches) = (hub.clone(), caches.clone());

@@ -8750,6 +8750,57 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     );
 }
 
+/// The Rules tab and a rule's page follow the rules live, their forms out of what is swapped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rules_tab_follows_the_rules_live() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::HubPhase;
+    let (addr, hub, _) = start_fleet().await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    egress_rule(
+        &hub,
+        "wab",
+        Some("gitlab gl, projects wab/**"),
+        HubPhase::Unrestricted,
+        HubPhase::Unrestricted,
+        RuleMode::Enforce,
+    );
+    let tab = get(addr, "/egress?tab=rules", Some(&operator)).await.body;
+    assert!(
+        tab.contains(
+            "<div hx-ext=\"sse\" sse-connect=\"/events/egress?tab=rules\" sse-swap=\"egress\" \
+             sse-close=\"close\">"
+        ),
+        "{tab}"
+    );
+    let page = get(addr, "/egress?tab=rules&rule=wab", Some(&operator))
+        .await
+        .body;
+    let (_, rest) = page
+        .split_once("sse-connect=\"/events/egress?tab=rules&amp;rule=wab\"")
+        .unwrap();
+    assert!(rest.contains("name=\"op\" value=\"preview\""), "{page}");
+
+    let mut stream = live(addr, "/events/egress?tab=rules", &operator).await;
+    let mut rule = live(addr, "/events/egress?tab=rules&rule=wab", &operator).await;
+    egress_rule(
+        &hub,
+        "other",
+        Some("gitlab gl, project-id 7"),
+        HubPhase::Unrestricted,
+        HubPhase::Unrestricted,
+        RuleMode::DryRun,
+    );
+    hub.egress_changed();
+    let event = next_with(&mut stream, "<strong>other</strong>").await;
+    assert!(event.starts_with("event: egress\n"), "{event}");
+    assert!(!event.contains("<form"), "{event}");
+    hub.db.remove_egress_rule("wab", "uid 1", 2).unwrap();
+    hub.egress_changed();
+    let event = next_with(&mut rule, "There is no such rule").await;
+    assert!(!event.contains("<form"), "{event}");
+}
+
 /// The hidden fields of the form in `body` posting `op`, encoded to post again.
 fn form_of(body: &str, op: &str) -> String {
     let marker = format!("name=\"op\" value=\"{op}\"");

@@ -1532,7 +1532,9 @@ that saved rules restrict nothing yet; on, it warns when no Fallback is enforced
 *None*, and each entry's use.
 Below the rules, *Node caps*: each node's own `[egress]` and `[egress.build]` as its inventory
 reports them, a dry-run run phase marked, too large to report, or not reported by an older `vk`,
-with its entries no job placed under them used, as on Observed traffic.
+with its entries no job placed under them used, as on Observed traffic. The list, and a rule's
+page but its forms, follow the rules, the jobs' reports and the nodes' inventories over
+`/events/egress?tab=rules[&rule=<name>]`.
 
 An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
 removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab
