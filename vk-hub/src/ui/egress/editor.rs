@@ -1000,15 +1000,19 @@ fn lost_section(h: &mut Html, p: &Preview) {
     if p.lost.is_empty() && p.maybe_lost.is_empty() {
         h.raw("<p class=\"empty\">none of the destinations reported</p>");
     }
+    let more = |h: &mut Html, n: usize| {
+        if n > 0 {
+            h.raw("<p class=\"sub\">")
+                .text(n)
+                .raw(" more not listed.</p>");
+        }
+    };
     lost_table(h, &p.lost);
+    more(h, p.more_lost);
     if !p.maybe_lost.is_empty() {
         h.raw("<p>Blocked unless a lookup of a listed name resolved to them:</p>");
         lost_table(h, &p.maybe_lost);
-    }
-    if p.more_lost > 0 {
-        h.raw("<p class=\"sub\">")
-            .text(p.more_lost)
-            .raw(" more not listed.</p>");
+        more(h, p.more_maybe_lost);
     }
     if p.observed_capped {
         h.raw("<p class=\"sub\">Observed traffic was read only in part: there is more than a ")
@@ -1050,4 +1054,53 @@ fn lost_table(h: &mut Html, lost: &[Lost]) {
 fn jobs_text(n: u64) -> String {
     let plural = if n == 1 { "" } else { "s" };
     format!("{n} job{plural}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::blocked::Subject as RowSubject;
+    use crate::egress::observed::Contact;
+    use vk_hub_proto::egress::{EgressDestination, EgressOutcome, EgressProtocol};
+
+    fn lost(name: &str, uncertain: bool) -> Lost {
+        Lost {
+            subject: RowSubject::Key { key: "k".into() },
+            who: "k".into(),
+            phase: "run".into(),
+            contact: Contact {
+                outcome: EgressOutcome::Observed,
+                protocol: EgressProtocol::Dns,
+                destination: EgressDestination::domain(name),
+            },
+            jobs: 1,
+            last_day: 0,
+            uncertain,
+        }
+    }
+
+    #[test]
+    fn each_list_of_lost_destinations_says_how_many_it_leaves_out() {
+        let p = Preview {
+            generation: 0,
+            as_enforced: false,
+            groups: Vec::new(),
+            more_groups: 0,
+            jobs_read: 0,
+            jobs_capped: false,
+            lost: vec![lost("a.example", false)],
+            maybe_lost: vec![lost("b.example", true)],
+            more_lost: 2,
+            more_maybe_lost: 3,
+            affected: Default::default(),
+            affected_unreported: 0,
+            observed_capped: false,
+        };
+        let mut h = Html::new();
+        lost_section(&mut h, &p);
+        let out = h.into_string();
+        let (sure, maybe) = out.split_once("Blocked unless a lookup").unwrap();
+        assert!(sure.contains("2 more not listed."), "{out}");
+        assert!(maybe.contains("3 more not listed."), "{out}");
+    }
 }

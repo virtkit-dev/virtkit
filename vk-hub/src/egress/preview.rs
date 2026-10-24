@@ -130,7 +130,9 @@ pub struct Preview {
     /// lookup of a listed name resolved to it.
     pub lost: Vec<Lost>,
     pub maybe_lost: Vec<Lost>,
+    /// Those not listed past [`MAX_LOST`], of each.
     pub more_lost: usize,
+    pub more_maybe_lost: usize,
     /// Each phase whose access the change alters for some jobs, by
     /// [`super::blocked::phase_key`]: those of its jobs that ran it within the history, and of
     /// them those that reported it completely. Then the jobs it affects that sent no report.
@@ -340,6 +342,7 @@ pub fn preview(
     let (mut maybe_lost, mut lost): (Vec<Lost>, Vec<Lost>) =
         lost.into_iter().partition(|l| l.uncertain);
     let more_lost = lost.len().saturating_sub(MAX_LOST);
+    let more_maybe_lost = maybe_lost.len().saturating_sub(MAX_LOST);
     lost.truncate(MAX_LOST);
     maybe_lost.truncate(MAX_LOST);
     Ok(Preview {
@@ -352,6 +355,7 @@ pub fn preview(
         lost,
         maybe_lost,
         more_lost,
+        more_maybe_lost,
         affected,
         affected_unreported: unreported,
         observed_capped,
