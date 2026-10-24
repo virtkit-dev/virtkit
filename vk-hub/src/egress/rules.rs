@@ -1,12 +1,14 @@
 //! Managing the hub's egress rules ([`crate::store::EgressRuleRow`]), from `vk-hub egress`, and
 //! resolving a job's layer from them.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use vk_hub_proto::egress::{HubEgress, HubPhase};
+use vk_hub_proto::egress::{EgressLayer, EgressOutcome, HubEgress, HubPhase};
 
 use crate::server::Hub;
-use crate::store::{EgressRuleRow, RuleChange, RuleMode};
+use crate::store::{EgressRuleRow, JobRow, RuleChange, RuleMode};
 use crate::subject::{JobClaims, Subject};
 
 /// The rules as `vk-hub egress list` shows them.
@@ -136,4 +138,92 @@ pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
     };
     let (_, rules) = hub.db.egress_rules()?;
     Ok(crate::store::resolve_egress(&rules, claims.as_ref()))
+}
+
+/// The latest jobs of the history [`RecentScan`] reads.
+pub const RECENT_SCAN: usize = 1000;
+
+/// How long ago a job may have been placed to count as recent, in seconds.
+pub const RECENT_SECS: u64 = 7 * 86_400;
+
+/// What one rule did to the recent jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleJobs {
+    /// Jobs placed under it, enforced: the Fallback's when it alone applied.
+    pub enforced: u64,
+    /// Jobs it selected in dry-run.
+    pub dry_run: u64,
+    /// Of those, the jobs whose node reported a destination it would have blocked.
+    pub would_block: u64,
+}
+
+/// The rules the recent jobs were placed under, from their records ([`crate::store::EgressRulesApplied`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recent {
+    pub rules: BTreeMap<String, RuleJobs>,
+    /// The jobs read, and whether the history holds more within [`RECENT_SECS`] than were.
+    pub read: usize,
+    pub capped: bool,
+}
+
+/// What the latest [`RECENT_SCAN`] jobs placed within [`RECENT_SECS`] of `now` were placed
+/// under, as they are visited, newest first, one at a time.
+pub struct RecentScan {
+    since: u64,
+    seen: usize,
+    last_created: Option<u64>,
+    out: Recent,
+}
+
+impl RecentScan {
+    pub fn new(now: u64) -> Self {
+        RecentScan {
+            since: now.saturating_sub(RECENT_SECS),
+            seen: 0,
+            last_created: None,
+            out: Recent::default(),
+        }
+    }
+
+    /// Count job `j`, the next newest-first; past [`RECENT_SCAN`] of them, none.
+    pub fn visit(&mut self, j: &JobRow) {
+        if self.seen >= RECENT_SCAN {
+            return;
+        }
+        self.seen = self.seen.saturating_add(1);
+        self.last_created = Some(j.created_at);
+        if j.created_at < self.since {
+            return;
+        }
+        let out = &mut self.out;
+        out.read = out.read.saturating_add(1);
+        let Some(applied) = &j.egress_rules else {
+            return;
+        };
+        for rule in &applied.rules {
+            let n = out.rules.entry(rule.clone()).or_default();
+            n.enforced = n.enforced.saturating_add(1);
+        }
+        let entries = super::report(j)
+            .map(|r| r.entries.as_slice())
+            .unwrap_or_default();
+        for rule in &applied.dry_run {
+            let n = out.rules.entry(rule.clone()).or_default();
+            n.dry_run = n.dry_run.saturating_add(1);
+            let blocked = entries.iter().any(|e| {
+                e.outcome == EgressOutcome::WouldBlock
+                    && e.layer == Some(EgressLayer::HubRule)
+                    && e.rule.as_ref() == Some(rule)
+            });
+            if blocked {
+                n.would_block = n.would_block.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Recent {
+        self.out.capped =
+            self.seen >= RECENT_SCAN && self.last_created.is_some_and(|c| c >= self.since);
+        self.out
+    }
 }

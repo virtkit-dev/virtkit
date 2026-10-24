@@ -4,12 +4,12 @@
 //! to look to allow it, by the layer that decided it. *Blocked*, *Would block* and
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
-//! from its page, as their session's principal. The *Observed traffic* tab is [`observed`]'s.
-//! The rows and the views' counts follow the jobs' reports, a running job's as its record is
-//! written with them, and the rows' triage, over `/events/egress`; the filter's form and the
-//! mutes' stay out of what is swapped. A rendering reads the view's rows from the store's
-//! indexes, the latest first, and at most [`ROW_BUDGET`] of them in all; streams of one filter
-//! share it ([`Renders`]).
+//! from its page, as their session's principal. The *Observed traffic* tab is [`observed`]'s,
+//! the *Rules* tab [`rules`]'s. The rows and the views' counts follow the jobs' reports, a
+//! running job's as its record is written with them, and the rows' triage, over
+//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
+//! reads the view's rows from the store's indexes, the latest first, and at most
+//! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
@@ -36,6 +36,7 @@ use crate::server::{HEARTBEAT, Hub};
 use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
 
 mod observed;
+mod rules;
 
 /// The page.
 pub(super) const PATH: &str = "/egress";
@@ -64,6 +65,8 @@ const ROW_JOBS: usize = 20;
 /// What the page's tabs share between their pages and streams.
 #[derive(Default)]
 pub(super) struct Caches {
+    /// The Rules tab's reads of the history.
+    aggregates: crate::egress::aggregates::Cache,
     /// The Blocked tab's streamed part, by filter.
     blocked: Renders,
 }
@@ -537,9 +540,17 @@ pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) 
 }
 
 /// `GET /egress[?…]` ([`Filter::of`]).
-pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+pub(super) async fn get(
+    query: Option<&str>,
+    auth: &Auth,
+    caches: &Arc<Caches>,
+    ui: &Ui,
+) -> Result<Response<Body>> {
     if let Some(q) = observed::Query::of(query) {
         return observed::get(q, auth, ui).await;
+    }
+    if let Some(q) = rules::Query::of(query) {
+        return rules::get(q, auth, caches, ui).await;
     }
     let filter = Filter::of(query);
     let (hub, wanted) = (ui.hub.clone(), filter.clone());
@@ -653,6 +664,7 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
 enum Tab {
     Blocked,
     Observed,
+    Rules,
 }
 
 /// The page's tabs, `here` the current one; Blocked's and Observed traffic's for `subject` when
@@ -674,6 +686,7 @@ fn tabs(h: &mut Html, here: Tab, subject: Option<&Subject>) {
     for (href, label, tab) in [
         (blocked_href, "Blocked", Tab::Blocked),
         (observed_href, "Observed traffic", Tab::Observed),
+        (rules::PATH.to_string(), "Rules", Tab::Rules),
     ] {
         h.raw("<a href=\"")
             .text(href)

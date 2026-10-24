@@ -14,6 +14,7 @@ use vk_hub_proto::egress::{
 
 use crate::store::JobRow;
 
+pub mod aggregates;
 pub mod blocked;
 pub mod observed;
 pub mod rules;

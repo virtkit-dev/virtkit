@@ -311,7 +311,9 @@ pub(super) async fn get(
         return super::clients::get(query, auth, ui).await.map(Some);
     }
     if path == super::egress::PATH {
-        return super::egress::get(query, auth, ui).await.map(Some);
+        return super::egress::get(query, auth, &site.egress, ui)
+            .await
+            .map(Some);
     }
     if let Some(id) = super::egress::row_target(path) {
         return super::egress::row(id, auth, ui).await.map(Some);

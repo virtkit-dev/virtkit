@@ -756,6 +756,26 @@ impl Db {
         Ok(out)
     }
 
+    /// Visit the latest `limit` jobs, newest first, decoding one record at a time: how many
+    /// were visited.
+    pub fn visit_jobs(&self, limit: usize, mut visit: impl FnMut(&str, &JobRow)) -> Result<usize> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(JOBS)?;
+        let order = txn.open_table(JOB_ORDER)?;
+        let mut visited = 0usize;
+        for entry in order.iter()?.rev() {
+            if visited >= limit {
+                break;
+            }
+            let id = entry?.1.value().to_string();
+            if let Some(row) = table.get(id.as_str())? {
+                visit(&id, &decode::<JobRow>(row.value())?);
+                visited = visited.saturating_add(1);
+            }
+        }
+        Ok(visited)
+    }
+
     /// How many jobs the history holds of each key, by key ID: one read of [`JOB_COUNTS`].
     pub fn job_counts_by_key(&self) -> Result<HashMap<String, u64>> {
         let txn = self.db.begin_read().context("starting a read")?;

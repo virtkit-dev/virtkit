@@ -2150,6 +2150,25 @@ async fn start_fleet_as(scheme: &str) -> (SocketAddr, Arc<Hub>, String) {
 
 /// [`start_fleet_as`], with `node_url` advertised as the hub's node endpoint.
 async fn start_fleet_with(scheme: &str, node_url: Option<&str>) -> (SocketAddr, Arc<Hub>, String) {
+    start_fleet_db(Db::open_memory().unwrap(), scheme, node_url).await
+}
+
+/// [`start_fleet`] with `[jobs] egress_rules = true` when `on`.
+async fn start_fleet_rules(on: bool) -> (SocketAddr, Arc<Hub>, String) {
+    start_fleet_db(
+        Db::open_memory().unwrap().with_egress_rules(on),
+        "http",
+        None,
+    )
+    .await
+}
+
+/// [`start_fleet_with`], on `db`.
+async fn start_fleet_db(
+    db: Db,
+    scheme: &str,
+    node_url: Option<&str>,
+) -> (SocketAddr, Arc<Hub>, String) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("{scheme}://{addr}");
@@ -2157,7 +2176,7 @@ async fn start_fleet_with(scheme: &str, node_url: Option<&str>) -> (SocketAddr, 
     // need not exist: removing one finds nothing to delete.
     let releases = std::env::temp_dir().join(format!("vk-hub-ui-releases-{}", std::process::id()));
     let hub = Arc::new(
-        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+        Hub::new(Arc::new(db), Some(origin.clone()))
             .with_releases(releases)
             .with_node_url(node_url.map(str::to_string)),
     );
@@ -8567,5 +8586,166 @@ async fn an_operator_triages_and_mutes_egress_rows() {
     assert!(
         lines[4].ends_with("acknowledged egress blocked DNS crates.io for acme/p42 on gl"),
         "{lines:?}"
+    );
+}
+
+/// Egress rule `name` stored as `uid 1`'s: `subject` none for the Fallback.
+fn egress_rule(
+    hub: &Hub,
+    name: &str,
+    subject: Option<&str>,
+    run: vk_hub_proto::egress::HubPhase,
+    build: vk_hub_proto::egress::HubPhase,
+    mode: crate::store::RuleMode,
+) {
+    let change = crate::store::RuleChange {
+        name: name.into(),
+        subject: subject.map(|s| crate::subject::Subject::parse(s).unwrap()),
+        run: Some(run),
+        build: Some(build),
+        mode: Some(mode),
+    };
+    hub.db
+        .put_egress_rule(&change, false, "uid 1", crate::now_secs())
+        .unwrap();
+}
+
+fn allow(names: &[&str], ips: &[&str]) -> vk_hub_proto::egress::HubPhase {
+    vk_hub_proto::egress::HubPhase::Allow {
+        names: names.iter().map(|s| s.to_string()).collect(),
+        ips: ips.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// The Rules tab lists the rules in plain words, the Fallback apart, with the recent jobs
+/// placed under each; it says that rules off restrict nothing, and warns of rules on with no
+/// enforced Fallback. A rule's page lists its entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rules_tab_lists_the_rules_in_plain_words() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::HubPhase;
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let empty = get(addr, "/egress?tab=rules", Some(&viewer)).await;
+    assert_eq!(empty.status, 200, "{}", empty.body);
+    assert!(empty.body.contains("no rules yet"), "{}", empty.body);
+    assert!(
+        empty
+            .body
+            .contains("<a href=\"/egress?tab=rules\" aria-current=\"page\">Rules</a>"),
+        "{}",
+        empty.body
+    );
+
+    egress_rule(
+        &hub,
+        "wab",
+        Some("gitlab gl, projects wab/**, protected"),
+        allow(&["corp.example.com"], &["10.10.140.49/32"]),
+        allow(&["debian.org", "crates.io", "pypi.org"], &[]),
+        RuleMode::Enforce,
+    );
+    egress_rule(
+        &hub,
+        "wab-release",
+        Some("gitlab gl, projects wab/**, ref release/*, protected"),
+        allow(&["partner.example.net"], &[]),
+        HubPhase::Unrestricted,
+        RuleMode::DryRun,
+    );
+    egress_rule(
+        &hub,
+        crate::store::DEFAULT_RULE,
+        None,
+        allow(&[], &[]),
+        allow(&["debian.org"], &[]),
+        RuleMode::Enforce,
+    );
+    // Two jobs placed under wab, one of them also selected by wab-release, which would have
+    // blocked a destination of it.
+    use vk_hub_proto::egress::*;
+    let mut would = blocked_report("x.example", 1);
+    would.entries[0].outcome = EgressOutcome::WouldBlock;
+    would.entries[0].layer = Some(EgressLayer::HubRule);
+    would.entries[0].rule = Some("wab-release".into());
+    for (n, report, dry) in [(1, EgressReport::default(), false), (2, would, true)] {
+        let id = egress_job(&hub, n, 42, &node, report);
+        let mut row = hub.db.job(&id).unwrap().unwrap();
+        row.created_at = crate::now_secs();
+        row.egress_rules = Some(crate::store::EgressRulesApplied {
+            rules: vec!["wab".into()],
+            dry_run: if dry {
+                vec!["wab-release".into()]
+            } else {
+                vec![]
+            },
+            generation: 3,
+        });
+        row.revision += 1;
+        assert!(hub.db.put_job(&id, &row, &[], 12).unwrap());
+    }
+
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(tab.contains("<strong>Hub rules are off.</strong> Saved rules restrict nothing yet"));
+    assert!(
+        tab.contains("<code>[jobs] egress_rules = true</code>"),
+        "{tab}"
+    );
+    assert!(
+        tab.contains(
+            "<td>Projects under wab/ on gl, protected branches and tags only</td>\
+             <td>corp.example.com + 1 IP range</td><td>3 domains</td>\
+             <td><span class=\"badge ok\">Enforce</span></td><td>2 jobs</td>"
+        ),
+        "{tab}"
+    );
+    assert!(
+        tab.contains(
+            "<td>partner.example.net</td><td>Unrestricted by this rule</td>\
+             <td><span class=\"badge warn\">Dry-run</span></td><td>1 job · 1 would block</td>"
+        ),
+        "{tab}"
+    );
+    let (list, fallback) = tab.split_once("<h2>Fallback</h2>").unwrap();
+    assert!(!list.contains("Fallback</strong>"), "{tab}");
+    assert!(
+        fallback.contains(
+            "<strong>Fallback</strong></a></td><td>Jobs no enforced rule selects, and every \
+             gitlab-runner job</td><td>No external access</td><td>debian.org</td>"
+        ),
+        "{tab}"
+    );
+
+    let page = get(addr, "/egress?tab=rules&rule=wab", Some(&viewer))
+        .await
+        .body;
+    assert!(
+        page.contains("<tr><th>Domains</th><td><code>corp.example.com</code></td></tr>"),
+        "{page}"
+    );
+    let page = get(addr, "/egress?tab=rules&rule=default", Some(&viewer))
+        .await
+        .body;
+    assert!(page.contains("Allow none: no external access."), "{page}");
+    let missing = get(addr, "/egress?tab=rules&rule=nope", Some(&viewer)).await;
+    assert_eq!(missing.status, 404);
+
+    // On, with no enforced Fallback: a warning.
+    let (addr, hub, _) = start_fleet_rules(true).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    egress_rule(
+        &hub,
+        "wab",
+        Some("gitlab gl, projects wab/**"),
+        HubPhase::Unrestricted,
+        HubPhase::Unrestricted,
+        RuleMode::Enforce,
+    );
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(!tab.contains("Hub rules are off"), "{tab}");
+    assert!(
+        tab.contains("<p class=\"callout warn\">No Fallback is enforced: every job no enforced"),
+        "{tab}"
     );
 }

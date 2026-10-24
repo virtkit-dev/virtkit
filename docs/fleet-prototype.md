@@ -1439,7 +1439,7 @@ last 2 MiB of text or so, with a notice for omitted lines and the remaining line
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
 `/egress`, *Egress* in the navigation, opens on the Blocked tab of the [Egress
-page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic
+page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic and Rules
 (below). The Blocked tab lists what the jobs of the
 history were refused, from their nodes' reports, a row per destination (protocol, and a port,
 kept; a domain never merged into a suffix) or refused declaration (variable and entry) and per
@@ -1497,6 +1497,16 @@ job leaving the history takes its part back. A project keeps at most 1000 destin
 phase; a contact past them is counted, shown as not listed, and taken back with its job, and a
 destination no job reaches any more frees its place for the next job written. A hub upgraded
 from a version without it builds it from the history on start.
+
+`/egress?tab=rules`, the *Rules* tab, lists the hub's egress rules: each with the jobs it
+applies to in plain words, as the namespaces page words them, its run and build phases in a few
+words (*Unrestricted by this rule*, *No external access*, *corp.example.com + 1 IP range*), its
+mode, and the jobs placed under it in the last 7 days — of the latest 1000 — from their records:
+enforced, or for a dry-run rule those it selected and those whose node reported a destination it
+would have blocked. The Fallback is listed apart. With `[jobs] egress_rules` off the tab says
+that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. A rule's page,
+`/egress?tab=rules&rule=<name>`, lists each phase's domains and IP ranges, an empty one reading
+*None*.
 
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,

@@ -101,6 +101,10 @@ All notable changes to virtkit will be documented in this file.
   protected or unprotected refs, beside the project's blocked rows for the same destination.
   Each project says how many of its jobs reported each phase completely, and how many sent no
   report; it updates live.
+- **The Egress page has a Rules tab**: the hub's egress rules, each with the jobs it applies to
+  in plain words, what its run and build phases allow, its mode and the jobs placed under it in
+  the last 7 days, the Fallback apart. It says when rules are off that saved rules restrict
+  nothing, and warns when they are on with no enforced Fallback.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never
