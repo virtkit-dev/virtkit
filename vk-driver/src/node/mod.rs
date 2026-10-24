@@ -51,6 +51,7 @@ pub(crate) mod tools;
 mod update;
 
 pub use ci_user::{runner_mode, runner_mode_in};
+pub use inventory::egress_caps;
 
 use std::io::Read;
 use std::os::fd::AsRawFd;

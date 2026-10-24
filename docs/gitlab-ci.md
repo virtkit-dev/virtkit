@@ -1526,6 +1526,15 @@ at each stage's start and every few seconds when it changed, and again after a r
 older than the node gets the report with the result alone. Jobs run by gitlab-runner report
 nothing. See [Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
 
+The node also reports its own caps in its inventory, each phase as it holds jobs to it:
+`[egress]` under `[net] mode = "switch"` (nothing without a network, nothing enforced over a
+tap), with `[egress] dry_run`, and `[egress.build]` whatever the mode — normalized and
+fingerprinted, so that the hub tells a changed cap from the one a job ran under. A list of more
+than 256 entries is reported as too large to show. The node reads its config once, its
+executors each time they start, so a job may be held to caps edited since the node last
+reported them: each phase of the job's report names the caps it was held to, by their
+fingerprint.
+
 ## Services
 
 CI `services:` run as **sibling microVMs** on the per-job switch, each resolvable

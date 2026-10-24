@@ -65,6 +65,11 @@ All notable changes to virtkit will be documented in this file.
   what it would block, in the build phase too, by name. A node whose `[net] mode` is `tap` or
   `pool` takes no job the rules restrict, and a Windows image does not build under rules that
   restrict the build phase.
+- **`vk node` reports its own `[egress]` and `[egress.build]` caps to its hub**, as it holds
+  jobs to them: `[egress]` counts only under `[net] mode = "switch"`, and `[egress] dry_run`
+  is reported with it. A list of more than 256 entries is reported as too large to show. Each
+  placed job's egress report names the caps each phase was held to, as its executor read them
+  when it started: a node edited since it last reported its caps holds its jobs to the new ones.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

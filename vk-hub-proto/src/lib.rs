@@ -719,6 +719,10 @@ pub struct Inventory {
     /// layer and runs the job under its cap alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub egress_rules: bool,
+    /// The node's own egress caps, `[egress]` and `[egress.build]`, versioned by their
+    /// fingerprint; `None` from an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_caps: Option<egress::NodeEgressCaps>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1439,6 +1443,7 @@ mod tests {
             job_tokens: false,
             egress_reports: false,
             egress_rules: false,
+            egress_caps: None,
         }
     }
 
@@ -2204,6 +2209,38 @@ mod tests {
                 ..inventory()
             },
             tokens,
+        );
+        let mut capped = serde_json::to_value(inventory()).unwrap();
+        capped["egress_caps"] = json!({
+            "kind": "listed",
+            "fingerprint": "ab".repeat(32),
+            "run": {"kind": "allow", "names": ["corp.example.com"], "ips": []},
+            "run_dry_run": true,
+            "build": {"kind": "unrestricted"},
+        });
+        pinned(
+            &Inventory {
+                egress_caps: Some(egress::NodeEgressCaps::Listed(egress::EgressCaps {
+                    fingerprint: "ab".repeat(32),
+                    run: egress::HubPhase::Allow {
+                        names: vec!["corp.example.com".into()],
+                        ips: vec![],
+                    },
+                    run_dry_run: true,
+                    build: egress::HubPhase::Unrestricted,
+                })),
+                ..inventory()
+            },
+            capped,
+        );
+        let mut too_large = serde_json::to_value(inventory()).unwrap();
+        too_large["egress_caps"] = json!({"kind": "too_large"});
+        pinned(
+            &Inventory {
+                egress_caps: Some(egress::NodeEgressCaps::TooLarge),
+                ..inventory()
+            },
+            too_large,
         );
         let mut labelled = serde_json::to_value(inventory()).unwrap();
         labelled["labels"] = json!(["large-memory"]);

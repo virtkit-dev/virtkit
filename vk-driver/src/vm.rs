@@ -1729,6 +1729,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
     // The job's services, by name, for its `vk-agent exec --service` ([`service_exec`]).
     let mut service_names: Vec<String> = Vec::new();
+    // Its run phase is held to the caps this config says, whatever the node's inventory says.
+    if let Some(record) = &ctx.egress_record {
+        crate::egress_report::mark_caps(record, EgressPhase::Run, &crate::node::egress_caps(cfg));
+    }
     match cfg.net.mode.as_str() {
         "none" => {}
         "tap" => {
@@ -2874,6 +2878,8 @@ fn build_record(ctx: &JobCtx, service: Option<&str>) -> Result<Option<crate::bui
         }
         return Ok(None);
     };
+    // Held to the caps this config says, whatever the node's inventory says.
+    crate::egress_report::mark_caps(dir, EgressPhase::Build, &crate::node::egress_caps(&ctx.cfg));
     Ok(Some(crate::build::EgressRecord {
         dir: dir.clone(),
         source: service.map(str::to_string),

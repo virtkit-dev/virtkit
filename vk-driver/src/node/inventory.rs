@@ -7,8 +7,10 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
+use vk_hub_proto::egress::{EgressCaps, HubPhase, NodeEgressCaps};
 use vk_hub_proto::{
     Admission, Check, Filesystem, FsUsage, Hardware, Heartbeat, Inventory, MemoryNode, Runner,
     StorageRole, Versions,
@@ -27,6 +29,9 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 /// The most of a gitlab-runner config read: a real one is a few kilobytes.
 pub(super) const MAX_RUNNER_CONFIG: u64 = 1 << 20;
+
+/// Whether the node said its egress caps are too large to report.
+static CAPS_TOO_LARGE_SAID: AtomicBool = AtomicBool::new(false);
 
 /// The most runner names reported, and the longest one kept.
 const MAX_RUNNERS: usize = 64;
@@ -90,6 +95,53 @@ pub fn inventory(cfg: &Config) -> Inventory {
         // A placed job's start may carry the hub's egress layer, which its switches enforce in
         // both phases, with its dry-run rules — a tap's job has no switch to enforce it.
         egress_rules: matches!(cfg.net.mode.as_str(), "switch" | "none"),
+        egress_caps: Some(match egress_caps(cfg) {
+            // Said once: the inventory is read again on every recheck, from the same config.
+            NodeEgressCaps::TooLarge => {
+                if !CAPS_TOO_LARGE_SAID.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "vk node: [egress] or [egress.build] lists more than the inventory \
+                         reports: the hub is told the caps are too large to show"
+                    );
+                }
+                NodeEgressCaps::TooLarge
+            }
+            caps => caps,
+        }),
+    }
+}
+
+/// The node's own egress caps, as its jobs are held to them: the run phase's by `[egress]` under
+/// the per-job switch, to nothing without a network, and not at all over a tap; the build
+/// phase's by `[egress.build]` whatever the network. Normalized and fingerprinted, or
+/// [`NodeEgressCaps::TooLarge`] past the inventory's bounds.
+pub fn egress_caps(cfg: &Config) -> NodeEgressCaps {
+    let phase = |ips: Option<&Vec<String>>, names: Option<&Vec<String>>| match (ips, names) {
+        (None, None) => HubPhase::Unrestricted,
+        (ips, names) => HubPhase::Allow {
+            names: names.cloned().unwrap_or_default(),
+            ips: ips.cloned().unwrap_or_default(),
+        },
+    };
+    let e = &cfg.egress;
+    let (run, run_dry_run) = match cfg.net.mode.as_str() {
+        "switch" => (phase(e.allow_ip.as_ref(), e.allow_name.as_ref()), e.dry_run),
+        "none" => (
+            HubPhase::Allow {
+                names: Vec::new(),
+                ips: Vec::new(),
+            },
+            false,
+        ),
+        _ => (HubPhase::Unrestricted, false),
+    };
+    let build = phase(e.build.allow_ip.as_ref(), e.build.allow_name.as_ref());
+    match EgressCaps::normalized(run, run_dry_run, build) {
+        Some(mut caps) => {
+            caps.fingerprint = vk_hub_proto::to_hex(&Sha256::digest(caps.canonical()));
+            NodeEgressCaps::Listed(caps)
+        }
+        None => NodeEgressCaps::TooLarge,
     }
 }
 
@@ -556,5 +608,42 @@ mod tests {
         let c: Config = toml::from_str("state_dir = \"/y\"\n").unwrap();
         assert_eq!(config_hash(&a), config_hash(&b));
         assert_ne!(config_hash(&a), config_hash(&c));
+    }
+
+    /// The caps report each phase as the node holds its jobs to it, the same however spelled,
+    /// their fingerprint moving with them.
+    #[test]
+    fn the_egress_caps_are_reported_as_enforced() {
+        let caps = |toml: &str| match egress_caps(&toml::from_str(toml).unwrap()) {
+            NodeEgressCaps::Listed(c) => c,
+            other => panic!("{other:?}"),
+        };
+        let allow = |names: &[&str], ips: &[&str]| HubPhase::Allow {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            ips: ips.iter().map(|s| s.to_string()).collect(),
+        };
+        let switch = caps(
+            "[net]\nmode = \"switch\"\n[egress]\nallow_name = [\"Crates.io\", \"corp.example.com\"]\n\
+             dry_run = true\n[egress.build]\nallow_ip = [\"10.0.0.0/8\"]\n",
+        );
+        assert_eq!(switch.run, allow(&["corp.example.com", "crates.io"], &[]));
+        assert!(switch.run_dry_run);
+        assert_eq!(switch.build, allow(&[], &["10.0.0.0/8"]));
+        switch.check().unwrap();
+        let same = caps(
+            "[net]\nmode = \"switch\"\n[egress]\nallow_name = [\"corp.example.com\", \"crates.io\"]\n\
+             dry_run = true\n[egress.build]\nallow_ip = [\"10.0.0.0/8\"]\n",
+        );
+        assert_eq!(same.fingerprint, switch.fingerprint);
+        // A tap is held to nothing in the run phase, no network to nothing at all; the build
+        // phase keeps its own.
+        let tap = caps("[net]\nmode = \"tap\"\n[egress]\nallow_name = []\n");
+        assert_eq!(
+            (&tap.run, &tap.build),
+            (&HubPhase::Unrestricted, &HubPhase::Unrestricted)
+        );
+        assert_ne!(tap.fingerprint, switch.fingerprint);
+        let none = caps("[net]\nmode = \"none\"\n");
+        assert_eq!(none.run, allow(&[], &[]));
     }
 }

@@ -26,6 +26,40 @@ pub const BUILD_PREFIX: &str = "build-";
 /// Windows image's, whose build records no egress.
 pub const UNRECORDED_BUILD: &str = "unrecorded-build";
 
+/// A file in a placed job's egress record naming the caps one of its phase's VMs was held to:
+/// `caps-<phase>-<fingerprint>`, created empty, once per caps ([`mark_caps`]).
+pub const CAPS_PREFIX: &str = "caps-";
+
+/// Note in `record` that a VM of `phase` is held to `caps`, the node's caps as the config of
+/// the process enforcing them says them, which the node's inventory may not: it reads its config
+/// once, an executor each time it starts. Its name says it whole, so it is never seen half
+/// written. Best-effort like the channels: a phase with none is reported held to the caps its
+/// job was placed under.
+pub fn mark_caps(record: &Path, phase: EgressPhase, caps: &vk_hub_proto::egress::NodeEgressCaps) {
+    let fingerprint = match caps {
+        vk_hub_proto::egress::NodeEgressCaps::Listed(c) => c.fingerprint.as_str(),
+        _ => vk_hub_proto::egress::UNKNOWN_CAPS,
+    };
+    let Some(phase) = caps_phase(phase) else {
+        return;
+    };
+    let name = format!("{CAPS_PREFIX}{phase}-{fingerprint}");
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(record.join(name));
+}
+
+/// A phase as a caps file names it.
+fn caps_phase(phase: EgressPhase) -> Option<&'static str> {
+    match phase {
+        EgressPhase::Run => Some("run"),
+        EgressPhase::Build => Some("build"),
+        EgressPhase::Other => None,
+    }
+}
+
 /// The egress declarations a placed job was refused at validation, in its egress record: one
 /// JSON [`EgressRefusal`] per line.
 pub const REFUSED: &str = "refused.jsonl";
@@ -834,6 +868,9 @@ pub struct JobRecord {
     watched: bool,
     /// The hub's enforced rules the job runs under, which its report names.
     hub_rules: Vec<String>,
+    /// The caps each phase's VMs were held to, by [`caps_phase`]: two at most, which says they
+    /// were not one.
+    caps: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>>,
 }
 
 impl JobRecord {
@@ -848,6 +885,7 @@ impl JobRecord {
             run_count: PhaseCount::default(),
             watched: false,
             hub_rules: Vec::new(),
+            caps: Default::default(),
         }
     }
 
@@ -868,6 +906,21 @@ impl JobRecord {
         let found = std::fs::read_dir(&self.record).into_iter().flatten();
         for e in found.filter_map(|e| e.ok()) {
             let name = e.file_name();
+            let held = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(CAPS_PREFIX))
+                .and_then(|n| n.split_once('-'));
+            if let Some((phase, fingerprint)) = held
+                && let Some(phase) = [EgressPhase::Run, EgressPhase::Build]
+                    .into_iter()
+                    .find_map(|p| caps_phase(p).filter(|k| *k == phase))
+            {
+                let seen = self.caps.entry(phase).or_default();
+                if seen.len() < 2 {
+                    seen.insert(fingerprint.to_string());
+                }
+                continue;
+            }
             let build = name.as_encoded_bytes().starts_with(BUILD_PREFIX.as_bytes());
             if build && e.file_type().is_ok_and(|t| t.is_dir()) {
                 self.builds.entry(e.path()).or_default();
@@ -927,6 +980,12 @@ impl JobRecord {
             if !p.omitted.is_empty() && p.coverage == EgressCoverage::Complete {
                 p.coverage = EgressCoverage::Partial;
             }
+            let held = caps_phase(p.phase).and_then(|k| self.caps.get(k));
+            p.caps = match held.map(|h| h.iter().collect::<Vec<_>>()).as_deref() {
+                None | Some([]) => None,
+                Some([one]) => Some((*one).clone()),
+                Some(_) => Some(vk_hub_proto::egress::UNKNOWN_CAPS.to_string()),
+            };
         }
 
         let mut entries = self.tally.entries.clone();
@@ -1157,6 +1216,52 @@ mod tests {
                 "egress denied (dns) b.example",
             ]
         );
+    }
+
+    /// A phase's report names the caps its VMs were held to, as the processes enforcing them
+    /// marked them; held to more than one, they are not known.
+    #[test]
+    fn a_phase_names_the_caps_its_vms_were_held_to() {
+        use vk_hub_proto::egress::{EgressCaps, HubPhase, NodeEgressCaps, UNKNOWN_CAPS};
+        let dir = std::env::temp_dir().join(format!("vk-egress-caps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(format!("{BUILD_PREFIX}1"))).unwrap();
+        let caps = |fingerprint: &str| {
+            let mut c =
+                EgressCaps::normalized(HubPhase::Unrestricted, false, HubPhase::Unrestricted)
+                    .unwrap();
+            c.fingerprint = fingerprint.to_string();
+            NodeEgressCaps::Listed(c)
+        };
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        mark_caps(&dir, EgressPhase::Build, &caps(&a));
+        mark_caps(&dir, EgressPhase::Build, &caps(&a));
+        mark_caps(&dir, EgressPhase::Run, &caps(&a));
+        mark_caps(&dir, EgressPhase::Run, &caps(&b));
+        let report = job_report(&dir, &[], true);
+        let held = |phase| {
+            report
+                .phases
+                .iter()
+                .find(|p| p.phase == phase)
+                .and_then(|p| p.caps.clone())
+        };
+        assert_eq!(held(EgressPhase::Build), Some(a.clone()));
+        assert_eq!(held(EgressPhase::Run), Some(UNKNOWN_CAPS.to_string()));
+        // Too large to report: not known either.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(format!("{BUILD_PREFIX}1"))).unwrap();
+        mark_caps(&dir, EgressPhase::Build, &NodeEgressCaps::TooLarge);
+        let report = job_report(&dir, &[], true);
+        assert_eq!(
+            report
+                .phases
+                .iter()
+                .map(|p| p.caps.as_deref())
+                .collect::<Vec<_>>(),
+            [Some(UNKNOWN_CAPS), None]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
