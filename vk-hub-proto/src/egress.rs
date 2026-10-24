@@ -234,6 +234,111 @@ impl HubEgress {
     }
 }
 
+/// A node's own egress caps, `[egress]` and `[egress.build]`, as its inventory reports them
+/// (`docs/fleet-design.md`, *Layers*): what each phase may ever reach on that node, so that the
+/// hub can show the cap beside its own layer. Absent from older nodes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeEgressCaps {
+    Listed(EgressCaps),
+    /// A list past [`MAX_HUB_ENTRIES`], or an entry past 253 bytes: not reported, rather than
+    /// cut short into a cap that reads complete.
+    TooLarge,
+    /// A kind from a later peer, or caps the hub could not read.
+    #[serde(other)]
+    Other,
+}
+
+/// A node's caps, each phase as a hub layer's reads ([`HubPhase`]): unrestricted when the node
+/// lists neither dimension, and once it lists one, an allowlist whose other dimension, unlisted,
+/// is empty. Normalized ([`EgressCaps::normalized`]), so that the same caps always read the same
+/// and carry the same fingerprint, which versions them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressCaps {
+    /// The hex SHA-256 of [`EgressCaps::canonical`].
+    pub fingerprint: String,
+    /// What the run phase may reach: under `[net] mode = "switch"`, `[egress]`; with no network,
+    /// nothing; over a tap, whatever the host's network reaches.
+    pub run: HubPhase,
+    /// `[egress] dry_run`: the run phase's cap reports what it would refuse, and refuses
+    /// nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_dry_run: bool,
+    /// `[egress.build]`.
+    pub build: HubPhase,
+}
+
+impl EgressCaps {
+    /// `run` and `build` normalized — names lower-cased and their leading dots dropped, ranges
+    /// trimmed, each list sorted and each entry once — with an empty fingerprint, for the node
+    /// to set from [`EgressCaps::canonical`]. `None` past the bounds.
+    pub fn normalized(run: HubPhase, run_dry_run: bool, build: HubPhase) -> Option<EgressCaps> {
+        let norm = |p: HubPhase| -> Option<HubPhase> {
+            let HubPhase::Allow { names, ips } = p else {
+                return Some(p);
+            };
+            let mut names: Vec<String> = names
+                .iter()
+                .map(|n| n.trim().trim_start_matches('.').to_ascii_lowercase())
+                .collect();
+            let mut ips: Vec<String> = ips.iter().map(|i| i.trim().to_string()).collect();
+            for list in [&mut names, &mut ips] {
+                list.sort();
+                list.dedup();
+                if list.len() > MAX_HUB_ENTRIES || list.iter().any(|e| e.len() > MAX_DOMAIN) {
+                    return None;
+                }
+            }
+            Some(HubPhase::Allow { names, ips })
+        };
+        Some(EgressCaps {
+            fingerprint: String::new(),
+            run: norm(run)?,
+            run_dry_run,
+            build: norm(build)?,
+        })
+    }
+
+    /// What its fingerprint hashes: its phases and its dry-run, as JSON.
+    pub fn canonical(&self) -> Vec<u8> {
+        serde_json::to_vec(&(&self.run, self.run_dry_run, &self.build)).unwrap_or_default()
+    }
+
+    /// Hold it to the bounds and to what a node's switch takes: each phase unrestricted or an
+    /// allowlist, at most [`MAX_HUB_ENTRIES`] valid entries per dimension, normalized, and a
+    /// well-formed fingerprint. Whether the fingerprint is the canonical form's hash is the
+    /// reader's to check: this crate hashes nothing.
+    pub fn check(&self) -> Result<(), String> {
+        if !crate::valid_sha256(&self.fingerprint) {
+            return Err("the caps' fingerprint is not a SHA-256".to_string());
+        }
+        for (what, p) in [("run", &self.run), ("build", &self.build)] {
+            p.check(&format!("the node's {what}-phase cap"))?;
+            if let HubPhase::Allow { names, ips } = p {
+                if let Some(e) = names.iter().chain(ips).find(|e| safe_text(e) != **e) {
+                    return Err(format!(
+                        "the {what}-phase cap lists {:?}, which is not an entry",
+                        safe_text(e)
+                    ));
+                }
+                for n in names {
+                    check_allow_name(n)
+                        .map_err(|e| format!("the {what}-phase cap's names: {e}"))?;
+                }
+                for i in ips {
+                    parse_allow_ip(i).map_err(|e| format!("the {what}-phase cap's ips: {e}"))?;
+                }
+            }
+            let normal =
+                EgressCaps::normalized(p.clone(), false, HubPhase::Unrestricted).map(|c| c.run);
+            if normal.as_ref() != Some(p) {
+                return Err(format!("the node's {what}-phase cap is not normalized"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `s` with control and [`crate::invisible`] characters replaced by U+FFFD, cut to
 /// [`MAX_EGRESS_TEXT`] bytes on a character boundary.
 pub fn safe_text(s: &str) -> String {
@@ -346,5 +451,65 @@ mod tests {
         assert!(big.check().is_err());
         assert!(valid_rule_name(&"a".repeat(MAX_RULE_NAME)));
         assert!(!valid_rule_name(&"a".repeat(MAX_RULE_NAME + 1)));
+    }
+
+    /// A node's caps read the same however its config spells them, within the bounds, and are
+    /// checked as a switch reads its lists.
+    #[test]
+    fn a_node_s_caps_are_normalized_and_bounded() {
+        let allow = |names: &[&str], ips: &[&str]| HubPhase::Allow {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            ips: ips.iter().map(|s| s.to_string()).collect(),
+        };
+        let a = EgressCaps::normalized(
+            allow(
+                &["Corp.example.com", ".crates.io", "crates.io"],
+                &[" 10.0.0.0/8 "],
+            ),
+            false,
+            HubPhase::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(
+            a.run,
+            allow(&["corp.example.com", "crates.io"], &["10.0.0.0/8"])
+        );
+        let b = EgressCaps::normalized(
+            allow(&["crates.io", "corp.example.com"], &["10.0.0.0/8"]),
+            false,
+            HubPhase::Unrestricted,
+        )
+        .unwrap();
+        assert_eq!(a.canonical(), b.canonical());
+        let dry = EgressCaps {
+            run_dry_run: true,
+            ..b.clone()
+        };
+        assert_ne!(dry.canonical(), b.canonical());
+        let too_many: Vec<String> = (0..=MAX_HUB_ENTRIES).map(|i| format!("h{i}.x")).collect();
+        let many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        assert_eq!(
+            EgressCaps::normalized(allow(&many, &[]), false, HubPhase::Unrestricted),
+            None
+        );
+        assert!(a.check().is_err(), "no fingerprint yet");
+        let signed = EgressCaps {
+            fingerprint: "ab".repeat(32),
+            ..a
+        };
+        signed.check().unwrap();
+        for bad in [
+            allow(&["https://x"], &[]),
+            allow(&[], &["::1"]),
+            allow(&["b.x", "a.x"], &[]),
+            allow(&["a\u{1b}x"], &[]),
+            HubPhase::Other,
+        ] {
+            let c = EgressCaps {
+                build: bad.clone(),
+                ..signed.clone()
+            };
+            assert!(c.check().is_err(), "{bad:?}");
+        }
     }
 }
