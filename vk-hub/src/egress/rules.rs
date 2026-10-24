@@ -156,6 +156,33 @@ pub fn claims_of(j: &JobRow) -> Option<JobClaims> {
     })
 }
 
+/// The claims of a project's jobs of `protection` ([`super::observed::protection_key`]) and
+/// `git_ref` in Observed traffic, `project_path` the path its latest job named: `None` for every
+/// job of a key bound to no GitLab instance. A protection not reported reads as unprotected, as
+/// at placement.
+pub fn claims_for(
+    subject: &super::blocked::Subject,
+    project_path: Option<&str>,
+    protection: &str,
+    git_ref: &str,
+) -> Option<JobClaims> {
+    let super::blocked::Subject::Gitlab {
+        instance,
+        project_id,
+    } = subject
+    else {
+        return None;
+    };
+    Some(JobClaims {
+        gitlab: instance.clone(),
+        project_id: *project_id,
+        project_path: project_path.unwrap_or_default().to_string(),
+        git_ref: git_ref.to_string(),
+        protected: protection == "protected",
+        pipeline_id: 0,
+    })
+}
+
 /// Add or change a rule as `actor`, as [`put`] does, from a page's preview of it made against
 /// the rules' `generation`: refused with [`crate::store::RulesChanged`] if they have changed
 /// since. `exists` refuses a rule not stored yet.

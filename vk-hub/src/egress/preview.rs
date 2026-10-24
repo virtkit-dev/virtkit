@@ -1,28 +1,37 @@
 //! What a change to the hub's egress rules would do, before it is saved (`docs/fleet-design.md`,
 //! *Rules on the page*): the recent jobs whose layer it changes or that the rule selects, each
 //! group of them with its layer before and after, both resolved with [`resolve_egress`] from
-//! their records' claims.
+//! their records' claims; and the destinations Observed traffic holds that the change would
+//! block, with how completely the jobs it affects reported, so that no reports never reads as
+//! nothing to lose.
 //!
 //! A dry-run rule blocks nothing: a change that leaves one in dry-run, or adds one, is compared
 //! as it would be enforced, which is what its jobs' reports then show as would-block.
 //!
-//! Every read is bounded: the latest [`JOB_SCAN`] jobs; what is shown is bounded apart, and
-//! says when it was cut.
+//! Every read is bounded: the latest [`JOB_SCAN`] jobs, [`OBSERVED_SCAN`] records of each of
+//! Observed traffic's tables; what is shown is bounded apart, and each says when it was cut.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use vk_hub_proto::egress::HubEgress;
+use vk_hub_proto::egress::{EgressPhase, HubEgress};
 
-use super::rules::claims_of;
+use super::blocked::Subject;
+use super::matching::{Dest, Verdict, verdict};
+use super::observed::Contact;
+use super::rules::{claims_for, claims_of};
 use crate::server::Hub;
-use crate::store::{EgressRuleRow, RuleMode, resolve_egress};
+use crate::store::{EgressRuleRow, RuleMode, UNREPORTED, resolve_egress};
 use crate::subject::JobClaims;
 
 /// The latest jobs of the history a preview reads.
 pub const JOB_SCAN: usize = 1000;
 /// The most groups of jobs a preview lists.
 pub const MAX_GROUPS: usize = 200;
+/// The most records a preview reads of each of Observed traffic's tables.
+pub const OBSERVED_SCAN: usize = 200_000;
+/// The most destinations a preview lists as lost.
+pub const MAX_LOST: usize = 200;
 
 /// The change previewed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +98,21 @@ pub struct Group {
     pub unplaceable: Option<String>,
 }
 
+/// A destination of Observed traffic the change would refuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lost {
+    pub subject: Subject,
+    /// Its project in words ([`Subject::text`]).
+    pub who: String,
+    pub phase: String,
+    pub contact: Contact,
+    /// The jobs that used it, and the latest day one first did, on its node's clock.
+    pub jobs: u64,
+    pub last_day: u64,
+    /// An address the change refuses unless a lookup of a listed name resolved to it.
+    pub uncertain: bool,
+}
+
 /// What a change would do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preview {
@@ -102,6 +126,42 @@ pub struct Preview {
     /// The jobs read, and whether the history holds more than were.
     pub jobs_read: usize,
     pub jobs_capped: bool,
+    /// What Observed traffic holds that it would refuse; and what it would refuse unless a
+    /// lookup of a listed name resolved to it.
+    pub lost: Vec<Lost>,
+    pub maybe_lost: Vec<Lost>,
+    pub more_lost: usize,
+    /// Each phase whose access the change alters for some jobs, by
+    /// [`super::blocked::phase_key`]: those of its jobs that ran it within the history, and of
+    /// them those that reported it completely. Then the jobs it affects that sent no report.
+    pub affected: BTreeMap<&'static str, Evidence>,
+    pub affected_unreported: u64,
+    /// Whether a bound cut what was read of Observed traffic.
+    pub observed_capped: bool,
+}
+
+/// How completely the jobs whose access a change alters reported one phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evidence {
+    pub ran: u64,
+    pub complete: u64,
+}
+
+/// The phase key of [`super::blocked::phase_key`] as a layer's phase.
+fn phase_of(key: &str) -> Option<EgressPhase> {
+    match key {
+        "run" => Some(EgressPhase::Run),
+        "build" => Some(EgressPhase::Build),
+        _ => None,
+    }
+}
+
+/// The phases, by key, whose layer differs between `before` and `after`.
+fn altered(before: &HubEgress, after: &HubEgress) -> impl Iterator<Item = &'static str> {
+    [("run", EgressPhase::Run), ("build", EgressPhase::Build)]
+        .into_iter()
+        .filter(move |(_, p)| before.phase(*p) != after.phase(*p))
+        .map(|(k, _)| k)
 }
 
 /// What groups jobs alike: their claims, the GitLab instance's name, project ID and path, ref
@@ -164,6 +224,7 @@ pub fn preview(
 
     // The recent jobs, grouped by claims, in the order of their latest job.
     let jobs = hub.db.jobs(JOB_SCAN)?;
+    let mut affected: BTreeMap<&'static str, Evidence> = BTreeMap::new();
     let mut groups: Vec<Group> = Vec::new();
     let mut at: HashMap<ClaimsKey, usize> = HashMap::new();
     for (id, j) in &jobs {
@@ -171,6 +232,9 @@ pub fn preview(
         let (before, after) = layers.of(claims.as_ref()).clone();
         if before == after && !names(&before) && !names(&after) {
             continue;
+        }
+        for key in altered(&before, &after) {
+            affected.entry(key).or_default();
         }
         let key = key_of(claims.as_ref());
         match at.get(&key) {
@@ -199,6 +263,85 @@ pub fn preview(
     let more_groups = groups.len().saturating_sub(MAX_GROUPS);
     groups.truncate(MAX_GROUPS);
 
+    // Observed traffic: each project, protection and ref whose layer changes.
+    let subjects: HashMap<String, crate::store::ObservedSubject> =
+        hub.db.observed_subjects()?.into_iter().collect();
+    let claims_at = |param: &str, protection: &str, git_ref: &str| {
+        let subject = Subject::parse(param)?;
+        let path = subjects.get(param).and_then(|s| s.project.as_deref());
+        Some((
+            subject.clone(),
+            claims_for(&subject, path, protection, git_ref),
+        ))
+    };
+    let mut lost: BTreeMap<(String, String, String, bool), Lost> = BTreeMap::new();
+    let mut observed_capped = !hub.db.observed_records(OBSERVED_SCAN, |r| {
+        let Some(phase) = phase_of(&r.phase) else {
+            return;
+        };
+        let Some((subject, claims)) = claims_at(&r.subject, &r.protection, &r.git_ref) else {
+            return;
+        };
+        let Some(contact) = Contact::parse(&r.contact) else {
+            return;
+        };
+        let Some(dest) = Dest::of(&contact.destination) else {
+            return;
+        };
+        let (before, after) = layers.of(claims.as_ref());
+        let (Some(b), Some(a)) = (before.phase(phase), after.phase(phase)) else {
+            return;
+        };
+        if !verdict(b, &dest).allows() {
+            return;
+        }
+        let maybe = match verdict(a, &dest) {
+            v if v.allows() => return,
+            Verdict::ByNameOnly => true,
+            _ => false,
+        };
+        let l = lost
+            .entry((r.subject.clone(), r.phase.clone(), r.contact.clone(), maybe))
+            .or_insert_with(|| Lost {
+                who: match subjects.get(&r.subject) {
+                    Some(s) => subject.text(s.project.as_deref(), &s.key_name),
+                    None => r.subject.clone(),
+                },
+                subject,
+                phase: r.phase.clone(),
+                contact,
+                jobs: 0,
+                last_day: 0,
+                uncertain: maybe,
+            });
+        l.jobs = l.jobs.saturating_add(r.jobs);
+        l.last_day = l.last_day.max(r.day);
+    })?;
+    let mut unreported = 0u64;
+    observed_capped |= !hub.db.coverage_records(OBSERVED_SCAN, |r| {
+        let Some((_, claims)) = claims_at(&r.subject, &r.protection, &r.git_ref) else {
+            return;
+        };
+        let (before, after) = layers.of(claims.as_ref());
+        if r.phase == UNREPORTED {
+            if before != after {
+                unreported = unreported.saturating_add(r.jobs);
+            }
+            return;
+        }
+        if let Some(key) = altered(before, after).find(|k| *k == r.phase) {
+            let e = affected.entry(key).or_default();
+            e.ran = e.ran.saturating_add(r.jobs);
+            e.complete = e.complete.saturating_add(r.complete);
+        }
+    })?;
+    let mut lost: Vec<Lost> = lost.into_values().collect();
+    lost.sort_by(|a, b| b.jobs.cmp(&a.jobs).then(b.last_day.cmp(&a.last_day)));
+    let (mut maybe_lost, mut lost): (Vec<Lost>, Vec<Lost>) =
+        lost.into_iter().partition(|l| l.uncertain);
+    let more_lost = lost.len().saturating_sub(MAX_LOST);
+    lost.truncate(MAX_LOST);
+    maybe_lost.truncate(MAX_LOST);
     Ok(Preview {
         generation,
         as_enforced,
@@ -206,6 +349,12 @@ pub fn preview(
         more_groups,
         jobs_read: jobs.len(),
         jobs_capped: jobs.len() >= JOB_SCAN,
+        lost,
+        maybe_lost,
+        more_lost,
+        affected,
+        affected_unreported: unreported,
+        observed_capped,
     })
 }
 

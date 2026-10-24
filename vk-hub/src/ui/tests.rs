@@ -8777,8 +8777,8 @@ fn form_of(body: &str, op: &str) -> String {
 }
 
 /// An operator adds, changes and removes egress rules through Preview → Save: the preview shows
-/// the recent jobs it affects, Save stores only what was previewed against the rules previewed,
-/// and each change is audited. Viewers read.
+/// the recent jobs it affects and what of Observed traffic it would block, Save stores only
+/// what was previewed against the rules previewed, and each change is audited. Viewers read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     use crate::store::RuleMode;
@@ -8870,7 +8870,7 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
         bad.body
     );
 
-    // The preview: the job's group replaces the Fallback.
+    // The preview: the job's group replaces the Fallback and loses crates.io.
     let preview = post_action(addr, &origin, &operator, "/egress/rules", &rule(""), false).await;
     assert_eq!(preview.status, 200, "{}", preview.body);
     let body = &preview.body;
@@ -8884,6 +8884,17 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
              <span class=\"badge\">Replaces the Fallback</span></td>\
              <td>now limited to pypi.org</td><td>now unrestricted by hub rules</td>"
         )),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "<li>Run: 1 of 1 job whose access it changes reported this phase completely</li>\
+             <li>Build: <span class=\"badge warn\">Insufficient evidence</span>"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("<td><code>DNS crates.io</code></td><td>Run</td>"),
         "{body}"
     );
     assert!(
@@ -8963,7 +8974,8 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
         .body;
     assert!(!page.contains("/egress/rules\""), "{page}");
 
-    // A rule for no recent job: in dry-run, compared as enforced.
+    // A rule for jobs that reported nothing: insufficient evidence; in dry-run, compared as
+    // enforced.
     let quiet = rule("")
         .replace("name=acme", "name=quiet")
         .replace("projects=path", "projects=id&project_id=9")
@@ -8974,6 +8986,13 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
         preview
             .body
             .contains("no recent job is affected or selected")
+    );
+    assert!(
+        preview
+            .body
+            .contains("Insufficient evidence: no job whose access it changes reported"),
+        "{}",
+        preview.body
     );
     assert!(
         preview

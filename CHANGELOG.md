@@ -108,7 +108,8 @@ All notable changes to virtkit will be documented in this file.
 - **Operators add, change and remove egress rules on the Rules tab, through Preview → Save**:
   the jobs a rule applies to chosen as the namespaces page words them, each phase explicitly
   unrestricted, limited to listed domains and IP ranges, or allowed none. A preview shows the
-  recent jobs whose access changes, and where the rule replaces the Fallback. Save carries the
+  recent jobs whose access changes, where the rule replaces the Fallback, and the observed
+  destinations it would block, or that there is not enough evidence to tell. Save carries the
   change as previewed, and is refused once the rules have changed since.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its

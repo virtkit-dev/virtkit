@@ -21,7 +21,7 @@ use super::super::html::Html;
 use super::super::{Auth, Body, Ui, blocking, field, fleet, html_response, message, pages};
 use super::rules::{self as tab, applies_to, mode_badge, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital, see_other};
-use crate::egress::preview::{self, Edit, Group, Preview};
+use crate::egress::preview::{self, Edit, Group, Lost, Preview};
 use crate::egress::rules::{self as ops, Rules};
 use crate::store::{DEFAULT_RULE, EgressRuleRow, Role, RuleChange, RuleMode, RulesChanged};
 use crate::subject::Subject;
@@ -769,6 +769,7 @@ fn preview_page(
         h.raw("</tbody></table>");
     }
     jobs_section(&mut h, p);
+    lost_section(&mut h, p);
 
     // Save: the change previewed, unchanged, with the generation it was made against.
     h.raw("<form class=\"wide\" method=\"post\" action=\"")
@@ -887,6 +888,86 @@ fn group_row(h: &mut Html, g: &Group) {
         .raw("</td><td>")
         .text(change_text(&g.before.build, &g.after.build))
         .raw("</td></tr>");
+}
+
+/// The destinations of Observed traffic the change would block, and how much evidence there is.
+fn lost_section(h: &mut Html, p: &Preview) {
+    h.raw("<section><h3>Observed destinations it would block</h3>");
+    if p.affected.is_empty() {
+        h.raw("<p class=\"callout warn\">Insufficient evidence: no job whose access it changes ")
+            .raw("reported, so what they would lose is unknown.</p>");
+    }
+    h.raw("<ul class=\"access\">");
+    for (key, label) in [("run", "Run: "), ("build", "Build: ")] {
+        let Some(e) = p.affected.get(key) else {
+            continue;
+        };
+        h.raw("<li>").raw(label);
+        if e.complete == 0 {
+            h.raw("<span class=\"badge warn\">Insufficient evidence</span> no job whose access ")
+                .raw("it changes reported this phase completely, so what they would lose is ")
+                .raw("unknown");
+        } else {
+            h.text(e.complete)
+                .raw(" of ")
+                .text(jobs_text(e.ran))
+                .raw(" whose access it changes reported this phase completely");
+        }
+        h.raw("</li>");
+    }
+    if p.affected_unreported > 0 {
+        h.raw("<li>")
+            .text(jobs_text(p.affected_unreported))
+            .raw(" whose access it changes sent no report</li>");
+    }
+    h.raw("</ul>");
+    if p.lost.is_empty() && p.maybe_lost.is_empty() {
+        h.raw("<p class=\"empty\">none of the destinations reported</p>");
+    }
+    lost_table(h, &p.lost);
+    if !p.maybe_lost.is_empty() {
+        h.raw("<p>Blocked unless a lookup of a listed name resolved to them:</p>");
+        lost_table(h, &p.maybe_lost);
+    }
+    if p.more_lost > 0 {
+        h.raw("<p class=\"sub\">")
+            .text(p.more_lost)
+            .raw(" more not listed.</p>");
+    }
+    if p.observed_capped {
+        h.raw("<p class=\"sub\">Observed traffic was read only in part: there is more than a ")
+            .raw("preview reads.</p>");
+    }
+    h.raw("<p class=\"sub\">From Observed traffic, as long as the job history keeps it.</p>")
+        .raw("</section>");
+}
+
+fn lost_table(h: &mut Html, lost: &[Lost]) {
+    if lost.is_empty() {
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>destination</th><th>phase</th>")
+        .raw("<th>project</th><th class=\"num\">jobs</th><th>last used</th></tr></thead><tbody>");
+    for l in lost {
+        h.raw("<tr><td><code>")
+            .node(&l.contact.text())
+            .raw("</code></td><td>")
+            .raw(match l.phase.as_str() {
+                "run" => "Run",
+                "build" => "Build",
+                _ => "Other",
+            })
+            .raw("</td><td><a href=\"")
+            .text(super::observed::subject_href(&l.subject))
+            .raw("\">")
+            .node(&l.who)
+            .raw("</a></td><td class=\"num\">")
+            .text(l.jobs)
+            .raw("</td><td>")
+            .text(super::observed::date(l.last_day))
+            .raw("</td></tr>");
+    }
+    h.raw("</tbody></table>");
 }
 
 /// `1 job`, `2 jobs`.

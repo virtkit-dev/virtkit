@@ -16,6 +16,7 @@ use crate::store::JobRow;
 
 pub mod aggregates;
 pub mod blocked;
+pub mod matching;
 pub mod observed;
 pub mod preview;
 pub mod rules;

@@ -440,6 +440,97 @@ impl Db {
     }
 }
 
+/// One record of a project's use of a destination: its jobs of a protection and ref that first
+/// used it on a day ([`OBSERVED`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedRecord {
+    /// [`Subject::param`].
+    pub subject: String,
+    pub phase: String,
+    /// [`Contact::key`].
+    pub contact: String,
+    pub protection: String,
+    pub git_ref: String,
+    pub day: u64,
+    pub jobs: u64,
+    pub attempts: u64,
+}
+
+/// One record of how completely a project's jobs of a protection and ref that ended on a day
+/// reported a phase ([`OBSERVED_COVERAGE`]); phase [`UNREPORTED`] for those that sent no
+/// report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverageRecord {
+    pub subject: String,
+    pub phase: String,
+    pub protection: String,
+    pub git_ref: String,
+    pub day: u64,
+    pub jobs: u64,
+    pub complete: u64,
+}
+
+impl Db {
+    /// Visit every project's use of each destination, in key order, at most `limit` records:
+    /// whether every one was visited.
+    pub fn observed_records(
+        &self,
+        limit: usize,
+        mut visit: impl FnMut(ObservedRecord),
+    ) -> Result<bool> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OBSERVED)?;
+        for (i, entry) in table.iter()?.enumerate() {
+            if i >= limit {
+                return Ok(false);
+            }
+            let (k, v) = entry?;
+            let (subject, phase, contact, protection, git_ref, day) = k.value();
+            let (jobs, attempts) = v.value();
+            visit(ObservedRecord {
+                subject: subject.to_string(),
+                phase: phase.to_string(),
+                contact: contact.to_string(),
+                protection: protection.to_string(),
+                git_ref: git_ref.to_string(),
+                day,
+                jobs,
+                attempts,
+            });
+        }
+        Ok(true)
+    }
+
+    /// Visit how completely every project's jobs reported each phase, in key order, at most
+    /// `limit` records: whether every one was visited.
+    pub fn coverage_records(
+        &self,
+        limit: usize,
+        mut visit: impl FnMut(CoverageRecord),
+    ) -> Result<bool> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OBSERVED_COVERAGE)?;
+        for (i, entry) in table.iter()?.enumerate() {
+            if i >= limit {
+                return Ok(false);
+            }
+            let (k, v) = entry?;
+            let (subject, phase, protection, git_ref, day) = k.value();
+            let (jobs, complete) = v.value();
+            visit(CoverageRecord {
+                subject: subject.to_string(),
+                phase: phase.to_string(),
+                protection: protection.to_string(),
+                git_ref: git_ref.to_string(),
+                day,
+                jobs,
+                complete,
+            });
+        }
+        Ok(true)
+    }
+}
+
 /// Create the tables, for the reads to find them however empty.
 pub(super) fn create(txn: &redb::WriteTransaction) -> Result<()> {
     drop(Tables::open(txn)?);

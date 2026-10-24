@@ -1517,7 +1517,9 @@ be refused is said in plain words, the node's own checks of each entry included.
 resolves the latest 1000 jobs' claims under the rules before and after, and lists up to 200
 groups of them, by project, ref and protection, whose layer changes or that the rule selects:
 the rules before and after, *Replaces the Fallback*, each phase's entries added and removed, or
-that the layer would fail to place. A rule left or added in dry-run is compared as enforced. Save
+that the layer would fail to place. It reads Observed traffic for the destinations allowed
+before and refused after, and says, for each phase it alters, how many of the jobs whose access
+changes reported it completely, or *Insufficient evidence* when none did. A rule left or added in dry-run is compared as enforced. Save
 carries what was previewed, unchanged, with the rules' generation, and is refused once they have
 moved on; the store audits each change as the operator's session, and steers nodes to a changed
 Fallback. The form takes up to 512 KiB. Viewers see no form, and their posts are refused.
