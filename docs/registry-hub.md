@@ -787,8 +787,9 @@ creating the first when a registry first takes tokens. `vk-hub token-keys list` 
 `token-keys rotate`. A registry with `[hub] tokens = true` gets every key in its desired
 state, and its namespaces' retention windows when gc is in its `[hub] allow`. A new key signs
 a registry's tokens once the registry reports applying the generation that first carried it;
-a key superseded for longer than any token lives (7 days and the skew) is retired, its file
-removed, at the next sync or the hourly sweep. `max_job_token_secs` in `hub.toml` (60 to
+a superseded key is retired, its file removed, once it has signed for no registry for longer
+than any token lives (7 days and the skew), at the next sync or the hourly sweep: a registry
+that has not applied the newer key keeps the older one in use. `max_job_token_secs` in `hub.toml` (60 to
 604800, 86400 by default) caps a token's lifetime.
 
 **Minting.** A job of a working bound key, placed on a node whose inventory names a registry

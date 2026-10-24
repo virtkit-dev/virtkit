@@ -5,8 +5,8 @@
 //! registry that takes tokens gets the public halves in its desired state, with its
 //! namespaces' retention windows. A new key signs a registry's tokens only once the registry
 //! reports applying the generation that first carried it, so a token never reaches a registry
-//! before the key to check it does; until then the previous key signs. A key superseded for
-//! longer than any token lives goes, at the next sync or the hourly sweep.
+//! before the key to check it does; until then the previous key signs. A key that has signed
+//! for no registry for longer than any token lives goes, at the next sync or the hourly sweep.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -21,6 +21,7 @@ use vk_hub_proto::token::{Claims, Grant, MAX_LABEL_LEN, MAX_TTL_SECS, SKEW_SECS,
 use vk_peer::token::Signer;
 
 use crate::server::Hub;
+pub(crate) use crate::store::signing_key;
 use crate::store::{
     Db, NamespaceRow, NoAccess, NodeRow, RegistryAccess, RegistryRow, TokenKeyRow,
     normalize_registry_url,
@@ -120,6 +121,7 @@ impl Keys {
             created_at: crate::now_secs(),
             seq: 0,
             superseded_at: None,
+            unused_since: None,
         };
         self.loaded
             .lock()
@@ -184,8 +186,9 @@ pub fn rotate(hub: &Hub, actor: &str) -> Result<TokenKeyRow> {
 }
 
 /// The keys registries should hold: every key but those retired now, generating the first
-/// when there is none. A key is retired once superseded for longer than any token lives,
-/// whatever `max_job_token_secs` says now: it may have been longer when the key signed.
+/// when there is none. A key is retired once it has signed for no registry for longer than
+/// any token lives, whatever `max_job_token_secs` says now: it may have been longer when the
+/// key signed.
 fn published(hub: &Hub) -> Result<Vec<TokenKey>> {
     let now = crate::now_secs();
     let before = now.saturating_sub(MAX_TTL_SECS).saturating_sub(SKEW_SECS);
@@ -306,21 +309,6 @@ impl MintCtx {
             .iter()
             .find(|(_, r, _)| r.url.as_ref() == Some(&url))
     }
-}
-
-/// The key to sign registry `row`'s tokens with: the newest whose generation it has applied.
-/// This takes a registry that applied a generation to hold its keys; one that pins a fleet
-/// root may refuse a key the root did not certify, which the trust model makes the hub check.
-pub(crate) fn signing_key<'a>(
-    keys: &'a [TokenKeyRow],
-    row: &RegistryRow,
-) -> Option<&'a TokenKeyRow> {
-    let applied = row.applied();
-    keys.iter().rev().find(|key| {
-        row.key_generations
-            .get(&key.public.kid)
-            .is_some_and(|g| *g <= applied)
-    })
 }
 
 /// The token for placed job `job`, sent to `node`, when everything it needs holds: the node
@@ -621,6 +609,7 @@ mod tests {
             created_at: 0,
             seq: 0,
             superseded_at: None,
+            unused_since: None,
         };
         assert!(key_file(&row(&format!("{}.pk8", "ab".repeat(16)))).is_ok());
         for bad in ["../x.pk8", "x.pk8", &format!("{}.key", "ab".repeat(16))] {

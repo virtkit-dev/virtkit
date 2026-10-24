@@ -30,6 +30,22 @@ pub struct TokenKeyRow {
     /// When a newer key took over signing; `None` for the newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_at: Option<u64>,
+    /// When the hub first found it superseded and signing for no registry: a registry that
+    /// has not applied a newer key yet still gets tokens signed with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused_since: Option<u64>,
+}
+
+/// The key to sign registry `row`'s tokens with: the newest whose generation it has applied.
+/// This takes a registry that applied a generation to hold its keys; one that pins a fleet
+/// root may refuse a key the root did not certify, which the trust model makes the hub check.
+pub fn signing_key<'a>(keys: &'a [TokenKeyRow], row: &RegistryRow) -> Option<&'a TokenKeyRow> {
+    let applied = row.applied();
+    keys.iter().rev().find(|key| {
+        row.key_generations
+            .get(&key.public.kid)
+            .is_some_and(|g| *g <= applied)
+    })
 }
 
 /// What minting reads, in one snapshot: the registries that take tokens and are bound to a
@@ -135,27 +151,44 @@ impl Db {
         Ok(())
     }
 
-    /// Forget the keys superseded before `before`: no token they signed is live any more.
-    /// Their rows, so the caller removes their files.
+    /// Mark the superseded keys no registry that takes tokens signs with any more as unused
+    /// since `now`, then forget those unused since before `before`: no token they signed is
+    /// live any more. Their rows, so the caller removes their files.
     pub fn retire_token_keys(&self, before: u64, now: u64) -> Result<Vec<TokenKeyRow>> {
         let txn = self.db.begin_write().context("starting a write")?;
         let mut retired = Vec::new();
+        let mut changed = false;
         {
-            let mut table = txn.open_table(TOKEN_KEYS)?;
-            let mut gone = Vec::new();
-            for entry in table.iter()? {
-                let (kid, value) = entry?;
-                let row = decode::<TokenKeyRow>(value.value())?;
-                if row.superseded_at.is_some_and(|at| at < before) {
-                    gone.push((kid.value().to_string(), row));
+            let mut keys = Vec::new();
+            for entry in txn.open_table(TOKEN_KEYS)?.iter()? {
+                keys.push(decode::<TokenKeyRow>(entry?.1.value())?);
+            }
+            keys.sort_by_key(|r| r.seq);
+            let mut signing = std::collections::BTreeSet::new();
+            for entry in txn.open_table(REGISTRIES)?.iter()? {
+                let row = decode::<RegistryRow>(entry?.1.value())?;
+                if let Some(key) = signing_key(&keys, &row).filter(|_| row.takes_tokens()) {
+                    signing.insert(key.public.kid.clone());
                 }
             }
-            for (kid, row) in gone {
-                table.remove(kid.as_str())?;
-                retired.push(row);
+            let mut table = txn.open_table(TOKEN_KEYS)?;
+            for mut row in keys {
+                let unused = row.superseded_at.is_some() && !signing.contains(&row.public.kid);
+                match (unused, row.unused_since) {
+                    (true, Some(at)) if at < before => {
+                        table.remove(row.public.kid.as_str())?;
+                        retired.push(row);
+                    }
+                    (true, None) | (false, Some(_)) => {
+                        row.unused_since = unused.then_some(now);
+                        table.insert(row.public.kid.as_str(), encode(&row)?.as_slice())?;
+                    }
+                    _ => continue,
+                }
+                changed = true;
             }
         }
-        if retired.is_empty() {
+        if !changed {
             txn.abort().context("dropping a write")?;
             return Ok(retired);
         }

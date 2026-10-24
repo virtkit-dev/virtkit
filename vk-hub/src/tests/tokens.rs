@@ -419,16 +419,23 @@ fn a_key_retires_once_no_token_it_signed_can_live() {
     let new = hub.token_keys.generate().unwrap();
     hub.db.add_token_key(&new, "uid 0", long_ago).unwrap();
     let file = dir.join("token-keys").join(&old.file);
-    assert!(file.exists());
+    let kids = || -> Vec<String> {
+        hub.db
+            .token_keys()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.public.kid)
+            .collect()
+    };
+    // The registry has not applied the new key: the old one still signs its tokens.
     crate::tokens::sync_registry(&hub, &id).unwrap();
-    let kids: Vec<String> = hub
-        .db
-        .token_keys()
-        .unwrap()
-        .into_iter()
-        .map(|k| k.public.kid)
-        .collect();
-    assert_eq!(kids, std::slice::from_ref(&new.public.kid));
+    assert_eq!(kids(), [old.public.kid.clone(), new.public.kid.clone()]);
+    assert!(file.exists());
+    // It applies the new key; the old one counts as unused only from then.
+    apply(&hub, &id);
+    hub.db.retire_token_keys(0, long_ago).unwrap();
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    assert_eq!(kids(), std::slice::from_ref(&new.public.kid));
     assert!(!file.exists(), "the retired key's file is still there");
     let sent = hub
         .db
@@ -440,6 +447,23 @@ fn a_key_retires_once_no_token_it_signed_can_live() {
         .token_keys
         .unwrap();
     assert_eq!(sent, [new.public]);
+}
+
+#[test]
+fn a_key_unused_only_lately_is_kept() {
+    let hub = hub_with_keys("unused-lately");
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    let long_ago =
+        now_secs() - vk_hub_proto::token::MAX_TTL_SECS - vk_hub_proto::token::SKEW_SECS - 10;
+    let new = hub.token_keys.generate().unwrap();
+    hub.db.add_token_key(&new, "uid 0", long_ago).unwrap();
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    apply(&hub, &id);
+    // Superseded long ago, but signing until the registry applied the new key just now.
+    crate::tokens::sync_registry(&hub, &id).unwrap();
+    let keys = hub.db.token_keys().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys[0].unused_since.is_some_and(|at| at > long_ago));
 }
 
 #[test]

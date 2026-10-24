@@ -78,7 +78,7 @@ pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
 };
-pub use token_keys::TokenKeyRow;
+pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
