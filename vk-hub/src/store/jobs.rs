@@ -893,8 +893,7 @@ impl Db {
         Ok(page)
     }
 
-    /// Job `id`'s spec as submitted, redacted.
-    #[cfg(test)]
+    /// Job `id`'s spec as submitted, redacted; `None` once it has expired.
     pub fn job_spec(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(JOB_SPECS)?;

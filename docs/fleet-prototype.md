@@ -1439,7 +1439,7 @@ last 2 MiB of text or so, with a notice for omitted lines and the remaining line
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
 `/egress`, *Egress* in the navigation, opens on the Blocked tab of the [Egress
-page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic and Rules
+page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic, Rules and Test a job
 (below). The Blocked tab lists what the jobs of the
 history were refused, from their nodes' reports, a row per destination (protocol, and a port,
 kept; a domain never merged into a suffix) or refused declaration (variable and entry) and per
@@ -1541,6 +1541,24 @@ changes reported it completely, or *Insufficient evidence* when none did. A rule
 carries what was previewed, unchanged, with the rules' generation, and is refused once they have
 moved on; the store audits each change as the operator's session, and steers nodes to a changed
 Fallback. The form takes up to 512 KiB. Viewers see no form, and their posts are refused.
+
+`/egress?tab=test`, *Test a job*, takes a recent job (`job=`), or a GitLab instance, project
+path and ID, ref and protection, and optionally a node and a destination (a DNS name, or an IPv4
+address with or without its port), all in the query. It shows each layer apart: the node's cap —
+the chosen node's, or the one the job ran on — per phase as its inventory reports it, a dry-run
+run phase blocking nothing, whether the job was placed under those caps, and whether the node
+enforces hub rules, or that the node does not report its caps and node limits are not
+evaluated; the hub's
+rules now — those enforced, the dry-run candidates, whether the Fallback is used — and, for a
+job, the rules it was dispatched under; the job's own narrowing and its services', read from its
+redacted spec while it is kept, a masked variable shown as hidden and one naming other
+variables as expanded on the node; an entry the node's cap, the hub's rules or, for a service,
+the job's lists leave nothing of, which the node keeps and warns of. Then the result per phase
+and VM — the job's, and each service declaring its own lists — each layer evaluated on its own
+and the result allowing only what every one allows: for a destination each layer's say and the
+first to refuse it, or that the job's restriction is not known; an address its ranges miss is
+allowed only if a listed name's lookup resolved to it. As the node enforces it, a narrowing that
+declares one dimension allows none of the other, whatever the cap allows of it.
 
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,

@@ -9039,6 +9039,237 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     );
 }
 
+/// Test a job shows each layer apart for a recent job, or for claims typed in, then the result
+/// per phase and the layer that decides a destination; a job's dispatch beside the rules now.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_job_shows_each_layer_apart() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::HubPhase;
+    use vk_hub_proto::job::{CiJob, JobSpec, Variable};
+    let (addr, hub, _) = start_fleet_rules(true).await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    egress_rule(
+        &hub,
+        "wab",
+        Some("gitlab gl, projects wab/**, protected"),
+        allow(&["corp.example.com"], &["10.10.140.49/32"]),
+        HubPhase::Unrestricted,
+        RuleMode::Enforce,
+    );
+    egress_rule(
+        &hub,
+        "wab-release",
+        Some("gitlab gl, projects wab/**, ref release/*, protected"),
+        allow(&["partner.example.net"], &[]),
+        HubPhase::Unrestricted,
+        RuleMode::DryRun,
+    );
+    egress_rule(
+        &hub,
+        crate::store::DEFAULT_RULE,
+        None,
+        allow(&[], &[]),
+        allow(&["debian.org"], &[]),
+        RuleMode::Enforce,
+    );
+    let id = format!("{:032x}", 1);
+    let mut row = crate::egress::testing::job(1, Default::default());
+    row.node = Some(node.clone());
+    row.gitlab = Some("gl".into());
+    row.project_id = Some(42);
+    row.project = Some("wab/api".into());
+    row.git_ref = Some("release/2".into());
+    row.protected = Some(true);
+    row.egress_rules = Some(crate::store::EgressRulesApplied {
+        rules: vec!["wab".into()],
+        dry_run: vec!["wab-release".into()],
+        generation: 3,
+    });
+    let mut ci = CiJob::default();
+    ci.variables.push(Variable {
+        key: "MICROVM_EGRESS_ALLOW_NAME".into(),
+        value: "corp.example.com partner.example.net".into(),
+        public: true,
+        ..Variable::default()
+    });
+    let spec = serde_json::to_vec(&JobSpec::GitlabCi(ci)).unwrap();
+    let mut queued = row.clone();
+    queued.result = None;
+    hub.db
+        .submit_job(&id, &queued, &id, &spec, "key gitlab", 10)
+        .unwrap();
+    assert!(hub.db.put_job(&id, &row, &[], 11).unwrap());
+
+    let empty = get(addr, "/egress?tab=test", Some(&viewer)).await;
+    assert_eq!(empty.status, 200, "{}", empty.body);
+    assert!(
+        empty
+            .body
+            .contains("<a href=\"/egress?tab=test\" aria-current=\"page\">Test a job</a>"),
+        "{}",
+        empty.body
+    );
+    assert!(!empty.body.contains("<h2>Result</h2>"));
+    assert!(
+        empty
+            .body
+            .contains(&format!("href=\"/egress?tab=test&amp;job={id}\""))
+    );
+
+    let page = get(
+        addr,
+        &format!("/egress?tab=test&job={id}&destination=partner.example.net"),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        page.contains(
+            "<p>Under current rules: enforced <a href=\"/egress?tab=rules&amp;rule=wab\">wab</a> \
+             · dry-run candidates <a href=\"/egress?tab=rules&amp;rule=wab-release\">wab-release\
+             </a> · Fallback not used.</p>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains("<p>As dispatched: wab; dry-run wab-release (rules generation 3).</p>"),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<li>Run: MICROVM_EGRESS_ALLOW_NAME corp.example.com, partner.example.net; IP \
+             ranges not declared</li>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains("It does not report its caps: node limits not evaluated."),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<tr><td>Run</td><td>job</td><td>not evaluated</td><td>Blocked by hub rules</td>\
+             <td>Would be allowed if wab-release were enforced</td>\
+             <td>Allowed by MICROVM_EGRESS_ALLOW_NAME</td><td>—</td>\
+             <td><span class=\"badge bad\">Blocked by hub rules</span></td></tr>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<p class=\"callout warn\">Run: MICROVM_EGRESS_ALLOW_NAME partner.example.net \
+             (outside the hub&#39;s rules). The node keeps them and warns of them; that layer \
+             refuses what they list when the job runs.</p>"
+        ),
+        "{page}"
+    );
+    // Typed in, the same claims meet the hub's rules alone.
+    let page = get(
+        addr,
+        "/egress?tab=test&gitlab=gl&project=wab%2Fapi&project_id=42&ref=release%2F2\
+         &protection=protected&destination=partner.example.net",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        page.contains(
+            "<td>Not known</td><td>—</td><td><span class=\"badge bad\">Blocked by hub rules</span>\
+             </td>"
+        ),
+        "{page}"
+    );
+
+    // Claims typed in: no enforced rule selects them, the Fallback applies.
+    let page = get(
+        addr,
+        "/egress?tab=test&gitlab=gl&project=other%2Fx&ref=main&protection=protected\
+         &destination=deb.debian.org",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        page.contains("no enforced rule selects it · Fallback used."),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<tr><td>Build</td><td>job</td><td>not evaluated</td><td>Allowed by Fallback · \
+             debian.org</td><td></td><td>Not known</td><td>—</td><td><span class=\"badge\">Not \
+             refused by any layer known</span> <span class=\"sub\">The node&#39;s cap and the \
+             job&#39;s restriction are not known; overall reachability cannot be determined.\
+             </span>"
+        ),
+        "{page}"
+    );
+    // An invalid entry fails the job, whatever the destination; a build-phase one only if it
+    // builds an image.
+    for (n, key, failure) in [
+        (
+            2,
+            "MICROVM_EGRESS_ALLOW_NAME",
+            "<span class=\"badge bad\">The job fails: an invalid entry</span>",
+        ),
+        (
+            3,
+            "MICROVM_BUILD_EGRESS_ALLOW_NAME",
+            "<span class=\"badge bad\">The job fails if it builds an image: an invalid \
+             entry</span>",
+        ),
+    ] {
+        let bad_id = format!("{n:032x}");
+        let mut ci = CiJob::default();
+        ci.variables.push(Variable {
+            key: key.into(),
+            value: "partner.example.net bad/name".into(),
+            public: true,
+            ..Variable::default()
+        });
+        let spec = serde_json::to_vec(&JobSpec::GitlabCi(ci)).unwrap();
+        let mut row = row.clone();
+        row.request_id = format!("{n:032}");
+        let mut queued = row.clone();
+        queued.result = None;
+        hub.db
+            .submit_job(&bad_id, &queued, &bad_id, &spec, "key gitlab", 10)
+            .unwrap();
+        assert!(hub.db.put_job(&bad_id, &row, &[], 11).unwrap());
+        let page = get(
+            addr,
+            &format!("/egress?tab=test&job={bad_id}&destination=partner.example.net"),
+            Some(&viewer),
+        )
+        .await
+        .body;
+        assert_eq!(page.matches(failure).count(), 2, "{page}");
+        assert!(page.contains("bad/name"), "{page}");
+    }
+    let missing = get(
+        addr,
+        &format!("/egress?tab=test&job={:032x}", 9),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        missing.contains("There is no such job in the history."),
+        "{missing}"
+    );
+    let bad = get(
+        addr,
+        &format!("/egress?tab=test&job={id}&destination=https%3A%2F%2Fx"),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        bad.contains("is neither a DNS name nor an IPv4 address"),
+        "{bad}"
+    );
+}
+
 /// Observed traffic compares each destination with the rules saved now, ref by ref, and names
 /// the rules' entries no contact matched in 30 days, with their coverage and the caution that
 /// goes with them; a rule's page shows each entry's use.

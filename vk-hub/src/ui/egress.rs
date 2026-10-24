@@ -5,10 +5,10 @@
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
 //! from its page, as their session's principal. The *Observed traffic* tab is [`observed`]'s,
-//! the *Rules* tab [`rules`]'s. The rows and the views' counts follow the jobs' reports, a
-//! running job's as its record is written with them, and the rows' triage, over
-//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
-//! reads the view's rows from the store's indexes, the latest first, and at most
+//! the *Rules* tab [`rules`]'s, *Test a job* [`test_job`]'s. The rows and the views' counts
+//! follow the jobs' reports, a running job's as its record is written with them, and the rows'
+//! triage, over `/events/egress`; the filter's form and the mutes' stay out of what is swapped.
+//! A rendering reads the view's rows from the store's indexes, the latest first, and at most
 //! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
@@ -38,6 +38,7 @@ use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, St
 mod editor;
 mod observed;
 mod rules;
+mod test_job;
 
 pub(super) use editor::{ACTION_PATH as RULES_ACTION_PATH, action as rules_action};
 
@@ -555,6 +556,9 @@ pub(super) async fn get(
     if let Some(q) = rules::Query::of(query) {
         return rules::get(q, auth, caches, ui).await;
     }
+    if let Some(q) = test_job::Query::of(query) {
+        return test_job::get(q, auth, ui).await;
+    }
     let filter = Filter::of(query);
     let (hub, wanted) = (ui.hub.clone(), filter.clone());
     let (listing, subjects) =
@@ -668,6 +672,7 @@ enum Tab {
     Blocked,
     Observed,
     Rules,
+    Test,
 }
 
 /// The page's tabs, `here` the current one; Blocked's and Observed traffic's for `subject` when
@@ -690,6 +695,7 @@ fn tabs(h: &mut Html, here: Tab, subject: Option<&Subject>) {
         (blocked_href, "Blocked", Tab::Blocked),
         (observed_href, "Observed traffic", Tab::Observed),
         (rules::PATH.to_string(), "Rules", Tab::Rules),
+        (test_job::PATH.to_string(), "Test a job", Tab::Test),
     ] {
         h.raw("<a href=\"")
             .text(href)

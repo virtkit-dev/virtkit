@@ -111,12 +111,21 @@ All notable changes to virtkit will be documented in this file.
   recent jobs whose access changes, where the rule replaces the Fallback, and the observed
   destinations it would block, or that there is not enough evidence to tell. Save carries the
   change as previewed, and is refused once the rules have changed since.
+- **The Egress page's Test a job tab says what a job would get, and why**: for a recent job, or
+  a GitLab instance, project, ref and protection, with a node and a destination if wanted, each
+  layer apart — the hub's rules enforced, the dry-run candidates and whether the Fallback
+  applies, the job's own and its services' lists from its spec — then the result per phase and
+  VM, allowed only where every layer allows it, and which layer decides the destination. A
+  recent job shows the rules it was dispatched under beside those that apply now.
 - **Observed traffic compares each destination with the hub's rules as saved now**, ref by ref:
   which rules and entries allow it, or that it falls outside them. Rule entries no contact of
   the jobs they apply to matched in 30 days show *No observed use in 30 days* on Observed
   traffic, the Rules tab and the rule's page, with their last use, how many of those jobs
   reported the phase completely, and the caution that no reported use does not prove an entry
   unnecessary. Nothing is removed automatically.
+- **The hub shows each node's own egress caps**: Test a job evaluates the node's cap in each
+  phase, a dry-run one included, and names a job's declared entries it or the hub's rules leave
+  nothing of.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

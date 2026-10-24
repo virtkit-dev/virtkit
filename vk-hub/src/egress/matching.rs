@@ -5,9 +5,20 @@
 //!
 //! The switch also carries a connection to an address one of the job's lookups of an allowed
 //! name resolved to, which nothing the hub keeps can tell: an address no IP range lists, in a
-//! phase that lists names, is [`Verdict::ByNameOnly`], neither allowed nor refused.
+//! phase that lists names, is [`Verdict::ByNameOnly`], neither allowed nor refused. A phase
+//! that restricts refuses every address on DNS's port, [`DNS_PORT`], whatever it lists: the
+//! switch sends a job's lookups through its own resolver, so that names it allows are pinned.
 
 use vk_hub_proto::egress::{EgressDestination, HubPhase, parse_allow_ip};
+
+/// DNS's port, which a restricting phase refuses on every address ([`dns_refused`]).
+pub const DNS_PORT: u16 = 53;
+
+/// Whether a phase that restricts refuses `d` whatever it lists: an address on [`DNS_PORT`].
+/// The switch's own resolver, the one exception, is no destination a report or a person names.
+pub fn dns_refused(d: &Dest) -> bool {
+    matches!(d, Dest::Address(_, Some(DNS_PORT)))
+}
 
 /// What a phase says of a destination.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +67,30 @@ pub fn ip_matches(entry: &str, ip: std::net::Ipv4Addr, port: Option<u16>) -> boo
     (u32::from(ip) & mask) == (u32::from(net) & mask) && only.is_none_or(|p| Some(p) == port)
 }
 
+/// Whether `allow_ip` entries `a` and `b` share an address and port: the shorter prefix holds
+/// both networks, and either names no port or both the same one.
+pub fn cidrs_overlap(a: &str, b: &str) -> bool {
+    let (Ok((a_ip, a_prefix, a_port)), Ok((b_ip, b_prefix, b_port))) =
+        (parse_allow_ip(a), parse_allow_ip(b))
+    else {
+        return false;
+    };
+    let mask = match a_prefix.min(b_prefix) {
+        0 => 0,
+        p => u32::MAX << (32 - u32::from(p.min(32))),
+    };
+    (u32::from(a_ip) & mask) == (u32::from(b_ip) & mask)
+        && match (a_port, b_port) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+}
+
+/// Whether `allow_name` entries `a` and `b` share a host: one under the other, either way.
+pub fn names_overlap(a: &str, b: &str) -> bool {
+    name_matches(a, b.trim_start_matches('.')) || name_matches(b, a.trim_start_matches('.'))
+}
+
 /// What phase `p` says of `d`.
 pub fn verdict<'a>(p: &'a HubPhase, d: &Dest) -> Verdict<'a> {
     let HubPhase::Allow { names, ips } = p else {
@@ -65,6 +100,9 @@ pub fn verdict<'a>(p: &'a HubPhase, d: &Dest) -> Verdict<'a> {
             _ => Verdict::Outside,
         };
     };
+    if dns_refused(d) {
+        return Verdict::Outside;
+    }
     match d {
         Dest::Name(name) => {
             let hits: Vec<&str> = names
@@ -110,6 +148,29 @@ impl Dest {
             _ => None,
         }
     }
+
+    /// What a person typed: a DNS name, or an IPv4 address with or without its port. `None`
+    /// for anything else.
+    pub fn parse(text: &str) -> Option<Dest> {
+        let text = text.trim();
+        if let Ok(addr) = text.parse::<std::net::SocketAddrV4>() {
+            return Some(Dest::Address(*addr.ip(), Some(addr.port())));
+        }
+        if let Ok(ip) = text.parse::<std::net::Ipv4Addr>() {
+            return Some(Dest::Address(ip, None));
+        }
+        let name = text.trim_end_matches('.').to_ascii_lowercase();
+        vk_hub_proto::egress::is_domain(&name).then_some(Dest::Name(name))
+    }
+
+    /// As a page shows it: `crates.io`, `10.0.0.1:443`, `10.0.0.1`.
+    pub fn text(&self) -> String {
+        match self {
+            Dest::Name(n) => n.clone(),
+            Dest::Address(ip, Some(port)) => format!("{ip}:{port}"),
+            Dest::Address(ip, None) => ip.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +204,22 @@ mod tests {
         assert!(ip_matches("0.0.0.0/0", ip, None));
         assert!(!ip_matches("10.10.140.48/32", ip, None));
         assert!(!ip_matches("not an ip", ip, None));
+        // Ranges overlap wider or narrower, on a port both allow.
+        assert!(cidrs_overlap("10.1.0.0/16", "10.0.0.0/8"));
+        assert!(cidrs_overlap("10.0.0.0/7", "10.0.0.0/8"));
+        assert!(cidrs_overlap("10.1.2.3:443", "10.0.0.0/8:443"));
+        assert!(cidrs_overlap("10.1.2.3", "10.0.0.0/8:443"));
+        assert!(!cidrs_overlap("10.1.2.3:22", "10.0.0.0/8:443"));
+        assert!(!cidrs_overlap("11.0.0.1", "10.0.0.0/8"));
+        assert!(!cidrs_overlap("not an ip", "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn names_overlap_one_under_the_other() {
+        assert!(names_overlap("debian.org", "deb.debian.org"));
+        assert!(names_overlap(".deb.debian.org", "Debian.ORG"));
+        assert!(!names_overlap("debian.org", "notdebian.org"));
+        assert!(!names_overlap("a.debian.org", "b.debian.org"));
     }
 
     #[test]
@@ -173,5 +250,20 @@ mod tests {
             Verdict::Unrestricted
         );
         assert_eq!(verdict(&allow(&[], &[]), &deb), Verdict::Outside);
+        // DNS goes through the switch's resolver: no entry allows an address on its port.
+        let dns = addr("1.1.1.1", Some(53));
+        assert_eq!(
+            verdict(&allow(&[], &["1.1.1.1/32:53"]), &dns),
+            Verdict::Outside
+        );
+        assert_eq!(verdict(&p, &addr("10.0.0.1", Some(53))), Verdict::Outside);
+        assert_eq!(
+            verdict(&HubPhase::Unrestricted, &dns),
+            Verdict::Unrestricted
+        );
+        assert_eq!(Dest::parse("https://x"), None);
+        assert_eq!(Dest::parse("10.0.0.1:443").unwrap().text(), "10.0.0.1:443");
+        assert_eq!(Dest::parse(" Deb.Debian.org. ").unwrap(), deb);
+        assert_eq!(Dest::parse("10.0.0.1").unwrap(), addr("10.0.0.1", None));
     }
 }

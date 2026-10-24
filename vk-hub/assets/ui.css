@@ -414,6 +414,9 @@ form.wide details > div { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s
 /* The egress rule editor: each phase an explicit choice, its lists beside it. */
 form.rule fieldset { flex-basis: 100%; align-items: flex-start; }
 form.rule textarea { display: block; min-width: 18rem; font-family: var(--mono); font-size: 12.5px; }
+/* Test a job: each layer apart, in the order a destination meets them. */
+ol.layers { margin: 0 0 var(--s4); padding-left: 1.4rem; }
+ol.layers > li + li { margin-top: var(--s3); }
 
 /* What an action said, or the question it asks first. */
 #flash:empty { display: none; }

@@ -204,6 +204,15 @@ fn tab_results(h: &mut Html, l: &Listing) {
     }
 }
 
+/// A node's cap's phase in a few words: `Unrestricted`, `No external access`,
+/// `corp.example.com + 1 IP range`.
+pub(super) fn cap_summary(p: &HubPhase) -> String {
+    match p {
+        HubPhase::Unrestricted => "Unrestricted".to_string(),
+        p => phase_summary(p),
+    }
+}
+
 /// One rule's row of the list.
 fn rule_row(h: &mut Html, r: &EgressRuleRow, l: &Listing) {
     h.raw("<tr><td><a href=\"")
