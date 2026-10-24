@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use super::egress::{EGRESS_MUTES, EGRESS_SUBJECT_ORDER, Mute};
 use super::keys::{API_KEYS, KeyRow};
+use super::observed::OBSERVED_SUBJECTS;
 use super::{Db, append_audit, decode, encode};
 
 /// Key: the instance's name. Value: JSON [`GitlabRow`].
@@ -109,8 +111,38 @@ pub fn normalize_gitlab_url(url: &str) -> Option<String> {
     })
 }
 
+/// Whether egress rows, live mutes or Observed traffic are kept for instance `name`'s
+/// projects at `now`: keyed by its name, they would be taken for those of a new instance of
+/// that name.
+fn egress_of(txn: &redb::WriteTransaction, name: &str, now: u64) -> Result<bool> {
+    // Subjects `gitlab:<name>:<project ID>`, `;` sorting right after `:`.
+    let (lo, hi) = (format!("gitlab:{name}:"), format!("gitlab:{name};"));
+    let (lo, hi) = (lo.as_str(), hi.as_str());
+    if txn
+        .open_table(EGRESS_SUBJECT_ORDER)?
+        .range((lo, "", "", 0, "")..(hi, "", "", 0, ""))?
+        .next()
+        .is_some()
+        || txn
+            .open_table(OBSERVED_SUBJECTS)?
+            .range(lo..hi)?
+            .next()
+            .is_some()
+    {
+        return Ok(true);
+    }
+    for entry in txn.open_table(EGRESS_MUTES)?.range(lo..hi)? {
+        let mute = decode::<Mute>(entry?.1.value())?;
+        if mute.live(now) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Db {
-    /// Add instance `name` at `url`, audited as `actor`'s.
+    /// Add instance `name` at `url`, audited as `actor`'s; refused while egress records of
+    /// an earlier instance of that name remain.
     pub fn add_gitlab(&self, name: &str, url: &str, actor: &str, now: u64) -> Result<GitlabRow> {
         if !valid_gitlab_name(name) {
             anyhow::bail!(
@@ -126,6 +158,12 @@ impl Db {
             let mut table = txn.open_table(GITLABS)?;
             if table.get(name)?.is_some() {
                 anyhow::bail!("there is already an instance named {name}");
+            }
+            if egress_of(&txn, name, now)? {
+                anyhow::bail!(
+                    "the egress records of an earlier instance named {name} remain, until its \
+                     jobs leave the history and its projects' mutes end; name this one otherwise"
+                );
             }
             for entry in table.iter()? {
                 let (other, value) = entry?;
@@ -201,6 +239,32 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_not_reused_while_its_egress_records_remain() {
+        use crate::egress::blocked::Subject;
+        let db = Db::open_memory().unwrap();
+        db.add_gitlab("gl", "https://a.example", "u", 1).unwrap();
+        let subject = Subject::Gitlab {
+            instance: "gl".into(),
+            project_id: 4,
+        };
+        db.egress_mute(&subject, "p", "noisy", None, "u", 1)
+            .unwrap();
+        assert!(db.remove_gitlab("gl", "u", 2).unwrap());
+        let err = db
+            .add_gitlab("gl", "https://b.example", "u", 3)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("earlier instance named gl"),
+            "{err:#}"
+        );
+        assert!(db.egress_unmute(&subject, "u", 4).unwrap());
+        // A mute that has ended holds nothing back.
+        db.egress_mute(&subject, "p", "noisy", Some(6), "u", 5)
+            .unwrap();
+        db.add_gitlab("gl", "https://b.example", "u", 6).unwrap();
+    }
 
     #[test]
     fn urls_normalize_to_one_form() {

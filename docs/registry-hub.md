@@ -744,7 +744,8 @@ The hub's side of step 4; the registry's is in
 `gitlabs remove <name>` keep the instances the hub takes jobs from, by a name of lowercase
 letters, digits and `-`, which namespaces call `{gitlab}`. A URL is normalized (lowercase
 scheme and host, no default port, no trailing `/`) and names one instance; an instance a
-working key is bound to is not removed. `vk-hub keys create … --gitlab <name> [--projects
+working key is bound to is not removed, and a removed instance's name is not reused while
+the egress records of its projects remain. `vk-hub keys create … --gitlab <name> [--projects
 <id>:<path>,…]` binds a jobs key. A bound key submits only jobs whose `server_url` is its
 instance's, naming a project (ID not 0), and with `--projects` only those projects, by ID and
 path both; anything else is 403. Keys bound to none submit as before, and their jobs get no
