@@ -3568,6 +3568,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress_rules: None,
+        egress_caps: None,
         egress: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
@@ -4477,6 +4479,8 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress_rules: None,
+        egress_caps: None,
         egress: None,
     }
 }

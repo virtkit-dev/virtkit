@@ -20,6 +20,31 @@ pub fn newest(
     }
 }
 
+/// The hub's egress rules a job was placed under, in words: `wab, wab-branches; dry-run
+/// wab-release (rules generation 7)`.
+pub fn rules_applied_text(a: &crate::store::EgressRulesApplied) -> String {
+    let named = |rules: &[String]| {
+        rules
+            .iter()
+            .map(|r| match r.as_str() {
+                crate::store::DEFAULT_RULE => "the Fallback (default)".to_string(),
+                r => r.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = match a.rules.as_slice() {
+        [] => "none: no rule selects it and no Fallback is enforced, so it may reach nothing"
+            .to_string(),
+        rules => named(rules),
+    };
+    if !a.dry_run.is_empty() {
+        out.push_str(&format!("; dry-run {}", named(&a.dry_run)));
+    }
+    out.push_str(&format!(" (rules generation {})", a.generation));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

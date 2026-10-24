@@ -3869,6 +3869,8 @@ fn the_jobs_table_says_how_each_job_stands() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress_rules: None,
+        egress_caps: None,
         egress: None,
     };
     let mut running = row(JobState::Running, None);
@@ -3976,6 +3978,8 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress_rules: None,
+        egress_caps: None,
         egress: None,
     };
     for n in 1..=2 {
@@ -4383,6 +4387,8 @@ fn a_job_is_shown_on_the_command_line() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress_rules: None,
+        egress_caps: None,
         egress: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
@@ -4742,5 +4748,155 @@ async fn a_refused_start_forgets_the_registry_access_it_was_given() {
         },
     });
     wait_until(|| shown().is_none()).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// With `[jobs] egress_rules`, a job is placed only on a node that enforces the rules, with
+/// the layer they resolve to from its claims, bounded by its key; one whose layer cannot be
+/// sent fails, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them() {
+    use crate::store::{RuleChange, RuleMode};
+    use crate::subject::Subject;
+    use vk_hub_proto::egress::HubPhase;
+    let dir = scratch("egress-rules");
+    let db = Arc::new(Db::open_memory().unwrap().with_egress_rules(true));
+    let (addr, hub) = serve_hub(db, &dir, Duration::from_secs(60)).await;
+    let now = now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
+        .unwrap();
+    let none = HubPhase::Allow {
+        names: Vec::new(),
+        ips: Vec::new(),
+    };
+    let rule = |name: &str, subject: Option<&str>, run: HubPhase| RuleChange {
+        name: name.into(),
+        subject: subject.map(|s| Subject::parse(s).unwrap()),
+        run: Some(run),
+        build: Some(none.clone()),
+        mode: Some(RuleMode::Enforce),
+    };
+    let wab = HubPhase::Allow {
+        names: vec!["corp.example.com".into()],
+        ips: Vec::new(),
+    };
+    for r in [
+        rule("default", None, HubPhase::Unrestricted),
+        rule("wab", Some("gitlab gl, projects wab/**"), wab.clone()),
+    ] {
+        hub.db.put_egress_rule(&r, false, "uid 0", now).unwrap();
+    }
+    let policy = KeyPolicy {
+        scopes: vec![Scope::Jobs],
+        pools: vec!["ci".into()],
+        max_envelope: None,
+        gitlab: Some("gl".into()),
+        projects: Vec::new(),
+    };
+    let (bound, _) = hub
+        .db
+        .create_api_key("bound", &policy, Duration::from_secs(3600), "uid 0", now)
+        .unwrap();
+    let unbound = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384 * 8).await;
+    // A node that does not say it enforces the rules has no room, and is sent nothing.
+    let fits = |key: String| async move {
+        api(
+            addr,
+            "POST",
+            "/v1/capacity",
+            Some(&key),
+            Some(json!({"placement": placement()})),
+        )
+        .await
+        .json::<Capacity>()
+        .fits
+    };
+    assert_eq!(fits(bound.clone()).await, 0);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&bound),
+        Some(bound_body(1, 42, "wab/core", 600)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let first: JobView = resp.json();
+    node.quiet(Duration::from_millis(1500)).await;
+    let node_id = node.id.clone();
+    let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
+    inventory.egress_rules = true;
+    // Its caps, which the job's record names by fingerprint.
+    let mut caps =
+        vk_hub_proto::egress::EgressCaps::normalized(HubPhase::Unrestricted, false, none.clone())
+            .unwrap();
+    caps.fingerprint =
+        vk_hub_proto::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(caps.canonical()));
+    inventory.egress_caps = Some(vk_hub_proto::egress::NodeEgressCaps::Listed(caps.clone()));
+    hub.db
+        .record_inventory(&node_id, inventory, true, now_secs())
+        .unwrap();
+    assert!(fits(bound.clone()).await > 0);
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    let egress = start.egress.expect("the hub's layer");
+    assert_eq!(
+        (egress.rules.as_slice(), &egress.run),
+        (&["wab".to_string()][..], &wab)
+    );
+    // Written once the start is sent.
+    wait_until(|| (hub.db.job(&first.id).unwrap()).is_some_and(|r| r.egress_rules.is_some())).await;
+    let applied = hub
+        .db
+        .job(&first.id)
+        .unwrap()
+        .unwrap()
+        .egress_rules
+        .unwrap();
+    assert_eq!(applied.rules, ["wab"]);
+    assert_eq!(
+        hub.db.job(&first.id).unwrap().unwrap().egress_caps,
+        Some(caps.fingerprint)
+    );
+    assert_eq!(
+        crate::egress::rules_applied_text(&applied),
+        "wab (rules generation 2)"
+    );
+    // A key bound to no instance: the Fallback alone, whatever its job claims.
+    let mut body = bound_body(2, 42, "wab/core", 600);
+    body["placement"] = json!(placement());
+    let resp = api(addr, "POST", "/v1/jobs", Some(&unbound), Some(body)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    let egress = start.egress.expect("the hub's layer");
+    assert_eq!(egress.rules, ["default"]);
+    assert_eq!(egress.run, HubPhase::Unrestricted);
+    // More rules selecting a job than a layer may name: it fails, saying why.
+    for i in 0..32 {
+        let r = rule(&format!("r{i:02}"), Some("gitlab gl"), none.clone());
+        hub.db.put_egress_rule(&r, false, "uid 0", now).unwrap();
+    }
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&bound),
+        Some(bound_body(3, 42, "wab/core", 600)),
+    )
+    .await;
+    let third: JobView = resp.json();
+    let failed = view_until(addr, &bound, &third.id, |v| v.state == JobState::Finished).await;
+    let result = failed.result.expect("a result");
+    assert_eq!(result.failure, Some(FailureClass::Configuration));
+    let message = result.message.unwrap_or_default();
+    assert!(
+        message.contains("egress rules") && message.contains("past 32"),
+        "{message}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

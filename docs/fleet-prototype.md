@@ -39,7 +39,10 @@ The prototype provides, all experimentally:
   history, and an audit log, with sign-in links from `vk-hub ui login`;
 - on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: API keys (`vk-hub
   keys`), pools (`vk-hub nodes pools`), the client API, reservations and job placement over
-  protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs).
+  protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs);
+- on the hub, egress rules by project and ref (`vk-hub egress`), held to placed jobs and, by
+  their Fallback, to the jobs of nodes' own gitlab-runners under `[jobs] egress_rules`; see
+  [Egress rules](#egress-rules).
 
 Restart and redeploy are not built.
 
@@ -1237,14 +1240,22 @@ also allows every host under it, or an IPv4 CIDR, a bare address for `/32`, opti
 rules. `default` is reserved for the Fallback: it takes no subject, and its mode is chosen when
 it is added. Every change is audited as the person's, and moves the rules' generation on.
 
-**The Fallback for gitlab-runner jobs.** With `[jobs] egress_rules = true` in `hub.toml`, the
-hub sets a node's desired state's `egress` to the layer of a job with no claims — the
-Fallback's alone — if the node announces `egress_fallback`, and to none otherwise: when the node
-reports what it enforces, when the Fallback changes, and at the hub's start, which also lifts it
-once rules are turned off. Each change takes the next generation and is audited as the hub's.
-The node keeps what it applied across hub outages; a job its gitlab-runner runs takes it at
-prepare and keeps it to its end. `vk-hub egress list` and the hub's start warn of rules that
-restrict nothing, and of rules on with no enforced Fallback.
+**`[jobs] egress_rules = true`** in `hub.toml` turns the rules on; off, as by default, the hub
+sends no layer and the rules restrict nothing. On, placement resolves each job's layer from the
+rules as they stand and sends it in the job's start; one that does not fit a start — more than
+32 rules, more than 256 entries in a list, past 256 KiB — fails the job `configuration`,
+saying why. Only a node announcing `egress_rules` in its inventory has room for placed jobs,
+reservations included; `vk-hub nodes` and the node's page say why another takes none. A job's
+record keeps the rules it was resolved under, with the rules' generation: its page and `vk-hub
+jobs show` name them. `vk-hub egress list` and the hub's start warn of rules that restrict
+nothing, and of rules on with no enforced Fallback.
+
+**The Fallback for gitlab-runner jobs.** With rules on, the hub sets a node's desired state's
+`egress` to the layer of a job with no claims — the Fallback's alone — if the node announces
+`egress_fallback`, and to none otherwise: when the node reports what it enforces, when the
+Fallback changes, and at the hub's start, which also lifts it once rules are turned off. Each
+change takes the next generation and is audited as the hub's. The node keeps what it applied
+across hub outages; a job its gitlab-runner runs takes it at prepare and keeps it to its end.
 
 ## Web UI
 

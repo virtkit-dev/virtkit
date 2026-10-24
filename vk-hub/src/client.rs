@@ -574,6 +574,8 @@ async fn submit(
         protected: match &ask.spec {
             JobSpec::GitlabCi(ci) => ci.sources.protected,
         },
+        egress_rules: None,
+        egress_caps: None,
     };
     let redacted = match &ask.spec {
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),

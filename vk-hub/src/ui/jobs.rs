@@ -1188,6 +1188,11 @@ pub(super) fn record(
     if let Some(access) = &j.registry_access {
         registry_access(h, access, registry);
     }
+    if let Some(applied) = &j.egress_rules {
+        h.raw("<section class=\"job-access\"><h2>Hub egress rules</h2><p>")
+            .text(crate::egress::rules_applied_text(applied))
+            .raw("</p></section>");
+    }
 }
 
 /// What the job's preparation does, whole: the image, and who builds or pulls it when the job

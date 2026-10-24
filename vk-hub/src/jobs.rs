@@ -60,7 +60,7 @@ use vk_hub_proto::dispatch::{
     Held, HubJobMsg, JobStart, LeaseEnd, LeaseState, MAX_LEASE_SECS, MAX_OUTPUT_CHUNK, NodeJobMsg,
     OfferReply, Refusal, RunState,
 };
-use vk_hub_proto::egress::EgressReport;
+use vk_hub_proto::egress::{EgressReport, HubEgress};
 use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 
@@ -916,6 +916,7 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
                 job.row.state = JobState::Queued;
                 job.row.node = None;
                 job.row.registry_access = None;
+                job.row.egress_rules = None;
                 job.row.revision = job.row.revision.saturating_add(1);
                 job.reservation = None;
                 writes.push((id, job.row.clone(), Vec::new()));
@@ -1084,6 +1085,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 row.state = JobState::Queued;
                 row.node = None;
                 row.registry_access = None;
+                row.egress_rules = None;
                 if let Some(reservation) = job.reservation.take() {
                     answers.push(HubJobMsg::Release { reservation });
                 }
@@ -1352,6 +1354,9 @@ fn room(
         return None;
     }
     let inventory = row.inventory.as_ref()?;
+    if !enforces_rules(hub, row) {
+        return None;
+    }
     if !placement
         .labels
         .iter()
@@ -2583,14 +2588,18 @@ async fn step(hub: &Hub) -> Result<()> {
         let state = hub.dispatch.lock();
         state.jobs.values().any(|j| j.row.state == JobState::Queued)
     };
-    let (nodes, mint) = if queued {
+    let (nodes, mint, rules) = if queued {
         let keys = hub.token_keys.clone();
         blocking(hub, move |db| {
-            Ok((db.nodes()?, crate::tokens::MintCtx::read(db, &keys)?))
+            let rules = match db.egress_rules_on() {
+                true => Some(db.egress_rules()?),
+                false => None,
+            };
+            Ok((db.nodes()?, crate::tokens::MintCtx::read(db, &keys)?, rules))
         })
         .await?
     } else {
-        (Vec::new(), crate::tokens::MintCtx::default())
+        (Vec::new(), crate::tokens::MintCtx::default(), None)
     };
     let mut writes = Vec::new();
     {
@@ -2652,6 +2661,7 @@ async fn step(hub: &Hub) -> Result<()> {
             let ctx = PlaceCtx {
                 nodes: &nodes,
                 mint: &mint,
+                rules: rules.as_ref(),
             };
             if let Some(w) = place(hub, &mut state, &ctx, &id, now) {
                 writes.push(w);
@@ -2684,12 +2694,46 @@ async fn step(hub: &Hub) -> Result<()> {
 struct PlaceCtx<'a> {
     nodes: &'a [(String, NodeRow)],
     mint: &'a crate::tokens::MintCtx,
+    /// The egress rules and their generation, with `[jobs] egress_rules` on.
+    rules: Option<&'a (u64, Vec<crate::store::EgressRuleRow>)>,
+}
+
+/// The hub's egress layer for job `job` from `rules`, the claims of its spec bounded by its key:
+/// its project and ref count only under a key bound to its GitLab instance, which checked its
+/// project. `Err` says why the layer resolved cannot be sent.
+fn egress_for(
+    job: &LiveJob,
+    spec: &JobSpec,
+    rules: &(u64, Vec<crate::store::EgressRuleRow>),
+) -> Result<(HubEgress, crate::store::EgressRulesApplied), String> {
+    let JobSpec::GitlabCi(ci) = spec;
+    let claims = job
+        .row
+        .gitlab
+        .as_deref()
+        .map(|g| crate::subject::JobClaims::of(g, ci));
+    let layer = crate::store::resolve_egress(&rules.1, claims.as_ref());
+    layer.check()?;
+    let applied = crate::store::EgressRulesApplied {
+        rules: layer.rules.clone(),
+        dry_run: layer.dry_run.iter().map(|d| d.rule.clone()).collect(),
+        generation: rules.0,
+    };
+    Ok((layer, applied))
+}
+
+/// Whether `row`'s node may run a placed job of this hub: one enforcing the hub's egress rules
+/// when `[jobs] egress_rules` is on, since an older node would ignore its layer and run the job
+/// under its own cap alone.
+pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
+    !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
 /// Send queued job `id` to its reservation's node while the reservation holds, else the
 /// least loaded candidate that has not refused it ([`candidates`]). Prefer a lightly loaded
 /// candidate holding its image unless the reservation's node also holds it ([`warm_nodes`]).
-/// Return the row to write if sent.
+/// With egress rules on, a job whose layer cannot be sent fails, saying why. Return the row to
+/// write if sent or failed.
 fn place(
     hub: &Hub,
     state: &mut State,
@@ -2697,9 +2741,19 @@ fn place(
     id: &str,
     now: Instant,
 ) -> Option<(String, JobRow, Vec<Event>)> {
-    let PlaceCtx { nodes, mint } = *ctx;
+    let PlaceCtx { nodes, mint, rules } = *ctx;
     let job = state.jobs.get(id)?;
     let spec = job.spec.clone()?;
+    let egress = match rules.map(|r| egress_for(job, &spec, r)) {
+        None => None,
+        Some(Ok(e)) => Some(e),
+        Some(Err(why)) => {
+            let message = format!("the hub's egress rules for this job cannot be sent: {why}");
+            let (row, events) =
+                finish(state, id, Some(FailureClass::Configuration), Some(message))?;
+            return Some((id.to_string(), row, events));
+        }
+    };
     let mint_key = job.mint_key.clone();
     let placement = job.row.placement.clone();
     let mut tried = job.tried.clone();
@@ -2719,7 +2773,8 @@ fn place(
     let reserved = job.reservation.as_ref().and_then(|r| {
         let x = state.reservations.get(r)?;
         let ok = matches!(x.phase, ResvPhase::Held { .. })
-            && state.links.get(&x.node).is_some_and(|l| l.held);
+            && state.links.get(&x.node).is_some_and(|l| l.held)
+            && (nodes.iter()).any(|(n, row)| *n == x.node && enforces_rules(hub, row));
         ok.then(|| (r.clone(), x.node.clone(), x.envelope, x.accepted_at))
     });
     // A reservation on a node without the image gives way to a lightly loaded node with it.
@@ -2777,7 +2832,7 @@ fn place(
         envelope,
         spec: (*spec).clone(),
         registry,
-        egress: None,
+        egress: egress.as_ref().map(|(layer, _)| layer.clone()),
     }));
     if !send(state, &node, start) {
         return None;
@@ -2793,6 +2848,13 @@ fn place(
     job.row.state = JobState::Starting;
     job.row.node = Some(node.clone());
     job.row.registry_access = shown;
+    job.row.egress_rules = egress.map(|(_, applied)| applied);
+    job.row.egress_caps = nodes.iter().find(|(n, _)| *n == node).and_then(|(_, row)| {
+        match row.inventory.as_ref()?.egress_caps.as_ref()? {
+            vk_hub_proto::egress::NodeEgressCaps::Listed(caps) => Some(caps.fingerprint.clone()),
+            _ => None,
+        }
+    });
     job.row.revision = job.row.revision.saturating_add(1);
     let row = job.row.clone();
     if let Some(r) = given_up

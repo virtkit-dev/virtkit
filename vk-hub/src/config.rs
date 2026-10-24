@@ -34,10 +34,11 @@
 //! # most a registry token may live.
 //! max_job_token_secs = 86400
 //!
-//! # What jobs are held to.
+//! # What placed jobs are held to.
 //! [jobs]
-//! # Give gitlab-runner's jobs the Fallback of the hub's egress rules (`vk-hub egress`), on
-//! # nodes that enforce it; off, the rules restrict nothing.
+//! # Resolve the hub's egress rules (`vk-hub egress`) for each placed job and place it only on a
+//! # node that enforces them, and give gitlab-runner's jobs the Fallback rule; off, the rules
+//! # restrict nothing.
 //! egress_rules = true
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.

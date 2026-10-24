@@ -2353,6 +2353,15 @@ fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
     n.placed = None;
     n.last_refusal = None;
     assert!(node_notes(&n).is_empty(), "{:?}", node_notes(&n));
+    // With egress rules on, a node that does not enforce them takes none of its jobs.
+    n.without_egress_rules = true;
+    assert_eq!(
+        node_notes(&n),
+        [
+            "ci-1: takes none of the hub's jobs: it does not enforce the hub's egress rules, \
+             which [jobs] egress_rules turns on"
+        ]
+    );
 }
 
 #[test]

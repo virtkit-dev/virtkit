@@ -1397,6 +1397,13 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
 
     let heartbeat = d.row.heartbeat.as_ref();
     section(&mut h, "Load");
+    if v.without_egress_rules {
+        kv(
+            &mut h,
+            "Takes no placed jobs",
+            "it does not enforce the hub's egress rules, which [jobs] egress_rules turns on",
+        );
+    }
     if let Some(why) = &v.last_refusal {
         kv_node(&mut h, "Refuses reservations", why);
     }

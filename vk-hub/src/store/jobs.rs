@@ -165,6 +165,29 @@ pub struct JobRow {
     /// `None` when GitLab did not say, or for an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected: Option<bool>,
+    /// The hub's egress rules its latest placement resolved for it; `None` before placement,
+    /// with `[jobs] egress_rules` off, and for jobs placed by older hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_rules: Option<EgressRulesApplied>,
+    /// The fingerprint of its node's egress caps ([`vk_hub_proto::egress::EgressCaps`]) as the
+    /// hub knew them when it placed the job; `None` for a node that did not report them, or a
+    /// job placed by an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_caps: Option<String>,
+}
+
+/// The hub's egress rules a placed job's layer was resolved from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressRulesApplied {
+    /// The enforced rules, `default` when the Fallback alone applied; none when no rule
+    /// selected the job and no Fallback is enforced, so that it could reach nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// The dry-run rules that selected it, the Fallback's included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dry_run: Vec<String>,
+    /// The rules' generation it was resolved under.
+    pub generation: u64,
 }
 
 /// What registry access a placed job got: its token's display data, or why it got none.
@@ -1269,6 +1292,8 @@ mod tests {
             gitlab: None,
             project_id: None,
             protected: None,
+            egress_rules: None,
+            egress_caps: None,
             egress: None,
         }
     }

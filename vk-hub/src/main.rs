@@ -200,7 +200,7 @@ enum Cmd {
     /// none, or DNS suffixes and IPv4 CIDRs[:port], as a node's [egress] lists. Rules that
     /// select a job add up; the rule named default, the Fallback, takes the jobs no other
     /// enforced rule selects. A rule in dry-run blocks nothing and reports what it would.
-    /// The Fallback holds nodes' gitlab-runner jobs once hub.toml sets [jobs] egress_rules = true.
+    /// Rules restrict placed jobs once hub.toml sets [jobs] egress_rules = true.
     Egress {
         #[command(flatten)]
         config: ConfigArg,
@@ -1613,6 +1613,12 @@ async fn serve(cfg: HubConfig) -> Result<()> {
             steered.len()
         );
     }
+    if cfg.egress_rules {
+        eprintln!(
+            "vk-hub: placed jobs are held to the hub's egress rules ([jobs] egress_rules), on \
+             nodes that enforce them only"
+        );
+    }
     // A default role lowered or removed while the hub was stopped takes effect at once, as a
     // lowered grant does.
     let ended = db.end_oidc_sessions_above_grants("hub", now_secs())?;
@@ -2234,6 +2240,13 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
     for event in result.map_or(&[][..], |r| &r.events) {
         out.push_str(&format!("{:<12} {event}\n", "event"));
     }
+    if let Some(applied) = &j.egress_rules {
+        out.push_str(&format!(
+            "{:<12} {}\n",
+            "hub rules",
+            egress::rules_applied_text(applied)
+        ));
+    }
     if let Some(output) = output {
         out.push_str(&format!(
             "\nThe last {} bytes of its output, masked as the node streamed it:\n",
@@ -2540,6 +2553,13 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
     if let Some(why) = own_runner {
         placement.push(format!(
             "{}: takes none of the hub's jobs: it runs its own gitlab-runner ({why})",
+            n.hostname
+        ));
+    }
+    if n.without_egress_rules {
+        placement.push(format!(
+            "{}: takes none of the hub's jobs: it does not enforce the hub's egress rules, \
+             which [jobs] egress_rules turns on",
             n.hostname
         ));
     }

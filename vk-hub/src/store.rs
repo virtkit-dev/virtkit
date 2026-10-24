@@ -56,11 +56,12 @@ pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use egress_rules::{
     DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, phase_text as rule_phase_text,
+    resolve_egress,
 };
 pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};
 pub use jobs::{
-    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, NoAccess, PREPARE_STAGE,
-    RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
+    DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
+    PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
@@ -647,7 +648,8 @@ pub enum Enrollment {
 
 pub struct Db {
     db: Database,
-    /// `[jobs] egress_rules`: gitlab-runner's jobs get the hub's Fallback egress layer.
+    /// `[jobs] egress_rules`: placed jobs, and gitlab-runner's under the Fallback, get the
+    /// hub's egress layer.
     egress_rules: bool,
     /// When a heartbeat's write was last made durable ([`HEARTBEAT_SYNC_SECS`]).
     heartbeat_synced_at: AtomicU64,
@@ -728,8 +730,8 @@ impl Db {
         self
     }
 
-    /// Whether `[jobs] egress_rules` is set: gitlab-runner's jobs get the hub's Fallback, on
-    /// nodes that enforce it.
+    /// Whether `[jobs] egress_rules` is set: placed jobs get the hub's egress layer, and are
+    /// placed only on nodes that enforce it.
     pub fn egress_rules_on(&self) -> bool {
         self.egress_rules
     }

@@ -66,6 +66,10 @@ pub struct NodeView {
     /// places no jobs.
     #[serde(default)]
     pub placed: Option<u64>,
+    /// It takes none of the hub's jobs: `[jobs] egress_rules` is on and it does not enforce
+    /// the hub's egress rules.
+    #[serde(default)]
+    pub without_egress_rules: bool,
 }
 
 impl NodeView {
@@ -116,6 +120,8 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
         placed: crate::jobs::accepting(hub)
             .is_ok()
             .then(|| crate::jobs::placed_on(hub, &id)),
+        without_egress_rules: crate::jobs::accepting(hub).is_ok()
+            && !crate::jobs::enforces_rules(hub, row),
         id,
     }
 }
