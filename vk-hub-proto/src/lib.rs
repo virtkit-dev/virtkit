@@ -1034,6 +1034,12 @@ pub struct DesiredState {
     /// The hub's cap on the runner's concurrency; `None` leaves it to the node.
     pub ceiling: Option<u32>,
     pub acquisition: Acquisition,
+    /// The hub's egress layer for the jobs the node's gitlab-runner runs: the Fallback
+    /// (`default`) rule's alone, since such a job's project and ref come from variables the job
+    /// can set. `None` imposes none, as before. Sent only to a node that enforces it: an older
+    /// one would ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<egress::HubEgress>,
 }
 
 /// A node's own state, persisted on the node: losing the hub changes none of it.
@@ -1564,11 +1570,13 @@ mod tests {
                 generation: 3,
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }),
             HubMsg::Desired(DesiredState {
                 generation: 1,
                 ceiling: None,
                 acquisition: Acquisition::Run,
+                egress: None,
             }),
             HubMsg::Command(Command {
                 id: id.clone(),
@@ -1935,6 +1943,7 @@ mod tests {
                 generation: 4,
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }),
             unsupported: vec!["stop acquisition".into()],
             state: Some(NodeState::Draining),
@@ -1987,6 +1996,7 @@ mod tests {
                 generation: 3,
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }),
             json!({"type": "desired", "generation": 3, "ceiling": 4, "acquisition": "stop"}),
         );
@@ -1995,8 +2005,29 @@ mod tests {
                 generation: 1,
                 ceiling: None,
                 acquisition: Acquisition::Run,
+                egress: None,
             }),
             json!({"type": "desired", "generation": 1, "ceiling": null, "acquisition": "run"}),
+        );
+        // The Fallback for gitlab-runner's jobs, optional within the version.
+        pinned(
+            &HubMsg::Desired(DesiredState {
+                generation: 2,
+                ceiling: None,
+                acquisition: Acquisition::Run,
+                egress: Some(egress::HubEgress {
+                    rules: vec!["default".into()],
+                    run: egress::HubPhase::Allow {
+                        names: Vec::new(),
+                        ips: Vec::new(),
+                    },
+                    build: egress::HubPhase::Unrestricted,
+                    dry_run: Vec::new(),
+                }),
+            }),
+            json!({"type": "desired", "generation": 2, "ceiling": null, "acquisition": "run",
+                   "egress": {"rules": ["default"], "run": {"kind": "allow", "names": [], "ips": []},
+                              "build": {"kind": "unrestricted"}}}),
         );
         for (op, kind) in [
             (Operation::Drain, "drain"),

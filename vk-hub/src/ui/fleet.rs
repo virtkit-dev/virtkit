@@ -2131,6 +2131,7 @@ mod tests {
             generation: 2,
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
+            egress: None,
         };
         assert_eq!(
             ops(&view(Ready, Managed, Some(paused.clone()))),
@@ -2156,6 +2157,7 @@ mod tests {
             generation: 2,
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
+            egress: None,
         };
         let mut v = view(NodeState::Ready, RunnerMode::Managed, Some(paused));
         let p = Panel::of(&v);
@@ -2208,6 +2210,7 @@ mod tests {
             generation: 3,
             ceiling: None,
             acquisition: Acquisition::Stop,
+            egress: None,
         });
         assert_eq!(
             Panel::of(&v).intake,
@@ -2253,6 +2256,7 @@ mod tests {
             generation: 4,
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
+            egress: None,
         });
         assert_eq!(
             Panel::of(&v).placed.as_deref(),

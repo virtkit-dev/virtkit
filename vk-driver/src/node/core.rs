@@ -699,6 +699,7 @@ mod tests {
             generation: 1,
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
+            egress: None,
         })
         .unwrap();
         step(&core, &cfg);
@@ -823,6 +824,7 @@ mod tests {
             generation: 1,
             ceiling: None,
             acquisition: Acquisition::Stop,
+            egress: None,
         })
         .unwrap();
         let report = core.report();
@@ -898,6 +900,7 @@ mod tests {
             generation: 1,
             ceiling: None,
             acquisition: Acquisition::Stop,
+            egress: None,
         })
         .unwrap();
         assert!(!*core.acquire().borrow());
@@ -967,6 +970,7 @@ mod tests {
                 generation,
                 ceiling: None,
                 acquisition: Acquisition::Run,
+                egress: None,
             })
             .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;

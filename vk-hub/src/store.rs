@@ -1176,6 +1176,8 @@ impl Db {
                         } else {
                             theirs.acquisition
                         },
+                        // The hub's alone to set.
+                        egress: ours.egress.clone(),
                     };
                     let same = |s: &DesiredState| (s.ceiling, s.acquisition);
                     if ours.generation > theirs.generation && same(&merged) == same(ours) {
@@ -2306,6 +2308,7 @@ const DEFAULT_DESIRED: DesiredState = DesiredState {
     generation: 0,
     ceiling: None,
     acquisition: Acquisition::Run,
+    egress: None,
 };
 
 /// Issue `op` to node `id` inside `txn`, valid for `ttl`, audited as `actor`'s; see
@@ -4052,6 +4055,7 @@ mod tests {
             generation: 3,
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
+            egress: None,
         };
         let report = Report {
             applied: Some(applied.clone()),
@@ -4094,6 +4098,7 @@ mod tests {
                 generation: 4,
                 ceiling: None,
                 acquisition: Acquisition::Stop,
+                egress: None,
             }
         );
         // A node that applied nothing gives the hub nothing to adopt.
@@ -4115,6 +4120,7 @@ mod tests {
             generation: 7,
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
+            egress: None,
         };
         let report = Report {
             applied: Some(applied.clone()),
@@ -4141,6 +4147,7 @@ mod tests {
             generation: 8,
             ceiling,
             acquisition,
+            egress: None,
         };
         let (desired, events) = outcome(&[DesiredChange::Ceiling(Some(5))]);
         assert_eq!(desired, state(Some(5), Acquisition::Stop));
@@ -4189,6 +4196,7 @@ mod tests {
                 generation: 1,
                 ceiling: Some(4),
                 acquisition: Acquisition::Run,
+                egress: None,
             }),
             ..Report::default()
         };
@@ -4197,6 +4205,7 @@ mod tests {
             generation: 3,
             ceiling: Some(4),
             acquisition: Acquisition::Run,
+            egress: None,
         };
         assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(ours.clone()));
         let caught_up = Report {
@@ -4232,6 +4241,7 @@ mod tests {
                 generation: 1,
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }),
             ..Report::default()
         };
@@ -4243,6 +4253,7 @@ mod tests {
                 generation: 3,
                 ceiling: Some(5),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }
         );
 
@@ -4282,6 +4293,7 @@ mod tests {
                 generation: 3,
                 ceiling: Some(2),
                 acquisition: Acquisition::Run,
+                egress: None,
             }),
             ..Report::default()
         };
@@ -4292,6 +4304,7 @@ mod tests {
                 generation: 4,
                 ceiling: Some(2),
                 acquisition: Acquisition::Stop,
+                egress: None,
             })
         );
     }

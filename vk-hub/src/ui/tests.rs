@@ -3064,6 +3064,7 @@ async fn an_operator_steers_a_node_from_its_page() {
                     generation: 4,
                     ceiling: None,
                     acquisition: Acquisition::Run,
+                    egress: None,
                 }),
                 state: Some(NodeState::Draining),
                 acquisition: Some(Acquisition::Stop),

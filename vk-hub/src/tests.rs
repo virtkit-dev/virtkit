@@ -609,6 +609,7 @@ fn applied(applied: Option<u64>) -> NodeMsg {
             generation,
             ceiling: None,
             acquisition: vk_hub_proto::Acquisition::Run,
+            egress: None,
         }),
         state: Some(vk_hub_proto::NodeState::Ready),
         ..vk_hub_proto::Report::default()
@@ -829,6 +830,7 @@ async fn a_hub_without_desired_state_keeps_the_nodes() {
         generation: 7,
         ceiling: Some(2),
         acquisition: Acquisition::Stop,
+        egress: None,
     };
     send(
         &mut ws,
@@ -858,6 +860,7 @@ async fn a_hub_without_desired_state_keeps_the_nodes() {
             generation: 8,
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
+            egress: None,
         }
     );
 }
@@ -2299,6 +2302,7 @@ fn sync_compares_the_applied_state_not_only_its_generation() {
         generation: 3,
         ceiling: Some(4),
         acquisition: Acquisition::Run,
+        egress: None,
     };
     let view = |applied: DesiredState| ops::NodeView {
         protocol: Some(vk_hub_proto::STEERING),
@@ -2370,12 +2374,14 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 generation: 3,
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
+                egress: None,
             }),
             report: Some(Report {
                 applied: Some(DesiredState {
                     generation: 2,
                     ceiling: Some(6),
                     acquisition: Acquisition::Run,
+                    egress: None,
                 }),
                 state: Some(NodeState::Draining),
                 acquisition: Some(Acquisition::Run),
@@ -2407,6 +2413,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 generation: 1,
                 ceiling: Some(2),
                 acquisition: Acquisition::Run,
+                egress: None,
             }),
             report: Some(Report::default()),
             ..ops::NodeView::default()

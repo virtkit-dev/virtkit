@@ -1300,6 +1300,7 @@ mod tests {
             generation: 1,
             ceiling: Some(2),
             acquisition: vk_hub_proto::Acquisition::Stop,
+            egress: None,
         })
     }
 

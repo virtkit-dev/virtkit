@@ -1051,6 +1051,7 @@ concurrent = 4
                 generation: 1,
                 ceiling: Some(3),
                 acquisition: vk_hub_proto::Acquisition::Run,
+                egress: None,
             });
             persisted.save(&node).unwrap();
             hub_ceiling(&cfg).unwrap()

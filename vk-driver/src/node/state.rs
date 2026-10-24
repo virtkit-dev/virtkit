@@ -811,6 +811,7 @@ mod tests {
             generation,
             ceiling,
             acquisition,
+            egress: None,
         }
     }
 
