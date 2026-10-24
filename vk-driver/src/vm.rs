@@ -340,6 +340,19 @@ fn record_refusals(ctx: &JobCtx, e: &anyhow::Error) {
     }
 }
 
+/// Make the job dir afresh, a leftover's dropped, with what the job's later commands read back
+/// from it: the Fallback its prepare took, which its supervisor holds the run phase to.
+pub(crate) fn fresh_job_dir(ctx: &JobCtx) -> Result<()> {
+    if ctx.job_dir.exists() {
+        std::fs::remove_dir_all(&ctx.job_dir)
+            .with_context(|| format!("removing stale {}", ctx.job_dir.display()))?;
+    }
+    std::fs::create_dir_all(&ctx.job_dir)
+        .with_context(|| format!("creating {}", ctx.job_dir.display()))
+        .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
+    ctx.keep_fallback()
+}
+
 async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
     // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
@@ -390,14 +403,7 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     // the checkout so a dying supervisor is not still virtio-fs-sharing the checkout dir.
     stop_supervisor(ctx);
     crate::net::release(ctx);
-    if ctx.job_dir.exists() {
-        std::fs::remove_dir_all(&ctx.job_dir)
-            .with_context(|| format!("removing stale {}", ctx.job_dir.display()))?;
-    }
-    std::fs::create_dir_all(&ctx.job_dir)
-        .with_context(|| format!("creating {}", ctx.job_dir.display()))
-        .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
-    ctx.keep_fallback()?;
+    fresh_job_dir(ctx)?;
 
     // Admission (`[executor.schedule]`) reserves guest and service RAM and job-dir growth,
     // waiting for both before boot. Reserve after stale-job teardown frees the previous claim,

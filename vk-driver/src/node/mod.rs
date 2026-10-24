@@ -1107,14 +1107,29 @@ concurrent = 4
         let mut ctx = job(&cfg);
         ctx.take_fallback().unwrap();
         assert_eq!(ctx.hub_egress, Some(fallback.clone()));
+        // A leftover of the same job id, with the Fallback it ran under, goes at prepare.
+        let stale = HubEgress {
+            rules: vec!["stale".into()],
+            ..fallback.clone()
+        };
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
-        ctx.keep_fallback().unwrap();
+        std::fs::write(
+            ctx.job_dir.join("hub-fallback.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        crate::vm::fresh_job_dir(&ctx).unwrap();
         let record = ctx.egress_record.clone().unwrap();
         assert!(record.is_dir() && record.starts_with(&ctx.job_dir));
-        // A later run stage reads it back, whatever the node applied since; a cleanup does not.
+        // Its supervisor, and a later run stage, read back what prepare took, whatever the node
+        // applied since; a cleanup does not.
         applying(None, 2);
+        let mut supervisor = job(&cfg);
+        assert_eq!(supervisor.hub_egress, None);
+        supervisor.load_fallback().unwrap();
+        assert_eq!(supervisor.hub_egress, Some(fallback.clone()));
+        assert_eq!(supervisor.egress_record, Some(record.clone()));
         let mut later = job(&cfg);
-        assert_eq!(later.hub_egress, None);
         later.load_fallback().unwrap();
         assert_eq!(later.hub_egress, Some(fallback));
         assert_eq!(later.egress_record, Some(record));
