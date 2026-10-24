@@ -2660,6 +2660,7 @@ fn place(
         envelope,
         spec: (*spec).clone(),
         registry,
+        egress: None,
     }));
     if !send(state, &node, start) {
         return None;

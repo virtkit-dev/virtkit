@@ -1428,6 +1428,7 @@ mod tests {
                     envelope: envelope(4096),
                     spec: spec(4242),
                     registry: None,
+                    egress: None,
                 }))),
             )
             .await;

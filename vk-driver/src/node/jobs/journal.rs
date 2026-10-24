@@ -228,6 +228,7 @@ mod tests {
                 cache_repo: None,
                 pipeline_prefix: None,
             }),
+            egress: None,
         };
         write_json(&dir.join(START), &start).unwrap();
         forget_registry(&dir).unwrap();

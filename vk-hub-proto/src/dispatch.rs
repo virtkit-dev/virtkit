@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::egress::HubEgress;
 use crate::job::{Envelope, JobResult, JobSpec};
 
 /// The longest lease a node grants; a longer ask is cut to it.
@@ -85,6 +86,11 @@ pub struct JobStart {
     /// The job's registry access, when the hub minted a token for the node's registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry: Option<JobRegistry>,
+    /// The hub's egress layer for the job, resolved from its rules; `None` when the hub imposes
+    /// none, and the job runs under its node's cap and its own narrowing alone. Sent only to a
+    /// node that enforces it: an older one would ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<HubEgress>,
 }
 
 /// A job's registry access: a token for one registry, and what the node needs to route
@@ -351,6 +357,7 @@ mod tests {
                 envelope: envelope(),
                 spec: JobSpec::GitlabCi(crate::job::tests::ci_job()),
                 registry: None,
+                egress: None,
             })),
             HubJobMsg::OutputAck {
                 job: id("b"),
@@ -504,6 +511,7 @@ mod tests {
         assert_eq!(start["kind"], "start");
         assert_eq!(start["spec"]["kind"], "gitlab_ci");
         assert!(start.get("registry").is_none());
+        assert!(start.get("egress").is_none());
         let access = JobRegistry {
             registry_id: id("r"),
             token: "vkt_x.y".into(),
@@ -531,6 +539,65 @@ mod tests {
         let read: JobRegistry = serde_json::from_value(bare.clone()).unwrap();
         assert_eq!(serde_json::to_value(&read).unwrap(), bare);
         assert!(!format!("{access:?}").contains("vkt_"));
+    }
+
+    /// The hub's egress layer, pinned: a start without one reads as today's, and a phase of a
+    /// kind from a later hub reads as one the node must refuse, never as unrestricted.
+    #[test]
+    fn a_start_carries_the_hubs_egress_layer() {
+        use crate::egress::{DryRunRule, HubEgress, HubPhase};
+        let HubJobMsg::Start(start) = hub_messages().remove(3) else {
+            panic!("not a start")
+        };
+        let layer = HubEgress {
+            rules: vec!["wab".into(), "wab-branches".into()],
+            run: HubPhase::Allow {
+                names: vec!["corp.example.com".into()],
+                ips: vec!["10.10.140.49/32".into()],
+            },
+            build: HubPhase::Unrestricted,
+            dry_run: vec![DryRunRule {
+                rule: "wab-release".into(),
+                run: HubPhase::Allow {
+                    names: vec![],
+                    ips: vec![],
+                },
+                build: HubPhase::Unrestricted,
+            }],
+        };
+        let with = JobStart {
+            egress: Some(layer.clone()),
+            ..*start.clone()
+        };
+        let wire = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            wire["egress"],
+            json!({
+                "rules": ["wab", "wab-branches"],
+                "run": {"kind": "allow", "names": ["corp.example.com"], "ips": ["10.10.140.49/32"]},
+                "build": {"kind": "unrestricted"},
+                "dry_run": [{
+                    "rule": "wab-release",
+                    "run": {"kind": "allow", "names": [], "ips": []},
+                    "build": {"kind": "unrestricted"},
+                }],
+            })
+        );
+        assert_eq!(serde_json::from_value::<JobStart>(wire).unwrap(), with);
+        assert_eq!(layer.check(), Ok(()));
+
+        let mut old = serde_json::to_value(&*start).unwrap();
+        assert_eq!(
+            serde_json::from_value::<JobStart>(old.clone()).unwrap(),
+            *start
+        );
+        old["egress"] = json!({"run": {"kind": "unrestricted"}, "build": {"kind": "quota"}});
+        let later = serde_json::from_value::<JobStart>(old)
+            .unwrap()
+            .egress
+            .unwrap();
+        assert_eq!(later.build, HubPhase::Other);
+        assert!(later.check().is_err());
     }
 
     #[test]

@@ -1106,6 +1106,7 @@ pub(crate) mod tests {
             envelope: envelope(4096),
             spec: spec(id),
             registry: None,
+            egress: None,
         }))
     }
 
@@ -1320,6 +1321,7 @@ pub(crate) mod tests {
             envelope: DISK_ASK,
             spec: spec(4242),
             registry: None,
+            egress: None,
         }))
     }
 

@@ -787,6 +787,7 @@ mod tests {
             envelope: Default::default(),
             spec: vk_hub_proto::job::JobSpec::GitlabCi(Default::default()),
             registry: Some(registry.clone()),
+            egress: None,
         };
         std::fs::write(&start, serde_json::to_vec(&job).unwrap()).unwrap();
         let env = |k: &str, v: &str| (k.to_string(), v.to_string());

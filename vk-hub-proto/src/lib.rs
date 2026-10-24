@@ -95,6 +95,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod client;
 pub mod dispatch;
+pub mod egress;
 pub mod job;
 pub mod registry;
 pub mod stamp;
