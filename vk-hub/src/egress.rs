@@ -176,6 +176,31 @@ impl Summary {
         [&mut self.blocked, &mut self.would_block, &mut self.observed]
     }
 
+    /// The one thing to say first, and how it reads: a refused declaration, which failed the
+    /// job; then blocked, then would-block destinations; then a declaration kept unreachable;
+    /// then a record that is incomplete, short of which nothing was blocked.
+    pub fn headline(&self) -> (Tone, String) {
+        if self.refusals > 0 {
+            (Tone::Bad, "Declaration refused".to_string())
+        } else if self.blocked.any() {
+            (
+                Tone::Bad,
+                format!("Blocked: {}", self.blocked.destinations_text()),
+            )
+        } else if self.would_block.any() {
+            (
+                Tone::Warn,
+                format!("Would block: {}", self.would_block.destinations_text()),
+            )
+        } else if self.unreachable > 0 {
+            (Tone::Warn, "Declaration warning".to_string())
+        } else if !self.complete {
+            (Tone::Warn, "Incomplete".to_string())
+        } else {
+            (Tone::Ok, "None blocked".to_string())
+        }
+    }
+
     /// Everything counted, on a line: `Declaration refused (1) · Declaration warnings (1) ·
     /// Blocked: 2 destinations (5 attempts) · Observed: 4 destinations (9 attempts) · incomplete
     /// record`.
@@ -219,6 +244,14 @@ fn outcome_index(o: EgressOutcome) -> usize {
         EgressOutcome::WouldBlock => 1,
         EgressOutcome::Observed => 2,
     }
+}
+
+/// How a summary reads: as a badge's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Ok,
+    Warn,
+    Bad,
 }
 
 /// A destination as a page shows it: `crates.io`, `10.0.0.1:443`, or the text a guest sent.
@@ -661,15 +694,27 @@ mod tests {
             (Tally::default(), 0, true)
         );
         assert_eq!(s.observed.destinations_text(), "1 destination");
+        assert_eq!(
+            s.headline(),
+            (Tone::Bad, "Blocked: 3 destinations".to_string())
+        );
 
         r.entries.clear();
         r.phases[0].coverage = EgressCoverage::Partial;
+        assert_eq!(
+            Summary::of(&r).headline(),
+            (Tone::Warn, "Incomplete".to_string())
+        );
         r.phases[0].omitted = EgressOmitted {
             would_block: 3,
             ..EgressOmitted::default()
         };
         let s = Summary::of(&r);
         assert_eq!((s.would_block.attempts, s.would_block.omitted), (3, 3));
+        assert_eq!(
+            s.headline(),
+            (Tone::Warn, "Would block: 1+ destinations".to_string())
+        );
         // A declaration kept unreachable warns below what was carried; one that failed the job
         // comes first. Those not listed are warnings, a report listing failures first, unless
         // every one listed failed the job.
@@ -686,11 +731,20 @@ mod tests {
         r.refusals_omitted = 1;
         let s = Summary::of(&r);
         assert_eq!((s.refusals, s.unreachable), (0, 2));
+        assert_eq!(
+            s.headline(),
+            (Tone::Warn, "Would block: 1+ destinations".to_string())
+        );
         r.phases[0].omitted = EgressOmitted::default();
         r.phases[0].coverage = EgressCoverage::Complete;
+        assert_eq!(
+            Summary::of(&r).headline(),
+            (Tone::Warn, "Declaration warning".to_string())
+        );
         r.refusals.push(refusal(RefusalReason::InvalidEntry));
         let s = Summary::of(&r);
         assert_eq!((s.refusals, s.unreachable), (1, 2));
+        assert_eq!(s.headline(), (Tone::Bad, "Declaration refused".to_string()));
         assert_eq!(
             s.text(),
             "Declaration refused (1) · Declaration warnings (2)"
@@ -698,6 +752,10 @@ mod tests {
         r.refusals.remove(0);
         let s = Summary::of(&r);
         assert_eq!((s.refusals, s.unreachable), (2, 0));
+        assert_eq!(
+            Summary::of(&EgressReport::default()).headline(),
+            (Tone::Ok, "None blocked".to_string())
+        );
     }
 
     /// A denial points at the setting of the layer that decided it, in its phase and dimension;

@@ -71,6 +71,7 @@ mod dev;
 mod egress;
 mod fleet;
 pub mod html;
+mod job_network;
 mod job_output;
 mod jobs;
 mod local;

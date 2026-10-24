@@ -23,7 +23,7 @@ use super::html::Html;
 use super::jobs::percent_encode;
 use super::pages;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
-use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, shares};
+use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, row_id, shares};
 use crate::egress::{self, Check};
 use crate::server::Hub;
 use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
@@ -1295,6 +1295,21 @@ fn see_other(location: &str) -> Response<Body> {
         HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static(PATH)),
     );
     resp
+}
+
+/// The row of `finding` of job `j`'s project, as an attribute's value.
+pub(super) fn row_href(j: &JobRow, finding: &Finding) -> String {
+    format!("{ROW_PREFIX}{}", row_id(&Subject::of(j), finding))
+}
+
+/// The rows job `id` shares in `view`, however they stand, as an attribute's value.
+pub(super) fn job_href(id: &str, view: View) -> String {
+    Filter {
+        job: Some(id.to_string()),
+        state: State::All,
+        ..Filter::default()
+    }
+    .href(view)
 }
 
 #[cfg(test)]

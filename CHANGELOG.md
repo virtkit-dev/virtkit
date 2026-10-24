@@ -30,6 +30,9 @@ All notable changes to virtkit will be documented in this file.
   only to nodes that enforce the rules; a node that does not says so. A job's page and `vk-hub
   jobs show` name the rules it ran under. Nodes that can enforce it get the Fallback rule for
   their gitlab-runner's jobs.
+- **What the hub's egress rules refused names those rules**, on the Egress page's Blocked rows,
+  a job's Network access and `vk-hub jobs show`: the rules the job ran under, or the dry-run
+  rule that would have refused it.
 - **`vk-hub registries set-url` and `vk-hub token create --kind registry --url` tell the hub
   which URL nodes reach a registry at.**
 - **Registries with `[hub] tokens = true` get the hub's token-signing keys**, and `vk-hub
@@ -64,6 +67,14 @@ All notable changes to virtkit will be documented in this file.
   refused it, what the job reached, the egress variables that failed it or that a setting
   above them leaves nothing of, and the bytes moved.
   A job's build-phase contacts and refusals are recorded whether or not audit is on.
+- **A fleet job's page shows its network access**: the egress variables that failed it, or that
+  a setting above them leaves nothing of, what was blocked or would have been under dry-run, by
+  phase and VM, with the setting that decided it and where to change it, what the job reached,
+  and whether its node recorded everything. A job whose node sent no report says so rather than
+  showing no traffic.
+- **The hub's Jobs page has a Network column**: whether a job had an egress declaration
+  refused or warned of, destinations blocked or that dry-run would block, or none, and whether
+  it was reported at all.
 - **`vk-hub jobs show` sums up a job's egress**: what was refused or blocked, where to change
   it, and whether its node recorded everything.
 - **The hub's web UI has an Egress page**: what jobs were blocked, would be blocked under
@@ -75,8 +86,12 @@ All notable changes to virtkit will be documented in this file.
 - **Operators triage the Egress page**: acknowledge a row until a later job repeats it, and
   mute a project's rows for 7 days, 30 days or indefinitely, with a reason, keeping them
   listed under Muted. Each is recorded in the audit log.
+- **A fleet job's Network column and Network access link to its rows on the Egress page.**
 - **Nodes report a placed job's egress while it runs, not only with its result**, to a hub at
   this version; an older hub still gets it once the job ends.
+- **A running fleet job's egress shows while it runs**: its page and the Jobs page's Network
+  column follow its node's reports. A job that ends without its result, its node having lost
+  its driver or the hub having ended it, keeps what was reported, marked incomplete.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

@@ -8173,6 +8173,19 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
     assert!(at_b < at_a, "the latest first: {body}");
     let unknown = format!("/egress/rows/{}", "0".repeat(32));
     assert_eq!(get(addr, &unknown, Some(&viewer)).await.status, 404);
+    // A job's page and its row in the Jobs table link to its rows.
+    let job = get(addr, &format!("/jobs/{a}"), Some(&viewer)).await.body;
+    assert!(
+        job.contains(&format!("<a href=\"/egress/rows/{row}\">")),
+        "{job}"
+    );
+    let jobs = get(addr, "/jobs", Some(&viewer)).await.body;
+    assert!(
+        jobs.contains(&format!(
+            "<a href=\"/egress?view=refused&amp;state=all&amp;job={c}\">"
+        )),
+        "{jobs}"
+    );
 
     // A node taking placed jobs without reporting is named; once it reports, it is not.
     hub.db

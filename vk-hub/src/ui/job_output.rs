@@ -302,12 +302,14 @@ fn record_html(hub: &Hub, row: &JobRow) -> Result<String> {
         .map(|(id, name)| (id.as_str(), name.as_str()))
         .collect();
     let registry = super::jobs::access_registry(hub, row)?;
+    let reports = super::jobs::reports_egress(hub, row)?;
     let mut record = Html::new();
     super::jobs::record(
         &mut record,
         row,
         &names,
         registry.as_ref(),
+        super::job_network::Shown { reports },
         crate::now_secs(),
     );
     Ok(record.into_string())

@@ -1337,9 +1337,15 @@ pipeline, linked to GitLab's page of it (`<project URL>/-/pipelines/<pipeline ID
 job's URL is one; its node, linked to the node's page; and its result, linked to the job's
 page: running with its stage, succeeded, failed with its class and exit code (the node's message
 on hover), or canceled, followed by a badge of the job's events, if any, the end of each one's
-first occurrence on hover. It also shows when a node accepted the job, its elapsed run time, its
-VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the placement
-envelope when the node did not report the guest size.
+first occurrence on hover. Its network column says what its node reported of its egress:
+*Declaration refused*, *Blocked: 2 destinations*, *Would block: 3 destinations* or *Declaration
+warning*, in that order, *Incomplete* when the node did not record everything, or *none blocked*, everything counted on
+hover, so far while it runs; *pending* while it runs with nothing reported yet, *unavailable*
+when it ran without a report, `-` when it never ran on a node; what was refused links to the
+job's rows on `/egress`. It also shows when a node
+accepted the job, its elapsed run time, its VM's peak memory and CPU time, and the guest's
+vCPUs and memory, falling back to the placement envelope when the node did not report the guest
+size.
 
 Key (`key=<key ID>`, the key's SHA-256), node, project, result (`running` for queued or running
 jobs, `success`, `failed`, `canceled`), job name, branch and pipeline filters, and *With events*
@@ -1399,6 +1405,23 @@ plain words (*CI caches: Read, Publish*), the token's prefixes, expiry and ID fo
 bound to no GitLab server, its node on an older `vk` or naming no registry the hub binds, a
 registry that takes no tokens or had applied no signing key, or a failed mint, each linking to
 where it is fixed.
+
+The record of a job that ran on a node then ends with *Network access*, from the egress report
+its node sent with its result, or while it runs the latest its node sent, *so far*: the egress
+declarations that failed it before its script ran, and those it ran with that a layer above
+leaves nothing of, each with the variable and entry, what is wrong with it and where to look (the
+variable in the job's CI configuration, for an entry outside the node's cap the node's `[egress]`
+or `[egress.build]` key, and for a service's outside the job's lists the job's variable); the destinations blocked, and those a dry-run allowlist would have
+blocked, each with its protocol, phase, VM, attempts and last sighting, the layer that decided
+it and where to look, saying that a block's effect on the job's result is unknown; what the
+job reached, folded; and per phase whether the node recorded everything, with what it left out
+past the report's bounds, and the bytes forwarded. A list longer than 20 is folded. A job that
+ran without a report says *Reporting unavailable*, never that it reached nothing; while it
+runs with nothing reported yet, the section says whether its node will report. A job its hub
+ended, or whose node lost its driver, keeps the last report sent, its phases partial. Each
+refused declaration and each destination blocked or that would be links to its row on
+`/egress`, and the section to its project's rows there. While the job runs, the section follows
+its node's reports, swapped in with the record.
 
 While the job runs, its page follows it over `/events/job/<id>`, a stream like the others
 (below): the hub notes each piece of output it stores and each change to the job's record, by

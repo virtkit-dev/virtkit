@@ -23,6 +23,7 @@ use hyper::{Response, StatusCode};
 use vk_hub_proto::client::JobState;
 
 use super::html::Html;
+use super::job_network::Shown;
 use super::job_output::{self, Output};
 use super::pages::{self, bytes, mib};
 use super::sse::Source;
@@ -453,11 +454,11 @@ fn job_table(
     // from shifting its columns.
     h.raw("<section class=\"jobs-table\"><table class=\"grid jobs\"><colgroup>")
         .raw("<col class=\"job\"><col class=\"project\"><col class=\"branch\"><col class=\"pipeline\">")
-        .raw("<col class=\"node\"><col class=\"result\"><col class=\"started\">")
+        .raw("<col class=\"node\"><col class=\"result\"><col class=\"network\"><col class=\"started\">")
         .raw("<col class=\"prep\"><col class=\"ran\"><col class=\"mem\"><col class=\"cpu\"><col class=\"size\">")
         .raw("</colgroup><thead><tr><th>job</th><th>project</th>")
         .raw("<th>branch</th><th>pipeline</th>")
-        .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\" title=\"preparing the executor: admission, building or pulling the image, booting\">prep</th><th class=\"num\">ran</th>")
+        .raw("<th>node</th><th>result</th><th>network</th><th>started</th><th class=\"num\" title=\"preparing the executor: admission, building or pulling the image, booting\">prep</th><th class=\"num\">ran</th>")
         .raw("<th class=\"num\">peak memory</th><th class=\"num\">CPU time</th>")
         .raw("<th class=\"num\">size</th></tr></thead><tbody>");
     for (_, id, j) in rows {
@@ -725,6 +726,8 @@ fn job_row(
     }
     events_badge(h, j);
     h.raw("</td><td>");
+    network_cell(h, id, j);
+    h.raw("</td><td>");
     match j.started_at {
         Some(at) => pages::at(h, at),
         None => h.raw("-"),
@@ -874,10 +877,11 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
             },
         };
         let registry = access_registry(&hub, &row)?;
-        anyhow::Ok(Some((row, output, hub.db.node_names()?, registry)))
+        let reports = reports_egress(&hub, &row)?;
+        anyhow::Ok(Some((row, output, hub.db.node_names()?, registry, reports)))
     })
     .await?;
-    let Some((row, output, names, registry)) = found else {
+    let Some((row, output, names, registry, reports)) = found else {
         return Ok(message(StatusCode::NOT_FOUND, "There is no such job."));
     };
     let main = job_page(
@@ -886,9 +890,22 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
         &output,
         &names,
         registry.as_ref(),
+        Shown { reports },
         crate::now_secs(),
     );
     Ok(page(fleet::layout("Job", PATH, auth, &main)))
+}
+
+/// Whether job `row`'s node announces egress reports now, as a running job's page says.
+pub(super) fn reports_egress(hub: &Hub, row: &JobRow) -> Result<bool> {
+    let Some(node) = row.node.as_deref() else {
+        return Ok(false);
+    };
+    Ok(hub
+        .db
+        .node(node)?
+        .and_then(|n| n.inventory)
+        .is_some_and(|i| i.egress_reports))
 }
 
 /// The job's registry name and namespaces, if still known to the hub.
@@ -1030,6 +1047,7 @@ fn job_page(
     output: &Output,
     names: &[(String, String)],
     registry: Option<&AccessRegistry>,
+    network: Shown,
     now: u64,
 ) -> Html {
     let names: HashMap<&str, &str> = names
@@ -1058,13 +1076,13 @@ fn job_page(
         h.raw("</div><aside id=\"job-record\" sse-swap=\"")
             .raw(job_output::RECORD)
             .raw("\">");
-        record(&mut h, j, &names, registry, now);
+        record(&mut h, j, &names, registry, network, now);
         h.raw("</aside></div>");
     } else {
         h.raw("<div class=\"job-page\"><div class=\"job-output\">");
         job_output::section(&mut h, j, output, false);
         h.raw("</div><aside id=\"job-record\">");
-        record(&mut h, j, &names, registry, now);
+        record(&mut h, j, &names, registry, network, now);
         h.raw("</aside></div>");
     }
     h
@@ -1099,13 +1117,15 @@ fn ran(h: &mut Html, j: &JobRow, now: u64) {
     };
 }
 
-/// A job's displayed record, ending with registry access if recorded. `registry` comes from
-/// [`access_registry`].
+/// A job's displayed record, ending with registry access if recorded, then its network
+/// access. `registry` comes from [`access_registry`], `network.reports` from
+/// [`reports_egress`].
 pub(super) fn record(
     h: &mut Html,
     j: &JobRow,
     names: &HashMap<&str, &str>,
     registry: Option<&AccessRegistry>,
+    network: Shown,
     now: u64,
 ) {
     let result = j.result.as_ref();
@@ -1193,6 +1213,11 @@ pub(super) fn record(
             .text(crate::egress::rules_applied_text(applied))
             .raw("</p></section>");
     }
+    let node = j
+        .node
+        .as_deref()
+        .map(|n| names.get(n).copied().unwrap_or(n));
+    super::job_network::section(h, j, node, network);
 }
 
 /// What the job's preparation does, whole: the image, and who builds or pulls it when the job
@@ -1280,6 +1305,60 @@ fn events_badge(h: &mut Html, j: &JobRow) {
         .raw("</span>");
 }
 
+/// What the job's node reported of its egress, in short ([`crate::egress::Summary::headline`]),
+/// everything counted on hover; whether reporting is pending or unavailable; `-` for a job that
+/// never ran on a node. What was refused links to the job's rows on the Egress page.
+fn network_cell(h: &mut Html, id: &str, j: &JobRow) {
+    use crate::egress::{Network, Summary, Tone};
+    match crate::egress::network(j) {
+        Network::NotRun => {
+            h.raw("-");
+        }
+        Network::Pending => {
+            h.raw("<span class=\"sub\" title=\"Nothing reported yet\">pending</span>");
+        }
+        Network::Unavailable => {
+            h.raw("<span class=\"sub\" title=\"Its node sent no egress report: this does not ")
+                .raw("mean the job made no network attempts\">unavailable</span>");
+        }
+        Network::Reported(report) => {
+            let summary = Summary::of(report);
+            match summary.headline() {
+                (Tone::Ok, text) => {
+                    h.raw("<span class=\"sub\" title=\"")
+                        .text(summary.text())
+                        .raw("\">")
+                        .text(text.to_lowercase())
+                        .raw("</span>");
+                }
+                (tone, text) => {
+                    use crate::egress::blocked::View;
+                    let view = if summary.refusals > 0 {
+                        Some(View::Refused)
+                    } else if summary.blocked.any() {
+                        Some(View::Blocked)
+                    } else if summary.would_block.any() {
+                        Some(View::WouldBlock)
+                    } else if summary.unreachable > 0 {
+                        Some(View::Refused)
+                    } else {
+                        None
+                    };
+                    if let Some(view) = view {
+                        h.raw("<a href=\"")
+                            .text(super::egress::job_href(id, view))
+                            .raw("\">");
+                    }
+                    super::job_network::badge(h, tone, &text, Some(&summary.text()));
+                    if view.is_some() {
+                        h.raw("</a>");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The most characters of each event's detail the events badge shows on hover: its end, which
 /// says what happened. The job's page has them whole.
 const TITLE_TAIL: usize = 160;
@@ -1332,7 +1411,7 @@ mod tests {
             egress: None,
         });
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), None, 1030);
+        record(&mut h, &j, &HashMap::new(), None, Shown::default(), 1030);
         let page = h.into_string();
         let escaped = format!("{}&lt;b&gt;: suspected lost interrupt", "x".repeat(300));
         assert!(
@@ -1360,7 +1439,7 @@ mod tests {
         events_badge(&mut h, &j);
         assert_eq!(h.into_string(), "");
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), None, 1030);
+        record(&mut h, &j, &HashMap::new(), None, Shown::default(), 1030);
         assert!(!h.into_string().contains("<th>Event</th>"));
     }
 
@@ -1375,7 +1454,7 @@ mod tests {
         j.stage = Some(crate::store::PREPARE_STAGE.into());
         let page = |j: &JobRow| {
             let mut h = Html::new();
-            record(&mut h, j, &HashMap::new(), None, 1030);
+            record(&mut h, j, &HashMap::new(), None, Shown::default(), 1030);
             h.into_string()
         };
         // Nothing said yet: preparing, for 30 seconds so far.
@@ -1718,13 +1797,90 @@ mod tests {
         assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
+    /// The Network column says what was blocked first, everything counted on hover, and keeps
+    /// a job without a report apart from one that reached nothing.
+    #[test]
+    fn a_job_s_network_shows_in_the_table() {
+        use crate::egress::testing::{entry, phase};
+        use vk_hub_proto::egress::{
+            EgressCoverage, EgressDestination, EgressLayer, EgressOutcome, EgressPhase,
+            EgressProtocol, EgressReport,
+        };
+        let cell = |j: &JobRow| {
+            let mut h = Html::new();
+            network_cell(&mut h, &"ab".repeat(16), j);
+            h.into_string()
+        };
+        let mut j = super::super::tests::history_job(1, "acme/web");
+        assert_eq!(cell(&j), "-");
+        j.node = Some("n1".into());
+        j.state = JobState::Running;
+        assert!(cell(&j).contains(">pending<"));
+        j.state = JobState::Finished;
+        j.started_at = Some(1_000);
+        assert!(cell(&j).contains(">unavailable<"), "{}", cell(&j));
+        let mut result = vk_hub_proto::job::JobResult {
+            failure: None,
+            exit_code: None,
+            message: None,
+            output_len: 0,
+            artifacts: vec![],
+            usage: None,
+            events: vec![],
+            egress: None,
+        };
+        let mut report = EgressReport {
+            phases: vec![phase(EgressPhase::Run, EgressCoverage::Complete)],
+            ..EgressReport::default()
+        };
+        result.egress = Some(report.clone());
+        j.result = Some(result.clone());
+        assert!(cell(&j).contains(">none blocked<"), "{}", cell(&j));
+        // Nothing listed of a phase the node did not record is no evidence of nothing blocked.
+        report.phases[0].coverage = EgressCoverage::Unavailable;
+        result.egress = Some(report.clone());
+        j.result = Some(result.clone());
+        assert_eq!(
+            cell(&j),
+            "<span class=\"badge warn\" title=\"No blocks recorded · incomplete record\">\
+             Incomplete</span>"
+        );
+        report.phases[0].coverage = EgressCoverage::Complete;
+        report.entries = vec![
+            entry(
+                EgressOutcome::Blocked,
+                EgressProtocol::Dns,
+                EgressDestination::domain("evil.example"),
+                Some(EgressLayer::NodeCap),
+            ),
+            entry(
+                EgressOutcome::Observed,
+                EgressProtocol::Dns,
+                EgressDestination::domain("crates.io"),
+                None,
+            ),
+        ];
+        result.egress = Some(report);
+        j.result = Some(result);
+        // Linked to the job's rows on the Egress page.
+        assert_eq!(
+            cell(&j),
+            format!(
+                "<a href=\"/egress?state=all&amp;job={}\"><span class=\"badge bad\" \
+                 title=\"Blocked: 1 destination (1 attempt) · Observed: 1 destination (1 \
+                 attempt)\">Blocked: 1 destination</span></a>",
+                "ab".repeat(16)
+            )
+        );
+    }
+
     /// Registry access ends the record, so record updates carry it after each placement.
     #[test]
     fn a_record_ends_with_the_job_s_registry_access() {
         use crate::store::{NoAccess, RegistryAccess};
         let mut j = super::super::tests::history_job(1, "acme/web");
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), None, 1030);
+        record(&mut h, &j, &HashMap::new(), None, Shown::default(), 1030);
         assert!(!h.into_string().contains("Registry access"));
         j.registry_access = Some(RegistryAccess::None {
             reason: NoAccess::MintFailed,
@@ -1732,7 +1888,7 @@ mod tests {
             url: None,
         });
         let mut h = Html::new();
-        record(&mut h, &j, &HashMap::new(), None, 1030);
+        record(&mut h, &j, &HashMap::new(), None, Shown::default(), 1030);
         let html = h.into_string();
         assert!(
             html.contains("<h2>Registry access</h2>") && html.contains("Minting its token failed"),

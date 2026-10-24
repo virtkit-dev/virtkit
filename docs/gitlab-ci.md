@@ -1531,9 +1531,10 @@ layer above leaves nothing of; and the bytes of each phase. The build phase is r
 or not audit is on, which only adds the summaries above to the trace. Once a build's or the
 run's log of denials or of contacts reaches 8 MiB, the switch only counts what else it sees, for
 the trace's lines and summaries too. While the job runs, the node sends what it recorded so far
-at each stage's start and every few seconds when it changed, and again after a reconnect; a hub
-older than the node gets the report with the result alone. Jobs run by gitlab-runner report
-nothing. See [Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
+at each stage's start and every few seconds when it changed, and again after a reconnect, so the
+hub's pages follow it; a hub older than the node gets the report with the result alone. Jobs run
+by gitlab-runner report nothing. See
+[Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
 
 The node also reports its own caps in its inventory, each phase as it holds jobs to it:
 `[egress]` under `[net] mode = "switch"` (nothing without a network, nothing enforced over a
