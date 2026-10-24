@@ -26,6 +26,23 @@ pub struct GitlabRow {
     pub created_by: String,
 }
 
+/// A refusal from [`Db::add_gitlab`] or [`Db::remove_gitlab`]: a bad name or URL, one taken, a
+/// relay bound to the instance, or one changed since asked. Its message can be shown to the user.
+#[derive(Debug)]
+pub struct GitlabRefused(pub String);
+
+impl std::fmt::Display for GitlabRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GitlabRefused {}
+
+fn refused(why: impl Into<String>) -> anyhow::Error {
+    GitlabRefused(why.into()).into()
+}
+
 /// Whether `s` is a GitLab project's full path: `/`-separated components of letters, digits,
 /// `_`, `.` and `-`, as GitLab allows them.
 pub fn valid_project_path(s: &str) -> bool {
@@ -111,30 +128,35 @@ impl Db {
     /// an earlier instance of that name remain.
     pub fn add_gitlab(&self, name: &str, url: &str, actor: &str, now: u64) -> Result<GitlabRow> {
         if !valid_gitlab_name(name) {
-            anyhow::bail!(
+            return Err(refused(format!(
                 "{name:?}: an instance's name is 1 to {MAX_GITLAB_NAME} lowercase letters, \
                  digits and '-', starting and ending with a letter or digit"
-            );
+            )));
         }
         let Some(url) = normalize_gitlab_url(url) else {
-            anyhow::bail!("{url:?} is not an http(s) URL");
+            return Err(refused(format!("{url:?} is not an http(s) URL")));
         };
         let txn = self.db.begin_write().context("starting a write")?;
         let row = {
             let mut table = txn.open_table(GITLABS)?;
             if table.get(name)?.is_some() {
-                anyhow::bail!("there is already an instance named {name}");
+                return Err(refused(format!(
+                    "there is already an instance named {name}"
+                )));
             }
             if egress_of(&txn, name, now)? {
-                anyhow::bail!(
+                return Err(refused(format!(
                     "the egress records of an earlier instance named {name} remain, until its \
                      jobs leave the history and its projects' mutes end; name this one otherwise"
-                );
+                )));
             }
             for entry in table.iter()? {
                 let (other, value) = entry?;
                 if decode::<GitlabRow>(value.value())?.url == url {
-                    anyhow::bail!("{url} is instance {} already", other.value());
+                    return Err(refused(format!(
+                        "{url} is instance {} already",
+                        other.value()
+                    )));
                 }
             }
             let row = GitlabRow {
@@ -176,7 +198,37 @@ impl Db {
     /// Remove instance `name` and forget its projects, audited as `actor`'s, and return
     /// whether it existed. Refused while a relay is bound to it.
     pub fn remove_gitlab(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
+        self.remove_gitlab_if(name, None, actor, now)
+    }
+
+    /// [`Db::remove_gitlab`], refused unless instance `name` is still `seen`: a namesake
+    /// added since is not the one an operator was asked about.
+    pub fn remove_gitlab_as_seen(
+        &self,
+        name: &str,
+        seen: &GitlabRow,
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
+        self.remove_gitlab_if(name, Some(seen), actor, now)
+    }
+
+    fn remove_gitlab_if(
+        &self,
+        name: &str,
+        seen: Option<&GitlabRow>,
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
+        if let Some(seen) = seen
+            && let Some(now_row) = txn.open_table(GITLABS)?.get(name)?
+            && decode::<GitlabRow>(now_row.value())? != *seen
+        {
+            return Err(refused(format!(
+                "instance {name} changed since you were asked; look again"
+            )));
+        }
         let url = txn
             .open_table(GITLABS)?
             .get(name)?
@@ -186,7 +238,9 @@ impl Db {
         if let Some(url) = &url
             && let Some(relay) = super::relays::relay_bound_to(&txn, url)?
         {
-            anyhow::bail!("relay {relay} is bound to instance {name}; remove it first");
+            return Err(refused(format!(
+                "relay {relay} is bound to instance {name}; remove it first"
+            )));
         }
         let removed = txn.open_table(GITLABS)?.remove(name)?.is_some();
         if removed {

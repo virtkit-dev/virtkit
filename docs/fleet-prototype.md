@@ -1037,8 +1037,9 @@ name, or, with none working, removes those of that name that no longer do. The h
 256 keys. No API key submits a GitLab job: only a relay does (below). A hub that bound keys to
 GitLab instances, before relays, converts them once at its first start: per instance it still
 knows, every project a bound key listed and every project its job history names is approved, and
-the bound keys are revoked and removed with their client instances, all audited as `hub`. Operators also create, revoke and remove keys on the web UI's `/clients` (see
-[Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
+the bound keys are revoked and removed with their client instances, all audited as `hub`.
+Operators also create, revoke and remove keys, and add and remove GitLab instances, on the web
+UI's `/clients` (see [Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.
 
@@ -1671,6 +1672,11 @@ of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the 
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
 with a `[hub]` table for `vk-gitlab`: `url` is the hub's node address, and `api_key_file`
 points to the key. The key never appears in live updates, logs or audit entries.
+
+Operators add a GitLab server on the *GitLab* tab with the same validation as `vk-hub gitlabs
+add`: a name and a URL, by a plain POST back to the tab. A server no relay is bound to has a
+*Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
+applies only to the server confirmed, not to a namesake added since. Both are audited.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require

@@ -267,10 +267,16 @@ fn an_instance_s_url_names_one_instance() {
     let db = Db::open_memory().unwrap();
     db.add_gitlab("gl", "https://GitLab.example.com/", "u", 1)
         .unwrap();
-    assert!(
-        db.add_gitlab("gl2", "https://gitlab.example.com:443", "u", 1)
-            .is_err()
-    );
+    // Refusals the web UI may show, as their own type.
+    for (name, url) in [
+        ("gl2", "https://gitlab.example.com:443"),
+        ("gl", "https://other.example.com"),
+        ("GL", "https://other.example.com"),
+        ("gl3", "ftp://other.example.com"),
+    ] {
+        let err = db.add_gitlab(name, url, "u", 1).unwrap_err();
+        assert!(err.is::<crate::store::GitlabRefused>(), "{name}: {err:#}");
+    }
 }
 
 #[test]

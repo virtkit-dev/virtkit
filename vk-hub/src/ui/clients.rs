@@ -15,6 +15,10 @@
 //! working key holds, removing them all; as on `/operations`, it posts with the CSRF token the
 //! page sets through `hx-headers`, and asks first ([`actions::ask_first`]). The store acts only
 //! on the keys the operator confirmed ([`crate::store::Db::revoke_api_keys_as_seen`]).
+//!
+//! On the GitLab tab, operators also add GitLab servers, as `vk-hub gitlabs add` does, by a
+//! plain form outside the fragment, and remove one no relay is bound to, as `vk-hub gitlabs
+//! remove` does, by a button in the fragment that asks first.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,8 +37,8 @@ use super::{Auth, Body, Ui, actions, blocking, field, page};
 use crate::clients::{InstanceView, KeyView};
 use crate::server::Hub;
 use crate::store::{
-    ANY_POOL, CLIENT_ACTIVE_SECS, GitlabRow, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged,
-    Role,
+    ANY_POOL, CLIENT_ACTIVE_SECS, GitlabRefused, GitlabRow, KeyOp, KeyPolicy, KeyRefused, KeyRow,
+    KeysChanged, RelayRow, Role,
 };
 
 /// The page, and where its forms post.
@@ -57,10 +61,11 @@ pub(super) const OTHER: &str = "/clients?tab=other";
 /// `/events/`. Both tabs' streams carry both tabs' fragments, rendered once for all of them.
 pub(super) const GITLAB_EVENT: &str = "gitlab";
 
-/// What the page shows: every key and its instances, and the GitLab servers.
+/// What the page shows: every key and its instances, the GitLab servers and the relays.
 struct Shown {
     views: Vec<KeyView>,
     gitlabs: Vec<(String, GitlabRow)>,
+    relays: Vec<(String, RelayRow)>,
 }
 
 impl Shown {
@@ -69,6 +74,7 @@ impl Shown {
         Ok(Shown {
             views: crate::clients::views(hub)?,
             gitlabs: hub.db.gitlabs()?,
+            relays: hub.db.relays()?,
         })
     }
 }
@@ -103,7 +109,11 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     let (id, event, fragment) = if other {
         ("clients", EVENT, fragment(&shown.views, now, steer))
     } else {
-        ("gitlab-servers", GITLAB_EVENT, gitlab_fragment(&shown))
+        (
+            "gitlab-servers",
+            GITLAB_EVENT,
+            gitlab_fragment(&shown, steer),
+        )
     };
     main.raw("<div id=\"")
         .raw(id)
@@ -118,31 +128,98 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
         main.raw("</div>");
         if other {
             create_form(&mut main, auth);
+        } else {
+            add_server_form(&mut main, auth);
         }
     }
     Ok(page(fleet::layout("Connections", PATH, auth, &main)))
 }
 
-/// The GitLab tab: the GitLab servers the hub takes jobs from.
-fn gitlab_fragment(shown: &Shown) -> Html {
+/// The GitLab tab: the GitLab servers the hub takes jobs from. With `steer`, a server no
+/// relay is bound to carries the button that removes it.
+fn gitlab_fragment(shown: &Shown, steer: bool) -> Html {
     let mut h = Html::new();
     h.raw("<section><h2>GitLab servers</h2>");
     if shown.gitlabs.is_empty() {
-        h.raw("<p class=\"empty\">None yet: <code>vk-hub gitlabs add &lt;name&gt; &lt;url&gt;</code> ")
-            .raw("adds one, and <code>vk-hub gitlabs approve</code> one a relay reports.</p>");
+        if steer {
+            h.raw("<p class=\"empty\">None yet: add one below or with <code>vk-hub gitlabs ")
+                .raw("add &lt;name&gt; &lt;url&gt;</code>, or approve one a relay reports.</p>");
+        } else {
+            h.raw("<p class=\"empty\">None yet: <code>vk-hub gitlabs add &lt;name&gt; ")
+                .raw("&lt;url&gt;</code> adds one, and <code>vk-hub gitlabs approve</code> one a ")
+                .raw("relay reports.</p>");
+        }
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th></tr></thead><tbody>");
+        h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th>");
+        if steer {
+            h.raw("<th>change</th>");
+        }
+        h.raw("</tr></thead><tbody>");
         for (name, row) in &shown.gitlabs {
             h.raw("<tr><td><strong>")
                 .text(name)
                 .raw("</strong></td><td>")
                 .text(&row.url)
-                .raw("</td></tr>");
+                .raw("</td>");
+            if steer {
+                h.raw("<td class=\"actions\">");
+                if !bound(&shown.relays, &row.url) {
+                    remove_server_button(&mut h, name);
+                }
+                h.raw("</td>");
+            }
+            h.raw("</tr>");
         }
         h.raw("</tbody></table>");
     }
     h.raw("</section>");
     h
+}
+
+/// Whether one of `relays` is bound to the GitLab server at `url`: while one is, the store
+/// refuses to remove the server.
+fn bound(relays: &[(String, RelayRow)], url: &str) -> bool {
+    relays
+        .iter()
+        .any(|(_, r)| r.server_url.as_deref() == Some(url))
+}
+
+/// A button posting the removal of the GitLab server named `name`: `remove` of a `server`, not
+/// of a key's `name`. No CSRF field: the page around the fragment sets the token as a header.
+fn remove_server_button(h: &mut Html, name: &str) {
+    h.raw("<form method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\" hx-post=\"")
+        .raw(PATH)
+        .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"remove\">")
+        .raw("<input type=\"hidden\" name=\"server\" value=\"")
+        .text(name)
+        .raw("\"><button class=\"danger\">Remove</button></form>");
+}
+
+/// The op adding a GitLab server.
+const ADD_SERVER: &str = "add-server";
+
+/// An operator's form adding a GitLab server, outside the live fragment: a plain POST.
+fn add_server_form(h: &mut Html, auth: &Auth) {
+    h.raw("<section><h2>Add a GitLab server</h2><form class=\"wide\" method=\"post\" ")
+        .raw("action=\"")
+        .raw(PATH)
+        .raw("\">");
+    csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"")
+        .raw(ADD_SERVER)
+        .raw("\"><label for=\"gitlab-name\">Name</label>")
+        .raw("<input id=\"gitlab-name\" type=\"text\" name=\"name\" autocomplete=\"off\" ")
+        .raw("spellcheck=\"false\" required placeholder=\"gl\">")
+        .raw("<label for=\"gitlab-url\">URL</label>")
+        .raw("<input id=\"gitlab-url\" type=\"url\" name=\"url\" autocomplete=\"off\" ")
+        .raw("spellcheck=\"false\" required placeholder=\"https://gitlab.example.com\">")
+        .raw("<button class=\"primary\">Add</button></form>")
+        .raw("<p class=\"sub\">As <code>vk-hub gitlabs add</code>, it approves the server ")
+        .raw("before a relay reports it: the name is what registry namespaces and egress rules ")
+        .raw("call the server, lowercase letters, digits and <code>-</code>; the URL is the one ")
+        .raw("its relays' <code>[gitlab] url</code> names.</p></section>");
 }
 
 /// The fragments, as one rendering for every page showing them: with the keys' buttons for an
@@ -159,7 +236,7 @@ pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
         let hub = hub.clone();
         Arc::new(move || {
             let shown = Shown::read(&hub)?;
-            Ok(gitlab_fragment(&shown).into_string())
+            Ok(gitlab_fragment(&shown, steer).into_string())
         })
     };
     sse::Events::from([(EVENT, other), (GITLAB_EVENT, gitlab)])
@@ -395,8 +472,9 @@ fn create_form(h: &mut Html, auth: &Auth) {
         .raw("empty is unbounded. The key is shown a single time.</p></section>");
 }
 
-/// `POST /clients`: create (`create`), revoke (`revoke`) or remove (`remove`) a key as the
-/// operator session's principal, as `vk-hub keys create` and `vk-hub keys revoke` do.
+/// `POST /clients`: create (`create`), revoke (`revoke`) or remove (`remove`) a key, or add
+/// (`add-server`) or remove (`remove` with a `server`) a GitLab server, as the operator session's
+/// principal, as `vk-hub keys create|revoke` and `vk-hub gitlabs add|remove` do.
 pub(super) async fn action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -410,7 +488,11 @@ pub(super) async fn action(
     match field(&form, "op") {
         Some("create") => create(ui, &auth, &form).await,
         Some("revoke") => revoke(ui, site, htmx, &auth, &form, KeyOp::Revoke).await,
+        Some("remove") if field(&form, "server").is_some() => {
+            remove_server(ui, site, htmx, &auth, &form).await
+        }
         Some("remove") => revoke(ui, site, htmx, &auth, &form, KeyOp::Remove).await,
+        Some(ADD_SERVER) => add_server(ui, &auth, &form).await,
         _ => Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
@@ -423,17 +505,7 @@ pub(super) async fn action(
 /// Its policy is checked as the CLI's: by [`crate::store::Db::create_api_key`], which refuses
 /// a bad name, pool or lifetime, and its limits parsed as the CLI parses them.
 async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
-    let refused = |why: String| {
-        let mut main = Html::new();
-        main.raw("<p class=\"message\">")
-            .text(format!("Refused: {why}."))
-            .raw("</p><p><a href=\"")
-            .raw(OTHER)
-            .raw("\">Back to the API clients</a></p>");
-        let mut resp = page(fleet::layout("API key", PATH, auth, &main));
-        *resp.status_mut() = StatusCode::BAD_REQUEST;
-        resp
-    };
+    let refused = |why: String| refused_page(auth, "API key", OTHER, &why);
     let mut scopes = Vec::new();
     for (_, s) in form.iter().filter(|(k, _)| k == "scope") {
         match crate::parse_scope(s) {
@@ -509,6 +581,154 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
         .raw(OTHER)
         .raw("\">Back to the API clients</a></p>");
     Ok(page(fleet::layout("API key", PATH, auth, &main)))
+}
+
+/// A plain form's refusal, `why`, as a page titled `title` leading back to `back`.
+fn refused_page(auth: &Auth, title: &str, back: &'static str, why: &str) -> Response<Body> {
+    let mut main = Html::new();
+    main.raw("<p class=\"message\">")
+        .text(format!("Refused: {why}."))
+        .raw("</p><p><a href=\"")
+        .raw(back)
+        .raw("\">")
+        .raw(if back == OTHER {
+            "Back to the API clients"
+        } else {
+            "Back to the GitLab servers"
+        })
+        .raw("</a></p>");
+    let mut resp = page(fleet::layout(title, PATH, auth, &main));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
+}
+
+/// Add the GitLab server `form` names, checked and audited by
+/// [`crate::store::Db::add_gitlab`] as for `vk-hub gitlabs add`, then back to the GitLab tab.
+/// The relays bound to it are told it is approved.
+async fn add_server(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
+    let name = field(form, "name").unwrap_or("").trim().to_string();
+    let url = field(form, "url").unwrap_or("").to_string();
+    let (hub, principal, named) = (ui.hub.clone(), auth.session.principal(), name.clone());
+    let added = blocking(move || {
+        let added = hub
+            .db
+            .add_gitlab(&named, &url, &principal, crate::now_secs());
+        if let Ok(row) = &added {
+            crate::relays::server_changed(&hub, &row.url)?;
+        }
+        Ok(added)
+    })
+    .await?;
+    let row = match added {
+        Ok(row) => row,
+        Err(e) if e.is::<GitlabRefused>() => {
+            return Ok(refused_page(auth, "GitLab server", PATH, &e.to_string()));
+        }
+        Err(e) => return Err(e),
+    };
+    ui.hub.clients_changed();
+    eprintln!(
+        "vk-hub: ui: {} added GitLab instance {name} at {}",
+        auth.session.principal(),
+        row.url
+    );
+    Ok(see_other(PATH))
+}
+
+/// Remove the GitLab server `form` names (`server`) once confirmed, as `vk-hub gitlabs remove`
+/// does. The question names the server as it was added, and the store removes it only if it
+/// still is, so a namesake added since is left alone; it refuses while a relay is bound to it
+/// ([`crate::store::Db::remove_gitlab_as_seen`]).
+async fn remove_server(
+    ui: &Ui,
+    site: &FleetSite,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+) -> Result<Response<Body>> {
+    let name = field(form, "server").unwrap_or("").to_string();
+    let (hub, named) = (ui.hub.clone(), name.clone());
+    let row = blocking(move || hub.db.gitlab(&named)).await?;
+    let Some(row) = row else {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such GitLab server.",
+        ));
+    };
+    let mut detail = Html::new();
+    detail
+        .raw("<p><strong>")
+        .text(&name)
+        .raw("</strong>: ")
+        .text(&row.url)
+        .raw(", added by ")
+        .text(&row.created_by)
+        .raw("</p>");
+    let ask = actions::Ask {
+        path: PATH.to_string(),
+        back: PATH.to_string(),
+        op: "remove".to_string(),
+        what: "Remove this GitLab server? Its projects' approvals go with it, and a relay that \
+               reports it again waits for approval; its name stays taken until its jobs leave \
+               the history.",
+        detail,
+        asked: vec![
+            ("server", name.clone()),
+            ("added", format!("{} {}", row.created_at, row.url)),
+        ],
+    };
+    if let Some(asked) = actions::ask_first(&site.questions, fleet::layout, htmx, auth, form, &ask)?
+    {
+        return Ok(asked);
+    }
+    let (hub, principal, named) = (ui.hub.clone(), auth.session.principal(), name.clone());
+    let done = blocking(move || {
+        Ok(hub
+            .db
+            .remove_gitlab_as_seen(&named, &row, &principal, crate::now_secs()))
+    })
+    .await?;
+    match done {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::NOT_FOUND,
+                "There is no such GitLab server.",
+            ));
+        }
+        Err(e) if e.is::<GitlabRefused>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e}."),
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    ui.hub.clients_changed();
+    eprintln!(
+        "vk-hub: ui: {} removed GitLab instance {name}",
+        auth.session.principal()
+    );
+    if !htmx {
+        return Ok(see_other(PATH));
+    }
+    let mut h = Html::new();
+    h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
+        .text(format!("Removed GitLab server {name}."))
+        .raw("</div>");
+    Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
+}
+
+/// A redirect to `to`, after a plain form's post.
+fn see_other(to: &'static str) -> Response<Body> {
+    let mut resp = Response::new(Body::default());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static(to));
+    resp
 }
 
 /// What a revoke or remove of the keys named `name` acts on, as `vk-hub keys revoke <name>`:
@@ -644,11 +864,7 @@ async fn revoke(
         auth.session.principal()
     );
     if !htmx {
-        let mut resp = Response::new(Body::default());
-        *resp.status_mut() = StatusCode::SEE_OTHER;
-        resp.headers_mut()
-            .insert(header::LOCATION, HeaderValue::from_static(back));
-        return Ok(resp);
+        return Ok(see_other(back));
     }
     let mut h = Html::new();
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")

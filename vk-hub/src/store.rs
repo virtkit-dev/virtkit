@@ -66,7 +66,7 @@ pub use egress_rules::{
     DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, RulesChanged, phase_text as rule_phase_text,
     resolve_egress,
 };
-pub use gitlabs::{GitlabRow, normalize_gitlab_url, valid_gitlab_name};
+pub use gitlabs::{GitlabRefused, GitlabRow, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
     PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,

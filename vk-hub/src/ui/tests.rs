@@ -7943,6 +7943,184 @@ async fn api_keys_and_their_instances_are_on_the_other_tab() {
     assert_eq!(reply.header("location"), Some("/clients?tab=other"));
 }
 
+/// A relay enrolled with key `key` and bound to the GitLab server at `url`.
+fn bound_relay(hub: &Hub, key: &str, url: &str) -> String {
+    use crate::store::{RelayEnrollment, RelayWrite, TokenKind};
+    let now = crate::now_secs();
+    let (token, _) = hub
+        .db
+        .create_token_for(TokenKind::Gitlab, Duration::from_secs(60), None, "u", now)
+        .unwrap();
+    let RelayEnrollment::Enrolled { id } = hub
+        .db
+        .enroll_relay(&token, key, "relay-1", "peer p", now)
+        .unwrap()
+    else {
+        panic!("not enrolled");
+    };
+    let inventory = vk_hub_proto::gitlab::Inventory {
+        version: "0.96.0".into(),
+        hostname: "relay-1".into(),
+        server: vk_hub_proto::gitlab::Server {
+            url: url.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    hub.db
+        .record_relay(&id, RelayWrite::Inventory(inventory), now)
+        .unwrap();
+    id
+}
+
+/// An operator adds a GitLab server from the GitLab tab, refused with the CLI's reason for a
+/// bad name or URL or one taken, and removes one once asked, only while no relay is bound to
+/// it and only the server asked about; each is audited and the tab follows live. A viewer gets
+/// no form nor button and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_adds_and_removes_gitlab_servers() {
+    let (addr, hub, origin) = start_fleet().await;
+    let good = "op=add-server&name=gl&url=https%3A%2F%2FGitLab.example.com%2F";
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(page.contains("<code>vk-hub gitlabs add"), "{page}");
+    for not in ["Add a GitLab server", "<form class=\"wide\""] {
+        assert!(!page.contains(not), "{not}: {page}");
+    }
+    for form in [good, "op=remove&server=gl"] {
+        let form = format!("_csrf={viewer_csrf}&{form}");
+        let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
+        assert_eq!(reply.status, 403, "{form}: {}", reply.body);
+    }
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients", Some(&operator)).await.body;
+    for want in [
+        "None yet: add one below",
+        "<h2>Add a GitLab server</h2><form class=\"wide\" method=\"post\" \
+         action=\"/clients\">",
+        "<input type=\"hidden\" name=\"op\" value=\"add-server\">",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    let mut live = Events::open(addr, "/events/gitlab", &operator).await;
+    live.next().await.unwrap();
+    let reply = post_action(addr, &origin, &operator, "/clients", good, false).await;
+    assert_eq!(reply.status, 403, "no CSRF token: {}", reply.body);
+    let form = format!("_csrf={csrf}&{good}");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(
+        hub.db.gitlab("gl").unwrap().map(|g| g.url).as_deref(),
+        Some("https://gitlab.example.com")
+    );
+    audited(
+        &hub,
+        "added GitLab instance gl at https://gitlab.example.com",
+    )
+    .await;
+    let event = next_with(&mut live, "<strong>gl</strong>").await;
+    assert!(
+        event.contains("<input type=\"hidden\" name=\"server\" value=\"gl\">"),
+        "{event}"
+    );
+    for (bad, said) in [
+        (
+            "name=GL&url=https%3A%2F%2Fa.example",
+            "an instance&#39;s name is",
+        ),
+        ("name=a&url=ftp%3A%2F%2Fa.example", "is not an http(s) URL"),
+        (
+            "name=gl&url=https%3A%2F%2Fa.example",
+            "already an instance named gl",
+        ),
+        (
+            "name=b&url=https%3A%2F%2Fgitlab.example.com",
+            "is instance gl already",
+        ),
+    ] {
+        let form = format!("_csrf={csrf}&op=add-server&{bad}");
+        let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+        assert!(reply.body.contains(said), "{bad}: {said}: {}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains("<a href=\"/clients\">Back to the GitLab servers"),
+            "{}",
+            reply.body
+        );
+    }
+    assert_eq!(hub.db.gitlabs().unwrap().len(), 1);
+
+    // While a relay is bound to it: no button, and a post is refused.
+    let now = crate::now_secs();
+    let relay = bound_relay(&hub, "aa", "https://gitlab.example.com");
+    let page = get(addr, "/clients", Some(&operator)).await.body;
+    assert!(!page.contains("name=\"server\""), "{page}");
+    let form = format!("_csrf={csrf}&op=remove&server=gl");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert!(reply.body.contains("Yes, remove"), "{}", reply.body);
+    let answer = format!(
+        "{form}&added={}&nonce={}&confirm=yes",
+        hidden(&reply.body, "added").replace(' ', "+"),
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains(&format!("relay {relay} is bound to instance gl")),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.gitlab("gl").unwrap().is_some());
+
+    // Asked about one server, a namesake added since is left alone.
+    assert!(hub.db.remove_relay(&relay, "uid 0", now).unwrap());
+    let page = get(addr, "/clients", Some(&operator)).await.body;
+    assert!(page.contains("name=\"server\" value=\"gl\""), "{page}");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
+    let answer = format!(
+        "{form}&added={}&nonce={}&confirm=yes",
+        hidden(&reply.body, "added").replace(' ', "+"),
+        hidden(&reply.body, "nonce")
+    );
+    assert!(hub.db.remove_gitlab("gl", "uid 0", now).unwrap());
+    hub.db
+        .add_gitlab("gl", "https://other.example.com", "uid 0", now)
+        .unwrap();
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(hub.db.gitlab("gl").unwrap().is_some());
+
+    // Removed once asked, back to the tab.
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    let answer = format!(
+        "{form}&added={}&nonce={}&confirm=yes",
+        hidden(&reply.body, "added").replace(' ', "+"),
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert!(hub.db.gitlab("gl").unwrap().is_none());
+    let audit = audited(&hub, "removed GitLab instance gl").await;
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.contains("(operator) removed GitLab instance gl")),
+        "{audit:?}"
+    );
+    next_with(&mut live, "None yet: add one below").await;
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
 /// A placed job's page shows rights per storage area in plain words, with token details
 /// folded away and never the token; or the reason it got no access.
 #[tokio::test(flavor = "multi_thread")]
