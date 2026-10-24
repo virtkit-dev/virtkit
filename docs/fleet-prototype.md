@@ -1205,9 +1205,13 @@ machine while it ran, beside why it failed: today a virtio-fs stall the VMM dete
 retried, counted in the VMM's stall warnings. `vk-hub jobs show <id>` prints one job's record,
 one field per line: outcome, exit code, node message, GitLab page, node, pool, key,
 submission/start/finish/settlement times, run time, VM size and resource usage, then an
-`event` line for each event with its first occurrence whole. It also prints the end of a
-finished job's output the hub kept, or before it is settled as much as settling would keep,
-made readable as in the web UI (below), so the job's escape sequences never reach the terminal.
+`event` line for each event with its first occurrence whole. For a job that ran on a node, a
+`network` line sums up its egress report, so far while it runs (or says reporting is
+unavailable), then `refused`, `blocked` and `would block` lines, at most 10 of each, give each
+one's deciding layer and the setting to check, and a `coverage` line per phase says whether the
+node recorded everything and the bytes it forwarded. It also prints the end of a finished job's
+output the hub kept, or before it is settled as much as settling would keep, made readable as in
+the web UI (below), so the job's escape sequences never reach the terminal.
 The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 

@@ -1793,6 +1793,21 @@ async fn a_job_s_egress_report_is_kept_bounded() {
         (run.coverage, run.omitted.blocked),
         (EgressCoverage::Partial, 10)
     );
+    // `vk-hub jobs show` sums it up, lists the first denials and says what it left out.
+    let (detail, _) = crate::jobs::detail(&hub, &id).unwrap().unwrap();
+    let shown = crate::render_job(&id, &detail, None, crate::now_secs());
+    for want in [
+        "network      Blocked: 512+ destinations (522 attempts) · incomplete record\n",
+        "blocked      DNS evil\u{fffd}[2J.example (run, job, 1 attempt): the node's cap; nothing to \
+         allow: not a name or an address\n",
+        "blocked      DNS d1.example (run, job, 1 attempt): the node's cap; check [egress] \
+         allow_name on its node\n",
+        "             … 502 more on the job's page\n",
+        "coverage     run: Partial: recording incomplete, 10 blocked attempts not listed; 1 bytes \
+         sent, 2 bytes received\n",
+    ] {
+        assert!(shown.contains(want), "{want}\n{shown}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

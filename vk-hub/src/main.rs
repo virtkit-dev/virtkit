@@ -2283,6 +2283,10 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
             egress::rules_applied_text(applied)
         ));
     }
+    for (key, value) in egress::lines(j) {
+        let value = vk_hub_proto::display_safe(&value);
+        out.push_str(&format!("{key:<12} {value}\n"));
+    }
     if let Some(output) = output {
         out.push_str(&format!(
             "\nThe last {} bytes of its output, masked as the node streamed it:\n",
