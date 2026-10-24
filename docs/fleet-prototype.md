@@ -1476,11 +1476,18 @@ it — a job newly sharing it, or one with more attempts — however soon after.
 mutes the row's project (for a key bound to no GitLab instance, every job of the key) with a
 reason, for 7 days, 30 days or until unmuted: its rows leave the inbox and the count, and stay
 listed under *Muted*, on their pages and on their jobs' pages; the page lists the mutes in
-force, each undone there or from a row's page. The state filter
-(`state=acknowledged|muted|all`) shows them; the default is the inbox, the New rows of projects
-not muted, which the navigation counts. Each acknowledgement, reopening, mute and unmute is
-audited as the operator's session, among people's actions; viewers see no form, and their
-posts are refused.
+force, each undone there or from a row's page. Two more states follow a proposal saved: *Allow
+saved, awaiting confirmation*, out of the inbox, an allow per phase keyed to the rules' generation
+its save left them at; then *Allowed by current policy* once, for every phase the row was refused
+in, a later job of the project placed under that generation or a later one, the rule saved applying
+to it, reaches the destination in that phase, is refused it by no VM, and reports the phase
+completely. A job placed under an earlier generation than the allow of each phase it was refused it
+in adds to the row without reopening it; any other that is refused it again, one with no generation
+recorded included, makes it New. Both states are checked against the rules saved now: one they no
+longer allow is marked. The state filter (`state=acknowledged|allow_saved|allowed|muted|all`) shows
+them; the default is the inbox, the New rows of projects not muted, which the navigation counts.
+Each acknowledgement, reopening, mute and unmute is audited as the operator's session, among
+people's actions; viewers see no form, and their posts are refused.
 
 `/egress?tab=observed`, the *Observed traffic* tab, lists what the jobs of the history reached,
 from their nodes' reports: each project, the latest first, with its jobs reported, its
@@ -1556,7 +1563,10 @@ lists, warned that they then reach every job of the project the rule selects, wh
 and warned of when these jobs mix both. It prefills the editor with the exact entry —
 `deb.debian.org`, which allows it and its subdomains, never broadened; an address as
 `10.0.0.1/32:443`, over TCP and UDP — and warns when the rule selects other projects, or is in
-dry-run. Nothing is saved but through Preview → Save.
+dry-run. Nothing is saved but through Preview → Save; a save from a row's proposal checks the
+row again, and in the rule's own write saves the row's allow for that phase, audited, when the
+rules as saved allow the destination to the row's latest job in it; the row's page then says
+whether they did.
 
 An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
 removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab

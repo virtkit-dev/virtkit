@@ -7,6 +7,15 @@
 //!
 //! A row is *New* until acknowledged, and again once a job adds to it after that: a share that
 //! is new or has more attempts moves the row's generation on, past the one acknowledged.
+//!
+//! An allow saved from the row's proposal ([`crate::egress::proposal`]) takes it out of New too,
+//! one per phase, keyed to the rules' generation it was saved at: *Allow saved, awaiting
+//! confirmation*, until a later job of its subject placed under that generation or a later one,
+//! with the rule saved applying to it, reaches the destination in that phase without being
+//! refused it, and reports the phase completely. A row whose every phase is so confirmed is
+//! *Allowed by current policy*. A job placed under an earlier generation than the allow of each
+//! phase it adds to the row in leaves the row standing; any other, one with no generation
+//! recorded included, reopens it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
@@ -15,9 +24,13 @@ use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use vk_hub_proto::egress::{EgressCoverage, EgressOutcome, EgressPhase};
+
 use super::jobs::{JOBS, JobRow};
 use super::{Db, append_audit, decode, encode};
 use crate::egress::blocked::{Finding, Share, Subject, View, shares};
+use crate::egress::matching::Dest;
+use crate::subject::JobClaims;
 
 /// Key: a row's ID ([`crate::egress::blocked::row_id`]). Value: JSON [`BlockedRow`].
 pub(super) const EGRESS_ROWS: TableDefinition<&str, &[u8]> = TableDefinition::new("egress_rows");
@@ -28,6 +41,10 @@ pub(super) const EGRESS_JOBS: TableDefinition<(&str, u64, &str), u64> =
 /// Key: a subject ([`Subject::param`]). Value: how many of its rows are New, kept in the
 /// writes that change them, so the count of New rows reads no row.
 pub(super) const EGRESS_NEW: TableDefinition<&str, u64> = TableDefinition::new("egress_new");
+/// Key: `(subject, row ID)` of each row whose allow awaits confirmation ([`AllowSaved`]), so
+/// that a job's subject finds its own. Value: the rules' generation it was saved at.
+pub(super) const EGRESS_ALLOWS: TableDefinition<(&str, &str), u64> =
+    TableDefinition::new("egress_allows");
 /// Key: a subject ([`Subject::param`]). Value: JSON [`Mute`].
 pub(super) const EGRESS_MUTES: TableDefinition<&str, &[u8]> = TableDefinition::new("egress_mutes");
 /// Key: `(view, state, u64::MAX - latest_at, row ID)` of each row ([`View::name`],
@@ -81,6 +98,44 @@ pub struct BlockedRow {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledged: Option<Acknowledged>,
+    /// The allows saved from its proposals, a phase's latest each, until a job reopens it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allows: Vec<AllowSaved>,
+}
+
+/// An allow saved for one phase of a row: the rule changed, and against which generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowSaved {
+    /// The rules' generation the save left them at.
+    pub generation: u64,
+    pub phase: EgressPhase,
+    pub rule: String,
+    /// The claims the rules were checked against: the row's latest job's; `None` for a job of a
+    /// key bound to no GitLab instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<JobClaims>,
+    pub by: String,
+    pub at: u64,
+    /// The job that confirmed it, once one has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Confirmed>,
+}
+
+/// The later job that reached a row's destination without being refused it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmed {
+    pub job: String,
+    pub at: u64,
+}
+
+/// What an allow is saved for: a row, the phase and rule its proposal changed, and the claims
+/// the rules are checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowRequest {
+    pub row: String,
+    pub phase: EgressPhase,
+    pub rule: String,
+    pub claims: Option<JobClaims>,
 }
 
 /// Who acknowledged a row, when, and as far as which generation.
@@ -91,28 +146,34 @@ pub struct Acknowledged {
     pub at: u64,
 }
 
-/// How a row stands as stored.
+/// How a row stands as stored: its triage but for whether the rules saved now allow what was
+/// saved for it, which only they say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stored {
     New,
     Acknowledged,
+    /// Not New, with allows saved.
+    Allows,
 }
 
 impl Stored {
-    pub const ALL: [Stored; 2] = [Stored::New, Stored::Acknowledged];
+    pub const ALL: [Stored; 3] = [Stored::New, Stored::Acknowledged, Stored::Allows];
 
     fn key(self) -> &'static str {
         match self {
             Stored::New => "new",
             Stored::Acknowledged => "acknowledged",
+            Stored::Allows => "allows",
         }
     }
 
     pub fn of(row: &BlockedRow) -> Stored {
         if row.is_new() {
             Stored::New
-        } else {
+        } else if row.allows.is_empty() {
             Stored::Acknowledged
+        } else {
+            Stored::Allows
         }
     }
 }
@@ -169,7 +230,38 @@ impl BlockedRow {
             phases: BTreeMap::new(),
             generation: 0,
             acknowledged: None,
+            allows: Vec::new(),
         }
+    }
+
+    /// Whether the rules `rules` allow its destination to the claims each of its allows was
+    /// saved for, in its phase: `false` without one.
+    pub fn allowed_by(&self, rules: &[crate::store::EgressRuleRow]) -> bool {
+        !self.allows.is_empty() && self.allows.iter().all(|a| self.allows_now(a, rules))
+    }
+
+    /// Whether the rules `rules` allow its destination as allow `a` was saved for.
+    pub fn allows_now(&self, a: &AllowSaved, rules: &[crate::store::EgressRuleRow]) -> bool {
+        let Finding::Denial {
+            view, destination, ..
+        } = &self.finding
+        else {
+            return false;
+        };
+        Dest::of(destination).is_some_and(|d| {
+            crate::egress::proposal::allows(*view, &a.rule, rules, a.claims.as_ref(), a.phase, &d)
+        })
+    }
+
+    /// Whether a job bore out an allow in every phase it was seen in.
+    pub fn confirmed(&self) -> bool {
+        !self.allows.is_empty()
+            && self.phases.keys().all(|p| {
+                self.allows.iter().any(|a| {
+                    crate::egress::proposal::phase_key(a.phase) == Some(p.as_str())
+                        && a.confirmed.is_some()
+                })
+            })
     }
 
     fn count(map: &mut BTreeMap<String, u64>, keys: &BTreeSet<&'static str>, add: bool) {
@@ -211,6 +303,7 @@ struct Tables<'t> {
     rows: redb::Table<'t, &'static str, &'static [u8]>,
     jobs: redb::Table<'t, (&'static str, u64, &'static str), u64>,
     new: redb::Table<'t, &'static str, u64>,
+    allows: redb::Table<'t, (&'static str, &'static str), u64>,
     index: Index<'t>,
 }
 
@@ -314,6 +407,7 @@ impl<'t> Tables<'t> {
             rows: txn.open_table(EGRESS_ROWS)?,
             jobs: txn.open_table(EGRESS_JOBS)?,
             new: txn.open_table(EGRESS_NEW)?,
+            allows: txn.open_table(EGRESS_ALLOWS)?,
             index: Index::open(txn)?,
         })
     }
@@ -340,6 +434,22 @@ impl<'t> Tables<'t> {
             }
             None => {
                 self.rows.remove(id)?;
+            }
+        }
+        // Indexed while an allow awaits confirmation, by the earliest generation of those.
+        let key = subject.param();
+        let due = row.and_then(|r| {
+            (r.allows.iter())
+                .filter(|a| a.confirmed.is_none())
+                .map(|a| a.generation)
+                .min()
+        });
+        match due {
+            Some(generation) => {
+                self.allows.insert((key.as_str(), id), generation)?;
+            }
+            None => {
+                self.allows.remove((key.as_str(), id))?;
             }
         }
         let is_new = row.is_some_and(BlockedRow::is_new);
@@ -410,6 +520,27 @@ pub(super) fn reshare(
             }
             if was.is_none_or(|w| share.attempts > w.attempts) {
                 row.generation = row.generation.saturating_add(1);
+                // A job placed before the allow of each phase it adds to the row in was saved
+                // leaves it standing; any other reopens it, one with no generation recorded
+                // included.
+                let placed = new
+                    .and_then(|j| j.egress_rules.as_ref())
+                    .map(|a| a.generation);
+                let before = share.phases.iter().all(|p| {
+                    row.allows.iter().any(|a| {
+                        crate::egress::proposal::phase_key(a.phase) == Some(*p)
+                            && placed.is_some_and(|g| g < a.generation)
+                    })
+                });
+                match (row.allows.is_empty(), before) {
+                    (true, _) => {}
+                    (false, true) => {
+                        if let Some(ack) = row.acknowledged.as_mut() {
+                            ack.generation = row.generation;
+                        }
+                    }
+                    (false, false) => row.allows.clear(),
+                }
             }
         }
         if row.jobs == 0 {
@@ -423,6 +554,142 @@ pub(super) fn reshare(
         t.put(row_id, Some(&row), indexed, &subject)?;
     }
     Ok(())
+}
+
+/// Confirm the allows of job `id`'s subject awaiting it that its record `job` bears out: placed
+/// under their generation or a later one, with their rule applying to it, it reached their
+/// destination in their phase and was refused it by no VM, and reported that phase completely.
+pub(super) fn confirm(
+    txn: &redb::WriteTransaction,
+    id: &str,
+    job: &JobRow,
+    now: u64,
+) -> Result<()> {
+    let (Some(placed), Some(report)) = (&job.egress_rules, crate::egress::report(job)) else {
+        return Ok(());
+    };
+    let subject = Subject::of(job);
+    let key = subject.param();
+    let mut t = Tables::open(txn)?;
+    let mut due = Vec::new();
+    for entry in t.allows.range((key.as_str(), "")..=(key.as_str(), "~"))? {
+        let (k, generation) = entry?;
+        if generation.value() <= placed.generation {
+            due.push(k.value().1.to_string());
+        }
+    }
+    if due.is_empty() {
+        return Ok(());
+    }
+    for row_id in due {
+        let Some(mut row) = t.get(&row_id)? else {
+            t.allows.remove((key.as_str(), row_id.as_str()))?;
+            continue;
+        };
+        let was = Indexed::of(&row);
+        let Finding::Denial {
+            view,
+            protocol,
+            destination,
+        } = row.finding.clone()
+        else {
+            continue;
+        };
+        let mut changed = false;
+        for a in row
+            .allows
+            .iter_mut()
+            .filter(|a| a.confirmed.is_none() && a.generation <= placed.generation)
+        {
+            // The rule saved applied to it: enforced, or for a would-block as the dry-run rule.
+            let applied = placed.rules.contains(&a.rule)
+                || (view == View::WouldBlock && placed.dry_run.contains(&a.rule));
+            let complete = report
+                .phases
+                .iter()
+                .any(|p| p.phase == a.phase && p.coverage == EgressCoverage::Complete);
+            let of_it = |e: &&vk_hub_proto::egress::EgressEntry| {
+                e.phase == a.phase && e.protocol == protocol && e.destination == destination
+            };
+            let reached = report.entries.iter().filter(of_it).any(|e| {
+                matches!(
+                    e.outcome,
+                    EgressOutcome::Observed | EgressOutcome::WouldBlock
+                )
+            });
+            let refused = report
+                .entries
+                .iter()
+                .filter(of_it)
+                .any(|e| match e.outcome {
+                    EgressOutcome::Observed => false,
+                    EgressOutcome::WouldBlock => view == View::WouldBlock,
+                    _ => true,
+                });
+            if applied && complete && reached && !refused {
+                a.confirmed = Some(Confirmed {
+                    job: id.to_string(),
+                    at: now,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            t.put(&row_id, Some(&row), Some(was), &subject)?;
+        }
+    }
+    Ok(())
+}
+
+/// Save an allow for `req`'s row as `actor`, its rule saved in `txn`, the rules now `rules` at
+/// `generation`, if they allow its destination to the claims and in the phase it names:
+/// audited. Return whether they did.
+pub(super) fn save_allow(
+    txn: &redb::WriteTransaction,
+    req: &AllowRequest,
+    generation: u64,
+    rules: &[crate::store::EgressRuleRow],
+    actor: &str,
+    now: u64,
+) -> Result<bool> {
+    let mut t = Tables::open(txn)?;
+    let Some(mut row) = t.get(&req.row)? else {
+        return Ok(false);
+    };
+    let was = Indexed::of(&row);
+    let allow = AllowSaved {
+        generation,
+        phase: req.phase,
+        rule: req.rule.clone(),
+        claims: req.claims.clone(),
+        by: actor.to_string(),
+        at: now,
+        confirmed: None,
+    };
+    if !row.allows_now(&allow, rules) {
+        return Ok(false);
+    }
+    // A phase's latest replaces its earlier one.
+    row.allows.retain(|a| a.phase != req.phase);
+    row.allows.push(allow);
+    row.acknowledged = Some(Acknowledged {
+        generation: row.generation,
+        by: actor.to_string(),
+        at: now,
+    });
+    let subject = row.subject.clone();
+    t.put(&req.row, Some(&row), Some(was), &subject)?;
+    let phase = crate::egress::phase_text(req.phase).to_ascii_lowercase();
+    let event = format!(
+        "{actor} saved an allow for egress {} {} for {}: rule {}, {phase} phase, rules \
+         generation {generation}",
+        view_text(row.finding.view()),
+        row.finding.text(),
+        row.who(),
+        req.rule,
+    );
+    append_audit(txn, None, actor, &event, now)?;
+    Ok(true)
 }
 
 /// A view as the audit log names it.
@@ -670,6 +937,8 @@ impl Db {
                 return Ok(None);
             };
             let was = Indexed::of(&row);
+            // An operator's triage replaces the allows saved.
+            row.allows.clear();
             row.acknowledged = acknowledge.then(|| Acknowledged {
                 generation: row.generation,
                 by: actor.to_string(),
@@ -845,6 +1114,151 @@ mod tests {
         assert!(db.egress_rows().unwrap().is_empty());
         assert_eq!(db.egress_new(0).unwrap(), 0);
         assert!(db.egress_row_jobs(&id, 10).unwrap().is_empty());
+    }
+
+    /// Job `n`, placed under rules generation `placed` (none recorded for `None`), ended with
+    /// `report`.
+    fn placed(db: &Db, n: u64, report: EgressReport, placed: Option<u64>) -> String {
+        let id = format!("{n:032x}");
+        let mut row = job(n, report);
+        row.egress_rules = placed.map(|generation| crate::store::EgressRulesApplied {
+            rules: vec![crate::store::DEFAULT_RULE.into()],
+            dry_run: vec![],
+            generation,
+        });
+        let mut queued = row.clone();
+        queued.result = None;
+        queued.revision = 1;
+        db.submit_job(&id, &queued, &id, b"{}", "key gitlab", 10)
+            .unwrap();
+        assert!(db.put_job(&id, &row, &[], 11).unwrap());
+        id
+    }
+
+    /// An allow saved takes a row out of New until a job placed under its generation refuses
+    /// it again; one placed before adds to it and leaves it standing. A later job reaching the
+    /// destination, its phase reported completely, confirms it. A save the rules as saved do
+    /// not bear out saves no allow.
+    #[test]
+    fn an_allow_saved_awaits_a_later_job_and_a_refusal_under_it_reopens_the_row() {
+        use vk_hub_proto::egress::{EgressCoverage, EgressPhase, HubPhase};
+
+        use crate::egress::testing::phase;
+        use crate::store::{AllowRequest, DEFAULT_RULE, RuleChange, RuleMode};
+        let db = Db::open_memory().unwrap();
+        let fallback = |names: &[&str]| RuleChange {
+            name: DEFAULT_RULE.into(),
+            subject: None,
+            run: Some(HubPhase::Unrestricted),
+            build: Some(HubPhase::Allow {
+                names: names.iter().map(|n| n.to_string()).collect(),
+                ips: vec![],
+            }),
+            mode: Some(RuleMode::Enforce),
+        };
+        db.put_egress_rule(&fallback(&[]), false, "uid 1", 1)
+            .unwrap();
+        let deb = || EgressDestination::domain("deb.debian.org");
+        let at_build = |e: EgressEntry| EgressEntry {
+            phase: EgressPhase::Build,
+            ..e
+        };
+        let refused = || EgressReport {
+            entries: vec![at_build(entry(
+                EgressOutcome::Blocked,
+                EgressProtocol::Dns,
+                deb(),
+                Some(EgressLayer::HubRule),
+            ))],
+            ..EgressReport::default()
+        };
+        let reached = |coverage| EgressReport {
+            entries: vec![at_build(entry(
+                EgressOutcome::Observed,
+                EgressProtocol::Dns,
+                deb(),
+                None,
+            ))],
+            phases: vec![phase(EgressPhase::Build, coverage)],
+            ..EgressReport::default()
+        };
+        placed(&db, 1, refused(), Some(1));
+        let (id, _) = only_row(&db);
+        let req = AllowRequest {
+            row: id.clone(),
+            phase: EgressPhase::Build,
+            rule: DEFAULT_RULE.into(),
+            claims: None,
+        };
+        // Another entry: the rules as saved still refuse it.
+        let (_, _, _, saved) = db
+            .put_egress_rule_allowing(&fallback(&["x.example"]), true, 1, &req, "uid 1", 2)
+            .unwrap();
+        assert!(!saved);
+        assert!(only_row(&db).1.is_new());
+        let (_, _, _, saved) = db
+            .put_egress_rule_allowing(&fallback(&["deb.debian.org"]), true, 2, &req, "uid 1", 3)
+            .unwrap();
+        assert!(saved);
+        let row = only_row(&db).1;
+        assert!(!row.is_new());
+        assert_eq!(
+            row.allows.iter().map(|a| a.generation).collect::<Vec<_>>(),
+            [3]
+        );
+        assert_eq!(db.egress_new(0).unwrap(), 0);
+
+        // Placed before the save: it adds to the row, and leaves it standing.
+        placed(&db, 2, refused(), Some(2));
+        let row = only_row(&db).1;
+        assert!(!row.is_new() && !row.allows.is_empty(), "{row:?}");
+        // Reached under it, but reported in part: no confirmation yet.
+        placed(&db, 3, reached(EgressCoverage::Partial), Some(3));
+        assert!(!only_row(&db).1.confirmed());
+        // Reached under it, but the rule saved did not apply to it.
+        let mut elsewhere = job(6, reached(EgressCoverage::Complete));
+        elsewhere.egress_rules = Some(crate::store::EgressRulesApplied {
+            rules: vec!["other".into()],
+            dry_run: vec![],
+            generation: 3,
+        });
+        let other = format!("{:032x}", 6);
+        let mut queued = elsewhere.clone();
+        queued.result = None;
+        queued.revision = 1;
+        db.submit_job(&other, &queued, &other, b"{}", "key gitlab", 10)
+            .unwrap();
+        db.put_job(&other, &elsewhere, &[], 11).unwrap();
+        assert!(!only_row(&db).1.confirmed());
+        let confirming = placed(&db, 4, reached(EgressCoverage::Complete), Some(3));
+        let row = only_row(&db).1;
+        assert!(row.confirmed());
+        assert_eq!(
+            row.allows[0].confirmed.as_ref().map(|c| c.job.clone()),
+            Some(confirming)
+        );
+        assert!(row.allowed_by(&db.egress_rules().unwrap().1));
+        assert!(!row.allowed_by(&[]));
+
+        // Refused again by a job with no generation recorded: New again.
+        placed(&db, 5, refused(), None);
+        let row = only_row(&db).1;
+        assert!(row.is_new() && row.allows.is_empty(), "{row:?}");
+        assert_eq!(db.egress_new(0).unwrap(), 1);
+        let audit: Vec<String> = db
+            .audits(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            audit.contains(
+                &"uid 1 saved an allow for egress blocked DNS deb.debian.org for key gitlab: rule \
+                  default, build phase, rules generation 3"
+                    .to_string()
+            ),
+            "{audit:?}"
+        );
     }
 
     /// Job `n` of key `k<n % 3>`, ended refused `10.0.0.<n % 7>:443`.

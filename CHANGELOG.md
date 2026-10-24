@@ -138,7 +138,9 @@ All notable changes to virtkit will be documented in this file.
   Network access or an Observed traffic destination outside the rules opens the rule editor
   prefilled with the exact destination and phase, for a rule that applies to the project or a
   new rule for exactly that project, saved only through Preview → Save. A refusal by a node's
-  cap or a job's own restrictions proposes nothing and says why.
+  cap or a job's own restrictions proposes nothing and says why. Once saved, the Blocked row
+  reads *Allow saved, awaiting confirmation*, then *Allowed by current policy* once a later
+  job reaches the destination; a job refused it again under the new rules reopens the row.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

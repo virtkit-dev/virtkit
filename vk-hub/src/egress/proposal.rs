@@ -111,6 +111,13 @@ pub struct Seed {
     pub project: Option<String>,
 }
 
+impl Seed {
+    /// The claims a save is checked against: its latest job's.
+    pub fn latest(&self) -> Option<&JobClaims> {
+        self.claims.first().and_then(Option::as_ref)
+    }
+}
+
 /// The phases of a run before a build, as [`super::blocked::phase_key`] names them.
 pub fn phase_key(p: EgressPhase) -> Option<&'static str> {
     match p {
@@ -569,6 +576,7 @@ mod tests {
             phases: BTreeMap::new(),
             generation: 1,
             acknowledged: None,
+            allows: Vec::new(),
         }
     }
 
@@ -584,6 +592,7 @@ mod tests {
         let seed = of_row(&row_of(&j), &[&j]).unwrap();
         assert_eq!(seed.entry.text, "deb.debian.org");
         assert_eq!(seed.phases, vec![EgressPhase::Build]);
+        assert_eq!(seed.latest().unwrap().project_id, 42);
         for (layer, why) in [
             (EgressLayer::NodeCap, NoProposal::NodeCap),
             (EgressLayer::Job, NoProposal::Narrowing),
@@ -696,6 +705,26 @@ mod tests {
         assert_eq!(new_name(&seed, &rules), "project-42");
         seed.project = Some("acme/wab".into());
         assert_eq!(new_name(&seed, &rules), "wab-2");
+        // Saved, the Fallback now allows it.
+        let mut after = rules.clone();
+        after[0].build = with_entry(&after[0].build, &seed.entry);
+        let dest = Dest::Name("deb.debian.org".into());
+        assert!(!allows(
+            View::Blocked,
+            "",
+            &rules,
+            seed.latest(),
+            EgressPhase::Build,
+            &dest
+        ));
+        assert!(allows(
+            View::Blocked,
+            "",
+            &after,
+            seed.latest(),
+            EgressPhase::Build,
+            &dest
+        ));
     }
 
     /// A would-block stands while its dry-run rule refuses it, whatever the enforced rules

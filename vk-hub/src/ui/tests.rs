@@ -9136,16 +9136,17 @@ fn placed_job(
 }
 
 /// A destination a hub rule refused is proposed for its project from its Blocked row, its job's
-/// page and Observed traffic, exactly as reported, to operators alone; the editor is prefilled.
-/// A node's cap proposes nothing.
+/// page and Observed traffic, exactly as reported, to operators alone; the editor is prefilled,
+/// and only Preview → Save saves it, which moves the row to Allow saved, awaiting confirmation,
+/// until a later job reaches it: Allowed by current policy. A node's cap proposes nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_hub_rule_s_denial_is_proposed_for_its_project() {
+async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_later_job() {
     use crate::store::RuleMode;
     use vk_hub_proto::egress::*;
-    let (addr, hub, _) = start_fleet().await;
+    let (addr, hub, origin) = start_fleet().await;
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     egress_rule(
         &hub,
         "acme",
@@ -9219,6 +9220,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project() {
         "<input type=\"radio\" name=\"target\" value=\"acme\" checked> <strong>acme</strong>",
         "allows deb.debian.org and its subdomains. Nothing broader is proposed",
         "name=\"build_names\" rows=\"3\" spellcheck=\"false\">crates.io\ndeb.debian.org</textarea>",
+        &format!("<input type=\"hidden\" name=\"from_row\" value=\"{deb}\">"),
         "> A new rule for exactly this project</label>",
     ] {
         assert!(body.contains(want), "{want}\n{body}");
@@ -9232,6 +9234,64 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project() {
     assert!(
         new.contains("name=\"project_id\" min=\"1\" value=\"42\""),
         "{new}"
+    );
+
+    // Previewed, then saved: the row awaits confirmation.
+    let preview = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &format!(
+            "_csrf={csrf}&op=preview&name=acme&gitlab=gl&projects=id&project_path=\
+             &project_id=42&protection=&git_ref=&run=unrestricted&run_names=&run_ips=\
+             &build=allow&build_names=crates.io%0Adeb.debian.org&build_ips=&mode=enforce\
+             &from_row={deb}&from_phase=build"
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(preview.status, 200, "{}", preview.body);
+    assert!(
+        preview.body.contains(&format!(
+            "Proposed for <a href=\"/egress/rows/{deb}\">a Blocked row</a>"
+        )),
+        "{}",
+        preview.body
+    );
+    let save = form_of(&preview.body, "save");
+    let saved = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &format!("_csrf={csrf}&{save}"),
+        false,
+    )
+    .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let back = format!("/egress/rows/{deb}?saved=build");
+    assert_eq!(saved.header("location"), Some(back.as_str()));
+    let page = get(addr, &back, Some(&operator)).await.body;
+    assert!(
+        page.contains("Saved: its allow awaits a later job"),
+        "{page}"
+    );
+    assert!(
+        page.contains(">Allow saved, awaiting confirmation</span>"),
+        "{page}"
+    );
+    let listed = get(addr, "/egress?state=allow_saved", Some(&viewer))
+        .await
+        .body;
+    assert!(
+        listed.contains("<code>DNS deb.debian.org</code>"),
+        "{listed}"
+    );
+    let inbox = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(
+        !inbox.contains("<code>DNS deb.debian.org</code>"),
+        "{inbox}"
     );
 
     // A later job reaches it, and another destination outside the rules: Observed traffic
@@ -9255,6 +9315,11 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project() {
         ..EgressReport::default()
     };
     placed_job(&hub, 3, 42, &node, reached, &["acme"]);
+    let listed = get(addr, "/egress?state=allowed", Some(&viewer)).await.body;
+    assert!(
+        listed.contains(">Allowed by current policy</span>"),
+        "{listed}"
+    );
     let observed = get(
         addr,
         "/egress?tab=observed&project=gitlab%3Agl%3A42",

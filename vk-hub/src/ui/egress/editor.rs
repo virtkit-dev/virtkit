@@ -22,8 +22,11 @@ use super::super::{Auth, Body, Ui, blocking, field, fleet, html_response, messag
 use super::rules::{self as tab, applies_to, mode_badge, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital, see_other};
 use crate::egress::preview::{self, Edit, Group, Lost, Preview};
+use crate::egress::proposal;
 use crate::egress::rules::{self as ops, Rules};
-use crate::store::{DEFAULT_RULE, EgressRuleRow, Role, RuleChange, RuleMode, RulesChanged};
+use crate::store::{
+    AllowRequest, DEFAULT_RULE, EgressRuleRow, Role, RuleChange, RuleMode, RulesChanged,
+};
 use crate::subject::Subject;
 
 /// Where the editor posts.
@@ -125,6 +128,10 @@ pub(super) struct Draft {
     pub(super) run: PhaseDraft,
     pub(super) build: PhaseDraft,
     pub(super) mode: RuleMode,
+    /// The Blocked row a proposal was made for, and its phase: what a save from it saves an
+    /// allow for, checked again then. Empty for none.
+    pub(super) from_row: String,
+    pub(super) from_phase: String,
 }
 
 impl Draft {
@@ -211,6 +218,14 @@ impl Draft {
             mode: field(form, "mode")
                 .and_then(RuleMode::parse)
                 .unwrap_or(RuleMode::DryRun),
+            from_row: field(form, "from_row")
+                .filter(|id| vk_hub_proto::valid_id(id))
+                .unwrap_or_default()
+                .to_string(),
+            from_phase: field(form, "from_phase")
+                .filter(|p| matches!(*p, "run" | "build"))
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -240,6 +255,10 @@ impl Draft {
             out.push((ips, p.ips.clone()));
         }
         out.push(("mode", self.mode.name().to_string()));
+        if !self.from_row.is_empty() {
+            out.push(("from_row", self.from_row.clone()));
+            out.push(("from_phase", self.from_phase.clone()));
+        }
         out
     }
 
@@ -391,6 +410,10 @@ pub(super) fn editor(h: &mut Html, d: &Draft, gitlabs: &[String], auth: &Auth) {
     hidden(h, "op", "preview");
     if d.new {
         hidden(h, "new", "1");
+    }
+    if !d.from_row.is_empty() {
+        hidden(h, "from_row", &d.from_row);
+        hidden(h, "from_phase", &d.from_phase);
     }
     if d.new && !d.is_fallback() {
         h.raw("<label>Name <input type=\"text\" name=\"name\" required maxlength=\"64\" ")
@@ -603,17 +626,34 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
     let saved = blocking(move || match change {
         Some(c) => {
             let exists = !matches!(&asked, Asked::Put(d) if d.new);
-            ops::save(&stored, &actor, &c, exists, generation).map(|_| asked)
+            let allow = match &asked {
+                Asked::Put(d) => allow_request(&stored, d)?,
+                Asked::Remove(_) => None,
+            };
+            match allow {
+                Some(req) => ops::save_allowing(&stored, &actor, &c, exists, generation, &req)
+                    .map(|_| (Some(req.row), asked)),
+                None => ops::save(&stored, &actor, &c, exists, generation).map(|_| (None, asked)),
+            }
         }
-        None => ops::remove_at(&stored, &actor, &name, generation).map(|_| asked),
+        None => ops::remove_at(&stored, &actor, &name, generation).map(|_| (None, asked)),
     })
     .await;
     match saved {
-        Ok(Asked::Remove(_)) => {
+        Ok((_, Asked::Remove(_))) => {
             ui.hub.egress_changed();
             Ok(see_other(tab::PATH))
         }
-        Ok(Asked::Put(d)) => {
+        // Back to the row it was proposed for, which says how its triage stands.
+        Ok((Some(row), Asked::Put(d))) => {
+            ui.hub.egress_changed();
+            let phase = &d.from_phase;
+            Ok(see_other(&format!(
+                "{}{row}?saved={phase}",
+                super::ROW_PREFIX
+            )))
+        }
+        Ok((None, Asked::Put(d))) => {
             ui.hub.egress_changed();
             Ok(see_other(&rule_href(&d.name)))
         }
@@ -639,6 +679,32 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
         }
         Err(e) => Err(e),
     }
+}
+
+/// The allow a save of `d` saves for the row it was proposed for, checked again: the row is
+/// still there, a hub rule still refused its destination to its latest jobs kept, in the phase
+/// `d` names. `None` for a draft no proposal made, or one that no longer holds.
+fn allow_request(hub: &crate::server::Hub, d: &Draft) -> Result<Option<AllowRequest>> {
+    if d.from_row.is_empty() {
+        return Ok(None);
+    }
+    let Some((row, jobs)) = super::kept(hub, &d.from_row)? else {
+        return Ok(None);
+    };
+    let jobs: Vec<&crate::store::JobRow> = jobs.iter().collect();
+    let Ok(seed) = proposal::of_row(&row, &jobs) else {
+        return Ok(None);
+    };
+    let Some(phase) = proposal::phase_of_key(&d.from_phase).filter(|p| seed.phases.contains(p))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AllowRequest {
+        row: d.from_row.clone(),
+        phase,
+        rule: d.name.clone(),
+        claims: seed.latest().cloned(),
+    }))
 }
 
 /// The form again, with why it was refused.
@@ -746,6 +812,16 @@ fn preview_page(
         name => h.raw("rule ").text(name),
     };
     h.raw("</h2>");
+    if let Asked::Put(d) = asked
+        && !d.from_row.is_empty()
+    {
+        h.raw("<p class=\"sub\">Proposed for <a href=\"")
+            .raw(super::ROW_PREFIX)
+            .text(&d.from_row)
+            .raw("\">a Blocked row</a>: saved, its triage moves to Allow saved, awaiting ")
+            .raw("confirmation, if the rules as saved allow its destination to its project's ")
+            .raw("latest job.</p>");
+    }
     if !rules.enabled {
         h.raw("<p class=\"callout\">Hub rules are off: saved, this change restricts nothing ")
             .raw("until <code>[jobs] egress_rules = true</code>. Below is what it would do with ")

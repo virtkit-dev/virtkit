@@ -200,6 +200,29 @@ pub fn save(
     Ok((row, changed))
 }
 
+/// [`save`], from a proposal for a Blocked row: the row's allow saved with the rule if the rules
+/// as changed allow its destination as `allow` asks ([`crate::store::Db::put_egress_rule_allowing`]).
+/// Returns whether the allow was saved.
+pub fn save_allowing(
+    hub: &Hub,
+    actor: &str,
+    change: &RuleChange,
+    exists: bool,
+    generation: u64,
+    allow: &crate::store::AllowRequest,
+) -> Result<bool> {
+    let (_, _, steered, saved) = hub.db.put_egress_rule_allowing(
+        change,
+        exists,
+        generation,
+        allow,
+        actor,
+        crate::now_secs(),
+    )?;
+    steered_fallback(hub, &steered);
+    Ok(saved)
+}
+
 /// Remove rule `name` as `actor`, as [`remove`] does, from a page's preview made against the
 /// rules' `generation`: refused with [`crate::store::RulesChanged`] if they have changed since.
 pub fn remove_at(hub: &Hub, actor: &str, name: &str, generation: u64) -> Result<bool> {

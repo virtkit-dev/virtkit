@@ -4,8 +4,8 @@
 //! `propose=observed&project=<subject>&contact=<contact>`, in one `phase`. The page chooses the
 //! rule to change — one that applies to the project's jobs now, or a new rule for exactly that
 //! project — and prefills the editor with the change ([`super::editor`]): nothing is saved but
-//! through its Preview → Save. Its choices are a plain GET form, so the page reads the same
-//! however it is reached.
+//! through its Preview → Save, and a save from a row's proposal checks the row again. Its
+//! choices are a plain GET form, so the page reads the same however it is reached.
 //!
 //! The destination is a guest's: it goes through [`Html::node`], and is never broadened.
 
@@ -312,7 +312,7 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
             .raw("it in this phase, and a new rule selects a GitLab project only.</p>");
         return h;
     };
-    let draft = match &chosen {
+    let mut draft = match &chosen {
         Chosen::Rule(r) => {
             let mut d = Draft::of_rule(r);
             let changed =
@@ -379,6 +379,10 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
             }
         }
     };
+    if let Some(id) = &p.row {
+        draft.from_row = id.clone();
+        draft.from_phase = proposal::phase_key(phase).unwrap_or("run").to_string();
+    }
     h.raw("<section><h3>");
     match &chosen {
         Chosen::Rule(r) => {
@@ -393,7 +397,14 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
         }
     }
     h.raw("</h3><p class=\"sub\">Prefilled: review it, then Preview changes. Save, from the ")
-        .raw("preview, is refused if the rules change in between.</p>");
+        .raw("preview, is refused if the rules change in between.");
+    if p.row.is_some() {
+        h.raw(
+            " Saved, the row's triage moves to Allow saved, awaiting confirmation, if the rules ",
+        )
+        .raw("as saved allow it to its project's latest job.");
+    }
+    h.raw("</p>");
     editor(&mut h, &draft, &p.gitlabs, auth);
     h.raw("</section>");
     h

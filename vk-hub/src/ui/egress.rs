@@ -5,12 +5,14 @@
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
 //! from its page, as their session's principal. A row a hub rule decided offers operators a
-//! proposal allowing it ([`propose`]). The *Observed traffic* tab is [`observed`]'s, the *Rules*
-//! tab [`rules`]'s, *Test a job* [`test_job`]'s. The rows and the views' counts follow the jobs'
-//! reports, a running job's as its record is written with them, and the rows' triage, over
-//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
-//! reads the view's rows from the store's indexes, the latest first, and at most [`ROW_BUDGET`]
-//! of them in all; streams of one filter share it ([`Renders`]).
+//! proposal allowing it ([`propose`]); one saved through Preview → Save moves the row to *Allow
+//! saved, awaiting confirmation*, then *Allowed by current policy* once a later job reaches it,
+//! each checked against the rules saved now. The *Observed traffic* tab is [`observed`]'s, the
+//! *Rules* tab [`rules`]'s, *Test a job* [`test_job`]'s. The rows and the views' counts follow
+//! the jobs' reports, a running job's as its record is written with them, and the rows' triage,
+//! over `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A
+//! rendering reads the view's rows from the store's indexes, the latest first, and at most
+//! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
@@ -34,7 +36,9 @@ use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, row_id, shares};
 use crate::egress::{self, Check};
 use crate::server::{HEARTBEAT, Hub};
-use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
+use crate::store::{
+    BlockedRow, EgressRuleRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored,
+};
 
 mod editor;
 mod observed;
@@ -92,19 +96,22 @@ struct Renders {
 type Latest = Arc<Mutex<Option<Rendered>>>;
 
 struct Rendered {
-    /// [`Hub::egress_generation`] before the rows were read.
-    generation: u64,
+    /// [`Hub::egress_generation`] and the rules' generation before the rows were read.
+    generations: (u64, u64),
     at: Instant,
     fragment: Arc<String>,
 }
 
 impl Rendered {
-    /// Whether it stands at `now` for `generation`: for [`super::sse`]'s debounce past a
+    /// Whether it stands at `now` for `generations`: for [`super::sse`]'s debounce past a
     /// change, so streams rendering within it share one rendering however fast the jobs' reports
-    /// change, and for half a heartbeat at most, for the ages shown and mutes ending.
-    fn stands(&self, generation: u64, now: Instant) -> bool {
+    /// change, and for half a heartbeat at most, for the ages shown and mutes ending. A change to
+    /// the rules, which the triage reads, renders it again at once.
+    fn stands(&self, generations: (u64, u64), now: Instant) -> bool {
         let age = now.saturating_duration_since(self.at);
-        age < HEARTBEAT / 2 && (generation == self.generation || age < SHARED)
+        age < HEARTBEAT / 2
+            && generations.1 == self.generations.1
+            && (generations.0 == self.generations.0 || age < SHARED)
     }
 }
 
@@ -131,9 +138,9 @@ impl Renders {
         };
         let mut rendered = lock(&entry);
         // Taken before the rows are read, so a change made meanwhile renders them again.
-        let generation = hub.egress_generation();
+        let generations = (hub.egress_generation(), hub.db.egress_rules()?.0);
         if let Some(r) = rendered.as_ref()
-            && r.stands(generation, now)
+            && r.stands(generations, now)
         {
             return Ok(r.fragment.clone());
         }
@@ -144,7 +151,7 @@ impl Renders {
         self.rendered
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *rendered = Some(Rendered {
-            generation,
+            generations,
             at: now,
             fragment: fragment.clone(),
         });
@@ -174,19 +181,32 @@ enum State {
     New,
     /// Acknowledged rows of subjects not muted.
     Acknowledged,
+    /// Rows of subjects not muted whose allow awaits confirmation.
+    AllowSaved,
+    /// Rows of subjects not muted whose allow a later job bore out.
+    Allowed,
     /// Rows of muted subjects, however they stand.
     Muted,
     All,
 }
 
 impl State {
-    const ALL: [State; 4] = [State::New, State::Acknowledged, State::Muted, State::All];
+    const ALL: [State; 6] = [
+        State::New,
+        State::Acknowledged,
+        State::AllowSaved,
+        State::Allowed,
+        State::Muted,
+        State::All,
+    ];
 
     /// The query's value; empty for the default.
     fn name(self) -> &'static str {
         match self {
             State::New => "",
             State::Acknowledged => "acknowledged",
+            State::AllowSaved => "allow_saved",
+            State::Allowed => "allowed",
             State::Muted => "muted",
             State::All => "all",
         }
@@ -196,6 +216,8 @@ impl State {
         match self {
             State::New => "New",
             State::Acknowledged => "Acknowledged",
+            State::AllowSaved => "Allow saved, awaiting confirmation",
+            State::Allowed => "Allowed by current policy",
             State::Muted => "Muted",
             State::All => "Every state",
         }
@@ -210,6 +232,7 @@ impl State {
         match self {
             State::New => &[Stored::New],
             State::Acknowledged => &[Stored::Acknowledged],
+            State::AllowSaved | State::Allowed => &[Stored::Allows],
             State::Muted | State::All => &Stored::ALL,
         }
     }
@@ -218,25 +241,39 @@ impl State {
         match self {
             State::New => triage == Triage::New && !muted,
             State::Acknowledged => triage == Triage::Acknowledged && !muted,
+            State::AllowSaved => matches!(triage, Triage::AllowSaved { .. }) && !muted,
+            State::Allowed => triage == Triage::Allowed && !muted,
             State::Muted => muted,
             State::All => true,
         }
     }
 }
 
-/// How a row stands.
+/// How a row stands, its allow checked against the rules saved now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Triage {
     New,
     Acknowledged,
+    /// An allow saved and not borne out yet, or no longer allowed by the rules saved now.
+    AllowSaved {
+        /// Whether the rules saved now still allow it.
+        allowed: bool,
+    },
+    /// A later job reached it without being refused it, and the rules saved now allow it.
+    Allowed,
 }
 
 impl Triage {
-    fn of(row: &BlockedRow) -> Triage {
+    fn of(row: &BlockedRow, rules: &[EgressRuleRow]) -> Triage {
         if row.is_new() {
-            Triage::New
-        } else {
-            Triage::Acknowledged
+            return Triage::New;
+        }
+        if row.allows.is_empty() {
+            return Triage::Acknowledged;
+        }
+        match (row.confirmed(), row.allowed_by(rules)) {
+            (true, true) => Triage::Allowed,
+            (_, allowed) => Triage::AllowSaved { allowed },
         }
     }
 }
@@ -339,6 +376,8 @@ struct Listing {
     unreported: Vec<(String, String)>,
     /// The mutes in force, by subject.
     mutes: HashMap<String, Mute>,
+    /// The egress rules saved now, that rows' allows are checked against.
+    rules: Vec<EgressRuleRow>,
     /// The rows read from the indexes.
     #[cfg(test)]
     read: usize,
@@ -376,6 +415,7 @@ fn unreported(hub: &Hub) -> Result<Vec<(String, String)>> {
 fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
     let now = crate::now_secs();
     let mutes = hub.db.egress_mutes(now)?;
+    let rules = hub.db.egress_rules()?.1;
     let job = match &filter.job {
         Some(id) => hub.db.job(id)?,
         None => None,
@@ -384,7 +424,7 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
     let any = totals.values().any(|n| *n > 0);
     let admits = |id: &str, row: &BlockedRow| {
         let muted = mutes.contains_key(&row.subject.param());
-        filter.admits(id, row, Triage::of(row), muted, None)
+        filter.admits(id, row, Triage::of(row, &rules), muted, None)
     };
     let view = filter.view();
     let mut l = Listing {
@@ -396,6 +436,7 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
         job: None,
         unreported: unreported(hub)?,
         mutes: HashMap::new(),
+        rules: Vec::new(),
         #[cfg(test)]
         read: 0,
     };
@@ -459,9 +500,11 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
             ControlFlow::Continue(())
         })?;
         l.shown = shown;
-        // Kept counts say how many rows each state holds, by subject: they answer a filter with
-        // no layer or phase.
-        let kept = filter.layer.is_none() && filter.phase.is_none();
+        // Kept counts say how many rows each state holds, by subject: they answer a filter of a
+        // state the rules play no part in, with no layer or phase.
+        let kept = filter.layer.is_none()
+            && filter.phase.is_none()
+            && !matches!(filter.state, State::AllowSaved | State::Allowed);
         // The counts the shown subjects add, and those the muted take from every subject's.
         let (mut added, mut taken) = (Vec::new(), Vec::new());
         if kept {
@@ -520,6 +563,7 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
     }
     l.job = job;
     l.mutes = mutes;
+    l.rules = rules;
     Ok(l)
 }
 
@@ -657,7 +701,7 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
         });
         return;
     }
-    rows_table(h, filter, &l.shown, &l.mutes);
+    rows_table(h, filter, &l.shown, &l.mutes, &l.rules);
     let count = l.counts.iter().find(|(v, _)| *v == view).map(|(_, c)| *c);
     let shown = u64::try_from(l.shown.len()).unwrap_or(u64::MAX);
     match count {
@@ -897,6 +941,7 @@ fn rows_table(
     filter: &Filter,
     rows: &[(String, BlockedRow)],
     mutes: &HashMap<String, Mute>,
+    rules: &[EgressRuleRow],
 ) {
     let view = filter.view();
     let refused = view == View::Refused;
@@ -938,7 +983,12 @@ fn rows_table(
         h.raw("<td>");
         pages::at(h, row.latest_at);
         h.raw("</td><td>").text(layers_text(row)).raw("</td><td>");
-        state_badge(h, row, Triage::of(row), mutes.get(&row.subject.param()));
+        state_badge(
+            h,
+            row,
+            Triage::of(row, rules),
+            mutes.get(&row.subject.param()),
+        );
         h.raw("</td></tr>");
     }
     h.raw("</tbody></table>");
@@ -964,7 +1014,11 @@ fn layers_text(row: &BlockedRow) -> String {
 
 /// How a row stands, and whether its subject is `muted`, the mute's reason on hover.
 fn state_badge(h: &mut Html, row: &BlockedRow, triage: Triage, muted: Option<&Mute>) {
-    let by = row.acknowledged.as_ref().map(|a| &a.by);
+    let by = row
+        .allows
+        .last()
+        .map(|a| &a.by)
+        .or(row.acknowledged.as_ref().map(|a| &a.by));
     match (triage, by) {
         (Triage::New, _) | (_, None) => {
             h.raw("<span class=\"badge bad\">New</span>");
@@ -973,6 +1027,20 @@ fn state_badge(h: &mut Html, row: &BlockedRow, triage: Triage, muted: Option<&Mu
             h.raw("<span class=\"badge\" title=\"By ")
                 .text(by)
                 .raw("\">Acknowledged</span>");
+        }
+        (Triage::AllowSaved { allowed }, Some(by)) => {
+            h.raw(if allowed {
+                "<span class=\"badge\" title=\"By "
+            } else {
+                "<span class=\"badge warn\" title=\"No longer allowed by the rules saved now; by "
+            })
+            .text(by)
+            .raw("\">Allow saved, awaiting confirmation</span>");
+        }
+        (Triage::Allowed, Some(by)) => {
+            h.raw("<span class=\"badge ok\" title=\"Allow saved by ")
+                .text(by)
+                .raw("\">Allowed by current policy</span>");
         }
     }
     if let Some(m) = muted {
@@ -996,6 +1064,10 @@ struct RowDetail {
     names: HashMap<String, String>,
     /// Its subject's mute in force.
     mute: Option<Mute>,
+    /// The egress rules saved now.
+    rules: Vec<EgressRuleRow>,
+    /// The phase a save from its proposal it follows was for.
+    saved: Option<vk_hub_proto::egress::EgressPhase>,
 }
 
 /// Row `id` and its latest jobs kept, the latest first: what its proposal is made from.
@@ -1010,8 +1082,15 @@ pub(super) fn kept(hub: &Hub, id: &str) -> Result<Option<(BlockedRow, Vec<JobRow
     Ok(Some((row, jobs)))
 }
 
-/// `GET /egress/rows/<id>`.
-pub(super) async fn row(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+/// `GET /egress/rows/<id>[?saved=run|build]`.
+pub(super) async fn row(
+    id: &str,
+    query: Option<&str>,
+    auth: &Auth,
+    ui: &Ui,
+) -> Result<Response<Body>> {
+    let saved = field(&decode_form(query.unwrap_or("").as_bytes()), "saved")
+        .and_then(crate::egress::proposal::phase_of_key);
     let (hub, wanted) = (ui.hub.clone(), id.to_string());
     let detail = blocking(move || {
         let Some(row) = hub.db.egress_row(&wanted)? else {
@@ -1032,6 +1111,8 @@ pub(super) async fn row(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>
             jobs,
             names,
             mute,
+            rules: hub.db.egress_rules()?.1,
+            saved,
         }))
     })
     .await?;
@@ -1100,7 +1181,7 @@ fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
     h.raw("<section><h2>Summary</h2><table class=\"kv\"><tbody>");
     pages::kv_html(&mut h, "State", &{
         let mut b = Html::new();
-        state_badge(&mut b, row, Triage::of(row), d.mute.as_ref());
+        state_badge(&mut b, row, Triage::of(row, &d.rules), d.mute.as_ref());
         b
     });
     pages::kv(&mut h, "Jobs", &format!("{} in the history", row.jobs));
@@ -1337,24 +1418,61 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
     } else {
         "key"
     };
-    h.raw("<section><h2>Triage</h2><p>");
-    match &row.acknowledged {
-        Some(a) if !row.is_new() => {
+    h.raw("<section><h2>Triage</h2>");
+    if let Some(phase) = d.saved {
+        saved_callout(h, row, phase);
+    }
+    h.raw("<p>");
+    let triage = Triage::of(row, &d.rules);
+    match (triage, &row.acknowledged) {
+        (Triage::AllowSaved { .. } | Triage::Allowed, _) => {
+            h.raw(match triage {
+                Triage::Allowed => "Allowed by current policy.",
+                _ => "Allow saved, awaiting confirmation.",
+            })
+            .raw("</p><ul class=\"access\">");
+            for a in &row.allows {
+                allow_item(h, row, a, &d.rules);
+            }
+            for (key, label) in PHASES {
+                let has = row
+                    .allows
+                    .iter()
+                    .any(|a| crate::egress::proposal::phase_key(a.phase) == Some(key));
+                if row.phases.contains_key(key) && !has {
+                    h.raw("<li>")
+                        .raw(label)
+                        .raw(": refused in this phase too, with no allow saved for it.</li>");
+                }
+            }
+            h.raw("</ul><p>A later job of this ")
+                .raw(what)
+                .raw(" placed under an allow's generation, the rule saved applying to it, that ")
+                .raw(
+                    "reaches the destination in that phase, refused it by no VM and reporting the ",
+                )
+                .raw("phase completely, confirms it.");
+        }
+        (_, Some(a)) if !row.is_new() => {
             h.raw("Acknowledged by ").text(&a.by).raw(" ");
             pages::at(h, a.at);
             h.raw(".");
         }
-        Some(a) => {
+        (_, Some(a)) => {
             h.raw("New again: acknowledged by ").text(&a.by).raw(" ");
             pages::at(h, a.at);
             h.raw(", and a job has added to it since.");
         }
-        None => {
+        _ => {
             h.raw("New: no one has acknowledged it.");
         }
     }
     if !row.is_new() {
-        h.raw(" A job that adds to it makes it New again.");
+        h.raw(" A job that adds to it makes it New again");
+        if !row.allows.is_empty() {
+            h.raw(", unless it was placed before the allow of each phase it was refused it in");
+        }
+        h.raw(".");
     }
     h.raw("</p>");
     if steer {
@@ -1402,6 +1520,64 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
         .raw(what)
         .raw(" out of the inbox and the navigation's count: they stay here under Muted, and on ")
         .raw("their jobs' pages.</p></section>");
+}
+
+/// An allow saved, and how it stands: confirmed or awaiting, and whether the rules saved now
+/// still allow it.
+fn allow_item(
+    h: &mut Html,
+    row: &BlockedRow,
+    a: &crate::store::AllowSaved,
+    rules: &[EgressRuleRow],
+) {
+    h.raw("<li>")
+        .text(egress::phase_text(a.phase))
+        .raw(": ")
+        .text(&a.by)
+        .raw(" saved rule ")
+        .text(&a.rule)
+        .raw(" ");
+    pages::at(h, a.at);
+    h.raw(", at rules generation ").text(a.generation).raw(". ");
+    match &a.confirmed {
+        Some(c) => {
+            h.raw("Job <a href=\"")
+                .raw(super::jobs::DETAIL_PREFIX)
+                .text(&c.job)
+                .raw("\">")
+                .text(c.job.get(..8).unwrap_or(&c.job))
+                .raw("</a> reached it ");
+            pages::at(h, c.at);
+            h.raw(".");
+        }
+        None => {
+            h.raw("Awaiting a later job's report.");
+        }
+    }
+    let dry = rules
+        .iter()
+        .any(|r| r.name == a.rule && r.mode == crate::store::RuleMode::DryRun);
+    if !row.allows_now(a, rules) {
+        h.raw(" <span class=\"badge warn\">Check</span> The rules saved now no longer allow it.");
+    } else if dry {
+        h.raw(" <span class=\"sub\">Rule ")
+            .text(&a.rule)
+            .raw(" is in dry-run: it would allow it once enforced.</span>");
+    }
+    h.raw("</li>");
+}
+
+/// What a save from the row's proposal for `phase` came to: its allow saved, or the rules as
+/// saved leaving its destination refused, its triage unchanged.
+fn saved_callout(h: &mut Html, row: &BlockedRow, phase: vk_hub_proto::egress::EgressPhase) {
+    if row.allows.iter().any(|a| a.phase == phase) {
+        h.raw("<p class=\"callout\" role=\"status\">Saved: its allow awaits a later job's ")
+            .raw("report.</p>");
+    } else {
+        h.raw("<p class=\"callout warn\" role=\"status\">Saved, but the rules as saved do ")
+            .raw("not allow it to this project's latest job in that phase: a rule in dry-run, or ")
+            .raw("one that does not select that job. Its triage is unchanged.</p>");
+    }
 }
 
 /// For a destination a hub rule refused, the operator's way to a proposal allowing it, a phase
@@ -1696,7 +1872,7 @@ mod tests {
     }
 
     /// Streams of one filter share a rendering within the debounce past a change, and render
-    /// again past it.
+    /// again past it or at once when the rules change.
     #[test]
     fn streams_of_one_filter_share_its_rendering() {
         let db = Arc::new(Db::open_memory().unwrap());
@@ -1722,5 +1898,20 @@ mod tests {
         };
         renders.render(&hub, &all, start + SHARED).unwrap();
         assert_eq!(rendered(), 3);
+        crate::egress::rules::put(
+            &hub,
+            "ops",
+            crate::egress::rules::Change {
+                name: "wab".into(),
+                subject: Some("gitlab gl, projects acme/**".into()),
+                run: Some(vk_hub_proto::egress::HubPhase::Unrestricted),
+                build: Some(vk_hub_proto::egress::HubPhase::Unrestricted),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        renders.render(&hub, &filter, start + SHARED).unwrap();
+        assert_eq!(rendered(), 4);
     }
 }

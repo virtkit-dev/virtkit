@@ -386,6 +386,32 @@ impl Db {
         Ok(out)
     }
 
+    /// [`Db::put_egress_rule_at`] from a proposal for a Blocked row: in the same write, the
+    /// row's allow saved ([`super::egress`]) if the rules as changed allow its destination to
+    /// the claims and in the phase `allow` names. Returns as it does, and whether the allow was
+    /// saved.
+    pub fn put_egress_rule_allowing(
+        &self,
+        change: &RuleChange,
+        exists: bool,
+        expect: u64,
+        allow: &super::AllowRequest,
+        actor: &str,
+        now: u64,
+    ) -> Result<(EgressRuleRow, bool, Vec<String>, bool)> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let (row, changed, steered) =
+            self.put_rule_in(&txn, change, exists, Some(expect), actor, now)?;
+        let generation = generation_in(&txn.open_table(EGRESS_RULES_META)?)?;
+        let mut rules = Vec::new();
+        for entry in txn.open_table(EGRESS_RULES)?.iter()? {
+            rules.push(decode::<EgressRuleRow>(entry?.1.value())?);
+        }
+        let saved = super::egress::save_allow(&txn, allow, generation, &rules, actor, now)?;
+        txn.commit().context("storing an egress rule")?;
+        Ok((row, changed, steered, saved))
+    }
+
     /// The write of [`Db::put_egress_rule_at`], in `txn`.
     fn put_rule_in(
         &self,

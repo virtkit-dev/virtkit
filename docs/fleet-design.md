@@ -395,11 +395,14 @@ Pages, in order of priority:
    rollouts, with a node's drain and reset steered from its page;
 4. **audit** — every operator action and every command's outcome;
 5. **clients** — the API keys and the client instances using each: host, version, runners,
-   when last heard from and what each holds; operators create and revoke keys there.
+   when last heard from and what each holds; operators create and revoke keys there;
+6. **egress** — what jobs were refused and reached, and the hub's egress rules
+   ([Job egress from the hub](#job-egress-from-the-hub)).
 
 Built: the nodes table, node detail and audit pages, the operations page's releases and
-rollouts, and the clients page. Proposed: pressure and admission waits in the nodes table, and
-recent jobs linked to GitLab, atop timelines and egress reports on node detail.
+rollouts, the clients page, and the egress page's Blocked, Observed traffic, Rules and Test a
+job tabs. Proposed: pressure and admission waits in the nodes table, and recent jobs linked to
+GitLab, atop timelines and egress reports on node detail.
 
 Proposed: metrics for capacity, admission waits and node states, exported for Prometheus.
 
@@ -655,8 +658,18 @@ version it matches.
 
 ## Job egress from the hub
 
-Without hub rules a job's egress is bounded by its node's `[egress]` and `[egress.build]` caps,
-and a job or one of its services may narrow them ([Egress
+Built: reporting — the node's side, live while a job runs, the job page's Network access, the
+job list's Network column, the Egress page's Blocked tab with its triage and mutes and its
+Observed traffic tab compared with the rules, kept current over SSE — the node's caps in its
+inventory, versioned by fingerprint; and rules: their store and `vk-hub egress` ([prototype
+reference](fleet-prototype.md#egress-rules)), the Rules tab with Preview → Save, the rollout's
+steps and the nodes' caps, live, proposals from Blocked rows, job pages and Observed traffic
+with the two triage states that follow them, Test a job with the node's cap, resolution at
+placement under `[jobs] egress_rules`, `JobStart`'s field enforced in both phases with its
+dry-run rules, placement only on nodes announcing `egress_rules`, and the Fallback for
+gitlab-runner jobs in desired state, enforced by nodes announcing `egress_fallback`. A refused
+declaration proposes no rule. Without hub rules a job's egress is bounded by its node's
+`[egress]` and `[egress.build]` caps, and a job or one of its services may narrow them ([Egress
 control](gitlab-ci.md#egress-control)). The hub adds one more layer, chosen by project and ref,
 so that what a project's jobs may reach is decided in one place, and reports what each job was
 refused or reached, so that refusals are caught and rules are written from evidence. Reporting
