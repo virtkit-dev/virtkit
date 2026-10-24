@@ -1527,9 +1527,9 @@ words (*Unrestricted by this rule*, *No external access*, *corp.example.com + 1 
 mode, and the jobs placed under it in the last 7 days — of the latest 1000 — from their records:
 enforced, or for a dry-run rule those it selected and those whose node reported a destination it
 would have blocked. The Fallback is listed apart. With `[jobs] egress_rules` off the tab says
-that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. A rule's page,
-`/egress?tab=rules&rule=<name>`, lists each phase's domains and IP ranges, an empty one reading
-*None*, and each entry's use.
+that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. It ends with
+the rollout's six steps, each with how it stands. A rule's page, `/egress?tab=rules&rule=<name>`,
+lists each phase's domains and IP ranges, an empty one reading *None*, and each entry's use.
 Below the rules, *Node caps*: each node's own `[egress]` and `[egress.build]` as its inventory
 reports them, a dry-run run phase marked, too large to report, or not reported by an older `vk`,
 with its entries no job placed under them used, as on Observed traffic. The list, and a rule's

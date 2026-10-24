@@ -78,6 +78,8 @@ struct Listing {
     rules: Rules,
     /// The GitLab instances, by name, for the editor.
     gitlabs: Vec<String>,
+    /// The nodes taking placed jobs that do not report.
+    unreported_nodes: usize,
     /// The enrolled nodes, by ID.
     nodes: Vec<(String, NodeRow)>,
     /// The rules' entries' use, the caps', and the recent jobs.
@@ -94,6 +96,7 @@ fn listing(hub: &Hub, caches: &Caches) -> Result<Listing> {
             .get(hub, &rules, &nodes, crate::now_secs())?,
         nodes,
         rules,
+        unreported_nodes: super::unreported(hub)?.len(),
         gitlabs: hub.db.gitlabs()?.into_iter().map(|(n, _)| n).collect(),
     })
 }
@@ -195,7 +198,9 @@ pub(super) fn state_callout(h: &mut Html, rules: &Rules) {
         h.raw("<div class=\"callout\"><p><strong>Hub rules are off.</strong> Saved rules ")
             .raw("restrict nothing yet: they apply once <code>hub.toml</code> sets ")
             .raw("<code>[jobs] egress_rules = true</code>. Node caps and jobs' own ")
-            .raw("restrictions still apply.</p></div>");
+            .raw("restrictions still apply. <a href=\"")
+            .raw(PATH)
+            .raw("#rollout\">How to turn them on safely</a></p></div>");
         return;
     }
     if let Some(warning) = rules.warning() {
@@ -229,8 +234,8 @@ fn tab_page(l: &Listing, auth: &Auth) -> Html {
     h
 }
 
-/// The tab's list: how the rules stand, the rules, the Fallback and the nodes' caps. No form:
-/// what is being typed elsewhere on the page is never reset by an update.
+/// The tab's list: how the rules stand, the rules, the Fallback, the nodes' caps and the
+/// rollout. No form: what is being typed elsewhere on the page is never reset by an update.
 fn tab_results(h: &mut Html, l: &Listing) {
     state_callout(h, &l.rules);
     let (fallback, rules): (Vec<&EgressRuleRow>, Vec<&EgressRuleRow>) =
@@ -238,6 +243,7 @@ fn tab_results(h: &mut Html, l: &Listing) {
     if rules.is_empty() && fallback.is_empty() {
         h.raw("<p class=\"empty\">no rules yet</p>");
         node_caps(h, &l.nodes, &l.used.cap_use);
+        rollout(h, l);
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr><th>rule</th><th>applies to</th><th>run</th>")
@@ -265,6 +271,7 @@ fn tab_results(h: &mut Html, l: &Listing) {
             .raw(" of the last 7 days.</p>");
     }
     node_caps(h, &l.nodes, &l.used.cap_use);
+    rollout(h, l);
 }
 
 /// A node's cap's phase in a few words: `Unrestricted`, `No external access`,
@@ -404,6 +411,140 @@ pub(super) fn caps_unused(h: &mut Html, nodes: &[&(String, NodeRow)], u: &CapUse
     }
     h.raw(" No reported use does not prove an entry unnecessary; nothing is removed ")
         .raw("automatically.</p></div>");
+}
+
+/// A rollout step's state: done, to do, or a warning, with what is known of it.
+enum Step {
+    Done(String),
+    ToDo(String),
+    Warn(String),
+}
+
+/// The six steps from rules off to enforced (`docs/fleet-design.md`, *Rollout*), each with how
+/// it stands where the hub can tell.
+fn rollout(h: &mut Html, l: &Listing) {
+    let rules = &l.rules.rules;
+    let fallback = rules.iter().find(|r| is_fallback(r));
+    let enforced_fallback = fallback.filter(|f| f.mode == RuleMode::Enforce);
+    let u = &l.used.rule_use;
+    let reported = |key: &str| u.reported.get(key).map_or(0, |c| c.complete);
+    let reports = match (reported("run"), reported("build")) {
+        (0, 0) => Step::ToDo("no job reported a phase completely in the last 30 days".into()),
+        (run, build) if run == 0 || build == 0 => Step::ToDo(format!(
+            "in the last 30 days, {run} jobs reported their run phase completely and {build} \
+             their build phase: both phases need reports"
+        )),
+        (run, build) => {
+            let text = format!(
+                "in the last 30 days, {run} jobs reported their run phase completely and {build} \
+                 their build phase; {} sent no report",
+                u.silent
+            );
+            if l.unreported_nodes == 0 {
+                Step::Done(text)
+            } else {
+                Step::Warn(format!(
+                    "{text}; {} nodes taking placed jobs do not report",
+                    l.unreported_nodes
+                ))
+            }
+        }
+    };
+    let unrestricted =
+        |f: &EgressRuleRow| f.run == HubPhase::Unrestricted && f.build == HubPhase::Unrestricted;
+    let saved_fallback = match fallback {
+        None => Step::ToDo("no Fallback saved".into()),
+        Some(f) if f.mode != RuleMode::Enforce => Step::ToDo("the Fallback is in dry-run".into()),
+        Some(f) if unrestricted(f) => Step::Done("enforced, unrestricted in both phases".into()),
+        Some(_) if l.rules.enabled => Step::Done("enforced, and already narrowed".into()),
+        Some(_) => Step::Warn(
+            "enforced but narrowed: turning rules on restricts every job no enforced rule \
+             selects"
+                .into(),
+        ),
+    };
+    let on = match (l.rules.enabled, enforced_fallback) {
+        (true, Some(_)) => Step::Done("hub rules are on".into()),
+        (true, None) => Step::Warn(
+            "hub rules are on with no enforced Fallback: every job no enforced rule selects, \
+             gitlab-runner's all, may reach nothing"
+                .into(),
+        ),
+        (false, _) => Step::ToDo("hub rules are off".into()),
+    };
+    let project_rules: Vec<&EgressRuleRow> = rules.iter().filter(|r| !is_fallback(r)).collect();
+    let dry: Vec<String> = project_rules
+        .iter()
+        .filter(|r| r.mode == RuleMode::DryRun)
+        .map(|r| {
+            let n = l
+                .used
+                .recent
+                .rules
+                .get(&r.name)
+                .copied()
+                .unwrap_or_default();
+            format!("{}: {}", r.name, jobs_summary(r.mode, n))
+        })
+        .collect();
+    let enforced = project_rules
+        .iter()
+        .filter(|r| r.mode == RuleMode::Enforce)
+        .count();
+    let dry_run = match (dry.is_empty(), enforced) {
+        (true, 0) => Step::ToDo("no project rule yet".into()),
+        (true, _) => Step::Done("no project rule left in dry-run".into()),
+        (false, _) => Step::ToDo(format!("in dry-run, last 7 days: {}", dry.join("; "))),
+    };
+    let enforce = match (enforced, dry.len()) {
+        (0, _) => Step::ToDo("no project rule enforced".into()),
+        (n, 0) => Step::Done(format!("{n} project rules enforced")),
+        (n, d) => Step::ToDo(format!("{n} project rules enforced, {d} in dry-run")),
+    };
+    let narrow = match enforced_fallback {
+        Some(f) if !unrestricted(f) => {
+            Step::Done("the Fallback restricts what it applies to".into())
+        }
+        Some(_) => Step::ToDo("the Fallback is still unrestricted".into()),
+        None => Step::ToDo("no enforced Fallback".into()),
+    };
+    h.raw("<section id=\"rollout\"><h2>Turning rules on safely</h2><ol class=\"layers\">");
+    for (text, step) in [
+        (
+            "Collect reports for both phases. Blocked and Observed traffic work with rules off.",
+            reports,
+        ),
+        (
+            "Save a Fallback that is enforced and explicitly Unrestricted, so that turning rules \
+             on changes nothing yet.",
+            saved_fallback,
+        ),
+        (
+            "Set <code>[jobs] egress_rules = true</code> in <code>hub.toml</code>.",
+            on,
+        ),
+        (
+            "Add project rules in dry-run and watch Would block.",
+            dry_run,
+        ),
+        (
+            "Enforce each rule once its reports are clean and its preview is reviewed.",
+            enforce,
+        ),
+        ("Narrow the Fallback last.", narrow),
+    ] {
+        h.raw("<li>").raw(text).raw(" ");
+        let (badge, state) = match &step {
+            Step::Done(s) => ("<span class=\"badge ok\">Done</span>", s),
+            Step::ToDo(s) => ("<span class=\"badge\">To do</span>", s),
+            Step::Warn(s) => ("<span class=\"badge warn\">Check</span>", s),
+        };
+        h.raw(badge)
+            .raw(" <span class=\"sub\">")
+            .text(state)
+            .raw("</span></li>");
+    }
+    h.raw("</ol></section>");
 }
 
 /// One rule's row of the list.

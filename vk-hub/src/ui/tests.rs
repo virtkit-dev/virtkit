@@ -8717,6 +8717,22 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
         "{tab}"
     );
 
+    // The rollout, step by step, as far as the hub can tell.
+    assert!(tab.contains("<a href=\"/egress?tab=rules#rollout\">How to turn them on safely</a>"));
+    for step in [
+        "<span class=\"badge\">To do</span> <span class=\"sub\">no job reported a phase \
+         completely in the last 30 days</span>",
+        "<span class=\"badge warn\">Check</span> <span class=\"sub\">enforced but narrowed: \
+         turning rules on restricts every job no enforced rule selects</span>",
+        "<span class=\"badge\">To do</span> <span class=\"sub\">hub rules are off</span>",
+        "<span class=\"sub\">in dry-run, last 7 days: wab-release: 1 job · 1 would block</span>",
+        "<span class=\"sub\">1 project rules enforced, 1 in dry-run</span>",
+        "<span class=\"badge ok\">Done</span> <span class=\"sub\">the Fallback restricts what \
+         it applies to</span>",
+    ] {
+        assert!(tab.contains(step), "{step}: {tab}");
+    }
+
     let page = get(addr, "/egress?tab=rules&rule=wab", Some(&viewer))
         .await
         .body;
@@ -8746,6 +8762,13 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     assert!(!tab.contains("Hub rules are off"), "{tab}");
     assert!(
         tab.contains("<p class=\"callout warn\">No Fallback is enforced: every job no enforced"),
+        "{tab}"
+    );
+    assert!(
+        tab.contains(
+            "<span class=\"badge warn\">Check</span> <span class=\"sub\">hub rules are on with \
+             no enforced Fallback"
+        ),
         "{tab}"
     );
 }

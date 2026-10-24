@@ -130,6 +130,10 @@ All notable changes to virtkit will be documented in this file.
   caution that other workloads on the node may use them.
 - **The Rules tab and a rule's page update live**, as rules, jobs' reports and nodes' caps
   change, without resetting a form being filled in.
+- **The Rules tab walks an operator from rules off to enforced**, step by step, each with how
+  it stands: reports collected, an enforced and unrestricted Fallback saved, `[jobs]
+  egress_rules = true`, project rules in dry-run with their would-block jobs, rules enforced, and
+  the Fallback narrowed last.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never
