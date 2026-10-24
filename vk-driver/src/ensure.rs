@@ -76,6 +76,8 @@ pub struct BuildRecipe {
     /// Audit the build's RUN egress into the job trace (`[egress.build] audit` /
     /// `MICROVM_BUILD_EGRESS_AUDIT`).
     pub audit: bool,
+    /// A placed job's egress record, which the build's denials and contacts go to.
+    pub record: Option<crate::build::EgressRecord>,
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
@@ -134,6 +136,7 @@ pub fn ensure_unit_build(
         // by default, like `docker build`, when unconfigured) + its build-audit flag.
         net: recipe.net.clone(),
         audit: recipe.audit,
+        record: recipe.record.clone(),
         require_cached: false,
         build_jobs: None,
         debug: false,
@@ -298,6 +301,7 @@ mod tests {
             cache_auth: Default::default(),
             net: crate::build::BuildNet::All,
             audit: false,
+            record: None,
         };
         let key = "deadbeef";
         let expected = fingerprint(&[key]);
@@ -334,6 +338,7 @@ mod tests {
             cache_auth: Default::default(),
             net: crate::build::BuildNet::All,
             audit: false,
+            record: None,
         };
         let key = "will-fail";
         let result = ensure_build_tier(
@@ -391,6 +396,7 @@ mod tests {
             cache_auth: Default::default(),
             net: crate::build::BuildNet::All,
             audit: false,
+            record: None,
         };
         let (got_dir, guard) = ensure_build_tier(
             &state_dir,

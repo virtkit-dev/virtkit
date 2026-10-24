@@ -31,7 +31,7 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use vk_hub_proto::egress::EgressLayer;
+use vk_hub_proto::egress::{EgressLayer, EgressOutcome};
 
 use crate::egress_report::Attrs;
 
@@ -717,6 +717,12 @@ struct EgressGuard {
     /// The services' VMs, by each of their addresses, which a record names its source by; an
     /// address not here is the job's own VM.
     vm_names: HashMap<Ipv4Addr, String>,
+    /// How long the denial and audit channels may grow, in bytes: past it a record is dropped
+    /// and only counted, and the counts are written out as `omitted` records. `None` =
+    /// unbounded. A guest that loops on its lookups fills a channel for as long as it runs.
+    record_limit: Option<u64>,
+    /// The attempts dropped past `record_limit` since they were last written out.
+    dropped: Mutex<HashMap<EgressOutcome, u64>>,
     /// Throttles the failed-flow log (see `log_flow_failure`).
     flow_log: LogLimiter,
 }
@@ -742,6 +748,8 @@ impl EgressGuard {
             dns_denied: Mutex::new(HashMap::new()),
             cap: None,
             vm_names: HashMap::new(),
+            record_limit: None,
+            dropped: Mutex::new(HashMap::new()),
             flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
         }
     }
@@ -782,6 +790,40 @@ impl EgressGuard {
     fn with_vm_names(mut self, vm_names: HashMap<Ipv4Addr, String>) -> Self {
         self.vm_names = vm_names;
         self
+    }
+
+    /// See the `record_limit` field.
+    fn with_record_limit(mut self, limit: Option<u64>) -> Self {
+        self.record_limit = limit;
+        self
+    }
+    /// Whether a record may still go to `path`: while it is under the `record_limit`, if any.
+    /// Past it, the record's `n` attempts with `outcome` are counted as dropped instead.
+    fn admit_record(&self, path: &Path, outcome: EgressOutcome, n: u64) -> bool {
+        let Some(limit) = self.record_limit else {
+            return true;
+        };
+        if std::fs::metadata(path).map_or(0, |m| m.len()) < limit {
+            return true;
+        }
+        let mut dropped = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        let count = dropped.entry(outcome).or_default();
+        *count = count.saturating_add(n);
+        false
+    }
+    /// Write out what [`Self::admit_record`] dropped since the last time: denials to the denial
+    /// channel, contacts to the audit channel.
+    fn flush_dropped(&self) {
+        let dropped = std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|e| e.into_inner()));
+        for (outcome, n) in dropped {
+            let path = match outcome {
+                EgressOutcome::Observed => &self.audit_log,
+                _ => &self.denied_log,
+            };
+            if let Some(path) = path {
+                crate::egress_report::append_omitted(path, outcome, n);
+            }
+        }
     }
 
     /// The layer that decides a denial of `src`: the first that `refuses` it, in the order they
@@ -902,7 +944,13 @@ impl EgressGuard {
         dst: SocketAddr,
         would_block: bool,
     ) {
-        if let Some(path) = &self.denied_log {
+        let outcome = match would_block {
+            true => EgressOutcome::WouldBlock,
+            false => EgressOutcome::Blocked,
+        };
+        if let Some(path) = &self.denied_log
+            && self.admit_record(path, outcome, 1)
+        {
             let attrs = Attrs {
                 layer: Some(self.flow_layer(src, dst)),
                 would_block,
@@ -962,7 +1010,13 @@ impl EgressGuard {
                     }
                 }
             };
-            if let Some((name, layer)) = first {
+            let outcome = match would_block {
+                true => EgressOutcome::WouldBlock,
+                false => EgressOutcome::Blocked,
+            };
+            if let Some((name, layer)) = first
+                && self.admit_record(path, outcome, 1)
+            {
                 let attrs = Attrs {
                     layer: Some(layer),
                     would_block,
@@ -974,8 +1028,13 @@ impl EgressGuard {
         }
     }
     /// Write out the repeats [`EgressGuard::deny_dns`] counted since the last time, one record
-    /// per name, source and outcome.
+    /// per name, source and outcome, then what was dropped past the `record_limit`.
     fn flush_dns_denials(&self) {
+        self.flush_repeats();
+        self.flush_dropped();
+    }
+    /// The repeats part of [`Self::flush_dns_denials`].
+    fn flush_repeats(&self) {
         let Some(path) = &self.denied_log else {
             return;
         };
@@ -994,6 +1053,13 @@ impl EgressGuard {
                 .collect()
         };
         for ((name, src, would_block), r) in repeats {
+            let outcome = match would_block {
+                true => EgressOutcome::WouldBlock,
+                false => EgressOutcome::Blocked,
+            };
+            if !self.admit_record(path, outcome, r.count) {
+                continue;
+            }
             let attrs = Attrs {
                 layer: Some(r.layer),
                 would_block,
@@ -1040,7 +1106,9 @@ impl EgressGuard {
     /// end-of-job "domains contacted" summary and the standing list of names a job reaches
     /// (see sites). No-op only where nothing reads the channel: a CI job always has one.
     fn record_contact(&self, src: Ipv4Addr, name: &str) {
-        if let Some(path) = &self.audit_log {
+        if let Some(path) = &self.audit_log
+            && self.admit_record(path, EgressOutcome::Observed, 1)
+        {
             crate::egress_report::append_contact(path, name, &self.attrs(Some(src)));
         }
     }
@@ -1076,7 +1144,9 @@ impl EgressGuard {
         let Some(path) = &self.audit_log else {
             return;
         };
-        if self.dns_ips.lock().unwrap().contains(&(src, *dst.ip())) {
+        if self.dns_ips.lock().unwrap().contains(&(src, *dst.ip()))
+            || !self.admit_record(path, EgressOutcome::Observed, 1)
+        {
             return;
         }
         let attrs = Attrs {
@@ -1533,6 +1603,9 @@ pub struct Spawn {
     /// The service each VM address belongs to, which records name their source by; an address
     /// not listed is the job's own VM.
     pub vm_names: Vec<(Ipv4Addr, String)>,
+    /// How long the denial and audit channels may grow, in bytes; past it records are only
+    /// counted (see egress_report). `None` = unbounded.
+    pub record_limit: Option<u64>,
     /// Take the default policy from this [`EgressFile`] instead of `allow_ip`/`allow_name`,
     /// and follow its edits for the switch's life. `None` = the lists above, fixed.
     pub egress_file: Option<PathBuf>,
@@ -1642,6 +1715,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     for (ip, name) in &opts.vm_names {
         cmd.arg("--vm-name").arg(format!("{ip}={name}"));
     }
+    if let Some(limit) = opts.record_limit {
+        cmd.arg("--record-limit").arg(limit.to_string());
+    }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
             .arg(format!("{sentinel}={host}"));
@@ -1727,6 +1803,7 @@ pub async fn run(
     // The node's cap, and each service VM's name by address (see `Spawn`).
     cap: Option<Egress>,
     vm_names: HashMap<Ipv4Addr, String>,
+    record_limit: Option<u64>,
     // An `--egress-file` to follow, with the bytes `egress` was loaded from.
     egress_file: Option<(PathBuf, Vec<u8>)>,
 ) -> Result<()> {
@@ -1756,7 +1833,8 @@ pub async fn run(
             .with_bytes_log(bytes_log)
             .with_dry_run(dry_run)
             .with_cap(cap)
-            .with_vm_names(vm_names),
+            .with_vm_names(vm_names)
+            .with_record_limit(record_limit),
     );
     let restricted = guard.restricted();
     guard.open_bytes();
@@ -5388,6 +5466,53 @@ mod tests {
         assert_eq!(open.verdict(guest, denied), Verdict::Allow);
     }
 
+    /// Past its record limit a channel takes no more records: what would have gone in is
+    /// counted, by outcome, and the counts are written out instead.
+    #[test]
+    fn a_record_limit_bounds_the_channels() {
+        use crate::egress_report::Proto;
+        let dir = std::env::temp_dir().join(format!("vk-egress-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (denied, audit) = (dir.join("denied.log"), dir.join("audit.log"));
+        let guest = Ipv4Addr::new(10, 0, 0, 2);
+        let g = EgressGuard::new(
+            Egress::restricted(&[], &[]).unwrap(),
+            Ipv4Addr::new(10, 0, 0, 1),
+        )
+        .with_denied_log(Some(denied.clone()))
+        .with_audit_log(Some(audit.clone()))
+        .with_record_limit(Some(1));
+        g.deny_dns(guest, "a.example", false, String::new);
+        g.deny_dns(guest, "b.example", false, String::new);
+        g.deny_dns(guest, "a.example", false, String::new);
+        assert!(!g.admit_flow(Proto::Tcp, Some(guest), "10.9.9.9:443".parse().unwrap()));
+        g.record_contact(guest, "c.example");
+        g.record_contact(guest, "d.example");
+        g.flush_dns_denials();
+        let lines = |p: &Path| -> Vec<String> {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    l.split("\tlayer=")
+                        .next()
+                        .unwrap()
+                        .split("\tt=")
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(lines(&denied), ["dns\ta.example\t1", "omitted\tblocked\t3"]);
+        assert_eq!(lines(&audit), ["name\tc.example", "omitted\tobserved\t1"]);
+        // Nothing more dropped, nothing more written.
+        g.flush_dns_denials();
+        assert_eq!(lines(&denied).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Each denial names the layer that decided it — the node's cap when the cap alone refuses
     /// it, else the narrowing of the VM it came from — the service it came from, whether a
     /// dry-run carried it, and when. Without a cap there is no telling the layers apart.
@@ -8057,6 +8182,7 @@ mod tests {
                 false,
                 None,
                 HashMap::new(),
+                None,
                 None,
             )
             .await;

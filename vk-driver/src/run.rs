@@ -2178,6 +2178,7 @@ async fn build_and_boot(
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
             Some(work.join(NET_BYTES)),
+            None,
             egress.restrict,
             None,
             egress.file,
@@ -3838,6 +3839,7 @@ async fn compose_up(
         None,
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
+        None,
         egress.restrict,
         None,
         egress.file,
@@ -3937,6 +3939,7 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         // Dev `vk run --compose` service builds share the run's `--build-net` / build-audit.
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
+        record: None,
     }
 }
 
@@ -3971,6 +3974,7 @@ pub(crate) fn service_build_options(
         build_args: args.build_args.clone(),
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
+        record: None,
         require_cached: args.require_cached,
         build_jobs: None,
         debug: false,
@@ -5378,6 +5382,8 @@ pub(crate) async fn spawn_vm_switch(
     // passes its shared scratch, so every stage's switch appends to the one file the build
     // reads at the end; a run passes its own work dir.
     bytes_log: Option<PathBuf>,
+    // A placed job's build stage: record its denials, attributed. `None` for every other switch.
+    record: Option<&StageRecord>,
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
     // for a job's own filter, and a run for `vk dev`'s `egress = "restricted"`.
     restrict: bool,
@@ -5408,6 +5414,13 @@ pub(crate) async fn spawn_vm_switch(
         reservations.push((crate::units::mac_for_ip(*extra), extra.to_string()));
     }
     all_listen.extend(extra_listen.iter().cloned());
+    let vm_names = match record.and_then(|r| r.source.as_ref()) {
+        Some(source) => all_listen
+            .iter()
+            .map(|(_, ip, _)| (*ip, source.clone()))
+            .collect(),
+        None => Vec::new(),
+    };
     let child = crate::switch::spawn(&crate::switch::Spawn {
         listen: all_listen,
         gateway: gw,
@@ -5425,14 +5438,17 @@ pub(crate) async fn spawn_vm_switch(
         // dev `vk run --compose` siblings share the run policy.
         per_source: Vec::new(),
         // A CI job's build stage checks its node's cap and its own filter apart; dev `vk run`
-        // has no cap.
+        // has no cap. A placed job's names the service whose image it builds.
         cap: cap.cloned(),
-        vm_names: Vec::new(),
+        vm_names,
+        // A placed job's build stage records within a bound: its guest chooses how much.
+        record_limit: record.map(|_| crate::egress_report::RECORD_LIMIT),
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
-        // log (eprintln) is enough interactively.
-        denied_log: None,
+        // log (eprintln) is enough interactively. A placed job's build records them for its
+        // report.
+        denied_log: record.map(|r| r.denied_log.clone()),
         // Audit mode (`--audit-egress` / `--build-audit-egress`) records every external
         // domain the guest resolves; the caller prints the summary when the run/build ends.
         audit_log,
@@ -5446,6 +5462,15 @@ pub(crate) async fn spawn_vm_switch(
     addrs.extend_from_slice(primary_extra_ips);
     let attach = crate::vmm::switch_attach(vsock, net_port, &addrs, prefix, gw);
     Ok((child, attach))
+}
+
+/// What a placed job's build-stage switch needs to record the denials it makes for the job's
+/// report (see `build::EgressRecord`): where, and the service whose image it builds (`None`
+/// for the job's own).
+#[derive(Clone, Debug)]
+pub(crate) struct StageRecord {
+    pub denied_log: PathBuf,
+    pub source: Option<String>,
 }
 
 /// The disk format of a stage image, by extension: forked stages are `.qcow2` (a
@@ -5550,6 +5575,9 @@ pub(crate) async fn boot_session(
     // stages the way the audit channel is: each stage's switch appends what it forwarded, and
     // the build sums them into its resource line. `None` = nothing reads it, so nothing counts.
     bytes_log: Option<&Path>,
+    // `Some` → a placed job's build: the switch records its denials, attributed (see
+    // `StageRecord`).
+    record: Option<&StageRecord>,
     cancel: Option<CancellationToken>,
     timings: &Timings,
 ) -> Result<VmSession> {
@@ -5691,6 +5719,7 @@ pub(crate) async fn boot_session(
             None,
             audit_log.map(Path::to_path_buf),
             bytes_log.map(Path::to_path_buf),
+            record,
             restrict,
             net.cap(),
             None,
@@ -6500,6 +6529,7 @@ mod tests {
                 cache_auth: Default::default(),
                 net: crate::build::BuildNet::All,
                 audit: false,
+                record: None,
             },
             crate::manager::ManagerDirs {
                 cache: PathBuf::from("/cache"),
@@ -8170,6 +8200,7 @@ mod tests {
                 None, // out_disk (--disk)
                 None, // audit_log
                 None, // bytes_log
+                None, // record
                 None, // cancel
                 &Timings::new(),
             )

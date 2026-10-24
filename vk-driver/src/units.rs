@@ -123,6 +123,8 @@ pub struct BuildOpts {
     pub net: crate::build::BuildNet,
     /// Audit the unit build's RUN egress into the job trace.
     pub audit: bool,
+    /// A placed job's egress record, which the unit build's denials and contacts go to.
+    pub record: Option<crate::build::EgressRecord>,
 }
 
 /// The build recipe + target + stage key for a `build:` unit, shared by the ext4-path
@@ -170,6 +172,7 @@ fn build_recipe(
             .map(|b| b.net.clone())
             .unwrap_or(crate::build::BuildNet::All),
         audit: build.is_some_and(|b| b.audit),
+        record: build.and_then(|b| b.record.clone()),
     };
     Ok((recipe, target.clone(), key))
 }
@@ -908,6 +911,7 @@ mod tests {
             cache_auth: Default::default(),
             net: crate::build::BuildNet::All,
             audit: false,
+            record: None,
         };
         let err = ensure_unit_build_sync(
             &unit,

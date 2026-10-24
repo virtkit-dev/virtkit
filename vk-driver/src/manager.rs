@@ -1118,6 +1118,7 @@ mod tests {
                 cache_auth: Default::default(),
                 net: crate::build::BuildNet::All,
                 audit: false,
+                record: None,
             },
             ManagerDirs {
                 cache: PathBuf::from("/cache"),

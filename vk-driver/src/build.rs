@@ -330,6 +330,9 @@ pub struct Options {
     /// steps resolve and print a "domains contacted" summary after the build. Observes only
     /// — egress is still governed by `net`.
     pub audit: bool,
+    /// A placed job's egress record: its stage switches then record every denial and contact
+    /// there, audit or not, where they outlive the scratch (see [`EgressRecord`]).
+    pub record: Option<EgressRecord>,
     /// Restores from the instruction cache are allowed, but nothing may actually
     /// build: any stage whose final snapshot is not cached aborts the build with a
     /// [`NotCached`] error (exit 3 at the CLI), so a caller can branch on
@@ -391,6 +394,16 @@ impl std::error::Error for NotCached {}
 /// and `vk dev task` falls back on them. Checked at the chain root — contexts wrap the error.
 pub fn not_cached(e: &anyhow::Error) -> bool {
     e.root_cause().downcast_ref::<NotCached>().is_some()
+}
+
+/// Where a placed job's build records its egress for the node's report, and what its stage
+/// switches need to say which layer refused a flow and whose image was being built.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EgressRecord {
+    /// The job's record dir; each build keeps its channels in a dir of its own there.
+    pub dir: PathBuf,
+    /// The service whose image this is; `None` for the job's own.
+    pub source: Option<String>,
 }
 
 /// Egress policy for the microVM build's `RUN` guests.
@@ -806,11 +819,13 @@ fn resolve_kernel_agent(
 }
 
 /// Build the microVM backend for a build: its instruction-cache registry (if any) and the
-/// `MicroVm` itself over `scratch`. Shared by the single-target [`build_backend`] and the
-/// unified multi-unit [`build_units`], so the two construct the backend identically.
+/// `MicroVm` itself over `scratch`, its stage switches recording into `channels` (see
+/// [`egress_channels`]). Shared by the single-target [`build_backend`] and the unified
+/// multi-unit [`build_units`], so the two construct the backend identically.
 fn make_microvm(
     opts: &Options,
     scratch: &Path,
+    channels: &Path,
     kernel: &Path,
     agent: &Path,
     timings: &Arc<Timings>,
@@ -830,6 +845,12 @@ fn make_microvm(
     });
     let cpus = exec::resolve_build_cpus(configured_build_cpus(), exec::host_cpus());
     let mem = exec::resolve_build_mem(configured_build_mem().as_deref());
+    // A placed job records its build's denials, attributed, and its contacts whatever audit
+    // says; the audit summary stays an audit feature.
+    let record = opts.record.as_ref().map(|r| crate::run::StageRecord {
+        denied_log: crate::jobctx::JobCtx::egress_denied_log_in(channels),
+        source: r.source.clone(),
+    });
     Ok(MicroVm::new(
         kernel.to_path_buf(),
         agent.to_path_buf(),
@@ -840,11 +861,55 @@ fn make_microvm(
         opts.net.clone(),
         opts.debug,
         !opts.tmp_tmpfs,
-        // Audit channel shared across the build's parallel stage switches (all workers
-        // share `scratch`); the summary is drained once the build finishes.
-        opts.audit.then(|| scratch.join(crate::run::AUDIT_LOG)),
+        // Channels shared across the build's parallel stage switches; the summaries are
+        // drained once the build finishes.
+        (opts.audit || record.is_some()).then(|| channels.join(crate::run::AUDIT_LOG)),
+        channels.join(crate::run::NET_BYTES),
+        record,
         Arc::clone(timings),
     ))
+}
+
+/// Where a build's stage switches keep their channels: in a placed job's record, a dir of
+/// their own named for `scratch`, which outlives it — the build is reported after the scratch
+/// is gone, and even when it was killed; otherwise the scratch itself.
+fn egress_channels(opts: &Options, scratch: &Path) -> Result<PathBuf> {
+    let Some(record) = &opts.record else {
+        return Ok(scratch.to_path_buf());
+    };
+    let name = scratch
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("naming the build's egress record")?;
+    let dir = record
+        .dir
+        .join(format!("{}{name}", crate::egress_report::BUILD_PREFIX));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the build's egress record {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// `--build-audit-egress`: the domains and the IPs the build's RUN steps contacted, from its
+/// `channels` (read before the scratch, which may hold them, is removed). "during the build"
+/// distinguishes them from a `vk run` guest summary. Gated on audit rather than on the channel,
+/// which a placed job's build keeps either way.
+fn print_audit_summaries(opts: &Options, channels: &Path) {
+    if !opts.audit {
+        return;
+    }
+    let audit_log = channels.join(crate::run::AUDIT_LOG);
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &audit_log,
+        "external domains contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &audit_log,
+        "external IPs/ports contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
 }
 
 /// Stamp an exported ext4 with its content-freshness UUID — `fingerprint([stage_key])`, the
@@ -1011,6 +1076,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // A SIGTERM or SIGINT ends the process without running the removal at the end.
     let _scratch_on_signal =
         crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
+    let channels = egress_channels(opts, &scratch)?;
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
     // needed set, and route each stage's guest output through it.
@@ -1022,7 +1088,14 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         let (committed, states, mut ex): (_, _, Box<dyn Executor>) = if microvm {
             let kernel = kernel.as_ref().expect("resolved under microvm");
             let agent = agent.as_ref().expect("resolved under microvm");
-            let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
+            let mv = make_microvm(
+                opts,
+                &scratch,
+                &channels,
+                &kernel.path,
+                &agent.path,
+                &timings,
+            )?;
             // One reading for both: the ceiling fits stages into it, the gate measures
             // against it. The ceiling is over the sizes this build's stages actually
             // declare, not over one nominal size they no longer share.
@@ -1106,28 +1179,14 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // so the figures are complete. After the dashboard froze, so it is safe to print. Silent
     // when the meter cannot attribute them to this build alone (see `usage`).
     if let Some(usage) = meter.and_then(|m| m.read()) {
-        // The egress figure comes from the stage switches, which publish into the scratch
-        // this reads before removing it — a build's guests are gone by now, and each was
+        // The egress figure comes from the stage switches, which publish into the channels
+        // this reads before removing the scratch — a build's guests are gone by now, and each was
         // stopped rather than killed so nothing it carried went unpublished.
-        let usage = usage.with_network(&scratch.join(crate::run::NET_BYTES));
+        let usage = usage.with_network(&channels.join(crate::run::NET_BYTES));
         eprintln!("{}", usage.summary("build"));
     }
-    // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
-    // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
-    // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A
-    // no-op when audit was off.
-    if let Some(summary) = crate::egress_report::contacts_summary(
-        &scratch.join(crate::run::AUDIT_LOG),
-        "external domains contacted during the build (audit)",
-    ) {
-        eprintln!("{summary}");
-    }
-    if let Some(summary) = crate::egress_report::ip_contacts_summary(
-        &scratch.join(crate::run::AUDIT_LOG),
-        "external IPs/ports contacted during the build (audit)",
-    ) {
-        eprintln!("{summary}");
-    }
+    // After the dashboard froze, so it is safe to print.
+    print_audit_summaries(opts, &channels);
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     let srcs = inputs
@@ -1230,7 +1289,15 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     let scratch_owner = claim_scratch(&scratch)?;
     let _scratch_on_signal =
         crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
-    let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
+    let channels = egress_channels(opts, &scratch)?;
+    let mut mv = make_microvm(
+        opts,
+        &scratch,
+        &channels,
+        &kernel.path,
+        &agent.path,
+        &timings,
+    )?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
     // stays within host RAM instead of multiplying live guests. The ceiling itself is
     // resolved further down, once every unit's plan says how big its stages are.
@@ -1588,25 +1655,11 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     drop(mv);
     // What the whole fleet build cost the host (see build_backend's counterpart).
     if let Some(usage) = meter.read() {
-        let usage = usage.with_network(&scratch.join(crate::run::NET_BYTES));
+        let usage = usage.with_network(&channels.join(crate::run::NET_BYTES));
         eprintln!("{}", usage.summary("build"));
     }
-    // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
-    // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
-    // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A
-    // no-op when audit was off.
-    if let Some(summary) = crate::egress_report::contacts_summary(
-        &scratch.join(crate::run::AUDIT_LOG),
-        "external domains contacted during the build (audit)",
-    ) {
-        eprintln!("{summary}");
-    }
-    if let Some(summary) = crate::egress_report::ip_contacts_summary(
-        &scratch.join(crate::run::AUDIT_LOG),
-        "external IPs/ports contacted during the build (audit)",
-    ) {
-        eprintln!("{summary}");
-    }
+    // After the dashboard froze, so it is safe to print.
+    print_audit_summaries(opts, &channels);
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     for u in &units {
@@ -6797,6 +6850,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -6869,6 +6923,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -6885,6 +6940,60 @@ ENTRYPOINT run me
         assert_eq!(cfg.argv(), ["/bin/app", "--port", "6379"]);
         // the ports the Dockerfile exposes reach the sidecar, so the guest gates on them
         assert_eq!(cfg.exposed_ports, [6379, 9000, 9001]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A placed job's build keeps its channels in a dir of its own in the job's record, which
+    /// outlives the build's scratch.
+    #[test]
+    fn a_recorded_build_keeps_its_channels_past_its_scratch() {
+        let tmp = tmpdir("egress-record");
+        std::fs::write(tmp.join("f"), "x").unwrap();
+        std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
+        let record = tmp.join("egress");
+        std::fs::create_dir_all(&record).unwrap();
+        let opts = Options {
+            dockerfiles: vec![tmp.join("Dockerfile")],
+            target: None,
+            stage_guests: Default::default(),
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            out: Some(tmp.join("img.ext4")),
+            out_disk: None,
+            print_plan: false,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            build_cache: BuildCache::default(),
+            journal: false,
+            out_format: ImageFormat::Raw,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            record: Some(EgressRecord {
+                dir: record.clone(),
+                source: None,
+            }),
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+        };
+        build_host(&opts).unwrap();
+        let kept: Vec<String> = std::fs::read_dir(&record)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].starts_with(crate::egress_report::BUILD_PREFIX));
+        // The scratch it was named for is gone.
+        let scratch = kept[0]
+            .strip_prefix(crate::egress_report::BUILD_PREFIX)
+            .unwrap();
+        assert!(!tmp.join(scratch).exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6920,6 +7029,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -6968,6 +7078,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -7022,6 +7133,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -7095,6 +7207,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -8264,6 +8377,7 @@ RUN ship
             build_args: vec![],
             net: BuildNet::All,
             audit: false,
+            record: None,
             require_cached: false,
             build_jobs: j,
             debug: false,

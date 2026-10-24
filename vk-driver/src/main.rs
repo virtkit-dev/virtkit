@@ -1700,6 +1700,12 @@ enum Cmd {
         /// executor.
         #[arg(long = "vm-name", value_name = "IP=NAME")]
         vm_name: Vec<String>,
+        /// stop recording denials and contacts once their log reaches this size, counting them
+        ///
+        /// What is dropped is counted, and the counts are recorded instead. Set internally for a
+        /// placed job's switches.
+        #[arg(long = "record-limit", value_name = "BYTES")]
+        record_limit: Option<u64>,
         /// redirect guest flows aimed at a sentinel address to a host-local registry proxy
         ///
         /// The value is `<sentinel-ip>=<host:port>`, set internally by
@@ -4263,6 +4269,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             build_args,
             net,
             audit: *build_audit_egress,
+            record: None,
             require_cached: *require_cached,
             build_jobs: build_jobs.or(b.jobs),
             debug: *debug,
@@ -4544,6 +4551,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         source_egress,
         egress_cap,
         vm_name,
+        record_limit,
         registry_proxy,
         denied_log,
         audit_log,
@@ -4663,6 +4671,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             *egress_dry_run,
             cap,
             vm_names,
+            *record_limit,
             followed,
         )
         .await

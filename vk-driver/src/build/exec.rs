@@ -586,8 +586,13 @@ pub struct MicroVm {
     net: crate::build::BuildNet,
     /// audit mode (`--build-audit-egress`): the shared channel every stage switch appends the
     /// external domains its RUNs resolve to, drained into the post-build summary. `None` =
-    /// off. All workers share this one path (they share `scratch`).
+    /// off, unless a placed job records its build (`record`). All workers share this one path.
     audit_log: Option<PathBuf>,
+    /// The channel every stage switch publishes the bytes it forwarded to, which the build sums
+    /// into its resource line: in the scratch, or in a placed job's record.
+    bytes_log: PathBuf,
+    /// What a placed job's stage switches need to record its denials (see `build::EgressRecord`).
+    record: Option<crate::run::StageRecord>,
     /// source-stage ext4s available to attach read-only to this stage's guest, in the
     /// first-use order computed by the driver. A boot attaches only a budget-sized subset.
     sources: Vec<(String, PathBuf)>,
@@ -1198,6 +1203,8 @@ impl MicroVm {
         debug: bool,
         tmp_disk_enabled: bool,
         audit_log: Option<PathBuf>,
+        bytes_log: PathBuf,
+        record: Option<crate::run::StageRecord>,
         timings: Arc<Timings>,
     ) -> Self {
         MicroVm {
@@ -1228,6 +1235,8 @@ impl MicroVm {
             timings,
             net,
             audit_log,
+            bytes_log,
+            record,
             sources: Vec::new(),
             source_dev: HashMap::new(),
             tmp_disk_enabled,
@@ -1348,6 +1357,8 @@ impl MicroVm {
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
             audit_log: self.audit_log.clone(),
+            bytes_log: self.bytes_log.clone(),
+            record: self.record.clone(),
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
@@ -1514,9 +1525,6 @@ impl MicroVm {
             .image_kernel_boot
             .as_ref()
             .map(|b| (b.kernel.as_path(), b.initramfs.as_path()));
-        // The one channel every stage's switch appends to, beside the audit log in the
-        // scratch the workers share — which is where the build reads it back from.
-        let bytes_log = self.scratch.join(crate::run::NET_BYTES);
         let s = block_on(crate::run::boot_session(
             &self.kernel,
             &self.agent,
@@ -1532,7 +1540,8 @@ impl MicroVm {
             image_kernel,
             self.out_disk.as_deref(),
             self.audit_log.as_deref(),
-            Some(&bytes_log),
+            Some(&self.bytes_log),
+            self.record.as_ref(),
             self.cancel.clone(),
             &self.timings,
         ))?;
@@ -3307,6 +3316,8 @@ mod tests {
             false,
             false,
             None,
+            dir.join(crate::run::NET_BYTES),
+            None,
             Arc::new(Timings::new()),
         );
         let worker = ex.worker();
@@ -3347,6 +3358,8 @@ mod tests {
             crate::build::BuildNet::None,
             false,
             false,
+            None,
+            dir.join(crate::run::NET_BYTES),
             None,
             Arc::new(Timings::new()),
         );

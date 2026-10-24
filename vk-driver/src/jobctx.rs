@@ -87,7 +87,7 @@ pub struct JobCtx {
     /// `[registry] guest_credential = "job"`.
     pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
     /// Where a placed job's executor commands keep what its node reports of its egress
-    /// ([`JOB_EGRESS`]): its refused declarations.
+    /// ([`JOB_EGRESS`]): its builds' records and its refused declarations.
     pub egress_record: Option<PathBuf>,
 }
 

@@ -14,6 +14,11 @@ use std::path::Path;
 
 use vk_hub_proto::egress::{EgressLayer, EgressRefusal};
 
+/// A placed job's egress record ([`crate::jobctx::JobCtx::egress_record`]) keeps each of the
+/// job's builds' channels in a dir of its own, named with this prefix, laid out as a build's
+/// scratch lays them out.
+pub const BUILD_PREFIX: &str = "build-";
+
 /// The egress declarations a placed job was refused at validation, in its egress record: one
 /// JSON [`EgressRefusal`] per line.
 pub const REFUSED: &str = "refused.jsonl";
@@ -73,6 +78,25 @@ impl Denial {
     /// A human line for the job trace — the shape the switch also logs for operators.
     pub fn display(&self) -> String {
         format!("egress denied ({}) {}", self.proto.as_str(), self.target)
+    }
+}
+
+/// How long a placed job's switches let each of its denial and audit channels grow, in bytes:
+/// past it they only count what they would have recorded, as [`append_omitted`] writes it.
+pub const RECORD_LIMIT: u64 = 8 << 20;
+
+/// Append `n` attempts with `outcome` that a switch dropped past its record limit to `path`, as
+/// an `omitted\toutcome\tn` record, which neither the trace's readers nor `vk egress-report`
+/// read as a denial or a contact.
+pub fn append_omitted(path: &Path, outcome: vk_hub_proto::egress::EgressOutcome, n: u64) {
+    use vk_hub_proto::egress::EgressOutcome;
+    let outcome = match outcome {
+        EgressOutcome::Observed => "observed",
+        EgressOutcome::WouldBlock => "would_block",
+        EgressOutcome::Blocked | EgressOutcome::Other => "blocked",
+    };
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(format!("omitted\t{outcome}\t{n}\n").as_bytes());
     }
 }
 

@@ -512,8 +512,8 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
             if let crate::compose::Source::Image(image) = &unit.source
                 && let Some(spec) = image.strip_prefix("dockerfile:")
             {
-                let (rootfs, _, guard) =
-                    build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                let (rootfs, _, guard) = build_git_image(ctx, spec, Some(&unit.name))
+                    .with_context(|| format!("service {}", unit.name))?;
                 booted.extend(rootfs.parent().map(Path::to_path_buf));
                 warm_guards.push(guard);
             }
@@ -756,7 +756,7 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
-    let (rootfs, config, guard) = build_git_image(ctx, spec)?;
+    let (rootfs, config, guard) = build_git_image(ctx, spec, None)?;
     Ok(BootPlan {
         media: Media {
             rootfs,
@@ -776,10 +776,12 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 /// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
 /// overrides it. `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
 /// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
-/// confined to the checkout, since all of them are job-authored.
+/// confined to the checkout, since all of them are job-authored. `service` names the service
+/// whose image it is, for the job's egress record; `None` for the job's own.
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
+    service: Option<&str>,
 ) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
     let cfg = &ctx.cfg;
     if !cfg.executor.host_checkout {
@@ -837,6 +839,7 @@ fn build_git_image(
         cache_auth: cache.auth,
         net,
         audit,
+        record: build_record(ctx, service)?,
     };
     let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -1372,6 +1375,7 @@ fn build_compose_unit(
         cache_auth: cache.auth,
         net,
         audit,
+        record: build_record(ctx, Some(&unit.name))?,
     };
     // The build reports the entry it materialized; addressing it separately would pin the
     // fingerprint computed here rather than the one the build settled on.
@@ -2526,8 +2530,8 @@ fn plan_services(
         let prov = match service_media(&unit.source) {
             ServiceMedia::Bundle => return Err(windows_service_refused(&unit)),
             ServiceMedia::Git(spec) => {
-                let (ext4, config, guard) =
-                    build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                let (ext4, config, guard) = build_git_image(ctx, spec, Some(&unit.name))
+                    .with_context(|| format!("service {}", unit.name))?;
                 guards.push(guard);
                 let merged = crate::compose::merged_config(&config, &unit);
                 crate::units::provisioned(&unit, ext4, merged, siting(slot, extra_ips))?
@@ -2702,6 +2706,12 @@ fn spawn_switch(
             cfg.egress.allow_name.as_deref(),
         )),
         vm_names,
+        // A placed job's switch records within a bound, for its report: its guests choose how
+        // much. The trace's lines and summaries read what is recorded.
+        record_limit: ctx
+            .egress_record
+            .as_ref()
+            .map(|_| crate::egress_report::RECORD_LIMIT),
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
@@ -2821,6 +2831,18 @@ fn service_per_source(
         }
     }
     Ok(out)
+}
+
+/// Where a placed job's build of `service`'s image (`None`: the job's own) records its egress
+/// for the job's report; `None` for a job no hub placed.
+fn build_record(ctx: &JobCtx, service: Option<&str>) -> Result<Option<crate::build::EgressRecord>> {
+    let Some(dir) = &ctx.egress_record else {
+        return Ok(None);
+    };
+    Ok(Some(crate::build::EgressRecord {
+        dir: dir.clone(),
+        source: service.map(str::to_string),
+    }))
 }
 
 /// This job's build-phase egress ([`crate::build::BuildNet`]) plus its build-audit flag: the
@@ -5658,6 +5680,21 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A placed job's build records into its egress record, with whose image it is.
+    #[test]
+    fn a_placed_jobs_build_records_into_its_egress_record() {
+        let mut c = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
+        assert_eq!(build_record(&c, None).unwrap(), None);
+        c.egress_record = Some(PathBuf::from("/n/j/egress"));
+        assert_eq!(
+            build_record(&c, Some("db")).unwrap(),
+            Some(crate::build::EgressRecord {
+                dir: PathBuf::from("/n/j/egress"),
+                source: Some("db".into()),
+            })
+        );
     }
 
     // pack_checkout_seed builds a portable tar (the `tar` crate, no host `tar` binary): it drops
