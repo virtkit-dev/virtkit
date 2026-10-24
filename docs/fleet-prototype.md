@@ -1561,7 +1561,8 @@ URL becomes a link only when it is a plain web URL without credentials.
 
 Operators create keys there with the same validation as `vk-hub keys create`: a name,
 scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
-of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the CLI's reason.
+of 90 days (the default), 7, 30 or 365 days. Binding a key to a GitLab instance and projects
+currently requires the CLI. Invalid names and policies get the CLI's reason.
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
 with a `[hub]` table for `vk-gitlab`: `url` is the hub's node address, and `api_key_file`
 points to the key. The key never appears in live updates, logs or audit entries.
