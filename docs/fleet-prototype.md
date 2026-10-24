@@ -1512,7 +1512,12 @@ seen in the history kept*, and how many of the jobs it applies to reported the p
 applicable jobs reported this phase completely*), beside how far back the reports go, the
 contacts not kept past a project's bound, and the caution that no reported use does not prove
 an entry unnecessary. Without a complete report, or when the read was cut, an entry reads
-*Insufficient evidence*. A job counts from the day it first used a destination, and the day
+*Insufficient evidence*. The nodes' cap entries follow, each with the jobs of its node held to
+the caps it has now (by their fingerprint, as each phase of a job's report names it, else as
+recorded on the job at placement), of the latest
+10,000 of the history, *no observed use since* the first of them when that is within the 30
+days, and the caution that only the hub's jobs count: other workloads on the node may use
+them. A job counts from the day it first used a destination, and the day
 before the window too, since it may have used it again within. Nothing is removed. Each read takes at most 200,000 records of each of the store's tables, and says
 when it was cut.
 
@@ -1525,6 +1530,9 @@ would have blocked. The Fallback is listed apart. With `[jobs] egress_rules` off
 that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. A rule's page,
 `/egress?tab=rules&rule=<name>`, lists each phase's domains and IP ranges, an empty one reading
 *None*, and each entry's use.
+Below the rules, *Node caps*: each node's own `[egress]` and `[egress.build]` as its inventory
+reports them, a dry-run run phase marked, too large to report, or not reported by an older `vk`,
+with its entries no job placed under them used, as on Observed traffic.
 
 An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
 removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab

@@ -1,9 +1,10 @@
 //! What the Rules tab and Observed traffic's list of projects read from the history
-//! ([`super::rule_use`], [`super::rules::RecentScan`]), computed once for every page and stream
-//! showing it: one pass over the latest [`super::rules::RECENT_SCAN`] jobs, a record decoded at
-//! a time, and at most one computation runs at once, those asking meanwhile waiting for it.
+//! ([`super::rule_use`], [`super::cap_use`], [`super::rules::RecentScan`]), computed once for
+//! every page and stream showing it: one pass over the latest [`super::cap_use::SCAN`] jobs feeds
+//! both job scans, a record decoded at a time, and at most one computation runs at once, those
+//! asking meanwhile waiting for it.
 //!
-//! A computation stands for the rules' generation and the day it was made for;
+//! A computation stands for the rules' generation, the nodes' caps and the day it was made for;
 //! past a change to the jobs' reports or the rows ([`Hub::egress_changed`]), for [`MIN_AGE`]
 //! more, so however fast jobs end and however many pages follow, the history is read at most once
 //! per [`MIN_AGE`]; and never past [`MAX_AGE`], as the recent jobs' window moves with the clock.
@@ -15,9 +16,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::cap_use::{self, CapUse};
 use super::rule_use::{self, RuleUse};
 use super::rules::{RECENT_SCAN, Recent, RecentScan, Rules};
 use crate::server::Hub;
+use crate::store::NodeRow;
 
 /// How long a computation stands past a change to the jobs' reports or the rows.
 pub const MIN_AGE: Duration = Duration::from_secs(5);
@@ -29,6 +32,7 @@ pub const MAX_AGE: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct Aggregates {
     pub rule_use: RuleUse,
+    pub cap_use: CapUse,
     pub recent: Recent,
 }
 
@@ -36,13 +40,21 @@ pub struct Aggregates {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Key {
     rules: u64,
+    /// Each node's ID and the fingerprint of the caps it lists.
+    caps: Vec<(String, String)>,
     today: u64,
 }
 
 impl Key {
-    fn of(rules: &Rules, now: u64) -> Key {
+    fn of(rules: &Rules, nodes: &[(String, NodeRow)], now: u64) -> Key {
+        let mut caps: Vec<(String, String)> = nodes
+            .iter()
+            .filter_map(|(id, n)| Some((id.clone(), cap_use::listed(n)?.fingerprint.clone())))
+            .collect();
+        caps.sort();
         Key {
             rules: rules.generation,
+            caps,
             today: now / 86_400,
         }
     }
@@ -79,14 +91,27 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Cache {
-    /// What the Rules tab reads for `rules` at `now` (seconds since the epoch): the latest
-    /// computation while it stands, else a new one.
-    pub fn get(&self, hub: &Hub, rules: &Rules, now: u64) -> Result<Arc<Aggregates>> {
-        self.get_at(hub, rules, now, Instant::now())
+    /// What the Rules tab reads for `rules` and `nodes` at `now` (seconds since the epoch):
+    /// the latest computation while it stands, else a new one.
+    pub fn get(
+        &self,
+        hub: &Hub,
+        rules: &Rules,
+        nodes: &[(String, NodeRow)],
+        now: u64,
+    ) -> Result<Arc<Aggregates>> {
+        self.get_at(hub, rules, nodes, now, Instant::now())
     }
 
-    fn get_at(&self, hub: &Hub, rules: &Rules, now: u64, at: Instant) -> Result<Arc<Aggregates>> {
-        let key = Key::of(rules, now);
+    fn get_at(
+        &self,
+        hub: &Hub,
+        rules: &Rules,
+        nodes: &[(String, NodeRow)],
+        now: u64,
+        at: Instant,
+    ) -> Result<Arc<Aggregates>> {
+        let key = Key::of(rules, nodes, now);
         let standing = |generation| {
             lock(&self.held)
                 .as_ref()
@@ -103,7 +128,7 @@ impl Cache {
         if let Some(v) = standing(generation) {
             return Ok(v);
         }
-        let value = Arc::new(compute(hub, rules, now)?);
+        let value = Arc::new(compute(hub, rules, nodes, now)?);
         self.computed.fetch_add(1, Ordering::Relaxed);
         *lock(&self.held) = Some(Held {
             key,
@@ -121,14 +146,24 @@ impl Cache {
     }
 }
 
-/// One computation: the rules' entries' use, and the recent jobs from one pass over the
-/// history.
-fn compute(hub: &Hub, rules: &Rules, now: u64) -> Result<Aggregates> {
+/// One computation: the rules' entries' use, the caps', and the recent jobs, the latter two
+/// from one pass over the history.
+fn compute(hub: &Hub, rules: &Rules, nodes: &[(String, NodeRow)], now: u64) -> Result<Aggregates> {
     let today = now / 86_400;
+    let mut caps = cap_use::Scan::new(nodes, today);
     let mut recent = RecentScan::new(now);
-    hub.db.visit_jobs(RECENT_SCAN, |_, j| recent.visit(j))?;
+    let limit = if caps.reads_jobs() {
+        cap_use::SCAN
+    } else {
+        RECENT_SCAN
+    };
+    hub.db.visit_jobs(limit, |_, j| {
+        caps.visit(j);
+        recent.visit(j);
+    })?;
     Ok(Aggregates {
         rule_use: rule_use::rule_use(hub, &rules.rules, today)?,
+        cap_use: caps.finish(),
         recent: recent.finish(),
     })
 }
@@ -148,8 +183,11 @@ mod tests {
         let cache = Arc::new(Cache::default());
         let rules = super::super::rules::list(&hub).unwrap();
         let start = Instant::now();
-        let get =
-            |rules: &Rules, at: Duration| cache.get_at(&hub, rules, 1_000_000, start + at).unwrap();
+        let get = |rules: &Rules, at: Duration| {
+            cache
+                .get_at(&hub, rules, &[], 1_000_000, start + at)
+                .unwrap()
+        };
         // Two streams and a page at once: one computation.
         std::thread::scope(|s| {
             for _ in 0..3 {

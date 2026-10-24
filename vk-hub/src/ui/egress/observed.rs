@@ -133,7 +133,8 @@ struct Listing {
     project: Option<Project>,
     unreported: Vec<(String, String)>,
     rules: Rules,
-    /// The rules' entries' use, for the list of projects.
+    /// The nodes, and the rules' entries' use and their caps', for the list of projects.
+    nodes: Vec<(String, crate::store::NodeRow)>,
     used: Option<Arc<Aggregates>>,
 }
 
@@ -193,8 +194,16 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
         }
     };
     let rules = ops::list(hub)?;
+    let nodes = match project {
+        None => hub.db.nodes()?,
+        Some(_) => Vec::new(),
+    };
     let used = match project {
-        None => Some(caches.aggregates.get(hub, &rules, crate::now_secs())?),
+        None => Some(
+            caches
+                .aggregates
+                .get(hub, &rules, &nodes, crate::now_secs())?,
+        ),
         Some(_) => None,
     };
     Ok(Listing {
@@ -203,6 +212,7 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
         project,
         unreported: unreported(hub)?,
         rules,
+        nodes,
         used,
     })
 }
@@ -356,8 +366,12 @@ fn coverage_lines(c: &Coverages) -> Vec<String> {
 /// Every project, its latest first, with how completely its jobs reported; then the rules'
 /// entries no contact matched.
 fn projects(h: &mut Html, q: &Query, l: &Listing) {
-    if let Some(u) = l.used.as_ref().filter(|_| !l.rules.rules.is_empty()) {
-        unused_callout(h, &u.rule_use);
+    if let Some(u) = &l.used {
+        if !l.rules.rules.is_empty() {
+            unused_callout(h, &u.rule_use);
+        }
+        let nodes: Vec<&(String, crate::store::NodeRow)> = l.nodes.iter().collect();
+        super::rules::caps_unused(h, &nodes, &u.cap_use);
     }
     if l.subjects.is_empty() {
         h.raw("<p class=\"empty\">nothing observed yet</p>");

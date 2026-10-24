@@ -1540,10 +1540,11 @@ The node also reports its own caps in its inventory, each phase as it holds jobs
 `[egress]` under `[net] mode = "switch"` (nothing without a network, nothing enforced over a
 tap), with `[egress] dry_run`, and `[egress.build]` whatever the mode — normalized and
 fingerprinted, so that the hub tells a changed cap from the one a job ran under. A list of more
-than 256 entries is reported as too large to show. The node reads its config once, its
-executors each time they start, so a job may be held to caps edited since the node last
-reported them: each phase of the job's report names the caps it was held to, by their
-fingerprint.
+than 256 entries is reported as too large to show. The hub shows them beside its own rules,
+evaluates them in *Test a job*, and names the entries its jobs show no use of; it cannot widen
+them. The node reads its config once, its executors each time they start, so a job may be held
+to caps edited since the node last reported them: each phase of the job's report names the
+caps it was held to, by their fingerprint, and the hub counts the phase toward those.
 
 ## Services
 

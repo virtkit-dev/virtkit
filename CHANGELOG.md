@@ -125,7 +125,9 @@ All notable changes to virtkit will be documented in this file.
   unnecessary. Nothing is removed automatically.
 - **The hub shows each node's own egress caps**: Test a job evaluates the node's cap in each
   phase, a dry-run one included, and names a job's declared entries it or the hub's rules leave
-  nothing of.
+  nothing of; the Rules tab lists each node's caps, and it and Observed traffic name the cap
+  entries no job the hub placed used in 30 days while held to them, with their coverage and the
+  caution that other workloads on the node may use them.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

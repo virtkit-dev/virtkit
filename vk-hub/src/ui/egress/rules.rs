@@ -4,7 +4,9 @@
 //! Fallback listed apart. With `[jobs] egress_rules` off the tab says that saved rules restrict
 //! nothing. Each rule has a page of its own, `/egress?tab=rules&rule=<name>`, listing its
 //! entries and each one's use; there operators change or remove it, and on
-//! `/egress?tab=rules&new=rule` add one, through Preview → Save ([`super::editor`]).
+//! `/egress?tab=rules&new=rule` add one, through Preview → Save ([`super::editor`]). Below the
+//! rules, each node's own caps as it reports them, with the entries of them the hub's jobs
+//! placed under them show no use of ([`crate::egress::cap_use`]).
 //!
 //! Rule names and entries are operators' to choose, checked as a node checks its own lists;
 //! they are escaped as any text.
@@ -13,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use hyper::{Response, StatusCode};
-use vk_hub_proto::egress::HubPhase;
+use vk_hub_proto::egress::{HubPhase, NodeEgressCaps};
 
 use super::super::html::Html;
 use super::super::jobs::percent_encode;
@@ -21,10 +23,11 @@ use super::super::pages;
 use super::super::{Auth, Body, Ui, access, blocking, decode_form, field, fleet, message, page};
 use super::{Caches, PATH as EGRESS, Tab, capital};
 use crate::egress::aggregates::Aggregates;
-use crate::egress::rule_use::{RuleUse, Standing};
+use crate::egress::cap_use::CapUse;
+use crate::egress::rule_use::{self, RuleUse, Standing};
 use crate::egress::rules::{self as ops, RECENT_SCAN, RuleJobs, Rules};
 use crate::server::Hub;
-use crate::store::{DEFAULT_RULE, EgressRuleRow, Role, RuleMode};
+use crate::store::{DEFAULT_RULE, EgressRuleRow, NodeRow, Role, RuleMode};
 
 /// The tab.
 pub(super) const PATH: &str = "/egress?tab=rules";
@@ -72,14 +75,21 @@ struct Listing {
     rules: Rules,
     /// The GitLab instances, by name, for the editor.
     gitlabs: Vec<String>,
-    /// The rules' entries' use, and the recent jobs.
+    /// The enrolled nodes, by ID.
+    nodes: Vec<(String, NodeRow)>,
+    /// The rules' entries' use, the caps', and the recent jobs.
     used: Arc<Aggregates>,
 }
 
 fn listing(hub: &Hub, caches: &Caches) -> Result<Listing> {
     let rules = ops::list(hub)?;
+    let mut nodes = hub.db.nodes()?;
+    nodes.sort_by(|a, b| (&a.1.hostname, &a.0).cmp(&(&b.1.hostname, &b.0)));
     Ok(Listing {
-        used: caches.aggregates.get(hub, &rules, crate::now_secs())?,
+        used: caches
+            .aggregates
+            .get(hub, &rules, &nodes, crate::now_secs())?,
+        nodes,
         rules,
         gitlabs: hub.db.gitlabs()?.into_iter().map(|(n, _)| n).collect(),
     })
@@ -169,13 +179,14 @@ fn tab_page(l: &Listing, auth: &Auth) -> Html {
     h
 }
 
-/// The tab's list: how the rules stand, the rules and the Fallback.
+/// The tab's list: how the rules stand, the rules, the Fallback and the nodes' caps.
 fn tab_results(h: &mut Html, l: &Listing) {
     state_callout(h, &l.rules);
     let (fallback, rules): (Vec<&EgressRuleRow>, Vec<&EgressRuleRow>) =
         l.rules.rules.iter().partition(|r| is_fallback(r));
     if rules.is_empty() && fallback.is_empty() {
         h.raw("<p class=\"empty\">no rules yet</p>");
+        node_caps(h, &l.nodes, &l.used.cap_use);
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr><th>rule</th><th>applies to</th><th>run</th>")
@@ -202,6 +213,7 @@ fn tab_results(h: &mut Html, l: &Listing) {
             .text(RECENT_SCAN)
             .raw(" of the last 7 days.</p>");
     }
+    node_caps(h, &l.nodes, &l.used.cap_use);
 }
 
 /// A node's cap's phase in a few words: `Unrestricted`, `No external access`,
@@ -211,6 +223,136 @@ pub(super) fn cap_summary(p: &HubPhase) -> String {
         HubPhase::Unrestricted => "Unrestricted".to_string(),
         p => phase_summary(p),
     }
+}
+
+/// Each node's own caps as it reports them, with the entries of them the hub's jobs show no use
+/// of.
+fn node_caps(h: &mut Html, nodes: &[(String, NodeRow)], u: &CapUse) {
+    let nodes: Vec<&(String, NodeRow)> = nodes
+        .iter()
+        .filter(|(_, n)| n.inventory.is_some())
+        .collect();
+    if nodes.is_empty() {
+        return;
+    }
+    h.raw("<section id=\"caps\"><h2>Node caps</h2><p class=\"sub\">Each node's own ")
+        .raw("<code>[egress]</code> and <code>[egress.build]</code>, as it reports them: what ")
+        .raw("its jobs may ever reach, whatever the hub's rules allow. A hub rule cannot widen ")
+        .raw("them.</p><table class=\"grid\"><thead><tr><th>node</th><th>run</th><th>build</th>")
+        .raw("<th>last 30 days</th></tr></thead><tbody>");
+    for (id, n) in &nodes {
+        h.raw("<tr><td><a href=\"/node/")
+            .text(id)
+            .raw("\">")
+            .node(&n.hostname)
+            .raw("</a></td>");
+        let reported = n.inventory.as_ref().and_then(|i| i.egress_caps.as_ref());
+        let c = match reported {
+            Some(NodeEgressCaps::Listed(c)) => c,
+            Some(NodeEgressCaps::TooLarge) => {
+                h.raw("<td colspan=\"3\">too large to report</td></tr>");
+                continue;
+            }
+            Some(NodeEgressCaps::Other) => {
+                h.raw("<td colspan=\"3\">reported in a form this hub cannot read</td></tr>");
+                continue;
+            }
+            None => {
+                h.raw("<td colspan=\"3\">not reported: a newer <code>vk</code> reports them</td></tr>");
+                continue;
+            }
+        };
+        h.raw("<td>").text(cap_summary(&c.run));
+        if c.run_dry_run {
+            h.raw(" <span class=\"badge warn\">Dry-run</span>");
+        }
+        h.raw("</td><td>")
+            .text(cap_summary(&c.build))
+            .raw("</td><td>");
+        match u.unused(id).len() {
+            0 => h.raw("-"),
+            1 => h.raw("1 entry with no observed use"),
+            n => h.text(n).raw(" entries with no observed use"),
+        };
+        if let Some(n) = u.unreported.get(id.as_str()).filter(|n| **n > 0) {
+            h.raw("; ").text(jobs_text(*n)).raw(" sent no report");
+        }
+        h.raw("</td></tr>");
+    }
+    h.raw("</tbody></table>");
+    caps_unused(h, &nodes, u);
+    h.raw("</section>");
+}
+
+/// The entries of the nodes' caps no contact of the hub's jobs placed under them matched within
+/// 30 days, each with its last use and its coverage, and the caution that goes with them.
+pub(super) fn caps_unused(h: &mut Html, nodes: &[&(String, NodeRow)], u: &CapUse) {
+    let today = crate::now_secs() / 86_400;
+    let window = today.saturating_sub(rule_use::USE_DAYS - 1);
+    let mut any = false;
+    for (id, n) in nodes {
+        for (phase, entry) in u.unused(id) {
+            if !any {
+                h.raw("<div class=\"callout\"><p><span class=\"badge\">No observed use</span> ")
+                    .raw("No contact of the hub's jobs placed under these caps matched these ")
+                    .raw("entries:</p><ul class=\"access\">");
+                any = true;
+            }
+            let since = u
+                .since_day
+                .get(id.as_str())
+                .copied()
+                .filter(|d| *d > window);
+            let used = u
+                .entries
+                .get(&(id.clone(), phase, entry.to_string()))
+                .and_then(|e| e.last_day);
+            let c = u
+                .coverage
+                .get(&(id.clone(), phase))
+                .copied()
+                .unwrap_or_default();
+            h.raw("<li><a href=\"/node/")
+                .text(id)
+                .raw("\"><strong>")
+                .node(&n.hostname)
+                .raw("</strong></a> · ")
+                .raw(if phase == "build" { "Build" } else { "Run" })
+                .raw(" · <code>")
+                .text(entry)
+                .raw("</code> · ");
+            match since {
+                Some(day) => h
+                    .raw("no observed use since ")
+                    .text(super::observed::date(day))
+                    .raw(", its first job kept under these caps"),
+                None => h.raw("no observed use in 30 days"),
+            };
+            match used {
+                Some(day) => h.raw(" · last used ").text(super::observed::date(day)),
+                None => h.raw(" · not seen in the history kept"),
+            };
+            h.raw(" · ")
+                .text(c.complete)
+                .raw(" of ")
+                .text(c.ran)
+                .raw(" jobs placed on it under these caps reported this phase completely");
+            if let Some(n) = u.unreported.get(id.as_str()).filter(|n| **n > 0) {
+                h.raw(", ").text(jobs_text(*n)).raw(" sent no report");
+            }
+            h.raw("</li>");
+        }
+    }
+    if !any {
+        return;
+    }
+    h.raw("</ul><p class=\"sub\">Hub-observed jobs only; other workloads on the node may use ")
+        .raw("them, its gitlab-runner's jobs among them.");
+    if u.capped {
+        h.raw(" The job history was read only in part.");
+    }
+    h.raw(" No reported use does not prove an entry unnecessary; nothing is removed ")
+        .raw("automatically.</p></div>");
 }
 
 /// One rule's row of the list.

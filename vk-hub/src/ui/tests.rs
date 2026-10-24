@@ -9270,6 +9270,180 @@ async fn test_a_job_shows_each_layer_apart() {
     );
 }
 
+/// A node's caps, as it reports them, show on the Rules tab with their entries' use by the
+/// jobs placed under them, and Test a job evaluates them, a job's declarations held to them.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_caps_are_shown_and_evaluated() {
+    use vk_hub_proto::egress::*;
+    use vk_hub_proto::job::{CiJob, JobSpec, Variable};
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    egress_rule(
+        &hub,
+        crate::store::DEFAULT_RULE,
+        None,
+        HubPhase::Unrestricted,
+        HubPhase::Unrestricted,
+        crate::store::RuleMode::Enforce,
+    );
+    let mut caps = EgressCaps::normalized(
+        allow(&["corp.example.com", "unused.example"], &[]),
+        false,
+        HubPhase::Unrestricted,
+    )
+    .unwrap();
+    caps.fingerprint =
+        vk_hub_proto::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(caps.canonical()));
+    let inventory = vk_hub_proto::Inventory {
+        hostname: "ci-1".into(),
+        egress_caps: Some(NodeEgressCaps::Listed(caps.clone())),
+        ..vk_hub_proto::Inventory::default()
+    };
+    hub.db
+        .record_inventory(&node, inventory, true, crate::now_secs())
+        .unwrap();
+    // A job placed under them reached corp.example.com, its run phase reported completely.
+    let now = crate::now_secs();
+    let report = EgressReport {
+        entries: vec![crate::egress::testing::entry(
+            EgressOutcome::Observed,
+            EgressProtocol::Dns,
+            EgressDestination::domain("api.corp.example.com"),
+            None,
+        )],
+        phases: vec![crate::egress::testing::phase(
+            EgressPhase::Run,
+            EgressCoverage::Complete,
+        )],
+        ..EgressReport::default()
+    };
+    let id = format!("{:032x}", 1);
+    let mut row = crate::egress::testing::job(1, report);
+    row.node = Some(node.clone());
+    row.finished_at = Some(now);
+    row.egress_caps = Some(caps.fingerprint.clone());
+    let mut ci = CiJob::default();
+    ci.variables.push(Variable {
+        key: "MICROVM_EGRESS_ALLOW_NAME".into(),
+        value: "corp.example.com partner.example.net".into(),
+        public: true,
+        ..Variable::default()
+    });
+    // Its build declares only an address: under a cap and rules restricting nothing, its builds
+    // reach no domain.
+    ci.variables.push(Variable {
+        key: "MICROVM_BUILD_EGRESS_ALLOW_IP".into(),
+        value: "10.0.0.1/32:443".into(),
+        public: true,
+        ..Variable::default()
+    });
+    // A service declaring its own lists is held to them and to the job's.
+    ci.services.push(vk_hub_proto::job::Image {
+        name: "postgres:16".into(),
+        variables: vec![Variable {
+            key: "MICROVM_EGRESS_ALLOW_NAME".into(),
+            value: "corp.example.com".into(),
+            public: true,
+            ..Variable::default()
+        }],
+        ..vk_hub_proto::job::Image::default()
+    });
+    let spec = serde_json::to_vec(&JobSpec::GitlabCi(ci)).unwrap();
+    let mut queued = row.clone();
+    queued.result = None;
+    hub.db
+        .submit_job(&id, &queued, &id, &spec, "key gitlab", 10)
+        .unwrap();
+    assert!(hub.db.put_job(&id, &row, &[], 11).unwrap());
+
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(
+        tab.contains(&format!(
+            "<tr><td><a href=\"/node/{node}\">ci-1</a></td><td>2 domains</td>\
+             <td>Unrestricted</td><td>1 entry with no observed use</td></tr>"
+        )),
+        "{tab}"
+    );
+    assert!(
+        tab.contains("· Run · <code>unused.example</code> · no observed use since"),
+        "{tab}"
+    );
+    assert!(
+        tab.contains("Hub-observed jobs only; other workloads on the node may use them"),
+        "{tab}"
+    );
+    assert!(
+        !tab.contains("<code>corp.example.com</code> · no observed"),
+        "{tab}"
+    );
+    let observed = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
+    assert!(
+        observed.contains("<code>unused.example</code>"),
+        "{observed}"
+    );
+
+    let page = get(
+        addr,
+        &format!("/egress?tab=test&job={id}&destination=other.example"),
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        page.contains("<li>Run: 2 domains</li><li>Build: Unrestricted</li>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("The caps the job was placed under."),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "A service that declares its own lists is held to them as well as to the job's, each \
+             checked on its own: it may reach only what both allow."
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<p class=\"callout warn\">Run: MICROVM_EGRESS_ALLOW_NAME partner.example.net \
+             (outside the node&#39;s cap). The node keeps them and warns of them; that layer \
+             refuses what they list when the job runs"
+        ),
+        "{page}"
+    );
+    // Each VM of the run phase gets its result: the service's held to the job's lists and its
+    // own, each layer on its own.
+    assert!(
+        page.contains(
+            "<tr><td>Run</td><td>job</td><td>Blocked by the node&#39;s cap</td>\
+             <td>Unrestricted</td><td></td><td>Blocked by MICROVM_EGRESS_ALLOW_NAME</td>\
+             <td>—</td><td><span class=\"badge bad\">Blocked by the node&#39;s cap</span>\
+             </td></tr>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<tr><td>Run</td><td>service postgres:16</td><td>Blocked by the node&#39;s cap</td>\
+             <td>Unrestricted</td><td></td><td>Blocked by MICROVM_EGRESS_ALLOW_NAME</td>\
+             <td>Blocked by MICROVM_EGRESS_ALLOW_NAME</td><td><span class=\"badge bad\">\
+             Blocked by the node&#39;s cap</span></td></tr>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<tr><td>Build</td><td>job</td><td>Unrestricted</td><td>Unrestricted</td><td></td>\
+             <td>Blocked: only MICROVM_BUILD_EGRESS_ALLOW_IP is declared, so its VM may reach \
+             no domains</td><td>—</td><td><span class=\"badge bad\">Blocked: only \
+             MICROVM_BUILD_EGRESS_ALLOW_IP is declared</span>"
+        ),
+        "{page}"
+    );
+}
+
 /// Observed traffic compares each destination with the rules saved now, ref by ref, and names
 /// the rules' entries no contact matched in 30 days, with their coverage and the caution that
 /// goes with them; a rule's page shows each entry's use.
