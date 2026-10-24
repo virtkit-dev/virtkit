@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The hub's Connections page spaces its API keys and Instances apart for operators**, as
+  it does for viewers.
+
 ## [0.95.0] - 2026-10-24
 
 ### Added
