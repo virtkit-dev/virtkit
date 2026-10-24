@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use vk_hub_proto::egress::EgressRefusal;
+use vk_hub_proto::egress::{EgressLayer, EgressRefusal};
 
 /// The egress declarations a placed job was refused at validation, in its egress record: one
 /// JSON [`EgressRefusal`] per line.
@@ -76,61 +76,129 @@ impl Denial {
     }
 }
 
+/// What the switch knew of a record when it wrote it, beyond the record itself: written after
+/// the record's own fields as tab-separated `key=value`s, which the trace's readers pass over.
+/// A record without them — from an older switch — reads as all unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attrs {
+    /// The layer that decided a denial (see vk_hub_proto::egress).
+    pub layer: Option<EgressLayer>,
+    /// The service whose VM sent it; `None` for the job's own VM.
+    pub vm: Option<String>,
+    /// A denial a dry-run allowlist carried rather than refused.
+    pub would_block: bool,
+    /// The protocol of a contact by IP, which its record does not otherwise say.
+    pub proto: Option<Proto>,
+    /// When it happened, in milliseconds since the Unix epoch; for a count of repeats, the
+    /// last of them.
+    pub at_ms: Option<u64>,
+}
+
+impl Attrs {
+    /// The attributes as they follow a record: `\tkey=value` each, the VM's name sanitized.
+    fn encode(&self) -> String {
+        let mut s = String::new();
+        if let Some(layer) = self.layer {
+            s.push_str(&format!("\tlayer={}", layer.as_str()));
+        }
+        if let Some(vm) = &self.vm {
+            s.push_str(&format!("\tvm={}", sanitize(vm)));
+        }
+        if self.would_block {
+            s.push_str("\tdry=1");
+        }
+        if let Some(proto) = self.proto {
+            s.push_str(&format!("\tp={}", proto.as_str()));
+        }
+        if let Some(at) = self.at_ms {
+            s.push_str(&format!("\tt={at}"));
+        }
+        s
+    }
+
+    /// The attributes in `fields`, the `key=value`s after a record's own. An unknown key, from
+    /// a later switch, is passed over.
+    fn decode<'a>(fields: impl Iterator<Item = &'a str>) -> Self {
+        let mut attrs = Attrs::default();
+        for (key, value) in fields.filter_map(|f| f.split_once('=')) {
+            match key {
+                "layer" => attrs.layer = Some(EgressLayer::parse(value)),
+                "vm" => attrs.vm = Some(value.to_string()),
+                "dry" => attrs.would_block = value == "1",
+                "p" => attrs.proto = Proto::parse(value),
+                "t" => attrs.at_ms = value.parse().ok(),
+                _ => {}
+            }
+        }
+        attrs
+    }
+}
+
+/// Now, in milliseconds since the Unix epoch, as [`Attrs::at_ms`] says it.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `s` with its control characters replaced with `U+FFFD`: a guest-controlled name holding one
+/// would otherwise tear the one-record-per-line format, or forge lines into the job trace.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 /// Append a denial to `path` (create-or-append). A DNS `target` is guest-controlled, so
-/// control characters — which would otherwise tear the one-record-per-line format or inject
-/// forged lines into the job trace — are replaced with `U+FFFD`; the record is then one
-/// unambiguous `proto\ttarget` line. Written in a single `write_all` so concurrent switch
-/// tasks appending at once don't interleave fragments of a line. Best-effort: any IO error
-/// is dropped — a lost denial notice must never disturb the job or the switch's forwarding.
-pub fn append(path: &Path, proto: Proto, target: &str) {
-    append_repeats(path, proto, target, 1);
+/// control characters are replaced (see [`sanitize`]); the record is then one unambiguous
+/// `proto\ttarget` line, followed by its `attrs`. Written in a single `write_all` so concurrent
+/// switch tasks appending at once don't interleave fragments of a line. Best-effort: any IO
+/// error is dropped — a lost denial notice must never disturb the job or the switch's
+/// forwarding.
+pub fn append(path: &Path, proto: Proto, target: &str, attrs: &Attrs) {
+    append_repeats(path, proto, target, 1, attrs);
 }
 
 /// [`append`] for `count` refusals of the same target at once, as a `proto\ttarget\tcount`
-/// record; the count is left off at one. The sanitized target holds no tab, so the count is
-/// unambiguous.
-pub fn append_repeats(path: &Path, proto: Proto, target: &str, count: u64) {
-    let target: String = target
-        .chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect();
-    let line = match count {
-        1 => format!("{}\t{target}\n", proto.as_str()),
-        n => format!("{}\t{target}\t{n}\n", proto.as_str()),
+/// record; the count is left off at one when no attributes follow. The sanitized target holds
+/// no tab, so the count is unambiguous.
+pub fn append_repeats(path: &Path, proto: Proto, target: &str, count: u64, attrs: &Attrs) {
+    let target = sanitize(target);
+    let attrs = attrs.encode();
+    let line = match (count, attrs.is_empty()) {
+        (1, true) => format!("{}\t{target}\n", proto.as_str()),
+        (n, _) => format!("{}\t{target}\t{n}{attrs}\n", proto.as_str()),
     };
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
     }
 }
 
-/// Append one audited external contact to the audit channel `path` (create-or-append). Audit
-/// mode (see switch's `EgressGuard`) records both the allowed external names the guest resolves
-/// (`kind = "name"`) and the external IPs it dials without a matching resolution (`kind = "ip"`),
-/// interleaved in one channel; the readers below split them back apart by kind. Unlike the
-/// denial channel this is drained once at the end of the job rather than per stage. `value` is
-/// guest-controlled, so — like `append` — control characters are neutralized to `U+FFFD` (no
-/// forged or torn lines in the summary) and the record is one `kind\tvalue` `write_all`, so
-/// concurrent stage switches sharing a build's channel never interleave fragments. Best-effort:
-/// IO errors are dropped, exactly like `append`.
-fn append_audit(path: &Path, kind: &str, value: &str) {
-    let value: String = value
-        .chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect();
+/// Append one external contact to the audit channel `path` (create-or-append). The switch
+/// records both the allowed external names the guest resolves (`kind = "name"`) and the
+/// external IPs it dials without a matching resolution (`kind = "ip"`), interleaved in one
+/// channel; the readers below split them back apart by kind. Unlike the denial channel this is
+/// drained once at the end of the job rather than per stage. `value` is guest-controlled, so —
+/// like `append` — control characters are neutralized to `U+FFFD` (no forged or torn lines in
+/// the summary) and the record is one `kind\tvalue` `write_all`, followed by its `attrs`, so
+/// concurrent stage switches sharing a build's channel never interleave fragments.
+/// Best-effort: IO errors are dropped, exactly like `append`.
+fn append_audit(path: &Path, kind: &str, value: &str, attrs: &Attrs) {
+    let value = sanitize(value);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(format!("{kind}\t{value}\n").as_bytes());
+        let _ = f.write_all(format!("{kind}\t{value}{}\n", attrs.encode()).as_bytes());
     }
 }
 
 /// Record one contacted external domain (see [`append_audit`]).
-pub fn append_contact(path: &Path, name: &str) {
-    append_audit(path, "name", name);
+pub fn append_contact(path: &Path, name: &str, attrs: &Attrs) {
+    append_audit(path, "name", name, attrs);
 }
 
 /// Record one external `ip:port` the guest dialed directly, i.e. without a resolution the
 /// switch handed it — the domains summary would otherwise miss it (see [`append_audit`]).
-pub fn append_ip_contact(path: &Path, ip_port: &str) {
-    append_audit(path, "ip", ip_port);
+pub fn append_ip_contact(path: &Path, ip_port: &str, attrs: &Attrs) {
+    append_audit(path, "ip", ip_port, attrs);
 }
 
 /// Read the audit channel `path` and return each `kind` contact paired with its count, ordered
@@ -147,12 +215,10 @@ fn read_audit(path: &Path, kind: &str) -> Vec<(String, usize)> {
 /// The `kind` contacts in the audit records `text`, counted and ranked as [`read_audit`] says.
 fn count_audit(text: &str, kind: &str) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for value in text.lines().filter_map(|l| {
-        l.split_once('\t')
-            .filter(|(k, _)| *k == kind)
-            .map(|(_, v)| v.trim())
-            .filter(|v| !v.is_empty())
-    }) {
+    for value in audit_records(text)
+        .filter(|(k, _, _)| *k == kind)
+        .map(|(_, v, _)| v)
+    {
         *counts.entry(value).or_default() += 1;
     }
     let mut counts: Vec<(String, usize)> = counts
@@ -161,6 +227,17 @@ fn count_audit(text: &str, kind: &str) -> Vec<(String, usize)> {
         .collect();
     counts.sort_by(|(an, ac), (bn, bc)| bc.cmp(ac).then_with(|| an.cmp(bn)));
     counts
+}
+
+/// Each `kind\tvalue[\tattrs…]` record in `text`, as its kind, its value and its [`Attrs`]; a
+/// record with no value is passed over.
+fn audit_records(text: &str) -> impl Iterator<Item = (&str, &str, Attrs)> {
+    text.lines().filter_map(|l| {
+        let mut fields = l.split('\t');
+        let kind = fields.next()?;
+        let value = fields.next().map(str::trim).filter(|v| !v.is_empty())?;
+        Some((kind, value, Attrs::decode(fields)))
+    })
 }
 
 /// The contacted domains, most-contacted first (see [`read_audit`]).
@@ -256,7 +333,12 @@ pub fn report(dir: &Path) -> Option<String> {
         }
     };
     let (denied, denied_cut) = read_tail(&JobCtx::egress_denied_log_in(dir), REPORT_TAIL);
-    let refused = denial_lines(&parse(&denied).0);
+    let denials: Vec<Denial> = parse_records(&denied)
+        .0
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    let refused = denial_lines(&denials);
     let refused = (!refused.is_empty()).then(|| {
         let mut s = format!(
             "virtkit: {}:",
@@ -347,6 +429,13 @@ pub fn read_net_bytes(path: &Path) -> Option<(u64, u64)> {
 /// per-job log is otherwise append-only and never rotated. A missing file (the job had no
 /// egress restriction, so the switch wrote none) yields no denials.
 pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
+    let (records, offset) = read_records_since(path, offset);
+    (records.into_iter().map(|(d, _)| d).collect(), offset)
+}
+
+/// Read the denials appended to `path` since byte `offset`, each with its [`Attrs`], as
+/// [`read_since`] does.
+pub fn read_records_since(path: &Path, offset: u64) -> (Vec<(Denial, Attrs)>, u64) {
     let Ok(mut f) = std::fs::File::open(path) else {
         return (Vec::new(), offset);
     };
@@ -361,35 +450,36 @@ pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
     if f.read_to_end(&mut buf).is_err() {
         return (Vec::new(), start);
     }
-    let (out, consumed) = parse(&buf);
+    let (out, consumed) = parse_records(&buf);
     (out, start + consumed as u64)
 }
 
-/// Parse records through the last newline in `buf` and return the number of bytes consumed.
-/// Ignore incomplete trailing lines and malformed records.
-fn parse(buf: &[u8]) -> (Vec<Denial>, usize) {
+/// Parse records through the last newline in `buf`, each with its [`Attrs`], and return the
+/// number of bytes consumed. Ignore incomplete trailing lines and malformed records. A record
+/// is `proto\ttarget[\tcount[\tattrs…]]`.
+fn parse_records(buf: &[u8]) -> (Vec<(Denial, Attrs)>, usize) {
     let consumed = match buf.iter().rposition(|&b| b == b'\n') {
         Some(nl) => nl + 1,
         None => return (Vec::new(), 0),
     };
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&buf[..consumed]).lines() {
-        if let Some((p, rest)) = line.split_once('\t')
-            && let Some(proto) = Proto::parse(p)
-        {
-            let (target, count) = match rest.rsplit_once('\t') {
-                Some((target, n)) => match n.parse() {
-                    Ok(n) => (target, n),
-                    Err(_) => continue,
-                },
-                None => (rest, 1),
-            };
-            out.push(Denial {
-                proto,
-                target: target.to_string(),
-                count,
-            });
-        }
+        let mut fields = line.split('\t');
+        let (Some(proto), Some(target)) = (fields.next().and_then(Proto::parse), fields.next())
+        else {
+            continue;
+        };
+        let count = match fields.next().map(str::parse) {
+            None => 1,
+            Some(Ok(n)) => n,
+            Some(Err(_)) => continue,
+        };
+        let denial = Denial {
+            proto,
+            target: target.to_string(),
+            count,
+        };
+        out.push((denial, Attrs::decode(fields)));
     }
     (out, consumed)
 }
@@ -426,16 +516,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(report(&dir), None);
-        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
-        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
+        append(
+            &dir.join("egress-denied.log"),
+            Proto::Dns,
+            "evil.example",
+            &Attrs::default(),
+        );
+        append(
+            &dir.join("egress-denied.log"),
+            Proto::Dns,
+            "evil.example",
+            &Attrs::default(),
+        );
         // The switch's later count of the same name's repeats.
         append_repeats(
             &dir.join("egress-denied.log"),
             Proto::Dns,
             "evil.example",
             40,
+            &Attrs::default(),
         );
-        append_contact(&dir.join("egress-audit.log"), "crates.io");
+        append_contact(
+            &dir.join("egress-audit.log"),
+            "crates.io",
+            &Attrs::default(),
+        );
         let text = report(&dir).unwrap();
         assert!(
             text.starts_with(
@@ -459,7 +564,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("egress-denied.log");
-        append(&path, Proto::Dns, "early.example");
+        append(&path, Proto::Dns, "early.example", &Attrs::default());
         let (line, last) = ("tcp\t10.0.0.1:443\n", "udp\t10.0.0.2:5353\n");
         let tail = usize::try_from(REPORT_TAIL).unwrap() - last.len();
         // The tail starts inside a tcp record, which is not counted.
@@ -511,13 +616,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("egress-audit.log");
-        append_contact(&path, "early.example");
+        append_contact(&path, "early.example", &Attrs::default());
         let line = "name\tcrates.io\n";
         let n = usize::try_from(REPORT_TAIL).unwrap() / line.len() + 2;
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(line.repeat(n).as_bytes()).unwrap();
         drop(f);
-        append_ip_contact(&path, "10.0.0.1:443");
+        append_ip_contact(&path, "10.0.0.1:443", &Attrs::default());
         let text = report(&dir).unwrap();
         assert!(!text.contains("early.example"), "{text}");
         assert!(
@@ -566,8 +671,8 @@ mod tests {
         let path = dir.join("egress-denied.log");
         let _ = std::fs::remove_file(&path);
 
-        append(&path, Proto::Dns, "wallix.com");
-        append(&path, Proto::Tcp, "93.184.216.34:443");
+        append(&path, Proto::Dns, "wallix.com", &Attrs::default());
+        append(&path, Proto::Tcp, "93.184.216.34:443", &Attrs::default());
         let (first, off) = read_since(&path, 0);
         assert_eq!(
             first,
@@ -589,8 +694,8 @@ mod tests {
         assert_eq!(read_since(&path, off), (Vec::new(), off));
 
         // A later append is picked up from the offset alone, repeats with their count.
-        append(&path, Proto::Udp, "8.8.8.8:53");
-        append_repeats(&path, Proto::Dns, "wallix.com", 41);
+        append(&path, Proto::Udp, "8.8.8.8:53", &Attrs::default());
+        append_repeats(&path, Proto::Dns, "wallix.com", 41, &Attrs::default());
         let (next, _) = read_since(&path, off);
         assert_eq!(
             next,
@@ -628,7 +733,7 @@ mod tests {
             "crates.io",
             "github.com",
         ] {
-            append_contact(&path, name);
+            append_contact(&path, name, &Attrs::default());
         }
         // Most-contacted first; equal counts fall back to name order.
         assert_eq!(
@@ -645,10 +750,10 @@ mod tests {
         let path = dir.join("egress-audit.log");
         let _ = std::fs::remove_file(&path);
 
-        append_contact(&path, "crates.io");
-        append_ip_contact(&path, "93.184.216.34:443");
-        append_ip_contact(&path, "93.184.216.34:443");
-        append_contact(&path, "crates.io");
+        append_contact(&path, "crates.io", &Attrs::default());
+        append_ip_contact(&path, "93.184.216.34:443", &Attrs::default());
+        append_ip_contact(&path, "93.184.216.34:443", &Attrs::default());
+        append_contact(&path, "crates.io", &Attrs::default());
 
         // Each reader sees only its own kind, counted independently.
         assert_eq!(read_contacts(&path), vec![("crates.io".into(), 2)]);
@@ -676,14 +781,14 @@ mod tests {
 
         // A guest DNS name smuggling a newline, trying to forge a second summary line: the
         // control char must be neutralized so it stays one record.
-        append_contact(&path, "evil\nforged.example.com");
+        append_contact(&path, "evil\nforged.example.com", &Attrs::default());
         assert_eq!(
             read_contacts(&path),
             vec![("evil\u{fffd}forged.example.com".into(), 1)]
         );
 
-        append_contact(&path, "crates.io");
-        append_contact(&path, "crates.io");
+        append_contact(&path, "crates.io", &Attrs::default());
+        append_contact(&path, "crates.io", &Attrs::default());
         let summary = contacts_summary(&path, "domains contacted (audit)").unwrap();
         let lines: Vec<&str> = summary.lines().collect();
         // Header, then one line per domain, most-contacted first.
@@ -737,7 +842,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // A guest DNS query smuggling a newline + tab, trying to forge a second record and
         // tear the format. It must stay one record with the control chars neutralized.
-        append(&path, Proto::Dns, "evil\ntcp\t10.0.0.1:22\tx.com");
+        append(
+            &path,
+            Proto::Dns,
+            "evil\ntcp\t10.0.0.1:22\tx.com",
+            &Attrs::default(),
+        );
         let (got, _) = read_since(&path, 0);
         assert_eq!(
             got,
@@ -746,6 +856,77 @@ mod tests {
                 target: "evil\u{fffd}tcp\u{fffd}10.0.0.1:22\u{fffd}x.com".into(),
                 count: 1,
             }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the switch knew of a record follows it, and the trace's readers see the record as
+    /// they always did: an attributed denial shows and counts as a bare one, and an attributed
+    /// contact under its value alone. A bare record, as an older switch wrote it, reads with no
+    /// attributes.
+    #[test]
+    fn attributes_follow_a_record_and_the_trace_reads_past_them() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-attrs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let denied = dir.join("egress-denied.log");
+        let attrs = Attrs {
+            layer: Some(EgressLayer::Service),
+            vm: Some("db\nforged".into()),
+            would_block: true,
+            proto: None,
+            at_ms: Some(1_700_000_000_123),
+        };
+        append(&denied, Proto::Tcp, "10.0.0.1:443", &attrs);
+        append_repeats(&denied, Proto::Dns, "a.example", 3, &attrs);
+        append(&denied, Proto::Dns, "a.example", &Attrs::default());
+        let text = std::fs::read_to_string(&denied).unwrap();
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "tcp\t10.0.0.1:443\t1\tlayer=service\tvm=db\u{fffd}forged\tdry=1\tt=1700000000123"
+            )
+        );
+        let sanitized = Attrs {
+            vm: Some("db\u{fffd}forged".into()),
+            ..attrs.clone()
+        };
+        let (records, _) = parse_records(text.as_bytes());
+        assert_eq!(
+            records.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>(),
+            [sanitized.clone(), sanitized, Attrs::default()]
+        );
+        assert_eq!(
+            denial_lines(&read_since(&denied, 0).0),
+            [
+                "egress denied (tcp) 10.0.0.1:443",
+                "egress denied (dns) a.example (x4)"
+            ]
+        );
+
+        let audit = dir.join("egress-audit.log");
+        let at = Attrs {
+            at_ms: Some(5),
+            ..Attrs::default()
+        };
+        append_contact(&audit, "crates.io", &at);
+        append_contact(&audit, "crates.io", &Attrs::default());
+        let by_ip = Attrs {
+            proto: Some(Proto::Udp),
+            ..at.clone()
+        };
+        append_ip_contact(&audit, "10.0.0.2:53", &by_ip);
+        assert_eq!(read_contacts(&audit), vec![("crates.io".into(), 2)]);
+        assert_eq!(read_ip_contacts(&audit), vec![("10.0.0.2:53".into(), 1)]);
+        let text = std::fs::read_to_string(&audit).unwrap();
+        let records: Vec<_> = audit_records(&text).collect();
+        assert_eq!(
+            records,
+            [
+                ("name", "crates.io", at),
+                ("name", "crates.io", Attrs::default()),
+                ("ip", "10.0.0.2:53", by_ip),
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

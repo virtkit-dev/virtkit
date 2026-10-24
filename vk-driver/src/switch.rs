@@ -31,6 +31,9 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use vk_hub_proto::egress::EgressLayer;
+
+use crate::egress_report::Attrs;
 
 /// Gateway MAC — locally administered, unicast. The guest learns it via ARP.
 const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
@@ -634,6 +637,18 @@ enum Verdict {
     WouldDeny,
 }
 
+/// What DNS denials are counted under: the name, the source, and whether a dry-run carried it.
+type DnsDenialKey = (String, Ipv4Addr, bool);
+
+/// The repeats of a DNS denial not yet written out, and what their record says.
+#[derive(Debug, Clone, Copy)]
+struct DnsRepeats {
+    count: u64,
+    layer: EgressLayer,
+    /// When the last of them happened, in milliseconds since the Unix epoch.
+    last_ms: u64,
+}
+
 /// Runtime egress enforcement: the static [`Egress`] policy + the set of IPs the
 /// DNS resolver dynamically pinned (the A-records it returned for allowed names,
 /// with their TTL). Transparent — the guest needs no proxy env: it resolves through
@@ -692,12 +707,16 @@ struct EgressGuard {
     dns_log: LogLimiter,
     /// Bounds the DNS denials logged (see `deny_dns`).
     dns_denials: RateLimiter,
-    /// Every name a DNS denial was recorded under, with its repeats not yet written out (see
-    /// `deny_dns`). Empty when nothing is recorded.
-    dns_denied: Mutex<HashMap<String, u64>>,
-    /// The node's cap, checked first for every source. `None` where there is none to check
-    /// (dev `vk run`).
+    /// Every name a DNS denial was recorded under, by source and outcome, with its repeats not
+    /// yet written out (see `deny_dns`). Empty when nothing is recorded.
+    dns_denied: Mutex<HashMap<DnsDenialKey, DnsRepeats>>,
+    /// The node's cap, checked first for every source, and the first layer a denial is
+    /// attributed to (see [`EgressGuard::layer`]). `None` where there is none to check nor
+    /// layers to tell apart (dev `vk run`).
     cap: Option<Arc<Egress>>,
+    /// The services' VMs, by each of their addresses, which a record names its source by; an
+    /// address not here is the job's own VM.
+    vm_names: HashMap<Ipv4Addr, String>,
     /// Throttles the failed-flow log (see `log_flow_failure`).
     flow_log: LogLimiter,
 }
@@ -722,6 +741,7 @@ impl EgressGuard {
             dns_denials: RateLimiter::new(DNS_LOG_WINDOW, DNS_DENIALS_PER_WINDOW),
             dns_denied: Mutex::new(HashMap::new()),
             cap: None,
+            vm_names: HashMap::new(),
             flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
         }
     }
@@ -757,6 +777,51 @@ impl EgressGuard {
     fn with_cap(mut self, cap: Option<Egress>) -> Self {
         self.cap = cap.map(Arc::new);
         self
+    }
+    /// See the `vm_names` field.
+    fn with_vm_names(mut self, vm_names: HashMap<Ipv4Addr, String>) -> Self {
+        self.vm_names = vm_names;
+        self
+    }
+
+    /// The layer that decides a denial of `src`: the first that `refuses` it, in the order they
+    /// are checked — the node's cap, the job's policy, then the service's own where `src` has
+    /// one. A destination is reachable only if every layer allows it. Where none refuses it — a
+    /// policy edited since — the narrowest of `src`'s own; [`EgressLayer::Unknown`] without a
+    /// cap.
+    fn layer(&self, src: Option<Ipv4Addr>, refuses: impl Fn(&Egress) -> bool) -> EgressLayer {
+        let Some(cap) = &self.cap else {
+            return EgressLayer::Unknown;
+        };
+        if refuses(cap) {
+            EgressLayer::NodeCap
+        } else if refuses(&self.default_policy()) {
+            EgressLayer::Job
+        } else if src.is_some_and(|s| self.per_source.contains_key(&s)) {
+            EgressLayer::Service
+        } else {
+            EgressLayer::Job
+        }
+    }
+    /// [`Self::layer`] of a direct flow to `dst`, each layer held to its own decision, pins
+    /// included ([`Self::layer_allows`]).
+    fn flow_layer(&self, src: Option<Ipv4Addr>, dst: SocketAddr) -> EgressLayer {
+        self.layer(src, |layer| {
+            src.is_none_or(|s| !self.layer_allows(layer, s, dst))
+        })
+    }
+    /// [`Self::layer`] of a lookup of `name`.
+    fn name_layer(&self, src: Ipv4Addr, name: &str) -> EgressLayer {
+        self.layer(Some(src), |layer| !layer.allows_host(name))
+    }
+    /// What a record from `src` says beyond itself: its VM, when it is a service's, and the
+    /// time.
+    fn attrs(&self, src: Option<Ipv4Addr>) -> Attrs {
+        Attrs {
+            vm: src.and_then(|s| self.vm_names.get(&s).cloned()),
+            at_ms: Some(crate::egress_report::now_ms()),
+            ..Attrs::default()
+        }
     }
 
     /// Add what has just crossed to the running totals: once per copy buffer for TCP — 8 KiB
@@ -827,42 +892,39 @@ impl EgressGuard {
             let _ = file.write_all(format!("{d_sent} {d_received}\n").as_bytes());
         }
     }
-    /// Record a refused flow to the denial channel for the job trace to surface. Paired
-    /// with the switch's own `eprintln!` operator log at each call site.
-    fn record_denial(&self, proto: crate::egress_report::Proto, target: &str) {
+    /// Record a flow from `src` refused, or under dry-run carried, to the denial channel for
+    /// the job trace to surface, with the layer that decided it. Paired with the switch's own
+    /// `eprintln!` operator log at each call site.
+    fn record_denial(
+        &self,
+        src: Option<Ipv4Addr>,
+        proto: crate::egress_report::Proto,
+        dst: SocketAddr,
+        would_block: bool,
+    ) {
         if let Some(path) = &self.denied_log {
-            crate::egress_report::append(path, proto, target);
+            let attrs = Attrs {
+                layer: Some(self.flow_layer(src, dst)),
+                would_block,
+                ..self.attrs(src)
+            };
+            crate::egress_report::append(path, proto, &dst.to_string(), &attrs);
         }
     }
-    /// Record `target` as a refused (or, in dry-run, would-be refused) DNS lookup, and log
-    /// `line` within the [`DNS_DENIALS_PER_WINDOW`] budget; a line past it carries the count
-    /// of those not logged. Every denial is recorded: a name's first at once, its repeats
-    /// counted and written out by [`EgressGuard::flush_dns_denials`], and past
-    /// [`DNS_DENIED_NAMES`] names under [`DNS_DENIED_MORE`].
-    fn deny_dns(&self, target: &str, line: impl FnOnce() -> String) {
-        if self.denied_log.is_some() {
-            let first = {
-                let mut denied = self.dns_denied.lock().unwrap_or_else(|e| e.into_inner());
-                let key = if denied.contains_key(target) || denied.len() < DNS_DENIED_NAMES {
-                    target
-                } else {
-                    DNS_DENIED_MORE
-                };
-                match denied.get_mut(key) {
-                    Some(repeats) => {
-                        *repeats += 1;
-                        None
-                    }
-                    None => {
-                        denied.insert(key.to_string(), 0);
-                        Some(key.to_string())
-                    }
-                }
-            };
-            if let Some(key) = first {
-                self.record_denial(crate::egress_report::Proto::Dns, &key);
-            }
-        }
+    /// Record `target` as a lookup from `src` refused (or, in dry-run, carried: `would_block`),
+    /// and log `line` within the [`DNS_DENIALS_PER_WINDOW`] budget; a line past it carries the
+    /// count of those not logged. Every denial is recorded: the first of a name from a source
+    /// with an outcome at once, its repeats counted and written out by
+    /// [`EgressGuard::flush_dns_denials`] with the time of the last, and past
+    /// [`DNS_DENIED_NAMES`] such names under [`DNS_DENIED_MORE`].
+    fn deny_dns(
+        &self,
+        src: Ipv4Addr,
+        target: &str,
+        would_block: bool,
+        line: impl FnOnce() -> String,
+    ) {
+        self.record_dns_denial(src, target, would_block);
         let Some(dropped) = self.dns_denials.admit(Instant::now()) else {
             return;
         };
@@ -872,22 +934,79 @@ impl EgressGuard {
         };
         eprintln!("switch: {}{more}", line());
     }
+    /// The record [`Self::deny_dns`] makes.
+    fn record_dns_denial(&self, src: Ipv4Addr, target: &str, would_block: bool) {
+        if let Some(path) = &self.denied_log {
+            let at_ms = crate::egress_report::now_ms();
+            let first = {
+                let mut denied = self.dns_denied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut key = (target.to_string(), src, would_block);
+                if !denied.contains_key(&key) && denied.len() >= DNS_DENIED_NAMES {
+                    key.0 = DNS_DENIED_MORE.to_string();
+                }
+                match denied.get_mut(&key) {
+                    Some(repeats) => {
+                        repeats.count += 1;
+                        repeats.last_ms = at_ms;
+                        None
+                    }
+                    None => {
+                        let layer = self.name_layer(src, target);
+                        let repeats = DnsRepeats {
+                            count: 0,
+                            layer,
+                            last_ms: at_ms,
+                        };
+                        denied.insert(key.clone(), repeats);
+                        Some((key.0, layer))
+                    }
+                }
+            };
+            if let Some((name, layer)) = first {
+                let attrs = Attrs {
+                    layer: Some(layer),
+                    would_block,
+                    at_ms: Some(at_ms),
+                    ..self.attrs(Some(src))
+                };
+                crate::egress_report::append(path, crate::egress_report::Proto::Dns, &name, &attrs);
+            }
+        }
+    }
     /// Write out the repeats [`EgressGuard::deny_dns`] counted since the last time, one record
-    /// per name.
+    /// per name, source and outcome.
     fn flush_dns_denials(&self) {
         let Some(path) = &self.denied_log else {
             return;
         };
-        let repeats: Vec<(String, u64)> = {
+        let repeats: Vec<(DnsDenialKey, DnsRepeats)> = {
             let mut denied = self.dns_denied.lock().unwrap_or_else(|e| e.into_inner());
             denied
                 .iter_mut()
-                .filter(|(_, n)| **n > 0)
-                .map(|(name, n)| (name.clone(), std::mem::take(n)))
+                .filter(|(_, r)| r.count > 0)
+                .map(|(key, r)| {
+                    let taken = DnsRepeats {
+                        count: std::mem::take(&mut r.count),
+                        ..*r
+                    };
+                    (key.clone(), taken)
+                })
                 .collect()
         };
-        for (name, n) in repeats {
-            crate::egress_report::append_repeats(path, crate::egress_report::Proto::Dns, &name, n);
+        for ((name, src, would_block), r) in repeats {
+            let attrs = Attrs {
+                layer: Some(r.layer),
+                would_block,
+                at_ms: Some(r.last_ms),
+                ..self.attrs(Some(src))
+            };
+            crate::egress_report::append_repeats(
+                path,
+                crate::egress_report::Proto::Dns,
+                &name,
+                r.count,
+                &attrs,
+            );
         }
     }
     /// Name the upstream resolver and the reason it failed a guest's lookup, throttled to
@@ -920,9 +1039,9 @@ impl EgressGuard {
     /// Record an allowed external domain the guest resolved to the audit channel, for the
     /// end-of-job "domains contacted" summary and the standing list of names a job reaches
     /// (see sites). No-op only where nothing reads the channel: a CI job always has one.
-    fn record_contact(&self, name: &str) {
+    fn record_contact(&self, src: Ipv4Addr, name: &str) {
         if let Some(path) = &self.audit_log {
-            crate::egress_report::append_contact(path, name);
+            crate::egress_report::append_contact(path, name, &self.attrs(Some(src)));
         }
     }
     /// Remember the A-record IPs the switch just handed `src` for an allowed name, so a
@@ -948,14 +1067,23 @@ impl EgressGuard {
     /// (dedup is on `(src, ip)`; DNS answers carry no port). No-op where there is no channel.
     /// A set lookup per outbound connection, which a CI job now always pays; the append
     /// behind it is reached only by a guest that dials an address it never resolved.
-    fn record_ip_contact(&self, src: Ipv4Addr, dst: SocketAddrV4) {
+    fn record_ip_contact(
+        &self,
+        src: Ipv4Addr,
+        dst: SocketAddrV4,
+        proto: crate::egress_report::Proto,
+    ) {
         let Some(path) = &self.audit_log else {
             return;
         };
         if self.dns_ips.lock().unwrap().contains(&(src, *dst.ip())) {
             return;
         }
-        crate::egress_report::append_ip_contact(path, &dst.to_string());
+        let attrs = Attrs {
+            proto: Some(proto),
+            ..self.attrs(Some(src))
+        };
+        crate::egress_report::append_ip_contact(path, &dst.to_string(), &attrs);
     }
     /// Any restriction at all — the node's cap, the default policy or any service's. Drives
     /// the startup log summary.
@@ -1077,19 +1205,19 @@ impl EgressGuard {
         match self.verdict(src, dst) {
             Verdict::Allow => {
                 if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
-                    self.record_ip_contact(s, v4);
+                    self.record_ip_contact(s, v4, proto);
                 }
                 true
             }
             Verdict::Deny => {
                 eprintln!("switch: egress denied ({tag}) {dst}");
-                self.record_denial(proto, &dst.to_string());
+                self.record_denial(src, proto, dst, false);
                 false
             }
             Verdict::WouldDeny => {
                 if proto != crate::egress_report::Proto::Tcp {
                     eprintln!("switch: egress would deny ({tag}) {dst} — dry-run, allowed");
-                    self.record_denial(proto, &dst.to_string());
+                    self.record_denial(src, proto, dst, true);
                 }
                 true
             }
@@ -1121,7 +1249,12 @@ impl EgressGuard {
         }
         if verdict == Verdict::Deny {
             eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
-            self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
+            self.record_denial(
+                Some(*syn.src.ip()),
+                crate::egress_report::Proto::Tcp,
+                SocketAddr::V4(syn.dst),
+                false,
+            );
             return tcp_rst_frame(&syn, client_mac);
         }
         if unroutable(*syn.dst.ip()) {
@@ -1138,7 +1271,12 @@ impl EgressGuard {
                 "switch: egress would deny (tcp) {} — dry-run, allowed",
                 syn.dst
             );
-            self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
+            self.record_denial(
+                Some(*syn.src.ip()),
+                crate::egress_report::Proto::Tcp,
+                SocketAddr::V4(syn.dst),
+                true,
+            );
         }
         None
     }
@@ -1392,6 +1530,9 @@ pub struct Spawn {
     /// The node's cap, checked for every source before the policies above. `None` = no cap
     /// (dev `vk run`).
     pub cap: Option<Cap>,
+    /// The service each VM address belongs to, which records name their source by; an address
+    /// not listed is the job's own VM.
+    pub vm_names: Vec<(Ipv4Addr, String)>,
     /// Take the default policy from this [`EgressFile`] instead of `allow_ip`/`allow_name`,
     /// and follow its edits for the switch's life. `None` = the lists above, fixed.
     pub egress_file: Option<PathBuf>,
@@ -1498,6 +1639,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         }
         None => {}
     }
+    for (ip, name) in &opts.vm_names {
+        cmd.arg("--vm-name").arg(format!("{ip}={name}"));
+    }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
             .arg(format!("{sentinel}={host}"));
@@ -1580,8 +1724,9 @@ pub async fn run(
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
     dry_run: bool,
-    // The node's cap (see `Spawn`).
+    // The node's cap, and each service VM's name by address (see `Spawn`).
     cap: Option<Egress>,
+    vm_names: HashMap<Ipv4Addr, String>,
     // An `--egress-file` to follow, with the bytes `egress` was loaded from.
     egress_file: Option<(PathBuf, Vec<u8>)>,
 ) -> Result<()> {
@@ -1610,7 +1755,8 @@ pub async fn run(
             .with_audit_log(audit_log)
             .with_bytes_log(bytes_log)
             .with_dry_run(dry_run)
-            .with_cap(cap),
+            .with_cap(cap)
+            .with_vm_names(vm_names),
     );
     let restricted = guard.restricted();
     guard.open_bytes();
@@ -2743,13 +2889,13 @@ async fn handle_dns(
         && minimal.is_none()
         && !egress.dry_run
     {
-        egress.deny_dns(NONSTANDARD_QUERY, || {
+        egress.deny_dns(client_ip, NONSTANDARD_QUERY, false, || {
             format!("dns refused (egress allowlist): {NONSTANDARD_QUERY} for {name}")
         });
         Some(dns_error(&query, *qend, nonstandard_rcode(&query)))
     } else if let Some((name, qtype, qend)) = parsed {
         if restricted && minimal.is_none() {
-            egress.deny_dns(NONSTANDARD_QUERY, || {
+            egress.deny_dns(client_ip, NONSTANDARD_QUERY, true, || {
                 format!(
                     "dns would refuse (egress allowlist): {NONSTANDARD_QUERY} for {name} — dry-run, forwarded"
                 )
@@ -2771,13 +2917,13 @@ async fn handle_dns(
                 // is IPv4, so an A query is what precedes a connection); the paired AAAA query
                 // for the same name is not double-counted.
                 if qtype == TYPE_A {
-                    egress.record_contact(&name);
+                    egress.record_contact(client_ip, &name);
                 }
             } else {
                 // Dry-run: the allowlist would refuse this name. Record the would-be denial,
                 // but resolve and pin it below anyway so the guest's connection succeeds and
                 // the job runs unchanged.
-                egress.deny_dns(&name, || {
+                egress.deny_dns(client_ip, &name, true, || {
                     format!("dns would refuse (egress allowlist): {name} — dry-run, resolved")
                 });
             }
@@ -2794,7 +2940,7 @@ async fn handle_dns(
                     // `--egress-file` can change the policy while awaiting the upstream: a
                     // name it no longer allows is refused, and its addresses not pinned.
                     if !egress.record_if_allowed(client_ip, &name, &ips, ttl) && !egress.dry_run {
-                        egress.deny_dns(&name, || {
+                        egress.deny_dns(client_ip, &name, false, || {
                             format!("dns refused (egress allowlist, just changed): {name}")
                         });
                         Some(dns_nxdomain(&query, qend))
@@ -2814,7 +2960,9 @@ async fn handle_dns(
                 }
             }
         } else {
-            egress.deny_dns(&name, || format!("dns refused (egress allowlist): {name}"));
+            egress.deny_dns(client_ip, &name, false, || {
+                format!("dns refused (egress allowlist): {name}")
+            });
             Some(dns_nxdomain(&query, qend))
         }
     } else {
@@ -2828,7 +2976,7 @@ async fn handle_dns(
             matches!(query.get(4..6), Some(&[hi, lo]) if u16::from_be_bytes([hi, lo]) > 1);
         let refuse = several || (restricted && !egress.dry_run);
         if restricted {
-            egress.deny_dns(UNPARSABLE_QUERY, || match refuse {
+            egress.deny_dns(client_ip, UNPARSABLE_QUERY, !refuse, || match refuse {
                 true => format!("dns refused (egress allowlist): {UNPARSABLE_QUERY}"),
                 false => format!(
                     "dns would refuse (egress allowlist): {UNPARSABLE_QUERY} — dry-run, forwarded"
@@ -5240,6 +5388,76 @@ mod tests {
         assert_eq!(open.verdict(guest, denied), Verdict::Allow);
     }
 
+    /// Each denial names the layer that decided it — the node's cap when the cap alone refuses
+    /// it, else the narrowing of the VM it came from — the service it came from, whether a
+    /// dry-run carried it, and when. Without a cap there is no telling the layers apart.
+    #[test]
+    fn denials_name_their_layer_vm_and_outcome() {
+        use crate::egress_report::Proto;
+        let dir = std::env::temp_dir().join(format!("vk-egress-layers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let (job, svc) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cap = Egress::restricted(
+            &names(&["1.2.3.0/24"]),
+            &names(&["crates.io", "debian.org"]),
+        )
+        .unwrap();
+        let guard = |name: &str, cap: Option<Egress>| {
+            let log = dir.join(format!("{name}.log"));
+            let job_policy = Egress::restricted(&[], &names(&["debian.org"])).unwrap();
+            let svc_policy = Egress::restricted(&[], &names(&["crates.io"])).unwrap();
+            let g = EgressGuard::new(job_policy, gw)
+                .with_per_source(HashMap::from([(svc, svc_policy)]))
+                .with_denied_log(Some(log.clone()))
+                .with_cap(cap)
+                .with_vm_names(HashMap::from([(svc, "db".to_string())]));
+            (g, log)
+        };
+        // The record after its time, which only says that there is one.
+        let lines = |log: &Path| -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    let (head, t) = l.rsplit_once("\tt=").unwrap();
+                    assert!(t.parse::<u64>().unwrap() > 0, "{l}");
+                    head.to_string()
+                })
+                .collect()
+        };
+
+        let (g, log) = guard("layers", Some(cap));
+        g.deny_dns(job, "crates.io", false, String::new);
+        g.deny_dns(job, "evil.example", false, String::new);
+        g.deny_dns(svc, "debian.org", false, String::new);
+        g.deny_dns(svc, "debian.org", false, String::new);
+        g.deny_dns(job, "crates.io", true, String::new);
+        assert!(!g.admit_flow(Proto::Tcp, Some(job), "1.2.3.4:443".parse().unwrap()));
+        assert!(!g.admit_flow(Proto::Udp, Some(svc), "9.9.9.9:443".parse().unwrap()));
+        g.flush_dns_denials();
+        assert_eq!(
+            lines(&log),
+            [
+                "dns\tcrates.io\t1\tlayer=job",
+                "dns\tevil.example\t1\tlayer=node_cap",
+                "dns\tdebian.org\t1\tlayer=service\tvm=db",
+                "dns\tcrates.io\t1\tlayer=job\tdry=1",
+                "tcp\t1.2.3.4:443\t1\tlayer=job",
+                "udp\t9.9.9.9:443\t1\tlayer=node_cap\tvm=db",
+                // The repeat, counted when written out.
+                "dns\tdebian.org\t1\tlayer=service\tvm=db",
+            ]
+        );
+
+        let (g, log) = guard("uncapped", None);
+        g.deny_dns(job, "crates.io", false, String::new);
+        assert_eq!(lines(&log), ["dns\tcrates.io\t1\tlayer=unknown"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn admit_flow_records_and_carries_by_verdict() {
         use crate::egress_report::{Denial, Proto};
@@ -5918,7 +6136,12 @@ mod tests {
         let names = DNS_DENIED_NAMES + 10;
         let round = || {
             for i in 0..names {
-                guard.deny_dns(&format!("n{i}.example"), || format!("dns refused: n{i}"));
+                guard.deny_dns(
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    &format!("n{i}.example"),
+                    false,
+                    || format!("dns refused: n{i}"),
+                );
             }
         };
         round();
@@ -6645,9 +6868,12 @@ mod tests {
         assert!(!g.name_allowed(job, "crates.io") && !g.name_allowed(job, "pypi.org"));
         // A service is held to the job's policy as well as its own.
         assert!(g.name_allowed(svc, "debian.org") && !g.name_allowed(svc, "crates.io"));
+        assert_eq!(g.name_layer(svc, "crates.io"), EgressLayer::Job);
+        assert_eq!(g.name_layer(job, "pypi.org"), EgressLayer::NodeCap);
         // The cap's range is no use to a job whose policy lists no ranges.
         let listed: SocketAddr = "1.2.3.4:443".parse().unwrap();
         assert!(!g.allows(job, listed));
+        assert_eq!(g.flow_layer(Some(job), listed), EgressLayer::Job);
 
         let (both, pypi) = (Ipv4Addr::new(7, 7, 7, 7), Ipv4Addr::new(5, 6, 7, 8));
         assert!(g.record_if_allowed(job, "debian.org", &[both], 60));
@@ -6662,6 +6888,7 @@ mod tests {
         let to_pypi = SocketAddr::new(pypi.into(), 443);
         assert!(g.layer_allows(&g.default_policy(), job, to_pypi));
         assert_eq!(g.verdict(Some(job), to_pypi), Verdict::WouldDeny);
+        assert_eq!(g.flow_layer(Some(job), to_pypi), EgressLayer::NodeCap);
         // The same address pinned for a name every layer allows is reachable.
         assert!(g.record_if_allowed(job, "debian.org", &[pypi], 60));
         assert_eq!(g.verdict(Some(job), to_pypi), Verdict::Allow);
@@ -7000,12 +7227,24 @@ mod tests {
         // vm_a resolved `resolved` through the switch, then dials it: already attributed to the
         // name in the domains summary, so it is NOT re-logged as a direct-IP contact.
         g.record_dns_ips(vm_a, &[resolved]);
-        g.record_ip_contact(vm_a, SocketAddrV4::new(resolved, 443));
+        g.record_ip_contact(
+            vm_a,
+            SocketAddrV4::new(resolved, 443),
+            crate::egress_report::Proto::Tcp,
+        );
         // vm_a dials an IP it never resolved: a genuine direct-IP contact, logged.
-        g.record_ip_contact(vm_a, SocketAddrV4::new(direct, 443));
+        g.record_ip_contact(
+            vm_a,
+            SocketAddrV4::new(direct, 443),
+            crate::egress_report::Proto::Tcp,
+        );
         // vm_b never resolved `resolved`, so vm_a's resolution must not mask vm_b's direct dial
         // to the same IP — the per-source key keeps them distinct.
-        g.record_ip_contact(vm_b, SocketAddrV4::new(resolved, 8080));
+        g.record_ip_contact(
+            vm_b,
+            SocketAddrV4::new(resolved, 8080),
+            crate::egress_report::Proto::Tcp,
+        );
 
         // Only the two genuine direct dials survive; the resolved-then-dialed one is suppressed.
         assert_eq!(
@@ -7018,7 +7257,11 @@ mod tests {
         let off = dir.join("never-written.log");
         let g = EgressGuard::new(Egress::AllowAll, gw);
         g.record_dns_ips(vm_a, &[resolved]);
-        g.record_ip_contact(vm_a, SocketAddrV4::new(direct, 443));
+        g.record_ip_contact(
+            vm_a,
+            SocketAddrV4::new(direct, 443),
+            crate::egress_report::Proto::Tcp,
+        );
         assert!(!off.exists());
     }
 
@@ -7813,6 +8056,7 @@ mod tests {
                 None,
                 false,
                 None,
+                HashMap::new(),
                 None,
             )
             .await;

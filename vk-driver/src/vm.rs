@@ -2674,6 +2674,14 @@ fn spawn_switch(
     };
     let (allow_ip, allow_name, restrict) = switch_lists(run_job_filter(cfg, ctx)?);
     let per_source = service_per_source(services)?;
+    let vm_names = services
+        .iter()
+        .flat_map(|svc| {
+            std::iter::once(svc.addr)
+                .chain(svc.extra_ips.iter().copied())
+                .map(|addr| (addr, svc.name.clone()))
+        })
+        .collect();
     crate::switch::spawn(&crate::switch::Spawn {
         // A CI job's allowlist is the job's, fixed for its run.
         egress_file: None,
@@ -2693,6 +2701,7 @@ fn spawn_switch(
             cfg.egress.allow_ip.as_deref(),
             cfg.egress.allow_name.as_deref(),
         )),
+        vm_names,
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),

@@ -1694,6 +1694,12 @@ enum Cmd {
         /// gitlab executor.
         #[arg(long = "egress-cap", value_name = "all|CIDRS;NAMES")]
         egress_cap: Option<String>,
+        /// the service VM an address belongs to, `<ip>=<name>` (repeatable)
+        ///
+        /// Recorded denials and contacts name their source by it. Set internally by the gitlab
+        /// executor.
+        #[arg(long = "vm-name", value_name = "IP=NAME")]
+        vm_name: Vec<String>,
         /// redirect guest flows aimed at a sentinel address to a host-local registry proxy
         ///
         /// The value is `<sentinel-ip>=<host:port>`, set internally by
@@ -4537,6 +4543,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         egress_dry_run,
         source_egress,
         egress_cap,
+        vm_name,
         registry_proxy,
         denied_log,
         audit_log,
@@ -4633,6 +4640,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(c) => c,
             Err(e) => return fail(&e, 2),
         };
+        let vm_names = match parse_vm_names(vm_name) {
+            Ok(m) => m,
+            Err(e) => return fail(&e, 2),
+        };
         // The switch logs into a file (a CI job's job dir, a run's work dir): a full
         // filesystem must not make a line a panic (see outrelay).
         let _relay = outrelay::relay();
@@ -4651,6 +4662,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             net_bytes.clone(),
             *egress_dry_run,
             cap,
+            vm_names,
             followed,
         )
         .await
@@ -6287,6 +6299,24 @@ fn parse_egress_cap(spec: &str) -> anyhow::Result<switch::Egress> {
         .map_err(|e| anyhow::anyhow!("egress-cap {spec:?}: {e}"))
 }
 
+/// Parse the repeatable switch `--vm-name <ip>=<name>`.
+fn parse_vm_names(
+    specs: &[String],
+) -> anyhow::Result<std::collections::HashMap<std::net::Ipv4Addr, String>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (ip, name) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("vm-name {spec:?}: want <ip>=<name>"))?;
+            let ip = ip
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|e| anyhow::anyhow!("vm-name {spec:?}: {e}"))?;
+            Ok((ip, name.to_string()))
+        })
+        .collect()
+}
+
 use crate::ensure::parse_uuid;
 
 fn exit_code(code: i32) -> ExitCode {
@@ -6557,6 +6587,9 @@ mod tests {
         let none = parse_egress_cap(";").unwrap();
         assert!(!none.allows_host("crates.io"));
         assert!(parse_egress_cap("nope;").is_err());
+        let names = parse_vm_names(&["10.0.0.5=db".to_string()]).unwrap();
+        assert_eq!(names[&"10.0.0.5".parse().unwrap()], "db");
+        assert!(parse_vm_names(&["db".to_string()]).is_err());
     }
 
     #[test]

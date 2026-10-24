@@ -5427,6 +5427,7 @@ pub(crate) async fn spawn_vm_switch(
         // A CI job's build stage checks its node's cap and its own filter apart; dev `vk run`
         // has no cap.
         cap: cap.cloned(),
+        vm_names: Vec::new(),
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
