@@ -1684,8 +1684,8 @@ enum Cmd {
         /// per-source egress filter `<src-ip>;<cidr,cidr>;<name,name>` (repeatable)
         ///
         /// Flows from that source are also held to this restricted allowlist, checked after the
-        /// default; an empty field is an empty (deny) list. Set internally by the gitlab executor for a
-        /// service that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
+        /// default; an empty field is an empty (deny) list. Set internally by the gitlab executor
+        /// for a service that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
         #[arg(long = "source-egress", value_name = "IP;CIDRS;NAMES")]
         source_egress: Vec<String>,
         /// the node's egress cap, checked for every source before the allowlists
