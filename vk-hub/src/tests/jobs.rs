@@ -578,6 +578,7 @@ fn result(failure: Option<FailureClass>, output_len: u64) -> JobResult {
         artifacts: vec![],
         usage: None,
         events: Vec::new(),
+        egress: None,
     }
 }
 
@@ -2089,6 +2090,7 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
             artifacts: vec![],
             usage: None,
             events: Vec::new(),
+            egress: None,
         },
     });
     assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });

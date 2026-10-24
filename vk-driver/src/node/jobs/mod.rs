@@ -588,6 +588,7 @@ impl Jobs {
                 artifacts: Vec::new(),
                 usage: None,
                 events: Vec::new(),
+                egress: None,
             };
             let _ = journal::write_json(&dir.join(journal::RESULT), &result);
         }
@@ -859,6 +860,7 @@ impl Jobs {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         };
         // Written before it is reported, so the next node to read this journal agrees; tried
         // again at the next poll when it cannot be.
@@ -1038,6 +1040,7 @@ pub(crate) mod tests {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         };
         journal::write_json(&dir.join(journal::RESULT), &result)
     }
@@ -1907,6 +1910,7 @@ pub(crate) mod tests {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         }
     }
 

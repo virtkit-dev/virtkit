@@ -380,6 +380,7 @@ mod tests {
                 artifacts: vec![],
                 usage: None,
                 events: Vec::new(),
+                egress: None,
             }),
         });
         round_trip(&CancelRequest {

@@ -430,6 +430,7 @@ mod tests {
                     }],
                     usage: None,
                     events: Vec::new(),
+                    egress: None,
                 },
             },
         ]

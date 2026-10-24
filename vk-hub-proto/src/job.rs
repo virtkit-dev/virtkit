@@ -416,6 +416,10 @@ pub struct JobResult {
     /// Absent from older nodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<JobEvent>,
+    /// What the node recorded of the job's egress, held to [`crate::egress`]'s bounds. Absent
+    /// from older nodes, from jobs that never reached a node, and from the hub's own results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<crate::egress::EgressReport>,
 }
 
 /// The most event kinds a job result carries.
@@ -1012,6 +1016,25 @@ pub(crate) mod tests {
             (later.events[0].count, later.events[0].detail.as_str()),
             (1, "EDAC MC0: 1 CE")
         );
+    }
+
+    /// Results from older nodes carry no egress report and send none; a report round-trips.
+    #[test]
+    fn a_result_carries_its_egress_report() {
+        let old: JobResult = serde_json::from_value(json!({"output_len": 7})).unwrap();
+        assert_eq!(old.egress, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("egress"));
+
+        let reported = JobResult {
+            egress: Some(crate::egress::EgressReport {
+                revision: 1,
+                ..Default::default()
+            }),
+            ..old
+        };
+        let wire = serde_json::to_value(&reported).unwrap();
+        assert_eq!(wire["egress"], json!({"revision": 1}));
+        assert_eq!(serde_json::from_value::<JobResult>(wire).unwrap(), reported);
     }
 
     /// An event without a count, from a peer that leaves it out, reads as uncounted, and shows

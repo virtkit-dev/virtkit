@@ -1324,6 +1324,7 @@ mod tests {
             artifacts: Vec::new(),
             usage: None,
             events: vec![JobEvent::new(JobEventKind::VirtioFsStall, 2, &detail)],
+            egress: None,
         });
         let mut h = Html::new();
         record(&mut h, &j, &HashMap::new(), None, 1030);

@@ -1384,6 +1384,7 @@ mod tests {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         });
         row
     }
@@ -1824,6 +1825,7 @@ mod tests {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         });
         assert_eq!(
             (lost.prepare_ms(100), lost.ran_ms(100)),
@@ -1844,6 +1846,7 @@ mod tests {
                 ..Default::default()
             }),
             events: Vec::new(),
+            egress: None,
         });
         assert_eq!(
             (ended.prepare_ms(100), ended.ran_ms(100)),

@@ -3528,6 +3528,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
             artifacts: Vec::new(),
             usage,
             events: Vec::new(),
+            egress: None,
         })
     };
     let job = |n: u64, project: &str, url: &str, state, result| crate::store::JobRow {
@@ -4507,6 +4508,7 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
+            egress: None,
         });
         row
     };
@@ -4848,6 +4850,7 @@ async fn a_running_job_s_page_follows_its_output() {
         artifacts: Vec::new(),
         usage: None,
         events: Vec::new(),
+        egress: None,
     });
     hub.db.put_job(&id, &row, &[], crate::now_secs()).unwrap();
     hub.job_changed(&id);
@@ -5124,6 +5127,7 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
         artifacts: Vec::new(),
         usage: None,
         events: Vec::new(),
+        egress: None,
     });
     hub.db.put_job(&id(1), &ended, &[], now).unwrap();
     submit(2, &history_job(2, "acme/web"));

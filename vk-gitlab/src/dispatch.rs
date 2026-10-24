@@ -423,6 +423,7 @@ mod fake {
                     artifacts: Vec::new(),
                     usage: None,
                     events: Vec::new(),
+                    egress: None,
                 });
             });
         }

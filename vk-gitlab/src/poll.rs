@@ -1150,6 +1150,7 @@ fn lost(message: String, output_len: u64) -> JobResult {
         artifacts: Vec::new(),
         usage: None,
         events: Vec::new(),
+        egress: None,
     }
 }
 

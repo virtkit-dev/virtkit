@@ -521,6 +521,7 @@ fn finish(
         artifacts: Vec::new(),
         usage: None,
         events: Vec::new(),
+        egress: None,
     });
     let events = event
         .map(|e| (row.node.clone(), HUB.to_string(), e))

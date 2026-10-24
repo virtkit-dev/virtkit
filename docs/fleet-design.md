@@ -693,8 +693,7 @@ absent from older nodes:
 - **Declaration refusals**: a job's or service's `MICROVM_*EGRESS_ALLOW_*` entry found at fault
   at validation: the variable, the entry, its dimension, phase and VM, the layer it falls
   outside, and the reason — `invalid_entry`, which fails the job, or `unreachable`, an entry
-  kept that a layer above leaves nothing of (`outside_cap`, which failed the job, comes only
-  from an older node). No count: nothing was attempted.
+  kept that a layer above leaves nothing of. No count: nothing was attempted.
 - **Coverage** per phase: `complete`, `partial` or `unavailable`, with the counts omitted, so
   that no reports never reads as no traffic. Build-phase contacts and denials are recorded
   whether or not audit is on, as run-phase contacts are; audit stays a trace option.

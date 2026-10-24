@@ -151,6 +151,7 @@ pub async fn run(cfg: Config, dir: &Path, ledger_fd: Option<i32>) -> Result<()> 
                 artifacts: Vec::new(),
                 usage: None,
                 events: Vec::new(),
+                egress: None,
             };
             journal::write_json(&dir.join(journal::RESULT), &result)?;
             // The setup's error is the one to report; this one only goes to the log.
@@ -294,6 +295,7 @@ impl Driver {
                 size,
             )),
             events,
+            egress: None,
         }
     }
 
