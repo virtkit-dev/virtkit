@@ -399,6 +399,16 @@ mod tests {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: plain pipe(2) into a local array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Moved high, still without `O_CLOEXEC`: the descriptors the listing opens for
+        // itself take the lowest free ones, which would otherwise be these once closed.
+        for fd in &mut fds {
+            // SAFETY: fcntl(2) and close(2) on this test's own descriptors.
+            let high = unsafe { libc::fcntl(*fd, libc::F_DUPFD, 100) };
+            assert!(high >= 100);
+            // SAFETY: as above.
+            unsafe { libc::close(*fd) };
+            *fd = high;
+        }
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "ls /proc/self/fd"]).stdout(Stdio::piped());
         // SAFETY: as in `start`.
