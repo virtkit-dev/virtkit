@@ -1,4 +1,4 @@
-//! Which jobs a rule selects: a registry namespace's grant today, an egress rule later.
+//! Which jobs a rule selects: a registry namespace's grant, or an egress rule.
 //!
 //! A subject is a list of terms, all of which must hold, written comma-separated:
 //! - `*`: any project;

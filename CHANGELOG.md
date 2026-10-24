@@ -21,6 +21,11 @@ All notable changes to virtkit will be documented in this file.
   projects.
 - **`vk-hub namespaces` declares, per registry, which jobs may read, write or lock under which
   path prefix**, by GitLab instance, project, ref and protection.
+- **`vk-hub egress` holds the hub's egress rules**: by GitLab instance, project, ref and
+  protection, what jobs may reach in their run and build phases, enforced or in dry-run, with a
+  Fallback rule for the jobs no other rule selects.
+- **`[jobs] egress_rules = true` in `hub.toml` steers nodes that can enforce it to the Fallback
+  rule for their gitlab-runner's jobs.**
 - **`vk-hub registries set-url` and `vk-hub token create --kind registry --url` tell the hub
   which URL nodes reach a registry at.**
 - **Registries with `[hub] tokens = true` get the hub's token-signing keys**, and `vk-hub

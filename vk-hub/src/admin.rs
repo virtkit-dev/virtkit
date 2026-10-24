@@ -1,7 +1,7 @@
 //! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub rollout`,
 //! `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`, `vk-hub keys`,
-//! `vk-hub jobs` and `vk-hub local login`, `sessions` and `logout` reach the running hub
-//! through a unix socket in its data directory.
+//! `vk-hub jobs`, `vk-hub egress` and `vk-hub local login`, `sessions` and `logout` reach the
+//! running hub through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -170,6 +170,16 @@ enum Call {
     },
     RemoveNamespace {
         id: String,
+        name: String,
+    },
+    ListEgressRules,
+    /// Add an egress rule, or change one; `exists` refuses one not stored yet.
+    PutEgressRule {
+        change: crate::egress::rules::Change,
+        #[serde(default)]
+        exists: bool,
+    },
+    RemoveEgressRule {
         name: String,
     },
     ListGitlabs,
@@ -650,6 +660,27 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             }
             serde_json::to_value(removed)?
         }
+        Call::ListEgressRules => serde_json::to_value(crate::egress::rules::list(hub)?)?,
+        Call::PutEgressRule { change, exists } => {
+            let (row, changed) = crate::egress::rules::put(hub, &actor, change, exists)?;
+            if changed {
+                eprintln!(
+                    "vk-hub: admin: {actor} set egress rule {} (version {})",
+                    row.name, row.version
+                );
+            }
+            serde_json::to_value((row, changed))?
+        }
+        Call::RemoveEgressRule { name } => {
+            let removed = crate::egress::rules::remove(hub, &actor, &name)?;
+            if removed {
+                eprintln!(
+                    "vk-hub: admin: {actor} removed egress rule {}",
+                    vk_hub_proto::display_safe(&name)
+                );
+            }
+            serde_json::to_value(removed)?
+        }
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
         Call::AddGitlab { name, url } => {
             let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
@@ -939,6 +970,26 @@ impl Client {
     pub fn remove_namespace(&self, id: &str, name: &str) -> Result<bool> {
         self.call(Call::RemoveNamespace {
             id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    pub fn egress_rules(&self) -> Result<crate::egress::rules::Rules> {
+        self.call(Call::ListEgressRules)
+    }
+
+    /// The rule as stored, and whether it changed.
+    pub fn put_egress_rule(
+        &self,
+        change: crate::egress::rules::Change,
+        exists: bool,
+    ) -> Result<(crate::store::EgressRuleRow, bool)> {
+        self.call(Call::PutEgressRule { change, exists })
+    }
+
+    /// Whether there was one.
+    pub fn remove_egress_rule(&self, name: &str) -> Result<bool> {
+        self.call(Call::RemoveEgressRule {
             name: name.to_string(),
         })
     }
@@ -1760,6 +1811,37 @@ mod tests {
             events.contains(&format!("uid 1000 put node {id} in pools big, ci").as_str()),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn egress_rules_are_set_over_the_socket() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let call = |c: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({"v": 1, "call": c})).unwrap();
+            dispatch(&body, &hub, 1000)
+        };
+        call(serde_json::json!({"op": "put-egress-rule", "change": {
+            "name": "default", "mode": "enforce",
+            "run": {"kind": "unrestricted"},
+            "build": {"kind": "allow", "names": ["debian.org"], "ips": []}}}))
+        .unwrap();
+        call(serde_json::json!({"op": "put-egress-rule", "change": {
+            "name": "wab", "subject": "gitlab gl, projects wab/**, protected", "mode": "enforce",
+            "run": {"kind": "allow", "names": ["corp.example.com"], "ips": []},
+            "build": {"kind": "unrestricted"}}}))
+        .unwrap();
+        // What a node would refuse is refused here.
+        let bad = call(serde_json::json!({"op": "put-egress-rule", "change": {
+            "name": "x", "subject": "*",
+            "run": {"kind": "allow", "names": ["*.x"], "ips": []},
+            "build": {"kind": "unrestricted"}}}));
+        assert!(format!("{:#}", bad.unwrap_err()).contains("DNS suffix"));
+        let removed = call(serde_json::json!({"op": "remove-egress-rule", "name": "wab"}));
+        assert_eq!(removed.unwrap(), true);
+        let listed: crate::egress::rules::Rules =
+            serde_json::from_value(call(serde_json::json!({"op": "list-egress-rules"})).unwrap())
+                .unwrap();
+        assert_eq!((listed.generation, listed.rules.len()), (3, 1));
     }
 
     #[test]

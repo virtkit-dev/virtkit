@@ -34,6 +34,12 @@
 //! # most a registry token may live.
 //! max_job_token_secs = 86400
 //!
+//! # What jobs are held to.
+//! [jobs]
+//! # Give gitlab-runner's jobs the Fallback of the hub's egress rules (`vk-hub egress`), on
+//! # nodes that enforce it; off, the rules restrict nothing.
+//! egress_rules = true
+//!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
 //! issuer = "https://login.example.com/app/1"
@@ -109,6 +115,8 @@ pub struct HubConfig {
     pub image_affinity: crate::jobs::Affinity,
     /// The longest a registry token the hub mints lives.
     pub max_job_token: std::time::Duration,
+    /// `[jobs] egress_rules`: whether the hub's egress rules restrict jobs.
+    pub egress_rules: bool,
 }
 
 /// The web UI's listener.
@@ -159,7 +167,15 @@ struct FileConfig {
     image_affinity_max_load: Option<f64>,
     image_affinity_max_extra_load: Option<f64>,
     max_job_token_secs: Option<u64>,
+    jobs: Option<FileJobs>,
     oidc: Option<FileOidc>,
+}
+
+/// `[jobs]` as written; `deny_unknown_fields` for the same reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileJobs {
+    egress_rules: Option<bool>,
 }
 
 /// `[oidc]` as written; `deny_unknown_fields` for the same reason.
@@ -366,6 +382,7 @@ impl HubConfig {
             kept_output_total,
             image_affinity,
             max_job_token,
+            egress_rules: f.jobs.and_then(|j| j.egress_rules).unwrap_or(false),
         })
     }
 
@@ -818,6 +835,16 @@ mod tests {
         assert_eq!(max("max_job_token_secs = 604800\n").unwrap(), 604_800);
         assert!(max("max_job_token_secs = 59\n").is_err());
         assert!(max("max_job_token_secs = 604801\n").is_err());
+    }
+
+    #[test]
+    fn egress_rules_are_off_unless_jobs_turns_them_on() {
+        let on =
+            |extra: &str| parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.egress_rules);
+        assert!(!on("").unwrap());
+        assert!(!on("[jobs]\n").unwrap());
+        assert!(on("[jobs]\negress_rules = true\n").unwrap());
+        assert!(on("[jobs]\negress_rule = true\n").is_err());
     }
 
     #[test]

@@ -435,6 +435,8 @@ async fn serve(
                 let mut report = false;
                 let write = match msg {
                     NodeMsg::Inventory(inventory) => {
+                        // What it enforces may move the Fallback in its desired state.
+                        report = true;
                         Some(Write::Inventory(inventory, pace.inventory_durable(now)))
                     }
                     NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(Write::Heartbeat),

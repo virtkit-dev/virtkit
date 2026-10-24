@@ -1208,6 +1208,44 @@ made readable as in the web UI (below), so the job's escape sequences never reac
 The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 
+## Egress rules
+
+The hub's side of [Job egress from the hub](fleet-design.md#job-egress-from-the-hub)'s rules.
+Rules are managed from the CLI.
+
+**Rules.** `vk-hub egress [list]` lists the rules, `show <name>` one, each with its subject,
+mode, version and per-phase choice:
+
+```text
+egress wab  gitlab gl, projects wab/**, protected  (enforce, version 3)
+  run    names [corp.example.com], ips [10.10.140.49/32]
+  build  names [debian.org, crates.io, pypi.org], ips []
+```
+
+`vk-hub egress set <name> [--subject TERMS] [--run unrestricted|none] [--run-name SUFFIX]…
+[--run-ip CIDR]… [--build unrestricted|none] [--build-name SUFFIX]… [--build-ip CIDR]… [--mode
+enforce|dry-run]` adds a rule or changes one, keeping what it is not given. A phase is
+`unrestricted`, `none`, or the destinations listed, an unlisted dimension then allowing none;
+a new rule chooses both, and starts in dry-run unless `--mode` says otherwise. `mode <name>
+enforce|dry-run` changes the mode alone, `delete <name>` removes a rule. A subject is a
+[namespace](registry-hub.md#namespaces)'s, comma-separated terms among `*`, `gitlab <name>`,
+`projects <glob>`, `project-id <n>`, `ref <glob>`, `protected` and `unprotected`, but `own
+project` and `own pipeline`; `projects` and `project-id` need `gitlab`, and `ref` needs
+`protected`. Entries are checked as a node checks its `[egress]` lists: a DNS suffix, which
+also allows every host under it, or an IPv4 CIDR, a bare address for `/32`, optionally
+`CIDR:port`; at most 256 per list, 253 bytes each, none twice. The hub holds at most 128
+rules. `default` is reserved for the Fallback: it takes no subject, and its mode is chosen when
+it is added. Every change is audited as the person's, and moves the rules' generation on.
+
+**The Fallback for gitlab-runner jobs.** With `[jobs] egress_rules = true` in `hub.toml`, the
+hub sets a node's desired state's `egress` to the layer of a job with no claims — the
+Fallback's alone — if the node announces `egress_fallback`, and to none otherwise: when the node
+reports what it enforces, when the Fallback changes, and at the hub's start, which also lifts it
+once rules are turned off. Each change takes the next generation and is audited as the hub's.
+The node keeps what it applied across hub outages; a job its gitlab-runner runs takes it at
+prepare and keeps it to its end. `vk-hub egress list` and the hub's start warn of rules that
+restrict nothing, and of rules on with no enforced Fallback.
+
 ## Web UI
 
 `ui_addr` in `hub.toml` turns the listener on, with its own `ui_tls_cert` and `ui_tls_key` or

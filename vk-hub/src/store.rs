@@ -43,6 +43,7 @@ use crate::rollout::{
 
 mod audit;
 mod clients;
+mod egress_rules;
 mod gitlabs;
 mod jobs;
 mod keys;
@@ -53,6 +54,9 @@ mod tools;
 
 pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
+pub use egress_rules::{
+    DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, phase_text as rule_phase_text,
+};
 pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, NoAccess, PREPARE_STAGE,
@@ -643,6 +647,8 @@ pub enum Enrollment {
 
 pub struct Db {
     db: Database,
+    /// `[jobs] egress_rules`: gitlab-runner's jobs get the hub's Fallback egress layer.
+    egress_rules: bool,
     /// When a heartbeat's write was last made durable ([`HEARTBEAT_SYNC_SECS`]).
     heartbeat_synced_at: AtomicU64,
     /// When requests past their keep were last swept.
@@ -716,6 +722,18 @@ impl Db {
         Self::init(db)
     }
 
+    /// The hub with `[jobs] egress_rules = true` when `on`.
+    pub fn with_egress_rules(mut self, on: bool) -> Self {
+        self.egress_rules = on;
+        self
+    }
+
+    /// Whether `[jobs] egress_rules` is set: gitlab-runner's jobs get the hub's Fallback, on
+    /// nodes that enforce it.
+    pub fn egress_rules_on(&self) -> bool {
+        self.egress_rules
+    }
+
     /// Use `role` for OIDC sessions when no grant matches.
     pub fn with_oidc_default_role(mut self, role: Role) -> Self {
         self.oidc_default_role = Some(role);
@@ -782,6 +800,10 @@ impl Db {
             .context("opening the namespaces table")?;
         txn.open_table(token_keys::TOKEN_KEYS)
             .context("opening the token keys table")?;
+        txn.open_table(egress_rules::EGRESS_RULES)
+            .context("opening the egress rules table")?;
+        txn.open_table(egress_rules::EGRESS_RULES_META)
+            .context("opening the egress rules' generation")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;
@@ -789,6 +811,7 @@ impl Db {
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,
+            egress_rules: false,
             heartbeat_synced_at: AtomicU64::new(0),
             requests_swept_at: AtomicU64::new(0),
             oidc_default_role: None,
@@ -1030,7 +1053,7 @@ impl Db {
         now: u64,
     ) -> Result<bool> {
         let inventory = display_safe_inventory(inventory);
-        self.update_txn(now, id, |row, _| {
+        self.update_txn(now, id, |row, txn| {
             let changed = row.inventory.as_ref() != Some(&inventory);
             let renamed = !inventory.hostname.is_empty() && row.hostname != inventory.hostname;
             if renamed {
@@ -1038,12 +1061,18 @@ impl Db {
             }
             row.inventory = Some(inventory);
             row.last_seen = Some(now);
-            let durability = if changed && durable {
+            let mut events = Vec::new();
+            if changed
+                && let Some(generation) = steer_fallback(row, self.fallback_in(txn)?.as_ref())
+            {
+                events.push(("hub".to_string(), fallback_event(row, generation)));
+            }
+            let durability = if (changed && durable) || !events.is_empty() {
                 Durability::Immediate
             } else {
                 Durability::None
             };
-            Ok((renamed, Vec::new(), durability))
+            Ok((renamed, events, durability))
         })
     }
 
@@ -1147,6 +1176,7 @@ impl Db {
         report.workloads_omitted = 0;
         let report = display_safe_report(report);
         self.update_txn(now, id, |row, txn| {
+            let fallback = self.fallback_in(txn)?;
             let durability = if row.report.as_ref() == Some(&report) {
                 Durability::None
             } else {
@@ -1177,10 +1207,10 @@ impl Db {
                         } else {
                             theirs.acquisition
                         },
-                        // The hub's alone to set.
+                        // The hub's alone to set: the Fallback, steered below.
                         egress: ours.egress.clone(),
                     };
-                    let same = |s: &DesiredState| (s.ceiling, s.acquisition);
+                    let same = |s: &DesiredState| (s.ceiling, s.acquisition, s.egress.clone());
                     if ours.generation > theirs.generation && same(&merged) == same(ours) {
                         // Ours already carries the change past the node's generation, and may
                         // be in flight: it stands, as the generation must never go back.
@@ -1235,6 +1265,9 @@ impl Db {
                 _ => {}
             }
             row.report = Some(report);
+            if let Some(generation) = steer_fallback(row, fallback.as_ref()) {
+                events.push(("hub".to_string(), fallback_event(row, generation)));
+            }
             row.last_seen = Some(now);
             // Kept apart from the row, which carries their count.
             if let Some(workloads) = workloads {
@@ -2301,6 +2334,100 @@ impl Db {
             .context("setting a write's durability")?;
         txn.commit().context("updating a node")?;
         Ok(out)
+    }
+}
+
+/// Give node `row` the Fallback egress layer `fallback` in its desired state when it enforces
+/// one, and none otherwise, as [`Db::set_desired`] makes a change: the next generation past both
+/// the hub's and the node's, and on the defaults recorded as such. `Some` with the new
+/// generation if that changed it. A node only monitored is left alone: it reads no desired
+/// state.
+fn steer_fallback(
+    row: &mut NodeRow,
+    fallback: Option<&vk_hub_proto::egress::HubEgress>,
+) -> Option<u64> {
+    if row.protocol.is_some_and(|v| v < STEERING) {
+        return None;
+    }
+    let enforces = row.inventory.as_ref().is_some_and(|i| i.egress_fallback);
+    let wanted = fallback.filter(|_| enforces).cloned();
+    let before = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
+    if before.egress == wanted {
+        return None;
+    }
+    let applied = row.report.as_ref().and_then(Report::applied_generation);
+    if row.desired.is_none() && applied.is_none() && row.set_on_defaults.is_none() {
+        row.set_on_defaults = Some(SetFields::default());
+    }
+    let generation = before
+        .generation
+        .max(applied.unwrap_or(0))
+        .saturating_add(1);
+    row.desired = Some(DesiredState {
+        generation,
+        egress: wanted,
+        ..before
+    });
+    Some(generation)
+}
+
+/// The audit line for [`steer_fallback`] having moved `row` to `generation`.
+fn fallback_event(row: &NodeRow, generation: u64) -> String {
+    match row.desired.as_ref().and_then(|d| d.egress.as_ref()) {
+        Some(_) => format!(
+            "set the egress Fallback for the node's gitlab-runner jobs (generation {generation})"
+        ),
+        None => format!(
+            "lifted the egress Fallback for the node's gitlab-runner jobs (generation {generation})"
+        ),
+    }
+}
+
+impl Db {
+    /// The Fallback egress layer for gitlab-runner's jobs, in `txn`: `None` with `[jobs]
+    /// egress_rules` off.
+    fn fallback_in(
+        &self,
+        txn: &redb::WriteTransaction,
+    ) -> Result<Option<vk_hub_proto::egress::HubEgress>> {
+        if !self.egress_rules {
+            return Ok(None);
+        }
+        egress_rules::fallback_in(txn).map(Some)
+    }
+
+    /// Steer every node's Fallback in `txn` ([`steer_fallback`]), audited as the hub's; the
+    /// nodes it changed.
+    fn steer_fallbacks_in(&self, txn: &redb::WriteTransaction, now: u64) -> Result<Vec<String>> {
+        let fallback = self.fallback_in(txn)?;
+        let mut changed = Vec::new();
+        {
+            let mut table = txn.open_table(NODES)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (id, row) = entry?;
+                rows.push((id.value().to_string(), decode::<NodeRow>(row.value())?));
+            }
+            for (id, mut row) in rows {
+                if let Some(generation) = steer_fallback(&mut row, fallback.as_ref()) {
+                    table.insert(id.as_str(), encode(&row)?.as_slice())?;
+                    changed.push((id, fallback_event(&row, generation)));
+                }
+            }
+        }
+        for (id, event) in &changed {
+            append_audit(txn, Some(id), "hub", event, now)?;
+        }
+        Ok(changed.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Steer every node's Fallback to what the rules and `[jobs] egress_rules` make it now, as
+    /// the hub starts; the nodes it changed.
+    pub fn steer_fallbacks(&self, now: u64) -> Result<Vec<String>> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let changed = self.steer_fallbacks_in(&txn, now)?;
+        txn.commit().context("steering the egress Fallback")?;
+        Ok(changed)
     }
 }
 
@@ -4144,6 +4271,98 @@ mod tests {
         };
         db.record_report(&fresh, Report::default(), 2).unwrap();
         assert_eq!(db.node(&fresh).unwrap().unwrap().desired, None);
+    }
+
+    /// With egress rules on, a node enforcing the Fallback gets it in its desired state, past
+    /// what it applied, kept through its reports and moved by a change to the Fallback; with
+    /// them off, or for a node that does not enforce it, it gets none.
+    #[test]
+    fn a_node_enforcing_the_fallback_is_steered_to_it() {
+        use crate::store::{RuleChange, RuleMode};
+        use vk_hub_proto::egress::HubPhase;
+        let db = Db::open_memory().unwrap().with_egress_rules(true);
+        let id = enrolled(&db);
+        let other = {
+            let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+            let Enrollment::Enrolled { node_id } =
+                db.enroll(&token, "bb", "h2", "peer p", 1).unwrap()
+            else {
+                panic!("expected an enrollment");
+            };
+            node_id
+        };
+        let fallback = |build: HubPhase| RuleChange {
+            name: DEFAULT_RULE.into(),
+            subject: None,
+            run: Some(HubPhase::Unrestricted),
+            build: Some(build),
+            mode: Some(RuleMode::Enforce),
+        };
+        let none = HubPhase::Allow {
+            names: Vec::new(),
+            ips: Vec::new(),
+        };
+        // Before any node says it enforces it, the rule steers nobody.
+        let (_, _, steered) = db
+            .put_egress_rule(&fallback(none.clone()), false, "uid 0", 2)
+            .unwrap();
+        assert!(steered.is_empty());
+        let applied = DesiredState {
+            generation: 5,
+            ceiling: Some(2),
+            acquisition: Acquisition::Run,
+            egress: None,
+        };
+        let report = Report {
+            applied: Some(applied.clone()),
+            ..Report::default()
+        };
+        for node in [&id, &other] {
+            db.record_report(node, report.clone(), 3).unwrap();
+        }
+        let enforcing = Inventory {
+            egress_fallback: true,
+            ..Inventory::default()
+        };
+        db.record_inventory(&id, enforcing, true, 4).unwrap();
+        let desired = |node: &str| db.node(node).unwrap().unwrap().desired.unwrap();
+        let wanted = desired(&id);
+        assert_eq!(wanted.generation, 6);
+        assert_eq!(wanted.ceiling, Some(2));
+        let egress = wanted.egress.clone().unwrap();
+        assert_eq!(
+            (egress.rules.as_slice(), &egress.build),
+            (&["default".to_string()][..], &none)
+        );
+        assert_eq!(desired(&other).egress, None);
+        // The node's report of the generation before keeps the hub's.
+        db.record_report(&id, report, 5).unwrap();
+        assert_eq!(desired(&id), wanted);
+        // A change to the Fallback moves it on, for the nodes that enforce it only.
+        let (_, _, steered) = db
+            .put_egress_rule(&fallback(HubPhase::Unrestricted), false, "uid 0", 6)
+            .unwrap();
+        assert_eq!(steered, std::slice::from_ref(&id));
+        assert_eq!(desired(&id).generation, 7);
+        assert_eq!(desired(&id).egress.unwrap().build, HubPhase::Unrestricted);
+        // Rules off: the Fallback is lifted at the hub's start.
+        let db = db.with_egress_rules(false);
+        assert_eq!(db.steer_fallbacks(7).unwrap(), std::slice::from_ref(&id));
+        let lifted = db.node(&id).unwrap().unwrap().desired.unwrap();
+        assert_eq!((lifted.generation, lifted.egress), (8, None));
+        let events: Vec<String> = db
+            .audits(Some(&id), 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            events.contains(
+                &"lifted the egress Fallback for the node's gitlab-runner jobs (generation 8)"
+                    .to_string()
+            ),
+            "{events:?}"
+        );
     }
 
     /// When the hub knows neither its desired state nor the node's applied state, operator

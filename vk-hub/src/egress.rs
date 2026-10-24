@@ -3,6 +3,8 @@
 
 use vk_hub_proto::egress::EgressReport;
 
+pub mod rules;
+
 /// The report to keep of `stored` and `incoming`: the one with the higher revision, `incoming`
 /// on a tie, held to its bounds ([`EgressReport::bounded`]). A report is a cumulative snapshot,
 /// so a replay replaces the counts rather than adding to them.

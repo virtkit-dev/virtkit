@@ -70,7 +70,7 @@ struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
     /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
     /// kept_output, kept_output_total, image_affinity_max_load, image_affinity_max_extra_load,
-    /// max_job_token_secs, [oidc] [default: built-in defaults]
+    /// max_job_token_secs, [jobs] egress_rules, [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -191,6 +191,21 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: NamespacesCmd,
+    },
+    /// List, set and remove the hub's egress rules: what each project's jobs may reach
+    ///
+    /// A rule selects jobs by a subject, comma-separated terms among *, gitlab <name>,
+    /// projects <glob>, project-id <n>, ref <glob> (with protected), protected and
+    /// unprotected, and says per phase, run and build, what they may reach: unrestricted,
+    /// none, or DNS suffixes and IPv4 CIDRs[:port], as a node's [egress] lists. Rules that
+    /// select a job add up; the rule named default, the Fallback, takes the jobs no other
+    /// enforced rule selects. A rule in dry-run blocks nothing and reports what it would.
+    /// The Fallback holds nodes' gitlab-runner jobs once hub.toml sets [jobs] egress_rules = true.
+    Egress {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<EgressCmd>,
     },
     /// List the keys registry tokens are signed with, or make a new one the signer
     TokenKeys {
@@ -518,6 +533,54 @@ enum NamespacesCmd {
     },
     /// Remove a namespace
     Remove { registry: String, name: String },
+}
+
+#[derive(Subcommand)]
+enum EgressCmd {
+    /// List the rules (the default)
+    List,
+    /// Show one rule
+    Show { name: String },
+    /// Add a rule, or change one: what is not given stays as it is
+    ///
+    /// A new rule chooses both phases, and starts in dry-run unless --mode says otherwise;
+    /// the Fallback, default, takes no subject and chooses its mode when added. A phase given
+    /// replaces the rule's: unrestricted, none, or the destinations listed.
+    Set {
+        name: String,
+        /// The jobs it selects, as 'gitlab gl, projects wab/**, protected'
+        #[arg(long)]
+        subject: Option<String>,
+        /// The run phase: unrestricted or none, unless destinations are listed
+        #[arg(long, value_name = "unrestricted|none")]
+        run: Option<String>,
+        /// A DNS suffix the run phase may reach; repeat for several
+        #[arg(long = "run-name", value_name = "SUFFIX")]
+        run_names: Vec<String>,
+        /// An IPv4 CIDR, optionally CIDR:port, the run phase may reach; repeat for several
+        #[arg(long = "run-ip", value_name = "CIDR")]
+        run_ips: Vec<String>,
+        /// The build phase: unrestricted or none, unless destinations are listed
+        #[arg(long, value_name = "unrestricted|none")]
+        build: Option<String>,
+        /// A DNS suffix the build phase may reach; repeat for several
+        #[arg(long = "build-name", value_name = "SUFFIX")]
+        build_names: Vec<String>,
+        /// An IPv4 CIDR, optionally CIDR:port, the build phase may reach; repeat for several
+        #[arg(long = "build-ip", value_name = "CIDR")]
+        build_ips: Vec<String>,
+        /// enforce or dry-run
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Enforce a rule, or put it in dry-run
+    Mode {
+        name: String,
+        /// enforce or dry-run
+        mode: String,
+    },
+    /// Remove a rule
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1168,6 +1231,10 @@ async fn run(cli: Cli) -> Result<()> {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || namespaces_blocking(&client, cmd)).await?
         }
+        Cmd::Egress { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || egress_blocking(&client, cmd)).await?
+        }
         Cmd::TokenKeys { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || token_keys_blocking(&client, cmd)).await?
@@ -1527,6 +1594,25 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     if let Some(role) = default_role {
         db = db.with_oidc_default_role(role);
     }
+    db = db.with_egress_rules(cfg.egress_rules);
+    // [jobs] egress_rules turned on or off while the hub was stopped holds from its start.
+    if cfg.egress_rules {
+        let rules = egress::rules::Rules {
+            generation: 0,
+            rules: db.egress_rules()?.1,
+            enabled: true,
+        };
+        if let Some(warning) = rules.warning() {
+            eprintln!("vk-hub: warning: {warning}");
+        }
+    }
+    let steered = db.steer_fallbacks(now_secs())?;
+    if !steered.is_empty() {
+        eprintln!(
+            "vk-hub: the egress Fallback for gitlab-runner jobs changed on {} node(s)",
+            steered.len()
+        );
+    }
     // A default role lowered or removed while the hub was stopped takes effect at once, as a
     // lowered grant does.
     let ended = db.end_oidc_sessions_above_grants("hub", now_secs())?;
@@ -1885,6 +1971,117 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
                 bail!("registry {registry} has no namespace {name}");
             }
             eprintln!("vk-hub: removed namespace {name}");
+        }
+    }
+    Ok(())
+}
+
+/// A rule as `vk-hub egress` prints it.
+fn egress_rule_text(r: &store::EgressRuleRow) -> String {
+    format!(
+        "egress {}  {}  ({}, version {})\n  run    {}\n  build  {}\n",
+        r.name,
+        r.subject_text(),
+        r.mode.name(),
+        r.version,
+        store::rule_phase_text(&r.run),
+        store::rule_phase_text(&r.build)
+    )
+}
+
+/// A phase from `vk-hub egress set`'s flags: `None` when none is given.
+fn egress_phase(
+    phase: &str,
+    choice: Option<String>,
+    names: Vec<String>,
+    ips: Vec<String>,
+) -> Result<Option<vk_hub_proto::egress::HubPhase>> {
+    use vk_hub_proto::egress::HubPhase;
+    let listed = !names.is_empty() || !ips.is_empty();
+    Ok(match choice.as_deref() {
+        Some(_) if listed => {
+            bail!("--{phase} is unrestricted or none; the destinations listed already choose it")
+        }
+        Some("unrestricted") => Some(HubPhase::Unrestricted),
+        Some("none") => Some(HubPhase::Allow {
+            names: Vec::new(),
+            ips: Vec::new(),
+        }),
+        Some(other) => bail!("--{phase} {other:?}: expected unrestricted or none"),
+        None if listed => Some(HubPhase::Allow { names, ips }),
+        None => None,
+    })
+}
+
+fn rule_mode(mode: &str) -> Result<store::RuleMode> {
+    store::RuleMode::parse(mode)
+        .ok_or_else(|| anyhow::anyhow!("{mode:?}: expected enforce or dry-run"))
+}
+
+/// `vk-hub egress` and its subcommands, which block on the admin socket.
+fn egress_blocking(client: &admin::Client, cmd: Option<EgressCmd>) -> Result<()> {
+    match cmd.unwrap_or(EgressCmd::List) {
+        EgressCmd::List => {
+            let listed = client.egress_rules()?;
+            if listed.rules.is_empty() {
+                eprintln!("vk-hub: no egress rules");
+            }
+            if let Some(warning) = listed.warning() {
+                eprintln!("vk-hub: warning: {warning}");
+            }
+            for r in &listed.rules {
+                print!("{}", egress_rule_text(r));
+            }
+        }
+        EgressCmd::Show { name } => {
+            let Some(r) = client
+                .egress_rules()?
+                .rules
+                .into_iter()
+                .find(|r| r.name == name)
+            else {
+                bail!("there is no egress rule {name}");
+            };
+            print!("{}", egress_rule_text(&r));
+        }
+        EgressCmd::Set {
+            name,
+            subject,
+            run,
+            run_names,
+            run_ips,
+            build,
+            build_names,
+            build_ips,
+            mode,
+        } => {
+            let change = egress::rules::Change {
+                name,
+                subject,
+                run: egress_phase("run", run, run_names, run_ips)?,
+                build: egress_phase("build", build, build_names, build_ips)?,
+                mode: mode.as_deref().map(rule_mode).transpose()?,
+            };
+            let (r, changed) = client.put_egress_rule(change, false)?;
+            if !changed {
+                eprintln!("vk-hub: egress rule {} is already so", r.name);
+            }
+            print!("{}", egress_rule_text(&r));
+        }
+        EgressCmd::Mode { name, mode } => {
+            let change = egress::rules::Change {
+                name,
+                mode: Some(rule_mode(&mode)?),
+                ..Default::default()
+            };
+            let (r, _) = client.put_egress_rule(change, true)?;
+            print!("{}", egress_rule_text(&r));
+        }
+        EgressCmd::Delete { name } => {
+            if !client.remove_egress_rule(&name)? {
+                bail!("there is no egress rule {name}");
+            }
+            eprintln!("vk-hub: removed egress rule {name}");
         }
     }
     Ok(())
