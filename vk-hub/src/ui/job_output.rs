@@ -18,7 +18,7 @@ use vk_hub_proto::client::JobState;
 
 use super::html::Html;
 use super::pages::bytes;
-use super::sse::{Source, Step};
+use super::sse::{Render, Source, Step};
 use crate::jobs::{Stretch, Trace, TraceLine};
 use crate::server::Hub;
 use crate::store::{JobOutcome, JobRow};
@@ -190,14 +190,15 @@ fn line_html(h: &mut Html, line: &TraceLine) {
 /// What `/events/job/<id>` streams: job `id`'s output and record as they change. Each stream
 /// reads the output for itself, from where it stands, rather than sharing a rendering as
 /// `/jobs`' streams do: a job's page has few readers, and each read is bounded ([`STEP`]).
-pub(super) fn source(hub: &Arc<Hub>, id: &str) -> Source {
+/// `counts` renders the navigation's counts, sent with the record when they change.
+pub(super) fn source(hub: &Arc<Hub>, id: &str, counts: Render) -> Source {
     let changes = hub.subscribe_job(id);
     let following = Mutex::new(Following::default());
     let (hub, id) = (hub.clone(), id.to_string());
     Source::Follow {
         name: RECORD,
         changes,
-        next: Arc::new(move || step(&hub, &id, &mut lock(&following))),
+        next: Arc::new(move || step(&hub, &id, &counts, &mut lock(&following))),
     }
 }
 
@@ -217,10 +218,12 @@ struct Following {
     held: Option<String>,
     /// The job's record's revision and output length, as last sent: the record shows both.
     record: Option<(u64, u64)>,
+    /// The navigation's counts, as last sent.
+    counts: Option<String>,
 }
 
 /// One step of job `id`'s stream.
-fn step(hub: &Hub, id: &str, f: &mut Following) -> Result<Step> {
+fn step(hub: &Hub, id: &str, counts: &Render, f: &mut Following) -> Result<Step> {
     let first = f.at.is_none();
     let max = if first { OPENING } else { STEP };
     let Some((row, stretch)) = crate::jobs::output_stretch(hub, id, f.at, max)? else {
@@ -283,9 +286,16 @@ fn step(hub: &Hub, id: &str, f: &mut Following) -> Result<Step> {
         events.push((HELD, held));
     }
     let record = (row.revision, row.output_len);
-    if f.record != Some(record) || ended {
+    let counts = counts()?;
+    let recount = f.counts.as_ref() != Some(&counts);
+    if f.record != Some(record) || ended || recount {
         f.record = Some(record);
-        events.push((RECORD, record_html(hub, &row)?));
+        let mut html = record_html(hub, &row)?;
+        if recount {
+            html.push_str(&counts);
+            f.counts = Some(counts);
+        }
+        events.push((RECORD, html));
     }
     Ok(Step {
         events,

@@ -141,6 +141,8 @@ pub struct Hub {
     touched: watch::Sender<u64>,
     /// Bumped by [`Hub::jobs_changed`] alone, for the job history's pages.
     jobs: watch::Sender<u64>,
+    /// Bumped by [`Hub::jobs_changed`] and [`Hub::egress_changed`], for the Egress page.
+    egress: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
     /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
@@ -203,6 +205,7 @@ impl Hub {
             job_changes: Followed::default(),
             touched: watch::Sender::new(0),
             jobs: watch::Sender::new(0),
+            egress: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             instances: crate::clients::Instances::default(),
@@ -293,6 +296,30 @@ impl Hub {
     /// Its output is not followed here, but by [`Hub::job_changed`].
     pub(crate) fn jobs_changed(&self) {
         self.jobs.send_modify(|n| *n = n.wrapping_add(1));
+        // The Egress page's rows follow the jobs' records.
+        self.egress_changed();
+    }
+
+    /// Note that a placed job's record changed in memory alone, as a running job's egress report
+    /// does until it is written: the job history's pages follow it, not the Egress page's
+    /// rows, read from the store.
+    pub(crate) fn live_jobs_changed(&self) {
+        self.jobs.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Note that the Egress page's rows, their triage or the mutes may have changed.
+    pub(crate) fn egress_changed(&self) {
+        self.egress.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::egress_changed`].
+    pub(crate) fn subscribe_egress(&self) -> watch::Receiver<u64> {
+        self.egress.subscribe()
+    }
+
+    /// How many times [`Hub::egress_changed`] has been called, wrapping.
+    pub(crate) fn egress_generation(&self) -> u64 {
+        *self.egress.borrow()
     }
 
     /// Note that placed job `id`'s output grew or its record changed.

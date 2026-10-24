@@ -4817,7 +4817,9 @@ async fn a_running_job_s_page_follows_its_output() {
     let record = stream.next().await.unwrap();
     assert!(
         record.starts_with("event: job\ndata: <section><h2>Job</h2>")
-            && record.contains("<span class=\"badge busy\">running: step_script</span>"),
+            && record.contains("<span class=\"badge busy\">running: step_script</span>")
+            // The navigation's count, kept current out of band.
+            && record.contains("<span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>"),
         "{record}"
     );
 
@@ -5099,7 +5101,8 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     let first = failed.next().await.unwrap();
     assert_eq!(
         first,
-        "event: jobs\ndata: <p class=\"empty\" role=\"status\">none match</p>\n\n"
+        "event: jobs\ndata: <p class=\"empty\" role=\"status\">none match</p>\
+         <span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>\n\n"
     );
 
     // A job submitted after the page opened.
@@ -8210,6 +8213,71 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
     hub.db.record_inventory(&node, reporting, true, 3).unwrap();
     let body = get(addr, "/egress", Some(&viewer)).await.body;
     assert!(!body.contains("Reporting unavailable"), "{body}");
+}
+
+/// The Egress page's rows and their views' counts follow its filter over SSE, the filter's form
+/// outside what is swapped in: a running job's report adds to them as it comes, and a triage
+/// moves a row out of the inbox. The navigation's count follows on every live page.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_egress_page_s_rows_follow_the_jobs_reports() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    egress_job(&hub, 1, 42, &node, blocked_report("crates.io", 2));
+    let page = get(addr, "/egress?project=gitlab%3Agl%3A42", Some(&operator))
+        .await
+        .body;
+    let swapped = "<div id=\"egress-results\"><div hx-ext=\"sse\" \
+                sse-connect=\"/events/egress?project=gitlab%3Agl%3A42\" sse-swap=\"egress\" \
+                sse-close=\"close\">";
+    let (at_form, at_live) = (
+        page.find("<form id=\"egress-filter\"").unwrap(),
+        page.find(swapped).expect(&page),
+    );
+    assert!(at_form < at_live, "the form is outside the swapped part");
+    assert!(!page[at_live..].contains("<form"), "{page}");
+
+    let mut stream = live(addr, "/events/egress?project=gitlab%3Agl%3A42", &operator).await;
+    let mut nodes = live(addr, "/events/nodes", &operator).await;
+    let count = |n: u64| {
+        format!(
+            "<span id=\"nav-count-egress\" hx-swap-oob=\"true\"> <span class=\"count\">{n}</span></span>"
+        )
+    };
+    // A running job of the project reports a denial: its row and the view's count appear.
+    let id = format!("{:032x}", 2);
+    let mut running = crate::egress::testing::job(2, Default::default());
+    running.result = None;
+    running.finished_at = None;
+    running.state = vk_hub_proto::client::JobState::Running;
+    running.node = Some(node.clone());
+    running.gitlab = Some("gl".into());
+    running.project_id = Some(42);
+    hub.db
+        .submit_job(&id, &running, &id, b"{}", "key gitlab", 10)
+        .unwrap();
+    running.revision += 1;
+    running.egress = Some(blocked_report("pypi.org", 1));
+    assert!(hub.db.put_job(&id, &running, &[], 11).unwrap());
+    hub.jobs_changed();
+    let event = next_with(&mut stream, "pypi.org").await;
+    assert!(event.starts_with("event: egress\n"), "{event}");
+    assert!(event.contains("Blocked (2)"), "{event}");
+    assert!(event.contains(&count(2)), "the navigation's count: {event}");
+    // Every live page keeps it current.
+    next_with(&mut nodes, &count(2)).await;
+    // Acknowledged, a row leaves the inbox.
+    let rows = hub.db.egress_rows().unwrap();
+    let (pypi, _) = rows
+        .iter()
+        .find(|(_, r)| r.finding.text().ends_with("pypi.org"))
+        .unwrap();
+    let form = format!("_csrf={csrf}&row={pypi}&op=acknowledge");
+    let done = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    let event = next_with(&mut stream, "Blocked (1)").await;
+    assert!(!event.contains("pypi.org"), "{event}");
+    assert!(event.contains(&count(1)), "{event}");
 }
 
 /// An operator acknowledges a row and mutes its project from the row's page, each audited as a

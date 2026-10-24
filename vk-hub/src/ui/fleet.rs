@@ -70,6 +70,8 @@ pub(super) struct FleetSite {
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     /// `/jobs`' newest pages, by filter.
     jobs: Arc<super::jobs::Renders>,
+    /// What `/egress`' pages and streams share.
+    egress: Arc<super::egress::Caches>,
     /// `/clients`' fragment, once for every viewer's page and once for every operator's.
     clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     steered_clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
@@ -80,17 +82,24 @@ impl FleetSite {
         FleetSite {
             questions: actions::Questions::new(),
             uploading: operations::Uploading::new(),
-            nodes_feed: sse::feed(hub.subscribe(), nodes_events(hub)),
-            operations_feed: sse::feed(hub.subscribe_touched(), operations_events(hub, false)),
+            nodes_feed: sse::feed(hub.subscribe(), counted_events(hub, nodes_events(hub))),
+            operations_feed: sse::feed(
+                hub.subscribe_touched(),
+                counted_events(hub, operations_events(hub, false)),
+            ),
             steered_operations_feed: sse::feed(
                 hub.subscribe_touched(),
-                operations_events(hub, true),
+                counted_events(hub, operations_events(hub, true)),
             ),
             jobs: Arc::default(),
-            clients_feed: sse::feed(hub.subscribe_clients(), super::clients::events(hub, false)),
+            egress: Arc::default(),
+            clients_feed: sse::feed(
+                hub.subscribe_clients(),
+                counted_events(hub, super::clients::events(hub, false)),
+            ),
             steered_clients_feed: sse::feed(
                 hub.subscribe_clients(),
-                super::clients::events(hub, true),
+                counted_events(hub, super::clients::events(hub, true)),
             ),
         }
     }
@@ -103,6 +112,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         "operations" => Some("operations"),
         super::jobs::EVENT => Some(super::jobs::EVENT),
         super::clients::EVENT => Some(super::clients::EVENT),
+        super::egress::EVENT => Some(super::egress::EVENT),
         _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
             .strip_prefix("node/")
@@ -121,8 +131,8 @@ fn job_event(event: &str) -> Option<&str> {
 
 /// A fleet `/events/<event>[?<query>]` stream for `auth`'s page. Operators see rollout buttons
 /// on `/operations` and node steering actions rendered per stream with the session's CSRF
-/// token. `/jobs`' stream follows the filter in `query`; a job's page's, `job/<id>`, its
-/// output.
+/// token. `/jobs`' and `/egress`' streams follow the filter in `query`; a job's page's,
+/// `job/<id>`, its output.
 pub(super) fn source(
     event: &str,
     query: Option<&str>,
@@ -134,13 +144,22 @@ pub(super) fn source(
     match event {
         super::jobs::EVENT => {
             let filter = super::jobs::stream_filter(query)?;
-            return Some(super::jobs::source(hub, &site.jobs, filter));
+            return Some(own_counted(
+                hub,
+                super::jobs::source(hub, &site.jobs, filter),
+            ));
         }
         // A job's page takes no query.
         _ if job_event(event).is_some() => {
             return job_event(event)
                 .filter(|_| query.is_none())
-                .map(|id| job_output::source(hub, id));
+                .map(|id| job_output::source(hub, id, counts_oob(hub)));
+        }
+        super::egress::EVENT => {
+            return Some(own_counted(
+                hub,
+                super::egress::source(hub, &site.egress, query),
+            ));
         }
         super::clients::EVENT => {
             let feed = if steer {
@@ -151,14 +170,14 @@ pub(super) fn source(
             return Some(Source::Shared {
                 name: super::clients::EVENT,
                 feed: feed.subscribe(),
-                events: super::clients::events(hub, steer),
+                events: counted_events(hub, super::clients::events(hub, steer)),
             });
         }
         "nodes" => {
             return Some(Source::Shared {
                 name: "nodes",
                 feed: site.nodes_feed.subscribe(),
-                events: nodes_events(hub),
+                events: counted_events(hub, nodes_events(hub)),
             });
         }
         "operations" => {
@@ -170,7 +189,7 @@ pub(super) fn source(
             return Some(Source::Shared {
                 name: "operations",
                 feed: feed.subscribe(),
-                events: operations_events(hub, steer),
+                events: counted_events(hub, operations_events(hub, steer)),
             });
         }
         _ => {}
@@ -179,13 +198,32 @@ pub(super) fn source(
         .strip_prefix("node/")
         .filter(|id| vk_hub_proto::valid_id(id))?
         .to_string();
-    let hub = hub.clone();
-    let csrf = steer_token(auth).map(str::to_string);
+    let render: sse::Render = {
+        let (hub, id) = (hub.clone(), id.clone());
+        let csrf = steer_token(auth).map(str::to_string);
+        Arc::new(move || render_node(&hub, &id, csrf.as_deref()))
+    };
     Some(Source::Own {
         name: "node",
-        changes: crate::jobs::subscribe_node_work(&hub, &id),
-        render: Arc::new(move || render_node(&hub, &id, csrf.as_deref())),
+        changes: crate::jobs::subscribe_node_work(hub, &id),
+        render: counted(hub, render),
     })
+}
+
+/// `source`, a page's own fragment, followed by the navigation's counts ([`counted`]).
+fn own_counted(hub: &Arc<Hub>, source: Source) -> Source {
+    match source {
+        Source::Own {
+            name,
+            changes,
+            render,
+        } => Source::Own {
+            name,
+            changes,
+            render: counted(hub, render),
+        },
+        other => other,
+    }
 }
 
 /// The page for `path`, if it is one of the fleet's: read-only, for any session. `swap` as
@@ -755,6 +793,32 @@ fn counts(hub: &Hub) -> Result<Vec<(&'static str, u64)>> {
         super::egress::PATH,
         hub.db.egress_new(crate::now_secs())?,
     )])
+}
+
+/// `render`, followed by the navigation's counts for the page to swap in out of band: each live
+/// page of the fleet keeps them current, within a [`crate::server::HEARTBEAT`] of a change it
+/// does not follow itself.
+fn counted(hub: &Arc<Hub>, render: sse::Render) -> sse::Render {
+    let counts = counts_oob(hub);
+    Arc::new(move || Ok(render()? + &counts()?))
+}
+
+/// The navigation's counts alone, for a page to swap in out of band ([`counted`]).
+fn counts_oob(hub: &Arc<Hub>) -> sse::Render {
+    let hub = hub.clone();
+    Arc::new(move || Ok(pages::counts_oob(&counts(&hub)?).into_string()))
+}
+
+/// `events` with the navigation's counts after the first, the page's fragment ([`counted`]).
+fn counted_events(hub: &Arc<Hub>, events: sse::Events) -> sse::Events {
+    events
+        .iter()
+        .enumerate()
+        .map(|(i, (name, render))| match i {
+            0 => (*name, counted(hub, render.clone())),
+            _ => (*name, render.clone()),
+        })
+        .collect()
 }
 
 const NAV: pages::Nav = &[

@@ -92,6 +92,9 @@ All notable changes to virtkit will be documented in this file.
 - **A running fleet job's egress shows while it runs**: its page and the Jobs page's Network
   column follow its node's reports. A job that ends without its result, its node having lost
   its driver or the hub having ended it, keeps what was reported, marked incomplete.
+- **The Egress page and its navigation count update live**: rows and counts follow what jobs
+  report, a running job's within 30 seconds, and other operators' triage, without resetting
+  the filter.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

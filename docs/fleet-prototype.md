@@ -1458,7 +1458,13 @@ rules, and for an unknown layer the evidence alone. The rows are kept with the j
 job's record adds its share as it is written, once however often, and takes it back as it leaves
 the history; a hub upgraded from a version without them builds them from the history on start.
 The page names the nodes that take placed jobs and do not announce egress reporting, whose jobs
-cannot appear there. The navigation counts the New rows.
+cannot appear there. Its rows, with the job chip and the views' counts, follow the jobs' reports
+— a running job's as its record is written with them, the first at once and later ones at most
+every 30 seconds or with the next stage — and the rows' triage over `/events/egress`, which
+takes the page's filter; the filter's form and the mutes stay outside what is swapped in, and a
+filter change replaces the part that follows, stream and all. The navigation's count of New rows
+rides every live page's stream, swapped in out of band: at once where the stream follows the
+change, within a heartbeat elsewhere.
 
 A row is *New* until an operator acknowledges it on its page, and *New* again once a job adds to
 it — a job newly sharing it, or one with more attempts — however soon after. An operator also

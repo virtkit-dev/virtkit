@@ -113,6 +113,16 @@ fn nav_count(h: &mut Html, path: &str, n: u64, oob: bool) {
     h.raw("</span>");
 }
 
+/// The navigation's `counts`, by path, for a live page to swap in out of band where its top bar
+/// shows them.
+pub fn counts_oob(counts: &[(&str, u64)]) -> Html {
+    let mut h = Html::new();
+    for (path, n) in counts {
+        nav_count(&mut h, path, *n, true);
+    }
+    h
+}
+
 /// The longest path in `nav` matching `here` or a parent, ignoring query and fragment.
 /// Fall back to `/` when no entry matches.
 fn current(nav: Nav, here: &str) -> &'static str {

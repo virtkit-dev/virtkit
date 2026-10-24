@@ -4,14 +4,19 @@
 //! to look to allow it, by the layer that decided it. *Blocked*, *Would block* and
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
-//! from its page, as their session's principal. A rendering reads the view's rows from the
-//! store's indexes, the latest first, and at most [`ROW_BUDGET`] of them in all.
+//! from its page, as their session's principal. The rows and the views' counts follow the jobs'
+//! reports, a running job's as its record is written with them, and the rows' triage, over
+//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
+//! reads the view's rows from the store's indexes, the latest first, and at most
+//! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -22,14 +27,18 @@ use vk_hub_proto::egress::{EgressEntry, EgressRefusal};
 use super::html::Html;
 use super::jobs::percent_encode;
 use super::pages;
+use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, row_id, shares};
 use crate::egress::{self, Check};
-use crate::server::Hub;
+use crate::server::{HEARTBEAT, Hub};
 use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
 
 /// The page.
 pub(super) const PATH: &str = "/egress";
+
+/// The event the page's rows are swapped in on, at `/events/egress`.
+pub(super) const EVENT: &str = "egress";
 
 /// A row's page, `/egress/rows/<id>`.
 pub(super) const ROW_PREFIX: &str = "/egress/rows/";
@@ -48,6 +57,88 @@ const ROW_BUDGET: usize = 300;
 
 /// The latest jobs a row's page shows, and reads its evidence from.
 const ROW_JOBS: usize = 20;
+
+/// What the page's tabs share between their pages and streams.
+#[derive(Default)]
+pub(super) struct Caches {
+    /// The Blocked tab's streamed part, by filter.
+    blocked: Renders,
+}
+
+/// The Blocked tab's streamed part per followed filter, shared by its streams.
+#[derive(Default)]
+struct Renders {
+    /// Renderings and last-request times by filter, forgotten after two heartbeats without a
+    /// request: an open stream requests one each heartbeat.
+    by_filter: Mutex<HashMap<Filter, (Instant, Latest)>>,
+    /// How many renderings were made.
+    #[cfg(test)]
+    rendered: std::sync::atomic::AtomicU64,
+}
+
+/// A filter's rendering, held while it is renewed.
+type Latest = Arc<Mutex<Option<Rendered>>>;
+
+struct Rendered {
+    /// [`Hub::egress_generation`] before the rows were read.
+    generation: u64,
+    at: Instant,
+    fragment: Arc<String>,
+}
+
+impl Rendered {
+    /// Whether it stands at `now` for `generation`: for [`super::sse`]'s debounce past a
+    /// change, so streams rendering within it share one rendering however fast the jobs' reports
+    /// change, and for half a heartbeat at most, for the ages shown and mutes ending.
+    fn stands(&self, generation: u64, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.at);
+        age < HEARTBEAT / 2 && (generation == self.generation || age < SHARED)
+    }
+}
+
+/// How long a rendering stands past a change to the jobs' reports or the rows.
+const SHARED: Duration = Duration::from_secs(1);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // A map and a rendering, each replaced whole: nothing half-written for a panic to leave.
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Renders {
+    /// `filter`'s streamed part at `now`: the latest rendering while it stands, else a new one.
+    /// Concurrent streams of one filter wait for a single one.
+    fn render(&self, hub: &Hub, filter: &Filter, now: Instant) -> Result<Arc<String>> {
+        let entry = {
+            let mut by_filter = lock(&self.by_filter);
+            by_filter.retain(|_, (asked, _)| now.saturating_duration_since(*asked) < 2 * HEARTBEAT);
+            let (asked, entry) = by_filter
+                .entry(filter.clone())
+                .or_insert_with(|| (now, Arc::default()));
+            *asked = now;
+            entry.clone()
+        };
+        let mut rendered = lock(&entry);
+        // Taken before the rows are read, so a change made meanwhile renders them again.
+        let generation = hub.egress_generation();
+        if let Some(r) = rendered.as_ref()
+            && r.stands(generation, now)
+        {
+            return Ok(r.fragment.clone());
+        }
+        let mut h = Html::new();
+        results(&mut h, filter, &listing(hub, filter)?);
+        let fragment = Arc::new(h.into_string());
+        #[cfg(test)]
+        self.rendered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *rendered = Some(Rendered {
+            generation,
+            at: now,
+            fragment: fragment.clone(),
+        });
+        Ok(fragment)
+    }
+}
 
 /// The rows a page shows: those of one view, matching every set field.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -420,6 +511,25 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
     Ok(l)
 }
 
+/// What `/events/egress[?…]` streams: the rows of the filter in `query` ([`Filter::of`]), with
+/// the views' counts, as the jobs' reports and the rows' triage change.
+pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) -> Source {
+    let filter = Filter::of(query);
+    let changes = hub.subscribe_egress();
+    let (hub, caches) = (hub.clone(), caches.clone());
+    Source::Own {
+        name: EVENT,
+        changes,
+        render: Arc::new(move || {
+            Ok(caches
+                .blocked
+                .render(&hub, &filter, Instant::now())?
+                .as_ref()
+                .clone())
+        }),
+    }
+}
+
 /// `GET /egress[?…]` ([`Filter::of`]).
 pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let filter = Filter::of(query);
@@ -438,10 +548,23 @@ fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)], aut
         .raw("project, as their nodes reported it.</p>");
     mutes_note(&mut h, &l.mutes, auth);
     filter_form(&mut h, filter, subjects);
-    // Replaced whole by the filter's form.
-    h.raw("<div id=\"").raw(RESULTS).raw("\">");
+    // Replaced whole by the filter's form, live part and all, so the old stream closes and the
+    // new filter's opens.
+    h.raw("<div id=\"")
+        .raw(RESULTS)
+        .raw("\"><div hx-ext=\"sse\" sse-connect=\"/events/")
+        .raw(EVENT)
+        .text(
+            filter
+                .href(filter.view())
+                .strip_prefix(PATH)
+                .unwrap_or_default(),
+        )
+        .raw("\" sse-swap=\"")
+        .raw(EVENT)
+        .raw("\" sse-close=\"close\">");
     results(&mut h, filter, l);
-    h.raw("</div>");
+    h.raw("</div></div>");
     h
 }
 
@@ -1242,6 +1365,7 @@ pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
                 .egress_unmute(&subject, &principal, crate::now_secs())
         })
         .await?;
+        ui.hub.egress_changed();
         return Ok(see_other(PATH));
     }
     let Some(id) = field(&form, "row")
@@ -1283,6 +1407,7 @@ pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
             "There is no such row: no job of the history shares it.",
         ));
     }
+    ui.hub.egress_changed();
     Ok(see_other(&format!("{ROW_PREFIX}{id}")))
 }
 
@@ -1314,8 +1439,6 @@ pub(super) fn job_href(id: &str, view: View) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::egress::testing::{entry, job};
     use crate::store::Db;
@@ -1393,5 +1516,34 @@ mod tests {
         let mut h = Html::new();
         results(&mut h, &layer, &l);
         assert!(h.into_string().contains("Blocked (201+)"));
+    }
+
+    /// Streams of one filter share a rendering within the debounce past a change, and render
+    /// again past it.
+    #[test]
+    fn streams_of_one_filter_share_its_rendering() {
+        let db = Arc::new(Db::open_memory().unwrap());
+        let hub = Hub::new(db.clone(), None);
+        refused(&db, 1);
+        let renders = Renders::default();
+        let rendered = || renders.rendered.load(std::sync::atomic::Ordering::Relaxed);
+        let start = Instant::now();
+        let filter = Filter::default();
+        let a = renders.render(&hub, &filter, start).unwrap();
+        let b = renders.render(&hub, &filter, start).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(rendered(), 1);
+        hub.egress_changed();
+        renders.render(&hub, &filter, start).unwrap();
+        assert_eq!(rendered(), 1);
+        renders.render(&hub, &filter, start + SHARED).unwrap();
+        assert_eq!(rendered(), 2);
+        // Another filter renders its own.
+        let all = Filter {
+            state: State::All,
+            ..Filter::default()
+        };
+        renders.render(&hub, &all, start + SHARED).unwrap();
+        assert_eq!(rendered(), 3);
     }
 }

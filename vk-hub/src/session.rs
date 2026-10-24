@@ -677,6 +677,8 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Peer, write: Write) -> Result<Opti
     let id = node.id.clone();
     let now = crate::now_secs();
     // Whether the node was renamed, which pages beyond its row show.
+    // The Egress page shows the nodes' caps from their inventories.
+    let inventory = matches!(write, Write::Inventory(..));
     let written = tokio::task::spawn_blocking(move || match write {
         Write::Inventory(inventory, durable) => db.record_inventory(&id, inventory, durable, now),
         Write::Heartbeat(heartbeat) => db.record_heartbeat(&id, heartbeat, now).map(|()| false),
@@ -688,6 +690,9 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Peer, write: Write) -> Result<Opti
             hub.changed(&node.id);
             if renamed {
                 hub.touch();
+            }
+            if inventory {
+                hub.egress_changed();
             }
             Ok(None)
         }

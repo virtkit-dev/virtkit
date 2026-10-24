@@ -1218,7 +1218,7 @@ fn on_egress(hub: &Hub, node: &str, id: &str, report: EgressReport) -> Vec<HubJo
         }
         row.revision = row.revision.saturating_add(1);
     }
-    hub.jobs_changed();
+    hub.live_jobs_changed();
     hub.job_changed(id);
     Vec::new()
 }
