@@ -251,7 +251,7 @@ fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
         }
         h.raw("</tr></thead><tbody>");
         for v in views {
-            key_row(&mut h, v, now);
+            key_row(&mut h, v, views, now);
             if steer {
                 h.raw("<td class=\"actions\">");
                 if v.row.live(now) {
@@ -269,7 +269,7 @@ fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
         h.raw("</tbody></table>");
     }
     h.raw("</section><section><h2>Instances</h2>");
-    if views.iter().all(|v| v.instances.is_empty()) {
+    if views.iter().all(|v| shown(views, v, now).next().is_none()) {
         h.raw("<p class=\"empty\">none: no client has used a key yet</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>key</th><th>host</th><th>instance</th>")
@@ -277,7 +277,7 @@ fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
             .raw("<th class=\"num\">reservations</th><th class=\"num\">queued</th>")
             .raw("<th class=\"num\">running</th></tr></thead><tbody>");
         for v in views {
-            for i in &v.instances {
+            for i in shown(views, v, now) {
                 instance_row(&mut h, &v.row, i, now);
             }
         }
@@ -287,8 +287,33 @@ fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
     h
 }
 
-/// Key `v`'s row, left open for an operator's button.
-fn key_row(h: &mut Html, v: &KeyView, now: u64) {
+/// Whether instance `i` of key `v` is one a working key of the same GitLab server, or of none,
+/// shows too, while `v` no longer works and `i` holds nothing: the same client, now using
+/// another key, which would otherwise show twice.
+fn superseded(views: &[KeyView], v: &KeyView, i: &InstanceView, now: u64) -> bool {
+    let w = i.work;
+    !v.row.live(now)
+        && !i.row.instance.is_empty()
+        && (w.reservations, w.queued, w.running) == (0, 0, 0)
+        && views.iter().any(|o| {
+            o.row.live(now)
+                && o.row.gitlab == v.row.gitlab
+                && o.instances.iter().any(|j| j.row.instance == i.row.instance)
+        })
+}
+
+/// The instances of key `v` to show: those not [`superseded`].
+fn shown<'a>(
+    views: &'a [KeyView],
+    v: &'a KeyView,
+    now: u64,
+) -> impl Iterator<Item = &'a InstanceView> {
+    (v.instances.iter()).filter(move |i| !superseded(views, v, i, now))
+}
+
+/// Key `v`'s row, left open for an operator's button; `views` all the keys, to count only the
+/// instances shown ([`superseded`]).
+fn key_row(h: &mut Html, v: &KeyView, views: &[KeyView], now: u64) {
     let k = &v.row;
     let scopes: Vec<&str> = k.scopes.iter().map(|s| s.name()).collect();
     let pools: Vec<&str> = (k.pools.iter())
@@ -322,13 +347,13 @@ fn key_row(h: &mut Html, v: &KeyView, now: u64) {
     }
     h.raw("</td><td>");
     match v.last_seen() {
-        Some(t) => heard_at(h, now, t),
+        Some(t) => heard_at(h, now, t, k.live(now)),
         None => {
             h.raw("-");
         }
     }
     h.raw("</td><td class=\"num\">")
-        .text(v.instances.len())
+        .text(shown(views, v, now).count())
         .raw("</td><td class=\"num\">");
     // The jobs page takes only a SHA-256 for a key: what the hub stores a key under.
     if vk_hub_proto::valid_sha256(&v.id) {
@@ -664,10 +689,13 @@ async fn revoke(
 }
 
 /// Instance `i` of key `key`: all that it said made display-safe again ([`Html::node`]), a
-/// runner's URL linked only when it is a plain web link.
+/// runner's URL linked only when it is a plain web link. Under a key that no longer works, the
+/// key says so and the instance is never shown connected: it can no longer be.
 fn instance_row(h: &mut Html, key: &KeyRow, i: &InstanceView, now: u64) {
     let r = &i.row;
-    h.raw("<tr><td>").text(&key.name).raw("</td><td>");
+    h.raw("<tr><td>").text(&key.name);
+    key_gone(h, key, now);
+    h.raw("</td><td>");
     or_dash(h, &r.hostname);
     h.raw("</td><td>");
     if r.instance.is_empty() {
@@ -695,7 +723,7 @@ fn instance_row(h: &mut Html, key: &KeyRow, i: &InstanceView, now: u64) {
     if r.last_seen == 0 {
         h.raw("-");
     } else {
-        heard_at(h, now, r.last_seen);
+        heard_at(h, now, r.last_seen, key.live(now));
     }
     let w = i.work;
     h.raw("</td><td class=\"num\">")
@@ -715,9 +743,19 @@ fn or_dash(h: &mut Html, value: &str) {
     };
 }
 
-/// When `then` was, marked connected when within [`CLIENT_ACTIVE_SECS`] of `now`.
-fn heard_at(h: &mut Html, now: u64, then: u64) {
-    if now.saturating_sub(then) <= CLIENT_ACTIVE_SECS {
+/// A badge after the name of `key` when it no longer works.
+fn key_gone(h: &mut Html, key: &KeyRow, now: u64) {
+    if key.revoked_at.is_some() {
+        h.raw(" <span class=\"badge bad\">key revoked</span>");
+    } else if key.expires_at <= now {
+        h.raw(" <span class=\"badge warn\">key expired</span>");
+    }
+}
+
+/// When `then` was, marked connected when within [`CLIENT_ACTIVE_SECS`] of `now` through a key
+/// that works (`live`).
+fn heard_at(h: &mut Html, now: u64, then: u64, live: bool) {
+    if live && now.saturating_sub(then) <= CLIENT_ACTIVE_SECS {
         h.raw("<span class=\"badge ok\">connected</span> ");
     }
     super::fleet::time_ago(h, now, then);
@@ -851,6 +889,59 @@ mod tests {
         let none = fragment(&[], 1000, false).into_string();
         assert!(none.contains("<code>vk-hub keys create</code>"), "{none}");
         assert!(none.contains("no client has used a key yet"), "{none}");
+    }
+
+    /// An instance seen through a key that no longer works is never shown connected, and its
+    /// key says why. The same instance shown under a working key, holding nothing, is not
+    /// shown again: it is the client that moved to the new key.
+    #[test]
+    fn instances_of_a_key_that_no_longer_works_are_not_live() {
+        let view = |id: &str, row: KeyRow, instances| KeyView {
+            id: id.repeat(32),
+            row,
+            instances,
+            jobs: 0,
+        };
+        let mut holding = instance("s_2", 990);
+        holding.work.running = 1;
+        let views = [
+            view(
+                "ab",
+                KeyRow {
+                    revoked_at: Some(500),
+                    ..key("vk-gitlab")
+                },
+                vec![instance("s_1", 990), holding],
+            ),
+            view(
+                "cd",
+                KeyRow {
+                    created_at: 500,
+                    ..key("vk-gitlab")
+                },
+                vec![instance("s_1", 995)],
+            ),
+        ];
+        let page = fragment(&views, 1000, false).into_string();
+        assert_eq!(page.matches("<code>s_1</code>").count(), 1, "{page}");
+        assert!(
+            page.contains(
+                "<td>vk-gitlab <span class=\"badge bad\">key revoked</span></td><td>-</td>\
+                 <td><code>s_2</code>"
+            ),
+            "{page}"
+        );
+        // The working key's row and its instance only.
+        assert_eq!(page.matches("badge ok\">connected").count(), 2, "{page}");
+        // The revoked key counts the instance it shows, not the one that moved on.
+        let revoked = page.split("<td>vk-gitlab</td>").nth(1).unwrap();
+        let revoked = revoked.split("</tr>").next().unwrap();
+        assert!(revoked.contains("<td class=\"num\">1</td>"), "{revoked}");
+
+        // Without a working key showing it, it is shown, marked.
+        let page = fragment(&views[..1], 1000, false).into_string();
+        assert_eq!(page.matches("<code>s_1</code>").count(), 1, "{page}");
+        assert!(!page.contains("connected"), "{page}");
     }
 
     /// An operator's fragment offers to revoke a working key, and to remove one that no

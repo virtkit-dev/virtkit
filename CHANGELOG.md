@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **An instance seen through a revoked or expired key no longer looks live on the hub's
+  Connections page**: it is marked with its key's state, and left out once the same client
+  shows under the key that replaced it.
 - **The hub's Connections page spaces its API keys and Instances apart for operators**, as
   it does for viewers.
 

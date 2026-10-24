@@ -1617,7 +1617,10 @@ Each instance shows its key, the host, program and version and each runner's nam
 GitLab URL its latest hello named, when it was last heard from — *connected* within the last
 180 seconds — and the reservations it holds and its jobs queued and running. Requests that
 named no instance, as an older `vk-gitlab`'s, show as the key's *unknown instance*, with when
-it was last heard from and what it holds. What a client said is shown as text, and a runner's
+it was last heard from and what it holds. An instance seen through a key that no longer works
+is never shown *connected*, its key marked *key revoked* or *key expired*; one a working key
+of the same GitLab server, or of none, shows too is left out while it holds nothing: it is the
+same client, now using that key. What a client said is shown as text, and a runner's
 URL becomes a link only when it is a plain web URL without credentials.
 
 Operators create keys there with the same validation as `vk-hub keys create`: a name,
