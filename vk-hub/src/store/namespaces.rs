@@ -327,6 +327,31 @@ fn ns_range(registry: &str) -> (String, String) {
     (format!("{registry}/"), format!("{registry}0"))
 }
 
+/// Why `ns` may not be stored on registry `registry` beside the namespaces in `table`, if it
+/// may not: the registry has [`MAX_NAMESPACES`] already, unless `ns` `replaces` one, or a
+/// retention would reach into another namespace.
+fn refusal(
+    table: &redb::Table<&str, &[u8]>,
+    registry: &str,
+    ns: &NamespaceRow,
+    replaces: bool,
+) -> Result<Option<String>> {
+    let (start, end) = ns_range(registry);
+    if !replaces && table.range(start.as_str()..end.as_str())?.count() >= MAX_NAMESPACES {
+        return Ok(Some(format!(
+            "registry {registry} has {MAX_NAMESPACES} namespaces already"
+        )));
+    }
+    let mut others = Vec::new();
+    for entry in table.range(start.as_str()..end.as_str())? {
+        let other = decode::<NamespaceRow>(entry?.1.value())?;
+        if other.name != ns.name {
+            others.push(other);
+        }
+    }
+    Ok(check_retention_overlap(ns, &others).err())
+}
+
 impl Db {
     /// Store namespace `ns` on registry `registry`, replacing one of its name, audited as
     /// `actor`'s.
@@ -346,20 +371,9 @@ impl Db {
         }
         let replaced = {
             let mut table = txn.open_table(NAMESPACES)?;
-            let (start, end) = ns_range(registry);
             let key = format!("{registry}/{}", ns.name);
             let replaced = table.get(key.as_str())?.is_some();
-            if !replaced && table.range(start.as_str()..end.as_str())?.count() >= MAX_NAMESPACES {
-                bail!("registry {registry} has {MAX_NAMESPACES} namespaces already");
-            }
-            let mut others = Vec::new();
-            for entry in table.range(start.as_str()..end.as_str())? {
-                let other = decode::<NamespaceRow>(entry?.1.value())?;
-                if other.name != ns.name {
-                    others.push(other);
-                }
-            }
-            if let Err(why) = check_retention_overlap(ns, &others) {
+            if let Some(why) = refusal(&table, registry, ns, replaced)? {
                 bail!("{why}");
             }
             table.insert(key.as_str(), encode(ns)?.as_slice())?;
@@ -412,9 +426,12 @@ impl Db {
         Ok(removed)
     }
 
-    /// Give registry `registry` the [`defaults`] it lacks, once: whether it got them now.
+    /// Give registry `registry` the [`defaults`] it lacks, once, each held to the checks
+    /// [`Db::put_namespace`] makes: one refused is skipped, and the audit log says why.
+    /// Whether it got them now.
     pub fn seed_namespaces(&self, registry: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
+        let mut events = Vec::new();
         let seeded = {
             let mut registries = txn.open_table(REGISTRIES)?;
             let Some(mut row) = registries
@@ -432,16 +449,21 @@ impl Db {
                 let mut table = txn.open_table(NAMESPACES)?;
                 for ns in defaults(now) {
                     let key = format!("{registry}/{}", ns.name);
-                    if table.get(key.as_str())?.is_none() {
-                        table.insert(key.as_str(), encode(&ns)?.as_slice())?;
+                    if table.get(key.as_str())?.is_some() {
+                        continue;
                     }
+                    if let Some(why) = refusal(&table, registry, &ns, false)? {
+                        events.push(format!("namespace {} not added by default: {why}", ns.name));
+                        continue;
+                    }
+                    table.insert(key.as_str(), encode(&ns)?.as_slice())?;
+                    events.push(format!("namespace {} added by default", ns.name));
                 }
                 true
             }
         };
-        if seeded {
-            let event = format!("namespaces {CI_CACHE} and {CI_PIPELINE} added by default");
-            append_audit(&txn, Some(registry), "hub", &event, now)?;
+        for event in &events {
+            append_audit(&txn, Some(registry), "hub", event, now)?;
         }
         txn.commit().context("seeding namespaces")?;
         Ok(seeded)
@@ -584,6 +606,55 @@ mod tests {
         ] {
             assert!(bad.check().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn seeding_holds_the_defaults_to_the_same_checks() {
+        use crate::store::{AuditFilter, RegistryEnrollment, TokenKind};
+        let db = Db::open_memory().unwrap();
+        let enroll = |key: &str| {
+            let ttl = std::time::Duration::from_secs(60);
+            let (token, _) = db
+                .create_token_for(TokenKind::Registry, ttl, None, "u", 1)
+                .unwrap();
+            let RegistryEnrollment::Enrolled { id } =
+                db.enroll_registry(&token, key, "reg", "p", 1).unwrap()
+            else {
+                panic!("not enrolled");
+            };
+            id
+        };
+        let (full, overlapping) = (enroll("aa"), enroll("bb"));
+        for i in 0..MAX_NAMESPACES {
+            let n = ns(&format!("n{i}"), &format!("p{i}"), &["r:*"], None);
+            db.put_namespace(&full, &n, "u", 1).unwrap();
+        }
+        let wider = ns("wider", "ci-pipeline", &["r:*"], Some(9));
+        db.put_namespace(&overlapping, &wider, "u", 1).unwrap();
+        assert!(db.seed_namespaces(&full, 2).unwrap());
+        assert!(db.seed_namespaces(&overlapping, 2).unwrap());
+        assert_eq!(db.namespaces(&full).unwrap().len(), MAX_NAMESPACES);
+        let names: Vec<String> = db
+            .namespaces(&overlapping)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(names, [CI_CACHE, "wider"]);
+        let events: Vec<String> = db
+            .audit_search(&AuditFilter::default(), None, 100)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|(_, r)| r.event)
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("namespace ci-pipeline not added by default: ")),
+            "{events:?}"
+        );
+        assert!(!db.seed_namespaces(&overlapping, 3).unwrap());
     }
 
     #[test]
