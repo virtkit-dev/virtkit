@@ -1240,6 +1240,17 @@ also allows every host under it, or an IPv4 CIDR, a bare address for `/32`, opti
 rules. `default` is reserved for the Fallback: it takes no subject, and its mode is chosen when
 it is added. Every change is audited as the person's, and moves the rules' generation on.
 
+**Resolution.** `vk-hub egress resolve [--gitlab NAME --project PATH --project-id N] [--ref
+REF] [--protected]` prints, as JSON, the layer a placed job of those claims gets from the rules
+now, as its start would carry it. The enforced rules selecting the job add up, per phase and
+dimension: an unrestricted phase absorbs the rest, lists join without repeats. With none, the
+Fallback applies if enforced; without it, both phases allow nothing. A dry-run rule selects
+nothing: each one that would select the job comes as the layer the job would have were it
+enforced, the enforced rules and it added up, the Fallback dropped; a dry-run Fallback comes so
+when no enforced rule selects the job. A job's claims are its project's ID and path, ref and
+protection, and count only under a key bound to its GitLab instance, which checked the project
+at submission: any other job, and `resolve` without `--gitlab`, gets the Fallback alone.
+
 **`[jobs] egress_rules = true`** in `hub.toml` turns the rules on; off, as by default, the hub
 sends no layer and the rules restrict nothing. On, placement resolves each job's layer from the
 rules as they stand and sends it in the job's start; one that does not fit a start — more than

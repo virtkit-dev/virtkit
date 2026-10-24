@@ -1,12 +1,13 @@
-//! Managing the hub's egress rules ([`crate::store::EgressRuleRow`]), from `vk-hub egress`.
+//! Managing the hub's egress rules ([`crate::store::EgressRuleRow`]), from `vk-hub egress`, and
+//! resolving a job's layer from them.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use vk_hub_proto::egress::HubPhase;
+use vk_hub_proto::egress::{HubEgress, HubPhase};
 
 use crate::server::Hub;
 use crate::store::{EgressRuleRow, RuleChange, RuleMode};
-use crate::subject::Subject;
+use crate::subject::{JobClaims, Subject};
 
 /// The rules as `vk-hub egress list` shows them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +55,22 @@ pub struct Change {
     pub mode: Option<RuleMode>,
 }
 
+/// A job's claims as `vk-hub egress resolve` gives them; no GitLab instance for a job whose key
+/// is bound to none.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Claims {
+    #[serde(default)]
+    pub gitlab: Option<String>,
+    #[serde(default)]
+    pub project_id: u64,
+    #[serde(default)]
+    pub project_path: String,
+    #[serde(default)]
+    pub git_ref: String,
+    #[serde(default)]
+    pub protected: bool,
+}
+
 pub fn list(hub: &Hub) -> Result<Rules> {
     let (generation, rules) = hub.db.egress_rules()?;
     Ok(Rules {
@@ -98,4 +115,25 @@ fn steered_fallback(hub: &Hub, nodes: &[String]) {
         hub.kick(id);
         hub.changed(id);
     }
+}
+
+/// The layer a job claiming `c` would get from the rules now.
+pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
+    let claims = match &c.gitlab {
+        Some(gitlab) => Some(JobClaims {
+            gitlab: gitlab.clone(),
+            project_id: c.project_id,
+            project_path: c.project_path.clone(),
+            git_ref: c.git_ref.clone(),
+            protected: c.protected,
+            pipeline_id: 0,
+        }),
+        None if c.project_id != 0 || !c.project_path.is_empty() => bail!(
+            "a job's project counts only under a key bound to its GitLab instance: name the \
+             instance too"
+        ),
+        None => None,
+    };
+    let (_, rules) = hub.db.egress_rules()?;
+    Ok(crate::store::resolve_egress(&rules, claims.as_ref()))
 }

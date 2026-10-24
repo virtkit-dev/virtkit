@@ -581,6 +581,26 @@ enum EgressCmd {
     },
     /// Remove a rule
     Delete { name: String },
+    /// Print the egress layer a placed job of these claims gets from the rules now, as JSON
+    ///
+    /// Without --gitlab, a job whose key is bound to no GitLab instance: the Fallback alone.
+    Resolve {
+        /// The GitLab instance the job's key is bound to, by the hub's name for it
+        #[arg(long)]
+        gitlab: Option<String>,
+        /// The project's path
+        #[arg(long, value_name = "PATH", default_value = "")]
+        project: String,
+        /// The project's ID
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        project_id: u64,
+        /// The job's ref
+        #[arg(long = "ref", value_name = "REF", default_value = "")]
+        git_ref: String,
+        /// The ref is protected
+        #[arg(long)]
+        protected: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2088,6 +2108,22 @@ fn egress_blocking(client: &admin::Client, cmd: Option<EgressCmd>) -> Result<()>
                 bail!("there is no egress rule {name}");
             }
             eprintln!("vk-hub: removed egress rule {name}");
+        }
+        EgressCmd::Resolve {
+            gitlab,
+            project,
+            project_id,
+            git_ref,
+            protected,
+        } => {
+            let layer = client.resolve_egress(egress::rules::Claims {
+                gitlab,
+                project_id,
+                project_path: project,
+                git_ref,
+                protected,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&layer)?);
         }
     }
     Ok(())

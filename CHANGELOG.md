@@ -23,7 +23,8 @@ All notable changes to virtkit will be documented in this file.
   path prefix**, by GitLab instance, project, ref and protection.
 - **`vk-hub egress` holds the hub's egress rules**: by GitLab instance, project, ref and
   protection, what jobs may reach in their run and build phases, enforced or in dry-run, with a
-  Fallback rule for the jobs no other rule selects.
+  Fallback rule for the jobs no other rule selects. `vk-hub egress resolve` prints what a job
+  would get.
 - **`[jobs] egress_rules = true` in `hub.toml` holds placed jobs to the hub's egress rules**,
   their project and ref counting only under a key bound to their GitLab instance. Such jobs go
   only to nodes that enforce the rules; a node that does not says so. A job's page and `vk-hub

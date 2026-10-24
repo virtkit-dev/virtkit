@@ -182,6 +182,10 @@ enum Call {
     RemoveEgressRule {
         name: String,
     },
+    /// The layer a job of these claims would get.
+    ResolveEgress {
+        claims: crate::egress::rules::Claims,
+    },
     ListGitlabs,
     AddGitlab {
         name: String,
@@ -681,6 +685,9 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             }
             serde_json::to_value(removed)?
         }
+        Call::ResolveEgress { claims } => {
+            serde_json::to_value(crate::egress::rules::resolve(hub, &claims)?)?
+        }
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
         Call::AddGitlab { name, url } => {
             let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
@@ -992,6 +999,13 @@ impl Client {
         self.call(Call::RemoveEgressRule {
             name: name.to_string(),
         })
+    }
+
+    pub fn resolve_egress(
+        &self,
+        claims: crate::egress::rules::Claims,
+    ) -> Result<vk_hub_proto::egress::HubEgress> {
+        self.call(Call::ResolveEgress { claims })
     }
 
     pub fn gitlabs(&self) -> Result<Vec<(String, crate::store::GitlabRow)>> {
@@ -1814,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn egress_rules_are_set_over_the_socket() {
+    fn egress_rules_are_set_and_resolved_over_the_socket() {
         let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
         let call = |c: serde_json::Value| {
             let body = serde_json::to_vec(&serde_json::json!({"v": 1, "call": c})).unwrap();
@@ -1836,6 +1850,22 @@ mod tests {
             "run": {"kind": "allow", "names": ["*.x"], "ips": []},
             "build": {"kind": "unrestricted"}}}));
         assert!(format!("{:#}", bad.unwrap_err()).contains("DNS suffix"));
+        let resolved = |claims: serde_json::Value| {
+            serde_json::from_value::<vk_hub_proto::egress::HubEgress>(
+                call(serde_json::json!({"op": "resolve-egress", "claims": claims})).unwrap(),
+            )
+            .unwrap()
+            .rules
+        };
+        let wab = serde_json::json!({"gitlab": "gl", "project_id": 1,
+            "project_path": "wab/core", "git_ref": "main", "protected": true});
+        assert_eq!(resolved(wab), ["wab"]);
+        assert_eq!(resolved(serde_json::json!({})), ["default"]);
+        assert!(
+            call(serde_json::json!({"op": "resolve-egress",
+            "claims": {"project_path": "wab/core"}}))
+            .is_err()
+        );
         let removed = call(serde_json::json!({"op": "remove-egress-rule", "name": "wab"}));
         assert_eq!(removed.unwrap(), true);
         let listed: crate::egress::rules::Rules =
