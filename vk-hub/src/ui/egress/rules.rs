@@ -3,7 +3,8 @@
 //! what each phase may reach under it, its mode, and the recent jobs placed under it; the
 //! Fallback listed apart. With `[jobs] egress_rules` off the tab says that saved rules restrict
 //! nothing. Each rule has a page of its own, `/egress?tab=rules&rule=<name>`, listing its
-//! entries.
+//! entries; there operators change or remove it, and on `/egress?tab=rules&new=rule` add one,
+//! through Preview → Save ([`super::editor`]).
 //!
 //! Rule names and entries are operators' to choose, checked as a node checks its own lists;
 //! they are escaped as any text.
@@ -22,7 +23,7 @@ use super::{Caches, PATH as EGRESS, Tab, capital};
 use crate::egress::aggregates::Aggregates;
 use crate::egress::rules::{self as ops, RECENT_SCAN, RuleJobs, Rules};
 use crate::server::Hub;
-use crate::store::{DEFAULT_RULE, EgressRuleRow, RuleMode};
+use crate::store::{DEFAULT_RULE, EgressRuleRow, Role, RuleMode};
 
 /// The tab.
 pub(super) const PATH: &str = "/egress?tab=rules";
@@ -35,6 +36,8 @@ const TAB: &str = "rules";
 pub(super) struct Query {
     /// A rule's name: its page.
     rule: Option<String>,
+    /// The form for a rule to add: the Fallback when `Some(true)`.
+    new: Option<bool>,
 }
 
 impl Query {
@@ -49,6 +52,11 @@ impl Query {
             rule: field(&query, "rule")
                 .filter(|r| vk_hub_proto::egress::valid_rule_name(r))
                 .map(str::to_string),
+            new: match field(&query, "new") {
+                Some("rule") => Some(false),
+                Some("fallback") => Some(true),
+                _ => None,
+            },
         })
     }
 }
@@ -61,6 +69,8 @@ pub(super) fn rule_href(name: &str) -> String {
 /// What the tab shows.
 struct Listing {
     rules: Rules,
+    /// The GitLab instances, by name, for the editor.
+    gitlabs: Vec<String>,
     /// The recent jobs.
     used: Arc<Aggregates>,
 }
@@ -70,6 +80,7 @@ fn listing(hub: &Hub, caches: &Caches) -> Result<Listing> {
     Ok(Listing {
         used: caches.aggregates.get(hub, &rules, crate::now_secs())?,
         rules,
+        gitlabs: hub.db.gitlabs()?.into_iter().map(|(n, _)| n).collect(),
     })
 }
 
@@ -82,17 +93,21 @@ pub(super) async fn get(
 ) -> Result<Response<Body>> {
     let (hub, caches) = (ui.hub.clone(), caches.clone());
     let listing = blocking(move || listing(&hub, &caches)).await?;
-    let main = match &q.rule {
-        Some(name) => {
+    let operator = auth.session.role >= Role::Operator;
+    let main = match (&q.rule, q.new) {
+        (None, Some(fallback)) if operator => {
+            super::editor::new_page(&listing.rules, fallback, &listing.gitlabs, auth)
+        }
+        (Some(name), _) => {
             let Some(rule) = listing.rules.rules.iter().find(|r| r.name == *name) else {
                 return Ok(message(
                     StatusCode::NOT_FOUND,
                     "There is no such rule: it may have been removed.",
                 ));
             };
-            rule_page(&listing, rule)
+            rule_page(&listing, rule, auth)
         }
-        None => tab_page(&listing),
+        _ => tab_page(&listing, auth),
     };
     Ok(page(fleet::layout("Egress", EGRESS, auth, &main)))
 }
@@ -131,13 +146,24 @@ pub(super) fn state_callout(h: &mut Html, rules: &Rules) {
     }
 }
 
-fn tab_page(l: &Listing) -> Html {
+fn tab_page(l: &Listing, auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, Tab::Rules, None);
     h.raw("<p class=\"sub\">What jobs may reach, by project, ref and protection, in each phase. ")
         .raw("Matching enforced rules add up: a rule cannot remove access another allows. Node ")
         .raw("caps and jobs' own restrictions still apply.</p>");
+    if auth.session.role >= Role::Operator {
+        h.raw("<p class=\"actions\"><a href=\"")
+            .raw(PATH)
+            .raw("&amp;new=rule\">Add a rule</a>");
+        if !l.rules.rules.iter().any(is_fallback) {
+            h.raw(" <a href=\"")
+                .raw(PATH)
+                .raw("&amp;new=fallback\">Add the Fallback</a>");
+        }
+        h.raw("</p>");
+    }
     tab_results(&mut h, l);
     h
 }
@@ -263,11 +289,14 @@ const PHASES: [(&str, &str); 2] = [
 ];
 
 /// Rule `r`'s page: what it selects, how, and each phase's entries.
-fn rule_page(l: &Listing, r: &EgressRuleRow) -> Html {
+fn rule_page(l: &Listing, r: &EgressRuleRow, auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, Tab::Rules, None);
     rule_results(&mut h, l, r);
+    if auth.session.role >= Role::Operator {
+        super::editor::rule_forms(&mut h, r, &l.gitlabs, auth);
+    }
     h
 }
 

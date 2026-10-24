@@ -8749,3 +8749,273 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
         "{tab}"
     );
 }
+
+/// The hidden fields of the form in `body` posting `op`, encoded to post again.
+fn form_of(body: &str, op: &str) -> String {
+    let marker = format!("name=\"op\" value=\"{op}\"");
+    let at = body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {op} form: {body}"));
+    let start = body[..at].rfind("<form").unwrap();
+    let end = at + body[at..].find("</form>").unwrap();
+    let mut out = Vec::new();
+    for input in body[start..end]
+        .split("<input type=\"hidden\" name=\"")
+        .skip(1)
+    {
+        let (name, rest) = input.split_once("\" value=\"").unwrap();
+        let value = rest.split('"').next().unwrap();
+        let value = value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&");
+        out.push(format!("{name}={}", super::jobs::percent_encode(&value)));
+    }
+    out.join("&")
+}
+
+/// An operator adds, changes and removes egress rules through Preview → Save: the preview shows
+/// the recent jobs it affects, Save stores only what was previewed against the rules previewed,
+/// and each change is audited. Viewers read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::*;
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    egress_rule(
+        &hub,
+        crate::store::DEFAULT_RULE,
+        None,
+        HubPhase::Unrestricted,
+        allow(&["debian.org"], &[]),
+        RuleMode::Enforce,
+    );
+    // A job of acme/p42 on gl that reached crates.io, reported completely.
+    let mut report = EgressReport {
+        entries: vec![crate::egress::testing::entry(
+            EgressOutcome::Observed,
+            EgressProtocol::Dns,
+            EgressDestination::domain("crates.io"),
+            None,
+        )],
+        phases: vec![crate::egress::testing::phase(
+            EgressPhase::Run,
+            EgressCoverage::Complete,
+        )],
+        ..EgressReport::default()
+    };
+    report.entries[0].count = 2;
+    let job = egress_job(&hub, 1, 42, &node, report);
+
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(!tab.contains("Add a rule"), "{tab}");
+    let tab = get(addr, "/egress?tab=rules", Some(&operator)).await.body;
+    assert!(tab.contains("&amp;new=rule\">Add a rule</a>"), "{tab}");
+    let form = get(addr, "/egress?tab=rules&new=rule", Some(&operator))
+        .await
+        .body;
+    assert!(form.contains("<form class=\"wide rule\" method=\"post\" action=\"/egress/rules\">"));
+    assert!(form.contains("Unrestricted by this rule"), "{form}");
+
+    let rule = |extra: &str| {
+        format!(
+            "_csrf={csrf}&op=preview&new=1&name=acme&gitlab=gl&projects=path\
+             &project_path=acme%2F**&protection=&run=allow&run_names=pypi.org&run_ips=\
+             &build=unrestricted&build_names=&build_ips=&mode=enforce{extra}"
+        )
+    };
+    let refused = post_action(addr, &origin, &viewer, "/egress/rules", &rule(""), false).await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    let _ = viewer_csrf;
+    // Refusals in plain words, the form kept as typed.
+    let bad = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &rule("&git_ref=release%2F*"),
+        false,
+    )
+    .await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert!(
+        bad.body.contains(
+            "A branch or tag pattern needs \u{201c}Protected only\u{201d}: anyone who can push \
+             can name a branch release/*."
+        ),
+        "{}",
+        bad.body
+    );
+    assert!(bad.body.contains("value=\"release/*\""), "{}", bad.body);
+    let bad = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &rule("").replace("run_names=pypi.org", "run_names=https%3A%2F%2Fpypi.org"),
+        false,
+    )
+    .await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert!(
+        bad.body.contains(
+            "The run phase&#39;s names: &quot;https://pypi.org&quot;: expected a DNS suffix"
+        ),
+        "{}",
+        bad.body
+    );
+
+    // The preview: the job's group replaces the Fallback.
+    let preview = post_action(addr, &origin, &operator, "/egress/rules", &rule(""), false).await;
+    assert_eq!(preview.status, 200, "{}", preview.body);
+    let body = &preview.body;
+    assert!(body.contains("<h2>Preview: add rule acme</h2>"), "{body}");
+    assert!(body.contains("Hub rules are off: saved, this change restricts nothing"));
+    assert!(
+        body.contains(&format!(
+            "<td class=\"num\"><a href=\"/jobs/{job}\" title=\"Their latest job\">1</a></td>\
+             <td>acme/p42 on gl <span class=\"sub\">(project 42)</span></td>\
+             <td>main (protected)</td><td>Fallback</td><td>acme \
+             <span class=\"badge\">Replaces the Fallback</span></td>\
+             <td>now limited to pypi.org</td><td>now unrestricted by hub rules</td>"
+        )),
+        "{body}"
+    );
+    assert!(
+        hub.db.egress_rules().unwrap().1.len() == 1,
+        "nothing saved yet"
+    );
+
+    // Saved against rules that moved on since: refused, nothing stored.
+    let save = form_of(body, "save");
+    egress_rule(
+        &hub,
+        "other",
+        Some("gitlab gl, project-id 7"),
+        HubPhase::Unrestricted,
+        HubPhase::Unrestricted,
+        RuleMode::DryRun,
+    );
+    let stale = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &format!("_csrf={csrf}&{save}"),
+        false,
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{}", stale.body);
+    assert!(
+        stale
+            .body
+            .contains("The rules changed since your preview: preview the change again.")
+    );
+    assert!(
+        !hub.db
+            .egress_rules()
+            .unwrap()
+            .1
+            .iter()
+            .any(|r| r.name == "acme")
+    );
+
+    // Previewed again, then saved.
+    let preview = post_action(addr, &origin, &operator, "/egress/rules", &rule(""), false).await;
+    let save = form_of(&preview.body, "save");
+    let saved = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &format!("_csrf={csrf}&{save}"),
+        false,
+    )
+    .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_eq!(
+        saved.header("location"),
+        Some("/egress?tab=rules&rule=acme")
+    );
+    let (_, rules) = hub.db.egress_rules().unwrap();
+    let acme = rules.iter().find(|r| r.name == "acme").unwrap();
+    assert_eq!(acme.run, allow(&["pypi.org"], &[]));
+    assert_eq!(acme.build, HubPhase::Unrestricted);
+    assert_eq!(acme.mode, RuleMode::Enforce);
+    assert_eq!(
+        acme.subject.as_ref().unwrap().to_string(),
+        "gitlab gl, projects acme/**"
+    );
+
+    // Its page offers the form, prefilled, to an operator alone.
+    let page = get(addr, "/egress?tab=rules&rule=acme", Some(&operator))
+        .await
+        .body;
+    assert!(page.contains("value=\"acme/**\""), "{page}");
+    assert!(page.contains("pypi.org</textarea>"), "{page}");
+    let page = get(addr, "/egress?tab=rules&rule=acme", Some(&viewer))
+        .await
+        .body;
+    assert!(!page.contains("/egress/rules\""), "{page}");
+
+    // A rule for no recent job: in dry-run, compared as enforced.
+    let quiet = rule("")
+        .replace("name=acme", "name=quiet")
+        .replace("projects=path", "projects=id&project_id=9")
+        .replace("mode=enforce", "mode=dry-run");
+    let preview = post_action(addr, &origin, &operator, "/egress/rules", &quiet, false).await;
+    assert_eq!(preview.status, 200, "{}", preview.body);
+    assert!(
+        preview
+            .body
+            .contains("no recent job is affected or selected")
+    );
+    assert!(
+        preview
+            .body
+            .contains("In dry-run this rule blocks nothing.")
+    );
+
+    // Removed through its preview too.
+    let ask = format!("_csrf={csrf}&op=preview&remove=1&name=acme");
+    let preview = post_action(addr, &origin, &operator, "/egress/rules", &ask, false).await;
+    assert_eq!(preview.status, 200, "{}", preview.body);
+    assert!(preview.body.contains("<h2>Preview: remove rule acme</h2>"));
+    assert!(
+        preview.body.contains("<td>acme</td><td>Fallback</td>"),
+        "{}",
+        preview.body
+    );
+    let save = form_of(&preview.body, "save");
+    let removed = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/egress/rules",
+        &format!("_csrf={csrf}&{save}"),
+        false,
+    )
+    .await;
+    assert_eq!(removed.status, 303, "{}", removed.body);
+    assert_eq!(removed.header("location"), Some("/egress?tab=rules"));
+    assert!(
+        !hub.db
+            .egress_rules()
+            .unwrap()
+            .1
+            .iter()
+            .any(|r| r.name == "acme")
+    );
+    let events = audited(&hub, "removed egress rule acme").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("ui session") && e.contains("added egress rule acme")),
+        "{events:?}"
+    );
+}

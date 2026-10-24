@@ -1,5 +1,5 @@
-//! Managing the hub's egress rules ([`crate::store::EgressRuleRow`]), from `vk-hub egress`, and
-//! resolving a job's layer from them.
+//! Managing the hub's egress rules ([`crate::store::EgressRuleRow`]), from `vk-hub egress` and
+//! the Egress page's Rules tab, and resolving a job's layer from them.
 
 use std::collections::BTreeMap;
 
@@ -138,6 +138,49 @@ pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
     };
     let (_, rules) = hub.db.egress_rules()?;
     Ok(crate::store::resolve_egress(&rules, claims.as_ref()))
+}
+
+/// The claims a placed job's record holds, as its placement resolved it from its spec: its
+/// project and ref count only under a key bound to its GitLab instance. A protection GitLab
+/// did not report reads as unprotected, as at placement. The record's project path and ref
+/// are display-safe copies of the spec's, the same for any path or ref a rule can name.
+pub fn claims_of(j: &JobRow) -> Option<JobClaims> {
+    let gitlab = j.gitlab.as_ref()?;
+    Some(JobClaims {
+        gitlab: gitlab.clone(),
+        project_id: j.project_id.unwrap_or_default(),
+        project_path: j.project.clone().unwrap_or_default(),
+        git_ref: j.git_ref.clone().unwrap_or_default(),
+        protected: j.protected == Some(true),
+        pipeline_id: j.pipeline.unwrap_or_default(),
+    })
+}
+
+/// Add or change a rule as `actor`, as [`put`] does, from a page's preview of it made against
+/// the rules' `generation`: refused with [`crate::store::RulesChanged`] if they have changed
+/// since. `exists` refuses a rule not stored yet.
+pub fn save(
+    hub: &Hub,
+    actor: &str,
+    change: &RuleChange,
+    exists: bool,
+    generation: u64,
+) -> Result<(EgressRuleRow, bool)> {
+    let (row, changed, steered) =
+        hub.db
+            .put_egress_rule_at(change, exists, Some(generation), actor, crate::now_secs())?;
+    steered_fallback(hub, &steered);
+    Ok((row, changed))
+}
+
+/// Remove rule `name` as `actor`, as [`remove`] does, from a page's preview made against the
+/// rules' `generation`: refused with [`crate::store::RulesChanged`] if they have changed since.
+pub fn remove_at(hub: &Hub, actor: &str, name: &str, generation: u64) -> Result<bool> {
+    let (removed, steered) =
+        hub.db
+            .remove_egress_rule_at(name, Some(generation), actor, crate::now_secs())?;
+    steered_fallback(hub, &steered);
+    Ok(removed)
 }
 
 /// The latest jobs of the history [`RecentScan`] reads.

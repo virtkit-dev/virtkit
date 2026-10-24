@@ -35,8 +35,11 @@ use crate::egress::{self, Check};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
 
+mod editor;
 mod observed;
 mod rules;
+
+pub(super) use editor::{ACTION_PATH as RULES_ACTION_PATH, action as rules_action};
 
 /// The page.
 pub(super) const PATH: &str = "/egress";

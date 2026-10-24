@@ -1218,7 +1218,7 @@ The web UI's jobs page shows the whole history to viewers and operators alike (s
 ## Egress rules
 
 The hub's side of [Job egress from the hub](fleet-design.md#job-egress-from-the-hub)'s rules.
-Rules are managed from the CLI.
+Rules are managed from the CLI, and on the Egress page's Rules tab ([Web UI](#web-ui)).
 
 **Rules.** `vk-hub egress [list]` lists the rules, `show <name>` one, each with its subject,
 mode, version and per-phase choice:
@@ -1507,6 +1507,20 @@ would have blocked. The Fallback is listed apart. With `[jobs] egress_rules` off
 that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. A rule's page,
 `/egress?tab=rules&rule=<name>`, lists each phase's domains and IP ranges, an empty one reading
 *None*.
+
+An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
+removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab
+instance, the projects (all, a path pattern or an ID), the protection and a branch or tag
+pattern, which needs *Protected only*; per phase *Unrestricted by this rule*, *Allow listed
+destinations* with domains and IP ranges one per line, or *Allow none*; and the mode. What would
+be refused is said in plain words, the node's own checks of each entry included. The preview
+resolves the latest 1000 jobs' claims under the rules before and after, and lists up to 200
+groups of them, by project, ref and protection, whose layer changes or that the rule selects:
+the rules before and after, *Replaces the Fallback*, each phase's entries added and removed, or
+that the layer would fail to place. A rule left or added in dry-run is compared as enforced. Save
+carries what was previewed, unchanged, with the rules' generation, and is refused once they have
+moved on; the store audits each change as the operator's session, and steers nodes to a changed
+Fallback. The form takes up to 512 KiB. Viewers see no form, and their posts are refused.
 
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,

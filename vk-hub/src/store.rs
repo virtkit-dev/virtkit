@@ -58,7 +58,7 @@ pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use egress::{BlockedRow, MAX_MUTE_REASON, Mute, RowRange, Stored};
 pub use egress_rules::{
-    DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, phase_text as rule_phase_text,
+    DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, RulesChanged, phase_text as rule_phase_text,
     resolve_egress,
 };
 pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};

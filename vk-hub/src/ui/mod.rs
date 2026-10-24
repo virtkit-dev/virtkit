@@ -387,6 +387,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     clients::action(req, ui, site).await
                 } else if path == egress::ACTION_PATH {
                     egress::action(req, ui).await
+                } else if path == egress::RULES_ACTION_PATH {
+                    egress::rules_action(req, ui).await
                 } else if path == fleet::TOKEN_PATH {
                     fleet::create_token(req, ui).await
                 } else if path == operations::ROLLOUT_PATH {
@@ -541,7 +543,7 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     if !from_own_page(req.headers(), &ui.origin, true) {
         return Ok(message(StatusCode::FORBIDDEN, CROSS_ORIGIN));
     }
-    let form = match read_form(req).await {
+    let form = match read_form(req, MAX_FORM).await {
         Ok(form) => form,
         Err((status, text)) => return Ok(message(status, text)),
     };
@@ -668,14 +670,15 @@ fn session_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a s
     }
 }
 
-/// Read a form of at most [`MAX_FORM`] bytes within [`FORM_TIMEOUT`], or say why not.
+/// Read a form of at most `max` bytes within [`FORM_TIMEOUT`], or say why not.
 async fn read_form(
     req: Request<Incoming>,
+    max: usize,
 ) -> Result<Vec<(String, String)>, (StatusCode, &'static str)> {
     // Capped while reading: a chunked body declares no length to check up front.
     match tokio::time::timeout(
         FORM_TIMEOUT,
-        http_body_util::Limited::new(req.into_body(), MAX_FORM).collect(),
+        http_body_util::Limited::new(req.into_body(), max).collect(),
     )
     .await
     {
@@ -698,6 +701,16 @@ async fn check_post(
     ui: &Ui,
     need: Role,
 ) -> Result<Result<(Auth, Vec<(String, String)>), (StatusCode, &'static str)>> {
+    check_post_sized(req, ui, need, MAX_FORM).await
+}
+
+/// [`check_post`], for a form of at most `max` bytes.
+async fn check_post_sized(
+    req: Request<Incoming>,
+    ui: &Ui,
+    need: Role,
+    max: usize,
+) -> Result<Result<(Auth, Vec<(String, String)>), (StatusCode, &'static str)>> {
     let auth = match check_caller(req.headers(), ui, need).await? {
         Ok(auth) => auth,
         Err(refused) => return Ok(Err(refused)),
@@ -707,7 +720,7 @@ async fn check_post(
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let form = match read_form(req).await {
+    let form = match read_form(req, max).await {
         Ok(form) => form,
         Err(refused) => return Ok(Err(refused)),
     };
