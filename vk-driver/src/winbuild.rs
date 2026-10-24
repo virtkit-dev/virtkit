@@ -1594,6 +1594,7 @@ fn make_step(
             None,
             None,
             restrict,
+            steps.net.cap(),
             None,
             crate::prio::Prio::Normal,
         );

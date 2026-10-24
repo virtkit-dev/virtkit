@@ -258,14 +258,17 @@ impl Cidr4 {
     fn matches(&self, ip: Ipv4Addr, port: u16) -> bool {
         (u32::from(ip) & mask4(self.prefix)) == self.net && self.port.is_none_or(|p| p == port)
     }
-    /// Is `other` entirely within this rule (this ⊇ other)? Used host-side to check a
-    /// per-job `allow_ip` request stays inside the configured cap: `other`'s network must
-    /// sit in this CIDR (so this prefix is no longer than other's), and if this rule is
-    /// port-scoped `other` must carry the same port (an unscoped cap admits any).
-    fn contains(&self, other: &Cidr4) -> bool {
-        self.prefix <= other.prefix
-            && (other.net & mask4(self.prefix)) == self.net
-            && self.port.is_none_or(|p| Some(p) == other.port)
+    /// Does this rule share an `ip:port` with `other`? Two CIDRs share an address iff the
+    /// shorter prefix holds both networks; two ports any port iff either is unscoped or they are
+    /// the same. Used host-side to tell an `allow_ip` entry of a job a layer above leaves
+    /// nothing of.
+    fn overlaps(&self, other: &Cidr4) -> bool {
+        let prefix = self.prefix.min(other.prefix);
+        (self.net & mask4(prefix)) == (other.net & mask4(prefix))
+            && match (self.port, other.port) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
     }
 }
 
@@ -305,16 +308,34 @@ impl Egress {
             .collect();
         Ok(Egress::Allow { ips, names })
     }
-    /// Is the CIDR request `cidr` (`a.b.c.d/prefix[:port]`) entirely within this policy?
-    /// `AllowAll` contains anything; an `Allow` policy contains it iff some allowed rule
-    /// does (see [`Cidr4::contains`]). Host-side check that a per-job `allow_ip` request
-    /// stays inside the configured cap — the executor's `narrow_ips`.
-    pub fn contains_cidr(&self, cidr: &str) -> Result<bool> {
-        let req = Cidr4::parse(cidr)?;
+    /// Does the CIDR entry `cidr` (`a.b.c.d/prefix[:port]`) share an address and port with
+    /// this policy's ranges? `AllowAll` shares anything; an `Allow` policy iff one of its rules
+    /// does (see [`Cidr4::overlaps`]). Host-side, to tell a job's `allow_ip` entry that a layer
+    /// above admits only through the names it allows.
+    pub fn overlaps_cidr(&self, cidr: &str) -> Result<bool> {
+        let entry = Cidr4::parse(cidr)?;
         Ok(match self {
             Egress::AllowAll => true,
-            Egress::Allow { ips, .. } => ips.iter().any(|c| c.contains(&req)),
+            Egress::Allow { ips, .. } => ips.iter().any(|c| c.overlaps(&entry)),
         })
+    }
+    /// Does the name suffix `suffix` share a host with this policy's names: one under the other,
+    /// either way? Host-side, to tell a job's `allow_name` entry whose lookups a layer above
+    /// refuses.
+    pub fn overlaps_host(&self, suffix: &str) -> bool {
+        match self {
+            Egress::AllowAll => true,
+            Egress::Allow { names, .. } => {
+                let s = suffix.trim_start_matches('.').to_ascii_lowercase();
+                names.iter().any(|n| {
+                    s == *n || s.ends_with(&format!(".{n}")) || n.ends_with(&format!(".{s}"))
+                })
+            }
+        }
+    }
+    /// Whether it allows no name at all: an allowlist listing none.
+    pub fn names_none(&self) -> bool {
+        matches!(self, Egress::Allow { names, .. } if names.is_empty())
     }
     /// Direct (non-proxied) egress: allow only listed IPv4 ranges, each optionally scoped
     /// to a destination port (IPv6 denied under an allowlist).
@@ -332,8 +353,6 @@ impl Egress {
         !matches!(self, Egress::AllowAll)
     }
     /// Resolver name check: allow a host equal to or under an allowed suffix.
-    /// Also used host-side to validate a per-job allow_name request stays within
-    /// the configured cap (the executor's `narrow_names`).
     pub fn allows_host(&self, host: &str) -> bool {
         match self {
             Egress::AllowAll => true,
@@ -6329,28 +6348,36 @@ mod tests {
     }
 
     #[test]
-    fn contains_cidr_subset_check() {
+    fn an_entry_overlaps_a_policy_wider_narrower_or_beside_it() {
         let cap =
             Egress::restricted(&["10.0.0.0/8".into(), "192.168.0.0/16:443".into()], &[]).unwrap();
-        // subset of an unscoped cap rule
-        assert!(cap.contains_cidr("10.1.2.0/24").unwrap());
-        assert!(cap.contains_cidr("10.1.2.3/32").unwrap());
-        // a superset (wider prefix) is not contained
-        assert!(!cap.contains_cidr("10.0.0.0/4").unwrap());
-        // a sibling range outside the cap
-        assert!(!cap.contains_cidr("172.16.0.0/12").unwrap());
-        // port must match a port-scoped cap rule
-        assert!(cap.contains_cidr("192.168.1.0/24:443").unwrap());
-        assert!(!cap.contains_cidr("192.168.1.0/24").unwrap()); // any-port request widens the cap
-        assert!(!cap.contains_cidr("192.168.1.0/24:80").unwrap());
-        // an empty allowlist contains nothing; AllowAll contains everything
-        assert!(
-            !Egress::restricted(&[], &[])
-                .unwrap()
-                .contains_cidr("10.0.0.0/8")
-                .unwrap()
-        );
-        assert!(Egress::AllowAll.contains_cidr("8.8.8.8/32").unwrap());
+        // Narrower, wider, or the same: they share addresses.
+        assert!(cap.overlaps_cidr("10.1.2.0/24").unwrap());
+        assert!(cap.overlaps_cidr("10.1.2.3/32").unwrap());
+        assert!(cap.overlaps_cidr("0.0.0.0/0").unwrap());
+        // A sibling range shares none.
+        assert!(!cap.overlaps_cidr("172.16.0.0/12").unwrap());
+        // Ports: an unscoped entry or rule shares any port, two scoped ones only their own.
+        assert!(cap.overlaps_cidr("192.168.1.0/24:443").unwrap());
+        assert!(cap.overlaps_cidr("192.168.1.0/24").unwrap());
+        assert!(!cap.overlaps_cidr("192.168.1.0/24:80").unwrap());
+        assert!(cap.overlaps_cidr("10.0.0.0/8:80").unwrap());
+        // An empty allowlist shares nothing; AllowAll everything.
+        let none = Egress::restricted(&[], &[]).unwrap();
+        assert!(!none.overlaps_cidr("10.0.0.0/8").unwrap() && none.names_none());
+        assert!(Egress::AllowAll.overlaps_cidr("8.8.8.8/32").unwrap());
+        assert!(!Egress::AllowAll.names_none());
+
+        // Names: one under the other, either way, never a sibling or a mere tail.
+        let names =
+            Egress::restricted(&[], &["api.corp.example.com".into(), "crates.io".into()]).unwrap();
+        assert!(names.overlaps_host("corp.example.com"));
+        assert!(names.overlaps_host("v2.api.corp.example.com"));
+        assert!(names.overlaps_host(".Crates.IO"));
+        assert!(!names.overlaps_host("www.corp.example.com"));
+        assert!(names.overlaps_host("io"));
+        assert!(!names.overlaps_host("ates.io") && !names.overlaps_host("pypi.org"));
+        assert!(!none.overlaps_host("crates.io") && Egress::AllowAll.overlaps_host("x.org"));
     }
 
     #[test]

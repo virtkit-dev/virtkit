@@ -1262,8 +1262,9 @@ is by address, not by name, so the limits are those of the address:
 
 ### Narrowing from a job
 
-A job may **narrow** its egress to a subset of the host cap, never widen it. Each
-variable is a **list** — one or more entries separated by spaces, commas, tabs, or
+A job may **narrow** its egress with lists of its own, never widen it: the switch checks
+them on their own when the job runs, after the host cap, so a destination is reachable only if
+each allows it. Each variable is a **list** — one or more entries separated by spaces, commas, tabs, or
 newlines (empty entries are ignored). A `#` begins an end-of-line comment, so a
 block-scalar list can document each entry inline:
 
@@ -1313,13 +1314,20 @@ rust-job:
     MICROVM_EGRESS_ALLOW_NAME: "$COMMON_EGRESS internal.corp.example.com"
 ```
 
-- Against an **unconstrained** (absent) cap dimension, the variable defines the
-  list freely.
-- Against a **restricted** cap, every requested entry must fall within it
-  (a suffix of some `allow_name`, or a subset of some `allow_ip` CIDR). A request
-  outside the cap **fails the job** with a job-visible error.
-- Against a **deny-all** (empty, or omitted-while-restricted) dimension, a job can
-  add nothing.
+- The lists read as the host cap's do: with neither variable set the job restricts nothing
+  of its own; once either is set, the dimension not set allows none. `MICROVM_EGRESS_ALLOW_NAME`
+  alone reaches no literal IP but the addresses its names resolve to; under a cap that lists
+  only `allow_ip`, a job's names resolve to nothing, since the cap allows no name.
+- No entry is checked against the cap: an entry the cap leaves nothing of — a name no
+  `allow_name` entry is under or over, a range no `allow_ip` range overlaps — is kept, and the
+  trace warns of it at prepare:
+  `virtkit: warning: MICROVM_EGRESS_ALLOW_NAME pypi.org: outside the node's [egress]
+  allow_name, its lookups will be refused`. Such a name reaches nothing; such a range reaches
+  only the addresses of names every layer allows (`reachable only as an address of a name it
+  allows`), nothing when the cap lists no name. Under dry-run the warning says the layer only
+  reports. An entry only partly within the cap reaches the part the cap allows.
+- An **invalid** entry (not a DNS suffix, not an IPv4 CIDR) **fails the job** with a
+  job-visible error.
 
 The same applies to the build phase via `MICROVM_BUILD_EGRESS_ALLOW_IP` /
 `_ALLOW_NAME`.
@@ -1361,8 +1369,8 @@ job-with-services:
 The switch enforces each policy against the flow's **source VM** — authenticated by
 the per-VM socket it arrives on, not by any address the guest writes into its
 packets — so a service cannot borrow another VM's (looser) policy. Requests are
-validated at job prepare, so a per-service value outside the host cap fails the job
-with a visible error before anything boots.
+checked at job prepare: an invalid entry fails the job with a visible error before anything
+boots, and one the host cap or the job's own lists leave nothing of is kept, and warned of.
 
 A job's script can still act through a service: `vk-agent exec --service NAME` runs a command
 in it (see [image selection](#image-selection)), under the service's policy — the job's lists

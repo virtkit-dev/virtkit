@@ -167,6 +167,10 @@ pub fn child_env(
         crate::jobctx::JOB_START,
         dir.join(super::journal::START).display().to_string(),
     );
+    set(
+        crate::jobctx::JOB_EGRESS,
+        dir.join(super::journal::EGRESS).display().to_string(),
+    );
     Ok(env)
 }
 
@@ -191,6 +195,7 @@ pub fn apply(cmd: &mut std::process::Command, env: &[(String, String)]) {
                 &b"JOB_RESPONSE_FILE"[..],
                 crate::jobctx::JOB_SERVER_URL.as_bytes(),
                 crate::jobctx::JOB_START.as_bytes(),
+                crate::jobctx::JOB_EGRESS.as_bytes(),
                 b"BUILD_EXIT_CODE_FILE",
                 b"BUILD_FAILURE_EXIT_CODE",
                 b"SYSTEM_FAILURE_EXIT_CODE",
@@ -314,6 +319,10 @@ mod tests {
         assert_eq!(
             get(crate::jobctx::JOB_START).as_deref(),
             Some("/n/j/start.json")
+        );
+        assert_eq!(
+            get(crate::jobctx::JOB_EGRESS).as_deref(),
+            Some("/n/j/egress")
         );
         let services: serde_json::Value =
             serde_json::from_str(&get("CUSTOM_ENV_CI_JOB_SERVICES").unwrap()).unwrap();

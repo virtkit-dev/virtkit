@@ -47,10 +47,10 @@ pub struct Provisioned {
     /// kernel (`Default`), the image's own kernel + modules (`Image`), or an explicit
     /// file (`Path`). Uniform with the primary path.
     pub kernel: crate::run::KernelSource,
-    /// This service's own egress override, from `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME`
-    /// in its `variables:`. `None` = the key was absent (share the run policy); `Some` (incl.
-    /// an empty string = deny that dimension) = a restricted per-service allowlist, narrowed
-    /// against the host `[egress]` cap by the executor. See vm.rs `spawn_switch`.
+    /// This service's own egress filter, from `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` in its
+    /// `variables:`. `None` = the key was absent (the job's filter alone holds it); `Some`
+    /// (incl. an empty string = deny that dimension) = a restricted per-service allowlist,
+    /// which the switch checks after the job's. See vm.rs `spawn_switch`.
     pub egress_allow_ip_req: Option<String>,
     pub egress_allow_name_req: Option<String>,
     /// Guest vCPUs / RAM (its compose `x-virtkit.cpus`/`.mem`, possibly overridden by
@@ -118,7 +118,7 @@ pub struct BuildOpts {
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
     pub cache_auth: crate::build::CacheAuth,
-    /// Egress policy for the unit build's RUN guests (`[egress.build]`, narrowed per job);
+    /// Egress policy for the unit build's RUN guests (`[egress.build]` and the job's own);
     /// `BuildNet::All` = unrestricted default.
     pub net: crate::build::BuildNet,
     /// Audit the unit build's RUN egress into the job trace.

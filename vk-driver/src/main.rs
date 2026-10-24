@@ -6536,11 +6536,11 @@ mod tests {
         .unwrap();
         // A populated allowlist admits within it and refuses outside.
         let a = &m[&"10.0.0.5".parse().unwrap()];
-        assert!(a.allows_host("corp.com") && a.contains_cidr("10.1.2.3/32").unwrap());
+        assert!(a.allows_host("corp.com") && a.overlaps_cidr("10.1.2.3/32").unwrap());
         assert!(!a.allows_host("evil.com"));
         // The empty spec is deny-all (restricted, not AllowAll).
         let b = &m[&"10.0.0.6".parse().unwrap()];
-        assert!(!b.allows_host("corp.com") && !b.contains_cidr("10.0.0.0/8").unwrap());
+        assert!(!b.allows_host("corp.com") && !b.overlaps_cidr("10.0.0.0/8").unwrap());
         // A bad source ip is rejected.
         assert!(parse_source_egress(&["nope;;".to_string()]).is_err());
     }

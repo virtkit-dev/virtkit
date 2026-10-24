@@ -20,15 +20,14 @@ pub struct JobCtx {
     /// the guest image's baked default (VIRTKIT_DEFAULT_RUN_USER). None = use
     /// that default.
     pub user_req: Option<String>,
-    /// MICROVM_EGRESS_ALLOW_IP / _ALLOW_NAME job variables (space/comma separated): narrow
-    /// this job's run-phase switch egress to a subset of the host `[egress]` allow_ip /
-    /// allow_name cap. None = use the cap unchanged. A request outside the cap fails the job
-    /// (a job can narrow but never widen its egress); against an absent (unconstrained) cap
-    /// dimension the variable defines the list freely.
+    /// MICROVM_EGRESS_ALLOW_IP / _ALLOW_NAME job variables (space/comma separated): this job's
+    /// own run-phase filter, which the switch checks beside the host `[egress]` cap, each
+    /// apart, so a job can restrict but never widen its egress. None = no filter of its own;
+    /// once either is set, the other's dimension allows none.
     pub egress_allow_ip_req: Option<String>,
     pub egress_allow_name_req: Option<String>,
     /// MICROVM_BUILD_EGRESS_ALLOW_IP / _ALLOW_NAME: the same, for the build phase (git-defined
-    /// image / compose `build:` RUN steps), narrowing the `[egress.build]` cap.
+    /// image / compose `build:` RUN steps), beside the `[egress.build]` cap.
     pub egress_build_allow_ip_req: Option<String>,
     pub egress_build_allow_name_req: Option<String>,
     /// MICROVM_EGRESS_AUDIT job variable: when truthy, audit this job's run-phase egress even
@@ -87,6 +86,9 @@ pub struct JobCtx {
     /// ([`JOB_START`]): the token its guest's registry proxy injects under
     /// `[registry] guest_credential = "job"`.
     pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
+    /// Where a placed job's executor commands keep what its node reports of its egress
+    /// ([`JOB_EGRESS`]): its refused declarations.
+    pub egress_record: Option<PathBuf>,
 }
 
 /// The GitLab URL the runner took the job from, passed by a placed job's driver to its
@@ -97,6 +99,11 @@ pub const JOB_SERVER_URL: &str = "VK_JOB_SERVER_URL";
 /// which read the job's registry access from it. Job variables cannot override it either:
 /// they arrive prefixed.
 pub const JOB_START: &str = "VK_JOB_START";
+
+/// The directory a placed job's executor commands record its egress in for the node's report,
+/// in the job's journal: passed by its driver like [`JOB_START`], and as far from the job's
+/// reach.
+pub const JOB_EGRESS: &str = "VK_JOB_EGRESS";
 
 /// The journaled start at `path`.
 fn read_job_start(path: &Path) -> Result<vk_hub_proto::dispatch::JobStart> {
@@ -204,6 +211,10 @@ impl JobCtx {
             Some(path) => read_job_start(Path::new(&path))?.registry,
             None => None,
         };
+        let egress_record = env(JOB_EGRESS)
+            .filter(|_| hub_placed)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
         Ok(JobCtx {
             cfg,
             job_id,
@@ -258,6 +269,7 @@ impl JobCtx {
             job_url,
             hub_placed,
             job_registry,
+            egress_record,
         })
     }
 
@@ -764,10 +776,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A placed job's registry access comes from the start its driver names, and only for a
-    /// placed job: anywhere else the variable is not the driver's.
+    /// A placed job's registry access and egress record come from what its driver names, and
+    /// only for a placed job: anywhere else the variables are not the driver's.
     #[test]
-    fn a_placed_job_reads_its_registry_access_from_its_start() {
+    fn a_placed_job_reads_its_registry_access_and_egress_from_its_start() {
         use vk_hub_proto::dispatch::{JobRegistry, JobStart};
         let dir = std::env::temp_dir().join(format!("vk-jobctx-start-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -798,16 +810,24 @@ mod tests {
                 env("CUSTOM_ENV_CI_JOB_ID", "5"),
                 env(JOB_SERVER_URL, "https://gitlab.example"),
                 env(JOB_START, &path),
+                env(JOB_EGRESS, "/n/j/egress"),
             ],
         )
         .unwrap();
         assert_eq!(placed.job_registry, Some(registry));
+        assert_eq!(placed.egress_record, Some(PathBuf::from("/n/j/egress")));
+        // A job no hub placed records nothing for a report, whatever its environment says.
         let unplaced = JobCtx::for_env(
             Config::default(),
-            &[env("CUSTOM_ENV_CI_JOB_ID", "5"), env(JOB_START, &path)],
+            &[
+                env("CUSTOM_ENV_CI_JOB_ID", "5"),
+                env(JOB_START, &path),
+                env(JOB_EGRESS, "/n/j/egress"),
+            ],
         )
         .unwrap();
         assert_eq!(unplaced.job_registry, None);
+        assert_eq!(unplaced.egress_record, None);
         let missing = JobCtx::for_env(
             Config::default(),
             &[
@@ -1019,6 +1039,7 @@ mod tests {
             job_url: None,
             hub_placed: false,
             job_registry: None,
+            egress_record: None,
         }
     }
 

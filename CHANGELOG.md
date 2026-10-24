@@ -60,6 +60,14 @@ All notable changes to virtkit will be documented in this file.
 - **A CI service's own `MICROVM_EGRESS_ALLOW_*` no longer replaces the job's for its VM**: the
   service is held to both, so it can no longer reach what the job's lists leave out. A service
   that declares none is held to the job's, as before.
+- **A CI job's or a service's `MICROVM_EGRESS_ALLOW_*` or `MICROVM_BUILD_EGRESS_ALLOW_*` entry
+  outside the node's `[egress]` or `[egress.build]` no longer fails the job.** Every list is
+  checked as the job runs, so such an entry reaches only what the node's lists allow too; the
+  trace warns of one they leave nothing of. An invalid entry still fails the job.
+- **A CI job listing only one of `MICROVM_EGRESS_ALLOW_NAME` and `MICROVM_EGRESS_ALLOW_IP`
+  allows none of the other**, as `[egress]` reads it, where it used to keep what the node's
+  cap allowed of it: with names alone, a job reaches only the addresses they resolve to. The
+  same goes for `MICROVM_BUILD_EGRESS_ALLOW_*`.
 
 ### Fixed
 

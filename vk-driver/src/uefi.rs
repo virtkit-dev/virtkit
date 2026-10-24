@@ -965,6 +965,7 @@ pub(crate) async fn run(
             Some(work.join(crate::run::NET_BYTES)),
             false,
             None,
+            None,
             crate::prio::Prio::Normal,
         )
         .await?;

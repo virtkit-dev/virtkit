@@ -2179,6 +2179,7 @@ async fn build_and_boot(
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
             Some(work.join(NET_BYTES)),
             egress.restrict,
+            None,
             egress.file,
             crate::prio::Prio::Normal,
         )
@@ -3838,6 +3839,7 @@ async fn compose_up(
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
         egress.restrict,
+        None,
         egress.file,
         crate::prio::Prio::Normal,
     )
@@ -5377,8 +5379,10 @@ pub(crate) async fn spawn_vm_switch(
     // reads at the end; a run passes its own work dir.
     bytes_log: Option<PathBuf>,
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
-    // for a restricted `[egress.build]`, and a run for `vk dev`'s `egress = "restricted"`.
+    // for a job's own filter, and a run for `vk dev`'s `egress = "restricted"`.
     restrict: bool,
+    // A CI job's build stage: the node's `[egress.build]` cap, checked before the lists above.
+    cap: Option<&crate::switch::Cap>,
     // Follow this `EgressFile` for the default policy instead of the lists above.
     egress_file: Option<&Path>,
     // Whether the VM this switch serves is a build stage (its downloads are the build's).
@@ -5420,8 +5424,9 @@ pub(crate) async fn spawn_vm_switch(
         // Per-service egress overrides are a CI feature (from a service's `variables:`);
         // dev `vk run --compose` siblings share the run policy.
         per_source: Vec::new(),
-        // Only a CI job's run phase checks its node's cap apart.
-        cap: None,
+        // A CI job's build stage checks its node's cap and its own filter apart; dev `vk run`
+        // has no cap.
+        cap: cap.cloned(),
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
@@ -5686,6 +5691,7 @@ pub(crate) async fn boot_session(
             audit_log.map(Path::to_path_buf),
             bytes_log.map(Path::to_path_buf),
             restrict,
+            net.cap(),
             None,
             crate::prio::Prio::Build,
         )

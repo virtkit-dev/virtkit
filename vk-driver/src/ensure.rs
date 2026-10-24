@@ -70,7 +70,7 @@ pub struct BuildRecipe {
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
     pub cache_auth: crate::build::CacheAuth,
-    /// Egress policy for the build's RUN guests (`[egress.build]`, narrowed per job).
+    /// Egress policy for the build's RUN guests (`[egress.build]` and the job's own).
     /// `BuildNet::All` = unrestricted (the docker-build-like default when unconfigured).
     pub net: crate::build::BuildNet,
     /// Audit the build's RUN egress into the job trace (`[egress.build] audit` /

@@ -10,6 +10,8 @@
 //! - `stage`: the stage the driver is in;
 //! - `cancel`: `graceful` or `immediate`, written by the session;
 //! - `result.json`: how the job ended, written last by the driver;
+//! - `egress/`: what the job's executor commands record of its egress for the hub, kept past
+//!   the executor's job dir (see [`crate::egress_report`]);
 //! - `scripts/`, `scratch/`: the driver's own.
 
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ pub const GUEST: &str = "guest.json";
 pub const CANCEL: &str = "cancel";
 pub const RESULT: &str = "result.json";
 pub const DRIVER_LOG: &str = "driver.log";
+pub const EGRESS: &str = "egress";
 
 /// What the session decided for a job when it took it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

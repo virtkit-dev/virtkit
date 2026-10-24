@@ -274,11 +274,21 @@ fn report_egress_audit(ctx: &JobCtx) {
 /// most readers are after. Best-effort: a job whose policy will not resolve — one already
 /// failed for it — has nothing to stamp a list with, and says nothing.
 fn report_contacted_names(ctx: &JobCtx) {
-    let Ok((allow_ip, allow_name, restrict)) = crate::vm::effective_run_egress(&ctx.cfg, ctx)
-    else {
+    let Ok(job) = crate::vm::run_job_filter(&ctx.cfg, ctx) else {
         return;
     };
-    let policy = crate::sites::fingerprint(&allow_ip, &allow_name, restrict);
+    // The node's cap, then the job's own lists where it declares them: each holds what the job
+    // may reach, the switch checking them apart.
+    let egress = &ctx.cfg.egress;
+    let mut policy = crate::sites::fingerprint(
+        egress.allow_ip.as_deref().unwrap_or_default(),
+        egress.allow_name.as_deref().unwrap_or_default(),
+        egress.allow_ip.is_some() || egress.allow_name.is_some(),
+    );
+    if let crate::switch::Cap::Allow { ips, names } = job {
+        let job = crate::sites::fingerprint(&ips, &names, true);
+        policy = format!("{policy}+job:{job}");
+    }
     let contacted: Vec<String> = crate::egress_report::read_contacts(&ctx.egress_audit_log())
         .into_iter()
         .map(|(name, _)| name)

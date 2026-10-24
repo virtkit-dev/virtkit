@@ -12,6 +12,28 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use vk_hub_proto::egress::EgressRefusal;
+
+/// The egress declarations a placed job was refused at validation, in its egress record: one
+/// JSON [`EgressRefusal`] per line.
+pub const REFUSED: &str = "refused.jsonl";
+
+/// Append `refusals` to `path` (create-or-append), each as one JSON line, in a single
+/// `write_all`. Best-effort like the channels: the job fails with the refusal in its trace
+/// either way.
+pub fn append_refusals(path: &Path, refusals: &[EgressRefusal]) {
+    let mut lines = String::new();
+    for r in refusals {
+        if let Ok(json) = serde_json::to_string(r) {
+            lines.push_str(&json);
+            lines.push('\n');
+        }
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(lines.as_bytes());
+    }
+}
+
 /// The kind of flow the switch refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proto {

@@ -408,6 +408,13 @@ pub enum BuildNet {
         ips: Vec<String>,
         names: Vec<String>,
     },
+    /// A CI job's build phase: the node's `[egress.build]` cap and the job's own
+    /// `MICROVM_BUILD_EGRESS_ALLOW_*`, each checked on its own by the guest's `vk switch`, the
+    /// cap first. A destination is reachable only if both allow it.
+    Filtered {
+        cap: crate::switch::Cap,
+        job: crate::switch::Cap,
+    },
 }
 
 impl BuildNet {
@@ -442,11 +449,25 @@ impl BuildNet {
 
     /// A `RUN` guest's egress policy for `vk switch`: allowed CIDRs, names, and whether to
     /// restrict egress to them. Empty restricted lists deny everything; `All` is unrestricted.
-    /// `None` has no switch, so nothing to enforce.
+    /// `None` has no switch, so nothing to enforce. A CI job's is its own filter, beside the
+    /// cap [`Self::cap`] gives the switch.
     pub fn switch_policy(&self) -> (&[String], &[String], bool) {
         match self {
-            BuildNet::Allow { ips, names } => (ips, names, true),
-            BuildNet::All | BuildNet::None => (&[], &[], false),
+            BuildNet::Allow { ips, names }
+            | BuildNet::Filtered {
+                job: crate::switch::Cap::Allow { ips, names },
+                ..
+            } => (ips, names, true),
+            BuildNet::All | BuildNet::None | BuildNet::Filtered { .. } => (&[], &[], false),
+        }
+    }
+
+    /// The node's cap a CI job's stage switch checks before [`Self::switch_policy`]'s; `None`
+    /// for any other build, which has no layers to tell apart.
+    pub fn cap(&self) -> Option<&crate::switch::Cap> {
+        match self {
+            BuildNet::Filtered { cap, .. } => Some(cap),
+            _ => None,
         }
     }
 }
