@@ -3,8 +3,11 @@
 //! ([`crate::egress::observed`]): each project with how completely its jobs reported, and for
 //! one project (`project=`) its destinations by phase, with their jobs, attempts, days, refs
 //! and latest job, filtered by phase and protection, and whether the same destination was also
-//! refused, on the Blocked tab. A destination is reached, or carried while a dry-run allowlist
-//! would have refused it; a DNS entry is a lookup. The listing follows the jobs' reports over
+//! refused, on the Blocked tab, and how the rules as they stand now treat it, ref by ref
+//! ([`crate::egress::rule_use::compare`]). The list of projects names the rules' entries no
+//! contact matched in 30 days ([`crate::egress::rule_use`]). A destination is reached, or
+//! carried while a dry-run allowlist would have refused it; a DNS entry is a lookup. The
+//! listing follows the jobs' reports over
 //! `/events/egress?tab=observed…`, as the Blocked tab's rows do; the filter's form stays out of
 //! what is swapped.
 //!
@@ -21,9 +24,13 @@ use super::super::html::Html;
 use super::super::jobs::percent_encode;
 use super::super::sse::Source;
 use super::super::{Auth, Body, Ui, blocking, decode_form, field, fleet, page};
-use super::{EVENT, PAGE_ROWS, PATH, ROW_PREFIX, unreported, unreported_callout};
+use super::{Caches, EVENT, PAGE_ROWS, PATH, ROW_PREFIX, unreported, unreported_callout};
+use crate::egress::aggregates::Aggregates;
 use crate::egress::blocked::{Finding, PHASES, Subject, View, row_id};
+use crate::egress::matching::Dest;
 use crate::egress::observed::PROTECTIONS;
+use crate::egress::rule_use::{self, Compared, RuleUse};
+use crate::egress::rules::{self as ops, Rules};
 use crate::server::Hub;
 use crate::store::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,
@@ -125,9 +132,12 @@ struct Listing {
     /// The query's project, when it names one.
     project: Option<Project>,
     unreported: Vec<(String, String)>,
+    rules: Rules,
+    /// The rules' entries' use, for the list of projects.
+    used: Option<Arc<Aggregates>>,
 }
 
-fn listing(hub: &Hub, q: &Query) -> Result<Listing> {
+fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
     let subjects = hub.db.observed_subjects()?;
     let mut coverages = HashMap::new();
     let project = match &q.subject {
@@ -182,34 +192,46 @@ fn listing(hub: &Hub, q: &Query) -> Result<Listing> {
             None
         }
     };
+    let rules = ops::list(hub)?;
+    let used = match project {
+        None => Some(caches.aggregates.get(hub, &rules, crate::now_secs())?),
+        Some(_) => None,
+    };
     Ok(Listing {
         subjects,
         coverages,
         project,
         unreported: unreported(hub)?,
+        rules,
+        used,
     })
 }
 
 /// What `/events/egress?tab=observed…` streams: the listing of the query, as the jobs' reports
 /// change.
-pub(super) fn source(hub: &Arc<Hub>, q: Query) -> Source {
+pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query) -> Source {
     let changes = hub.subscribe_egress();
-    let hub = hub.clone();
+    let (hub, caches) = (hub.clone(), caches.clone());
     Source::Own {
         name: EVENT,
         changes,
         render: Arc::new(move || {
             let mut h = Html::new();
-            results(&mut h, &q, &listing(&hub, &q)?, crate::now_secs());
+            results(&mut h, &q, &listing(&hub, &caches, &q)?, crate::now_secs());
             Ok(h.into_string())
         }),
     }
 }
 
 /// `GET /egress?tab=observed…` ([`Query::of`]).
-pub(super) async fn get(q: Query, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    let (hub, wanted) = (ui.hub.clone(), q.clone());
-    let listing = blocking(move || listing(&hub, &wanted)).await?;
+pub(super) async fn get(
+    q: Query,
+    auth: &Auth,
+    caches: &Arc<Caches>,
+    ui: &Ui,
+) -> Result<Response<Body>> {
+    let (hub, caches, wanted) = (ui.hub.clone(), caches.clone(), q.clone());
+    let listing = blocking(move || listing(&hub, &caches, &wanted)).await?;
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, super::Tab::Observed, q.subject.as_ref());
@@ -331,8 +353,12 @@ fn coverage_lines(c: &Coverages) -> Vec<String> {
     out
 }
 
-/// Every project, its latest first, with how completely its jobs reported.
+/// Every project, its latest first, with how completely its jobs reported; then the rules'
+/// entries no contact matched.
 fn projects(h: &mut Html, q: &Query, l: &Listing) {
+    if let Some(u) = l.used.as_ref().filter(|_| !l.rules.rules.is_empty()) {
+        unused_callout(h, &u.rule_use);
+    }
     if l.subjects.is_empty() {
         h.raw("<p class=\"empty\">nothing observed yet</p>");
         return;
@@ -440,12 +466,13 @@ fn project(h: &mut Html, q: &Query, subject: &Subject, l: &Listing, p: &Project,
         return;
     }
     let uses = &p.uses;
+    let project_path = summary.as_ref().and_then(|(_, s)| s.project.as_deref());
     let today = now / 86_400;
     let since = today.saturating_sub(RECENT_DAYS - 1);
     h.raw("<table class=\"grid\"><thead><tr><th>destination</th><th>phase</th>")
         .raw("<th class=\"num\">jobs</th><th class=\"num\">attempts</th><th>first seen</th>")
         .raw("<th>last seen</th><th class=\"num\" title=\"The days a job first used it on, in the last 30\">days, last 30</th><th>refs</th>")
-        .raw("<th>latest job</th><th>also refused</th></tr>")
+        .raw("<th>latest job</th><th>also refused</th><th>under current rules</th></tr>")
         .raw("</thead><tbody>");
     for u in uses.iter().take(PAGE_ROWS) {
         let text = u.contact.text();
@@ -507,6 +534,8 @@ fn project(h: &mut Html, q: &Query, subject: &Subject, l: &Listing, p: &Project,
                 h.raw("-");
             }
         }
+        h.raw("</td><td>");
+        compared(h, &l.rules, subject, project_path, u);
         h.raw("</td></tr>");
     }
     h.raw("</tbody></table>");
@@ -516,7 +545,8 @@ fn project(h: &mut Html, q: &Query, subject: &Subject, l: &Listing, p: &Project,
             .raw(" more, used longer ago: narrow the filter to see them.</p>");
     }
     h.raw("<p class=\"sub\">Times are its nodes' clocks. Also refused: the project's rows of ")
-        .raw("the same destination on the Blocked tab, in any phase.</p>");
+        .raw("the same destination on the Blocked tab, in any phase. Under current rules: as ")
+        .raw("the rules saved now would treat each of its refs, not as its jobs ran.</p>");
 }
 
 /// A destination's refs, the most jobs first: `main (protected) ×12, topic ×3, 2 more`.
@@ -541,4 +571,167 @@ fn refs(h: &mut Html, u: &ObservedUse) {
     if let Some(more) = refs.len().checked_sub(SHOWN_REFS).filter(|n| *n > 0) {
         h.raw(", ").text(more).raw(" more");
     }
+}
+
+/// How the rules saved now treat `u`'s destination for each of its refs: `Allowed by wab ·
+/// debian.org`, `Outside current hub rules for 1 of 3 refs`. Returns whether they leave it
+/// outside, or allow it by name only, for any of them.
+fn compared(
+    h: &mut Html,
+    rules: &Rules,
+    subject: &Subject,
+    project: Option<&str>,
+    u: &ObservedUse,
+) -> bool {
+    if rules.rules.is_empty() {
+        h.raw(if rules.enabled {
+            "<span class=\"badge warn\">Outside current hub rules</span> <span class=\"sub\">no \
+             rules saved</span>"
+        } else {
+            "<span class=\"sub\">No saved rules: once on, the hub would allow nothing</span>"
+        });
+        return true;
+    }
+    let Some(dest) = Dest::of(&u.contact.destination) else {
+        h.raw("-");
+        return false;
+    };
+    let mut allowed: Vec<String> = Vec::new();
+    let (mut outside, mut by_name) = (0usize, 0usize);
+    for (git_ref, protection) in u.refs.keys() {
+        match rule_use::compare(
+            &rules.rules,
+            subject,
+            project,
+            protection,
+            git_ref,
+            &u.phase,
+            &dest,
+        ) {
+            Compared::Allowed(by) => {
+                for b in by {
+                    if !allowed.contains(&b) {
+                        allowed.push(b);
+                    }
+                }
+            }
+            Compared::ByNameOnly => by_name += 1,
+            Compared::Outside => outside += 1,
+        }
+    }
+    if !rules.enabled {
+        h.raw("<span class=\"sub\">If on:</span> ");
+    }
+    let refs = u.refs.len();
+    if outside > 0 {
+        h.raw("<span class=\"badge warn\">Outside current hub rules</span>");
+        if outside < refs {
+            h.raw(" for ")
+                .text(outside)
+                .raw(" of ")
+                .text(refs)
+                .raw(" refs");
+        }
+    }
+    if by_name > 0 {
+        if outside > 0 {
+            h.raw("; ");
+        }
+        h.raw("Not allowed by address: only if a listed name's lookup resolved to it");
+    }
+    if !allowed.is_empty() {
+        if outside + by_name > 0 {
+            h.raw("; otherwise ");
+        }
+        h.raw("Allowed by ").text(allowed.join("; "));
+    }
+    outside + by_name > 0
+}
+
+/// The most entries with no observed use the list of projects names.
+const SHOWN_UNUSED: usize = 50;
+
+/// The rules' entries no contact matched within 30 days, each with its last use and its
+/// coverage, and the caution that goes with them.
+pub(super) fn unused_callout(h: &mut Html, u: &RuleUse) {
+    let unused: Vec<(&String, &'static str, &String)> = u
+        .entries
+        .keys()
+        .filter(|(r, p, e)| u.standing(r, p, e) == rule_use::Standing::Unused)
+        .map(|(r, p, e)| (r, *p, e))
+        .collect();
+    if unused.is_empty() {
+        return;
+    }
+    h.raw("<div class=\"callout\"><p><span class=\"badge\">No observed use in 30 days</span> ")
+        .raw("No contact of the jobs these rules apply to matched these entries:</p>")
+        .raw("<ul class=\"access\">");
+    for (rule, phase, entry) in unused.iter().take(SHOWN_UNUSED) {
+        h.raw("<li><a href=\"")
+            .text(super::rules::rule_href(rule))
+            .raw("\"><strong>")
+            .text(if *rule == crate::store::DEFAULT_RULE {
+                "Fallback"
+            } else {
+                rule.as_str()
+            })
+            .raw("</strong></a> · ")
+            .raw(if *phase == "build" { "Build" } else { "Run" })
+            .raw(" · <code>")
+            .text(entry)
+            .raw("</code> · ")
+            .text(use_text(u, rule, phase, entry))
+            .raw("</li>");
+    }
+    h.raw("</ul>");
+    if unused.len() > SHOWN_UNUSED {
+        h.raw("<p class=\"sub\">")
+            .text(unused.len() - SHOWN_UNUSED)
+            .raw(" more, on their rules' pages.</p>");
+    }
+    caution(h, u);
+    h.raw("</div>");
+}
+
+/// An entry's last use and its rule's coverage of the phase: `last used 2026-09-04 · 84 of 100
+/// applicable jobs reported this phase completely`.
+pub(super) fn use_text(u: &RuleUse, rule: &str, phase: &'static str, entry: &str) -> String {
+    let last = u
+        .entries
+        .get(&(rule.to_string(), phase, entry.to_string()))
+        .and_then(|e| e.last_day);
+    let last = match last {
+        Some(day) => format!("last used {}", date(day)),
+        None => "not seen in the history kept".to_string(),
+    };
+    let c = u
+        .coverage
+        .get(&(rule.to_string(), phase))
+        .copied()
+        .unwrap_or_default();
+    format!(
+        "{last} · {} of {} applicable jobs reported this phase completely",
+        c.complete, c.ran
+    )
+}
+
+/// What qualifies a rule entry's use: how far back the history goes, what was not kept or read,
+/// and that no reported use does not prove an entry unnecessary.
+pub(super) fn caution(h: &mut Html, u: &RuleUse) {
+    h.raw("<p class=\"sub\">");
+    if let Some(day) = u.since_day {
+        h.raw("The history's reports go back to ")
+            .text(date(day))
+            .raw(". ");
+    }
+    let dropped: u64 = u.dropped.values().sum();
+    if dropped > 0 {
+        h.text(dropped)
+            .raw(" contacts of these projects were not kept, past their bound. ");
+    }
+    if u.capped {
+        h.raw("Observed traffic was read only in part. ");
+    }
+    h.raw("Only placed jobs report, never gitlab-runner's. No reported use does not prove an ")
+        .raw("entry unnecessary; nothing is removed automatically.</p>");
 }

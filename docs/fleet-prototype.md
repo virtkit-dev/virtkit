@@ -1498,6 +1498,24 @@ phase; a contact past them is counted, shown as not listed, and taken back with 
 destination no job reaches any more frees its place for the next job written. A hub upgraded
 from a version without it builds it from the history on start.
 
+Each destination is compared with the hub's rules as saved now, for each of its refs: *Allowed
+by wab · debian.org* (the rules and every entry of theirs that allows it, a domain by suffix, an
+address by CIDR and port), *Outside current hub rules*, for some refs or all, or for an address
+no IP range lists in a phase that lists names, allowed only if a listed name's lookup resolved
+to it. With rules off it reads *If on:*; with none saved, that the hub would allow nothing once
+on. Above the projects, the rules' entries with *No observed use in 30 days*: a contact counts
+toward every entry of every rule that applies to its jobs now — enforced, as the Fallback, or
+as a dry-run candidate, resolved per project, protection and ref — and allows it, a contact a
+dry-run allowlist would have blocked included; an entry none matched within 30 days, among jobs
+that reported the phase completely, is listed with the day a job last first used it, or *not
+seen in the history kept*, and how many of the jobs it applies to reported the phase (*1 of 1
+applicable jobs reported this phase completely*), beside how far back the reports go, the
+contacts not kept past a project's bound, and the caution that no reported use does not prove
+an entry unnecessary. Without a complete report, or when the read was cut, an entry reads
+*Insufficient evidence*. A job counts from the day it first used a destination, and the day
+before the window too, since it may have used it again within. Nothing is removed. Each read takes at most 200,000 records of each of the store's tables, and says
+when it was cut.
+
 `/egress?tab=rules`, the *Rules* tab, lists the hub's egress rules: each with the jobs it
 applies to in plain words, as the namespaces page words them, its run and build phases in a few
 words (*Unrestricted by this rule*, *No external access*, *corp.example.com + 1 IP range*), its
@@ -1506,7 +1524,7 @@ enforced, or for a dry-run rule those it selected and those whose node reported 
 would have blocked. The Fallback is listed apart. With `[jobs] egress_rules` off the tab says
 that saved rules restrict nothing yet; on, it warns when no Fallback is enforced. A rule's page,
 `/egress?tab=rules&rule=<name>`, lists each phase's domains and IP ranges, an empty one reading
-*None*.
+*None*, and each entry's use.
 
 An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
 removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab

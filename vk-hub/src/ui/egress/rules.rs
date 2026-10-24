@@ -3,8 +3,8 @@
 //! what each phase may reach under it, its mode, and the recent jobs placed under it; the
 //! Fallback listed apart. With `[jobs] egress_rules` off the tab says that saved rules restrict
 //! nothing. Each rule has a page of its own, `/egress?tab=rules&rule=<name>`, listing its
-//! entries; there operators change or remove it, and on `/egress?tab=rules&new=rule` add one,
-//! through Preview → Save ([`super::editor`]).
+//! entries and each one's use; there operators change or remove it, and on
+//! `/egress?tab=rules&new=rule` add one, through Preview → Save ([`super::editor`]).
 //!
 //! Rule names and entries are operators' to choose, checked as a node checks its own lists;
 //! they are escaped as any text.
@@ -21,6 +21,7 @@ use super::super::pages;
 use super::super::{Auth, Body, Ui, access, blocking, decode_form, field, fleet, message, page};
 use super::{Caches, PATH as EGRESS, Tab, capital};
 use crate::egress::aggregates::Aggregates;
+use crate::egress::rule_use::{RuleUse, Standing};
 use crate::egress::rules::{self as ops, RECENT_SCAN, RuleJobs, Rules};
 use crate::server::Hub;
 use crate::store::{DEFAULT_RULE, EgressRuleRow, Role, RuleMode};
@@ -71,7 +72,7 @@ struct Listing {
     rules: Rules,
     /// The GitLab instances, by name, for the editor.
     gitlabs: Vec<String>,
-    /// The recent jobs.
+    /// The rules' entries' use, and the recent jobs.
     used: Arc<Aggregates>,
 }
 
@@ -209,7 +210,15 @@ fn rule_row(h: &mut Html, r: &EgressRuleRow, l: &Listing) {
         .text(rule_href(&r.name))
         .raw("\"><strong>")
         .text(rule_name(r))
-        .raw("</strong></a></td><td>")
+        .raw("</strong></a>");
+    let unused = l.used.rule_use.unused(&r.name).len();
+    if unused > 0 {
+        h.raw("<div class=\"sub\">")
+            .text(unused)
+            .raw(if unused == 1 { " entry" } else { " entries" })
+            .raw(" with no observed use in 30 days</div>");
+    }
+    h.raw("</td><td>")
         .text(applies_to(r))
         .raw("</td><td>")
         .text(phase_summary(&r.run))
@@ -301,7 +310,7 @@ fn rule_page(l: &Listing, r: &EgressRuleRow, auth: &Auth) -> Html {
 }
 
 /// Rule `r`'s page but its forms: how the rules stand, what it selects, how, and each phase's
-/// entries.
+/// entries with their use.
 fn rule_results(h: &mut Html, l: &Listing, r: &EgressRuleRow) {
     state_callout(h, &l.rules);
     h.raw("<h2>").text(rule_name(r));
@@ -343,11 +352,13 @@ fn rule_results(h: &mut Html, l: &Listing, r: &EgressRuleRow) {
         b
     });
     h.raw("</tbody></table>");
-    for ((_, label), phase) in PHASES.iter().zip([&r.run, &r.build]) {
+    for ((key, label), phase) in PHASES.iter().zip([&r.run, &r.build]) {
         h.raw("<section><h3>").raw(label).raw("</h3>");
         phase_detail(h, phase);
+        entries_use(h, &l.used.rule_use, r, key, phase);
         h.raw("</section>");
     }
+    super::observed::caution(h, &l.used.rule_use);
 }
 
 /// A phase's choice and, when it lists destinations, each dimension's entries: `None` for an
@@ -376,4 +387,49 @@ fn phase_detail(h: &mut Html, p: &HubPhase) {
         pages::kv_html(h, label, &b);
     }
     h.raw("</tbody></table>");
+}
+
+/// Each entry of rule `r`'s phase `key` with its use in the last 30 days, and the phase's
+/// coverage among the jobs the rule applies to.
+fn entries_use(h: &mut Html, u: &RuleUse, r: &EgressRuleRow, key: &'static str, p: &HubPhase) {
+    let HubPhase::Allow { names, ips } = p else {
+        return;
+    };
+    if names.is_empty() && ips.is_empty() {
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>entry</th><th class=\"num\">jobs, last 30 ")
+        .raw("days</th><th>use</th></tr></thead><tbody>");
+    for e in names.iter().chain(ips) {
+        let used = u
+            .entries
+            .get(&(r.name.clone(), key, e.clone()))
+            .cloned()
+            .unwrap_or_default();
+        h.raw("<tr><td><code>")
+            .text(e)
+            .raw("</code></td><td class=\"num\">")
+            .text(used.jobs)
+            .raw("</td><td>");
+        match u.standing(&r.name, key, e) {
+            Standing::Used => {
+                h.raw("Used");
+            }
+            Standing::Unused => {
+                h.raw("<span class=\"badge\">No observed use in 30 days</span> ");
+            }
+            Standing::NoEvidence => {
+                h.raw("<span class=\"badge warn\">Insufficient evidence</span> ");
+            }
+        }
+        h.raw(" <span class=\"sub\">")
+            .text(super::observed::use_text(u, &r.name, key, e))
+            .raw("</span></td></tr>");
+    }
+    h.raw("</tbody></table>");
+    if let Some(n) = u.unreported.get(&r.name).filter(|n| **n > 0) {
+        h.raw("<p class=\"sub\">")
+            .text(n)
+            .raw(" jobs it applies to sent no report in the last 30 days.</p>");
+    }
 }

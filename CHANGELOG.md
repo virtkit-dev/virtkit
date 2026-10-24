@@ -111,6 +111,12 @@ All notable changes to virtkit will be documented in this file.
   recent jobs whose access changes, where the rule replaces the Fallback, and the observed
   destinations it would block, or that there is not enough evidence to tell. Save carries the
   change as previewed, and is refused once the rules have changed since.
+- **Observed traffic compares each destination with the hub's rules as saved now**, ref by ref:
+  which rules and entries allow it, or that it falls outside them. Rule entries no contact of
+  the jobs they apply to matched in 30 days show *No observed use in 30 days* on Observed
+  traffic, the Rules tab and the rule's page, with their last use, how many of those jobs
+  reported the phase completely, and the caution that no reported use does not prove an entry
+  unnecessary. Nothing is removed automatically.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

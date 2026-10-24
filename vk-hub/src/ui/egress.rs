@@ -68,7 +68,7 @@ const ROW_JOBS: usize = 20;
 /// What the page's tabs share between their pages and streams.
 #[derive(Default)]
 pub(super) struct Caches {
-    /// The Rules tab's reads of the history.
+    /// The Rules tab's and Observed traffic's reads of the history.
     aggregates: crate::egress::aggregates::Cache,
     /// The Blocked tab's streamed part, by filter.
     blocked: Renders,
@@ -524,7 +524,7 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
 /// the views' counts, as the jobs' reports and the rows' triage change.
 pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) -> Source {
     if let Some(q) = observed::Query::of(query) {
-        return observed::source(hub, q);
+        return observed::source(hub, caches, q);
     }
     let filter = Filter::of(query);
     let changes = hub.subscribe_egress();
@@ -550,7 +550,7 @@ pub(super) async fn get(
     ui: &Ui,
 ) -> Result<Response<Body>> {
     if let Some(q) = observed::Query::of(query) {
-        return observed::get(q, auth, ui).await;
+        return observed::get(q, auth, caches, ui).await;
     }
     if let Some(q) = rules::Query::of(query) {
         return rules::get(q, auth, caches, ui).await;

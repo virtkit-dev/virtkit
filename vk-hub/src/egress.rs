@@ -19,6 +19,7 @@ pub mod blocked;
 pub mod matching;
 pub mod observed;
 pub mod preview;
+pub mod rule_use;
 pub mod rules;
 
 /// The report to keep of `stored` and `incoming`: the one with the higher revision, `incoming`

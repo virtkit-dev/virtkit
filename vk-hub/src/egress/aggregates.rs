@@ -1,7 +1,7 @@
-//! What the Rules tab reads from the history ([`super::rules::RecentScan`]), computed once for
-//! every page and stream showing it: one pass over the latest [`super::rules::RECENT_SCAN`]
-//! jobs, a record decoded at a time, and at most one computation runs at once, those asking
-//! meanwhile waiting for it.
+//! What the Rules tab and Observed traffic's list of projects read from the history
+//! ([`super::rule_use`], [`super::rules::RecentScan`]), computed once for every page and stream
+//! showing it: one pass over the latest [`super::rules::RECENT_SCAN`] jobs, a record decoded at
+//! a time, and at most one computation runs at once, those asking meanwhile waiting for it.
 //!
 //! A computation stands for the rules' generation and the day it was made for;
 //! past a change to the jobs' reports or the rows ([`Hub::egress_changed`]), for [`MIN_AGE`]
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::rule_use::{self, RuleUse};
 use super::rules::{RECENT_SCAN, Recent, RecentScan, Rules};
 use crate::server::Hub;
 
@@ -27,6 +28,7 @@ pub const MAX_AGE: Duration = Duration::from_secs(60);
 /// What the Rules tab reads from the history.
 #[derive(Debug)]
 pub struct Aggregates {
+    pub rule_use: RuleUse,
     pub recent: Recent,
 }
 
@@ -101,7 +103,7 @@ impl Cache {
         if let Some(v) = standing(generation) {
             return Ok(v);
         }
-        let value = Arc::new(compute(hub, now)?);
+        let value = Arc::new(compute(hub, rules, now)?);
         self.computed.fetch_add(1, Ordering::Relaxed);
         *lock(&self.held) = Some(Held {
             key,
@@ -119,11 +121,14 @@ impl Cache {
     }
 }
 
-/// One computation: the recent jobs, from one pass over the history.
-fn compute(hub: &Hub, now: u64) -> Result<Aggregates> {
+/// One computation: the rules' entries' use, and the recent jobs from one pass over the
+/// history.
+fn compute(hub: &Hub, rules: &Rules, now: u64) -> Result<Aggregates> {
+    let today = now / 86_400;
     let mut recent = RecentScan::new(now);
     hub.db.visit_jobs(RECENT_SCAN, |_, j| recent.visit(j))?;
     Ok(Aggregates {
+        rule_use: rule_use::rule_use(hub, &rules.rules, today)?,
         recent: recent.finish(),
     })
 }

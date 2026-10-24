@@ -9038,3 +9038,115 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
         "{events:?}"
     );
 }
+
+/// Observed traffic compares each destination with the rules saved now, ref by ref, and names
+/// the rules' entries no contact matched in 30 days, with their coverage and the caution that
+/// goes with them; a rule's page shows each entry's use.
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_traffic_is_compared_with_the_rules() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::*;
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let now = crate::now_secs();
+    let reached = |dest: &str, phase: EgressPhase| EgressEntry {
+        phase,
+        first_seen_ms: now * 1000,
+        last_seen_ms: now * 1000,
+        ..crate::egress::testing::entry(
+            EgressOutcome::Observed,
+            EgressProtocol::Dns,
+            EgressDestination::domain(dest),
+            None,
+        )
+    };
+    let report = EgressReport {
+        entries: vec![
+            reached("deb.debian.org", EgressPhase::Build),
+            reached("partner.example.net", EgressPhase::Run),
+        ],
+        phases: vec![
+            crate::egress::testing::phase(EgressPhase::Run, EgressCoverage::Complete),
+            crate::egress::testing::phase(EgressPhase::Build, EgressCoverage::Complete),
+        ],
+        ..EgressReport::default()
+    };
+    let id = egress_job(&hub, 1, 42, &node, report);
+    let mut row = hub.db.job(&id).unwrap().unwrap();
+    (row.finished_at, row.revision) = (Some(now), row.revision + 1);
+    assert!(hub.db.put_job(&id, &row, &[], now).unwrap());
+    let p42 = "/egress?tab=observed&project=gitlab%3Agl%3A42";
+
+    let page = get(addr, p42, Some(&viewer)).await.body;
+    assert!(
+        page.contains("No saved rules: once on, the hub would allow nothing"),
+        "{page}"
+    );
+
+    egress_rule(
+        &hub,
+        "acme",
+        Some("gitlab gl, projects acme/**, protected"),
+        allow(&["corp.example.com"], &[]),
+        allow(&["debian.org", "pypi.org"], &[]),
+        RuleMode::Enforce,
+    );
+    let page = get(addr, p42, Some(&viewer)).await.body;
+    assert!(page.contains("<th>under current rules</th>"), "{page}");
+    assert!(
+        page.contains(
+            "<td><span class=\"sub\">If on:</span> Allowed by acme · debian.org</td></tr>"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<td><span class=\"sub\">If on:</span> <span class=\"badge warn\">Outside current \
+             hub rules</span></td></tr>"
+        ),
+        "{page}"
+    );
+
+    let list = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
+    assert!(
+        list.contains("<span class=\"badge\">No observed use in 30 days</span>"),
+        "{list}"
+    );
+    assert!(
+        list.contains(
+            "<strong>acme</strong></a> · Build · <code>pypi.org</code> · not seen in the history \
+             kept · 1 of 1 applicable jobs reported this phase completely</li>"
+        ),
+        "{list}"
+    );
+    assert!(
+        list.contains("<strong>acme</strong></a> · Run · <code>corp.example.com</code>"),
+        "{list}"
+    );
+    assert!(!list.contains("<code>debian.org</code> · "), "{list}");
+    assert!(
+        list.contains("No reported use does not prove an entry unnecessary"),
+        "{list}"
+    );
+
+    let page = get(addr, "/egress?tab=rules&rule=acme", Some(&viewer))
+        .await
+        .body;
+    assert!(
+        page.contains("<tr><td><code>debian.org</code></td><td class=\"num\">1</td><td>Used"),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "<tr><td><code>pypi.org</code></td><td class=\"num\">0</td><td><span \
+             class=\"badge\">No observed use in 30 days</span>"
+        ),
+        "{page}"
+    );
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(
+        tab.contains("<div class=\"sub\">2 entries with no observed use in 30 days</div>"),
+        "{tab}"
+    );
+}
