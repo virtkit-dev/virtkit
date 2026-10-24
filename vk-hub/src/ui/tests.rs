@@ -8198,3 +8198,146 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
     let body = get(addr, "/egress", Some(&viewer)).await.body;
     assert!(!body.contains("Reporting unavailable"), "{body}");
 }
+
+/// An operator acknowledges a row and mutes its project from the row's page, each audited as a
+/// person's action; the inbox and the navigation's count follow, a later job reopens the row,
+/// and a muted project's rows stay listed under Muted. A viewer gets no form and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_triages_and_mutes_egress_rows() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    egress_job(&hub, 1, 42, &node, blocked_report("crates.io", 2));
+    egress_job(&hub, 2, 7, &node, blocked_report("pypi.org", 1));
+    let rows = hub.db.egress_rows().unwrap();
+    let id_of = |dest: &str| {
+        rows.iter()
+            .find(|(_, r)| r.finding.text().ends_with(dest))
+            .unwrap()
+            .0
+            .clone()
+    };
+    let (crates, pypi) = (id_of("crates.io"), id_of("pypi.org"));
+    let row_page = format!("/egress/rows/{crates}");
+
+    let seen = get(addr, &row_page, Some(&viewer)).await.body;
+    assert!(seen.contains("New: no one has acknowledged it."), "{seen}");
+    assert!(!seen.contains("/egress/action"), "{seen}");
+    let form = format!("_csrf={viewer_csrf}&row={crates}&op=acknowledge");
+    let refused = post_action(addr, &origin, &viewer, "/egress/action", &form, false).await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+
+    let page = get(addr, &row_page, Some(&operator)).await.body;
+    assert!(page.contains("<button>Acknowledge</button>"), "{page}");
+    assert!(
+        page.contains("<button>Mute this project</button>"),
+        "{page}"
+    );
+    let form = format!("_csrf={csrf}&row={crates}&op=acknowledge");
+    let done = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    assert_eq!(done.header("location"), Some(row_page.as_str()));
+    let page = get(addr, &row_page, Some(&operator)).await.body;
+    assert!(page.contains("Acknowledged by ui session"), "{page}");
+    assert!(page.contains("<button>Reopen</button>"), "{page}");
+    let inbox = get(addr, "/egress", Some(&operator)).await.body;
+    assert!(!inbox.contains("crates.io</code>") && inbox.contains("pypi.org</code>"));
+    assert!(
+        inbox
+            .contains("Egress<span id=\"nav-count-egress\"> <span class=\"count\">1</span></span>"),
+        "{inbox}"
+    );
+    let acked = get(addr, "/egress?state=acknowledged", Some(&operator))
+        .await
+        .body;
+    assert!(acked.contains("crates.io</code>") && !acked.contains("pypi.org</code>"));
+
+    // A later job of the project reopens it.
+    egress_job(&hub, 3, 42, &node, blocked_report("crates.io", 1));
+    let page = get(addr, &row_page, Some(&operator)).await.body;
+    assert!(page.contains("New again: acknowledged by"), "{page}");
+
+    // Muting project 7 takes its row out of the inbox and the count, not out of the page.
+    let pypi_page = format!("/egress/rows/{pypi}");
+    for bad in ["&reason=+&for=7", "&reason=x&for=9"] {
+        let form = format!("_csrf={csrf}&row={pypi}&op=mute{bad}");
+        let reply = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+    }
+    let form = format!("_csrf={csrf}&row={pypi}&op=mute&reason=a+known+mirror&for=30");
+    let done = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    let inbox = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(!inbox.contains("pypi.org</code>") && inbox.contains("crates.io</code>"));
+    assert!(
+        inbox
+            .contains("Egress<span id=\"nav-count-egress\"> <span class=\"count\">1</span></span>"),
+        "{inbox}"
+    );
+    assert!(
+        inbox.contains(
+            "<li><a href=\"/egress?state=muted&amp;project=gitlab%3Agl%3A7\">\
+             acme/p7 on gl</a> until"
+        ),
+        "{inbox}"
+    );
+    assert!(inbox.contains("(a known mirror)"), "{inbox}");
+    let muted = get(addr, "/egress?state=muted", Some(&viewer)).await.body;
+    assert!(muted.contains("pypi.org</code>") && muted.contains(">Muted</span>"));
+    let page = get(addr, &pypi_page, Some(&operator)).await.body;
+    assert!(
+        page.contains("This project is muted by ui session"),
+        "{page}"
+    );
+    let form = format!("_csrf={csrf}&row={pypi}&op=unmute");
+    let done = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    let inbox = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(
+        inbox
+            .contains("Egress<span id=\"nav-count-egress\"> <span class=\"count\">2</span></span>"),
+        "{inbox}"
+    );
+    // A mute is also undone from the list, by its subject, as its rows may be gone.
+    let form = format!("_csrf={csrf}&row={pypi}&op=mute&reason=again&for=never");
+    post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    let listed = get(addr, "/egress", Some(&operator)).await.body;
+    assert!(
+        listed.contains("name=\"subject\" value=\"gitlab:gl:7\""),
+        "{listed}"
+    );
+    let seen = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(!seen.contains("name=\"subject\""), "{seen}");
+    let form = format!("_csrf={csrf}&op=unmute&subject=gitlab%3Agl%3A7");
+    let done = post_action(addr, &origin, &operator, "/egress/action", &form, false).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    assert_eq!(done.header("location"), Some("/egress"));
+    assert!(hub.db.egress_mutes(crate::now_secs()).unwrap().is_empty());
+
+    // Each audited as a person's action.
+    let people = crate::store::AuditFilter {
+        category: crate::store::AuditCategory::People,
+        text: Some("egress".into()),
+        ..Default::default()
+    };
+    let found = hub.db.audit_search(&people, None, 10).unwrap();
+    let lines: Vec<&str> = found.rows.iter().map(|(_, r)| r.event.as_str()).collect();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    for unmuted in [lines[0], lines[2]] {
+        assert!(
+            unmuted.ends_with("unmuted egress of acme/p7 on gl"),
+            "{lines:?}"
+        );
+    }
+    assert!(lines[1].ends_with("until unmuted: again"), "{lines:?}");
+    assert!(
+        lines[3].contains("muted egress of acme/p7 on gl until "),
+        "{lines:?}"
+    );
+    assert!(lines[3].ends_with(": a known mirror"), "{lines:?}");
+    assert!(
+        lines[4].ends_with("acknowledged egress blocked DNS crates.io for acme/p42 on gl"),
+        "{lines:?}"
+    );
+}

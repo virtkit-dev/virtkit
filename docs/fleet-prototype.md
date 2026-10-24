@@ -1437,6 +1437,17 @@ the history; a hub upgraded from a version without them builds them from the his
 The page names the nodes that take placed jobs and do not announce egress reporting, whose jobs
 cannot appear there. The navigation counts the New rows.
 
+A row is *New* until an operator acknowledges it on its page, and *New* again once a job adds to
+it — a job newly sharing it, or one with more attempts — however soon after. An operator also
+mutes the row's project (for a key bound to no GitLab instance, every job of the key) with a
+reason, for 7 days, 30 days or until unmuted: its rows leave the inbox and the count, and stay
+listed under *Muted*, on their pages and on their jobs' pages; the page lists the mutes in
+force, each undone there or from a row's page. The state filter
+(`state=acknowledged|muted|all`) shows them; the default is the inbox, the New rows of projects
+not muted, which the navigation counts. Each acknowledgement, reopening, mute and unmute is
+audited as the operator's session, among people's actions; viewers see no form, and their
+posts are refused.
+
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,
 the projects they may submit jobs of (*All projects* when one key's ceiling is the whole

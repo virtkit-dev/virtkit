@@ -1,8 +1,9 @@
 //! The Egress page's *Blocked* rows ([`crate::egress::blocked`]), kept as the job history is:
 //! each record written adds its job's shares and takes back those of the record it replaces,
 //! and each record leaving the history takes back its own, so a row counts the jobs of the
-//! history and nothing else, and a row no job shares any more goes. A mute takes a subject's
-//! rows out of the inbox and its count, never out of the store.
+//! history and nothing else, and a row no job shares any more goes. Triage and mutes are
+//! people's, and audited: a mute takes a subject's rows out of the inbox and its count, never
+//! out of the store.
 //!
 //! A row is *New* until acknowledged, and again once a job adds to it after that: a share that
 //! is new or has more attempts moves the row's generation on, past the one acknowledged.
@@ -10,12 +11,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::jobs::{JOBS, JobRow};
-use super::{Db, decode, encode};
+use super::{Db, append_audit, decode, encode};
 use crate::egress::blocked::{Finding, Share, Subject, View, shares};
 
 /// Key: a row's ID ([`crate::egress::blocked::row_id`]). Value: JSON [`BlockedRow`].
@@ -50,6 +51,9 @@ pub(super) const EGRESS_SUBJECTS: TableDefinition<&str, (u64, &str)> =
 /// Key: [`BUILT`]. Value: 1 once the rows hold every job of the history.
 const EGRESS_META: TableDefinition<&str, u64> = TableDefinition::new("egress_meta");
 const BUILT: &str = "built";
+
+/// The longest reason a mute takes.
+pub const MAX_MUTE_REASON: usize = vk_hub_proto::MAX_DISPLAY;
 
 /// A destination refused, or a declaration refused, gathered over the jobs of one subject.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +423,15 @@ pub(super) fn reshare(
     Ok(())
 }
 
+/// A view as the audit log names it.
+fn view_text(v: View) -> &'static str {
+    match v {
+        View::Blocked => "blocked",
+        View::WouldBlock => "would-block",
+        View::Refused => "declaration issue",
+    }
+}
+
 /// Fill the rows from the history once: the jobs a build without them recorded. A job's
 /// record is decoded at a time.
 pub(super) fn share_history(txn: &redb::WriteTransaction) -> Result<()> {
@@ -629,6 +642,105 @@ impl Db {
         }
         Ok(n)
     }
+
+    /// Acknowledge row `id` as `actor`, as far as the jobs it has now, or reopen it; audited.
+    /// Return the row, or `None` for no such row.
+    pub fn egress_triage(
+        &self,
+        id: &str,
+        acknowledge: bool,
+        actor: &str,
+        now: u64,
+    ) -> Result<Option<BlockedRow>> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let row = {
+            let mut t = Tables::open(&txn)?;
+            let Some(mut row) = t.get(id)? else {
+                return Ok(None);
+            };
+            let was = Indexed::of(&row);
+            row.acknowledged = acknowledge.then(|| Acknowledged {
+                generation: row.generation,
+                by: actor.to_string(),
+                at: now,
+            });
+            let subject = row.subject.clone();
+            t.put(id, Some(&row), Some(was), &subject)?;
+            row
+        };
+        let did = if acknowledge {
+            "acknowledged"
+        } else {
+            "reopened"
+        };
+        let what = view_text(row.finding.view());
+        let event = format!(
+            "{actor} {did} egress {what} {} for {}",
+            row.finding.text(),
+            row.who()
+        );
+        append_audit(&txn, None, actor, &event, now)?;
+        txn.commit().context("triaging an egress row")?;
+        Ok(Some(row))
+    }
+
+    /// Mute `subject`'s rows as `actor`, for `reason`, until `until` or for good; audited. A
+    /// mute of it in force is replaced, and mutes past their end are swept.
+    pub fn egress_mute(
+        &self,
+        subject: &Subject,
+        who: &str,
+        reason: &str,
+        until: Option<u64>,
+        actor: &str,
+        now: u64,
+    ) -> Result<()> {
+        let reason = vk_hub_proto::display_safe_up_to(reason.trim(), MAX_MUTE_REASON);
+        if reason.is_empty() {
+            anyhow::bail!("a mute needs a reason");
+        }
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(EGRESS_MUTES)?;
+            table.retain(|_, v| decode::<Mute>(v).is_ok_and(|m| m.live(now)))?;
+            let mute = Mute {
+                who: who.to_string(),
+                reason: reason.clone(),
+                until,
+                by: actor.to_string(),
+                at: now,
+            };
+            table.insert(subject.param().as_str(), encode(&mute)?.as_slice())?;
+        }
+        let until = match until {
+            Some(t) => format!("until {}", crate::utc(t)),
+            None => "until unmuted".to_string(),
+        };
+        let event = format!("{actor} muted egress of {who} {until}: {reason}");
+        append_audit(&txn, None, actor, &event, now)?;
+        txn.commit().context("muting egress rows")?;
+        Ok(())
+    }
+
+    /// End `subject`'s mute as `actor`; audited. Return whether one was in force.
+    pub fn egress_unmute(&self, subject: &Subject, actor: &str, now: u64) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let removed = {
+            let mut table = txn.open_table(EGRESS_MUTES)?;
+            let removed = table
+                .remove(subject.param().as_str())?
+                .map(|g| decode::<Mute>(g.value()))
+                .transpose()?;
+            removed.filter(|m| m.live(now))
+        };
+        let Some(mute) = removed else {
+            return Ok(false);
+        };
+        let event = format!("{actor} unmuted egress of {}", mute.who);
+        append_audit(&txn, None, actor, &event, now)?;
+        txn.commit().context("unmuting egress rows")?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +836,24 @@ mod tests {
         assert!(db.egress_row_jobs(&id, 10).unwrap().is_empty());
     }
 
+    /// Job `n` of key `k<n % 3>`, ended refused `10.0.0.<n % 7>:443`.
+    fn varied(db: &Db, n: u64) -> String {
+        let id = format!("{n:032x}");
+        let mut report = denied(1);
+        if let Some(e) = report.entries.first_mut() {
+            e.destination = EgressDestination::address(&format!("10.0.0.{}:443", n % 7));
+        }
+        let mut row = job(n, report);
+        row.key = format!("k{}", n % 3);
+        let mut queued = row.clone();
+        queued.result = None;
+        queued.revision = 1;
+        db.submit_job(&id, &queued, &id, b"{}", "key gitlab", 10)
+            .unwrap();
+        assert!(db.put_job(&id, &row, &[], 11).unwrap());
+        id
+    }
+
     /// The indexes say of the rows what the rows say: each view's and state's rows, every
     /// subject's and each one's, the latest first, their counts, and the subjects.
     fn check_index(db: &Db) {
@@ -783,6 +913,58 @@ mod tests {
         }
     }
 
+    /// The indexes follow the rows as jobs add to them, are triaged, and leave the history;
+    /// a scan merges its ranges the latest first and reads no more than its budget.
+    #[test]
+    fn the_rows_are_indexed_by_view_state_subject_and_time() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=30 {
+            varied(&db, n);
+        }
+        check_index(&db);
+        let rows = db.egress_rows().unwrap();
+        for (i, (id, _)) in rows.iter().enumerate() {
+            if i % 2 == 0 {
+                db.egress_triage(id, true, "ops", 20).unwrap();
+            }
+        }
+        check_index(&db);
+        // Added to again, an acknowledged row is New again and moves on in time.
+        for n in 31..=40 {
+            varied(&db, n);
+        }
+        check_index(&db);
+        db.prune_jobs(50, 12).unwrap();
+        check_index(&db);
+
+        // New and Acknowledged rows merged: the latest first, whichever range holds it.
+        let ranges = [Stored::New, Stored::Acknowledged].map(|stored| RowRange {
+            view: View::Blocked,
+            stored,
+            subject: None,
+        });
+        let mut all = Vec::new();
+        let mut budget = usize::MAX;
+        db.egress_scan(&ranges, &mut budget, |id, r| {
+            all.push((r.latest_at, id.to_string()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert!(all.windows(2).all(|w| w[0].0 >= w[1].0), "{all:?}");
+        assert_eq!(all.len(), db.egress_rows().unwrap().len());
+        // Within a budget: no more rows read, and the scan says it was cut.
+        let mut budget = 3;
+        let mut read = Vec::new();
+        let cut = db
+            .egress_scan(&ranges, &mut budget, |id, r| {
+                read.push((r.latest_at, id.to_string()));
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(cut);
+        assert_eq!((budget, read.as_slice()), (0, &all[..3]));
+    }
+
     /// Rows built from a history recorded without them are those kept as it was recorded.
     #[test]
     fn the_rows_are_built_once_from_the_history() {
@@ -810,5 +992,71 @@ mod tests {
         share_history(&txn).unwrap();
         txn.commit().unwrap();
         assert_eq!(db.egress_rows().unwrap(), kept);
+    }
+
+    /// An acknowledged row is New again once a job adds to it, in the same second as much as
+    /// later; a job written again does not reopen it. A mute takes its subject's rows out of the
+    /// count until it ends, with no write to end it, or is undone.
+    #[test]
+    fn triage_and_mutes_hold_until_a_job_adds_or_they_end() {
+        let db = Db::open_memory().unwrap();
+        let (a, mut row_a) = ended(&db, 1, denied(2));
+        let (id, row) = only_row(&db);
+        let acked = db
+            .egress_triage(&id, true, "uid 0", 1_002)
+            .unwrap()
+            .unwrap();
+        assert!(!acked.is_new());
+        assert_eq!(db.egress_new(0).unwrap(), 0);
+        row_a.revision += 1;
+        db.put_job(&a, &row_a, &[], 12).unwrap();
+        assert!(!only_row(&db).1.is_new());
+        // Another job, ending the second it was acknowledged.
+        ended(&db, 2, denied(1));
+        assert!(only_row(&db).1.is_new());
+        assert_eq!(db.egress_new(0).unwrap(), 1);
+        db.egress_triage(&id, true, "uid 0", 1_002).unwrap();
+        db.egress_triage(&id, false, "uid 0", 1_003).unwrap();
+        assert_eq!(db.egress_new(0).unwrap(), 1);
+        assert!(
+            db.egress_triage(&"0".repeat(32), true, "uid 0", 1)
+                .unwrap()
+                .is_none()
+        );
+
+        let who = row.who();
+        assert!(
+            db.egress_mute(&row.subject, &who, " \n", None, "uid 0", 10)
+                .is_err()
+        );
+        db.egress_mute(&row.subject, &who, "known", Some(100), "uid 0", 10)
+            .unwrap();
+        assert_eq!(db.egress_new(99).unwrap(), 0);
+        assert_eq!(
+            db.egress_mutes(99).unwrap()[&row.subject.param()].reason,
+            "known"
+        );
+        assert_eq!(db.egress_new(100).unwrap(), 1);
+        assert!(!db.egress_unmute(&row.subject, "uid 0", 100).unwrap());
+        db.egress_mute(&row.subject, &who, "known", None, "uid 0", 10)
+            .unwrap();
+        assert!(db.egress_unmute(&row.subject, "uid 0", 11).unwrap());
+        assert_eq!(db.egress_new(11).unwrap(), 1);
+        let audit: Vec<String> = db
+            .audits(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .filter(|e| e.contains("egress"))
+            .collect();
+        assert!(
+            audit.contains(&format!(
+                "uid 0 acknowledged egress blocked TCP 10.0.0.1:443 for {who}"
+            )),
+            "{audit:?}"
+        );
+        assert!(audit.contains(&format!("uid 0 muted egress of {who} until unmuted: known")));
+        assert!(audit.contains(&format!("uid 0 unmuted egress of {who}")));
+        assert_eq!(audit.len(), 6, "{audit:?}");
     }
 }

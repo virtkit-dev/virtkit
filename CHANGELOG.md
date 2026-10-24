@@ -72,6 +72,9 @@ All notable changes to virtkit will be documented in this file.
   many jobs and attempts and which setting refused it; filtered by project, layer, phase or
   job. Each row lists its latest jobs and where to allow it. The navigation counts the new
   rows, and the page names the nodes whose jobs cannot appear because they do not report.
+- **Operators triage the Egress page**: acknowledge a row until a later job repeats it, and
+  mute a project's rows for 7 days, 30 days or indefinitely, with a reason, keeping them
+  listed under Muted. Each is recorded in the audit log.
 - **Nodes report a placed job's egress while it runs, not only with its result**, to a hub at
   this version; an older hub still gets it once the job ends.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build

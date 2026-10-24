@@ -3,8 +3,9 @@
 //! row with a page of its own, `/egress/rows/<id>`, of the latest jobs that share it and where
 //! to look to allow it, by the layer that decided it. *Blocked*, *Would block* and
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
-//! projects not muted. A rendering reads the view's rows from the store's indexes, the latest
-//! first, and at most [`ROW_BUDGET`] of them in all.
+//! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
+//! from its page, as their session's principal. A rendering reads the view's rows from the
+//! store's indexes, the latest first, and at most [`ROW_BUDGET`] of them in all.
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
@@ -13,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use anyhow::Result;
-use hyper::{Response, StatusCode};
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderValue};
+use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::egress::{EgressEntry, EgressRefusal};
 
 use super::html::Html;
@@ -23,7 +26,7 @@ use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, shares};
 use crate::egress::{self, Check};
 use crate::server::Hub;
-use crate::store::{BlockedRow, JobRow, Mute, RowRange, Stored};
+use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, Stored};
 
 /// The page.
 pub(super) const PATH: &str = "/egress";
@@ -423,17 +426,17 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     let (hub, wanted) = (ui.hub.clone(), filter.clone());
     let (listing, subjects) =
         blocking(move || Ok((listing(&hub, &wanted)?, hub.db.egress_subjects()?))).await?;
-    let main = listing_page(&filter, &listing, &subjects);
+    let main = listing_page(&filter, &listing, &subjects, auth);
     Ok(page(fleet::layout("Egress", PATH, auth, &main)))
 }
 
-fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)]) -> Html {
+fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)], auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     unreported_callout(&mut h, &l.unreported);
     h.raw("<p class=\"sub\">What the jobs of the history were refused, by destination and ")
         .raw("project, as their nodes reported it.</p>");
-    mutes_note(&mut h, &l.mutes);
+    mutes_note(&mut h, &l.mutes, auth);
     filter_form(&mut h, filter, subjects);
     // Replaced whole by the filter's form.
     h.raw("<div id=\"").raw(RESULTS).raw("\">");
@@ -536,8 +539,9 @@ fn unreported_callout(h: &mut Html, nodes: &[(String, String)]) {
 }
 
 /// The mutes in force, each with its reason and end, when there are any: their rows are out of
-/// the inbox and its count, shown under *Muted*.
-fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>) {
+/// the inbox and its count, shown under *Muted*. An operator unmutes each here too: a mute
+/// outlives the rows it took out.
+fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>, auth: &Auth) {
     if mutes.is_empty() {
         return;
     }
@@ -558,6 +562,16 @@ fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>) {
             .raw("</a> ");
         until(h, m);
         h.raw(" (").node(&m.reason).raw(")");
+        if auth.session.role >= Role::Operator {
+            h.raw(" <form class=\"steer\" method=\"post\" action=\"")
+                .raw(ACTION_PATH)
+                .raw("\">");
+            pages::csrf_field(h, auth);
+            h.raw("<input type=\"hidden\" name=\"op\" value=\"unmute\">")
+                .raw("<input type=\"hidden\" name=\"subject\" value=\"")
+                .text(subject)
+                .raw("\"><button>Unmute</button></form>");
+        }
         h.raw("</li>");
     }
     h.raw("</ul></div>");
@@ -807,7 +821,7 @@ pub(super) async fn row(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>
             "There is no such row: no job of the history shares it.",
         ));
     };
-    let main = row_page(&detail);
+    let main = row_page(id, &detail, auth);
     Ok(page(fleet::layout("Egress", PATH, auth, &main)))
 }
 
@@ -838,7 +852,7 @@ fn evidence<'a>(finding: &Finding, j: &'a JobRow) -> Evidence<'a> {
     }
 }
 
-fn row_page(d: &RowDetail) -> Html {
+fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
     let row = &d.row;
     let view = row.finding.view();
     let mut h = Html::new();
@@ -913,7 +927,7 @@ fn row_page(d: &RowDetail) -> Html {
         .text(kept.len())
         .raw(" jobs kept; protection as GitLab reported it.</p></section>");
 
-    triage(&mut h, d);
+    triage(&mut h, id, d, auth);
     what_to_change(&mut h, &kept, &d.names);
     row_jobs(&mut h, view, d);
     h
@@ -1079,9 +1093,21 @@ fn row_jobs(h: &mut Html, view: View, d: &RowDetail) {
     h.raw("</section>");
 }
 
-/// How the row stands and who triaged it, and its subject's mute.
-fn triage(h: &mut Html, d: &RowDetail) {
+/// Where a row's page posts its triage and its subject's mute.
+pub(super) const ACTION_PATH: &str = "/egress/action";
+
+/// How long a mute lasts, as the form offers it: the field's value, in days, or for good.
+const MUTE_FOR: [(&str, Option<u64>, &str); 3] = [
+    ("7", Some(7), "7 days"),
+    ("30", Some(30), "30 days"),
+    ("never", None, "Indefinitely"),
+];
+
+/// How the row stands and who triaged it, its subject's mute, and for an operator the forms
+/// that acknowledge or reopen it and mute or unmute its subject. Plain posts, back to the row.
+fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
     let row = &d.row;
+    let steer = auth.session.role >= Role::Operator;
     let what = if row.subject.is_project() {
         "project"
     } else {
@@ -1107,16 +1133,168 @@ fn triage(h: &mut Html, d: &RowDetail) {
         h.raw(" A job that adds to it makes it New again.");
     }
     h.raw("</p>");
-    if let Some(m) = &d.mute {
-        h.raw("<p>This ")
-            .raw(what)
-            .raw(" is muted by ")
-            .text(&m.by)
-            .raw(" ");
-        until(h, m);
-        h.raw(": ").node(&m.reason).raw(".</p>");
+    if steer {
+        let (op, label) = if row.is_new() {
+            ("acknowledge", "Acknowledge")
+        } else {
+            ("reopen", "Reopen")
+        };
+        action_form(h, id, auth, op);
+        h.raw("<button>").raw(label).raw("</button></form>");
     }
-    h.raw("</section>");
+    match &d.mute {
+        Some(m) => {
+            h.raw("<p>This ")
+                .raw(what)
+                .raw(" is muted by ")
+                .text(&m.by)
+                .raw(" ");
+            until(h, m);
+            h.raw(": ").node(&m.reason).raw(".</p>");
+            if steer {
+                action_form(h, id, auth, "unmute");
+                h.raw("<button>Unmute</button></form>");
+            }
+        }
+        None if steer => {
+            action_form(h, id, auth, "mute");
+            h.raw("<label>Reason <input type=\"text\" name=\"reason\" required maxlength=\"")
+                .text(MAX_MUTE_REASON)
+                .raw("\" autocomplete=\"off\"></label> <select name=\"for\" aria-label=\"For\">");
+            for (value, _, label) in MUTE_FOR {
+                h.raw("<option value=\"")
+                    .raw(value)
+                    .raw("\">")
+                    .raw(label)
+                    .raw("</option>");
+            }
+            h.raw("</select> <button>Mute this ")
+                .raw(what)
+                .raw("</button></form>");
+        }
+        None => {}
+    }
+    h.raw("<p class=\"sub\">A mute takes every row of this ")
+        .raw(what)
+        .raw(" out of the inbox and the navigation's count: they stay here under Muted, and on ")
+        .raw("their jobs' pages.</p></section>");
+}
+
+/// Open a form posting `op` on row `id`, its button left to the caller.
+fn action_form(h: &mut Html, id: &str, auth: &Auth, op: &'static str) {
+    h.raw("<form class=\"steer\" method=\"post\" action=\"")
+        .raw(ACTION_PATH)
+        .raw("\">");
+    pages::csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"row\" value=\"")
+        .text(id)
+        .raw("\"><input type=\"hidden\" name=\"op\" value=\"")
+        .raw(op)
+        .raw("\">");
+}
+
+/// What an operator's form asks of a row.
+enum Act {
+    Triage(bool),
+    Mute { reason: String, until: Option<u64> },
+    Unmute,
+}
+
+fn act(form: &[(String, String)], now: u64) -> Result<Act, &'static str> {
+    Ok(match field(form, "op").unwrap_or("") {
+        "acknowledge" => Act::Triage(true),
+        "reopen" => Act::Triage(false),
+        "unmute" => Act::Unmute,
+        "mute" => {
+            let reason = field(form, "reason").unwrap_or("").trim();
+            if reason.is_empty() || reason.chars().count() > MAX_MUTE_REASON {
+                return Err("Refused: a mute needs a reason, of at most 256 characters.");
+            }
+            let Some((_, days, _)) = MUTE_FOR
+                .iter()
+                .find(|(v, _, _)| Some(*v) == field(form, "for"))
+            else {
+                return Err("Refused: a mute lasts 7 days, 30 days or indefinitely.");
+            };
+            Act::Mute {
+                reason: reason.to_string(),
+                until: days.map(|d| now.saturating_add(d.saturating_mul(86_400))),
+            }
+        }
+        _ => return Err("No such action."),
+    })
+}
+
+/// `POST /egress/action`: an operator's triage of a row, or mute of its subject, as the
+/// session's principal; audited by the store. Back to the row's page.
+pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(message(status, text)),
+    };
+    // A mute named by its subject, from the page's list of mutes: it outlives its rows.
+    if field(&form, "op") == Some("unmute")
+        && let Some(subject) = field(&form, "subject").and_then(Subject::parse)
+    {
+        let (hub, principal) = (ui.hub.clone(), auth.session.principal());
+        blocking(move || {
+            hub.db
+                .egress_unmute(&subject, &principal, crate::now_secs())
+        })
+        .await?;
+        return Ok(see_other(PATH));
+    }
+    let Some(id) = field(&form, "row")
+        .filter(|id| vk_hub_proto::valid_id(id))
+        .map(str::to_string)
+    else {
+        return Ok(message(StatusCode::BAD_REQUEST, "No such row."));
+    };
+    let now = crate::now_secs();
+    let act = match act(&form, now) {
+        Ok(act) => act,
+        Err(why) => return Ok(message(StatusCode::BAD_REQUEST, why)),
+    };
+    let (hub, principal, row_id) = (ui.hub.clone(), auth.session.principal(), id.clone());
+    let found = blocking(move || {
+        // The subject muted is the row's, never one the form names.
+        let Some(row) = hub.db.egress_row(&row_id)? else {
+            return anyhow::Ok(false);
+        };
+        match act {
+            Act::Triage(acknowledge) => {
+                hub.db
+                    .egress_triage(&row_id, acknowledge, &principal, now)?;
+            }
+            Act::Mute { reason, until } => {
+                hub.db
+                    .egress_mute(&row.subject, &row.who(), &reason, until, &principal, now)?;
+            }
+            Act::Unmute => {
+                hub.db.egress_unmute(&row.subject, &principal, now)?;
+            }
+        }
+        Ok(true)
+    })
+    .await?;
+    if !found {
+        return Ok(message(
+            StatusCode::NOT_FOUND,
+            "There is no such row: no job of the history shares it.",
+        ));
+    }
+    Ok(see_other(&format!("{ROW_PREFIX}{id}")))
+}
+
+/// Back to `location`, one of this page's.
+fn see_other(location: &str) -> Response<Body> {
+    let mut resp = Response::new(Body::default());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static(PATH)),
+    );
+    resp
 }
 
 #[cfg(test)]
