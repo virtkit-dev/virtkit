@@ -9113,6 +9113,185 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     );
 }
 
+/// Job `n` of project `project_id`, ended on `node` with `report`, placed under the hub's rules
+/// as they stand: `rules` enforced at their generation now.
+fn placed_job(
+    hub: &Hub,
+    n: u64,
+    project_id: u64,
+    node: &str,
+    report: vk_hub_proto::egress::EgressReport,
+    rules: &[&str],
+) -> String {
+    let id = egress_job(hub, n, project_id, node, report);
+    let mut row = hub.db.job(&id).unwrap().unwrap();
+    row.egress_rules = Some(crate::store::EgressRulesApplied {
+        rules: rules.iter().map(|r| r.to_string()).collect(),
+        dry_run: vec![],
+        generation: hub.db.egress_rules().unwrap().0,
+    });
+    row.revision += 1;
+    assert!(hub.db.put_job(&id, &row, &[], 12).unwrap());
+    id
+}
+
+/// A destination a hub rule refused is proposed for its project from its Blocked row, its job's
+/// page and Observed traffic, exactly as reported, to operators alone; the editor is prefilled.
+/// A node's cap proposes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_rule_s_denial_is_proposed_for_its_project() {
+    use crate::store::RuleMode;
+    use vk_hub_proto::egress::*;
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    egress_rule(
+        &hub,
+        "acme",
+        Some("gitlab gl, project-id 42"),
+        HubPhase::Unrestricted,
+        allow(&["crates.io"], &[]),
+        RuleMode::Enforce,
+    );
+    let at_build = |e: EgressEntry| EgressEntry {
+        phase: EgressPhase::Build,
+        ..e
+    };
+    let mut refused = blocked_report("deb.debian.org", 3);
+    refused.entries[0] = at_build(refused.entries[0].clone());
+    refused.entries[0].layer = Some(EgressLayer::HubRule);
+    refused.hub_rules = vec!["acme".into()];
+    let job = placed_job(&hub, 1, 42, &node, refused, &["acme"]);
+    // A node's cap, and a malformed name: nothing to propose.
+    egress_job(&hub, 2, 7, &node, blocked_report("x.example", 1));
+    let rows = hub.db.egress_rows().unwrap();
+    let row_of = |text: &str| {
+        rows.iter()
+            .find(|(_, r)| r.finding.text() == text)
+            .map(|(id, _)| id.clone())
+            .unwrap()
+    };
+    let (deb, capped) = (row_of("DNS deb.debian.org"), row_of("DNS x.example"));
+    let link = format!(
+        "<a href=\"/egress?tab=rules&amp;propose={deb}&amp;phase=build\">Propose allowing for \
+         acme/p42 on gl…</a>"
+    );
+
+    let page = get(addr, &format!("/egress/rows/{deb}"), Some(&viewer))
+        .await
+        .body;
+    assert!(!page.contains("Propose allowing"), "{page}");
+    assert!(
+        page.contains("an operator may propose a rule allowing it"),
+        "{page}"
+    );
+    let page = get(addr, &format!("/egress/rows/{deb}"), Some(&operator))
+        .await
+        .body;
+    assert!(page.contains(&link), "{page}");
+    let page = get(addr, &format!("/egress/rows/{capped}"), Some(&operator))
+        .await
+        .body;
+    assert!(
+        page.contains(
+            "No hub rule to propose: a node&#39;s cap refused it, and a hub rule cannot override \
+             a node&#39;s cap."
+        ),
+        "{page}"
+    );
+    // The job's page offers it beside the denial, to an operator.
+    let page = get(addr, &format!("/jobs/{job}"), Some(&operator))
+        .await
+        .body;
+    assert!(page.contains(&link), "{page}");
+    let page = get(addr, &format!("/jobs/{job}"), Some(&viewer)).await.body;
+    assert!(!page.contains("Propose allowing"), "{page}");
+
+    let path = format!("/egress?tab=rules&propose={deb}&phase=build");
+    assert_eq!(get(addr, &path, Some(&viewer)).await.status, 403);
+    let form = get(addr, &path, Some(&operator)).await;
+    assert_eq!(form.status, 200, "{}", form.body);
+    let body = &form.body;
+    for want in [
+        "<h2>Propose allowing <code>deb.debian.org</code> for acme/p42 on gl</h2>",
+        "A hub rule refused DNS <code>deb.debian.org</code> to its jobs, in the build phase",
+        "<input type=\"radio\" name=\"target\" value=\"acme\" checked> <strong>acme</strong>",
+        "allows deb.debian.org and its subdomains. Nothing broader is proposed",
+        "name=\"build_names\" rows=\"3\" spellcheck=\"false\">crates.io\ndeb.debian.org</textarea>",
+        "> A new rule for exactly this project</label>",
+    ] {
+        assert!(body.contains(want), "{want}\n{body}");
+    }
+    assert!(hub.db.egress_rules().unwrap().1[0].build == allow(&["crates.io"], &[]));
+    // A new rule for exactly the project, by its ID, in dry-run.
+    let new = get(addr, &format!("{path}&target=new"), Some(&operator))
+        .await
+        .body;
+    assert!(new.contains("<h3>A new rule, in dry-run</h3>"), "{new}");
+    assert!(
+        new.contains("name=\"project_id\" min=\"1\" value=\"42\""),
+        "{new}"
+    );
+
+    // A later job reaches it, and another destination outside the rules: Observed traffic
+    // proposes that one.
+    let reached = EgressReport {
+        entries: ["deb.debian.org", "pypi.org"]
+            .into_iter()
+            .map(|d| {
+                at_build(crate::egress::testing::entry(
+                    EgressOutcome::Observed,
+                    EgressProtocol::Dns,
+                    EgressDestination::domain(d),
+                    None,
+                ))
+            })
+            .collect(),
+        phases: vec![crate::egress::testing::phase(
+            EgressPhase::Build,
+            EgressCoverage::Complete,
+        )],
+        ..EgressReport::default()
+    };
+    placed_job(&hub, 3, 42, &node, reached, &["acme"]);
+    let observed = get(
+        addr,
+        "/egress?tab=observed&project=gitlab%3Agl%3A42",
+        Some(&operator),
+    )
+    .await
+    .body;
+    let (_, pypi) = observed.split_once("<code>DNS pypi.org</code>").unwrap();
+    let pypi = pypi.split("</tr>").next().unwrap();
+    assert!(
+        pypi.contains("&amp;propose=observed&amp;project=gitlab%3Agl%3A42&amp;phase=build"),
+        "{pypi}"
+    );
+    let href = pypi
+        .split("<a href=\"")
+        .find(|s| s.contains("propose=observed"))
+        .and_then(|s| s.split('"').next())
+        .unwrap()
+        .replace("&amp;", "&");
+    let page = get(addr, &href, Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("<h2>Propose allowing <code>pypi.org</code> for acme/p42 on gl</h2>"),
+        "{}",
+        page.body
+    );
+    let viewer_observed = get(
+        addr,
+        "/egress?tab=observed&project=gitlab%3Agl%3A42",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(!viewer_observed.contains("Propose allowing"));
+}
+
 /// Test a job shows each layer apart for a recent job, or for claims typed in, then the result
 /// per phase and the layer that decides a destination; a job's dispatch beside the rules now.
 #[tokio::test(flavor = "multi_thread")]

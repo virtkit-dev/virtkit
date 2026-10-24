@@ -21,6 +21,7 @@ pub mod matching;
 pub mod narrowing;
 pub mod observed;
 pub mod preview;
+pub mod proposal;
 pub mod rule_use;
 pub mod rules;
 

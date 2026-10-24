@@ -23,6 +23,8 @@ const OPEN_ROWS: usize = 20;
 pub(super) struct Shown {
     /// Whether its node announces egress reports now.
     pub reports: bool,
+    /// Whether the session may propose hub rules from it: an operator's.
+    pub propose: bool,
 }
 
 /// Job `j`'s network access, for a job that reached a node. `node` is its node's name.
@@ -48,7 +50,7 @@ pub(super) fn section(h: &mut Html, j: &JobRow, node: Option<&str>, shown: Shown
             h.raw("<p>No egress report is available for this job. This does not mean it made ")
                 .raw("no network attempts.</p>");
         }
-        Network::Reported(report) => reported(h, j, report, node),
+        Network::Reported(report) => reported(h, j, report, node, shown.propose),
     }
     h.raw("</section>");
 }
@@ -70,7 +72,7 @@ pub(super) fn badge(h: &mut Html, tone: Tone, text: &str, title: Option<&str>) {
     h.raw(">").node(text).raw("</span>");
 }
 
-fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>) {
+fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>, propose: bool) {
     let summary = Summary::of(report);
     let (tone, headline) = summary.headline();
     h.raw("<p>");
@@ -89,14 +91,15 @@ fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>)
     }
     h.raw("</p>");
     refusals(h, j, report, &summary, node);
-    denials(h, j, report, EgressOutcome::Blocked, &summary.blocked, node);
+    let at = Where { node, propose };
+    denials(h, j, report, EgressOutcome::Blocked, &summary.blocked, at);
     denials(
         h,
         j,
         report,
         EgressOutcome::WouldBlock,
         &summary.would_block,
-        node,
+        at,
     );
     observed(h, report, &summary.observed);
     coverage(h, report);
@@ -172,14 +175,22 @@ fn refusals(
     h.raw("</details>");
 }
 
+/// Where a denial is shown: its node's name, and whether a proposal may be made from it.
+#[derive(Clone, Copy)]
+struct Where<'a> {
+    node: Option<&'a str>,
+    propose: bool,
+}
+
 fn denials(
     h: &mut Html,
     j: &JobRow,
     report: &EgressReport,
     outcome: EgressOutcome,
     tally: &Tally,
-    node: Option<&str>,
+    at: Where,
 ) {
+    let node = at.node;
     if !tally.any() {
         return;
     }
@@ -229,6 +240,17 @@ fn denials(
                 h.raw("check ");
                 check(h, &c, node);
             }
+        }
+        if at.propose
+            && let Some(href) = super::egress::proposal_href(j, e)
+        {
+            h.raw(" · ");
+            super::egress::proposal_link(
+                h,
+                &href,
+                &Subject::of(j).text(j.project.as_deref(), &j.key_name),
+                None,
+            );
         }
         h.raw("</div></li>");
     }
@@ -369,7 +391,15 @@ mod tests {
 
     fn shown(j: &JobRow, reports: bool) -> String {
         let mut h = Html::new();
-        section(&mut h, j, Some("ci-1"), Shown { reports });
+        section(
+            &mut h,
+            j,
+            Some("ci-1"),
+            Shown {
+                reports,
+                propose: false,
+            },
+        );
         h.into_string()
     }
 

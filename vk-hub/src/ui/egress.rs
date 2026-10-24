@@ -4,12 +4,13 @@
 //! to look to allow it, by the layer that decided it. *Blocked*, *Would block* and
 //! *Declaration issues* are separate views, each with its count. The inbox is the New rows of
 //! projects not muted; operators acknowledge or reopen a row, and mute or unmute its project,
-//! from its page, as their session's principal. The *Observed traffic* tab is [`observed`]'s,
-//! the *Rules* tab [`rules`]'s, *Test a job* [`test_job`]'s. The rows and the views' counts
-//! follow the jobs' reports, a running job's as its record is written with them, and the rows'
-//! triage, over `/events/egress`; the filter's form and the mutes' stay out of what is swapped.
-//! A rendering reads the view's rows from the store's indexes, the latest first, and at most
-//! [`ROW_BUDGET`] of them in all; streams of one filter share it ([`Renders`]).
+//! from its page, as their session's principal. A row a hub rule decided offers operators a
+//! proposal allowing it ([`propose`]). The *Observed traffic* tab is [`observed`]'s, the *Rules*
+//! tab [`rules`]'s, *Test a job* [`test_job`]'s. The rows and the views' counts follow the jobs'
+//! reports, a running job's as its record is written with them, and the rows' triage, over
+//! `/events/egress`; the filter's form and the mutes' stay out of what is swapped. A rendering
+//! reads the view's rows from the store's indexes, the latest first, and at most [`ROW_BUDGET`]
+//! of them in all; streams of one filter share it ([`Renders`]).
 //!
 //! Destinations, service names and declared entries are the jobs' or their guests' to choose:
 //! each goes through [`Html::node`].
@@ -37,6 +38,7 @@ use crate::store::{BlockedRow, JobRow, MAX_MUTE_REASON, Mute, Role, RowRange, St
 
 mod editor;
 mod observed;
+mod propose;
 mod rules;
 mod test_job;
 
@@ -522,10 +524,16 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
 }
 
 /// What `/events/egress[?…]` streams: the rows of the filter in `query` ([`Filter::of`]), with
-/// the views' counts, as the jobs' reports and the rows' triage change.
-pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, query: Option<&str>) -> Source {
+/// the views' counts, as the jobs' reports and the rows' triage change; `steer` for an
+/// operator's page.
+pub(super) fn source(
+    hub: &Arc<Hub>,
+    caches: &Arc<Caches>,
+    query: Option<&str>,
+    steer: bool,
+) -> Source {
     if let Some(q) = observed::Query::of(query) {
-        return observed::source(hub, caches, q);
+        return observed::source(hub, caches, q, steer);
     }
     if let Some(q) = rules::Query::of(query) {
         return rules::source(hub, caches, q);
@@ -990,6 +998,18 @@ struct RowDetail {
     mute: Option<Mute>,
 }
 
+/// Row `id` and its latest jobs kept, the latest first: what its proposal is made from.
+pub(super) fn kept(hub: &Hub, id: &str) -> Result<Option<(BlockedRow, Vec<JobRow>)>> {
+    let Some(row) = hub.db.egress_row(id)? else {
+        return Ok(None);
+    };
+    let mut jobs = Vec::new();
+    for (job, _, _) in hub.db.egress_row_jobs(id, ROW_JOBS)? {
+        jobs.extend(hub.db.job(&job)?);
+    }
+    Ok(Some((row, jobs)))
+}
+
 /// `GET /egress/rows/<id>`.
 pub(super) async fn row(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let (hub, wanted) = (ui.hub.clone(), id.to_string());
@@ -1130,6 +1150,8 @@ fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
         .raw(" jobs kept; protection as GitLab reported it.</p></section>");
 
     triage(&mut h, id, d, auth);
+    let jobs: Vec<&JobRow> = kept.iter().map(|(j, _)| *j).collect();
+    proposal_section(&mut h, id, d, &jobs, auth);
     what_to_change(&mut h, &kept, &d.names);
     row_jobs(&mut h, view, d);
     h
@@ -1382,6 +1404,58 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
         .raw("their jobs' pages.</p></section>");
 }
 
+/// For a destination a hub rule refused, the operator's way to a proposal allowing it, a phase
+/// at a time; otherwise why there is none.
+fn proposal_section(h: &mut Html, id: &str, d: &RowDetail, jobs: &[&JobRow], auth: &Auth) {
+    if d.row.finding.view() == View::Refused {
+        return;
+    }
+    h.raw("<section><h2>Allow it</h2>");
+    match crate::egress::proposal::of_row(&d.row, jobs) {
+        Ok(seed) => {
+            if auth.session.role >= Role::Operator {
+                h.raw("<p class=\"actions\">");
+                for phase in &seed.phases {
+                    proposal_link(h, &propose::row_href(id, *phase), &d.row.who(), {
+                        (seed.phases.len() > 1).then_some(*phase)
+                    });
+                    h.raw(" ");
+                }
+                h.raw("</p><p class=\"sub\">It opens the rule editor prefilled with this exact ")
+                    .raw("destination. Nothing is saved but through Preview → Save.</p>");
+            } else {
+                h.raw("<p>A hub rule refused it: an operator may propose a rule allowing it.</p>");
+            }
+        }
+        Err(why) => {
+            h.raw("<p>No hub rule to propose: ")
+                .text(why.text())
+                .raw(".</p>");
+        }
+    }
+    h.raw("</section>");
+}
+
+/// A link to a proposal, `phase` named when the destination was refused in more than one.
+pub(super) fn proposal_link(
+    h: &mut Html,
+    href: &str,
+    who: &str,
+    phase: Option<vk_hub_proto::egress::EgressPhase>,
+) {
+    h.raw("<a href=\"")
+        .text(href)
+        .raw("\">Propose allowing for ")
+        .node(who)
+        .raw("…");
+    if let Some(p) = phase {
+        h.raw(" (")
+            .text(egress::phase_text(p).to_ascii_lowercase())
+            .raw(" phase)");
+    }
+    h.raw("</a>");
+}
+
 /// Open a form posting `op` on row `id`, its button left to the caller.
 fn action_form(h: &mut Html, id: &str, auth: &Auth, op: &'static str) {
     h.raw("<form class=\"steer\" method=\"post\" action=\"")
@@ -1499,6 +1573,30 @@ fn see_other(location: &str) -> Response<Body> {
         HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static(PATH)),
     );
     resp
+}
+
+/// The proposal allowing denial `e` of job `j` ([`crate::egress::proposal`]), as an attribute's
+/// value: for a destination a hub rule refused, a name or an address, in the run or build phase.
+pub(super) fn proposal_href(j: &JobRow, e: &EgressEntry) -> Option<String> {
+    use vk_hub_proto::egress::{EgressLayer, EgressOutcome, EgressProtocol};
+    let refused = match e.outcome {
+        EgressOutcome::Blocked => true,
+        EgressOutcome::WouldBlock => e.rule.is_some(),
+        _ => false,
+    };
+    if !refused
+        || e.layer != Some(EgressLayer::HubRule)
+        || e.protocol == EgressProtocol::Other
+        || crate::egress::proposal::entry(&e.destination).is_none()
+        || crate::egress::proposal::phase_key(e.phase).is_none()
+    {
+        return None;
+    }
+    let finding = Finding::denial(e)?;
+    Some(propose::row_href(
+        &row_id(&Subject::of(j), &finding),
+        e.phase,
+    ))
 }
 
 /// The row of `finding` of job `j`'s project, as an attribute's value.

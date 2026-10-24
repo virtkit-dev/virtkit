@@ -45,6 +45,8 @@ pub(super) struct Query {
     rule: Option<String>,
     /// The form for a rule to add: the Fallback when `Some(true)`.
     new: Option<bool>,
+    /// A proposal allowing a destination.
+    propose: Option<super::propose::Ask>,
 }
 
 impl Query {
@@ -64,6 +66,7 @@ impl Query {
                 Some("fallback") => Some(true),
                 _ => None,
             },
+            propose: super::propose::Ask::of(&query),
         })
     }
 }
@@ -153,6 +156,9 @@ pub(super) async fn get(
     caches: &Arc<Caches>,
     ui: &Ui,
 ) -> Result<Response<Body>> {
+    if let Some(ask) = q.propose {
+        return super::propose::get(ask, auth, ui).await;
+    }
     let (hub, caches) = (ui.hub.clone(), caches.clone());
     let listing = blocking(move || listing(&hub, &caches)).await?;
     let operator = auth.session.role >= Role::Operator;

@@ -190,15 +190,16 @@ fn line_html(h: &mut Html, line: &TraceLine) {
 /// What `/events/job/<id>` streams: job `id`'s output and record as they change. Each stream
 /// reads the output for itself, from where it stands, rather than sharing a rendering as
 /// `/jobs`' streams do: a job's page has few readers, and each read is bounded ([`STEP`]).
-/// `counts` renders the navigation's counts, sent with the record when they change.
-pub(super) fn source(hub: &Arc<Hub>, id: &str, counts: Render) -> Source {
+/// `counts` renders the navigation's counts, sent with the record when they change; `propose`
+/// whether the record offers proposals from its denials, to an operator.
+pub(super) fn source(hub: &Arc<Hub>, id: &str, counts: Render, propose: bool) -> Source {
     let changes = hub.subscribe_job(id);
     let following = Mutex::new(Following::default());
     let (hub, id) = (hub.clone(), id.to_string());
     Source::Follow {
         name: RECORD,
         changes,
-        next: Arc::new(move || step(&hub, &id, &counts, &mut lock(&following))),
+        next: Arc::new(move || step(&hub, &id, &counts, propose, &mut lock(&following))),
     }
 }
 
@@ -223,7 +224,7 @@ struct Following {
 }
 
 /// One step of job `id`'s stream.
-fn step(hub: &Hub, id: &str, counts: &Render, f: &mut Following) -> Result<Step> {
+fn step(hub: &Hub, id: &str, counts: &Render, propose: bool, f: &mut Following) -> Result<Step> {
     let first = f.at.is_none();
     let max = if first { OPENING } else { STEP };
     let Some((row, stretch)) = crate::jobs::output_stretch(hub, id, f.at, max)? else {
@@ -237,7 +238,7 @@ fn step(hub: &Hub, id: &str, counts: &Render, f: &mut Following) -> Result<Step>
         // Its output went before the stream opened: the page keeps what it was served, and
         // takes the record, with how the job ended.
         return Ok(Step {
-            events: vec![(RECORD, record_html(hub, &row)?)],
+            events: vec![(RECORD, record_html(hub, &row, propose)?)],
             more: false,
             last: true,
         });
@@ -290,7 +291,7 @@ fn step(hub: &Hub, id: &str, counts: &Render, f: &mut Following) -> Result<Step>
     let recount = f.counts.as_ref() != Some(&counts);
     if f.record != Some(record) || ended || recount {
         f.record = Some(record);
-        let mut html = record_html(hub, &row)?;
+        let mut html = record_html(hub, &row, propose)?;
         if recount {
             html.push_str(&counts);
             f.counts = Some(counts);
@@ -304,8 +305,8 @@ fn step(hub: &Hub, id: &str, counts: &Render, f: &mut Following) -> Result<Step>
     })
 }
 
-/// Job `row`'s record, as its page shows it.
-fn record_html(hub: &Hub, row: &JobRow) -> Result<String> {
+/// Job `row`'s record, as its page shows it, with proposals from its denials when `propose`.
+fn record_html(hub: &Hub, row: &JobRow, propose: bool) -> Result<String> {
     let names = hub.db.node_names()?;
     let names: HashMap<&str, &str> = names
         .iter()
@@ -319,7 +320,7 @@ fn record_html(hub: &Hub, row: &JobRow) -> Result<String> {
         row,
         &names,
         registry.as_ref(),
-        super::job_network::Shown { reports },
+        super::job_network::Shown { reports, propose },
         crate::now_secs(),
     );
     Ok(record.into_string())

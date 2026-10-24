@@ -134,6 +134,11 @@ All notable changes to virtkit will be documented in this file.
   it stands: reports collected, an enforced and unrestricted Fallback saved, `[jobs]
   egress_rules = true`, project rules in dry-run with their would-block jobs, rules enforced, and
   the Fallback narrowed last.
+- **Operators propose a hub egress rule from what a hub rule refused**: a Blocked row, a job's
+  Network access or an Observed traffic destination outside the rules opens the rule editor
+  prefilled with the exact destination and phase, for a rule that applies to the project or a
+  new rule for exactly that project, saved only through Preview → Save. A refusal by a node's
+  cap or a job's own restrictions proposes nothing and says why.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never

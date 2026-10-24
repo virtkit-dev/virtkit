@@ -219,7 +219,7 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
 
 /// What `/events/egress?tab=observed…` streams: the listing of the query, as the jobs' reports
 /// change.
-pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query) -> Source {
+pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query, steer: bool) -> Source {
     let changes = hub.subscribe_egress();
     let (hub, caches) = (hub.clone(), caches.clone());
     Source::Own {
@@ -227,7 +227,13 @@ pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query) -> Source {
         changes,
         render: Arc::new(move || {
             let mut h = Html::new();
-            results(&mut h, &q, &listing(&hub, &caches, &q)?, crate::now_secs());
+            results(
+                &mut h,
+                &q,
+                &listing(&hub, &caches, &q)?,
+                crate::now_secs(),
+                steer,
+            );
             Ok(h.into_string())
         }),
     }
@@ -258,7 +264,8 @@ pub(super) async fn get(
         .raw("\" sse-swap=\"")
         .raw(EVENT)
         .raw("\" sse-close=\"close\">");
-    results(&mut h, &q, &listing, crate::now_secs());
+    let steer = auth.session.role >= crate::store::Role::Operator;
+    results(&mut h, &q, &listing, crate::now_secs(), steer);
     h.raw("</div></div>");
     Ok(page(fleet::layout("Egress", PATH, auth, &h)))
 }
@@ -330,10 +337,11 @@ fn who(param: &str, s: &ObservedSubject) -> String {
 }
 
 /// The part of the page that follows the jobs' reports: every project, or one project's
-/// destinations. No form: a choice being made is never reset by an update.
-fn results(h: &mut Html, q: &Query, l: &Listing, now: u64) {
+/// destinations, with proposals from them when `steer`. No form: a choice being made is never
+/// reset by an update.
+fn results(h: &mut Html, q: &Query, l: &Listing, now: u64, steer: bool) {
     match (&q.subject, &l.project) {
-        (Some(subject), Some(p)) => project(h, q, subject, l, p, now),
+        (Some(subject), Some(p)) => project(h, q, subject, l, p, now, steer),
         _ => projects(h, q, l),
     }
 }
@@ -430,7 +438,15 @@ pub(super) fn date(day: u64) -> String {
 }
 
 /// One project's destinations, the latest used first.
-fn project(h: &mut Html, q: &Query, subject: &Subject, l: &Listing, p: &Project, now: u64) {
+fn project(
+    h: &mut Html,
+    q: &Query,
+    subject: &Subject,
+    l: &Listing,
+    p: &Project,
+    now: u64,
+    steer: bool,
+) {
     let summary = l
         .subjects
         .iter()
@@ -549,7 +565,20 @@ fn project(h: &mut Html, q: &Query, subject: &Subject, l: &Listing, p: &Project,
             }
         }
         h.raw("</td><td>");
-        compared(h, &l.rules, subject, project_path, u);
+        let outside = compared(h, &l.rules, subject, project_path, u);
+        if steer && outside && Dest::of(&u.contact.destination).is_some() {
+            let who = summary
+                .as_ref()
+                .map_or_else(|| subject.param(), |(name, _)| name.clone());
+            h.raw("<div class=\"sub\">");
+            super::proposal_link(
+                h,
+                &super::propose::contact_href(subject, &u.phase, &u.contact),
+                &who,
+                None,
+            );
+            h.raw("</div>");
+        }
         h.raw("</td></tr>");
     }
     h.raw("</tbody></table>");

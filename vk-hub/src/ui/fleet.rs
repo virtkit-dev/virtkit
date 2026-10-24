@@ -153,12 +153,12 @@ pub(super) fn source(
         _ if job_event(event).is_some() => {
             return job_event(event)
                 .filter(|_| query.is_none())
-                .map(|id| job_output::source(hub, id, counts_oob(hub)));
+                .map(|id| job_output::source(hub, id, counts_oob(hub), steer));
         }
         super::egress::EVENT => {
             return Some(own_counted(
                 hub,
-                super::egress::source(hub, &site.egress, query),
+                super::egress::source(hub, &site.egress, query, steer),
             ));
         }
         super::clients::EVENT => {

@@ -30,7 +30,8 @@ use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
-    JobFilter, JobOutcome, JobPage, JobRow, NamespaceRow, NoAccess, RegistryAccess, SUMMARY_JOBS,
+    JobFilter, JobOutcome, JobPage, JobRow, NamespaceRow, NoAccess, RegistryAccess, Role,
+    SUMMARY_JOBS,
 };
 
 /// The page.
@@ -890,7 +891,10 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
         &output,
         &names,
         registry.as_ref(),
-        Shown { reports },
+        Shown {
+            reports,
+            propose: auth.session.role >= Role::Operator,
+        },
         crate::now_secs(),
     );
     Ok(page(fleet::layout("Job", PATH, auth, &main)))

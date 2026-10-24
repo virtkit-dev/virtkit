@@ -1413,7 +1413,8 @@ leaves nothing of, each with the variable and entry, what is wrong with it and w
 variable in the job's CI configuration, for an entry outside the node's cap the node's `[egress]`
 or `[egress.build]` key, and for a service's outside the job's lists the job's variable); the destinations blocked, and those a dry-run allowlist would have
 blocked, each with its protocol, phase, VM, attempts and last sighting, the layer that decided
-it and where to look, saying that a block's effect on the job's result is unknown; what the
+it and where to look — for an operator, beside one a hub rule decided, *Propose allowing for*
+its project — saying that a block's effect on the job's result is unknown; what the
 job reached, folded; and per phase whether the node recorded everything, with what it left out
 past the report's bounds, and the bytes forwarded. A list longer than 20 is folded. A job that
 ran without a report says *Reporting unavailable*, never that it reached nothing; while it
@@ -1455,17 +1456,20 @@ each linked, with its ref, node, attempts and result, which a denial's effect on
 refused declaration caused — the VMs and refs, with the protection GitLab reported, and where to
 look to allow it by the layer that decided it: the node's `[egress]` or `[egress.build]` key and
 the nodes, or the job's or a service's variable in the job's CI configuration; for a hub rule the
-rules, and for an unknown layer the evidence alone. The rows are kept with the job history: a
-job's record adds its share as it is written, once however often, and takes it back as it leaves
-the history; a hub upgraded from a version without them builds them from the history on start.
-The page names the nodes that take placed jobs and do not announce egress reporting, whose jobs
-cannot appear there. Its rows, with the job chip and the views' counts, follow the jobs' reports
-— a running job's as its record is written with them, the first at once and later ones at most
-every 30 seconds or with the next stage — and the rows' triage over `/events/egress`, which
-takes the page's filter; the filter's form and the mutes stay outside what is swapped in, and a
-filter change replaces the part that follows, stream and all. The navigation's count of New rows
-rides every live page's stream, swapped in out of band: at once where the stream follows the
-change, within a heartbeat elsewhere.
+rules, and for an unknown layer the evidence alone. Its *Allow it* section offers an operator a
+proposal for a destination its latest jobs recorded as refused by a hub rule (below), a phase at
+a time, and otherwise says why there is none: a node's cap, which no hub rule widens, the job's
+own narrowing, an unknown layer, or a destination that is not a name or an address. The rows
+are kept with the job history: a job's record adds its share as it is written, once however often,
+and takes it back as it leaves the history; a hub upgraded from a version without them builds them
+from the history on start. The page names the nodes that take placed jobs and do not announce egress
+reporting, whose jobs cannot appear there. Its rows, with the job chip and the views' counts, follow
+the jobs' reports — a running job's as its record is written with them, the first at once and later
+ones at most every 30 seconds or with the next stage — and the rows' triage over `/events/egress`,
+which takes the page's filter; the filter's form and the mutes stay outside what is swapped in, and
+a filter change replaces the part that follows, stream and all. The navigation's count of New rows
+rides every live page's stream, swapped in out of band: at once where the stream follows the change,
+within a heartbeat elsewhere.
 
 A row is *New* until an operator acknowledges it on its page, and *New* again once a job adds to
 it — a job newly sharing it, or one with more attempts — however soon after. An operator also
@@ -1517,7 +1521,8 @@ the caps it has now (by their fingerprint, as each phase of a job's report names
 recorded on the job at placement), of the latest
 10,000 of the history, *no observed use since* the first of them when that is within the 30
 days, and the caution that only the hub's jobs count: other workloads on the node may use
-them. A job counts from the day it first used a destination, and the day
+them. An operator sees, on a destination outside the rules for some ref, *Propose allowing for*
+its project (below). A job counts from the day it first used a destination, and the day
 before the window too, since it may have used it again within. Nothing is removed. Each read takes at most 200,000 records of each of the store's tables, and says
 when it was cut.
 
@@ -1535,6 +1540,23 @@ reports them, a dry-run run phase marked, too large to report, or not reported b
 with its entries no job placed under them used, as on Observed traffic. The list, and a rule's
 page but its forms, follow the rules, the jobs' reports and the nodes' inventories over
 `/events/egress?tab=rules[&rule=<name>]`.
+
+`/egress?tab=rules&propose=<row ID>&phase=run|build`, *Propose allowing for* a project, is an
+operator's, from a Blocked row, a job's Network access (beside a denial a hub rule decided) or a
+destination of Observed traffic outside the rules
+(`&propose=observed&project=<subject>&contact=<contact>`). Only a denial its nodes recorded as a
+hub rule's seeds one, a would-block naming the dry-run rule that would have refused it; never a
+node's cap's, a narrowing's, an unknown layer's, a declaration, or a destination that is neither
+a domain nor an IPv4 address and a port other than 0. A plain GET form chooses the phase and the
+rule to change: one that applies to the project's jobs now — for a block the enforced rules or
+the Fallback, for a would-block its dry-run rule — those already allowing it or unrestricted in
+that phase shown and not offered, or *A new rule for exactly this project*, by its ID or its
+exact path, in dry-run, starting from the entry alone, or if asked from the enforced Fallback's
+lists, warned that they then reach every job of the project the rule selects, whatever its ref;
+and warned of when these jobs mix both. It prefills the editor with the exact entry —
+`deb.debian.org`, which allows it and its subdomains, never broadened; an address as
+`10.0.0.1/32:443`, over TCP and UDP — and warns when the rule selects other projects, or is in
+dry-run. Nothing is saved but through Preview → Save.
 
 An operator adds a rule (`&new=rule`, or the Fallback with `&new=fallback`), and changes or
 removes one from its page, through Preview → Save, posted to `/egress/rules`: the GitLab
