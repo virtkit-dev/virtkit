@@ -1811,9 +1811,9 @@ async fn a_job_s_egress_report_is_kept_bounded() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A running job's egress report from a version-6 node is kept on its record, never replaced by
-/// an older revision; its result's replaces it. A job its hub ends keeps the last, as far as it
-/// went. A version-3 node sending one ends its session.
+/// A running job's egress report from a version-6 node is kept on its record and in the Egress
+/// page's rows, never replaced by an older revision; its result's replaces it. A job its hub
+/// ends keeps the last, as far as it went. A version-3 node sending one ends its session.
 /// (Written as it comes: [`Hub::writing_egress_every`] is zero.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
@@ -1862,6 +1862,14 @@ async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
         ..EgressReport::default()
     };
     let live = |job: &str| hub.db.job(job).unwrap().unwrap().egress;
+    let attempts = || {
+        hub.db
+            .egress_rows()
+            .unwrap()
+            .iter()
+            .map(|(_, r)| r.attempts)
+            .sum::<u64>()
+    };
 
     let job = running_job(addr, &key, &mut node, 1).await;
     node.send(NodeJobMsg::Egress {
@@ -1869,6 +1877,7 @@ async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
         report: report(2, 3),
     });
     wait_until(|| live(&job).is_some_and(|r| r.revision == 2)).await;
+    assert_eq!(attempts(), 3, "the Blocked rows follow it");
     // An older revision, replayed, changes nothing; a newer one replaces the counts.
     node.send(NodeJobMsg::Egress {
         job: job.clone(),
@@ -1879,6 +1888,7 @@ async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
         report: report(3, 5),
     });
     wait_until(|| live(&job).is_some_and(|r| r.revision == 3)).await;
+    assert_eq!(attempts(), 5);
     let mut ended = result(None, 0);
     ended.egress = Some(report(4, 6));
     node.send(NodeJobMsg::Result {
@@ -1890,6 +1900,7 @@ async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
     let row = hub.db.job(&job).unwrap().unwrap();
     assert_eq!(row.egress, None);
     assert_eq!(row.result.unwrap().egress, Some(report(4, 6)));
+    assert_eq!(attempts(), 6);
 
     // Lost with its node: what it reported, as far as it went.
     let lost = running_job(addr, &key, &mut node, 2).await;

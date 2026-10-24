@@ -1196,8 +1196,8 @@ async fn on_output(
 }
 
 /// A running job's egress report: kept when it is newer than the one held, for the job's page
-/// and the job list to show at once. Its record is written by [`write_egress`] within
-/// [`Dispatch::egress_write_every`].
+/// and the job list to show at once. Its record is written by [`write_egress`], so the Egress
+/// page's rows follow it within [`Dispatch::egress_write_every`].
 fn on_egress(hub: &Hub, node: &str, id: &str, report: EgressReport) -> Vec<HubJobMsg> {
     {
         let mut state = hub.dispatch.lock();

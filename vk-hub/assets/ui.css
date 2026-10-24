@@ -93,6 +93,18 @@ p { margin: var(--s2) 0; }
 }
 .topbar nav a:hover { background: var(--raised); color: var(--fg); text-decoration: none; }
 .topbar nav a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* Things waiting for someone, beside the entry leading to them. */
+.topbar nav .count {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0 var(--s1);
+  border-radius: 999px;
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 0.8em;
+  font-weight: 600;
+  text-align: center;
+}
 .who { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin: 0; }
 .who .identity { font-weight: 500; }
 .who .until { color: var(--muted); font-size: 0.9em; }

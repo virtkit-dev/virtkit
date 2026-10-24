@@ -627,6 +627,7 @@ mod tests {
             session,
             csrf: String::new(),
             secret,
+            counts: Vec::new(),
         };
         (hub, auth)
     }

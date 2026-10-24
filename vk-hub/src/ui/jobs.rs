@@ -1233,7 +1233,7 @@ fn activity_cell(h: &mut Html, activity: &vk_hub_proto::dispatch::Activity) {
 
 /// How the job stands: its outcome's colour, with the failure's class and exit code, or the
 /// stage it is in — what it does, while it prepares.
-fn result_badge(h: &mut Html, j: &JobRow) {
+pub(super) fn result_badge(h: &mut Html, j: &JobRow) {
     let result = j.result.as_ref();
     let text = match j.outcome() {
         JobOutcome::Running => crate::jobs::state_text(j),

@@ -1415,6 +1415,28 @@ closes. The output stays scrolled to its end as it grows, unless scrolled up to 
 last 2 MiB of text or so, with a notice for omitted lines and the remaining line numbers intact.
 This requires the embedded `follow.js`; without it, output grows unscrolled and untrimmed.
 
+`/egress`, *Egress* in the navigation, opens on the Blocked tab of the [Egress
+page](fleet-design.md#job-egress-from-the-hub). The Blocked tab lists what the jobs of the
+history were refused, from their nodes' reports, a row per destination (protocol, and a port,
+kept; a domain never merged into a suffix) or refused declaration (variable and entry) and per
+project — a project of the GitLab instance its jobs' key is bound to, by GitLab's ID, or for a
+key bound to none every job of the key. *Blocked*, *Would block* and *Declaration issues* are
+separate views (`view=blocked|would_block|refused`), each with its count. A row shows its jobs
+and attempts in the history, its latest job's end, the layers that decided it in plain words,
+and its state; at most 200 rows, the latest first. Project (`project=gitlab:<instance>:<ID>` or
+`key:<key ID>`), deciding layer (`layer=node_cap|hub_rule|job|service|unknown`), phase
+(`phase=run|build|other`) and job (`job=<ID>`: the rows it shares) filter it, applied at once
+with htmx as on the audit log. A row's page, `/egress/rows/<id>`, shows its latest 20 jobs —
+each linked, with its ref, node, attempts and result, which a denial's effect on is unknown and a
+refused declaration caused — the VMs and refs, with the protection GitLab reported, and where to
+look to allow it by the layer that decided it: the node's `[egress]` or `[egress.build]` key and
+the nodes, or the job's or a service's variable in the job's CI configuration; for a hub rule the
+rules, and for an unknown layer the evidence alone. The rows are kept with the job history: a
+job's record adds its share as it is written, once however often, and takes it back as it leaves
+the history; a hub upgraded from a version without them builds them from the history on start.
+The page names the nodes that take placed jobs and do not announce egress reporting, whose jobs
+cannot appear there. The navigation counts the New rows.
+
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,
 the projects they may submit jobs of (*All projects* when one key's ceiling is the whole

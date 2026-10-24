@@ -14,6 +14,7 @@ use vk_hub_proto::egress::{
 
 use crate::store::JobRow;
 
+pub mod blocked;
 pub mod rules;
 
 /// The report to keep of `stored` and `incoming`: the one with the higher revision, `incoming`
@@ -916,8 +917,11 @@ mod tests {
 pub(crate) mod testing {
     use vk_hub_proto::egress::{
         EgressCoverage, EgressDestination, EgressEntry, EgressLayer, EgressOmitted, EgressOutcome,
-        EgressPhase, EgressPhaseReport, EgressProtocol, EgressSource,
+        EgressPhase, EgressPhaseReport, EgressProtocol, EgressReport, EgressSource,
     };
+    use vk_hub_proto::job::JobResult;
+
+    use crate::store::JobRow;
 
     /// One attempt from the job's VM in the run phase, decided by `layer` for a denial.
     pub fn entry(
@@ -938,6 +942,61 @@ pub(crate) mod testing {
             last_seen_ms: 1_000_000,
             stage: None,
             rule: None,
+        }
+    }
+
+    /// Job `n`, of key `k` and project `acme/web`, ended at second `1_000 + n` on node `n1` with
+    /// `report`.
+    pub fn job(n: u64, report: EgressReport) -> JobRow {
+        use vk_hub_proto::client::{JobState, Placement};
+        JobRow {
+            key: "k".into(),
+            key_name: "gitlab".into(),
+            instance: None,
+            request_id: format!("{n:032}"),
+            placement: Placement {
+                pool: "ci".into(),
+                labels: vec![],
+                envelope: vk_hub_proto::job::Envelope::default(),
+            },
+            title: format!("GitLab job {n} of acme/web (build)"),
+            job_url: None,
+            project: Some("acme/web".into()),
+            name: Some(format!("build-{n}")),
+            git_ref: Some("main".into()),
+            pipeline: None,
+            commit: None,
+            created_at: 1_000,
+            state: JobState::Finished,
+            revision: 3,
+            node: Some("n1".into()),
+            stage: None,
+            activity: None,
+            cancel: None,
+            result: Some(JobResult {
+                failure: None,
+                exit_code: None,
+                message: None,
+                output_len: 0,
+                artifacts: vec![],
+                usage: None,
+                events: vec![],
+                egress: Some(report),
+            }),
+            output_len: 0,
+            started_at: Some(1_000),
+            prepared_at: None,
+            guest: None,
+            finished_at: Some(1_000 + n),
+            settled_at: None,
+            expired_at: None,
+            registry_access: None,
+            gitlab: None,
+            project_id: None,
+            protected: None,
+            egress_rules: None,
+            egress_caps: None,
+            egress: None,
         }
     }
 

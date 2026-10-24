@@ -66,6 +66,12 @@ All notable changes to virtkit will be documented in this file.
   A job's build-phase contacts and refusals are recorded whether or not audit is on.
 - **`vk-hub jobs show` sums up a job's egress**: what was refused or blocked, where to change
   it, and whether its node recorded everything.
+- **The hub's web UI has an Egress page**: what jobs were blocked, would be blocked under
+  dry-run, or declared amiss — an invalid entry, which failed them, or one a setting above
+  leaves nothing of — by destination and project, with how
+  many jobs and attempts and which setting refused it; filtered by project, layer, phase or
+  job. Each row lists its latest jobs and where to allow it. The navigation counts the new
+  rows, and the page names the nodes whose jobs cannot appear because they do not report.
 - **Nodes report a placed job's egress while it runs, not only with its result**, to a hub at
   this version; an older hub still gets it once the job ends.
 - **Nodes enforce the egress rules a hub sends with a placed job**, in the run and build

@@ -545,6 +545,8 @@ impl Db {
                 .insert(id, encode(row)?.as_slice())?
                 .is_some();
             if !replaced {
+                // A job submitted has no report; a record restored with one shares it.
+                super::egress::reshare(&txn, id, None, Some(row))?;
                 let mut counts = txn.open_table(JOB_COUNTS)?;
                 let n = counts.get(row.key.as_str())?.map_or(0, |g| g.value());
                 counts.insert(row.key.as_str(), n.saturating_add(1))?;
@@ -623,6 +625,7 @@ impl Db {
                     let mut row = row.clone();
                     row.expired_at = row.expired_at.or(stored.expired_at);
                     table.insert(id, encode(&row)?.as_slice())?;
+                    super::egress::reshare(&txn, id, Some(&stored), Some(&row))?;
                     true
                 }
             }
@@ -931,7 +934,7 @@ impl Db {
                     if holds_output(&row) {
                         outputs.push(id.clone());
                     }
-                    dropped.push((id, row.key));
+                    dropped.push((id, row));
                 }
             }
             for seq in unplaced {
@@ -941,9 +944,10 @@ impl Db {
             let mut lens = txn.open_table(JOB_TAIL_LENS)?;
             let mut uncached = HashMap::new();
             let mut uncounted: HashMap<&str, u64> = HashMap::new();
-            for (id, key) in &dropped {
+            for (id, row) in &dropped {
                 table.remove(id.as_str())?;
-                let n = uncounted.entry(key.as_str()).or_default();
+                super::egress::reshare(&txn, id, Some(row), None)?;
+                let n = uncounted.entry(row.key.as_str()).or_default();
                 *n = n.saturating_add(1);
                 specs.remove(id.as_str())?;
                 tails.remove(id.as_str())?;

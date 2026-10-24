@@ -272,6 +272,12 @@ pub(super) async fn get(
     if path == super::clients::PATH {
         return super::clients::get(query, auth, ui).await.map(Some);
     }
+    if path == super::egress::PATH {
+        return super::egress::get(query, auth, ui).await.map(Some);
+    }
+    if let Some(id) = super::egress::row_target(path) {
+        return super::egress::row(id, auth, ui).await.map(Some);
+    }
     if path == super::jobs::PATH {
         return super::jobs::get(query, auth, &site.jobs, ui, swap)
             .await
@@ -738,10 +744,24 @@ fn nav(auth: &Auth) -> pages::Nav {
     }
 }
 
+/// The counts the fleet's navigation shows: the New egress rows.
+pub(super) async fn nav_counts(hub: &Arc<Hub>) -> Result<Vec<(&'static str, u64)>> {
+    let hub = hub.clone();
+    blocking(move || counts(&hub)).await
+}
+
+fn counts(hub: &Hub) -> Result<Vec<(&'static str, u64)>> {
+    Ok(vec![(
+        super::egress::PATH,
+        hub.db.egress_new(crate::now_secs())?,
+    )])
+}
+
 const NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
+    (super::egress::PATH, "Egress"),
     (super::clients::PATH, "Connections"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
@@ -751,6 +771,7 @@ const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
     (super::registries::PATH, "Registries"),
     (super::jobs::PATH, "Jobs"),
+    (super::egress::PATH, "Egress"),
     (super::clients::PATH, "Connections"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),

@@ -43,6 +43,7 @@ use crate::rollout::{
 
 mod audit;
 mod clients;
+mod egress;
 mod egress_rules;
 mod gitlabs;
 mod jobs;
@@ -54,6 +55,7 @@ mod tools;
 
 pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
+pub use egress::{BlockedRow, Mute, RowRange, Stored};
 pub use egress_rules::{
     DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, phase_text as rule_phase_text,
     resolve_egress,
@@ -810,6 +812,7 @@ impl Db {
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;
         audit::index_audit_by_who(&txn).context("indexing the audit log by who")?;
+        egress::share_history(&txn).context("gathering the history's egress reports")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,

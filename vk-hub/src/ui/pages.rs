@@ -67,7 +67,11 @@ pub fn frame(title: &str, here: &str, auth: &Auth, nav: Nav, main: &Html) -> Htm
         if path == current {
             h.raw(" aria-current=\"page\"");
         }
-        h.raw(">").raw(label).raw("</a>");
+        h.raw(">").raw(label);
+        if let Some((_, n)) = auth.counts.iter().find(|(p, _)| *p == path) {
+            nav_count(&mut h, path, *n, false);
+        }
+        h.raw("</a>");
     }
     let s = &auth.session;
     let principal = s.principal();
@@ -91,6 +95,22 @@ pub fn frame(title: &str, here: &str, auth: &Auth, nav: Nav, main: &Html) -> Htm
         .html(main)
         .raw("</main></body></html>");
     h
+}
+
+/// The count beside the navigation's entry for `path`, when there are any, in an element of its
+/// own that a live page swaps in out of band (`oob`) to keep it current.
+fn nav_count(h: &mut Html, path: &str, n: u64, oob: bool) {
+    h.raw("<span id=\"nav-count")
+        .text(path.replace('/', "-"))
+        .raw("\"");
+    if oob {
+        h.raw(" hx-swap-oob=\"true\"");
+    }
+    h.raw(">");
+    if n > 0 {
+        h.raw(" <span class=\"count\">").text(n).raw("</span>");
+    }
+    h.raw("</span>");
 }
 
 /// The longest path in `nav` matching `here` or a parent, ignoring query and fragment.

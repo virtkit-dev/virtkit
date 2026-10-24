@@ -3486,7 +3486,8 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         assert!(
             page.contains(
                 "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
-                 <a href=\"/jobs\">Jobs</a><a href=\"/clients\">Connections</a>\
+                 <a href=\"/jobs\">Jobs</a><a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
+                 <a href=\"/clients\">Connections</a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -4053,7 +4054,8 @@ async fn api_keys_and_their_clients_are_shown_live() {
         let (cookie, _) = sign_in(addr, &hub, role).await;
         let page = get(addr, "/clients?tab=other", Some(&cookie)).await.body;
         for want in [
-            "<a href=\"/jobs\">Jobs</a><a href=\"/clients\" aria-current=\"page\">Connections</a>",
+            "<a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
+             <a href=\"/clients\" aria-current=\"page\">Connections</a>",
             "sse-connect=\"/events/clients\"",
             &format!("<a href=\"/jobs?key={id}\">1</a>"),
             "ci-1&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;&lt;img",
@@ -8034,4 +8036,165 @@ async fn a_job_page_says_what_registry_access_the_job_got() {
         .unwrap();
     let body = get(addr, &format!("/jobs/{old}"), Some(&viewer)).await.body;
     assert!(!body.contains("Registry access"), "{body}");
+}
+
+/// Job `n` of `project` (`gitlab:gl:<project_id>`), ended on `node` with `report`, recorded as
+/// the hub records one.
+fn egress_job(
+    hub: &Hub,
+    n: u64,
+    project_id: u64,
+    node: &str,
+    report: vk_hub_proto::egress::EgressReport,
+) -> String {
+    let id = format!("{n:032x}");
+    let mut row = crate::egress::testing::job(n, report);
+    row.node = Some(node.to_string());
+    row.gitlab = Some("gl".into());
+    row.project_id = Some(project_id);
+    row.project = Some(format!("acme/p{project_id}"));
+    row.protected = Some(true);
+    let mut queued = row.clone();
+    queued.result = None;
+    hub.db
+        .submit_job(&id, &queued, &id, b"{}", "key gitlab", 10)
+        .unwrap();
+    assert!(hub.db.put_job(&id, &row, &[], 11).unwrap());
+    id
+}
+
+/// Two jobs' blocked destination, each with the evidence its node recorded.
+fn blocked_report(dest: &str, count: u64) -> vk_hub_proto::egress::EgressReport {
+    use vk_hub_proto::egress::*;
+    EgressReport {
+        entries: vec![EgressEntry {
+            count,
+            ..crate::egress::testing::entry(
+                EgressOutcome::Blocked,
+                EgressProtocol::Dns,
+                EgressDestination::domain(dest),
+                Some(EgressLayer::NodeCap),
+            )
+        }],
+        ..EgressReport::default()
+    }
+}
+
+/// The Egress page lists what jobs were refused by destination and project, as text, the
+/// views apart with their counts; a row's page shows its latest jobs and where to allow it;
+/// the navigation counts the New rows; nodes without reporting are named.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_egress_page_lists_denials_by_destination_and_project() {
+    use vk_hub_proto::egress::*;
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let empty = get(addr, "/egress", Some(&viewer)).await;
+    assert_eq!(empty.status, 200, "{}", empty.body);
+    assert!(empty.body.contains("nothing refused yet"), "{}", empty.body);
+    assert!(!empty.body.contains("class=\"count\""));
+
+    let a = egress_job(&hub, 1, 42, &node, blocked_report("crates.io", 2));
+    let b = egress_job(&hub, 2, 42, &node, blocked_report("crates.io", 3));
+    let mut refused = blocked_report("pypi.org", 1);
+    refused.refusals.push(EgressRefusal {
+        variable: "MICROVM_EGRESS_ALLOW_NAME".into(),
+        entry: "<script>x</script>".into(),
+        dimension: EgressDimension::Name,
+        phase: EgressPhase::Run,
+        source: EgressSource::Job,
+        layer: Some(EgressLayer::NodeCap),
+        reason: RefusalReason::InvalidEntry,
+    });
+    let c = egress_job(&hub, 3, 7, &node, refused);
+
+    let page = get(addr, "/egress", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let body = &page.body;
+    assert!(body.contains("<code>DNS crates.io</code>"), "{body}");
+    assert!(body.contains("acme/p42 on gl"), "{body}");
+    assert!(body.contains("Blocked (2)") && body.contains("Declaration issues (1)"));
+    assert!(body.contains("the node&#39;s cap"), "{body}");
+    // Three New rows: two destinations and a declaration.
+    assert!(
+        body.contains("Egress<span id=\"nav-count-egress\"> <span class=\"count\">3</span></span>"),
+        "{body}"
+    );
+    assert!(!body.contains("<script>x"));
+
+    let refusals = get(addr, "/egress?view=refused", Some(&viewer)).await.body;
+    assert!(
+        refusals.contains("MICROVM_EGRESS_ALLOW_NAME &lt;script&gt;x&lt;/script&gt;"),
+        "{refusals}"
+    );
+    assert!(!refusals.contains("crates.io</code>"));
+    // By project, by job.
+    let p7 = get(addr, "/egress?project=gitlab%3Agl%3A7", Some(&viewer))
+        .await
+        .body;
+    assert!(
+        p7.contains("pypi.org") && !p7.contains("crates.io</code>"),
+        "{p7}"
+    );
+    let of_a = get(addr, &format!("/egress?job={a}"), Some(&viewer))
+        .await
+        .body;
+    assert!(
+        of_a.contains("crates.io") && !of_a.contains("pypi.org"),
+        "{of_a}"
+    );
+    let of_c = get(addr, &format!("/egress?job={c}&layer=job"), Some(&viewer))
+        .await
+        .body;
+    assert!(of_c.contains("none match"), "{of_c}");
+
+    // A row's page: its jobs, latest first, and where to allow it.
+    let subject = crate::egress::blocked::Subject::Gitlab {
+        instance: "gl".into(),
+        project_id: 42,
+    };
+    let finding = crate::egress::blocked::Finding::Denial {
+        view: crate::egress::blocked::View::Blocked,
+        protocol: EgressProtocol::Dns,
+        destination: EgressDestination::domain("crates.io"),
+    };
+    let row = crate::egress::blocked::row_id(&subject, &finding);
+    let detail = get(addr, &format!("/egress/rows/{row}"), Some(&viewer)).await;
+    assert_eq!(detail.status, 200, "{}", detail.body);
+    let body = &detail.body;
+    assert!(body.contains("2 in the history"), "{body}");
+    assert!(
+        body.contains("<code>[egress] allow_name</code> on node ci-1"),
+        "{body}"
+    );
+    assert!(body.contains("main (protected)"), "{body}");
+    assert!(body.contains("effect on it is unknown"), "{body}");
+    let (at_a, at_b) = (body.find(&a).unwrap(), body.find(&b).unwrap());
+    assert!(at_b < at_a, "the latest first: {body}");
+    let unknown = format!("/egress/rows/{}", "0".repeat(32));
+    assert_eq!(get(addr, &unknown, Some(&viewer)).await.status, 404);
+
+    // A node taking placed jobs without reporting is named; once it reports, it is not.
+    hub.db
+        .set_pools(&node, &["ci".to_string()], "uid 0", crate::now_secs())
+        .unwrap();
+    let inventory = vk_hub_proto::Inventory {
+        hostname: "ci-1".into(),
+        ..Default::default()
+    };
+    hub.db
+        .record_inventory(&node, inventory.clone(), true, 2)
+        .unwrap();
+    let body = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(
+        body.contains("Reporting unavailable on <a href=\"/node/") && body.contains(">ci-1</a>"),
+        "{body}"
+    );
+    let reporting = vk_hub_proto::Inventory {
+        egress_reports: true,
+        ..inventory
+    };
+    hub.db.record_inventory(&node, reporting, true, 3).unwrap();
+    let body = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(!body.contains("Reporting unavailable"), "{body}");
 }

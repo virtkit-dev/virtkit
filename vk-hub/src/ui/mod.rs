@@ -67,6 +67,7 @@ mod assets;
 mod body;
 mod clients;
 mod dev;
+mod egress;
 mod fleet;
 pub mod html;
 mod job_output;
@@ -356,13 +357,19 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             if from_another_site(req.headers()) {
                 return Ok(message(StatusCode::FORBIDDEN, ANOTHER_SITE));
             }
-            let auth = match authenticate(req.headers(), ui).await? {
+            let mut auth = match authenticate(req.headers(), ui).await? {
                 Ok(auth) => auth,
                 Err(why) => {
                     return Ok(signed_out_stream(&path, req.headers(), ui)
                         .unwrap_or_else(|| ui.signed_out_page(StatusCode::UNAUTHORIZED, why)));
                 }
             };
+            // A page's navigation, not a stream's fragments.
+            if let Site::Fleet(_) = &ui.site
+                && !path.starts_with("/events/")
+            {
+                auth.counts = fleet::nav_counts(&ui.hub).await?;
+            }
             let swap = jobs::filter_swap(req.headers());
             get(&path, req.uri().query(), &auth, ui, swap).await
         }
@@ -610,6 +617,9 @@ pub struct Auth {
     /// The cookie: what a sign-out ends the session by, rather than its ID, which another
     /// may share, and what a live update checks the session by on every render.
     secret: String,
+    /// The counts its page's navigation shows beside its entries, by path: things waiting
+    /// for someone, such as New egress rows. Filled for a fleet page alone.
+    pub counts: Vec<(&'static str, u64)>,
 }
 
 /// The session the request's cookie names if it is live, or why there is none.
@@ -628,6 +638,7 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
             session,
             csrf,
             secret,
+            counts: Vec::new(),
         })
         .ok_or(ui.texts().signed_out))
 }
