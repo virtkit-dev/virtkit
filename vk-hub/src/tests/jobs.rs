@@ -1708,6 +1708,74 @@ async fn a_job_s_events_are_kept_bounded_found_and_shown() {
     );
 }
 
+/// The egress report a node sends with a job's result is held to its bounds again before it is
+/// kept: past the bound, denials are counted rather than listed, and a destination that is not
+/// a name is kept as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_s_egress_report_is_kept_bounded() {
+    use vk_hub_proto::egress::{
+        EgressCoverage, EgressDestination, EgressEntry, EgressLayer, EgressOutcome, EgressPhase,
+        EgressPhaseReport, EgressProtocol, EgressReport, EgressSource, MAX_EGRESS_DENIALS,
+    };
+    let dir = scratch("job-egress");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 8192).await;
+
+    let id = running_job(addr, &key, &mut node, 1).await;
+    let denial = |name: String| EgressEntry {
+        outcome: EgressOutcome::Blocked,
+        protocol: EgressProtocol::Dns,
+        destination: EgressDestination::Domain { name },
+        phase: EgressPhase::Run,
+        source: EgressSource::Job,
+        layer: Some(EgressLayer::NodeCap),
+        count: 1,
+        first_seen_ms: 1_000,
+        last_seen_ms: 1_000,
+        stage: None,
+        rule: None,
+    };
+    let mut ended = result(None, 0);
+    ended.egress = Some(EgressReport {
+        revision: 1,
+        entries: std::iter::once("evil\x1b[2J.example".to_string())
+            .chain((1..MAX_EGRESS_DENIALS + 10).map(|i| format!("d{i}.example")))
+            .map(denial)
+            .collect(),
+        phases: vec![EgressPhaseReport {
+            phase: EgressPhase::Run,
+            coverage: EgressCoverage::Complete,
+            omitted: Default::default(),
+            sent_bytes: Some(1),
+            received_bytes: Some(2),
+            caps: None,
+        }],
+        ..EgressReport::default()
+    });
+    node.send(NodeJobMsg::Result {
+        job: id.clone(),
+        result: ended,
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+    view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
+    let row = hub.db.job(&id).unwrap().unwrap();
+    let report = row.result.unwrap().egress.unwrap();
+    assert_eq!(report.entries.len(), MAX_EGRESS_DENIALS);
+    assert!(
+        matches!(&report.entries[0].destination, EgressDestination::Malformed { text }
+            if !text.contains('\x1b')),
+        "{:?}",
+        report.entries[0]
+    );
+    let run = &report.phases[0];
+    assert_eq!(
+        (run.coverage, run.omitted.blocked),
+        (EgressCoverage::Partial, 10)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A job ended in memory but not yet written is read as it ended, never as the older row
 /// the database still holds, whose output is shorter than a reader was already given.
 #[tokio::test(flavor = "multi_thread")]

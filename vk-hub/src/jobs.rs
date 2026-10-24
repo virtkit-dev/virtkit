@@ -60,6 +60,7 @@ use vk_hub_proto::dispatch::{
     Held, HubJobMsg, JobStart, LeaseEnd, LeaseState, MAX_LEASE_SECS, MAX_OUTPUT_CHUNK, NodeJobMsg,
     OfferReply, Refusal, RunState,
 };
+use vk_hub_proto::egress::EgressReport;
 use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 
@@ -1188,6 +1189,8 @@ async fn on_result(
                 ),
             );
         }
+        // Held to its bounds again.
+        result.egress = result.egress.take().map(EgressReport::bounded);
         // Audited only when the node or its images failed it, for an operator to see; its
         // record holds its node, result and events either way.
         let audited = matches!(
