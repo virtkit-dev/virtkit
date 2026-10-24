@@ -997,6 +997,12 @@ fn lost_section(h: &mut Html, p: &Preview) {
             .raw(" whose access it changes sent no report</li>");
     }
     h.raw("</ul>");
+    if p.dropped > 0 {
+        h.raw("<p class=\"callout warn\">Incomplete: ")
+            .text(p.dropped)
+            .raw(" destinations used by the projects whose access it changes were not kept, ")
+            .raw("past each project's bound, so they are not listed here.</p>");
+    }
     if p.lost.is_empty() && p.maybe_lost.is_empty() {
         h.raw("<p class=\"empty\">none of the destinations reported</p>");
     }
@@ -1095,6 +1101,7 @@ mod tests {
             affected: Default::default(),
             affected_unreported: 0,
             observed_capped: false,
+            dropped: 0,
         };
         let mut h = Html::new();
         lost_section(&mut h, &p);
@@ -1102,5 +1109,13 @@ mod tests {
         let (sure, maybe) = out.split_once("Blocked unless a lookup").unwrap();
         assert!(sure.contains("2 more not listed."), "{out}");
         assert!(maybe.contains("3 more not listed."), "{out}");
+        assert!(!out.contains("Incomplete"), "{out}");
+        let mut h = Html::new();
+        lost_section(&mut h, &Preview { dropped: 4, ..p });
+        let out = h.into_string();
+        assert!(
+            out.contains("Incomplete: 4 destinations used by the projects whose access"),
+            "{out}"
+        );
     }
 }

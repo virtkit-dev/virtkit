@@ -11,7 +11,7 @@
 //! Every read is bounded: the latest [`JOB_SCAN`] jobs, [`OBSERVED_SCAN`] records of each of
 //! Observed traffic's tables; what is shown is bounded apart, and each says when it was cut.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use vk_hub_proto::egress::{EgressPhase, HubEgress};
@@ -140,6 +140,9 @@ pub struct Preview {
     pub affected_unreported: u64,
     /// Whether a bound cut what was read of Observed traffic.
     pub observed_capped: bool,
+    /// The contacts Observed traffic did not keep, past their project's bound, of the projects
+    /// whose access the change alters: `lost` cannot hold them.
+    pub dropped: u64,
 }
 
 /// How completely the jobs whose access a change alters reported one phase.
@@ -320,11 +323,15 @@ pub fn preview(
         l.last_day = l.last_day.max(r.day);
     })?;
     let mut unreported = 0u64;
+    let mut altering = BTreeSet::new();
     observed_capped |= !hub.db.coverage_records(OBSERVED_SCAN, |r| {
         let Some((_, claims)) = claims_at(&r.subject, &r.protection, &r.git_ref) else {
             return;
         };
         let (before, after) = layers.of(claims.as_ref());
+        if before != after {
+            altering.insert(r.subject.clone());
+        }
         if r.phase == UNREPORTED {
             if before != after {
                 unreported = unreported.saturating_add(r.jobs);
@@ -337,6 +344,10 @@ pub fn preview(
             e.complete = e.complete.saturating_add(r.complete);
         }
     })?;
+    let dropped = altering
+        .iter()
+        .filter_map(|param| subjects.get(param))
+        .fold(0u64, |n, s| n.saturating_add(s.dropped));
     let mut lost: Vec<Lost> = lost.into_values().collect();
     lost.sort_by(|a, b| b.jobs.cmp(&a.jobs).then(b.last_day.cmp(&a.last_day)));
     let (mut maybe_lost, mut lost): (Vec<Lost>, Vec<Lost>) =
@@ -359,6 +370,7 @@ pub fn preview(
         affected,
         affected_unreported: unreported,
         observed_capped,
+        dropped,
     })
 }
 

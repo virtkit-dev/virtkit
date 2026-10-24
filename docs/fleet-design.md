@@ -800,7 +800,8 @@ list beside an empty one. Subjects read as the namespaces page words them, and `
 *Fallback*, listed apart. A change goes through Preview → Save: Preview shows recent jobs the
 rule selects with their permissions before and after, including where it replaces the
 Fallback, and the observed destinations it would block, or *insufficient evidence* without
-reports. **Test a job** takes a recent job, or a GitLab instance, project, ref and protection,
+reports; marked *incomplete* when its projects used destinations past Observed traffic's bound,
+which it cannot list. **Test a job** takes a recent job, or a GitLab instance, project, ref and protection,
 and optionally a node, and shows each layer apart — the rules selected, dry-run candidates,
 whether the Fallback applies, the node's cap, the job's and services' narrowing when known —
 then the result per phase and VM, each layer evaluated on its own and the result allowing only

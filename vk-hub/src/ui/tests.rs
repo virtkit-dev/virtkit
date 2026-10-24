@@ -8850,6 +8850,50 @@ fn form_of(body: &str, op: &str) -> String {
     out.join("&")
 }
 
+/// A rules preview counts the destinations Observed traffic did not keep of the projects whose
+/// access the change alters, which it cannot list.
+#[test]
+fn a_rules_preview_counts_what_its_projects_did_not_keep() {
+    use crate::store::{MAX_OBSERVED_CONTACTS, RuleMode};
+    use vk_hub_proto::egress::*;
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+    egress_rule(
+        &hub,
+        crate::store::DEFAULT_RULE,
+        None,
+        HubPhase::Unrestricted,
+        allow(&["debian.org"], &[]),
+        RuleMode::Enforce,
+    );
+    let entries = (0..=MAX_OBSERVED_CONTACTS)
+        .map(|i| {
+            crate::egress::testing::entry(
+                EgressOutcome::Observed,
+                EgressProtocol::Dns,
+                EgressDestination::domain(&format!("h{i}.example")),
+                None,
+            )
+        })
+        .collect();
+    let report = EgressReport {
+        entries,
+        phases: vec![crate::egress::testing::phase(
+            EgressPhase::Run,
+            EgressCoverage::Complete,
+        )],
+        ..EgressReport::default()
+    };
+    egress_job(&hub, 1, 42, "ci-1", report);
+    let (generation, rules) = hub.db.egress_rules().unwrap();
+    let edit = crate::egress::preview::Edit::Remove(crate::store::DEFAULT_RULE.into());
+    let p = crate::egress::preview::preview(&hub, generation, &rules, &edit).unwrap();
+    assert_eq!(p.dropped, 1);
+    assert_eq!(
+        p.lost.len(),
+        usize::try_from(MAX_OBSERVED_CONTACTS).unwrap()
+    );
+}
+
 /// An operator adds, changes and removes egress rules through Preview → Save: the preview shows
 /// the recent jobs it affects and what of Observed traffic it would block, Save stores only
 /// what was previewed against the rules previewed, and each change is audited. Viewers read.
