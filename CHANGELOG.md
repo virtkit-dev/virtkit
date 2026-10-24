@@ -55,6 +55,8 @@ All notable changes to virtkit will be documented in this file.
   refused it, what the job reached, the egress variables that failed it or that a setting
   above them leaves nothing of, and the bytes moved.
   A job's build-phase contacts and refusals are recorded whether or not audit is on.
+- **Nodes report a placed job's egress while it runs, not only with its result**, to a hub at
+  this version; an older hub still gets it once the job ends.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

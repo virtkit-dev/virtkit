@@ -35,6 +35,7 @@ use vk_hub_proto::dispatch::{
     Held, HeldJob, HubJobMsg, JobStart, LeaseEnd, LeaseState, MAX_OUTPUT_CHUNK, NodeJobMsg,
     OUTPUT_WINDOW, OfferReply, Refusal, RunState,
 };
+use vk_hub_proto::egress::EgressReport;
 use vk_hub_proto::job::{CiJob, FailureClass, JobResult, JobSpec, MAX_JOB_SPEC};
 
 use crate::config::Config;
@@ -131,6 +132,9 @@ struct Track {
     cleaning: Option<Arc<AtomicBool>>,
     /// The stage last told, what it was doing, and the VM's size.
     told: Option<Told>,
+    /// The egress report last read, by its journal file's stamp, and the highest revision told
+    /// this session.
+    egress_told: Option<(journal::Stamp, u64)>,
     result: Option<JobResult>,
     result_told: Option<Instant>,
     started: Instant,
@@ -276,6 +280,7 @@ impl Jobs {
                     disowned: false,
                     cleaning: None,
                     told: None,
+                    egress_told: None,
                     result_told: None,
                     started: Instant::now(),
                 },
@@ -307,6 +312,8 @@ impl Jobs {
             t.disowned = false;
             t.sent = t.acked;
             t.result_told = None;
+            // The latest report goes again: the hub keeps the highest revision.
+            t.egress_told = None;
             let stage = journal::read_stage(&t.dir);
             let activity = stage.as_deref().and_then(|s| stage_activity(&t.dir, s));
             t.told = stage.map(|stage| Told {
@@ -604,6 +611,7 @@ impl Jobs {
                 disowned: false,
                 cleaning: None,
                 told: None,
+                egress_told: None,
                 result_told: None,
                 started: Instant::now(),
             },
@@ -748,9 +756,10 @@ impl Jobs {
         Ok(cmd)
     }
 
-    /// What the hub has yet to hear: lapsed leases, stages, output within the window, results.
-    /// `quarantined` releases every reservation.
-    pub fn poll(&self, now: Instant, quarantined: bool) -> Vec<NodeJobMsg> {
+    /// What the hub has yet to hear: lapsed leases, stages, running jobs' egress reports when
+    /// `live_egress` (a session from [`vk_hub_proto::LIVE_EGRESS`]), output within the window,
+    /// results. `quarantined` releases every reservation.
+    pub fn poll(&self, now: Instant, quarantined: bool, live_egress: bool) -> Vec<NodeJobMsg> {
         let mut state = lock(&self.state);
         let mut msgs = Vec::new();
         let gone: Vec<(String, LeaseEnd)> = match quarantined {
@@ -808,6 +817,9 @@ impl Jobs {
                 continue;
             }
             if !t.disowned {
+                if live_egress && t.result.is_none() {
+                    msgs.extend(egress_news(id, t));
+                }
                 msgs.extend(output_chunks(id, t));
             }
             if let Some(result) = &t.result
@@ -860,7 +872,8 @@ impl Jobs {
             artifacts: Vec::new(),
             usage: None,
             events: Vec::new(),
-            egress: None,
+            // What it last journaled, as far as it went.
+            egress: journal::read_egress(&t.dir).map(EgressReport::interrupted),
         };
         // Written before it is reported, so the next node to read this journal agrees; tried
         // again at the next poll when it cannot be.
@@ -921,6 +934,22 @@ fn reap(mut child: std::process::Child) {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+}
+
+/// The running job's egress report, when its driver has journaled one with a revision this
+/// session has not told. Its journal file is read only when its stamp has changed.
+fn egress_news(id: &str, t: &mut Track) -> Option<NodeJobMsg> {
+    let stamp = journal::egress_stamp(&t.dir)?;
+    if t.egress_told.is_some_and(|(read, _)| read == stamp) {
+        return None;
+    }
+    let report = journal::read_egress(&t.dir)?;
+    let told = t.egress_told.map_or(0, |(_, revision)| revision);
+    t.egress_told = Some((stamp, told.max(report.revision)));
+    (report.revision > told).then(|| NodeJobMsg::Egress {
+        job: id.to_string(),
+        report,
+    })
 }
 
 /// The output past what was sent, within the window past the last ack.
@@ -1181,7 +1210,7 @@ pub(crate) mod tests {
             }]
         );
         // Output first; the result only once every byte of it is acked.
-        let msgs = jobs.poll(now, false);
+        let msgs = jobs.poll(now, false, true);
         let Some(NodeJobMsg::Output {
             offset: 0, data, ..
         }) = msgs.iter().find(|m| matches!(m, NodeJobMsg::Output { .. }))
@@ -1199,16 +1228,16 @@ pub(crate) mod tests {
             OPEN,
             now,
         );
-        let msgs = jobs.poll(now, false);
+        let msgs = jobs.poll(now, false, true);
         assert!(msgs.contains(&NodeJobMsg::Job {
             job: hex("b"),
             state: RunState::Finished
         }));
         assert!(msgs.iter().any(|m| matches!(m, NodeJobMsg::Result { .. })));
         // Repeated until recorded, not at once.
-        assert!(jobs.poll(now, false).is_empty());
+        assert!(jobs.poll(now, false, true).is_empty());
         assert!(
-            jobs.poll(now + RESULT_REPEAT, false)
+            jobs.poll(now + RESULT_REPEAT, false, true)
                 .iter()
                 .any(|m| matches!(m, NodeJobMsg::Result { .. }))
         );
@@ -1437,7 +1466,7 @@ pub(crate) mod tests {
         jobs.handle(start(&hex("b"), None, 2), OPEN, now);
         let job_dir = dir.join("jobs").join(hex("b"));
         let told = || -> Vec<RunState> {
-            jobs.poll(now, false)
+            jobs.poll(now, false, true)
                 .into_iter()
                 .filter_map(|m| match m {
                     NodeJobMsg::Job { state, .. } => Some(state),
@@ -1593,7 +1622,7 @@ pub(crate) mod tests {
         // One ends: room for one more under 2, none under 1.
         let ended = dir.join("jobs").join(hex("b"));
         journal::write_json(&ended.join(journal::RESULT), &interrupted()).unwrap();
-        jobs.poll(now, false);
+        jobs.poll(now, false, true);
         let msgs = jobs.handle(offer("c"), at(1), now);
         assert!(refused_at_ceiling(&msgs), "{msgs:?}");
         assert!(granted(jobs.handle(offer("c"), at(2), now)));
@@ -1772,7 +1801,7 @@ pub(crate) mod tests {
             now,
         );
         jobs.handle(start(&hex("b"), None, 7), OPEN, now);
-        assert!(!jobs.poll(now, false).is_empty());
+        assert!(!jobs.poll(now, false, true).is_empty());
         // A new session: held lists both, and output waits for the hub's offset.
         let NodeJobMsg::Held(held) = jobs.held(now) else {
             panic!("not held");
@@ -1780,7 +1809,7 @@ pub(crate) mod tests {
         assert_eq!(held.reservations.len(), 1);
         assert_eq!(held.jobs.len(), 1);
         assert!(held.jobs[0].finished);
-        let lapsed = jobs.poll(now + Duration::from_secs(5), false);
+        let lapsed = jobs.poll(now + Duration::from_secs(5), false, true);
         assert_eq!(
             lapsed,
             vec![NodeJobMsg::Lease {
@@ -1798,7 +1827,7 @@ pub(crate) mod tests {
             OPEN,
             now,
         );
-        let msgs = jobs.poll(now, false);
+        let msgs = jobs.poll(now, false, true);
         assert!(matches!(
             msgs.first(),
             Some(NodeJobMsg::Output { offset: 2, .. })
@@ -1957,9 +1986,9 @@ pub(crate) mod tests {
             now,
         );
         // A driver still starting has the benefit of the doubt.
-        assert!(jobs.poll(now, false).is_empty());
+        assert!(jobs.poll(now, false, true).is_empty());
         assert!(!job_dir.join("cleaned").exists());
-        let msgs = jobs.poll(now + DRIVER_START, false);
+        let msgs = jobs.poll(now + DRIVER_START, false, true);
         let Some(NodeJobMsg::Result { result, .. }) =
             msgs.iter().find(|m| matches!(m, NodeJobMsg::Result { .. }))
         else {
@@ -1968,6 +1997,85 @@ pub(crate) mod tests {
         assert_eq!(result.failure, Some(FailureClass::Interrupted));
         assert_eq!(journal::read_result(&job_dir).as_ref(), Some(result));
         assert!(job_dir.join("cleaned").exists(), "cleaned up");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A running job's egress report goes to a hub that reads it each time its driver journals
+    /// a newer revision, and again after a reconnect; a lost driver's result carries the last,
+    /// as far as it went.
+    #[test]
+    fn a_running_job_s_egress_report_is_sent_as_it_grows() {
+        use vk_hub_proto::egress::{EgressCoverage, EgressPhase, EgressPhaseReport};
+        let (_, dir) = jobs("live-egress", None);
+        let job_dir = journaled(&dir, &hex("b"), 2);
+        let journal_egress = |revision| {
+            let report = EgressReport {
+                revision,
+                phases: vec![EgressPhaseReport {
+                    phase: EgressPhase::Run,
+                    coverage: EgressCoverage::Complete,
+                    omitted: Default::default(),
+                    sent_bytes: None,
+                    received_bytes: None,
+                    caps: None,
+                }],
+                ..EgressReport::default()
+            };
+            journal::write_json(&job_dir.join(journal::LIVE_EGRESS), &report).unwrap();
+        };
+        journal_egress(1);
+        let jobs = reopen(&dir);
+        let now = Instant::now();
+        let reconnect = || {
+            jobs.held(now);
+            jobs.handle(
+                HubJobMsg::OutputAck {
+                    job: hex("b"),
+                    offset: 0,
+                },
+                OPEN,
+                now,
+            );
+        };
+        let told = |msgs: Vec<NodeJobMsg>| -> Vec<u64> {
+            msgs.into_iter()
+                .filter_map(|m| match m {
+                    NodeJobMsg::Egress { report, .. } => Some(report.revision),
+                    _ => None,
+                })
+                .collect()
+        };
+        reconnect();
+        assert_eq!(
+            told(jobs.poll(now, false, false)),
+            [0u64; 0],
+            "an older hub"
+        );
+        assert_eq!(told(jobs.poll(now, false, true)), [1]);
+        assert_eq!(told(jobs.poll(now, false, true)), [0u64; 0]);
+        journal_egress(1);
+        assert_eq!(
+            told(jobs.poll(now, false, true)),
+            [0u64; 0],
+            "no newer revision"
+        );
+        journal_egress(2);
+        assert_eq!(told(jobs.poll(now, false, true)), [2]);
+        reconnect();
+        assert_eq!(
+            told(jobs.poll(now, false, true)),
+            [2],
+            "again after a reconnect"
+        );
+        let msgs = jobs.poll(now + DRIVER_START, false, true);
+        let Some(NodeJobMsg::Result { result, .. }) =
+            msgs.iter().find(|m| matches!(m, NodeJobMsg::Result { .. }))
+        else {
+            panic!("no result in {msgs:?}");
+        };
+        let egress = result.egress.as_ref().unwrap();
+        assert_eq!(egress.revision, 3);
+        assert_eq!(egress.phases[0].coverage, EgressCoverage::Partial);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2015,14 +2123,14 @@ pub(crate) mod tests {
             now,
         );
         let later = now + DRIVER_START;
-        assert!(jobs.poll(later, false).is_empty(), "cleaning up");
-        assert!(jobs.poll(later, false).is_empty(), "still");
+        assert!(jobs.poll(later, false, true).is_empty(), "cleaning up");
+        assert!(jobs.poll(later, false, true).is_empty(), "still");
         assert!(journal::read_result(&job_dir).is_none());
         let token = |dir: &Path| journal::read_start(dir).unwrap().registry.is_some();
         assert!(token(&job_dir), "the cleanup still has the job's token");
         let done = lock(&SLOW_CLEANUP).take().expect("one cleanup started");
         done.store(true, Ordering::Release);
-        let msgs = jobs.poll(later, false);
+        let msgs = jobs.poll(later, false, true);
         assert!(
             msgs.iter().any(|m| matches!(m, NodeJobMsg::Result { .. })),
             "{msgs:?}"
@@ -2105,9 +2213,9 @@ pub(crate) mod tests {
         );
         assert_eq!(journal::read_cancel(&job_dir), Some(CancelMode::Immediate));
         // Nothing until the driver ends, and never its output.
-        assert!(jobs.poll(now, false).is_empty());
+        assert!(jobs.poll(now, false, true).is_empty());
         journal::write_json(&job_dir.join(journal::RESULT), &interrupted()).unwrap();
-        let msgs = jobs.poll(now, false);
+        let msgs = jobs.poll(now, false, true);
         assert!(!msgs.iter().any(|m| matches!(m, NodeJobMsg::Output { .. })));
         assert!(msgs.iter().any(|m| matches!(m, NodeJobMsg::Result { .. })));
         jobs.handle(HubJobMsg::Recorded { job: hex("b") }, OPEN, now);

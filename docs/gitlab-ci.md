@@ -1467,15 +1467,18 @@ alone denies it all. Dry-run is CI-only.
 
 ### Reported to the hub
 
-A job a hub placed on a `vk node` also reports its egress to the hub with its result: each
-destination refused, or flagged under dry-run, in both phases, with the VM it came from, the
-layer that decided it (the node's cap, the job's variables or a service's) and when; what the
-job's guests reached; the `MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a layer
-above leaves nothing of; and the bytes of each phase. The build phase is recorded whether or not
-audit is on, which only adds the summaries above to the trace. Once a build's or the run's log
-of denials or of contacts reaches 8 MiB, the switch only counts what else it sees, for the
-trace's lines and summaries too. Jobs run by gitlab-runner report nothing. See [Job egress from
-the hub](fleet-design.md#job-egress-from-the-hub).
+A job a hub placed on a `vk node` also reports its egress to the hub, while it runs and with its
+result: each destination refused, or flagged under dry-run, in both phases, with the VM it came
+from, the layer that decided it (the node's cap, the job's variables or a service's) and when;
+what the job's guests reached; the `MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a
+layer above leaves nothing of; and the bytes of each phase. The build phase is recorded whether
+or not audit is on, which only adds the summaries above to the trace. Once a build's or the
+run's log of denials or of contacts reaches 8 MiB, the switch only counts what else it sees, for
+the trace's lines and summaries too. While the job runs, the node sends what it recorded so far
+at each stage's start and every few seconds when it changed, and again after a reconnect; a hub
+older than the node gets the report with the result alone. Jobs run by gitlab-runner report
+nothing. See [Job egress from the
+hub](fleet-design.md#job-egress-from-the-hub).
 
 ## Services
 

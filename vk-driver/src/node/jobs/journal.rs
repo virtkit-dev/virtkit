@@ -12,6 +12,8 @@
 //! - `result.json`: how the job ended, written last by the driver;
 //! - `egress/`: what the job's executor commands record of its egress for the hub, kept past
 //!   the executor's job dir (see [`crate::egress_report`]);
+//! - `egress.json`: the report of that record last taken while the job runs, for the session to
+//!   send the hub, written by the driver whenever it changes;
 //! - `scripts/`, `scratch/`: the driver's own.
 
 use std::path::{Path, PathBuf};
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::dispatch::{CancelMode, JobStart};
+use vk_hub_proto::egress::EgressReport;
 use vk_hub_proto::job::JobResult;
 
 pub const START: &str = "start.json";
@@ -34,6 +37,8 @@ pub const CANCEL: &str = "cancel";
 pub const RESULT: &str = "result.json";
 pub const DRIVER_LOG: &str = "driver.log";
 pub const EGRESS: &str = "egress";
+/// The running job's egress report, as last taken: JSON.
+pub const LIVE_EGRESS: &str = "egress.json";
 
 /// What the session decided for a job when it took it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +136,34 @@ pub fn write_cancel(dir: &Path, mode: CancelMode) -> Result<()> {
         CancelMode::Immediate | CancelMode::Other => "immediate",
     };
     vk_fs::write_atomic(&dir.join(CANCEL), word.as_bytes(), 0o600)
+}
+
+/// A file's inode, change time in seconds and nanoseconds, and length.
+pub type Stamp = (u64, i64, i64, u64);
+
+/// What tells one write of the running job's egress report from another: its file's inode,
+/// change time and length. `None` while there is none.
+pub fn egress_stamp(dir: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(dir.join(LIVE_EGRESS)).ok()?;
+    Some((m.ino(), m.ctime(), m.ctime_nsec(), m.len()))
+}
+
+/// The running job's egress report, as the driver last wrote it; `None` when there is none,
+/// or none this node can read within the bound of a report.
+pub fn read_egress(dir: &Path) -> Option<EgressReport> {
+    use std::io::Read;
+    let max = vk_hub_proto::egress::MAX_EGRESS_REPORT as u64;
+    let mut bytes = Vec::new();
+    std::fs::File::open(dir.join(LIVE_EGRESS))
+        .ok()?
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > max {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// The output's length so far.

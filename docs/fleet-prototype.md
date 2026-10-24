@@ -246,8 +246,9 @@ report; and the definition's download, `GET /v1/tools/<sha256>`, signed as a rel
 but under the label `vk-fleet tools-download v1` (see [CI tools](#ci-tools)). Version 5 adds
 the `none` runner mode on the report ([Drain and runner lifecycle](#drain-and-runner-lifecycle));
 in a session below it a node with no runner reports `external`, which an older hub reads and
-steers the more cautious way. The hub speaks versions 1 to 5, and so does `vk node`, from ranges
-of their own; `vk_hub_proto::PROTOCOL` stays 1 to 2.
+steers the more cautious way. Version 6 adds a running job's egress report, the `egress` job
+message; below it a node sends the report with the job's result alone. The hub speaks versions
+1 to 6, and so does `vk node`, from ranges of their own; `vk_hub_proto::PROTOCOL` stays 1 to 2.
 A session negotiates version 3 or later only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
@@ -787,7 +788,7 @@ audited as plain `reset`.
 
 ## Placed jobs on the node
 
-A node speaks protocol versions 1 to 3, but accepts placed jobs only in version 3, under the
+A node speaks protocol versions 1 to 6, but accepts placed jobs only from version 3, under the
 [GitLab dispatch](gitlab-dispatch.md) contract. After the steering messages, it sends `held`
 as its first job message, listing every reservation and job it holds. The hub needs this
 list before placing work.

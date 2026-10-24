@@ -288,9 +288,15 @@ one offering at most 2 is steered and never offered a job.
 | `job {job, state}` | `accepted`, `refused {reason, message?}`, `running {stage, activity?, guest? {cpus, mem_mib}}`, `finished` |
 | `output {job, offset, data}` | output bytes from `offset`, base64, at most 256 KiB |
 | `result {job, result}` | how the job ended; repeated until `recorded` |
+| `egress {job, report}` | from version 6: a running job's egress report so far, when it changes and after a reconnect |
 
 A `running` state's `guest` is the size of the job's VM, once its prepare has sized it; a hub
 older than it ignores it.
+
+An `egress` report is cumulative, with a revision: the hub keeps the highest, so one sent again
+replaces the counts rather than adding to them, and the result's report, the last, has the
+highest. The node takes it at each stage's start and every 5 seconds, at most once every 2, and
+sends it when it changed; a session below version 6 gets the result's alone.
 
 Refusal reasons are `memory`, `disk`, `cpus`, `not_ready` (draining, drained, quarantined, in
 maintenance), `policy`, `no_reservation`, `invalid`, `ceiling` (the node's placed jobs not

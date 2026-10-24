@@ -111,20 +111,29 @@ struct Driver {
     prepared_in: Option<Duration>,
     /// The registry access the hub gave the job, from its start.
     registry: Option<JobRegistry>,
-    /// The job's egress, as its report is taken once it has ended.
+    /// The job's egress, as its report is taken while it runs and once it has ended.
     egress: Arc<Egress>,
 }
 
+/// How often a running job's egress report is taken: at each stage's start too, but never
+/// within [`LIVE_EGRESS_GAP`] of the last.
+const LIVE_EGRESS_EVERY: Duration = Duration::from_secs(5);
+const LIVE_EGRESS_GAP: Duration = Duration::from_secs(2);
+
 /// A job's egress as its driver follows it: its record, read as it grows, and what its report
-/// says beside the record.
+/// says beside the record. While the job runs, the report is journaled for the session to send
+/// the hub whenever it changes ([`journal::LIVE_EGRESS`]), each time with the next revision; the
+/// result's report comes last, past them all.
 struct Egress {
     /// Each stage the job entered, with when, in milliseconds since the epoch: what its report
     /// dates its entries by.
     timeline: std::sync::Mutex<Vec<(String, u64)>>,
     /// Whether preparation succeeded, so that the job reached its run phase.
     prepared: std::sync::atomic::AtomicBool,
-    /// Taken by one reader at a time.
-    read: std::sync::Mutex<crate::egress_report::JobRecord>,
+    /// Taken by one reader at a time: the record, and the report last journaled.
+    read: std::sync::Mutex<(crate::egress_report::JobRecord, Option<EgressReport>)>,
+    /// Raised at each stage's start.
+    stage: tokio::sync::Notify,
 }
 
 impl Egress {
@@ -133,7 +142,11 @@ impl Egress {
         Egress {
             timeline: Default::default(),
             prepared: Default::default(),
-            read: std::sync::Mutex::new(crate::egress_report::JobRecord::new(record, run_dir)),
+            read: std::sync::Mutex::new((
+                crate::egress_report::JobRecord::new(record, run_dir),
+                None,
+            )),
+            stage: tokio::sync::Notify::new(),
         }
     }
 
@@ -148,14 +161,60 @@ impl Egress {
         self.prepared.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Read what the record gained and journal the report in job `dir` when it changed, as the
+    /// next revision. One not journaled is tried again at the next read.
+    fn journal(&self, dir: &Path) {
+        let (timeline, prepared) = (self.timeline(), self.prepared());
+        let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        let (record, told) = &mut *read;
+        record.read();
+        let revision = told.as_ref().map_or(1, |r| r.revision.saturating_add(1));
+        let report = record.report(&timeline, prepared, revision);
+        let unchanged = told.as_ref().is_some_and(|t| {
+            EgressReport {
+                revision,
+                ..t.clone()
+            } == report
+        });
+        if !unchanged && journal::write_json(&dir.join(journal::LIVE_EGRESS), &report).is_ok() {
+            *told = Some(report);
+        }
+    }
+
     /// The last report, once cleanup has kept the run phase's channels in `run_dir`: the record
-    /// read to its end.
+    /// read to its end, with a revision past every one journaled.
     fn last(&self, run_dir: &Path) -> EgressReport {
         let (timeline, prepared) = (self.timeline(), self.prepared());
-        let mut record = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        let (record, told) = &mut *read;
         record.move_run(run_dir);
         record.read();
-        record.report(&timeline, prepared, 1)
+        let revision = told.as_ref().map_or(1, |r| r.revision.saturating_add(1));
+        record.report(&timeline, prepared, revision)
+    }
+
+    /// Journal the report in job `dir` at each stage's start and every [`LIVE_EGRESS_EVERY`],
+    /// until `stop` is raised; returns once no read is under way.
+    async fn follow(self: Arc<Self>, dir: PathBuf, stop: CancellationToken) {
+        let mut every = tokio::time::interval_at(
+            tokio::time::Instant::now() + LIVE_EGRESS_EVERY,
+            LIVE_EGRESS_EVERY,
+        );
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = self.stage.notified() => {}
+                _ = every.tick() => {}
+            }
+            let (egress, dir) = (self.clone(), dir.clone());
+            // Awaited whatever `stop` says: the last report is taken once this one is done.
+            let _ = tokio::task::spawn_blocking(move || egress.journal(&dir)).await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(LIVE_EGRESS_GAP) => {}
+            }
+        }
     }
 }
 
@@ -306,7 +365,12 @@ impl Driver {
         for w in &settings.warnings {
             t.warning(w);
         }
+        let stop = CancellationToken::new();
+        let following = tokio::spawn(self.egress.clone().follow(self.dir.clone(), stop.clone()));
         let (end, class, artifacts) = self.stages(vars, settings, place).await;
+        // Stopped before cleanup moves the run phase's channels from under it.
+        stop.cancel();
+        let _ = following.await;
         // Read before cleanup removes the job directory and the VMM log in it.
         let vmm_log = self.ctx.vmm_log();
         let events = tokio::task::spawn_blocking(move || crate::jobevents::from_vmm_log(&vmm_log))
@@ -719,6 +783,8 @@ impl Driver {
         // stage before was doing is over.
         let _ = std::fs::remove_file(self.dir.join(journal::ACTIVITY));
         let _ = vk_fs::write_atomic(&self.dir.join(journal::STAGE), stage.as_bytes(), 0o600);
+        // What the stage before did is in the record by now, or soon.
+        self.egress.stage.notify_one();
     }
 
     /// A stage's header, as gitlab-runner prints its description.
@@ -1313,7 +1379,44 @@ mod tests {
         let egress = result.egress.unwrap();
         assert_eq!(egress.refusals, [refusal]);
         assert_eq!(egress.phases, []);
-        assert_eq!(egress.revision, 1);
+        // Past any report journaled while it ran.
+        let live = journal::read_egress(&f.dir).map_or(0, |r| r.revision);
+        assert_eq!(egress.revision, live + 1);
+    }
+
+    /// While a job runs its report is journaled each time it changes, with the next revision,
+    /// and the last is past them all.
+    #[test]
+    fn a_running_job_s_egress_is_journaled_as_it_changes() {
+        let f = Fixture::new("driver-live-egress", "https://gitlab.example");
+        let (record, run) = (f.dir.join(journal::EGRESS), f.dir.join("run-channels"));
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        let egress = Egress::new(&record, &run);
+        egress.journal(&f.dir);
+        let first = journal::read_egress(&f.dir).unwrap();
+        assert_eq!(first.revision, 1);
+        let stamp = journal::egress_stamp(&f.dir);
+        egress.journal(&f.dir);
+        assert_eq!(
+            journal::egress_stamp(&f.dir),
+            stamp,
+            "unchanged, not written"
+        );
+        crate::egress_report::append(
+            &JobCtx::egress_denied_log_in(&run),
+            crate::egress_report::Proto::Dns,
+            "a.example",
+            &crate::egress_report::Attrs::default(),
+        );
+        egress.journal(&f.dir);
+        let live = journal::read_egress(&f.dir).unwrap();
+        assert_eq!((live.revision, live.entries.len()), (2, 1));
+        // Cleanup kept the channels in the record.
+        crate::egress_report::keep_run_channels(&run, &record);
+        let last = egress.last(&record.join(crate::egress_report::RUN_DIR));
+        assert_eq!(last.revision, 3);
+        assert_eq!(last.entries, live.entries);
     }
 
     #[test]

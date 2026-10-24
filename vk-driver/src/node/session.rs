@@ -55,7 +55,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// "none"` on top of what every peer shares.
 pub const NODE_PROTOCOL: VersionRange = VersionRange {
     min: PROTOCOL.min,
-    max: vk_hub_proto::RUNNER_NONE,
+    max: vk_hub_proto::LIVE_EGRESS,
 };
 
 /// How often the node looks at its placed jobs for news: output, stages, results, leases.
@@ -266,7 +266,7 @@ pub async fn run(
             }
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
             _ = job_tick.tick(), if placing => {
-                for msg in poll_jobs(node).await? {
+                for msg in poll_jobs(node, version).await? {
                     if !send_unless_stopped(&mut ws, &msg, heartbeat, stop).await? {
                         return Ok(());
                     }
@@ -321,7 +321,7 @@ pub async fn run(
                                 bail!("the hub sent a job message in a version-{version} session");
                             }
                             let mut replies = handle_job(node, job).await?;
-                            replies.extend(poll_jobs(node).await?);
+                            replies.extend(poll_jobs(node, version).await?);
                             for reply in &replies {
                                 if !send_unless_stopped(&mut ws, reply, heartbeat, stop).await? {
                                     return Ok(());
@@ -365,14 +365,17 @@ async fn handle_job(node: &Node, msg: vk_hub_proto::dispatch::HubJobMsg) -> Resu
     Ok(replies.into_iter().map(NodeMsg::Job).collect())
 }
 
-/// What the placed jobs have to tell the hub now.
-async fn poll_jobs(node: &Node) -> Result<Vec<NodeMsg>> {
+/// What the placed jobs have to tell the hub now, in a session at `version`: from
+/// [`vk_hub_proto::LIVE_EGRESS`], running jobs' egress reports too.
+async fn poll_jobs(node: &Node, version: u32) -> Result<Vec<NodeMsg>> {
     let quarantined = node.core.state() == vk_hub_proto::NodeState::Quarantined;
+    let live_egress = version >= vk_hub_proto::LIVE_EGRESS;
     let jobs = node.jobs.clone();
-    let msgs =
-        tokio::task::spawn_blocking(move || jobs.poll(std::time::Instant::now(), quarantined))
-            .await
-            .context("following the placed jobs")?;
+    let msgs = tokio::task::spawn_blocking(move || {
+        jobs.poll(std::time::Instant::now(), quarantined, live_egress)
+    })
+    .await
+    .context("following the placed jobs")?;
     Ok(msgs.into_iter().map(NodeMsg::Job).collect())
 }
 
@@ -747,7 +750,6 @@ mod tests {
             [NodeMsg::Report(r)] => r.runner,
             other => panic!("{other:?}"),
         };
-        assert_eq!(NODE_PROTOCOL.max, vk_hub_proto::RUNNER_NONE);
         assert_eq!(
             told(vk_hub_proto::RUNNER_NONE),
             Some(vk_hub_proto::RunnerMode::None)
