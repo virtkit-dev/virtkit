@@ -3225,8 +3225,8 @@ struct HubBound {
 
 /// The hub's layer for `phase` of a placed job, as its switches take it: held to its bounds,
 /// every entry checked as a switch checks it. `None` where the hub sends none, or sets nothing
-/// for the phase. A layer that fails the checks fails the job: it would otherwise run under
-/// less than the hub's rules.
+/// for the phase and has no dry-run rule for it. A layer that fails the checks fails the job:
+/// it would otherwise run under less than the hub's rules.
 pub(crate) fn hub_layer(
     ctx: &JobCtx,
     phase: EgressPhase,
@@ -3272,10 +3272,16 @@ fn hub_egress_lines(ctx: &JobCtx) -> Result<Vec<String>> {
             false => rules.join(", "),
         }
     };
-    let head = format!(
+    let mut head = format!(
         "virtkit: egress under the hub's rules: {}",
         names(&mut egress.rules.iter())
     );
+    if !egress.dry_run.is_empty() {
+        head.push_str(&format!(
+            " (dry-run, not enforced: {})",
+            names(&mut egress.dry_run.iter().map(|d| &d.rule))
+        ));
+    }
     let mut lines = vec![head];
     let cfg = &ctx.cfg;
     for (phase, cap_ip, cap_name, job_ip, job_name) in [
@@ -5614,11 +5620,11 @@ mod tests {
         assert!(msg.starts_with("[egress] allow_name "), "{msg}");
     }
 
-    /// A placed job's hub layer reaches its switches by phase; one the node cannot hold to its
-    /// checks fails the job rather than run it under less.
+    /// A placed job's hub layer reaches its switches by phase, its dry-run rules with it; one
+    /// the node cannot hold to its checks fails the job rather than run it under less.
     #[test]
     fn the_hubs_layer_is_taken_by_phase_and_checked() {
-        use vk_hub_proto::egress::{HubEgress, HubPhase};
+        use vk_hub_proto::egress::{DryRunRule, HubEgress, HubPhase};
         let allow = |names: &[&str]| HubPhase::Allow {
             names: names.iter().map(|n| n.to_string()).collect(),
             ips: Vec::new(),
@@ -5629,14 +5635,24 @@ mod tests {
             rules: vec!["wab".into(), "default".into()],
             run: allow(&["corp.example.com"]),
             build: HubPhase::Unrestricted,
-            dry_run: Vec::new(),
+            dry_run: vec![DryRunRule {
+                rule: "wab-release".into(),
+                run: HubPhase::Unrestricted,
+                build: allow(&["debian.org"]),
+            }],
         });
         let run = hub_layer(&c, EgressPhase::Run).unwrap().unwrap();
         assert_eq!(
             run.enforce.as_ref().map(|l| l.names.clone()),
             Some(vec!["corp.example.com".to_string()])
         );
-        assert!(hub_layer(&c, EgressPhase::Build).unwrap().is_none());
+        assert!(
+            run.dry_run.is_empty(),
+            "an unrestricted rule refuses nothing"
+        );
+        let build = hub_layer(&c, EgressPhase::Build).unwrap().unwrap();
+        assert!(build.enforce.is_none());
+        assert_eq!(build.dry_run[0].rule, "wab-release");
         assert!(hub_bound(&c, EgressPhase::Build).unwrap().is_none());
         assert_eq!(
             hub_bound(&c, EgressPhase::Run).unwrap().unwrap().rules,
@@ -5648,7 +5664,8 @@ mod tests {
         assert_eq!(
             hub_egress_lines(&c).unwrap(),
             [
-                "virtkit: egress under the hub's rules: wab, default",
+                "virtkit: egress under the hub's rules: wab, default (dry-run, not enforced: \
+                 wab-release)",
                 "virtkit:   run: node cap unrestricted; hub names corp.example.com, ips none; job \
                  names api.corp.example.com, ips none",
                 "virtkit:   build: node cap names debian.org, ips none; hub unrestricted; job not \
@@ -5957,6 +5974,7 @@ mod tests {
                     ips: Vec::new(),
                     names,
                 }),
+                dry_run: Vec::new(),
             })
         );
         c.egress_record = None;

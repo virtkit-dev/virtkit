@@ -713,6 +713,12 @@ pub struct Inventory {
     /// placed on one that does not has no report to show.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub egress_reports: bool,
+    /// Whether the node enforces the hub's egress layer for a placed job
+    /// ([`dispatch::JobStart::egress`]) and reports what its dry-run rules would block: a job
+    /// the hub's rules restrict is placed only on one that does, since an older node ignores the
+    /// layer and runs the job under its cap alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress_rules: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1432,6 +1438,7 @@ mod tests {
             registry: None,
             job_tokens: false,
             egress_reports: false,
+            egress_rules: false,
         }
     }
 
@@ -2187,11 +2194,13 @@ mod tests {
         tokens["registry"] = json!("https://reg.example.com");
         tokens["job_tokens"] = json!(true);
         tokens["egress_reports"] = json!(true);
+        tokens["egress_rules"] = json!(true);
         pinned(
             &Inventory {
                 registry: Some("https://reg.example.com".into()),
                 job_tokens: true,
                 egress_reports: true,
+                egress_rules: true,
                 ..inventory()
             },
             tokens,

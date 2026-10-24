@@ -405,8 +405,8 @@ pub struct EgressRecord {
     pub dir: PathBuf,
     /// The service whose image this is; `None` for the job's own.
     pub source: Option<String>,
-    /// The hub's build-phase layer, enforced by every stage switch beside `net`; `None` where
-    /// the hub sets none.
+    /// The hub's build-phase layer, enforced by every stage switch beside `net`, with its
+    /// dry-run rules; `None` where the hub sets none.
     pub hub: Option<crate::switch::HubLayer>,
 }
 

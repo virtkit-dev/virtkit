@@ -123,6 +123,8 @@ pub struct Attrs {
     /// When it happened, in milliseconds since the Unix epoch; for a count of repeats, the
     /// last of them.
     pub at_ms: Option<u64>,
+    /// The hub's dry-run rule whose would-be denial it is.
+    pub rule: Option<String>,
 }
 
 impl Attrs {
@@ -144,6 +146,9 @@ impl Attrs {
         if let Some(at) = self.at_ms {
             s.push_str(&format!("\tt={at}"));
         }
+        if let Some(rule) = &self.rule {
+            s.push_str(&format!("\trule={}", sanitize(rule)));
+        }
         s
     }
 
@@ -158,6 +163,7 @@ impl Attrs {
                 "dry" => attrs.would_block = value == "1",
                 "p" => attrs.proto = Proto::parse(value),
                 "t" => attrs.at_ms = value.parse().ok(),
+                "rule" => attrs.rule = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -630,7 +636,7 @@ struct PhaseCount {
 }
 
 /// What a report entry is counted under: one destination, reached or refused one way, by one
-/// VM in one phase, decided by one layer.
+/// VM in one phase, decided by one layer — or, for a would-be denial, by one hub dry-run rule.
 type EntryKey = (
     EgressOutcome,
     EgressProtocol,
@@ -638,6 +644,7 @@ type EntryKey = (
     EgressPhase,
     EgressSource,
     Option<EgressLayer>,
+    Option<String>,
 );
 
 /// A job's records counted into report entries as they are read, bounded as the report is: an
@@ -664,7 +671,7 @@ impl Tally {
             }
             return;
         }
-        let (outcome, protocol, destination, phase, source, layer) = key.clone();
+        let (outcome, protocol, destination, phase, source, layer, rule) = key.clone();
         let (kept, max) = match outcome.is_denial() {
             true => (&mut self.denials, MAX_EGRESS_DENIALS),
             false => (&mut self.contacts, MAX_EGRESS_CONTACTS),
@@ -686,7 +693,7 @@ impl Tally {
             first_seen_ms: at_ms.unwrap_or(0),
             last_seen_ms: at_ms.unwrap_or(0),
             stage: None,
-            rule: None,
+            rule,
         });
     }
 
@@ -727,7 +734,16 @@ impl Tally {
                 Proto::Udp => (EgressProtocol::Udp, EgressDestination::address(&d.target)),
             };
             let layer = Some(attrs.layer.unwrap_or(EgressLayer::Unknown));
-            let key = (outcome, protocol, destination, phase, source(&attrs), layer);
+            let rule = attrs.rule.clone().filter(|_| attrs.would_block);
+            let key = (
+                outcome,
+                protocol,
+                destination,
+                phase,
+                source(&attrs),
+                layer,
+                rule,
+            );
             self.add(key, d.count, attrs.at_ms, &mut count.omitted);
         }
         let audit = read
@@ -757,6 +773,7 @@ impl Tally {
                 destination,
                 phase,
                 source(&attrs),
+                None,
                 None,
             );
             self.add(key, 1, attrs.at_ms, &mut count.omitted);
@@ -1353,6 +1370,7 @@ mod tests {
             would_block: true,
             proto: None,
             at_ms: Some(1_700_000_000_123),
+            rule: None,
         };
         append(&denied, Proto::Tcp, "10.0.0.1:443", &attrs);
         append_repeats(&denied, Proto::Dns, "a.example", 3, &attrs);
@@ -1426,6 +1444,7 @@ mod tests {
             would_block,
             proto: None,
             at_ms: Some(ms),
+            rule: None,
         };
         let build_denied = JobCtx::egress_denied_log_in(&build);
         append(
@@ -1767,5 +1786,56 @@ mod tests {
         assert!(!run.join(crate::run::AUDIT_LOG).exists());
         assert!(!job.join("egress-denied.log").exists());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A hub dry-run rule's would-be denial is an entry of its own, naming its rule, beside the
+    /// same destination's denial by another layer; the trace reads it as any other record.
+    #[test]
+    fn a_dry_run_rules_denial_names_its_rule() {
+        use crate::jobctx::JobCtx;
+        let record = std::env::temp_dir().join(format!("vk-egress-rule-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&record);
+        let run = record.join(RUN_DIR);
+        std::fs::create_dir_all(&run).unwrap();
+        let denied = JobCtx::egress_denied_log_in(&run);
+        let by = |rule: Option<&str>| Attrs {
+            layer: Some(EgressLayer::HubRule),
+            would_block: true,
+            at_ms: Some(1_000),
+            rule: rule.map(str::to_string),
+            ..Attrs::default()
+        };
+        append(&denied, Proto::Dns, "evil.example", &by(Some("trial")));
+        append(&denied, Proto::Dns, "evil.example", &by(Some("trial")));
+        append(&denied, Proto::Dns, "evil.example", &by(None));
+        let text = std::fs::read_to_string(&denied).unwrap();
+        assert!(
+            text.starts_with("dns\tevil.example\t1\tlayer=hub_rule\tdry=1\tt=1000\trule=trial\n")
+        );
+        assert_eq!(read_since(&denied, 0).0.len(), 3);
+        let report = job_report(&record, &[], true);
+        let entries: Vec<_> = report
+            .entries
+            .iter()
+            .map(|e| (e.outcome, e.layer, e.rule.as_deref(), e.count))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (
+                    EgressOutcome::WouldBlock,
+                    Some(EgressLayer::HubRule),
+                    Some("trial"),
+                    2
+                ),
+                (
+                    EgressOutcome::WouldBlock,
+                    Some(EgressLayer::HubRule),
+                    None,
+                    1
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&record);
     }
 }

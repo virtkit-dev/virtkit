@@ -1702,8 +1702,8 @@ enum Cmd {
         vm_name: Vec<String>,
         /// the hub's egress layer for this phase, a JSON file read once at start
         ///
-        /// Enforced for every source on top of the allowlists, dry-run or not. Set internally
-        /// for a placed job's switches.
+        /// Enforced for every source on top of the allowlists, dry-run or not; its dry-run
+        /// rules only record what each would block. Set internally for a placed job's switches.
         #[arg(long = "hub-egress", value_name = "FILE")]
         hub_egress: Option<PathBuf>,
         /// stop recording denials and contacts once their log reaches this size, counting them

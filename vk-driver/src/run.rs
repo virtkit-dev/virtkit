@@ -5432,7 +5432,8 @@ pub(crate) async fn spawn_vm_switch(
         allow_name: allow_name.to_vec(),
         restrict,
         egress_file: egress_file.map(Path::to_path_buf),
-        // Dry-run is run-phase CI only (vm.rs): dev `vk run` and every build phase enforce.
+        // The node's dry-run is run-phase CI only (vm.rs): dev `vk run` and every build phase
+        // enforce. A placed job's build stage has the hub's dry-run rules in `hub`.
         dry_run: false,
         // Per-service egress overrides are a CI feature (from a service's `variables:`);
         // dev `vk run --compose` siblings share the run policy.

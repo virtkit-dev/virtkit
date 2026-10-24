@@ -1356,15 +1356,17 @@ The hub can only narrow what the node's cap allows, never widen it.
 
 The node's own dry-run, `[egress] dry_run` or `MICROVM_EGRESS_DRY_RUN`, never relaxes the hub's
 rules: what they refuse is refused, its names resolve to `NXDOMAIN`, and queries the gateway
-cannot rebuild are refused, dry-run or not. Only the per-job switch enforces the hub's rules, so
-a node whose `[net] mode` is `tap` or `pool` takes no job they restrict, and fails one whose run
-phase they restrict. A Windows image does not build under rules that restrict the build phase,
-since its build steps cannot be held to them.
+cannot rebuild are refused, dry-run or not. A rule the hub has in dry-run blocks nothing, in
+either phase: what it would block is reported to the hub under its name, and listed in the
+trace for the run phase. Only the per-job switch enforces the hub's rules, so a node whose
+`[net] mode` is `tap` or `pool` takes no job they restrict, and fails one whose run phase they
+restrict. A Windows image does not build under rules that restrict the build phase, since its
+build steps cannot be held to them, and a dry-run rule says nothing of them.
 
 The trace names the rules and each phase's lists, layer by layer:
 
 ```
-virtkit: egress under the hub's rules: wab, wab-branches
+virtkit: egress under the hub's rules: wab, wab-branches (dry-run, not enforced: wab-release)
 virtkit:   run: node cap unrestricted; hub names corp.example.com, ips 10.10.140.49/32; job not narrowed
 virtkit:   build: node cap names debian.org crates.io, ips none; hub names debian.org, ips none; job not narrowed
 ```
@@ -1474,7 +1476,8 @@ still resolves, so the job runs unchanged. To roll an allowlist out, turn it on,
 pipelines, and add whatever the trace flags before enforcement bites.
 
 Dry-run covers the service VMs on the job's LAN too, including a service's own
-`MICROVM_EGRESS_ALLOW_*` lists. It never relaxes the [hub's rules](#the-hubs-rules).
+`MICROVM_EGRESS_ALLOW_*` lists. It never relaxes the [hub's rules](#the-hubs-rules), whose own
+dry-run covers both phases.
 
 ```toml
 [egress]
@@ -1508,15 +1511,15 @@ alone denies it all. Dry-run is CI-only.
 A job a hub placed on a `vk node` also reports its egress to the hub, while it runs and with its
 result: each destination refused, or flagged under dry-run, in both phases, with the VM it came
 from, the layer that decided it (the node's cap, the hub's rules, the job's variables or a
-service's) and when; the hub rules the job ran under; what the job's guests reached; the
-`MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a layer above leaves nothing of; and
-the bytes of each phase. The build phase is recorded whether or not audit is on, which only adds
-the summaries above to the trace. Once a build's or the run's log of denials or of contacts
-reaches 8 MiB, the switch only counts what else it sees, for the trace's lines and summaries
-too. While the job runs, the node sends what it recorded so far at each stage's start and every
-few seconds when it changed, and again after a reconnect; a hub older than the node gets the
-report with the result alone. Jobs run by gitlab-runner report nothing. See
-[Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
+service's) and when, and for a hub rule in dry-run its name; the hub rules the job ran under;
+what the job's guests reached; the `MICROVM_*EGRESS_ALLOW_*` entries that failed it, or that a
+layer above leaves nothing of; and the bytes of each phase. The build phase is recorded whether
+or not audit is on, which only adds the summaries above to the trace. Once a build's or the
+run's log of denials or of contacts reaches 8 MiB, the switch only counts what else it sees, for
+the trace's lines and summaries too. While the job runs, the node sends what it recorded so far
+at each stage's start and every few seconds when it changed, and again after a reconnect; a hub
+older than the node gets the report with the result alone. Jobs run by gitlab-runner report
+nothing. See [Job egress from the hub](fleet-design.md#job-egress-from-the-hub).
 
 ## Services
 

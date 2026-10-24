@@ -87,6 +87,9 @@ pub fn inventory(cfg: &Config) -> Inventory {
         job_tokens: true,
         // Each placed job's result carries its egress report.
         egress_reports: true,
+        // A placed job's start may carry the hub's egress layer, which its switches enforce in
+        // both phases, with its dry-run rules — a tap's job has no switch to enforce it.
+        egress_rules: matches!(cfg.net.mode.as_str(), "switch" | "none"),
     }
 }
 

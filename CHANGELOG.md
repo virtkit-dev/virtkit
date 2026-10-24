@@ -61,8 +61,9 @@ All notable changes to virtkit will be documented in this file.
   phases, beside the node's own `[egress]` and `[egress.build]` and the job's and its
   services' `MICROVM_*EGRESS_ALLOW_*`, a destination passing each; the node's dry-run never
   relaxes the hub's rules. The trace names the rules applied and each phase's lists, setting
-  by setting. A node whose `[net] mode` is `tap` or `pool` takes no job the rules restrict,
-  and a Windows image does not build under rules that restrict the build phase.
+  by setting. A rule in dry-run blocks nothing and reports what it would block, in the build
+  phase too, by name. A node whose `[net] mode` is `tap` or `pool` takes no job the rules
+  restrict, and a Windows image does not build under rules that restrict the build phase.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

@@ -87,7 +87,7 @@ pub struct JobCtx {
     /// `[registry] guest_credential = "job"`.
     pub job_registry: Option<vk_hub_proto::dispatch::JobRegistry>,
     /// The hub's egress layer for a placed job, from the same start: what the rules that select
-    /// it allow, enforced below the node's cap.
+    /// it allow, enforced below the node's cap, and what its dry-run rules would.
     pub hub_egress: Option<vk_hub_proto::egress::HubEgress>,
     /// Where a placed job's executor commands keep what its node reports of its egress
     /// ([`JOB_EGRESS`]): its builds' records, its refused declarations, and at cleanup the run

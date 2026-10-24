@@ -90,7 +90,8 @@ pub struct JobStart {
     pub registry: Option<JobRegistry>,
     /// The hub's egress layer for the job, resolved from its rules; `None` when the hub imposes
     /// none, and the job runs under its node's cap and its own narrowing alone. Sent only to a
-    /// node that enforces it: an older one would ignore it.
+    /// node announcing [`Inventory::egress_rules`](crate::Inventory::egress_rules): an older one
+    /// would ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<HubEgress>,
 }
