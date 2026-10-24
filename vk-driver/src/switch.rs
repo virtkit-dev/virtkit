@@ -527,19 +527,36 @@ const MAX_DNS_IPS: usize = 65536;
 /// address they hold is next checked.
 const PIN_SWEEP_EVERY: usize = 1024;
 
-/// The pins of one switch, by `(source, address)`, with the bounds above. Every eviction
-/// removes a name, so it can only shorten or revoke what a pin admits, never admit more: the
-/// flow it would have carried is denied as though its name had never resolved there.
-#[derive(Default)]
+/// The pins of one switch, or of one of its hub dry-run rules, by `(source, address)`, with
+/// the bounds above. Every eviction removes a name, so it can only shorten or revoke what a pin
+/// admits, never admit more: the flow it would have carried is denied as though its name had
+/// never resolved there.
 struct Pins {
     by_addr: HashMap<(Ipv4Addr, Ipv4Addr), NamePin>,
     /// The names held across `by_addr`.
     len: usize,
     /// Pins taken since the last sweep.
     since_sweep: usize,
+    /// The most names held: [`MAX_PINS`], or its share for one of several dry-run rules.
+    max: usize,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Pins::bounded(MAX_PINS)
+    }
 }
 
 impl Pins {
+    /// No pins, holding at most `max` names (at least one).
+    fn bounded(max: usize) -> Self {
+        Pins {
+            by_addr: HashMap::new(),
+            len: 0,
+            since_sweep: 0,
+            max: max.max(1),
+        }
+    }
     /// Pin `key` for `name` until `until`, as [`NamePin::extend`] does, within the bounds.
     fn pin(&mut self, key: (Ipv4Addr, Ipv4Addr), name: &str, until: Instant, now: Instant) {
         self.since_sweep += 1;
@@ -557,7 +574,7 @@ impl Pins {
         }
         pin.extend(name, until);
         self.len = self.len - before + pin.names.len();
-        if self.len > MAX_PINS {
+        if self.len > self.max {
             self.shed(now);
         }
     }
@@ -596,11 +613,11 @@ impl Pins {
         self.since_sweep = 0;
         self.retain(|_, _, t| t > cutoff);
     }
-    /// Back within [`MAX_PINS`]: drop the expired names, then the eighth expiring soonest (ties
+    /// Back within its bound: drop the expired names, then the eighth expiring soonest (ties
     /// with the last of them too).
     fn shed(&mut self, now: Instant) {
         self.drop_through(now);
-        let target = MAX_PINS - MAX_PINS / 8;
+        let target = self.max - self.max / 8;
         if self.len <= target {
             return;
         }
@@ -616,6 +633,18 @@ impl Pins {
     fn is_empty(&self) -> bool {
         self.by_addr.is_empty()
     }
+}
+
+/// A hub dry-run rule, as a switch judges what it carries by it.
+struct TrialRule {
+    rule: String,
+    /// The layer the hub would enforce under the rule.
+    layer: Arc<Egress>,
+    /// The addresses the switch handed each source in a DNS answer for a name `layer` allows,
+    /// by name and for as long as a pin would hold them: the rule would admit a connection to
+    /// one, as its pin would. Its own, so that names it refuses never shed what it holds; its
+    /// share of [`MAX_PINS`], so a rule judges an address shed as it would enforce it: refused.
+    pins: Mutex<Pins>,
 }
 
 /// Whether `pins` hold `dst` for `src`, live, under a name `layer` allows. Expired names go.
@@ -694,11 +723,6 @@ struct EgressGuard {
     /// same IP. Tracked independently of `pinned` because audit runs even under `AllowAll`,
     /// where nothing is pinned. Empty when audit is off.
     dns_ips: Mutex<HashSet<(Ipv4Addr, Ipv4Addr)>>,
-    /// The addresses the switch handed each source in a DNS answer, by name and for as long as
-    /// a pin would hold them, while the hub has dry-run rules: a rule would admit a connection
-    /// to one through a name it allows, as its pin would. Empty without dry-run rules; bounded
-    /// as `pinned` is, so a rule judges a shed address as it would enforce it: refused.
-    trial_pins: Mutex<Pins>,
     /// Where the bytes forwarded are written for the job trace to read. `None` = don't
     /// count. Unlike the audit channel this is not opt-in: what a job moved over the network
     /// is part of what it cost, and the counting is one relaxed add per copy buffer.
@@ -729,7 +753,7 @@ struct EgressGuard {
     hub: Option<Arc<Egress>>,
     /// The hub's dry-run rules, each with the layer the hub would enforce under it: what one
     /// refuses and the switch carries is recorded as that rule's would-be denial, and carried.
-    hub_dry_run: Vec<(String, Arc<Egress>)>,
+    hub_dry_run: Vec<TrialRule>,
     /// How long the denial and audit channels may grow, in bytes: past it a record is dropped
     /// and only counted, and the counts are written out as `omitted` records. `None` =
     /// unbounded. A guest that loops on its lookups fills a channel for as long as it runs.
@@ -752,7 +776,6 @@ impl EgressGuard {
             denied_log: None,
             audit_log: None,
             dns_ips: Mutex::new(HashSet::new()),
-            trial_pins: Mutex::default(),
             bytes_log: None,
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
@@ -812,10 +835,19 @@ impl EgressGuard {
     /// unrestricted dry-run rule would refuse nothing.
     fn with_hub(mut self, hub: Option<Egress>, dry_run: Vec<(String, Egress)>) -> Self {
         self.hub = hub.filter(|h| !matches!(h, Egress::AllowAll)).map(Arc::new);
-        self.hub_dry_run = dry_run
+        let dry_run: Vec<_> = dry_run
             .into_iter()
             .filter(|(_, e)| !matches!(e, Egress::AllowAll))
-            .map(|(rule, e)| (rule, Arc::new(e)))
+            .collect();
+        // Each rule its share of the one bound, so together they hold no more than `pinned`.
+        let share = MAX_PINS / dry_run.len().max(1);
+        self.hub_dry_run = dry_run
+            .into_iter()
+            .map(|(rule, e)| TrialRule {
+                rule,
+                layer: Arc::new(e),
+                pins: Mutex::new(Pins::bounded(share)),
+            })
             .collect();
         self
     }
@@ -1323,23 +1355,26 @@ impl EgressGuard {
     /// Record, for each hub dry-run rule that would refuse a lookup of `name` the switch is
     /// carrying, that rule's would-be denial.
     fn dry_run_rules_dns(&self, src: Ipv4Addr, name: &str) {
-        for (rule, layer) in &self.hub_dry_run {
+        for TrialRule { rule, layer, .. } in &self.hub_dry_run {
             if !layer.allows_host(name) {
                 self.record_dns_denial(src, name, true, Some(rule));
             }
         }
     }
-    /// Remember that the switch handed `src` these addresses for `name`, for the hub's dry-run
-    /// rules to judge a connection to one as a pin of theirs would ([`Self::trial_pins`]).
+    /// Remember that the switch handed `src` these addresses for `name`, for each hub dry-run
+    /// rule allowing `name` to judge a connection to one as its pin would ([`TrialRule::pins`]).
     fn pin_for_trials(&self, src: Ipv4Addr, name: &str, ips: &[Ipv4Addr], ttl: u32) {
-        if self.hub_dry_run.is_empty() {
-            return;
-        }
         let now = Instant::now();
         let until = now + Duration::from_secs(u64::from(ttl).max(30) + 60);
-        let mut pins = self.trial_pins.lock().unwrap();
-        for ip in ips.iter().filter(|ip| !unroutable(**ip)) {
-            pins.pin((src, *ip), name, until, now);
+        for trial in self
+            .hub_dry_run
+            .iter()
+            .filter(|t| t.layer.allows_host(name))
+        {
+            let mut pins = trial.pins.lock().unwrap();
+            for ip in ips.iter().filter(|ip| !unroutable(**ip)) {
+                pins.pin((src, *ip), name, until, now);
+            }
         }
     }
     /// Record, for each hub dry-run rule that would refuse a direct flow the switch is
@@ -1358,9 +1393,8 @@ impl EgressGuard {
             return;
         }
         let foreign_dns = dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway);
-        for (rule, layer) in &self.hub_dry_run {
-            let allows =
-                layer.allows_ip(dst.ip(), dst.port()) || pinned_by(&self.trial_pins, layer, s, dst);
+        for TrialRule { rule, layer, pins } in &self.hub_dry_run {
+            let allows = layer.allows_ip(dst.ip(), dst.port()) || pinned_by(pins, layer, s, dst);
             if foreign_dns || !allows {
                 self.record_denial_by(src, proto, dst, true, Some(rule));
             }
@@ -7803,14 +7837,14 @@ mod tests {
         let reachable = |i: u32| g.allows(src, SocketAddr::new(ip(i).into(), 443));
         let judged = |i: u32| {
             pinned_by(
-                &g.trial_pins,
+                &g.hub_dry_run[0].pins,
                 &trial,
                 src,
                 SocketAddr::new(ip(i).into(), 443),
             )
         };
         assert!(g.pinned.lock().unwrap().len <= MAX_PINS);
-        assert!(g.trial_pins.lock().unwrap().len <= MAX_PINS);
+        assert!(g.hub_dry_run[0].pins.lock().unwrap().len <= MAX_PINS);
         // The latest lookup holds, the earliest was shed and is refused once more.
         assert!(reachable(flood - 1) && judged(flood - 1));
         assert!(!reachable(0) && !judged(0));
@@ -7819,6 +7853,32 @@ mod tests {
         let live = (0..flood).filter(|&i| reachable(i)).count();
         assert!(live > 0 && live <= MAX_PINS, "{live}");
         assert_eq!(live, (0..flood).filter(|&i| judged(i)).count());
+    }
+
+    /// Each dry-run rule holds the pins of the names it allows only, within its share of the
+    /// bound: a flood of names one rule refuses sheds nothing another holds.
+    #[test]
+    fn a_dry_run_rules_pins_are_its_own() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let narrow = Egress::restricted(&[], &["crates.io".into()]).unwrap();
+        let wide = Egress::restricted(&[], &["example.com".into()]).unwrap();
+        let g = EgressGuard::new(Egress::AllowAll, gw).with_hub(
+            None,
+            vec![("narrow".into(), narrow.clone()), ("wide".into(), wide)],
+        );
+        let crates = Ipv4Addr::new(7, 7, 7, 7);
+        // Expiring before every name of the flood: the first to go from a shared bound.
+        g.pin_for_trials(src, "static.crates.io", &[crates], 30);
+        for i in 0..(2 * MAX_PINS as u32) {
+            let ip = Ipv4Addr::from(0x0a00_0000 + i);
+            g.pin_for_trials(src, &format!("h{i}.example.com"), &[ip], 300);
+        }
+        let held = |t: &TrialRule| t.pins.lock().unwrap().len;
+        assert_eq!(held(&g.hub_dry_run[0]), 1);
+        assert!(held(&g.hub_dry_run[0]) + held(&g.hub_dry_run[1]) <= MAX_PINS);
+        let to = SocketAddr::new(crates.into(), 443);
+        assert!(pinned_by(&g.hub_dry_run[0].pins, &narrow, src, to));
     }
 
     #[test]
