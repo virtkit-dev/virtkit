@@ -2832,7 +2832,11 @@ fn place(
         crate::tokens::for_job(hub, mint, (n, row), id, &spec, mint_key.as_deref())
     });
     let (registry, events, shown) = match minted {
-        Some(Ok(((access, (index, event)), shown))) => (
+        Some(Ok(crate::tokens::Minted {
+            access,
+            audit: (index, event),
+            shown,
+        })) => (
             Some(access),
             vec![(index, HUB.to_string(), event)],
             Some(shown),

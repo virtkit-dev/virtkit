@@ -262,8 +262,15 @@ pub async fn sweep(hub: Arc<Hub>) {
     }
 }
 
-/// A minted job token: the access to send, and its audit event, indexed under the registry.
-pub type Minted = (JobRegistry, (Option<String>, String));
+/// A minted job token.
+pub struct Minted {
+    /// The access to send in the job's start.
+    pub access: JobRegistry,
+    /// Its audit event, indexed under the registry.
+    pub audit: (Option<String>, String),
+    /// What the job's record shows of it.
+    pub shown: RegistryAccess,
+}
 
 /// Minting inputs, read and signing keys loaded before taking the dispatch lock:
 /// registries that take tokens, their namespaces, signing keys, and jobs keys bound to
@@ -314,8 +321,7 @@ impl MintCtx {
 /// The token for placed job `job`, sent to `node`, when everything it needs holds: the node
 /// uses job tokens and names a registry the hub binds, that registry takes tokens and has a
 /// key it applied, and the job's jobs key (`key`) is still working and bound to a GitLab
-/// instance. The access to send, the audit event, indexed under the registry, and what the
-/// job's record shows; else what it shows of why there is none, nothing on a hub where no
+/// instance; else what the job's record shows of why there is none, nothing on a hub where no
 /// registry takes tokens or is bound to an address, whose jobs are not meant to get any.
 /// Never fails a placement: what cannot be minted is logged and the job goes without.
 pub fn for_job(
@@ -325,7 +331,7 @@ pub fn for_job(
     job: &str,
     spec: &JobSpec,
     key: Option<&str>,
-) -> Result<(Minted, RegistryAccess), Option<RegistryAccess>> {
+) -> Result<Minted, Option<RegistryAccess>> {
     if ctx.registries.is_empty() && ctx.untokened.is_empty() {
         return Err(None);
     }
@@ -363,14 +369,18 @@ pub fn for_job(
         gitlab,
     };
     match mint_for_job(hub, ctx, &target, (node.0, job), spec) {
-        Ok(minted) => {
-            let access = RegistryAccess::Issued {
-                registry: minted.0.registry_id.clone(),
-                grants: minted.0.grants.clone(),
-                expires_at: minted.0.expires_at,
-                jti: minted.2,
+        Ok((access, audit, jti)) => {
+            let shown = RegistryAccess::Issued {
+                registry: access.registry_id.clone(),
+                grants: access.grants.clone(),
+                expires_at: access.expires_at,
+                jti,
             };
-            Ok(((minted.0, minted.1), access))
+            Ok(Minted {
+                access,
+                audit,
+                shown,
+            })
         }
         Err(e) => {
             eprintln!("vk-hub: job {job}: no registry token: {e:#}");
