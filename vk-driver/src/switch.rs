@@ -13,7 +13,7 @@
 //!     sockets (transparent egress). ipstack's reply packets are routed back to
 //!     the owning VM by destination IP.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::IoSlice;
@@ -246,28 +246,7 @@ pub struct Cidr4 {
 
 impl Cidr4 {
     fn parse(s: &str) -> Result<Self> {
-        // Report IPv6 explicitly before port or IPv4 parsing.
-        let host = s.split(['/', '%']).next().unwrap_or(s);
-        if s.starts_with('[') || host.parse::<std::net::Ipv6Addr>().is_ok() {
-            bail!("{s:?}: IPv6 is refused; an allowlist takes IPv4 CIDRs (optionally CIDR:port)");
-        }
-        // Optional `:port` suffix; IPv4 has no colons, so a colon unambiguously starts it.
-        let (cidr, port) = match s.rsplit_once(':') {
-            Some((c, p)) => (
-                c,
-                Some(p.parse().with_context(|| format!("bad port in {s:?}"))?),
-            ),
-            None => (s, None),
-        };
-        let (addr, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
-        let ip: Ipv4Addr = addr
-            .parse()
-            .with_context(|| format!("bad CIDR address in {s:?}"))?;
-        let prefix: u8 = prefix
-            .parse()
-            .ok()
-            .filter(|p| *p <= 32)
-            .with_context(|| format!("bad CIDR prefix in {s:?}"))?;
+        let (ip, prefix, port) = vk_hub_proto::egress::parse_allow_ip(s).map_err(|e| anyhow!(e))?;
         Ok(Cidr4 {
             net: u32::from(ip) & mask4(prefix),
             prefix,
@@ -400,18 +379,7 @@ impl EgressFile {
 /// (`allow-name`, `--allow-name`).
 pub fn check_allow_names(names: &[String], key: &str) -> Result<()> {
     for name in names {
-        let bare = name.trim_start_matches('.');
-        // A trailing dot is a fully qualified name, which no suffix match the switch
-        // makes would ever equal.
-        if bare.is_empty()
-            || bare.ends_with('.')
-            || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
-        {
-            bail!(
-                "{key} {name:?}: expected a DNS suffix such as \"debian.org\", which also \
-                 allows every host under it"
-            );
-        }
+        vk_hub_proto::egress::check_allow_name(name).map_err(|e| anyhow!("{key} {e}"))?;
     }
     Ok(())
 }
