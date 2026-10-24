@@ -1902,6 +1902,14 @@ impl HubLayer {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
     }
+
+    /// Write the layer to `path` for a switch to [`HubLayer::read`]: private, and published by
+    /// `rename`, so a reader sees one layer whole and a name already there is replaced, never
+    /// written through. Not fsynced: a switch reads it once, and nothing after a crash.
+    fn write(&self, path: &Path) -> Result<()> {
+        vk_fs::write_atomic_unsynced(path, &serde_json::to_vec(self)?, 0o600)
+            .with_context(|| format!("writing {}", path.display()))
+    }
 }
 
 /// A node's egress cap, as [`Spawn::cap`] passes it.
@@ -1997,18 +2005,8 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     if let Some(hub) = &opts.hub {
         // A file rather than flags: a layer and its dry-run rules can be hundreds of entries.
         // Written whole before the switch starts, which reads it once.
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let path = opts.log.with_file_name(HUB_EGRESS);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        f.write_all(&serde_json::to_vec(hub)?)
-            .with_context(|| format!("writing {}", path.display()))?;
+        hub.write(&path)?;
         cmd.arg("--hub-egress").arg(&path);
     }
     if let Some((sentinel, host)) = opts.registry_proxy {
@@ -6211,6 +6209,7 @@ mod tests {
     /// and name the rule they are in.
     #[test]
     fn a_hub_layer_file_reads_back_with_its_checks() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("vk-hub-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6226,7 +6225,15 @@ mod tests {
                 names: vec!["crates.io".into()],
             }],
         };
-        std::fs::write(&path, serde_json::to_vec(&layer).unwrap()).unwrap();
+        // A name already there is replaced, not written through.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"kept").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        layer.write(&path).unwrap();
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"kept");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let read = HubLayer::read(&path).unwrap();
         assert_eq!(read, layer);
         let (enforce, dry_run) = read.policies().unwrap();
