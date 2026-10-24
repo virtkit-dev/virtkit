@@ -1266,6 +1266,11 @@ fn build_windows_unit(
             unit.name
         );
     }
+    // Nor does the job's egress record: say so, so that its build phase reads as unrecorded
+    // rather than as quiet. Best-effort, like the record itself.
+    if let Some(dir) = &ctx.egress_record {
+        let _ = std::fs::write(dir.join(crate::egress_report::UNRECORDED_BUILD), b"");
+    }
     let registry = crate::windows_registry(None, false, &cfg.build)?;
     let (cpus, mem) = crate::winbuild::default_size();
     let opts = crate::winbuild::Options {
@@ -3839,6 +3844,10 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     // Before the job dir goes: the marker naming the archive directory is in it.
     crate::atop::compress_job_log(ctx);
     crate::vmmthreads::archive(ctx);
+    // And the run phase's egress channels, which a placed job's report is read from.
+    if let Some(record) = &ctx.egress_record {
+        crate::egress_report::keep_run_channels(&ctx.job_dir, record);
+    }
     let removed = match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

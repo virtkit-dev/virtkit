@@ -50,6 +50,11 @@ All notable changes to virtkit will be documented in this file.
   instances are its Other API clients tab.
 - **A fleet job's page shows its registry access**: rights per storage area in plain words,
   with token details folded away, or the reason it got none and where to fix it.
+- **Nodes report each placed job's egress to the hub with its result**: what was refused, or
+  flagged under dry-run, in the build phase as in the run phase, by VM and by the setting that
+  refused it, what the job reached, the egress variables that failed it or that a setting
+  above them leaves nothing of, and the bytes moved.
+  A job's build-phase contacts and refusals are recorded whether or not audit is on.
 - **The hub's Audit page leaves jobs out by default** and filters by category (people's
   actions, hub and nodes, jobs, everything), by person — every web session of one identity
   together — and by text, as well as by node or registry. Clicking who did something narrows

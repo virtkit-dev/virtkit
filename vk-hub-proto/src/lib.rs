@@ -702,6 +702,10 @@ pub struct Inventory {
     /// does not would run the job with its own credential.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job_tokens: bool,
+    /// Whether the node sends each placed job's egress report ([`job::JobResult::egress`]): a job
+    /// placed on one that does not has no report to show.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress_reports: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1420,6 +1424,7 @@ mod tests {
             labels: Vec::new(),
             registry: None,
             job_tokens: false,
+            egress_reports: false,
         }
     }
 
@@ -2174,10 +2179,12 @@ mod tests {
         let mut tokens = serde_json::to_value(inventory()).unwrap();
         tokens["registry"] = json!("https://reg.example.com");
         tokens["job_tokens"] = json!(true);
+        tokens["egress_reports"] = json!(true);
         pinned(
             &Inventory {
                 registry: Some("https://reg.example.com".into()),
                 job_tokens: true,
+                egress_reports: true,
                 ..inventory()
             },
             tokens,

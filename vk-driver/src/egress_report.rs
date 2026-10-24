@@ -10,14 +10,21 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use vk_hub_proto::egress::{EgressLayer, EgressRefusal};
+use vk_hub_proto::egress::{
+    EgressCoverage, EgressDestination, EgressEntry, EgressLayer, EgressOmitted, EgressOutcome,
+    EgressPhase, EgressPhaseReport, EgressProtocol, EgressRefusal, EgressReport, EgressSource,
+    MAX_EGRESS_CONTACTS, MAX_EGRESS_DENIALS,
+};
 
 /// A placed job's egress record ([`crate::jobctx::JobCtx::egress_record`]) keeps each of the
 /// job's builds' channels in a dir of its own, named with this prefix, laid out as a build's
 /// scratch lays them out.
 pub const BUILD_PREFIX: &str = "build-";
+/// A file in a placed job's egress record saying that one of its builds recorded nothing: a
+/// Windows image's, whose build records no egress.
+pub const UNRECORDED_BUILD: &str = "unrecorded-build";
 
 /// The egress declarations a placed job was refused at validation, in its egress record: one
 /// JSON [`EgressRefusal`] per line.
@@ -428,12 +435,17 @@ fn read_tail(path: &Path, max: u64) -> (Vec<u8>, bool) {
 /// switched at layer 2 without ever being proxied.
 pub fn read_net_bytes(path: &Path) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
+    Some(sum_net_bytes(&text))
+}
+
+/// The traffic the byte channel's lines in `text` add up to, `(sent, received)`.
+fn sum_net_bytes(text: &str) -> (u64, u64) {
     // Each line is one switch's traffic since it last wrote, so the total is their sum —
     // over every publish, and over every switch that shared the channel (a build's stages
     // each have their own LAN). One publish is one small `write_all` to an `O_APPEND` fd,
     // which the kernel does not split, so a reader never sees half a record — and a line
     // that does not hold two numbers is passed over rather than read as a figure.
-    let total = text.lines().fold((0u64, 0u64), |(sent, received), line| {
+    text.lines().fold((0u64, 0u64), |(sent, received), line| {
         let mut fields = line.split_whitespace();
         match (
             fields.next().and_then(|f| f.parse::<u64>().ok()),
@@ -442,8 +454,7 @@ pub fn read_net_bytes(path: &Path) -> Option<(u64, u64)> {
             (Some(s), Some(r)) => (sent.saturating_add(s), received.saturating_add(r)),
             _ => (sent, received),
         }
-    });
-    Some(total)
+    })
 }
 
 /// Read the denials appended to `path` since byte `offset`, returning them with the new
@@ -506,6 +517,439 @@ fn parse_records(buf: &[u8]) -> (Vec<(Denial, Attrs)>, usize) {
         out.push((denial, Attrs::decode(fields)));
     }
     (out, consumed)
+}
+
+/// The dir of a placed job's egress record its run phase's channels are kept in at cleanup,
+/// laid out as the job dir lays them out ([`keep_run_channels`]).
+pub const RUN_DIR: &str = "run";
+
+/// The run phase's channels in the executor's `job_dir`, moved into the job's egress `record`
+/// before cleanup removes the job dir: the switch is stopped by then, and has written out all
+/// it counted. Best-effort: a channel that cannot be kept leaves the report without it.
+pub fn keep_run_channels(job_dir: &Path, record: &Path) {
+    use crate::jobctx::JobCtx;
+    let run = record.join(RUN_DIR);
+    if std::fs::create_dir_all(&run).is_err() {
+        return;
+    }
+    for from in [
+        JobCtx::egress_denied_log_in(job_dir),
+        JobCtx::egress_audit_log_in(job_dir),
+        job_dir.join(crate::run::NET_BYTES),
+    ] {
+        let Some(name) = from.file_name() else {
+            continue;
+        };
+        let to = run.join(name);
+        // A copy where the two are not on one filesystem; nothing at all where there is no
+        // channel, as for a job whose guest had no switch.
+        if std::fs::rename(&from, &to).is_err() && from.exists() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
+/// How much of each channel a [`JobRecord`] reads, from its start: what a job's switch records
+/// past it is left out, and the phase's coverage says so.
+const JOB_REPORT_READ: u64 = 16 << 20;
+
+/// How far one channel has been read: whole lines up to `offset`, and whether some of it was
+/// left out.
+#[derive(Default)]
+struct Channel {
+    offset: u64,
+    cut: bool,
+}
+
+impl Channel {
+    /// The whole lines `path` holds past the last read, within [`JOB_REPORT_READ`] of its start;
+    /// a line still being written is read again, whole, the next time. `None` for a missing file,
+    /// which holds nothing yet; one that cannot be read, holds more than the bound, or has lost
+    /// lines read before, is cut.
+    fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            // Gone after lines were read from it: whatever followed them is left out.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.cut |= self.offset > 0;
+                return None;
+            }
+            // There, but not to be read: whatever it holds is left out.
+            Err(_) => {
+                self.cut = true;
+                return Some(Vec::new());
+            }
+        };
+        // Shorter than what was read of it: not the file read, and what followed is left out.
+        if f.metadata().is_ok_and(|m| m.len() < self.offset) {
+            self.cut = true;
+            return Some(Vec::new());
+        }
+        let room = JOB_REPORT_READ.saturating_sub(self.offset);
+        let mut buf = Vec::new();
+        let read = f.seek(SeekFrom::Start(self.offset)).and_then(|_| {
+            f.take(room.saturating_add(1))
+                .read_to_end(&mut buf)
+                .map(|_| ())
+        });
+        if read.is_err() {
+            self.cut = true;
+            return Some(Vec::new());
+        }
+        if buf.len() as u64 > room {
+            self.cut = true;
+            buf.truncate(usize::try_from(room).unwrap_or(usize::MAX));
+        }
+        let whole = buf.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+        buf.truncate(whole);
+        self.offset = self.offset.saturating_add(whole as u64);
+        Some(buf)
+    }
+}
+
+/// How far a dir's channels have been read: its denials, its contacts and its bytes.
+#[derive(Default)]
+struct Channels {
+    denied: Channel,
+    audit: Channel,
+    bytes: Channel,
+}
+
+impl Channels {
+    fn cut(&self) -> bool {
+        self.denied.cut || self.audit.cut || self.bytes.cut
+    }
+}
+
+/// What a phase's channels counted beyond their entries.
+#[derive(Default)]
+struct PhaseCount {
+    omitted: EgressOmitted,
+    sent_bytes: Option<u64>,
+    received_bytes: Option<u64>,
+}
+
+/// What a report entry is counted under: one destination, reached or refused one way, by one
+/// VM in one phase, decided by one layer.
+type EntryKey = (
+    EgressOutcome,
+    EgressProtocol,
+    EgressDestination,
+    EgressPhase,
+    EgressSource,
+    Option<EgressLayer>,
+);
+
+/// A job's records counted into report entries as they are read, bounded as the report is: an
+/// entry past [`MAX_EGRESS_DENIALS`] or [`MAX_EGRESS_CONTACTS`] is only counted, as omitted.
+#[derive(Default)]
+struct Tally {
+    entries: Vec<EgressEntry>,
+    index: std::collections::HashMap<EntryKey, usize>,
+    denials: usize,
+    contacts: usize,
+}
+
+impl Tally {
+    /// Count `count` attempts under `key` at `at_ms`; past the bounds, into `omitted`.
+    fn add(&mut self, key: EntryKey, count: u64, at_ms: Option<u64>, omitted: &mut EgressOmitted) {
+        if let Some(e) = self.index.get(&key).and_then(|&i| self.entries.get_mut(i)) {
+            e.count = e.count.saturating_add(count);
+            if let Some(at) = at_ms {
+                e.first_seen_ms = match e.first_seen_ms {
+                    0 => at,
+                    first => first.min(at),
+                };
+                e.last_seen_ms = e.last_seen_ms.max(at);
+            }
+            return;
+        }
+        let (outcome, protocol, destination, phase, source, layer) = key.clone();
+        let (kept, max) = match outcome.is_denial() {
+            true => (&mut self.denials, MAX_EGRESS_DENIALS),
+            false => (&mut self.contacts, MAX_EGRESS_CONTACTS),
+        };
+        if *kept >= max {
+            omitted.add(outcome, count);
+            return;
+        }
+        *kept += 1;
+        self.index.insert(key, self.entries.len());
+        self.entries.push(EgressEntry {
+            outcome,
+            protocol,
+            destination,
+            phase,
+            source,
+            layer,
+            count,
+            first_seen_ms: at_ms.unwrap_or(0),
+            last_seen_ms: at_ms.unwrap_or(0),
+            stage: None,
+            rule: None,
+        });
+    }
+
+    /// Count what the channels in `dir` hold past `read` into `phase`, its omissions and its
+    /// bytes included.
+    fn add_channels(
+        &mut self,
+        dir: &Path,
+        read: &mut Channels,
+        phase: EgressPhase,
+        count: &mut PhaseCount,
+    ) {
+        use crate::jobctx::JobCtx;
+        let source = |attrs: &Attrs| match &attrs.vm {
+            Some(name) => EgressSource::Service { name: name.clone() },
+            None => EgressSource::Job,
+        };
+        let denied = read
+            .denied
+            .read(&JobCtx::egress_denied_log_in(dir))
+            .unwrap_or_default();
+        for (outcome, n) in omitted_records(&denied) {
+            count.omitted.add(outcome, n);
+        }
+        for (d, attrs) in parse_records(&denied).0 {
+            let outcome = match attrs.would_block {
+                true => EgressOutcome::WouldBlock,
+                false => EgressOutcome::Blocked,
+            };
+            // The switch's count of the names it had no room to keep: attempts, not a place.
+            if d.target == crate::switch::DNS_DENIED_MORE {
+                count.omitted.add(outcome, d.count);
+                continue;
+            }
+            let (protocol, destination) = match d.proto {
+                Proto::Dns => (EgressProtocol::Dns, EgressDestination::domain(&d.target)),
+                Proto::Tcp => (EgressProtocol::Tcp, EgressDestination::address(&d.target)),
+                Proto::Udp => (EgressProtocol::Udp, EgressDestination::address(&d.target)),
+            };
+            let layer = Some(attrs.layer.unwrap_or(EgressLayer::Unknown));
+            let key = (outcome, protocol, destination, phase, source(&attrs), layer);
+            self.add(key, d.count, attrs.at_ms, &mut count.omitted);
+        }
+        let audit = read
+            .audit
+            .read(&JobCtx::egress_audit_log_in(dir))
+            .unwrap_or_default();
+        for (outcome, n) in omitted_records(&audit) {
+            count.omitted.add(outcome, n);
+        }
+        let audit = String::from_utf8_lossy(&audit);
+        for (kind, value, attrs) in audit_records(&audit) {
+            let (protocol, destination) = match kind {
+                "name" => (EgressProtocol::Dns, EgressDestination::domain(value)),
+                "ip" => (
+                    match attrs.proto {
+                        Some(Proto::Tcp) => EgressProtocol::Tcp,
+                        Some(Proto::Udp) => EgressProtocol::Udp,
+                        _ => EgressProtocol::Other,
+                    },
+                    EgressDestination::address(value),
+                ),
+                _ => continue,
+            };
+            let key = (
+                EgressOutcome::Observed,
+                protocol,
+                destination,
+                phase,
+                source(&attrs),
+                None,
+            );
+            self.add(key, 1, attrs.at_ms, &mut count.omitted);
+        }
+        if let Some(bytes) = read.bytes.read(&dir.join(crate::run::NET_BYTES)) {
+            let (sent, received) = sum_net_bytes(&String::from_utf8_lossy(&bytes));
+            count.sent_bytes = Some(count.sent_bytes.unwrap_or(0).saturating_add(sent));
+            count.received_bytes = Some(count.received_bytes.unwrap_or(0).saturating_add(received));
+        }
+    }
+}
+
+/// The attempts a switch dropped past its record limit, from the [`append_omitted`] records in
+/// a channel's `text`.
+fn omitted_records(text: &[u8]) -> Vec<(EgressOutcome, u64)> {
+    String::from_utf8_lossy(text)
+        .lines()
+        .filter_map(|l| {
+            let mut fields = l.strip_prefix("omitted\t")?.split('\t');
+            let outcome = match fields.next()? {
+                "observed" => EgressOutcome::Observed,
+                "would_block" => EgressOutcome::WouldBlock,
+                _ => EgressOutcome::Blocked,
+            };
+            Some((outcome, fields.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// A phase's account before anything is counted into it.
+fn phase_report(phase: EgressPhase, coverage: EgressCoverage) -> EgressPhaseReport {
+    EgressPhaseReport {
+        phase,
+        coverage,
+        omitted: EgressOmitted::default(),
+        sent_bytes: None,
+        received_bytes: None,
+        caps: None,
+    }
+}
+
+/// A placed job's egress record, read as it grows: each read takes only what its channels
+/// gained since the last, so that the report of a running job can be taken again and again at
+/// the cost of what is new. Its builds' channels are in the record; its run phase's in
+/// `run_dir`, the executor's job dir while the job runs and the record's [`RUN_DIR`] once
+/// cleanup has kept them there, the same bytes either way.
+pub struct JobRecord {
+    record: PathBuf,
+    run_dir: PathBuf,
+    tally: Tally,
+    /// Each build's channels, by dir.
+    builds: std::collections::BTreeMap<PathBuf, Channels>,
+    build: PhaseCount,
+    run: Channels,
+    run_count: PhaseCount,
+    /// A run-phase switch was seen: it opens its byte channel as it starts.
+    watched: bool,
+}
+
+impl JobRecord {
+    pub fn new(record: &Path, run_dir: &Path) -> Self {
+        JobRecord {
+            record: record.to_path_buf(),
+            run_dir: run_dir.to_path_buf(),
+            tally: Tally::default(),
+            builds: Default::default(),
+            build: PhaseCount::default(),
+            run: Channels::default(),
+            run_count: PhaseCount::default(),
+            watched: false,
+        }
+    }
+
+    /// Read the run phase's channels from `dir` from now on, where they read as far as before:
+    /// cleanup keeps them in the record's [`RUN_DIR`].
+    pub fn move_run(&mut self, dir: &Path) {
+        self.run_dir = dir.to_path_buf();
+    }
+
+    /// Count what the channels gained since the last read, and the builds begun since.
+    pub fn read(&mut self) {
+        let found = std::fs::read_dir(&self.record).into_iter().flatten();
+        for e in found.filter_map(|e| e.ok()) {
+            let name = e.file_name();
+            let build = name.as_encoded_bytes().starts_with(BUILD_PREFIX.as_bytes());
+            if build && e.file_type().is_ok_and(|t| t.is_dir()) {
+                self.builds.entry(e.path()).or_default();
+            }
+        }
+        for (dir, read) in &mut self.builds {
+            self.tally
+                .add_channels(dir, read, EgressPhase::Build, &mut self.build);
+        }
+        let watched = self.run_dir.join(crate::run::NET_BYTES).exists();
+        // A switch's byte channel seen, then gone: the run's channels were not all kept.
+        self.run.bytes.cut |= self.watched && !watched;
+        self.watched |= watched;
+        self.tally.add_channels(
+            &self.run_dir,
+            &mut self.run,
+            EgressPhase::Run,
+            &mut self.run_count,
+        );
+    }
+
+    /// The report of what has been read, as its node sends it the hub, with `revision`: the
+    /// builds' and the run's denials and contacts, counted per destination, VM and layer, each
+    /// with the stage of `stages` — `(stage, start in ms since the epoch)`, in order — it was
+    /// first seen in; the refused declarations; and each phase the job ran, with its coverage
+    /// and bytes. `run_reached` says the job got past preparing, so that a run phase with no
+    /// channel is reported as unrecorded rather than left out. Bounded
+    /// ([`EgressReport::bounded`]).
+    pub fn report(
+        &self,
+        stages: &[(String, u64)],
+        run_reached: bool,
+        revision: u64,
+    ) -> EgressReport {
+        let mut phases = Vec::new();
+        let unrecorded = self.record.join(UNRECORDED_BUILD).exists();
+        if !self.builds.is_empty() || unrecorded {
+            let mut coverage = match (self.builds.is_empty(), unrecorded) {
+                (true, _) => EgressCoverage::Unavailable,
+                (false, true) => EgressCoverage::Partial,
+                (false, false) => EgressCoverage::Complete,
+            };
+            if self.builds.values().any(Channels::cut) && coverage == EgressCoverage::Complete {
+                coverage = EgressCoverage::Partial;
+            }
+            phases.push(counted(EgressPhase::Build, coverage, &self.build));
+        }
+        if self.watched || run_reached {
+            let coverage = match (self.watched, self.run.cut()) {
+                (false, _) => EgressCoverage::Unavailable,
+                (true, true) => EgressCoverage::Partial,
+                (true, false) => EgressCoverage::Complete,
+            };
+            phases.push(counted(EgressPhase::Run, coverage, &self.run_count));
+        }
+        for p in &mut phases {
+            if !p.omitted.is_empty() && p.coverage == EgressCoverage::Complete {
+                p.coverage = EgressCoverage::Partial;
+            }
+        }
+
+        let mut entries = self.tally.entries.clone();
+        for e in &mut entries {
+            e.stage = stages
+                .iter()
+                .take_while(|(_, start)| e.first_seen_ms != 0 && *start <= e.first_seen_ms)
+                .last()
+                .map(|(stage, _)| stage.clone());
+        }
+        // Denials first, then what was observed, each in the order first seen.
+        entries.sort_by_key(|e| (!e.outcome.is_denial(), e.first_seen_ms));
+
+        // A handful of lines at most: read whole each time.
+        let refused = Channel::default()
+            .read(&self.record.join(REFUSED))
+            .unwrap_or_default();
+        let refusals: Vec<EgressRefusal> = String::from_utf8_lossy(&refused)
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        EgressReport {
+            revision,
+            entries,
+            refusals,
+            refusals_omitted: 0,
+            phases,
+            hub_rules: Vec::new(),
+        }
+        .bounded()
+    }
+}
+
+/// Phase `phase`'s account, with `coverage` and what its channels counted.
+fn counted(phase: EgressPhase, coverage: EgressCoverage, count: &PhaseCount) -> EgressPhaseReport {
+    EgressPhaseReport {
+        omitted: count.omitted,
+        sent_bytes: count.sent_bytes,
+        received_bytes: count.received_bytes,
+        ..phase_report(phase, coverage)
+    }
+}
+
+/// What a placed job's egress `record` holds, read whole, as the first report its node sends
+/// the hub ([`JobRecord::report`]), its run phase's channels in the record's [`RUN_DIR`].
+#[cfg(test)]
+pub fn job_report(record: &Path, stages: &[(String, u64)], run_reached: bool) -> EgressReport {
+    let mut read = JobRecord::new(record, &record.join(RUN_DIR));
+    read.read();
+    read.report(stages, run_reached, 1)
 }
 
 #[cfg(test)]
@@ -953,5 +1397,366 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A placed job's record read into its report: each destination counted per outcome, VM
+    /// and layer, with its first and last times and the stage it was first seen in; the
+    /// switch's overflow count as omitted attempts; malformed names kept as text; the refused
+    /// declarations; and each phase with its coverage and bytes.
+    #[test]
+    fn a_job_record_reads_as_its_report() {
+        use crate::jobctx::JobCtx;
+        let record = std::env::temp_dir().join(format!("vk-egress-job-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&record);
+        let (build, run) = (record.join("build-a"), record.join(RUN_DIR));
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        let at = |ms, layer, vm: Option<&str>, would_block| Attrs {
+            layer,
+            vm: vm.map(str::to_string),
+            would_block,
+            proto: None,
+            at_ms: Some(ms),
+        };
+        let build_denied = JobCtx::egress_denied_log_in(&build);
+        append(
+            &build_denied,
+            Proto::Dns,
+            "Crates.io",
+            &at(1_000, Some(EgressLayer::NodeCap), None, false),
+        );
+        append_repeats(
+            &build_denied,
+            Proto::Dns,
+            "crates.io",
+            4,
+            &at(1_500, Some(EgressLayer::NodeCap), None, false),
+        );
+        std::fs::write(build.join(crate::run::NET_BYTES), "0 0\n10 20\n").unwrap();
+
+        let run_denied = JobCtx::egress_denied_log_in(&run);
+        append(
+            &run_denied,
+            Proto::Tcp,
+            "10.0.0.1:443",
+            &at(3_500, Some(EgressLayer::Service), Some("db"), true),
+        );
+        append(
+            &run_denied,
+            Proto::Dns,
+            "evil\nname",
+            &at(4_000, Some(EgressLayer::Job), None, false),
+        );
+        append_repeats(
+            &run_denied,
+            Proto::Dns,
+            crate::switch::DNS_DENIED_MORE,
+            7,
+            &at(4_000, Some(EgressLayer::Job), None, false),
+        );
+        // What the switch dropped past its record limit.
+        append_omitted(&run_denied, EgressOutcome::WouldBlock, 3);
+        // From an older switch: nothing known but the record.
+        append(&run_denied, Proto::Udp, "10.0.0.2:53", &Attrs::default());
+        let run_audit = JobCtx::egress_audit_log_in(&run);
+        append_contact(&run_audit, "debian.org", &at(3_000, None, None, false));
+        append_contact(&run_audit, "debian.org", &at(5_000, None, None, false));
+        let by_ip = Attrs {
+            proto: Some(Proto::Udp),
+            ..at(3_200, None, Some("db"), false)
+        };
+        append_ip_contact(&run_audit, "10.0.0.3:123", &by_ip);
+        std::fs::write(run.join(crate::run::NET_BYTES), "0 0\n5 6\n").unwrap();
+
+        let refusal = EgressRefusal {
+            variable: "MICROVM_EGRESS_ALLOW_NAME".into(),
+            entry: "evil.com".into(),
+            dimension: vk_hub_proto::egress::EgressDimension::Name,
+            phase: EgressPhase::Run,
+            source: EgressSource::Job,
+            layer: Some(EgressLayer::NodeCap),
+            reason: vk_hub_proto::egress::RefusalReason::Unreachable,
+        };
+        append_refusals(&record.join(REFUSED), std::slice::from_ref(&refusal));
+
+        let stages = [
+            ("prepare_executor".to_string(), 500),
+            ("step_script".to_string(), 3_100),
+        ];
+        let report = job_report(&record, &stages, true);
+        let entry = |outcome,
+                     protocol,
+                     destination,
+                     phase,
+                     source,
+                     layer,
+                     count,
+                     times: (u64, u64),
+                     stage: Option<&str>| {
+            EgressEntry {
+                outcome,
+                protocol,
+                destination,
+                phase,
+                source,
+                layer,
+                count,
+                first_seen_ms: times.0,
+                last_seen_ms: times.1,
+                stage: stage.map(str::to_string),
+                rule: None,
+            }
+        };
+        let db = || EgressSource::Service { name: "db".into() };
+        assert_eq!(
+            report.entries,
+            [
+                entry(
+                    EgressOutcome::Blocked,
+                    EgressProtocol::Udp,
+                    EgressDestination::address("10.0.0.2:53"),
+                    EgressPhase::Run,
+                    EgressSource::Job,
+                    Some(EgressLayer::Unknown),
+                    1,
+                    (0, 0),
+                    None
+                ),
+                entry(
+                    EgressOutcome::Blocked,
+                    EgressProtocol::Dns,
+                    EgressDestination::domain("crates.io"),
+                    EgressPhase::Build,
+                    EgressSource::Job,
+                    Some(EgressLayer::NodeCap),
+                    5,
+                    (1_000, 1_500),
+                    Some("prepare_executor")
+                ),
+                entry(
+                    EgressOutcome::WouldBlock,
+                    EgressProtocol::Tcp,
+                    EgressDestination::address("10.0.0.1:443"),
+                    EgressPhase::Run,
+                    db(),
+                    Some(EgressLayer::Service),
+                    1,
+                    (3_500, 3_500),
+                    Some("step_script")
+                ),
+                entry(
+                    EgressOutcome::Blocked,
+                    EgressProtocol::Dns,
+                    EgressDestination::Malformed {
+                        text: "evil\u{fffd}name".into()
+                    },
+                    EgressPhase::Run,
+                    EgressSource::Job,
+                    Some(EgressLayer::Job),
+                    1,
+                    (4_000, 4_000),
+                    Some("step_script")
+                ),
+                entry(
+                    EgressOutcome::Observed,
+                    EgressProtocol::Dns,
+                    EgressDestination::domain("debian.org"),
+                    EgressPhase::Run,
+                    EgressSource::Job,
+                    None,
+                    2,
+                    (3_000, 5_000),
+                    Some("prepare_executor")
+                ),
+                entry(
+                    EgressOutcome::Observed,
+                    EgressProtocol::Udp,
+                    EgressDestination::address("10.0.0.3:123"),
+                    EgressPhase::Run,
+                    db(),
+                    None,
+                    1,
+                    (3_200, 3_200),
+                    Some("step_script")
+                ),
+            ]
+        );
+        assert_eq!(report.refusals, [refusal]);
+        assert_eq!(
+            report.phases,
+            [
+                EgressPhaseReport {
+                    sent_bytes: Some(10),
+                    received_bytes: Some(20),
+                    ..phase_report(EgressPhase::Build, EgressCoverage::Complete)
+                },
+                EgressPhaseReport {
+                    omitted: EgressOmitted {
+                        blocked: 7,
+                        would_block: 3,
+                        observed: 0,
+                    },
+                    sent_bytes: Some(5),
+                    received_bytes: Some(6),
+                    ..phase_report(EgressPhase::Run, EgressCoverage::Partial)
+                },
+            ]
+        );
+        assert_eq!(report.revision, 1);
+        let _ = std::fs::remove_dir_all(&record);
+    }
+
+    /// A phase that ran with nothing recording it reads as unrecorded, not as quiet; one the
+    /// job never reached is left out.
+    #[test]
+    fn an_unrecorded_phase_reads_as_unavailable() {
+        let record = std::env::temp_dir().join(format!("vk-egress-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&record);
+        std::fs::create_dir_all(&record).unwrap();
+        assert_eq!(job_report(&record, &[], false).phases, []);
+        std::fs::write(record.join(UNRECORDED_BUILD), b"").unwrap();
+        assert_eq!(
+            job_report(&record, &[], true).phases,
+            [
+                phase_report(EgressPhase::Build, EgressCoverage::Unavailable),
+                phase_report(EgressPhase::Run, EgressCoverage::Unavailable),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&record);
+    }
+
+    /// Past its bound a destination is counted, not listed, and the entries kept are the
+    /// first seen.
+    #[test]
+    fn a_job_reports_the_denials_past_its_bound_as_omitted() {
+        let record = std::env::temp_dir().join(format!("vk-egress-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&record);
+        let run = record.join(RUN_DIR);
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(crate::run::NET_BYTES), "0 0\n").unwrap();
+        let denied = crate::jobctx::JobCtx::egress_denied_log_in(&run);
+        for i in 0..MAX_EGRESS_DENIALS + 5 {
+            append_repeats(
+                &denied,
+                Proto::Dns,
+                &format!("n{i}.example"),
+                2,
+                &Attrs::default(),
+            );
+        }
+        let report = job_report(&record, &[], true);
+        assert_eq!(report.entries.len(), MAX_EGRESS_DENIALS);
+        assert_eq!(
+            report.entries[0].destination,
+            EgressDestination::domain("n0.example")
+        );
+        assert_eq!(report.phases[0].coverage, EgressCoverage::Partial);
+        assert_eq!(report.phases[0].omitted.blocked, 10);
+        let _ = std::fs::remove_dir_all(&record);
+    }
+
+    /// A record read as it grows — a line caught half-written, a build begun between reads,
+    /// the run's channels kept in the record by cleanup — reports as it does read whole.
+    #[test]
+    fn a_job_record_read_as_it_grows_reads_as_it_does_whole() {
+        use crate::jobctx::JobCtx;
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("vk-egress-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (job, record) = (tmp.join("job"), tmp.join("record"));
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::create_dir_all(&record).unwrap();
+        let attrs = |ms| Attrs {
+            layer: Some(EgressLayer::NodeCap),
+            at_ms: Some(ms),
+            ..Attrs::default()
+        };
+        let denied = JobCtx::egress_denied_log_in(&job);
+        let mut live = JobRecord::new(&record, &job);
+        live.read();
+        std::fs::write(job.join(crate::run::NET_BYTES), "1 2\n").unwrap();
+        append(&denied, Proto::Dns, "a.example", &attrs(1_000));
+        live.read();
+        assert_eq!(live.report(&[], true, 1).entries.len(), 1);
+        // Half a line, then the rest.
+        let mut f = OpenOptions::new().append(true).open(&denied).unwrap();
+        f.write_all(b"dns\tb.exa").unwrap();
+        live.read();
+        assert_eq!(live.report(&[], true, 1).entries.len(), 1);
+        f.write_all(b"mple\t1\tlayer=job\tt=2000\n").unwrap();
+        append(&denied, Proto::Dns, "a.example", &attrs(3_000));
+        let build = record.join("build-x");
+        std::fs::create_dir_all(&build).unwrap();
+        append(
+            &JobCtx::egress_denied_log_in(&build),
+            Proto::Tcp,
+            "10.0.0.1:443",
+            &attrs(2_500),
+        );
+        live.read();
+        std::fs::write(job.join(crate::run::NET_BYTES), "1 2\n3 4\n").unwrap();
+        keep_run_channels(&job, &record);
+        live.move_run(&record.join(RUN_DIR));
+        live.read();
+        let stages = [("step_script".to_string(), 500)];
+        let whole = job_report(&record, &stages, true);
+        assert_eq!(live.report(&stages, true, 1), whole);
+        assert_eq!(whole.entries.len(), 3);
+        assert_eq!(whole.entries[0].count, 2);
+        assert_eq!(whole.phases[1].sent_bytes, Some(4));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Channels gone, or shorter than what was read of them, have lost what followed: the phase
+    /// reads as partial, with what was counted before.
+    #[test]
+    fn a_channel_lost_after_it_was_read_leaves_its_phase_partial() {
+        let tmp = std::env::temp_dir().join(format!("vk-egress-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let run = tmp.join(RUN_DIR);
+        std::fs::create_dir_all(&run).unwrap();
+        let denied = crate::jobctx::JobCtx::egress_denied_log_in(&run);
+        let coverage = |live: &JobRecord| live.report(&[], true, 1).phases[0].coverage;
+        for lose in [
+            |run: &Path| std::fs::remove_dir_all(run).unwrap(),
+            |run: &Path| {
+                std::fs::write(crate::jobctx::JobCtx::egress_denied_log_in(run), "").unwrap()
+            },
+        ] {
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::write(run.join(crate::run::NET_BYTES), "1 2\n").unwrap();
+            append(&denied, Proto::Dns, "a.example", &Attrs::default());
+            let mut live = JobRecord::new(&tmp, &run);
+            live.read();
+            assert_eq!(coverage(&live), EgressCoverage::Complete);
+            lose(&run);
+            live.read();
+            assert_eq!(coverage(&live), EgressCoverage::Partial);
+            assert_eq!(live.report(&[], true, 1).entries.len(), 1);
+            let _ = std::fs::remove_dir_all(&run);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Cleanup keeps the run phase's channels, those there are, in the job's record.
+    #[test]
+    fn run_channels_are_kept_in_the_record() {
+        let tmp = std::env::temp_dir().join(format!("vk-egress-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (job, record) = (tmp.join("job"), tmp.join("record"));
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(job.join(crate::run::NET_BYTES), "0 0\n").unwrap();
+        std::fs::write(job.join("egress-denied.log"), "dns\ta.example\n").unwrap();
+        keep_run_channels(&job, &record);
+        let run = record.join(RUN_DIR);
+        assert_eq!(
+            std::fs::read_to_string(run.join("egress-denied.log")).unwrap(),
+            "dns\ta.example\n"
+        );
+        assert!(run.join(crate::run::NET_BYTES).exists());
+        assert!(!run.join(crate::run::AUDIT_LOG).exists());
+        assert!(!job.join("egress-denied.log").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

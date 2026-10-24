@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use vk_hub_proto::dispatch::CancelMode;
+use vk_hub_proto::egress::EgressReport;
 use vk_hub_proto::job::{
     ArtifactOutcome, CiJob, FailureClass, JobResult, JobSpec, JobUsage, STEP_AFTER_SCRIPT,
     UploadState,
@@ -110,6 +111,52 @@ struct Driver {
     prepared_in: Option<Duration>,
     /// The registry access the hub gave the job, from its start.
     registry: Option<JobRegistry>,
+    /// The job's egress, as its report is taken once it has ended.
+    egress: Arc<Egress>,
+}
+
+/// A job's egress as its driver follows it: its record, read as it grows, and what its report
+/// says beside the record.
+struct Egress {
+    /// Each stage the job entered, with when, in milliseconds since the epoch: what its report
+    /// dates its entries by.
+    timeline: std::sync::Mutex<Vec<(String, u64)>>,
+    /// Whether preparation succeeded, so that the job reached its run phase.
+    prepared: std::sync::atomic::AtomicBool,
+    /// Taken by one reader at a time.
+    read: std::sync::Mutex<crate::egress_report::JobRecord>,
+}
+
+impl Egress {
+    /// The egress recorded in `record`, the run phase's channels in `run_dir` while the job runs.
+    fn new(record: &Path, run_dir: &Path) -> Self {
+        Egress {
+            timeline: Default::default(),
+            prepared: Default::default(),
+            read: std::sync::Mutex::new(crate::egress_report::JobRecord::new(record, run_dir)),
+        }
+    }
+
+    fn timeline(&self) -> Vec<(String, u64)> {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn prepared(&self) -> bool {
+        self.prepared.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The last report, once cleanup has kept the run phase's channels in `run_dir`: the record
+    /// read to its end.
+    fn last(&self, run_dir: &Path) -> EgressReport {
+        let (timeline, prepared) = (self.timeline(), self.prepared());
+        let mut record = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        record.move_run(run_dir);
+        record.read();
+        record.report(&timeline, prepared, 1)
+    }
 }
 
 /// What the driver works from, read from the journal.
@@ -216,6 +263,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
     )?);
     let timeout = Duration::from_secs(job.timeout_secs.max(1));
     let ctx = JobCtx::for_env(cfg, &child_env)?;
+    let egress = Arc::new(Egress::new(&dir.join(journal::EGRESS), &ctx.job_dir));
     let driver = Driver {
         ctx,
         env: child_env,
@@ -228,6 +276,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         stopped: CancellationToken::new(),
         prepared_in: None,
         registry,
+        egress,
     };
     Ok(Setup {
         driver,
@@ -272,6 +321,17 @@ impl Driver {
             Ok(end) => say_log(&self.dir, &format!("cleanup: {end:?}")),
             Err(e) => say_log(&self.dir, &format!("cleanup: {e:#}")),
         }
+        // After cleanup, which keeps the run phase's channels in the job's egress record once
+        // the switch has stopped (see `vm::cleanup`).
+        let (egress, run) = (
+            self.egress.clone(),
+            self.dir
+                .join(journal::EGRESS)
+                .join(crate::egress_report::RUN_DIR),
+        );
+        let egress = tokio::task::spawn_blocking(move || egress.last(&run))
+            .await
+            .ok();
         for event in &events {
             t.warning(&format!("virtkit: {event}"));
         }
@@ -300,7 +360,7 @@ impl Driver {
                 size,
             )),
             events,
-            egress: None,
+            egress,
         }
     }
 
@@ -628,6 +688,9 @@ impl Driver {
             .await;
         self.prepared_in = Some(preparing.elapsed());
         if matches!(prepared, Ok(End::Ok)) {
+            self.egress
+                .prepared
+                .store(true, std::sync::atomic::Ordering::Release);
             self.note_guest_size();
         }
         prepared
@@ -646,6 +709,12 @@ impl Driver {
     }
 
     fn set_stage(&self, stage: &str) {
+        let started = crate::egress_report::now_ms();
+        self.egress
+            .timeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((stage.to_string(), started));
         // Best effort: the stage is for the hub's display, the trace says it too. What the
         // stage before was doing is over.
         let _ = std::fs::remove_file(self.dir.join(journal::ACTIVITY));
@@ -1080,6 +1149,7 @@ mod tests {
             stopped: CancellationToken::new(),
             prepared_in: None,
             registry: f.registry.clone(),
+            egress: Arc::new(Egress::new(&f.dir.join(journal::EGRESS), &f.dir)),
         }
     }
 
@@ -1200,6 +1270,50 @@ mod tests {
             output.contains(&format!("virtkit: virtio-fs stall: {detail}")),
             "{output}"
         );
+    }
+
+    /// A job's result carries the egress report of its record, read after cleanup: here a job
+    /// whose prepare refused a declaration, which never reached its run phase.
+    #[tokio::test]
+    async fn a_job_s_result_carries_its_egress_report() {
+        let f = Fixture::new("driver-egress", "https://gitlab.example");
+        let exe = fake_vk(&f, "#!/bin/sh\nexit 2\n");
+        let mut driver = driver(&f, exe);
+        let record = f.dir.join(journal::EGRESS);
+        std::fs::create_dir_all(&record).unwrap();
+        let refusal = vk_hub_proto::egress::EgressRefusal {
+            variable: "MICROVM_EGRESS_ALLOW_NAME".into(),
+            entry: "evil.com".into(),
+            dimension: vk_hub_proto::egress::EgressDimension::Name,
+            phase: vk_hub_proto::egress::EgressPhase::Run,
+            source: vk_hub_proto::egress::EgressSource::Job,
+            layer: Some(vk_hub_proto::egress::EgressLayer::NodeCap),
+            reason: vk_hub_proto::egress::RefusalReason::Unreachable,
+        };
+        crate::egress_report::append_refusals(
+            &record.join(crate::egress_report::REFUSED),
+            std::slice::from_ref(&refusal),
+        );
+        let mut vars = Vars::default();
+        let settings = Settings::of(&f.job, &vars);
+        let place = super::super::vars::Place {
+            builds_dir: "/builds".into(),
+            project_dir: "/builds/acme/web".into(),
+            concurrent_id: 0,
+            concurrent_project_id: 0,
+        };
+        let meta = Meta {
+            gitlab_id: 4242,
+            slot: 0,
+            project_slot: 0,
+            project_id: 1,
+        };
+        let result = driver.run_job(&mut vars, &settings, &place, &meta).await;
+        assert_eq!(result.failure, Some(FailureClass::System));
+        let egress = result.egress.unwrap();
+        assert_eq!(egress.refusals, [refusal]);
+        assert_eq!(egress.phases, []);
+        assert_eq!(egress.revision, 1);
     }
 
     #[test]

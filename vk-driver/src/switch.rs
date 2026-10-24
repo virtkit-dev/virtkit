@@ -108,8 +108,8 @@ const DNS_DENIALS_PER_WINDOW: u32 = 32;
 /// counted under [`DNS_DENIED_MORE`]. The names are the guest's to choose, and each is held
 /// for the switch's life so its repeats are counted rather than written out one by one.
 const DNS_DENIED_NAMES: usize = 4096;
-/// The target denials past [`DNS_DENIED_NAMES`] are recorded under.
-const DNS_DENIED_MORE: &str = "more names (not recorded)";
+/// The target denials past [`DNS_DENIED_NAMES`] are recorded under: a count, not a destination.
+pub(crate) const DNS_DENIED_MORE: &str = "more names (not recorded)";
 /// How often the repeats of DNS denials already recorded are written out, each name's as one
 /// counted record: a stage's last few seconds of them reach the trace with the next stage.
 const DNS_REPEATS_FLUSH: Duration = Duration::from_secs(2);
