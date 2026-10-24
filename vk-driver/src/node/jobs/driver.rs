@@ -308,9 +308,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
     let settings = Settings::of(&job, &vars);
     let child_env = env::child_env(&job, &vars, &place, dir)?;
     // Where the executor commands record the job's egress (see `env::child_env`).
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .create(dir.join(journal::EGRESS))
+    crate::egress_report::create_record_dir(&dir.join(journal::EGRESS))
         .context("creating the job's egress record")?;
     let phrases = masked_phrases(&vars, &job, registry.as_ref());
     let trace = Arc::new(Trace::open(

@@ -564,13 +564,23 @@ fn parse_records(buf: &[u8]) -> (Vec<(Denial, Attrs)>, usize) {
 /// laid out as the job dir lays them out ([`keep_run_channels`]).
 pub const RUN_DIR: &str = "run";
 
+/// Make `dir`, a job's egress record or one of its dirs, and any parent it lacks: private to
+/// the user it runs as, whatever the umask, as the job dir it may sit in is.
+pub fn create_record_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// The run phase's channels in the executor's `job_dir`, moved into the job's egress `record`
 /// before cleanup removes the job dir: the switch is stopped by then, and has written out all
 /// it counted. Best-effort: a channel that cannot be kept leaves the report without it.
 pub fn keep_run_channels(job_dir: &Path, record: &Path) {
     use crate::jobctx::JobCtx;
     let run = record.join(RUN_DIR);
-    if std::fs::create_dir_all(&run).is_err() {
+    if create_record_dir(&run).is_err() {
         return;
     }
     for from in [
@@ -1062,6 +1072,23 @@ mod tests {
         std::fs::write(&path, "100 2000\n7").unwrap();
         assert_eq!(read_net_bytes(&path), Some((100, 2000)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record's dirs, and any parent made for them, are the user's alone: a umask can only
+    /// clear bits, so none is laxer than `0700` whatever it is.
+    #[test]
+    fn record_dirs_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("vk-record-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let run = tmp.join("record").join(RUN_DIR);
+        create_record_dir(&run).unwrap();
+        create_record_dir(&run).unwrap();
+        for dir in [&tmp, &tmp.join("record"), &run] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", dir.display());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

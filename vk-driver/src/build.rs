@@ -889,7 +889,7 @@ fn egress_channels(opts: &Options, scratch: &Path) -> Result<PathBuf> {
     let dir = record
         .dir
         .join(format!("{}{name}", crate::egress_report::BUILD_PREFIX));
-    std::fs::create_dir_all(&dir)
+    crate::egress_report::create_record_dir(&dir)
         .with_context(|| format!("creating the build's egress record {}", dir.display()))?;
     Ok(dir)
 }

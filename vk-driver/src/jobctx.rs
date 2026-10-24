@@ -342,7 +342,7 @@ impl JobCtx {
             return Ok(());
         };
         if let Some(record) = &self.egress_record {
-            std::fs::create_dir_all(record)
+            crate::egress_report::create_record_dir(record)
                 .with_context(|| format!("creating {}", record.display()))?;
         }
         let path = self.job_dir.join(HUB_FALLBACK);
