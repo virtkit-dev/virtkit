@@ -2124,6 +2124,10 @@ fn egress_blocking(client: &admin::Client, cmd: Option<EgressCmd>) -> Result<()>
                 protected,
             })?;
             println!("{}", serde_json::to_string_pretty(&layer)?);
+            // Placement holds the layer to the same bounds, and fails a job whose layer fails.
+            if let Err(why) = layer.check() {
+                bail!("a job of these claims would fail: its layer cannot be sent: {why}");
+            }
         }
     }
     Ok(())

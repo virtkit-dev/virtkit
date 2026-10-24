@@ -1246,7 +1246,8 @@ it is added. Every change is audited as the person's, and moves the rules' gener
 
 **Resolution.** `vk-hub egress resolve [--gitlab NAME --project PATH --project-id N] [--ref
 REF] [--protected]` prints, as JSON, the layer a placed job of those claims gets from the rules
-now, as its start would carry it. The enforced rules selecting the job add up, per phase and
+now, as its start would carry it, and fails when that layer is past the bounds a start may
+carry, as such a job would fail. The enforced rules selecting the job add up, per phase and
 dimension: an unrestricted phase absorbs the rest, lists join without repeats. With none, the
 Fallback applies if enforced; without it, both phases allow nothing. A dry-run rule selects
 nothing: each one that would select the job comes as the layer the job would have were it
