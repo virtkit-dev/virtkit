@@ -114,21 +114,24 @@ pub(super) fn area(ns: &NamespaceRow) -> Area {
     }
 }
 
-/// The grant's source namespace, matched by its path with placeholders filled.
-/// `None` if no namespace matches, for example after a namespace change.
+/// The grant's source namespace, matched by its path with placeholders filled. `None` unless
+/// exactly one namespace matches: none after a namespace change, several where paths overlap
+/// (`p/{project_id}` and `p/{pipeline_id}`), which the prefix alone cannot tell apart.
 pub(super) fn source<'a>(
     namespaces: &'a [NamespaceRow],
     grant: &Grant,
 ) -> Option<&'a NamespaceRow> {
-    namespaces.iter().find(|ns| {
+    let prefix: Vec<&str> = grant.prefix.split('/').collect();
+    let mut matching = namespaces.iter().filter(|ns| {
         let template: Vec<&str> = ns.path.split('/').collect();
-        let prefix: Vec<&str> = grant.prefix.split('/').collect();
         template.len() == prefix.len()
             && template
                 .iter()
                 .zip(&prefix)
                 .all(|(t, p)| t == p || PLACEHOLDERS.contains(t))
-    })
+    });
+    let found = matching.next()?;
+    matching.next().is_none().then_some(found)
 }
 
 #[cfg(test)]
@@ -271,5 +274,14 @@ mod tests {
         assert_eq!(name("ci-pipeline/gl/1172/30551"), Some(CI_PIPELINE));
         assert_eq!(name("p/gl"), None);
         assert_eq!(name("other"), None);
+        let overlapping = [
+            ns("by-project", "q/{gitlab}/{project_id}", &["r:own project"]),
+            ns(
+                "by-pipeline",
+                "q/{gitlab}/{pipeline_id}",
+                &["r:own pipeline"],
+            ),
+        ];
+        assert!(source(&overlapping, &grant("q/gl/7")).is_none());
     }
 }
