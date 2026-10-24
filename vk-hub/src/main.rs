@@ -29,6 +29,7 @@ mod admin;
 mod client;
 mod clients;
 mod config;
+mod egress;
 mod fetch;
 mod jobs;
 mod local;

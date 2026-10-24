@@ -52,7 +52,17 @@ async fn serve_hub(
     dir: &std::path::Path,
     lost_after: Duration,
 ) -> (SocketAddr, Arc<Hub>) {
-    let (addr, hub) = serve_undriven(db, dir, lost_after).await;
+    serve_hub_with(db, dir, lost_after, |hub| hub).await
+}
+
+/// A hub as [`serve_hub`]'s, configured by `configure` past its jobs' defaults.
+async fn serve_hub_with(
+    db: Arc<Db>,
+    dir: &std::path::Path,
+    lost_after: Duration,
+    configure: impl FnOnce(Hub) -> Hub,
+) -> (SocketAddr, Arc<Hub>) {
+    let (addr, hub) = serve_undriven_with(db, dir, lost_after, configure).await;
     tokio::spawn(crate::jobs::drive(hub.clone()));
     (addr, hub)
 }
@@ -63,9 +73,19 @@ async fn serve_undriven(
     dir: &std::path::Path,
     lost_after: Duration,
 ) -> (SocketAddr, Arc<Hub>) {
+    serve_undriven_with(db, dir, lost_after, |hub| hub).await
+}
+
+/// A hub as [`serve_undriven`]'s, configured by `configure` past its jobs' defaults.
+async fn serve_undriven_with(
+    db: Arc<Db>,
+    dir: &std::path::Path,
+    lost_after: Duration,
+    configure: impl FnOnce(Hub) -> Hub,
+) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
-    let hub = Arc::new(
+    let hub = Arc::new(configure(
         Hub::new(db, None)
             .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
             .with_jobs(
@@ -74,7 +94,7 @@ async fn serve_undriven(
                 crate::store::DEFAULT_JOB_HISTORY,
             )
             .unwrap(),
-    );
+    ));
     crate::jobs::recover(&hub).await.unwrap();
     tokio::spawn(server::serve(listener, None, hub.clone()));
     (addr, hub)
@@ -1773,6 +1793,215 @@ async fn a_job_s_egress_report_is_kept_bounded() {
         (run.coverage, run.omitted.blocked),
         (EgressCoverage::Partial, 10)
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A running job's egress report from a version-6 node is kept on its record, never replaced by
+/// an older revision; its result's replaces it. A job its hub ends keeps the last, as far as it
+/// went. A version-3 node sending one ends its session.
+/// (Written as it comes: [`Hub::writing_egress_every`] is zero.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_job_s_egress_report_is_kept_until_it_ends() {
+    use vk_hub_proto::egress::{
+        EgressCoverage, EgressDestination, EgressEntry, EgressLayer, EgressOutcome, EgressPhase,
+        EgressPhaseReport, EgressProtocol, EgressReport, EgressSource,
+    };
+    let dir = scratch("live-egress");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub_with(db, &dir, Duration::from_secs(1), |hub| {
+        hub.writing_egress_every(Duration::ZERO)
+    })
+    .await;
+    let key = jobs_key(&hub);
+    let node_key = keypair();
+    let id = new_node(addr, &hub, &node_key).await;
+    let v6 = VersionRange {
+        min: 1,
+        max: vk_hub_proto::LIVE_EGRESS,
+    };
+    let mut node = connect(addr, &id, &node_key, v6, 16384, Some(Held::default())).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
+    let report = |revision, count| EgressReport {
+        revision,
+        entries: vec![EgressEntry {
+            outcome: EgressOutcome::Blocked,
+            protocol: EgressProtocol::Dns,
+            destination: EgressDestination::domain("a.example"),
+            phase: EgressPhase::Run,
+            source: EgressSource::Job,
+            layer: Some(EgressLayer::NodeCap),
+            count,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            stage: None,
+            rule: None,
+        }],
+        phases: vec![EgressPhaseReport {
+            phase: EgressPhase::Run,
+            coverage: EgressCoverage::Complete,
+            omitted: Default::default(),
+            sent_bytes: None,
+            received_bytes: None,
+            caps: None,
+        }],
+        ..EgressReport::default()
+    };
+    let live = |job: &str| hub.db.job(job).unwrap().unwrap().egress;
+
+    let job = running_job(addr, &key, &mut node, 1).await;
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(2, 3),
+    });
+    wait_until(|| live(&job).is_some_and(|r| r.revision == 2)).await;
+    // An older revision, replayed, changes nothing; a newer one replaces the counts.
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(1, 9),
+    });
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(3, 5),
+    });
+    wait_until(|| live(&job).is_some_and(|r| r.revision == 3)).await;
+    let mut ended = result(None, 0);
+    ended.egress = Some(report(4, 6));
+    node.send(NodeJobMsg::Result {
+        job: job.clone(),
+        result: ended,
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });
+    view_until(addr, &key, &job, |v| v.state == JobState::Finished).await;
+    let row = hub.db.job(&job).unwrap().unwrap();
+    assert_eq!(row.egress, None);
+    assert_eq!(row.result.unwrap().egress, Some(report(4, 6)));
+
+    // Lost with its node: what it reported, as far as it went.
+    let lost = running_job(addr, &key, &mut node, 2).await;
+    node.send(NodeJobMsg::Egress {
+        job: lost.clone(),
+        report: report(1, 2),
+    });
+    wait_until(|| live(&lost).is_some()).await;
+    drop(node);
+    view_until(addr, &key, &lost, |v| v.state == JobState::Finished).await;
+    // Shown ended from memory before its record is written: the sweep persists it after.
+    let stored = || hub.db.job(&lost).unwrap().unwrap();
+    wait_until(|| stored().state == JobState::Finished).await;
+    let kept = stored().result.unwrap().egress;
+    assert_eq!(kept, Some(report(1, 2).interrupted()));
+
+    // Not in a session below version 6.
+    let mut old = ready_node(addr, &hub, 16384).await;
+    old.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(9, 1),
+    });
+    let Some(HubMsg::Refused { code, .. }) = old.ended().await else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(code, RefusalCode::Protocol);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A running job's egress report shows at once, and its record is written with it at once the
+/// first time, then at most every [`Hub::writing_egress_every`] — or with any other change to the
+/// record, such as a new stage. A hub restarted past what it wrote gets the latest again from
+/// the node, which sends it after a reconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_job_s_egress_report_is_written_at_most_every_so_often() {
+    use vk_hub_proto::egress::EgressReport;
+    let dir = scratch("live-egress-writes");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let hourly = |hub: Hub| hub.writing_egress_every(Duration::from_secs(3600));
+    let (addr, hub) = serve_hub_with(db.clone(), &dir, Duration::from_secs(60), hourly).await;
+    let key = jobs_key(&hub);
+    let node_key = keypair();
+    let id = new_node(addr, &hub, &node_key).await;
+    let v6 = VersionRange {
+        min: 1,
+        max: vk_hub_proto::LIVE_EGRESS,
+    };
+    let mut node = connect(addr, &id, &node_key, v6, 16384, Some(Held::default())).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
+    let job = running_job(addr, &key, &mut node, 1).await;
+    let report = |revision| EgressReport {
+        revision,
+        ..EgressReport::default()
+    };
+    let written = || db.job(&job).unwrap().unwrap().egress.map(|r| r.revision);
+    let shown = |hub: &Hub| {
+        crate::jobs::detail(hub, &job)
+            .unwrap()
+            .unwrap()
+            .0
+            .egress
+            .map(|r| r.revision)
+    };
+
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(1),
+    });
+    wait_until(|| written() == Some(1)).await;
+    for revision in 2..=20 {
+        node.send(NodeJobMsg::Egress {
+            job: job.clone(),
+            report: report(revision),
+        });
+    }
+    wait_until(|| shown(&hub) == Some(20)).await;
+    // Past two of the writer's passes, the record still holds the first.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(written(), Some(1));
+    // A new stage writes the record, with the latest report.
+    node.send(NodeJobMsg::Job {
+        job: job.clone(),
+        state: RunState::Running {
+            stage: "step_script".into(),
+            activity: None,
+            guest: None,
+        },
+    });
+    wait_until(|| written() == Some(20)).await;
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(21),
+    });
+    wait_until(|| shown(&hub) == Some(21)).await;
+    drop(node);
+
+    // Restarted over the same database: the 21st was never written, and comes again.
+    let (addr, hub) = serve_hub_with(db.clone(), &dir, Duration::from_secs(60), hourly).await;
+    assert_eq!(shown(&hub), Some(20));
+    let held = Held {
+        reservations: Vec::new(),
+        jobs: vec![HeldJob {
+            job: job.clone(),
+            state: RunState::Running {
+                stage: "step_script".into(),
+                activity: None,
+                guest: None,
+            },
+            output_len: 0,
+            finished: false,
+        }],
+    };
+    let mut node = connect(addr, &id, &node_key, v6, 16384, Some(held)).await;
+    assert_eq!(
+        node.job().await,
+        HubJobMsg::OutputAck {
+            job: job.clone(),
+            offset: 0
+        }
+    );
+    node.send(NodeJobMsg::Egress {
+        job: job.clone(),
+        report: report(21),
+    });
+    // The first report since the restart is written at once.
+    wait_until(|| written() == Some(21)).await;
+    drop(hub);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -3640,6 +3869,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);
@@ -3746,6 +3976,7 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress: None,
     };
     for n in 1..=2 {
         let id = format!("{n:032x}");
@@ -4152,6 +4383,7 @@ fn a_job_is_shown_on_the_command_line() {
         gitlab: None,
         project_id: None,
         protected: None,
+        egress: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
     let id = "cd".repeat(16);

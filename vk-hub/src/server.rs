@@ -254,6 +254,14 @@ impl Hub {
         self
     }
 
+    /// Write a running job's record for a newer egress report alone at most `every`.
+    /// Call after [`Hub::with_jobs`], which sets the default.
+    #[cfg(test)]
+    pub fn writing_egress_every(mut self, every: Duration) -> Self {
+        self.dispatch.egress_write_every = every;
+        self
+    }
+
     /// Prefer nodes holding a job's image according to `affinity`.
     /// Call after [`Hub::with_jobs`], which sets the default.
     pub fn preferring_warm_images(mut self, affinity: crate::jobs::Affinity) -> Self {

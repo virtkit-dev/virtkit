@@ -2,7 +2,8 @@
 //! hello/challenge/auth, then store inventory, heartbeats and reports until it disconnects.
 //! From version [`STEERING`], also send desired state and commands; from version [`JOBS`],
 //! reservations and jobs ([`crate::jobs`]); from version [`vk_hub_proto::TOOLS`], tools builds;
-//! from version [`vk_hub_proto::RUNNER_NONE`], reports of nodes that run no gitlab-runner.
+//! from version [`vk_hub_proto::RUNNER_NONE`], reports of nodes that run no gitlab-runner; from
+//! version [`LIVE_EGRESS`], running jobs' egress reports.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -18,9 +19,10 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use vk_hub_proto::dispatch::NodeJobMsg;
 use vk_hub_proto::{
-    CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, PUBLIC_KEY_LEN,
-    RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange, from_hex_lower,
+    CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, JOBS, LIVE_EGRESS, NodeMsg,
+    PUBLIC_KEY_LEN, RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange, from_hex_lower,
 };
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
@@ -37,11 +39,11 @@ pub(crate) const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 pub(crate) const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
 /// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`],
-/// [`vk_hub_proto::TOOLS`] and [`vk_hub_proto::RUNNER_NONE`]. A node offering less negotiates
-/// the highest version both speak.
+/// [`vk_hub_proto::TOOLS`], [`vk_hub_proto::RUNNER_NONE`] and [`LIVE_EGRESS`]. A node offering
+/// less negotiates the highest version both speak.
 pub const PROTOCOL: VersionRange = VersionRange {
     min: vk_hub_proto::PROTOCOL.min,
-    max: vk_hub_proto::RUNNER_NONE,
+    max: LIVE_EGRESS,
 };
 
 /// What a node removed from the hub is told.
@@ -455,6 +457,12 @@ async fn serve(
                     }
                     NodeMsg::Job(_) if node.version < JOBS => {
                         let reason = format!("a job message in a version-{} session", node.version);
+                        refuse(ws, RefusalCode::Protocol, &reason).await;
+                        bail!("the node sent {reason}");
+                    }
+                    NodeMsg::Job(NodeJobMsg::Egress { .. }) if node.version < LIVE_EGRESS => {
+                        let reason =
+                            format!("an egress report in a version-{} session", node.version);
                         refuse(ws, RefusalCode::Protocol, &reason).await;
                         bail!("the node sent {reason}");
                     }

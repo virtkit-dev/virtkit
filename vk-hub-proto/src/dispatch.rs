@@ -18,6 +18,8 @@
 //! past the last ack, resending it from there in the next session. The node sends the
 //! [`JobResult`] once the job's output is all acked, and repeats it until the hub answers
 //! [`HubJobMsg::Recorded`]. [`HubJobMsg::Cancel`] stops a job.
+//! From version [`LIVE_EGRESS`](crate::LIVE_EGRESS) the node also sends a running job's egress
+//! report as it changes ([`NodeJobMsg::Egress`]).
 //!
 //! **Reconnects.** A session at version [`JOBS`](crate::JOBS) opens, after the report, with
 //! [`NodeJobMsg::Held`]: every reservation and job the node holds. The hub releases a
@@ -26,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::egress::HubEgress;
+use crate::egress::{EgressReport, HubEgress};
 use crate::job::{Envelope, JobResult, JobSpec};
 
 /// The longest lease a node grants; a longer ask is cut to it.
@@ -170,6 +172,10 @@ pub enum NodeJobMsg {
     },
     /// How the job ended; repeated until [`HubJobMsg::Recorded`].
     Result { job: String, result: JobResult },
+    /// The egress of a job still running, as recorded so far: a cumulative snapshot, sent
+    /// when it changes and again after a reconnect. The result carries the last, with the
+    /// highest revision. From version [`LIVE_EGRESS`](crate::LIVE_EGRESS).
+    Egress { job: String, report: EgressReport },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +439,13 @@ mod tests {
                     egress: None,
                 },
             },
+            NodeJobMsg::Egress {
+                job: id("b"),
+                report: crate::egress::EgressReport {
+                    revision: 3,
+                    ..Default::default()
+                },
+            },
         ]
     }
 
@@ -506,6 +519,16 @@ mod tests {
                     "output_len": 8192,
                     "artifacts": [{"name": "artifacts", "artifact_type": "archive", "state": "skipped"}],
                 },
+            })
+        );
+        let egress = NodeMsg::Job(node_messages().remove(7));
+        assert_eq!(
+            serde_json::to_value(egress).unwrap(),
+            json!({
+                "type": "job",
+                "kind": "egress",
+                "job": id("b"),
+                "report": {"revision": 3},
             })
         );
         let start = serde_json::to_value(HubMsg::Job(hub_messages().remove(3))).unwrap();

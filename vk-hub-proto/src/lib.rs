@@ -68,6 +68,9 @@
 //! a session below it a node reports that mode as [`RunnerMode::External`], which an older hub
 //! reads and steers more cautiously: it leaves the node out of an unforced rollout.
 //!
+//! Version 6 ([`LIVE_EGRESS`]) adds [`dispatch::NodeJobMsg::Egress`], a running job's egress
+//! report. Below it a node sends the report with the job's result only.
+//!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
 //! concurrency, drain and update progress — and the node acks every command whose
@@ -162,6 +165,10 @@ pub const TOOLS: u32 = 4;
 /// The first protocol version whose [`Report::runner`] may be [`RunnerMode::None`]. Not in
 /// [`PROTOCOL`] either.
 pub const RUNNER_NONE: u32 = 5;
+
+/// The first protocol version carrying [`dispatch::NodeJobMsg::Egress`]. Not in [`PROTOCOL`]
+/// either.
+pub const LIVE_EGRESS: u32 = 6;
 
 /// The largest tools definition — a build context packed as a tar — a hub holds and a node
 /// takes: a Dockerfile and the few files it copies, not the tools themselves.

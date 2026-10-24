@@ -168,6 +168,10 @@ impl Default for Affinity {
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
+/// How often at most a running job's record is written for a newer egress report alone, by
+/// default: a hub restarting loses no more of it, and its node sends its latest again.
+pub const DEFAULT_EGRESS_WRITE_EVERY: Duration = Duration::from_secs(30);
+
 /// The hub's dispatch state.
 pub struct Dispatch {
     state: Mutex<State>,
@@ -189,6 +193,8 @@ pub struct Dispatch {
     pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub affinity: Affinity,
+    /// How often at most a running job's record is written for a newer egress report alone.
+    pub egress_write_every: Duration,
 }
 
 #[derive(Default)]
@@ -281,12 +287,38 @@ struct LiveJob {
     /// its registry token is minted for, while the key still works. `None` for a key bound to
     /// none, whose jobs get no token, and for a job recovered after a restart.
     mint_key: Option<String>,
+    /// How far its record as written holds its egress report.
+    egress: EgressWritten,
+}
+
+/// How far a running job's record as written holds its egress report, which its node sends
+/// every few seconds while it changes: kept in memory at once, written at most every
+/// [`Dispatch::egress_write_every`] unless another change writes the record first.
+#[derive(Clone, Copy, Debug, Default)]
+struct EgressWritten {
+    /// The revision of the report the record was last written with; 0 for none.
+    revision: u64,
+    /// When a write of a newer report was last made or tried.
+    at: Option<Instant>,
 }
 
 impl LiveJob {
     /// The node it has been sent to, accepted or not.
     fn node(&self) -> Option<&str> {
         self.row.node.as_deref()
+    }
+
+    /// Whether its record is to be written now for its egress report alone: the report held is
+    /// newer than the one written, and no write of one was made or tried within `every`.
+    fn egress_due(&self, now: Instant, every: Duration) -> bool {
+        self.row
+            .egress
+            .as_ref()
+            .is_some_and(|r| r.revision > self.egress.revision)
+            && self
+                .egress
+                .at
+                .is_none_or(|at| now.duration_since(at) >= every)
     }
 }
 
@@ -309,6 +341,7 @@ impl Dispatch {
             kept_output: DEFAULT_KEPT_OUTPUT,
             kept_output_total: DEFAULT_KEPT_OUTPUT_TOTAL,
             affinity: Affinity::default(),
+            egress_write_every: DEFAULT_EGRESS_WRITE_EVERY,
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -447,19 +480,29 @@ async fn blocking<T: Send + 'static>(
 /// Write `row`, with `events` audited, and tell the web UI's pages.
 async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) -> Result<()> {
     let id = id.to_string();
-    let (id, row) = blocking(hub, move |db| {
-        db.put_job(&id, &row, &events, crate::now_secs())?;
-        Ok((id, row))
+    let (id, row, written) = blocking(hub, move |db| {
+        let written = db.put_job(&id, &row, &events, crate::now_secs())?;
+        Ok((id, row, written))
     })
     .await?;
-    if row.state == JobState::Finished {
+    {
         let mut state = hub.dispatch.lock();
-        if state
-            .finished
-            .get(&id)
-            .is_some_and(|r| r.revision <= row.revision)
+        if row.state == JobState::Finished
+            && state
+                .finished
+                .get(&id)
+                .is_some_and(|r| r.revision <= row.revision)
         {
             state.finished.remove(&id);
+        }
+        // Written with this report: [`write_egress`] leaves it, not one newer that came since.
+        if let (true, Some(report), Some(job)) = (written, &row.egress, state.jobs.get_mut(&id))
+            && report.revision > job.egress.revision
+        {
+            job.egress = EgressWritten {
+                revision: report.revision,
+                at: Some(Instant::now()),
+            };
         }
     }
     hub.touch();
@@ -508,6 +551,9 @@ fn finish(
     row.finished_at = Some(crate::now_secs());
     row.activity = None;
     let output_len = row.output_len;
+    // Ended by the hub, or before its node sent its result: the last report its node sent,
+    // as far as it went.
+    let egress = row.egress.take().map(EgressReport::interrupted);
     let event = failure
         .filter(|f| *f != FailureClass::Canceled)
         .map(|f| match &message {
@@ -522,7 +568,7 @@ fn finish(
         artifacts: Vec::new(),
         usage: None,
         events: Vec::new(),
-        egress: None,
+        egress,
     });
     let events = event
         .map(|e| (row.node.clone(), HUB.to_string(), e))
@@ -787,6 +833,7 @@ pub async fn on_node(
         NodeJobMsg::Job { job, state } => on_job_state(hub, node, &job, state).await,
         NodeJobMsg::Output { job, offset, data } => on_output(hub, node, &job, offset, &data).await,
         NodeJobMsg::Result { job, result } => on_result(hub, node, &job, result).await,
+        NodeJobMsg::Egress { job, report } => Ok(on_egress(hub, node, &job, report)),
     };
     hub.dispatch.bump();
     out
@@ -1146,6 +1193,62 @@ async fn on_output(
     }])
 }
 
+/// A running job's egress report: kept when it is newer than the one held, for the job's page
+/// and the job list to show at once. Its record is written by [`write_egress`] within
+/// [`Dispatch::egress_write_every`].
+fn on_egress(hub: &Hub, node: &str, id: &str, report: EgressReport) -> Vec<HubJobMsg> {
+    {
+        let mut state = hub.dispatch.lock();
+        let Some(job) = state.jobs.get_mut(id).filter(|j| j.node() == Some(node)) else {
+            // Ended, or never its: the result carries what counts.
+            return Vec::new();
+        };
+        let row = &mut job.row;
+        if row.state != JobState::Running {
+            return Vec::new();
+        }
+        let stored = row.egress.take();
+        let kept = crate::egress::newest(stored.clone(), Some(report));
+        let changed = kept != stored;
+        row.egress = kept;
+        if !changed {
+            return Vec::new();
+        }
+        row.revision = row.revision.saturating_add(1);
+    }
+    hub.jobs_changed();
+    hub.job_changed(id);
+    Vec::new()
+}
+
+/// Write the record of each running job whose egress report is due ([`LiveJob::egress_due`]),
+/// checking every second, until the process ends.
+async fn write_egress(hub: Arc<Hub>) {
+    let mut every = tokio::time::interval(Duration::from_secs(1));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let due: Vec<(String, JobRow)> = {
+            let mut state = hub.dispatch.lock();
+            let now = Instant::now();
+            let write_every = hub.dispatch.egress_write_every;
+            state
+                .jobs
+                .iter_mut()
+                .filter(|(_, j)| j.egress_due(now, write_every))
+                .map(|(id, j)| {
+                    // Tried: a write that fails is tried again past the same wait.
+                    j.egress.at = Some(now);
+                    (id.clone(), j.row.clone())
+                })
+                .collect()
+        };
+        for (id, row) in due {
+            persist_logged(&hub, &id, row, Vec::new()).await;
+        }
+    }
+}
+
 async fn on_result(
     hub: &Hub,
     node: &str,
@@ -1189,8 +1292,9 @@ async fn on_result(
                 ),
             );
         }
-        // Held to its bounds again.
-        result.egress = result.egress.take().map(EgressReport::bounded);
+        // Held to its bounds again, and never older than the report the hub already has.
+        let stored = job.row.egress.take();
+        result.egress = crate::egress::newest(stored, result.egress.take());
         // Audited only when the node or its images failed it, for an operator to see; its
         // record holds its node, result and events either way.
         let audited = matches!(
@@ -2058,6 +2162,7 @@ pub fn admit(
             reservation_accepted_at: 0,
             image_key,
             mint_key,
+            egress: EgressWritten::default(),
         },
     );
     drop(state);
@@ -2293,6 +2398,8 @@ pub async fn recover(hub: &Hub) -> Result<()> {
         row.output_len = stored_len(&dir, &id);
         if row.state == JobState::Running && row.node.is_some() {
             let limit = DEFAULT_OUTPUT_LIMIT.max(row.output_len);
+            // As written: its node sends its latest report again once it is back.
+            let egress_revision = row.egress.as_ref().map_or(0, |r| r.revision);
             hub.dispatch.lock().jobs.insert(
                 id.clone(),
                 LiveJob {
@@ -2308,6 +2415,10 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     reservation_accepted_at: 0,
                     image_key: None,
                     mint_key: None,
+                    egress: EgressWritten {
+                        revision: egress_revision,
+                        at: None,
+                    },
                 },
             );
             continue;
@@ -2326,6 +2437,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 reservation_accepted_at: 0,
                 image_key: None,
                 mint_key: None,
+                egress: EgressWritten::default(),
             },
         );
         if let Some((row, events)) = finish(
@@ -2420,6 +2532,7 @@ fn sweep_outputs(db: &crate::store::Db, dir: &Path) -> Result<()> {
 /// Place queued jobs, end those past their deadline and those whose node was lost, until the
 /// process ends.
 pub async fn drive(hub: Arc<Hub>) {
+    tokio::spawn(write_egress(hub.clone()));
     let mut pruned = Instant::now();
     loop {
         let mut changed = hub.dispatch.subscribe();
@@ -3490,7 +3603,29 @@ mod tests {
             reservation_accepted_at: 0,
             image_key: None,
             mint_key: None,
+            egress: EgressWritten::default(),
         }
+    }
+
+    /// A running job's record is due a write for its egress report once it holds one newer than
+    /// the one written, and none was written or tried within the wait.
+    #[test]
+    fn a_job_s_egress_report_is_due_past_the_wait() {
+        let every = Duration::from_secs(30);
+        let now = Instant::now() + Duration::from_secs(60);
+        let mut job = sent("n1", 2, Some(10));
+        assert!(!job.egress_due(now, every), "no report");
+        job.row.egress = Some(EgressReport {
+            revision: 2,
+            ..EgressReport::default()
+        });
+        assert!(job.egress_due(now, every), "never written");
+        job.egress.at = Some(now - Duration::from_secs(5));
+        assert!(!job.egress_due(now, every), "written or tried just now");
+        job.egress.at = Some(now - every);
+        assert!(job.egress_due(now, every));
+        job.egress.revision = 2;
+        assert!(!job.egress_due(now, every), "written as it is");
     }
 
     /// The node a job of 2 vCPUs goes to first among `found`, least loaded first, with `warm`

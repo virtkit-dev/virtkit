@@ -123,6 +123,10 @@ pub struct JobRow {
     pub cancel: Option<CancelMode>,
     #[serde(default)]
     pub result: Option<JobResult>,
+    /// The egress report of a job still running, as its node last sent it; the result's holds
+    /// it once the job has ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<vk_hub_proto::egress::EgressReport>,
     /// The output's length: as stored while the job runs, final once it has finished.
     #[serde(default)]
     pub output_len: u64,
@@ -1265,6 +1269,7 @@ mod tests {
             gitlab: None,
             project_id: None,
             protected: None,
+            egress: None,
         }
     }
 

@@ -557,6 +557,7 @@ async fn submit(
         stage: None,
         cancel: None,
         result: None,
+        egress: None,
         output_len: 0,
         started_at: None,
         finished_at: None,
