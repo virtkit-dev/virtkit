@@ -55,6 +55,12 @@ All notable changes to virtkit will be documented in this file.
   together — and by text, as well as by node or registry. Clicking who did something narrows
   to them; each filtered view is a link of its own.
 
+### Changed
+
+- **A CI service's own `MICROVM_EGRESS_ALLOW_*` no longer replaces the job's for its VM**: the
+  service is held to both, so it can no longer reach what the job's lists leave out. A service
+  that declares none is held to the job's, as before.
+
 ### Fixed
 
 - **A failed build recorded by one pipeline no longer clears another pipeline's record** of

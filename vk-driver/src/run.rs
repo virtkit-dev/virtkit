@@ -5420,6 +5420,8 @@ pub(crate) async fn spawn_vm_switch(
         // Per-service egress overrides are a CI feature (from a service's `variables:`);
         // dev `vk run --compose` siblings share the run policy.
         per_source: Vec::new(),
+        // Only a CI job's run phase checks its node's cap apart.
+        cap: None,
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own

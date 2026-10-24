@@ -1681,13 +1681,19 @@ enum Cmd {
         /// when the host sets no run-phase cap); no effect on an unrestricted policy.
         #[arg(long = "egress-dry-run")]
         egress_dry_run: bool,
-        /// per-source egress override `<src-ip>;<cidr,cidr>;<name,name>` (repeatable)
+        /// per-source egress filter `<src-ip>;<cidr,cidr>;<name,name>` (repeatable)
         ///
-        /// Flows from that source use this restricted allowlist instead of the default; an
-        /// empty field is an empty (deny) list. Set internally by the gitlab executor for a
+        /// Flows from that source are also held to this restricted allowlist, checked after the
+        /// default; an empty field is an empty (deny) list. Set internally by the gitlab executor for a
         /// service that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
         #[arg(long = "source-egress", value_name = "IP;CIDRS;NAMES")]
         source_egress: Vec<String>,
+        /// the node's egress cap, checked for every source before the allowlists
+        ///
+        /// `all`, or `<cidr,cidr>;<name,name>`, an empty field denying. Set internally by the
+        /// gitlab executor.
+        #[arg(long = "egress-cap", value_name = "all|CIDRS;NAMES")]
+        egress_cap: Option<String>,
         /// redirect guest flows aimed at a sentinel address to a host-local registry proxy
         ///
         /// The value is `<sentinel-ip>=<host:port>`, set internally by
@@ -4530,6 +4536,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         egress_file,
         egress_dry_run,
         source_egress,
+        egress_cap,
         registry_proxy,
         denied_log,
         audit_log,
@@ -4622,6 +4629,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(m) => m,
             Err(e) => return fail(&e, 2),
         };
+        let cap = match egress_cap.as_deref().map(parse_egress_cap).transpose() {
+            Ok(c) => c,
+            Err(e) => return fail(&e, 2),
+        };
         // The switch logs into a file (a CI job's job dir, a run's work dir): a full
         // filesystem must not make a line a panic (see outrelay).
         let _relay = outrelay::relay();
@@ -4639,6 +4650,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             audit_log.clone(),
             net_bytes.clone(),
             *egress_dry_run,
+            cap,
             followed,
         )
         .await
@@ -6257,6 +6269,24 @@ fn parse_source_egress(
     Ok(map)
 }
 
+/// Parse a switch `--egress-cap`: `all`, or `<cidr,cidr>;<name,name>` as a restricted
+/// allowlist (empty fields = deny), the shape of a `--source-egress` without its source.
+fn parse_egress_cap(spec: &str) -> anyhow::Result<switch::Egress> {
+    if spec == "all" {
+        return Ok(switch::Egress::AllowAll);
+    }
+    let split = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (ips, names) = spec.split_once(';').unwrap_or((spec, ""));
+    switch::Egress::restricted(&split(ips), &split(names))
+        .map_err(|e| anyhow::anyhow!("egress-cap {spec:?}: {e}"))
+}
+
 use crate::ensure::parse_uuid;
 
 fn exit_code(code: i32) -> ExitCode {
@@ -6513,6 +6543,20 @@ mod tests {
         assert!(!b.allows_host("corp.com") && !b.contains_cidr("10.0.0.0/8").unwrap());
         // A bad source ip is rejected.
         assert!(parse_source_egress(&["nope;;".to_string()]).is_err());
+    }
+
+    #[test]
+    fn egress_caps_and_vm_names_parse() {
+        assert!(matches!(
+            parse_egress_cap("all").unwrap(),
+            switch::Egress::AllowAll
+        ));
+        let cap = parse_egress_cap("10.0.0.0/8;crates.io").unwrap();
+        assert!(cap.allows_host("crates.io") && !cap.allows_host("evil.com"));
+        // Empty fields deny, as a source's allowlist's do.
+        let none = parse_egress_cap(";").unwrap();
+        assert!(!none.allows_host("crates.io"));
+        assert!(parse_egress_cap("nope;").is_err());
     }
 
     #[test]

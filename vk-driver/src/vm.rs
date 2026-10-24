@@ -2661,6 +2661,10 @@ fn spawn_switch(
         restrict,
         dry_run: ctx.egress_run_dry_run(),
         per_source,
+        cap: Some(egress_cap(
+            cfg.egress.allow_ip.as_deref(),
+            cfg.egress.allow_name.as_deref(),
+        )),
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
@@ -2673,6 +2677,18 @@ fn spawn_switch(
         prio: crate::prio::Prio::Normal,
     })
     .context("spawning the per-job switch")
+}
+
+/// A phase's cap as the switch takes it: unrestricted when neither list is set, and once one is,
+/// an allowlist whose absent sibling denies.
+fn egress_cap(cap_ip: Option<&[String]>, cap_name: Option<&[String]>) -> crate::switch::Cap {
+    match (cap_ip, cap_name) {
+        (None, None) => crate::switch::Cap::Unrestricted,
+        (ips, names) => crate::switch::Cap::Allow {
+            ips: ips.unwrap_or_default().to_vec(),
+            names: names.unwrap_or_default().to_vec(),
+        },
+    }
 }
 
 /// This job's effective run-phase switch egress: the host `[egress]` cap narrowed by the

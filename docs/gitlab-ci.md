@@ -1194,8 +1194,8 @@ the throughput.
 
 A job's networking is governed by the host `[egress]` configuration. virtkit runs
 **one userspace switch per job**; the booted job guest and every [service](#services)
-VM share that switch, each with its own address. By default they all share the run
-policy, but a service may narrow itself further with its own allowlist (see
+VM share that switch, each with its own address. They are all held to the run policy,
+and a service may narrow itself further with its own allowlist (see
 [per-service egress](#per-service-egress)) — the switch enforces the policy per
 source VM, so one VM cannot use another's network policy. A job that runs commands in a
 service with `vk-agent exec --service` does reach what that service may; see
@@ -1327,12 +1327,12 @@ The same applies to the build phase via `MICROVM_BUILD_EGRESS_ALLOW_IP` /
 ### Per-service egress
 
 A `services:` entry can carry its own `MICROVM_EGRESS_ALLOW_IP` /
-`MICROVM_EGRESS_ALLOW_NAME` in its `variables:` to get an egress allowlist
-**distinct from the primary and from other services**. The rules are the same as a
-job-level request — it narrows the host `[egress]` cap, never widens it — with one
-addition: for a service, a *present-but-empty* value denies that dimension (e.g.
-`MICROVM_EGRESS_ALLOW_NAME: ""` gives the service no external DNS egress). A service
-that sets neither variable shares the run policy.
+`MICROVM_EGRESS_ALLOW_NAME` in its `variables:` to narrow its own VM further: the switch
+holds it to its own lists **and** the job's, each checked on its own, so it reaches only what
+both allow, within the host cap. The rules are those of a job's lists, with one addition: for a
+service, a *present-but-empty* value denies that dimension (e.g.
+`MICROVM_EGRESS_ALLOW_NAME: ""` gives the service no external DNS egress). A service that
+sets neither variable is held to the job's lists alone.
 
 A per-service value is the same kind of **list** (space/comma/newline-separated)
 and supports the same `$VAR` references:
@@ -1365,9 +1365,9 @@ validated at job prepare, so a per-service value outside the host cap fails the 
 with a visible error before anything boots.
 
 A job's script can still act through a service: `vk-agent exec --service NAME` runs a command
-in it (see [image selection](#image-selection)), under the service's policy. Giving a
-service wider egress than the job therefore gives it to the job's script too; narrow the
-job by narrowing its services, or set `[executor] guest_service_exec = false`.
+in it (see [image selection](#image-selection)), under the service's policy — the job's lists
+and its own, so never more than the job may reach itself; set
+`[executor] guest_service_exec = false` to refuse it.
 
 ### What a job contacts
 

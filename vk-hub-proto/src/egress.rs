@@ -316,13 +316,14 @@ pub fn valid_rule_name(name: &str) -> bool {
 
 /// Why `name` is not an `allow_name` entry, as a node's switch reads one: a DNS suffix, its
 /// leading dots dropped, that also allows every host under it. A URL, a pattern or a fully
-/// qualified name (a trailing dot) would match nothing. The hub holds its rules to it, so that
-/// it never sends what a node would refuse.
+/// qualified name (a trailing dot) would match nothing, and a comma would split it where a list
+/// travels comma-joined. The hub holds its rules to it, so that it never sends what a node would
+/// refuse.
 pub fn check_allow_name(name: &str) -> Result<(), String> {
     let bare = name.trim_start_matches('.');
     if bare.is_empty()
         || bare.ends_with('.')
-        || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
+        || bare.contains(|c: char| c.is_whitespace() || "/:@*,".contains(c))
     {
         return Err(format!(
             "{name:?}: expected a DNS suffix such as \"debian.org\", which also allows every \
@@ -974,6 +975,8 @@ mod tests {
         for bad in ["", ".", "debian.org.", "https://x", "*.x", "a b", "u@x"] {
             assert!(check_allow_name(bad).is_err(), "{bad}");
         }
+        // A list's separator: a cap travels to the switch comma-joined.
+        assert!(check_allow_name("a.x,b.x").is_err());
         let ip = |s| parse_allow_ip(s);
         assert_eq!(ip("10.0.0.1"), Ok((Ipv4Addr::new(10, 0, 0, 1), 32, None)));
         assert_eq!(

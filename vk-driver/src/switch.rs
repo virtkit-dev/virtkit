@@ -327,6 +327,10 @@ impl Egress {
             },
         }
     }
+    /// Whether it restricts anything: an allowlist, even an empty one.
+    pub fn restricts(&self) -> bool {
+        !matches!(self, Egress::AllowAll)
+    }
     /// Resolver name check: allow a host equal to or under an allowed suffix.
     /// Also used host-side to validate a per-job allow_name request stays within
     /// the configured cap (the executor's `narrow_names`).
@@ -592,6 +596,16 @@ impl Pins {
     }
 }
 
+/// Whether `pins` hold `dst` for `src`, live, under a name `layer` allows. Expired names go.
+fn pinned_by(pins: &Mutex<Pins>, layer: &Egress, src: Ipv4Addr, dst: SocketAddr) -> bool {
+    let IpAddr::V4(v4) = dst.ip() else {
+        return false;
+    };
+    pins.lock()
+        .unwrap()
+        .holds((src, v4), Instant::now(), |name| layer.allows_host(name))
+}
+
 /// The guard's call on one direct flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -608,14 +622,14 @@ enum Verdict {
 /// allowed CIDR or an IP we just resolved for an allowed name. A restricted switch
 /// serves a single job VM, so the pin set is per-switch (not keyed by VM).
 struct EgressGuard {
-    /// The default policy — the primary guest and any service without its own override.
-    /// Replaced whole when an `--egress-file` changes (see [`EgressGuard::replace_policy`]);
-    /// a flow takes the policy current when it is decided, so one being decided never sees
-    /// half of an edit.
+    /// The default policy — a CI job's own filter, which holds every VM of the job, its
+    /// services' included. Replaced whole when an `--egress-file` changes (see
+    /// [`EgressGuard::replace_policy`]); a flow takes the policy current when it is decided, so
+    /// one being decided never sees half of an edit.
     policy: RwLock<Arc<Egress>>,
-    /// Per-source overrides, keyed by the source VM's IPv4 (a service that declared its own
-    /// egress in its `variables:`). A flow's policy is `per_source[src]` or `policy`. Fixed
-    /// for the switch's life: an `--egress-file` governs the default policy only.
+    /// Per-source filters, keyed by the source VM's IPv4 (a service that declared its own
+    /// egress in its `variables:`), checked after `policy`, never in its place. Fixed for the
+    /// switch's life: an `--egress-file` governs the default policy only.
     per_source: HashMap<Ipv4Addr, Arc<Egress>>,
     gateway: Ipv4Addr,
     /// Observe the policy instead of enforcing it. `false` (the default) blocks a denied flow:
@@ -662,6 +676,9 @@ struct EgressGuard {
     /// Every name a DNS denial was recorded under, with its repeats not yet written out (see
     /// `deny_dns`). Empty when nothing is recorded.
     dns_denied: Mutex<HashMap<String, u64>>,
+    /// The node's cap, checked first for every source. `None` where there is none to check
+    /// (dev `vk run`).
+    cap: Option<Arc<Egress>>,
     /// Throttles the failed-flow log (see `log_flow_failure`).
     flow_log: LogLimiter,
 }
@@ -685,6 +702,7 @@ impl EgressGuard {
             dns_log: LogLimiter::new(DNS_LOG_WINDOW),
             dns_denials: RateLimiter::new(DNS_LOG_WINDOW, DNS_DENIALS_PER_WINDOW),
             dns_denied: Mutex::new(HashMap::new()),
+            cap: None,
             flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
         }
     }
@@ -714,6 +732,11 @@ impl EgressGuard {
     }
     fn with_bytes_log(mut self, path: Option<PathBuf>) -> Self {
         self.bytes_log = path;
+        self
+    }
+    /// See the `cap` field.
+    fn with_cap(mut self, cap: Option<Egress>) -> Self {
+        self.cap = cap.map(Arc::new);
         self
     }
 
@@ -915,51 +938,84 @@ impl EgressGuard {
         }
         crate::egress_report::append_ip_contact(path, &dst.to_string());
     }
-    /// Any restriction at all — the default policy or any per-source override. Drives the
-    /// startup log summary.
+    /// Any restriction at all — the node's cap, the default policy or any service's. Drives
+    /// the startup log summary.
     fn restricted(&self) -> bool {
-        !matches!(*self.default_policy(), Egress::AllowAll) || !self.per_source.is_empty()
+        self.cap.as_deref().is_some_and(Egress::restricts)
+            || self.default_policy().restricts()
+            || !self.per_source.is_empty()
+    }
+    /// Whether `src`'s lookups are held to an allowlist: one of the node's layers'.
+    fn restricted_for(&self, src: Ipv4Addr) -> bool {
+        let job = self.default_policy();
+        self.node_layers(&job, src).any(Egress::restricts)
     }
     fn default_policy(&self) -> Arc<Egress> {
         self.policy.read().unwrap().clone()
     }
-    /// Replace the default policy and remove disallowed names from its DNS pins, revoking
+    /// The node's layers that hold `src`, given the job's policy `job`, in the order they are
+    /// checked: the node's cap, the job's, then the service's own where `src` has one. Each is
+    /// checked alone, and dry-run softens them all. `src` is authenticated by `handle_frame`
+    /// against the address bound to its port, so a guest cannot forge a sibling's source to
+    /// select its layers.
+    fn node_layers<'a>(
+        &'a self,
+        job: &'a Egress,
+        src: Ipv4Addr,
+    ) -> impl Iterator<Item = &'a Egress> {
+        self.cap
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(job))
+            .chain(self.per_source.get(&src).map(|p| &**p))
+    }
+    /// Replace the default policy and remove disallowed names from the DNS pins, revoking
     /// their access before the TTL expires. An address stays pinned until the latest expiry
-    /// among its still-allowed names. Sources with their own policy keep their pins.
-    /// Prune under the write lock: [`Self::record_if_allowed`] either pins under the old
-    /// policy before this pruning, or waits and checks the new policy.
+    /// among its still-allowed names. The policy holds every source, so every source's pins
+    /// are pruned. Prune under the write lock: [`Self::record_if_allowed`] either pins under
+    /// the old policy before this pruning, or waits and checks the new policy.
     fn replace_policy(&self, policy: Egress) {
         let mut current = self.policy.write().unwrap();
-        self.pinned.lock().unwrap().retain(|(src, _), name, _| {
-            self.per_source.contains_key(src) || policy.allows_host(name)
-        });
+        self.pinned
+            .lock()
+            .unwrap()
+            .retain(|_, name, _| policy.allows_host(name));
         *current = Arc::new(policy);
     }
-    /// The policy that governs flows from source `src`: its per-source override, else the
-    /// default. `src` is authenticated by `handle_frame` against the address bound to its
-    /// port, so a guest cannot forge a sibling's source to select the sibling's policy.
-    fn policy_for(&self, src: Ipv4Addr) -> Arc<Egress> {
-        match self.per_source.get(&src) {
-            Some(own) => own.clone(),
-            None => self.default_policy(),
-        }
-    }
-    /// May `src`'s resolver answer this name? (allowed names get forwarded + pinned.)
+    /// May `src`'s resolver answer this name? (allowed names get forwarded + pinned.) Every
+    /// node layer of `src` must allow it, which dry-run softens.
     fn name_allowed(&self, src: Ipv4Addr, host: &str) -> bool {
-        self.policy_for(src).allows_host(host)
+        let job = self.default_policy();
+        self.node_layers(&job, src).all(|l| l.allows_host(host))
+    }
+    /// Does `layer` alone admit a direct flow from `src` to `dst`? Unrestricted, yes. Otherwise
+    /// DNS must go to our resolver (so pinning holds), and `dst` must be in a range `layer`
+    /// lists, or an address pinned for `src` under a name `layer` allows: a pin admits an
+    /// address only through the layers that allow its name, so a name one layer allows never
+    /// opens an address another refuses.
+    fn layer_allows(&self, layer: &Egress, src: Ipv4Addr, dst: SocketAddr) -> bool {
+        if !layer.restricts() {
+            return true;
+        }
+        if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
+            return false; // force DNS through the switch
+        }
+        layer.allows_ip(dst.ip(), dst.port()) || pinned_by(&self.pinned, layer, src, dst)
     }
     /// Pin the A-records `src` resolved `name` to for their TTL (+ a small grace), scoped to
     /// the resolving source so the guest's imminent connection to one of them is permitted —
-    /// and only that guest's, not another VM's. Returns whether `src`'s policy allows `name`
-    /// now, which is checked and pinned under one read of the policy so an edit landing in
-    /// between cannot leave a pin for a name it removed; dry-run pins a refused name too.
+    /// and only that guest's, not another VM's. Returns whether every node layer of `src`
+    /// allows `name` now, which is checked and pinned under one read of the policy so an edit
+    /// landing in between cannot leave a pin for a name it removed. Dry-run pins a refused name
+    /// too, whose addresses then pass only the layers that allow it ([`Self::layer_allows`]).
     /// Never pin [`unroutable`] answers: an allowed name's zone must not add loopback or
-    /// link-local addresses to the policy, even though the proxies refuse them before dialling.
+    /// link-local addresses to the policy, even though the proxies refuse them before
+    /// dialling. Nothing is pinned where no layer restricts `src`.
     fn record_if_allowed(&self, src: Ipv4Addr, name: &str, ips: &[Ipv4Addr], ttl: u32) -> bool {
-        let default = self.policy.read().unwrap();
-        let policy = self.per_source.get(&src).unwrap_or(&*default);
-        let allowed = policy.allows_host(name);
-        if (!allowed && !self.dry_run) || matches!(**policy, Egress::AllowAll) || ips.is_empty() {
+        let job = self.policy.read().unwrap();
+        let allowed = self.node_layers(&job, src).all(|l| l.allows_host(name));
+        let restricted = self.node_layers(&job, src).any(Egress::restricts);
+        if (!allowed && !self.dry_run) || !restricted || ips.is_empty() {
             return allowed;
         }
         let now = Instant::now();
@@ -970,27 +1026,12 @@ impl EgressGuard {
         }
         allowed
     }
-    /// May `src` open a direct flow to `dst`? Unrestricted => yes. Otherwise DNS must go to
-    /// our resolver (so pinning holds), and the dst must be in `src`'s static allowlist or
-    /// freshly pinned by one of `src`'s own allowed-name lookups.
+    /// May `src` open a direct flow to `dst` under the node's layers? Each of them must allow
+    /// it ([`Self::layer_allows`]).
     fn allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
-        let policy = self.policy_for(src);
-        if matches!(*policy, Egress::AllowAll) {
-            return true;
-        }
-        if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
-            return false; // force DNS through the switch
-        }
-        if policy.allows_ip(dst.ip(), dst.port()) {
-            return true;
-        }
-        let IpAddr::V4(v4) = dst.ip() else {
-            return false;
-        };
-        self.pinned
-            .lock()
-            .unwrap()
-            .holds((src, v4), Instant::now(), |_| true)
+        let job = self.default_policy();
+        self.node_layers(&job, src)
+            .all(|l| self.layer_allows(l, src, dst))
     }
     /// What to do with a direct flow from `src` to `dst`: [`Self::allows`], softened to
     /// [`Verdict::WouldDeny`] in dry-run. A `None` source (not IPv4) is denied.
@@ -1321,12 +1362,17 @@ pub struct Spawn {
     pub restrict: bool,
     /// Dry-run the allowlist: evaluate the policy and record would-be denials for the
     /// job trace, but carry the flow instead of blocking it (see `EgressGuard::dry_run`).
-    /// Covers the default and per-source policies alike; no effect on an unrestricted one.
+    /// Covers the cap and the default and per-source policies alike; no effect on an
+    /// unrestricted one.
     pub dry_run: bool,
-    /// Per-source egress overrides — a service that set its own `MICROVM_EGRESS_ALLOW_*`
+    /// Per-source egress filters — a service that set its own `MICROVM_EGRESS_ALLOW_*`
     /// (see vm.rs). Each entry `(source-ip, allow_ip, allow_name)` is always a restricted
-    /// allowlist (empty = deny); a source with no entry uses the default (run) policy.
+    /// allowlist (empty = deny), checked for that source after the default policy, which
+    /// holds every source.
     pub per_source: Vec<(Ipv4Addr, Vec<String>, Vec<String>)>,
+    /// The node's cap, checked for every source before the policies above. `None` = no cap
+    /// (dev `vk run`).
+    pub cap: Option<Cap>,
     /// Take the default policy from this [`EgressFile`] instead of `allow_ip`/`allow_name`,
     /// and follow its edits for the switch's life. `None` = the lists above, fixed.
     pub egress_file: Option<PathBuf>,
@@ -1347,6 +1393,17 @@ pub struct Spawn {
     /// Whether this switch serves a build stage, and so starts at the build's scheduling
     /// priority: it proxies everything the stage downloads (see [`crate::prio`]).
     pub prio: crate::prio::Prio,
+}
+
+/// A node's egress cap, as [`Spawn::cap`] passes it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cap {
+    Unrestricted,
+    /// An allowlist, as `[egress]` lists it: an empty list denies.
+    Allow {
+        ips: Vec<String>,
+        names: Vec<String>,
+    },
 }
 
 /// How often the switch publishes what it has forwarded. Short, because a reader that cannot
@@ -1410,6 +1467,17 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         // an empty field is an empty (deny) list.
         cmd.arg("--source-egress")
             .arg(format!("{ip};{};{}", ips.join(","), names.join(",")));
+    }
+    match &opts.cap {
+        // The same separators as a source's allowlist above.
+        Some(Cap::Allow { ips, names }) => {
+            cmd.arg("--egress-cap")
+                .arg(format!("{};{}", ips.join(","), names.join(",")));
+        }
+        Some(Cap::Unrestricted) => {
+            cmd.arg("--egress-cap").arg("all");
+        }
+        None => {}
     }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
@@ -1493,6 +1561,8 @@ pub async fn run(
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
     dry_run: bool,
+    // The node's cap (see `Spawn`).
+    cap: Option<Egress>,
     // An `--egress-file` to follow, with the bytes `egress` was loaded from.
     egress_file: Option<(PathBuf, Vec<u8>)>,
 ) -> Result<()> {
@@ -1520,7 +1590,8 @@ pub async fn run(
             .with_denied_log(denied_log)
             .with_audit_log(audit_log)
             .with_bytes_log(bytes_log)
-            .with_dry_run(dry_run),
+            .with_dry_run(dry_run)
+            .with_cap(cap),
     );
     let restricted = guard.restricted();
     guard.open_bytes();
@@ -1762,7 +1833,7 @@ impl Switch {
             .then(|| ipv4_src(&frame[14..]))
             .flatten();
         // Admit DHCP from 0.0.0.0, or a source address owned by this port's VM. The socket
-        // supplies the VM identity, so accepted sources are safe inputs to `policy_for` and
+        // supplies the VM identity, so accepted sources are safe inputs to `node_layers` and
         // `route_in`; a guest cannot borrow a sibling's policy or steal its replies. Anything
         // else from 0.0.0.0 would fall to the default policy rather than the sender's own.
         //
@@ -2636,7 +2707,7 @@ async fn handle_dns(
         .first()
         .copied()
         .unwrap_or_else(|| SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT));
-    let restricted = !matches!(*egress.policy_for(client_ip), Egress::AllowAll);
+    let restricted = egress.restricted_for(client_ip);
     let parsed = parse_question(&query);
     // Under an allowlist the upstream is sent a query rebuilt from the checked question, not
     // the guest's bytes; `None` where the query has no shape it can be rebuilt from.
@@ -5344,7 +5415,12 @@ mod tests {
             }]
         );
         assert!(crate::egress_report::read_contacts(&audit_log).is_empty());
-        assert!(guard.allows(guest, SocketAddr::new(ip.into(), 443)));
+        // Its address is pinned, through a name the allowlist refuses: carried, as a would-be
+        // denial.
+        assert_eq!(
+            guard.verdict(Some(guest), SocketAddr::new(ip.into(), 443)),
+            Verdict::WouldDeny
+        );
         let _ = std::fs::remove_dir_all(denied_log.parent().unwrap());
     }
 
@@ -5452,8 +5528,8 @@ mod tests {
         assert_eq!(reverse_lookup(&dry, guest).await, (0, true));
         assert_eq!(crate::egress_report::read_since(&log, 0).0, denial);
 
-        // Per-source: an unrestricted default does not open a restricted source, and a
-        // restricted default does not close an unrestricted one.
+        // Per-source: an unrestricted default does not open a restricted source, nor an
+        // unrestricted source a restricted default: both hold it.
         let per_source = Arc::new(
             EgressGuard::new(Egress::AllowAll, gw)
                 .with_per_source(HashMap::from([(guest, allowlist())])),
@@ -5467,7 +5543,10 @@ mod tests {
             EgressGuard::new(allowlist(), gw)
                 .with_per_source(HashMap::from([(open_guest, Egress::AllowAll)])),
         );
-        assert_eq!(reverse_lookup(&per_source, open_guest).await, (0, true));
+        assert_eq!(
+            reverse_lookup(&per_source, open_guest).await,
+            (RCODE_NXDOMAIN, false)
+        );
 
         // A replaced default policy governs the next lookup.
         let reloaded = Arc::new(EgressGuard::new(Egress::AllowAll, gw));
@@ -6504,6 +6583,63 @@ mod tests {
         assert!(any.allows(src, "8.8.8.8:53".parse().unwrap()));
     }
 
+    /// A destination passes only if the node's cap, the job's policy and a service's own each
+    /// allow it, every one of them checked alone: an address pinned under a name counts only
+    /// for the layers that allow that name, so a name pinned under dry-run, or under one layer,
+    /// never opens its address to another.
+    #[test]
+    fn every_layer_must_allow_a_destination_each_through_its_own_names() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let (job, svc) = (
+            Ipv4Addr::new(192, 168, 231, 2),
+            Ipv4Addr::new(192, 168, 231, 5),
+        );
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cap = Egress::restricted(
+            &names(&["1.2.3.0/24"]),
+            &names(&["crates.io", "debian.org"]),
+        )
+        .unwrap();
+        let guard = |dry_run: bool| {
+            EgressGuard::new(
+                Egress::restricted(&[], &names(&["debian.org", "pypi.org"])).unwrap(),
+                gw,
+            )
+            .with_per_source(HashMap::from([(
+                svc,
+                Egress::restricted(&[], &names(&["crates.io", "debian.org"])).unwrap(),
+            )]))
+            .with_cap(Some(cap.clone()))
+            .with_dry_run(dry_run)
+        };
+        let g = guard(false);
+        assert!(g.name_allowed(job, "deb.debian.org"));
+        // Refused by the job's policy, then by the cap.
+        assert!(!g.name_allowed(job, "crates.io") && !g.name_allowed(job, "pypi.org"));
+        // A service is held to the job's policy as well as its own.
+        assert!(g.name_allowed(svc, "debian.org") && !g.name_allowed(svc, "crates.io"));
+        // The cap's range is no use to a job whose policy lists no ranges.
+        let listed: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        assert!(!g.allows(job, listed));
+
+        let (both, pypi) = (Ipv4Addr::new(7, 7, 7, 7), Ipv4Addr::new(5, 6, 7, 8));
+        assert!(g.record_if_allowed(job, "debian.org", &[both], 60));
+        assert!(g.allows(job, SocketAddr::new(both.into(), 443)));
+        assert!(!g.record_if_allowed(job, "pypi.org", &[pypi], 60));
+        assert!(!g.allows(job, SocketAddr::new(pypi.into(), 443)));
+
+        // Dry-run pins a name the cap refuses; the job's policy admits its address, the cap does
+        // not, so the flow is a would-be denial the cap decides.
+        let g = guard(true);
+        assert!(!g.record_if_allowed(job, "pypi.org", &[pypi], 60));
+        let to_pypi = SocketAddr::new(pypi.into(), 443);
+        assert!(g.layer_allows(&g.default_policy(), job, to_pypi));
+        assert_eq!(g.verdict(Some(job), to_pypi), Verdict::WouldDeny);
+        // The same address pinned for a name every layer allows is reachable.
+        assert!(g.record_if_allowed(job, "debian.org", &[pypi], 60));
+        assert_eq!(g.verdict(Some(job), to_pypi), Verdict::Allow);
+    }
+
     #[test]
     fn egress_guard_per_source_override() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
@@ -6553,9 +6689,9 @@ mod tests {
         // Nor can a lookup decided on the old policy pin it after the fact.
         assert!(!g.record_if_allowed(src, "git.corp.example.com", &ip, 300));
         assert!(!g.allows(src, corp));
-        // A source with its own policy keeps it, and what it pinned.
-        assert!(g.name_allowed(db, "git.corp.example.com"));
-        assert!(g.allows(db, corp));
+        // A source with its own policy is held to the new one too, its own allowing it or not.
+        assert!(!g.name_allowed(db, "git.corp.example.com"));
+        assert!(!g.allows(db, corp));
     }
 
     #[test]
@@ -7650,6 +7786,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .await;
         });
@@ -7736,7 +7873,7 @@ mod tests {
 
     /// A VM may only source IPv4 from the address bound to its socket: a frame forging a
     /// sibling's source is dropped before it can flood, egress, or select that sibling's
-    /// egress policy. Since the source drives `policy_for`/`route_in`, this is the isolation
+    /// egress policy. Since the source drives `node_layers`/`route_in`, this is the isolation
     /// that makes per-service egress sound against an untrusted guest.
     #[tokio::test]
     async fn drops_source_spoofed_frames() {
