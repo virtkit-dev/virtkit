@@ -31,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use vk_hub_proto::egress::NodeEgressCaps;
 use vk_hub_proto::{
     Acquisition, Command, CommandAck, DesiredState, Heartbeat, Inventory, NodeState, Operation,
     Outcome, Report, STEERING, Workload,
@@ -2850,6 +2851,13 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
             clean(name);
         }
     }
+    // Caps that do not check, or whose fingerprint is not theirs, are caps this hub cannot read.
+    if let Some(NodeEgressCaps::Listed(caps)) = &inventory.egress_caps {
+        let fingerprint = vk_hub_proto::to_hex(&Sha256::digest(caps.canonical()));
+        if caps.check().is_err() || caps.fingerprint != fingerprint {
+            inventory.egress_caps = Some(NodeEgressCaps::Other);
+        }
+    }
     inventory
 }
 
@@ -3092,6 +3100,32 @@ mod tests {
         assert_eq!(kept.hardware.memory_nodes.len(), MAX_INVENTORY_ITEMS);
         assert_eq!(kept.storage.len(), MAX_INVENTORY_ITEMS);
         assert_eq!(kept.runner.unwrap().runners.len(), MAX_INVENTORY_ITEMS);
+
+        // Caps are kept as the node fingerprinted them, or read as unknown.
+        let caps = vk_hub_proto::egress::EgressCaps::normalized(
+            vk_hub_proto::egress::HubPhase::Allow {
+                names: vec!["crates.io".into()],
+                ips: vec![],
+            },
+            false,
+            vk_hub_proto::egress::HubPhase::Unrestricted,
+        )
+        .unwrap();
+        let fingerprint = vk_hub_proto::to_hex(&Sha256::digest(caps.canonical()));
+        for (fingerprint, kept) in [(fingerprint, true), ("ab".repeat(32), false)] {
+            let caps = NodeEgressCaps::Listed(vk_hub_proto::egress::EgressCaps {
+                fingerprint,
+                ..caps.clone()
+            });
+            let inventory = Inventory {
+                egress_caps: Some(caps.clone()),
+                ..Inventory::default()
+            };
+            db.record_inventory(&node_id, inventory, true, 3).unwrap();
+            let row = db.node(&node_id).unwrap().unwrap();
+            let want = if kept { caps } else { NodeEgressCaps::Other };
+            assert_eq!(row.inventory.unwrap().egress_caps, Some(want));
+        }
     }
 
     #[test]
