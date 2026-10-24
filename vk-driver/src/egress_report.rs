@@ -576,28 +576,90 @@ pub fn create_record_dir(dir: &Path) -> std::io::Result<()> {
 
 /// The run phase's channels in the executor's `job_dir`, moved into the job's egress `record`
 /// before cleanup removes the job dir: the switch is stopped by then, and has written out all
-/// it counted. Best-effort: a channel that cannot be kept leaves the report without it.
+/// it counted. Both dirs are resolved once and worked through their descriptors, so a name
+/// swapped in either meanwhile redirects nothing. Best-effort: a channel that cannot be kept
+/// leaves the report without it.
 pub fn keep_run_channels(job_dir: &Path, record: &Path) {
     use crate::jobctx::JobCtx;
-    let run = record.join(RUN_DIR);
-    if create_record_dir(&run).is_err() {
+    use std::os::fd::AsFd;
+    let (Ok(job), Ok(record)) = (vk_fs::open_dir(job_dir), vk_fs::open_dir(record)) else {
         return;
-    }
+    };
+    let Ok(run) = run_dir_in(record.as_fd()) else {
+        return;
+    };
     for from in [
         JobCtx::egress_denied_log_in(job_dir),
         JobCtx::egress_audit_log_in(job_dir),
         job_dir.join(crate::run::NET_BYTES),
     ] {
-        let Some(name) = from.file_name() else {
-            continue;
-        };
-        let to = run.join(name);
-        // A copy where the two are not on one filesystem; nothing at all where there is no
-        // channel, as for a job whose guest had no switch.
-        if std::fs::rename(&from, &to).is_err() && from.exists() {
-            let _ = std::fs::copy(&from, &to);
+        if let Some(name) = from.file_name() {
+            // Best-effort, as above: the report goes without the channel.
+            let _ = keep_channel(job.as_fd(), run.as_fd(), name);
         }
     }
+}
+
+/// [`RUN_DIR`] in `record`, made private if it is not there yet; never through a symlink.
+fn run_dir_in(record: std::os::fd::BorrowedFd<'_>) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(RUN_DIR)?;
+    // SAFETY: the descriptor is live and the name NUL-terminated, both outliving the call.
+    if unsafe { libc::mkdirat(record.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e.into());
+        }
+    }
+    vk_fs::open_dir_in(record, std::ffi::OsStr::new(RUN_DIR))
+}
+
+/// Move the channel `name` from the dir `from` to the dir `to`, both held open: by `rename`,
+/// or by a copy where the two are not on one filesystem. Nothing at all where there is no
+/// channel, as for a job whose guest had no switch. Neither end is followed through a symlink.
+fn keep_channel(
+    from: std::os::fd::BorrowedFd<'_>,
+    to: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: the descriptors are live and the name NUL-terminated, all outliving the call.
+    let renamed = unsafe {
+        libc::renameat(
+            from.as_raw_fd(),
+            name.as_ptr(),
+            to.as_raw_fd(),
+            name.as_ptr(),
+        )
+    };
+    if renamed == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() != Some(libc::EXDEV) {
+        return match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(e),
+        };
+    }
+    let open_at = |dir: std::os::fd::BorrowedFd<'_>, flags: libc::c_int| {
+        // SAFETY: as above; a descriptor the call returns is handed straight to `OwnedFd`.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    let nofollow = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut src = open_at(from, libc::O_RDONLY | libc::O_NONBLOCK | nofollow)?;
+    if !src.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    // Only a file of its own: nothing there is written through, whatever it is.
+    let mut dst = open_at(to, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | nofollow)?;
+    std::io::copy(&mut src, &mut dst).map(|_| ())
 }
 
 /// How much of each channel a [`JobRecord`] reads, from its start: what a job's switch records
@@ -1918,6 +1980,24 @@ mod tests {
         assert!(run.join(crate::run::NET_BYTES).exists());
         assert!(!run.join(crate::run::AUDIT_LOG).exists());
         assert!(!job.join("egress-denied.log").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A record whose run dir is a symlink keeps nothing through it: the channels stay where
+    /// they are, for cleanup to remove with the job dir.
+    #[test]
+    fn run_channels_are_not_kept_through_a_symlink() {
+        let tmp = std::env::temp_dir().join(format!("vk-egress-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (job, record, elsewhere) = (tmp.join("job"), tmp.join("record"), tmp.join("else"));
+        for dir in [&job, &record, &elsewhere] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&elsewhere, record.join(RUN_DIR)).unwrap();
+        std::fs::write(job.join("egress-denied.log"), "dns\ta.example\n").unwrap();
+        keep_run_channels(&job, &record);
+        assert!(job.join("egress-denied.log").exists());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
