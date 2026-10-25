@@ -831,8 +831,9 @@ and ID are on the registry's page.
 
 A registry's page has three tabs. *Overview* (`/registry/<id>`) is what it reports and what
 the hub asks of it. *Job access* (`?tab=access`) lists its storage areas, each with who may
-read and who may publish there in plain words ("Projects under wab/ on gl, protected
-branches and tags only · can coordinate builds"); the two the hub keeps for CI, `ci-cache`
+read and who may publish there in plain words ("Projects under wab/ [gl], protected
+branches and tags only · can coordinate builds", the instance left out while it is the hub's
+only one, and a rule of none marked `[every server]` while the hub has several); the two the hub keeps for CI, `ci-cache`
 and `ci-pipeline`, are folded under *Managed by CI*. It says when cleanup after inactivity
 does not apply, because the registry's `[hub] allow` lacks `gc` or the registry refused a
 window, and links to the registry's audit log. *Settings* (`?tab=settings`) shows the bound

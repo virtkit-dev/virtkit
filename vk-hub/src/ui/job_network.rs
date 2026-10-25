@@ -20,15 +20,17 @@ const OPEN_ROWS: usize = 20;
 
 /// What a job's network access shows beside its report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Shown {
+pub(super) struct Shown<'a> {
     /// Whether its node announces egress reports now.
     pub reports: bool,
     /// Whether the session may propose hub rules from it: an operator's.
     pub propose: bool,
+    /// The instance its project leaves unnamed ([`crate::store::Db::sole_gitlab`]).
+    pub sole: Option<&'a str>,
 }
 
 /// Job `j`'s network access, for a job that reached a node. `node` is its node's name.
-pub(super) fn section(h: &mut Html, j: &JobRow, node: Option<&str>, shown: Shown) {
+pub(super) fn section(h: &mut Html, j: &JobRow, node: Option<&str>, shown: Shown<'_>) {
     let reports = shown.reports;
     let network = egress::network(j);
     if matches!(network, Network::NotRun) {
@@ -50,7 +52,7 @@ pub(super) fn section(h: &mut Html, j: &JobRow, node: Option<&str>, shown: Shown
             h.raw("<p>No egress report is available for this job. This does not mean it made ")
                 .raw("no network attempts.</p>");
         }
-        Network::Reported(report) => reported(h, j, report, node, shown.propose),
+        Network::Reported(report) => reported(h, j, report, node, shown),
     }
     h.raw("</section>");
 }
@@ -72,7 +74,7 @@ pub(super) fn badge(h: &mut Html, tone: Tone, text: &str, title: Option<&str>) {
     h.raw(">").node(text).raw("</span>");
 }
 
-fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>, propose: bool) {
+fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>, shown: Shown<'_>) {
     let summary = Summary::of(report);
     let (tone, headline) = summary.headline();
     h.raw("<p>");
@@ -91,7 +93,11 @@ fn reported(h: &mut Html, j: &JobRow, report: &EgressReport, node: Option<&str>,
     }
     h.raw("</p>");
     refusals(h, j, report, &summary, node);
-    let at = Where { node, propose };
+    let at = Where {
+        node,
+        propose: shown.propose,
+        sole: shown.sole,
+    };
     denials(h, j, report, EgressOutcome::Blocked, &summary.blocked, at);
     denials(
         h,
@@ -180,6 +186,7 @@ fn refusals(
 struct Where<'a> {
     node: Option<&'a str>,
     propose: bool,
+    sole: Option<&'a str>,
 }
 
 fn denials(
@@ -248,7 +255,7 @@ fn denials(
             super::egress::proposal_link(
                 h,
                 &href,
-                &Subject::of(j).text(j.project.as_deref(), &j.key_name),
+                &Subject::of(j).label(j.project.as_deref(), &j.key_name, at.sole),
                 None,
             );
         }
@@ -398,6 +405,7 @@ mod tests {
             Shown {
                 reports,
                 propose: false,
+                sole: None,
             },
         );
         h.into_string()

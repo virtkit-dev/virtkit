@@ -217,6 +217,12 @@ impl BlockedRow {
         self.subject.text(self.project.as_deref(), &self.key_name)
     }
 
+    /// Its subject as pages name it ([`Subject::label`]), the instance `sole` left out.
+    pub fn label(&self, sole: Option<&str>) -> String {
+        self.subject
+            .label(self.project.as_deref(), &self.key_name, sole)
+    }
+
     fn new(share: &Share) -> Self {
         BlockedRow {
             subject: share.subject.clone(),

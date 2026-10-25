@@ -4,6 +4,7 @@
 
 use vk_hub_proto::token::Grant;
 
+use crate::egress::blocked::instance_tag;
 use crate::store::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant};
 use crate::subject::{Projects, Subject};
 
@@ -28,29 +29,21 @@ pub(super) fn rights(read: bool, write: bool, lock: bool) -> String {
     }
 }
 
-/// The jobs a subject selects, in plain words: `Every job`, `Each project from gl, its own`,
-/// `Projects under wab/ on gl, protected branches and tags only`. The GitLab instance is named
-/// whenever the subject names one.
-pub(super) fn who(s: &Subject) -> String {
-    let on = |g: &Option<String>| g.as_ref().map(|g| format!(" on {g}")).unwrap_or_default();
-    let from = |g: &Option<String>| g.as_ref().map(|g| format!(" from {g}")).unwrap_or_default();
+/// The jobs a subject selects, in plain words, its GitLab instance named as projects name it
+/// ([`instance_tag`]) by `sole`, the hub's only one: `Every job`, `Each project [gl], its own`,
+/// `Projects under wab/ [gl], protected branches and tags only`, `Every job [every server]`.
+pub(super) fn who(s: &Subject, sole: Option<&str>) -> String {
+    let tag = instance_tag(s.gitlab.as_deref(), sole);
     let mut text = match &s.projects {
-        Projects::Own | Projects::Any if s.own_pipeline => {
-            format!("Each pipeline{}, its own", from(&s.gitlab))
-        }
-        Projects::Own => format!("Each project{}, its own", from(&s.gitlab)),
-        Projects::Any => match &s.gitlab {
-            Some(g) => format!("Every job from {g}"),
-            None => "Every job".to_string(),
-        },
+        Projects::Own | Projects::Any if s.own_pipeline => format!("Each pipeline{tag}, its own"),
+        Projects::Own => format!("Each project{tag}, its own"),
+        Projects::Any => format!("Every job{tag}"),
         Projects::Path(glob) => match glob.strip_suffix("/**") {
-            Some(under) if !under.contains('*') => {
-                format!("Projects under {under}/{}", on(&s.gitlab))
-            }
-            _ if glob.contains('*') => format!("Projects matching {glob}{}", on(&s.gitlab)),
-            _ => format!("{glob}{}", on(&s.gitlab)),
+            Some(under) if !under.contains('*') => format!("Projects under {under}/{tag}"),
+            _ if glob.contains('*') => format!("Projects matching {glob}{tag}"),
+            _ => format!("{glob}{tag}"),
         },
-        Projects::Id(id) => format!("Project {id}{}", on(&s.gitlab)),
+        Projects::Id(id) => format!("Project {id}{tag}"),
     };
     if s.own_pipeline && matches!(s.projects, Projects::Path(_) | Projects::Id(_)) {
         text.push_str(", its own pipeline");
@@ -92,9 +85,9 @@ pub(super) fn label(name: &str) -> String {
     }
 }
 
-/// Namespace `ns` as a storage area.
-pub(super) fn area(ns: &NamespaceRow) -> Area {
-    let line = |g: &NsGrant| who(&g.subject);
+/// Namespace `ns` as a storage area, its rules' instance named by `sole` ([`who`]).
+pub(super) fn area(ns: &NamespaceRow, sole: Option<&str>) -> Area {
+    let line = |g: &NsGrant| who(&g.subject, sole);
     Area {
         name: ns.name.clone(),
         label: label(&ns.name),
@@ -150,53 +143,87 @@ mod tests {
         assert_eq!(rights(false, false, false), "No access");
     }
 
+    /// With the hub's only instance, a rule names none; with several, its own or every server.
     #[test]
     fn subjects_read_as_who_they_select() {
-        for (text, want) in [
-            ("*", "Every job"),
-            ("gitlab gl", "Every job from gl"),
-            ("own project", "Each project, its own"),
-            ("own project, own pipeline", "Each pipeline, its own"),
-            ("gitlab gl, own project", "Each project from gl, its own"),
+        for (text, alone, several) in [
+            ("*", "Every job", "Every job [every server]"),
+            ("gitlab gl", "Every job", "Every job [gl]"),
+            (
+                "own project",
+                "Each project, its own",
+                "Each project [every server], its own",
+            ),
+            (
+                "own project, own pipeline",
+                "Each pipeline, its own",
+                "Each pipeline [every server], its own",
+            ),
+            (
+                "gitlab gl, own project",
+                "Each project, its own",
+                "Each project [gl], its own",
+            ),
             (
                 "gitlab gl, own project, own pipeline",
-                "Each pipeline from gl, its own",
+                "Each pipeline, its own",
+                "Each pipeline [gl], its own",
             ),
-            ("gitlab gl, own pipeline", "Each pipeline from gl, its own"),
             (
                 "gitlab gl, projects wab/**, own pipeline",
-                "Projects under wab/ on gl, its own pipeline",
+                "Projects under wab/, its own pipeline",
+                "Projects under wab/ [gl], its own pipeline",
             ),
             (
                 "gitlab gl, project-id 7, own pipeline",
-                "Project 7 on gl, its own pipeline",
+                "Project 7, its own pipeline",
+                "Project 7 [gl], its own pipeline",
             ),
             (
                 "own project, protected",
                 "Each project, its own, protected branches and tags only",
+                "Each project [every server], its own, protected branches and tags only",
             ),
-            ("gitlab gl, projects wab/**", "Projects under wab/ on gl"),
+            (
+                "gitlab gl, projects wab/**",
+                "Projects under wab/",
+                "Projects under wab/ [gl]",
+            ),
             (
                 "gitlab gl, projects wab/*-ci",
-                "Projects matching wab/*-ci on gl",
+                "Projects matching wab/*-ci",
+                "Projects matching wab/*-ci [gl]",
             ),
             (
                 "gitlab gl, projects infra/images, protected",
-                "infra/images on gl, protected branches and tags only",
+                "infra/images, protected branches and tags only",
+                "infra/images [gl], protected branches and tags only",
             ),
-            ("gitlab gl, project-id 1172", "Project 1172 on gl"),
+            (
+                "gitlab gl, project-id 1172",
+                "Project 1172",
+                "Project 1172 [gl]",
+            ),
             (
                 "gitlab gl, projects wab/**, ref release/*, protected",
-                "Projects under wab/ on gl, refs matching release/*, protected branches and \
-                 tags only",
+                "Projects under wab/, refs matching release/*, protected branches and tags only",
+                "Projects under wab/ [gl], refs matching release/*, protected branches and tags \
+                 only",
             ),
             (
                 "unprotected",
                 "Every job, unprotected branches and tags only",
+                "Every job [every server], unprotected branches and tags only",
             ),
         ] {
-            assert_eq!(who(&subject(text)), want, "{text}");
+            assert_eq!(who(&subject(text), Some("gl")), alone, "{text}");
+            assert_eq!(who(&subject(text), None), several, "{text}");
         }
+        // A rule of an instance the hub no longer has still names it.
+        assert_eq!(
+            who(&subject("gitlab old, projects wab/**"), Some("gl")),
+            "Projects under wab/ [old]"
+        );
     }
 
     fn ns(name: &str, path: &str, grants: &[&str]) -> NamespaceRow {
@@ -222,29 +249,33 @@ mod tests {
                 "l:gitlab gl, project-id 7",
             ],
         );
-        let a = area(&wab);
+        let a = area(&wab, None);
         assert_eq!(a.label, "wab");
         assert!(!a.managed);
         assert_eq!(
             a.readers,
             [
-                "Projects under wab/ on gl, protected branches and tags only",
-                "Projects under wab/ on gl"
+                "Projects under wab/ [gl], protected branches and tags only",
+                "Projects under wab/ [gl]"
             ]
         );
         assert_eq!(
             a.publishers,
             [
-                "Projects under wab/ on gl, protected branches and tags only · can coordinate \
+                "Projects under wab/ [gl], protected branches and tags only · can coordinate \
                  builds",
-                "Project 7 on gl · coordinate builds only"
+                "Project 7 [gl] · coordinate builds only"
             ]
         );
-        let cache = area(&ns(
-            CI_CACHE,
-            "ci-cache/{gitlab}/{project_id}/{protection}",
-            &["rw:own project"],
-        ));
+        assert_eq!(area(&wab, Some("gl")).readers[1], "Projects under wab/");
+        let cache = area(
+            &ns(
+                CI_CACHE,
+                "ci-cache/{gitlab}/{project_id}/{protection}",
+                &["rw:own project"],
+            ),
+            None,
+        );
         assert_eq!(cache.label, "CI caches");
         assert!(cache.managed);
     }

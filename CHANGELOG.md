@@ -27,6 +27,12 @@ All notable changes to virtkit will be documented in this file.
 - **Guests' lookups of `localhost` and `invalid` names are answered on the host**: names under
   `localhost` resolve to the loopback addresses and those under `invalid` to `NXDOMAIN`, under
   any egress policy, without reaching the host's resolver or showing as blocked lookups.
+- **The hub's web UI names a GitLab project's instance only when the hub has several**: a
+  project reads `acme/web` while `gl` is the hub's only instance, and `acme/web [gl]` otherwise,
+  where it read `acme/web on gl`, on the Egress page and on a job's page. Egress rules and
+  storage areas' access rules read the same way (`Projects under wab/`,
+  `Projects under wab/ [gl]`), and while the hub has several instances a rule bound to none
+  reads `[every server]`.
 
 ### Fixed
 

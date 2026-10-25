@@ -1495,7 +1495,10 @@ project — a project of the GitLab instance its jobs' relay is bound to, by Git
 an older hub's jobs of an API key bound to none, every job of the key. *Blocked*, *Would block* and *Declaration issues* are
 separate views (`view=blocked|would_block|refused`), each with its count. A row shows its jobs
 and attempts in the history, its latest job's end, the layers that decided it in plain words,
-and its state; at most 200 rows, the latest first. Project (`project=gitlab:<instance>:<ID>` or
+and its state; at most 200 rows, the latest first. Here, as wherever the web UI names a project
+with its instance, a project reads as its path, or `project <ID>` when no job named one, then its
+instance in brackets (`acme/web [gl]`); the instance is left out while it is the hub's only one.
+Project (`project=gitlab:<instance>:<ID>` or
 `key:<key ID>`), deciding layer (`layer=node_cap|hub_rule|job|service|unknown`), phase
 (`phase=run|build|other`) and job (`job=<ID>`: the rows it shares) filter it, applied at once
 with htmx as on the audit log. A row's page, `/egress/rows/<id>`, shows its latest 20 jobs —

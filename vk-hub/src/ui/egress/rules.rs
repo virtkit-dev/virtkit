@@ -26,6 +26,7 @@ use super::super::sse::Source;
 use super::super::{Auth, Body, Ui, access, blocking, decode_form, field, fleet, message, page};
 use super::{Caches, PATH as EGRESS, Tab, capital};
 use crate::egress::aggregates::Aggregates;
+use crate::egress::blocked::sole_instance;
 use crate::egress::cap_use::CapUse;
 use crate::egress::rule_use::{self, RuleUse, Standing};
 use crate::egress::rules::{self as ops, RECENT_SCAN, RuleJobs, Rules};
@@ -190,10 +191,10 @@ pub(super) fn rule_name(r: &EgressRuleRow) -> &str {
     if is_fallback(r) { "Fallback" } else { &r.name }
 }
 
-/// The jobs rule `r` selects, in plain words.
-pub(super) fn applies_to(r: &EgressRuleRow) -> String {
+/// The jobs rule `r` selects, in plain words, its instance named by `sole` ([`access::who`]).
+pub(super) fn applies_to(r: &EgressRuleRow, sole: Option<&str>) -> String {
     match &r.subject {
-        Some(s) => access::who(s),
+        Some(s) => access::who(s, sole),
         None => "Jobs no enforced rule selects, and every gitlab-runner job".to_string(),
     }
 }
@@ -568,7 +569,7 @@ fn rule_row(h: &mut Html, r: &EgressRuleRow, l: &Listing) {
             .raw(" with no observed use in 30 days</div>");
     }
     h.raw("</td><td>")
-        .text(applies_to(r))
+        .text(applies_to(r, sole_instance(&l.gitlabs)))
         .raw("</td><td>")
         .text(phase_summary(&r.run))
         .raw("</td><td>")
@@ -671,7 +672,7 @@ fn rule_results(h: &mut Html, l: &Listing, r: &EgressRuleRow) {
     h.raw("</h2><p><a href=\"")
         .raw(PATH)
         .raw("\">Every rule</a></p><table class=\"kv\"><tbody>");
-    pages::kv(h, "Applies to", &applies_to(r));
+    pages::kv(h, "Applies to", &applies_to(r, sole_instance(&l.gitlabs)));
     pages::kv_html(h, "Mode", &{
         let mut b = Html::new();
         mode_badge(&mut b, r.mode);

@@ -196,6 +196,12 @@ impl Db {
         Ok(out)
     }
 
+    /// The instance pages leave unnamed ([`crate::egress::blocked::sole_instance`]).
+    pub fn sole_gitlab(&self) -> Result<Option<String>> {
+        let names: Vec<String> = self.gitlabs()?.into_iter().map(|(n, _)| n).collect();
+        Ok(crate::egress::blocked::sole_instance(&names).map(str::to_string))
+    }
+
     /// Remove instance `name` and forget its projects, audited as `actor`'s, and return
     /// whether it existed. Refused while a relay is bound to it.
     pub fn remove_gitlab(&self, name: &str, actor: &str, now: u64) -> Result<bool> {

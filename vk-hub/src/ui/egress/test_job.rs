@@ -26,6 +26,7 @@ use super::super::jobs::percent_encode;
 use super::super::{Auth, Body, Ui, blocking, decode_form, field, fleet, page};
 use super::rules::{cap_summary, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital};
+use crate::egress::blocked::{project_label, sole_instance};
 use crate::egress::cap_use::listed;
 use crate::egress::matching::{Dest, Verdict, dns_refused, verdict};
 use crate::egress::narrowing::{self, Declared, Narrowing, Says, Stand};
@@ -269,11 +270,10 @@ fn result(h: &mut Html, q: &Query, l: &Listing) {
     };
     let layer = resolve_egress(&l.rules.rules, claims.as_ref());
     h.raw("<section><h2>Tested as</h2><p>");
+    let sole = sole_instance(&l.gitlabs);
     match &claims {
         Some(c) => {
-            h.node(&c.project_path)
-                .raw(" on ")
-                .text(&c.gitlab)
+            h.node(&project_label(&c.project_path, &c.gitlab, sole))
                 .raw(" (project ")
                 .text(c.project_id)
                 .raw("), ")

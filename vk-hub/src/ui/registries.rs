@@ -222,13 +222,14 @@ pub(super) async fn detail(
     let tab = Tab::of(query);
     let hub = ui.hub.clone();
     let wanted = id.to_string();
-    let Some((view, commands, namespaces, keys)) = blocking(move || {
+    let Some((view, commands, namespaces, keys, sole)) = blocking(move || {
         let Some((view, commands)) = ops::detail(&hub, &wanted)? else {
             return Ok(None);
         };
         let namespaces = hub.db.namespaces(&wanted)?;
         let keys = hub.db.token_keys()?;
-        Ok::<_, anyhow::Error>(Some((view, commands, namespaces, keys)))
+        let sole = hub.db.sole_gitlab()?;
+        Ok::<_, anyhow::Error>(Some((view, commands, namespaces, keys, sole)))
     })
     .await?
     else {
@@ -261,7 +262,7 @@ pub(super) async fn detail(
             usage(&mut main, &view);
             commands_table(&mut main, &view, &commands, now);
         }
-        Tab::Access => access(&mut main, &view, &namespaces),
+        Tab::Access => access(&mut main, &view, &namespaces, sole.as_deref()),
         Tab::Settings => settings(&mut main, &view, &keys, now),
     }
     Ok(page(super::fleet::layout(
@@ -273,8 +274,9 @@ pub(super) async fn detail(
 }
 
 /// The Job access tab: the registry's storage areas, those the hub keeps for CI folded away,
-/// and what keeps jobs from getting access, when something does.
-fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow]) {
+/// and what keeps jobs from getting access, when something does; access rules name their GitLab
+/// instance by `sole` ([`super::access::who`]).
+fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], sole: Option<&str>) {
     if !v.row.takes_tokens() {
         h.raw("<p class=\"callout\">Jobs get no access here: the registry does not take the ")
             .raw("hub's tokens. <code>[hub] tokens = true</code> in its config turns it on.</p>");
@@ -303,7 +305,9 @@ fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow]) {
             .raw("</strong> the registry refused a cleanup window (shorter than its floor, or ")
             .raw("invalid). A shorter one needs <code>[[gc.prefix]]</code> in its own config.</p>");
     }
-    let areas: Vec<_> = namespaces.iter().map(super::access::area).collect();
+    let areas: Vec<_> = (namespaces.iter())
+        .map(|ns| super::access::area(ns, sole))
+        .collect();
     let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
     h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
         .raw("Jobs get access only where an access rule allows it.</p>");

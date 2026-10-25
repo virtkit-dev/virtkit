@@ -21,6 +21,7 @@ use super::super::html::Html;
 use super::super::{Auth, Body, Ui, blocking, field, fleet, html_response, message, pages};
 use super::rules::{self as tab, applies_to, mode_badge, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital, see_other};
+use crate::egress::blocked::{project_label, sole_instance};
 use crate::egress::preview::{self, Edit, Group, Lost, Preview};
 use crate::egress::proposal;
 use crate::egress::rules::{self as ops, Rules};
@@ -834,7 +835,7 @@ fn preview_page(
     }
     if let Edit::Put(r) = edit {
         h.raw("<table class=\"kv\"><tbody>");
-        pages::kv(&mut h, "Applies to", &applies_to(r));
+        pages::kv(&mut h, "Applies to", &applies_to(r, sole_instance(gitlabs)));
         pages::kv(&mut h, "Run", &phase_summary(&r.run));
         pages::kv(&mut h, "Build", &phase_summary(&r.build));
         pages::kv_html(&mut h, "Mode", &{
@@ -844,7 +845,7 @@ fn preview_page(
         });
         h.raw("</tbody></table>");
     }
-    jobs_section(&mut h, p);
+    jobs_section(&mut h, p, sole_instance(gitlabs));
     lost_section(&mut h, p);
 
     // Save: the change previewed, unchanged, with the generation it was made against.
@@ -888,8 +889,8 @@ fn preview_page(
 }
 
 /// The groups of recent jobs the change affects or the rule selects, with their layer before
-/// and after.
-fn jobs_section(h: &mut Html, p: &Preview) {
+/// and after, their projects' instance left unnamed when it is `sole`.
+fn jobs_section(h: &mut Html, p: &Preview, sole: Option<&str>) {
     h.raw("<section><h3>Recent jobs</h3>");
     if p.groups.is_empty() {
         h.raw("<p class=\"empty\">no recent job is affected or selected</p>");
@@ -898,7 +899,7 @@ fn jobs_section(h: &mut Html, p: &Preview) {
             .raw("<th>rules before</th><th>rules after</th><th>run</th><th>build</th>")
             .raw("</tr></thead><tbody>");
         for g in &p.groups {
-            group_row(h, g);
+            group_row(h, g, sole);
         }
         h.raw("</tbody></table>");
     }
@@ -915,7 +916,7 @@ fn jobs_section(h: &mut Html, p: &Preview) {
     h.raw(". Entries added may allow nothing new where another entry already did.</p></section>");
 }
 
-fn group_row(h: &mut Html, g: &Group) {
+fn group_row(h: &mut Html, g: &Group, sole: Option<&str>) {
     h.raw("<tr><td class=\"num\"><a href=\"")
         .raw(super::super::jobs::DETAIL_PREFIX)
         .text(&g.latest)
@@ -924,9 +925,8 @@ fn group_row(h: &mut Html, g: &Group) {
         .raw("</a></td><td>");
     match &g.claims {
         Some(c) => {
-            h.node(g.project.as_deref().unwrap_or(&c.project_path))
-                .raw(" on ")
-                .text(&c.gitlab)
+            let project = g.project.as_deref().unwrap_or(&c.project_path);
+            h.node(&project_label(project, &c.gitlab, sole))
                 .raw(" <span class=\"sub\">(project ")
                 .text(c.project_id)
                 .raw(")</span>");

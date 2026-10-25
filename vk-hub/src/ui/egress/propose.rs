@@ -19,7 +19,7 @@ use super::super::{Auth, Body, Ui, blocking, field, fleet, message, page};
 use super::editor::{Draft, PhaseDraft, editor};
 use super::rules::{self as tab, applies_to, rule_href, rule_name};
 use super::{PATH as EGRESS, ROW_PREFIX, Tab};
-use crate::egress::blocked::Subject;
+use crate::egress::blocked::{Subject, sole_instance};
 use crate::egress::observed::Contact;
 use crate::egress::proposal::{self, Base, By, NoProposal, Seed, Standing};
 use crate::egress::rules::{self as ops, Rules, claims_for, claims_of};
@@ -222,7 +222,8 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
         .filter(|ph| seed.phases.contains(ph))
         .or(seed.phases.first().copied())
         .unwrap_or(EgressPhase::Run);
-    let who = seed.subject.text(seed.project.as_deref(), "");
+    let sole = sole_instance(&p.gitlabs);
+    let who = seed.subject.label(seed.project.as_deref(), "", sole);
     let who = match &seed.subject {
         Subject::Gitlab { .. } => who,
         Subject::Key { .. } => "the jobs of this key".to_string(),
@@ -326,7 +327,7 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
                 h.raw("<p class=\"callout warn\">")
                     .text(rule_name(r))
                     .raw(" applies to ")
-                    .text(applies_to(r).to_lowercase())
+                    .text(applies_to(r, sole).to_lowercase())
                     .raw(": the entry is allowed to every job it selects, not only these.</p>");
             }
             if r.mode == RuleMode::DryRun {
@@ -494,7 +495,7 @@ fn choices(
         h.raw("> <strong>")
             .text(rule_name(t.rule))
             .raw("</strong> <span class=\"sub\">")
-            .text(applies_to(t.rule))
+            .text(applies_to(t.rule, sole_instance(&p.gitlabs)))
             .raw("; applies to ")
             .text(t.applies)
             .raw(" of the ")

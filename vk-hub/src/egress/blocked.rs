@@ -86,6 +86,60 @@ impl Subject {
             (Subject::Key { .. }, _) => format!("key {key_name}"),
         }
     }
+
+    /// As pages name it ([`project_label`]), the instance left out when it is `sole`:
+    /// `acme/web`, `project 42 [gl]`, `key ci`.
+    pub fn label(&self, project: Option<&str>, key_name: &str, sole: Option<&str>) -> String {
+        match self {
+            Subject::Gitlab {
+                instance,
+                project_id,
+            } => {
+                let project = project.map_or_else(|| format!("project {project_id}"), Into::into);
+                project_label(&project, instance, sole)
+            }
+            Subject::Key { .. } => format!("key {key_name}"),
+        }
+    }
+
+    /// [`Subject::label`] from the words [`Subject::text`] wrote for it, as a mute and the list
+    /// of subjects keep them.
+    pub fn relabel(&self, text: &str, sole: Option<&str>) -> String {
+        match self {
+            Subject::Gitlab { instance, .. } => match text.strip_suffix(&format!(" on {instance}"))
+            {
+                Some(project) => project_label(project, instance, sole),
+                None => text.to_string(),
+            },
+            Subject::Key { .. } => text.to_string(),
+        }
+    }
+}
+
+/// A GitLab project of `instance`, or the words standing for it, as pages name it: alone when
+/// `instance` is `sole`, the hub's only one, else with its instance: `acme/web`,
+/// `acme/web [gl]`.
+pub fn project_label(project: &str, instance: &str, sole: Option<&str>) -> String {
+    format!("{project}{}", instance_tag(Some(instance), sole))
+}
+
+/// What follows the jobs of `instance`, or of any (`None`), as pages name them: nothing when
+/// the hub has one instance, `sole`, and they are its; else ` [gl]`, or ` [every server]`.
+pub fn instance_tag(instance: Option<&str>, sole: Option<&str>) -> String {
+    match (instance, sole) {
+        (Some(i), Some(s)) if i == s => String::new(),
+        (None, Some(_)) => String::new(),
+        (Some(i), _) => format!(" [{i}]"),
+        (None, None) => " [every server]".to_string(),
+    }
+}
+
+/// The instance pages leave unnamed, of the hub's `instances` ([`project_label`]): its only one.
+pub fn sole_instance(instances: &[String]) -> Option<&str> {
+    match instances {
+        [only] => Some(only),
+        _ => None,
+    }
 }
 
 /// Which of the page's separate views a row is in, each with its own counts.
@@ -299,6 +353,37 @@ mod tests {
                 ..EgressReport::default()
             },
         )
+    }
+
+    /// The instance is named unless it is the hub's only one, from a project's path, its ID, or
+    /// the words a mute kept.
+    #[test]
+    fn a_project_names_its_instance_unless_it_is_the_only_one() {
+        let subject = Subject::Gitlab {
+            instance: "gl".into(),
+            project_id: 42,
+        };
+        let key = Subject::Key {
+            key: "a".repeat(64),
+        };
+        for (sole, path, id) in [
+            (Some("gl"), "acme/web", "project 42"),
+            (Some("other"), "acme/web [gl]", "project 42 [gl]"),
+            (None, "acme/web [gl]", "project 42 [gl]"),
+        ] {
+            assert_eq!(subject.label(Some("acme/web"), "ci", sole), path);
+            assert_eq!(subject.label(None, "ci", sole), id);
+            assert_eq!(subject.relabel("acme/web on gl", sole), path);
+            assert_eq!(subject.relabel("project 42 on gl", sole), id);
+            assert_eq!(key.label(None, "ci", sole), "key ci");
+            assert_eq!(key.relabel("key ci", sole), "key ci");
+        }
+        assert_eq!(sole_instance(&["gl".into()]), Some("gl"));
+        assert_eq!(sole_instance(&["a".into(), "b".into()]), None);
+        assert_eq!(sole_instance(&[]), None);
+        assert_eq!(instance_tag(None, Some("gl")), "");
+        assert_eq!(instance_tag(None, None), " [every server]");
+        assert_eq!(instance_tag(Some("old"), Some("gl")), " [old]");
     }
 
     /// A job's denials are shared by destination, summed across phases and VMs, an observed
