@@ -53,6 +53,7 @@ both!(
     a_failed_verify_is_retried_for_the_runner_id,
     a_running_jobs_view_poll_outlives_the_tick,
     gitlab_is_asked_only_while_the_hub_approves_its_server,
+    a_job_of_a_project_not_approved_fails_pointing_at_the_hub,
 );
 
 async fn job_runs_and_reports(via: Via) {
@@ -595,5 +596,53 @@ async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
         assert_eq!(h.job_requests(), requests, "{state:?}: no more requests");
     }
     // A job taken meanwhile would still run: only new requests wait.
+    h.stop().await;
+}
+
+async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
+    let h = Harness::start(2, via).await;
+    h.hub.set_slots("p1", 2);
+    for (id, kind, said) in [
+        (
+            60,
+            ErrorKind::ApprovalPending,
+            "is waiting for approval on the fleet hub https://hub.example.com.",
+        ),
+        (
+            61,
+            ErrorKind::ProjectRejected,
+            "was rejected on the fleet hub https://hub.example.com.",
+        ),
+    ] {
+        h.hub.refuse_submit(DispatchError::new(kind, "refused"));
+        let mut job = job_json(id);
+        job["job_info"]["project_id"] = 12.into();
+        job["features"]["failure_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push("runner_configuration_error".into());
+        h.gl.push_job(job);
+        let fin = h.final_update(id).await;
+        assert_eq!(fin["state"], "failed");
+        assert_eq!(
+            fin["failure_reason"], "runner_configuration_error",
+            "{kind:?}"
+        );
+        let log = h.gl.log(id);
+        assert!(
+            log.contains(&format!("ERROR: project g/p (ID 12) {said}")),
+            "{log}"
+        );
+        assert!(log.contains("operator"), "{log}");
+        assert!(!h.committed(id));
+        eventually("the job dropped", || {
+            vk_gitlab::state::StateFile::read(&h.state_dir.join("r1.json"))
+                .unwrap()
+                .is_empty()
+        })
+        .await;
+    }
+    // Refused once each, not resubmitted.
+    assert_eq!(h.count_calls(|c| matches!(c, FakeCall::Submit { .. })), 2);
     h.stop().await;
 }

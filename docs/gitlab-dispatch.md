@@ -245,6 +245,8 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 | 400 | `invalid` | unparseable body, malformed ID, a job without a project | no |
 | 401 | `unauthorized` | no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
 | 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job | no |
+| 403 | `approval_pending` | a job of a project, or of a server, an operator has yet to approve on the hub | no: the job fails |
+| 403 | `project_rejected` | a job of a project, or of a server, an operator rejected | no: the job fails |
 | 404 | `not_found` | no such job or reservation of this relay's | no |
 | 409 | `conflict` | `request_id` reused with another body | no |
 | 410 | `reservation_gone` | lapsed, released, or its node lost | reserve again |
@@ -256,6 +258,20 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 
 An error body is `{error, code, retry_after_secs?}`; a code the client does not know reads as
 `other`.
+
+A job refused `approval_pending` or `project_rejected` is not held: approval is a human step.
+`vk-gitlab` releases its reservation and fails it in GitLab, uncommitted, as
+`runner_configuration_error` (`script_failure` where GitLab does not know it), its trace ending
+with what to do, as for a project pending:
+
+```text
+ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub https://hub.example.com.
+Retry this job once an operator has approved it (Connections > GitLab > Pending).
+```
+
+GitLab's `retry: when: runner_system_failure` does not retry that reason, so a pending project
+does not loop. The hub keeps the refusal as the answer to the submission's `request_id`, so it
+counts once.
 
 ## Hub ↔ node: protocol version 3
 

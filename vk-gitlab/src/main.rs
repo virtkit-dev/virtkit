@@ -193,7 +193,7 @@ async fn run(config: PathBuf) -> Result<()> {
     let result = poll::run(
         &cfg,
         &system_id,
-        &relay.enrollment.relay_id,
+        &relay.enrollment,
         status,
         dispatcher,
         RunOptions::default(),

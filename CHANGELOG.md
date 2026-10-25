@@ -25,12 +25,12 @@ All notable changes to virtkit will be documented in this file.
 
 - **Breaking: the hub takes GitLab jobs only from enrolled relays, and only of approved
   projects.** A relay signs its requests with its own key; an API key's GitLab jobs are
-  refused. The first job of a project the hub has not approved fails and lists the project as
-  pending (`vk-hub gitlabs pending`), until an operator approves it with `vk-hub gitlabs
-  projects approve`; a rejected project's jobs fail too. Registry tokens and egress rules follow
-  the GitLab server the relay is bound to. To upgrade, drain each `vk-gitlab`, upgrade, move
-  its runners' URL to `[gitlab] url`, drop `[hub]`, then enroll it: `vk-hub token create --kind
-  gitlab | vk-gitlab join <hub-url> --token -`.
+  refused. The first job of a project the hub has not approved fails, its trace naming the hub
+  to ask, and lists the project as pending (`vk-hub gitlabs pending`), until an operator
+  approves it with `vk-hub gitlabs projects approve`; a rejected project's jobs fail too.
+  Registry tokens and egress rules follow the GitLab server the relay is bound to. To upgrade,
+  drain each `vk-gitlab`, upgrade, move its runners' URL to `[gitlab] url`, drop `[hub]`, then
+  enroll it: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`.
 - **Breaking: a `vk-gitlab` takes jobs from one GitLab server**, named by `[gitlab] url` in its
   config; its runners no longer take a `url` each. A daemon serving two GitLab servers becomes
   two, each with its own config and state directory.

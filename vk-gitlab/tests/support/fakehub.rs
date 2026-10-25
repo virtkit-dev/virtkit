@@ -99,6 +99,8 @@ fn dispatch_error(e: DispatchError) -> Resp {
         ErrorKind::NoCapacity => (503, ErrorCode::NoCapacity),
         ErrorKind::Unavailable => (503, ErrorCode::Unavailable),
         ErrorKind::Forbidden => (403, ErrorCode::Forbidden),
+        ErrorKind::ApprovalPending => (403, ErrorCode::ApprovalPending),
+        ErrorKind::ProjectRejected => (403, ErrorCode::ProjectRejected),
         ErrorKind::OutputRange { length } => {
             let mut r = error(416, ErrorCode::Invalid, &e.message, None);
             r.headers_mut()

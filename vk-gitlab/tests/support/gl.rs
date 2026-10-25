@@ -10,7 +10,7 @@ use vk_gitlab::config::Config;
 use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
-use vk_gitlab::relay;
+use vk_gitlab::relay::{self, Enrollment};
 use vk_gitlab::session::Status;
 use vk_gitlab::trace::TraceSettings;
 use vk_hub_proto::gitlab::{ServerState, ServerStatus};
@@ -20,6 +20,8 @@ use super::{FakeGitLab, Recorded, Reply, TEST_SYSTEM_ID};
 
 /// The runner ID the fake GitLab's `/runners/verify` answers.
 pub const RUNNER_ID: i64 = 77;
+/// The hub's URL as the daemon names it in a job's trace.
+pub const TEST_HUB: &str = "https://hub.example.com";
 /// The token of the default runner, `r1`.
 pub const TOKEN: &str = "glrt-test-token";
 
@@ -359,6 +361,11 @@ impl Harness {
         let status = Status::new(&cfg, TEST_SYSTEM_ID, "test-host");
         status.set_server(Some(server_status(self.server)));
         let status2 = Arc::clone(&status);
+        let relay = Enrollment {
+            hub: TEST_HUB.to_owned(),
+            relay_id: TEST_RELAY_ID.to_owned(),
+            ca: false,
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -370,25 +377,16 @@ impl Harness {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
                 rt.spawn(async move {
-                    poll::run(
-                        &cfg,
-                        TEST_SYSTEM_ID,
-                        TEST_RELAY_ID,
-                        status2,
-                        d,
-                        options,
-                        shutdown,
-                    )
-                    .await
+                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, status2, d, options, shutdown).await
                 })
             }
             Via::Http => {
-                let relay = relay::open(&self.state_dir).unwrap();
+                let enrolled = relay::open(&self.state_dir).unwrap();
                 let d = Arc::new(HubClient::new(HubOptions {
-                    hub: relay.enrollment.hub.clone(),
-                    tls: relay.tls,
-                    relay_id: relay.enrollment.relay_id.clone(),
-                    identity: relay.identity,
+                    hub: enrolled.enrollment.hub.clone(),
+                    tls: enrolled.tls,
+                    relay_id: enrolled.enrollment.relay_id.clone(),
+                    identity: enrolled.identity,
                     retry: HubRetry {
                         max_attempts: 5,
                         backoff_min: Duration::from_millis(50),
@@ -396,16 +394,7 @@ impl Harness {
                     },
                 }));
                 rt.spawn(async move {
-                    poll::run(
-                        &cfg,
-                        TEST_SYSTEM_ID,
-                        TEST_RELAY_ID,
-                        status2,
-                        d,
-                        options,
-                        shutdown,
-                    )
-                    .await
+                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, status2, d, options, shutdown).await
                 })
             }
         };

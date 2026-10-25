@@ -44,6 +44,7 @@ use crate::dispatch::{
 };
 use crate::failure::{FailureReason, FailureReasonMapper, JobState};
 use crate::job::Job;
+use crate::relay::Enrollment;
 use crate::secret::Secret;
 use crate::session::Status;
 use crate::spec::{self, SpecContext};
@@ -284,6 +285,8 @@ impl Health {
 /// State shared by every runner.
 struct Shared<D> {
     dispatcher: Arc<D>,
+    /// The hub's URL, for the jobs it refuses.
+    hub: String,
     /// The server's status the hub sent, and what the runners are doing.
     status: Arc<Status>,
     concurrent: Arc<Semaphore>,
@@ -513,12 +516,12 @@ pub fn client_for(
 }
 
 /// Polls every configured runner until `shutdown` stops it and the running jobs end, its jobs
-/// submitted as relay `relay_id`. A runner asks GitLab for jobs only while `status` says the
-/// hub approved the server; the jobs it already holds run either way.
+/// submitted as the relay `relay` enrolled. A runner asks GitLab for jobs only while `status`
+/// says the hub approved the server; the jobs it already holds run either way.
 pub async fn run<D: Dispatcher>(
     config: &Config,
     system_id: &str,
-    relay_id: &str,
+    relay: &Enrollment,
     status: Arc<Status>,
     dispatcher: Arc<D>,
     options: RunOptions,
@@ -526,6 +529,7 @@ pub async fn run<D: Dispatcher>(
 ) -> Result<()> {
     let shared = Arc::new(Shared {
         dispatcher,
+        hub: relay.hub.clone(),
         status: Arc::clone(&status),
         concurrent: Arc::new(Semaphore::new(config.concurrent)),
         job_done: Notify::new(),
@@ -548,7 +552,7 @@ pub async fn run<D: Dispatcher>(
             shared.options.retry.clone(),
         )?;
         let state = StateFile::open(&state_dir.join(format!("{}.json", cfg.name)))?;
-        check_relay(&state, relay_id)?;
+        check_relay(&state, &relay.relay_id)?;
         let server_ca_pem = match &cfg.tls_ca_file {
             Some(f) => Some(
                 std::fs::read_to_string(f)
@@ -1357,6 +1361,29 @@ async fn submit_recorded<D: Dispatcher>(
     }
 }
 
+/// Why a job the hub refused for its approval fails, for its trace: the project, the hub, and
+/// what to do. A refusal for its server, which a relay polling only an approved server meets
+/// only in a race with an operator, reads as its project's.
+fn not_approved(hub: &str, kind: ErrorKind, spec: Option<&JobSpec>) -> String {
+    let project = match spec {
+        Some(JobSpec::GitlabCi(ci)) => {
+            format!("project {} (ID {})", ci.job.project_path, ci.job.project_id)
+        }
+        None => "this job's project".to_owned(),
+    };
+    if kind == ErrorKind::ProjectRejected {
+        format!(
+            "{project} was rejected on the fleet hub {hub}.\nAn operator can approve it there \
+             (Connections > GitLab), then retry this job."
+        )
+    } else {
+        format!(
+            "{project} is waiting for approval on the fleet hub {hub}.\nRetry this job once \
+             an operator has approved it (Connections > GitLab > Pending)."
+        )
+    }
+}
+
 /// Whether a failed submission may have reached the hub all the same.
 fn outcome_unknown(e: &Option<DispatchError>) -> bool {
     e.as_ref().is_none_or(|e| {
@@ -1487,6 +1514,19 @@ async fn drive<D: Dispatcher>(
                         fail(
                             "Job failed: aborted: the runner is shutting down".to_owned(),
                             FailureReason::new(FailureReason::RUNNER_INTERRUPTED),
+                        )
+                        .await;
+                    }
+                    Some(e)
+                        if matches!(
+                            e.kind,
+                            ErrorKind::ApprovalPending | ErrorKind::ProjectRejected
+                        ) =>
+                    {
+                        log::warn!(job = gitlab_job, error = e.message.as_str(); "The hub refused the job until an operator approves its project");
+                        fail(
+                            not_approved(&shared.hub, e.kind, rec.spec.as_ref()),
+                            FailureReason::new(FailureReason::CONFIGURATION_ERROR),
                         )
                         .await;
                     }

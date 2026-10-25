@@ -360,10 +360,9 @@ fn error_of(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> DispatchErr
     }
     let kind = match parsed.as_ref().map(|p| p.code) {
         Some(ErrorCode::Unauthorized) => ErrorKind::Unauthorized,
-        // Told apart once the relay fails a job refused for approval.
-        Some(ErrorCode::Forbidden | ErrorCode::ApprovalPending | ErrorCode::ProjectRejected) => {
-            ErrorKind::Forbidden
-        }
+        Some(ErrorCode::Forbidden) => ErrorKind::Forbidden,
+        Some(ErrorCode::ApprovalPending) => ErrorKind::ApprovalPending,
+        Some(ErrorCode::ProjectRejected) => ErrorKind::ProjectRejected,
         Some(ErrorCode::NotFound) => ErrorKind::NotFound,
         Some(ErrorCode::Invalid) => ErrorKind::Invalid,
         Some(ErrorCode::Conflict) => ErrorKind::Conflict,

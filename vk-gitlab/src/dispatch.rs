@@ -79,6 +79,10 @@ pub enum ErrorKind {
     /// The reservation lapsed, was released, or its node was lost: reserve again.
     ReservationGone,
     TooLarge,
+    /// A job of a GitLab project, or server, an operator has yet to approve on the hub.
+    ApprovalPending,
+    /// A job of a GitLab project, or server, an operator rejected on the hub.
+    ProjectRejected,
     Unavailable,
     Internal,
     /// An output offset past the end; `length` is the output's length.
