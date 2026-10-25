@@ -178,9 +178,8 @@ enum Cmd {
     /// and approve their projects
     ///
     /// A GitLab server a relay reports is pending until approved under a name, which its
-    /// relays then poll, or rejected. A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
-    /// instance's jobs only, and only its jobs get registry tokens; the name is what registry
-    /// namespaces call {gitlab}.
+    /// relays then poll, or rejected. The name is what registry namespaces and egress rules
+    /// call {gitlab}.
     Gitlabs {
         #[command(flatten)]
         config: ConfigArg,
@@ -489,22 +488,10 @@ enum KeysCmd {
         /// How long the key works: <n>s, <n>m, <n>h or <n>d (at most 365d)
         #[arg(long, default_value = "90d", value_parser = parse_key_ttl)]
         ttl: Duration,
-        /// The GitLab instance whose jobs it submits (`vk-hub gitlabs`): its jobs must come
-        /// from there, and only a bound key's jobs get registry tokens
-        #[arg(long, value_name = "NAME")]
-        gitlab: Option<String>,
-        /// The projects of that instance it may submit jobs of, as <id>:<path>, comma-separated
-        /// or repeated [default: the whole instance]
-        #[arg(long = "projects", value_name = "ID:PATH", value_delimiter = ',', value_parser = parse_project, requires = "gitlab")]
-        projects: Vec<store::ProjectCeiling>,
     },
     /// Revoke the working key of that name; with none working, remove those that no longer
     /// work
     Revoke { name: String },
-}
-
-fn parse_project(s: &str) -> Result<store::ProjectCeiling, String> {
-    store::ProjectCeiling::parse(s)
 }
 
 #[derive(Subcommand)]
@@ -529,7 +516,7 @@ enum GitlabsCmd {
     Reject { url: String },
     /// Forget a server's rejection: it is pending again while a relay reports it
     Forget { url: String },
-    /// Remove an instance no working key and no relay is bound to, and forget its projects
+    /// Remove an instance no relay is bound to, and forget its projects
     Remove { name: String },
     /// List, approve, reject and forget the projects whose jobs an instance's relays submit
     ///
@@ -666,9 +653,10 @@ enum EgressCmd {
     Delete { name: String },
     /// Print the egress layer a placed job of these claims gets from the rules now, as JSON
     ///
-    /// Without --gitlab, a job whose key is bound to no GitLab instance: the Fallback alone.
+    /// Without --gitlab, a job of no GitLab instance, as an older hub recorded some: the Fallback
+    /// alone.
     Resolve {
-        /// The GitLab instance the job's key is bound to, by the hub's name for it
+        /// The GitLab instance the job's relay is bound to, by the hub's name for it
         #[arg(long)]
         gitlab: Option<String>,
         /// The project's path
@@ -1938,13 +1926,8 @@ async fn keys_cmd(client: admin::Client, cmd: KeysCmd) -> Result<()> {
             max_cpus,
             max_disk,
             ttl,
-            gitlab,
-            projects,
         } => {
-            let mut policy =
-                store::KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
-            policy.gitlab = gitlab;
-            policy.projects = projects;
+            let policy = store::KeyPolicy::with_limits(scopes, pools, max_mem, max_cpus, max_disk);
             let created =
                 tokio::task::spawn_blocking(move || client.create_key(&name, policy, ttl))
                     .await??;
@@ -1996,26 +1979,12 @@ fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
             ]
         })
         .collect();
-    let mut out = table(
+    table(
         &[
             "NAME", "KEY", "SCOPES", "POOLS", "LARGEST", "CREATED", "BY", "STATE",
         ],
         &rows,
-    );
-    for k in keys {
-        let Some(g) = &k.gitlab else { continue };
-        let projects: Vec<String> = k.projects.iter().map(ToString::to_string).collect();
-        out.push_str(&format!(
-            "{}: GitLab {g}, {}\n",
-            k.name,
-            if projects.is_empty() {
-                "every project".to_string()
-            } else {
-                format!("projects {}", projects.join(", "))
-            }
-        ));
-    }
-    out
+    )
 }
 
 /// `vk-hub gitlabs` and its subcommands, which block on the admin socket.

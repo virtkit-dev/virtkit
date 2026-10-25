@@ -5,9 +5,7 @@ use vk_hub_proto::registry::{Inventory as RegistryInventory, Report as RegistryR
 use vk_hub_proto::token::Grant;
 
 use super::*;
-use crate::store::{
-    KeyPolicy, ProjectCeiling, RegistryEnrollment, RegistryWrite, Scope, TokenKind,
-};
+use crate::store::{RegistryEnrollment, RegistryWrite, TokenKind};
 use crate::tokens::Keys;
 
 pub(super) const REGISTRY_URL: &str = "https://reg.example.com";
@@ -264,44 +262,15 @@ fn a_registry_url_is_bound_once() {
     assert!(hub.db.set_registry_url(&a, None, "u", 1).unwrap());
 }
 
-fn policy(gitlab: Option<&str>, projects: Vec<ProjectCeiling>) -> KeyPolicy {
-    KeyPolicy {
-        scopes: vec![Scope::Jobs],
-        pools: vec!["ci".into()],
-        max_envelope: None,
-        gitlab: gitlab.map(str::to_string),
-        projects,
-    }
-}
-
 #[test]
-fn a_bound_key_holds_its_instance() {
+fn an_instance_s_url_names_one_instance() {
     let db = Db::open_memory().unwrap();
-    let ttl = Duration::from_secs(3600);
-    assert!(
-        db.create_api_key("a", &policy(Some("gl"), Vec::new()), ttl, "u", 1)
-            .is_err(),
-        "an unknown instance"
-    );
     db.add_gitlab("gl", "https://GitLab.example.com/", "u", 1)
         .unwrap();
     assert!(
-        db.add_gitlab("gl2", "https://gitlab.example.com", "u", 1)
+        db.add_gitlab("gl2", "https://gitlab.example.com:443", "u", 1)
             .is_err()
     );
-    let listed = vec![ProjectCeiling::parse("42:wab/core").unwrap()];
-    assert!(
-        db.create_api_key("b", &policy(None, listed.clone()), ttl, "u", 1)
-            .is_err(),
-        "projects without an instance"
-    );
-    let (key, _) = db
-        .create_api_key("c", &policy(Some("gl"), listed), ttl, "u", 1)
-        .unwrap();
-    db.api_key(&key, 2).unwrap().unwrap();
-    assert!(db.remove_gitlab("gl", "u", 2).is_err(), "a key is bound");
-    db.revoke_api_key("c", "u", 3).unwrap();
-    assert!(db.remove_gitlab("gl", "u", 3).unwrap());
 }
 
 #[test]
@@ -350,36 +319,28 @@ fn the_token_commands_parse() {
             "--url",
             "https://reg",
         ],
+        &["vk-hub", "keys", "create", "--name", "k", "--pool", "ci"],
+        &["vk-hub", "gitlabs", "reject", "https://gitlab.example.com"],
+        &["vk-hub", "gitlabs", "forget", "https://gitlab.example.com"],
+        &["vk-hub", "gitlabs", "projects"],
+        &["vk-hub", "gitlabs", "projects", "list", "gl", "--pending"],
         &[
-            "vk-hub",
-            "keys",
-            "create",
-            "--name",
-            "k",
-            "--pool",
-            "ci",
-            "--gitlab",
-            "gl",
-            "--projects",
-            "1:a/b,2:c/d",
+            "vk-hub", "gitlabs", "projects", "approve", "gl", "1:a/b", "2",
         ],
+        &["vk-hub", "gitlabs", "projects", "reject", "gl", "3"],
+        &["vk-hub", "gitlabs", "projects", "forget", "gl", "1", "2"],
     ] {
         crate::Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
     }
     for bad in [
         &["vk-hub", "registries", "set-url", "r"][..],
         &[
-            "vk-hub",
-            "keys",
-            "create",
-            "--name",
-            "k",
-            "--pool",
-            "ci",
-            "--projects",
-            "1:a",
+            "vk-hub", "keys", "create", "--name", "k", "--pool", "ci", "--gitlab", "gl",
         ],
         &["vk-hub", "namespaces", "add", "r", "n", "--path", "p"],
+        &["vk-hub", "gitlabs", "projects", "approve", "gl"],
+        &["vk-hub", "gitlabs", "projects", "approve", "gl", "0:a"],
+        &["vk-hub", "gitlabs", "projects", "forget", "gl", "x"],
     ] {
         assert!(crate::Cli::try_parse_from(bad).is_err(), "{bad:?}");
     }

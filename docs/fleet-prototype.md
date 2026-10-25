@@ -1025,20 +1025,19 @@ directory its workspace is at. Nothing acts on a node's workloads; local mode ac
 The hub implements its side of [GitLab dispatch](gitlab-dispatch.md).
 
 **API keys.** `vk-hub keys create --name <name> --pool <pool> [--pool …] [--scope jobs|capacity]
-[--max-mem <size>] [--max-cpus <n>] [--max-disk <size>] [--gitlab <instance> [--projects
-<id>:<path>,…]] [--ttl 90d]` prints a key, `vkk_` and
+[--max-mem <size>] [--max-cpus <n>] [--max-disk <size>] [--ttl 90d]` prints a key, `vkk_` and
 64 hex digits, once; the hub keeps its sha256 only. A key lives at most 365 days and works
 until it expires or is revoked. Its name is unique among the keys that work. Scope `jobs` is
 the client API but job submission, which only an enrolled relay makes; `capacity` is `POST
 /v1/capacity` alone. Its pools — `*` for any — and
 largest envelope bound every placement it names: anything outside them is 403 `forbidden`. `keys
 list` shows each key's name, first 8 characters, scopes, pools, largest envelope, when and by
-whom it was created, the GitLab instance and projects it is bound to, and whether it works; `keys revoke <name>` revokes the working key of that
+whom it was created, and whether it works; `keys revoke <name>` revokes the working key of that
 name, or, with none working, removes those of that name that no longer do. The hub holds at most
-256 keys. A key bound to a GitLab instance (`vk-hub gitlabs add <name> <url>`, `gitlabs list`,
-`gitlabs remove <name>`) submits only that instance's jobs, and with `--projects` only those
-projects', by ID and path both: anything else is 403 `forbidden`. No API key submits a GitLab
-job: only a relay does (below). Operators also create, revoke and remove keys on the web UI's `/clients` (see
+256 keys. No API key submits a GitLab job: only a relay does (below). A hub that bound keys to
+GitLab instances, before relays, converts them once at its first start: per instance it still
+knows, every project a bound key listed and every project its job history names is approved, and
+the bound keys are revoked and removed with their client instances, all audited as `hub`. Operators also create, revoke and remove keys on the web UI's `/clients` (see
 [Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.
@@ -1447,8 +1446,8 @@ The record of a job placed by a hub that mints registry tokens ends with a *Regi
 section, as recorded at its latest placement, which the record's live updates carry: the
 registry it was issued for, linked to its Job access tab, and per storage area its rights in
 plain words (*CI caches: Read, Publish*), the token's prefixes, expiry and ID folded under
-*Technical details*, never the token; or, when it got none, the one reason why: its runner key
-bound to no GitLab server, its node on an older `vk` or naming no registry the hub binds, a
+*Technical details*, never the token; or, when it got none, the one reason why: its relay
+removed or its GitLab server no longer approved, its node on an older `vk` or naming no registry the hub binds, a
 registry that takes no tokens or had applied no signing key, or a failed mint, each linking to
 where it is fixed.
 
@@ -1648,18 +1647,10 @@ first to refuse it, or that the job's restriction is not known; an address its r
 allowed only if a listed name's lookup resolved to it. As the node enforces it, a narrowing that
 declares one dimension allows none of the other, whatever the cap allows of it.
 
-`/clients`, *Connections* in the navigation, opens on its *GitLab* tab: per GitLab server the
-hub takes jobs from (`vk-hub gitlabs`), its name and URL, the working runner keys bound to it,
-the projects they may submit jobs of (*All projects* when one key's ceiling is the whole
-server), and the nearest of their expiries, warned about under 14 days. A working jobs key
-bound to no server is called out above: its jobs get no registry access. Below, *Runner keys*
-lists every key bound to a server, working or not, and *Instances* the client instances using
-them, each with a *server* column — a server the hub no longer knows marked *unknown* — and each
-key with the projects it may submit jobs of. Runner keys are made with `vk-hub keys create
---gitlab`; one is replaced by creating its successor under another name, pointing `vk-gitlab` at
-it and revoking the old one. Its *Other API clients* tab (`/clients?tab=other`) shows the API
-keys bound to no server (see [Placed jobs](#placed-jobs)) and the client instances using each,
-saying so when there are none but runner keys. Both tabs show viewers and operators alike the
+`/clients`, *Connections* in the navigation, opens on its *GitLab* tab: each GitLab server the
+hub takes jobs from (`vk-hub gitlabs`), its name and URL. Its *Other API clients* tab
+(`/clients?tab=other`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
+instances using each. Both tabs show viewers and operators alike the
 same things of a key and an instance. Each key shows its name, first 8
 characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
 revoked, expired or when it expires, when any of its instances was last heard from, how many
@@ -1670,14 +1661,13 @@ GitLab URL its latest hello named, when it was last heard from — *connected* w
 named no instance, as an older `vk-gitlab`'s, show as the key's *unknown instance*, with when
 it was last heard from and what it holds. An instance seen through a key that no longer works
 is never shown *connected*, its key marked *key revoked* or *key expired*; one a working key
-of the same GitLab server, or of none, shows too is left out while it holds nothing: it is the
+shows too is left out while it holds nothing: it is the
 same client, now using that key. What a client said is shown as text, and a runner's
 URL becomes a link only when it is a plain web URL without credentials.
 
 Operators create keys on the *Other API clients* tab with the same validation as `vk-hub keys
 create`: a name, scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
-of 90 days (the default), 7, 30 or 365 days. Binding a key to a GitLab instance and projects
-currently requires the CLI. Invalid names and policies get the CLI's reason.
+of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the CLI's reason.
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
 with a `[hub]` table for `vk-gitlab`: `url` is the hub's node address, and `api_key_file`
 points to the key. The key never appears in live updates, logs or audit entries.

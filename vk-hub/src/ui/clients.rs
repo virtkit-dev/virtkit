@@ -50,19 +50,17 @@ const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
 /// Where the key page suggests vk-gitlab keeps it.
 const KEY_FILE: &str = "/etc/vk-gitlab/hub.key";
 
-/// The other API clients' tab: the keys bound to no GitLab server and their instances.
+/// The other API clients' tab: the API keys and their instances.
 pub(super) const OTHER: &str = "/clients?tab=other";
 
 /// The event the GitLab tab's fragment is swapped in on, and its stream's name under
 /// `/events/`. Both tabs' streams carry both tabs' fragments, rendered once for all of them.
 pub(super) const GITLAB_EVENT: &str = "gitlab";
 
-/// What the page shows: every key and its instances, the GitLab servers, and whether a registry
-/// takes the hub's tokens.
+/// What the page shows: every key and its instances, and the GitLab servers.
 struct Shown {
     views: Vec<KeyView>,
     gitlabs: Vec<(String, GitlabRow)>,
-    tokens: bool,
 }
 
 impl Shown {
@@ -71,15 +69,13 @@ impl Shown {
         Ok(Shown {
             views: crate::clients::views(hub)?,
             gitlabs: hub.db.gitlabs()?,
-            tokens: hub.db.registries()?.iter().any(|(_, r)| r.takes_tokens()),
         })
     }
 }
 
 /// `GET /clients[?tab=other]`: Connections. Its GitLab tab, the default, lists the GitLab
-/// servers the hub takes jobs from, the runner keys bound to each and the instances using
-/// them; its other tab is the API keys bound to no server and their instances. Each tab's
-/// fragment is live, on a stream of its own.
+/// servers the hub takes jobs from; its other tab is the API keys and their instances. Each
+/// tab's fragment is live, on a stream of its own.
 pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let form = super::decode_form(query.unwrap_or("").as_bytes());
     let other = field(&form, "tab") == Some("other");
@@ -107,11 +103,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     let (id, event, fragment) = if other {
         ("clients", EVENT, fragment(&shown.views, now, steer))
     } else {
-        (
-            "gitlab-servers",
-            GITLAB_EVENT,
-            gitlab_fragment(&shown, now, steer),
-        )
+        ("gitlab-servers", GITLAB_EVENT, gitlab_fragment(&shown))
     };
     main.raw("<div id=\"")
         .raw(id)
@@ -131,151 +123,26 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     Ok(page(fleet::layout("Connections", PATH, auth, &main)))
 }
 
-/// A runner key's expiry this close draws a warning.
-const EXPIRY_WARNING: u64 = 14 * 86_400;
-
-/// The GitLab tab: each GitLab server's working runner keys, allowed projects and nearest
-/// expiry; then every key bound to a server, and the instances using them. Warn about working
-/// jobs keys bound to unknown servers. When a registry takes hub tokens, also warn about
-/// unbound jobs keys: their jobs get no registry access.
-fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
-    let Shown {
-        views,
-        gitlabs,
-        tokens,
-    } = shown;
+/// The GitLab tab: the GitLab servers the hub takes jobs from.
+fn gitlab_fragment(shown: &Shown) -> Html {
     let mut h = Html::new();
-    let runners: Vec<&KeyView> = views
-        .iter()
-        .filter(|v| v.row.live(now) && v.row.scopes.contains(&crate::store::Scope::Jobs))
-        .collect();
-    for v in &runners {
-        match &v.row.gitlab {
-            None if *tokens => {
-                h.raw("<p class=\"callout warn\"><strong>")
-                    .text(&v.row.name)
-                    .raw("</strong> submits jobs but is connected to no GitLab server: its jobs ")
-                    .raw(
-                        "get no registry access. <code>vk-hub keys create --gitlab</code> makes a ",
-                    )
-                    .raw("key bound to one.</p>");
-            }
-            Some(g) if !known(gitlabs, g) => {
-                h.raw("<p class=\"callout warn\"><strong>")
-                    .text(&v.row.name)
-                    .raw("</strong> is bound to <strong>")
-                    .text(g)
-                    .raw("</strong>, a GitLab server the hub no longer knows.</p>");
-            }
-            _ => {}
-        }
-    }
     h.raw("<section><h2>GitLab servers</h2>");
-    if gitlabs.is_empty() {
+    if shown.gitlabs.is_empty() {
         h.raw("<p class=\"empty\">None yet: <code>vk-hub gitlabs add &lt;name&gt; &lt;url&gt;</code> ")
-            .raw("adds one, and <code>vk-hub keys create --gitlab &lt;name&gt;</code> binds a ")
-            .raw("runner key to it.</p></section>");
+            .raw("adds one, and <code>vk-hub gitlabs approve</code> one a relay reports.</p>");
     } else {
-        servers_table(&mut h, gitlabs, &runners, now);
-        h.raw("</section>");
+        h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th></tr></thead><tbody>");
+        for (name, row) in &shown.gitlabs {
+            h.raw("<tr><td><strong>")
+                .text(name)
+                .raw("</strong></td><td>")
+                .text(&row.url)
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
     }
-    let mut bound: Vec<&KeyView> = views.iter().filter(|v| v.row.gitlab.is_some()).collect();
-    // Stable: a server's keys stay oldest first.
-    bound.sort_by(|a, b| a.row.gitlab.cmp(&b.row.gitlab));
-    if gitlabs.is_empty() && bound.is_empty() {
-        return h;
-    }
-    h.raw("<section><h2>Runner keys</h2>");
-    if bound.is_empty() {
-        h.raw("<p class=\"empty\">none: <code>vk-hub keys create --gitlab &lt;name&gt;</code> ")
-            .raw("makes one</p>");
-    } else {
-        keys_table(&mut h, &bound, views, now, steer, Some(gitlabs));
-    }
-    h.raw("<p class=\"sub\"><code>vk-hub keys create --gitlab &lt;name&gt; [--projects ")
-        .raw("&lt;id&gt;:&lt;path&gt;,…]</code> makes a runner key. To replace one, create its ")
-        .raw("successor under another name, point vk-gitlab at it, then revoke the old one.</p>")
-        .raw("</section><section><h2>Instances</h2>");
-    instances_table(
-        &mut h,
-        &bound,
-        views,
-        now,
-        Some(gitlabs),
-        "none: no runner has used a key yet",
-    );
     h.raw("</section>");
     h
-}
-
-/// Whether the hub knows the GitLab server named `name`.
-fn known(gitlabs: &[(String, GitlabRow)], name: &str) -> bool {
-    gitlabs.iter().any(|(n, _)| n == name)
-}
-
-/// Each GitLab server with its working runner keys (of `runners`), the projects they allow and
-/// their nearest expiry.
-fn servers_table(h: &mut Html, gitlabs: &[(String, GitlabRow)], runners: &[&KeyView], now: u64) {
-    h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>runner keys</th>")
-        .raw("<th>allowed projects</th><th>key expires</th></tr></thead><tbody>");
-    for (name, row) in gitlabs {
-        let keys: Vec<&&KeyView> = runners
-            .iter()
-            .filter(|v| v.row.gitlab.as_deref() == Some(name.as_str()))
-            .collect();
-        h.raw("<tr><td><strong>")
-            .text(name)
-            .raw("</strong><div class=\"sub\">")
-            .text(&row.url)
-            .raw("</div></td><td>");
-        if keys.is_empty() {
-            h.raw("<span class=\"sub\">none</span>");
-        }
-        for (i, v) in keys.iter().enumerate() {
-            if i > 0 {
-                h.raw("<br>");
-            }
-            h.text(&v.row.name);
-        }
-        h.raw("</td><td>");
-        if keys.iter().any(|v| v.row.projects.is_empty()) {
-            h.raw("All projects");
-        } else {
-            let mut paths: Vec<&str> = keys
-                .iter()
-                .flat_map(|v| v.row.projects.iter().map(|p| p.path.as_str()))
-                .collect();
-            paths.sort_unstable();
-            paths.dedup();
-            if paths.is_empty() {
-                h.raw("<span class=\"sub\">none</span>");
-            } else {
-                h.text(paths.join(", "));
-            }
-        }
-        h.raw("</td><td>");
-        let within = |at: u64| {
-            format!(
-                "in {}",
-                crate::human_duration(Duration::from_secs(at.saturating_sub(now))).trim_end()
-            )
-        };
-        match keys.iter().map(|v| v.row.expires_at).min() {
-            Some(at) if at.saturating_sub(now) < EXPIRY_WARNING => {
-                h.raw("<span class=\"badge warn\">");
-                pages::time(h, at, &within(at));
-                h.raw("</span>");
-            }
-            Some(at) => {
-                pages::time(h, at, &within(at));
-            }
-            None => {
-                h.raw("<span class=\"sub\">-</span>");
-            }
-        }
-        h.raw("</td></tr>");
-    }
-    h.raw("</tbody></table>");
 }
 
 /// The fragments, as one rendering for every page showing them: with the keys' buttons for an
@@ -292,57 +159,43 @@ pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
         let hub = hub.clone();
         Arc::new(move || {
             let shown = Shown::read(&hub)?;
-            Ok(gitlab_fragment(&shown, crate::now_secs(), steer).into_string())
+            Ok(gitlab_fragment(&shown).into_string())
         })
     };
     sse::Events::from([(EVENT, other), (GITLAB_EVENT, gitlab)])
 }
 
-/// The other tab: the keys bound to no GitLab server, then their instances.
+/// The other tab: the keys, then their instances.
 fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
-    let unbound: Vec<&KeyView> = views.iter().filter(|v| v.row.gitlab.is_none()).collect();
+    let keys: Vec<&KeyView> = views.iter().collect();
     let mut h = Html::new();
     h.raw("<section><h2>API keys</h2>");
-    if unbound.is_empty() {
+    if keys.is_empty() {
         h.raw(if steer {
             "<p class=\"empty\">none: create one below or with <code>vk-hub keys create</code>"
         } else {
             "<p class=\"empty\">none: <code>vk-hub keys create</code> creates one"
         });
-        if unbound.len() < views.len() {
-            h.raw(". GitLab runner keys are on the <a href=\"")
-                .raw(PATH)
-                .raw("\">GitLab</a> tab.");
-        }
         h.raw("</p>");
     } else {
-        keys_table(&mut h, &unbound, views, now, steer, None);
+        keys_table(&mut h, &keys, views, now, steer);
     }
     h.raw("</section><section><h2>Instances</h2>");
     instances_table(
         &mut h,
-        &unbound,
+        &keys,
         views,
         now,
-        None,
         "none: no client has used a key yet",
     );
     h.raw("</section>");
     h
 }
 
-/// The keys `rows` of all the keys `views`, with a server and a projects column given the GitLab
-/// servers (`gitlabs`). With `steer`, a working key carries the button that revokes it; under a
-/// name [`target`] would remove keys of, the newest carries the button that removes them all,
-/// whichever tab it is on.
-fn keys_table(
-    h: &mut Html,
-    rows: &[&KeyView],
-    views: &[KeyView],
-    now: u64,
-    steer: bool,
-    gitlabs: Option<&[(String, GitlabRow)]>,
-) {
+/// The keys `rows` of all the keys `views`. With `steer`, a working key carries the button that
+/// revokes it; under a name [`target`] would remove keys of, the newest carries the button that
+/// removes them all.
+fn keys_table(h: &mut Html, rows: &[&KeyView], views: &[KeyView], now: u64, steer: bool) {
     let working: HashSet<&str> = views
         .iter()
         .filter(|v| v.row.live(now))
@@ -358,22 +211,16 @@ fn keys_table(
             *newest = v;
         }
     }
-    h.raw("<table class=\"grid\"><thead><tr>");
-    if gitlabs.is_some() {
-        h.raw("<th>server</th>");
-    }
-    h.raw("<th>name</th><th>key</th><th>scopes</th><th>pools</th><th>largest</th>");
-    if gitlabs.is_some() {
-        h.raw("<th>projects</th>");
-    }
-    h.raw("<th>created</th><th>by</th><th>state</th><th>last heard</th>")
+    h.raw("<table class=\"grid\"><thead><tr>")
+        .raw("<th>name</th><th>key</th><th>scopes</th><th>pools</th><th>largest</th>")
+        .raw("<th>created</th><th>by</th><th>state</th><th>last heard</th>")
         .raw("<th class=\"num\">instances</th><th class=\"num\">jobs</th>");
     if steer {
         h.raw("<th>change</th>");
     }
     h.raw("</tr></thead><tbody>");
     for &v in rows {
-        key_row(h, v, views, now, gitlabs);
+        key_row(h, v, views, now);
         if steer {
             h.raw("<td class=\"actions\">");
             if v.row.live(now) {
@@ -391,49 +238,25 @@ fn keys_table(
     h.raw("</tbody></table>");
 }
 
-/// The instances shown of the keys `rows` of all the keys `views`, with a server column given
-/// the GitLab servers (`gitlabs`); `empty` when there are none.
-fn instances_table(
-    h: &mut Html,
-    rows: &[&KeyView],
-    views: &[KeyView],
-    now: u64,
-    gitlabs: Option<&[(String, GitlabRow)]>,
-    empty: &str,
-) {
+/// The instances shown of the keys `rows` of all the keys `views`; `empty` when there are none.
+fn instances_table(h: &mut Html, rows: &[&KeyView], views: &[KeyView], now: u64, empty: &str) {
     if rows.iter().all(|v| shown(views, v, now).next().is_none()) {
         h.raw("<p class=\"empty\">").text(empty).raw("</p>");
         return;
     }
-    h.raw("<table class=\"grid\"><thead><tr>");
-    if gitlabs.is_some() {
-        h.raw("<th>server</th>");
-    }
-    h.raw("<th>key</th><th>host</th><th>instance</th><th>program</th><th>runners</th>")
+    h.raw("<table class=\"grid\"><thead><tr>")
+        .raw("<th>key</th><th>host</th><th>instance</th><th>program</th><th>runners</th>")
         .raw("<th>last heard</th><th class=\"num\">reservations</th>")
         .raw("<th class=\"num\">queued</th><th class=\"num\">running</th></tr></thead><tbody>");
     for v in rows {
         for i in shown(views, v, now) {
-            instance_row(h, &v.row, i, now, gitlabs);
+            instance_row(h, &v.row, i, now);
         }
     }
     h.raw("</tbody></table>");
 }
 
-/// The cell of the GitLab server key `key` is bound to, marked when the hub no longer knows it.
-fn server_cell(h: &mut Html, key: &KeyRow, gitlabs: &[(String, GitlabRow)]) {
-    h.raw("<td>");
-    if let Some(g) = &key.gitlab {
-        h.text(g);
-        if !known(gitlabs, g) {
-            h.raw(" <span class=\"badge warn\">unknown</span>");
-        }
-    }
-    h.raw("</td>");
-}
-
-/// Whether instance `i` of key `v` is one a working key of the same GitLab server, or of none,
-/// shows too, while `v` no longer works and `i` holds nothing: the same client, now using
+/// Whether instance `i` of key `v` is one a working key shows too, while `v` no longer works and `i` holds nothing: the same client, now using
 /// another key, which would otherwise show twice.
 fn superseded(views: &[KeyView], v: &KeyView, i: &InstanceView, now: u64) -> bool {
     let w = i.work;
@@ -441,9 +264,7 @@ fn superseded(views: &[KeyView], v: &KeyView, i: &InstanceView, now: u64) -> boo
         && !i.row.instance.is_empty()
         && (w.reservations, w.queued, w.running) == (0, 0, 0)
         && views.iter().any(|o| {
-            o.row.live(now)
-                && o.row.gitlab == v.row.gitlab
-                && o.instances.iter().any(|j| j.row.instance == i.row.instance)
+            o.row.live(now) && o.instances.iter().any(|j| j.row.instance == i.row.instance)
         })
 }
 
@@ -457,25 +278,14 @@ fn shown<'a>(
 }
 
 /// Key `v`'s row, left open for an operator's button; `views` all the keys, to count only the
-/// instances shown ([`superseded`]). Given the GitLab servers (`gitlabs`), with its server and
-/// the projects it may submit jobs of.
-fn key_row(
-    h: &mut Html,
-    v: &KeyView,
-    views: &[KeyView],
-    now: u64,
-    gitlabs: Option<&[(String, GitlabRow)]>,
-) {
+/// instances shown ([`superseded`]).
+fn key_row(h: &mut Html, v: &KeyView, views: &[KeyView], now: u64) {
     let k = &v.row;
     let scopes: Vec<&str> = k.scopes.iter().map(|s| s.name()).collect();
     let pools: Vec<&str> = (k.pools.iter())
         .map(|p| if p == ANY_POOL { "any" } else { p })
         .collect();
-    h.raw("<tr>");
-    if let Some(gitlabs) = gitlabs {
-        server_cell(h, k, gitlabs);
-    }
-    h.raw("<td>")
+    h.raw("<tr><td>")
         .text(&k.name)
         .raw("</td><td><code>vkk_")
         .text(&k.prefix)
@@ -489,15 +299,6 @@ fn key_row(
                 .map_or_else(pages::dash, crate::store::envelope_text),
         )
         .raw("</td><td>");
-    if gitlabs.is_some() {
-        if k.projects.is_empty() {
-            h.raw("All projects");
-        } else {
-            let paths: Vec<&str> = k.projects.iter().map(|p| p.path.as_str()).collect();
-            h.text(paths.join(", "));
-        }
-        h.raw("</td><td>");
-    }
     pages::at(h, k.created_at)
         .raw("</td><td>")
         .text(&k.created_by)
@@ -778,11 +579,7 @@ async fn revoke(
         .raw(" job(s) queued or running</p>");
     let ids: Vec<String> = keys.iter().map(|v| v.id.clone()).collect();
     // Back to the tab showing them.
-    let back = if keys.iter().any(|v| v.row.gitlab.is_some()) {
-        PATH
-    } else {
-        OTHER
-    };
+    let back = OTHER;
     let ask = actions::Ask {
         path: PATH.to_string(),
         back: back.to_string(),
@@ -860,22 +657,12 @@ async fn revoke(
     Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
 }
 
-/// Instance `i` of key `key`, with its server given the GitLab servers (`gitlabs`): all that it said made display-safe again ([`Html::node`]), a
+/// Instance `i` of key `key`: all that it said made display-safe again ([`Html::node`]), a
 /// runner's URL linked only when it is a plain web link. Under a key that no longer works, the
 /// key says so and the instance is never shown connected: it can no longer be.
-fn instance_row(
-    h: &mut Html,
-    key: &KeyRow,
-    i: &InstanceView,
-    now: u64,
-    gitlabs: Option<&[(String, GitlabRow)]>,
-) {
+fn instance_row(h: &mut Html, key: &KeyRow, i: &InstanceView, now: u64) {
     let r = &i.row;
-    h.raw("<tr>");
-    if let Some(gitlabs) = gitlabs {
-        server_cell(h, key, gitlabs);
-    }
-    h.raw("<td>").text(&key.name);
+    h.raw("<tr><td>").text(&key.name);
     key_gone(h, key, now);
     h.raw("</td><td>");
     or_dash(h, &r.hostname);
@@ -962,8 +749,6 @@ mod tests {
             created_by: "uid 0".into(),
             expires_at: 10_000,
             revoked_at: None,
-            gitlab: None,
-            projects: Vec::new(),
         }
     }
 

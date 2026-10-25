@@ -184,8 +184,9 @@ key's GitLab jobs are refused.
 The hub converts once, at its first start, so no operator state is lost: every server it knows
 stays, approved under its name, so namespaces, egress records, mutes, Observed traffic, Blocked
 rows and token `pipeline` claims are unchanged; per server, every project a bound key lists and
-every project its retained job history names is approved; the bound keys are revoked. All of it
-audited as migrated. Projects older than the history, or run only through unbound keys, go
+every project its retained job history names is approved; the bound keys are revoked and
+removed, with their client instances. All of it is audited as the hub's; a hub with no bound key
+left converts nothing. Projects older than the history, or run only through unbound keys, go
 pending at their next job, or are approved beforehand with `gitlabs projects approve`.
 
 vk-gitlab's state file records the relay its jobs were submitted as, `run` refuses records of

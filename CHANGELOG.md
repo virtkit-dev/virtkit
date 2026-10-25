@@ -25,6 +25,15 @@ All notable changes to virtkit will be documented in this file.
   the GitLab server the relay is bound to. To upgrade, drain each `vk-gitlab`, upgrade, then
   enroll it: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`.
 
+### Removed
+
+- **GitLab-bound API keys**: `vk-hub keys create --gitlab/--projects` and the Runner keys on
+  the Connections page's GitLab tab are gone. At its first start the hub approves every project
+  a bound key listed, revoked and expired keys included, or its job history names, for every
+  relay of that GitLab server, and revokes and removes the bound keys, all audited; GitLab
+  servers, egress rules and registry namespaces carry over unchanged. Check the approved
+  projects with `vk-hub gitlabs projects list` after upgrading.
+
 ## [0.95.1] - 2026-10-24
 
 ### Fixed

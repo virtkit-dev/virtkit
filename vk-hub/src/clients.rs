@@ -397,8 +397,6 @@ mod tests {
             scopes: vec![Scope::Jobs],
             pools: vec!["ci".into()],
             max_envelope: None,
-            gitlab: None,
-            projects: Vec::new(),
         }
     }
 

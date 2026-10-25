@@ -1,4 +1,5 @@
-//! API keys: the credentials automation — `vk-gitlab` first — holds for the hub's client API.
+//! API keys: the credentials automation holds for the hub's client API. A GitLab relay holds
+//! none: it signs its requests with its own key.
 //! A key is `vkk_` and 32 random bytes in hex, shown once at creation and stored only as its
 //! `sha256`, as `vk-registry` stores its keys; a row records the key's name, its scopes, the
 //! pools it may place work in and the largest envelope it may ask for, when it expires and
@@ -13,7 +14,6 @@ use vk_hub_proto::client::Placement;
 use vk_hub_proto::job::Envelope;
 
 use super::clients::remove_clients_of;
-use super::gitlabs::{GITLABS, ProjectCeiling};
 use super::{Db, append_audit, decode, encode, token_key};
 
 /// Key: `sha256(key)`, hex. Value: JSON [`KeyRow`].
@@ -84,13 +84,6 @@ pub struct KeyRow {
     pub expires_at: u64,
     #[serde(default)]
     pub revoked_at: Option<u64>,
-    /// The GitLab instance whose jobs it submits, by the hub's name for it: its jobs must come
-    /// from that instance, and only a bound key's jobs get registry tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gitlab: Option<String>,
-    /// The projects of [`KeyRow::gitlab`] it may submit jobs of; empty for the whole instance.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub projects: Vec<ProjectCeiling>,
 }
 
 impl KeyRow {
@@ -106,10 +99,6 @@ pub struct KeyPolicy {
     pub scopes: Vec<Scope>,
     pub pools: Vec<String>,
     pub max_envelope: Option<Envelope>,
-    #[serde(default)]
-    pub gitlab: Option<String>,
-    #[serde(default)]
-    pub projects: Vec<ProjectCeiling>,
 }
 
 impl KeyPolicy {
@@ -132,8 +121,6 @@ impl KeyPolicy {
             scopes,
             pools,
             max_envelope,
-            gitlab: None,
-            projects: Vec::new(),
         }
     }
 }
@@ -322,19 +309,6 @@ impl Db {
         {
             return Err(refused(format!("{bad:?} is not a pool's name")));
         }
-        if policy.gitlab.is_none() && !policy.projects.is_empty() {
-            return Err(refused(
-                "a key's projects are those of the GitLab instance it is bound to",
-            ));
-        }
-        if let Some(dup) = policy
-            .projects
-            .iter()
-            .enumerate()
-            .find(|(i, p)| policy.projects.iter().skip(i + 1).any(|q| q.id == p.id))
-        {
-            return Err(refused(format!("project {} is listed twice", dup.1.id)));
-        }
         let mut scopes = policy.scopes.clone();
         scopes.sort();
         scopes.dedup();
@@ -353,15 +327,8 @@ impl Db {
             created_by: actor.to_string(),
             expires_at: now.saturating_add(ttl.as_secs()),
             revoked_at: None,
-            gitlab: policy.gitlab.clone(),
-            projects: policy.projects.clone(),
         };
         let txn = self.db.begin_write().context("starting a write")?;
-        if let Some(gitlab) = &row.gitlab
-            && txn.open_table(GITLABS)?.get(gitlab.as_str())?.is_none()
-        {
-            return Err(refused(format!("there is no GitLab instance {gitlab}")));
-        }
         {
             let mut table = txn.open_table(API_KEYS)?;
             let mut count = 0usize;
@@ -384,21 +351,8 @@ impl Db {
         let limit = row
             .max_envelope
             .map_or_else(|| "no limit".to_string(), envelope_text);
-        let bound = match &row.gitlab {
-            None => String::new(),
-            Some(g) if row.projects.is_empty() => format!("; GitLab {g}"),
-            Some(g) => format!(
-                "; GitLab {g}, projects {}",
-                row.projects
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
         let event = format!(
-            "{actor} created API key {name} ({}; pools {}; envelope {limit}{bound}), valid for \
-             {}s",
+            "{actor} created API key {name} ({}; pools {}; envelope {limit}), valid for {}s",
             scopes.join(", "),
             row.pools.join(", "),
             ttl.as_secs()
@@ -553,8 +507,6 @@ mod tests {
                 cpus: 8,
                 disk_bytes: 16 << 30,
             }),
-            gitlab: None,
-            projects: Vec::new(),
         }
     }
 

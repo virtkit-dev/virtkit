@@ -1,6 +1,6 @@
-//! The GitLab instances the hub takes jobs from, each under a short name the hub gives it. A
-//! jobs key bound to one may submit only that instance's jobs, and only those of the projects
-//! its ceiling lists; the name is what registry namespaces call `{gitlab}`.
+//! The GitLab instances the hub takes jobs from, each under a short name the hub gives it: an
+//! approved server, whose relays submit its jobs ([`super::relays`]). The name is what registry
+//! namespaces call `{gitlab}`.
 
 use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use super::approvals::{REJECTED_GITLABS, forget_projects_of};
 use super::egress::{EGRESS_MUTES, EGRESS_SUBJECT_ORDER, Mute};
-use super::keys::{API_KEYS, KeyRow};
 use super::observed::OBSERVED_SUBJECTS;
 use super::{Db, append_audit, decode, encode};
 
@@ -25,40 +24,6 @@ pub struct GitlabRow {
     pub url: String,
     pub created_at: u64,
     pub created_by: String,
-}
-
-/// A project a jobs key may submit jobs of: by GitLab's ID, with the path it has there.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectCeiling {
-    pub id: u64,
-    pub path: String,
-}
-
-impl ProjectCeiling {
-    /// `<id>:<path>`.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let (id, path) = s
-            .split_once(':')
-            .ok_or_else(|| format!("{s:?}: expected <project id>:<project path>"))?;
-        let id: u64 = id
-            .parse()
-            .ok()
-            .filter(|id| *id > 0)
-            .ok_or_else(|| format!("{id:?} is not a project ID"))?;
-        if !valid_project_path(path) {
-            return Err(format!("{path:?} is not a project path"));
-        }
-        Ok(ProjectCeiling {
-            id,
-            path: path.to_string(),
-        })
-    }
-}
-
-impl std::fmt::Display for ProjectCeiling {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.id, self.path)
-    }
 }
 
 /// Whether `s` is a GitLab project's full path: `/`-separated components of letters, digits,
@@ -209,21 +174,9 @@ impl Db {
     }
 
     /// Remove instance `name` and forget its projects, audited as `actor`'s, and return
-    /// whether it existed. Refused while a working key or a relay is bound to it.
+    /// whether it existed. Refused while a relay is bound to it.
     pub fn remove_gitlab(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
-        {
-            let keys = txn.open_table(API_KEYS)?;
-            for entry in keys.iter()? {
-                let row = decode::<KeyRow>(entry?.1.value())?;
-                if row.gitlab.as_deref() == Some(name) && row.live(now) {
-                    anyhow::bail!(
-                        "key {} is bound to instance {name}; revoke it first",
-                        row.name
-                    );
-                }
-            }
-        }
         let url = txn
             .open_table(GITLABS)?
             .get(name)?
@@ -313,19 +266,5 @@ mod tests {
         for bad in ["", "-gl", "gl-", "GL", "g_l", "g.l", &"a".repeat(33)] {
             assert!(!valid_gitlab_name(bad), "{bad}");
         }
-    }
-
-    #[test]
-    fn project_ceilings_parse() {
-        let p = ProjectCeiling::parse("42:wab/core").unwrap();
-        assert_eq!((p.id, p.path.as_str()), (42, "wab/core"));
-        assert_eq!(p.to_string(), "42:wab/core");
-        assert!(ProjectCeiling::parse("x:wab").is_err());
-        assert!(ProjectCeiling::parse("42").is_err());
-        assert!(ProjectCeiling::parse("42:").is_err());
-        assert!(ProjectCeiling::parse("0:wab").is_err());
-        assert!(ProjectCeiling::parse("42:wab/\u{7}x").is_err());
-        assert!(ProjectCeiling::parse("42:wab//x").is_err());
-        assert!(ProjectCeiling::parse("42:wab/ x").is_err());
     }
 }

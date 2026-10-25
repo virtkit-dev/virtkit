@@ -7,13 +7,17 @@
 //! The approval gate ([`Db::gate_job`]) lets a relay's new GitLab job through only when its
 //! server and project are approved; a job of a project not known makes it pending.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::ErrorCode;
 
+use super::clients::remove_clients_of;
 use super::gitlabs::{GITLABS, GitlabRow, normalize_gitlab_url, valid_project_path};
-use super::jobs::{REQUEST_KEEP, REQUESTS, RequestRow, request_key, sweep_requests};
+use super::jobs::{JOBS, REQUEST_KEEP, REQUESTS, RequestRow, request_key, sweep_requests};
+use super::keys::API_KEYS;
 use super::relays::{RELAYS, RelayRow, Servers};
 use super::{Db, append_audit, decode, encode};
 
@@ -180,6 +184,132 @@ pub(super) fn forget_projects_of(txn: &redb::WriteTransaction, name: &str) -> Re
         table.remove((name, *id))?;
     }
     Ok(ids.len())
+}
+
+/// Convert, once, a hub whose API keys were bound to GitLab instances — before relays: per
+/// instance still known, approve every project a bound key listed and every project its job
+/// history names, then revoke and remove the bound keys with their client instances. Audited
+/// as the hub's. Nothing to do once no key is bound.
+pub(super) fn migrate_bound_keys(txn: &redb::WriteTransaction, now: u64) -> Result<()> {
+    /// What a key bound to an instance held, as an older hub wrote it.
+    #[derive(Deserialize)]
+    struct Bound {
+        name: String,
+        #[serde(default)]
+        gitlab: Option<String>,
+        #[serde(default)]
+        projects: Vec<Listed>,
+    }
+    #[derive(Deserialize)]
+    struct Listed {
+        id: u64,
+        path: String,
+    }
+    /// What a job's record says of its project.
+    #[derive(Deserialize)]
+    struct Claimed {
+        #[serde(default)]
+        gitlab: Option<String>,
+        #[serde(default)]
+        project_id: Option<u64>,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        created_at: u64,
+    }
+    let mut bound = Vec::new();
+    for entry in txn.open_table(API_KEYS)?.iter()? {
+        let (id, value) = entry?;
+        let key = decode::<Bound>(value.value())?;
+        if let Some(gitlab) = key.gitlab.clone() {
+            bound.push((id.value().to_string(), gitlab, key));
+        }
+    }
+    if bound.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<String> = txn
+        .open_table(GITLABS)?
+        .iter()?
+        .map(|e| e.map(|(name, _)| name.value().to_string()))
+        .collect::<Result<_, _>>()?;
+    // Per (instance, project): its path, the newest seen, by when.
+    let mut found: BTreeMap<(String, u64), (u64, String)> = BTreeMap::new();
+    let mut note = |gitlab: &str, id: u64, path: &str, at: u64| {
+        if id == 0 || !known.iter().any(|k| k == gitlab) {
+            return;
+        }
+        let e = found
+            .entry((gitlab.to_string(), id))
+            .or_insert((at, path.to_string()));
+        if at >= e.0 {
+            *e = (at, path.to_string());
+        }
+    };
+    for (_, gitlab, key) in &bound {
+        for p in &key.projects {
+            note(gitlab, p.id, &vk_hub_proto::display_safe(&p.path), 0);
+        }
+    }
+    for entry in txn.open_table(JOBS)?.iter()? {
+        let Ok(job) = decode::<Claimed>(entry?.1.value()) else {
+            continue;
+        };
+        if let (Some(gitlab), Some(id)) = (&job.gitlab, job.project_id) {
+            note(
+                gitlab,
+                id,
+                job.project.as_deref().unwrap_or_default(),
+                job.created_at,
+            );
+        }
+    }
+    let actor = "hub";
+    let mut approved: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    {
+        let mut table = txn.open_table(GITLAB_PROJECTS)?;
+        for ((gitlab, id), (_, path)) in &found {
+            if table.get((gitlab.as_str(), *id))?.is_some() {
+                continue;
+            }
+            let row = ProjectRow {
+                state: ProjectState::Approved,
+                path: path.clone(),
+                since: now,
+                first_job: None,
+                first_job_url: None,
+                relay: None,
+                refused: 0,
+                decided_by: Some(actor.to_string()),
+                decided_at: Some(now),
+            };
+            table.insert((gitlab.as_str(), *id), encode(&row)?.as_slice())?;
+            approved
+                .entry(gitlab.clone())
+                .or_default()
+                .push(project_text(*id, path));
+        }
+    }
+    for (gitlab, projects) in &approved {
+        let event = format!(
+            "{actor} approved project(s) {} of GitLab instance {gitlab}, from its bound keys and \
+             job history, as relays replace bound keys",
+            projects.join(", ")
+        );
+        append_audit(txn, None, actor, &event, now)?;
+    }
+    let mut keys = txn.open_table(API_KEYS)?;
+    for (id, gitlab, key) in &bound {
+        keys.remove(id.as_str())?;
+        remove_clients_of(txn, id)?;
+        let event = format!(
+            "{actor} revoked and removed API key {}, bound to GitLab instance {gitlab}: \
+             vk-gitlab enrolls as a relay instead",
+            key.name
+        );
+        append_audit(txn, None, actor, &event, now)?;
+    }
+    Ok(())
 }
 
 /// Why the approval gate refused a job: its client API error. A refusal for approval is the
@@ -916,6 +1046,89 @@ mod tests {
             code(gate(&job(4, "acme/site"), 10)),
             ErrorCode::Unauthorized
         );
+    }
+
+    /// A hub that bound keys to instances keeps their projects approved and loses the keys.
+    #[test]
+    fn bound_keys_are_converted_once() {
+        let db = Db::open_memory().unwrap();
+        db.add_gitlab("gl", "https://gl.example", "u", 1).unwrap();
+        let txn = db.db.begin_write().unwrap();
+        {
+            let mut keys = txn.open_table(API_KEYS).unwrap();
+            let key = |name: &str, gitlab: Option<&str>, projects: serde_json::Value| {
+                serde_json::to_vec(&serde_json::json!({
+                    "name": name, "prefix": "ab", "scopes": ["jobs"], "pools": ["*"],
+                    "created_at": 1, "created_by": "u", "expires_at": u64::MAX,
+                    "gitlab": gitlab, "projects": projects,
+                }))
+                .unwrap()
+            };
+            let listed = serde_json::json!([{"id": 4, "path": "acme/web"}]);
+            keys.insert("aa", key("runner", Some("gl"), listed).as_slice())
+                .unwrap();
+            let gone = serde_json::json!([{"id": 5, "path": "x/y"}]);
+            keys.insert("bb", key("old", Some("gone"), gone).as_slice())
+                .unwrap();
+            keys.insert("cc", key("deploy", None, serde_json::json!([])).as_slice())
+                .unwrap();
+            let mut jobs = txn.open_table(JOBS).unwrap();
+            let job = |gitlab: &str, id: u64, path: &str, at: u64| {
+                serde_json::to_vec(&serde_json::json!({
+                    "gitlab": gitlab, "project_id": id, "project": path, "created_at": at,
+                }))
+                .unwrap()
+            };
+            jobs.insert("j1", job("gl", 9, "acme/old", 1).as_slice())
+                .unwrap();
+            jobs.insert("j2", job("gl", 9, "acme/api", 2).as_slice())
+                .unwrap();
+            jobs.insert("j3", job("gl", 4, "acme/web", 3).as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        // As a restart runs it.
+        let txn = db.db.begin_write().unwrap();
+        migrate_bound_keys(&txn, 10).unwrap();
+        txn.commit().unwrap();
+        let projects: Vec<(u64, String, ProjectState)> = db
+            .gitlab_projects(None)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.row.path, p.row.state))
+            .collect();
+        assert_eq!(
+            projects,
+            [
+                (4, "acme/web".into(), ProjectState::Approved),
+                (9, "acme/api".into(), ProjectState::Approved)
+            ]
+        );
+        let names: Vec<String> = db.api_keys().unwrap().into_iter().map(|k| k.name).collect();
+        assert_eq!(names, ["deploy"]);
+        let audit: Vec<String> = db
+            .audits(None, 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            audit.iter().any(|e| e.starts_with(
+                "hub approved project(s) 4 (acme/web), 9 (acme/api) of GitLab instance gl"
+            )),
+            "{audit:?}"
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|e| e.starts_with("hub revoked and removed API key old, bound to GitLab")),
+            "{audit:?}"
+        );
+        // Nothing bound is left: a second run changes nothing.
+        let txn = db.db.begin_write().unwrap();
+        migrate_bound_keys(&txn, 11).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(db.audits(None, 20).unwrap().len(), audit.len());
     }
 
     #[test]

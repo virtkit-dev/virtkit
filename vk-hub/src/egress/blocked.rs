@@ -19,10 +19,11 @@ use crate::store::JobRow;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Subject {
-    /// A project, by GitLab's ID, of the instance its jobs' key is bound to: the key's ceiling
+    /// A project, by GitLab's ID, of the instance its jobs' relay is bound to: the approval gate
     /// held the claim to that instance.
     Gitlab { instance: String, project_id: u64 },
-    /// Every job of a key bound to no GitLab instance, whose projects are its own claim.
+    /// Every job of a key bound to no GitLab instance, whose projects are its own claim: an
+    /// older hub's.
     Key { key: String },
 }
 

@@ -126,8 +126,6 @@ fn api_key(hub: &Hub, name: &str, scopes: &[Scope], at: u64, ttl: Duration) -> S
             cpus: 4,
             disk_bytes: 8 << 30,
         }),
-        gitlab: None,
-        projects: Vec::new(),
     };
     hub.db
         .create_api_key(name, &policy, ttl, "uid 0", at)

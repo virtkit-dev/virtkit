@@ -66,7 +66,7 @@ pub use egress_rules::{
     DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, RulesChanged, phase_text as rule_phase_text,
     resolve_egress,
 };
-pub use gitlabs::{GitlabRow, ProjectCeiling, normalize_gitlab_url, valid_gitlab_name};
+pub use gitlabs::{GitlabRow, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
     PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
@@ -830,6 +830,8 @@ impl Db {
         jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         jobs::count_jobs(&txn).context("counting the job history by key")?;
         audit::index_audit_by_who(&txn).context("indexing the audit log by who")?;
+        approvals::migrate_bound_keys(&txn, crate::now_secs())
+            .context("converting the API keys bound to GitLab instances")?;
         egress::share_history(&txn).context("gathering the history's egress reports")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {

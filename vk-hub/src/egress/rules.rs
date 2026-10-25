@@ -57,8 +57,8 @@ pub struct Change {
     pub mode: Option<RuleMode>,
 }
 
-/// A job's claims as `vk-hub egress resolve` gives them; no GitLab instance for a job whose key
-/// is bound to none.
+/// A job's claims as `vk-hub egress resolve` gives them; no GitLab instance for a job of none,
+/// as an older hub recorded the jobs of a key bound to none.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Claims {
     #[serde(default)]
@@ -131,8 +131,8 @@ pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
             pipeline_id: 0,
         }),
         None if c.project_id != 0 || !c.project_path.is_empty() => bail!(
-            "a job's project counts only under a key bound to its GitLab instance: name the \
-             instance too"
+            "a job's project counts only under the GitLab instance its relay is bound to: name \
+             the instance too"
         ),
         None => None,
     };
@@ -141,7 +141,7 @@ pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
 }
 
 /// The claims a placed job's record holds, as its placement resolved it from its spec: its
-/// project and ref count only under a key bound to its GitLab instance. A protection GitLab
+/// project and ref count only under the GitLab instance its relay is bound to. A protection GitLab
 /// did not report reads as unprotected, as at placement. The record's project path and ref
 /// are display-safe copies of the spec's, the same for any path or ref a rule can name.
 pub fn claims_of(j: &JobRow) -> Option<JobClaims> {
@@ -158,7 +158,8 @@ pub fn claims_of(j: &JobRow) -> Option<JobClaims> {
 
 /// The claims of a project's jobs of `protection` ([`super::observed::protection_key`]) and
 /// `git_ref` in Observed traffic, `project_path` the path its latest job named: `None` for every
-/// job of a key bound to no GitLab instance. A protection not reported reads as unprotected, as
+/// job of no GitLab instance (an older hub's, of a key bound to none). A protection not reported
+/// reads as unprotected, as
 /// at placement.
 pub fn claims_for(
     subject: &super::blocked::Subject,

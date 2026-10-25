@@ -496,22 +496,20 @@ namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}" 
   roles: the node stores a job's caches in the repositories they resolve to (see 4a).
 
 **Trust.** A job's claims (project ID and path, ref, protection, pipeline) are vk-gitlab's,
-sent with the `vkk_` jobs key that submits it, and the hub does not check them with GitLab.
-Each of them is a separate field of the job, so the hub bounds the key, not the fields one
-by one:
+submitted by the relay it enrolled as ([design](gitlab-relay-enrollment.md)), and the hub does
+not check them with GitLab. Each of them is a separate field of the job, so the hub bounds the
+relay, not the fields one by one:
 
 - The hub knows each GitLab instance it takes jobs from, by URL, under a short name it gives
-  it (`vk-hub gitlabs add|list|remove`). A jobs key may be bound to one instance
-  (`vk-hub keys create --gitlab <name> [--projects id:path,…]`), and the hub refuses a job of
-  that key whose `server_url` is not that instance's.
-- A bound key's ceiling is either the whole instance, or a list of projects, each by ID with
-  its path. The hub refuses a job whose project ID is not on the list, or whose path is not
-  the one listed for that ID; a rename on GitLab means updating the list.
-- A key bound to no instance behaves as today, and its jobs never get a token.
-- Protection and pipeline ID are trusted as vk-gitlab asserts them. A key whose ceiling is
-  the whole instance is trusted for the whole instance.
+  it (`vk-hub gitlabs add|approve|list|remove`). A relay is bound to the server its first
+  inventory names, and the hub refuses its jobs whose `server_url` is not that server's, and
+  every job of a server not approved.
+- A project's jobs are accepted once an operator approved it for its instance, by ID; its path
+  is recorded from its jobs.
+- Protection and pipeline ID are trusted as vk-gitlab asserts them. A relay is trusted for
+  the approved projects of its instance.
 
-A leaked or compromised bound key thus reaches only the namespaces its ceiling selects,
+A compromised relay thus reaches only the namespaces of its instance's approved projects,
 though within them it can claim protection.
 
 ### Tokens
@@ -740,16 +738,13 @@ retention_days = 2
 The hub's side of step 4; the registry's is in
 [vk-registry's design](../vk-registry/DESIGN.md).
 
-**GitLab instances and bound keys.** `vk-hub gitlabs add <name> <url>`, `gitlabs list` and
+**GitLab instances.** `vk-hub gitlabs add <name> <url>`, `gitlabs list` and
 `gitlabs remove <name>` keep the instances the hub takes jobs from, by a name of lowercase
 letters, digits and `-`, which namespaces call `{gitlab}`. A URL is normalized (lowercase
 scheme and host, no default port, no trailing `/`) and names one instance; an instance a
-working key is bound to is not removed, and a removed instance's name is not reused while
-the egress records of its projects remain. `vk-hub keys create … --gitlab <name> [--projects
-<id>:<path>,…]` binds a jobs key. A bound key submits only jobs whose `server_url` is its
-instance's, naming a project (ID not 0), and with `--projects` only those projects, by ID and
-path both; anything else is 403. Keys bound to none submit as before, and their jobs get no
-token.
+relay is bound to is not removed, and a removed instance's name is not reused while the egress
+records of its projects remain. Only relays submit GitLab jobs, each of its server's approved
+projects ([Placed jobs](fleet-prototype.md#placed-jobs)).
 
 **Namespaces.** `vk-hub namespaces list|show <registry> [<name>]`, `namespaces add <registry>
 <name> --path <template> [--retention-days <n>] --grant <rights>:<subject> [--grant …]` (adding

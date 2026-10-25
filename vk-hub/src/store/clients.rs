@@ -333,8 +333,6 @@ mod tests {
             scopes: vec![Scope::Jobs],
             pools: vec!["ci".into()],
             max_envelope: None,
-            gitlab: None,
-            projects: Vec::new(),
         };
         let (key, _) = db.create_api_key(name, &policy, DAY, "uid 0", at).unwrap();
         crate::store::token_key(&key)

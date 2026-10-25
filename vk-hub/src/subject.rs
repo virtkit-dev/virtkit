@@ -34,7 +34,7 @@ pub struct JobClaims {
 }
 
 impl JobClaims {
-    /// A placed GitLab job's claims, as submitted under a key bound to the instance `gitlab`.
+    /// A placed GitLab job's claims, as submitted by a relay bound to the instance `gitlab`.
     pub fn of(gitlab: &str, ci: &vk_hub_proto::job::CiJob) -> Self {
         JobClaims {
             gitlab: gitlab.to_string(),
