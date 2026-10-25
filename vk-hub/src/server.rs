@@ -30,8 +30,8 @@ use vk_hub_proto::{
 };
 
 use crate::session::PeerKind;
-use crate::store::{Db, Enrollment, RegistryEnrollment};
-use vk_hub_proto::registry;
+use crate::store::{Db, Enrollment, RegistryEnrollment, RelayEnrollment};
+use vk_hub_proto::{gitlab, registry};
 
 /// A response body: whole, or a release binary streamed from its file.
 pub(crate) type Body = BoxBody<Bytes, std::io::Error>;
@@ -766,9 +766,13 @@ async fn handle(
     let resp = match (req.method(), req.uri().path()) {
         (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Node).await,
         (&Method::POST, registry::ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Registry).await,
+        (&Method::POST, gitlab::ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Relay).await,
         (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported, PeerKind::Node)),
         (&Method::GET, registry::SESSION_PATH) => {
             Ok(upgrade(req, hub, peer, exported, PeerKind::Registry))
+        }
+        (&Method::GET, gitlab::SESSION_PATH) => {
+            Ok(upgrade(req, hub, peer, exported, PeerKind::Relay))
         }
         (&Method::GET, path) if path.starts_with(registry::RELEASE_PATH) => {
             download(
@@ -821,7 +825,8 @@ async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Re
 }
 
 /// `POST /v1/enroll`: check the node's proof of its key, then spend the token on it.
-/// `POST /v1/registry/enroll` does the same for a registry, with a token issued for one.
+/// `POST /v1/registry/enroll` does the same for a registry, and `POST /v1/gitlab/enroll` for
+/// a relay, each with a token issued for one.
 async fn enroll(
     req: Request<Incoming>,
     hub: &Hub,
@@ -860,8 +865,10 @@ async fn enroll(
             "the signature does not match the key",
         ));
     }
-    if kind == PeerKind::Registry {
-        return enroll_registry(hub, peer, ask).await;
+    match kind {
+        PeerKind::Registry => return enroll_registry(hub, peer, ask).await,
+        PeerKind::Relay => return enroll_relay(hub, peer, ask).await,
+        PeerKind::Node => {}
     }
     let db = hub.db.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -931,6 +938,38 @@ async fn enroll_registry(
         RegistryEnrollment::BadToken => error(
             StatusCode::FORBIDDEN,
             "the enrollment token is unknown, used, expired, or not issued for a registry",
+        ),
+    })
+}
+
+/// A relay's enrollment, its proof of its key already checked.
+async fn enroll_relay(hub: &Hub, peer: SocketAddr, ask: EnrollRequest) -> Result<Response<Body>> {
+    let db = hub.db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let actor = format!("peer {peer}");
+        db.enroll_relay(
+            &ask.token,
+            &ask.public_key,
+            &ask.hostname,
+            &actor,
+            crate::now_secs(),
+        )
+    })
+    .await
+    .context("running an enrollment")??;
+    Ok(match outcome {
+        RelayEnrollment::Enrolled { id } => {
+            eprintln!("vk-hub: {peer}: enrolled relay {id}");
+            hub.touch();
+            json(StatusCode::OK, &gitlab::EnrollResponse { relay_id: id })
+        }
+        RelayEnrollment::Reenrolled { id } => {
+            eprintln!("vk-hub: {peer}: relay {id} enrolled again with its pinned key");
+            json(StatusCode::OK, &gitlab::EnrollResponse { relay_id: id })
+        }
+        RelayEnrollment::BadToken => error(
+            StatusCode::FORBIDDEN,
+            "the enrollment token is unknown, used, expired, or not issued for a GitLab relay",
         ),
     })
 }
@@ -1176,7 +1215,8 @@ async fn download(
     Ok(resp)
 }
 
-/// `GET /v1/node`, or a registry's `GET /v1/registry/session`: answer the WebSocket
+/// `GET /v1/node`, a registry's `GET /v1/registry/session` or a relay's
+/// `GET /v1/gitlab/session`: answer the WebSocket
 /// handshake and run the `kind` of session on the upgraded connection, or 503 with every
 /// handshake permit taken.
 fn upgrade(
@@ -1241,6 +1281,7 @@ fn upgrade(
         match kind {
             PeerKind::Node => crate::session::run(ws, hub, peer, exported, permit).await,
             PeerKind::Registry => crate::registries::run(ws, hub, peer, exported, permit).await,
+            PeerKind::Relay => crate::relays::run(ws, hub, peer, exported, permit).await,
         }
     });
     let mut resp = Response::new(full(Bytes::new()));

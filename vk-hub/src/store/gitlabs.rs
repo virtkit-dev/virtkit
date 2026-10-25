@@ -206,7 +206,7 @@ impl Db {
     }
 
     /// Remove instance `name`, audited as `actor`'s, and return whether it existed.
-    /// Refused while a working key is bound to it.
+    /// Refused while a working key or a relay is bound to it.
     pub fn remove_gitlab(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         {
@@ -220,6 +220,17 @@ impl Db {
                     );
                 }
             }
+        }
+        let url = txn
+            .open_table(GITLABS)?
+            .get(name)?
+            .map(|g| decode::<GitlabRow>(g.value()))
+            .transpose()?
+            .map(|row| row.url);
+        if let Some(url) = &url
+            && let Some(relay) = super::relays::relay_bound_to(&txn, url)?
+        {
+            anyhow::bail!("relay {relay} is bound to instance {name}; remove it first");
         }
         let removed = txn.open_table(GITLABS)?.remove(name)?.is_some();
         if removed {

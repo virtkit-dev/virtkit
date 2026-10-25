@@ -35,6 +35,7 @@ mod jobs;
 mod local;
 mod ops;
 mod registries;
+mod relays;
 mod releases;
 mod rollout;
 mod server;
@@ -101,6 +102,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<RegistriesCmd>,
     },
+    /// List the GitLab relays (vk-gitlab) enrolled with the hub, or show or remove one
+    Relays {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<RelaysCmd>,
+    },
     /// Keep vk or vk-registry binaries for nodes or registries to update to
     Release {
         #[command(flatten)]
@@ -166,9 +174,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
     },
-    /// Add, list and remove the GitLab instances the hub takes jobs from
+    /// Add, list, approve and remove the GitLab instances the hub takes jobs from
     ///
-    /// A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
+    /// A GitLab server a relay reports is pending until approved under a name, which its
+    /// relays then poll. A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
     /// instance's jobs only, and only its jobs get registry tokens; the name is what registry
     /// namespaces call {gitlab}.
     Gitlabs {
@@ -503,8 +512,32 @@ enum GitlabsCmd {
     List,
     /// Add an instance under a name: lowercase letters, digits and '-'
     Add { name: String, url: String },
-    /// Remove an instance no working key is bound to
+    /// List the GitLab servers relays report that no instance has
+    Pending,
+    /// Approve a pending server under a name: `add` with the arguments swapped
+    Approve {
+        url: String,
+        /// Lowercase letters, digits and '-': what namespaces and egress rules call {gitlab}
+        #[arg(long)]
+        name: String,
+    },
+    /// Remove an instance no working key and no relay is bound to
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum RelaysCmd {
+    /// List the relays (the default)
+    List,
+    /// Show a relay: its GitLab server and runners
+    Show {
+        /// The relay's ID, as `vk-hub relays` lists it
+        id: String,
+    },
+    /// Remove a relay: unpin its key and end its session
+    ///
+    /// It can join again only with a new token.
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -826,7 +859,8 @@ enum TokenCmd {
         /// How long the token stays valid: <n>s, <n>m, <n>h or <n>d (at most 30d)
         #[arg(long, default_value = "1h", value_parser = parse_token_ttl)]
         ttl: Duration,
-        /// What it enrolls: a node (`vk node join`) or a registry (`vk-registry join`)
+        /// What it enrolls: a node (`vk node join`), a registry (`vk-registry join`) or a
+        /// GitLab relay (`vk-gitlab join`)
         #[arg(long, default_value = "node", value_parser = parse_token_kind)]
         kind: store::TokenKind,
         /// The URL clients reach the registry it enrolls at, https://host[:port]: nodes whose
@@ -840,7 +874,8 @@ fn parse_token_kind(s: &str) -> Result<store::TokenKind, String> {
     match s {
         "node" => Ok(store::TokenKind::Node),
         "registry" => Ok(store::TokenKind::Registry),
-        _ => Err(format!("{s:?}: expected node or registry")),
+        "gitlab" => Ok(store::TokenKind::Gitlab),
+        _ => Err(format!("{s:?}: expected node, registry or gitlab")),
     }
 }
 
@@ -990,9 +1025,14 @@ async fn run(cli: Cli) -> Result<()> {
                 match kind {
                     store::TokenKind::Node => "vk node",
                     store::TokenKind::Registry => "vk-registry",
+                    store::TokenKind::Gitlab => "vk-gitlab",
                 }
             );
             Ok(())
+        }
+        Cmd::Relays { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || relays_blocking(&client, cmd)).await?
         }
         Cmd::Registries { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
@@ -1939,9 +1979,32 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
                 .collect();
             print!("{}", table(&["NAME", "URL", "ADDED", "BY"], &rows));
         }
-        GitlabsCmd::Add { name, url } => {
+        GitlabsCmd::Add { name, url } | GitlabsCmd::Approve { url, name } => {
             let row = client.add_gitlab(&name, &url)?;
             eprintln!("vk-hub: GitLab instance {name} is {}", row.url);
+        }
+        GitlabsCmd::Pending => {
+            let rows: Vec<[String; 4]> = client
+                .pending_gitlabs()?
+                .into_iter()
+                .map(|p| {
+                    let since = p.relays.iter().map(|(_, _, at)| *at).min();
+                    [
+                        p.url,
+                        p.spki_sha256.unwrap_or_else(|| "-".to_string()),
+                        p.relays
+                            .iter()
+                            .map(|(id, name, _)| format!("{name} ({id})"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        since.map_or("-".to_string(), utc),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                table(&["URL", "CERTIFICATE KEY SHA256", "RELAYS", "SINCE"], &rows)
+            );
         }
         GitlabsCmd::Remove { name } => {
             if !client.remove_gitlab(&name)? {
@@ -1951,6 +2014,126 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// `vk-hub relays` and its subcommands, which block on the admin socket.
+fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()> {
+    let now = now_secs();
+    match cmd.unwrap_or(RelaysCmd::List) {
+        RelaysCmd::List => print!("{}", render_relays(&client.list_relays()?, now)),
+        RelaysCmd::Show { id } => {
+            let Some(r) = client.show_relay(&id)? else {
+                bail!("there is no relay {id}");
+            };
+            print!("{}", render_relay(&r, now));
+        }
+        RelaysCmd::Remove { id } => {
+            if !client.remove_relay(&id)? {
+                bail!("there is no relay {id}");
+            }
+            eprintln!("vk-hub: removed relay {id}");
+        }
+    }
+    Ok(())
+}
+
+/// `vk-hub relays`' table, with each relay's notes under it.
+fn render_relays(views: &[relays::RelayView], now: u64) -> String {
+    let rows: Vec<[String; 7]> = views.iter().map(|r| relays::cells(r, now)).collect();
+    let mut out = table(&relays::COLUMNS, &rows);
+    for r in views {
+        for note in relays::notes(r) {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `vk-hub relays show`.
+fn render_relay(r: &relays::RelayView, now: u64) -> String {
+    let mut out = render_relays(std::slice::from_ref(r), now);
+    let Some(i) = &r.row.inventory else {
+        out.push_str("\nno inventory yet\n");
+        return out;
+    };
+    out.push_str(&format!(
+        "\nhost {}, system ID {}, concurrent {}\n",
+        i.hostname, i.system_id, i.concurrent
+    ));
+    out.push_str(&format!("GitLab {}", i.server.url));
+    if let Some(v) = &i.server.version {
+        out.push_str(&format!(", version {v}"));
+    }
+    out.push('\n');
+    if let Some(k) = &i.server.spki_sha256 {
+        out.push_str(&format!("certificate key sha256 {k}\n"));
+    }
+    if let Some(s) = &r.server {
+        out.push_str(&format!("server {}\n", relays::server_text(s)));
+    }
+    let state = |name: &str| {
+        r.row
+            .report
+            .as_ref()
+            .and_then(|rep| rep.runners.iter().find(|x| x.name == name))
+            .map_or("-".to_string(), |x| {
+                let state = serde_json::to_value(x.state)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                match &x.message {
+                    Some(m) => format!("{state}: {m}"),
+                    None => state,
+                }
+            })
+    };
+    let load = |name: &str| {
+        r.row
+            .heartbeat
+            .as_ref()
+            .and_then(|h| h.runners.iter().find(|x| x.name == name))
+            .map_or("-".to_string(), |x| {
+                format!("{} held, {} asking", x.jobs, x.requests)
+            })
+    };
+    let rows: Vec<[String; 7]> = i
+        .runners
+        .iter()
+        .map(|x| {
+            let mut placement = x.placement.pool.clone();
+            if !x.placement.labels.is_empty() {
+                placement.push_str(&format!(" [{}]", x.placement.labels.join(", ")));
+            }
+            [
+                x.name.clone(),
+                x.runner_id.map_or("-".to_string(), |id| id.to_string()),
+                placement,
+                store::envelope_text(x.placement.envelope),
+                x.limit.map_or("-".to_string(), |l| l.to_string()),
+                if x.verified {
+                    state(&x.name)
+                } else {
+                    format!("not verified; {}", state(&x.name))
+                },
+                load(&x.name),
+            ]
+        })
+        .collect();
+    out.push('\n');
+    out.push_str(&table(
+        &[
+            "RUNNER",
+            "GITLAB ID",
+            "POOL",
+            "ENVELOPE",
+            "LIMIT",
+            "STATE",
+            "LOAD",
+        ],
+        &rows,
+    ));
+    out
 }
 
 /// `vk-hub namespaces` and its subcommands, which block on the admin socket.

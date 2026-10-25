@@ -51,6 +51,7 @@ mod keys;
 mod namespaces;
 mod observed;
 mod registries;
+mod relays;
 mod token_keys;
 mod tools;
 
@@ -61,7 +62,7 @@ pub use egress_rules::{
     DEFAULT_RULE, EgressRuleRow, RuleChange, RuleMode, RulesChanged, phase_text as rule_phase_text,
     resolve_egress,
 };
-pub use gitlabs::{GitlabRow, ProjectCeiling, valid_gitlab_name};
+pub use gitlabs::{GitlabRow, ProjectCeiling, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
     PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
@@ -78,6 +79,7 @@ pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
 };
+pub use relays::{PendingGitlab, RelayEnrollment, RelayRow, RelayWrite};
 pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
 
@@ -482,13 +484,14 @@ struct TokenRow {
     url: Option<String>,
 }
 
-/// What an enrollment token enrolls: a node or a registry, never either.
+/// What an enrollment token enrolls: a node, a registry or a GitLab relay, never another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenKind {
     #[default]
     Node,
     Registry,
+    Gitlab,
 }
 
 impl TokenKind {
@@ -496,6 +499,7 @@ impl TokenKind {
         match self {
             TokenKind::Node => "node",
             TokenKind::Registry => "registry",
+            TokenKind::Gitlab => "gitlab",
         }
     }
 }
@@ -804,6 +808,8 @@ impl Db {
             .context("opening the job output lengths table")?;
         txn.open_table(gitlabs::GITLABS)
             .context("opening the GitLab instances table")?;
+        txn.open_table(relays::RELAYS)
+            .context("opening the relays table")?;
         txn.open_table(namespaces::NAMESPACES)
             .context("opening the namespaces table")?;
         txn.open_table(token_keys::TOKEN_KEYS)

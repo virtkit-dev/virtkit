@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The hub enrolls GitLab relays**: `vk-hub token create --kind gitlab` issues their token,
+  `vk-hub relays` lists them with their GitLab server and runners, and `relays show|remove`
+  inspects or revokes one. A GitLab server a relay reports is pending until an operator
+  approves it under a name, with `vk-hub gitlabs pending` and `gitlabs approve <url> --name
+  <name>`; a server's instance cannot be removed while a relay is bound to it.
+
 ## [0.95.1] - 2026-10-24
 
 ### Fixed

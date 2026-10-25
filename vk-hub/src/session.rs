@@ -139,6 +139,7 @@ pub(crate) struct Peer {
 pub(crate) enum PeerKind {
     Node,
     Registry,
+    Relay,
 }
 
 impl PeerKind {
@@ -146,6 +147,7 @@ impl PeerKind {
         match self {
             PeerKind::Node => PROTOCOL,
             PeerKind::Registry => vk_hub_proto::registry::PROTOCOL,
+            PeerKind::Relay => vk_hub_proto::gitlab::PROTOCOL,
         }
     }
 
@@ -153,6 +155,7 @@ impl PeerKind {
         match self {
             PeerKind::Node => "node",
             PeerKind::Registry => "registry",
+            PeerKind::Relay => "relay",
         }
     }
 }
@@ -255,6 +258,9 @@ pub(crate) async fn handshake(
                 .map(|r| (r.public_key, r.hostname, r.incarnation)),
             PeerKind::Registry => db
                 .registry(&id)?
+                .map(|r| (r.public_key, r.hostname, r.incarnation)),
+            PeerKind::Relay => db
+                .relay(&id)?
                 .map(|r| (r.public_key, r.hostname, r.incarnation)),
         })
     })

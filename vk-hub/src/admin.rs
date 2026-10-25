@@ -187,12 +187,21 @@ enum Call {
         claims: crate::egress::rules::Claims,
     },
     ListGitlabs,
+    /// The servers relays report that no instance has.
+    PendingGitlabs,
     AddGitlab {
         name: String,
         url: String,
     },
     RemoveGitlab {
         name: String,
+    },
+    ListRelays,
+    ShowRelay {
+        id: String,
+    },
+    RemoveRelay {
+        id: String,
     },
     ListTokenKeys,
     RotateTokenKeys,
@@ -689,9 +698,11 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(crate::egress::rules::resolve(hub, &claims)?)?
         }
         Call::ListGitlabs => serde_json::to_value(hub.db.gitlabs()?)?,
+        Call::PendingGitlabs => serde_json::to_value(hub.db.pending_gitlabs()?)?,
         Call::AddGitlab { name, url } => {
             let row = hub.db.add_gitlab(&name, &url, &actor, crate::now_secs())?;
             hub.clients_changed();
+            crate::relays::server_changed(hub, &row.url)?;
             eprintln!(
                 "vk-hub: admin: {actor} added GitLab instance {name} at {}",
                 row.url
@@ -707,6 +718,17 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                     vk_hub_proto::display_safe(&name)
                 );
             }
+            serde_json::to_value(removed)?
+        }
+        Call::ListRelays => serde_json::to_value(crate::relays::views(hub)?)?,
+        Call::ShowRelay { id } => serde_json::to_value(crate::relays::detail(hub, &id)?)?,
+        Call::RemoveRelay { id } => {
+            let removed = crate::relays::remove(hub, &actor, &id)?;
+            eprintln!(
+                "vk-hub: admin: {actor} removed relay {} ({})",
+                vk_hub_proto::display_safe(&id),
+                if removed { "applied" } else { "no such relay" }
+            );
             serde_json::to_value(removed)?
         }
         Call::ListTokenKeys => serde_json::to_value(hub.db.token_keys()?)?,
@@ -1019,6 +1041,23 @@ impl Client {
             name: name.to_string(),
             url: url.to_string(),
         })
+    }
+
+    pub fn pending_gitlabs(&self) -> Result<Vec<crate::store::PendingGitlab>> {
+        self.call(Call::PendingGitlabs)
+    }
+
+    pub fn list_relays(&self) -> Result<Vec<crate::relays::RelayView>> {
+        self.call(Call::ListRelays)
+    }
+
+    pub fn show_relay(&self, id: &str) -> Result<Option<crate::relays::RelayView>> {
+        self.call(Call::ShowRelay { id: id.to_string() })
+    }
+
+    /// Whether there was such a relay to remove.
+    pub fn remove_relay(&self, id: &str) -> Result<bool> {
+        self.call(Call::RemoveRelay { id: id.to_string() })
     }
 
     /// Whether there was one.
@@ -1979,6 +2018,55 @@ mod tests {
             assert!(client.remove_registry(&id).unwrap());
             assert!(!client.remove_registry(&id).unwrap());
             assert!(client.show_registry(&id).unwrap().is_none());
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The relay calls, and approving the server a relay reports, as the CLI sends them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_are_served_over_the_socket() {
+        let dir = scratch("admin-relays");
+        let path = dir.join("admin.sock");
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+        tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
+        let client = Client::connect(&path).unwrap();
+        let hub2 = hub.clone();
+        tokio::task::spawn_blocking(move || {
+            let created = client
+                .create_token_for(TokenKind::Gitlab, Duration::from_secs(60))
+                .unwrap();
+            let crate::store::RelayEnrollment::Enrolled { id } = hub2
+                .db
+                .enroll_relay(&created.token, "aa", "relay-1", "peer p", 1)
+                .unwrap()
+            else {
+                panic!("expected an enrollment");
+            };
+            let mut inventory = vk_hub_proto::gitlab::Inventory::default();
+            inventory.server.url = "https://gl.example".into();
+            hub2.db
+                .record_relay(&id, crate::store::RelayWrite::Inventory(inventory), 2)
+                .unwrap();
+            let pending = client.pending_gitlabs().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].url, "https://gl.example");
+            let listed = client.list_relays().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(
+                listed[0].server.as_ref().unwrap().state,
+                vk_hub_proto::gitlab::ServerState::Pending
+            );
+            client.add_gitlab("gl", "https://gl.example").unwrap();
+            assert!(client.pending_gitlabs().unwrap().is_empty());
+            let shown = client.show_relay(&id).unwrap().unwrap();
+            assert_eq!(shown.server.unwrap().name.as_deref(), Some("gl"));
+            assert!(client.remove_gitlab("gl").is_err());
+            assert!(client.remove_relay(&id).unwrap());
+            assert!(!client.remove_relay(&id).unwrap());
+            assert!(client.show_relay(&id).unwrap().is_none());
+            assert!(client.remove_gitlab("gl").unwrap());
         })
         .await
         .unwrap();

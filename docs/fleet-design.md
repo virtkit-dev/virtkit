@@ -30,7 +30,8 @@ embedded database, no replication.
   `redb`, as `vk-registry`'s accounts store is.
 - **`vk-gitlab`** — experimental, a crate of this workspace: gitlab-runner's GitLab-facing
   side, reimplemented. It holds runner tokens, takes jobs from GitLab and submits them to the hub,
-  and writes their traces and states back to GitLab.
+  and writes their traces and states back to GitLab. It is to enroll with the hub as a relay
+  ([design](gitlab-relay-enrollment.md)), whose hub side exists.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
   prints for the programs on its host, the hub's client API and the job spec. A node and the
   hub negotiate the protocol version on connect; a rolling update runs mixed versions by

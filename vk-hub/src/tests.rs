@@ -2773,5 +2773,6 @@ fn audit_times_are_utc() {
 
 mod jobs;
 mod registries;
+mod relays;
 pub(crate) mod tokens;
 mod tools;

@@ -1042,6 +1042,24 @@ registry tokens. Operators also create, revoke and remove keys on the web UI's `
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.
 
+**GitLab relays.** `vk-gitlab` is to enroll with the hub as a relay
+([design](gitlab-relay-enrollment.md)); the hub's side is in place. `vk-hub token create --kind
+gitlab` issues a token only a relay's enrollment, at `POST /v1/gitlab/enroll`, spends; the
+relay's key is pinned in a table of its own, so no node or registry is taken for a relay. Its
+session, at `/v1/gitlab/session`, opens with the handshake every peer shares, then carries its
+inventory (version, hostname, system ID, `concurrent`, its GitLab server's URL, certificate key
+digest and version, and per runner its name, GitLab ID, placement, `limit` and whether `verify`
+passed), heartbeats and runner states, all stored. The first inventory binds the relay to its
+server's URL, normalized as `vk-hub gitlabs` compares them, audited; the hub answers with the
+server's status — `approved` under the name of the instance at that URL, else `pending` — and
+again whenever an operator changes it. A relay that later reports another URL stays bound and is
+told `rebound`; one reporting no printable http(s) URL of at most 256 characters is refused. `vk-hub gitlabs pending` lists the
+servers relays report that no instance has, with the digest to check and the relays that report
+them; `vk-hub gitlabs approve <url> --name <name>` (or `gitlabs add`) approves one, and its relays
+hear it at once. `gitlabs remove` is refused while a relay is bound to the instance. `vk-hub
+relays` lists the relays — reach, version, server, runners, last seen — `relays show <id>` adds
+its server and runners, and `relays remove <id>` unpins its key and ends its session, audited.
+
 **Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>` sets the pools a node is in,
 audited. Labels come from the node's inventory. `vk-hub nodes` lists each node's pools and
 labels under the table.
