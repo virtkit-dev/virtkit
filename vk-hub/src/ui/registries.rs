@@ -12,6 +12,7 @@ use vk_hub_proto::registry::GcPolicy;
 use super::html::Html;
 use super::pages::{self, end_section, header_cells, kv, kv_node, section};
 use super::{Auth, Body, Ui, blocking, field, message, page};
+use crate::egress::blocked::Instances;
 use crate::registries::{self as ops, RegistryView};
 use crate::store::{NamespaceRow, NotEnrolled, RegistryCommandRow, RegistryRow, Role, TokenKeyRow};
 
@@ -222,13 +223,14 @@ pub(super) async fn detail(
     let tab = Tab::of(query);
     let hub = ui.hub.clone();
     let wanted = id.to_string();
-    let Some((view, commands, namespaces, keys)) = blocking(move || {
+    let Some((view, commands, namespaces, keys, instances)) = blocking(move || {
         let Some((view, commands)) = ops::detail(&hub, &wanted)? else {
             return Ok(None);
         };
         let namespaces = hub.db.namespaces(&wanted)?;
         let keys = hub.db.token_keys()?;
-        Ok::<_, anyhow::Error>(Some((view, commands, namespaces, keys)))
+        let instances = hub.db.gitlab_instances()?;
+        Ok::<_, anyhow::Error>(Some((view, commands, namespaces, keys, instances)))
     })
     .await?
     else {
@@ -261,7 +263,7 @@ pub(super) async fn detail(
             usage(&mut main, &view);
             commands_table(&mut main, &view, &commands, now);
         }
-        Tab::Access => access(&mut main, &view, &namespaces),
+        Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref()),
         Tab::Settings => settings(&mut main, &view, &keys, now),
     }
     Ok(page(super::fleet::layout(
@@ -273,8 +275,9 @@ pub(super) async fn detail(
 }
 
 /// The Job access tab: the registry's storage areas, those the hub keeps for CI folded away,
-/// and what keeps jobs from getting access, when something does.
-fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow]) {
+/// and what keeps jobs from getting access, when something does; access rules name their GitLab
+/// instance by the hub's `instances` ([`super::access::who`]).
+fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances: Instances<&str>) {
     if !v.row.takes_tokens() {
         h.raw("<p class=\"callout\">Jobs get no access here: the registry does not take the ")
             .raw("hub's tokens. <code>[hub] tokens = true</code> in its config turns it on.</p>");
@@ -303,7 +306,10 @@ fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow]) {
             .raw("</strong> the registry refused a cleanup window (shorter than its floor, or ")
             .raw("invalid). A shorter one needs <code>[[gc.prefix]]</code> in its own config.</p>");
     }
-    let areas: Vec<_> = namespaces.iter().map(super::access::area).collect();
+    let areas: Vec<_> = namespaces
+        .iter()
+        .map(|ns| super::access::area(ns, instances))
+        .collect();
     let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
     h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
         .raw("Jobs get access only where an access rule allows it.</p>");

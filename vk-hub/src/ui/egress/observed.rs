@@ -26,7 +26,7 @@ use super::super::sse::Source;
 use super::super::{Auth, Body, Ui, blocking, decode_form, field, fleet, page};
 use super::{Caches, EVENT, PAGE_ROWS, PATH, ROW_PREFIX, unreported, unreported_callout};
 use crate::egress::aggregates::Aggregates;
-use crate::egress::blocked::{Finding, PHASES, Subject, View, row_id};
+use crate::egress::blocked::{Finding, Instances, PHASES, Subject, View, row_id};
 use crate::egress::matching::Dest;
 use crate::egress::observed::PROTECTIONS;
 use crate::egress::rule_use::{self, Compared, RuleUse};
@@ -136,6 +136,9 @@ struct Listing {
     /// The nodes, and the rules' entries' use and their caps', for the list of projects.
     nodes: Vec<(String, crate::store::NodeRow)>,
     used: Option<Arc<Aggregates>>,
+    /// The hub's instances, that its projects are named by
+    /// ([`crate::store::Db::gitlab_instances`]).
+    instances: Instances<String>,
 }
 
 fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
@@ -214,6 +217,7 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
         rules,
         nodes,
         used,
+        instances: hub.db.gitlab_instances()?,
     })
 }
 
@@ -255,7 +259,7 @@ pub(super) async fn get(
     h.raw("<p class=\"sub\">What the jobs of the history reached, by destination and project, ")
         .raw("as their nodes reported it: allowed, or carried while a dry-run allowlist would ")
         .raw("have blocked it. A DNS entry is a lookup, not proof of a connection.</p>");
-    filter_form(&mut h, &q, &listing.subjects);
+    filter_form(&mut h, &q, &listing.subjects, listing.instances.as_deref());
     h.raw("<div id=\"")
         .raw(RESULTS)
         .raw("\"><div hx-ext=\"sse\" sse-connect=\"/events/")
@@ -272,7 +276,12 @@ pub(super) async fn get(
 
 /// The filter's form: project, phase and protection, applied at once with htmx as on the
 /// Blocked tab.
-fn filter_form(h: &mut Html, q: &Query, subjects: &[(String, ObservedSubject)]) {
+fn filter_form(
+    h: &mut Html,
+    q: &Query,
+    subjects: &[(String, ObservedSubject)],
+    instances: Instances<&str>,
+) {
     h.raw("<form id=\"observed-filter\" class=\"filter\" method=\"get\" action=\"")
         .raw(PATH)
         .raw("\" hx-get=\"")
@@ -285,7 +294,10 @@ fn filter_form(h: &mut Html, q: &Query, subjects: &[(String, ObservedSubject)]) 
         .raw("<input type=\"hidden\" name=\"tab\" value=\"")
         .raw(TAB)
         .raw("\">");
-    let mut named: Vec<(&String, String)> = subjects.iter().map(|(p, s)| (p, who(p, s))).collect();
+    let mut named: Vec<(&String, String)> = subjects
+        .iter()
+        .map(|(p, s)| (p, who(p, s, instances)))
+        .collect();
     named.sort_by(|a, b| (&a.1, a.0).cmp(&(&b.1, b.0)));
     let chosen = q.subject.as_ref().map(Subject::param);
     h.raw("<select name=\"project\" aria-label=\"Project\">")
@@ -328,10 +340,11 @@ fn filter_form(h: &mut Html, q: &Query, subjects: &[(String, ObservedSubject)]) 
     h.raw("</select> <button>Show</button></form>");
 }
 
-/// A project in words ([`Subject::text`]), or its subject's param when it cannot be read.
-fn who(param: &str, s: &ObservedSubject) -> String {
+/// A project as pages name it ([`Subject::label`]), or its subject's param when it cannot be
+/// read.
+fn who(param: &str, s: &ObservedSubject, instances: Instances<&str>) -> String {
     match Subject::parse(param) {
-        Some(subject) => subject.text(s.project.as_deref(), &s.key_name),
+        Some(subject) => subject.label(s.project.as_deref(), &s.key_name, instances),
         None => param.to_string(),
     }
 }
@@ -398,7 +411,7 @@ fn projects(h: &mut Html, q: &Query, l: &Listing) {
         h.raw("<tr><td><a href=\"")
             .text(chosen.href())
             .raw("\">")
-            .node(&who(param, s))
+            .node(&who(param, s, l.instances.as_deref()))
             .raw("</a></td><td class=\"num\">")
             .text(s.jobs)
             .raw("</td><td class=\"num\">")
@@ -451,7 +464,7 @@ fn project(
         .subjects
         .iter()
         .find(|(param, _)| *param == subject.param())
-        .map(|(param, s)| (who(param, s), s));
+        .map(|(param, s)| (who(param, s, l.instances.as_deref()), s));
     h.raw("<h2>");
     match &summary {
         Some((name, _)) => h.node(name),

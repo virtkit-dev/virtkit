@@ -314,13 +314,18 @@ fn record_html(hub: &Hub, row: &JobRow, propose: bool) -> Result<String> {
         .collect();
     let registry = super::jobs::access_registry(hub, row)?;
     let reports = super::jobs::reports_egress(hub, row)?;
+    let instances = hub.db.gitlab_instances()?;
     let mut record = Html::new();
     super::jobs::record(
         &mut record,
         row,
         &names,
         registry.as_ref(),
-        super::job_network::Shown { reports, propose },
+        super::job_network::Shown {
+            reports,
+            propose,
+            instances: instances.as_deref(),
+        },
         crate::now_secs(),
     );
     Ok(record.into_string())

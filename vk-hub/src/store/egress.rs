@@ -28,7 +28,7 @@ use vk_hub_proto::egress::{EgressCoverage, EgressOutcome, EgressPhase};
 
 use super::jobs::{JOBS, JobRow};
 use super::{Db, append_audit, decode, encode};
-use crate::egress::blocked::{Finding, Share, Subject, View, shares};
+use crate::egress::blocked::{Finding, Instances, Share, Subject, View, shares};
 use crate::egress::matching::Dest;
 use crate::subject::JobClaims;
 
@@ -215,6 +215,12 @@ impl BlockedRow {
     /// Its subject in words ([`Subject::text`]).
     pub fn who(&self) -> String {
         self.subject.text(self.project.as_deref(), &self.key_name)
+    }
+
+    /// Its subject as pages name it ([`Subject::label`]), by the hub's `instances`.
+    pub fn label(&self, instances: Instances<&str>) -> String {
+        self.subject
+            .label(self.project.as_deref(), &self.key_name, instances)
     }
 
     fn new(share: &Share) -> Self {

@@ -102,7 +102,7 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lost {
     pub subject: Subject,
-    /// Its project in words ([`Subject::text`]).
+    /// Project text from [`Subject::text`], displayed through [`Subject::relabel`].
     pub who: String,
     pub phase: String,
     pub contact: Contact,

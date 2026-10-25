@@ -879,10 +879,18 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
         };
         let registry = access_registry(&hub, &row)?;
         let reports = reports_egress(&hub, &row)?;
-        anyhow::Ok(Some((row, output, hub.db.node_names()?, registry, reports)))
+        let names = hub.db.node_names()?;
+        anyhow::Ok(Some((
+            row,
+            output,
+            names,
+            registry,
+            reports,
+            hub.db.gitlab_instances()?,
+        )))
     })
     .await?;
-    let Some((row, output, names, registry, reports)) = found else {
+    let Some((row, output, names, registry, reports, instances)) = found else {
         return Ok(message(StatusCode::NOT_FOUND, "There is no such job."));
     };
     let main = job_page(
@@ -894,6 +902,7 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
         Shown {
             reports,
             propose: auth.session.role >= Role::Operator,
+            instances: instances.as_deref(),
         },
         crate::now_secs(),
     );
@@ -1052,7 +1061,7 @@ fn job_page(
     output: &Output,
     names: &[(String, String)],
     registry: Option<&AccessRegistry>,
-    network: Shown,
+    network: Shown<'_>,
     now: u64,
 ) -> Html {
     let names: HashMap<&str, &str> = names
@@ -1130,7 +1139,7 @@ pub(super) fn record(
     j: &JobRow,
     names: &HashMap<&str, &str>,
     registry: Option<&AccessRegistry>,
-    network: Shown,
+    network: Shown<'_>,
     now: u64,
 ) {
     let result = j.result.as_ref();

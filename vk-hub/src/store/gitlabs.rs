@@ -10,6 +10,7 @@ use super::approvals::{REJECTED_GITLABS, forget_projects_of};
 use super::egress::{EGRESS_MUTES, EGRESS_SUBJECT_ORDER, Mute};
 use super::observed::OBSERVED_SUBJECTS;
 use super::{Db, append_audit, decode, encode};
+use crate::egress::blocked::Instances;
 
 /// Key: the instance's name. Value: JSON [`GitlabRow`].
 pub(super) const GITLABS: TableDefinition<&str, &[u8]> = TableDefinition::new("gitlabs");
@@ -194,6 +195,11 @@ impl Db {
             out.push((name.value().to_string(), decode(value.value())?));
         }
         Ok(out)
+    }
+
+    /// Its instances, as far as pages naming them care ([`Instances`]).
+    pub fn gitlab_instances(&self) -> Result<Instances<String>> {
+        Ok(Instances::of(self.gitlabs()?.into_iter().map(|(n, _)| n)))
     }
 
     /// Remove instance `name` and forget its projects, audited as `actor`'s, and return

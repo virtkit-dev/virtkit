@@ -1495,28 +1495,30 @@ project — a project of the GitLab instance its jobs' relay is bound to, by Git
 an older hub's jobs of an API key bound to none, every job of the key. *Blocked*, *Would block* and *Declaration issues* are
 separate views (`view=blocked|would_block|refused`), each with its count. A row shows its jobs
 and attempts in the history, its latest job's end, the layers that decided it in plain words,
-and its state; at most 200 rows, the latest first. Project (`project=gitlab:<instance>:<ID>` or
-`key:<key ID>`), deciding layer (`layer=node_cap|hub_rule|job|service|unknown`), phase
-(`phase=run|build|other`) and job (`job=<ID>`: the rows it shares) filter it, applied at once
-with htmx as on the audit log. A row's page, `/egress/rows/<id>`, shows its latest 20 jobs —
-each linked, with its ref, node, attempts and result, which a denial's effect on is unknown and a
-refused declaration caused — the VMs and refs, with the protection GitLab reported, and where to
-look to allow it by the layer that decided it: the node's `[egress]` or `[egress.build]` key and
-the nodes, or the job's or a service's variable in the job's CI configuration; for a hub rule the
-rules, and for an unknown layer the evidence alone. Its *Allow it* section offers an operator a
-proposal for a destination its latest jobs recorded as refused by a hub rule (below), a phase at
-a time, and otherwise says why there is none: a node's cap, which no hub rule widens, the job's
-own narrowing, an unknown layer, or a destination that is not a name or an address. The rows
-are kept with the job history: a job's record adds its share as it is written, once however often,
-and takes it back as it leaves the history; a hub upgraded from a version without them builds them
-from the history on start. The page names the nodes that take placed jobs and do not announce egress
-reporting, whose jobs cannot appear there. Its rows, with the job chip and the views' counts, follow
-the jobs' reports — a running job's as its record is written with them, the first at once and later
-ones at most every 30 seconds or with the next stage — and the rows' triage over `/events/egress`,
-which takes the page's filter; the filter's form and the mutes stay outside what is swapped in, and
-a filter change replaces the part that follows, stream and all. The navigation's count of New rows
-rides every live page's stream, swapped in out of band: at once where the stream follows the change,
-within a heartbeat elsewhere.
+and its state; at most 200 rows, the latest first. Where the web UI names a project with its instance,
+it uses the path, or `project <ID>` when no job named one, followed by the instance in brackets
+(`acme/web [gl]`). The instance is omitted while it is the hub's only one.
+Project (`project=gitlab:<instance>:<ID>` or `key:<key ID>`), deciding layer
+(`layer=node_cap|hub_rule|job|service|unknown`), phase (`phase=run|build|other`) and job
+(`job=<ID>`: the rows it shares) filter it, applied at once with htmx as on the audit log. A row's
+page, `/egress/rows/<id>`, shows its latest 20 jobs — each linked, with its ref, node, attempts and
+result, which a denial's effect on is unknown and a refused declaration caused — the VMs and refs,
+with the protection GitLab reported, and where to look to allow it by the layer that decided it: the
+node's `[egress]` or `[egress.build]` key and the nodes, or the job's or a service's variable in the
+job's CI configuration; for a hub rule the rules, and for an unknown layer the evidence alone. Its
+*Allow it* section offers an operator a proposal for a destination its latest jobs recorded as
+refused by a hub rule (below), a phase at a time, and otherwise says why there is none: a node's
+cap, which no hub rule widens, the job's own narrowing, an unknown layer, or a destination that is
+not a name or an address. The rows are kept with the job history: a job's record adds its share as
+it is written, once however often, and takes it back as it leaves the history; a hub upgraded from a
+version without them builds them from the history on start. The page names the nodes that take
+placed jobs and do not announce egress reporting, whose jobs cannot appear there. Its rows, with the
+job chip and the views' counts, follow the jobs' reports — a running job's as its record is written
+with them, the first at once and later ones at most every 30 seconds or with the next stage — and
+the rows' triage over `/events/egress`, which takes the page's filter; the filter's form and the
+mutes stay outside what is swapped in, and a filter change replaces the part that follows, stream
+and all. The navigation's count of New rows rides every live page's stream, swapped in out of band:
+at once where the stream follows the change, within a heartbeat elsewhere.
 
 A row is *New* until an operator acknowledges it on its page, and *New* again once a job adds to
 it — a job newly sharing it, or one with more attempts — however soon after. An operator also

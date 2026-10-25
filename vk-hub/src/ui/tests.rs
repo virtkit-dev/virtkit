@@ -7752,8 +7752,8 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
         "aria-current=\"page\">Job access</a>",
         "<h2>Storage areas</h2>",
         "<strong>wab</strong>",
-        "Projects under wab/ on gl, protected branches and tags only · can coordinate builds",
-        "Projects under wab/ on gl</td>",
+        "Projects under wab/, protected branches and tags only · can coordinate builds",
+        "Projects under wab/</td>",
         "<summary>Managed by CI",
         "<strong>CI caches</strong>",
         "<strong>Pipeline storage</strong>",
@@ -7763,6 +7763,23 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
         assert!(access.contains(want), "{want}: {access}");
     }
     assert!(!access.contains("callout"), "{access}");
+    // With a second instance, a rule names its own, and one of none every server.
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", crate::now_secs())
+        .unwrap();
+    let access = page(format!("/registry/{id}?tab=access")).await;
+    for want in [
+        "Projects under wab/ [gl], protected branches and tags only · can coordinate builds",
+        "Projects under wab/ [gl]</td>",
+        "Each pipeline [every server], its own",
+    ] {
+        assert!(access.contains(want), "{want}: {access}");
+    }
+    assert!(
+        hub.db
+            .remove_gitlab("gl2", "uid 0", crate::now_secs())
+            .unwrap()
+    );
     // The registry refused the hub's cleanup window: the tab says what it needs.
     let report = vk_hub_proto::registry::Report {
         applied: hub
@@ -8737,6 +8754,9 @@ fn blocked_report(dest: &str, count: u64) -> vk_hub_proto::egress::EgressReport 
 async fn the_egress_page_lists_denials_by_destination_and_project() {
     use vk_hub_proto::egress::*;
     let (addr, hub, _) = start_fleet().await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let empty = get(addr, "/egress", Some(&viewer)).await;
@@ -8762,7 +8782,9 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
     assert_eq!(page.status, 200, "{}", page.body);
     let body = &page.body;
     assert!(body.contains("<code>DNS crates.io</code>"), "{body}");
-    assert!(body.contains("acme/p42 on gl"), "{body}");
+    // The hub's only instance goes unnamed.
+    assert!(body.contains("\">acme/p42</a>"), "{body}");
+    assert!(!body.contains("[gl]"), "{body}");
     assert!(body.contains("Blocked (2)") && body.contains("Declaration issues (1)"));
     assert!(body.contains("the node&#39;s cap"), "{body}");
     // Three New rows: two destinations and a declaration.
@@ -8860,6 +8882,14 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
     hub.db.record_inventory(&node, reporting, true, 3).unwrap();
     let body = get(addr, "/egress", Some(&viewer)).await.body;
     assert!(!body.contains("Reporting unavailable"), "{body}");
+
+    // With a second instance, each project names its own.
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", 4)
+        .unwrap();
+    let body = get(addr, "/egress", Some(&viewer)).await.body;
+    assert!(body.contains("\">acme/p42 [gl]</a>"), "{body}");
+    assert!(body.contains(">acme/p42 [gl]</option>"), "{body}");
 }
 
 /// The Egress page's rows and their views' counts follow its filter over SSE, the filter's form
@@ -8935,6 +8965,9 @@ async fn the_egress_page_s_rows_follow_the_jobs_reports() {
 async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() {
     use vk_hub_proto::egress::*;
     let (addr, hub, _) = start_fleet().await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let empty = get(addr, "/egress?tab=observed", Some(&viewer)).await;
@@ -8985,9 +9018,7 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
 
     let list = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
     assert!(
-        list.contains(
-            "<a href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">acme/p42 on gl</a>"
-        ),
+        list.contains("<a href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">acme/p42</a>"),
         "{list}"
     );
     assert!(
@@ -8997,6 +9028,8 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
 
     let p42 = "/egress?tab=observed&project=gitlab%3Agl%3A42";
     let page = get(addr, p42, Some(&viewer)).await.body;
+    // The hub's only instance goes unnamed.
+    assert!(page.contains("<h2>acme/p42</h2>"), "{page}");
     assert!(
         page.contains("<code>DNS crates.io</code> <span class=\"sub\">lookup</span>"),
         "{page}"
@@ -9072,6 +9105,12 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
         event.contains(&a[..8]) || event.contains(&b[..8]),
         "{event}"
     );
+    // With a second instance, each project names its own.
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", 5)
+        .unwrap();
+    let page = get(addr, p42, Some(&viewer)).await.body;
+    assert!(page.contains("<h2>acme/p42 [gl]</h2>"), "{page}");
 }
 
 /// An operator acknowledges a row and mutes its project from the row's page, each audited as a
@@ -9080,6 +9119,9 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_triages_and_mutes_egress_rows() {
     let (addr, hub, origin) = start_fleet().await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
@@ -9153,7 +9195,7 @@ async fn an_operator_triages_and_mutes_egress_rows() {
     assert!(
         inbox.contains(
             "<li><a href=\"/egress?state=muted&amp;project=gitlab%3Agl%3A7\">\
-             acme/p7 on gl</a> until"
+             acme/p7</a> until"
         ),
         "{inbox}"
     );
@@ -9253,6 +9295,9 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     use crate::store::RuleMode;
     use vk_hub_proto::egress::HubPhase;
     let (addr, hub, _) = start_fleet().await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let empty = get(addr, "/egress?tab=rules", Some(&viewer)).await;
@@ -9322,7 +9367,7 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     );
     assert!(
         tab.contains(
-            "<td>Projects under wab/ on gl, protected branches and tags only</td>\
+            "<td>Projects under wab/, protected branches and tags only</td>\
              <td>corp.example.com + 1 IP range</td><td>3 domains</td>\
              <td><span class=\"badge ok\">Enforce</span></td><td>2 jobs</td>"
         ),
@@ -9374,6 +9419,28 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     assert!(page.contains("Allow none: no external access."), "{page}");
     let missing = get(addr, "/egress?tab=rules&rule=nope", Some(&viewer)).await;
     assert_eq!(missing.status, 404);
+
+    // With a second instance, a rule names its own, and one of none every server.
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", 2)
+        .unwrap();
+    egress_rule(
+        &hub,
+        "any",
+        Some("protected"),
+        allow(&["example.org"], &[]),
+        HubPhase::Unrestricted,
+        RuleMode::DryRun,
+    );
+    let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
+    assert!(
+        tab.contains("<td>Projects under wab/ [gl], protected branches and tags only</td>"),
+        "{tab}"
+    );
+    assert!(
+        tab.contains("<td>Every job [every server], protected branches and tags only</td>"),
+        "{tab}"
+    );
 
     // On, with no enforced Fallback: a warning.
     let (addr, hub, _) = start_fleet_rules(true).await;
@@ -9625,7 +9692,7 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     assert!(
         body.contains(&format!(
             "<td class=\"num\"><a href=\"/jobs/{job}\" title=\"Their latest job\">1</a></td>\
-             <td>acme/p42 on gl <span class=\"sub\">(project 42)</span></td>\
+             <td>acme/p42 [gl] <span class=\"sub\">(project 42)</span></td>\
              <td>main (protected)</td><td>Fallback</td><td>acme \
              <span class=\"badge\">Replaces the Fallback</span></td>\
              <td>now limited to pypi.org</td><td>now unrestricted by hub rules</td>"
@@ -9639,8 +9706,12 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
         ),
         "{body}"
     );
+    // Its project named as elsewhere: the hub has no instance, so not left unnamed.
     assert!(
-        body.contains("<td><code>DNS crates.io</code></td><td>Run</td>"),
+        body.contains(
+            "<td><code>DNS crates.io</code></td><td>Run</td><td><a \
+             href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">acme/p42 [gl]</a></td>"
+        ),
         "{body}"
     );
     assert!(
@@ -9816,6 +9887,9 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     use crate::store::RuleMode;
     use vk_hub_proto::egress::*;
     let (addr, hub, origin) = start_fleet().await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
@@ -9848,7 +9922,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     let (deb, capped) = (row_of("DNS deb.debian.org"), row_of("DNS x.example"));
     let link = format!(
         "<a href=\"/egress?tab=rules&amp;propose={deb}&amp;phase=build\">Propose allowing for \
-         acme/p42 on gl…</a>"
+         acme/p42…</a>"
     );
 
     let page = get(addr, &format!("/egress/rows/{deb}"), Some(&viewer))
@@ -9880,6 +9954,18 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     assert!(page.contains(&link), "{page}");
     let page = get(addr, &format!("/jobs/{job}"), Some(&viewer)).await.body;
     assert!(!page.contains("Propose allowing"), "{page}");
+    // With a second instance, the link names the project's.
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", 2)
+        .unwrap();
+    let page = get(addr, &format!("/jobs/{job}"), Some(&operator))
+        .await
+        .body;
+    assert!(
+        page.contains(&link.replace("acme/p42…", "acme/p42 [gl]…")),
+        "{page}"
+    );
+    assert!(hub.db.remove_gitlab("gl2", "uid 0", 3).unwrap());
 
     let path = format!("/egress?tab=rules&propose={deb}&phase=build");
     assert_eq!(get(addr, &path, Some(&viewer)).await.status, 403);
@@ -9887,7 +9973,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     assert_eq!(form.status, 200, "{}", form.body);
     let body = &form.body;
     for want in [
-        "<h2>Propose allowing <code>deb.debian.org</code> for acme/p42 on gl</h2>",
+        "<h2>Propose allowing <code>deb.debian.org</code> for acme/p42</h2>",
         "A hub rule refused DNS <code>deb.debian.org</code> to its jobs, in the build phase",
         "<input type=\"radio\" name=\"target\" value=\"acme\" checked> <strong>acme</strong>",
         "allows deb.debian.org and its subdomains. Nothing broader is proposed",
@@ -10015,7 +10101,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body
-            .contains("<h2>Propose allowing <code>pypi.org</code> for acme/p42 on gl</h2>"),
+            .contains("<h2>Propose allowing <code>pypi.org</code> for acme/p42</h2>"),
         "{}",
         page.body
     );
@@ -10037,6 +10123,9 @@ async fn test_a_job_shows_each_layer_apart() {
     use vk_hub_proto::egress::HubPhase;
     use vk_hub_proto::job::{CiJob, JobSpec, Variable};
     let (addr, hub, _) = start_fleet_rules(true).await;
+    hub.db
+        .add_gitlab("gl", "https://gl.example.com", "uid 0", 1)
+        .unwrap();
     let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     egress_rule(
@@ -10257,6 +10346,22 @@ async fn test_a_job_shows_each_layer_apart() {
     assert!(
         bad.contains("is neither a DNS name nor an IPv4 address"),
         "{bad}"
+    );
+
+    // The project tested names its instance unless it is the hub's only one.
+    let tested = format!("/egress?tab=test&job={id}&destination=partner.example.net");
+    let page = get(addr, &tested, Some(&viewer)).await.body;
+    assert!(
+        page.contains("<h2>Tested as</h2><p>wab/api (project 42)"),
+        "{page}"
+    );
+    hub.db
+        .add_gitlab("gl2", "https://gl2.example.com", "uid 0", 12)
+        .unwrap();
+    let page = get(addr, &tested, Some(&viewer)).await.body;
+    assert!(
+        page.contains("<h2>Tested as</h2><p>wab/api [gl] (project 42)"),
+        "{page}"
     );
 }
 

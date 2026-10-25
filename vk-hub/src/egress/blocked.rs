@@ -86,6 +86,96 @@ impl Subject {
             (Subject::Key { .. }, _) => format!("key {key_name}"),
         }
     }
+
+    /// As pages name it ([`project_label`]), by the hub's `instances`: `acme/web`,
+    /// `project 42 [gl]`, `key ci`.
+    pub fn label(
+        &self,
+        project: Option<&str>,
+        key_name: &str,
+        instances: Instances<&str>,
+    ) -> String {
+        match self {
+            Subject::Gitlab {
+                instance,
+                project_id,
+            } => {
+                let project = project.map_or_else(|| format!("project {project_id}"), Into::into);
+                project_label(&project, instance, instances)
+            }
+            Subject::Key { .. } => format!("key {key_name}"),
+        }
+    }
+
+    /// Convert [`Subject::text`] stored in mutes and subject lists to [`Subject::label`],
+    /// stripping the project's trailing ` on {instance}`.
+    pub fn relabel(&self, text: &str, instances: Instances<&str>) -> String {
+        match self {
+            Subject::Gitlab { instance, .. } => match text.strip_suffix(&format!(" on {instance}"))
+            {
+                Some(project) => project_label(project, instance, instances),
+                None => text.to_string(),
+            },
+            Subject::Key { .. } => text.to_string(),
+        }
+    }
+}
+
+/// The hub's GitLab instances, as far as pages naming them care.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Instances<S> {
+    /// None.
+    #[default]
+    None,
+    /// One, that pages leave unnamed.
+    Sole(S),
+    /// Several, that pages name, a rule of none marked `[every server]`.
+    Several,
+}
+
+impl<S> Instances<S> {
+    /// Of the instances `names`.
+    pub fn of(names: impl IntoIterator<Item = S>) -> Self {
+        let mut names = names.into_iter();
+        match (names.next(), names.next()) {
+            (None, _) => Instances::None,
+            (Some(only), None) => Instances::Sole(only),
+            (Some(_), Some(_)) => Instances::Several,
+        }
+    }
+}
+
+impl Instances<String> {
+    /// Borrowing the sole instance's name.
+    pub fn as_deref(&self) -> Instances<&str> {
+        match self {
+            Instances::None => Instances::None,
+            Instances::Sole(s) => Instances::Sole(s),
+            Instances::Several => Instances::Several,
+        }
+    }
+}
+
+/// The hub's instances, of their `names`.
+pub fn instances(names: &[String]) -> Instances<&str> {
+    Instances::of(names.iter().map(String::as_str))
+}
+
+/// A GitLab project or its description, omitting `instance` when it is the hub's only one:
+/// `acme/web`, otherwise `acme/web [gl]`.
+pub fn project_label(project: &str, instance: &str, instances: Instances<&str>) -> String {
+    format!("{project}{}", instance_tag(Some(instance), instances))
+}
+
+/// The suffix for jobs of `instance`: ` [gl]` unless it is the hub's only instance.
+/// For jobs of any instance (`None`), ` [every server]` when the hub has several, else nothing.
+pub fn instance_tag(instance: Option<&str>, instances: Instances<&str>) -> String {
+    match (instance, instances) {
+        (Some(i), Instances::Sole(s)) if i == s => String::new(),
+        (Some(i), _) => format!(" [{i}]"),
+        (None, Instances::Several) => " [every server]".to_string(),
+        (None, Instances::None | Instances::Sole(_)) => String::new(),
+    }
 }
 
 /// Which of the page's separate views a row is in, each with its own counts.
@@ -299,6 +389,47 @@ mod tests {
                 ..EgressReport::default()
             },
         )
+    }
+
+    /// The instance is named unless it is the hub's only one, from a project's path, its ID, or
+    /// the words a mute kept.
+    #[test]
+    fn a_project_names_its_instance_unless_it_is_the_only_one() {
+        let subject = Subject::Gitlab {
+            instance: "gl".into(),
+            project_id: 42,
+        };
+        let key = Subject::Key {
+            key: "a".repeat(64),
+        };
+        for (instances, path, id) in [
+            (Instances::Sole("gl"), "acme/web", "project 42"),
+            (Instances::Sole("other"), "acme/web [gl]", "project 42 [gl]"),
+            (Instances::Several, "acme/web [gl]", "project 42 [gl]"),
+            (Instances::None, "acme/web [gl]", "project 42 [gl]"),
+        ] {
+            assert_eq!(subject.label(Some("acme/web"), "ci", instances), path);
+            assert_eq!(subject.label(None, "ci", instances), id);
+            assert_eq!(subject.relabel("acme/web on gl", instances), path);
+            assert_eq!(subject.relabel("project 42 on gl", instances), id);
+            // What `text` stores, `relabel` reads back as `label` names it.
+            for project in [Some("acme/web"), None] {
+                assert_eq!(
+                    subject.relabel(&subject.text(project, "ci"), instances),
+                    subject.label(project, "ci", instances)
+                );
+            }
+            assert_eq!(key.label(None, "ci", instances), "key ci");
+            assert_eq!(key.relabel("key ci", instances), "key ci");
+        }
+        assert_eq!(instances(&["gl".into()]), Instances::Sole("gl"));
+        assert_eq!(instances(&["a".into(), "b".into()]), Instances::Several);
+        assert_eq!(instances(&[]), Instances::None);
+        assert_eq!(instance_tag(None, Instances::Sole("gl")), "");
+        assert_eq!(instance_tag(None, Instances::None), "");
+        assert_eq!(instance_tag(None, Instances::Several), " [every server]");
+        assert_eq!(instance_tag(Some("old"), Instances::Sole("gl")), " [old]");
+        assert_eq!(instance_tag(Some("gl"), Instances::None), " [gl]");
     }
 
     /// A job's denials are shared by destination, summed across phases and VMs, an observed

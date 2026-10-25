@@ -26,6 +26,7 @@ use super::super::jobs::percent_encode;
 use super::super::{Auth, Body, Ui, blocking, decode_form, field, fleet, page};
 use super::rules::{cap_summary, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital};
+use crate::egress::blocked::{instances, project_label};
 use crate::egress::cap_use::listed;
 use crate::egress::matching::{Dest, Verdict, dns_refused, verdict};
 use crate::egress::narrowing::{self, Declared, Narrowing, Says, Stand};
@@ -271,22 +272,24 @@ fn result(h: &mut Html, q: &Query, l: &Listing) {
     h.raw("<section><h2>Tested as</h2><p>");
     match &claims {
         Some(c) => {
-            h.node(&c.project_path)
-                .raw(" on ")
-                .text(&c.gitlab)
-                .raw(" (project ")
-                .text(c.project_id)
-                .raw("), ")
-                .node(if c.git_ref.is_empty() {
-                    "no ref"
-                } else {
-                    &c.git_ref
-                })
-                .raw(if c.protected {
-                    ", protected"
-                } else {
-                    ", unprotected"
-                });
+            h.node(&project_label(
+                &c.project_path,
+                &c.gitlab,
+                instances(&l.gitlabs),
+            ))
+            .raw(" (project ")
+            .text(c.project_id)
+            .raw("), ")
+            .node(if c.git_ref.is_empty() {
+                "no ref"
+            } else {
+                &c.git_ref
+            })
+            .raw(if c.protected {
+                ", protected"
+            } else {
+                ", unprotected"
+            });
         }
         None => {
             h.raw("A job of no GitLab instance: only the Fallback applies to it.");

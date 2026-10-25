@@ -21,6 +21,7 @@ use super::super::html::Html;
 use super::super::{Auth, Body, Ui, blocking, field, fleet, html_response, message, pages};
 use super::rules::{self as tab, applies_to, mode_badge, phase_summary, rule_href};
 use super::{PATH as EGRESS, Tab, capital, see_other};
+use crate::egress::blocked::{Instances, instances, project_label};
 use crate::egress::preview::{self, Edit, Group, Lost, Preview};
 use crate::egress::proposal;
 use crate::egress::rules::{self as ops, Rules};
@@ -834,7 +835,7 @@ fn preview_page(
     }
     if let Edit::Put(r) = edit {
         h.raw("<table class=\"kv\"><tbody>");
-        pages::kv(&mut h, "Applies to", &applies_to(r));
+        pages::kv(&mut h, "Applies to", &applies_to(r, instances(gitlabs)));
         pages::kv(&mut h, "Run", &phase_summary(&r.run));
         pages::kv(&mut h, "Build", &phase_summary(&r.build));
         pages::kv_html(&mut h, "Mode", &{
@@ -844,8 +845,8 @@ fn preview_page(
         });
         h.raw("</tbody></table>");
     }
-    jobs_section(&mut h, p);
-    lost_section(&mut h, p);
+    jobs_section(&mut h, p, instances(gitlabs));
+    lost_section(&mut h, p, instances(gitlabs));
 
     // Save: the change previewed, unchanged, with the generation it was made against.
     h.raw("<form class=\"wide\" method=\"post\" action=\"")
@@ -888,8 +889,8 @@ fn preview_page(
 }
 
 /// The groups of recent jobs the change affects or the rule selects, with their layer before
-/// and after.
-fn jobs_section(h: &mut Html, p: &Preview) {
+/// and after, their projects named by the hub's `instances`.
+fn jobs_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
     h.raw("<section><h3>Recent jobs</h3>");
     if p.groups.is_empty() {
         h.raw("<p class=\"empty\">no recent job is affected or selected</p>");
@@ -898,7 +899,7 @@ fn jobs_section(h: &mut Html, p: &Preview) {
             .raw("<th>rules before</th><th>rules after</th><th>run</th><th>build</th>")
             .raw("</tr></thead><tbody>");
         for g in &p.groups {
-            group_row(h, g);
+            group_row(h, g, instances);
         }
         h.raw("</tbody></table>");
     }
@@ -915,7 +916,7 @@ fn jobs_section(h: &mut Html, p: &Preview) {
     h.raw(". Entries added may allow nothing new where another entry already did.</p></section>");
 }
 
-fn group_row(h: &mut Html, g: &Group) {
+fn group_row(h: &mut Html, g: &Group, instances: Instances<&str>) {
     h.raw("<tr><td class=\"num\"><a href=\"")
         .raw(super::super::jobs::DETAIL_PREFIX)
         .text(&g.latest)
@@ -924,9 +925,8 @@ fn group_row(h: &mut Html, g: &Group) {
         .raw("</a></td><td>");
     match &g.claims {
         Some(c) => {
-            h.node(g.project.as_deref().unwrap_or(&c.project_path))
-                .raw(" on ")
-                .text(&c.gitlab)
+            let project = g.project.as_deref().unwrap_or(&c.project_path);
+            h.node(&project_label(project, &c.gitlab, instances))
                 .raw(" <span class=\"sub\">(project ")
                 .text(c.project_id)
                 .raw(")</span>");
@@ -966,8 +966,9 @@ fn group_row(h: &mut Html, g: &Group) {
         .raw("</td></tr>");
 }
 
-/// The destinations of Observed traffic the change would block, and how much evidence there is.
-fn lost_section(h: &mut Html, p: &Preview) {
+/// The destinations of Observed traffic the change would block, and how much evidence there is,
+/// their projects named by the hub's `instances`.
+fn lost_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
     h.raw("<section><h3>Observed destinations it would block</h3>");
     if p.affected.is_empty() {
         h.raw("<p class=\"callout warn\">Insufficient evidence: no job whose access it changes ")
@@ -1013,11 +1014,11 @@ fn lost_section(h: &mut Html, p: &Preview) {
                 .raw(" more not listed.</p>");
         }
     };
-    lost_table(h, &p.lost);
+    lost_table(h, &p.lost, instances);
     more(h, p.more_lost);
     if !p.maybe_lost.is_empty() {
         h.raw("<p>Blocked unless a lookup of a listed name resolved to them:</p>");
-        lost_table(h, &p.maybe_lost);
+        lost_table(h, &p.maybe_lost, instances);
         more(h, p.more_maybe_lost);
     }
     if p.observed_capped {
@@ -1028,7 +1029,7 @@ fn lost_section(h: &mut Html, p: &Preview) {
         .raw("</section>");
 }
 
-fn lost_table(h: &mut Html, lost: &[Lost]) {
+fn lost_table(h: &mut Html, lost: &[Lost], instances: Instances<&str>) {
     if lost.is_empty() {
         return;
     }
@@ -1046,7 +1047,7 @@ fn lost_table(h: &mut Html, lost: &[Lost]) {
             .raw("</td><td><a href=\"")
             .text(super::observed::subject_href(&l.subject))
             .raw("\">")
-            .node(&l.who)
+            .node(&l.subject.relabel(&l.who, instances))
             .raw("</a></td><td class=\"num\">")
             .text(l.jobs)
             .raw("</td><td>")
@@ -1104,14 +1105,14 @@ mod tests {
             dropped: 0,
         };
         let mut h = Html::new();
-        lost_section(&mut h, &p);
+        lost_section(&mut h, &p, Instances::None);
         let out = h.into_string();
         let (sure, maybe) = out.split_once("Blocked unless a lookup").unwrap();
         assert!(sure.contains("2 more not listed."), "{out}");
         assert!(maybe.contains("3 more not listed."), "{out}");
         assert!(!out.contains("Incomplete"), "{out}");
         let mut h = Html::new();
-        lost_section(&mut h, &Preview { dropped: 4, ..p });
+        lost_section(&mut h, &Preview { dropped: 4, ..p }, Instances::None);
         let out = h.into_string();
         assert!(
             out.contains("Incomplete: 4 destinations used by the projects whose access"),

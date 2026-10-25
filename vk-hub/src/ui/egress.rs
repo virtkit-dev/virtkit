@@ -33,7 +33,9 @@ use super::jobs::percent_encode;
 use super::pages;
 use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
-use crate::egress::blocked::{Finding, LAYERS, PHASES, Subject, View, layer_label, row_id, shares};
+use crate::egress::blocked::{
+    Finding, Instances, LAYERS, PHASES, Subject, View, layer_label, row_id, shares,
+};
 use crate::egress::{self, Check};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
@@ -378,6 +380,9 @@ struct Listing {
     mutes: HashMap<String, Mute>,
     /// The egress rules saved now, that rows' allows are checked against.
     rules: Vec<EgressRuleRow>,
+    /// The hub's instances, that its projects are named by
+    /// ([`crate::store::Db::gitlab_instances`]).
+    instances: Instances<String>,
     /// The rows read from the indexes.
     #[cfg(test)]
     read: usize,
@@ -437,6 +442,7 @@ fn listing(hub: &Hub, filter: &Filter) -> Result<Listing> {
         unreported: unreported(hub)?,
         mutes: HashMap::new(),
         rules: Vec::new(),
+        instances: hub.db.gitlab_instances()?,
         #[cfg(test)]
         read: 0,
     };
@@ -629,8 +635,8 @@ fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)], aut
     unreported_callout(&mut h, &l.unreported);
     h.raw("<p class=\"sub\">What the jobs of the history were refused, by destination and ")
         .raw("project, as their nodes reported it.</p>");
-    mutes_note(&mut h, &l.mutes, auth);
-    filter_form(&mut h, filter, subjects);
+    mutes_note(&mut h, &l.mutes, l.instances.as_deref(), auth);
+    filter_form(&mut h, filter, subjects, l.instances.as_deref());
     // Replaced whole by the filter's form, live part and all, so the old stream closes and the
     // new filter's opens.
     h.raw("<div id=\"")
@@ -701,7 +707,14 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
         });
         return;
     }
-    rows_table(h, filter, &l.shown, &l.mutes, &l.rules);
+    rows_table(
+        h,
+        filter,
+        &l.shown,
+        &l.mutes,
+        &l.rules,
+        l.instances.as_deref(),
+    );
     let count = l.counts.iter().find(|(v, _)| *v == view).map(|(_, c)| *c);
     let shown = u64::try_from(l.shown.len()).unwrap_or(u64::MAX);
     match count {
@@ -793,14 +806,22 @@ fn unreported_callout(h: &mut Html, nodes: &[(String, String)]) {
 /// The mutes in force, each with its reason and end, when there are any: their rows are out of
 /// the inbox and its count, shown under *Muted*. An operator unmutes each here too: a mute
 /// outlives the rows it took out.
-fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>, auth: &Auth) {
+fn mutes_note(
+    h: &mut Html,
+    mutes: &HashMap<String, Mute>,
+    instances: Instances<&str>,
+    auth: &Auth,
+) {
     if mutes.is_empty() {
         return;
     }
-    let mut mutes: Vec<(&String, &Mute)> = mutes.iter().collect();
-    mutes.sort_by(|a, b| (&a.1.who, a.0).cmp(&(&b.1.who, b.0)));
+    let mut mutes: Vec<(&String, &Mute, String)> = mutes
+        .iter()
+        .map(|(subject, m)| (subject, m, relabel(subject, &m.who, instances)))
+        .collect();
+    mutes.sort_by(|a, b| (&a.2, a.0).cmp(&(&b.2, b.0)));
     h.raw("<div class=\"callout\"><p>Muted, out of the inbox and its count, not out of the record:</p><ul>");
-    for (subject, m) in &mutes {
+    for (subject, m, who) in &mutes {
         h.raw("<li>");
         let shown = Filter {
             subject: Subject::parse(subject),
@@ -810,7 +831,7 @@ fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>, auth: &Auth) {
         h.raw("<a href=\"")
             .text(shown.href(View::Blocked))
             .raw("\">")
-            .node(&m.who)
+            .node(who)
             .raw("</a> ");
         until(h, m);
         h.raw(" (").node(&m.reason).raw(")");
@@ -827,6 +848,11 @@ fn mutes_note(h: &mut Html, mutes: &HashMap<String, Mute>, auth: &Auth) {
         h.raw("</li>");
     }
     h.raw("</ul></div>");
+}
+
+/// The words `who` kept for subject `param` as pages name it ([`Subject::relabel`]).
+fn relabel(param: &str, who: &str, instances: Instances<&str>) -> String {
+    Subject::parse(param).map_or_else(|| who.to_string(), |s| s.relabel(who, instances))
 }
 
 /// When mute `m` ends: `until 2026-…`, or `until unmuted`.
@@ -866,7 +892,12 @@ fn job_chip(h: &mut Html, filter: &Filter, id: &str, job: Option<&JobRow>) {
 
 /// The filter's form: state, project, layer and phase, the view and job kept. As on the audit log,
 /// with htmx a choice applies at once, the rows swapped in and the URL updated.
-fn filter_form(h: &mut Html, filter: &Filter, subjects: &[(String, String)]) {
+fn filter_form(
+    h: &mut Html,
+    filter: &Filter,
+    subjects: &[(String, String)],
+    instances: Instances<&str>,
+) {
     h.raw("<form id=\"egress-filter\" class=\"filter\" method=\"get\" action=\"")
         .raw(PATH)
         .raw("\" hx-get=\"")
@@ -896,7 +927,10 @@ fn filter_form(h: &mut Html, filter: &Filter, subjects: &[(String, String)]) {
     }
     h.raw("</select>");
     // Each subject once, in the words of one of its rows.
-    let mut subjects: BTreeMap<String, String> = subjects.iter().cloned().collect();
+    let mut subjects: BTreeMap<String, String> = subjects
+        .iter()
+        .map(|(param, who)| (param.clone(), relabel(param, who, instances)))
+        .collect();
     if let Some(s) = &filter.subject {
         subjects.entry(s.param()).or_insert_with(|| s.param());
     }
@@ -942,6 +976,7 @@ fn rows_table(
     rows: &[(String, BlockedRow)],
     mutes: &HashMap<String, Mute>,
     rules: &[EgressRuleRow],
+    instances: Instances<&str>,
 ) {
     let view = filter.view();
     let refused = view == View::Refused;
@@ -973,7 +1008,7 @@ fn rows_table(
                 .href(view),
             )
             .raw("\">")
-            .node(&row.who())
+            .node(&row.label(instances))
             .raw("</a></td><td class=\"num\">")
             .text(row.jobs)
             .raw("</td>");
@@ -1068,6 +1103,9 @@ struct RowDetail {
     rules: Vec<EgressRuleRow>,
     /// The phase a save from its proposal it follows was for.
     saved: Option<vk_hub_proto::egress::EgressPhase>,
+    /// The hub's instances, that its project is named by
+    /// ([`crate::store::Db::gitlab_instances`]).
+    instances: Instances<String>,
 }
 
 /// Row `id` and its latest jobs kept, the latest first: what its proposal is made from.
@@ -1113,6 +1151,7 @@ pub(super) async fn row(
             mute,
             rules: hub.db.egress_rules()?.1,
             saved,
+            instances: hub.db.gitlab_instances()?,
         }))
     })
     .await?;
@@ -1164,7 +1203,7 @@ fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
         .raw(" · <a href=\"")
         .text(subject_href(&row.subject))
         .raw("\">")
-        .node(&row.who())
+        .node(&row.label(d.instances.as_deref()))
         .raw("</a> · <a href=\"")
         .text(observed::subject_href(&row.subject))
         .raw("\">Its observed traffic</a> · <a href=\"")
@@ -1322,6 +1361,20 @@ fn capital(s: &str) -> String {
     match c.next() {
         Some(first) => first.to_uppercase().chain(c).collect(),
         None => String::new(),
+    }
+}
+
+/// `s` with the first letter of its leading word, when that word is a plain one, in
+/// lowercase, as [`capital`]'s counterpart: the rest, such as a project's path or an
+/// instance's name, as it is.
+fn lower(s: &str) -> String {
+    let word = s.split(' ').next().unwrap_or_default();
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) if word.chars().all(char::is_alphabetic) => {
+            first.to_lowercase().chain(c).collect()
+        }
+        _ => s.to_string(),
     }
 }
 
@@ -1592,7 +1645,8 @@ fn proposal_section(h: &mut Html, id: &str, d: &RowDetail, jobs: &[&JobRow], aut
             if auth.session.role >= Role::Operator {
                 h.raw("<p class=\"actions\">");
                 for phase in &seed.phases {
-                    proposal_link(h, &propose::row_href(id, *phase), &d.row.who(), {
+                    let who = d.row.label(d.instances.as_deref());
+                    proposal_link(h, &propose::row_href(id, *phase), &who, {
                         (seed.phases.len() > 1).then_some(*phase)
                     });
                     h.raw(" ");
@@ -1818,6 +1872,21 @@ mod tests {
         db.submit_job(&id, &queued, &id, b"{}", "key gitlab", 10)
             .unwrap();
         db.put_job(&id, &row, &[], 11).unwrap();
+    }
+
+    /// Only a plain leading word is lowered; a path or an instance's name is kept as it is.
+    #[test]
+    fn lower_keeps_names_as_they_are() {
+        assert_eq!(
+            lower("Projects under wab/ [GL]"),
+            "projects under wab/ [GL]"
+        );
+        assert_eq!(
+            lower("Every job [every server]"),
+            "every job [every server]"
+        );
+        assert_eq!(lower("Infra/Images [GL]"), "Infra/Images [GL]");
+        assert_eq!(lower(""), "");
     }
 
     /// The inbox's page reads its rows from the indexes, one past those it shows, and its
