@@ -141,7 +141,8 @@ struct Listing {
 }
 
 fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
-    let subjects = hub.db.observed_subjects()?;
+    let mut subjects = hub.db.observed_subjects()?;
+    subjects.retain(|(_, s)| listed(s));
     let mut coverages = HashMap::new();
     let project = match &q.subject {
         Some(subject) => {
@@ -218,6 +219,12 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
         used,
         sole: hub.db.sole_gitlab()?,
     })
+}
+
+/// Whether subject `s` is listed: a job of it reported, or a destination of it is kept. Jobs
+/// that sent no report alone, as a key's from before the hub bound keys to GitLab, are not.
+fn listed(s: &ObservedSubject) -> bool {
+    s.jobs > 0 || s.contacts > 0
 }
 
 /// What `/events/egress?tab=observed…` streams: the listing of the query, as the jobs' reports

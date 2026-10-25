@@ -8965,6 +8965,31 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
         empty.body
     );
 
+    // A project whose jobs sent no report is not listed, nor offered by the filter.
+    let silent = format!("{:032x}", 9);
+    let mut row = crate::egress::testing::job(9, EgressReport::default());
+    row.result.as_mut().unwrap().egress = None;
+    row.node = Some(node.to_string());
+    row.gitlab = Some("gl".into());
+    row.project_id = Some(9);
+    row.project = Some("acme/p9".into());
+    let mut queued = row.clone();
+    queued.result = None;
+    hub.db
+        .submit_job(&silent, &queued, &silent, b"{}", "key gitlab", 10)
+        .unwrap();
+    assert!(hub.db.put_job(&silent, &row, &[], 11).unwrap());
+    let subjects = hub.db.observed_subjects().unwrap();
+    assert!(
+        subjects
+            .iter()
+            .any(|(p, s)| p == "gitlab:gl:9" && s.unreported == 1),
+        "{subjects:?}"
+    );
+    let empty = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
+    assert!(empty.contains("nothing observed yet"), "{empty}");
+    assert!(!empty.contains("acme/p9"), "{empty}");
+
     let reached = |dest: &str| EgressEntry {
         count: 2,
         ..crate::egress::testing::entry(
@@ -9007,6 +9032,7 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
         list.contains("Run: 2 of 2 jobs reported this phase completely · Build: 0 of 1 job"),
         "{list}"
     );
+    assert!(!list.contains("acme/p9"), "{list}");
 
     let p42 = "/egress?tab=observed&project=gitlab%3Agl%3A42";
     let page = get(addr, p42, Some(&viewer)).await.body;

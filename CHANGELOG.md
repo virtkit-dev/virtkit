@@ -33,6 +33,9 @@ All notable changes to virtkit will be documented in this file.
   storage areas' access rules read the same way (`Projects under wab/`,
   `Projects under wab/ [gl]`), and while the hub has several instances a rule bound to none
   reads `[every server]`.
+- **The Egress page's Observed traffic leaves out projects with no reported job**, such as an
+  API key's jobs from before the hub bound keys to GitLab, listed with nothing but the jobs that
+  sent no report.
 
 ### Fixed
 

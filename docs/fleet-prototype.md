@@ -1542,7 +1542,9 @@ people's actions; viewers see no form, and their posts are refused.
 `/egress?tab=observed`, the *Observed traffic* tab, lists what the jobs of the history reached,
 from their nodes' reports: each project, the latest first, with its jobs reported, its
 destinations, and per phase how many of its jobs that ran it reported it completely (*Run: 84
-of 100 jobs reported this phase completely*) and how many sent no report. A project
+of 100 jobs reported this phase completely*) and how many sent no report; a project none of
+whose jobs reported, such as an API key's from before the hub bound keys to GitLab, is left
+out. A project
 (`project=`, as on the Blocked tab) lists its destinations, the latest used first: a contact
 allowed, or one a dry-run allowlist would have blocked and the switch carried, marked *would
 block* — a DNS entry marked a lookup, not proof of a connection — with its phase, jobs and
