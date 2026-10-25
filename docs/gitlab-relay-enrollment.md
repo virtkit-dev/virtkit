@@ -39,7 +39,7 @@ Nodes and registries have none of this: one token, one pinned identity, one sess
   gitlab` issues it (CLI or the Connections page); spending it pins the relay's ed25519 key. From
   then on the relay is trusted like a node: it already holds the runner tokens and sees every
   job's secrets, so a hub-side ceiling on what it claims would protect little. Removing it from
-  the page or with `vk-hub relays remove` revokes it.
+  the page or with `vk-hub relays remove` revokes it; there is no pausing one short of that.
 - **What is new is approved on the hub.** A GitLab server not yet known, and a project not yet
   approved for its server, are **pending** until an operator approves them. Approval is per
   server, so it covers every relay of that server. Nothing else needs the operator.
@@ -127,11 +127,9 @@ The relay is the job's principal: jobs, reservations and request IDs belong to i
 `{gitlab}` is its server's name, which is what egress rules, Blocked rows, registry namespaces
 and job tokens key on. The relay submits `egress: None` as today and receives no egress setting.
 
-**The approval gate.** It applies to every GitLab job submitted, whatever the principal: a
-relay's, or during the migration a key's (its bound server, or for an unbound key the server
-whose URL is the job's `server_url`). A submission whose request ID the hub has seen is answered
-with its first answer before the gate (today's handler checks the key's ceiling first), body
-digest compared as today, so a relay recovering an accepted job after a restart is not refused
+**The approval gate.** It applies to every GitLab job submitted. Only a relay submits GitLab
+jobs: an API key's are refused. A submission whose request ID the hub has seen is answered
+with its first answer before the gate, body digest compared as today, so a relay recovering an accepted job after a restart is not refused
 by a later rejection, for as long as the hub keeps request answers (a day). The gate
 applies to new submissions only: rejecting or forgetting a server or project leaves its queued
 and running jobs alone; an operator cancels them if needed.
@@ -150,9 +148,7 @@ Retry this job once an operator has approved it (Connections > GitLab > Pending)
 The job is not held: approval is a human step, and GitLab's `retry: when:
 runner_system_failure` does not retry this reason, so a pending project does not loop. A
 rejected project's jobs fail the same way, with `project_rejected` and a message saying so.
-A refused submission retried under the same request ID counts once. A 0.95 vk-gitlab refused
-this way reads a plain 403 and fails the job as `runner_system_failure`, which a project's
-`retry:` may retry once or twice; the trace says why.
+A refused submission retried under the same request ID counts once.
 
 ## Approval on the hub
 
@@ -164,7 +160,8 @@ this way reads a plain 403 and fails the job as `runner_system_failure`, which a
 - **Where.** A *Pending* section on top of the Connections page's GitLab tab, and its count on
   the Connections link, as the Egress link counts *New* items. Each row says which relay
   reported it and when, and for a project its path, first job and how many jobs failed waiting.
-  Rows of one group can be selected together for a bulk approve.
+  Rows of one group can be selected together for a bulk approve; no rule such as `acme/**`
+  approves projects no one has looked at, at the cost of each new project's first job.
 - **CLI.** `vk-hub gitlabs pending`, `gitlabs approve <url> --name <name>`, `gitlabs projects
   approve <gitlab> <id>[:<path>] …`, `reject`, `forget`. `gitlabs add <name> <url>` and
   `projects approve` also work before anything is pending.
@@ -176,30 +173,26 @@ this way reads a plain 403 and fails the job as `runner_system_failure`, which a
 
 ## Migration from 0.95
 
-No hub data is converted: a server keeps its name, so namespaces, egress records, mutes,
-Observed traffic, Blocked rows and token `pipeline` claims are unchanged. At its first start the
-0.96 hub approves every server it knows and, per server, every project a bound key lists and
-every project its retained job history names, audited as migrated. Projects older than the
-history, or run only through unbound keys, are not recoverable: they go pending at their next
-job, or are approved beforehand with `gitlabs projects approve`. From 0.96 keys pass the same
-gate, after their ceiling: a key with a project list keeps refusing other projects with a
-plain 403, as today, and its daemon is switched to a relay to have them listed as pending.
+A breaking release: no coexistence. vk-gitlab runs only as an enrolled relay, and GitLab-bound
+API keys go — `keys create --gitlab`/`--projects`, the key's binding and project ceiling, the
+Runner keys on the GitLab tab, and the hub's resolution of a job's server from its key. An API
+key's GitLab jobs are refused.
 
-The hub scopes jobs to their principal. vk-gitlab's state file records today the key its jobs
-were submitted with (`check_hub_key`), which a relay, holding no key, would skip; it records a
-tagged principal instead (`key:<fingerprint>` or `relay:<hub>/<id>`), `run` refuses records of
-another, and `join`, `join --replace` and `leave` refuse while records remain. SIGTERM's
-bounded shutdown can leave some: wait until the state files are empty. Each switch is **drain,
-switch, start**:
+The hub converts once, at its first start, so no operator state is lost: every server it knows
+stays, approved under its name, so namespaces, egress records, mutes, Observed traffic, Blocked
+rows and token `pipeline` claims are unchanged; per server, every project a bound key lists and
+every project its retained job history names is approved; the bound keys are revoked. All of it
+audited as migrated. Projects older than the history, or run only through unbound keys, go
+pending at their next job, or are approved beforehand with `gitlabs projects approve`.
 
-1. upgrade the hub to 0.96; keys keep working;
-2. per daemon: `vk-hub token create --kind gitlab`; stop vk-gitlab with SIGTERM and let it drain;
-   `vk-gitlab join`, move the runners' URL to `[gitlab] url`, drop `[hub]`'s key, start. Undo:
-   drain, `leave`, restore the key, start;
-3. revoke the key once its jobs are settled: its instance rows go with it, and so do the
-   duplicates;
-4. 0.98 or later: `keys create --gitlab`/`--projects` removed, and a key's GitLab jobs refused
-   with a message pointing here; `KeyRow.gitlab`/`projects` stay readable.
+vk-gitlab's state file records the relay its jobs were submitted as, `run` refuses records of
+another, and `join`, `join --replace` and `leave` refuse while records remain; a 0.95 state
+file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
+
+1. stop each vk-gitlab with SIGTERM and let it drain, until its state files are empty;
+2. upgrade the hub and vk-gitlab;
+3. per daemon: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`, move the
+   runners' URL to `[gitlab] url`, drop `[hub]`'s key, start.
 
 `/v1/clients` and `vk-client-instance` stay for the API keys of other clients.
 
@@ -207,7 +200,7 @@ switch, start**:
 
 | Commit | Fate |
 |---|---|
-| `c5d7f33b` add and remove GitLab servers | survives: adding pre-approves a server; the removal guard extends to bound relays. Land it |
+| `c5d7f33b` add and remove GitLab servers | survives: adding pre-approves a server; the removal guard moves from bound keys to bound relays. Land it |
 | `8abfff87` create runner keys | dropped: an *Add relay* button issuing an enrollment token replaces the key form and its policy fields |
 | `00d56a06` Replace link | dropped: re-keying is `join --replace` with a new token, then removing the old relay |
 
@@ -228,19 +221,10 @@ takes a new version; enums read from the wire (runner states, server status) car
 2. Hub: `TokenKind::Gitlab`, the relays table, enroll and session, inventory stored, server
    status; `vk-hub relays list|show|remove`, servers pending and approved.
 3. Hub: signed requests as a principal on the client API; the approval gate for every GitLab
-   job, after the request-ID lookup; projects pending, approved and rejected; the migration's
-   approvals; registry token minting and egress resolution taking the server from the relay
-   (today `tokens.rs` resolves it from a snapshot of GitLab-bound keys).
-4. vk-gitlab: `join`, `leave`, the session, the signed hub client, the tagged principal in
-   state files, failing a job refused for approval.
-5. UI: relays and runners on the GitLab tab, *Add relay*, the Pending section and its count;
-   land `c5d7f33b`.
-6. Removal of GitLab-bound keys.
-
-## Open questions
-
-- **Approving by group?** Proposed: one project at a time, with bulk selection. A rule such as
-  `acme/**` would spare each new project's first failed job, but approves projects no one has
-  looked at.
-- **Pausing a relay** from the hub, short of removing it: wanted now?
-- **Hub-side placement**: needed, or is the relay's config enough?
+   job, after the request-ID lookup; projects pending, approved and rejected; the migration;
+   registry token minting and egress resolution taking the server from the relay; removal of
+   GitLab-bound keys.
+4. vk-gitlab: `join`, `leave`, the session, the signed hub client, the relay as the principal
+   in state files, failing a job refused for approval; removal of its API key.
+5. UI: relays and runners on the GitLab tab, *Add relay*, the Pending section and its count,
+   the Runner keys gone; land `c5d7f33b`.
