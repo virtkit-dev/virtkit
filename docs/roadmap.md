@@ -24,6 +24,9 @@ runs beside it; **C**, the trust model, starts once A3 has shipped.
 | A6d. Hub rules | egress rules (store, CLI, Rules tab with Preview → Save), `JobStart`'s field, the enforcing capability that gates placement, dry-run in both phases, Test a job; Observed traffic compared with the rules, no observed use for rule entries, and for node caps reported versioned | egress by project and ref, and which entries a project does not use | M |
 | A6e. Rules from reports | prefilled proposals from Blocked rows, promotion previews, rollout guidance | rules written from evidence | S |
 
+A1's GitLab-bound keys and their project ceilings are gone: [GitLab relays](gitlab-relay-enrollment.md)
+and per-project approval on the hub replace them.
+
 A6a needs no other milestone; A6b to A6e build on it in that order, A6d also on A1's matcher and
 A3's `JobStart` field.
 

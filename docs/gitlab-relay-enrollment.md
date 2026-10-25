@@ -1,8 +1,8 @@
 # A GitLab relay that enrolls with the hub (design)
 
-Status: **proposed**. Builds on [the fleet design](fleet-design.md),
-[GitLab dispatch](gitlab-dispatch.md) and [a registry the hub manages](registry-hub.md), whose
-enrollment and session this reuses.
+Status: **implemented** (steps 1 to 5 below), in the release after 0.95. Builds on [the fleet
+design](fleet-design.md), [GitLab dispatch](gitlab-dispatch.md) and [a registry the hub
+manages](registry-hub.md), whose enrollment and session this reuses.
 
 `vk-gitlab` becomes a **relay**: a peer that enrolls with the hub as a node or a registry does,
 then says what it is and what it sees. Its identity replaces the hub API key. The hub trusts an
