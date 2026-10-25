@@ -13,7 +13,7 @@ use vk_hub_proto::client::Placement;
 use vk_hub_proto::job::Envelope;
 
 use super::clients::remove_clients_of;
-use super::gitlabs::{GITLABS, ProjectCeiling, normalize_gitlab_url};
+use super::gitlabs::{GITLABS, ProjectCeiling};
 use super::{Db, append_audit, decode, encode, token_key};
 
 /// Key: `sha256(key)`, hex. Value: JSON [`KeyRow`].
@@ -43,7 +43,8 @@ pub const ANY_POOL: &str = "*";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
-    /// The whole client API: capacity, reservations, jobs.
+    /// The client API but job submission, which only an enrolled relay makes: capacity,
+    /// reservations, existing jobs.
     Jobs,
     /// Only `POST /v1/capacity`: watching the fleet's room, holding nothing.
     Capacity,
@@ -182,33 +183,58 @@ fn refused(why: impl Into<String>) -> anyhow::Error {
     KeyRefused(why.into()).into()
 }
 
-/// Who a client request authenticated as.
+/// Who a client request authenticated as: an API key, or an enrolled GitLab relay signing
+/// its requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiPrincipal {
-    /// `sha256(key)`, hex: what the key's jobs and reservations are recorded under, so a new
-    /// key of the same name does not inherit them.
+    /// What its jobs and reservations are recorded under: a key's `sha256(key)`, hex, so a new
+    /// key of the same name does not inherit them; a relay's ID, shorter, so neither is taken
+    /// for the other.
     pub id: String,
-    pub row: KeyRow,
+    /// Its name, for display: a key's name, a relay's hostname.
+    pub name: String,
     /// The client instance the request named in
     /// [`INSTANCE_HEADER`](vk_hub_proto::client::INSTANCE_HEADER); `None` when it named
-    /// none, or a malformed one.
+    /// none, or a malformed one, and for a relay.
     pub instance: Option<String>,
+    pub kind: PrincipalKind,
+}
+
+/// What authenticated a client request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrincipalKind {
+    Key(Box<KeyRow>),
+    /// An enrolled relay: trusted as a node is, with no policy of its own.
+    Relay,
 }
 
 impl ApiPrincipal {
     /// The principal as the audit log names it.
     pub fn actor(&self) -> String {
-        format!("key {}", self.row.name)
+        match self.kind {
+            PrincipalKind::Key(_) => format!("key {}", self.name),
+            PrincipalKind::Relay => format!("relay {}", self.id),
+        }
+    }
+
+    /// Whether it is a relay.
+    pub fn is_relay(&self) -> bool {
+        self.kind == PrincipalKind::Relay
     }
 
     pub fn has(&self, scope: Scope) -> bool {
-        self.row.scopes.contains(&scope)
+        match &self.kind {
+            PrincipalKind::Key(row) => row.scopes.contains(&scope),
+            PrincipalKind::Relay => true,
+        }
     }
 
     /// Why `placement` is outside this key's policy, if it is.
     pub fn refuses(&self, placement: &Placement) -> Option<String> {
-        if !self
-            .row
+        let PrincipalKind::Key(row) = &self.kind else {
+            return None;
+        };
+        if !row
             .pools
             .iter()
             .any(|p| p == ANY_POOL || *p == placement.pool)
@@ -218,50 +244,12 @@ impl ApiPrincipal {
                 placement.pool
             ));
         }
-        if let Some(max) = self.row.max_envelope
+        if let Some(max) = row.max_envelope
             && !placement.envelope.fits_in(max)
         {
             return Some(format!(
                 "the envelope is larger than this key's limit of {}",
                 envelope_text(max)
-            ));
-        }
-        None
-    }
-
-    /// Why this key refuses `ci`, or `None`. Bound keys submit only their instance's jobs,
-    /// restricted by both ID and path when projects are listed. `instance_url` must be in
-    /// [`normalize_gitlab_url`]'s form.
-    pub fn refuses_job(
-        &self,
-        ci: &vk_hub_proto::job::CiJob,
-        instance_url: Option<&str>,
-    ) -> Option<String> {
-        let name = self.row.gitlab.as_deref()?;
-        let from = normalize_gitlab_url(&ci.server_url);
-        if instance_url.is_none() || from.as_deref() != instance_url {
-            return Some(format!(
-                "this key submits the jobs of GitLab instance {name} only, not of {:?}",
-                vk_hub_proto::display_safe(&ci.server_url)
-            ));
-        }
-        if ci.job.project_id == 0 {
-            return Some(
-                "a job from a bound key names its project: its ID is what its namespaces use"
-                    .to_string(),
-            );
-        }
-        if !self.row.projects.is_empty()
-            && !self
-                .row
-                .projects
-                .iter()
-                .any(|p| p.id == ci.job.project_id && p.path == ci.job.project_path)
-        {
-            return Some(format!(
-                "this key may not submit jobs of project {} ({})",
-                ci.job.project_id,
-                vk_hub_proto::display_safe(&ci.job.project_path)
             ));
         }
         None
@@ -437,10 +425,11 @@ impl Db {
         else {
             return Ok(None);
         };
-        Ok(row.live(now).then_some(ApiPrincipal {
+        Ok(row.live(now).then(|| ApiPrincipal {
             id,
-            row,
+            name: row.name.clone(),
             instance: None,
+            kind: PrincipalKind::Key(Box::new(row)),
         }))
     }
 
@@ -578,7 +567,7 @@ mod tests {
         assert!(key.starts_with(KEY_PREFIX));
         assert!(key.contains(&row.prefix));
         let found = db.api_key(&key, 101).unwrap().unwrap();
-        assert_eq!(found.row.name, "gitlab");
+        assert_eq!(found.name, "gitlab");
         assert_eq!(found.actor(), "key gitlab");
         // Expired, then a guess and the bare prefix.
         assert!(db.api_key(&key, 100 + DAY.as_secs()).unwrap().is_none());

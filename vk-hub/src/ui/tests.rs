@@ -4226,18 +4226,21 @@ async fn an_operator_creates_an_api_key_shown_once() {
     assert_eq!(key.len(), 4 + 64, "{key}");
     let now = crate::now_secs();
     let principal = hub.db.api_key(&key, now).unwrap().expect("a working key");
-    assert_eq!(principal.row.scopes, [Scope::Jobs, Scope::Capacity]);
-    assert_eq!(principal.row.pools, ["build", "ci"]);
+    let crate::store::PrincipalKind::Key(row) = principal.kind else {
+        panic!("not a key");
+    };
+    assert_eq!(row.scopes, [Scope::Jobs, Scope::Capacity]);
+    assert_eq!(row.pools, ["build", "ci"]);
     assert_eq!(
-        principal.row.max_envelope,
+        row.max_envelope,
         Some(vk_hub_proto::job::Envelope {
             mem_mib: 16 << 10,
             cpus: 8,
             disk_bytes: u64::MAX,
         })
     );
-    assert!(principal.row.expires_at.abs_diff(now + 30 * 86_400) < 60);
-    assert!(principal.row.created_by.contains("(operator)"));
+    assert!(row.expires_at.abs_diff(now + 30 * 86_400) < 60);
+    assert!(row.created_by.contains("(operator)"));
     let audit = audited(&hub, "created API key gitlab").await;
     assert!(audit.iter().all(|e| !e.contains(&key)), "{audit:?}");
 
@@ -8150,7 +8153,7 @@ async fn a_job_page_says_what_registry_access_the_job_got() {
     for (id, want) in [
         (
             none(2, NoAccess::UnboundKey, None, None),
-            "connected to no GitLab server. <a href=\"/clients\">Connections</a>",
+            "no longer approved. <a href=\"/clients\">Connections</a>",
         ),
         (
             none(3, NoAccess::NodeWithoutJobTokens, None, None),

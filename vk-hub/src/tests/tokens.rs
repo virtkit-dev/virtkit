@@ -275,7 +275,7 @@ fn policy(gitlab: Option<&str>, projects: Vec<ProjectCeiling>) -> KeyPolicy {
 }
 
 #[test]
-fn a_bound_key_submits_its_instance_s_listed_projects_only() {
+fn a_bound_key_holds_its_instance() {
     let db = Db::open_memory().unwrap();
     let ttl = Duration::from_secs(3600);
     assert!(
@@ -298,28 +298,7 @@ fn a_bound_key_submits_its_instance_s_listed_projects_only() {
     let (key, _) = db
         .create_api_key("c", &policy(Some("gl"), listed), ttl, "u", 1)
         .unwrap();
-    let principal = db.api_key(&key, 2).unwrap().unwrap();
-    let url = db.gitlab("gl").unwrap().unwrap().url;
-    let mut ci = vk_hub_proto::job::CiJob {
-        server_url: "https://gitlab.example.com:443".into(),
-        ..vk_hub_proto::job::CiJob::default()
-    };
-    ci.job.project_id = 42;
-    ci.job.project_path = "wab/core".into();
-    assert_eq!(principal.refuses_job(&ci, Some(&url)), None);
-    let mut other_path = ci.clone();
-    other_path.job.project_path = "wab/other".into();
-    assert!(principal.refuses_job(&other_path, Some(&url)).is_some());
-    let mut other_id = ci.clone();
-    other_id.job.project_id = 43;
-    assert!(principal.refuses_job(&other_id, Some(&url)).is_some());
-    let mut other_gitlab = ci.clone();
-    other_gitlab.server_url = "https://evil.example.com".into();
-    assert!(principal.refuses_job(&other_gitlab, Some(&url)).is_some());
-    assert!(
-        principal.refuses_job(&ci, None).is_some(),
-        "instance removed"
-    );
+    db.api_key(&key, 2).unwrap().unwrap();
     assert!(db.remove_gitlab("gl", "u", 2).is_err(), "a key is bound");
     db.revoke_api_key("c", "u", 3).unwrap();
     assert!(db.remove_gitlab("gl", "u", 3).unwrap());
@@ -604,26 +583,31 @@ fn a_url_taken_since_the_token_was_issued_is_not_bound() {
 }
 
 #[test]
-fn only_working_bound_keys_have_their_jobs_minted_for() {
+fn only_relays_of_approved_servers_have_their_jobs_minted_for() {
     let db = Db::open_memory().unwrap();
     db.add_gitlab("gl", "https://gitlab.example.com", "u", 1)
         .unwrap();
-    let ttl = Duration::from_secs(3600);
-    let now = now_secs();
-    db.create_api_key("bound", &policy(Some("gl"), Vec::new()), ttl, "u", now)
+    let relay = |key: &str, url: &str| {
+        let (token, _) = db
+            .create_token_for(TokenKind::Gitlab, Duration::from_secs(60), None, "u", 1)
+            .unwrap();
+        let crate::store::RelayEnrollment::Enrolled { id } =
+            db.enroll_relay(&token, key, "h", "p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let mut inventory = vk_hub_proto::gitlab::Inventory::default();
+        inventory.server.url = url.into();
+        db.record_relay(&id, crate::store::RelayWrite::Inventory(inventory), 1)
+            .unwrap();
+        id
+    };
+    let approved = relay("aa", "https://gitlab.example.com/");
+    relay("bb", "https://pending.example.com");
+    relay("cc", "https://rejected.example.com");
+    db.reject_gitlab("https://rejected.example.com", "u", 2)
         .unwrap();
-    db.create_api_key("plain", &policy(None, Vec::new()), ttl, "u", now)
-        .unwrap();
-    db.create_api_key("gone", &policy(Some("gl"), Vec::new()), ttl, "u", now)
-        .unwrap();
-    db.revoke_api_key("gone", "u", now).unwrap();
-    let ids: std::collections::BTreeMap<String, String> = db
-        .api_keys_with_ids()
-        .unwrap()
-        .into_iter()
-        .map(|(id, row)| (row.name, id))
-        .collect();
-    let bound = db.mint_snapshot(now).unwrap().bound;
+    let bound = db.mint_snapshot().unwrap().bound;
     assert_eq!(bound.len(), 1);
-    assert_eq!(bound.get(&ids["bound"]).map(String::as_str), Some("gl"));
+    assert_eq!(bound.get(&approved).map(String::as_str), Some("gl"));
 }

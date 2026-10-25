@@ -3,12 +3,18 @@
 //! instance has is pending until approved ([`Db::add_gitlab`]) or rejected here; a project is
 //! keyed by its instance's name and GitLab's ID for it, so removing the instance forgets them.
 //! Every decision is audited.
+//!
+//! The approval gate ([`Db::gate_job`]) lets a relay's new GitLab job through only when its
+//! server and project are approved; a job of a project not known makes it pending.
 
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use vk_hub_proto::client::ErrorCode;
 
 use super::gitlabs::{GITLABS, GitlabRow, normalize_gitlab_url, valid_project_path};
+use super::jobs::{REQUEST_KEEP, REQUESTS, RequestRow, request_key, sweep_requests};
+use super::relays::{RELAYS, RelayRow, Servers};
 use super::{Db, append_audit, decode, encode};
 
 /// Key: `(instance name, project ID)`. Value: JSON [`ProjectRow`].
@@ -174,6 +180,326 @@ pub(super) fn forget_projects_of(txn: &redb::WriteTransaction, name: &str) -> Re
         table.remove((name, *id))?;
     }
     Ok(ids.len())
+}
+
+/// Why the approval gate refused a job: its client API error. A refusal for approval is the
+/// answer of the request that submitted the job, so a retry under the same request ID gets it
+/// again and counts once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub code: ErrorCode,
+    pub error: String,
+}
+
+/// What a relay's GitLab job is, as the approval gate looks at it.
+#[derive(Clone, Debug)]
+pub struct GateJob<'a> {
+    /// The job's GitLab server, as its spec names it.
+    pub server_url: &'a str,
+    pub project_id: u64,
+    pub project_path: &'a str,
+    /// GitLab's ID of the job, and its page.
+    pub job_id: u64,
+    pub job_url: Option<&'a str>,
+}
+
+/// What the approval gate came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Accepted, of the instance by this name.
+    Pass(String),
+    Refused(Refusal),
+    /// Another attempt of the request was answered with a job meanwhile.
+    Seen,
+}
+
+/// What the gate makes of a job before writing anything.
+enum Check {
+    Refuse {
+        refusal: Refusal,
+        recorded: bool,
+    },
+    /// Server approved, under this name; the project as stored, if it is.
+    Project {
+        gitlab: String,
+        project: Option<ProjectRow>,
+    },
+}
+
+fn refuse(code: ErrorCode, error: String, recorded: bool) -> Check {
+    Check::Refuse {
+        refusal: Refusal { code, error },
+        recorded,
+    }
+}
+
+/// Relay `relay`'s job `job` against the relays, servers and projects as stored.
+fn check(
+    relays: &impl ReadableTable<&'static str, &'static [u8]>,
+    servers: &Servers,
+    projects: &impl ReadableTable<(&'static str, u64), &'static [u8]>,
+    relay: &str,
+    job: &GateJob<'_>,
+) -> Result<Check> {
+    let Some(row) = relays
+        .get(relay)?
+        .map(|g| decode::<RelayRow>(g.value()))
+        .transpose()?
+    else {
+        return Ok(refuse(
+            ErrorCode::Unauthorized,
+            "this relay was removed from the hub".into(),
+            false,
+        ));
+    };
+    let Some(bound) = row.server_url.as_deref() else {
+        return Ok(refuse(
+            ErrorCode::Forbidden,
+            "this relay has not reported its GitLab server to the hub yet".into(),
+            false,
+        ));
+    };
+    if normalize_gitlab_url(job.server_url).as_deref() != Some(bound) {
+        return Ok(refuse(
+            ErrorCode::Forbidden,
+            format!(
+                "this relay is bound to GitLab {bound}, not {}",
+                vk_hub_proto::display_safe(job.server_url)
+            ),
+            false,
+        ));
+    }
+    let reported = row.inventory.as_ref().map(|i| i.server.url.as_str());
+    let status = servers.status_of(bound, reported);
+    let gitlab = match (status.state, status.name) {
+        (vk_hub_proto::gitlab::ServerState::Approved, Some(name)) => name,
+        (vk_hub_proto::gitlab::ServerState::Rejected, _) => {
+            return Ok(refuse(
+                ErrorCode::ProjectRejected,
+                format!("GitLab server {bound} was rejected on the hub"),
+                true,
+            ));
+        }
+        (vk_hub_proto::gitlab::ServerState::Rebound, _) => {
+            return Ok(refuse(
+                ErrorCode::Forbidden,
+                format!(
+                    "this relay is bound to GitLab {bound} but reports another server: enroll \
+                     it again"
+                ),
+                false,
+            ));
+        }
+        _ => {
+            return Ok(refuse(
+                ErrorCode::ApprovalPending,
+                format!(
+                    "GitLab server {bound} is waiting for approval on the hub: `vk-hub gitlabs \
+                     approve {bound} --name <name>`"
+                ),
+                true,
+            ));
+        }
+    };
+    if job.project_id == 0 || !valid_project_path(job.project_path) {
+        return Ok(refuse(
+            ErrorCode::Invalid,
+            "a GitLab job names its project, by ID and path".into(),
+            false,
+        ));
+    }
+    let project = projects
+        .get((gitlab.as_str(), job.project_id))?
+        .map(|g| decode::<ProjectRow>(g.value()))
+        .transpose()?;
+    Ok(Check::Project { gitlab, project })
+}
+
+fn pending_error(gitlab: &str, id: u64, path: &str) -> String {
+    format!(
+        "project {path} (ID {id}) of GitLab instance {gitlab} is waiting for approval on the \
+         hub: `vk-hub gitlabs projects approve {gitlab} {id}`"
+    )
+}
+
+impl Db {
+    /// The approval gate, for a new GitLab job relay `relay` submits as request `request_id`
+    /// with a body hashing to `digest`: the job's instance when its server and project are
+    /// approved. A project not known becomes pending, audited; a refusal for approval is
+    /// counted on the project and recorded as the request's answer.
+    pub fn gate_job(
+        &self,
+        relay: &str,
+        job: &GateJob<'_>,
+        (request_id, digest): (&str, &str),
+        now: u64,
+    ) -> Result<Gate> {
+        let path = vk_hub_proto::display_safe(job.project_path);
+        {
+            // Most jobs are of a project approved, as it is named: no write.
+            let txn = self.db.begin_read().context("starting a read")?;
+            let servers = Servers::read(&txn)?;
+            let checked = check(
+                &txn.open_table(RELAYS)?,
+                &servers,
+                &txn.open_table(GITLAB_PROJECTS)?,
+                relay,
+                job,
+            )?;
+            if let Check::Project {
+                gitlab,
+                project: Some(p),
+            } = checked
+                && p.state == ProjectState::Approved
+                && p.path == path
+            {
+                return Ok(Gate::Pass(gitlab));
+            }
+        }
+        let txn = self.db.begin_write().context("starting a write")?;
+        // An attempt of this request given up on may have been answered meanwhile: that answer
+        // stands, and counts once.
+        let answered = txn
+            .open_table(REQUESTS)?
+            .get(request_key(relay, request_id).as_str())?
+            .map(|g| decode::<RequestRow>(g.value()))
+            .transpose()?
+            .filter(|r| now.saturating_sub(r.at) < REQUEST_KEEP);
+        if let Some(answered) = answered {
+            return Ok(match answered.refusal() {
+                _ if answered.digest != digest => Gate::Refused(Refusal {
+                    code: ErrorCode::Conflict,
+                    error: "this request_id was used before with another body".into(),
+                }),
+                Some(refusal) => Gate::Refused(refusal),
+                None => Gate::Seen,
+            });
+        }
+        let servers = Servers::read_from(
+            &txn.open_table(GITLABS)?,
+            &txn.open_table(REJECTED_GITLABS)?,
+        )?;
+        let checked = {
+            let projects = txn.open_table(GITLAB_PROJECTS)?;
+            check(&txn.open_table(RELAYS)?, &servers, &projects, relay, job)?
+        };
+        let (gate, recorded) = match checked {
+            Check::Refuse { refusal, recorded } => (Gate::Refused(refusal), recorded),
+            Check::Project { gitlab, project } => {
+                let mut table = txn.open_table(GITLAB_PROJECTS)?;
+                let key = (gitlab.as_str(), job.project_id);
+                match project {
+                    Some(mut p) if p.state == ProjectState::Approved => {
+                        p.path = path;
+                        table.insert(key, encode(&p)?.as_slice())?;
+                        (Gate::Pass(gitlab.clone()), false)
+                    }
+                    Some(mut p) => {
+                        p.refused = p.refused.saturating_add(1);
+                        p.path = path;
+                        table.insert(key, encode(&p)?.as_slice())?;
+                        let error = if p.state == ProjectState::Rejected {
+                            Refusal {
+                                code: ErrorCode::ProjectRejected,
+                                error: format!(
+                                    "project {} (ID {}) of GitLab instance {gitlab} was rejected \
+                                     on the hub",
+                                    p.path, job.project_id
+                                ),
+                            }
+                        } else {
+                            Refusal {
+                                code: ErrorCode::ApprovalPending,
+                                error: pending_error(&gitlab, job.project_id, &p.path),
+                            }
+                        };
+                        (Gate::Refused(error), true)
+                    }
+                    None => {
+                        let count = table
+                            .range((gitlab.as_str(), 0)..=(gitlab.as_str(), u64::MAX))?
+                            .count();
+                        if count >= MAX_PROJECTS {
+                            let error = format!(
+                                "GitLab instance {gitlab} has {MAX_PROJECTS} projects on the \
+                                 hub already: an operator forgets some first"
+                            );
+                            (
+                                Gate::Refused(Refusal {
+                                    code: ErrorCode::Forbidden,
+                                    error,
+                                }),
+                                false,
+                            )
+                        } else {
+                            let row = ProjectRow {
+                                state: ProjectState::Pending,
+                                path: path.clone(),
+                                since: now,
+                                first_job: Some(job.job_id),
+                                first_job_url: job.job_url.map(vk_hub_proto::display_safe),
+                                relay: Some(relay.to_string()),
+                                refused: 1,
+                                decided_by: None,
+                                decided_at: None,
+                            };
+                            table.insert(key, encode(&row)?.as_slice())?;
+                            let actor = format!("relay {relay}");
+                            let event = format!(
+                                "{actor} submitted job {} of project {path} (ID {}) of GitLab \
+                                 instance {gitlab}, which is pending approval",
+                                job.job_id, job.project_id
+                            );
+                            append_audit(&txn, Some(relay), &actor, &event, now)?;
+                            let error = pending_error(&gitlab, job.project_id, &path);
+                            (
+                                Gate::Refused(Refusal {
+                                    code: ErrorCode::ApprovalPending,
+                                    error,
+                                }),
+                                true,
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        if let (Gate::Refused(refusal), true) = (&gate, recorded) {
+            let mut requests = txn.open_table(REQUESTS)?;
+            sweep_requests(self, &mut requests, now)?;
+            let row = RequestRow {
+                at: now,
+                digest: digest.to_string(),
+                answer: serde_json::json!({ "refused": refusal }),
+            };
+            requests.insert(
+                request_key(relay, request_id).as_str(),
+                encode(&row)?.as_slice(),
+            )?;
+        }
+        txn.commit().context("gating a GitLab job")?;
+        Ok(gate)
+    }
+
+    /// The name of the instance relay `relay` is bound to, if its server is one: what a job
+    /// it submitted before is recorded under.
+    pub fn relay_gitlab(&self, relay: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let Some(row) = txn
+            .open_table(RELAYS)?
+            .get(relay)?
+            .map(|g| decode::<RelayRow>(g.value()))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let servers = Servers::read(&txn)?;
+        Ok(row
+            .server_url
+            .as_deref()
+            .and_then(|url| servers.name_of(url))
+            .map(str::to_string))
+    }
 }
 
 impl Db {
@@ -463,6 +789,133 @@ mod tests {
         let err = db.reject_gitlab("https://gl.example", "u", 6).unwrap_err();
         assert!(err.to_string().contains("instance gl"), "{err:#}");
         assert!(db.reject_gitlab("not a url", "u", 6).is_err());
+    }
+
+    /// A relay enrolled and bound to `url`.
+    fn relay(db: &Db, key: &str, url: &str) -> String {
+        let (token, _) = db
+            .create_token_for(
+                super::super::TokenKind::Gitlab,
+                std::time::Duration::from_secs(60),
+                None,
+                "u",
+                1,
+            )
+            .unwrap();
+        let super::super::RelayEnrollment::Enrolled { id } =
+            db.enroll_relay(&token, key, "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let mut inventory = vk_hub_proto::gitlab::Inventory::default();
+        inventory.server.url = url.into();
+        db.record_relay(&id, super::super::RelayWrite::Inventory(inventory), 1)
+            .unwrap();
+        id
+    }
+
+    fn job(project_id: u64, path: &str) -> GateJob<'_> {
+        GateJob {
+            server_url: "https://gl.example/",
+            project_id,
+            project_path: path,
+            job_id: 100 + project_id,
+            job_url: Some("https://gl.example/acme/web/-/jobs/1"),
+        }
+    }
+
+    fn code(gate: Gate) -> ErrorCode {
+        match gate {
+            Gate::Refused(r) => r.code,
+            Gate::Pass(name) => panic!("passed as {name}"),
+            Gate::Seen => panic!("seen"),
+        }
+    }
+
+    #[test]
+    fn the_gate_passes_jobs_of_approved_servers_and_projects_only() {
+        let db = Db::open_memory().unwrap();
+        let id = relay(&db, "aa", "https://gl.example");
+        let rid = |n: u8| format!("{n:02x}").repeat(16);
+        let gate = |job: &GateJob<'_>, n: u8| db.gate_job(&id, job, (&rid(n), "d"), 10).unwrap();
+        // The server waits: refused, the refusal kept as the request's answer.
+        assert_eq!(
+            code(gate(&job(4, "acme/web"), 1)),
+            ErrorCode::ApprovalPending
+        );
+        let answer = db.request(&id, &rid(1), 10).unwrap().unwrap();
+        assert_eq!(answer.refusal().unwrap().code, ErrorCode::ApprovalPending);
+        db.reject_gitlab("https://gl.example", "u", 2).unwrap();
+        assert_eq!(
+            code(gate(&job(4, "acme/web"), 2)),
+            ErrorCode::ProjectRejected
+        );
+        db.add_gitlab("gl", "https://gl.example", "u", 3).unwrap();
+        // Another server's job, and one naming no project.
+        let mut foreign = job(4, "acme/web");
+        foreign.server_url = "https://evil.example";
+        assert_eq!(code(gate(&foreign, 3)), ErrorCode::Forbidden);
+        assert!(db.request(&id, &rid(3), 10).unwrap().is_none());
+        assert_eq!(code(gate(&job(0, "acme/web"), 3)), ErrorCode::Invalid);
+        // A project not known becomes pending, from its first job; each refusal counts.
+        assert_eq!(
+            code(gate(&job(4, "acme/web"), 4)),
+            ErrorCode::ApprovalPending
+        );
+        assert_eq!(
+            code(gate(&job(4, "acme/web"), 5)),
+            ErrorCode::ApprovalPending
+        );
+        // An attempt of a request answered meanwhile gets that answer, and counts once.
+        assert_eq!(
+            code(gate(&job(4, "acme/web"), 5)),
+            ErrorCode::ApprovalPending
+        );
+        let other = db.gate_job(&id, &job(4, "acme/web"), (&rid(5), "e"), 10);
+        assert_eq!(code(other.unwrap()), ErrorCode::Conflict);
+        let p = &db.gitlab_projects(Some("gl")).unwrap()[0];
+        assert_eq!(
+            (p.id, p.row.state, p.row.refused),
+            (4, ProjectState::Pending, 2)
+        );
+        assert_eq!(
+            (p.row.first_job, p.row.relay.as_deref(), p.row.path.as_str()),
+            (Some(104), Some(id.as_str()), "acme/web")
+        );
+        assert!(
+            db.audits(Some(&id), 20)
+                .unwrap()
+                .iter()
+                .any(|a| a.event.contains("which is pending approval"))
+        );
+        // Approved: through, its path kept current.
+        let approve = [ProjectRef::parse("4").unwrap()];
+        db.decide_projects("gl", &approve, Decision::Approve, "u", 6)
+            .unwrap();
+        assert_eq!(gate(&job(4, "acme/web"), 6), Gate::Pass("gl".into()));
+        assert_eq!(gate(&job(4, "acme/site"), 7), Gate::Pass("gl".into()));
+        assert_eq!(
+            db.gitlab_projects(Some("gl")).unwrap()[0].row.path,
+            "acme/site"
+        );
+        // Rejected.
+        db.decide_projects("gl", &approve, Decision::Reject, "u", 8)
+            .unwrap();
+        assert_eq!(
+            code(gate(&job(4, "acme/site"), 8)),
+            ErrorCode::ProjectRejected
+        );
+        // A relay reporting another server than its own is refused; a removed one too.
+        let mut inventory = vk_hub_proto::gitlab::Inventory::default();
+        inventory.server.url = "https://other.example".into();
+        db.record_relay(&id, super::super::RelayWrite::Inventory(inventory), 9)
+            .unwrap();
+        assert_eq!(code(gate(&job(4, "acme/site"), 9)), ErrorCode::Forbidden);
+        db.remove_relay(&id, "u", 10).unwrap();
+        assert_eq!(
+            code(gate(&job(4, "acme/site"), 10)),
+            ErrorCode::Unauthorized
+        );
     }
 
     #[test]

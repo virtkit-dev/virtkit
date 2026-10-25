@@ -1029,15 +1029,16 @@ The hub implements its side of [GitLab dispatch](gitlab-dispatch.md).
 <id>:<path>,…]] [--ttl 90d]` prints a key, `vkk_` and
 64 hex digits, once; the hub keeps its sha256 only. A key lives at most 365 days and works
 until it expires or is revoked. Its name is unique among the keys that work. Scope `jobs` is
-the whole client API; `capacity` is `POST /v1/capacity` alone. Its pools — `*` for any — and
+the client API but job submission, which only an enrolled relay makes; `capacity` is `POST
+/v1/capacity` alone. Its pools — `*` for any — and
 largest envelope bound every placement it names: anything outside them is 403 `forbidden`. `keys
 list` shows each key's name, first 8 characters, scopes, pools, largest envelope, when and by
 whom it was created, the GitLab instance and projects it is bound to, and whether it works; `keys revoke <name>` revokes the working key of that
 name, or, with none working, removes those of that name that no longer do. The hub holds at most
 256 keys. A key bound to a GitLab instance (`vk-hub gitlabs add <name> <url>`, `gitlabs list`,
 `gitlabs remove <name>`) submits only that instance's jobs, and with `--projects` only those
-projects', by ID and path both: anything else is 403 `forbidden`. Only a bound key's jobs get
-registry tokens. Operators also create, revoke and remove keys on the web UI's `/clients` (see
+projects', by ID and path both: anything else is 403 `forbidden`. No API key submits a GitLab
+job: only a relay does (below). Operators also create, revoke and remove keys on the web UI's `/clients` (see
 [Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.
@@ -1068,12 +1069,30 @@ Every rejection, approval and forget is audited. `vk-hub
 relays` lists the relays — reach, version, server, runners, last seen — `relays show <id>` adds
 its server and runners, and `relays remove <id>` unpins its key and ends its session, audited.
 
+**A relay on the client API.** A relay signs each client API request with its pinned key instead
+of carrying an API key: `vk-relay` names it, `vk-time` the time and `vk-signature` an ed25519
+signature over `vk_hub_proto::client::client_request_message` — its ID, the method, path and
+query, the body's SHA-256, the time and the TLS connection's exporter. The hub checks the relay
+is enrolled and the time within 5 minutes of its clock before reading the body, and the
+signature once it has; anything wrong is 401 `unauthorized`. A relay has the whole client API
+but hellos, holds no pool or envelope ceiling, and owns its jobs and reservations, audited as
+`relay <id>`. Only a relay submits GitLab jobs; an API key's are 403 `forbidden`. **The approval
+gate** lets a relay's new job through only when the job's `server_url` is its bound server's,
+that server is approved and not reported as another, and the job's project, by ID, is approved
+for its instance: the job is recorded under the instance's name, which its egress rules and
+registry token key on. A job of a project not known makes it pending, audited under the relay,
+and is refused 403 `approval_pending`, as is a job of a pending server; a rejected project's or
+server's, 403 `project_rejected`; each counts on the project. A path seen on a job replaces the
+one recorded. A submission whose `request_id` was seen is answered as it was first — the job, or
+the refusal — before the gate, so a retry counts once and a relay recovering an accepted job is
+not refused by a later rejection; queued and running jobs stay as they are.
+
 **Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>` sets the pools a node is in,
 audited. Labels come from the node's inventory. `vk-hub nodes` lists each node's pools and
 labels under the table.
 
 **The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
-`/v1/jobs`. The key is checked before the body is read. A body is at most 64 KiB, a job
+`/v1/jobs`. The key, or the relay and its signed time, is checked before the body is read. A body is at most 64 KiB, a job
 submission 576 KiB, its spec 512 KiB (413 `too_large`), and has 30 seconds to arrive. A
 connection counts among the 256 unauthenticated ones until a key checks; then it counts among
 1024 client connections shared by every key, past which a request is answered 503
@@ -1083,7 +1102,7 @@ warns when that stays below what its connection caps add up to. A client connect
 closes when idle for 10 seconds between requests, and after 10 minutes finishes the request it
 serves, within 2 more, then closes. Long polls hold at most 60 seconds. A `request_id` makes a
 create idempotent for a day, kept in the database: for a reservation, the grant only, so a
-request that got no reservation is tried afresh; for a job, the job.
+request that got no reservation is tried afresh; for a job, the job or the gate's refusal.
 
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
 `held`, it is connected, in the pool, carries every label, reports itself ready and has at least
@@ -1279,8 +1298,8 @@ Fallback applies if enforced; without it, both phases allow nothing. A dry-run r
 nothing: each one that would select the job comes as the layer the job would have were it
 enforced, the enforced rules and it added up, the Fallback dropped; a dry-run Fallback comes so
 when no enforced rule selects the job. A job's claims are its project's ID and path, ref and
-protection, and count only under a key bound to its GitLab instance, which checked the project
-at submission: any other job, and `resolve` without `--gitlab`, gets the Fallback alone.
+protection, under the GitLab instance its relay is bound to, whose approval gate checked the
+project at submission; `resolve` without `--gitlab` gets the Fallback alone.
 
 **`[jobs] egress_rules = true`** in `hub.toml` turns the rules on; off, as by default, the hub
 sends no layer and the rules restrict nothing. On, placement resolves each job's layer from the

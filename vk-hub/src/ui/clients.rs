@@ -587,7 +587,8 @@ fn create_form(h: &mut Html, auth: &Auth) {
     }
     h.raw("</select><button class=\"primary\">Create</button></form>")
         .raw("<p class=\"sub\">As <code>vk-hub keys create</code>: scope <code>jobs</code> is ")
-        .raw("the whole client API, <code>capacity</code> only asks for room. Pools are ")
+        .raw("the client API but job submission, which takes an enrolled relay; ")
+        .raw("<code>capacity</code> only asks for room. Pools are ")
         .raw("comma-separated, <code>*</code> for any. A job's largest memory and disk take ")
         .raw("<code>&lt;n&gt;K|M|G|T</code>; memory at least <code>1M</code>. A limit left ")
         .raw("empty is unbounded. The key is shown a single time.</p></section>");

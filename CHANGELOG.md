@@ -15,6 +15,16 @@ All notable changes to virtkit will be documented in this file.
   reject|forget <url>` refuses a server's relays or takes that back, and `vk-hub gitlabs
   projects` lists, approves, rejects and forgets an instance's projects by ID, all audited.
 
+### Changed
+
+- **Breaking: the hub takes GitLab jobs only from enrolled relays, and only of approved
+  projects.** A relay signs its requests with its own key; an API key's GitLab jobs are
+  refused. The first job of a project the hub has not approved fails and lists the project as
+  pending (`vk-hub gitlabs pending`), until an operator approves it with `vk-hub gitlabs
+  projects approve`; a rejected project's jobs fail too. Registry tokens and egress rules follow
+  the GitLab server the relay is bound to. To upgrade, drain each `vk-gitlab`, upgrade, then
+  enroll it: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`.
+
 ## [0.95.1] - 2026-10-24
 
 ### Fixed

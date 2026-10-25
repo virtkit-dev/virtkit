@@ -1,11 +1,16 @@
-//! The client API on the node listener (`vk_hub_proto::client`): `vk-gitlab` requests and
-//! reserves capacity, submits jobs and follows them using an API key in `authorization: Bearer`.
-//! This module handles HTTP paths, bodies, long polls, idempotent creates and error codes;
-//! [`crate::jobs`] handles the work.
+//! The client API on the node listener (`vk_hub_proto::client`): an enrolled GitLab relay
+//! (`vk-gitlab`) signing each request with its key, or a client holding an API key in
+//! `authorization: Bearer`, requests and reserves capacity, submits jobs and follows them. Only
+//! a relay submits GitLab jobs, each through the approval gate ([`Db::gate_job`]). This module
+//! handles HTTP paths, bodies, long polls, idempotent creates and error codes; [`crate::jobs`]
+//! handles the work.
 //!
-//! A request is authenticated before its body is read, and its body is read capped and timed:
-//! [`MAX_BODY`], or [`MAX_JOB_BODY`] for a job. A long poll holds its request for at most
+//! A request's key, or the relay it names and its signed time, is checked before its body is
+//! read; a relay's signature, over the body's digest, once it is, before the connection counts
+//! among the clients'. The body is read capped and timed: [`MAX_BODY`], or [`MAX_JOB_BODY`] for a job. A long poll holds its request for at most
 //! [`MAX_WAIT_SECS`].
+//!
+//! [`Db::gate_job`]: crate::store::Db::gate_job
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,14 +26,18 @@ use vk_hub_proto::client::{
     AUTHORIZATION, CAPACITY_PATH, CLIENTS_PATH, CancelRequest, CapacityRequest, ClientError,
     ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobState, JobSubmission,
     MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS, MAX_INSTANCE_LEN, MAX_OUTPUT_READ, MAX_WAIT_SECS,
-    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement,
+    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RELAY_HEADER,
     RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, valid_instance,
 };
 use vk_hub_proto::job::{JobSpec, MAX_JOB_SPEC};
+use vk_hub_proto::{PUBLIC_KEY_LEN, SIGNATURE_LEN, from_hex_lower};
 
 use crate::jobs::{self, OutputError};
-use crate::server::{Body, Hub, full};
-use crate::store::{ApiPrincipal, JobRow, RequestRow, Scope, Submitted, valid_name};
+use crate::server::{Body, Exported, Hub, full};
+use crate::store::{
+    ApiPrincipal, Gate, GateJob, JobRow, PrincipalKind, Refusal, RequestRow, Scope, Submitted,
+    valid_name,
+};
 
 /// The largest non-job request body: a placement and a few numbers.
 const MAX_BODY: usize = 64 * 1024;
@@ -122,53 +131,176 @@ fn instance(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The key the request carries, if the hub knows it and it still works, with the instance
-/// the request names.
-pub async fn authenticate(headers: &HeaderMap, hub: &Hub) -> Result<ApiPrincipal, ApiError> {
-    let unauthorized = || {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            ErrorCode::Unauthorized,
-            "an API key the hub knows is required, as authorization: Bearer",
-        )
-    };
-    let key = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+/// Who a request says it comes from, checked as far as its headers go.
+pub enum Claimed {
+    Key(ApiPrincipal),
+    /// A relay, its signature still to check against the body.
+    Relay {
+        principal: ApiPrincipal,
+        public_key: [u8; PUBLIC_KEY_LEN],
+        at: u64,
+        signature: [u8; SIGNATURE_LEN],
+    },
+}
+
+fn unauthorized(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, message)
+}
+
+/// Who the request comes from: an enrolled relay naming itself in [`RELAY_HEADER`], its
+/// signed time within [`DOWNLOAD_SKEW_SECS`](vk_hub_proto::DOWNLOAD_SKEW_SECS) of the hub's
+/// clock, or else the key it carries, if the hub knows it and it still works, with the
+/// instance the request names.
+pub async fn authenticate(headers: &HeaderMap, hub: &Hub) -> Result<Claimed, ApiError> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(relay) = header(RELAY_HEADER) {
+        let signed = || {
+            unauthorized(format!(
+                "a relay's request carries its ID, {} and {}",
+                vk_hub_proto::TIME_HEADER,
+                vk_hub_proto::SIGNATURE_HEADER
+            ))
+        };
+        if !vk_hub_proto::valid_id(relay) {
+            return Err(signed());
+        }
+        let at = header(vk_hub_proto::TIME_HEADER)
+            .and_then(|t| t.parse::<u64>().ok())
+            .ok_or_else(signed)?;
+        let signature = header(vk_hub_proto::SIGNATURE_HEADER)
+            .and_then(from_hex_lower::<SIGNATURE_LEN>)
+            .ok_or_else(signed)?;
+        if crate::now_secs().abs_diff(at) > vk_hub_proto::DOWNLOAD_SKEW_SECS {
+            return Err(unauthorized(
+                "the signed time is too far from the hub's clock",
+            ));
+        }
+        let (db, id) = (hub.db.clone(), relay.to_string());
+        let row = tokio::task::spawn_blocking(move || db.relay(&id))
+            .await
+            .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??
+            .ok_or_else(|| unauthorized("no such relay: it was removed, or never enrolled"))?;
+        let public_key = from_hex_lower::<PUBLIC_KEY_LEN>(&row.public_key).ok_or_else(|| {
+            ApiError::from(anyhow::anyhow!("relay {relay} has a corrupt pinned key"))
+        })?;
+        return Ok(Claimed::Relay {
+            principal: ApiPrincipal {
+                id: relay.to_string(),
+                name: row.hostname,
+                instance: None,
+                kind: PrincipalKind::Relay,
+            },
+            public_key,
+            at,
+            signature,
+        });
+    }
+    let key = header(AUTHORIZATION)
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
-        .ok_or_else(unauthorized)?
+        .ok_or_else(|| {
+            unauthorized(
+                "an API key the hub knows is required, as authorization: Bearer, or a relay's \
+                 signature",
+            )
+        })?
         .to_string();
     let db = hub.db.clone();
     let found = tokio::task::spawn_blocking(move || db.api_key(&key, crate::now_secs()))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    let principal = found.ok_or_else(unauthorized)?;
-    Ok(ApiPrincipal {
+    let principal = found.ok_or_else(|| {
+        unauthorized("an API key the hub knows is required, as authorization: Bearer")
+    })?;
+    Ok(Claimed::Key(ApiPrincipal {
         instance: instance(headers),
         ..principal
+    }))
+}
+
+/// A request authenticated, its body read.
+pub struct Admitted {
+    parts: hyper::http::request::Parts,
+    body: Bytes,
+    pub principal: ApiPrincipal,
+}
+
+/// Read the body of a request whose headers [`authenticate`]d it, and check a relay's
+/// signature over it: until then, the request has proved nothing.
+pub async fn admit(
+    req: Request<Incoming>,
+    claimed: Claimed,
+    exported: Exported,
+) -> Result<Admitted, ApiError> {
+    let (parts, body) = req.into_parts();
+    let limit = if parts.method == Method::POST && parts.uri.path() == JOBS_PATH {
+        MAX_JOB_BODY
+    } else {
+        MAX_BODY
+    };
+    let body = read_body(&parts.headers, body, limit).await?;
+    let principal = match claimed {
+        Claimed::Key(p) => p,
+        Claimed::Relay {
+            principal,
+            public_key,
+            at,
+            signature,
+        } => {
+            let channel = match &exported {
+                Some(exported) => vk_hub_proto::Channel::Tls(exported),
+                None => vk_hub_proto::Channel::Plaintext,
+            };
+            let digest: [u8; vk_hub_proto::SHA256_LEN] = Sha256::digest(&body).into();
+            let message = vk_hub_proto::client::client_request_message(
+                &principal.id,
+                parts.method.as_str(),
+                parts
+                    .uri
+                    .path_and_query()
+                    .map_or(parts.uri.path(), |p| p.as_str()),
+                &digest,
+                at,
+                channel,
+            );
+            if !crate::verify(&public_key, &message, &signature) {
+                return Err(unauthorized(
+                    "the signature does not match the relay's pinned key; a proxy terminating \
+                     TLS in front of the hub breaks its binding to the connection: pass TLS \
+                     through",
+                ));
+            }
+            principal
+        }
+    };
+    Ok(Admitted {
+        parts,
+        body,
+        principal,
     })
 }
 
-/// Serve an authenticated request.
-pub async fn serve(
-    req: Request<Incoming>,
-    hub: &Arc<Hub>,
-    principal: ApiPrincipal,
-) -> Response<Body> {
-    route(req, hub, &principal)
+/// Serve an [`admit`]ted request.
+pub async fn serve(admitted: Admitted, hub: &Arc<Hub>) -> Response<Body> {
+    let Admitted {
+        parts,
+        body,
+        principal,
+    } = admitted;
+    route(&parts, body, hub, &principal)
         .await
         .unwrap_or_else(|e| e.response())
 }
 
 async fn route(
-    req: Request<Incoming>,
+    parts: &hyper::http::request::Parts,
+    body: Bytes,
     hub: &Arc<Hub>,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or_default().to_string();
-    let method = req.method().clone();
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or_default();
+    let method = parts.method.clone();
     let wanted = if path == CAPACITY_PATH || path == CLIENTS_PATH {
         [Scope::Capacity, Scope::Jobs].as_slice()
     } else {
@@ -190,11 +322,11 @@ async fn route(
         }
     };
     match (method, segments.as_slice()) {
-        (Method::POST, ["v1", "capacity"]) => capacity(req, hub, principal).await,
-        (Method::POST, ["v1", "reservations"]) => reserve(req, hub, principal).await,
+        (Method::POST, ["v1", "capacity"]) => capacity(&body, hub, principal).await,
+        (Method::POST, ["v1", "reservations"]) => reserve(&body, hub, principal).await,
         (Method::POST, ["v1", "reservations", r, "renew"]) => {
             let r = id(r)?;
-            let ask: RenewRequest = read_json(req, MAX_BODY).await?.0;
+            let ask: RenewRequest = parse_json(&body)?.0;
             let grant = jobs::renew(hub, principal, &r, ask.lease_secs).await?;
             Ok(json(StatusCode::OK, &grant))
         }
@@ -202,12 +334,12 @@ async fn route(
             jobs::release(hub, principal, &id(r)?)?;
             Ok(empty(StatusCode::NO_CONTENT))
         }
-        (Method::POST, ["v1", "jobs"]) => submit(req, hub, principal).await,
-        (Method::GET, ["v1", "jobs", j]) => job(hub, principal, &id(j)?, &query).await,
-        (Method::GET, ["v1", "jobs", j, "output"]) => output(hub, principal, &id(j)?, &query).await,
+        (Method::POST, ["v1", "jobs"]) => submit(&body, hub, principal).await,
+        (Method::GET, ["v1", "jobs", j]) => job(hub, principal, &id(j)?, query).await,
+        (Method::GET, ["v1", "jobs", j, "output"]) => output(hub, principal, &id(j)?, query).await,
         (Method::POST, ["v1", "jobs", j, "cancel"]) => {
             let j = id(j)?;
-            let ask: CancelRequest = read_json(req, MAX_BODY).await?.0;
+            let ask: CancelRequest = parse_json(&body)?.0;
             let view = jobs::cancel(hub, principal, &j, ask.mode).await?;
             Ok(json(StatusCode::ACCEPTED, &view))
         }
@@ -215,7 +347,7 @@ async fn route(
             jobs::settle(hub, principal, &id(j)?).await?;
             Ok(empty(StatusCode::NO_CONTENT))
         }
-        (Method::POST, ["v1", "clients"]) => hello(req, hub, principal).await,
+        (Method::POST, ["v1", "clients"]) => hello(&body, hub, principal).await,
         _ => Err(ApiError::new(
             StatusCode::NOT_FOUND,
             ErrorCode::NotFound,
@@ -224,12 +356,8 @@ async fn route(
     }
 }
 
-/// Read a JSON body of at most `limit` bytes, timed: the value, and its canonical JSON for
-/// telling a retry from another request.
-async fn read_json<T: serde::de::DeserializeOwned + serde::Serialize>(
-    req: Request<Incoming>,
-    limit: usize,
-) -> Result<(T, Vec<u8>), ApiError> {
+/// Read a body of at most `limit` bytes, timed.
+async fn read_body(headers: &HeaderMap, body: Incoming, limit: usize) -> Result<Bytes, ApiError> {
     let too_large = || {
         ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -237,31 +365,34 @@ async fn read_json<T: serde::de::DeserializeOwned + serde::Serialize>(
             format!("the body is larger than {limit} bytes"),
         )
     };
-    let declared = req
-        .headers()
+    let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > limit as u64) {
         return Err(too_large());
     }
-    let body = match tokio::time::timeout(
+    match tokio::time::timeout(
         BODY_TIMEOUT,
-        http_body_util::Limited::new(req.into_body(), limit).collect(),
+        http_body_util::Limited::new(body, limit).collect(),
     )
     .await
     {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(_)) => return Err(too_large()),
-        Err(_) => {
-            return Err(ApiError::new(
-                StatusCode::REQUEST_TIMEOUT,
-                ErrorCode::Invalid,
-                "the body was too slow to arrive",
-            ));
-        }
-    };
-    let value: T = serde_json::from_slice(&body)
+        Ok(Ok(b)) => Ok(b.to_bytes()),
+        Ok(Err(_)) => Err(too_large()),
+        Err(_) => Err(ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            ErrorCode::Invalid,
+            "the body was too slow to arrive",
+        )),
+    }
+}
+
+/// A JSON body: the value, and its canonical JSON for telling a retry from another request.
+fn parse_json<T: serde::de::DeserializeOwned + serde::Serialize>(
+    body: &[u8],
+) -> Result<(T, Vec<u8>), ApiError> {
+    let value: T = serde_json::from_slice(body)
         .map_err(|e| ApiError::invalid(format!("the body does not parse: {e}")))?;
     let canonical = serde_json::to_vec(&value).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
     Ok((value, canonical))
@@ -326,11 +457,11 @@ fn query_number(query: &str, name: &str) -> Result<Option<u64>, ApiError> {
 }
 
 async fn capacity(
-    req: Request<Incoming>,
+    body: &[u8],
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, _) = read_json::<CapacityRequest>(req, MAX_BODY).await?;
+    let (ask, _) = parse_json::<CapacityRequest>(body)?;
     check_placement(&ask.placement, principal)?;
     let deadline = Instant::now() + wait_for(ask.wait_secs);
     loop {
@@ -349,11 +480,18 @@ async fn capacity(
 }
 
 async fn hello(
-    req: Request<Incoming>,
+    body: &[u8],
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (hello, _) = read_json::<ClientHello>(req, MAX_BODY).await?;
+    if principal.is_relay() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "a relay says what it is in its session, not in a hello",
+        ));
+    }
+    let (hello, _) = parse_json::<ClientHello>(body)?;
     if !valid_instance(&hello.instance) {
         return Err(ApiError::invalid(format!(
             "instance is 1 to {MAX_INSTANCE_LEN} letters, digits, '.', '_' or '-', starting \
@@ -385,11 +523,11 @@ async fn hello(
 }
 
 async fn reserve(
-    req: Request<Incoming>,
+    body: &[u8],
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, canonical) = read_json::<ReservationRequest>(req, MAX_BODY).await?;
+    let (ask, canonical) = parse_json::<ReservationRequest>(body)?;
     request_id(&ask.request_id)?;
     check_placement(&ask.placement, principal)?;
     let digest = vk_hub_proto::to_hex(&Sha256::digest(&canonical));
@@ -485,12 +623,19 @@ fn title(spec: &JobSpec) -> String {
 }
 
 async fn submit(
-    req: Request<Incoming>,
+    body: &[u8],
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, canonical) = read_json::<JobSubmission>(req, MAX_JOB_BODY).await?;
+    let (ask, canonical) = parse_json::<JobSubmission>(body)?;
     request_id(&ask.request_id)?;
+    if !principal.is_relay() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "only an enrolled relay submits GitLab jobs (vk-gitlab join), not an API key",
+        ));
+    }
     if ask
         .reservation
         .as_ref()
@@ -499,7 +644,6 @@ async fn submit(
         return Err(ApiError::invalid("reservation is not an ID"));
     }
     check_placement(&ask.placement, principal)?;
-    check_ceiling(hub, &ask.spec, principal).await?;
     let spec_len = serde_json::to_vec(&ask.spec)
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
         .len();
@@ -513,19 +657,36 @@ async fn submit(
     jobs::accepting(hub)?;
     let digest = vk_hub_proto::to_hex(&Sha256::digest(&canonical));
     let _serving = jobs::begin_request(hub, &format!("{}/{}", principal.id, ask.request_id))?;
-    // Capped for a new job only: a request made before is answered with its job. No other
-    // attempt of this request runs meanwhile, so it stays new until submitted.
+    // Gated and capped for a new job only: a request made before is answered with what it
+    // came to, so a relay recovering an accepted job is not refused by a later rejection. No
+    // other attempt of this request runs meanwhile, so it stays new until submitted.
+    // One time for the lookup and the record: a request seen is still seen when its job is.
+    let now = crate::now_secs();
     let (db, key, rid) = (hub.db.clone(), principal.id.clone(), ask.request_id.clone());
-    let seen = tokio::task::spawn_blocking(move || db.request(&key, &rid, crate::now_secs()))
+    let seen = tokio::task::spawn_blocking(move || db.request(&key, &rid, now))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    if seen.is_none() {
-        jobs::room_for_job(hub)?;
-    }
+    let gitlab = match &seen {
+        Some(before) => match before.refusal() {
+            Some(_) if before.digest != digest => return Err(conflict()),
+            Some(refusal) => return Err(refused(refusal)),
+            None => {
+                let (db, relay) = (hub.db.clone(), principal.id.clone());
+                tokio::task::spawn_blocking(move || db.relay_gitlab(&relay))
+                    .await
+                    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??
+            }
+        },
+        None => {
+            let gitlab = gate(hub, principal, &ask, &digest, now).await?;
+            jobs::room_for_job(hub)?;
+            gitlab
+        }
+    };
     let id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
     let row = JobRow {
         key: principal.id.clone(),
-        key_name: principal.row.name.clone(),
+        key_name: principal.name.clone(),
         instance: principal.instance.clone(),
         request_id: ask.request_id.clone(),
         placement: ask.placement.clone(),
@@ -550,7 +711,7 @@ async fn submit(
         commit: match &ask.spec {
             JobSpec::GitlabCi(ci) => commit(&ci.sources.sha),
         },
-        created_at: crate::now_secs(),
+        created_at: now,
         state: JobState::Queued,
         revision: 1,
         node: None,
@@ -567,7 +728,7 @@ async fn submit(
         prepared_at: None,
         guest: None,
         registry_access: None,
-        gitlab: principal.row.gitlab.clone(),
+        gitlab,
         project_id: match &ask.spec {
             JobSpec::GitlabCi(ci) => Some(ci.job.project_id).filter(|&p| p > 0),
         },
@@ -599,7 +760,7 @@ async fn submit(
                 ask.spec,
                 ask.reservation,
                 place_within,
-                principal.row.gitlab.is_some().then(|| principal.id.clone()),
+                Some(principal.id.clone()),
             );
             hub.touch();
             Ok(json(StatusCode::CREATED, &view))
@@ -618,29 +779,61 @@ async fn submit(
     }
 }
 
-/// Refuse a job its key's ceiling does not cover: another GitLab instance's, or a project the
-/// key does not list ([`ApiPrincipal::refuses_job`]).
-async fn check_ceiling(
+/// Pass `ask`, a new job of relay `principal` with a body hashing to `digest`, through the
+/// approval gate at `now`: the name of its GitLab instance, or the refusal. `None` when another
+/// attempt of the request was answered meanwhile, which recording the job then finds.
+async fn gate(
     hub: &Hub,
-    spec: &JobSpec,
     principal: &ApiPrincipal,
-) -> Result<(), ApiError> {
-    let Some(gitlab) = principal.row.gitlab.clone() else {
-        return Ok(());
-    };
-    let db = hub.db.clone();
-    let instance = tokio::task::spawn_blocking(move || db.gitlab(&gitlab))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    let JobSpec::GitlabCi(ci) = spec;
-    match principal.refuses_job(ci, instance.as_ref().map(|i| i.url.as_str())) {
-        Some(why) => Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            ErrorCode::Forbidden,
-            why,
-        )),
-        None => Ok(()),
+    ask: &JobSubmission,
+    digest: &str,
+    now: u64,
+) -> Result<Option<String>, ApiError> {
+    let JobSpec::GitlabCi(ci) = &ask.spec;
+    let (db, relay, ci, rid, digest) = (
+        hub.db.clone(),
+        principal.id.clone(),
+        ci.clone(),
+        ask.request_id.clone(),
+        digest.to_string(),
+    );
+    let gate = tokio::task::spawn_blocking(move || {
+        let url = ci.job_url();
+        let job = GateJob {
+            server_url: &ci.server_url,
+            project_id: ci.job.project_id,
+            project_path: &ci.job.project_path,
+            job_id: ci.job.id,
+            job_url: url.as_deref(),
+        };
+        db.gate_job(&relay, &job, (&rid, &digest), now)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    match gate {
+        Gate::Pass(gitlab) => Ok(Some(gitlab)),
+        Gate::Seen => Ok(None),
+        Gate::Refused(refusal) => {
+            if matches!(
+                refusal.code,
+                ErrorCode::ApprovalPending | ErrorCode::ProjectRejected
+            ) {
+                hub.touch();
+            }
+            Err(refused(refusal))
+        }
     }
+}
+
+/// The approval gate's refusal as the client API answers it.
+fn refused(refusal: Refusal) -> ApiError {
+    let status = match refusal.code {
+        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorCode::Invalid => StatusCode::BAD_REQUEST,
+        ErrorCode::Conflict => StatusCode::CONFLICT,
+        _ => StatusCode::FORBIDDEN,
+    };
+    ApiError::new(status, refusal.code, refusal.error)
 }
 
 async fn job(

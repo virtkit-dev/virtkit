@@ -169,7 +169,7 @@ pub async fn hello(hub: &Hub, principal: &ApiPrincipal, hello: ClientHello) -> R
     let (db, key, name, i) = (
         hub.db.clone(),
         principal.id.clone(),
-        principal.row.name.clone(),
+        principal.name.clone(),
         instance.clone(),
     );
     let written = tokio::task::spawn_blocking(move || {

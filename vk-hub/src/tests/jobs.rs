@@ -135,13 +135,113 @@ fn api_key(hub: &Hub, name: &str, scopes: &[Scope], at: u64, ttl: Duration) -> S
         .0
 }
 
-fn jobs_key(hub: &Hub) -> String {
+/// An API key for pool `ci` with scope `jobs`, named `gitlab`.
+fn plain_key(hub: &Hub) -> String {
     api_key(
         hub,
         "gitlab",
         &[Scope::Jobs],
         now_secs(),
         Duration::from_secs(3600),
+    )
+}
+
+/// The GitLab server of [`spec`]'s jobs, approved as instance `gl`.
+const GITLAB_URL: &str = "https://gitlab.example.com";
+
+/// The project of [`spec`]'s jobs, approved.
+const PROJECT_ID: u64 = 7;
+
+/// A relay enrolled with `hub` and bound to [`GITLAB_URL`], approved as instance `gl` with
+/// project [`PROJECT_ID`]: its credential for [`api`], `relay:<id>:<seed hex>`.
+fn jobs_key(hub: &Hub) -> String {
+    let seed: [u8; 32] = vk_hub_proto::from_hex_lower(&random_hex(32).unwrap()).unwrap();
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let public = vk_hub_proto::to_hex(ring::signature::KeyPair::public_key(&pair).as_ref());
+    let (token, _) = hub
+        .db
+        .create_token_for(
+            crate::store::TokenKind::Gitlab,
+            Duration::from_secs(60),
+            None,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    let crate::store::RelayEnrollment::Enrolled { id } = hub
+        .db
+        .enroll_relay(&token, &public, "relay-1", "peer p", now_secs())
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    let inventory = vk_hub_proto::gitlab::Inventory {
+        hostname: "relay-1".into(),
+        server: vk_hub_proto::gitlab::Server {
+            url: GITLAB_URL.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    hub.db
+        .record_relay(
+            &id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+    if hub.db.gitlab("gl").unwrap().is_none() {
+        hub.db
+            .add_gitlab("gl", GITLAB_URL, "u", now_secs())
+            .unwrap();
+    }
+    let project = crate::store::ProjectRef::parse(&format!("{PROJECT_ID}:group/project")).unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[project],
+            crate::store::Decision::Approve,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    format!("relay:{id}:{}", vk_hub_proto::to_hex(&seed))
+}
+
+/// What the audit log calls the relay of credential `key`, from [`jobs_key`].
+fn actor_of(key: &str) -> String {
+    let id = key
+        .strip_prefix("relay:")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap();
+    format!("relay {id}")
+}
+
+/// The headers authenticating a request as [`jobs_key`]'s relay or with an API key.
+fn auth_headers(key: &str, method: &str, path: &str, body: &[u8]) -> String {
+    let Some((id, seed)) = key.strip_prefix("relay:").and_then(|k| k.split_once(':')) else {
+        return format!("Authorization: Bearer {key}\r\n");
+    };
+    let seed: [u8; 32] = vk_hub_proto::from_hex_lower(seed).unwrap();
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let at = now_secs();
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(body).into();
+    let message = vk_hub_proto::client::client_request_message(
+        id,
+        method,
+        path,
+        &digest,
+        at,
+        vk_hub_proto::Channel::Plaintext,
+    );
+    let signature = vk_hub_proto::to_hex(pair.sign(&message).as_ref());
+    format!(
+        "{}: {id}\r\n{}: {at}\r\n{}: {signature}\r\n",
+        vk_hub_proto::client::RELAY_HEADER,
+        vk_hub_proto::TIME_HEADER,
+        vk_hub_proto::SIGNATURE_HEADER
     )
 }
 
@@ -191,23 +291,28 @@ async fn api_as(
     instance: Option<&str>,
     body: Option<Value>,
 ) -> Resp {
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let body = body
         .map(|b| serde_json::to_vec(&b).unwrap())
         .unwrap_or_default();
     let auth = key
-        .map(|k| format!("Authorization: Bearer {k}\r\n"))
+        .map(|k| auth_headers(k, method, path, &body))
         .unwrap_or_default();
     let instance = instance
         .map(|i| format!("{INSTANCE_HEADER}: {i}\r\n"))
         .unwrap_or_default();
+    send_raw(addr, method, path, &format!("{auth}{instance}"), &body).await
+}
+
+/// A request with `headers`, each line ending in CRLF, and `body`, on a connection of its own.
+async fn send_raw(addr: SocketAddr, method: &str, path: &str, headers: &str, body: &[u8]) -> Resp {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: hub\r\n{auth}{instance}\
+        "{method} {path} HTTP/1.1\r\nHost: hub\r\n{headers}\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(&body).await.unwrap();
+    stream.write_all(body).await.unwrap();
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).await.unwrap();
     let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
@@ -245,6 +350,7 @@ fn spec(gitlab_id: u64) -> JobSpec {
     };
     ci.job.id = gitlab_id;
     ci.job.project_path = "group/project".into();
+    ci.job.project_id = PROJECT_ID;
     ci.job.name = "test".into();
     ci.job.pipeline_id = 900 + gitlab_id;
     ci.sources.git_ref = "feature/\u{202e}menu".into();
@@ -607,7 +713,7 @@ async fn api_keys_are_checked_on_every_request() {
     let dir = scratch("keys");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let ask = || Some(json!({"placement": placement()}));
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
     assert_eq!(resp.status, 200, "{resp:?}");
     assert_eq!(resp.json::<Capacity>().fits, 0);
@@ -693,6 +799,156 @@ async fn api_keys_are_checked_on_every_request() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A relay is who its signature says, over the request's method, path, body and time, while
+/// it is enrolled; only a relay submits GitLab jobs, and a hello is not its.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_signs_each_request() {
+    let dir = scratch("relay-signed");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let ask = serde_json::to_vec(&json!({"placement": placement()})).unwrap();
+    let signed = |path: &str, body: &[u8]| auth_headers(&key, "POST", path, body);
+    let resp = send_raw(
+        addr,
+        "POST",
+        "/v1/capacity",
+        &signed("/v1/capacity", &ask),
+        &ask,
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    // Signed over another body, path or method; a time out of skew; an unknown relay.
+    let other = serde_json::to_vec(&json!({"placement": placement(), "wait_secs": 1})).unwrap();
+    for headers in [
+        signed("/v1/capacity", &other),
+        signed("/v1/reservations", &ask),
+        auth_headers(&key, "GET", "/v1/capacity", &ask),
+        signed("/v1/capacity", &ask).replace(
+            &format!("{}: {}", vk_hub_proto::TIME_HEADER, now_secs()),
+            &format!("{}: {}", vk_hub_proto::TIME_HEADER, now_secs() - 600),
+        ),
+        signed("/v1/capacity", &ask).replace(
+            &format!("{}: ", vk_hub_proto::client::RELAY_HEADER),
+            &format!("{}: {}", vk_hub_proto::client::RELAY_HEADER, "0".repeat(32)),
+        ),
+    ] {
+        let resp = send_raw(addr, "POST", "/v1/capacity", &headers, &ask).await;
+        assert_eq!(
+            (resp.status, resp.code()),
+            (401, ErrorCode::Unauthorized),
+            "{headers}"
+        );
+    }
+    // A relay's hello is refused: it reports in its session.
+    let hello = serde_json::to_vec(&hello_body("s_1")).unwrap();
+    let resp = send_raw(
+        addr,
+        "POST",
+        "/v1/clients",
+        &signed("/v1/clients", &hello),
+        &hello,
+    )
+    .await;
+    assert_eq!((resp.status, resp.code()), (403, ErrorCode::Forbidden));
+    assert!(hub.db.clients().unwrap().is_empty());
+    // An API key's GitLab job is refused.
+    let plain = plain_key(&hub);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&plain),
+        Some(job_body(1, None, 300)),
+    )
+    .await;
+    assert_eq!((resp.status, resp.code()), (403, ErrorCode::Forbidden));
+    // A removed relay is no one.
+    let id = actor_of(&key).trim_start_matches("relay ").to_string();
+    assert!(crate::relays::remove(&hub, "uid 0", &id).unwrap());
+    let resp = send_raw(
+        addr,
+        "POST",
+        "/v1/capacity",
+        &signed("/v1/capacity", &ask),
+        &ask,
+    )
+    .await;
+    assert_eq!((resp.status, resp.code()), (401, ErrorCode::Unauthorized));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A job of a project not approved is refused and makes it pending; a retry of that request
+/// gets the same answer and counts once, approved or not, and the project's next job passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_of_a_project_not_approved_is_refused_until_it_is() {
+    let dir = scratch("relay-gate");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let submit = |body: Value| {
+        let key = key.clone();
+        async move { api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await }
+    };
+    let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::ApprovalPending)
+    );
+    let error = resp.json::<vk_hub_proto::client::ClientError>().error;
+    assert!(error.contains("acme/web (ID 42)"), "{error}");
+    let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::ApprovalPending)
+    );
+    // The same request ID with another body is a conflict.
+    let resp = submit(bound_body(1, 42, "acme/site", 600)).await;
+    assert_eq!((resp.status, resp.code()), (409, ErrorCode::Conflict));
+    let pending = hub.db.gitlab_projects(Some("gl")).unwrap();
+    let p = pending.iter().find(|p| p.id == 42).unwrap();
+    assert_eq!(
+        (p.row.state, p.row.refused),
+        (crate::store::ProjectState::Pending, 1)
+    );
+    approve(&hub, "42");
+    let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::ApprovalPending)
+    );
+    let resp = submit(bound_body(2, 42, "acme/web", 600)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let row = hub.db.job(&resp.json::<JobView>().id).unwrap().unwrap();
+    assert_eq!(
+        (row.gitlab.as_deref(), row.project_id),
+        (Some("gl"), Some(42))
+    );
+    assert_eq!(row.key_name, "relay-1");
+    // Once accepted, a later rejection leaves the request's answer alone.
+    let project = crate::store::ProjectRef::parse("42").unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[project],
+            crate::store::Decision::Reject,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    let again = submit(bound_body(2, 42, "acme/web", 600)).await;
+    assert_eq!(again.status, 201, "{again:?}");
+    assert_eq!(again.json::<JobView>().id, row_id(&resp));
+    let resp = submit(bound_body(3, 42, "acme/web", 600)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::ProjectRejected)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn row_id(resp: &Resp) -> String {
+    resp.json::<JobView>().id
+}
+
 fn hello_body(instance: &str) -> Value {
     json!({
         "instance": instance,
@@ -707,7 +963,7 @@ fn hello_body(instance: &str) -> Value {
 async fn client_instances_are_recorded_from_their_requests_and_hellos() {
     let dir = scratch("clients");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let watcher = api_key(
         &hub,
         "watcher",
@@ -747,8 +1003,9 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
     let resp = hello(&key, "s_1", body).await;
     assert_eq!((resp.status, resp.code()), (413, ErrorCode::TooLarge));
 
-    // The header names the instance a job comes from; without it, or malformed, the
-    // request is recorded under its key alone.
+    // The header names the instance a request comes from, one refused included: an API key
+    // submits no GitLab job. Without it, or malformed, the request is recorded under its key
+    // alone.
     let resp = api_as(
         addr,
         "POST",
@@ -758,10 +1015,7 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
         Some(job_body(1, None, 300)),
     )
     .await;
-    assert_eq!(resp.status, 201, "{resp:?}");
-    let job = resp.json::<JobView>().id;
-    let row = hub.db.job(&job).unwrap().unwrap();
-    assert_eq!(row.instance.as_deref(), Some("s_1"));
+    assert_eq!((resp.status, resp.code()), (403, ErrorCode::Forbidden));
     let ask = || Some(json!({"placement": placement()}));
     let resp = api_as(addr, "POST", "/v1/capacity", Some(&key), Some("a b"), ask()).await;
     assert_eq!(resp.status, 200);
@@ -780,14 +1034,8 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
     assert_eq!(rows[1].runners[0].pool, "ci");
     assert_eq!(rows[0].hello_at, None);
 
-    // The clients page's view: each key with its instances, what they hold, and its jobs.
+    // The clients page's view: each key with its instances.
     let id = crate::store::token_key(&key);
-    let work = crate::jobs::client_work(&hub);
-    let queued = crate::jobs::Work {
-        queued: 1,
-        ..Default::default()
-    };
-    assert_eq!(work.get(&(id.clone(), "s_1".into())), Some(&queued));
     let views = crate::clients::views(&hub).unwrap();
     let shown: Vec<(&str, u64, Vec<&str>)> = views
         .iter()
@@ -799,9 +1047,7 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
     assert_eq!(shown.len(), 2);
     assert!(shown.contains(&("watcher", 0, vec!["s_2"])), "{shown:?}");
     let gitlab = views.iter().find(|v| v.id == id).unwrap();
-    assert_eq!(gitlab.jobs, 1);
-    let s_1 = gitlab.instances.iter().find(|i| i.row.instance == "s_1");
-    assert_eq!(s_1.map(|i| i.work), Some(queued));
+    assert_eq!(gitlab.jobs, 0);
     assert_eq!(gitlab.instances.len(), 2);
 
     // A revoked key's requests are not recorded.
@@ -821,7 +1067,7 @@ async fn client_instances_are_recorded_from_their_requests_and_hellos() {
 async fn a_hello_is_recorded_under_the_instance_its_body_names() {
     let dir = scratch("hello-instance");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let hello = |header: Option<&'static str>, body: &str| {
         let (key, body) = (key.clone(), hello_body(body));
         async move { api_as(addr, "POST", "/v1/clients", Some(&key), header, Some(body)).await }
@@ -851,7 +1097,7 @@ async fn a_hello_is_recorded_under_the_instance_its_body_names() {
 async fn a_hello_at_a_full_key_evicts_as_memory_does() {
     let dir = scratch("hello-evict");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let id = crate::store::token_key(&key);
     let now = now_secs();
     for i in 0..crate::store::MAX_INSTANCES_PER_KEY {
@@ -887,7 +1133,7 @@ async fn a_hello_at_a_full_key_evicts_as_memory_does() {
 async fn a_first_contact_at_a_full_key_evicts_as_memory_does() {
     let dir = scratch("contact-evict");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let id = crate::store::token_key(&key);
     let now = now_secs();
     // As after a restart: the database holds a full key, memory nothing of it.
@@ -928,7 +1174,7 @@ async fn a_first_contact_at_a_full_key_evicts_as_memory_does() {
 async fn contacts_reach_the_database_through_the_flush() {
     let dir = scratch("clients-flush");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let id = crate::store::token_key(&key);
     let ask = || Some(json!({"placement": placement()}));
     let row = |instance: &str| {
@@ -1592,10 +1838,11 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     };
     assert_eq!(code, RefusalCode::Protocol);
     // Its audit holds who submitted it; its record, where it ran and how it ended.
+    let actor = actor_of(&key);
     assert_eq!(
         job_audit(&hub, &id),
         [format!(
-            "key gitlab submitted job {id}: GitLab job 2 of group/project (test)"
+            "{actor} submitted job {id}: GitLab job 2 of group/project (test)"
         )]
     );
     // The UI links the job to its page on GitLab, and its history shows where it ran, when,
@@ -2288,11 +2535,12 @@ async fn cancellation_ends_a_queued_job_and_reaches_a_running_one() {
     assert_eq!(view.result.unwrap().failure, Some(FailureClass::Canceled));
     // Its canceler's line stands for its ending.
     let id = &queued.id;
+    let actor = actor_of(&key);
     assert_eq!(
         job_audit(&hub, id),
         [
-            format!("key gitlab submitted job {id}: GitLab job 1 of group/project (test)"),
-            format!("key gitlab canceled job {id} before it was placed"),
+            format!("{actor} submitted job {id}: GitLab job 1 of group/project (test)"),
+            format!("{actor} canceled job {id} before it was placed"),
         ]
     );
 
@@ -2366,10 +2614,11 @@ async fn a_lost_node_loses_its_job_and_is_told_to_cancel_it_when_back() {
     );
     // The hub ended it: audited.
     wait_until(|| job_audit(&hub, &job).len() == 2).await;
+    let actor = actor_of(&key);
     assert_eq!(
         job_audit(&hub, &job),
         [
-            format!("key gitlab submitted job {job}: GitLab job 1 of group/project (test)"),
+            format!("{actor} submitted job {job}: GitLab job 1 of group/project (test)"),
             format!("job {job} ended: lost: node {id} was unreachable for 1s"),
         ]
     );
@@ -2444,10 +2693,11 @@ async fn a_job_is_placed_again_only_while_no_node_can_have_started_it() {
     );
     let id = &job.id;
     wait_until(|| job_audit(&hub, id).len() == 2).await;
+    let actor = actor_of(&key);
     assert_eq!(
         job_audit(&hub, id),
         [
-            format!("key gitlab submitted job {id}: GitLab job 1 of group/project (test)"),
+            format!("{actor} submitted job {id}: GitLab job 1 of group/project (test)"),
             format!("job {id} ended: no capacity: no node took it within its placement window"),
         ]
     );
@@ -2989,7 +3239,7 @@ async fn submissions_past_the_live_jobs_cap_are_told_to_retry() {
 async fn client_connections_past_the_cap_are_told_to_retry() {
     let dir = scratch("client-cap");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let key = jobs_key(&hub);
+    let key = plain_key(&hub);
     let ask = || Some(json!({"placement": placement()}));
     let all = u32::try_from(server::MAX_CLIENT_CONNS).unwrap();
     let held = hub
@@ -4286,8 +4536,9 @@ async fn a_system_or_image_pull_failure_is_audited() {
             result: ended,
         });
         assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+        let actor = actor_of(&key);
         let mut expected = vec![format!(
-            "key gitlab submitted job {id}: GitLab job {n} of group/project (test)"
+            "{actor} submitted job {id}: GitLab job {n} of group/project (test)"
         )];
         expected.extend(line.map(|l| format!("job {id} ended: {l}")));
         assert_eq!(job_audit(&hub, &id), expected);
@@ -4459,8 +4710,22 @@ fn a_commit_is_hex_or_nothing() {
     }
 }
 
-/// A job body of project `id` at `path`, from the instance the bound keys name, which runs
-/// for `timeout_secs`.
+/// Approve project `id_path`, `<id>[:<path>]`, of instance `gl`.
+fn approve(hub: &Hub, id_path: &str) {
+    let project = crate::store::ProjectRef::parse(id_path).unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[project],
+            crate::store::Decision::Approve,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+}
+
+/// A job body of project `id` at `path`, from the instance [`jobs_key`]'s relay is bound to,
+/// which runs for `timeout_secs`.
 fn bound_body(n: u8, id: u64, path: &str, timeout_secs: u64) -> Value {
     let mut body = job_body(n, None, 30);
     let JobSpec::GitlabCi(mut ci) = spec(u64::from(n));
@@ -4472,41 +4737,10 @@ fn bound_body(n: u8, id: u64, path: &str, timeout_secs: u64) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
+async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
     let dir = scratch("token");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let now = now_secs();
-    hub.db
-        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
-        .unwrap();
-    let bound = |projects: Vec<crate::store::ProjectCeiling>| KeyPolicy {
-        scopes: vec![Scope::Jobs],
-        pools: vec!["ci".into()],
-        max_envelope: None,
-        gitlab: Some("gl".into()),
-        projects,
-    };
-    let (key, _) = hub
-        .db
-        .create_api_key(
-            "bound",
-            &bound(Vec::new()),
-            Duration::from_secs(3600),
-            "uid 0",
-            now,
-        )
-        .unwrap();
-    let listed = vec![crate::store::ProjectCeiling::parse("42:wab/core").unwrap()];
-    let (listed_key, _) = hub
-        .db
-        .create_api_key(
-            "listed",
-            &bound(listed),
-            Duration::from_secs(3600),
-            "uid 0",
-            now,
-        )
-        .unwrap();
+    let key = jobs_key(&hub);
     let registry = super::tokens::token_registry(&hub, super::tokens::REGISTRY_URL, "cc");
     // Room for every job below at once: none of them ends.
     let mut node = ready_node(addr, &hub, 16384 * 8).await;
@@ -4523,25 +4757,34 @@ async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
     let submit = |key: String, body: Value| async move {
         api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await
     };
-    // What the key's ceiling does not cover is refused before it is queued: another
-    // instance's job, a project the list does not hold by ID and path, and a job naming no
-    // project.
+    // What the approval gate does not let through is refused before it is queued: another
+    // server's job, a job naming no project, and one of a project not approved yet, which
+    // makes it pending.
     let mut foreign = bound_body(1, 42, "wab/core", 600);
     foreign["spec"]["server_url"] = json!("https://evil.example.com");
-    for (k, body) in [
-        (&key, foreign),
-        (&listed_key, bound_body(1, 42, "wab/other", 600)),
-        (&listed_key, bound_body(1, 43, "wab/core", 600)),
-        (&key, bound_body(1, 0, "wab/core", 600)),
-    ] {
-        let resp = submit(k.clone(), body).await;
-        assert_eq!(resp.status, 403, "{resp:?}");
-        assert_eq!(resp.code(), ErrorCode::Forbidden);
-    }
-    let resp = submit(listed_key.clone(), bound_body(2, 42, "wab/core", 600)).await;
+    let resp = submit(key.clone(), foreign).await;
+    assert_eq!((resp.status, resp.code()), (403, ErrorCode::Forbidden));
+    let resp = submit(key.clone(), bound_body(1, 0, "wab/core", 600)).await;
+    assert_eq!((resp.status, resp.code()), (400, ErrorCode::Invalid));
+    let resp = submit(key.clone(), bound_body(1, 42, "wab/core", 600)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::ApprovalPending)
+    );
+    let project = crate::store::ProjectRef::parse("42").unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[project],
+            crate::store::Decision::Approve,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    let resp = submit(key.clone(), bound_body(2, 42, "wab/core", 600)).await;
     assert_eq!(resp.status, 201, "{resp:?}");
     let view: JobView = resp.json();
-    // Its record keeps the claims its key's ceiling held it to, and the protection reported.
+    // Its record keeps the claims the gate held it to, and the protection reported.
     let row = hub.db.job(&view.id).unwrap().unwrap();
     assert_eq!(
         (row.gitlab.as_deref(), row.project_id, row.protected),
@@ -4632,9 +4875,8 @@ async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
         claims.exp - claims.iat,
         crate::tokens::DEFAULT_MAX_JOB_TOKEN.as_secs()
     );
-    // Jobs go without when anything a token needs is missing: an unbound key, a node that
-    // uses none or names no registry the hub binds.
-    let plain = jobs_key(&hub);
+    // Jobs go without when anything a token needs is missing: a node that uses none or names
+    // no registry the hub binds.
     let mut n = 4;
     let mut goes_without = |key: String| {
         n += 1;
@@ -4648,17 +4890,6 @@ async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
             url: url.map(str::to_string),
         })
     };
-    let (k, body) = goes_without(plain).await;
-    let resp = submit(k, body).await;
-    assert_eq!(resp.status, 201);
-    let HubJobMsg::Start(start) = node.job().await else {
-        panic!("expected a start");
-    };
-    assert!(start.registry.is_none(), "an unbound key");
-    assert_eq!(
-        shown(&resp.json::<JobView>().id),
-        none(NoAccess::UnboundKey, None, None)
-    );
     // A registry bound to the URL but taking no tokens.
     let untokened = super::tokens::token_registry(&hub, "https://plain.example.com", "dd");
     let inventory = vk_hub_proto::registry::Inventory::default();
@@ -4721,21 +4952,8 @@ async fn a_bound_key_s_job_gets_a_token_for_its_node_s_registry() {
 async fn a_refused_start_forgets_the_registry_access_it_was_given() {
     let dir = scratch("token-refused");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
-    let now = now_secs();
-    hub.db
-        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
-        .unwrap();
-    let policy = KeyPolicy {
-        scopes: vec![Scope::Jobs],
-        pools: vec!["ci".into()],
-        max_envelope: None,
-        gitlab: Some("gl".into()),
-        projects: Vec::new(),
-    };
-    let (key, _) = hub
-        .db
-        .create_api_key("bound", &policy, Duration::from_secs(3600), "uid 0", now)
-        .unwrap();
+    let key = jobs_key(&hub);
+    approve(&hub, "42:wab/core");
     super::tokens::token_registry(&hub, super::tokens::REGISTRY_URL, "cc");
     let node = ready_node(addr, &hub, 16384 * 8).await;
     let mut inventory = hub.db.node(&node.id).unwrap().unwrap().inventory.unwrap();
@@ -4789,9 +5007,7 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
     let db = Arc::new(Db::open_memory().unwrap().with_egress_rules(true));
     let (addr, hub) = serve_hub(db, &dir, Duration::from_secs(60)).await;
     let now = now_secs();
-    hub.db
-        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
-        .unwrap();
+    let key = jobs_key(&hub);
     let none = HubPhase::Allow {
         names: Vec::new(),
         ips: Vec::new(),
@@ -4813,18 +5029,7 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
     ] {
         hub.db.put_egress_rule(&r, false, "uid 0", now).unwrap();
     }
-    let policy = KeyPolicy {
-        scopes: vec![Scope::Jobs],
-        pools: vec!["ci".into()],
-        max_envelope: None,
-        gitlab: Some("gl".into()),
-        projects: Vec::new(),
-    };
-    let (bound, _) = hub
-        .db
-        .create_api_key("bound", &policy, Duration::from_secs(3600), "uid 0", now)
-        .unwrap();
-    let unbound = jobs_key(&hub);
+    approve(&hub, "42:wab/core");
     let mut node = ready_node(addr, &hub, 16384 * 8).await;
     // A node that does not say it enforces the rules has no room, and is sent nothing.
     let fits = |key: String| async move {
@@ -4839,12 +5044,12 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
         .json::<Capacity>()
         .fits
     };
-    assert_eq!(fits(bound.clone()).await, 0);
+    assert_eq!(fits(key.clone()).await, 0);
     let resp = api(
         addr,
         "POST",
         "/v1/jobs",
-        Some(&bound),
+        Some(&key),
         Some(bound_body(1, 42, "wab/core", 600)),
     )
     .await;
@@ -4864,7 +5069,7 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
     hub.db
         .record_inventory(&node_id, inventory, true, now_secs())
         .unwrap();
-    assert!(fits(bound.clone()).await > 0);
+    assert!(fits(key.clone()).await > 0);
     let HubJobMsg::Start(start) = node.job().await else {
         panic!("expected a start");
     };
@@ -4891,10 +5096,10 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
         crate::egress::rules_applied_text(&applied),
         "wab (rules generation 2)"
     );
-    // A key bound to no instance: the Fallback alone, whatever its job claims.
-    let mut body = bound_body(2, 42, "wab/core", 600);
+    // A project no rule selects: the Fallback alone.
+    let mut body = bound_body(2, PROJECT_ID, "group/project", 600);
     body["placement"] = json!(placement());
-    let resp = api(addr, "POST", "/v1/jobs", Some(&unbound), Some(body)).await;
+    let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
     assert_eq!(resp.status, 201, "{resp:?}");
     let HubJobMsg::Start(start) = node.job().await else {
         panic!("expected a start");
@@ -4911,12 +5116,12 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
         addr,
         "POST",
         "/v1/jobs",
-        Some(&bound),
+        Some(&key),
         Some(bound_body(3, 42, "wab/core", 600)),
     )
     .await;
     let third: JobView = resp.json();
-    let failed = view_until(addr, &bound, &third.id, |v| v.state == JobState::Finished).await;
+    let failed = view_until(addr, &key, &third.id, |v| v.state == JobState::Finished).await;
     let result = failed.result.expect("a result");
     assert_eq!(result.failure, Some(FailureClass::Configuration));
     let message = result.message.unwrap_or_default();

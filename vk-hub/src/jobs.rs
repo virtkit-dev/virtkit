@@ -283,9 +283,8 @@ struct LiveJob {
     /// Its [`image_key`], from its spec; `None` for a job recovered after a restart whose
     /// spec expired.
     image_key: Option<String>,
-    /// Its jobs key's [`ApiPrincipal::id`] when that key is bound to a GitLab instance: what
-    /// its registry token is minted for, while the key still works. `None` for a key bound to
-    /// none, whose jobs get no token, and for a job recovered after a restart.
+    /// Its relay's ID ([`ApiPrincipal::id`]): its registry token is minted while the relay is
+    /// enrolled and its server approved. `None` for a job recovered after a restart.
     mint_key: Option<String>,
     /// How far its record as written holds its egress report.
     egress: EgressWritten,
@@ -2141,8 +2140,7 @@ pub fn release(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(), ApiE
 }
 
 /// Take job `id`, recorded as `row`, with its `spec`, to start on `reservation` or be placed
-/// within `place_within`; `mint_key` is its jobs key's ID when that key is bound to a GitLab
-/// instance. The caller has recorded it.
+/// within `place_within`; `mint_key` is its relay's ID. The caller has recorded it.
 pub fn admit(
     hub: &Hub,
     id: &str,
@@ -2712,9 +2710,9 @@ struct PlaceCtx<'a> {
     rules: Option<&'a (u64, Vec<crate::store::EgressRuleRow>)>,
 }
 
-/// The hub's egress layer for job `job` from `rules`, the claims of its spec bounded by its key:
-/// its project and ref count only under a key bound to its GitLab instance, which checked its
-/// project. `Err` says why the layer resolved cannot be sent.
+/// The hub's egress layer for job `job` from `rules`, the claims of its spec under the GitLab
+/// instance its relay is bound to, whose approval gate checked its project. `Err` says why the
+/// layer resolved cannot be sent.
 fn egress_for(
     job: &LiveJob,
     spec: &JobSpec,

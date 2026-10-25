@@ -273,8 +273,8 @@ pub struct Minted {
 }
 
 /// Minting inputs, read and signing keys loaded before taking the dispatch lock:
-/// registries that take tokens, their namespaces, signing keys, and jobs keys bound to
-/// a GitLab instance.
+/// registries that take tokens, their namespaces, signing keys, and the relays whose GitLab
+/// server is approved.
 #[derive(Default)]
 pub struct MintCtx {
     registries: Vec<(String, RegistryRow, Vec<NamespaceRow>)>,
@@ -288,7 +288,7 @@ impl MintCtx {
     /// Read from `db` in one snapshot, and load the signing keys from `keys`: a key that does
     /// not load is logged and signs nothing.
     pub fn read(db: &Db, keys: &Keys) -> Result<Self> {
-        let snap = db.mint_snapshot(crate::now_secs())?;
+        let snap = db.mint_snapshot()?;
         let mut signers = BTreeMap::new();
         if !snap.registries.is_empty() {
             for row in &snap.keys {
@@ -320,8 +320,8 @@ impl MintCtx {
 
 /// The token for placed job `job`, sent to `node`, when everything it needs holds: the node
 /// uses job tokens and names a registry the hub binds, that registry takes tokens and has a
-/// key it applied, and the job's jobs key (`key`) is still working and bound to a GitLab
-/// instance; else what the job's record shows of why there is none, nothing on a hub where no
+/// key it applied, and the job's relay (`key`) is still enrolled and its GitLab server
+/// approved; else what the job's record shows of why there is none, nothing on a hub where no
 /// registry takes tokens or is bound to an address, whose jobs are not meant to get any.
 /// Never fails a placement: what cannot be minted is logged and the job goes without.
 pub fn for_job(

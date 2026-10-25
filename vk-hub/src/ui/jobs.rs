@@ -999,7 +999,8 @@ fn registry_access(
             h.raw("<p><span class=\"badge warn\">Unavailable</span></p><p>");
             match (reason, id) {
                 (NoAccess::UnboundKey, _) => {
-                    h.raw("Its runner key is connected to no GitLab server. <a href=\"")
+                    h.raw("Its relay was removed, or its GitLab server is no longer approved. ")
+                        .raw("<a href=\"")
                         .raw(super::clients::PATH)
                         .raw("\">Connections</a>");
                 }

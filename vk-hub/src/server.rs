@@ -791,7 +791,9 @@ async fn handle(
         (&Method::GET, path) if path.starts_with(TOOLS_PATH) => {
             download(&req, &hub, peer, exported, &state, Download::Tools).await
         }
-        (_, path) if crate::client::is_client_path(path) => Ok(client(req, &hub, &state).await),
+        (_, path) if crate::client::is_client_path(path) => {
+            Ok(client(req, &hub, exported, &state).await)
+        }
         _ => Ok(error(StatusCode::NOT_FOUND, "no such endpoint")),
     };
     Ok(resp.unwrap_or_else(|e| {
@@ -800,10 +802,24 @@ async fn handle(
     }))
 }
 
-/// A client API request: its key checked before anything else is read.
-async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Response<Body> {
-    let principal = match crate::client::authenticate(req.headers(), hub).await {
-        Ok(p) => p,
+/// A client API request: its key, or its relay and signed time, checked before anything else
+/// is read, and its body read and a relay's signature checked before the connection counts
+/// among the clients'.
+async fn client(
+    req: Request<Incoming>,
+    hub: &Arc<Hub>,
+    exported: Exported,
+    state: &ConnState,
+) -> Response<Body> {
+    let claimed = match crate::client::authenticate(req.headers(), hub).await {
+        Ok(c) => c,
+        Err(e) => return e.response(),
+    };
+    let hello =
+        req.method() == Method::POST && req.uri().path() == vk_hub_proto::client::CLIENTS_PATH;
+    // Under the connection's unauthenticated permit until a relay's signature checks.
+    let admitted = match crate::client::admit(req, claimed, exported).await {
+        Ok(a) => a,
         Err(e) => return e.response(),
     };
     if !state.claim_client(hub) {
@@ -815,13 +831,13 @@ async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Re
         .retry_after(1)
         .response();
     }
-    // A hello naming no instance in its header is recorded under the one its body names.
-    let hello =
-        req.method() == Method::POST && req.uri().path() == vk_hub_proto::client::CLIENTS_PATH;
-    if principal.instance.is_some() || !hello {
-        crate::clients::seen(hub, &principal, crate::now_secs());
+    // A hello naming no instance in its header is recorded under the one its body names. A
+    // relay's contacts are its session's.
+    let principal = &admitted.principal;
+    if !principal.is_relay() && (principal.instance.is_some() || !hello) {
+        crate::clients::seen(hub, principal, crate::now_secs());
     }
-    crate::client::serve(req, hub, principal).await
+    crate::client::serve(admitted, hub).await
 }
 
 /// `POST /v1/enroll`: check the node's proof of its key, then spend the token on it.

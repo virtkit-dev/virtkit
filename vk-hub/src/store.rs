@@ -56,7 +56,9 @@ mod relays;
 mod token_keys;
 mod tools;
 
-pub use approvals::{Decision, ProjectRef, ProjectState, ProjectView, RejectedGitlab};
+pub use approvals::{
+    Decision, Gate, GateJob, ProjectRef, ProjectState, ProjectView, Refusal, RejectedGitlab,
+};
 pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use egress::{AllowRequest, AllowSaved, BlockedRow, MAX_MUTE_REASON, Mute, RowRange, Stored};
@@ -70,8 +72,8 @@ pub use jobs::{
     PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
 };
 pub use keys::{
-    ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL, Scope,
-    envelope_text, valid_name,
+    ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
+    PrincipalKind, Scope, envelope_text, valid_name,
 };
 pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retention, resolve};
 pub use observed::{

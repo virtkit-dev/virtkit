@@ -132,7 +132,9 @@ jobs: an API key's are refused. A submission whose request ID the hub has seen i
 with its first answer before the gate, body digest compared as today, so a relay recovering an accepted job after a restart is not refused
 by a later rejection, for as long as the hub keeps request answers (a day). The gate
 applies to new submissions only: rejecting or forgetting a server or project leaves its queued
-and running jobs alone; an operator cancels them if needed.
+and running jobs alone; an operator cancels them if needed. A job whose `server_url` is not its relay's server, or of a
+relay told `rebound`, is 403 `forbidden`; one of a pending server is refused `approval_pending`,
+of a rejected one `project_rejected`, as a project's are.
 
 **A job of a project not approved.** The hub records the project as pending (server, ID, path,
 first job, relay) and refuses the submission with 403 `approval_pending`; the relay releases its

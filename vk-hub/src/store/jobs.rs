@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::{CancelMode, JobState, JobView, Placement};
 use vk_hub_proto::job::{FailureClass, JobResult};
 
+use super::approvals::Refusal;
 use super::{Db, append_audit, decode, encode};
 
 /// Key: job ID. Value: JSON [`JobRow`].
@@ -78,9 +79,9 @@ pub const PREPARE_STAGE: &str = "prepare_executor";
 /// A job the hub has taken.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRow {
-    /// The submitting key's ID ([`super::ApiPrincipal::id`]).
+    /// The submitting relay's or key's ID ([`super::ApiPrincipal::id`]).
     pub key: String,
-    /// Its name, for display.
+    /// Its name, for display: a relay's hostname, a key's name.
     pub key_name: String,
     /// The client instance that submitted it ([`super::ApiPrincipal::instance`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,8 +155,9 @@ pub struct JobRow {
     /// `None` before placement and for jobs placed by older hubs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_access: Option<RegistryAccess>,
-    /// The GitLab instance its key was bound to at submission, by name: the instance the hub
-    /// checked its project against. `None` for a key bound to none, or an older hub's record.
+    /// The GitLab instance its relay was bound to at submission, by name: the instance the
+    /// approval gate checked its project against. `None` for an older hub's record of a key
+    /// bound to none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gitlab: Option<String>,
     /// GitLab's ID of its project; `None` when the spec has none or for an older hub's record.
@@ -219,7 +221,8 @@ pub enum RegistryAccess {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoAccess {
-    /// Its jobs key is bound to no GitLab instance, or no longer works.
+    /// Its relay was removed, or its GitLab server is no longer approved; or, for an older
+    /// hub's record, its jobs key was bound to no GitLab instance.
     UnboundKey,
     /// Its node does not announce job tokens: an older `vk`.
     NodeWithoutJobTokens,
@@ -482,8 +485,16 @@ pub struct RequestRow {
     /// `sha256` of the request's body as parsed, hex: the same ID with another body is a
     /// conflict, not a retry.
     pub digest: String,
-    /// The job created, or the reservation granted.
+    /// The job created, the reservation granted, or the submission's refusal by the
+    /// approval gate (`{"refused": `[`Refusal`]`}`).
     pub answer: serde_json::Value,
+}
+
+impl RequestRow {
+    /// The approval gate's refusal of the job this request submitted, if it was refused.
+    pub fn refusal(&self) -> Option<Refusal> {
+        serde_json::from_value(self.answer.get("refused")?.clone()).ok()
+    }
 }
 
 /// What a job submission came to.
@@ -497,7 +508,7 @@ pub enum Submitted {
 }
 
 /// A request's key in [`REQUESTS`].
-fn request_key(key: &str, request_id: &str) -> String {
+pub(super) fn request_key(key: &str, request_id: &str) -> String {
     format!("{key}/{request_id}")
 }
 
@@ -1243,7 +1254,11 @@ pub(super) fn order_jobs(txn: &redb::WriteTransaction) -> Result<()> {
 }
 
 /// Drop requests past [`REQUEST_KEEP`], at most once every [`REQUEST_SWEEP_SECS`].
-fn sweep_requests(db: &Db, requests: &mut redb::Table<'_, &str, &[u8]>, now: u64) -> Result<()> {
+pub(super) fn sweep_requests(
+    db: &Db,
+    requests: &mut redb::Table<'_, &str, &[u8]>,
+    now: u64,
+) -> Result<()> {
     let last = db.requests_swept_at.load(Ordering::Relaxed);
     if now.saturating_sub(last) < REQUEST_SWEEP_SECS {
         return Ok(());

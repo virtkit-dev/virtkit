@@ -92,15 +92,25 @@ pub(super) struct Servers {
 
 impl Servers {
     pub(super) fn read(txn: &redb::ReadTransaction) -> Result<Self> {
+        Self::read_from(
+            &txn.open_table(GITLABS)?,
+            &txn.open_table(REJECTED_GITLABS)?,
+        )
+    }
+
+    /// From the instances' and the rejected servers' tables.
+    pub(super) fn read_from(
+        gitlabs: &impl ReadableTable<&'static str, &'static [u8]>,
+        rejected: &impl ReadableTable<&'static str, &'static [u8]>,
+    ) -> Result<Self> {
         let mut instances = Vec::new();
-        for entry in txn.open_table(GITLABS)?.iter()? {
+        for entry in gitlabs.iter()? {
             let (name, value) = entry?;
             instances.push((name.value().to_string(), decode(value.value())?));
         }
-        let rejected = rejected_in(&txn.open_table(REJECTED_GITLABS)?)?;
         Ok(Servers {
             instances,
-            rejected,
+            rejected: rejected_in(rejected)?,
         })
     }
 
@@ -113,7 +123,7 @@ impl Servers {
     }
 
     /// The status of a relay bound to `bound` that reports `reported`.
-    fn status_of(&self, bound: &str, reported: Option<&str>) -> ServerStatus {
+    pub(super) fn status_of(&self, bound: &str, reported: Option<&str>) -> ServerStatus {
         let rebound = reported.is_some_and(|r| normalize_gitlab_url(r).as_deref() != Some(bound));
         let name = self.name_of(bound).map(str::to_string);
         let state = match (&name, rebound) {

@@ -9,9 +9,9 @@ use vk_hub_proto::token::TokenKey;
 
 use std::collections::BTreeMap;
 
-use super::keys::{API_KEYS, KeyRow};
 use super::namespaces::{NAMESPACES, NamespaceRow};
 use super::registries::{REGISTRIES, RegistryRow};
+use super::relays::{RELAYS, RelayRow, Servers};
 use super::{Db, append_audit, decode, encode};
 
 /// Key: the key's ID. Value: JSON [`TokenKeyRow`].
@@ -49,8 +49,8 @@ pub fn signing_key<'a>(keys: &'a [TokenKeyRow], row: &RegistryRow) -> Option<&'a
 }
 
 /// What minting reads, in one snapshot: the registries that take tokens and are bound to a
-/// URL, with their namespaces; the signing keys, oldest first; and, per jobs key bound to a
-/// GitLab instance and still working, that instance's name. Registries bound to a URL that
+/// URL, with their namespaces; the signing keys, oldest first; and, per relay whose GitLab
+/// server is approved, that instance's name. Registries bound to a URL that
 /// take no tokens are kept by URL, to say why a job got none.
 pub struct MintSnapshot {
     pub registries: Vec<(String, RegistryRow, Vec<NamespaceRow>)>,
@@ -61,7 +61,7 @@ pub struct MintSnapshot {
 
 impl Db {
     /// [`MintSnapshot`] as of one read, at `now`.
-    pub fn mint_snapshot(&self, now: u64) -> Result<MintSnapshot> {
+    pub fn mint_snapshot(&self) -> Result<MintSnapshot> {
         let txn = self.db.begin_read().context("starting a read")?;
         let namespaces = txn.open_table(NAMESPACES)?;
         let mut registries = Vec::new();
@@ -89,14 +89,12 @@ impl Db {
             keys.push(decode::<TokenKeyRow>(entry?.1.value())?);
         }
         keys.sort_by_key(|r| r.seq);
+        let servers = Servers::read(&txn)?;
         let mut bound = BTreeMap::new();
-        for entry in txn.open_table(API_KEYS)?.iter()? {
+        for entry in txn.open_table(RELAYS)?.iter()? {
             let (id, value) = entry?;
-            let row = decode::<KeyRow>(value.value())?;
-            if let Some(gitlab) = row
-                .gitlab
-                .filter(|_| row.revoked_at.is_none() && row.expires_at > now)
-            {
+            let row = decode::<RelayRow>(value.value())?;
+            if let Some(gitlab) = servers.relay_status(&row).and_then(|s| s.name) {
                 bound.insert(id.value().to_string(), gitlab);
             }
         }
