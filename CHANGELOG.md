@@ -24,6 +24,10 @@ All notable changes to virtkit will be documented in this file.
   address while it stays pinned for the VM under a name every layer allows, without
   `NXDOMAIN` or a blocked-lookup record. Other reverse lookups remain refused, including
   addresses reachable only through `allow_ip`.
+- **Guests' lookups of `localhost` and `invalid` names are answered on the host**: well-formed
+  names under `localhost` resolve to the loopback addresses and those under `invalid` to
+  `NXDOMAIN`, under any egress policy, without reaching the host's resolver or showing as
+  blocked lookups.
 
 ### Fixed
 

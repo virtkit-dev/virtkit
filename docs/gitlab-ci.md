@@ -1249,10 +1249,12 @@ lookup of an address the gateway resolved for that VM under an allowed name is f
 too, for as long as that address is open to it (see below): its name says nothing the
 guest chose beyond which of those addresses it asks about. An address open only through
 `allow_ip` does not qualify. Listing `in-addr.arpa` or `ip6.arpa` in `allow_name` reopens
-reverse lookups as a way to carry data out in the names queried. The gateway rebuilds
-forwarded queries from their question, keeping only the id, RD, AD and CD flags and a bare
-EDNS record. Queries it cannot rebuild are `REFUSED`, or `NOTIMP` for a DNS update or
-notify.
+reverse lookups as a way to carry data out in the names queried. Under any policy, the
+gateway answers the `localhost` and `invalid` special-use names itself, never forwarding
+them: `localhost` and names under it resolve to the loopback addresses, `invalid` and names
+under it to `NXDOMAIN`. The gateway rebuilds forwarded queries from their question, keeping
+only the id, RD, AD and CD flags and a bare EDNS record. Queries it cannot rebuild are
+`REFUSED`, or `NOTIMP` for a DNS update or notify.
 
 An allowed name is reached by address: resolving it through the gateway opens, to that VM
 alone, the IPv4 addresses its answer gives for it (directly or through its CNAME aliases,
