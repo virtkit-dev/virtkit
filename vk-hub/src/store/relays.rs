@@ -3,7 +3,8 @@
 //! registry. Audit rows are indexed by relay ID, as node audit rows are by node ID.
 //!
 //! A relay is bound to the server its first inventory names. A server no instance has (see
-//! [`super::gitlabs`]) is pending: an operator approves it by adding an instance at its URL.
+//! [`super::gitlabs`]) is pending: an operator approves it by adding an instance at its URL,
+//! or rejects it ([`super::approvals`]).
 
 use std::collections::BTreeMap;
 
@@ -12,6 +13,7 @@ use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::gitlab::{Heartbeat, Inventory, Report, ServerState, ServerStatus};
 
+use super::approvals::{REJECTED_GITLABS, rejected_in};
 use super::gitlabs::{GITLABS, GitlabRow, normalize_gitlab_url};
 use super::{Db, NotEnrolled, TokenKind, append_audit, decode, encode, spend_token, token_key};
 
@@ -82,38 +84,57 @@ pub struct PendingGitlab {
     pub relays: Vec<(String, String, u64)>,
 }
 
-/// The status of a relay bound to `bound` that reports `reported`, given `instances`.
-fn status_of(
-    bound: &str,
-    reported: Option<&str>,
-    instances: &[(String, GitlabRow)],
-) -> ServerStatus {
-    let rebound = reported.is_some_and(|r| normalize_gitlab_url(r).as_deref() != Some(bound));
-    let name = instances
-        .iter()
-        .find(|(_, row)| row.url == bound)
-        .map(|(name, _)| name.clone());
-    let state = match (&name, rebound) {
-        (_, true) => ServerState::Rebound,
-        (Some(_), false) => ServerState::Approved,
-        (None, false) => ServerState::Pending,
-    };
-    ServerStatus {
-        state,
-        url: bound.to_string(),
-        name: name.filter(|_| state.approved()),
-    }
+/// What decides a server's status: the instances, and the servers rejected.
+pub(super) struct Servers {
+    pub(super) instances: Vec<(String, GitlabRow)>,
+    pub(super) rejected: Vec<String>,
 }
 
-fn instances_in(
-    table: &impl ReadableTable<&'static str, &'static [u8]>,
-) -> Result<Vec<(String, GitlabRow)>> {
-    let mut out = Vec::new();
-    for entry in table.iter()? {
-        let (name, value) = entry?;
-        out.push((name.value().to_string(), decode(value.value())?));
+impl Servers {
+    pub(super) fn read(txn: &redb::ReadTransaction) -> Result<Self> {
+        let mut instances = Vec::new();
+        for entry in txn.open_table(GITLABS)?.iter()? {
+            let (name, value) = entry?;
+            instances.push((name.value().to_string(), decode(value.value())?));
+        }
+        let rejected = rejected_in(&txn.open_table(REJECTED_GITLABS)?)?;
+        Ok(Servers {
+            instances,
+            rejected,
+        })
     }
-    Ok(out)
+
+    /// The name of the instance at `url`, normalized, if any.
+    pub(super) fn name_of(&self, url: &str) -> Option<&str> {
+        self.instances
+            .iter()
+            .find(|(_, row)| row.url == url)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The status of a relay bound to `bound` that reports `reported`.
+    fn status_of(&self, bound: &str, reported: Option<&str>) -> ServerStatus {
+        let rebound = reported.is_some_and(|r| normalize_gitlab_url(r).as_deref() != Some(bound));
+        let name = self.name_of(bound).map(str::to_string);
+        let state = match (&name, rebound) {
+            (_, true) => ServerState::Rebound,
+            (Some(_), false) => ServerState::Approved,
+            (None, false) if self.rejected.iter().any(|r| r == bound) => ServerState::Rejected,
+            (None, false) => ServerState::Pending,
+        };
+        ServerStatus {
+            state,
+            url: bound.to_string(),
+            name: name.filter(|_| state.approved()),
+        }
+    }
+
+    /// The status of `row`'s server, once it is bound to one.
+    pub(super) fn relay_status(&self, row: &RelayRow) -> Option<ServerStatus> {
+        let bound = row.server_url.as_deref()?;
+        let reported = row.inventory.as_ref().map(|i| i.server.url.as_str());
+        Some(self.status_of(bound, reported))
+    }
 }
 
 impl Db {
@@ -191,13 +212,13 @@ impl Db {
     /// one snapshot.
     pub fn relays_with_status(&self) -> Result<Vec<(String, RelayRow, Option<ServerStatus>)>> {
         let txn = self.db.begin_read().context("starting a read")?;
-        let instances = instances_in(&txn.open_table(GITLABS)?)?;
+        let servers = Servers::read(&txn)?;
         let table = txn.open_table(RELAYS)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
             let (id, value) = entry?;
             let row: RelayRow = decode(value.value())?;
-            let status = relay_status(&row, &instances);
+            let status = servers.relay_status(&row);
             out.push((id.value().to_string(), row, status));
         }
         Ok(out)
@@ -214,8 +235,7 @@ impl Db {
         else {
             return Ok(None);
         };
-        let instances = instances_in(&txn.open_table(GITLABS)?)?;
-        let status = relay_status(&row, &instances);
+        let status = Servers::read(&txn)?.relay_status(&row);
         Ok(Some((row, status)))
     }
 
@@ -229,10 +249,10 @@ impl Db {
             .collect())
     }
 
-    /// The servers relays are bound to that no instance has, by URL.
+    /// The servers relays are bound to that no instance has and no operator rejected, by URL.
     pub fn pending_gitlabs(&self) -> Result<Vec<PendingGitlab>> {
         let txn = self.db.begin_read().context("starting a read")?;
-        let instances = instances_in(&txn.open_table(GITLABS)?)?;
+        let servers = Servers::read(&txn)?;
         let mut pending: BTreeMap<String, PendingGitlab> = BTreeMap::new();
         let table = txn.open_table(RELAYS)?;
         for entry in table.iter()? {
@@ -241,7 +261,7 @@ impl Db {
             let Some(url) = row.server_url.clone() else {
                 continue;
             };
-            if instances.iter().any(|(_, i)| i.url == url) {
+            if servers.name_of(&url).is_some() || servers.rejected.contains(&url) {
                 continue;
             }
             // What a relay reports of another server is not this one's.
@@ -399,13 +419,6 @@ impl Db {
         txn.commit().context("updating a relay")?;
         Ok(out)
     }
-}
-
-/// The status of `row`'s server, once it is bound to one.
-fn relay_status(row: &RelayRow, instances: &[(String, GitlabRow)]) -> Option<ServerStatus> {
-    let bound = row.server_url.as_deref()?;
-    let reported = row.inventory.as_ref().map(|i| i.server.url.as_str());
-    Some(status_of(bound, reported, instances))
 }
 
 /// A relay bound to the server at `url`, normalized, if any: its instance is not removed
@@ -577,6 +590,27 @@ mod tests {
         assert!(db.remove_relay(&id, "u", 9).unwrap());
         assert!(!db.remove_relay(&id, "u", 9).unwrap());
         assert!(db.remove_gitlab("gl", "u", 10).unwrap());
+    }
+
+    /// A rejected server is no longer pending, and is pending again once forgotten.
+    #[test]
+    fn a_relay_is_told_its_server_was_rejected() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db, "aa");
+        db.record_relay(
+            &id,
+            RelayWrite::Inventory(inventory("https://gl.example")),
+            1,
+        )
+        .unwrap();
+        db.reject_gitlab("https://gl.example", "u", 2).unwrap();
+        let status = db.relay_with_status(&id).unwrap().unwrap().1.unwrap();
+        assert_eq!((status.state, status.name), (ServerState::Rejected, None));
+        assert!(db.pending_gitlabs().unwrap().is_empty());
+        db.forget_gitlab("https://gl.example", "u", 3).unwrap();
+        let status = db.relay_with_status(&id).unwrap().unwrap().1.unwrap();
+        assert_eq!(status.state, ServerState::Pending);
+        assert_eq!(db.pending_gitlabs().unwrap().len(), 1);
     }
 
     /// A pending server is shown with what a relay reports of it, not of another server.

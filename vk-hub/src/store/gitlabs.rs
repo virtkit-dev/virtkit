@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use super::approvals::{REJECTED_GITLABS, forget_projects_of};
 use super::egress::{EGRESS_MUTES, EGRESS_SUBJECT_ORDER, Mute};
 use super::keys::{API_KEYS, KeyRow};
 use super::observed::OBSERVED_SUBJECTS;
@@ -179,6 +180,8 @@ impl Db {
             table.insert(name, encode(&row)?.as_slice())?;
             row
         };
+        // Approving a server rejected before ends its rejection.
+        txn.open_table(REJECTED_GITLABS)?.remove(row.url.as_str())?;
         let event = format!("{actor} added GitLab instance {name} at {}", row.url);
         append_audit(&txn, None, actor, &event, now)?;
         txn.commit().context("adding a GitLab instance")?;
@@ -205,8 +208,8 @@ impl Db {
         Ok(out)
     }
 
-    /// Remove instance `name`, audited as `actor`'s, and return whether it existed.
-    /// Refused while a working key or a relay is bound to it.
+    /// Remove instance `name` and forget its projects, audited as `actor`'s, and return
+    /// whether it existed. Refused while a working key or a relay is bound to it.
     pub fn remove_gitlab(&self, name: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         {
@@ -234,6 +237,7 @@ impl Db {
         }
         let removed = txn.open_table(GITLABS)?.remove(name)?.is_some();
         if removed {
+            forget_projects_of(&txn, name)?;
             append_audit(
                 &txn,
                 None,

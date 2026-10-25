@@ -196,6 +196,28 @@ enum Call {
     RemoveGitlab {
         name: String,
     },
+    /// Refuse the jobs of a server relays report, without listing it as pending.
+    RejectGitlab {
+        url: String,
+    },
+    /// Forget a server's rejection.
+    ForgetGitlab {
+        url: String,
+    },
+    ListRejectedGitlabs,
+    /// The projects of an instance, or of all.
+    ListProjects {
+        gitlab: Option<String>,
+    },
+    DecideProjects {
+        gitlab: String,
+        projects: Vec<crate::store::ProjectRef>,
+        decision: crate::store::Decision,
+    },
+    ForgetProjects {
+        gitlab: String,
+        ids: Vec<u64>,
+    },
     ListRelays,
     ShowRelay {
         id: String,
@@ -720,6 +742,60 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             }
             serde_json::to_value(removed)?
         }
+        Call::RejectGitlab { url } => {
+            let (url, changed) = hub.db.reject_gitlab(&url, &actor, crate::now_secs())?;
+            if changed {
+                crate::relays::server_changed(hub, &url)?;
+                eprintln!("vk-hub: admin: {actor} rejected GitLab server {url}");
+            }
+            serde_json::to_value(changed)?
+        }
+        Call::ForgetGitlab { url } => {
+            let (url, changed) = hub.db.forget_gitlab(&url, &actor, crate::now_secs())?;
+            if changed {
+                crate::relays::server_changed(hub, &url)?;
+                eprintln!("vk-hub: admin: {actor} forgot rejected GitLab server {url}");
+            }
+            serde_json::to_value(changed)?
+        }
+        Call::ListRejectedGitlabs => serde_json::to_value(hub.db.rejected_gitlabs()?)?,
+        Call::ListProjects { gitlab } => {
+            serde_json::to_value(hub.db.gitlab_projects(gitlab.as_deref())?)?
+        }
+        Call::DecideProjects {
+            gitlab,
+            projects,
+            decision,
+        } => {
+            let n =
+                hub.db
+                    .decide_projects(&gitlab, &projects, decision, &actor, crate::now_secs())?;
+            if n > 0 {
+                hub.touch();
+                eprintln!(
+                    "vk-hub: admin: {actor} {} {n} project(s) of GitLab instance {}",
+                    match decision {
+                        crate::store::Decision::Approve => "approved",
+                        crate::store::Decision::Reject => "rejected",
+                    },
+                    vk_hub_proto::display_safe(&gitlab)
+                );
+            }
+            serde_json::to_value(n)?
+        }
+        Call::ForgetProjects { gitlab, ids } => {
+            let n = hub
+                .db
+                .forget_projects(&gitlab, &ids, &actor, crate::now_secs())?;
+            if n > 0 {
+                hub.touch();
+                eprintln!(
+                    "vk-hub: admin: {actor} forgot {n} project(s) of GitLab instance {}",
+                    vk_hub_proto::display_safe(&gitlab)
+                );
+            }
+            serde_json::to_value(n)?
+        }
         Call::ListRelays => serde_json::to_value(crate::relays::views(hub)?)?,
         Call::ShowRelay { id } => serde_json::to_value(crate::relays::detail(hub, &id)?)?,
         Call::RemoveRelay { id } => {
@@ -1045,6 +1121,52 @@ impl Client {
 
     pub fn pending_gitlabs(&self) -> Result<Vec<crate::store::PendingGitlab>> {
         self.call(Call::PendingGitlabs)
+    }
+
+    /// Whether it was not rejected already.
+    pub fn reject_gitlab(&self, url: &str) -> Result<bool> {
+        self.call(Call::RejectGitlab {
+            url: url.to_string(),
+        })
+    }
+
+    /// Whether it was rejected.
+    pub fn forget_gitlab(&self, url: &str) -> Result<bool> {
+        self.call(Call::ForgetGitlab {
+            url: url.to_string(),
+        })
+    }
+
+    pub fn rejected_gitlabs(&self) -> Result<Vec<(String, crate::store::RejectedGitlab)>> {
+        self.call(Call::ListRejectedGitlabs)
+    }
+
+    pub fn gitlab_projects(&self, gitlab: Option<&str>) -> Result<Vec<crate::store::ProjectView>> {
+        self.call(Call::ListProjects {
+            gitlab: gitlab.map(str::to_string),
+        })
+    }
+
+    /// How many changed.
+    pub fn decide_projects(
+        &self,
+        gitlab: &str,
+        projects: Vec<crate::store::ProjectRef>,
+        decision: crate::store::Decision,
+    ) -> Result<usize> {
+        self.call(Call::DecideProjects {
+            gitlab: gitlab.to_string(),
+            projects,
+            decision,
+        })
+    }
+
+    /// How many there were.
+    pub fn forget_projects(&self, gitlab: &str, ids: Vec<u64>) -> Result<usize> {
+        self.call(Call::ForgetProjects {
+            gitlab: gitlab.to_string(),
+            ids,
+        })
     }
 
     pub fn list_relays(&self) -> Result<Vec<crate::relays::RelayView>> {
@@ -2052,6 +2174,11 @@ mod tests {
             let pending = client.pending_gitlabs().unwrap();
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].url, "https://gl.example");
+            assert!(client.reject_gitlab("https://gl.example/").unwrap());
+            assert!(client.pending_gitlabs().unwrap().is_empty());
+            assert_eq!(client.rejected_gitlabs().unwrap().len(), 1);
+            assert!(client.forget_gitlab("https://gl.example").unwrap());
+            assert!(!client.forget_gitlab("https://gl.example").unwrap());
             let listed = client.list_relays().unwrap();
             assert_eq!(listed.len(), 1);
             assert_eq!(
@@ -2063,6 +2190,12 @@ mod tests {
             let shown = client.show_relay(&id).unwrap().unwrap();
             assert_eq!(shown.server.unwrap().name.as_deref(), Some("gl"));
             assert!(client.remove_gitlab("gl").is_err());
+            let projects = vec![crate::store::ProjectRef::parse("4:acme/web").unwrap()];
+            let approve = crate::store::Decision::Approve;
+            assert_eq!(client.decide_projects("gl", projects, approve).unwrap(), 1);
+            let listed = client.gitlab_projects(Some("gl")).unwrap();
+            assert_eq!((listed[0].id, listed[0].row.path.as_str()), (4, "acme/web"));
+            assert_eq!(client.forget_projects("gl", vec![4, 5]).unwrap(), 1);
             assert!(client.remove_relay(&id).unwrap());
             assert!(!client.remove_relay(&id).unwrap());
             assert!(client.show_relay(&id).unwrap().is_none());

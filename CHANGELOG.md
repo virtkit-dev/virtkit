@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   inspects or revokes one. A GitLab server a relay reports is pending until an operator
   approves it under a name, with `vk-hub gitlabs pending` and `gitlabs approve <url> --name
   <name>`; a server's instance cannot be removed while a relay is bound to it.
+- **GitLab servers can be rejected and GitLab projects approved on the hub**: `vk-hub gitlabs
+  reject|forget <url>` refuses a server's relays or takes that back, and `vk-hub gitlabs
+  projects` lists, approves, rejects and forgets an instance's projects by ID, all audited.
 
 ## [0.95.1] - 2026-10-24
 

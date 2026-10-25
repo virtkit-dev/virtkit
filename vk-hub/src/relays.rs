@@ -299,7 +299,7 @@ pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
 }
 
 /// Have the sessions of the relays bound to the server at `url` tell them its status anew,
-/// after an operator approved or removed it.
+/// after an operator approved, rejected or forgot it.
 pub fn server_changed(hub: &Hub, url: &str) -> Result<()> {
     for id in hub.db.relays_of(url)? {
         hub.kick(&id);
@@ -364,6 +364,11 @@ pub fn notes(r: &RelayView) -> Vec<String> {
         match s.state {
             ServerState::Pending => notes.push(format!(
                 "{name}: GitLab {} waits for approval: `vk-hub gitlabs approve {} --name <name>`",
+                s.url, s.url
+            )),
+            ServerState::Rejected => notes.push(format!(
+                "{name}: GitLab {} was rejected: `vk-hub gitlabs approve {} --name <name>` \
+                 approves it",
                 s.url, s.url
             )),
             ServerState::Rebound => {

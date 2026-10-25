@@ -174,10 +174,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
     },
-    /// Add, list, approve and remove the GitLab instances the hub takes jobs from
+    /// Add, list, approve, reject and remove the GitLab instances the hub takes jobs from,
+    /// and approve their projects
     ///
     /// A GitLab server a relay reports is pending until approved under a name, which its
-    /// relays then poll. A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
+    /// relays then poll, or rejected. A jobs key bound to an instance (`vk-hub keys create --gitlab <name>`) submits that
     /// instance's jobs only, and only its jobs get registry tokens; the name is what registry
     /// namespaces call {gitlab}.
     Gitlabs {
@@ -512,7 +513,8 @@ enum GitlabsCmd {
     List,
     /// Add an instance under a name: lowercase letters, digits and '-'
     Add { name: String, url: String },
-    /// List the GitLab servers relays report that no instance has
+    /// List the GitLab servers relays report that no instance has, and the projects waiting
+    /// for approval
     Pending,
     /// Approve a pending server under a name: `add` with the arguments swapped
     Approve {
@@ -521,8 +523,56 @@ enum GitlabsCmd {
         #[arg(long)]
         name: String,
     },
-    /// Remove an instance no working key and no relay is bound to
+    /// Refuse the jobs of a server relays report, and stop listing it as pending
+    ///
+    /// `approve` still approves it later.
+    Reject { url: String },
+    /// Forget a server's rejection: it is pending again while a relay reports it
+    Forget { url: String },
+    /// Remove an instance no working key and no relay is bound to, and forget its projects
     Remove { name: String },
+    /// List, approve, reject and forget the projects whose jobs an instance's relays submit
+    ///
+    /// A project's first job makes it pending, and is refused; its jobs are accepted once it
+    /// is approved.
+    Projects {
+        #[command(subcommand)]
+        cmd: Option<ProjectsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectsCmd {
+    /// List the projects of an instance, or of every instance (the default)
+    List {
+        gitlab: Option<String>,
+        /// Only those waiting for approval
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve projects of an instance, pending or not, by ID: <id> or <id>:<path>
+    Approve {
+        gitlab: String,
+        #[arg(required = true, value_parser = parse_project_ref)]
+        projects: Vec<store::ProjectRef>,
+    },
+    /// Reject projects of an instance by ID: their jobs are refused, and they are no longer
+    /// pending
+    Reject {
+        gitlab: String,
+        #[arg(required = true, value_parser = parse_project_ref)]
+        projects: Vec<store::ProjectRef>,
+    },
+    /// Forget projects of an instance: the next job of one makes it pending again
+    Forget {
+        gitlab: String,
+        #[arg(required = true)]
+        ids: Vec<u64>,
+    },
+}
+
+fn parse_project_ref(s: &str) -> Result<store::ProjectRef, String> {
+    store::ProjectRef::parse(s)
 }
 
 #[derive(Subcommand)]
@@ -1978,6 +2028,13 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
                 .map(|(name, g)| [name, g.url, utc(g.created_at), g.created_by])
                 .collect();
             print!("{}", table(&["NAME", "URL", "ADDED", "BY"], &rows));
+            for (url, r) in client.rejected_gitlabs()? {
+                println!(
+                    "rejected: {url} (by {}, {})",
+                    r.rejected_by,
+                    utc(r.rejected_at)
+                );
+            }
         }
         GitlabsCmd::Add { name, url } | GitlabsCmd::Approve { url, name } => {
             let row = client.add_gitlab(&name, &url)?;
@@ -2005,7 +2062,30 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
                 "{}",
                 table(&["URL", "CERTIFICATE KEY SHA256", "RELAYS", "SINCE"], &rows)
             );
+            let projects: Vec<store::ProjectView> = client
+                .gitlab_projects(None)?
+                .into_iter()
+                .filter(|p| p.row.state == store::ProjectState::Pending)
+                .collect();
+            if !projects.is_empty() {
+                println!();
+                print!("{}", render_projects(&projects));
+            }
         }
+        GitlabsCmd::Reject { url } => {
+            if client.reject_gitlab(&url)? {
+                eprintln!("vk-hub: rejected GitLab server {url}");
+            } else {
+                eprintln!("vk-hub: GitLab server {url} was rejected already");
+            }
+        }
+        GitlabsCmd::Forget { url } => {
+            if !client.forget_gitlab(&url)? {
+                bail!("GitLab server {url} is not rejected");
+            }
+            eprintln!("vk-hub: forgot the rejection of GitLab server {url}");
+        }
+        GitlabsCmd::Projects { cmd } => projects_blocking(client, cmd)?,
         GitlabsCmd::Remove { name } => {
             if !client.remove_gitlab(&name)? {
                 bail!("there is no GitLab instance {name}");
@@ -2014,6 +2094,69 @@ fn gitlabs_blocking(client: &admin::Client, cmd: Option<GitlabsCmd>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// `vk-hub gitlabs projects` and its subcommands.
+fn projects_blocking(client: &admin::Client, cmd: Option<ProjectsCmd>) -> Result<()> {
+    let cmd = cmd.unwrap_or(ProjectsCmd::List {
+        gitlab: None,
+        pending: false,
+    });
+    match cmd {
+        ProjectsCmd::List { gitlab, pending } => {
+            let projects: Vec<store::ProjectView> = client
+                .gitlab_projects(gitlab.as_deref())?
+                .into_iter()
+                .filter(|p| !pending || p.row.state == store::ProjectState::Pending)
+                .collect();
+            print!("{}", render_projects(&projects));
+        }
+        ProjectsCmd::Approve { gitlab, projects } => {
+            let n = client.decide_projects(&gitlab, projects, store::Decision::Approve)?;
+            eprintln!("vk-hub: approved {n} project(s) of GitLab instance {gitlab}");
+        }
+        ProjectsCmd::Reject { gitlab, projects } => {
+            let n = client.decide_projects(&gitlab, projects, store::Decision::Reject)?;
+            eprintln!("vk-hub: rejected {n} project(s) of GitLab instance {gitlab}");
+        }
+        ProjectsCmd::Forget { gitlab, ids } => {
+            let n = client.forget_projects(&gitlab, ids)?;
+            eprintln!("vk-hub: forgot {n} project(s) of GitLab instance {gitlab}");
+        }
+    }
+    Ok(())
+}
+
+/// Projects as `vk-hub gitlabs projects` and `gitlabs pending` print them.
+fn render_projects(projects: &[store::ProjectView]) -> String {
+    let rows: Vec<[String; 7]> = projects
+        .iter()
+        .map(|p| {
+            let r = &p.row;
+            [
+                p.gitlab.clone(),
+                p.id.to_string(),
+                if r.path.is_empty() {
+                    "-".to_string()
+                } else {
+                    r.path.clone()
+                },
+                r.state.name().to_string(),
+                utc(r.since),
+                r.refused.to_string(),
+                match (&r.decided_by, r.first_job, &r.relay) {
+                    (Some(by), _, _) => format!("by {by}"),
+                    (None, Some(job), Some(relay)) => format!("job {job} via relay {relay}"),
+                    (None, Some(job), None) => format!("job {job}"),
+                    _ => "-".to_string(),
+                },
+            ]
+        })
+        .collect();
+    table(
+        &["GITLAB", "ID", "PATH", "STATE", "SINCE", "REFUSED", "FROM"],
+        &rows,
+    )
 }
 
 /// `vk-hub relays` and its subcommands, which block on the admin socket.

@@ -41,6 +41,7 @@ use crate::rollout::{
     DeleteRule, Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState,
 };
 
+mod approvals;
 mod audit;
 mod clients;
 mod egress;
@@ -55,6 +56,7 @@ mod relays;
 mod token_keys;
 mod tools;
 
+pub use approvals::{Decision, ProjectRef, ProjectState, ProjectView, RejectedGitlab};
 pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};
 pub use egress::{AllowRequest, AllowSaved, BlockedRow, MAX_MUTE_REASON, Mute, RowRange, Stored};
@@ -810,6 +812,10 @@ impl Db {
             .context("opening the GitLab instances table")?;
         txn.open_table(relays::RELAYS)
             .context("opening the relays table")?;
+        txn.open_table(approvals::GITLAB_PROJECTS)
+            .context("opening the GitLab projects table")?;
+        txn.open_table(approvals::REJECTED_GITLABS)
+            .context("opening the rejected GitLab servers table")?;
         txn.open_table(namespaces::NAMESPACES)
             .context("opening the namespaces table")?;
         txn.open_table(token_keys::TOKEN_KEYS)

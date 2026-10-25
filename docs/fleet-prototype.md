@@ -1056,7 +1056,15 @@ again whenever an operator changes it. A relay that later reports another URL st
 told `rebound`; one reporting no printable http(s) URL of at most 256 characters is refused. `vk-hub gitlabs pending` lists the
 servers relays report that no instance has, with the digest to check and the relays that report
 them; `vk-hub gitlabs approve <url> --name <name>` (or `gitlabs add`) approves one, and its relays
-hear it at once. `gitlabs remove` is refused while a relay is bound to the instance. `vk-hub
+hear it at once. `vk-hub gitlabs reject <url>` refuses a server instead: it is no longer listed
+as pending, its relays are told `rejected`, and `approve` still approves it later; `gitlabs
+forget <url>` drops the rejection, so a server a relay still reports is pending again. `gitlabs
+remove` is refused while a relay is bound to the instance, and forgets its projects. Projects are
+approved per instance: `vk-hub gitlabs projects [list] [<instance>] [--pending]` lists them with
+their state, path, first refused job and how many were refused, `gitlabs projects approve|reject
+<instance> <id>[:<path>] …` decides on them, pending or not, and `gitlabs projects forget
+<instance> <id> …` forgets them; `gitlabs pending` lists the pending projects under the servers.
+Every rejection, approval and forget is audited. `vk-hub
 relays` lists the relays — reach, version, server, runners, last seen — `relays show <id>` adds
 its server and runners, and `relays remove <id>` unpins its key and ends its session, audited.
 

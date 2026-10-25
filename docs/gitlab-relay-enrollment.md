@@ -168,7 +168,8 @@ A refused submission retried under the same request ID counts once.
 - **Reject** keeps the item and refuses its jobs, without listing it as pending again; it can be
   approved later. **Forget** deletes it: a project's next job makes it pending again, and a
   forgotten server is pending again at once if a relay still reports it. Removing a server,
-  refused while relays are bound to it, forgets its projects.
+  refused while relays are bound to it, forgets its projects. An approved server is not
+  rejected: its relays are removed, then the server.
 - **Audit.** Every approval, rejection and forget, with the actor.
 
 ## Migration from 0.95
