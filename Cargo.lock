@@ -4179,7 +4179,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "vk-fs",
  "vk-hub-proto",
+ "vk-peer",
 ]
 
 [[package]]

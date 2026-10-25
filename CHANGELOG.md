@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
 - **GitLab servers can be rejected and GitLab projects approved on the hub**: `vk-hub gitlabs
   reject|forget <url>` refuses a server's relays or takes that back, and `vk-hub gitlabs
   projects` lists, approves, rejects and forgets an instance's projects by ID, all audited.
+- **`vk-gitlab join` enrolls a `vk-gitlab` with a hub as a relay**, with a token from `vk-hub
+  token create --kind gitlab`, and `vk-gitlab leave` forgets the hub; both are refused while
+  its runners hold jobs.
 
 ### Changed
 

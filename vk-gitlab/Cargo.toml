@@ -35,6 +35,9 @@ httpdate.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "signal"] }
 # The hub's client API and the job spec it carries.
 vk-hub-proto = { path = "../vk-hub-proto" }
+# The relay's identity, enrollment and session with the hub, and its files written whole.
+vk-fs = { path = "../vk-fs" }
+vk-peer = { path = "../vk-peer" }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
