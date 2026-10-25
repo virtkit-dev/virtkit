@@ -435,8 +435,9 @@ allow-ip = ["192.0.2.10/32:22"]
 `allow-name` entries are DNS suffixes, dot-anchored: `debian.org` also allows
 `deb.debian.org`. A name outside them resolves to nothing, and the guest may reach the
 addresses an allowed name resolved to. Compose service names still resolve, and so do
-reverse (PTR) lookups of the environment's own addresses. Other reverse lookups are names
-like any other, so they resolve to nothing unless listed; listing `in-addr.arpa` or
+reverse (PTR) lookups of the environment's own addresses, and of the addresses an allowed
+name resolved to, while the guest may reach them. Other reverse lookups are names like any
+other, so they resolve to nothing unless listed; listing `in-addr.arpa` or
 `ip6.arpa` reopens them as a way to carry data out in the names queried. A query the
 gateway cannot parse is refused, and one it forwards is rebuilt from its question, keeping
 only its id, the RD, AD and CD flags and a bare EDNS record.

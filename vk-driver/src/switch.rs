@@ -927,12 +927,19 @@ impl EgressGuard {
             blocked,
         )
     }
-    /// [`Self::layer`] of a lookup of `name`.
+    /// [`Self::layer`] of a lookup of `name`: a reverse name passes a layer that holds its
+    /// address through a pin, as [`Self::reverse_allowed`] decides.
     fn name_layer(&self, src: Ipv4Addr, name: &str, blocked: bool) -> EgressLayer {
+        let addr = reverse_v4(name);
+        let hub_allows =
+            self.hub_allows_host(name) || addr.is_some_and(|ip| self.hub_allows_reverse(src, ip));
         self.layer(
             Some(src),
-            |layer| !layer.allows_host(name),
-            self.hub_allows_host(name),
+            |layer| {
+                !layer.allows_host(name)
+                    && addr.is_none_or(|ip| !pinned_by(&self.pinned, layer, src, (ip, 0).into()))
+            },
+            hub_allows,
             blocked,
         )
     }
@@ -1331,6 +1338,25 @@ impl EgressGuard {
     fn hub_allows_host(&self, host: &str) -> bool {
         self.hub.as_ref().is_none_or(|h| h.allows_host(host))
     }
+    /// May `src`'s resolver forward a reverse lookup of `ip`, whatever its name? Only where every
+    /// node layer of `src` that restricts holds `ip` through a live pin, which dry-run softens;
+    /// the hub's layer is [`Self::hub_allows_reverse`]. The name is then fully determined by an
+    /// address the switch handed `src` for a name it allows, and that `src` may already dial, so
+    /// it carries no data the guest chose beyond which of those addresses it asks about. A
+    /// listed range does not qualify an address: the guest would pick any address in it, and
+    /// encode what it liked in the name.
+    fn reverse_allowed(&self, src: Ipv4Addr, ip: Ipv4Addr) -> bool {
+        let job = self.default_policy();
+        self.node_layers(&job, src)
+            .all(|l| !l.restricts() || pinned_by(&self.pinned, l, src, (ip, 0).into()))
+    }
+    /// Does the hub's layer allow a reverse lookup of `ip` from `src`? As
+    /// [`Self::reverse_allowed`] decides for a node layer; yes where it restricts nothing.
+    fn hub_allows_reverse(&self, src: Ipv4Addr, ip: Ipv4Addr) -> bool {
+        self.hub
+            .as_ref()
+            .is_none_or(|hub| pinned_by(&self.pinned, hub, src, (ip, 0).into()))
+    }
     /// Does the hub's layer allow a direct flow from `src` to `dst`? As [`Self::layer_allows`]
     /// decides for every layer; yes where it restricts nothing.
     fn hub_allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
@@ -1353,10 +1379,13 @@ impl EgressGuard {
         layer.allows_ip(dst.ip(), dst.port()) || pinned_by(&self.pinned, layer, src, dst)
     }
     /// Record, for each hub dry-run rule that would refuse a lookup of `name` the switch is
-    /// carrying, that rule's would-be denial.
+    /// carrying, that rule's would-be denial. A rule allows a reverse name whose address its
+    /// own pins hold, as the hub's layer would ([`Self::hub_allows_reverse`]).
     fn dry_run_rules_dns(&self, src: Ipv4Addr, name: &str) {
-        for TrialRule { rule, layer, .. } in &self.hub_dry_run {
-            if !layer.allows_host(name) {
+        let addr = reverse_v4(name);
+        for TrialRule { rule, layer, pins } in &self.hub_dry_run {
+            let reverse = addr.is_some_and(|ip| pinned_by(pins, layer, src, (ip, 0).into()));
+            if !layer.allows_host(name) && !reverse {
                 self.record_dns_denial(src, name, true, Some(rule));
             }
         }
@@ -3327,16 +3356,26 @@ async fn handle_dns(
         // Format the lookup only when reporting a failure.
         let question = || format!("{name} ({})", qtype_name(qtype));
         // Other reverse (PTR) names are held to the allowlist like any other: forwarding
-        // them would carry whatever labels the guest chose to the upstream resolver.
-        let name_allowed = egress.name_allowed(client_ip, &name);
+        // them would carry whatever labels the guest chose to the upstream resolver. The
+        // exception is the reverse name of an address pinned for this guest, which a layer
+        // that would refuse the name admits through the pin (`EgressGuard::reverse_allowed`).
+        let mut name_allowed = egress.name_allowed(client_ip, &name);
+        let mut hub_allows = egress.hub_allows_host(&name);
+        // Admitted through a pin: nothing is pinned from its answer, nor counted as a contact.
+        let mut by_pin = false;
+        if let Some(ip) = reverse_v4(&name).filter(|_| !(name_allowed && hub_allows)) {
+            by_pin = true;
+            name_allowed = name_allowed || egress.reverse_allowed(client_ip, ip);
+            hub_allows = hub_allows || egress.hub_allows_reverse(client_ip, ip);
+        }
         // The hub's layer refuses what it refuses under dry-run too.
-        if egress.hub_allows_host(&name) && (name_allowed || egress.dry_run) {
+        if hub_allows && (name_allowed || egress.dry_run) {
             egress.dry_run_rules_dns(client_ip, &name);
             if name_allowed {
                 // Audit: count the guest's A-record lookups as its external contacts (egress
                 // is IPv4, so an A query is what precedes a connection); the paired AAAA query
                 // for the same name is not double-counted.
-                if qtype == TYPE_A {
+                if qtype == TYPE_A && !by_pin {
                     egress.record_contact(client_ip, &name);
                 }
             } else {
@@ -3358,8 +3397,14 @@ async fn handle_dns(
                     }
                     let (ips, ttl) = parse_a_records(a.pin_source(), upstream_query, &name);
                     // `--egress-file` can change the policy while awaiting the upstream: a
-                    // name it no longer allows is refused, and its addresses not pinned.
-                    if !egress.record_if_allowed(client_ip, &name, &ips, ttl) && !egress.dry_run {
+                    // name it no longer allows is refused, and its addresses not pinned. An
+                    // answer admitted through a pin is never pinned, so an edit has nothing of
+                    // it to revoke.
+                    if by_pin {
+                        Some(a.for_guest(guest_udp_size(&query, qend)))
+                    } else if !egress.record_if_allowed(client_ip, &name, &ips, ttl)
+                        && !egress.dry_run
+                    {
                         egress.deny_dns(client_ip, &name, false, || {
                             format!("dns refused (egress allowlist, just changed): {name}")
                         });
@@ -6699,6 +6744,175 @@ mod tests {
             DNS_TEST_LAN.gateway,
         ));
         assert_eq!(reverse_lookup(&listed, guest).await, (0, true));
+    }
+
+    /// A reverse lookup of an address pinned for the guest under an allowed name is forwarded
+    /// and recorded as nothing; one of an address not pinned for it, open only through
+    /// `allow_ip`, pinned for another guest, or whose pin expired is NXDOMAIN and recorded.
+    #[tokio::test]
+    async fn a_reverse_lookup_of_a_pinned_address_is_forwarded() {
+        use crate::egress_report::{Denial, Proto};
+        let (guest, other) = (
+            Ipv4Addr::new(192, 168, 231, 2),
+            Ipv4Addr::new(192, 168, 231, 3),
+        );
+        let dir = std::env::temp_dir().join(format!("vk-dns-ptr-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ptr = |ip: &str| dns_question(9, &format!("{ip}.in-addr.arpa"), 12);
+        let denial = |ip: &str| Denial {
+            proto: Proto::Dns,
+            target: format!("{ip}.in-addr.arpa"),
+            count: 1,
+        };
+        let policy =
+            || Egress::restricted(&["10.20.0.0/16".into()], &["corp.example.com".into()]).unwrap();
+        let pinned = Ipv4Addr::new(10, 10, 1, 68);
+
+        let log = dir.join("enforce.log");
+        let guard = Arc::new(
+            EgressGuard::new(policy(), DNS_TEST_LAN.gateway).with_denied_log(Some(log.clone())),
+        );
+        assert!(guard.record_if_allowed(guest, "wab.corp.example.com", &[pinned], 60));
+        assert_eq!(
+            lookup(&guard, guest, ptr("68.1.10.10")).await,
+            (Some(0), true)
+        );
+        // Any qtype: the name is what is checked.
+        let any = dns_question(9, "68.1.10.10.in-addr.arpa", 255);
+        assert_eq!(lookup(&guard, guest, any).await, (Some(0), true));
+        assert!(crate::egress_report::read_since(&log, 0).0.is_empty());
+        for (src, ip) in [
+            (guest, "69.1.10.10"), // not pinned
+            (guest, "5.0.20.10"),  // allow_ip only
+            (other, "68.1.10.10"), // pinned for another guest
+        ] {
+            assert_eq!(
+                lookup(&guard, src, ptr(ip)).await,
+                (Some(RCODE_NXDOMAIN), false),
+                "{ip}"
+            );
+        }
+        // Expired.
+        let expired = Ipv4Addr::new(10, 10, 1, 70);
+        let now = Instant::now();
+        guard
+            .pinned
+            .lock()
+            .unwrap()
+            .pin((guest, expired), "old.corp.example.com", now, now);
+        assert_eq!(
+            lookup(&guard, guest, ptr("70.1.10.10")).await,
+            (Some(RCODE_NXDOMAIN), false)
+        );
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            ["69.1.10.10", "5.0.20.10", "68.1.10.10", "70.1.10.10"].map(denial)
+        );
+
+        // Dry-run: forwarded either way, a would-be denial only where nothing pins it.
+        let log = dir.join("dry.log");
+        let dry = Arc::new(
+            EgressGuard::new(policy(), DNS_TEST_LAN.gateway)
+                .with_denied_log(Some(log.clone()))
+                .with_dry_run(true),
+        );
+        assert!(dry.record_if_allowed(guest, "wab.corp.example.com", &[pinned], 60));
+        assert_eq!(
+            lookup(&dry, guest, ptr("68.1.10.10")).await,
+            (Some(0), true)
+        );
+        assert_eq!(
+            lookup(&dry, guest, ptr("69.1.10.10")).await,
+            (Some(0), true)
+        );
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            [denial("69.1.10.10")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hub's layer admits a reverse lookup through its own pins only: an address resolved
+    /// under a name it refuses is never pinned, so its reverse lookup is refused, node dry-run
+    /// or not. A hub dry-run rule records no would-be denial for an address its pins hold.
+    #[tokio::test]
+    async fn reverse_lookups_through_the_hub_layer_and_its_dry_run_rules() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let ptr = |ip: &str| dns_question(9, &format!("{ip}.in-addr.arpa"), 12);
+        let corp = || Egress::restricted(&[], &["corp.example.com".into()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("vk-dns-ptr-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let log = dir.join("hub.log");
+        let hub = Arc::new(
+            EgressGuard::new(
+                Egress::restricted(&[], &["corp.example.com".into(), "other.example".into()])
+                    .unwrap(),
+                DNS_TEST_LAN.gateway,
+            )
+            .with_dry_run(true)
+            .with_cap(Some(Egress::AllowAll))
+            .with_hub(Some(corp()), Vec::new())
+            .with_denied_log(Some(log.clone())),
+        );
+        assert!(hub.record_if_allowed(
+            guest,
+            "git.corp.example.com",
+            &[Ipv4Addr::new(10, 0, 0, 1)],
+            60
+        ));
+        assert!(!hub.record_if_allowed(
+            guest,
+            "x.other.example",
+            &[Ipv4Addr::new(10, 0, 0, 2)],
+            60
+        ));
+        assert_eq!(lookup(&hub, guest, ptr("1.0.0.10")).await, (Some(0), true));
+        assert_eq!(
+            lookup(&hub, guest, ptr("2.0.0.10")).await,
+            (Some(RCODE_NXDOMAIN), false)
+        );
+        assert_eq!(
+            crate::egress_report::read_records_since(&log, 0)
+                .0
+                .into_iter()
+                .map(|(d, a)| (d.target, a.layer))
+                .collect::<Vec<_>>(),
+            [(
+                "2.0.0.10.in-addr.arpa".to_string(),
+                Some(EgressLayer::HubRule)
+            )]
+        );
+
+        let log = dir.join("trial.log");
+        let trial = Arc::new(
+            EgressGuard::new(Egress::AllowAll, DNS_TEST_LAN.gateway)
+                .with_hub(None, vec![("trial".into(), corp())])
+                .with_denied_log(Some(log.clone())),
+        );
+        trial.pin_for_trials(
+            guest,
+            "git.corp.example.com",
+            &[Ipv4Addr::new(10, 0, 0, 1)],
+            60,
+        );
+        assert_eq!(
+            lookup(&trial, guest, ptr("1.0.0.10")).await,
+            (Some(0), true)
+        );
+        assert_eq!(
+            lookup(&trial, guest, ptr("2.0.0.10")).await,
+            (Some(0), true)
+        );
+        let records = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(records.lines().count(), 1, "{records}");
+        assert!(
+            records.starts_with("dns\t2.0.0.10.in-addr.arpa\t1\tlayer=hub_rule\tdry=1"),
+            "{records}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
