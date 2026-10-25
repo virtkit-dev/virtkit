@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
   address back up, for as long as it may connect to it, instead of getting `NXDOMAIN` and a
   blocked-lookup record. Other reverse lookups are refused as before, those of addresses
   reachable only through `allow_ip` included.
+- **Guests' lookups of `localhost` and `invalid` names are answered on the host**: names under
+  `localhost` resolve to the loopback addresses and those under `invalid` to `NXDOMAIN`, under
+  any egress policy, without reaching the host's resolver or showing as blocked lookups.
 
 ### Fixed
 

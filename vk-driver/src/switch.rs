@@ -3284,9 +3284,9 @@ fn host_upstreams() -> Vec<SocketAddr> {
         .collect()
 }
 
-/// Resolve a guest DNS query and send the response back to it: service names and reverse
-/// lookups on the LAN are answered from the local map; everything else is forwarded to the
-/// host's resolver.
+/// Resolve a guest DNS query and send the response back to it: special-use names, service
+/// names and reverse lookups on the LAN are answered by the switch; everything else is
+/// forwarded to the host's resolver.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dns(
     query: Vec<u8>,
@@ -3324,8 +3324,8 @@ async fn handle_dns(
         _ => None,
     };
     let response = if let Some(r) = local_answer(&query, &hosts, lan) {
-        // A service name, or a reverse lookup of a LAN address: the switch is their
-        // authority under any policy, and they are not subject to egress pinning.
+        // A special-use name, a service name, or a reverse lookup of a LAN address: the switch
+        // is their authority under any policy, and they are not subject to egress pinning.
         Some(r)
     } else if let Some((name, _, qend)) = &parsed
         && restricted
@@ -3745,20 +3745,38 @@ fn qtype_name(qtype: u16) -> std::borrow::Cow<'static, str> {
     }
 }
 
-/// Answer a query the switch is the authority for: a known service name (an A record for A
-/// queries, NODATA otherwise so the name never leaks upstream), or the reverse name of an
-/// address on the LAN (the service names at that address as PTR records, NXDOMAIN when there
-/// are none — the host's resolver knows nothing of this subnet). NOTIMP for either under an
-/// opcode other than QUERY, which the switch has no answer for. Else None.
+/// Answer a query the switch is the authority for: a special-use name ([`SpecialUse`]), a
+/// known service name (an A record for A queries, NODATA otherwise so the name never leaks
+/// upstream), or the reverse name of an address on the LAN (the service names at that address
+/// as PTR records, NXDOMAIN when there are none — the host's resolver knows nothing of this
+/// subnet). NOTIMP for any of them under an opcode other than QUERY, which the switch has no
+/// answer for. Else None.
 fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>, lan: Cfg) -> Option<Vec<u8>> {
     let (name, qtype, qend) = parse_question(query)?;
+    let special = SpecialUse::of(&name);
     let service = hosts.get(&name);
     let addr = reverse_v4(&name).filter(|ip| lan.on_lan(*ip));
-    if service.is_none() && addr.is_none() {
+    if special.is_none() && service.is_none() && addr.is_none() {
         return None;
     }
     if query[2] & 0x78 != 0 {
         return Some(dns_error(query, qend, RCODE_NOTIMP));
+    }
+    match special {
+        Some(SpecialUse::Invalid) => return Some(dns_nxdomain(query, qend)),
+        Some(SpecialUse::Localhost) => {
+            const TYPE_AAAA: u16 = 28;
+            return Some(match qtype {
+                TYPE_AAAA => dns_answers(
+                    query,
+                    qend,
+                    TYPE_AAAA,
+                    &[std::net::Ipv6Addr::LOCALHOST.octets().to_vec()],
+                ),
+                _ => dns_response(query, qend, qtype, Ipv4Addr::LOCALHOST),
+            });
+        }
+        None => {}
     }
     if let Some(ip) = service {
         return Some(dns_response(query, qend, qtype, *ip));
@@ -3774,6 +3792,35 @@ fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>, lan: Cfg) -> Op
     }
     names.sort_unstable();
     Some(dns_ptr_response(query, qend, qtype, &names))
+}
+
+/// The special-use names (RFC 6761) the switch answers itself under any policy, as their
+/// resolvers must: never forwarded, so never a denial nor a contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecialUse {
+    /// `invalid` and the names under it: NXDOMAIN.
+    Invalid,
+    /// `localhost` and the names under it: the loopback addresses.
+    Localhost,
+}
+
+impl SpecialUse {
+    /// Which special-use name `name` (lowercase, as [`parse_question`] reads it) is, if any.
+    fn of(name: &str) -> Option<SpecialUse> {
+        let under = |zone: &str| {
+            name == zone
+                || name
+                    .strip_suffix(zone)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        };
+        if under("invalid") {
+            Some(SpecialUse::Invalid)
+        } else if under("localhost") {
+            Some(SpecialUse::Localhost)
+        } else {
+            None
+        }
+    }
 }
 
 /// The address an IPv4 reverse name (`d.c.b.a.in-addr.arpa`) names, in canonical decimal;
@@ -7009,6 +7056,95 @@ mod tests {
         let reply = local_answer(&q, &few, DNS_TEST_LAN).expect("answered");
         assert_eq!(reply[2] & 0x02, 0, "TC clear");
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 3);
+    }
+
+    /// Special-use names are answered by the switch under any policy: nothing reaches the
+    /// upstream, and nothing is recorded as a denial or a contact.
+    #[tokio::test]
+    async fn special_use_names_are_answered_locally_under_any_policy() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let dir = std::env::temp_dir().join(format!("vk-dns-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (tag, policy, dry_run) in [
+            ("open", Egress::AllowAll, false),
+            ("enforce", Egress::restricted(&[], &[]).unwrap(), false),
+            ("dry", Egress::restricted(&[], &[]).unwrap(), true),
+        ] {
+            let (denied_log, audit_log) = (
+                dir.join(format!("{tag}-denied.log")),
+                dir.join(format!("{tag}-audit.log")),
+            );
+            let guard = Arc::new(
+                EgressGuard::new(policy, DNS_TEST_LAN.gateway)
+                    .with_denied_log(Some(denied_log.clone()))
+                    .with_audit_log(Some(audit_log.clone()))
+                    .with_dry_run(dry_run),
+            );
+            let ask = |name: &str, qtype| {
+                let guard = guard.clone();
+                let query = dns_question(9, name, qtype);
+                async move {
+                    let (reply, forwarded) = exchange(
+                        &guard,
+                        guest,
+                        query,
+                        HashMap::new(),
+                        Ipv4Addr::new(10, 0, 0, 1),
+                        || {},
+                    )
+                    .await;
+                    assert!(forwarded.is_none(), "{tag}: forwarded");
+                    reply.expect("handle_dns answers the guest")
+                }
+            };
+            for name in ["invalid", "x.Invalid", "a.b.invalid"] {
+                for qtype in [1, 28, 12] {
+                    let reply = ask(name, qtype).await;
+                    assert_eq!(reply[3] & 0x0f, RCODE_NXDOMAIN, "{tag}: {name}");
+                }
+            }
+            for name in ["localhost", "db.localhost"] {
+                let query = dns_question(9, name, 1);
+                let reply = ask(name, 1).await;
+                assert_eq!(reply[3] & 0x0f, 0, "{tag}: {name}");
+                assert_eq!(
+                    parse_a_records(&reply, &query, &name.to_ascii_lowercase()).0,
+                    vec![Ipv4Addr::LOCALHOST],
+                    "{tag}: {name}"
+                );
+                let reply = ask(name, 28).await;
+                assert_eq!((reply[3] & 0x0f, &reply[6..8]), (0, &[0, 1][..]));
+                assert!(reply.ends_with(&std::net::Ipv6Addr::LOCALHOST.octets()));
+                let reply = ask(name, 16).await;
+                assert_eq!((reply[3] & 0x0f, &reply[6..8]), (0, &[0, 0][..]));
+            }
+            assert!(
+                crate::egress_report::read_since(&denied_log, 0)
+                    .0
+                    .is_empty()
+            );
+            assert!(crate::egress_report::read_contacts(&audit_log).is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn special_use_names_are_whole_labels() {
+        for (name, want) in [
+            ("invalid", Some(SpecialUse::Invalid)),
+            ("x.invalid", Some(SpecialUse::Invalid)),
+            ("localhost", Some(SpecialUse::Localhost)),
+            ("a.b.localhost", Some(SpecialUse::Localhost)),
+            ("notinvalid", None),
+            ("mylocalhost", None),
+            ("invalid.example", None),
+            ("localhost.localdomain", None),
+            ("printer.local", None),
+            ("x.test", None),
+        ] {
+            assert_eq!(SpecialUse::of(name), want, "{name}");
+        }
     }
 
     #[test]
