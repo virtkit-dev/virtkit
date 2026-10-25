@@ -1686,7 +1686,10 @@ add`: a name and a URL, by a plain POST back to the tab. A server no relay is bo
 *Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
 applies only to the server confirmed, not to a namesake added since. Each relay has a *Remove*
 button that removes it, once confirmed, as `vk-hub relays remove` does: its key is no longer
-pinned and its session ends. All are audited.
+pinned and its session ends. All are audited. *Add a relay* issues a single-use token of kind
+`gitlab`, valid an hour, as `vk-hub token create --kind gitlab` does, by a plain POST to
+`/tokens` answered by a page of its own showing it once with the `vk-gitlab join <hub-url>
+--token -` that redeems it.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require

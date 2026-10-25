@@ -8121,6 +8121,56 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
+/// An operator adds a relay from the GitLab tab: a single-use relay token, shown once with the
+/// `vk-gitlab join` redeeming it, that enrolls a relay and nothing else. A viewer has no form.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
+    use crate::store::RelayEnrollment;
+    let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(!page.contains("Add a relay"), "{page}");
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients", Some(&operator)).await.body;
+    assert!(
+        page.contains("<h2>Add a relay</h2><form method=\"post\" action=\"/tokens\">")
+            && page.contains("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">"),
+        "{page}"
+    );
+    let form = format!("_csrf={csrf}&kind=gitlab&ttl=3600");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    for want in [
+        "<h1>Relay enrollment token</h1>",
+        "<pre>vk-gitlab join https://hub.example.com:8443 --token -</pre>",
+        "<a href=\"/clients\">Back to the GitLab tab</a>",
+        "aria-current=\"page\">Connections",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    let at = reply.body.find("vkh_").expect("the token");
+    let token: String = reply.body[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    // A node does not redeem it; a relay does.
+    assert!(matches!(
+        hub.db.enroll(&token, "aa", "node", "peer p", 1).unwrap(),
+        crate::store::Enrollment::BadToken
+    ));
+    assert!(matches!(
+        hub.db
+            .enroll_relay(&token, "aa", "relay", "peer p", crate::now_secs())
+            .unwrap(),
+        RelayEnrollment::Enrolled { .. }
+    ));
+    let form = format!("_csrf={csrf}&kind=other&ttl=3600");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+}
+
 /// The GitLab tab shows each relay, what the hub makes of its server and what it reports of it,
 /// and each runner's placement, state and load, all as text; it follows a relay's reports live.
 /// An operator removes a relay once asked, audited; a viewer has no button and is refused.

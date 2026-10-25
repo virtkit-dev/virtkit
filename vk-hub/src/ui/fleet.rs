@@ -903,10 +903,11 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     let kind = match field(&form, "kind") {
         None | Some("node") => crate::store::TokenKind::Node,
         Some("registry") => crate::store::TokenKind::Registry,
+        Some("gitlab") => crate::store::TokenKind::Gitlab,
         Some(_) => {
             return Ok(message(
                 StatusCode::BAD_REQUEST,
-                "Refused: a token enrolls a node or a registry.",
+                "Refused: a token enrolls a node, a registry or a GitLab relay.",
             ));
         }
     };
@@ -926,8 +927,14 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
         auth.session.principal(),
         kind.name()
     );
-    if kind == crate::store::TokenKind::Registry {
-        return Ok(page(registry_token(ui, &auth, &token, expires_at)));
+    match kind {
+        crate::store::TokenKind::Registry => {
+            return Ok(page(registry_token(ui, &auth, &token, expires_at)));
+        }
+        crate::store::TokenKind::Gitlab => {
+            return Ok(page(relay_token(ui, &auth, &token, expires_at)));
+        }
+        _ => {}
     }
     let mut main = Html::new();
     main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ");
@@ -977,6 +984,33 @@ fn registry_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
         .raw("<code>vk-registry leave</code> undoes it.</p>")
         .raw("<p><a href=\"/registries\">Back to the registries</a></p>");
     layout("Registry enrollment token", "/registries", auth, &main)
+}
+
+/// The page showing a GitLab relay's enrollment token once, with the `vk-gitlab join` that
+/// redeems it.
+fn relay_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
+    let mut main = Html::new();
+    main.raw("<h1>Relay enrollment token</h1><p>Single-use, valid until ");
+    pages::at(&mut main, expires_at)
+        .raw(". It is shown this once: copy it now.</p><pre>")
+        .text(token)
+        .raw("</pre><p>On the relay's host, as the user <code>vk-gitlab run</code> runs as, ")
+        .raw("run this, then paste the token and press Enter:</p><pre>vk-gitlab join ");
+    match &ui.hub.node_url {
+        Some(url) => main.text(url),
+        None => main.raw("&lt;hub-url&gt;"),
+    };
+    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as for ")
+        .raw("<code>run</code>, <code>--ca &lt;file&gt;</code> when the hub's certificate is not ")
+        .raw("one the system's roots verify, and <code>--replace</code> to enroll a relay ")
+        .raw("enrolled already, as a new one. Its config names its GitLab server in ")
+        .raw("<code>[gitlab] url</code>; the server waits for approval on the GitLab tab until ")
+        .raw("an operator gives it a name. Read on stdin, the token stays out of the shell's ")
+        .raw("history and the process list.</p>")
+        .raw("<p><a href=\"")
+        .raw(super::clients::PATH)
+        .raw("\">Back to the GitLab tab</a></p>");
+    layout("Relay enrollment token", super::clients::PATH, auth, &main)
 }
 
 // Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs

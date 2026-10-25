@@ -132,6 +132,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
         if other {
             create_form(&mut main, auth);
         } else {
+            add_relay_form(&mut main, auth);
             add_server_form(&mut main, auth);
         }
     }
@@ -412,6 +413,21 @@ fn remove_server_button(h: &mut Html, name: &str) {
         .raw("<input type=\"hidden\" name=\"server\" value=\"")
         .text(name)
         .raw("\"><button class=\"danger\">Remove</button></form>");
+}
+
+/// An operator's form issuing a relay's enrollment token, outside the live fragment: a plain
+/// POST answered by a page of its own showing the token, as for a node's.
+fn add_relay_form(h: &mut Html, auth: &Auth) {
+    h.raw("<section><h2>Add a relay</h2><form method=\"post\" action=\"")
+        .raw(fleet::TOKEN_PATH)
+        .raw("\">");
+    csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">")
+        .raw("<input type=\"hidden\" name=\"ttl\" value=\"3600\">")
+        .raw("<button class=\"primary\">Issue a relay token, valid an hour</button></form>")
+        .raw("<p class=\"sub\">Single-use: a <code>vk-gitlab</code> redeems it with ")
+        .raw("<code>vk-gitlab join</code>, as <code>vk-hub token create --kind gitlab</code> ")
+        .raw("issues one. Shown a single time.</p></section>");
 }
 
 /// The op adding a GitLab server.
