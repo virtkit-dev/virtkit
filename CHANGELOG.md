@@ -17,6 +17,14 @@ All notable changes to virtkit will be documented in this file.
   their rights. Namespace paths may no longer start with `job`; existing paths under `job`
   disable aliases until moved. Nodes before this release get no aliases.
 
+### Changed
+
+- **Restricted egress answers reverse lookups of the addresses an allowed name resolved to.**
+  A job allowed `corp.example.com` that resolves `git.corp.example.com` can look up its
+  address while it stays pinned for the VM under a name every layer allows, without
+  `NXDOMAIN` or a blocked-lookup record. Other reverse lookups remain refused, including
+  addresses reachable only through `allow_ip`.
+
 ### Fixed
 
 - **The guest registry proxy forwards request bodies for every method**. The registry

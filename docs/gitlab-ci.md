@@ -1244,11 +1244,15 @@ The list semantics are the load-bearing part:
 
 Under an allowlist, a name outside `allow_name` resolves to `NXDOMAIN`, reverse (PTR)
 lookups included, and a query the gateway cannot parse is `REFUSED`; the job's own
-service aliases still resolve, as do reverse lookups of the job's own addresses. Listing
-`in-addr.arpa` or `ip6.arpa` in `allow_name` reopens reverse lookups as a way to carry
-data out in the names queried. The gateway rebuilds forwarded queries from their question,
-keeping only the id, RD, AD and CD flags and a bare EDNS record. Queries it cannot rebuild
-are `REFUSED`, or `NOTIMP` for a DNS update or notify.
+service aliases still resolve, as do reverse lookups of the job's own addresses. A reverse
+lookup of an address the gateway resolved for that VM under an allowed name is forwarded
+too, for as long as that address is open to it (see below): its name says nothing the
+guest chose beyond which of those addresses it asks about. An address open only through
+`allow_ip` does not qualify. Listing `in-addr.arpa` or `ip6.arpa` in `allow_name` reopens
+reverse lookups as a way to carry data out in the names queried. The gateway rebuilds
+forwarded queries from their question, keeping only the id, RD, AD and CD flags and a bare
+EDNS record. Queries it cannot rebuild are `REFUSED`, or `NOTIMP` for a DNS update or
+notify.
 
 An allowed name is reached by address: resolving it through the gateway opens, to that VM
 alone, the IPv4 addresses its answer gives for it (directly or through its CNAME aliases,
