@@ -1541,13 +1541,14 @@ people's actions; viewers see no form, and their posts are refused.
 `/egress?tab=observed`, the *Observed traffic* tab, lists what the jobs of the history reached,
 from their nodes' reports: each project, the latest first, with its jobs reported, its
 destinations, and per phase how many of its jobs that ran it reported it completely (*Run: 84
-of 100 jobs reported this phase completely*) and how many sent no report. A project
-(`project=`, as on the Blocked tab) lists its destinations, the latest used first: a contact
-allowed, or one a dry-run allowlist would have blocked and the switch carried, marked *would
-block* — a DNS entry marked a lookup, not proof of a connection — with its phase, jobs and
-attempts, the day first seen and the time last seen on its nodes' clocks, the days in the last
-30 a job first used it on, its refs with their protection, its latest job, and the project's Blocked rows
-of the same destination. Phase (`phase=run|build|other`) and protection
+of 100 jobs reported this phase completely*) and how many sent no report. Projects with no
+reported jobs are omitted, such as an API key's from before the hub bound keys to GitLab.
+A project (`project=`, as on the Blocked tab) lists its destinations, the latest used
+first: a contact allowed, or one a dry-run allowlist would have blocked and the switch carried,
+marked *would block* — a DNS entry marked a lookup, not proof of a connection — with its phase,
+jobs and attempts, the day first seen and the time last seen on its nodes' clocks, the days in
+the last 30 a job first used it on, its refs with their protection, its latest job, and the
+project's Blocked rows of the same destination. Phase (`phase=run|build|other`) and protection
 (`protection=protected|unprotected|unknown`) filter it, coverage included — and, for every
 project, the coverage alone — applied at once as on the Blocked tab, and it follows the jobs' reports over `/events/egress?tab=observed…`. The store
 keeps each job's part by project, phase, exact destination (a domain, or an address and port),

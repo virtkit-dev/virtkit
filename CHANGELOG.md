@@ -33,6 +33,8 @@ All notable changes to virtkit will be documented in this file.
   otherwise, replacing `acme/web on gl`. Egress rules and storage areas' access rules use
   the same labels (`Projects under wab/`, `Projects under wab/ [gl]`). With several
   instances, rules bound to none show `[every server]`.
+- **The Egress page's Observed traffic hides projects with no reported jobs**,
+  such as those of API keys from before the hub bound keys to GitLab.
 
 ### Fixed
 

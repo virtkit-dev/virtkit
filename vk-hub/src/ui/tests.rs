@@ -8985,6 +8985,47 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
         empty.body
     );
 
+    // A project whose jobs sent no report is not listed, nor offered by the filter.
+    let silent_job = |n: u64, project_id: u64| {
+        let id = format!("{n:032x}");
+        let mut row = crate::egress::testing::job(n, EgressReport::default());
+        row.result.as_mut().unwrap().egress = None;
+        row.node = Some(node.to_string());
+        row.gitlab = Some("gl".into());
+        row.project_id = Some(project_id);
+        row.project = Some(format!("acme/p{project_id}"));
+        let mut queued = row.clone();
+        queued.result = None;
+        hub.db
+            .submit_job(&id, &queued, &id, b"{}", "key gitlab", 10)
+            .unwrap();
+        assert!(hub.db.put_job(&id, &row, &[], 11).unwrap());
+    };
+    silent_job(9, 9);
+    let subjects = hub.db.observed_subjects().unwrap();
+    assert!(
+        subjects
+            .iter()
+            .any(|(p, s)| p == "gitlab:gl:9" && s.unreported == 1),
+        "{subjects:?}"
+    );
+    let empty = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
+    assert!(empty.contains("nothing observed yet"), "{empty}");
+    assert!(!empty.contains("acme/p9"), "{empty}");
+    // An explicitly selected project keeps its name and summary.
+    let p9 = get(
+        addr,
+        "/egress?tab=observed&project=gitlab%3Agl%3A9",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(p9.contains("<h2>acme/p9</h2>"), "{p9}");
+    assert!(
+        p9.contains("<option value=\"gitlab:gl:9\" selected>acme/p9</option>"),
+        "{p9}"
+    );
+
     let reached = |dest: &str| EgressEntry {
         count: 2,
         ..crate::egress::testing::entry(
@@ -9015,6 +9056,8 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
     };
     later.entries[0].last_seen_ms = 2_000_000;
     let b = egress_job(&hub, 2, 42, &node, later);
+    // A job that sent no report leaves a project with reports listed.
+    silent_job(8, 42);
 
     let list = get(addr, "/egress?tab=observed", Some(&viewer)).await.body;
     assert!(
@@ -9022,9 +9065,13 @@ async fn the_egress_page_s_observed_traffic_lists_each_project_s_destinations() 
         "{list}"
     );
     assert!(
-        list.contains("Run: 2 of 2 jobs reported this phase completely · Build: 0 of 1 job"),
+        list.contains(
+            "Run: 2 of 2 jobs reported this phase completely · Build: 0 of 1 job reported this \
+             phase completely · 1 job sent no report"
+        ),
         "{list}"
     );
+    assert!(!list.contains("acme/p9"), "{list}");
 
     let p42 = "/egress?tab=observed&project=gitlab%3Agl%3A42";
     let page = get(addr, p42, Some(&viewer)).await.body;

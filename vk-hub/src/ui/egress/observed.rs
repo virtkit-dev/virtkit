@@ -126,6 +126,8 @@ struct Project {
 
 /// What the tab shows.
 struct Listing {
+    /// All subjects, including those not [`listed`], so the query's project keeps its name
+    /// and summary.
     subjects: Vec<(String, ObservedSubject)>,
     /// Each project's coverage, for the list of projects.
     coverages: HashMap<String, Coverages>,
@@ -185,7 +187,7 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
             })
         }
         None => {
-            for (param, _) in &subjects {
+            for (param, _) in subjects.iter().filter(|(_, s)| listed(s)) {
                 if let Some(subject) = Subject::parse(param) {
                     coverages.insert(
                         param.clone(),
@@ -219,6 +221,12 @@ fn listing(hub: &Hub, caches: &Caches, q: &Query) -> Result<Listing> {
         used,
         instances: hub.db.gitlab_instances()?,
     })
+}
+
+/// List subjects with at least one reported job; omit those with none, such as a key's
+/// from before the hub bound keys to GitLab.
+fn listed(s: &ObservedSubject) -> bool {
+    s.jobs > 0
 }
 
 /// What `/events/egress?tab=observed…` streams: the listing of the query, as the jobs' reports
@@ -294,12 +302,13 @@ fn filter_form(
         .raw("<input type=\"hidden\" name=\"tab\" value=\"")
         .raw(TAB)
         .raw("\">");
+    let chosen = q.subject.as_ref().map(Subject::param);
     let mut named: Vec<(&String, String)> = subjects
         .iter()
+        .filter(|(p, s)| listed(s) || chosen.as_ref() == Some(p))
         .map(|(p, s)| (p, who(p, s, instances)))
         .collect();
     named.sort_by(|a, b| (&a.1, a.0).cmp(&(&b.1, b.0)));
-    let chosen = q.subject.as_ref().map(Subject::param);
     h.raw("<select name=\"project\" aria-label=\"Project\">")
         .raw("<option value=\"\">Every project</option>");
     if let Some(c) = chosen
@@ -394,11 +403,12 @@ fn projects(h: &mut Html, q: &Query, l: &Listing) {
         let nodes: Vec<&(String, crate::store::NodeRow)> = l.nodes.iter().collect();
         super::rules::caps_unused(h, &nodes, &u.cap_use);
     }
-    if l.subjects.is_empty() {
+    let mut subjects: Vec<&(String, ObservedSubject)> =
+        l.subjects.iter().filter(|(_, s)| listed(s)).collect();
+    if subjects.is_empty() {
         h.raw("<p class=\"empty\">nothing observed yet</p>");
         return;
     }
-    let mut subjects: Vec<&(String, ObservedSubject)> = l.subjects.iter().collect();
     subjects.sort_by(|a, b| b.1.latest_at.cmp(&a.1.latest_at).then(a.0.cmp(&b.0)));
     h.raw("<table class=\"grid\"><thead><tr><th>project</th><th class=\"num\">jobs reported</th>")
         .raw("<th class=\"num\">destinations</th><th>coverage</th><th>latest</th>")
