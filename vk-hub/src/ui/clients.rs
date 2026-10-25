@@ -1,11 +1,10 @@
-//! `/clients`: the API keys the client API takes and the client instances using each — the
-//! host, program and runners an instance's hello named, when it was last heard from and what
-//! it holds — for viewers and operators alike: on its GitLab tab the GitLab servers and the
-//! keys bound to them, on its other tab the keys bound to none. Both tabs' fragments are
-//! rendered once for all open viewers' pages and once for all operators' ([`sse::feed`]), on a
-//! key created, revoked or removed, a GitLab server added or removed, an instance heard from
-//! anew, a hello recorded or instances pruned ([`Hub::clients_changed`]), and, while a page is
-//! open, once a heartbeat interval, which moves the ages and what the instances hold.
+//! `/clients`, Connections, for viewers and operators alike: on its GitLab tab the GitLab
+//! servers, the relays and their runners; on its other tab the API keys the client API takes and
+//! the client instances using each — the host, program and runners an instance's hello named,
+//! when it was last heard from and what it holds. Both tabs' fragments are rendered once for all
+//! open viewers' pages and once for all operators' ([`sse::feed`]), on what
+//! [`Hub::clients_changed`] notes, and, while a page is open, once a heartbeat interval, which
+//! moves the ages, what the instances hold and the relays' load.
 //!
 //! Operators create, revoke and remove keys here as `vk-hub keys create` and `vk-hub keys
 //! revoke` do, as their session's principal. A key is created by a plain form outside the
@@ -16,9 +15,11 @@
 //! page sets through `hx-headers`, and asks first ([`actions::ask_first`]). The store acts only
 //! on the keys the operator confirmed ([`crate::store::Db::revoke_api_keys_as_seen`]).
 //!
-//! On the GitLab tab, operators also add GitLab servers, as `vk-hub gitlabs add` does, by a
-//! plain form outside the fragment, and remove one no relay is bound to, as `vk-hub gitlabs
-//! remove` does, by a button in the fragment that asks first.
+//! The GitLab tab shows the GitLab servers, then the relays enrolled — their reach, server,
+//! what they report of it — and their runners, with what each is doing. Operators add GitLab
+//! servers there, as `vk-hub gitlabs add` does, by a plain form outside the fragment, remove
+//! one no relay is bound to, as `vk-hub gitlabs remove` does, and remove a relay, as `vk-hub
+//! relays remove` does, by buttons in the fragment that ask first.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,11 +36,13 @@ use super::pages::{self, csrf_field};
 use super::sse;
 use super::{Auth, Body, Ui, actions, blocking, field, page};
 use crate::clients::{InstanceView, KeyView};
+use crate::relays::RelayView;
 use crate::server::Hub;
 use crate::store::{
     ANY_POOL, CLIENT_ACTIVE_SECS, GitlabRefused, GitlabRow, KeyOp, KeyPolicy, KeyRefused, KeyRow,
-    KeysChanged, RelayRow, Role,
+    KeysChanged, Role,
 };
+use vk_hub_proto::gitlab::{RunnerState, ServerState, ServerStatus};
 
 /// The page, and where its forms post.
 pub(super) const PATH: &str = "/clients";
@@ -65,7 +68,7 @@ pub(super) const GITLAB_EVENT: &str = "gitlab";
 struct Shown {
     views: Vec<KeyView>,
     gitlabs: Vec<(String, GitlabRow)>,
-    relays: Vec<(String, RelayRow)>,
+    relays: Vec<RelayView>,
 }
 
 impl Shown {
@@ -74,7 +77,7 @@ impl Shown {
         Ok(Shown {
             views: crate::clients::views(hub)?,
             gitlabs: hub.db.gitlabs()?,
-            relays: hub.db.relays()?,
+            relays: crate::relays::views(hub)?,
         })
     }
 }
@@ -112,7 +115,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
         (
             "gitlab-servers",
             GITLAB_EVENT,
-            gitlab_fragment(&shown, steer),
+            gitlab_fragment(&shown, now, steer),
         )
     };
     main.raw("<div id=\"")
@@ -135,9 +138,10 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     Ok(page(fleet::layout("Connections", PATH, auth, &main)))
 }
 
-/// The GitLab tab: the GitLab servers the hub takes jobs from. With `steer`, a server no
-/// relay is bound to carries the button that removes it.
-fn gitlab_fragment(shown: &Shown, steer: bool) -> Html {
+/// The GitLab tab: the GitLab servers the hub takes jobs from, then the relays and their
+/// runners. With `steer`, a server no relay is bound to carries the button that removes it, and
+/// each relay the one that removes it.
+fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     let mut h = Html::new();
     h.raw("<section><h2>GitLab servers</h2>");
     if shown.gitlabs.is_empty() {
@@ -172,17 +176,230 @@ fn gitlab_fragment(shown: &Shown, steer: bool) -> Html {
         }
         h.raw("</tbody></table>");
     }
+    h.raw("</section><section><h2>Relays</h2>");
+    if shown.relays.is_empty() {
+        h.raw(if steer {
+            "<p class=\"empty\">None yet: add one below, or with <code>vk-hub token create \
+             --kind gitlab</code> and <code>vk-gitlab join</code>.</p>"
+        } else {
+            "<p class=\"empty\">None yet: an operator enrolls a <code>vk-gitlab</code> with \
+             <code>vk-hub token create --kind gitlab</code> and <code>vk-gitlab join</code>.</p>"
+        });
+    } else {
+        relays_table(&mut h, &shown.relays, now, steer);
+    }
+    h.raw("</section><section><h2>Runners</h2>");
+    runners_table(&mut h, &shown.relays, now);
     h.raw("</section>");
     h
 }
 
 /// Whether one of `relays` is bound to the GitLab server at `url`: while one is, the store
 /// refuses to remove the server.
-fn bound(relays: &[(String, RelayRow)], url: &str) -> bool {
+fn bound(relays: &[RelayView], url: &str) -> bool {
     relays
         .iter()
-        .any(|(_, r)| r.server_url.as_deref() == Some(url))
+        .any(|r| r.row.server_url.as_deref() == Some(url))
 }
+
+/// Each relay: its reach, the GitLab server it is bound to and what the hub makes of it, what it
+/// reports of that server, its version and runners. With `steer`, the button removing it.
+fn relays_table(h: &mut Html, relays: &[RelayView], now: u64, steer: bool) {
+    h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>state</th><th>last heard</th>")
+        .raw("<th>server</th><th>GitLab</th><th>version</th><th class=\"num\">runners</th>")
+        .raw("<th class=\"num\">concurrent</th>");
+    if steer {
+        h.raw("<th>change</th>");
+    }
+    h.raw("</tr></thead><tbody>");
+    for r in relays {
+        let inventory = r.row.inventory.as_ref();
+        h.raw("<tr><td><strong>")
+            .node(&r.row.hostname)
+            .raw("</strong> <code class=\"sub\">")
+            .text(crate::rollout::short_id(&r.id))
+            .raw("</code></td><td>")
+            .raw(if r.connected {
+                "<span class=\"badge ok\">connected</span>"
+            } else {
+                "<span class=\"badge bad\">unreachable</span>"
+            })
+            .raw("</td><td>");
+        match r.row.last_seen {
+            Some(t) => super::fleet::time_ago(h, now, t),
+            None => h.raw("never"),
+        };
+        h.raw("</td><td>");
+        match &r.server {
+            Some(status) => server_status(h, status),
+            None => {
+                h.raw("<span class=\"sub\">not reported yet</span>");
+            }
+        }
+        h.raw("</td><td>");
+        match inventory {
+            Some(i) => {
+                h.external_link(Some(&i.server.url), &i.server.url);
+                if let Some(spki) = &i.server.spki_sha256 {
+                    h.raw("<br><span class=\"sub\">certificate key sha256 <code>")
+                        .node(spki)
+                        .raw("</code></span>");
+                }
+                if let Some(v) = &i.server.version {
+                    h.raw("<br><span class=\"sub\">GitLab ")
+                        .node(v)
+                        .raw("</span>");
+                }
+            }
+            None => {
+                h.raw("-");
+            }
+        }
+        h.raw("</td><td>")
+            .node(inventory.map_or("-", |i| i.version.as_str()))
+            .raw("</td><td class=\"num\">")
+            .text(inventory.map_or(0, |i| i.runners.len()))
+            .raw("</td><td class=\"num\">")
+            .text(inventory.map_or(0, |i| i.concurrent))
+            .raw("</td>");
+        if steer {
+            h.raw("<td class=\"actions\"><form method=\"post\" action=\"")
+                .raw(PATH)
+                .raw("\" hx-post=\"")
+                .raw(PATH)
+                .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"")
+                .raw(REMOVE_RELAY)
+                .raw("\"><input type=\"hidden\" name=\"relay\" value=\"")
+                .text(&r.id)
+                .raw("\"><button class=\"danger\">Remove</button></form></td>");
+        }
+        h.raw("</tr>");
+    }
+    h.raw("</tbody></table>");
+}
+
+/// What the hub makes of a relay's server: its name once approved, else its URL and why not.
+fn server_status(h: &mut Html, s: &ServerStatus) {
+    match (s.state, &s.name) {
+        (ServerState::Approved, Some(name)) => {
+            h.raw("<strong>").text(name).raw("</strong>");
+        }
+        (state, _) => {
+            h.text(&s.url).raw(" ").raw(match state {
+                ServerState::Approved => "<span class=\"badge ok\">approved</span>",
+                ServerState::Pending => "<span class=\"badge warn\">pending</span>",
+                ServerState::Rejected => "<span class=\"badge bad\">rejected</span>",
+                ServerState::Rebound => {
+                    "<span class=\"badge bad\">reports another server: enroll it again</span>"
+                }
+                ServerState::Other => "<span class=\"badge\">unknown</span>",
+            });
+        }
+    }
+}
+
+/// Each relay's runners: GitLab's ID for each, where its jobs go, how many at once, whether
+/// GitLab took its token, what it is doing and its load, as the relay last said.
+fn runners_table(h: &mut Html, relays: &[RelayView], now: u64) {
+    let runners = || {
+        relays.iter().flat_map(|r| {
+            (r.row.inventory.iter())
+                .flat_map(|i| &i.runners)
+                .map(move |runner| (r, runner))
+        })
+    };
+    if runners().next().is_none() {
+        h.raw("<p class=\"empty\">none: no relay has reported a runner yet</p>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>runner</th>")
+        .raw("<th>GitLab ID</th><th>placement</th><th class=\"num\">limit</th><th>state</th>")
+        .raw("<th class=\"num\">requests</th><th class=\"num\">jobs</th>")
+        .raw("<th>last GitLab answer</th></tr></thead><tbody>");
+    for (r, runner) in runners() {
+        let report = (r.row.report.iter())
+            .flat_map(|rep| &rep.runners)
+            .find(|rep| rep.name == runner.name);
+        let load = (r.row.heartbeat.iter())
+            .flat_map(|hb| &hb.runners)
+            .find(|l| l.name == runner.name);
+        let p = &runner.placement;
+        h.raw("<tr><td>")
+            .node(&r.row.hostname)
+            .raw("</td><td>")
+            .node(&runner.name)
+            .raw("</td><td>");
+        match runner.runner_id {
+            Some(id) => h.text(id),
+            None => h.raw("-"),
+        };
+        h.raw("</td><td>pool ").node(&p.pool);
+        if !p.labels.is_empty() {
+            h.raw(" · ").node(&p.labels.join(", "));
+        }
+        h.raw(" · ")
+            .text(crate::store::envelope_text(p.envelope))
+            .raw("</td><td class=\"num\">");
+        match runner.limit {
+            Some(n) => h.text(n),
+            None => h.raw("-"),
+        };
+        h.raw("</td><td>");
+        if !runner.verified {
+            h.raw("<span class=\"badge bad\">token not verified</span> ");
+        }
+        match report {
+            Some(rep) => {
+                h.raw(runner_badge(rep.state));
+                if let Some(m) = &rep.message {
+                    h.raw(" <span class=\"sub\">").node(m).raw("</span>");
+                }
+            }
+            None => {
+                h.raw("-");
+            }
+        }
+        h.raw("</td>");
+        match load {
+            Some(l) => {
+                h.raw("<td class=\"num\">")
+                    .text(l.requests)
+                    .raw("</td><td class=\"num\">")
+                    .text(l.jobs)
+                    .raw("</td><td>");
+                if let Some(t) = l.last_answer_at {
+                    super::fleet::time_ago(h, now, t);
+                    if let Some(status) = l.last_status {
+                        h.raw(" · HTTP ").text(status);
+                    }
+                } else {
+                    h.raw("-");
+                }
+                h.raw("</td>");
+            }
+            None => {
+                h.raw("<td class=\"num\">-</td><td class=\"num\">-</td><td>-</td>");
+            }
+        }
+        h.raw("</tr>");
+    }
+    h.raw("</tbody></table>");
+}
+
+/// A runner's state as a badge.
+fn runner_badge(state: RunnerState) -> &'static str {
+    match state {
+        RunnerState::Polling => "<span class=\"badge ok\">polling</span>",
+        RunnerState::WaitingCapacity => "<span class=\"badge busy\">waiting for capacity</span>",
+        RunnerState::ServerPending => "<span class=\"badge warn\">server not approved</span>",
+        RunnerState::Unhealthy => "<span class=\"badge bad\">unhealthy</span>",
+        RunnerState::TokenRefused => "<span class=\"badge bad\">token refused</span>",
+        RunnerState::Other => "<span class=\"badge\">unknown</span>",
+    }
+}
+
+/// The op removing a relay.
+const REMOVE_RELAY: &str = "remove-relay";
 
 /// A button posting the removal of the GitLab server named `name`: `remove` of a `server`, not
 /// of a key's `name`. No CSRF field: the page around the fragment sets the token as a header.
@@ -236,7 +453,7 @@ pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
         let hub = hub.clone();
         Arc::new(move || {
             let shown = Shown::read(&hub)?;
-            Ok(gitlab_fragment(&shown, steer).into_string())
+            Ok(gitlab_fragment(&shown, crate::now_secs(), steer).into_string())
         })
     };
     sse::Events::from([(EVENT, other), (GITLAB_EVENT, gitlab)])
@@ -493,6 +710,7 @@ pub(super) async fn action(
         }
         Some("remove") => revoke(ui, site, htmx, &auth, &form, KeyOp::Remove).await,
         Some(ADD_SERVER) => add_server(ui, &auth, &form).await,
+        Some(REMOVE_RELAY) => remove_relay(ui, site, htmx, &auth, &form).await,
         _ => Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
@@ -719,6 +937,77 @@ async fn remove_server(
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
         .text(format!("Removed GitLab server {name}."))
         .raw("</div>");
+    Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
+}
+
+/// Remove the relay `form` names (`relay`) once confirmed, as `vk-hub relays remove` does: its
+/// key is no longer pinned and its session ends ([`crate::relays::remove`]).
+async fn remove_relay(
+    ui: &Ui,
+    site: &FleetSite,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+) -> Result<Response<Body>> {
+    let id = field(form, "relay").unwrap_or("").to_string();
+    let (hub, wanted) = (ui.hub.clone(), id.clone());
+    let relay = if vk_hub_proto::valid_id(&id) {
+        blocking(move || crate::relays::detail(&hub, &wanted)).await?
+    } else {
+        None
+    };
+    let Some(relay) = relay else {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such relay.",
+        ));
+    };
+    let mut detail = Html::new();
+    detail
+        .raw("<p><strong>")
+        .node(&relay.row.hostname)
+        .raw("</strong> <code>")
+        .text(&relay.id)
+        .raw("</code>");
+    if let Some(s) = &relay.server {
+        detail.raw(", GitLab ").text(crate::relays::server_text(s));
+    }
+    detail.raw("</p>");
+    let ask = actions::Ask {
+        path: PATH.to_string(),
+        back: PATH.to_string(),
+        op: REMOVE_RELAY.to_string(),
+        what: "Remove this relay? Its key is no longer trusted and its session ends: it takes \
+               no more jobs, and can no longer follow or settle those under way. Enrolling it \
+               again takes a new token and `vk-gitlab join --replace`.",
+        detail,
+        asked: vec![("relay", id.clone())],
+    };
+    if let Some(asked) = actions::ask_first(&site.questions, fleet::layout, htmx, auth, form, &ask)?
+    {
+        return Ok(asked);
+    }
+    let (hub, principal, wanted) = (ui.hub.clone(), auth.session.principal(), id.clone());
+    let removed = blocking(move || crate::relays::remove(&hub, &principal, &wanted)).await?;
+    if !removed {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such relay.",
+        ));
+    }
+    eprintln!(
+        "vk-hub: ui: {} removed relay {id}",
+        auth.session.principal()
+    );
+    if !htmx {
+        return Ok(see_other(PATH));
+    }
+    let mut h = Html::new();
+    h.raw("<div id=\"flash\" hx-swap-oob=\"true\">Removed relay ")
+        .node(&relay.row.hostname)
+        .raw(".</div>");
     Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
 }
 

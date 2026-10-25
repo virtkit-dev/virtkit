@@ -343,9 +343,10 @@ impl Hub {
         *self.jobs.borrow()
     }
 
-    /// Note that an API key or the client instances using one may have changed: a key
-    /// created, revoked or removed, an instance heard from anew (first since the hub started,
-    /// or since memory forgot it), a hello recorded, or instances pruned.
+    /// Note that something the Connections page shows may have changed: an API key created,
+    /// revoked or removed, an instance heard from anew (first since the hub started, or since
+    /// memory forgot it), a hello recorded, or instances pruned; a GitLab server added, removed,
+    /// rejected or forgotten; a relay connected, disconnected, removed, or reporting anew.
     pub(crate) fn clients_changed(&self) {
         self.client_changes.send_modify(|n| *n = n.wrapping_add(1));
     }

@@ -49,9 +49,11 @@ pub async fn run(
         relay.id, relay.hostname
     );
     hub.changed(&relay.id);
+    hub.clients_changed();
     let ended = serve(&mut ws, &hub, &relay, session, &ending).await;
     hub.close_session(&relay.id, session);
     hub.changed(&relay.id);
+    hub.clients_changed();
     match ended {
         Ok(why) => eprintln!("vk-hub: {peer}: relay {} disconnected: {why}", relay.id),
         Err(e) => {
@@ -205,10 +207,16 @@ async fn store(
     let db = hub.db.clone();
     let id = relay.id.clone();
     let now = crate::now_secs();
+    // The Connections page follows what a relay is and does; its load, it shows once a
+    // heartbeat regardless.
+    let shown = !matches!(write, RelayWrite::Heartbeat(_));
     let written = tokio::task::spawn_blocking(move || db.record_relay(&id, write, now)).await?;
     match written {
         Ok(()) => {
             hub.changed(&relay.id);
+            if shown {
+                hub.clients_changed();
+            }
             Ok(None)
         }
         Err(e) if e.is::<NotEnrolled>() => {
@@ -294,6 +302,7 @@ pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
     if removed {
         hub.revoke(id);
         hub.touch();
+        hub.clients_changed();
     }
     Ok(removed)
 }
@@ -305,6 +314,7 @@ pub fn server_changed(hub: &Hub, url: &str) -> Result<()> {
         hub.kick(&id);
         hub.changed(&id);
     }
+    hub.clients_changed();
     Ok(())
 }
 

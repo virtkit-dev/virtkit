@@ -8121,6 +8121,159 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
+/// The GitLab tab shows each relay, what the hub makes of its server and what it reports of it,
+/// and each runner's placement, state and load, all as text; it follows a relay's reports live.
+/// An operator removes a relay once asked, audited; a viewer has no button and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn relays_and_their_runners_are_on_the_gitlab_tab() {
+    use crate::store::RelayWrite;
+    use vk_hub_proto::client::Placement;
+    use vk_hub_proto::gitlab::{
+        Heartbeat, Inventory, Report, Runner, RunnerLoad, RunnerReport, RunnerState, Server,
+    };
+    let (addr, hub, origin) = start_fleet().await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(
+        page.contains("<h2>Relays</h2><p class=\"empty\">None yet"),
+        "{page}"
+    );
+    let mut live = Events::open(addr, "/events/gitlab", &viewer).await;
+    live.next().await.unwrap();
+
+    let hostile = "<script>x</script>";
+    let relay = bound_relay(&hub, "aa", "https://gitlab.example.com");
+    let now = crate::now_secs();
+    let inventory = Inventory {
+        version: "0.96.0".into(),
+        hostname: "relay-1".into(),
+        system_id: "s_0123456789ab".into(),
+        concurrent: 6,
+        server: Server {
+            url: "https://gitlab.example.com".into(),
+            spki_sha256: Some("ab".repeat(32)),
+            version: None,
+        },
+        runners: vec![
+            Runner {
+                name: "ci".into(),
+                runner_id: Some(42),
+                placement: Placement {
+                    pool: "ci".into(),
+                    labels: vec!["large".into()],
+                    envelope: vk_hub_proto::job::Envelope {
+                        mem_mib: 4096,
+                        cpus: 2,
+                        disk_bytes: 1 << 30,
+                    },
+                },
+                limit: Some(4),
+                verified: true,
+            },
+            Runner {
+                name: hostile.into(),
+                runner_id: None,
+                placement: Placement {
+                    pool: "ci".into(),
+                    labels: vec![],
+                    envelope: vk_hub_proto::job::Envelope {
+                        mem_mib: 1024,
+                        cpus: 1,
+                        disk_bytes: 1 << 30,
+                    },
+                },
+                limit: None,
+                verified: false,
+            },
+        ],
+    };
+    let writes = [
+        RelayWrite::Inventory(inventory),
+        RelayWrite::Report(Report {
+            runners: vec![
+                RunnerReport {
+                    name: "ci".into(),
+                    state: RunnerState::ServerPending,
+                    message: None,
+                },
+                RunnerReport {
+                    name: hostile.into(),
+                    state: RunnerState::TokenRefused,
+                    message: Some(hostile.into()),
+                },
+            ],
+        }),
+        RelayWrite::Heartbeat(Heartbeat {
+            runners: vec![RunnerLoad {
+                name: "ci".into(),
+                requests: 1,
+                jobs: 3,
+                last_answer_at: Some(now),
+                last_status: Some(204),
+            }],
+        }),
+    ];
+    for write in writes {
+        hub.db.record_relay(&relay, write, now).unwrap();
+    }
+    hub.clients_changed();
+    let event = next_with(&mut live, "relay-1").await;
+    for want in [
+        "<strong>relay-1</strong> <code class=\"sub\">",
+        "<span class=\"badge bad\">unreachable</span>",
+        "https://gitlab.example.com <span class=\"badge warn\">pending</span>",
+        &format!("certificate key sha256 <code>{}</code>", "ab".repeat(32)),
+        "<td>0.96.0</td><td class=\"num\">2</td><td class=\"num\">6</td>",
+        "<td>relay-1</td><td>ci</td><td>42</td><td>pool ci · large · 4096 MiB",
+        "<td class=\"num\">4</td><td><span class=\"badge warn\">server not approved</span>",
+        "<td class=\"num\">1</td><td class=\"num\">3</td><td><time",
+        " · HTTP 204</td>",
+        "<span class=\"badge bad\">token not verified</span> \
+         <span class=\"badge bad\">token refused</span>",
+        "&lt;script&gt;x&lt;/script&gt;",
+    ] {
+        assert!(event.contains(want), "{want}: {event}");
+    }
+    assert!(!event.contains("<script>"), "{event}");
+    assert!(!event.contains("<form"), "{event}");
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
+        .unwrap();
+    hub.clients_changed();
+    next_with(&mut live, "<td><strong>gl</strong></td><td>https://gitlab").await;
+
+    let form = format!("_csrf={viewer_csrf}&op=remove-relay&relay={relay}");
+    let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients", Some(&operator)).await.body;
+    assert!(
+        page.contains(&format!(
+            "<input type=\"hidden\" name=\"op\" value=\"remove-relay\"><input \
+             type=\"hidden\" name=\"relay\" value=\"{relay}\">"
+        )),
+        "{page}"
+    );
+    let form = format!("_csrf={csrf}&op=remove-relay&relay={relay}");
+    let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
+    assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
+    assert!(reply.body.contains("Remove this relay?"), "{}", reply.body);
+    assert!(hub.db.relay(&relay).unwrap().is_some());
+    let answer = format!("{form}&nonce={}&confirm=yes", hidden(&reply.body, "nonce"));
+    let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert!(hub.db.relay(&relay).unwrap().is_none());
+    audited(&hub, &format!("removed relay {relay}")).await;
+    next_with(&mut live, "<h2>Relays</h2><p class=\"empty\">None yet").await;
+    for bad in [relay.as_str(), "nope"] {
+        let form = format!("_csrf={csrf}&op=remove-relay&relay={bad}");
+        let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
+        assert_eq!(reply.status, 404, "{}", reply.body);
+    }
+}
+
 /// A placed job's page shows rights per storage area in plain words, with token details
 /// folded away and never the token; or the reason it got no access.
 #[tokio::test(flavor = "multi_thread")]

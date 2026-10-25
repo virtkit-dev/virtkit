@@ -1649,7 +1649,15 @@ allowed only if a listed name's lookup resolved to it. As the node enforces it, 
 declares one dimension allows none of the other, whatever the cap allows of it.
 
 `/clients`, *Connections* in the navigation, opens on its *GitLab* tab: each GitLab server the
-hub takes jobs from (`vk-hub gitlabs`), its name and URL. Its *Other API clients* tab
+hub takes jobs from (`vk-hub gitlabs`), its name and URL; then each relay (`vk-hub relays`) —
+its hostname and ID, whether it is connected, when it was last heard from, the server it is
+bound to and what the hub makes of it (the instance's name once approved, else *pending*,
+*rejected* or *reports another server*), the URL, certificate key digest and version it reports
+of that server, its version, runners and `concurrent`; then each relay's runners — GitLab's ID
+for it, its pool, labels and envelope, its `limit`, its state (*polling*, *waiting for
+capacity*, *server not approved*, *unhealthy*, *token refused*, and *token not verified* when
+`verify` failed), the job requests it has outstanding, the jobs it holds, and when GitLab last
+answered it and with which HTTP status. What a relay said is shown as text. Its *Other API clients* tab
 (`/clients?tab=other`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
 instances using each. Both tabs show viewers and operators alike the
 same things of a key and an instance. Each key shows its name, first 8
@@ -1676,7 +1684,9 @@ points to the key. The key never appears in live updates, logs or audit entries.
 Operators add a GitLab server on the *GitLab* tab with the same validation as `vk-hub gitlabs
 add`: a name and a URL, by a plain POST back to the tab. A server no relay is bound to has a
 *Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
-applies only to the server confirmed, not to a namesake added since. Both are audited.
+applies only to the server confirmed, not to a namesake added since. Each relay has a *Remove*
+button that removes it, once confirmed, as `vk-hub relays remove` does: its key is no longer
+pinned and its session ends. All are audited.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
@@ -1737,9 +1747,11 @@ history; and, by job, each piece of its output stored, which wakes that job's pa
 `/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
 nodes page is sent that one rendering; `/operations` likewise, once for every viewer's page and
 once for every operator's; `/clients` likewise, both its tabs' fragments in one rendering, woken
-by a key created, revoked or removed, a GitLab server added or removed, an instance heard from
-anew, a hello recorded or instances pruned, and rendered once a heartbeat
-interval regardless while a stream is open, which moves its ages and what its instances hold. A
+by a key created, revoked or removed, a GitLab server added, removed, rejected or forgotten, an
+instance heard from anew, a hello recorded or instances pruned, a relay connected, disconnected,
+removed or reporting its inventory or runner states, and rendered once a heartbeat interval
+regardless while a stream is open, which moves its ages, what its instances hold and the relays'
+load. A
 node's page is woken by changes to that node alone, and `/jobs` by changes to jobs alone, never
 by a heartbeat. `/jobs`' stream carries the page's filter in its URL
 (`/events/jobs?project=acme%2Fweb&result=failed`), checked as the page's query is, except that a

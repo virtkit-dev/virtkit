@@ -19,6 +19,9 @@ All notable changes to virtkit will be documented in this file.
   its runners hold jobs.
 - **Operators add and remove GitLab servers on the hub's Connections page**, as `vk-hub gitlabs
   add` and `remove` do; a server is removed only once no relay is bound to it.
+- **The Connections page's GitLab tab shows the relays and their runners**, live: each relay's
+  reach, server and its approval, the certificate digest it reports, and each runner's
+  placement, state and load. Operators remove a relay there.
 - **An enrolled `vk-gitlab` reports to its hub** its GitLab server, with the digest of its
   certificate's key to check before approving it, and each runner's GitLab ID, placement and
   state, and asks GitLab for jobs only while the hub approves the server.
