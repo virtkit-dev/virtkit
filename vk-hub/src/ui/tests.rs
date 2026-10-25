@@ -4213,8 +4213,8 @@ async fn an_operator_creates_an_api_key_shown_once() {
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert!(
         reply.body.contains(
-            "<pre>[hub]\nurl = \"https://hub.example.com:8443\"\n\
-             api_key_file = \"/etc/vk-gitlab/hub.key\"</pre>"
+            "client API, at <code>https://hub.example.com:8443</code>, as \
+             <code>Authorization: Bearer &lt;key&gt;</code>"
         ),
         "{}",
         reply.body
@@ -4318,7 +4318,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.header("hx-reswap"), Some("none"));
     for want in [
-        "vk-gitlab can no longer follow or settle its jobs under way",
+        "can no longer follow or settle its jobs under way",
         "<button class=\"danger\">Yes, revoke</button>",
         "0 reservation(s), 0 job(s) queued or running",
     ] {

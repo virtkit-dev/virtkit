@@ -156,7 +156,7 @@ impl EgressRuleRow {
     }
 
     /// Whether it selects the job claiming `claims`: never [`DEFAULT_RULE`], and no rule a job
-    /// with no claims, whose key is bound to no GitLab instance.
+    /// with no claims, of no GitLab instance.
     fn selects(&self, claims: Option<&JobClaims>) -> bool {
         match (&self.subject, claims) {
             (Some(s), Some(c)) => s.matches(c),
@@ -254,8 +254,9 @@ fn union<'a>(rules: impl IntoIterator<Item = &'a EgressRuleRow> + Clone) -> (Hub
     (add(&|r| &r.run), add(&|r| &r.build))
 }
 
-/// The hub's layer for the job claiming `claims`, from `rules`; `None` claims for a job whose
-/// key is bound to no GitLab instance, which only [`DEFAULT_RULE`] applies to.
+/// The hub's layer for the job claiming `claims`, from `rules`; `None` claims for a job of no
+/// GitLab instance (an older hub's, of a key bound to none), which only [`DEFAULT_RULE`]
+/// applies to.
 ///
 /// The enforced rules selecting the job add up, per phase and dimension; with none, the
 /// Fallback applies if it is enforced, and otherwise the job may reach nothing. A dry-run rule
@@ -647,7 +648,7 @@ mod tests {
         assert_eq!(got.rules, vec!["wab-branches".to_string()]);
         assert_eq!(got.run, allow(&["corp.example.com"], &[]));
         assert!(got.dry_run.is_empty());
-        // Another project, or a key bound to no instance: the Fallback alone.
+        // Another project, or no instance: the Fallback alone.
         for c in [Some(claims("other/x", "main", true)), None] {
             let got = resolve_egress(&rules, c.as_ref());
             assert_eq!(got.rules, vec![DEFAULT_RULE.to_string()]);

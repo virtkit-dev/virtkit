@@ -79,11 +79,11 @@ pub fn apply(
     (after, compared, as_enforced)
 }
 
-/// Some jobs alike: of one GitLab instance's project, ref and protection, or of keys bound to
-/// none.
+/// Some jobs alike: of one GitLab instance's project, ref and protection, or of no instance
+/// (an older hub's jobs of keys bound to none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
-    /// Their claims; `None` for jobs of keys bound to no GitLab instance.
+    /// Their claims; `None` for jobs of no GitLab instance.
     pub claims: Option<JobClaims>,
     /// The display-safe project their latest job named.
     pub project: Option<String>,
@@ -170,7 +170,7 @@ fn altered(before: &HubEgress, after: &HubEgress) -> impl Iterator<Item = &'stat
 }
 
 /// What groups jobs alike: their claims, the GitLab instance's name, project ID and path, ref
-/// and protection; `None` for keys bound to no instance.
+/// and protection; `None` for jobs of no instance.
 type ClaimsKey = Option<(String, u64, String, String, bool)>;
 
 fn key_of(claims: Option<&JobClaims>) -> ClaimsKey {

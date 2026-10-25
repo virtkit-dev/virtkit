@@ -14,8 +14,9 @@
 //! release out to the fleet a wave at a time. A node
 //! whose `vk` speaks only the first fleet protocol version is monitored, not steered. A web UI
 //! on a listener of its own shows the fleet to people signed in with links the admin socket
-//! issues. Automation holding an API key — `vk-gitlab` — reserves capacity on nodes and has
-//! jobs placed on them through the client API (`docs/gitlab-dispatch.md`).
+//! issues. GitLab relays — `vk-gitlab`, enrolled — and automation holding an API key reserve
+//! capacity on nodes and have jobs placed on them through the client API
+//! (`docs/gitlab-dispatch.md`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -223,7 +224,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<TokenKeysCmd>,
     },
-    /// Issue, list and revoke the API keys automation such as vk-gitlab places jobs with
+    /// Issue, list and revoke the API keys automation reserves capacity and places jobs with
     Keys {
         #[command(flatten)]
         config: ConfigArg,

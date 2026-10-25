@@ -64,9 +64,6 @@ pub(super) const EVENT: &str = "clients";
 /// `vk-hub keys create`; the CLI takes any lifetime up to [`crate::store::MAX_KEY_TTL`].
 const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
 
-/// Where the key page suggests vk-gitlab keeps it.
-const KEY_FILE: &str = "/etc/vk-gitlab/hub.key";
-
 /// The other API clients' tab: the API keys and their instances.
 pub(super) const OTHER: &str = "/clients?tab=other";
 
@@ -981,7 +978,7 @@ fn create_form(h: &mut Html, auth: &Auth) {
     h.raw("<input type=\"hidden\" name=\"op\" value=\"create\">")
         .raw("<label for=\"key-name\">Name</label>")
         .raw("<input id=\"key-name\" type=\"text\" name=\"name\" autocomplete=\"off\" ")
-        .raw("spellcheck=\"false\" required placeholder=\"gitlab-ci\">")
+        .raw("spellcheck=\"false\" required placeholder=\"deploy\">")
         .raw("<label for=\"key-pools\">Pools</label>")
         .raw("<input id=\"key-pools\" type=\"text\" name=\"pools\" autocomplete=\"off\" ")
         .raw("spellcheck=\"false\" required placeholder=\"ci, build or *\">")
@@ -1050,7 +1047,7 @@ pub(super) async fn action(
     }
 }
 
-/// Create the key `form` asks for, and show it this once with the vk-gitlab config using it.
+/// Create the key `form` asks for, and show it this once with how a client sends it.
 /// Its policy is checked as the CLI's: by [`crate::store::Db::create_api_key`], which refuses
 /// a bad name, pool or lifetime, and its limits parsed as the CLI parses them.
 async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
@@ -1116,17 +1113,15 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
     pages::at(&mut main, row.expires_at)
         .raw(". It is shown this once: copy it now.</p><pre>")
         .text(&key)
-        .raw("</pre><p>Keep it in a file only vk-gitlab's user reads, such as <code>")
-        .raw(KEY_FILE)
-        .raw("</code>, and point vk-gitlab's config at it:</p><pre>[hub]\nurl = \"");
+        .raw("</pre><p>Keep it where only its holder reads it. A client sends it to the hub's ")
+        .raw("client API, at <code>");
     match &ui.hub.node_url {
         Some(url) => main.text(url),
         None => main.raw("&lt;hub-url&gt;"),
     };
-    main.raw("\"\napi_key_file = \"")
-        .raw(KEY_FILE)
-        .raw("\"</pre><p class=\"sub\">Add <code>ca_file</code> when the hub's certificate ")
-        .raw("is not one the system's roots verify.</p><p><a href=\"")
+    main.raw("</code>, as <code>Authorization: Bearer &lt;key&gt;</code>. A GitLab runner ")
+        .raw("needs none: <code>vk-gitlab</code> enrolls as a relay, from the GitLab ")
+        .raw("tab.</p><p><a href=\"")
         .raw(OTHER)
         .raw("\">Back to the API clients</a></p>");
     Ok(page(fleet::layout("API key", PATH, auth, &main)))
@@ -1588,8 +1583,8 @@ async fn revoke(
         what: match (op, keys.len()) {
             (KeyOp::Revoke, _) => {
                 "Revoke this API key? It stops working at once: whatever holds it can reserve \
-                 and place nothing more, and vk-gitlab can no longer follow or settle its jobs \
-                 under way."
+                 and place nothing more, and can no longer follow or settle its jobs under \
+                 way."
             }
             (KeyOp::Remove, 1) => {
                 "Remove this API key, which no longer works? Its client instances go with it \

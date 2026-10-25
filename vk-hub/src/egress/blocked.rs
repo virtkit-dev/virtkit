@@ -302,8 +302,8 @@ mod tests {
     }
 
     /// A job's denials are shared by destination, summed across phases and VMs, an observed
-    /// contact left out; refusals apart, attempting nothing; a bound key's job by project, an
-    /// unbound key's by key.
+    /// contact left out; refusals apart, attempting nothing; a job of an instance by project, an
+    /// older hub's job of an unbound key by key.
     #[test]
     fn a_job_shares_its_denials_by_destination_and_subject() {
         use EgressOutcome::*;

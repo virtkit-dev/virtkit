@@ -822,11 +822,12 @@ Fallback warns that every job no rule selects loses egress.
 
 - **Placed jobs.** The hub resolves the rules at placement, from the job's claims (project ID
   and path, ref, protection), and sends the result in `JobStart`: the lists per phase, and the
-  rules' names. Those claims are bounded by the jobs key's ceiling
-  ([trust](registry-hub.md#namespaces)); a job submitted with a key bound to no GitLab
-  instance gets only the `default` rule. A node announces in its inventory that it enforces
-  the field; the hub never places a job whose rules it must enforce on a node that does not,
-  since an older node would ignore the field and run the job under its cap alone.
+  rules' names. Those claims are held by the approval gate to the projects approved for the
+  GitLab server the relay is bound to ([GitLab relays](gitlab-relay-enrollment.md)); a job of
+  no GitLab instance, as an older hub recorded an unbound key's, gets only the `default` rule.
+  A node announces in its inventory that it enforces the field; the hub never places a job
+  whose rules it must enforce on a node that does not, since an older node would ignore the
+  field and run the job under its cap alone.
 - **Jobs run by gitlab-runner.** The executor sees the job's identity only as variables.
   GitLab's documented precedence puts predefined variables last, below a pipeline's own
   `variables:`, so a job can claim another `CI_PROJECT_PATH` or `CI_COMMIT_REF_PROTECTED`

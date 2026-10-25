@@ -110,8 +110,8 @@ pub struct AllowSaved {
     pub generation: u64,
     pub phase: EgressPhase,
     pub rule: String,
-    /// The claims the rules were checked against: the row's latest job's; `None` for a job of a
-    /// key bound to no GitLab instance.
+    /// The claims the rules were checked against: the row's latest job's; `None` for a job of no
+    /// GitLab instance (an older hub's, of a key bound to none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims: Option<JobClaims>,
     pub by: String,

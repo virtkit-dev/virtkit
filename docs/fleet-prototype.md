@@ -37,7 +37,8 @@ The prototype provides, all experimentally:
 - live nodes, node detail and operations pages, steering and resetting from a node's page,
   pausing, resuming, aborting and deleting rollouts from the operations page, a live job
   history, and an audit log, with sign-in links from `vk-hub ui login`;
-- on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: API keys (`vk-hub
+- on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: GitLab relays and
+  the servers and projects they bring (`vk-hub relays`, `vk-hub gitlabs`), API keys (`vk-hub
   keys`), pools (`vk-hub nodes pools`), the client API, reservations and job placement over
   protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs);
 - on the hub, egress rules by project and ref (`vk-hub egress`), held to placed jobs and, by
@@ -1043,8 +1044,8 @@ UI's `/clients` (see [Web UI](#web-ui)). Creating, revoking and removing are aud
 `key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
 strands its jobs under way: their client can no longer follow or settle them with it.
 
-**GitLab relays.** `vk-gitlab` is to enroll with the hub as a relay
-([design](gitlab-relay-enrollment.md)); the hub's side is in place. `vk-hub token create --kind
+**GitLab relays.** `vk-gitlab` enrolls with the hub as a relay, with `vk-gitlab join`
+([design](gitlab-relay-enrollment.md)). `vk-hub token create --kind
 gitlab` issues a token only a relay's enrollment, at `POST /v1/gitlab/enroll`, spends; the
 relay's key is pinned in a table of its own, so no node or registry is taken for a relay. Its
 session, at `/v1/gitlab/session`, opens with the handshake every peer shares, then carries its
@@ -1490,8 +1491,8 @@ page](fleet-design.md#job-egress-from-the-hub), beside Observed traffic, Rules a
 (below). The Blocked tab lists what the jobs of the
 history were refused, from their nodes' reports, a row per destination (protocol, and a port,
 kept; a domain never merged into a suffix) or refused declaration (variable and entry) and per
-project — a project of the GitLab instance its jobs' key is bound to, by GitLab's ID, or for a
-key bound to none every job of the key. *Blocked*, *Would block* and *Declaration issues* are
+project — a project of the GitLab instance its jobs' relay is bound to, by GitLab's ID, or, for
+an older hub's jobs of an API key bound to none, every job of the key. *Blocked*, *Would block* and *Declaration issues* are
 separate views (`view=blocked|would_block|refused`), each with its count. A row shows its jobs
 and attempts in the history, its latest job's end, the layers that decided it in plain words,
 and its state; at most 200 rows, the latest first. Project (`project=gitlab:<instance>:<ID>` or
@@ -1519,7 +1520,7 @@ within a heartbeat elsewhere.
 
 A row is *New* until an operator acknowledges it on its page, and *New* again once a job adds to
 it — a job newly sharing it, or one with more attempts — however soon after. An operator also
-mutes the row's project (for a key bound to no GitLab instance, every job of the key) with a
+mutes the row's project (for an older hub's key bound to no GitLab instance, every job of the key) with a
 reason, for 7 days, 30 days or until unmuted: its rows leave the inbox and the count, and stay
 listed under *Muted*, on their pages and on their jobs' pages; the page lists the mutes in
 force, each undone there or from a row's page. Two more states follow a proposal saved: *Allow
@@ -1685,8 +1686,8 @@ Operators create keys on the *Other API clients* tab with the same validation as
 create`: a name, scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
 of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the CLI's reason.
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
-with a `[hub]` table for `vk-gitlab`: `url` is the hub's node address, and `api_key_file`
-points to the key. The key never appears in live updates, logs or audit entries.
+with the hub's node address its client sends it to, as `Authorization: Bearer`; `vk-gitlab`
+needs none, as a relay. The key never appears in live updates, logs or audit entries.
 
 Operators add a GitLab server on the *GitLab* tab with the same validation as `vk-hub gitlabs
 add`: a name and a URL, by a plain POST back to the tab. A server no relay is bound to has a
@@ -1711,7 +1712,7 @@ state there, so that ticking them all fits a form; `vk-hub gitlabs projects` lis
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
-confirmation; revocation warns that `vk-gitlab` can no longer follow or settle ongoing jobs.
+confirmation; revocation warns that the key's client can no longer follow or settle ongoing jobs.
 The actions apply only to the keys confirmed. As on `/operations`, the buttons post with
 the token set through `hx-headers` and need htmx; `vk-hub keys revoke` works without it.
 

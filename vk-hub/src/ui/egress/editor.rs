@@ -932,7 +932,7 @@ fn group_row(h: &mut Html, g: &Group) {
                 .raw(")</span>");
         }
         None => {
-            h.raw("<span class=\"sub\">keys bound to no GitLab instance: the Fallback only</span>");
+            h.raw("<span class=\"sub\">jobs of no GitLab instance: the Fallback only</span>");
         }
     }
     h.raw("</td><td>");

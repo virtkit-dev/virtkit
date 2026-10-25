@@ -394,8 +394,8 @@ fn fragment(
     let s = &jobs.summary;
     if s.matched == 0 {
         h.raw(if *filter == JobFilter::default() {
-            "<p class=\"empty\">none placed yet: a producer such as vk-gitlab places jobs with \
-             a key from <code>vk-hub keys create</code></p>"
+            "<p class=\"empty\">none placed yet: a <code>vk-gitlab</code> enrolled as a relay \
+             places them, or a client with a key from <code>vk-hub keys create</code></p>"
         } else {
             "<p class=\"empty\" role=\"status\">none match</p>"
         });

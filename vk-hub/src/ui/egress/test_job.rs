@@ -85,7 +85,8 @@ impl Query {
             && self.git_ref.is_empty())
     }
 
-    /// The claims typed in; `None` with no GitLab instance, as a key bound to none submits.
+    /// The claims typed in; `None` with no GitLab instance, as an older hub recorded the jobs
+    /// of an API key bound to none.
     fn claims(&self) -> Option<JobClaims> {
         (!self.gitlab.is_empty()).then(|| JobClaims {
             gitlab: self.gitlab.clone(),
@@ -186,7 +187,7 @@ fn form(h: &mut Html, q: &Query, l: &Listing) {
         .raw("\">");
     input(h, "Job ID", "job", &q.job, "a recent job");
     h.raw("<fieldset><legend>Or what a job would claim</legend><label>GitLab <select ")
-        .raw("name=\"gitlab\"><option value=\"\">None: a key bound to no instance</option>");
+        .raw("name=\"gitlab\"><option value=\"\">None: a job of no GitLab instance</option>");
     for g in &l.gitlabs {
         h.raw("<option value=\"").text(g).raw("\"");
         if *g == q.gitlab {
@@ -288,7 +289,7 @@ fn result(h: &mut Html, q: &Query, l: &Listing) {
                 });
         }
         None => {
-            h.raw("A job of a key bound to no GitLab instance: only the Fallback applies to it.");
+            h.raw("A job of no GitLab instance: only the Fallback applies to it.");
         }
     }
     if let Some(t) = &l.job {

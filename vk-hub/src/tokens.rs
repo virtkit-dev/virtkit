@@ -592,7 +592,7 @@ mod tests {
             Some(RegistryAccess::None { reason, .. }) => reason,
             other => panic!("{other:?}"),
         };
-        // An unbound key wins over a node with no inventory at all.
+        // A relay bound to no approved instance wins over a node with no inventory at all.
         assert_eq!(reason(none(&ctx, None)), NoAccess::UnboundKey);
         ctx.bound.insert("k".into(), "gl".into());
         assert_eq!(

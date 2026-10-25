@@ -104,8 +104,8 @@ pub struct Seed {
     pub phases: Vec<EgressPhase>,
     /// For a would-block, the dry-run rules that would have refused it.
     pub dry_run: BTreeSet<String>,
-    /// The claims of the jobs it comes from, the latest first; `None` for a job of a key bound
-    /// to no GitLab instance.
+    /// The claims of the jobs it comes from, the latest first; `None` for a job of no GitLab
+    /// instance (an older hub's, of a key bound to none).
     pub claims: Vec<Option<JobClaims>>,
     /// The project path its latest job named.
     pub project: Option<String>,
@@ -391,8 +391,8 @@ pub enum By {
     Path,
 }
 
-/// A new rule's subject, exactly the seed's project: `None` for a key bound to no GitLab
-/// instance, or by a path that is not one exactly — a glob's `*` would select others.
+/// A new rule's subject, exactly the seed's project: `None` for jobs of no GitLab instance,
+/// or by a path that is not one exactly — a glob's `*` would select others.
 pub fn new_subject(seed: &Seed, by: By) -> Option<crate::subject::Subject> {
     let Subject::Gitlab {
         instance,
