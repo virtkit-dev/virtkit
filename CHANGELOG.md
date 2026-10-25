@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-10-25
+
 ### Added
 
 - **The hub enrolls GitLab relays**: `vk-hub token create --kind gitlab` issues their token,
@@ -4748,7 +4750,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.95.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.96.0...HEAD
+[0.96.0]: https://github.com/virtkit-dev/virtkit/compare/v0.95.1...v0.96.0
 [0.95.1]: https://github.com/virtkit-dev/virtkit/compare/v0.95.0...v0.95.1
 [0.95.0]: https://github.com/virtkit-dev/virtkit/compare/v0.94.1...v0.95.0
 [0.94.1]: https://github.com/virtkit-dev/virtkit/compare/v0.94.0...v0.94.1
