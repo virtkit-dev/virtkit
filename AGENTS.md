@@ -68,8 +68,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with fifteen crates:
   in fleet mode: enrollment, the session's messages, protocol version negotiation, and the
   payloads each side signs or verifies; and the hub's client API and the job spec a producer
   such as `vk-gitlab` submits through it; and what `vk-registry` and `vk-hub` exchange when
-  the hub manages a registry. Types and pure functions only — no runtime,
-  transport or crypto.
+  the hub manages a registry, and `vk-gitlab` when it enrolls as a relay. Types and pure
+  functions only — no runtime, transport or crypto.
 - **`vk-peer/`** — what a peer of `vk-hub` needs to join it and hold a session: its ed25519
   identity, enrollment, TLS and the session's opening handshake, release keys, and the
   pieces of a self-update on trial (download under the peer's signature, publish by rename,

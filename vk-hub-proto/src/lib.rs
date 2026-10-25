@@ -3,7 +3,7 @@
 //! each side handles its own transport, storage and crypto.
 //!
 //! Five exchanges exist, and [`registry`] adds a sixth for a registry the hub manages, with
-//! [`token`]'s tokens:
+//! [`token`]'s tokens, and [`gitlab`] a seventh for a `vk-gitlab` relay:
 //!
 //! - **Workloads**: `vk workloads` prints the VMs running on its host for its user as a
 //!   [`WorkloadList`], one JSON document per line, for a local UI or any other reader on the
@@ -99,6 +99,7 @@ use serde::{Deserialize, Serialize};
 pub mod client;
 pub mod dispatch;
 pub mod egress;
+pub mod gitlab;
 pub mod job;
 pub mod registry;
 pub mod stamp;

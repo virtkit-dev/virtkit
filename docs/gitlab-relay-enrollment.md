@@ -101,7 +101,7 @@ The hub binds the relay to the normalized URL of its first inventory, and answer
 server's **status** (`approved` with its name, `pending`, `rejected`), again whenever it changes.
 A relay whose server is not approved does not poll GitLab, so it takes no job the hub would
 refuse for its server; the hub refuses its submissions anyway. A relay that later reports
-another URL is refused jobs until re-enrolled (`join --replace`).
+another URL is told `rebound` and refused jobs until re-enrolled (`join --replace`).
 
 **Projects are learned from jobs.** A runner token cannot list the projects a runner serves, so
 the relay knows a project only once GitLab gives it one of its jobs, and the hub learns it from
