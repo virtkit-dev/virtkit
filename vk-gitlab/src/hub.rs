@@ -363,7 +363,10 @@ async fn error_of(resp: Response) -> DispatchError {
     }
     let kind = match parsed.as_ref().map(|p| p.code) {
         Some(ErrorCode::Unauthorized) => ErrorKind::Unauthorized,
-        Some(ErrorCode::Forbidden) => ErrorKind::Forbidden,
+        // Told apart once the relay fails a job refused for approval.
+        Some(ErrorCode::Forbidden | ErrorCode::ApprovalPending | ErrorCode::ProjectRejected) => {
+            ErrorKind::Forbidden
+        }
         Some(ErrorCode::NotFound) => ErrorKind::NotFound,
         Some(ErrorCode::Invalid) => ErrorKind::Invalid,
         Some(ErrorCode::Conflict) => ErrorKind::Conflict,

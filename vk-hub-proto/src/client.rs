@@ -306,6 +306,11 @@ pub enum ErrorCode {
     Unavailable,
     /// 500.
     Internal,
+    /// 403: the job's GitLab project, or its server, waits for an operator's approval. Not
+    /// retryable: approval is a human step.
+    ApprovalPending,
+    /// 403: an operator rejected the job's GitLab project, or its server.
+    ProjectRejected,
     /// A code from a later hub.
     #[serde(other)]
     Other,
@@ -510,6 +515,17 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Other);
         assert!(!error.code.is_retryable());
         assert!(ErrorCode::NoCapacity.is_retryable());
+        for (code, wire) in [
+            (ErrorCode::ApprovalPending, "approval_pending"),
+            (ErrorCode::ProjectRejected, "project_rejected"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ErrorCode>(json!(wire)).unwrap(),
+                code
+            );
+            assert!(!code.is_retryable());
+        }
     }
 
     #[test]
