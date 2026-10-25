@@ -1,6 +1,6 @@
 //! The daemon against the fake hub's HTTP API, for what only the wire shows: retries on the
-//! hub's 503s, a restarted daemon resuming its jobs from the state file, and the instance
-//! and hello it tells the hub.
+//! hub's 503s, a restarted daemon resuming its jobs from the state file, and every request
+//! signed by the enrolled relay.
 //!
 //! vk-hub has no library target, so its handlers cannot run in process here; the fake hub
 //! follows `vk-hub/src/client.rs`, idempotent submissions included.
@@ -10,14 +10,18 @@ mod support;
 use std::path::Path;
 use std::time::Duration;
 
-use support::TEST_SYSTEM_ID;
-use support::fakehub::TEST_API_KEY;
-use support::gl::{HELLO_INTERVAL, Harness, TOKEN, Via, eventually, job_json, runner_toml, within};
-use vk_gitlab::dispatch::{CancelMode, Dispatcher, FakeCall, Placement, Submission};
+use std::sync::Arc;
+
+use support::fakehub::TEST_RELAY_ID;
+use support::gl::{Harness, TOKEN, Via, eventually, job_json, runner_toml, within};
+use vk_gitlab::dispatch::{CancelMode, Dispatcher, ErrorKind, FakeCall, Placement, Submission};
+use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
+use vk_gitlab::relay;
 use vk_gitlab::spec::{self, SpecContext};
-use vk_gitlab::state::{JobRecord, Phase, StateFile, key_fingerprint};
+use vk_gitlab::state::{JobRecord, Phase, StateFile};
 use vk_hub_proto::client::ErrorCode;
 use vk_hub_proto::job::JobSpec;
+use vk_peer::identity::Identity;
 
 fn p1() -> Placement {
     Placement {
@@ -78,8 +82,10 @@ async fn submitted(h: &Harness, id: i64, reservation: Option<String>) -> String 
         .id
 }
 
+/// Records jobs as an earlier daemon, this relay, did.
 fn put(h: &Harness, runner: &str, records: Vec<JobRecord>) {
     let state = StateFile::open(&h.state_dir.join(format!("{runner}.json"))).unwrap();
+    state.set_relay(TEST_RELAY_ID).unwrap();
     for r in records {
         state.put(r).unwrap();
     }
@@ -361,7 +367,7 @@ async fn every_runners_resumed_jobs_come_before_any_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn jobs_of_another_hub_key_refuse_the_start() {
+async fn jobs_of_another_relay_refuse_the_start() {
     let mut h = Harness::unstarted(2, Via::Http).await;
     put(
         &h,
@@ -370,13 +376,13 @@ async fn jobs_of_another_hub_key_refuse_the_start() {
     );
     let path = h.state_dir.join("r1.json");
     let state = StateFile::open(&path).unwrap();
-    state.set_hub_key(key_fingerprint("vkk_another")).unwrap();
+    state.set_relay(&"a".repeat(32)).unwrap();
     h.daemon = h.spawn_daemon();
     let err = format!("{:#}", h.daemon.exit().await.unwrap_err());
-    assert!(err.contains("another hub API key"), "{err}");
+    assert!(err.contains("submitted as another relay"), "{err}");
     assert_eq!(records(&path).len(), 1, "the jobs are kept");
-    // Under the key they were submitted with, they resume.
-    state.set_hub_key(key_fingerprint(TEST_API_KEY)).unwrap();
+    // As the relay they were submitted as, they resume.
+    state.set_relay(TEST_RELAY_ID).unwrap();
     h.daemon = h.spawn_daemon();
     h.final_update(48).await;
     h.stop().await;
@@ -481,11 +487,10 @@ async fn resumed_jobs_hold_their_slots() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_hub_request_names_the_instance_and_hellos_arrive() {
+async fn every_hub_request_is_signed_by_the_relay() {
     let mut h = Harness::unstarted(2, Via::Http).await;
+    // A retried request is signed too.
     let fake_hub = h.http_hub.as_ref().unwrap();
-    fake_hub.take_hellos(true);
-    // A retried request names the instance too.
     fake_hub.fail_next(1, "/v1/jobs", 503, ErrorCode::Unavailable, None);
     h.daemon = h.spawn_daemon();
     h.hub.set_slots("p1", 1);
@@ -494,105 +499,44 @@ async fn every_hub_request_names_the_instance_and_hellos_arrive() {
     h.hub.finish(&hub_id, None, None);
     assert_eq!(h.final_update(50).await["state"], "success");
     let fake_hub = h.http_hub.as_ref().unwrap();
-    eventually("a second hello", || {
-        fake_hub.hellos.lock().unwrap().len() >= 2
-    })
-    .await;
-
-    let hellos = fake_hub.hellos.lock().unwrap().clone();
-    let hello = &hellos[0];
-    assert_eq!(hello.instance, TEST_SYSTEM_ID);
-    assert_eq!(hello.program, "vk-gitlab");
-    assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(hello.concurrent, Some(2));
-    assert_eq!(hello.runners.len(), 1);
-    let runner = &hello.runners[0];
-    assert_eq!((runner.name.as_str(), runner.pool.as_str()), ("r1", "p1"));
-    assert_eq!(runner.labels, ["big"]);
-    assert!(runner.url.starts_with(&h.fake.url), "{}", runner.url);
-    let json = serde_json::to_string(&hellos).unwrap();
-    assert!(
-        !json.contains(TOKEN) && !json.contains(TEST_API_KEY),
-        "{json}"
-    );
-
     let requests = fake_hub.requests.lock().unwrap().clone();
     let submissions = requests
         .iter()
         .filter(|r| r.method == "POST" && r.path == "/v1/jobs")
         .count();
     assert!(submissions >= 2, "the 503'd submission retried");
-    for r in &requests {
+    for r in requests.iter().filter(|r| r.path != "/v1/gitlab/enroll") {
+        let header = |name: &str| r.headers.get(name).and_then(|v| v.to_str().ok());
         assert_eq!(
-            r.headers
-                .get("vk-client-instance")
-                .and_then(|v| v.to_str().ok()),
-            Some(TEST_SYSTEM_ID),
+            header("vk-relay"),
+            Some(TEST_RELAY_ID),
             "{} {}",
             r.method,
             r.path
         );
+        assert!(header("vk-signature").is_some() && header("vk-time").is_some());
+        assert!(header("authorization").is_none() && header("vk-client-instance").is_none());
     }
     h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hub_that_predates_hellos_runs_jobs_and_gets_one_hello() {
-    let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
-    h.gl.push_job(job_json(51));
-    let (hub_id, _) = h.accepted_job(1).await;
-    h.hub.finish(&hub_id, None, None);
-    assert_eq!(h.final_update(51).await["state"], "success");
-    let fake_hub = h.http_hub.as_ref().unwrap();
-    eventually("the hello", || fake_hub.requests_to("/v1/clients") > 0).await;
-    tokio::time::sleep(HELLO_INTERVAL * 3).await;
-    assert_eq!(
-        fake_hub.requests_to("/v1/clients"),
-        1,
-        "a 404 ends the hellos"
-    );
-    let requests = fake_hub.requests.lock().unwrap().clone();
-    let hello = requests.iter().find(|r| r.path == "/v1/clients").unwrap();
-    assert_eq!(
-        hello
-            .headers
-            .get("vk-client-instance")
-            .and_then(|v| v.to_str().ok()),
-        Some(TEST_SYSTEM_ID)
-    );
-    assert!(h.daemon.is_running());
+async fn a_key_the_hub_did_not_enroll_is_refused() {
+    let h = Harness::unstarted(2, Via::Http).await;
+    let relay = relay::open(&h.state_dir).unwrap();
+    let other = support::gl::temp_dir("other-key");
+    let client = HubClient::new(HubOptions {
+        hub: relay.enrollment.hub.clone(),
+        tls: relay.tls,
+        relay_id: relay.enrollment.relay_id.clone(),
+        identity: Arc::new(Identity::load_or_create(&other).unwrap()),
+        retry: HubRetry::default(),
+    });
+    let err = client
+        .capacity(&p1(), None, Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
+    std::fs::remove_dir_all(&other).unwrap();
     h.stop().await;
-}
-
-/// The first hello is answered `status` and `code`; the next ones are taken.
-async fn hellos_go_on_after(status: u16, code: ErrorCode, job: i64) {
-    let mut h = Harness::unstarted(2, Via::Http).await;
-    let fake_hub = h.http_hub.as_ref().unwrap();
-    fake_hub.take_hellos(true);
-    fake_hub.fail_next(1, "/v1/clients", status, code, None);
-    h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
-    h.gl.push_job(job_json(job));
-    let (hub_id, _) = h.accepted_job(1).await;
-    h.hub.finish(&hub_id, None, None);
-    assert_eq!(h.final_update(job).await["state"], "success");
-    let fake_hub = h.http_hub.as_ref().unwrap();
-    eventually("a hello taken after the failed one", || {
-        !fake_hub.hellos.lock().unwrap().is_empty()
-    })
-    .await;
-    assert!(fake_hub.requests_to("/v1/clients") >= 2);
-    assert!(h.daemon.is_running());
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_hello_is_said_again_and_the_run_goes_on() {
-    hellos_go_on_after(503, ErrorCode::Unavailable, 52).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_404_with_a_code_does_not_end_the_hellos() {
-    hellos_go_on_after(404, ErrorCode::NotFound, 53).await;
 }

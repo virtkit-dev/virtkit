@@ -176,8 +176,8 @@ impl Default for RunOptions {
 const HUB_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Paces the retries of a hub call that keeps failing: the hub's `retry_after`, else a
-/// backoff from `retry_pause` up to [`HUB_ERROR_BACKOFF_MAX`]. A refused API key is an
-/// error, not a warning: nothing works until it is replaced.
+/// backoff from `retry_pause` up to [`HUB_ERROR_BACKOFF_MAX`]. A relay the hub refuses is an
+/// error, not a warning: nothing works until it is enrolled again.
 struct HubErrors {
     backoff: Backoff,
 }
@@ -201,7 +201,7 @@ impl HubErrors {
     /// Logs `e` and returns how long to wait before trying again.
     fn failed(&mut self, hub_job: &str, what: &str, e: &DispatchError) -> Duration {
         if matches!(e.kind, ErrorKind::Unauthorized | ErrorKind::Forbidden) {
-            log::error!(hub_job = hub_job, error = e.to_string().as_str(); "{what} failed: the hub refuses the API key");
+            log::error!(hub_job = hub_job, error = e.to_string().as_str(); "{what} failed: the hub refuses this relay");
         } else {
             log::warn!(hub_job = hub_job, error = e.to_string().as_str(); "{what} failed");
         }
@@ -481,10 +481,12 @@ pub fn client_for(
     .with_context(|| format!("runner {:?}", cfg.name))
 }
 
-/// Polls every configured runner until `shutdown` stops it and the running jobs end.
+/// Polls every configured runner until `shutdown` stops it and the running jobs end, its jobs
+/// submitted as relay `relay_id`.
 pub async fn run<D: Dispatcher>(
     config: &Config,
     system_id: &str,
+    relay_id: &str,
     dispatcher: Arc<D>,
     options: RunOptions,
     shutdown: Shutdown,
@@ -501,10 +503,6 @@ pub async fn run<D: Dispatcher>(
         .state_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_STATE_DIR));
-    let hub_key = config
-        .hub
-        .as_ref()
-        .map(|h| crate::state::key_fingerprint(h.api_key().expose()));
     // Every runner is built before any loop starts: a bad one fails the whole run.
     let mut runners = Vec::with_capacity(config.runners.len());
     for cfg in &config.runners {
@@ -516,7 +514,7 @@ pub async fn run<D: Dispatcher>(
             shared.options.retry.clone(),
         )?;
         let state = StateFile::open(&state_dir.join(format!("{}.json", cfg.name)))?;
-        check_hub_key(&state, hub_key.as_deref())?;
+        check_relay(&state, relay_id)?;
         let server_ca_pem = match &cfg.tls_ca_file {
             Some(f) => Some(
                 std::fs::read_to_string(f)
@@ -590,24 +588,21 @@ pub async fn run<D: Dispatcher>(
     Ok(())
 }
 
-/// Refuses a state file whose jobs were submitted with another hub API key: the hub scopes
-/// jobs to the key that submitted them, so this one could neither follow nor settle them.
-/// Without jobs, or without a key recorded, the file takes this key.
-fn check_hub_key(state: &StateFile, fingerprint: Option<&str>) -> Result<()> {
-    let Some(fingerprint) = fingerprint else {
-        return Ok(());
-    };
+/// Refuses a state file whose jobs were submitted as another relay, or by a vk-gitlab from
+/// before relays: the hub scopes jobs to the relay that submitted them, so this one could
+/// neither follow nor settle them. Without jobs, the file takes this relay.
+fn check_relay(state: &StateFile, relay_id: &str) -> Result<()> {
     let jobs = state.records().len();
-    match state.hub_key() {
-        Some(k) if k == fingerprint => Ok(()),
-        Some(_) if jobs > 0 => anyhow::bail!(
-            "{}: {jobs} job(s) were submitted with another hub API key, which this one cannot \
-             reach. Run with the previous key until they end (stop the daemon with SIGTERM and \
-             let it drain), or remove the file to give them up: GitLab then times them out, \
-             and their hub jobs stay unsettled",
+    match state.relay() {
+        Some(r) if r == relay_id => Ok(()),
+        _ if jobs > 0 => anyhow::bail!(
+            "{}: {jobs} job(s) were submitted as another relay, or by a vk-gitlab from before \
+             relays, which this relay cannot reach. Run the previous one until they end (stop \
+             the daemon with SIGTERM and let it drain), or remove the file to give them up: \
+             GitLab then times them out, and their hub jobs stay unsettled",
             state.path().display()
         ),
-        _ => state.set_hub_key(fingerprint.to_owned()),
+        _ => state.set_relay(relay_id),
     }
 }
 

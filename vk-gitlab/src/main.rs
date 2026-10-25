@@ -12,7 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vk_gitlab::config::Config;
 use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
-use vk_gitlab::{logging, presence, relay, system_id};
+use vk_gitlab::{logging, relay, system_id};
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -150,21 +150,17 @@ async fn run(config: PathBuf) -> Result<()> {
     }
     let system_id = system_id_for(&cfg)?;
     log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
-    let Some(hub) = &cfg.hub else {
-        anyhow::bail!(
-            "{}: `vk-gitlab run` needs a [hub] section",
-            config.display()
-        );
-    };
-    let dispatcher = HubClient::new(HubOptions {
-        url: hub.url.clone(),
-        api_key: hub.api_key().clone(),
-        ca_file: hub.ca_file.clone(),
+    // Held until the daemon exits: no join or leave meanwhile.
+    let _lock = relay::lock(&state_dir(&cfg))?;
+    let relay = relay::open(&state_dir(&cfg))?;
+    log::info!(hub = relay.enrollment.hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "Relaying jobs to the hub");
+    let dispatcher = Arc::new(HubClient::new(HubOptions {
+        hub: relay.enrollment.hub.clone(),
+        tls: Arc::clone(&relay.tls),
+        relay_id: relay.enrollment.relay_id.clone(),
+        identity: Arc::clone(&relay.identity),
         retry: Default::default(),
-        instance: system_id.clone(),
-    })
-    .context("the [hub] section")?;
-    let dispatcher = Arc::new(dispatcher);
+    }));
     let (handle, shutdown) = ShutdownHandle::new();
     let shutdown_timeout = cfg.shutdown_timeout();
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
@@ -192,20 +188,15 @@ async fn run(config: PathBuf) -> Result<()> {
         log::error!("Exiting now; the jobs still in the state files resume on the next start");
         std::process::exit(1);
     });
-    let hello = tokio::spawn(presence::report(
-        Arc::clone(&dispatcher),
-        presence::hello_for(&cfg, &system_id),
-        presence::HELLO_INTERVAL,
-    ));
     let result = poll::run(
         &cfg,
         &system_id,
+        &relay.enrollment.relay_id,
         dispatcher,
         RunOptions::default(),
         shutdown,
     )
     .await;
-    hello.abort();
     signals.abort();
     result
 }

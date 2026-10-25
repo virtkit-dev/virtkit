@@ -38,6 +38,10 @@ vk-hub-proto = { path = "../vk-hub-proto" }
 # The relay's identity, enrollment and session with the hub, and its files written whole.
 vk-fs = { path = "../vk-fs" }
 vk-peer = { path = "../vk-peer" }
+# The hub client: one signed HTTP/1.1 request per connection vk-peer dials.
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

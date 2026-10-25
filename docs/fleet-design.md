@@ -552,13 +552,14 @@ and only under a retry policy that says its side effects can repeat.
 
 ### Authentication for submitted jobs
 
-Two kinds of principal submit jobs; nodes never do — a node's key authenticates its session
+Three kinds of principal submit jobs; nodes never do — a node's key authenticates its session
 and nothing else.
 
 | Principal | Credential | Client side |
 |---|---|---|
 | a person | OIDC login on the hub, exchanged for a short-lived hub session token | `vk hub login https://hub` — the OAuth device flow, so it works over SSH; the token is kept `0600` under `~/.config/virtkit/` |
-| other automation — `vk-gitlab` first | a scoped API key: hashed at rest, expiring, revocable | `token_file` in the config, as the registry client does |
+| `vk-gitlab`, a GitLab relay | its ed25519 key, pinned by an enrollment token as a node's is; each request signed and bound to its TLS connection | `vk-gitlab join`, which keeps the key under its state directory |
+| other automation | a scoped API key: hashed at rest, expiring, revocable | `token_file` in the config, as the registry client does |
 
 The hub and `vk-registry` are to share one identity layer — the registry's accounts
 machinery, used by both — so a person has one login and an API key is issued in one place.
@@ -606,7 +607,7 @@ GitLab ◀──runner API──▶ vk-gitlab ──client API──▶ vk-hub �
 
 | Party | Does | Holds |
 |---|---|---|
-| `vk-gitlab` | job requests, the commit, trace patches, state updates, keep-alives, the final update, cancellation from `Job-Status`, failure mapping | runner tokens, its hub API key, the jobs it has taken |
+| `vk-gitlab` | job requests, the commit, trace patches, state updates, keep-alives, the final update, cancellation from `Job-Status`, failure mapping | runner tokens, its relay key, the jobs it has taken |
 | hub | capacity, reservations, placement, output storage, cancellation and loss of jobs | job records and output; specs in memory until a node accepts |
 | node | admission, the stages, masking, the clone, caches, dependency downloads, artifact uploads | the job's spec, its tokens and secrets, while it runs |
 
@@ -620,10 +621,13 @@ within a bound, and otherwise fails as `runner_system_failure`.
 
 **Placement.** GitLab's job response does not carry the job's tags, and tags already decide
 which runners may take a job, so a runner maps to one placement: a hub pool, node labels and
-an envelope, in `vk-gitlab`'s configuration. The API key's policy on the hub bounds the pools
-and envelopes the daemon may use. Services run with the job as a compose group on its node.
+an envelope, in `vk-gitlab`'s configuration, which it reports to the hub. An enrolled relay is
+trusted as a node is: it already holds the runner tokens and sees every job's secrets, so the
+hub sets it no ceiling; what it asks the operator is only what is new, a GitLab server or a
+project not yet approved ([GitLab relay enrollment](gitlab-relay-enrollment.md)). Services run
+with the job as a compose group on its node.
 
-**Trust.** Runner tokens and the API key stay with `vk-gitlab`. The node gets the job token,
+**Trust.** Runner tokens and the relay's key stay with `vk-gitlab`. The node gets the job token,
 the dependency tokens and the job's variables: everything the job itself is given, and what
 it needs to clone and transfer artifacts. The hub sees a job's secrets in transit and does not
 store them.
@@ -908,7 +912,8 @@ carry IDs of their own, node-local policy stays authoritative and the protocol i
 5. **A node job API** that runs a placed workload for the hub: durable job and stage
    identity, ordered output resumable from an offset, cancellation, exit codes that keep
    build failures apart from system failures, and cleanup when the lease lapses.
-6. **GitLab jobs.** The hub's client API with API keys, pools and labels, and `vk-gitlab`;
+6. **GitLab jobs.** The hub's client API with pools and labels, and `vk-gitlab` as an enrolled
+   relay;
    nodes run GitLab jobs' stages themselves. Nodes move over one at a time, each draining its
    local gitlab-runner; a fleet runs both kinds of node meanwhile, and no node runs both.
 7. **Generic jobs.** `vk submit`, people as principals and their policy, scoring on locality,

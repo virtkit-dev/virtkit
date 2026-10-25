@@ -8,11 +8,6 @@
 //!
 //! state_dir = "/var/lib/vk-gitlab"   # each runner's taken jobs
 //!
-//! [hub]
-//! url = "https://hub.example.com:8443"
-//! api_key_file = "/etc/vk-gitlab/hub.key"
-//! ca_file = "/etc/vk-gitlab/hub-ca.pem"
-//!
 //! [gitlab]
 //! url = "https://gitlab.example.com"   # the one GitLab server every runner takes jobs from
 //!
@@ -65,70 +60,11 @@ pub struct Config {
     /// `/var/lib/vk-gitlab`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
-    /// The vk fleet hub jobs are handed to; `vk-gitlab run` requires it.
-    #[serde(default)]
-    pub hub: Option<HubConfig>,
     /// The GitLab server the runners take jobs from; required with runners.
     #[serde(default)]
     pub gitlab: Option<GitlabConfig>,
     #[serde(default)]
     pub runners: Vec<RunnerConfig>,
-}
-
-/// `[hub]`: where the fleet hub is, and the API key it knows this daemon by.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HubConfig {
-    /// `https://hub.example.com:8443`; `http://` only to a loopback hub.
-    pub url: String,
-    /// The API key (`vkk_…`). Prefer `api_key_file`.
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_key_file: Option<PathBuf>,
-    /// A PEM bundle the hub's certificate is verified against instead of the system roots.
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-    #[serde(skip)]
-    resolved_key: Secret,
-}
-
-impl std::fmt::Debug for HubConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HubConfig")
-            .field("url", &self.url)
-            .field("api_key", &self.resolved_key)
-            .field("ca_file", &self.ca_file)
-            .finish()
-    }
-}
-
-impl HubConfig {
-    pub fn api_key(&self) -> &Secret {
-        &self.resolved_key
-    }
-
-    fn resolve(&mut self, base: &Path) -> Result<()> {
-        // The raw key is not kept beside the resolved one.
-        self.resolved_key = match (self.api_key.take(), &self.api_key_file) {
-            (Some(k), None) => Secret::new(k.trim()),
-            (None, Some(file)) => {
-                let file = base.join(file);
-                let raw = std::fs::read_to_string(&file)
-                    .with_context(|| format!("hub: reading api_key_file {}", file.display()))?;
-                Secret::new(raw.trim())
-            }
-            (Some(_), Some(_)) => bail!("hub: set api_key or api_key_file, not both"),
-            (None, None) => bail!("hub: api_key or api_key_file is required"),
-        };
-        if !crate::hub::valid_api_key(self.resolved_key.expose()) {
-            bail!("hub: the API key is not `vkk_` and 64 lowercase hex digits");
-        }
-        if let Some(ca) = &self.ca_file {
-            self.ca_file = Some(base.join(ca));
-        }
-        Ok(())
-    }
 }
 
 /// `[gitlab]`: the one GitLab server of this daemon.
@@ -335,9 +271,6 @@ impl Config {
         let mut cfg: Config = toml::from_str(text)?;
         if cfg.concurrent == 0 {
             bail!("concurrent must be at least 1");
-        }
-        if let Some(hub) = cfg.hub.as_mut() {
-            hub.resolve(base)?;
         }
         cfg.state_dir = Some(
             base.join(
@@ -570,11 +503,7 @@ mod tests {
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\nname = \"../x\"\ntoken = \"a\"\n",
                 "runner name",
             ),
-            (
-                "[hub]\nurl = \"https://h\"\napi_key = \"nope\"\n",
-                "API key",
-            ),
-            ("[hub]\nurl = \"https://h\"\n", "api_key or api_key_file"),
+            ("[hub]\nurl = \"https://h\"\n", "unknown field `hub`"),
             (
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nenvelope = { mem = \"lots\", cpus = 1, disk = \"1G\" }\n",
                 "envelope mem",
@@ -614,23 +543,6 @@ mod tests {
             .unwrap();
             assert_eq!(cfg.runners[0].unhealthy_requests_limit(), want, "{set}");
         }
-    }
-
-    #[test]
-    fn hub_section() {
-        let key = format!("vkk_{}", "ab".repeat(32));
-        let cfg = parse(&format!(
-            "[hub]\nurl = \"https://hub:8443\"\napi_key = \"{key}\"\nca_file = \"ca.pem\"\n"
-        ))
-        .unwrap();
-        let hub = cfg.hub.as_ref().unwrap();
-        assert_eq!(hub.api_key().expose(), key);
-        assert_eq!(
-            hub.ca_file.as_deref(),
-            Some(Path::new("/etc/vk-gitlab/ca.pem"))
-        );
-        assert!(!format!("{cfg:?}").contains(&key));
-        assert_eq!(cfg.state_dir.as_deref(), Some(Path::new(DEFAULT_STATE_DIR)));
     }
 
     #[test]

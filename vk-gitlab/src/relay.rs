@@ -41,7 +41,7 @@ pub struct Enrollment {
 /// An enrolled relay, as `run` reaches its hub.
 pub struct Relay {
     pub enrollment: Enrollment,
-    pub identity: Identity,
+    pub identity: Arc<Identity>,
     pub tls: Arc<rustls::ClientConfig>,
 }
 
@@ -89,6 +89,9 @@ pub async fn join(
         );
     }
     let token = token.read()?;
+    // reqwest is built without a crypto provider; ring is the one this binary links.
+    // Installing it again is a no-op error, ignored.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = match ca {
         Some(path) => {
             let pem = vk_peer::net::read_nofollow(path)?;
@@ -216,7 +219,7 @@ pub fn open(state_dir: &Path) -> Result<Relay> {
         Err(e) => return Err(e),
     };
     vk_peer::net::check_private(&dir)?;
-    let identity = Identity::load(&dir)?;
+    let identity = Arc::new(Identity::load(&dir)?);
     let tls = vk_peer::net::client_tls(enrollment.ca.then(|| dir.join(CA_FILE)).as_deref())?;
     Ok(Relay {
         enrollment,

@@ -1,12 +1,11 @@
 //! vk-hub's client API over HTTP (`vk-hub/src/client.rs`: paths,
 //! statuses, error bodies, output headers), served from the in-memory `FakeDispatcher`, so
-//! the real hub client is tested on the wire. Hellos are taken only once
-//! [`FakeHub::take_hellos`] is on; until then `/v1/clients` gets, before any key check, the
-//! bare 404 a hub that predates it answers an unknown path (`vk-hub/src/server.rs`).
+//! the real hub client is tested on the wire. A relay enrolls at `/v1/gitlab/enroll`, and
+//! every request after must carry its signature, checked as the hub checks it; a request
+//! without one is answered 401.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,12 +20,12 @@ use tokio::net::TcpListener;
 
 use vk_gitlab::dispatch::{DispatchError, Dispatcher, ErrorKind, FakeDispatcher, Submission};
 use vk_hub_proto::client::{
-    CancelRequest, CapacityRequest, ClientError, ClientHello, ErrorCode, JobSubmission,
-    RenewRequest, ReservationGrant, ReservationRequest,
+    CancelRequest, CapacityRequest, ClientError, ErrorCode, JobSubmission, RenewRequest,
+    ReservationGrant, ReservationRequest,
 };
 
-pub const TEST_API_KEY: &str =
-    "vkk_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The ID the fake hub gives the relay that enrolls.
+pub const TEST_RELAY_ID: &str = "0123456789abcdef0123456789abcdef";
 
 /// An injected failure: the next matching requests are answered this way.
 #[derive(Clone, Debug)]
@@ -48,9 +47,8 @@ pub struct HubRequest {
 pub struct FakeHub {
     pub url: String,
     pub requests: Arc<Mutex<Vec<HubRequest>>>,
-    /// The hellos taken, in order.
-    pub hellos: Arc<Mutex<Vec<ClientHello>>>,
-    clients: Arc<AtomicBool>,
+    /// The enrolled relay's public key.
+    relay_key: Arc<Mutex<Option<Vec<u8>>>>,
     faults: Arc<Mutex<VecDeque<Fault>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -119,16 +117,51 @@ fn query(q: &str, name: &str) -> Option<u64> {
         .and_then(|(_, v)| v.parse().ok())
 }
 
-async fn serve(hub: FakeDispatcher, req: Request<Incoming>) -> Resp {
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let q = req.uri().query().unwrap_or("").to_owned();
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map(|b| b.to_bytes())
-        .unwrap_or_default();
+/// Whether the request is signed by the relay whose key is `key`, as `vk-hub/src/client.rs`
+/// checks it (over plain TCP: no TLS exporter).
+fn signed(
+    key: &[u8],
+    headers: &HeaderMap,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let (Some(relay), Some(at), Some(signature)) = (
+        header("vk-relay"),
+        header("vk-time").and_then(|t| t.parse::<u64>().ok()),
+        header("vk-signature")
+            .and_then(vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SIGNATURE_LEN }>),
+    ) else {
+        return false;
+    };
+    if relay != TEST_RELAY_ID || headers.contains_key("authorization") {
+        return false;
+    }
+    let digest: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, body)
+        .as_ref()
+        .try_into()
+        .unwrap();
+    let message = vk_hub_proto::client::client_request_message(
+        relay,
+        method,
+        path_and_query,
+        &digest,
+        at,
+        vk_hub_proto::Channel::Plaintext,
+    );
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(&message, &signature)
+        .is_ok()
+}
+
+async fn serve(
+    hub: FakeDispatcher,
+    method: hyper::Method,
+    path: String,
+    q: String,
+    body: Bytes,
+) -> Resp {
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let wait = Duration::from_secs(query(&q, "wait").unwrap_or(0).min(60));
     macro_rules! parse {
@@ -245,13 +278,11 @@ impl FakeHub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let hellos = Arc::new(Mutex::new(Vec::new()));
-        let clients = Arc::new(AtomicBool::new(false));
+        let relay_key = Arc::new(Mutex::new(None));
         let faults: Arc<Mutex<VecDeque<Fault>>> = Arc::new(Mutex::new(VecDeque::new()));
         let state = (
             Arc::clone(&requests),
-            Arc::clone(&hellos),
-            Arc::clone(&clients),
+            Arc::clone(&relay_key),
             Arc::clone(&faults),
         );
         let task = tokio::spawn(async move {
@@ -262,30 +293,45 @@ impl FakeHub {
                 let (hub, state) = (hub.clone(), state.clone());
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let (hub, (recs, hels, clis, flts)) = (hub.clone(), state.clone());
+                        let (hub, (recs, key, flts)) = (hub.clone(), state.clone());
                         async move {
-                            let path = req.uri().path().to_owned();
+                            let (parts, body) = req.into_parts();
+                            let path = parts.uri.path().to_owned();
+                            let q = parts.uri.query().unwrap_or("").to_owned();
+                            let body = body.collect().await.unwrap().to_bytes();
                             recs.lock().unwrap().push(HubRequest {
-                                method: req.method().to_string(),
+                                method: parts.method.to_string(),
                                 path: path.clone(),
-                                headers: req.headers().clone(),
+                                headers: parts.headers.clone(),
                             });
-                            if path == "/v1/clients" && !clis.load(Ordering::SeqCst) {
+                            if parts.method == "POST" && path == "/v1/gitlab/enroll" {
+                                let ask: vk_hub_proto::EnrollRequest =
+                                    serde_json::from_slice(&body).unwrap();
+                                *key.lock().unwrap() =
+                                    Some(vk_hub_proto::from_hex(&ask.public_key).unwrap());
                                 return Ok::<_, Infallible>(json(
-                                    404,
-                                    &serde_json::json!({"error": "no such endpoint"}),
+                                    200,
+                                    &vk_hub_proto::gitlab::EnrollResponse {
+                                        relay_id: TEST_RELAY_ID.to_owned(),
+                                    },
                                 ));
                             }
-                            let auth = req
-                                .headers()
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            if auth != format!("Bearer {TEST_API_KEY}") {
+                            let path_and_query =
+                                parts.uri.path_and_query().map_or("", |p| p.as_str());
+                            let known = key.lock().unwrap().clone();
+                            if !known.is_some_and(|k| {
+                                signed(
+                                    &k,
+                                    &parts.headers,
+                                    parts.method.as_str(),
+                                    path_and_query,
+                                    &body,
+                                )
+                            }) {
                                 return Ok(error(
                                     401,
                                     ErrorCode::Unauthorized,
-                                    "an API key the hub knows is required",
+                                    "a request signed by an enrolled relay is required",
                                     None,
                                 ));
                             }
@@ -306,17 +352,7 @@ impl FakeHub {
                                 }
                                 return Ok(r);
                             }
-                            if req.method() == "POST" && path == "/v1/clients" {
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                return Ok(match serde_json::from_slice(&body) {
-                                    Ok(hello) => {
-                                        hels.lock().unwrap().push(hello);
-                                        empty(204)
-                                    }
-                                    Err(e) => error(400, ErrorCode::Invalid, &e.to_string(), None),
-                                });
-                            }
-                            Ok(serve(hub, req).await)
+                            Ok(serve(hub, parts.method, path, q, body).await)
                         }
                     });
                     let _ = http1::Builder::new()
@@ -328,16 +364,10 @@ impl FakeHub {
         FakeHub {
             url: format!("http://{addr}"),
             requests,
-            hellos,
-            clients,
+            relay_key,
             faults,
             task,
         }
-    }
-
-    /// Whether hellos are taken, or answered the bare 404 of a hub that predates them.
-    pub fn take_hellos(&self, on: bool) {
-        self.clients.store(on, Ordering::SeqCst);
     }
 
     /// Answers the next `n` requests under `path_prefix` with `status` and `code`.

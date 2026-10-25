@@ -70,8 +70,8 @@ vk-hub token create --kind gitlab | ssh ci-relay-1 vk-gitlab join https://hub.ex
 ```
 
 `join` creates `<state_dir>/hub/` (`0700`) with the relay's key, the hub's URL, its CA and the
-relay ID, as `vk-registry join` does. `vk-gitlab leave` deletes it. A config with both an
-enrollment and `[hub] api_key_file` is refused.
+relay ID, as `vk-registry join` does. `vk-gitlab leave` deletes it. A config with a `[hub]`
+table, or a runner with a `url` of its own, is refused.
 
 - **The GitLab credential is the runner tokens (`glrt-`), as today.** They take jobs and nothing
   else; `verify` gives each runner's ID. A token that lists a runner's projects or creates
@@ -195,8 +195,9 @@ file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
 
 1. stop each vk-gitlab with SIGTERM and let it drain, until its state files are empty;
 2. upgrade the hub and vk-gitlab;
-3. per daemon: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`, move the
-   runners' URL to `[gitlab] url`, drop `[hub]`'s key, start.
+3. per daemon: move the runners' URL to `[gitlab] url` and drop the `[hub]` table, which the
+   new vk-gitlab refuses, then `vk-hub token create --kind gitlab | vk-gitlab join <hub-url>
+   --token -`, and start it.
 
 `/v1/clients` and `vk-client-instance` stay for the API keys of other clients.
 

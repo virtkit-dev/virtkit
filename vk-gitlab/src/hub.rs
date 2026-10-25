@@ -1,6 +1,12 @@
-//! The hub client: [`Dispatcher`] over vk-hub's client API (HTTP/1.1 and JSON, TLS 1.3, an
-//! API key as `authorization: Bearer`), as `docs/gitlab-dispatch.md`, "Daemon ↔ hub",
-//! and vk-hub's `src/client.rs` define it.
+//! The hub client: [`Dispatcher`] over vk-hub's client API (HTTP/1.1 and JSON, TLS 1.3),
+//! as `docs/gitlab-dispatch.md`, "Daemon ↔ hub", and vk-hub's `src/client.rs` define it.
+//!
+//! Each request is signed by the relay's key, as a node signs a release download: the
+//! [`RELAY_HEADER`], [`TIME_HEADER`] and [`SIGNATURE_HEADER`] headers carry the relay's ID,
+//! the time, and its signature over [`client_request_message`] — the method, path and query,
+//! the body's SHA-256, the time and the TLS connection's exporter. A signature is good on its
+//! own connection only, so each request opens a connection of its own, and a retry signs
+//! again; a long poll then never holds a renewal up behind it.
 //!
 //! Transport errors and the retryable codes (`unavailable`, `internal`, and `no_capacity`
 //! outside a reservation) are retried with backoff from 1 to 30 seconds and jitter, honouring
@@ -9,41 +15,40 @@
 //! first answer: a submission is retried until its `place_within` is up. An answer whose
 //! body is cut short is retried as a request without one is. A renewal is tried once, and
 //! its caller retries it within the lease.
-//!
-//! Every request names this daemon's instance in `vk-client-instance`, and
-//! [`HubClient::hello`] says what the instance is (see [`crate::presence`]).
 
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use bytes::Bytes;
-use reqwest::{Method, Response, StatusCode, Url};
+use http_body_util::BodyExt;
+use hyper::header::{HeaderMap, HeaderValue};
+use hyper::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vk_hub_proto::client::{
-    CAPACITY_PATH, CLIENTS_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError,
-    ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobSubmission, JobView, MAX_INSTANCE_LEN,
-    MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement,
-    RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, valid_instance,
+    CAPACITY_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError, ErrorCode,
+    JOBS_PATH, JobSubmission, JobView, MAX_OUTPUT_READ, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER,
+    OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RELAY_HEADER, RESERVATIONS_PATH,
+    RenewRequest, ReservationGrant, ReservationRequest, client_request_message,
 };
 use vk_hub_proto::dispatch::MAX_LEASE_SECS;
 use vk_hub_proto::job::MAX_JOB_SPEC;
-use vk_hub_proto::valid_id;
+use vk_hub_proto::{SIGNATURE_HEADER, TIME_HEADER, valid_id};
+use vk_peer::identity::Identity;
 
-use crate::api::ClientError as SetupError;
 use crate::backoff::Backoff;
 use crate::dispatch::{
     DispatchError, DispatchResult, Dispatcher, ErrorKind, OutputChunk, Reservation, Submission,
 };
-use crate::secret::Secret;
 
 /// How long a request may take beyond the long poll it asks for.
 const REQUEST_SLACK: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest `retry_after_secs` (or `Retry-After`) honoured.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// The most an answer's body is read to: an output read, and room for its headers' worth.
+const MAX_ANSWER: usize = MAX_OUTPUT_READ + (64 << 10);
 
 /// How often a call is tried.
 #[derive(Debug, Clone, Copy)]
@@ -74,117 +79,145 @@ impl Default for HubRetry {
     }
 }
 
-#[derive(Debug, Clone)]
+/// The enrolled relay a client speaks as.
+#[derive(Clone)]
 pub struct HubOptions {
-    /// `https://…`, or `http://` to a loopback hub.
-    pub url: String,
-    /// `vkk_` and 64 hex digits.
-    pub api_key: Secret,
-    /// A PEM bundle the hub is verified against instead of the system roots.
-    pub ca_file: Option<PathBuf>,
+    /// The hub's base URL, as `join` checked it: `https://…`, or `http://` to a loopback hub.
+    pub hub: String,
+    /// The TLS the hub is reached with.
+    pub tls: Arc<rustls::ClientConfig>,
+    /// The relay's ID and key.
+    pub relay_id: String,
+    pub identity: Arc<Identity>,
     pub retry: HubRetry,
-    /// The instance every request names in [`INSTANCE_HEADER`] ([`valid_instance`]).
-    pub instance: String,
-}
-
-/// Whether `key` has the shape of a hub API key.
-pub fn valid_api_key(key: &str) -> bool {
-    key.strip_prefix("vkk_").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
 }
 
 pub struct HubClient {
-    http: reqwest::Client,
-    base: Url,
-    key: Secret,
-    retry: HubRetry,
+    opts: HubOptions,
 }
 
 impl std::fmt::Debug for HubClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubClient")
-            .field("base", &self.base.as_str())
+            .field("hub", &self.opts.hub)
+            .field("relay_id", &self.opts.relay_id)
             .finish_non_exhaustive()
     }
 }
 
+/// A successful answer, read whole.
+struct Answer {
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl Answer {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
 impl HubClient {
-    pub fn new(opts: HubOptions) -> Result<Self, SetupError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let base = Url::parse(&opts.url)
-            .map_err(|e| SetupError::new(format!("hub url {:?}: {e}", opts.url)))?;
-        match base.scheme() {
-            "https" => {}
-            "http" if is_loopback(&base) => {}
-            _ => {
-                return Err(SetupError::new(format!(
-                    "hub url {:?}: https, or http to a loopback hub",
-                    opts.url
-                )));
-            }
-        }
-        if !valid_api_key(opts.api_key.expose()) {
-            return Err(SetupError::new(
-                "the hub API key is not `vkk_` and 64 hex digits".to_owned(),
+    pub fn new(opts: HubOptions) -> Self {
+        Self { opts }
+    }
+
+    /// One request on a connection of its own, signed for it, and its answer read whole,
+    /// all within `timeout`. `Err` is a failed answer, or [`ErrorKind::Transport`] when none
+    /// came whole.
+    async fn send(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        body: &Bytes,
+        timeout: Duration,
+    ) -> DispatchResult<Answer> {
+        let exchange = async {
+            let transport = |what: &str, e: &dyn std::fmt::Display| {
+                DispatchError::new(ErrorKind::Transport, format!("{what}: {e}"))
+            };
+            let (io, exported, authority) = vk_peer::session::dial(&self.opts.hub, &self.opts.tls)
+                .await
+                .map_err(|e| transport("reaching the hub", &format!("{e:#}")))?;
+            let channel = match &exported {
+                Some(e) => vk_hub_proto::Channel::Tls(e),
+                None => vk_hub_proto::Channel::Plaintext,
+            };
+            let at = vk_peer::now_secs();
+            let digest: [u8; vk_hub_proto::SHA256_LEN] =
+                ring::digest::digest(&ring::digest::SHA256, body)
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| DispatchError::new(ErrorKind::Other, "a SHA-256 of 32 bytes"))?;
+            let signature = self.opts.identity.sign(&client_request_message(
+                &self.opts.relay_id,
+                method.as_str(),
+                path_and_query,
+                &digest,
+                at,
+                channel,
             ));
-        }
-        if !valid_instance(&opts.instance) {
-            return Err(SetupError::new(format!(
-                "instance {:?}: 1 to {MAX_INSTANCE_LEN} letters, digits, '.', '_' or '-', the first \
-                 a letter or digit",
-                opts.instance
-            )));
-        }
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            INSTANCE_HEADER,
-            reqwest::header::HeaderValue::from_str(&opts.instance)
-                .map_err(|e| SetupError::new(format!("instance {:?}: {e}", opts.instance)))?,
-        );
-        let mut builder = reqwest::Client::builder()
-            .user_agent(format!("vk-gitlab {}", env!("CARGO_PKG_VERSION")))
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tls_version_min(reqwest::tls::Version::TLS_1_3);
-        if let Some(ca) = &opts.ca_file {
-            let pem = std::fs::read(ca)
-                .map_err(|e| SetupError::new(format!("reading {}: {e}", ca.display())))?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem)
-                .map_err(|e| SetupError::new(format!("parsing {}: {e}", ca.display())))?;
-            builder = builder.tls_certs_only(certs);
-        }
-        let http = builder
-            .build()
-            .map_err(|e| SetupError::new(format!("building the hub client: {e}")))?;
-        Ok(Self {
-            http,
-            base,
-            key: opts.api_key,
-            retry: opts.retry,
-        })
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+                    .await
+                    .map_err(|e| transport("opening the request", &e))?;
+            let driver = tokio::spawn(conn);
+            let mut request = hyper::Request::builder()
+                .method(method.clone())
+                .uri(path_and_query)
+                .header(hyper::header::HOST, authority)
+                .header(
+                    hyper::header::USER_AGENT,
+                    concat!("vk-gitlab ", env!("CARGO_PKG_VERSION")),
+                )
+                .header(RELAY_HEADER, &self.opts.relay_id)
+                .header(TIME_HEADER, at.to_string())
+                .header(SIGNATURE_HEADER, signature);
+            if !body.is_empty() {
+                request = request.header(
+                    hyper::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
+            let request = request
+                .body(http_body_util::Full::new(body.clone()))
+                .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?;
+            let answer = async {
+                let resp = sender
+                    .send_request(request)
+                    .await
+                    .map_err(|e| transport("sending the request", &e))?;
+                let (parts, incoming) = resp.into_parts();
+                let body = http_body_util::Limited::new(incoming, MAX_ANSWER)
+                    .collect()
+                    .await
+                    .map_err(|e| transport("reading the answer", &e))?
+                    .to_bytes();
+                Ok((parts.status, parts.headers, body))
+            }
+            .await;
+            driver.abort();
+            let (status, headers, body) = answer?;
+            if status.is_success() {
+                Ok(Answer { headers, body })
+            } else {
+                Err(error_of(status, &headers, &body))
+            }
+        };
+        tokio::time::timeout(timeout, exchange)
+            .await
+            .unwrap_or_else(|_| {
+                Err(DispatchError::new(
+                    ErrorKind::Transport,
+                    format!("the hub did not answer within {}s", timeout.as_secs()),
+                ))
+            })
     }
 
-    fn url(&self, path: &str, query: &str) -> Result<Url, DispatchError> {
-        let mut url = self
-            .base
-            .join(path)
-            .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?;
-        if !query.is_empty() {
-            url.set_query(Some(query));
-        }
-        Ok(url)
-    }
-
-    /// Retries a call according to `tries`. `read` decodes a successful response; its
-    /// transport errors (a truncated body) are retried like request errors.
+    /// Retries a call according to `tries`, and decodes a successful answer with `read`.
     /// `retry_no_capacity` is false when the caller waits for capacity itself.
     #[allow(clippy::too_many_arguments)]
-    async fn call<T, F: Future<Output = DispatchResult<T>>>(
+    async fn call<T>(
         &self,
         method: Method,
         path: &str,
@@ -193,30 +226,26 @@ impl HubClient {
         timeout: Duration,
         retry_no_capacity: bool,
         tries: Tries,
-        read: impl Fn(Response) -> F,
+        read: impl Fn(Answer) -> DispatchResult<T>,
     ) -> DispatchResult<T> {
-        let url = self.url(path, query)?;
-        let mut backoff = Backoff::new(self.retry.backoff_min, self.retry.backoff_max, 2.0, true);
+        let path_and_query = if query.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}?{query}")
+        };
+        let body = body.unwrap_or_default();
+        let mut backoff = Backoff::new(
+            self.opts.retry.backoff_min,
+            self.opts.retry.backoff_max,
+            2.0,
+            true,
+        );
         let mut attempt = 0u32;
         loop {
             attempt = attempt.saturating_add(1);
-            let mut rb = self
-                .http
-                .request(method.clone(), url.clone())
-                .bearer_auth(self.key.expose())
-                .timeout(timeout);
-            if let Some(b) = &body {
-                rb = rb
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(b.clone());
-            }
-            let err = match rb.send().await {
-                Ok(resp) if resp.status().is_success() => match read(resp).await {
-                    Err(e) if e.kind == ErrorKind::Transport => e,
-                    done => return done,
-                },
-                Ok(resp) => error_of(resp).await,
-                Err(e) => transport(e),
+            let err = match self.send(&method, &path_and_query, &body, timeout).await {
+                Ok(answer) => return read(answer),
+                Err(e) => e,
             };
             let retryable = match err.kind {
                 ErrorKind::Transport | ErrorKind::Unavailable | ErrorKind::Internal => true,
@@ -227,7 +256,7 @@ impl HubClient {
                 .retry_after
                 .map_or_else(|| backoff.next_delay(), |d| d.min(MAX_RETRY_AFTER));
             let again = match tries {
-                Tries::Attempts => attempt < self.retry.max_attempts,
+                Tries::Attempts => attempt < self.opts.retry.max_attempts,
                 Tries::Once => false,
                 Tries::Until(deadline) => Instant::now() + wait < deadline,
             };
@@ -261,20 +290,7 @@ impl HubClient {
             timeout_for(Duration::ZERO),
             true,
             tries,
-            |resp| async move { resp.bytes().await.map(drop).map_err(transport) },
-        )
-        .await
-    }
-
-    /// Describes this instance to the hub. Tried once; the caller sends periodic hellos.
-    pub async fn hello(&self, hello: &ClientHello) -> DispatchResult<()> {
-        let body = serde_json::to_vec(hello)
-            .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?;
-        self.call_empty(
-            Method::POST,
-            CLIENTS_PATH,
-            Some(Bytes::from(body)),
-            Tries::Once,
+            |_| Ok(()),
         )
         .await
     }
@@ -306,9 +322,8 @@ impl HubClient {
             timeout,
             retry_no_capacity,
             tries,
-            |resp| async move {
-                let bytes = resp.bytes().await.map_err(transport)?;
-                serde_json::from_slice(&bytes).map_err(|e| {
+            |answer| {
+                serde_json::from_slice(&answer.body).map_err(|e| {
                     DispatchError::new(
                         ErrorKind::Other,
                         format!("the hub's answer does not parse: {e}"),
@@ -320,35 +335,17 @@ impl HubClient {
     }
 }
 
-fn transport(e: reqwest::Error) -> DispatchError {
-    DispatchError::new(ErrorKind::Transport, e.without_url().to_string())
-}
-
-fn is_loopback(url: &Url) -> bool {
-    match url.host_str() {
-        Some("localhost") => true,
-        Some(h) => h
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback()),
-        None => false,
-    }
-}
-
 /// A failed answer as an error: the body's code when it has one, else the status's.
-async fn error_of(resp: Response) -> DispatchError {
-    let status = resp.status();
+fn error_of(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> DispatchError {
     let header = |name: &str| {
-        resp.headers()
+        headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
     };
     let retry_header = header("retry-after");
     let length = header(OUTPUT_LENGTH_HEADER);
-    let body = resp.bytes().await.unwrap_or_default();
-    let parsed = serde_json::from_slice::<ClientError>(&body).ok();
+    let parsed = serde_json::from_slice::<ClientError>(body).ok();
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         return DispatchError {
             status: Some(status.as_u16()),
@@ -563,19 +560,16 @@ impl Dispatcher for HubClient {
             timeout_for(wait),
             true,
             Tries::Attempts,
-            |resp| async move {
-                let header = |name: &str| {
-                    resp.headers()
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned)
-                };
-                let chunk_offset = header(OUTPUT_OFFSET_HEADER)
+            |answer| {
+                let chunk_offset = answer
+                    .header(OUTPUT_OFFSET_HEADER)
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(offset);
-                let length = header(OUTPUT_LENGTH_HEADER).and_then(|v| v.parse().ok());
-                let complete = header(OUTPUT_COMPLETE_HEADER).as_deref() == Some("true");
-                let data = resp.bytes().await.map_err(transport)?;
+                let length = answer
+                    .header(OUTPUT_LENGTH_HEADER)
+                    .and_then(|v| v.parse().ok());
+                let complete = answer.header(OUTPUT_COMPLETE_HEADER) == Some("true");
+                let data = answer.body;
                 Ok(OutputChunk {
                     offset: chunk_offset,
                     length: length.unwrap_or(chunk_offset.saturating_add(data.len() as u64)),
@@ -612,56 +606,4 @@ fn lease_secs(lease: Duration) -> u32 {
     u32::try_from(lease.as_secs())
         .unwrap_or(u32::MAX)
         .clamp(1, MAX_LEASE_SECS)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn api_keys() {
-        assert!(valid_api_key(&format!("vkk_{}", "0f".repeat(32))));
-        assert!(!valid_api_key(&format!("vkk_{}", "0F".repeat(32))));
-        assert!(!valid_api_key(&"0f".repeat(32)));
-        assert!(!valid_api_key("vkk_abc"));
-    }
-
-    #[test]
-    fn urls() {
-        let key = Secret::new(format!("vkk_{}", "0f".repeat(32)));
-        let mk = |url: &str| {
-            HubClient::new(HubOptions {
-                url: url.to_owned(),
-                api_key: key.clone(),
-                ca_file: None,
-                retry: HubRetry::default(),
-                instance: "s_0123456789ab".to_owned(),
-            })
-        };
-        assert!(mk("https://hub.example.com:8443").is_ok());
-        assert!(mk("http://127.0.0.1:8443").is_ok());
-        assert!(mk("http://[::1]:8443").is_ok());
-        assert!(mk("http://localhost:8443").is_ok());
-        assert!(mk("http://hub.example.com").is_err());
-        assert!(mk("ftp://hub").is_err());
-    }
-
-    #[test]
-    fn instances() {
-        let mk = |instance: &str| {
-            HubClient::new(HubOptions {
-                url: "https://hub.example.com:8443".to_owned(),
-                api_key: Secret::new(format!("vkk_{}", "0f".repeat(32))),
-                ca_file: None,
-                retry: HubRetry::default(),
-                instance: instance.to_owned(),
-            })
-        };
-        assert!(mk("s_0123456789ab").is_ok());
-        assert!(mk("").is_err());
-        assert!(mk("a b").is_err());
-        assert!(mk("-x").is_err());
-        assert!(mk(&"a".repeat(64)).is_ok());
-        assert!(mk(&"a".repeat(65)).is_err());
-    }
 }

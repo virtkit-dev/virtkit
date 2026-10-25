@@ -10,19 +10,16 @@ use vk_gitlab::config::Config;
 use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
-use vk_gitlab::presence;
-use vk_gitlab::secret::Secret;
+use vk_gitlab::relay;
 use vk_gitlab::trace::TraceSettings;
 
-use super::fakehub::{FakeHub, TEST_API_KEY};
+use super::fakehub::{FakeHub, TEST_RELAY_ID};
 use super::{FakeGitLab, Recorded, Reply, TEST_SYSTEM_ID};
 
 /// The runner ID the fake GitLab's `/runners/verify` answers.
 pub const RUNNER_ID: i64 = 77;
 /// The token of the default runner, `r1`.
 pub const TOKEN: &str = "glrt-test-token";
-/// How often a daemon behind the fake hub's HTTP API says its hello.
-pub const HELLO_INTERVAL: Duration = Duration::from_millis(100);
 
 /// GitLab: jobs to hand out per runner token, the `Job-Status` of each job, and each job's
 /// log as the patches assembled it — a patch must start where the log ends (or at 0, a
@@ -306,6 +303,14 @@ impl Harness {
             Via::Http => Some(FakeHub::start(hub.clone()).await),
         };
         let state_dir = temp_dir("state");
+        if let Some(hub) = &http_hub {
+            // Enrolled as `vk-gitlab join` enrolls it.
+            let token = vk_peer::net::TokenSource::Literal("vkh_test".to_owned());
+            let id = relay::join(&state_dir, &hub.url, &token, None, false)
+                .await
+                .unwrap();
+            assert_eq!(id, TEST_RELAY_ID);
+        }
         let runners = runner_toml("r1", TOKEN, "");
         Harness {
             gl,
@@ -326,16 +331,9 @@ impl Harness {
     }
 
     pub fn config(&self) -> Config {
-        let hub = match &self.http_hub {
-            Some(hub) => format!(
-                "[hub]\nurl = \"{}\"\napi_key = \"{TEST_API_KEY}\"\n",
-                hub.url
-            ),
-            None => String::new(),
-        };
         Config::parse(
             &format!(
-                "concurrent = {}\ncheck_interval = 1\nstate_dir = \"{}\"\n{hub}\
+                "concurrent = {}\ncheck_interval = 1\nstate_dir = \"{}\"\n\
                  [gitlab]\nurl = \"{}\"\n{}",
                 self.concurrent,
                 self.state_dir.display(),
@@ -360,30 +358,26 @@ impl Harness {
         let task = match self.via {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
-                rt.spawn(async move { poll::run(&cfg, TEST_SYSTEM_ID, d, options, shutdown).await })
+                rt.spawn(async move {
+                    poll::run(&cfg, TEST_SYSTEM_ID, TEST_RELAY_ID, d, options, shutdown).await
+                })
             }
             Via::Http => {
-                let hub = cfg.hub.clone().unwrap();
-                let client = HubClient::new(HubOptions {
-                    url: hub.url.clone(),
-                    api_key: Secret::new(TEST_API_KEY),
-                    ca_file: None,
+                let relay = relay::open(&self.state_dir).unwrap();
+                let d = Arc::new(HubClient::new(HubOptions {
+                    hub: relay.enrollment.hub.clone(),
+                    tls: relay.tls,
+                    relay_id: relay.enrollment.relay_id.clone(),
+                    identity: relay.identity,
                     retry: HubRetry {
                         max_attempts: 5,
                         backoff_min: Duration::from_millis(50),
                         backoff_max: Duration::from_millis(200),
                     },
-                    instance: TEST_SYSTEM_ID.to_owned(),
+                }));
+                rt.spawn(async move {
+                    poll::run(&cfg, TEST_SYSTEM_ID, TEST_RELAY_ID, d, options, shutdown).await
                 })
-                .unwrap();
-                let d = Arc::new(client);
-                // As main.rs does; it ends with the runtime.
-                rt.spawn(presence::report(
-                    Arc::clone(&d),
-                    presence::hello_for(&cfg, TEST_SYSTEM_ID),
-                    HELLO_INTERVAL,
-                ));
-                rt.spawn(async move { poll::run(&cfg, TEST_SYSTEM_ID, d, options, shutdown).await })
             }
         };
         Daemon {

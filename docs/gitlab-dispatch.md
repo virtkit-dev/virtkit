@@ -20,7 +20,7 @@ Three parties take part:
 | Credential | Held by | Used for |
 |---|---|---|
 | runner authentication token (`glrt-…`) | `vk-gitlab` alone | `POST /api/v4/jobs/request`, `/runners/verify` |
-| hub API key | `vk-gitlab` alone | every [client API](#daemon--hub-the-client-api) request |
+| relay key (ed25519, `<state_dir>/hub/key.pk8`) | `vk-gitlab` alone | signing every [client API](#daemon--hub-the-client-api) request; its session with the hub |
 | `CI_JOB_TOKEN` (the job response's `token`) | `vk-gitlab`; the job's node, in the spec | the daemon: trace, state; the node: clone, artifact upload |
 | dependency tokens (`dependencies[].token`) | the job's node | downloading that dependency's artifacts |
 | registry credentials (`credentials`) | the job's node | pulling the job's images |
@@ -111,9 +111,9 @@ GitLab's job response does not carry the job's tags, and GitLab only gives a run
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
 of that class registered in GitLab and its pool and labels here. A pool is a set of nodes the
 hub's operator names (`vk-hub nodes pools <id> <a,b>`); a label is one a node declares in its
-own configuration and reports in its inventory's `labels`, absent from an older node's. The API key's
-policy on the hub decides the pools the daemon may use and the largest envelope it may ask
-for.
+own configuration and reports in its inventory's `labels`, absent from an older node's. The
+placement stays in the daemon's configuration, which it reports to the hub; the hub sets the
+relay no ceiling on it.
 
 A node's concurrency ceiling (`vk-hub nodes ceiling`) and its own executor limit
 (`[executor.schedule] max_concurrency`, which the node reports) cap its placed work at the
@@ -151,8 +151,22 @@ and the hub releases the reservation. Under heavier load the order above holds.
 
 ## Daemon ↔ hub: the client API
 
-HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Every
-request carries `authorization: Bearer <api key>`. Bodies are `vk_hub_proto::client`'s.
+HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Bodies are
+`vk_hub_proto::client`'s. `vk-gitlab` is an enrolled relay ([GitLab relay
+enrollment](gitlab-relay-enrollment.md)): `vk-hub token create --kind gitlab | vk-gitlab join
+<hub-url> --token - [--ca FILE]` pins its key on the hub and keeps it, the hub's URL, its CA and
+the relay's ID under `<state_dir>/hub/` (`0700`); `vk-gitlab leave` deletes them. Both are
+refused while a state file holds a job.
+
+**Authentication.** Each request is signed by the relay's key, as a node signs a release
+download: `vk-relay` carries the relay's ID, `vk-time` the time, and `vk-signature` its
+ed25519 signature over `client_request_message` — the relay ID, method, path and query, the
+body's SHA-256, the time, and the TLS connection's exporter. The hub checks that the relay is
+enrolled and not removed, the time within `DOWNLOAD_SKEW_SECS`, and the signature. A signature
+is good on its own connection only, so the daemon opens one connection per request and signs
+a retry again; a TLS-terminating proxy in front of the hub breaks the binding. A relay is
+held to no pool or envelope ceiling: it already holds the runner tokens and sees every job's
+secrets.
 
 | Request | Body | Answer |
 |---|---|---|
@@ -165,7 +179,7 @@ request carries `authorization: Bearer <api key>`. Bodies are `vk_hub_proto::cli
 | `GET /v1/jobs/<id>/output?offset=<n>&wait=<secs>` | — | 200 bytes |
 | `POST /v1/jobs/<id>/cancel` | `CancelRequest` | 202 `JobView` |
 | `POST /v1/jobs/<id>/settle` | — | 204 |
-| `POST /v1/clients` | `ClientHello` | 204 |
+| `POST /v1/clients` | `ClientHello` | 204 (API keys of other clients; a relay is refused) |
 
 **Long polls.** `wait` on the two `GET`s, and `wait_secs` in a capacity request, hold a
 request for at most 60 seconds: a capacity answer until its `revision` passes `after`, a job
@@ -208,39 +222,6 @@ cancelling a finished job changes nothing and answers its view.
 **Settle.** The daemon has delivered the outcome to GitLab; the hub drops the job's output and
 keeps its record.
 
-**Instances.** Several daemons may share a key; a request names the one it comes from in a
-`vk-client-instance` header, 1 to 64 letters, digits, `.`, `_` or `-`, the first a letter or
-digit. The hub records when it last heard from each instance of each key, and puts the
-instance on the jobs it submits; a request without the header, or with a malformed one,
-counts as the key's unknown instance. A hello — `{instance, program, version, hostname,
-concurrent?, runners}`, each runner `{name, url, pool, labels, limit?}`, at most 64 runners
-of at most 32 labels each and never a credential — says what an instance is; a key of either
-scope may send one, and the hub keeps only the latest, stored display-safe, with any
-credentials, query or fragment cut from runner URLs; a URL that is not `http://` or
-`https://`, or has an `@` past its host, is dropped. A hello is recorded under the instance
-its body names; one whose well-formed header names another is refused, and one without a
-well-formed header — a malformed one counts as none — does not also count for the key's
-unknown instance. Neither decides anything. The hub keeps up to 32 instances per key, drops
-those unheard from for 30 days, and those of a key once it is removed. A hub that predates
-`/v1/clients` answers a hello with a 404 without a `code` and ignores the header, so a
-client stops sending hellos on that 404 and goes on as before.
-
-**Presence.** `vk-gitlab run` names itself by its system ID in `vk-client-instance` on every
-request, and sends a hello at startup and every minute: `program` `vk-gitlab`, its
-version, the host's name, `concurrent`, and each runner's name, GitLab URL (without
-credentials, query or fragment), pool, labels and `limit` — the first 64 runners, the first
-32 labels of each. Runner tokens and the API key never go in it. A failed hello is logged
-and retried a minute later; jobs never wait on it. A hello answered with a 404 without a
-`code` stops the hellos until the daemon restarts: restart it after upgrading the hub. Two
-daemons on one host share a system ID unless `system_id` sets them apart, and so show as one
-instance, each hello overwriting the other's every minute: its runners flip between the two
-configs.
-
-| | Hub with `/v1/clients` | Hub without |
-|---|---|---|
-| **vk-gitlab that says hellos** | instance, host, version and runners shown | header ignored; the first hello's 404 is logged once and no more are sent until a restart |
-| **vk-gitlab without** | the key's unknown instance, last heard from by its requests | as before |
-
 **Idempotency and retries.** `request_id` — 16 random bytes, hex — makes a create
 idempotent for a day: the same ID with the same body answers the first answer again, or 410
 `not_found` once the hub has dropped that job from its history; with another body, 409
@@ -250,10 +231,10 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|
-| 400 | `invalid` | unparseable body, malformed ID, a hello's malformed instance or one its header contradicts | no |
-| 401 | `unauthorized` | no key, or expired or revoked | no |
-| 403 | `forbidden` | pool or envelope outside the key's policy | no |
-| 404 | `not_found` | no such job or reservation of this key's | no |
+| 400 | `invalid` | unparseable body, malformed ID, a job without a project | no |
+| 401 | `unauthorized` | no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
+| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job | no |
+| 404 | `not_found` | no such job or reservation of this relay's | no |
 | 409 | `conflict` | `request_id` reused with another body | no |
 | 410 | `reservation_gone` | lapsed, released, or its node lost | reserve again |
 | 410 | `not_found` | a create retried after its job left the hub's history | no |
@@ -402,14 +383,13 @@ submission. A runner's `name` defaults to its token's short form, so a runner wh
 change needs an explicit `name`, or the new token starts an empty file and the old one's jobs
 are never resumed; the daemon warns at start about state files no configured runner owns.
 
-Hub jobs and reservations belong to the API key that created them, and the hub answers
-`not_found` for them to any other key. The state file records a fingerprint of the key, and a
-daemon started with another key refuses to start while the file holds jobs. Before rotating
-the key, stop the daemon (SIGTERM) and let its running jobs finish within
-`shutdown_timeout`; a job still recorded then keeps the new key from starting until the old
-key resumes it or the file is removed, which gives the job up to GitLab's timeout. A key
-expires (`--ttl`, 90 days by default, at most a year), and the hub does not tell the daemon
-when: its rotation is the operator's to schedule.
+Hub jobs and reservations belong to the relay that created them, and the hub answers
+`not_found` for them to any other. The state file records the relay's ID, and a daemon
+enrolled as another relay refuses to start while the file holds jobs, as it does a file of a
+`vk-gitlab` from before relays. Before enrolling again (`join --replace`), stop the daemon
+(SIGTERM) and let its running jobs finish within `shutdown_timeout`; `join` and `leave` are
+refused while a job is still recorded, until it ends or the file is removed, which gives the
+job up to GitLab's timeout.
 
 The daemon does not rotate runner tokens. It verifies the token at start and daily, warns
 from a week before GitLab's `token_expires_at`, and logs an error once it has expired.

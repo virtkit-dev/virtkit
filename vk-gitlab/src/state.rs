@@ -6,8 +6,8 @@
 //!
 //! The file holds job tokens: it is created `0600` in a `0700` directory (a directory
 //! others can enter is refused), and every write replaces it whole (written beside it,
-//! synced, renamed, the directory synced). It also holds a fingerprint of the hub API key
-//! its jobs were submitted with: the hub scopes jobs to the key that submitted them.
+//! synced, renamed, the directory synced). It also names the relay its jobs were submitted
+//! as: the hub scopes jobs to the relay that submitted them.
 
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -87,17 +87,11 @@ fn timestamps_default() -> bool {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Contents {
-    /// [`key_fingerprint`] of the hub API key the jobs were submitted with.
+    /// The ID of the relay the jobs were submitted as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    hub_key: Option<String>,
+    relay: Option<String>,
     #[serde(default)]
     jobs: Vec<JobRecord>,
-}
-
-/// The first 8 bytes of the key's SHA-256, hex: tells keys apart without revealing them.
-pub fn key_fingerprint(key: &str) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
-    hex(&digest.as_ref()[..8])
 }
 
 /// One runner's state file.
@@ -189,15 +183,15 @@ impl StateFile {
             .cloned()
     }
 
-    /// The [`key_fingerprint`] the file records, if any.
-    pub fn hub_key(&self) -> Option<String> {
-        self.lock().hub_key.clone()
+    /// The relay the file's jobs were submitted as, if it records one.
+    pub fn relay(&self) -> Option<String> {
+        self.lock().relay.clone()
     }
 
-    /// Records the hub API key's fingerprint, and writes the file.
-    pub fn set_hub_key(&self, fingerprint: String) -> Result<()> {
+    /// Records the relay jobs are submitted as, and writes the file.
+    pub fn set_relay(&self, relay_id: &str) -> Result<()> {
         let mut c = self.lock();
-        c.hub_key = Some(fingerprint);
+        c.relay = Some(relay_id.to_owned());
         self.write(&c)
     }
 
@@ -339,21 +333,19 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_key_fingerprint_cleans_up_and_refuses_open_directories() {
+    fn keeps_the_relay_cleans_up_and_refuses_open_directories() {
         let dir =
             std::env::temp_dir().join(format!("vk-gitlab-state-{}", hex(&random_bytes::<6>())));
         let path = dir.join("r1.json");
         let state = StateFile::open(&path).unwrap();
-        let fp = key_fingerprint("vkk_a");
-        assert_eq!(fp.len(), 16);
-        assert_ne!(fp, key_fingerprint("vkk_b"));
-        state.set_hub_key(fp.clone()).unwrap();
+        let relay = "0123456789abcdef0123456789abcdef";
+        state.set_relay(relay).unwrap();
         state.put(record(1)).unwrap();
         // A crash between writing the temporary file and renaming it.
         std::fs::write(dir.join(".r1.json.0123456789ab"), b"{").unwrap();
         std::fs::write(dir.join(".r2.json.0123456789ab"), b"{").unwrap();
         let again = StateFile::open(&path).unwrap();
-        assert_eq!(again.hub_key(), Some(fp));
+        assert_eq!(again.relay().as_deref(), Some(relay));
         assert_eq!(StateFile::read(&path).unwrap().len(), 1);
         assert!(!dir.join(".r1.json.0123456789ab").exists());
         assert!(
