@@ -93,14 +93,8 @@ impl FleetSite {
             ),
             jobs: Arc::default(),
             egress: Arc::default(),
-            clients_feed: sse::feed(
-                hub.subscribe_clients(),
-                counted_events(hub, super::clients::events(hub, false)),
-            ),
-            steered_clients_feed: sse::feed(
-                hub.subscribe_clients(),
-                counted_events(hub, super::clients::events(hub, true)),
-            ),
+            clients_feed: sse::feed(hub.subscribe_clients(), clients_events(hub, false)),
+            steered_clients_feed: sse::feed(hub.subscribe_clients(), clients_events(hub, true)),
         }
     }
 }
@@ -176,7 +170,7 @@ pub(super) fn source(
                     super::clients::GITLAB_EVENT
                 },
                 feed: feed.subscribe(),
-                events: counted_events(hub, super::clients::events(hub, steer)),
+                events: clients_events(hub, steer),
             });
         }
         "nodes" => {
@@ -790,17 +784,18 @@ fn nav(auth: &Auth) -> pages::Nav {
     }
 }
 
-/// The counts the fleet's navigation shows: the New egress rows.
+/// The counts the fleet's navigation shows: the New egress rows, and the GitLab servers and
+/// projects waiting for approval.
 pub(super) async fn nav_counts(hub: &Arc<Hub>) -> Result<Vec<(&'static str, u64)>> {
     let hub = hub.clone();
     blocking(move || counts(&hub)).await
 }
 
 fn counts(hub: &Hub) -> Result<Vec<(&'static str, u64)>> {
-    Ok(vec![(
-        super::egress::PATH,
-        hub.db.egress_new(crate::now_secs())?,
-    )])
+    Ok(vec![
+        (super::egress::PATH, hub.db.egress_new(crate::now_secs())?),
+        (super::clients::PATH, hub.db.gitlab_pending()?),
+    ])
 }
 
 /// `render`, followed by the navigation's counts for the page to swap in out of band: each live
@@ -815,6 +810,15 @@ fn counted(hub: &Arc<Hub>, render: sse::Render) -> sse::Render {
 fn counts_oob(hub: &Arc<Hub>) -> sse::Render {
     let hub = hub.clone();
     Arc::new(move || Ok(pages::counts_oob(&counts(&hub)?).into_string()))
+}
+
+/// `/clients`' events, each tab's fragment followed by the navigation's counts ([`counted`]):
+/// a tab swaps in its own alone.
+fn clients_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
+    super::clients::events(hub, steer)
+        .iter()
+        .map(|(name, render)| (*name, counted(hub, render.clone())))
+        .collect()
 }
 
 /// `events` with the navigation's counts after the first, the page's fragment ([`counted`]).

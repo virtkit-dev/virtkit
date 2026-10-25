@@ -3506,7 +3506,7 @@ async fn placed_jobs_are_a_tab_of_their_own() {
             page.contains(
                 "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
                  <a href=\"/jobs\">Jobs</a><a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
-                 <a href=\"/clients\">Connections</a>\
+                 <a href=\"/clients\">Connections<span id=\"nav-count-clients\"></span></a>\
                  <a href=\"/operations\" aria-current=\"page\">Operations</a>\
                  <a href=\"/audit\">Audit</a>"
             ),
@@ -4070,7 +4070,8 @@ async fn api_keys_and_their_clients_are_shown_live() {
         let page = get(addr, "/clients?tab=other", Some(&cookie)).await.body;
         for want in [
             "<a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
-             <a href=\"/clients\" aria-current=\"page\">Connections</a>",
+             <a href=\"/clients\" aria-current=\"page\">Connections\
+             <span id=\"nav-count-clients\"></span></a>",
             "sse-connect=\"/events/clients\"",
             &format!("<a href=\"/jobs?key={id}\">1</a>"),
             "ci-1&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;&lt;img",
@@ -5116,7 +5117,8 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     assert_eq!(
         first,
         "event: jobs\ndata: <p class=\"empty\" role=\"status\">none match</p>\
-         <span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>\n\n"
+         <span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>\
+         <span id=\"nav-count-clients\" hx-swap-oob=\"true\"></span>\n\n"
     );
 
     // A job submitted after the page opened.
@@ -7838,7 +7840,8 @@ async fn connections_list_gitlab_servers() {
         "aria-current=\"page\">GitLab</a>",
         "id=\"gitlab-servers\" hx-ext=\"sse\" sse-connect=\"/events/gitlab\" \
          sse-swap=\"gitlab\"",
-        "<tr><td><strong>gl</strong></td><td>https://gitlab.example.com</td></tr>",
+        "<tr><td><strong>gl</strong></td><td>https://gitlab.example.com</td>\
+         <td class=\"num\">0</td><td class=\"num\">0</td></tr>",
         "<strong>partner</strong>",
     ] {
         assert!(body.contains(want), "{want}: {body}");
@@ -8322,6 +8325,222 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
         let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
         assert_eq!(reply.status, 404, "{}", reply.body);
     }
+}
+
+/// What waits for approval is on top of the GitLab tab, counted on the Connections link: a
+/// server a relay reports, with the certificate key to check, and the projects the approval
+/// gate refused, by instance. An operator approves a server under a name, rejects it or forgets
+/// its rejection, and approves, rejects or forgets the projects ticked; each is audited and the
+/// tab follows live. A viewer sees the same without a form, and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
+    use crate::store::{GateJob, ProjectState, RelayWrite};
+    let (addr, hub, origin) = start_fleet().await;
+    let relay = bound_relay(&hub, "aa", "https://gitlab.example.com");
+    let mut inventory = hub.db.relay(&relay).unwrap().unwrap().inventory.unwrap();
+    inventory.server.spki_sha256 = Some("cd".repeat(32));
+    let now = crate::now_secs();
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory), now)
+        .unwrap();
+    let count = |n: u64| {
+        format!(
+            "Connections<span id=\"nav-count-clients\"> <span class=\"count\">{n}</span></span>"
+        )
+    };
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    for want in [
+        count(1).as_str(),
+        "<section><h2>Pending</h2><h3>GitLab servers</h3>",
+        "<tr><td>https://gitlab.example.com</td><td><code>cdcd",
+        "<td>relay-1 since <time",
+        "<code>vk-hub gitlabs approve &lt;url&gt; --name &lt;name&gt;</code>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("approve-server"), "{page}");
+    for form in [
+        "op=approve-server&url=https%3A%2F%2Fgitlab.example.com&name=gl",
+        "op=reject-server&url=https%3A%2F%2Fgitlab.example.com",
+        "op=approve-projects&gitlab=gl&project=42",
+    ] {
+        let form = format!("_csrf={viewer_csrf}&{form}");
+        let reply = post_action(addr, &origin, &viewer, "/clients", &form, true).await;
+        assert_eq!(reply.status, 403, "{form}: {}", reply.body);
+    }
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let mut live = Events::open(addr, "/events/gitlab", &operator).await;
+    let first = next_with(&mut live, "approve-server").await;
+    for want in [
+        "name=\"op\" value=\"approve-server\"><input type=\"hidden\" name=\"url\" \
+         value=\"https://gitlab.example.com\">",
+        "hx-preserve=\"true\"",
+        "name=\"op\" value=\"reject-server\"",
+        // Kept current where the tab shows it.
+        "<span id=\"nav-count-clients\" hx-swap-oob=\"true\"> <span class=\"count\">1</span>",
+    ] {
+        assert!(first.contains(want), "{want}: {first}");
+    }
+    let post = |form: String| {
+        let (origin, operator) = (origin.clone(), operator.clone());
+        async move { post_action(addr, &origin, &operator, "/clients", &form, true).await }
+    };
+    let url = "url=https%3A%2F%2Fgitlab.example.com";
+    let reply = post(format!("_csrf={csrf}&op=approve-server&{url}&name=GL")).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("an instance&#39;s name is"),
+        "{}",
+        reply.body
+    );
+    let reply = post(format!("_csrf={csrf}&op=approve-server&{url}&name=gl")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Approved GitLab server https://gitlab.example.com as gl."),
+        "{}",
+        reply.body
+    );
+    audited(
+        &hub,
+        "added GitLab instance gl at https://gitlab.example.com",
+    )
+    .await;
+    next_with(&mut live, "<td><strong>gl</strong></td>").await;
+
+    // Two projects' jobs refused: pending, under the instance.
+    for (n, (id, path)) in [(42, "acme/web"), (43, "acme/api")].into_iter().enumerate() {
+        let job = GateJob {
+            server_url: "https://gitlab.example.com",
+            project_id: id,
+            project_path: path,
+            job_id: 100 + id,
+            job_url: Some("https://gitlab.example.com/acme/web/-/jobs/142"),
+        };
+        let rid = format!("{n:02x}").repeat(16);
+        hub.db.gate_job(&relay, &job, (&rid, "d"), now).unwrap();
+    }
+    hub.clients_changed();
+    let event = next_with(&mut live, "acme/api").await;
+    for want in [
+        "<input type=\"hidden\" name=\"gitlab\" value=\"gl\"><input type=\"hidden\" \
+         name=\"url\" value=\"https://gitlab.example.com\"><fieldset>",
+        "data-check=\"all\"",
+        "<td><input id=\"pick-pending-gl-42\" hx-preserve=\"true\" type=\"checkbox\" \
+         name=\"project\" value=\"42\" aria-label=\"42\"></td>\
+         <td>acme/web</td><td class=\"num\">42</td><td><a \
+         href=\"https://gitlab.example.com/acme/web/-/jobs/142\"",
+        ">#142</a></td><td>relay-1</td><td><time",
+        "name=\"op\" value=\"approve-projects\">Approve</button>",
+        "name=\"op\" value=\"reject-projects\">Reject</button>",
+        "name=\"op\" value=\"forget-projects\">Forget</button>",
+        "<span class=\"count\">2</span>",
+    ] {
+        assert!(event.contains(want), "{want}: {event}");
+    }
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    assert!(page.contains(&count(2)), "{page}");
+    assert!(!page.contains("type=\"checkbox\""), "{page}");
+    assert!(page.contains("projects approve gl &lt;id&gt;"), "{page}");
+
+    let gl = "gitlab=gl&url=https%3A%2F%2Fgitlab.example.com";
+    let reply = post(format!("_csrf={csrf}&op=approve-projects&{gl}")).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    // Ticked on a page showing an instance gl elsewhere.
+    let stale = "gitlab=gl&url=https%3A%2F%2Felsewhere.example&project=42";
+    let reply = post(format!("_csrf={csrf}&op=approve-projects&{stale}")).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("changed since you looked"),
+        "{}",
+        reply.body
+    );
+    let reply = post(format!(
+        "_csrf={csrf}&op=approve-projects&gitlab=nope&project=42"
+    ))
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("no GitLab instance nope"),
+        "{}",
+        reply.body
+    );
+    let reply = post(format!("_csrf={csrf}&op=approve-projects&{gl}&project=42")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Approved 1 project(s) of gl."),
+        "{}",
+        reply.body
+    );
+    let reply = post(format!("_csrf={csrf}&op=reject-projects&{gl}&project=43")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    audited(
+        &hub,
+        "rejected project(s) 43 (acme/api) of GitLab instance gl",
+    )
+    .await;
+    let state = |id: u64| {
+        (hub.db.gitlab_projects(Some("gl")).unwrap().into_iter())
+            .find(|p| p.id == id)
+            .map(|p| p.row.state)
+    };
+    assert_eq!(state(42), Some(ProjectState::Approved));
+    assert_eq!(state(43), Some(ProjectState::Rejected));
+    let event = next_with(&mut live, "<h2>Rejected</h2>").await;
+    assert!(
+        event.contains("<section><h2>Pending</h2><p class=\"empty\">"),
+        "{event}"
+    );
+    assert!(
+        event.contains("<td class=\"num\">1</td>"),
+        "approved: {event}"
+    );
+    let rejected = event.split("<h2>Rejected</h2>").nth(1).unwrap();
+    assert!(rejected.contains("acme/api"), "{rejected}");
+    assert!(!rejected.contains("reject-projects"), "{rejected}");
+    let reply = post(format!("_csrf={csrf}&op=forget-projects&{gl}&project=43")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(state(43), None);
+
+    // Another server: rejected, then its rejection forgotten.
+    let other = bound_relay(&hub, "bb", "https://other.example");
+    let url = "url=https%3A%2F%2Fother.example";
+    let reply = post(format!("_csrf={csrf}&op=reject-server&{url}")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Rejected GitLab server https://other.example.")
+    );
+    assert_eq!(
+        hub.db
+            .relay_with_status(&other)
+            .unwrap()
+            .unwrap()
+            .1
+            .unwrap()
+            .state,
+        vk_hub_proto::gitlab::ServerState::Rejected
+    );
+    let event = next_with(&mut live, "<h2>Rejected</h2><p class=\"sub\">").await;
+    assert!(
+        event.contains("name=\"op\" value=\"forget-server\""),
+        "{event}"
+    );
+    let reply = post(format!("_csrf={csrf}&op=forget-server&{url}")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    audited(&hub, "forgot rejected GitLab server https://other.example").await;
+    assert!(hub.db.rejected_gitlabs().unwrap().is_empty());
+    // An approved server is not rejected.
+    let reply = post(format!(
+        "_csrf={csrf}&op=reject-server&url=https%3A%2F%2Fgitlab.example.com"
+    ))
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
 }
 
 /// A placed job's page shows rights per storage area in plain words, with token details

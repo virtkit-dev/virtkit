@@ -22,6 +22,9 @@ All notable changes to virtkit will be documented in this file.
 - **The Connections page's GitLab tab shows the relays and their runners**, live: each relay's
   reach, server and its approval, the certificate digest it reports, and each runner's
   placement, state and load. Operators remove a relay there.
+- **The Connections page lists the GitLab servers and projects waiting for approval**, counted
+  on its link, and the rejected ones: operators approve a server under a name, reject it or
+  forget its rejection, and approve, reject or forget an instance's projects, ticked together.
 - **Operators add a GitLab relay from the Connections page**: its token is shown once, with the
   `vk-gitlab join` command that redeems it.
 - **An enrolled `vk-gitlab` reports to its hub** its GitLab server, with the digest of its

@@ -20,8 +20,16 @@
 //! servers there, as `vk-hub gitlabs add` does, by a plain form outside the fragment, remove
 //! one no relay is bound to, as `vk-hub gitlabs remove` does, and remove a relay, as `vk-hub
 //! relays remove` does, by buttons in the fragment that ask first.
+//!
+//! Above them, *Pending* lists the GitLab servers relays report that no instance has, and the
+//! projects whose jobs the approval gate refused, by instance; *Rejected* those an operator
+//! rejected. Operators approve, reject and forget them there, as `vk-hub gitlabs
+//! approve|reject|forget` and `vk-hub gitlabs projects approve|reject|forget` do: a server one
+//! at a time, under the name its approval gives it, and an instance's projects together, by
+//! ticking them. Each server's form and each project's box is `hx-preserve`d under an ID of
+//! what it decides on, so the fragment's updates leave one being filled in alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +37,7 @@ use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
+use sha2::{Digest, Sha256};
 
 use super::fleet::{self, FleetSite};
 use super::html::Html;
@@ -39,8 +48,9 @@ use crate::clients::{InstanceView, KeyView};
 use crate::relays::RelayView;
 use crate::server::Hub;
 use crate::store::{
-    ANY_POOL, CLIENT_ACTIVE_SECS, GitlabRefused, GitlabRow, KeyOp, KeyPolicy, KeyRefused, KeyRow,
-    KeysChanged, Role,
+    ANY_POOL, CLIENT_ACTIVE_SECS, Decision, GitlabRefused, GitlabRow, KeyOp, KeyPolicy, KeyRefused,
+    KeyRow, KeysChanged, PendingGitlab, ProjectRef, ProjectState, ProjectView, RejectedGitlab,
+    Role,
 };
 use vk_hub_proto::gitlab::{RunnerState, ServerState, ServerStatus};
 
@@ -64,10 +74,14 @@ pub(super) const OTHER: &str = "/clients?tab=other";
 /// `/events/`. Both tabs' streams carry both tabs' fragments, rendered once for all of them.
 pub(super) const GITLAB_EVENT: &str = "gitlab";
 
-/// What the page shows: every key and its instances, the GitLab servers and the relays.
+/// What the page shows: every key and its instances, the GitLab servers, those pending and
+/// those rejected, every project decided or pending, and the relays.
 struct Shown {
     views: Vec<KeyView>,
     gitlabs: Vec<(String, GitlabRow)>,
+    pending: Vec<PendingGitlab>,
+    rejected: Vec<(String, RejectedGitlab)>,
+    projects: Vec<ProjectView>,
     relays: Vec<RelayView>,
 }
 
@@ -77,6 +91,9 @@ impl Shown {
         Ok(Shown {
             views: crate::clients::views(hub)?,
             gitlabs: hub.db.gitlabs()?,
+            pending: hub.db.pending_gitlabs()?,
+            rejected: hub.db.rejected_gitlabs()?,
+            projects: hub.db.gitlab_projects(None)?,
             relays: crate::relays::views(hub)?,
         })
     }
@@ -144,6 +161,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
 /// each relay the one that removes it.
 fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     let mut h = Html::new();
+    pending_section(&mut h, shown, steer);
     h.raw("<section><h2>GitLab servers</h2>");
     if shown.gitlabs.is_empty() {
         if steer {
@@ -155,7 +173,8 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
                 .raw("relay reports.</p>");
         }
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th>");
+        h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th>")
+            .raw("<th class=\"num\">relays</th><th class=\"num\">projects approved</th>");
         if steer {
             h.raw("<th>change</th>");
         }
@@ -165,6 +184,18 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
                 .text(name)
                 .raw("</strong></td><td>")
                 .text(&row.url)
+                .raw("</td><td class=\"num\">")
+                .text(
+                    (shown.relays.iter())
+                        .filter(|r| r.row.server_url.as_deref() == Some(row.url.as_str()))
+                        .count(),
+                )
+                .raw("</td><td class=\"num\">")
+                .text(
+                    (shown.projects.iter())
+                        .filter(|p| p.gitlab == *name && p.row.state == ProjectState::Approved)
+                        .count(),
+                )
                 .raw("</td>");
             if steer {
                 h.raw("<td class=\"actions\">");
@@ -193,6 +224,284 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     runners_table(&mut h, &shown.relays, now);
     h.raw("</section>");
     h
+}
+
+/// *Pending*, then *Rejected* when an operator rejected any: the servers and the projects, each
+/// with what an operator decides on — for an operator, the forms deciding.
+fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
+    let by_state = |state: ProjectState| {
+        let mut groups: BTreeMap<&str, Vec<&ProjectView>> = BTreeMap::new();
+        for p in shown.projects.iter().filter(|p| p.row.state == state) {
+            groups.entry(&p.gitlab).or_default().push(p);
+        }
+        groups
+    };
+    let pending = by_state(ProjectState::Pending);
+    h.raw("<section><h2>Pending</h2>");
+    if shown.pending.is_empty() && pending.is_empty() {
+        h.raw("<p class=\"empty\">Nothing waits for approval: a GitLab server a relay reports ")
+            .raw("and a project a relay submits a job of wait here until an operator ")
+            .raw("approves them.</p>");
+    }
+    if !shown.pending.is_empty() {
+        h.raw("<h3>GitLab servers</h3>");
+        if !steer {
+            h.raw("<p class=\"sub\">An operator approves one under a name, as <code>vk-hub ")
+                .raw("gitlabs approve &lt;url&gt; --name &lt;name&gt;</code> does, or rejects ")
+                .raw("it. Check its certificate key first.</p>");
+        }
+        h.raw("<table class=\"grid\"><thead><tr><th>URL</th><th>certificate key sha256</th>")
+            .raw("<th>reported by</th>");
+        if steer {
+            h.raw("<th>decide</th>");
+        }
+        h.raw("</tr></thead><tbody>");
+        for p in &shown.pending {
+            h.raw("<tr><td>").text(&p.url).raw("</td><td>");
+            match &p.spki_sha256 {
+                Some(spki) => h.raw("<code>").node(spki).raw("</code>"),
+                None => h.raw("<span class=\"sub\">none reported</span>"),
+            };
+            if let Some(v) = &p.version {
+                h.raw("<br><span class=\"sub\">GitLab ")
+                    .node(v)
+                    .raw("</span>");
+            }
+            h.raw("</td><td>");
+            for (n, (_, hostname, since)) in p.relays.iter().enumerate() {
+                if n > 0 {
+                    h.raw("<br>");
+                }
+                h.node(hostname).raw(" since ");
+                pages::at(h, *since);
+            }
+            h.raw("</td>");
+            if steer {
+                h.raw("<td class=\"actions\">");
+                approve_server_form(h, &p.url);
+                server_button(h, REJECT_SERVER, &p.url, "Reject");
+                h.raw("</td>");
+            }
+            h.raw("</tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    for (gitlab, projects) in &pending {
+        projects_form(h, shown, gitlab, projects, ProjectState::Pending, steer);
+    }
+    h.raw("</section>");
+    let rejected = by_state(ProjectState::Rejected);
+    if shown.rejected.is_empty() && rejected.is_empty() {
+        return;
+    }
+    h.raw("<section><h2>Rejected</h2><p class=\"sub\">Their jobs are refused. Approving one ")
+        .raw("takes the rejection back; forgetting one lets it wait for approval again at its ")
+        .raw("next job.</p>");
+    if !shown.rejected.is_empty() {
+        h.raw("<h3>GitLab servers</h3><table class=\"grid\"><thead><tr><th>URL</th>")
+            .raw("<th>rejected</th><th>by</th>");
+        if steer {
+            h.raw("<th>decide</th>");
+        }
+        h.raw("</tr></thead><tbody>");
+        for (url, r) in &shown.rejected {
+            h.raw("<tr><td>").text(url).raw("</td><td>");
+            pages::at(h, r.rejected_at)
+                .raw("</td><td>")
+                .text(&r.rejected_by)
+                .raw("</td>");
+            if steer {
+                h.raw("<td class=\"actions\">");
+                approve_server_form(h, url);
+                server_button(h, FORGET_SERVER, url, "Forget");
+                h.raw("</td>");
+            }
+            h.raw("</tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    for (gitlab, projects) in &rejected {
+        projects_form(h, shown, gitlab, projects, ProjectState::Rejected, steer);
+    }
+    h.raw("</section>");
+}
+
+/// The ops deciding on a server, and on an instance's projects.
+const APPROVE_SERVER: &str = "approve-server";
+const REJECT_SERVER: &str = "reject-server";
+const FORGET_SERVER: &str = "forget-server";
+const APPROVE_PROJECTS: &str = "approve-projects";
+const REJECT_PROJECTS: &str = "reject-projects";
+const FORGET_PROJECTS: &str = "forget-projects";
+
+/// An ID for an element of `kind` showing `what`, from its digest: the same while it shows the
+/// same, for `hx-preserve` to keep it as an operator fills it in.
+fn preserved_id(kind: &str, what: &str) -> String {
+    let digest = Sha256::digest(what.as_bytes());
+    format!("{kind}-{}", vk_hub_proto::to_hex(&digest[..8]))
+}
+
+/// An operator's form approving the server at `url` under a name. No CSRF field: the page
+/// around the fragment sets the token as a header.
+fn approve_server_form(h: &mut Html, url: &str) {
+    h.raw("<form id=\"")
+        .text(preserved_id("approve", url))
+        .raw("\" hx-preserve=\"true\" method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\" hx-post=\"")
+        .raw(PATH)
+        .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"")
+        .raw(APPROVE_SERVER)
+        .raw("\"><input type=\"hidden\" name=\"url\" value=\"")
+        .text(url)
+        .raw("\"><input type=\"text\" name=\"name\" aria-label=\"Name\" autocomplete=\"off\" ")
+        .raw("spellcheck=\"false\" required size=\"10\" placeholder=\"name\">")
+        .raw("<button class=\"primary\">Approve</button></form>");
+}
+
+/// A button posting `op` on the server at `url`.
+fn server_button(h: &mut Html, op: &'static str, url: &str, label: &'static str) {
+    h.raw("<form method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\" hx-post=\"")
+        .raw(PATH)
+        .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"")
+        .raw(op)
+        .raw("\"><input type=\"hidden\" name=\"url\" value=\"")
+        .text(url)
+        .raw("\"><button class=\"danger\">")
+        .raw(label)
+        .raw("</button></form>");
+}
+
+/// The most projects of one instance and state listed, so that ticking them all still fits the
+/// largest form a page posts.
+const MAX_LISTED_PROJECTS: usize = 500;
+
+/// Instance `gitlab`'s `projects` in `state`: each one's path and ID, its first job refused and
+/// the relay that submitted it, since when and how many of its jobs were refused. For an
+/// operator, a form ticking some of them to approve, reject (pending ones) or forget together.
+fn projects_form(
+    h: &mut Html,
+    shown: &Shown,
+    gitlab: &str,
+    projects: &[&ProjectView],
+    state: ProjectState,
+    steer: bool,
+) {
+    let mut table = Html::new();
+    table
+        .raw("<table class=\"grid\"><thead><tr>")
+        .raw(if steer { "<th></th>" } else { "" })
+        .raw("<th>project</th><th class=\"num\">ID</th><th>first job refused</th>")
+        .raw("<th>by relay</th><th>since</th><th class=\"num\">jobs refused</th>")
+        .raw("</tr></thead><tbody>");
+    for p in projects.iter().take(MAX_LISTED_PROJECTS) {
+        table.raw("<tr>");
+        if steer {
+            table
+                .raw("<td><input id=\"pick-")
+                .raw(state.name())
+                .raw("-")
+                .text(gitlab)
+                .raw("-")
+                .text(p.id)
+                .raw("\" hx-preserve=\"true\" type=\"checkbox\" name=\"project\" value=\"")
+                .text(p.id)
+                .raw("\" aria-label=\"")
+                .text(p.id)
+                .raw("\"></td>");
+        }
+        table.raw("<td>");
+        if p.row.path.is_empty() {
+            table.raw("<span class=\"sub\">path not known</span>");
+        } else {
+            table.node(&p.row.path);
+        }
+        table
+            .raw("</td><td class=\"num\">")
+            .text(p.id)
+            .raw("</td><td>");
+        match (p.row.first_job, &p.row.first_job_url) {
+            (Some(job), url) => {
+                table.external_link(url.as_deref(), &format!("#{job}"));
+            }
+            (None, _) => {
+                table.raw("-");
+            }
+        }
+        table.raw("</td><td>");
+        match &p.row.relay {
+            Some(id) => match shown.relays.iter().find(|r| r.id == *id) {
+                Some(r) => table.node(&r.row.hostname),
+                None => table
+                    .raw("<code>")
+                    .text(crate::rollout::short_id(id))
+                    .raw("</code> <span class=\"sub\">removed</span>"),
+            },
+            None => table.raw("-"),
+        };
+        table.raw("</td><td>");
+        pages::at(&mut table, p.row.since)
+            .raw("</td><td class=\"num\">")
+            .text(p.row.refused)
+            .raw("</td></tr>");
+    }
+    table.raw("</tbody></table>");
+    if let Some(more) = projects.len().checked_sub(MAX_LISTED_PROJECTS)
+        && more > 0
+    {
+        table
+            .raw("<p class=\"sub\">")
+            .text(more)
+            .raw(" more: <code>vk-hub gitlabs projects list ")
+            .text(gitlab)
+            .raw("</code> lists them all.</p>");
+    }
+    h.raw("<h3>Projects of <strong>")
+        .text(gitlab)
+        .raw("</strong></h3>");
+    if !steer {
+        h.html(&table);
+        if state == ProjectState::Pending {
+            h.raw("<p class=\"sub\">An operator approves them, as <code>vk-hub gitlabs ")
+                .raw("projects approve ")
+                .text(gitlab)
+                .raw(" &lt;id&gt;…</code> does; a job then needs retrying in GitLab.</p>");
+        }
+        return;
+    }
+    // The instance as shown: one added since under its name is not the one decided on.
+    let url = (shown.gitlabs.iter())
+        .find(|(name, _)| name == gitlab)
+        .map_or("", |(_, row)| row.url.as_str());
+    let mut form = Html::new();
+    form.raw("<input type=\"hidden\" name=\"gitlab\" value=\"")
+        .text(gitlab)
+        .raw("\"><input type=\"hidden\" name=\"url\" value=\"")
+        .text(url)
+        .raw("\"><fieldset><legend>Projects</legend>")
+        .raw("<button type=\"button\" class=\"secondary\" data-check=\"all\">All</button>")
+        .raw("<button type=\"button\" class=\"secondary\" data-check=\"none\">None</button>")
+        .html(&table)
+        .raw("</fieldset><button class=\"primary\" name=\"op\" value=\"")
+        .raw(APPROVE_PROJECTS)
+        .raw("\">Approve</button>");
+    if state == ProjectState::Pending {
+        form.raw("<button class=\"danger\" name=\"op\" value=\"")
+            .raw(REJECT_PROJECTS)
+            .raw("\">Reject</button>");
+    }
+    form.raw("<button class=\"secondary\" name=\"op\" value=\"")
+        .raw(FORGET_PROJECTS)
+        .raw("\">Forget</button>");
+    h.raw("<form method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\" hx-post=\"")
+        .raw(PATH)
+        .raw("\" hx-swap=\"none\">")
+        .html(&form)
+        .raw("</form>");
 }
 
 /// Whether one of `relays` is bound to the GitLab server at `url`: while one is, the store
@@ -727,6 +1036,12 @@ pub(super) async fn action(
         Some("remove") => revoke(ui, site, htmx, &auth, &form, KeyOp::Remove).await,
         Some(ADD_SERVER) => add_server(ui, &auth, &form).await,
         Some(REMOVE_RELAY) => remove_relay(ui, site, htmx, &auth, &form).await,
+        Some(op @ (APPROVE_SERVER | REJECT_SERVER | FORGET_SERVER)) => {
+            decide_server(ui, htmx, &auth, &form, op).await
+        }
+        Some(op @ (APPROVE_PROJECTS | REJECT_PROJECTS | FORGET_PROJECTS)) => {
+            decide_projects(ui, htmx, &auth, &form, op).await
+        }
         _ => Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
@@ -1025,6 +1340,167 @@ async fn remove_relay(
         .node(&relay.row.hostname)
         .raw(".</div>");
     Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
+}
+
+/// Approve the server at the `url` `form` names under its `name`, as `vk-hub gitlabs approve`
+/// does, or reject it or forget its rejection, as `vk-hub gitlabs reject|forget` do; its relays
+/// are told. Refusals, such as a name taken, are shown as the store gives them.
+async fn decide_server(
+    ui: &Ui,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    op: &str,
+) -> Result<Response<Body>> {
+    let url = field(form, "url").unwrap_or("").to_string();
+    let name = field(form, "name").unwrap_or("").trim().to_string();
+    let (hub, principal, op_, named) = (
+        ui.hub.clone(),
+        auth.session.principal(),
+        op.to_string(),
+        name.clone(),
+    );
+    let done = blocking(move || {
+        let now = crate::now_secs();
+        let done = match op_.as_str() {
+            APPROVE_SERVER => hub
+                .db
+                .add_gitlab(&named, &url, &principal, now)
+                .map(|row| (row.url, true)),
+            REJECT_SERVER => hub.db.reject_gitlab(&url, &principal, now),
+            _ => hub.db.forget_gitlab(&url, &principal, now),
+        };
+        if let Ok((url, true)) = &done {
+            crate::relays::server_changed(&hub, url)?;
+        }
+        Ok(done)
+    })
+    .await?;
+    let (url, changed) = match done {
+        Ok(done) => done,
+        Err(e) if e.is::<GitlabRefused>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e}."),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let said = match (op, changed) {
+        (APPROVE_SERVER, _) => format!("Approved GitLab server {url} as {name}."),
+        (REJECT_SERVER, true) => format!("Rejected GitLab server {url}."),
+        (REJECT_SERVER, false) => format!("GitLab server {url} was rejected already."),
+        (_, true) => format!("Forgot the rejection of GitLab server {url}."),
+        (_, false) => format!("GitLab server {url} was not rejected."),
+    };
+    if changed {
+        eprintln!(
+            "vk-hub: ui: {} {}",
+            auth.session.principal(),
+            match op {
+                APPROVE_SERVER => format!("added GitLab instance {name} at {url}"),
+                REJECT_SERVER => format!("rejected GitLab server {url}"),
+                _ => format!("forgot rejected GitLab server {url}"),
+            }
+        );
+    }
+    if !htmx {
+        return Ok(see_other(PATH));
+    }
+    Ok(fleet::said_so(&said))
+}
+
+/// Approve, reject or forget the projects of instance `gitlab` `form` ticks (`project`), as
+/// `vk-hub gitlabs projects approve|reject|forget` do, only while the instance is still at the
+/// `url` the form showed; approving or rejecting keeps the path recorded.
+async fn decide_projects(
+    ui: &Ui,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    op: &str,
+) -> Result<Response<Body>> {
+    let gitlab = field(form, "gitlab").unwrap_or("").to_string();
+    let url = field(form, "url").unwrap_or("").to_string();
+    let mut ids = Vec::new();
+    for (_, id) in form.iter().filter(|(k, _)| k == "project") {
+        match id.parse::<u64>() {
+            Ok(id) if id > 0 => ids.push(id),
+            _ => {
+                return Ok(actions::refused(
+                    htmx,
+                    StatusCode::BAD_REQUEST,
+                    "Refused: not a project ID.",
+                ));
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::BAD_REQUEST,
+            "Tick at least one project.",
+        ));
+    }
+    let (hub, principal, op_, named) = (
+        ui.hub.clone(),
+        auth.session.principal(),
+        op.to_string(),
+        gitlab.clone(),
+    );
+    let done = blocking(move || {
+        let now = crate::now_secs();
+        let refs: Vec<ProjectRef> = (ids.iter())
+            .map(|&id| ProjectRef { id, path: None })
+            .collect();
+        let seen = (named.as_str(), url.as_str());
+        Ok(match op_.as_str() {
+            APPROVE_PROJECTS => {
+                (hub.db).decide_projects_as_seen(seen, &refs, Decision::Approve, &principal, now)
+            }
+            REJECT_PROJECTS => {
+                (hub.db).decide_projects_as_seen(seen, &refs, Decision::Reject, &principal, now)
+            }
+            _ => (hub.db).forget_projects_as_seen(seen, &ids, &principal, now),
+        })
+    })
+    .await?;
+    let n = match done {
+        Ok(n) => n,
+        Err(e) if e.is::<GitlabRefused>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e}."),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let done = match op {
+        APPROVE_PROJECTS => "approved",
+        REJECT_PROJECTS => "rejected",
+        _ => "forgot",
+    };
+    if n > 0 {
+        ui.hub.clients_changed();
+        ui.hub.touch();
+        eprintln!(
+            "vk-hub: ui: {} {done} {n} project(s) of GitLab instance {gitlab}",
+            auth.session.principal()
+        );
+    }
+    if !htmx {
+        return Ok(see_other(PATH));
+    }
+    Ok(fleet::said_so(&format!(
+        "{} {n} project(s) of {gitlab}.",
+        match op {
+            APPROVE_PROJECTS => "Approved",
+            REJECT_PROJECTS => "Rejected",
+            _ => "Forgot",
+        }
+    )))
 }
 
 /// A redirect to `to`, after a plain form's post.

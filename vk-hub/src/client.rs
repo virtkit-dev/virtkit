@@ -819,6 +819,7 @@ async fn gate(
                 ErrorCode::ApprovalPending | ErrorCode::ProjectRejected
             ) {
                 hub.touch();
+                hub.clients_changed();
             }
             Err(refused(refusal))
         }

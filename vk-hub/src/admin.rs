@@ -772,6 +772,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                     .decide_projects(&gitlab, &projects, decision, &actor, crate::now_secs())?;
             if n > 0 {
                 hub.touch();
+                hub.clients_changed();
                 eprintln!(
                     "vk-hub: admin: {actor} {} {n} project(s) of GitLab instance {}",
                     match decision {
@@ -789,6 +790,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 .forget_projects(&gitlab, &ids, &actor, crate::now_secs())?;
             if n > 0 {
                 hub.touch();
+                hub.clients_changed();
                 eprintln!(
                     "vk-hub: admin: {actor} forgot {n} project(s) of GitLab instance {}",
                     vk_hub_proto::display_safe(&gitlab)

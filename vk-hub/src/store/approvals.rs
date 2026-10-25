@@ -9,13 +9,13 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::ErrorCode;
 
 use super::clients::remove_clients_of;
-use super::gitlabs::{GITLABS, GitlabRow, normalize_gitlab_url, valid_project_path};
+use super::gitlabs::{GITLABS, GitlabRow, normalize_gitlab_url, refused, valid_project_path};
 use super::jobs::{JOBS, REQUEST_KEEP, REQUESTS, RequestRow, request_key, sweep_requests};
 use super::keys::API_KEYS;
 use super::relays::{RELAYS, RelayRow, Servers};
@@ -169,7 +169,19 @@ pub(super) fn rejected_in(
 fn instance_url(txn: &redb::WriteTransaction, name: &str) -> Result<String> {
     match txn.open_table(GITLABS)?.get(name)? {
         Some(g) => Ok(decode::<GitlabRow>(g.value())?.url),
-        None => bail!("there is no GitLab instance {name}"),
+        None => Err(refused(format!("there is no GitLab instance {name}"))),
+    }
+}
+
+/// Refuse unless instance `name` is at `seen`, when given: an instance of that name added at
+/// another URL since is not the one an operator decided on.
+fn instance_seen(txn: &redb::WriteTransaction, name: &str, seen: Option<&str>) -> Result<()> {
+    let url = instance_url(txn, name)?;
+    match seen {
+        Some(seen) if seen != url => Err(refused(format!(
+            "instance {name} changed since you looked; look again"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -664,11 +676,34 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<usize> {
+        self.decide_projects_if((gitlab, None), projects, decision, actor, now)
+    }
+
+    /// [`Db::decide_projects`], refused unless instance `gitlab` is still at `url`.
+    pub fn decide_projects_as_seen(
+        &self,
+        (gitlab, url): (&str, &str),
+        projects: &[ProjectRef],
+        decision: Decision,
+        actor: &str,
+        now: u64,
+    ) -> Result<usize> {
+        self.decide_projects_if((gitlab, Some(url)), projects, decision, actor, now)
+    }
+
+    fn decide_projects_if(
+        &self,
+        (gitlab, seen): (&str, Option<&str>),
+        projects: &[ProjectRef],
+        decision: Decision,
+        actor: &str,
+        now: u64,
+    ) -> Result<usize> {
         if projects.is_empty() {
-            bail!("name at least one project");
+            return Err(refused("name at least one project"));
         }
         let txn = self.db.begin_write().context("starting a write")?;
-        instance_url(&txn, gitlab)?;
+        instance_seen(&txn, gitlab, seen)?;
         let mut changed = Vec::new();
         {
             let mut table = txn.open_table(GITLAB_PROJECTS)?;
@@ -680,7 +715,9 @@ impl Db {
                     .transpose()?;
                 if old.is_none() {
                     if count >= MAX_PROJECTS {
-                        bail!("instance {gitlab} has {MAX_PROJECTS} projects already");
+                        return Err(refused(format!(
+                            "instance {gitlab} has {MAX_PROJECTS} projects already"
+                        )));
                     }
                     count = count.saturating_add(1);
                 }
@@ -732,8 +769,29 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<usize> {
+        self.forget_projects_if((gitlab, None), ids, actor, now)
+    }
+
+    /// [`Db::forget_projects`], refused unless instance `gitlab` is still at `url`.
+    pub fn forget_projects_as_seen(
+        &self,
+        (gitlab, url): (&str, &str),
+        ids: &[u64],
+        actor: &str,
+        now: u64,
+    ) -> Result<usize> {
+        self.forget_projects_if((gitlab, Some(url)), ids, actor, now)
+    }
+
+    fn forget_projects_if(
+        &self,
+        (gitlab, seen): (&str, Option<&str>),
+        ids: &[u64],
+        actor: &str,
+        now: u64,
+    ) -> Result<usize> {
         let txn = self.db.begin_write().context("starting a write")?;
-        instance_url(&txn, gitlab)?;
+        instance_seen(&txn, gitlab, seen)?;
         let mut forgotten = Vec::new();
         {
             let mut table = txn.open_table(GITLAB_PROJECTS)?;
@@ -760,16 +818,16 @@ impl Db {
     /// removed instead. Its URL as normalized, and whether it was not rejected already.
     pub fn reject_gitlab(&self, url: &str, actor: &str, now: u64) -> Result<(String, bool)> {
         let Some(url) = normalize_gitlab_url(url) else {
-            bail!("{url:?} is not an http(s) URL");
+            return Err(refused(format!("{url:?} is not an http(s) URL")));
         };
         let txn = self.db.begin_write().context("starting a write")?;
         for entry in txn.open_table(GITLABS)?.iter()? {
             let (name, value) = entry?;
             if decode::<GitlabRow>(value.value())?.url == url {
-                bail!(
+                return Err(refused(format!(
                     "{url} is approved as instance {}: remove its relays, then the instance",
                     name.value()
-                );
+                )));
             }
         }
         let added = {
@@ -796,7 +854,7 @@ impl Db {
     /// while a relay reports it. Its URL as normalized, and whether it was rejected.
     pub fn forget_gitlab(&self, url: &str, actor: &str, now: u64) -> Result<(String, bool)> {
         let Some(url) = normalize_gitlab_url(url) else {
-            bail!("{url:?} is not an http(s) URL");
+            return Err(refused(format!("{url:?} is not an http(s) URL")));
         };
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn
@@ -809,6 +867,20 @@ impl Db {
         }
         txn.commit().context("forgetting a GitLab server")?;
         Ok((url, removed))
+    }
+
+    /// How many GitLab servers and projects wait for an operator: what the Connections link
+    /// counts.
+    pub fn gitlab_pending(&self) -> Result<u64> {
+        let servers = self.pending_gitlabs()?.len();
+        let txn = self.db.begin_read().context("starting a read")?;
+        let mut projects = 0usize;
+        for entry in txn.open_table(GITLAB_PROJECTS)?.iter()? {
+            if decode::<ProjectRow>(entry?.1.value())?.state == ProjectState::Pending {
+                projects = projects.saturating_add(1);
+            }
+        }
+        Ok(u64::try_from(servers.saturating_add(projects)).unwrap_or(u64::MAX))
     }
 
     /// The servers rejected, by URL.
@@ -848,6 +920,7 @@ mod tests {
             .decide_projects("gl", &refs(&["4"]), Decision::Approve, "u", 1)
             .unwrap_err();
         assert!(err.to_string().contains("no GitLab instance gl"), "{err:#}");
+        assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
         db.add_gitlab("gl", "https://gl.example", "u", 1).unwrap();
         db.add_gitlab("other", "https://other.example", "u", 1)
             .unwrap();
@@ -883,7 +956,29 @@ mod tests {
             (p.row.state, p.row.path.as_str()),
             (ProjectState::Rejected, "acme/web")
         );
-        assert_eq!(db.forget_projects("gl", &[4, 5], "u", 5).unwrap(), 1);
+        // Decided on as seen at another URL: refused.
+        let err = db
+            .forget_projects_as_seen(("gl", "https://elsewhere.example"), &[4], "u", 5)
+            .unwrap_err();
+        assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
+        let err = db
+            .decide_projects_as_seen(
+                ("gl", "https://elsewhere.example"),
+                &refs(&["4"]),
+                Decision::Approve,
+                "u",
+                5,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed since you looked"),
+            "{err:#}"
+        );
+        assert_eq!(
+            db.forget_projects_as_seen(("gl", "https://gl.example"), &[4, 5], "u", 5)
+                .unwrap(),
+            1
+        );
         assert_eq!(db.gitlab_projects(Some("gl")).unwrap().len(), 1);
         // Removing the instance forgets its projects, not another's.
         db.remove_gitlab("gl", "u", 6).unwrap();
@@ -918,7 +1013,9 @@ mod tests {
         assert!(db.rejected_gitlabs().unwrap().is_empty());
         let err = db.reject_gitlab("https://gl.example", "u", 6).unwrap_err();
         assert!(err.to_string().contains("instance gl"), "{err:#}");
-        assert!(db.reject_gitlab("not a url", "u", 6).is_err());
+        assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
+        let err = db.reject_gitlab("not a url", "u", 6).unwrap_err();
+        assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
     }
 
     /// A relay enrolled and bound to `url`.
@@ -968,7 +1065,9 @@ mod tests {
         let id = relay(&db, "aa", "https://gl.example");
         let rid = |n: u8| format!("{n:02x}").repeat(16);
         let gate = |job: &GateJob<'_>, n: u8| db.gate_job(&id, job, (&rid(n), "d"), 10).unwrap();
-        // The server waits: refused, the refusal kept as the request's answer.
+        // The server waits, counted as pending.
+        assert_eq!(db.gitlab_pending().unwrap(), 1);
+        // Refused, the refusal kept as the request's answer.
         assert_eq!(
             code(gate(&job(4, "acme/web"), 1)),
             ErrorCode::ApprovalPending
@@ -976,6 +1075,7 @@ mod tests {
         let answer = db.request(&id, &rid(1), 10).unwrap().unwrap();
         assert_eq!(answer.refusal().unwrap().code, ErrorCode::ApprovalPending);
         db.reject_gitlab("https://gl.example", "u", 2).unwrap();
+        assert_eq!(db.gitlab_pending().unwrap(), 0);
         assert_eq!(
             code(gate(&job(4, "acme/web"), 2)),
             ErrorCode::ProjectRejected
@@ -1008,6 +1108,7 @@ mod tests {
             (p.id, p.row.state, p.row.refused),
             (4, ProjectState::Pending, 2)
         );
+        assert_eq!(db.gitlab_pending().unwrap(), 1);
         assert_eq!(
             (p.row.first_job, p.row.relay.as_deref(), p.row.path.as_str()),
             (Some(104), Some(id.as_str()), "acme/web")
@@ -1022,6 +1123,7 @@ mod tests {
         let approve = [ProjectRef::parse("4").unwrap()];
         db.decide_projects("gl", &approve, Decision::Approve, "u", 6)
             .unwrap();
+        assert_eq!(db.gitlab_pending().unwrap(), 0);
         assert_eq!(gate(&job(4, "acme/web"), 6), Gate::Pass("gl".into()));
         assert_eq!(gate(&job(4, "acme/site"), 7), Gate::Pass("gl".into()));
         assert_eq!(

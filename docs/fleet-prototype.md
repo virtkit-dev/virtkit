@@ -1657,7 +1657,14 @@ of that server, its version, runners and `concurrent`; then each relay's runners
 for it, its pool, labels and envelope, its `limit`, its state (*polling*, *waiting for
 capacity*, *server not approved*, *unhealthy*, *token refused*, and *token not verified* when
 `verify` failed), the job requests it has outstanding, the jobs it holds, and when GitLab last
-answered it and with which HTTP status. What a relay said is shown as text. Its *Other API clients* tab
+answered it and with which HTTP status. What a relay said is shown as text. Above them,
+*Pending* lists what waits for an operator (`vk-hub gitlabs pending`): each GitLab server relays
+report that no instance has, with the certificate key digest and version reported and the relays
+reporting it since when; and, by instance, each project whose job the approval gate refused, with
+its path, ID, first job refused (linked to its GitLab page), the relay that submitted it, since
+when and how many jobs were refused. *Rejected* lists the servers rejected, when and by whom, and
+by instance the projects rejected. The navigation's *Connections* link counts the servers and
+projects pending, as *Egress* counts *New* rows. Its *Other API clients* tab
 (`/clients?tab=other`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
 instances using each. Both tabs show viewers and operators alike the
 same things of a key and an instance. Each key shows its name, first 8
@@ -1690,6 +1697,17 @@ pinned and its session ends. All are audited. *Add a relay* issues a single-use 
 `gitlab`, valid an hour, as `vk-hub token create --kind gitlab` does, by a plain POST to
 `/tokens` answered by a page of its own showing it once with the `vk-gitlab join <hub-url>
 --token -` that redeems it.
+
+Operators decide there on what is pending or rejected, as `vk-hub gitlabs approve|reject|forget`
+and `gitlabs projects approve|reject|forget` do, audited: a server is approved under a name typed
+beside it, rejected, or its rejection forgotten; an instance's projects are ticked, with *All*
+and *None* to tick or untick them at once, then approved, rejected (pending ones) or forgotten
+together. The store's refusals — a name taken or malformed, an approved server rejected, an
+instance gone — are shown as such. These forms are in the live fragment and post with the token
+set through `hx-headers`; each server's form and each project's box is `hx-preserve`d, so one
+being filled in is kept as the tab updates. A decision on projects applies only while their
+instance is still at the URL the page showed, and an instance lists at most 500 projects per
+state there, so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require

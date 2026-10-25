@@ -26,8 +26,9 @@ pub struct GitlabRow {
     pub created_by: String,
 }
 
-/// A refusal from [`Db::add_gitlab`] or [`Db::remove_gitlab`]: a bad name or URL, one taken, a
-/// relay bound to the instance, or one changed since asked. Its message can be shown to the user.
+/// A refusal from [`Db::add_gitlab`] or [`Db::remove_gitlab`] — a bad name or URL, one taken, a
+/// relay bound to the instance, or one changed since asked — or from a decision on a server or
+/// its projects ([`super::approvals`]). Its message can be shown to the user.
 #[derive(Debug)]
 pub struct GitlabRefused(pub String);
 
@@ -39,7 +40,7 @@ impl std::fmt::Display for GitlabRefused {
 
 impl std::error::Error for GitlabRefused {}
 
-fn refused(why: impl Into<String>) -> anyhow::Error {
+pub(super) fn refused(why: impl Into<String>) -> anyhow::Error {
     GitlabRefused(why.into()).into()
 }
 
