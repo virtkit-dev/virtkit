@@ -5,7 +5,11 @@
 //!
 //! Every request carries an API key as `authorization: Bearer <key>` ([`AUTHORIZATION`]); the
 //! key is the principal its jobs are recorded under, and the hub's policy for it decides the
-//! pools it may use and the largest envelope it may ask for. A request that creates something
+//! pools it may use and the largest envelope it may ask for. A [`gitlab`](crate::gitlab) relay
+//! carries no key: it signs each request with its enrolled key instead, its ID, the time and
+//! its signature over [`client_request_message`] in the [`RELAY_HEADER`],
+//! [`TIME_HEADER`](crate::TIME_HEADER) and [`SIGNATURE_HEADER`](crate::SIGNATURE_HEADER)
+//! headers, and is the principal of its jobs. A request that creates something
 //! carries a client-generated `request_id` ([`valid_id`](crate::valid_id)). Reusing the ID
 //! returns the original answer without creating another reservation or job, so the client
 //! can retry after losing an answer. Failed requests return [`ClientError`].
@@ -39,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::dispatch::CancelMode;
 use crate::job::{Envelope, JobResult, JobSpec};
+use crate::{Channel, SHA256_LEN, channel_part, part};
 
 pub const CAPACITY_PATH: &str = "/v1/capacity";
 /// Followed by `/<id>` for one reservation.
@@ -49,6 +54,9 @@ pub const CLIENTS_PATH: &str = "/v1/clients";
 
 /// The header an API key rides in, as `Bearer <key>`.
 pub const AUTHORIZATION: &str = "authorization";
+
+/// The header carrying the ID of the relay that signed a request.
+pub const RELAY_HEADER: &str = "vk-relay";
 
 /// The header naming the client instance a request comes from ([`valid_instance`]).
 pub const INSTANCE_HEADER: &str = "vk-client-instance";
@@ -232,6 +240,28 @@ pub struct ClientRunner {
     /// How many of its jobs run at once, when limited: the runner's `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// What a relay signs to make a client API request: its ID, the request's method and its path
+/// with the query, the sha256 of its body (of no bytes when it has none), the time, and the
+/// channel it arrives on. A signature makes that one request, on that one connection, near
+/// that time: a hub takes it within [`DOWNLOAD_SKEW_SECS`](crate::DOWNLOAD_SKEW_SECS).
+pub fn client_request_message(
+    relay_id: &str,
+    method: &str,
+    path_and_query: &str,
+    body_sha256: &[u8; SHA256_LEN],
+    at: u64,
+    channel: Channel<'_>,
+) -> Vec<u8> {
+    let mut m = b"vk-fleet client-request v1\0".to_vec();
+    part(&mut m, relay_id.as_bytes());
+    part(&mut m, method.as_bytes());
+    part(&mut m, path_and_query.as_bytes());
+    part(&mut m, body_sha256);
+    m.extend_from_slice(&at.to_be_bytes());
+    channel_part(&mut m, channel);
+    m
 }
 
 /// Whether `s` may name a client instance: 1 to [`MAX_INSTANCE_LEN`] bytes, each an ASCII
@@ -507,6 +537,81 @@ mod tests {
         .unwrap();
         assert!(runner.labels.is_empty());
         assert_eq!(runner.limit, None);
+    }
+
+    /// The exact bytes a relay signs: a change here breaks every signature between a relay
+    /// and a hub of different builds.
+    #[test]
+    fn a_signed_request_keeps_its_bytes() {
+        assert_eq!(RELAY_HEADER, "vk-relay");
+        let sha = *b"0123456789abcdef0123456789ABCDEF";
+        let head: &[u8] = b"vk-fleet client-request v1\0\
+              \0\0\0\0\0\0\0\x01r\
+              \0\0\0\0\0\0\0\x04POST\
+              \0\0\0\0\0\0\0\x0c/v1/jobs?a=1\
+              \0\0\0\0\0\0\0\x200123456789abcdef0123456789ABCDEF\
+              \0\0\0\0\0\0\x01\x02";
+        assert_eq!(
+            client_request_message(
+                "r",
+                "POST",
+                "/v1/jobs?a=1",
+                &sha,
+                0x0102,
+                Channel::Plaintext
+            ),
+            [head, b"\0\0\0\0\0\0\0\x09plaintext"].concat()
+        );
+        assert_eq!(
+            client_request_message(
+                "r",
+                "POST",
+                "/v1/jobs?a=1",
+                &sha,
+                0x0102,
+                Channel::Tls(&[b'Z'; crate::TLS_EXPORTER_LEN])
+            ),
+            [
+                head,
+                b"\0\0\0\0\0\0\0\x0ctls-exporter\0\0\0\0\0\0\0\x20",
+                b"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_signed_request_is_labelled_and_bound() {
+        let sha = [7; SHA256_LEN];
+        let sign = |id: &str, method: &str, path: &str, at| {
+            client_request_message(id, method, path, &sha, at, Channel::Plaintext)
+        };
+        let base = sign("r", "POST", "/v1/jobs", 5);
+        for other in [
+            sign("s", "POST", "/v1/jobs", 5),
+            sign("r", "GET", "/v1/jobs", 5),
+            sign("r", "POST", "/v1/jobs?x", 5),
+            sign("r", "POST", "/v1/jobs", 6),
+            client_request_message(
+                "r",
+                "POST",
+                "/v1/jobs",
+                &[8; SHA256_LEN],
+                5,
+                Channel::Plaintext,
+            ),
+            client_request_message(
+                "r",
+                "POST",
+                "/v1/jobs",
+                &sha,
+                5,
+                Channel::Tls(&[1; crate::TLS_EXPORTER_LEN]),
+            ),
+        ] {
+            assert_ne!(other, base);
+        }
+        assert!(base.starts_with(b"vk-fleet client-request v1\0"));
     }
 
     #[test]

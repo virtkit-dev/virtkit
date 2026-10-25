@@ -24,8 +24,9 @@
 //!   A tools download, `GET` [`TOOLS_PATH`]`<sha256>`, fetches the definition an
 //!   [`Operation::Tools`] names the same way, signed over [`tools_download_message`]; the body
 //!   is the definition's tar.
-//! - **The client API** ([`client`]): a job producer holding an API key reserves capacity,
-//!   submits [`job::JobSpec`]s and follows their output and results over HTTP.
+//! - **The client API** ([`client`]): a job producer holding an API key, or a [`gitlab`] relay
+//!   signing each request with its key ([`client::client_request_message`]), reserves
+//!   capacity, submits [`job::JobSpec`]s and follows their output and results over HTTP.
 //!
 //! A registry token ([`token`]) grants access to path prefixes on one registry: the hub signs
 //! it, and the registry verifies it against the token keys the hub sends in its desired state,
