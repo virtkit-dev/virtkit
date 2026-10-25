@@ -64,7 +64,7 @@ async fn verify(config: PathBuf) -> Result<bool> {
     let mut all_ok = true;
     for r in &cfg.runners {
         let info = poll::runner_info();
-        let client = poll::client_for(r, &system_id, info, Default::default())?;
+        let client = poll::client_for(cfg.gitlab_url(), r, &system_id, info, Default::default())?;
         match client.verify().await {
             Ok(Some(_)) => println!("{}: valid", r.name),
             Ok(None) => {

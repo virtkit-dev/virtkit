@@ -348,9 +348,11 @@ async fn shutdown_abort_interrupts_running_jobs(via: Via) {
 
 async fn an_idle_runner_leaves_the_slot_to_another(via: Via) {
     // One slot over two runners: the idle one must not keep it.
-    let h = Harness::start_with(1, via, |url| {
-        runner_toml("r1", TOKEN, url, "") + &runner_toml("r2", "glrt-other-token", url, "")
-    })
+    let h = Harness::start_with(
+        1,
+        via,
+        runner_toml("r1", TOKEN, "") + &runner_toml("r2", "glrt-other-token", ""),
+    )
     .await;
     h.hub.set_slots("p1", 5);
     h.gl.push_job_for("glrt-other-token", job_json(20));
@@ -362,9 +364,11 @@ async fn an_idle_runner_leaves_the_slot_to_another(via: Via) {
 }
 
 async fn limit_bounds_a_runners_jobs(via: Via) {
-    let h = Harness::start_with(5, via, |url| {
-        runner_toml("r1", TOKEN, url, "limit = 1\nrequest_concurrency = 2\n")
-    })
+    let h = Harness::start_with(
+        5,
+        via,
+        runner_toml("r1", TOKEN, "limit = 1\nrequest_concurrency = 2\n"),
+    )
     .await;
     h.hub.set_slots("p1", 5);
     h.gl.push_job(job_json(21));
@@ -430,9 +434,11 @@ async fn stop_lets_a_running_job_finish(via: Via) {
 }
 
 async fn an_unhealthy_runner_backs_off(via: Via) {
-    let h = Harness::start_with(2, via, |url| {
-        runner_toml("r1", TOKEN, url, "unhealthy_requests_limit = 2\n")
-    })
+    let h = Harness::start_with(
+        2,
+        via,
+        runner_toml("r1", TOKEN, "unhealthy_requests_limit = 2\n"),
+    )
     .await;
     h.gl.forbidden.lock().unwrap().insert(TOKEN.to_owned());
     h.hub.set_slots("p1", 1);
@@ -451,7 +457,7 @@ async fn second_request_gap(via: Via, strict: bool) -> Duration {
     } else {
         ""
     };
-    let h = Harness::start_with(5, via, |url| runner_toml("r1", TOKEN, url, extra)).await;
+    let h = Harness::start_with(5, via, runner_toml("r1", TOKEN, extra)).await;
     h.gl.push_job(job_json(25));
     h.gl.push_job(job_json(26));
     h.hub.set_slots("p1", 5);

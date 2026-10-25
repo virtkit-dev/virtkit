@@ -13,9 +13,11 @@
 //! api_key_file = "/etc/vk-gitlab/hub.key"
 //! ca_file = "/etc/vk-gitlab/hub-ca.pem"
 //!
+//! [gitlab]
+//! url = "https://gitlab.example.com"   # the one GitLab server every runner takes jobs from
+//!
 //! [[runners]]
 //! name = "ci"
-//! url = "https://gitlab.example.com"
 //! token_file = "/etc/vk-gitlab/runner-ci.token"
 //! pool = "ci"
 //! labels = ["large-memory"]
@@ -66,6 +68,9 @@ pub struct Config {
     /// The vk fleet hub jobs are handed to; `vk-gitlab run` requires it.
     #[serde(default)]
     pub hub: Option<HubConfig>,
+    /// The GitLab server the runners take jobs from; required with runners.
+    #[serde(default)]
+    pub gitlab: Option<GitlabConfig>,
     #[serde(default)]
     pub runners: Vec<RunnerConfig>,
 }
@@ -126,6 +131,14 @@ impl HubConfig {
     }
 }
 
+/// `[gitlab]`: the one GitLab server of this daemon.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitlabConfig {
+    /// The GitLab instance URL.
+    pub url: String,
+}
+
 fn one() -> usize {
     1
 }
@@ -138,8 +151,6 @@ pub struct RunnerConfig {
     /// the old one's jobs are no longer resumed.
     #[serde(default)]
     pub name: String,
-    /// The GitLab instance URL.
-    pub url: String,
     /// The runner authentication token (`glrt-…`). Prefer `token_file`.
     #[serde(default)]
     token: Option<String>,
@@ -252,7 +263,6 @@ impl std::fmt::Debug for RunnerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerConfig")
             .field("name", &self.name)
-            .field("url", &self.url)
             .field("token", &self.resolved_token)
             .field("pool", &self.pool)
             .finish_non_exhaustive()
@@ -339,6 +349,16 @@ impl Config {
         if let Some(f) = &cfg.system_id_file {
             cfg.system_id_file = Some(base.join(f));
         }
+        match &cfg.gitlab {
+            Some(g) => {
+                api_base_url(&g.url)
+                    .map_err(|e| anyhow::anyhow!("gitlab: url {:?}: {e}", g.url))?;
+            }
+            None if !cfg.runners.is_empty() => {
+                bail!("[gitlab] url is required: the GitLab server the runners take jobs from")
+            }
+            None => {}
+        }
         let mut names = HashSet::new();
         for (i, r) in cfg.runners.iter_mut().enumerate() {
             let which = if r.name.is_empty() {
@@ -346,7 +366,6 @@ impl Config {
             } else {
                 format!("runner {:?}", r.name)
             };
-            api_base_url(&r.url).map_err(|e| anyhow::anyhow!("{which}: url {:?}: {e}", r.url))?;
             r.resolved_token = match (&r.token, &r.token_file) {
                 (Some(t), None) => Secret::new(t.trim()),
                 (None, Some(file)) => {
@@ -407,6 +426,12 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The GitLab server's URL; empty without `[gitlab]`, which only a config without
+    /// runners may leave out.
+    pub fn gitlab_url(&self) -> &str {
+        self.gitlab.as_ref().map_or("", |g| g.url.as_str())
+    }
+
     pub fn check_interval(&self) -> Duration {
         match self.check_interval {
             0 => DEFAULT_CHECK_INTERVAL,
@@ -441,8 +466,9 @@ mod tests {
     fn minimal_runner() {
         let cfg = parse(
             r#"
-            [[runners]]
+            [gitlab]
             url = "https://gitlab.example.com/"
+            [[runners]]
             token = " glrt-t1_abcdefghijklmnop "
             "#,
         )
@@ -483,9 +509,10 @@ mod tests {
             r#"
             concurrent = 8
             check_interval = 5
+            [gitlab]
+            url = "https://gitlab.example.com"
             [[runners]]
             name = "fleet"
-            url = "https://gitlab.example.com"
             token = "glrt-x"
             tls-ca-file = "ca.pem"
             pool = "big"
@@ -516,29 +543,31 @@ mod tests {
     fn rejects_bad_configs() {
         for (text, needle) in [
             (
-                "[[runners]]\nurl = \"https://g\"\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\n",
                 "token or token_file is required",
             ),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\ntoken_file = \"f\"\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\ntoken_file = \"f\"\n",
                 "not both",
             ),
             (
-                "[[runners]]\nurl = \"gitlab\"\ntoken = \"a\"\n",
+                "[gitlab]\nurl = \"gitlab\"\n[[runners]]\ntoken = \"a\"\n",
                 "only http or https",
             ),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\ntypo = 1\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\ntypo = 1\n",
                 "unknown field",
             ),
             ("concurent = 2\n", "unknown field"),
             ("concurrent = 0\n", "at least 1"),
+            ("[[runners]]\ntoken = \"a\"\n", "[gitlab] url is required"),
             (
-                "[[runner]]\nurl = \"https://g\"\ntoken = \"a\"\n",
-                "unknown field",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\n",
+                "unknown field `url`",
             ),
+            ("[[runner]]\ntoken = \"a\"\n", "unknown field"),
             (
-                "[[runners]]\nname = \"../x\"\nurl = \"https://g\"\ntoken = \"a\"\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\nname = \"../x\"\ntoken = \"a\"\n",
                 "runner name",
             ),
             (
@@ -547,23 +576,23 @@ mod tests {
             ),
             ("[hub]\nurl = \"https://h\"\n", "api_key or api_key_file"),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\nenvelope = { mem = \"lots\", cpus = 1, disk = \"1G\" }\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nenvelope = { mem = \"lots\", cpus = 1, disk = \"1G\" }\n",
                 "envelope mem",
             ),
             (
-                "[[runners]]\nname = \"a\"\nurl = \"https://g\"\ntoken = \"x\"\n[[runners]]\nname = \"a\"\nurl = \"https://g\"\ntoken = \"y\"\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\nname = \"a\"\ntoken = \"x\"\n[[runners]]\nname = \"a\"\ntoken = \"y\"\n",
                 "unique",
             ),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\ntls-cert-file = \"c\"\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\ntls-cert-file = \"c\"\n",
                 "go together",
             ),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\nlabels = [\"\"]\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nlabels = [\"\"]\n",
                 "labels must not be empty",
             ),
             (
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\nlabels = [\"x\", \"x\"]\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nlabels = [\"x\", \"x\"]\n",
                 "listed twice",
             ),
         ] {
@@ -580,7 +609,7 @@ mod tests {
             ("unhealthy_requests_limit = 5\n", 5),
         ] {
             let cfg = parse(&format!(
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\n{set}"
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\n{set}"
             ))
             .unwrap();
             assert_eq!(cfg.runners[0].unhealthy_requests_limit(), want, "{set}");
@@ -607,7 +636,8 @@ mod tests {
     #[test]
     fn debug_hides_the_token() {
         let cfg =
-            parse("[[runners]]\nurl = \"https://g\"\ntoken = \"glrt-secretvalue\"\n").unwrap();
+            parse("[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"glrt-secretvalue\"\n")
+                .unwrap();
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("secretvalue"), "{dbg}");
     }

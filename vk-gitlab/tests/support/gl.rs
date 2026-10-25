@@ -276,26 +276,22 @@ pub struct Harness {
 }
 
 /// A `[[runners]]` table on pool `p1`; `extra` is appended to it.
-pub fn runner_toml(name: &str, token: &str, url: &str, extra: &str) -> String {
+pub fn runner_toml(name: &str, token: &str, extra: &str) -> String {
     format!(
-        "[[runners]]\nname = \"{name}\"\nurl = \"{url}\"\ntoken = \"{token}\"\npool = \"p1\"\nlabels = [\"big\"]\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
+        "[[runners]]\nname = \"{name}\"\ntoken = \"{token}\"\npool = \"p1\"\nlabels = [\"big\"]\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
     )
 }
 
 impl Harness {
     /// One runner, `r1`, on pool `p1`.
     pub async fn start(concurrent: usize, via: Via) -> Harness {
-        Self::start_with(concurrent, via, |url| runner_toml("r1", TOKEN, url, "")).await
+        Self::start_with(concurrent, via, runner_toml("r1", TOKEN, "")).await
     }
 
-    /// `runners(url)` gives the `[[runners]]` tables, all against the one fake GitLab.
-    pub async fn start_with(
-        concurrent: usize,
-        via: Via,
-        runners: impl FnOnce(&str) -> String,
-    ) -> Harness {
+    /// `runners` are the `[[runners]]` tables, all against the one fake GitLab.
+    pub async fn start_with(concurrent: usize, via: Via, runners: String) -> Harness {
         let mut h = Self::unstarted(concurrent, via).await;
-        h.runners = runners(&h.fake.url);
+        h.runners = runners;
         h.daemon = h.spawn_daemon();
         h
     }
@@ -310,7 +306,7 @@ impl Harness {
             Via::Http => Some(FakeHub::start(hub.clone()).await),
         };
         let state_dir = temp_dir("state");
-        let runners = runner_toml("r1", TOKEN, &fake.url, "");
+        let runners = runner_toml("r1", TOKEN, "");
         Harness {
             gl,
             fake,
@@ -339,9 +335,11 @@ impl Harness {
         };
         Config::parse(
             &format!(
-                "concurrent = {}\ncheck_interval = 1\nstate_dir = \"{}\"\n{hub}{}",
+                "concurrent = {}\ncheck_interval = 1\nstate_dir = \"{}\"\n{hub}\
+                 [gitlab]\nurl = \"{}\"\n{}",
                 self.concurrent,
                 self.state_dir.display(),
+                self.fake.url,
                 self.runners
             ),
             Path::new("/"),

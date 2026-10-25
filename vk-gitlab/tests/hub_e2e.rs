@@ -328,8 +328,7 @@ async fn a_refused_runner_still_resumes_its_jobs() {
 async fn every_runners_resumed_jobs_come_before_any_request() {
     const OTHER: &str = "glrt-other-token";
     let mut h = Harness::unstarted(1, Via::Http).await;
-    h.runners =
-        runner_toml("r1", TOKEN, &h.fake.url, "") + &runner_toml("r2", OTHER, &h.fake.url, "");
+    h.runners = runner_toml("r1", TOKEN, "") + &runner_toml("r2", OTHER, "");
     h.hub.set_slots("p1", 5);
     let first = submitted(&h, 45, None).await;
     let second = submitted(&h, 46, None).await;

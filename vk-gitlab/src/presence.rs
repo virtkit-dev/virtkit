@@ -32,7 +32,7 @@ pub fn hello_for(cfg: &Config, instance: &str) -> ClientHello {
             .take(MAX_CLIENT_RUNNERS)
             .map(|r| ClientRunner {
                 name: r.name.clone(),
-                url: public_url(&r.url),
+                url: public_url(cfg.gitlab_url()),
                 pool: r.pool.clone(),
                 labels: r
                     .labels
@@ -121,8 +121,9 @@ mod tests {
             &format!(
                 "concurrent = 4\n\
                  [hub]\nurl = \"https://hub:8443\"\napi_key = \"{}\"\n\
-                 [[runners]]\nname = \"ci\"\n\
+                 [gitlab]\n\
                  url = \"https://bob:PASSWORD@gitlab.example.com/sub/?private_token=QUERY#FRAGMENT\"\n\
+                 [[runners]]\nname = \"ci\"\n\
                  token = \"{RUNNER_TOKEN}\"\npool = \"big\"\nlabels = [\"kvm\"]\nlimit = 2\n",
                 hub_key()
             ),
@@ -159,11 +160,11 @@ mod tests {
     #[test]
     fn hello_stays_within_the_hubs_limits() {
         let labels: Vec<String> = (0..40).map(|i| format!("\"l{i}\"")).collect();
-        let mut text = String::new();
+        let mut text = "[gitlab]\nurl = \"https://g\"\n".to_owned();
         for i in 0..70 {
             let _ = write!(
                 text,
-                "[[runners]]\nname = \"r{i}\"\nurl = \"https://g\"\ntoken = \"t{i}\"\n\
+                "[[runners]]\nname = \"r{i}\"\ntoken = \"t{i}\"\n\
                  labels = [{}]\n",
                 labels.join(", ")
             );

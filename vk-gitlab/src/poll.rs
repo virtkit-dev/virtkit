@@ -326,6 +326,8 @@ struct Runner {
     state: Arc<StateFile>,
     /// The runner ID `/runners/verify` returned (the spec's `job.runner_id`).
     runner_id: AtomicU64,
+    /// The GitLab server's URL, as configured: jobs' `CI_SERVER_URL`.
+    server_url: String,
     /// The CA bundle GitLab is verified against, passed to jobs (`CI_SERVER_TLS_CA_FILE`).
     server_ca_pem: Option<String>,
 }
@@ -458,15 +460,16 @@ pub fn runner_info() -> Info {
     Info::this_runner()
 }
 
-/// Builds the API client for one configured runner.
+/// Builds the API client for one configured runner of the GitLab server at `url`.
 pub fn client_for(
+    url: &str,
     cfg: &RunnerConfig,
     system_id: &str,
     info: Info,
     retry: RetryPolicy,
 ) -> Result<GitLabClient> {
     GitLabClient::new(ClientOptions {
-        url: cfg.url.clone(),
+        url: url.to_owned(),
         token: cfg.token().clone(),
         tls_ca_file: cfg.tls_ca_file.clone(),
         tls_cert_file: cfg.tls_cert_file.clone(),
@@ -505,7 +508,13 @@ pub async fn run<D: Dispatcher>(
     // Every runner is built before any loop starts: a bad one fails the whole run.
     let mut runners = Vec::with_capacity(config.runners.len());
     for cfg in &config.runners {
-        let client = client_for(cfg, system_id, runner_info(), shared.options.retry.clone())?;
+        let client = client_for(
+            config.gitlab_url(),
+            cfg,
+            system_id,
+            runner_info(),
+            shared.options.retry.clone(),
+        )?;
         let state = StateFile::open(&state_dir.join(format!("{}.json", cfg.name)))?;
         check_hub_key(&state, hub_key.as_deref())?;
         let server_ca_pem = match &cfg.tls_ca_file {
@@ -524,6 +533,7 @@ pub async fn run<D: Dispatcher>(
             next_poll: Mutex::new(Instant::now()),
             state: Arc::new(state),
             runner_id: AtomicU64::new(0),
+            server_url: config.gitlab_url().to_owned(),
             server_ca_pem,
         }));
     }
@@ -559,7 +569,7 @@ pub async fn run<D: Dispatcher>(
             runner = cfg.name.as_str(),
             token = cfg.token().short().as_str(),
             pool = cfg.pool.as_str(),
-            url = cfg.url.as_str(),
+            url = runner.server_url.as_str(),
             request_concurrency = cfg.request_concurrency();
             "Starting runner"
         );
@@ -1206,7 +1216,7 @@ async fn run_job<D: Dispatcher>(
     let translated = spec::translate(
         &job,
         &SpecContext {
-            server_url: runner.cfg.url.clone(),
+            server_url: runner.server_url.clone(),
             server_ca_pem: runner.server_ca_pem.clone(),
             runner_id: runner.runner_id().await,
             output_limit: runner.cfg.output_limit_bytes() as u64,
@@ -1826,7 +1836,7 @@ mod tests {
     async fn health_disables_then_forces_a_check() {
         let cfg: RunnerConfig = {
             let c = Config::parse(
-                "[[runners]]\nurl = \"https://g\"\ntoken = \"t\"\nunhealthy_interval = 120\n",
+                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"t\"\nunhealthy_interval = 120\n",
                 std::path::Path::new("/"),
             )
             .unwrap();

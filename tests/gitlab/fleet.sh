@@ -159,9 +159,11 @@ url = "https://127.0.0.1:$HUB_PORT"
 api_key_file = "$RUN/hub.key"
 ca_file = "$RUN/pki/ca.pem"
 
+[gitlab]
+url = "$GL_URL"
+
 [[runners]]
 name = "e2e"
-url = "$GL_URL"
 token_file = "$RUN/runner.token"
 pool = "e2e"
 labels = ["e2e"]

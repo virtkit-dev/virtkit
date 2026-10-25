@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
   projects approve`; a rejected project's jobs fail too. Registry tokens and egress rules follow
   the GitLab server the relay is bound to. To upgrade, drain each `vk-gitlab`, upgrade, then
   enroll it: `vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token -`.
+- **Breaking: a `vk-gitlab` takes jobs from one GitLab server**, named by `[gitlab] url` in its
+  config; its runners no longer take a `url` each. A daemon serving two GitLab servers becomes
+  two, each with its own config and state directory.
 
 ### Removed
 

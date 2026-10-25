@@ -91,12 +91,15 @@ lease ends earlier than the node does.
 
 ## Placement
 
-A runner in `vk-gitlab`'s configuration names its placement:
+A runner in `vk-gitlab`'s configuration names its placement; every runner of one `vk-gitlab`
+takes jobs from the one GitLab server its `[gitlab] url` names:
 
 ```toml
+[gitlab]
+url = "https://gitlab.example.com"
+
 [[runners]]
 name = "ci"
-url = "https://gitlab.example.com"
 token_file = "/etc/vk-gitlab/runner-ci.token"   # glrt-…
 pool = "ci"
 labels = ["large-memory"]
