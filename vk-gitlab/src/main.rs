@@ -12,7 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vk_gitlab::config::Config;
 use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
-use vk_gitlab::{logging, relay, system_id};
+use vk_gitlab::{logging, relay, session, system_id};
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -152,8 +152,10 @@ async fn run(config: PathBuf) -> Result<()> {
     log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
     // Held until the daemon exits: no join or leave meanwhile.
     let _lock = relay::lock(&state_dir(&cfg))?;
-    let relay = relay::open(&state_dir(&cfg))?;
+    let relay = Arc::new(relay::open(&state_dir(&cfg))?);
     log::info!(hub = relay.enrollment.hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "Relaying jobs to the hub");
+    let status = session::Status::new(&cfg, &system_id, &relay::hostname());
+    let session = tokio::spawn(session::hold(Arc::clone(&relay), Arc::clone(&status)));
     let dispatcher = Arc::new(HubClient::new(HubOptions {
         hub: relay.enrollment.hub.clone(),
         tls: Arc::clone(&relay.tls),
@@ -192,11 +194,13 @@ async fn run(config: PathBuf) -> Result<()> {
         &cfg,
         &system_id,
         &relay.enrollment.relay_id,
+        status,
         dispatcher,
         RunOptions::default(),
         shutdown,
     )
     .await;
+    session.abort();
     signals.abort();
     result
 }

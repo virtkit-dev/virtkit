@@ -182,6 +182,19 @@ impl Req {
     }
 }
 
+/// The SHA-256 of a DER certificate's subject public key info, lowercase hex; `None` when it
+/// does not parse.
+pub fn spki_sha256(der: &[u8]) -> Option<String> {
+    let der = rustls::pki_types::CertificateDer::from(der);
+    let cert = webpki::EndEntityCert::try_from(&der).ok()?;
+    let spki = cert.subject_public_key_info();
+    Some(hex(ring::digest::digest(
+        &ring::digest::SHA256,
+        spki.as_ref(),
+    )
+    .as_ref()))
+}
+
 /// `200 OK`, as Go's `Response.Status` prints a status.
 pub fn status_text(status: StatusCode) -> String {
     format!(
@@ -320,6 +333,10 @@ pub struct GitLabClient {
     info: Info,
     retry: RetryPolicy,
     last_update: Mutex<String>,
+    /// When GitLab last answered, and with what status.
+    answered: Mutex<Option<(u64, u16)>>,
+    /// The SHA-256 of GitLab's certificate's public key, as last seen over TLS.
+    spki_sha256: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for GitLabClient {
@@ -355,7 +372,8 @@ impl GitLabClient {
             .timeout(CLIENT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Duration::from_secs(30));
+            .tcp_keepalive(Duration::from_secs(30))
+            .tls_info(true);
         if let Some(ca) = &opts.tls_ca_file {
             let pem = read_file(ca, "tls-ca-file")?;
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
@@ -389,7 +407,40 @@ impl GitLabClient {
             info: opts.info,
             retry: opts.retry,
             last_update: Mutex::new(String::new()),
+            answered: Mutex::new(None),
+            spki_sha256: Mutex::new(None),
         })
+    }
+
+    /// When GitLab last answered a request of this runner's, in seconds since the epoch,
+    /// and the status it answered with.
+    pub fn last_answer(&self) -> Option<(u64, u16)> {
+        self.answered.lock().ok().and_then(|g| *g)
+    }
+
+    /// The SHA-256 of GitLab's certificate's public key (SPKI), lowercase hex, as last seen;
+    /// `None` over plain http or before GitLab answered.
+    pub fn spki_sha256(&self) -> Option<String> {
+        self.spki_sha256.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn record_answer(&self, resp: &Response) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Ok(mut g) = self.answered.lock() {
+            *g = Some((now, resp.status().as_u16()));
+        }
+        let spki = resp
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|t| t.peer_certificate())
+            .and_then(spki_sha256);
+        if spki.is_some()
+            && let Ok(mut g) = self.spki_sha256.lock()
+        {
+            *g = spki;
+        }
     }
 
     pub fn api_url(&self) -> &Url {
@@ -522,6 +573,7 @@ impl GitLabClient {
                 Ok(r) => r,
                 Err(e) => return (Err(e), correlation_id),
             };
+            self.record_answer(&resp);
             attempts = attempts.saturating_add(1);
             let status = resp.status();
             let rate_limited_final =

@@ -284,8 +284,15 @@ impl Config {
         }
         match &cfg.gitlab {
             Some(g) => {
-                api_base_url(&g.url)
+                let url = api_base_url(&g.url)
                     .map_err(|e| anyhow::anyhow!("gitlab: url {:?}: {e}", g.url))?;
+                // The URL is the server's identity on the hub, which takes none of these.
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || g.url.contains(['?', '#'])
+                {
+                    bail!("gitlab: url {:?}: no credentials, query or fragment", g.url);
+                }
             }
             None if !cfg.runners.is_empty() => {
                 bail!("[gitlab] url is required: the GitLab server the runners take jobs from")
@@ -493,6 +500,14 @@ mod tests {
             ),
             ("concurent = 2\n", "unknown field"),
             ("concurrent = 0\n", "at least 1"),
+            (
+                "[gitlab]\nurl = \"https://u:p@g\"\n",
+                "no credentials, query or fragment",
+            ),
+            (
+                "[gitlab]\nurl = \"https://g/?x=1\"\n",
+                "no credentials, query or fragment",
+            ),
             ("[[runners]]\ntoken = \"a\"\n", "[gitlab] url is required"),
             (
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\n",

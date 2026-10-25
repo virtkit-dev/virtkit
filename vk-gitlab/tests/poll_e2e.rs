@@ -7,9 +7,12 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use support::gl::{Harness, RUNNER_ID, TOKEN, Via, eventually, job_json, runner_toml, within};
+use support::gl::{
+    Harness, RUNNER_ID, TOKEN, Via, eventually, job_json, runner_toml, server_status, within,
+};
 use vk_gitlab::dispatch::{CancelMode, DispatchError, ErrorKind, FailureClass, FakeCall};
 use vk_gitlab::trace::TraceBuffer;
+use vk_hub_proto::gitlab::{RunnerState, ServerState};
 use vk_hub_proto::job::JobSpec;
 
 /// Each scenario, in process and over HTTP.
@@ -49,6 +52,7 @@ both!(
     abort_reports_a_job_the_hub_never_ends,
     a_failed_verify_is_retried_for_the_runner_id,
     a_running_jobs_view_poll_outlives_the_tick,
+    gitlab_is_asked_only_while_the_hub_approves_its_server,
 );
 
 async fn job_runs_and_reports(via: Via) {
@@ -550,5 +554,46 @@ async fn a_running_jobs_view_poll_outlives_the_tick(via: Via) {
     assert!(more <= 1, "{more} reads of the job's view in 3 s");
     h.hub.finish(&hub_id, None, None);
     assert_eq!(h.final_update(40).await["state"], "success");
+    h.stop().await;
+}
+
+async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
+    let mut h = Harness::unstarted(2, via).await;
+    h.server = ServerState::Pending;
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    let status = h.daemon.status.clone().unwrap();
+    eventually("verified", || {
+        status
+            .runner_status("r1")
+            .is_some_and(|r| r.runner.verified && r.runner.runner_id == Some(RUNNER_ID as u64))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(h.job_requests(), 0, "a pending server is not polled");
+    assert_eq!(
+        h.count_calls(|c| matches!(c, FakeCall::Reserve(..))),
+        0,
+        "nor is capacity reserved for it"
+    );
+    assert_eq!(
+        status.runner_status("r1").unwrap().state,
+        RunnerState::ServerPending
+    );
+    status.set_server(Some(server_status(ServerState::Approved)));
+    eventually("a job request", || h.job_requests() > 0).await;
+    eventually("polling reported", || {
+        status.runner_status("r1").unwrap().state == RunnerState::Polling
+    })
+    .await;
+    for state in [ServerState::Rejected, ServerState::Rebound] {
+        status.set_server(Some(server_status(state)));
+        // A request in flight finishes; none follows it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let requests = h.job_requests();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(h.job_requests(), requests, "{state:?}: no more requests");
+    }
+    // A job taken meanwhile would still run: only new requests wait.
     h.stop().await;
 }

@@ -171,6 +171,15 @@ impl StateFile {
         self.contents.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// How many jobs the file holds.
+    pub fn len(&self) -> usize {
+        self.lock().jobs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().jobs.is_empty()
+    }
+
     pub fn records(&self) -> Vec<JobRecord> {
         self.lock().jobs.clone()
     }

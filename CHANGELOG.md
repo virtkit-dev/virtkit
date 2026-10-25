@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-gitlab join` enrolls a `vk-gitlab` with a hub as a relay**, with a token from `vk-hub
   token create --kind gitlab`, and `vk-gitlab leave` forgets the hub; both are refused while
   its runners hold jobs.
+- **An enrolled `vk-gitlab` reports to its hub** its GitLab server, with the digest of its
+  certificate's key to check before approving it, and each runner's GitLab ID, placement and
+  state, and asks GitLab for jobs only while the hub approves the server.
 
 ### Changed
 

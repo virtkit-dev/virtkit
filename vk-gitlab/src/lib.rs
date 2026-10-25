@@ -16,6 +16,7 @@ pub mod logging;
 pub mod poll;
 pub mod relay;
 pub mod secret;
+pub mod session;
 pub mod spec;
 pub mod state;
 pub mod system_id;

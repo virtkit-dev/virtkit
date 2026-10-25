@@ -168,6 +168,17 @@ a retry again; a TLS-terminating proxy in front of the hub breaks the binding. A
 held to no pool or envelope ceiling: it already holds the runner tokens and sees every job's
 secrets.
 
+**Session.** Besides the client API, `vk-gitlab run` holds a session with the hub at
+`/v1/gitlab/session`, as a node does, redialing it when lost: it reports its version, host,
+system ID, `concurrent`, its GitLab server's URL and the SHA-256 of its certificate's public
+key, and each runner's name, GitLab runner ID, placement, `limit` and whether GitLab took its
+token; every heartbeat, each runner's job requests outstanding, jobs held and last GitLab
+answer; and each runner's state (`polling`, `waiting_capacity`, `server_pending`,
+`unhealthy`, `token_refused`). The hub answers with its status of the server. A runner asks
+GitLab for jobs only while that status is `approved`: not before the first status, nor while
+the server is pending, rejected or the relay `rebound`, nor once the hub refused the relay for
+good. Jobs it already holds run either way.
+
 | Request | Body | Answer |
 |---|---|---|
 | `POST /v1/capacity` | `CapacityRequest` | 200 `Capacity` |

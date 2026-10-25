@@ -993,3 +993,17 @@ fn tls_settings() {
         assert_eq!(err, "tls-cert-file and tls-key-file go together");
     }
 }
+
+// Not upstream: the digest a relay reports of its GitLab server's key.
+#[test]
+fn spki_sha256_of_a_certificate() {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    let cert = CertificateDer::from_pem_file(tls_fixture("cert.pem")).unwrap();
+    // openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum
+    assert_eq!(
+        vk_gitlab::api::spki_sha256(&cert).as_deref(),
+        Some("c8966d0ee81bf81620c22fb5002950dc3befe5454b6ae3c01f649b80f6e9b137")
+    );
+    assert_eq!(vk_gitlab::api::spki_sha256(b"not a certificate"), None);
+}

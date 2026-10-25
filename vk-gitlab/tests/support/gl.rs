@@ -11,7 +11,9 @@ use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
 use vk_gitlab::relay;
+use vk_gitlab::session::Status;
 use vk_gitlab::trace::TraceSettings;
+use vk_hub_proto::gitlab::{ServerState, ServerStatus};
 
 use super::fakehub::{FakeHub, TEST_RELAY_ID};
 use super::{FakeGitLab, Recorded, Reply, TEST_SYSTEM_ID};
@@ -201,6 +203,8 @@ pub enum Via {
 
 /// The daemon, on a runtime of its own so a test can kill it outright.
 pub struct Daemon {
+    /// What its session with the hub would set: the server's status.
+    pub status: Option<Arc<Status>>,
     rt: Option<tokio::runtime::Runtime>,
     handle: Option<ShutdownHandle>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -269,6 +273,8 @@ pub struct Harness {
     pub runners: String,
     pub via: Via,
     pub options: RunOptions,
+    /// The state of the server's status the daemon starts with: approved unless set.
+    pub server: ServerState,
     pub daemon: Daemon,
 }
 
@@ -322,7 +328,9 @@ impl Harness {
             runners,
             via,
             options: options(),
+            server: ServerState::Approved,
             daemon: Daemon {
+                status: None,
                 rt: None,
                 handle: None,
                 task: None,
@@ -348,6 +356,9 @@ impl Harness {
     /// Starts the daemon (again, after a kill: it resumes from the state file).
     pub fn spawn_daemon(&self) -> Daemon {
         let cfg = self.config();
+        let status = Status::new(&cfg, TEST_SYSTEM_ID, "test-host");
+        status.set_server(Some(server_status(self.server)));
+        let status2 = Arc::clone(&status);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -359,7 +370,16 @@ impl Harness {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
                 rt.spawn(async move {
-                    poll::run(&cfg, TEST_SYSTEM_ID, TEST_RELAY_ID, d, options, shutdown).await
+                    poll::run(
+                        &cfg,
+                        TEST_SYSTEM_ID,
+                        TEST_RELAY_ID,
+                        status2,
+                        d,
+                        options,
+                        shutdown,
+                    )
+                    .await
                 })
             }
             Via::Http => {
@@ -376,11 +396,21 @@ impl Harness {
                     },
                 }));
                 rt.spawn(async move {
-                    poll::run(&cfg, TEST_SYSTEM_ID, TEST_RELAY_ID, d, options, shutdown).await
+                    poll::run(
+                        &cfg,
+                        TEST_SYSTEM_ID,
+                        TEST_RELAY_ID,
+                        status2,
+                        d,
+                        options,
+                        shutdown,
+                    )
+                    .await
                 })
             }
         };
         Daemon {
+            status: Some(status),
             rt: Some(rt),
             handle: Some(handle),
             task: Some(task),
@@ -433,6 +463,15 @@ impl Harness {
         self.daemon.stop().await;
         let _ = std::fs::remove_dir_all(&self.state_dir);
         self.hub.clone()
+    }
+}
+
+/// The server's status as the hub would send it.
+pub fn server_status(state: ServerState) -> ServerStatus {
+    ServerStatus {
+        state,
+        url: "https://gitlab.example.com".to_owned(),
+        name: (state == ServerState::Approved).then(|| "gl".to_owned()),
     }
 }
 

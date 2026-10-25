@@ -28,6 +28,8 @@ log = { workspace = true, features = ["kv", "std"] }
 reqwest.workspace = true
 # The API client installs ring as the process's crypto provider.
 rustls.workspace = true
+# The SPKI of the GitLab server's certificate, which the relay reports.
+rustls-webpki.workspace = true
 # HMAC-SHA256 for the system ID, and the OS RNG for correlation IDs and backoff jitter.
 ring.workspace = true
 # RateLimit-ResetTime / Retry-After dates.
@@ -42,6 +44,9 @@ vk-peer = { path = "../vk-peer" }
 hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
+# The relay's session with the hub, dialed through vk-peer.
+futures.workspace = true
+tokio-tungstenite.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

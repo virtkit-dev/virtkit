@@ -45,9 +45,11 @@ use crate::dispatch::{
 use crate::failure::{FailureReason, FailureReasonMapper, JobState};
 use crate::job::Job;
 use crate::secret::Secret;
+use crate::session::Status;
 use crate::spec::{self, SpecContext};
 use crate::state::{JobRecord, Phase, StateFile};
 use crate::trace::{JobTrace, TraceSettings};
+use vk_hub_proto::gitlab::RunnerState;
 
 /// gitlab-runner's `ExitCodeUnsupportedOptions`.
 const EXIT_CODE_UNSUPPORTED_OPTIONS: i32 = 3;
@@ -282,6 +284,8 @@ impl Health {
 /// State shared by every runner.
 struct Shared<D> {
     dispatcher: Arc<D>,
+    /// The server's status the hub sent, and what the runners are doing.
+    status: Arc<Status>,
     concurrent: Arc<Semaphore>,
     /// Signalled when a job ends, freeing a slot.
     job_done: Notify,
@@ -326,6 +330,8 @@ struct Runner {
     state: Arc<StateFile>,
     /// The runner ID `/runners/verify` returned (the spec's `job.runner_id`).
     runner_id: AtomicU64,
+    /// Where the runner's state is reported.
+    status: Arc<Status>,
     /// The GitLab server's URL, as configured: jobs' `CI_SERVER_URL`.
     server_url: String,
     /// The CA bundle GitLab is verified against, passed to jobs (`CI_SERVER_TLS_CA_FILE`).
@@ -355,7 +361,7 @@ impl Runner {
     /// warning ahead of the token's expiry.
     async fn verify(&self) -> Verified {
         let name = self.cfg.name.as_str();
-        match self.client.verify().await {
+        let verified = match self.client.verify().await {
             Ok(Some(v)) => {
                 self.runner_id
                     .store(u64::try_from(v.id).unwrap_or(0), Ordering::Relaxed);
@@ -369,7 +375,32 @@ impl Runner {
                 log::warn!(runner = name, error = e.to_string().as_str(); "Verifying the runner failed; trying again with its next job");
                 Verified::Unknown
             }
-        }
+        };
+        self.status.set_spki(self.client.spki_sha256());
+        let runner_id = self.runner_id.load(Ordering::Relaxed);
+        self.status.runner(name, |r| {
+            r.last_answer = self.client.last_answer();
+            if verified != Verified::Unknown {
+                r.runner.verified = verified == Verified::Valid;
+            }
+            r.runner.runner_id = (runner_id > 0).then_some(runner_id);
+            if verified == Verified::Refused {
+                r.state = RunnerState::TokenRefused;
+                r.message = Some("GitLab refuses the runner's token".to_owned());
+            } else if r.state == RunnerState::TokenRefused {
+                r.state = RunnerState::Polling;
+                r.message = None;
+            }
+        });
+        verified
+    }
+
+    /// Reports what the runner is doing.
+    fn report(&self, state: RunnerState, message: Option<String>) {
+        self.status.runner(&self.cfg.name, |r| {
+            r.state = state;
+            r.message = message;
+        });
     }
 
     /// The runner ID for a job's spec (`CI_RUNNER_ID`); verified again while unknown, and 0
@@ -482,17 +513,20 @@ pub fn client_for(
 }
 
 /// Polls every configured runner until `shutdown` stops it and the running jobs end, its jobs
-/// submitted as relay `relay_id`.
+/// submitted as relay `relay_id`. A runner asks GitLab for jobs only while `status` says the
+/// hub approved the server; the jobs it already holds run either way.
 pub async fn run<D: Dispatcher>(
     config: &Config,
     system_id: &str,
     relay_id: &str,
+    status: Arc<Status>,
     dispatcher: Arc<D>,
     options: RunOptions,
     shutdown: Shutdown,
 ) -> Result<()> {
     let shared = Arc::new(Shared {
         dispatcher,
+        status: Arc::clone(&status),
         concurrent: Arc::new(Semaphore::new(config.concurrent)),
         job_done: Notify::new(),
         running_jobs: AtomicUsize::new(0),
@@ -531,6 +565,7 @@ pub async fn run<D: Dispatcher>(
             next_poll: Mutex::new(Instant::now()),
             state: Arc::new(state),
             runner_id: AtomicU64::new(0),
+            status: Arc::clone(&status),
             server_url: config.gitlab_url().to_owned(),
             server_ca_pem,
         }));
@@ -547,7 +582,11 @@ pub async fn run<D: Dispatcher>(
         if refused {
             log::error!(runner = name; "GitLab refuses the runner's token; the runner requests no jobs");
         }
-        for rec in runner.state.records() {
+        let records = runner.state.records();
+        status.runner(name, |r| {
+            r.jobs = u32::try_from(records.len()).unwrap_or(u32::MAX)
+        });
+        for rec in records {
             log::info!(runner = name, job = rec.gitlab_job, phase = format!("{:?}", rec.phase).as_str(); "Resuming a job from the state file");
             let mut running = RunningJob::new(Arc::clone(&shared), acquire_slots(&shared, &runner));
             let (shared2, runner2) = (Arc::clone(&shared), Arc::clone(&runner));
@@ -797,8 +836,21 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         if shared.shutdown.stopping() {
             return;
         }
+        // Only a server the hub approved is asked for jobs: the hub refuses the others'.
+        if !shared.status.approved() {
+            runner.report(RunnerState::ServerPending, None);
+            tokio::select! {
+                () = shared.status.wait_approved() => {}
+                () = wait_true(&mut stop) => return,
+            }
+            continue;
+        }
         let health_wait = runner.health.lock().ok().and_then(|mut h| h.check(&name));
         if let Some(wait) = health_wait {
+            runner.report(
+                RunnerState::Unhealthy,
+                Some("GitLab has been failing its job requests".to_owned()),
+            );
             tokio::select! {
                 () = tokio::time::sleep(wait) => {}
                 () = wait_true(&mut stop) => return,
@@ -834,6 +886,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             Ok(c) => {
                 capacity_revision = Some(c.revision);
                 if c.fits == 0 {
+                    runner.report(RunnerState::WaitingCapacity, None);
                     continue;
                 }
             }
@@ -883,9 +936,25 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             release(&shared, held).await;
             return;
         }
+        // The server may have lost its approval meanwhile.
+        if !shared.status.approved() {
+            drop(slots);
+            release(&shared, held).await;
+            continue;
+        }
         // Then the job request, under the reservation. Never aborted: GitLab may already
         // have assigned the job.
+        runner.report(RunnerState::Polling, None);
+        shared
+            .status
+            .runner(&name, |r| r.requests = r.requests.saturating_add(1));
         let result = keep_alive(&shared, &name, &mut held, runner.client.request_job()).await;
+        shared.status.runner(&name, |r| {
+            r.requests = r.requests.saturating_sub(1);
+            r.last_answer = runner.client.last_answer();
+        });
+        // A key GitLab rotated shows on the hub without waiting for the next verify.
+        shared.status.set_spki(runner.client.spki_sha256());
         if let Ok(mut h) = runner.health.lock() {
             h.mark(result.healthy, &name);
         }
@@ -1171,6 +1240,10 @@ async fn record(
     let result = tokio::task::spawn_blocking(move || change(&state))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+    let jobs = runner.state.len();
+    runner.status.runner(&runner.cfg.name, |r| {
+        r.jobs = u32::try_from(jobs).unwrap_or(u32::MAX);
+    });
     if let Err(e) = result {
         log::error!(runner = runner.cfg.name.as_str(), state_file = runner.state.path().display().to_string().as_str(), error = format!("{e:#}").as_str(); "Could not record the job ({what})");
     }

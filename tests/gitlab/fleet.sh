@@ -98,18 +98,11 @@ data_dir = "$RUN/hub/data"
 EOF
   bg hub "$VK_HUB" serve --config "$RUN/hub/hub.toml"
   wait_for 30 eval 'hub nodes >/dev/null 2>&1' || die "vk-hub did not come up (see $LOGS/hub.log)"
-  # The key is bound to the GitLab instance, which job tokens need ({gitlab} = e2e).
-  local bind=()
-  if [ "$E2E_TOKENS" != 0 ]; then
-    hub gitlabs add e2e "$GL_URL" >>"$LOGS/hub-cli.log" 2>&1 || die "vk-hub gitlabs add failed"
-    bind=(--gitlab e2e)
-  fi
-  (
-    umask 077
-    hub keys create --name vk-gitlab-e2e --pool e2e --max-mem 4G --max-cpus 2 --max-disk 16G \
-      --ttl 1d "${bind[@]}" >"$RUN/hub.key" 2>>"$LOGS/hub-cli.log"
-  )
-  grep -q '^vkk_' "$RUN/hub.key" || die "vk-hub keys create printed no key"
+  # The relay's GitLab server and the test project, approved beforehand ({gitlab} = e2e): the
+  # first job of a project the hub has not approved would fail.
+  hub gitlabs add e2e "$GL_URL" >>"$LOGS/hub-cli.log" 2>&1 || die "vk-hub gitlabs add failed"
+  hub gitlabs projects approve e2e "$GL_PROJECT_ID:$GL_PROJECT_PATH" >>"$LOGS/hub-cli.log" 2>&1 ||
+    die "vk-hub gitlabs projects approve failed"
   log "hub: https://127.0.0.1:$HUB_PORT"
 }
 
@@ -154,11 +147,6 @@ shutdown_timeout = 5
 state_dir = "$RUN/vk-gitlab/state"
 system_id_file = "$RUN/vk-gitlab/system-id"
 
-[hub]
-url = "https://127.0.0.1:$HUB_PORT"
-api_key_file = "$RUN/hub.key"
-ca_file = "$RUN/pki/ca.pem"
-
 [gitlab]
 url = "$GL_URL"
 
@@ -169,6 +157,11 @@ pool = "e2e"
 labels = ["e2e"]
 envelope = { mem = "1G", cpus = 1, disk = "4G" }
 EOF
+  hub token create --kind gitlab 2>>"$LOGS/hub-cli.log" |
+    "$VK_GITLAB" join "https://127.0.0.1:$HUB_PORT" --token - --ca "$RUN/pki/ca.pem" \
+      --config "$RUN/vk-gitlab/config.toml" >"$LOGS/vk-gitlab-join.log" 2>&1 ||
+    { cat "$LOGS/vk-gitlab-join.log" >&2; die "vk-gitlab join failed"; }
+  log "vk-gitlab: enrolled as relay $(jq -r .relay_id "$RUN/vk-gitlab/state/hub/enrollment.json")"
 }
 
 vk_gitlab_up() {
