@@ -563,6 +563,13 @@ mod tests {
             .expect("a free port below the ephemeral range")
     }
 
+    /// `allocate`, retried while one of its own probes is still bound: a child another test
+    /// forked keeps the probe's socket until it execs (see `crate::testutil::released`). A
+    /// re-ask passes `live`, so a port held that way fails the call instead of moving the block.
+    fn allocated(plan: &Plan, service: Option<&str>, live: bool) -> Ipv4Addr {
+        crate::testutil::once_released("cannot bind", || allocate(plan, service, live)).unwrap()
+    }
+
     #[test]
     fn allocation_is_stable_per_service_and_remembered() {
         let t = scratch("stable");
@@ -575,13 +582,13 @@ mod tests {
                 ep("web", None, web, None),
             ],
         );
-        let a = allocate(&plan, Some("runner"), false).unwrap();
-        let b = allocate(&plan, Some("runner-2"), false).unwrap();
-        let c = allocate(&plan, None, false).unwrap();
+        let a = allocated(&plan, Some("runner"), false);
+        let b = allocated(&plan, Some("runner-2"), false);
+        let c = allocated(&plan, None, false);
         // One block, one octet each, in allocation order; re-asking answers the same.
         assert_eq!(a.octets()[..3], b.octets()[..3]);
         assert_eq!((a.octets()[3], b.octets()[3], c.octets()[3]), (1, 2, 3));
-        assert_eq!(allocate(&plan, Some("runner"), false).unwrap(), a);
+        assert_eq!(allocated(&plan, Some("runner"), true), a);
         let remembered = load(&plan).unwrap().unwrap();
         assert_eq!(remembered.address(Some("runner")), Some(a));
         assert_eq!(remembered.address(None), Some(c));
@@ -622,12 +629,12 @@ mod tests {
         second.state_dir = t.path().join("two");
         std::fs::create_dir_all(&second.state_dir).unwrap();
 
-        let a = allocate(&first, None, false).unwrap();
-        let b = allocate(&second, None, false).unwrap();
+        let a = allocated(&first, None, false);
+        let b = allocated(&second, None, false);
         assert_ne!(a.octets()[2], b.octets()[2], "a block each: {a} and {b}");
         // Each still answers with its own, and neither took the other into account twice.
-        assert_eq!(allocate(&first, None, false).unwrap(), a);
-        assert_eq!(allocate(&second, None, false).unwrap(), b);
+        assert_eq!(allocated(&first, None, true), a);
+        assert_eq!(allocated(&second, None, true), b);
     }
 
     #[test]
@@ -641,8 +648,8 @@ mod tests {
                 ep("b.web", Some("b"), b_port, None),
             ],
         );
-        let a = allocate(&plan, Some("a"), false).unwrap();
-        let b = allocate(&plan, Some("b"), false).unwrap();
+        let a = allocated(&plan, Some("a"), false);
+        let b = allocated(&plan, Some("b"), false);
 
         assert!(forget(&plan, Some("a")), "the octet was dropped");
         let left = load(&plan).unwrap().unwrap();
@@ -650,7 +657,7 @@ mod tests {
         assert_eq!(left.address(Some("a")), None, "a lost only its own");
         assert_eq!(left.block, a.octets()[2], "and the block stayed");
         // The next allocation for `a` takes a free octet in the same block.
-        let again = allocate(&plan, Some("a"), false).unwrap();
+        let again = allocated(&plan, Some("a"), false);
         assert_eq!(again.octets()[2], a.octets()[2]);
         assert_ne!(again, b);
     }
@@ -661,7 +668,7 @@ mod tests {
         let (_held, port) = free_port();
         let plan = plan_in(t.path(), vec![ep("web", None, port, None)]);
         assert!(load(&plan).unwrap().is_none(), "nothing written yet");
-        let first = allocate(&plan, None, false).unwrap();
+        let first = allocated(&plan, None, false);
         // A truncated file, as a crash mid-write would leave.
         std::fs::write(path(&plan), "{\"block\": 2").unwrap();
         let e = load(&plan).unwrap_err();
@@ -682,10 +689,10 @@ mod tests {
         let t = scratch("taken");
         let (_held, port) = free_port();
         let plan = plan_in(t.path(), vec![ep("web", None, port, None)]);
-        let first = allocate(&plan, None, false).unwrap();
+        let first = allocated(&plan, None, false);
         // Something else squats our address:port while nothing of ours is published.
         let squatter = TcpListener::bind(SocketAddrV4::new(first, port)).unwrap();
-        let moved = allocate(&plan, None, false).unwrap();
+        let moved = allocated(&plan, None, false);
         assert_ne!(moved, first);
         assert_ne!(moved.octets()[2], first.octets()[2], "a different block");
         // With relays of ours live the block is pinned, so a squatter on the port is the
@@ -699,14 +706,13 @@ mod tests {
         drop(squatter2);
         // A child another test forked while the squatter was open holds its socket until it
         // execs: see `crate::testutil::released`.
-        let again = crate::testutil::once_released("cannot bind", || allocate(&plan, None, true));
-        assert_eq!(again.unwrap(), moved);
+        assert_eq!(allocated(&plan, None, true), moved);
         drop(squatter);
         // Forgetting drops the octet, not the block: the next allocation is in the block
         // this environment already holds.
         assert!(forget(&plan, None));
         assert_eq!(load(&plan).unwrap().unwrap().octets, BTreeMap::new());
-        assert_eq!(allocate(&plan, None, false).unwrap(), moved);
+        assert_eq!(allocated(&plan, None, false), moved);
     }
 
     #[test]
