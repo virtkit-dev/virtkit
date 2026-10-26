@@ -31,7 +31,7 @@ futures.workspace = true
 redb.workspace = true
 ring.workspace = true
 sha2.workspace = true
-# kept job output, stored compressed
+# kept job output and job specs, stored compressed
 zstd.workspace = true
 # tools definitions packed reproducibly; already in the tree through vk-driver
 tar.workspace = true

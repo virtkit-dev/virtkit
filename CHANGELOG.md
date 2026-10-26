@@ -19,26 +19,6 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
-- **Restricted egress answers reverse lookups of the addresses an allowed name resolved to.**
-  A job allowed `corp.example.com` that resolves `git.corp.example.com` can now look its
-  address back up, for as long as it may connect to it, instead of getting `NXDOMAIN` and a
-  blocked-lookup record. Other reverse lookups are refused as before, those of addresses
-  reachable only through `allow_ip` included.
-- **Guests' lookups of `localhost` and `invalid` names are answered on the host**: names under
-  `localhost` resolve to the loopback addresses and those under `invalid` to `NXDOMAIN`, under
-  any egress policy, without reaching the host's resolver or showing as blocked lookups.
-- **The hub's web UI names a GitLab project's instance only when the hub has several**: a
-  project reads `acme/web` while `gl` is the hub's only instance, and `acme/web [gl]` otherwise,
-  where it read `acme/web on gl`, on the Egress page and on a job's page. Egress rules and
-  storage areas' access rules read the same way (`Projects under wab/`,
-  `Projects under wab/ [gl]`), and while the hub has several instances a rule bound to none
-  reads `[every server]`.
-- **The Egress page's Observed traffic leaves out projects with no reported job**, such as an
-  API key's jobs from before the hub bound keys to GitLab, listed with nothing but the jobs that
-  sent no report.
-- **The hub stores kept job output compressed**: it takes about 8 times less room in its
-  database. What an earlier hub kept is compressed in the background after the upgrade; the
-  database file does not shrink, but the room freed is reused.
 - **`kept_output_total` counts the kept output of jobs that did not fail as stored,
   compressed**, so the default 1 GiB holds about 8 times more of it. `kept_output` and
   `kept_failure_output` still bound each job's output as it reads, uncompressed.

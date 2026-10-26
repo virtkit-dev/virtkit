@@ -168,6 +168,9 @@ impl Default for Affinity {
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
+/// How often the database's job specs and kept output are packed ([`pack`]).
+const PACK_EVERY: Duration = Duration::from_secs(3600);
+
 /// The pause between two steps of packing, so the hub's other writes do not queue behind a run
 /// of them.
 const PACK_PAUSE: Duration = Duration::from_millis(100);
@@ -2577,29 +2580,61 @@ pub async fn drive(hub: Arc<Hub>) {
     }
 }
 
-/// Pack the kept output a hub before packing stored, a bounded step at a time, once at start:
-/// nothing stores it unpacked since.
+/// At start and then every [`PACK_EVERY`], until the process ends: train the job specs' next
+/// dictionary when it is due, pack what is stored unpacked — by a hub before packing, or
+/// specs from before the first dictionary — and drop the dictionaries no spec names.
 pub async fn pack(hub: Arc<Hub>) {
+    loop {
+        match blocking(&hub, |db| db.train_spec_dict()).await {
+            Ok(Some(id)) => eprintln!("vk-hub: trained job spec dictionary {id}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("vk-hub: {e:#}"),
+        }
+        if let Err(e) = pack_stored(&hub).await {
+            eprintln!("vk-hub: packing stored jobs: {e:#}");
+        }
+        match blocking(&hub, |db| db.drop_unused_spec_dicts()).await {
+            Ok(dropped) => {
+                for id in dropped {
+                    eprintln!("vk-hub: dropped job spec dictionary {id}, no spec uses it");
+                }
+            }
+            Err(e) => eprintln!("vk-hub: dropping job spec dictionaries: {e:#}"),
+        }
+        tokio::time::sleep(PACK_EVERY).await;
+    }
+}
+
+/// Pack the kept output and the specs stored unpacked, a bounded step at a time.
+async fn pack_stored(hub: &Hub) -> Result<()> {
     let mut tails = 0usize;
     loop {
-        match blocking(&hub, |db| db.pack_legacy_tails()).await {
-            Ok(0) => break,
-            Ok(n) => tails = tails.saturating_add(n),
-            Err(e) => {
-                eprintln!("vk-hub: packing kept job output: {e:#}");
-                return;
-            }
+        let n = blocking(hub, |db| db.pack_legacy_tails()).await?;
+        if n == 0 {
+            break;
         }
+        tails = tails.saturating_add(n);
         tokio::time::sleep(PACK_PAUSE).await;
     }
     if tails > 0 {
-        eprintln!("vk-hub: packed {tails} kept job outputs");
         // An end that did not compress takes a byte more packed.
         let total = hub.dispatch.kept_output_total;
-        if let Err(e) = blocking(&hub, move |db| db.fit_job_cache(total)).await {
-            eprintln!("vk-hub: fitting the job output cache: {e:#}");
-        }
+        blocking(hub, move |db| db.fit_job_cache(total)).await?;
     }
+    let (mut specs, mut after) = (0usize, None);
+    loop {
+        let (n, next) = blocking(hub, move |db| db.pack_specs(after.as_deref())).await?;
+        specs = specs.saturating_add(n);
+        let Some(next) = next else {
+            break;
+        };
+        after = Some(next);
+        tokio::time::sleep(PACK_PAUSE).await;
+    }
+    if tails > 0 || specs > 0 {
+        eprintln!("vk-hub: packed {tails} kept job outputs and {specs} job specs");
+    }
+    Ok(())
 }
 
 async fn prune(hub: &Hub) {

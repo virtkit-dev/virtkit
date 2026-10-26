@@ -10,19 +10,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::{CancelMode, JobState, JobView, Placement};
 use vk_hub_proto::job::{FailureClass, JobResult};
 
 use super::approvals::Refusal;
-use super::packed::{TAIL_LEVEL, pack, unpack};
+use super::packed::{SPEC_DICTS, TAIL_LEVEL, pack, spec_to_store, unpack};
 use super::{Db, append_audit, decode, encode};
 
 /// Key: job ID. Value: JSON [`JobRow`].
 pub(super) const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
-/// Key: job ID. Value: the job's spec as submitted, redacted, JSON.
+/// Key: job ID. Value: the job's spec as submitted, redacted, JSON, packed
+/// ([`super::packed`]).
 pub(super) const JOB_SPECS: TableDefinition<&str, &[u8]> = TableDefinition::new("job_specs");
 /// Key: `<key id>/<request_id>`. Value: JSON [`RequestRow`].
 pub(super) const REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("requests");
@@ -532,7 +533,9 @@ impl Db {
         now: u64,
     ) -> Result<Submitted> {
         let request = request_key(&row.key, &row.request_id);
+        let spec = self.pack_spec(redacted_spec)?;
         let txn = self.db.begin_write().context("starting a write")?;
+        let spec = spec_to_store(&txn, redacted_spec, spec)?;
         {
             let mut requests = txn.open_table(REQUESTS)?;
             if let Some(previous) = requests
@@ -570,7 +573,7 @@ impl Db {
                 let n = counts.get(row.key.as_str())?.map_or(0, |g| g.value());
                 counts.insert(row.key.as_str(), n.saturating_add(1))?;
             }
-            txn.open_table(JOB_SPECS)?.insert(id, redacted_spec)?;
+            txn.open_table(JOB_SPECS)?.insert(id, spec.as_slice())?;
             let mut order = txn.open_table(JOB_ORDER)?;
             let seq = next_seq(&order, &txn.open_table(JOB_META)?)?;
             order.insert(seq, id)?;
@@ -744,7 +747,9 @@ impl Db {
     pub fn job_tail(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read().context("starting a read")?;
         if let Some(tail) = txn.open_table(JOB_TAILS)?.get(id)? {
-            return unpack(tail.value()).map(Some);
+            // Kept output names no dictionary.
+            let tail = unpack(tail.value(), |d| bail!("kept output names dictionary {d}"))?;
+            return Ok(Some(tail));
         }
         let legacy = txn.open_table(LEGACY_TAILS)?;
         Ok(legacy.get(id)?.map(|g| g.value().to_vec()))
@@ -817,8 +822,9 @@ impl Db {
     }
 
     /// Visit the latest `limit` jobs, newest first, retaining only jobs a node accepted
-    /// that finished at or after `since` or remain unfinished. Pass each redacted spec to
-    /// `visit`, holding one spec at a time. Skip jobs whose specs expired.
+    /// that finished at or after `since` or remain unfinished. Pass each redacted spec,
+    /// unpacked, to `visit`, holding one spec at a time. Skip jobs whose specs expired, and
+    /// those whose specs do not unpack.
     pub fn recent_job_specs(
         &self,
         since: u64,
@@ -828,6 +834,7 @@ impl Db {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(JOBS)?;
         let specs = txn.open_table(JOB_SPECS)?;
+        let dicts = txn.open_table(SPEC_DICTS)?;
         let order = txn.open_table(JOB_ORDER)?;
         for entry in order.iter()?.rev().take(limit) {
             let id = entry?.1.value().to_string();
@@ -841,8 +848,12 @@ impl Db {
             {
                 continue;
             }
-            if let Some(spec) = specs.get(id.as_str())? {
-                visit(id, row, spec.value());
+            let Some(spec) = specs.get(id.as_str())? else {
+                continue;
+            };
+            match self.unpack_spec(&dicts, spec.value()) {
+                Ok(spec) => visit(id, row, &spec),
+                Err(e) => eprintln!("vk-hub: job {id}'s spec: {e:#}"),
             }
         }
         Ok(())
@@ -921,11 +932,15 @@ impl Db {
         Ok(page)
     }
 
-    /// Job `id`'s spec as submitted, redacted; `None` once it has expired.
+    /// Job `id`'s spec as submitted, redacted, unpacked; `None` once it has expired.
     pub fn job_spec(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(JOB_SPECS)?;
-        Ok(table.get(id)?.map(|g| g.value().to_vec()))
+        let Some(spec) = table.get(id)? else {
+            return Ok(None);
+        };
+        let dicts = txn.open_table(SPEC_DICTS)?;
+        self.unpack_spec(&dicts, spec.value()).map(Some)
     }
 
     /// Keep the history to its newest `keep` jobs: past that count, the oldest finished jobs
