@@ -367,6 +367,7 @@ pub fn for_job(
         namespaces,
         key,
         gitlab,
+        areas: inventory.is_some_and(|i| i.registry_areas),
     };
     match mint_for_job(hub, ctx, &target, (node.0, job), spec) {
         Ok((access, audit, jti)) => {
@@ -394,6 +395,8 @@ struct MintTarget<'a> {
     namespaces: &'a [NamespaceRow],
     key: &'a TokenKeyRow,
     gitlab: &'a str,
+    /// Whether the node maps a job's aliases ([`vk_hub_proto::Inventory::registry_areas`]).
+    areas: bool,
 }
 
 fn mint_for_job(
@@ -408,6 +411,7 @@ fn mint_for_job(
         namespaces,
         key,
         gitlab,
+        areas,
     } = *target;
     let Some(signer) = ctx.signers.get(&key.public.kid) else {
         bail!("token-signing key {} is not loaded", key.public.kid);
@@ -446,6 +450,8 @@ fn mint_for_job(
         grants: claims.grants.clone(),
         cache_repo: resolved.cache_repo,
         pipeline_prefix: resolved.pipeline_prefix,
+        // An older node would leave `job/…` paths unmapped.
+        areas: if areas { resolved.areas } else { Vec::new() },
         token: signer.sign(claims)?,
     };
     Ok((access, (Some(registry), event), jti))

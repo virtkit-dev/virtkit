@@ -256,15 +256,28 @@ pub fn guest_registry<'a>(
 }
 
 /// The variables that tell a job's steps where its registry is, and what they may do there:
-/// `VK_REGISTRY`, the guest's proxy, and `VK_REGISTRY_NAMESPACES`, its grants as
-/// `<prefix>=<rights>`, space-separated, raw: a grant whose prefix is not a repository name
-/// is left out, so the hub cannot put a separator or a `$` reference in it. Never the token.
+/// `VK_REGISTRY`, the guest's proxy; `VK_REGISTRY_NAMESPACES`, its grants as
+/// `<prefix>=<rights>`; and `VK_REGISTRY_AREAS`, its aliases as `<alias>=<rights>`, the
+/// rights of the grant on the alias's prefix (`job/<alias>` on the proxy). Space-separated,
+/// raw: an entry that is not a repository name is left out, so the hub cannot put a
+/// separator or a `$` reference in it, and so is an area the proxy does not map
+/// ([`crate::regproxy::usable_areas`], which logs it) or whose prefix has no grant. Never the
+/// token.
 fn registry_vars(registry: &JobRegistry) -> Vec<Variable> {
     let namespaces = registry
         .grants
         .iter()
         .filter(|g| vk_hub_proto::token::valid_prefix(&g.prefix))
         .map(|g| format!("{}={}", g.prefix, g.rights()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The proxy logs what it skips; this runs on the same node for the same job.
+    let areas = crate::regproxy::usable_areas(&registry.areas, |_, _| {})
+        .into_iter()
+        .filter_map(|a| {
+            let grant = registry.grants.iter().find(|g| g.prefix == a.prefix)?;
+            Some(format!("{}={}", a.alias, grant.rights()))
+        })
         .collect::<Vec<_>>()
         .join(" ");
     vec![
@@ -275,6 +288,10 @@ fn registry_vars(registry: &JobRegistry) -> Vec<Variable> {
         Variable {
             raw: true,
             ..runner_var("VK_REGISTRY_NAMESPACES", namespaces)
+        },
+        Variable {
+            raw: true,
+            ..runner_var("VK_REGISTRY_AREAS", areas)
         },
     ]
 }
@@ -323,6 +340,7 @@ mod tests {
             ],
             cache_repo: None,
             pipeline_prefix: None,
+            areas: vec![],
         }
     }
 
@@ -394,6 +412,34 @@ mod tests {
             .find(|v| v.key == "VK_REGISTRY_NAMESPACES")
             .unwrap();
         assert!(ns.raw);
+    }
+
+    /// The areas are listed by alias with their prefix's rights; one whose prefix the token
+    /// does not grant is left out, and so is one the proxy skips: an alias that is not a name
+    /// component or repeats an earlier one.
+    #[test]
+    fn the_areas_are_listed_by_alias() {
+        use vk_hub_proto::dispatch::Area;
+        let area = |alias: &str, prefix: &str| Area {
+            alias: alias.into(),
+            prefix: prefix.into(),
+        };
+        let mut r = job_registry();
+        r.areas = vec![
+            area("task-cache", "p/gl/42"),
+            area("gone", "not/granted"),
+            area("$X", "images"),
+            area("task-cache", "images"),
+            area("imgs", "images"),
+        ];
+        let vars = Vars::of_placed(&cfg(JOB), &CiJob::default(), Some(&r), &place());
+        assert_eq!(vars.get("VK_REGISTRY_AREAS"), "task-cache=rwl imgs=r");
+        let areas = vars
+            .0
+            .iter()
+            .find(|v| v.key == "VK_REGISTRY_AREAS")
+            .unwrap();
+        assert!(areas.raw);
     }
 
     /// Go's `os.Expand` cases (`os/env_test.go` `expandTests`).

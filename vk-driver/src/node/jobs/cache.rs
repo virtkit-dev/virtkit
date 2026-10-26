@@ -805,6 +805,7 @@ mod tests {
             grants: Vec::new(),
             cache_repo: cache_repo.map(str::to_string),
             pipeline_prefix: None,
+            areas: vec![],
         }
     }
 

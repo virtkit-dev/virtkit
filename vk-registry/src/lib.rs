@@ -5704,9 +5704,10 @@ pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
 
 /// Percent-encode a string for use as one query-parameter value: everything but the
 /// unreserved set (`A-Za-z0-9-._~`) becomes `%XX`. Its callers build URLs — the OIDC
-/// endpoints and the `?target=` on a login redirect — never HTML, so this needs no
-/// HTML-escaping counterpart; that is [`html_escape`].
-pub(crate) fn percent_encode(s: &str) -> String {
+/// endpoints, the `?target=` on a login redirect, and vk-driver's guest proxy re-encoding a
+/// lock name it mapped — never HTML, so this needs no HTML-escaping counterpart; that is
+/// [`html_escape`].
+pub fn percent_encode(s: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -5726,7 +5727,7 @@ pub(crate) fn percent_encode(s: &str) -> String {
 /// guard, so slicing `s[i + 1..i + 3]` after checking `i + 3 <= s.len()` panics whenever a
 /// `%` is followed by a multi-byte character (`"%€"`). Every caller here feeds it a query
 /// string or a form body, which is exactly where an attacker chooses the bytes.
-pub(crate) fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     /// One hex digit's value, or `None` — including for a byte that is not one.
     fn hex(c: u8) -> Option<u8> {
         match c {

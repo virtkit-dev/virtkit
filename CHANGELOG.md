@@ -10,6 +10,12 @@ All notable changes to virtkit will be documented in this file.
   access, removes the tag, or by digest every tag on it and the manifest itself from that
   repository, answering 202; the gc reclaims the space once nothing else uses it. It used to
   answer 405.
+- **Jobs reach their storage areas by a fixed alias**: `vk-hub namespaces add … --alias
+  task-cache` gives a namespace an alias. On `registry.vk`, `job/task-cache` resolves to its
+  path for the job under `/v2/`, `/dav/files/` and in lock names. Tools use the same path
+  across projects and protection levels. `VK_REGISTRY_AREAS` lists the job's aliases with
+  their rights. Namespace paths may no longer start with `job`; existing paths under `job`
+  disable aliases until moved. Nodes before this release get no aliases.
 
 ### Fixed
 

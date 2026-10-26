@@ -598,6 +598,10 @@ enum NamespacesCmd {
         /// 3650; the registry applies it only with gc in its [hub] allow, within its own floors
         #[arg(long, value_name = "DAYS")]
         retention_days: Option<u64>,
+        /// What jobs reach the path by on their guest registry proxy, as job/<ALIAS> under
+        /// /v2/ and /dav/files/ and in lock names: one repository name component, as task-cache
+        #[arg(long, value_name = "ALIAS")]
+        alias: Option<String>,
         /// A grant line, <rights>:<subject>, as 'rw:own project' or 'r:*'; repeat for several
         #[arg(long = "grant", value_name = "LINE", required = true)]
         grants: Vec<String>,
@@ -2253,6 +2257,9 @@ fn render_relay(r: &relays::RelayView, now: u64) -> String {
 fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()> {
     let show = |ns: &store::NamespaceRow| {
         let mut out = format!("{} {}", ns.name, ns.path);
+        if let Some(a) = &ns.alias {
+            out.push_str(&format!(" (alias {a})"));
+        }
         if let Some(d) = ns.retention_days {
             out.push_str(&format!(" (retention {d} days)"));
         }
@@ -2283,9 +2290,17 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
             name,
             path,
             retention_days,
+            alias,
             grants,
         } => {
-            let ns = client.put_namespace(&registry, &name, &path, retention_days, grants)?;
+            let ns = client.put_namespace(
+                &registry,
+                &name,
+                &path,
+                retention_days,
+                alias.as_deref(),
+                grants,
+            )?;
             print!("{}", show(&ns));
         }
         NamespacesCmd::Remove { registry, name } => {

@@ -4873,6 +4873,35 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         claims.exp - claims.iat,
         crate::tokens::DEFAULT_MAX_JOB_TOKEN.as_secs()
     );
+    assert!(access.areas.is_empty(), "no namespace has an alias yet");
+    // A namespace's alias reaches a job only on a node that maps it.
+    let tc = crate::store::NamespaceRow {
+        name: "tc".into(),
+        path: "task-cache/{gitlab}/{project_id}/{protection}".into(),
+        retention_days: None,
+        alias: Some("task-cache".into()),
+        grants: vec![crate::store::NsGrant::parse("rwl:own project").unwrap()],
+        created_at: 0,
+        created_by: "t".into(),
+    };
+    crate::registries::put_namespace(&hub, "u", &registry, &tc).unwrap();
+    let area = vk_hub_proto::dispatch::Area {
+        alias: "task-cache".into(),
+        prefix: "task-cache/gl/42/unprotected".into(),
+    };
+    for (n, maps, want) in [(40, false, vec![]), (41, true, vec![area])] {
+        let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
+        inventory.registry_areas = maps;
+        hub.db
+            .record_inventory(&node_id, inventory, true, now_secs())
+            .unwrap();
+        let resp = submit(key.clone(), bound_body(n, 42, "wab/core", 600)).await;
+        assert_eq!(resp.status, 201, "{resp:?}");
+        let HubJobMsg::Start(start) = node.job().await else {
+            panic!("expected a start");
+        };
+        assert_eq!(start.registry.expect("a registry token").areas, want);
+    }
     // Jobs go without when anything a token needs is missing: a node that uses none or names
     // no registry the hub binds.
     let mut n = 4;

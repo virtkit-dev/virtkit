@@ -204,6 +204,7 @@ mod tests {
             name: name.into(),
             path: path.into(),
             retention_days: None,
+            alias: None,
             grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
             created_at: 0,
             created_by: "uid 0".into(),

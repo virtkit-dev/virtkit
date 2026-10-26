@@ -10,8 +10,9 @@
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use vk_hub_proto::dispatch::Area;
 use vk_hub_proto::registry::PrefixRetention;
-use vk_hub_proto::token::{Grant, valid_prefix};
+use vk_hub_proto::token::{ALIAS_ROOT, Grant, valid_component, valid_prefix};
 
 use super::registries::REGISTRIES;
 use super::{Db, NotEnrolled, append_audit, decode, encode};
@@ -45,6 +46,10 @@ pub struct NamespaceRow {
     /// Idle tags under it go after this many days; `None` for the registry's own window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u64>,
+    /// What a job reaches the path by on its guest registry proxy, as `job/<alias>`: one
+    /// repository name component, unique on the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub grants: Vec<NsGrant>,
     pub created_at: u64,
     pub created_by: String,
@@ -117,6 +122,19 @@ impl NamespaceRow {
                 self.path
             ));
         }
+        if self.under_alias_root() {
+            return Err(format!(
+                "{:?}: {ALIAS_ROOT}/ is where jobs reach aliases, so no path starts there",
+                self.path
+            ));
+        }
+        if let Some(alias) = &self.alias
+            && !valid_component(alias)
+        {
+            return Err(format!(
+                "{alias:?}: an alias is one repository name component, as task-cache"
+            ));
+        }
         match self.retention_days {
             Some(0) => return Err("a retention of 0 days would drop every tag".to_string()),
             Some(d) if d > MAX_RETENTION_DAYS => {
@@ -147,6 +165,12 @@ impl NamespaceRow {
             }
         }
         Ok(())
+    }
+
+    /// Whether the path starts at [`ALIAS_ROOT`], which [`NamespaceRow::check`] refuses for a
+    /// namespace stored now; one stored before still may.
+    fn under_alias_root(&self) -> bool {
+        self.path.split('/').next() == Some(ALIAS_ROOT)
     }
 
     /// Whether a fixed component follows a placeholder: `p/{gitlab}/dev`.
@@ -189,6 +213,25 @@ fn check_retention_overlap(ns: &NamespaceRow, others: &[NamespaceRow]) -> Result
         }
     }
     Ok(())
+}
+
+/// Refuse `ns`'s alias if another namespace has it or a legacy path under [`ALIAS_ROOT`]
+/// could be hidden by it.
+fn check_alias(ns: &NamespaceRow, others: &[NamespaceRow]) -> Option<String> {
+    let alias = ns.alias.as_ref()?;
+    if let Some(other) = others.iter().find(|o| o.alias.as_ref() == Some(alias)) {
+        return Some(format!(
+            "namespace {} has the alias {alias} already",
+            other.name
+        ));
+    }
+    others.iter().find(|o| o.under_alias_root()).map(|o| {
+        format!(
+            "namespace {}'s path {} starts at {ALIAS_ROOT}/, where jobs reach aliases: move it \
+             before giving any namespace an alias",
+            o.name, o.path
+        )
+    })
 }
 
 /// `path` with each placeholder filled by a sample value, to check it makes a repository
@@ -240,6 +283,8 @@ pub struct Resolved {
     pub cache_repo: Option<String>,
     /// [`CI_PIPELINE`]'s path for the job, when it selects the job.
     pub pipeline_prefix: Option<String>,
+    /// The aliases of the namespaces selecting the job, with the prefix each stands for.
+    pub areas: Vec<Area>,
 }
 
 /// The grants the namespaces `ns` give the job claiming `c`: per namespace whose path fills,
@@ -267,6 +312,12 @@ pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
             CI_PIPELINE => out.pipeline_prefix = Some(prefix.clone()),
             _ => {}
         }
+        if let Some(alias) = &n.alias {
+            out.areas.push(Area {
+                alias: alias.clone(),
+                prefix: prefix.clone(),
+            });
+        }
         match out.grants.iter_mut().find(|g| g.prefix == prefix) {
             Some(g) => {
                 g.read |= grant.read;
@@ -278,6 +329,11 @@ pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
     }
     // One grant per namespace at most, and a registry holds at most a token's worth.
     debug_assert!(out.grants.len() <= vk_hub_proto::token::MAX_GRANTS);
+    // A path under the alias root, stored before such paths were refused, could be hidden by
+    // an alias: none are lent until it moves.
+    if ns.iter().any(NamespaceRow::under_alias_root) {
+        out.areas.clear();
+    }
     out
 }
 
@@ -308,6 +364,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             name: CI_CACHE.into(),
             path: "ci-cache/{gitlab}/{project_id}/{protection}".into(),
             retention_days: None,
+            alias: None,
             grants: vec![grant("rw:own project")],
             created_at: now,
             created_by: "hub".into(),
@@ -316,6 +373,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             name: CI_PIPELINE.into(),
             path: "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}".into(),
             retention_days: Some(2),
+            alias: None,
             grants: vec![grant("rwl:own project, own pipeline")],
             created_at: now,
             created_by: "hub".into(),
@@ -328,8 +386,9 @@ fn ns_range(registry: &str) -> (String, String) {
 }
 
 /// Why `ns` may not be stored on registry `registry` beside the namespaces in `table`, if it
-/// may not: the registry has [`MAX_NAMESPACES`] already, unless `ns` `replaces` one, or a
-/// retention would reach into another namespace.
+/// may not: the registry has [`MAX_NAMESPACES`] already, unless `ns` `replaces` one; another
+/// namespace has `ns`'s alias, or `ns` has one while another's path lies under [`ALIAS_ROOT`]
+/// ([`check_alias`]); or a retention would reach into another namespace.
 fn refusal(
     table: &redb::Table<&str, &[u8]>,
     registry: &str,
@@ -348,6 +407,9 @@ fn refusal(
         if other.name != ns.name {
             others.push(other);
         }
+    }
+    if let Some(why) = check_alias(ns, &others) {
+        return Ok(Some(why));
     }
     Ok(check_retention_overlap(ns, &others).err())
 }
@@ -381,10 +443,13 @@ impl Db {
         };
         let grants: Vec<String> = ns.grants.iter().map(ToString::to_string).collect();
         let event = format!(
-            "{actor} {} namespace {} at {}{} granting {}",
+            "{actor} {} namespace {} at {}{}{} granting {}",
             if replaced { "replaced" } else { "added" },
             ns.name,
             ns.path,
+            ns.alias
+                .as_ref()
+                .map_or(String::new(), |a| format!(", alias {a},")),
             ns.retention_days
                 .map_or(String::new(), |d| format!(", retention {d} days,")),
             grants.join("; ")
@@ -498,6 +563,7 @@ mod tests {
             name: name.into(),
             path: path.into(),
             retention_days,
+            alias: None,
             grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
             created_at: 0,
             created_by: "t".into(),
@@ -691,6 +757,115 @@ mod tests {
                     retention_days: 5
                 },
             ]
+        );
+    }
+
+    fn aliased(name: &str, path: &str, alias: &str) -> NamespaceRow {
+        NamespaceRow {
+            alias: Some(alias.into()),
+            ..ns(name, path, &["rwl:own project"], None)
+        }
+    }
+
+    #[test]
+    fn an_alias_is_one_component_and_no_path_starts_at_the_alias_root() {
+        aliased(
+            "tc",
+            "task-cache/{gitlab}/{project_id}/{protection}",
+            "task-cache",
+        )
+        .check()
+        .unwrap();
+        for bad in ["Task", "a/b", "", "-a", "job x"] {
+            let n = aliased("tc", "task-cache/{gitlab}/{project_id}", bad);
+            assert!(n.check().is_err(), "{bad:?}");
+        }
+        assert!(
+            ns("j", "job/{gitlab}/{project_id}", &["r:*"], None)
+                .check()
+                .is_err()
+        );
+        ns("j", "jobs/{gitlab}/{project_id}", &["r:*"], None)
+            .check()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_job_gets_the_areas_selecting_it() {
+        let all = [
+            aliased(
+                "tc",
+                "task-cache/{gitlab}/{project_id}/{protection}",
+                "task-cache",
+            ),
+            aliased("other", "other/{gitlab}/{project_id}", "other"),
+            ns(
+                "plain",
+                "plain/{gitlab}/{project_id}",
+                &["r:own project"],
+                None,
+            ),
+        ];
+        let r = resolve(&all, &claims(false, 7));
+        assert_eq!(
+            r.areas,
+            vec![
+                Area {
+                    alias: "task-cache".into(),
+                    prefix: "task-cache/gl/42/unprotected".into(),
+                },
+                Area {
+                    alias: "other".into(),
+                    prefix: "other/gl/42".into(),
+                },
+            ]
+        );
+        // A path under the alias root, stored before it was refused, withholds every area.
+        let mut legacy = all.to_vec();
+        legacy.push(ns("old", "job/x", &["r:*"], None));
+        assert!(resolve(&legacy, &claims(false, 7)).areas.is_empty());
+    }
+
+    #[test]
+    fn aliases_are_unique_and_wait_for_paths_under_the_alias_root_to_move() {
+        use crate::store::{RegistryEnrollment, TokenKind};
+        let db = Db::open_memory().unwrap();
+        let ttl = std::time::Duration::from_secs(60);
+        let (token, _) = db
+            .create_token_for(TokenKind::Registry, ttl, None, "u", 1)
+            .unwrap();
+        let RegistryEnrollment::Enrolled { id } =
+            db.enroll_registry(&token, "aa", "reg", "p", 1).unwrap()
+        else {
+            panic!("not enrolled");
+        };
+        let tc = aliased("tc", "task-cache/{gitlab}/{project_id}", "task-cache");
+        db.put_namespace(&id, &tc, "u", 1).unwrap();
+        // Replacing itself keeps its alias.
+        db.put_namespace(&id, &tc, "u", 2).unwrap();
+        let dup = aliased("tc2", "tc2/{gitlab}/{project_id}", "task-cache");
+        let err = db.put_namespace(&id, &dup, "u", 3).unwrap_err().to_string();
+        assert!(err.contains("has the alias task-cache already"), "{err}");
+
+        // A namespace under `job/` from before the check, written as an older hub stored it.
+        let legacy = ns("old", "job/x", &["r:*"], None);
+        let txn = db.db.begin_write().unwrap();
+        txn.open_table(NAMESPACES)
+            .unwrap()
+            .insert(
+                format!("{id}/old").as_str(),
+                encode(&legacy).unwrap().as_slice(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let other = aliased("o", "o/{gitlab}/{project_id}", "o");
+        let err = db
+            .put_namespace(&id, &other, "u", 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("move it before giving any namespace an alias"),
+            "{err}"
         );
     }
 }

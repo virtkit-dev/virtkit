@@ -2099,6 +2099,7 @@ pub(crate) mod tests {
             grants: Vec::new(),
             cache_repo: None,
             pipeline_prefix: None,
+            areas: vec![],
         });
         journal::write_json(&job_dir.join(journal::START), &start).unwrap();
         let cfg: Config =

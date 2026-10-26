@@ -1173,6 +1173,7 @@ mod tests {
             grants: Vec::new(),
             cache_repo: None,
             pipeline_prefix: None,
+            areas: vec![],
         };
         let job = CiJob::default();
         let phrases = masked_phrases(&Vars::default(), &job, Some(&registry));
