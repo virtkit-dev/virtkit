@@ -1773,6 +1773,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     }
     tokio::spawn(tokens::sweep(hub.clone()));
     tokio::spawn(jobs::drive(hub.clone()));
+    tokio::spawn(jobs::pack(hub.clone()));
     tokio::spawn(clients::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.

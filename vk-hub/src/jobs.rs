@@ -126,8 +126,8 @@ pub const DEFAULT_KEPT_FAILURE_OUTPUT: u64 = 256 * 1024;
 /// (`kept_output` in `hub.toml`).
 pub const DEFAULT_KEPT_OUTPUT: u64 = 1 << 20;
 
-/// Default total byte limit for retained output of jobs that did not fail
-/// (`kept_output_total` in `hub.toml`); the oldest retained tails are evicted first.
+/// Default total byte limit for retained output of jobs that did not fail, as stored,
+/// compressed (`kept_output_total` in `hub.toml`); the oldest retained tails are evicted first.
 pub const DEFAULT_KEPT_OUTPUT_TOTAL: u64 = 1 << 30;
 
 /// How long a node keeps an image no job uses, when it does not say: `vk`'s default
@@ -168,6 +168,9 @@ impl Default for Affinity {
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
+/// Pause between packing steps so other hub writes do not queue behind them.
+const PACK_PAUSE: Duration = Duration::from_millis(100);
+
 /// How often at most a running job's record is written for a newer egress report alone, by
 /// default: a hub restarting loses no more of it, and its node sends its latest again.
 pub const DEFAULT_EGRESS_WRITE_EVERY: Duration = Duration::from_secs(30);
@@ -189,7 +192,8 @@ pub struct Dispatch {
     /// Bytes retained from the end of a job's output on settlement if it did not fail.
     /// The cache stays within `kept_output_total`; 0 keeps none.
     pub kept_output: u64,
-    /// Total byte limit for retained tails of jobs that did not fail; 0 keeps none.
+    /// Total byte limit for retained tails of jobs that did not fail, as stored, compressed;
+    /// 0 keeps none.
     pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub affinity: Affinity,
@@ -2363,8 +2367,11 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
     let (keep, cache) = match row.outcome() {
         JobOutcome::Failed => (hub.dispatch.kept_failure_output, None),
         _ => {
+            // The total counts the tail as stored: one byte more than it reads, when it does
+            // not compress.
             let total = hub.dispatch.kept_output_total;
-            (hub.dispatch.kept_output.min(total), Some(total))
+            let keep = hub.dispatch.kept_output.min(total.saturating_sub(1));
+            (keep, Some(total))
         }
     };
     if keep > 0 {
@@ -2565,6 +2572,30 @@ pub async fn drive(hub: Arc<Hub>) {
             _ = changed.changed() => {}
             _ = node_changed.changed() => {}
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Pack legacy kept output in bounded steps at startup; new output is already packed.
+pub async fn pack(hub: Arc<Hub>) {
+    let mut tails = 0usize;
+    loop {
+        match blocking(&hub, |db| db.pack_legacy_tails()).await {
+            Ok(0) => break,
+            Ok(n) => tails = tails.saturating_add(n),
+            Err(e) => {
+                eprintln!("vk-hub: packing kept job output: {e:#}");
+                return;
+            }
+        }
+        tokio::time::sleep(PACK_PAUSE).await;
+    }
+    if tails > 0 {
+        eprintln!("vk-hub: moved {tails} kept job outputs to the packed table");
+        // An end that did not compress takes a byte more packed.
+        let total = hub.dispatch.kept_output_total;
+        if let Err(e) = blocking(&hub, move |db| db.fit_job_cache(total)).await {
+            eprintln!("vk-hub: fitting the job output cache: {e:#}");
         }
     }
 }
