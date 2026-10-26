@@ -4217,6 +4217,7 @@ dependencies = [
  "vk-oidc",
  "vk-peer",
  "vk-selfupdate",
+ "zstd",
 ]
 
 [[package]]

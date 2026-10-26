@@ -1204,22 +1204,29 @@ the hub masks nothing more, and every signed-in session of the web UI, a viewer'
 read it. The kept output lives exactly as long as the record: the 30 days that expire an
 unsettled job's output do not touch it, and it goes when the history drops the record. A failed
 job its producer never settles keeps none: its output goes with those 30 days. Before it is
-settled, a job's page reads its stored output (see [Web UI](#web-ui)). The database holds
-roughly `job_history` × `kept_failure_output` of it — about 2.4 GiB at the defaults, were every
-job to fail; more between the hourly trims, or for tails kept before `kept_failure_output` was
-lowered — and its file does not shrink when they go.
+settled, a job's page reads its stored output (see [Web UI](#web-ui)). Kept output is stored
+compressed (zstd), so the database holds at most `job_history` × `kept_failure_output` of it —
+2.4 GiB at the defaults, were every job to fail with output that does not compress; CI logs
+compress about 8 times, to some 300 MiB. It holds more between the hourly trims, or for tails
+kept before `kept_failure_output` was lowered, and its file does not shrink when they go.
 
 **Other jobs' output.** Settling a successful or canceled job retains its output tail the same
-way, but in a cache with a total size limit. Each tail holds up to `kept_output` bytes (`1M`
-by default, at most `4M`), capped by `kept_output_total` (`1G` by default, at most `64G`).
-Setting either to `"0"` keeps none. The cache evicts the oldest retained tails until a new
-tail fits within `kept_output_total`. Failed jobs' retained output is exempt from this limit
-and eviction. Pruning a job's history record also removes its cached tail. Lowering the total
-while the hub is stopped causes eviction to the new limit at startup.
+way, but in a cache with a total size limit. Each tail holds up to `kept_output` bytes of
+output (`1M` by default, at most `4M`), capped by `kept_output_total` (`1G` by default, at most
+`64G`). Setting either to `"0"` keeps none. `kept_output_total` counts the tails as stored,
+compressed: at the 8 times CI logs compress, the default 1 GiB holds about 8 GiB of output. The
+cache evicts the oldest retained tails until a new tail fits within `kept_output_total`. Failed
+jobs' retained output is exempt from this limit and eviction. Pruning a job's history record
+also removes its cached tail. Lowering the total while the hub is stopped causes eviction to the
+new limit at startup.
 At every start the hub rebuilds the cache's index and count from the ends the database holds,
 so a database an older hub wrote to is consistent again. The database grows by up to
 `kept_output_total` (1 GiB by default) on top of the failed jobs' kept output, and its file does
 not shrink when an end is evicted or the total lowered.
+
+**Compressed storage.** Kept output a hub before compression stored as it was is compressed in
+the background after an upgrade, a few megabytes per write, counting at its stored size until
+then; redb reuses the pages it frees, but the file does not shrink.
 
 **History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
 1,000,000), in submission order: once an hour the oldest finished ones past that count go if

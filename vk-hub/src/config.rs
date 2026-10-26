@@ -21,7 +21,7 @@
 //! kept_failure_output = "256K"
 //! # Bytes retained from the end of any other finished job's output once settled ("0" keeps
 //! # none), capped by kept_output_total. The cache evicts the oldest retained tails first
-//! # to stay within kept_output_total.
+//! # to stay within kept_output_total, which counts them as stored, compressed.
 //! kept_output = "1M"
 //! kept_output_total = "1G"
 //! # A job whose image its node builds goes first to a node that still holds that image while
@@ -88,7 +88,7 @@ const MAX_KEPT_FAILURE_OUTPUT: u64 = 4 << 20;
 /// carries it whole.
 const MAX_KEPT_OUTPUT: u64 = 4 << 20;
 
-/// The most `kept_output_total` may hold: the database holds it all.
+/// The most `kept_output_total` may hold, compressed: the database holds it all.
 const MAX_KEPT_OUTPUT_TOTAL: u64 = 64 << 30;
 
 /// The resolved configuration.
@@ -110,7 +110,8 @@ pub struct HubConfig {
     /// Bytes retained from the end of any other finished job's output once settled, capped
     /// by `kept_output_total`. The cache's total also stays within that limit.
     pub kept_output: u64,
-    /// Total byte limit for those tails; the oldest retained tails are evicted first.
+    /// Total byte limit for those tails as stored, compressed; the oldest retained tails are
+    /// evicted first.
     pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub image_affinity: crate::jobs::Affinity,

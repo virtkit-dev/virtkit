@@ -51,6 +51,7 @@ mod jobs;
 mod keys;
 mod namespaces;
 mod observed;
+mod packed;
 mod registries;
 mod relays;
 mod token_keys;
@@ -806,6 +807,8 @@ impl Db {
             .context("opening the requests table")?;
         txn.open_table(jobs::JOB_TAILS)
             .context("opening the job output tails table")?;
+        txn.open_table(jobs::LEGACY_TAILS)
+            .context("opening the unpacked job output tails table")?;
         txn.open_table(jobs::JOB_CACHE)
             .context("opening the job output cache table")?;
         txn.open_table(jobs::JOB_TAIL_LENS)

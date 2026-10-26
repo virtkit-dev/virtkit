@@ -36,6 +36,12 @@ All notable changes to virtkit will be documented in this file.
 - **The Egress page's Observed traffic leaves out projects with no reported job**, such as an
   API key's jobs from before the hub bound keys to GitLab, listed with nothing but the jobs that
   sent no report.
+- **The hub stores kept job output compressed**: it takes about 8 times less room in its
+  database. What an earlier hub kept is compressed in the background after the upgrade; the
+  database file does not shrink, but the room freed is reused.
+- **`kept_output_total` counts the kept output of jobs that did not fail as stored,
+  compressed**, so the default 1 GiB holds about 8 times more of it. `kept_output` and
+  `kept_failure_output` still bound each job's output as it reads, uncompressed.
 
 ### Fixed
 

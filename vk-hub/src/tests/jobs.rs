@@ -4476,7 +4476,8 @@ async fn a_settled_job_keeps_the_end_of_its_output() {
         hub.db.job_tail(&canceled).unwrap().as_deref(),
         Some(&b"stop\n"[..])
     );
-    // 6 and 5 bytes kept of 16: 7 more evict the oldest, and only it.
+    // 7 and 6 bytes stored of 16, each with its format's byte: 8 more evict the oldest, and
+    // only it.
     let more = settled_job(addr, &key, &mut node, 5, b"later!\n", None).await;
     assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
     assert_eq!(crate::jobs::detail(&hub, &ok).unwrap().unwrap().1, None);
@@ -4506,6 +4507,16 @@ async fn a_settled_job_keeps_the_end_of_its_output() {
     let mut node = ready_node(addr, &hub, 16384).await;
     let ok = settled_job(addr, &key, &mut node, 1, out, None).await;
     assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
+    // A cache no larger than a tail keeps one that does not compress, cut to fit stored.
+    let tight = dir.join("tight");
+    let (addr, hub) = start_keeping(&tight, 0, (16, 16)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let ok = settled_job(addr, &key, &mut node, 1, b"0123456789\nabcd\n", None).await;
+    assert_eq!(
+        hub.db.job_tail(&ok).unwrap().as_deref(),
+        Some(&b"abcd\n"[..])
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
