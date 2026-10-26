@@ -69,8 +69,8 @@ pub use egress_rules::{
 };
 pub use gitlabs::{GitlabRefused, GitlabRow, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
-    DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
-    PREPARE_STAGE, RegistryAccess, RequestRow, Submitted,
+    DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow,
+    MAX_JOB_HISTORY, NoAccess, PREPARE_STAGE, RegistryAccess, RequestRow, Submitted,
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,

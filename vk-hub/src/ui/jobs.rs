@@ -2,7 +2,8 @@
 //! first, a page at a time, filtered by API key, node, GitLab project, result, job name, branch
 //! and pipeline, with what each used on its node where the node reported it
 //! ([`vk_hub_proto::job::JobUsage`]) and a line summing up every job the filter matches.
-//! Read only. Each job's result links to its page, `/jobs/<id>`: its record and its output as
+//! Operators set how many jobs the history keeps, over `job_history` ([`action`]). Each
+//! job's result links to its page, `/jobs/<id>`: its record and its output as
 //! far as the hub holds or kept it, followed while it runs ([`super::job_output`]), for when
 //! GitLab's trace is cut, late or out of reach.
 //!
@@ -18,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use hyper::header::{HeaderMap, HeaderValue};
-use hyper::{Response, StatusCode};
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::client::JobState;
 
 use super::html::Html;
@@ -28,9 +30,11 @@ use super::job_output::{self, Output};
 use super::pages::{self, bytes, mib};
 use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
+use crate::jobs::HistorySource;
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
-    JobFilter, JobOutcome, JobPage, JobRow, NamespaceRow, NoAccess, RegistryAccess, Role,
+    JobFilter, JobOutcome, JobPage, JobRow, MAX_JOB_HISTORY, NamespaceRow, NoAccess,
+    RegistryAccess, Role,
 };
 
 /// The page.
@@ -75,8 +79,16 @@ pub(super) async fn get(
     }
     let before = field(&query, "before").and_then(|b| b.parse().ok());
     let hub = ui.hub.clone();
+    let kept = blocking(move || {
+        anyhow::Ok((
+            crate::jobs::history_count(&hub)?,
+            crate::jobs::history_unset(&hub),
+        ))
+    })
+    .await?;
+    let hub = ui.hub.clone();
     let wanted = filter.clone();
-    let main = match before {
+    let mut main = match before {
         None => {
             let renders = renders.clone();
             let (newest, key_name) = blocking(move || {
@@ -115,6 +127,7 @@ pub(super) async fn get(
             )
         }
     };
+    history_form(&mut main, auth, kept.0, kept.1);
     Ok(page(fleet::layout("Jobs", PATH, auth, &main)))
 }
 
@@ -132,6 +145,95 @@ async fn reading(ui: &Ui) -> Result<Response<Body>> {
     } else {
         *resp.status_mut() = StatusCode::NO_CONTENT;
     }
+    Ok(resp)
+}
+
+/// The form's operations: set the history's count, or clear the count set.
+const SET_HISTORY: &str = "set-history";
+const CLEAR_HISTORY: &str = "clear-history";
+
+/// The history count and its source, outside the live fragment, with an operator's form
+/// posting to [`action`]. `unset` is the fallback count and source when the override is cleared.
+fn history_form(
+    h: &mut Html,
+    auth: &Auth,
+    (count, source): (usize, HistorySource),
+    unset: (usize, HistorySource),
+) {
+    let fallback = match unset {
+        (n, HistorySource::Config) => format!("hub.toml's {}", thousands(n)),
+        (n, _) => format!("the default of {}", thousands(n)),
+    };
+    h.raw("<section><h2>History</h2><p>The history keeps the newest ")
+        .text(thousands(count));
+    match source {
+        HistorySource::Default => h.raw(" jobs, by default."),
+        HistorySource::Config => h.raw(" jobs, as <code>job_history</code> in hub.toml sets it."),
+        HistorySource::Ui => h.raw(" jobs, as set here, over ").text(&fallback).raw("."),
+    };
+    h.raw("</p>");
+    if auth.session.role >= Role::Operator {
+        history_op(h, auth, SET_HISTORY);
+        h.raw("<label>Jobs kept <input type=\"number\" name=\"count\" min=\"1\" max=\"")
+            .text(MAX_JOB_HISTORY)
+            .raw("\" value=\"")
+            .text(count)
+            .raw("\" required></label><button>Save</button></form>");
+        if source == HistorySource::Ui {
+            history_op(h, auth, CLEAR_HISTORY);
+            h.raw("<button>Use ")
+                .text(&fallback)
+                .raw("</button></form>");
+        }
+        h.raw("<p class=\"sub\">It applies at once: a lower count drops the oldest finished ")
+            .raw("jobs in the background, a step at a time.</p>");
+    }
+    h.raw("</section>");
+}
+
+/// The start of a form posting `op` to [`action`].
+fn history_op(h: &mut Html, auth: &Auth, op: &'static str) {
+    h.raw("<form class=\"act\" method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\">");
+    pages::csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"")
+        .raw(op)
+        .raw("\">");
+}
+
+/// `POST /jobs`: an operator sets how many jobs the history keeps (`set-history` with a
+/// `count`), or clears that so `job_history` applies (`clear-history`), as the session's
+/// principal; back to the page.
+pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(message(status, text)),
+    };
+    let count = match field(&form, "op") {
+        Some(SET_HISTORY) => {
+            let count = field(&form, "count").and_then(|c| c.trim().parse::<u64>().ok());
+            match count.filter(|n| (1..=MAX_JOB_HISTORY).contains(n)) {
+                Some(n) => Some(usize::try_from(n)?),
+                None => {
+                    let max = thousands(usize::try_from(MAX_JOB_HISTORY)?);
+                    return Ok(message(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Refused: the history keeps 1 to {max} jobs."),
+                    ));
+                }
+            }
+        }
+        Some(CLEAR_HISTORY) => None,
+        _ => return Ok(message(StatusCode::BAD_REQUEST, "No such action.")),
+    };
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    blocking(move || crate::jobs::set_history(&hub, &principal, count)).await?;
+    let mut resp = Response::new(Body::default());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static(PATH));
     Ok(resp)
 }
 

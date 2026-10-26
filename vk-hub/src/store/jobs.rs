@@ -54,6 +54,8 @@ pub(super) const JOB_META: TableDefinition<&str, u64> = TableDefinition::new("jo
 const EXPIRED_BELOW: &str = "expired_below";
 /// The bytes, as stored, of the ends that [`JOB_CACHE`] holds.
 pub(super) const CACHED_BYTES: &str = "cached_bytes";
+/// How many jobs' records the history keeps, as set from the web UI: over `job_history`.
+const HISTORY: &str = "history";
 /// Set once [`JOB_TAIL_LENS`] has every end kept: a database a build without it
 /// wrote has them filled in once. An end a build without the lengths writes later (a dev
 /// downgrade) has none, so orphan cleanup misses it; it is outside the cache, so nothing is
@@ -77,6 +79,10 @@ const TRIM_DROP: u64 = 1_000;
 
 /// How many jobs' records the history keeps by default (`job_history` in `hub.toml`).
 pub const DEFAULT_JOB_HISTORY: usize = 10_000;
+
+/// The most jobs' records the history may keep, however its count is set: each is a few
+/// kilobytes in the database.
+pub const MAX_JOB_HISTORY: u64 = 1_000_000;
 
 /// How often, at most, requests past [`REQUEST_KEEP`] are swept.
 const REQUEST_SWEEP_SECS: u64 = 600;
@@ -1412,6 +1418,49 @@ impl Db {
             .context("pruning jobs")?;
         Ok(Pruned { outputs, more })
     }
+
+    /// How many jobs' records the history keeps as set from the web UI; `None` when it was
+    /// not, and `job_history` applies.
+    pub fn job_history_set(&self) -> Result<Option<usize>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let meta = txn.open_table(JOB_META)?;
+        let set = meta.get(HISTORY)?.map(|g| g.value());
+        set.map(usize::try_from).transpose().map_err(Into::into)
+    }
+
+    /// Have the history keep `count` jobs' records, over `job_history`, or clear the count
+    /// set (`None`), audited as `actor`'s; `cleared` says, for the audit, what then applies.
+    pub fn set_job_history(
+        &self,
+        count: Option<usize>,
+        cleared: &str,
+        actor: &str,
+        now: u64,
+    ) -> Result<()> {
+        let count = count.map(u64::try_from).transpose()?;
+        if let Some(n) = count
+            && !(1..=MAX_JOB_HISTORY).contains(&n)
+        {
+            bail!("the history keeps 1 to {MAX_JOB_HISTORY} jobs, not {n}");
+        }
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut meta = txn.open_table(JOB_META)?;
+            let event = match count {
+                Some(n) => {
+                    meta.insert(HISTORY, n)?;
+                    format!("job history set to keep {n} jobs")
+                }
+                None => {
+                    meta.remove(HISTORY)?;
+                    format!("job history count cleared: {cleared}")
+                }
+            };
+            append_audit(&txn, None, actor, &event, now)?;
+        }
+        txn.commit().context("setting the job history")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2568,6 +2617,38 @@ mod tests {
         assert!(!db.prune_jobs_scanning(11, 1, 2, TRIM_SCAN).unwrap().more);
         assert_eq!(listed(&db), [5].map(id));
         assert!(!db.prune_jobs_scanning(11, 1, 2, TRIM_SCAN).unwrap().more);
+    }
+
+    /// The count set from the web UI is kept until cleared, within the history's bounds, and
+    /// audited.
+    #[test]
+    fn the_history_count_is_set_and_cleared() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.job_history_set().unwrap(), None);
+        db.set_job_history(Some(500), "", "admin", 1).unwrap();
+        assert_eq!(db.job_history_set().unwrap(), Some(500));
+        let max = usize::try_from(MAX_JOB_HISTORY).unwrap();
+        for bad in [0, max + 1] {
+            assert!(
+                db.set_job_history(Some(bad), "", "admin", 2).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(db.job_history_set().unwrap(), Some(500));
+        db.set_job_history(None, "the default applies", "admin", 3)
+            .unwrap();
+        assert_eq!(db.job_history_set().unwrap(), None);
+        let events: Vec<String> = (db.audits(None, 10).unwrap().into_iter())
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().any(|e| e.contains("500")), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.ends_with("cleared: the default applies")),
+            "{events:?}"
+        );
     }
 
     /// The node's own measure of a job's run wins over the hub's timestamps.

@@ -88,11 +88,7 @@ async fn serve_undriven_with(
     let hub = Arc::new(configure(
         Hub::new(db, None)
             .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
-            .with_jobs(
-                dir.join("jobs"),
-                lost_after,
-                crate::store::DEFAULT_JOB_HISTORY,
-            )
+            .with_jobs(dir.join("jobs"), lost_after, None)
             .unwrap(),
     ));
     crate::jobs::recover(&hub).await.unwrap();
@@ -2891,6 +2887,94 @@ async fn a_job_expired_or_dropped_from_the_history_says_so() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A count set lower than the history, as the Jobs page sets it, trims the history in the
+/// background, past what one write drops, to the newest jobs; cleared, `job_history` applies
+/// again and the audit says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lower_history_count_trims_the_history_write_after_write() {
+    use crate::jobs::HistorySource;
+    use crate::store::JobFilter;
+    let dir = scratch("trim");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let settled = |n: u64| crate::store::JobRow {
+        key: "k".into(),
+        key_name: "gitlab".into(),
+        instance: None,
+        request_id: format!("{n:032x}"),
+        placement: placement(),
+        title: format!("GitLab job {n}"),
+        job_url: None,
+        project: None,
+        name: None,
+        created_at: 1000 + n,
+        state: JobState::Finished,
+        revision: 2,
+        node: Some("ab".repeat(16)),
+        stage: None,
+        cancel: None,
+        result: None,
+        output_len: 0,
+        started_at: Some(1000 + n),
+        finished_at: Some(1010 + n),
+        settled_at: Some(1010 + n),
+        git_ref: None,
+        pipeline: None,
+        expired_at: None,
+        commit: None,
+        activity: None,
+        prepared_at: None,
+        guest: None,
+        registry_access: None,
+        gitlab: None,
+        project_id: None,
+        protected: None,
+        egress_rules: None,
+        egress_caps: None,
+        egress: None,
+    };
+    // Well past the 1,000 jobs one trim drops at most.
+    let jobs = 2_500u64;
+    db.fill_history((1..=jobs).map(|n| (format!("{n:032x}"), settled(n))))
+        .unwrap();
+    let (_, hub) = serve_hub_with(db, &dir, Duration::from_secs(60), |hub| {
+        hub.with_jobs(dir.join("jobs"), Duration::from_secs(60), Some(5_000))
+            .unwrap()
+    })
+    .await;
+    assert_eq!(
+        crate::jobs::history_unset(&hub),
+        (5_000, HistorySource::Config)
+    );
+    let all = JobFilter::default();
+    let held = || {
+        let page = hub.db.job_page(&all, None, 1).unwrap();
+        (!page.reading).then_some(page.summary.matched)
+    };
+    eventually(|| held() == Some(2_500)).await;
+
+    crate::jobs::set_history(&hub, "uid 0", Some(100)).unwrap();
+    eventually(|| held() == Some(100)).await;
+    let page = hub.db.job_page(&all, None, 1).unwrap();
+    assert_eq!(page.rows[0].1, format!("{jobs:032x}"));
+    let oldest = hub.db.job_page(&all, Some(page.rows[0].0 - 98), 1).unwrap();
+    assert_eq!(oldest.rows[0].1, format!("{:032x}", jobs - 99));
+    assert_eq!(oldest.older, None);
+
+    crate::jobs::set_history(&hub, "uid 0", None).unwrap();
+    assert_eq!(
+        crate::jobs::history_count(&hub).unwrap(),
+        (5_000, HistorySource::Config)
+    );
+    let audit = hub.db.audits(None, 10).unwrap();
+    assert!(
+        (audit.iter()).any(|r| r
+            .event
+            .ends_with("cleared: job_history in hub.toml applies, 5000 jobs")),
+        "{audit:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A restarted hub deletes the output files no job may read again: a settled job's, and one
 /// of a job it holds no record of.
 #[tokio::test(flavor = "multi_thread")]
@@ -4358,11 +4442,7 @@ async fn start_keeping(
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
-        .with_jobs(
-            dir.join("jobs"),
-            Duration::from_secs(60),
-            crate::store::DEFAULT_JOB_HISTORY,
-        )
+        .with_jobs(dir.join("jobs"), Duration::from_secs(60), None)
         .unwrap()
         .keeping_failure_output(keep)
         .keeping_output(bytes, total);

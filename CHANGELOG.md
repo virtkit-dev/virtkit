@@ -16,6 +16,9 @@ All notable changes to virtkit will be documented in this file.
   across projects and protection levels. `VK_REGISTRY_AREAS` lists the job's aliases with
   their rights. Namespace paths may no longer start with `job`; existing paths under `job`
   disable aliases until moved. Nodes before this release get no aliases.
+- **The job history's length can be set on the hub's Jobs page**: the count is audited,
+  applies at once and wins over `job_history` until cleared; a lower count is trimmed in the
+  background.
 
 ### Changed
 

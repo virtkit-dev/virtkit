@@ -3549,6 +3549,80 @@ async fn the_jobs_page_waits_for_the_history_to_be_read() {
     assert!(page.body.contains("none placed yet"), "{}", page.body);
 }
 
+/// An operator sets how many jobs the history keeps from the Jobs page, and clears it; a
+/// viewer sees the count and its source, without the form, and cannot post it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_sets_the_job_history_from_the_jobs_page() {
+    let (addr, hub, origin) = start_fleet().await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/jobs", Some(&viewer)).await;
+    assert!(
+        page.body
+            .contains("keeps the newest 10,000 jobs, by default"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("set-history"), "{}", page.body);
+    let form = format!("_csrf={viewer_csrf}&op=set-history&count=5");
+    let refused = post_action(addr, &origin, &viewer, "/jobs", &form, false).await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(hub.db.job_history_set().unwrap(), None);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    for bad in ["0", "1000001", "x", ""] {
+        let form = format!("_csrf={csrf}&op=set-history&count={bad}");
+        let refused = post_action(addr, &origin, &operator, "/jobs", &form, false).await;
+        assert_eq!(refused.status, 400, "{bad}: {}", refused.body);
+    }
+    let form = format!("_csrf={csrf}&op=set-history&count=2500");
+    let set = post_action(addr, &origin, &operator, "/jobs", &form, false).await;
+    assert_eq!(set.status, 303, "{}", set.body);
+    assert_eq!(hub.db.job_history_set().unwrap(), Some(2500));
+    assert_eq!(
+        crate::jobs::history_count(&hub).unwrap(),
+        (2500, crate::jobs::HistorySource::Ui)
+    );
+    let page = get(addr, "/jobs", Some(&operator)).await;
+    assert!(
+        page.body
+            .contains("keeps the newest 2,500 jobs, as set here, over the default of 10,000."),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("value=\"clear-history\""),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains("<button>Use the default of 10,000</button>"),
+        "{}",
+        page.body
+    );
+    let audit = hub.db.audits(None, 10).unwrap();
+    assert!(audit.iter().any(|r| r.event.contains("2500")), "{audit:?}");
+
+    let form = format!("_csrf={csrf}&op=clear-history");
+    let cleared = post_action(addr, &origin, &operator, "/jobs", &form, false).await;
+    assert_eq!(cleared.status, 303, "{}", cleared.body);
+    assert_eq!(hub.db.job_history_set().unwrap(), None);
+    let audit = hub.db.audits(None, 10).unwrap();
+    assert!(
+        (audit.iter()).any(|r| r
+            .event
+            .ends_with("cleared: the default applies, 10000 jobs")),
+        "{audit:?}"
+    );
+    let page = get(addr, "/jobs", Some(&operator)).await;
+    assert!(page.body.contains("by default"), "{}", page.body);
+    assert!(
+        !page.body.contains("value=\"clear-history\""),
+        "{}",
+        page.body
+    );
+}
+
 /// `/jobs` shows a viewer the job history newest first with what each job used, links a job
 /// to GitLab only by a plain web URL and its node to the node's page, filters by node, project
 /// and result, and pages back from the oldest job shown, keeping the filter.
@@ -4752,7 +4826,11 @@ async fn start_fleet_placing(dir: &std::path::Path) -> (SocketAddr, Arc<Hub>) {
     let origin = format!("http://{addr}");
     let hub = Arc::new(
         Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
-            .with_jobs(dir.to_path_buf(), crate::jobs::DEFAULT_LOST_AFTER, 100)
+            .with_jobs(
+                dir.to_path_buf(),
+                crate::jobs::DEFAULT_LOST_AFTER,
+                Some(100),
+            )
             .unwrap(),
     );
     let ui = Arc::new(Ui::new(hub.clone(), &origin));

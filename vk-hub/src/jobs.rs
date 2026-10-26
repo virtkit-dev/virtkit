@@ -187,8 +187,11 @@ pub struct Dispatch {
     output_dir: Option<PathBuf>,
     /// How long a node holding a job may be unreachable before the job is lost.
     pub lost_after: Duration,
-    /// How many jobs' records the history keeps.
-    history: usize,
+    /// How many jobs' records the history keeps as `job_history` sets it; `None` when it does
+    /// not. A count set from the web UI wins ([`history_count`]).
+    history: Option<usize>,
+    /// Wakes [`trim`] early: the history's count was set.
+    trim_now: tokio::sync::Notify,
     /// How many bytes from the end of a failed job's output are kept when it is settled; 0
     /// keeps none.
     pub kept_failure_output: u64,
@@ -336,13 +339,14 @@ const HUB: &str = "hub";
 
 impl Dispatch {
     /// Dispatch keeping output in `output_dir`, or none at all, and the records of the newest
-    /// `history` jobs.
-    pub fn new(output_dir: Option<PathBuf>, lost_after: Duration, history: usize) -> Self {
+    /// `history` jobs, [`DEFAULT_JOB_HISTORY`](crate::store::DEFAULT_JOB_HISTORY) for `None`.
+    pub fn new(output_dir: Option<PathBuf>, lost_after: Duration, history: Option<usize>) -> Self {
         Dispatch {
             changes: watch::Sender::new(0),
             output_dir,
             lost_after,
             history,
+            trim_now: tokio::sync::Notify::new(),
             kept_failure_output: DEFAULT_KEPT_FAILURE_OUTPUT,
             kept_output: DEFAULT_KEPT_OUTPUT,
             kept_output_total: DEFAULT_KEPT_OUTPUT_TOTAL,
@@ -2486,9 +2490,10 @@ pub async fn recover(hub: &Hub) -> Result<()> {
 async fn recall_warm(hub: &Hub) -> Result<()> {
     let now = crate::now_secs();
     let since = now.saturating_sub(MAX_IMAGE_IDLE_SECS);
-    let limit = hub.dispatch.history;
+    let hub_history = hub.dispatch.history;
     // Each spec's key alone is kept, not the spec.
     let jobs = blocking(hub, move |db| {
+        let limit = history_in(db, hub_history)?.0;
         let mut jobs = Vec::new();
         db.recent_job_specs(since, limit, |id, row, spec| {
             // A spec that no longer parses, from another version of the hub, has no key: its
@@ -2637,11 +2642,65 @@ async fn pack_stored(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
-/// Every [`PRUNE_EVERY`], until the process ends: trim the history to its count, one bounded
-/// step after another, and drop outputs past their keep.
+/// Where the history's count comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistorySource {
+    /// [`DEFAULT_JOB_HISTORY`](crate::store::DEFAULT_JOB_HISTORY): neither sets it.
+    Default,
+    /// `job_history` in `hub.toml`.
+    Config,
+    /// The web UI, over `job_history`.
+    Ui,
+}
+
+/// How many jobs' records the history keeps, and where that comes from.
+pub fn history_count(hub: &Hub) -> Result<(usize, HistorySource)> {
+    history_in(&hub.db, hub.dispatch.history)
+}
+
+/// [`history_count`] from `db`, with `job_history` set to `configured`.
+fn history_in(db: &crate::store::Db, configured: Option<usize>) -> Result<(usize, HistorySource)> {
+    Ok(match db.job_history_set()? {
+        Some(n) => (n, HistorySource::Ui),
+        None => history_unset_in(configured),
+    })
+}
+
+/// The history count and its source after clearing the web UI's override.
+pub fn history_unset(hub: &Hub) -> (usize, HistorySource) {
+    history_unset_in(hub.dispatch.history)
+}
+
+/// [`history_unset`], with `job_history` set to `configured`.
+fn history_unset_in(configured: Option<usize>) -> (usize, HistorySource) {
+    match configured {
+        Some(n) => (n, HistorySource::Config),
+        None => (crate::store::DEFAULT_JOB_HISTORY, HistorySource::Default),
+    }
+}
+
+/// Have the history keep `count` jobs' records, or what `job_history` or the default sets
+/// (`None`), as `actor`; a lower count is trimmed to in the background at once.
+pub fn set_history(hub: &Hub, actor: &str, count: Option<usize>) -> Result<()> {
+    let cleared = match history_unset(hub) {
+        (n, HistorySource::Config) => format!("job_history in hub.toml applies, {n} jobs"),
+        (n, _) => format!("the default applies, {n} jobs"),
+    };
+    hub.db
+        .set_job_history(count, &cleared, actor, crate::now_secs())?;
+    hub.dispatch.trim_now.notify_one();
+    Ok(())
+}
+
+/// Every [`PRUNE_EVERY`], and as soon as the history's count is set, until the process ends:
+/// trim the history to its count, one bounded step after another, and drop outputs past
+/// their keep.
 async fn trim(hub: Arc<Hub>) {
     loop {
-        tokio::time::sleep(PRUNE_EVERY).await;
+        tokio::select! {
+            () = tokio::time::sleep(PRUNE_EVERY) => {}
+            () = hub.dispatch.trim_now.notified() => {}
+        }
         while prune(&hub).await {
             tokio::time::sleep(PACK_PAUSE).await;
         }
@@ -2677,8 +2736,12 @@ async fn read_briefs(hub: Arc<Hub>) {
 
 /// Trim the history once and report whether to trim again.
 async fn prune(hub: &Hub) -> bool {
-    let keep = hub.dispatch.history;
-    let pruned = blocking(hub, move |db| db.prune_jobs(crate::now_secs(), keep)).await;
+    let configured = hub.dispatch.history;
+    let pruned = blocking(hub, move |db| {
+        let keep = history_in(db, configured)?.0;
+        db.prune_jobs(crate::now_secs(), keep)
+    })
+    .await;
     let pruned = match pruned {
         Ok(pruned) => pruned,
         Err(e) => {
