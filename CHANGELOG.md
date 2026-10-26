@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-registry` deletes manifests**: `DELETE /v2/<name>/manifests/<tag|digest>`, with write
+  access, removes the tag, or by digest every tag on it and the manifest itself from that
+  repository, answering 202; the gc reclaims the space once nothing else uses it. It used to
+  answer 405.
+
 ### Fixed
 
 - **The guest registry proxy forwards request bodies for every method**. The registry

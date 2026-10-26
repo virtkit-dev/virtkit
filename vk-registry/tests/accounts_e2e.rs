@@ -1518,6 +1518,220 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Manifest `DELETE` requires write access. Digest deletion removes the repository's
+/// tags and membership, including mount markers. Reads then require access to another
+/// repository holding the digest. Layer markers survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_manifest_takes_write_and_drops_its_membership() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("manifest-delete");
+    let state = accounts_state(&dir);
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let key_with = |action: Action| {
+        let scope = Scope {
+            action,
+            repo_pattern: "team-a/*".to_string(),
+        };
+        db.create_api_key(Some(&user.id), "team-a", &[scope], None)
+            .unwrap()
+            .1
+    };
+    let reader = key_with(Action::Read);
+    let writer = key_with(Action::Write);
+
+    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+    let mdigest = store
+        .put_manifest(
+            "team-a/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            manifest,
+        )
+        .unwrap();
+    // the same bytes in a repository the keys cannot read, which must not answer for them
+    store
+        .put_manifest(
+            "team-b/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            manifest,
+        )
+        .unwrap();
+    let layer = store.put_blob(b"team-a's layer").unwrap();
+    store
+        .record_blob("team-a/app", layer.trim_start_matches("sha256:"))
+        .unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+    let delete = async |key: &str, path: String| {
+        client
+            .delete(format!("{url}/v2/{path}"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    let get = async |path: String| {
+        client
+            .get(format!("{url}/v2/{path}"))
+            .bearer_auth(&writer)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    assert_eq!(
+        delete(&reader, format!("team-a/app/manifests/{mdigest}")).await,
+        403
+    );
+    assert_eq!(get(format!("team-a/app/manifests/{mdigest}")).await, 200);
+
+    assert_eq!(
+        delete(&writer, format!("team-a/app/manifests/{mdigest}")).await,
+        202
+    );
+    assert_eq!(get("team-a/app/manifests/v1".to_string()).await, 404);
+    assert_eq!(
+        get(format!("team-a/app/manifests/{mdigest}")).await,
+        404,
+        "the bytes are still in the pool, but no longer this repository's"
+    );
+    assert!(store.get_manifest("team-b/app", "v1").unwrap().is_some());
+
+    // Not a manifest: the layer stays a member, so the images using it stay pullable.
+    assert_eq!(
+        delete(&writer, format!("team-a/app/manifests/{layer}")).await,
+        404
+    );
+    assert_eq!(get(format!("team-a/app/blobs/{layer}")).await, 200);
+
+    // An index pushed to team-a/idx mounts its child from team-a/src, which the writer may
+    // read: the child is a member of team-a/idx through a marker, not a sidecar.
+    let child = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[],"annotations":{"c":"1"}}"#;
+    let cdigest = store
+        .put_manifest(
+            "team-a/src",
+            "c",
+            "application/vnd.oci.image.manifest.v1+json",
+            child,
+        )
+        .unwrap();
+    let index = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{cdigest}","size":{}}}]}}"#,
+        child.len()
+    );
+    let resp = client
+        .put(format!("{url}/v2/team-a/idx/manifests/v1"))
+        .bearer_auth(&writer)
+        .header("Content-Type", "application/vnd.oci.image.index.v1+json")
+        .body(index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let chex = cdigest.trim_start_matches("sha256:");
+    assert!(store.repo_has_blob("team-a/idx", chex));
+
+    assert_eq!(
+        delete(&writer, format!("team-a/idx/manifests/{cdigest}")).await,
+        202
+    );
+    assert!(!store.repo_has_blob("team-a/idx", chex));
+    assert_eq!(
+        delete(&writer, format!("team-a/idx/manifests/{cdigest}")).await,
+        404
+    );
+    assert_eq!(
+        get(format!("team-a/idx/manifests/{cdigest}")).await,
+        200,
+        "still readable through team-a/idx: the writer may read team-a/src, which holds it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without per-repository scopes, deleted digests remain readable until gc removes the
+/// bytes, but their tags are gone. Read-only stores refuse `DELETE` like other writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_manifest_on_an_open_server() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("manifest-delete-open");
+    let store = Arc::new(Store::new(dir.join("store")).unwrap());
+    let mdigest = store
+        .put_manifest(
+            "any/repo",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            br#"{"schemaVersion":2,"layers":[]}"#,
+        )
+        .unwrap();
+    store
+        .put_manifest(
+            "any/repo",
+            "v2",
+            "application/vnd.oci.image.manifest.v1+json",
+            br#"{"schemaVersion":2,"layers":[],"annotations":{"v":"2"}}"#,
+        )
+        .unwrap();
+    let url = spawn(Arc::new(ServerState {
+        store: store.clone(),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+        webdav: true,
+        tokens: Default::default(),
+    }));
+    let client = no_redirect_client();
+    let status = async |method: reqwest::Method, path: String| {
+        client
+            .request(method, format!("{url}/v2/{path}"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    assert_eq!(
+        status(
+            reqwest::Method::DELETE,
+            format!("any/repo/manifests/{mdigest}")
+        )
+        .await,
+        202
+    );
+    assert_eq!(
+        status(reqwest::Method::GET, "any/repo/manifests/v1".to_string()).await,
+        404
+    );
+    assert_eq!(
+        status(
+            reqwest::Method::GET,
+            format!("any/repo/manifests/{mdigest}")
+        )
+        .await,
+        200
+    );
+
+    store.set_read_only(true);
+    assert_eq!(
+        status(reqwest::Method::DELETE, "any/repo/manifests/v2".to_string()).await,
+        503
+    );
+    assert!(store.get_manifest("any/repo", "v2").unwrap().is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The admin socket of a server built by [`accounts_state`], serving the very db that
 /// server holds — the wiring `serve_config` does, done here so the test can also drive the
 /// HTTP surface on an ephemeral port.

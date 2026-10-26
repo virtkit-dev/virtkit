@@ -1349,6 +1349,34 @@ async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `DELETE` is never relayed: a tag this mirror holds no copy of answers 404, though a
+/// `GET` of it relays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_delete_is_never_relayed() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let manifest = br#"{"schemaVersion":2,"layers":[]}"#.to_vec();
+    let up_addr = fixed_upstream("application/vnd.oci.image.manifest.v1+json", manifest);
+    let dir = tmp("relay-delete");
+    let url = spawn(mirror_of(up_addr, &dir));
+    let http = reqwest::Client::new();
+
+    let r = http
+        .delete(format!("{url}/v2/app/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = http
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Like the store, the digest-pinned relay rejects non-object manifests.
 /// It neither caches nor serves them and attributes the error to the upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

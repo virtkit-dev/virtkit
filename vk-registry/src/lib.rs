@@ -171,12 +171,17 @@ pub(crate) const MANIFEST_MEDIA_TYPES: &[&str] = &[
 /// with the `mediaType` in its body, so that would turn a lenient push into an unpullable
 /// image. The return is always one of the four literals, so the stored label is canonical.
 pub(crate) fn manifest_media_type(ctype: &str) -> &'static str {
+    known_manifest_media_type(ctype).unwrap_or(DEFAULT_MANIFEST_TYPE)
+}
+
+/// Which of [`MANIFEST_MEDIA_TYPES`] `ctype` is, matched as [`manifest_media_type`] matches
+/// it, else `None`.
+fn known_manifest_media_type(ctype: &str) -> Option<&'static str> {
     let base = ctype.split(';').next().unwrap_or("").trim();
     MANIFEST_MEDIA_TYPES
         .iter()
         .find(|t| t.eq_ignore_ascii_case(base))
         .copied()
-        .unwrap_or(DEFAULT_MANIFEST_TYPE)
 }
 
 /// Fixed zstd level: identical raw chunks must compress to identical bytes for a
@@ -1201,6 +1206,7 @@ impl Store {
         // otherwise disagree — every reader goes through `get_manifest`, which filters too —
         // but so a caller-supplied string is never what is persisted, and so a future reader
         // that skips the filter still cannot serve one.
+        let _writes = self.flock_at(MANIFEST_WRITES_LOCK, libc::LOCK_EX)?;
         atomic_write(
             &self.manifest_type_path(name, hex),
             manifest_media_type(ctype).as_bytes(),
@@ -1493,6 +1499,56 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e).with_context(|| format!("removing the tag {}", path.display())),
         }
+    }
+
+    /// `DELETE /v2/<name>/manifests/<reference>`: delete a tag as [`Store::delete_tag`]
+    /// does, or a digest's tags and membership in `name`: its sidecar and any mount marker
+    /// for an index child declaring a manifest media type. Other repositories' tags and
+    /// membership are untouched.
+    ///
+    /// Bytes remain for gc, as for a deleted tag. Until then [`readable_through`] serves
+    /// the digest as one `name` never held. Returns `Ok(false)` if nothing was dropped.
+    ///
+    /// [`MANIFEST_WRITES_LOCK`] prevents a concurrent [`Store::put_manifest`] from moving
+    /// a matched tag before unlink or losing its re-pushed membership.
+    pub fn delete_manifest(&self, name: &str, reference: &str) -> Result<bool> {
+        let Some(hex) = reference.strip_prefix("sha256:") else {
+            return self.delete_tag(name, reference);
+        };
+        if !valid_name(name) || !is_blob_hex(hex) {
+            bail!("invalid manifest reference {name}@{reference}");
+        }
+        let _lock = self.lock_shared()?;
+        let _writes = self.flock_at(MANIFEST_WRITES_LOCK, libc::LOCK_EX)?;
+        let mut dropped = false;
+        let mut remove = |path: &Path| match std::fs::remove_file(path) {
+            Ok(()) => {
+                dropped = true;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        };
+        for tag in self.list_tags(name) {
+            let path = self.tag_path(name, &tag);
+            if std::fs::read_to_string(&path).is_ok_and(|d| d.trim() == reference) {
+                remove(&path)?;
+            }
+        }
+        remove(&self.manifest_type_path(name, hex))?;
+        // Markers also record layers and configs pushed here; deleting them as manifests
+        // would break images that use them. Cap the read because the caller chooses the
+        // digest.
+        let marker = self.repo_blob_path(name, hex);
+        if marker.is_file()
+            && self
+                .read_blob_capped(hex, MAX_MANIFEST_BYTES)?
+                .and_then(|data| declared_media_type(&data))
+                .is_some_and(|t| known_manifest_media_type(&t).is_some())
+        {
+            remove(&marker)?;
+        }
+        Ok(dropped)
     }
 
     /// Take the store lock shared — held by every writer/reader across its whole
@@ -3235,6 +3291,10 @@ const TRY_PATIENCE: Duration = Duration::from_millis(50);
 /// Held by the [`Store::gc_with`] pass that runs, so a second one waits or gives up rather than
 /// read the whole store alongside it.
 const GC_LOCK: &str = ".gc.lock";
+/// Serializes [`Store::put_manifest`]'s sidecar/tag writes with
+/// [`Store::delete_manifest`]'s tag reads and unlinks. Index children are mounted before
+/// the push acquires this exclusive lock.
+const MANIFEST_WRITES_LOCK: &str = ".manifest-writes.lock";
 
 /// `report` with its last figures: what the sweep removed, not what the size phase expected
 /// to, and the longest exclusive spell.
@@ -4562,7 +4622,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         };
     }
 
-    // <name>/manifests/<tag|digest> — PUT (store) / GET / HEAD.
+    // <name>/manifests/<tag|digest> — PUT (store) / GET / HEAD / DELETE.
     if let Some(idx) = rest.rfind("/manifests/") {
         let name = &rest[..idx];
         let reference = &rest[idx + "/manifests/".len()..];
@@ -4573,7 +4633,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 reference,
             ));
         }
-        let action = if method == Method::PUT {
+        let action = if matches!(method, Method::PUT | Method::DELETE) {
             accounts::Action::Write
         } else {
             accounts::Action::Read
@@ -4582,6 +4642,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             return Ok(resp);
         }
         return match method {
+            Method::DELETE => delete_manifest(&store, name, reference),
             Method::PUT => {
                 let ctype = req
                     .headers()
@@ -4972,6 +5033,22 @@ fn put_manifest(
         .status(StatusCode::CREATED)
         .header("Location", format!("/v2/{name}/manifests/{digest}"))
         .header("Docker-Content-Digest", &digest)
+        .body(body_of(Bytes::new()))
+        .map_err(Into::into)
+}
+
+/// DELETE /v2/<name>/manifests/<tag|digest>: 202 once dropped, 404 when there was nothing.
+/// Never relayed: an upstream's copy is not this registry's to delete.
+fn delete_manifest(store: &Store, name: &str, reference: &str) -> Result<Response<Body>> {
+    if !store.delete_manifest(name, reference)? {
+        return Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            reference,
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
         .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
@@ -7279,6 +7356,48 @@ mod tests {
             !store.tag_path("img", "v1").exists(),
             "a refused push leaves no tag"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DELETE by tag drops that tag only; by digest, every tag of the repository on it and
+    /// its membership, leaving other repositories' tags on the same bytes alone. Nothing to
+    /// drop is a 404.
+    #[tokio::test]
+    async fn deleting_a_manifest_by_tag_or_digest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-mdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let body = br#"{"a":1}"#;
+        let digest = store
+            .put_manifest("img", "v1", DEFAULT_MANIFEST_TYPE, body)
+            .unwrap();
+        for (repo, tag) in [("img", "v2"), ("img", "keep-other"), ("other", "v1")] {
+            let b: &[u8] = if tag == "keep-other" {
+                br#"{"b":2}"#
+            } else {
+                body
+            };
+            store
+                .put_manifest(repo, tag, DEFAULT_MANIFEST_TYPE, b)
+                .unwrap();
+        }
+
+        let res = delete_manifest(&store, "img", "v1").unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert!(store.get_manifest("img", "v1").unwrap().is_none());
+        assert!(store.get_manifest("img", "v2").unwrap().is_some());
+        let res = delete_manifest(&store, "img", "v1").unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let res = delete_manifest(&store, "img", &digest).unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert!(store.get_manifest("img", "v2").unwrap().is_none());
+        assert!(!store.repo_has_manifest("img", &digest[7..]));
+        assert!(store.get_manifest("img", "keep-other").unwrap().is_some());
+        assert!(store.get_manifest("other", "v1").unwrap().is_some());
+        assert!(store.repo_has_manifest("other", &digest[7..]));
+        let res = delete_manifest(&store, "img", &digest).unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
