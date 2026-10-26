@@ -73,8 +73,14 @@ OCI clients:
 - registry capability probing through `GET /v2/`;
 - blob `GET` and `HEAD`;
 - monolithic and chunked blob uploads;
-- manifest `GET`, `HEAD`, and `PUT`; and
+- manifest `GET`, `HEAD`, `PUT` and `DELETE`; and
 - tag listing.
+
+A manifest `DELETE` takes write access, as a `PUT` does, and answers 202, or 404 when there
+is nothing to drop. By tag it drops that tag; by digest, every tag of the repository on that
+digest and the manifest's membership there, so the digest is no longer readable through it.
+Other repositories keep theirs, and the bytes wait for the gc, as for a tag deleted from
+`/browse`. It is never relayed upstream.
 
 An upload is bound to the repository that opened it. Finishing an upload recomputes the
 digest and rejects a mismatch, so a caller cannot claim content it did not send or finish

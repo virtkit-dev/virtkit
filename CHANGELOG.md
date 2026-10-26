@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-registry` deletes manifests**: `DELETE /v2/<name>/manifests/<tag>` drops the tag, and
+  by digest every tag of the repository on that digest and its membership there, with write
+  access, answering 202. The bytes wait for the gc. It used to answer 405.
+
 ### Fixed
 
 - **The guest registry proxy passes on a request body of any method**, so a `MKCOL` with a
