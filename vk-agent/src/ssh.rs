@@ -972,8 +972,8 @@ async fn pty_bridge(
 }
 
 /// Bridge client input to stdin, stdout to channel data, and stderr to extended data,
-/// then report the exit status. On disconnect, hang up the command's process group
-/// and kill it if it stays.
+/// then report the exit status. On disconnect, close the command's pipes without
+/// signalling its process group.
 ///
 /// Keeping the two output streams apart is what makes the channel a binary-transparent
 /// pipe, which is the whole contract a command without a tty is run under. A client that
@@ -1033,11 +1033,15 @@ async fn exec_bridge(
     });
     let Some(status) = waited.await else {
         // Connection gone: no one to report to, and a pump may sit parked on the window.
+        // Dropping the pumps closes the command's pipes, so it reads EOF and its writes
+        // fail; nothing is signalled, as under sshd without a tty. A process the command
+        // left behind in its group, such as the server VS Code starts from its `ssh -T`
+        // bootstrap, is meant to outlive the connection and be found by the next one.
         stdin_task.abort();
         out_task.abort();
         err_task.abort();
         // The status has no one to go to.
-        let _ = hangup_and_reap(&mut child).await;
+        let _ = child.wait().await;
         return;
     };
     // Let the pumps drain the command's last output, unless the connection goes first.
@@ -1512,6 +1516,54 @@ echo end
         assert_eq!(unsafe { libc::geteuid() }, 0);
         super::kill_group_as(0, pgid(&roots), libc::SIGKILL).unwrap();
         roots.wait().unwrap();
+    }
+
+    /// A command without a tty is not hung up on when its connection goes, as under sshd:
+    /// its pipes close, and what it left running in its group carries on. The command
+    /// starts a job that marks a file once the client is gone, then waits on stdin.
+    #[tokio::test]
+    async fn a_command_without_a_tty_outlives_its_connection() {
+        let mark =
+            std::env::temp_dir().join(format!("vk-agent-ssh-survivor-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let mark_path = mark.display();
+        let test = test_session().await;
+        let mut channel = test.session.channel_open_session().await.unwrap();
+        channel
+            .exec(
+                true,
+                format!(
+                    "exec sh -c '(sleep 0.5; touch {mark_path}) >/dev/null 2>&1 & \
+                     echo ready; exec cat >/dev/null'"
+                ),
+            )
+            .await
+            .unwrap();
+        let ready = async {
+            while let Some(msg) = channel.wait().await {
+                if let russh::ChannelMsg::Data { data } = msg
+                    && data.windows(5).any(|w| w == b"ready")
+                {
+                    return;
+                }
+            }
+            panic!("the channel closed before the command was ready");
+        };
+        tokio::time::timeout(Duration::from_secs(30), ready)
+            .await
+            .expect("the command starts");
+        test.session
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        let survived = async {
+            while !mark.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let survived = tokio::time::timeout(Duration::from_secs(10), survived).await;
+        let _ = std::fs::remove_file(&mark);
+        survived.expect("the job left in the command's group runs on");
     }
 
     #[tokio::test]
