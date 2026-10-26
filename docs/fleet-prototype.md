@@ -1206,9 +1206,10 @@ unsettled job's output do not touch it, and it goes when the history drops the r
 job its producer never settles keeps none: its output goes with those 30 days. Before it is
 settled, a job's page reads its stored output (see [Web UI](#web-ui)). Kept output is stored
 compressed (zstd), so the database holds roughly `job_history` × `kept_failure_output` of it —
-2.4 GiB at the defaults, were every job to fail with output that does not compress; CI logs
-compress about 8 times, to some 300 MiB. It holds more between the hourly trims, or for tails
-kept before `kept_failure_output` was lowered, and its file does not shrink when they go.
+24 GiB at the defaults (100,000 jobs × 256 KiB), were every job to fail with output that does
+not compress; CI logs compress about 8 times, to some 3 GiB. It holds more between the hourly
+trims, or for tails kept before `kept_failure_output` was lowered, and its file does not shrink
+when they go.
 
 **Other jobs' output.** Settling a successful or canceled job retains its output tail the same
 way, but in a cache with a total size limit. Each tail holds up to `kept_output` bytes of
@@ -1232,16 +1233,17 @@ After an upgrade, legacy kept output and specs are compressed in the background:
 megabytes of output or a few hundred specs per write. Output counts at its stored size until
 then. redb reuses freed pages, but the file does not shrink.
 
-**History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1
+**History.** The hub keeps the records of the newest `job_history` jobs (100,000 by default, 1
 to 1,000,000), in submission order. An operator can set that count on the Jobs page, audited; it
 is kept in the database, applies at once and wins over `job_history` until cleared there, when
 `job_history` applies again, or the default if `hub.toml` sets none: the page names which. Once
 an hour, and as soon as the count is set, the oldest finished jobs past that count go if they
 were settled or are past those 30 days, at most 1,000 per write, write after write until the
-history fits; a job not finished, or finished and not yet settled, stays however old. Retrying
-the create of a job gone from the history answers 410 `not_found`. A record says when the job
-was submitted, when a node accepted it and when it ended, how it ended, and what the node
-reported it used (see
+history fits; a job not finished, or finished and not yet settled, stays however old. A hub
+upgraded from a release that kept 10,000 by default, and that sets no `job_history`, keeps ten
+times as many: its database can grow about tenfold. Retrying the create of a job gone from the
+history answers 410 `not_found`. A record says when the job was submitted, when a node accepted
+it and when it ended, how it ended, and what the node reported it used (see
 [Result](gitlab-dispatch.md#hub--node-protocol-version-3)): wall-clock time, CPU time and peak
 memory of its VM, and the guest's vCPUs and memory. Records with no place in the order — from a
 hub before the history, or one run since — join its newest end, by when they were submitted,

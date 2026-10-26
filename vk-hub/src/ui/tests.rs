@@ -3558,7 +3558,7 @@ async fn an_operator_sets_the_job_history_from_the_jobs_page() {
     let page = get(addr, "/jobs", Some(&viewer)).await;
     assert!(
         page.body
-            .contains("keeps the newest 10,000 jobs, by default"),
+            .contains("keeps the newest 100,000 jobs, by default"),
         "{}",
         page.body
     );
@@ -3585,7 +3585,7 @@ async fn an_operator_sets_the_job_history_from_the_jobs_page() {
     let page = get(addr, "/jobs", Some(&operator)).await;
     assert!(
         page.body
-            .contains("keeps the newest 2,500 jobs, as set here, over the default of 10,000."),
+            .contains("keeps the newest 2,500 jobs, as set here, over the default of 100,000."),
         "{}",
         page.body
     );
@@ -3596,7 +3596,7 @@ async fn an_operator_sets_the_job_history_from_the_jobs_page() {
     );
     assert!(
         page.body
-            .contains("<button>Use the default of 10,000</button>"),
+            .contains("<button>Use the default of 100,000</button>"),
         "{}",
         page.body
     );
@@ -3611,7 +3611,7 @@ async fn an_operator_sets_the_job_history_from_the_jobs_page() {
     assert!(
         (audit.iter()).any(|r| r
             .event
-            .ends_with("cleared: the default applies, 10000 jobs")),
+            .ends_with("cleared: the default applies, 100000 jobs")),
         "{audit:?}"
     );
     let page = get(addr, "/jobs", Some(&operator)).await;

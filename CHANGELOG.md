@@ -22,6 +22,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **The job history keeps 100,000 jobs by default**, up from 10,000: the database of an upgraded
+  hub that sets no `job_history` can grow about tenfold.
 - **The Jobs page's summary covers every matching job**, not the newest 10,000. A page of a
   100,000-job history renders in tens of milliseconds; for a few seconds after the hub starts,
   the page says it is still reading the history.

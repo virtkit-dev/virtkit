@@ -78,7 +78,7 @@ const TRIM_SCAN: u64 = 10_000;
 const TRIM_DROP: u64 = 1_000;
 
 /// How many jobs' records the history keeps by default (`job_history` in `hub.toml`).
-pub const DEFAULT_JOB_HISTORY: usize = 10_000;
+pub const DEFAULT_JOB_HISTORY: usize = 100_000;
 
 /// The most jobs' records the history may keep, however its count is set: each is a few
 /// kilobytes in the database.

@@ -16,7 +16,7 @@
 //! job_lost_after_secs = 300
 //! # How many placed jobs' records the job history keeps, newest first, until an operator
 //! # sets it on the web UI's Jobs page.
-//! job_history = 10000
+//! job_history = 100000
 //! # How much of the end of a failed job's output is kept, with its record, once its producer
 //! # settles it; "0" keeps none.
 //! kept_failure_output = "256K"
