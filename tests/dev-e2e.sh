@@ -16,7 +16,8 @@
 #   4. the named endpoint is published on its remembered loopback address and answers.
 #   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots;
 #      bare `ssh`, `scp` and `sftp` reach the VM with only the run's `bin/` put on PATH, and
-#      a killed ssh client takes its remote command, or its hang-up-proof shell, with it;
+#      a killed ssh client leaves its remote command without a tty running, as sshd does,
+#      and takes its hang-up-proof shell on a tty with it;
 #      `code --reset-server` empties the guest's server directory and opens the editor, and
 #      `editor reset` does the same without one.
 #   6. `storage reset` stops the owner and empties the item; the next start recreates it.
@@ -294,19 +295,21 @@ if shimmed sftp -q -b - "$alias" <<<"get /tmp/scp-in.txt $WORK/sftp-out.txt" > "
 else
   bad "bare sftp through the shim did not read the file back"; cat "$WORK/sftp.err"
 fi
-# A client that dies takes what it ran with it: the guest hangs up on the process group, as
-# sshd does, and kills what ignores that — rather than leaving it to run to completion.
+# A client that dies takes what it ran on a tty with it: the guest hangs up on the process
+# group, as sshd does, and kills what ignores that. A command without a tty is left running,
+# as under sshd, so a server a bootstrap started is there for the next connection.
 # `grep -c` exits 1 on a count of zero, which is an answer here, not a failure. A failed
 # exec prints nothing, which no numeric test accepts — so a guest that stops answering after
 # the disconnect cannot pass as "no sleep left".
 remote_sleeps() { vkd exec -- sh -c "ps -o args | grep -c '^sleep $1\$' || true" 2>/dev/null; }
-# Run the ssh client given as the rest of the arguments in the background with `$3` on its
-# stdin, wait for its `sleep $1` to show up in the guest, kill the client, and expect the
-# sleep gone within 20 s (the guest gives a hung-up group 5 s before killing it). The stdin
+# Run the ssh client given as the rest of the arguments in the background with `$4` on its
+# stdin, wait for its `sleep $1` to show up in the guest, and kill the client. With `$2` set
+# to `ends`, expect the sleep gone within 20 s (the guest gives a hung-up group 5 s before
+# killing it); with `stays`, expect it still there after 8 s, then kill it. The stdin
 # redirect has to sit on the command itself: a background command otherwise reads /dev/null.
-client_death_ends() {
-  local mark=$1 what=$2 input=$3 pid
-  shift 3
+client_death() {
+  local mark=$1 expect=$2 what=$3 input=$4 pid
+  shift 4
   "$@" <<< "$input" > /dev/null 2>&1 &
   pid=$!
   for _ in $(seq 1 50); do [ "$(remote_sleeps "$mark")" -gt 0 ] 2>/dev/null && break; sleep 0.2; done
@@ -314,8 +317,14 @@ client_death_ends() {
     # A client that already died is reaped, and kill on it fails: still nothing to end.
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    for _ in $(seq 1 100); do [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && break; sleep 0.2; done
-    [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && ok "killing the ssh client took $what with it" || bad "$what outlived its ssh client"
+    if [ "$expect" = ends ]; then
+      for _ in $(seq 1 100); do [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && break; sleep 0.2; done
+      [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && ok "killing the ssh client took $what with it" || bad "$what outlived its ssh client"
+    else
+      sleep 8
+      [ "$(remote_sleeps "$mark")" -gt 0 ] 2>/dev/null && ok "$what outlived its killed ssh client" || bad "killing the ssh client took $what with it"
+      vkd exec -- pkill -x -f "sleep $mark" > /dev/null 2>&1 || true
+    fi
   else
     bad "$what never started"
     kill "$pid" 2>/dev/null || true
@@ -324,11 +333,11 @@ client_death_ends() {
 }
 # Not via `shimmed`: a backgrounded function is a subshell, and killing that would orphan
 # the client rather than end it. `env` execs `timeout`, which forwards the signal to ssh.
-client_death_ends 271 "its remote command" "" \
+client_death 271 stays "its remote command without a tty" "" \
   env PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh -n "$alias" 'sleep 271'
 # An interactive shell that ignores SIGHUP, running a command that inherits that: only
 # closing its pty and, failing that, killing the group gets rid of it.
-client_death_ends 272 "a shell that ignores the hang-up" 'trap "" HUP; exec sleep 272' \
+client_death 272 ends "a shell that ignores the hang-up" 'trap "" HUP; exec sleep 272' \
   env PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh -tt "$alias"
 
 # `code --reset-server`: the guest's server directory is emptied — not removed, it may be a
