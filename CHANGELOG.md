@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The guest registry proxy passes on a request body of any method**, so a `MKCOL` with a
+  body reaches the registry, which refuses it (415). The proxy used to drop it, and the
+  collection was created as if the request had none.
+
 ## [0.96.0] - 2026-10-25
 
 ### Added

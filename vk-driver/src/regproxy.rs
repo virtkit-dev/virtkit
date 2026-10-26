@@ -317,10 +317,13 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(body)?);
     }
-    // WebDAV's PROPFIND carries a body as the OCI writes do.
-    let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
-        || method.as_str() == "PROPFIND";
+    // WebDAV's PROPFIND carries a body as the OCI writes do. Any other request that came
+    // with one passes it on too, so the registry judges it: dropped, a MKCOL body the
+    // registry refuses (RFC 4918 §9.3) would create the collection instead.
     let (parts, incoming) = req.into_parts();
+    let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
+        || method.as_str() == "PROPFIND"
+        || !hyper::body::Body::is_end_stream(&incoming);
 
     let mut rb = cfg.client.request(method, url);
     for (k, v) in parts.headers.iter() {
@@ -729,8 +732,8 @@ mod tests {
         assert_eq!(seen.lock().unwrap().0, "", "nothing forwarded");
     }
 
-    /// Under /dav/files/ only the verbs the registry serves there pass, and a PROPFIND's body
-    /// reaches the registry.
+    /// Under /dav/files/ only the verbs the registry serves there pass, and a PROPFIND's or a
+    /// MKCOL's body reaches the registry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plain_files_take_the_registrys_verbs_and_their_bodies() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -763,6 +766,17 @@ mod tests {
             .unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(*seen.lock().unwrap(), b"<propfind/>".to_vec());
+        let r = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                format!("http://{proxy}/dav/files/p/x"),
+            )
+            .body("<mkcol/>")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(*seen.lock().unwrap(), b"<mkcol/>".to_vec());
     }
 
     /// An upstream that records the body of the last request it took.
