@@ -469,8 +469,9 @@ fn answered(
     Ok(())
 }
 
-/// The question an action that cannot be taken back asks first, in the flash's place — or,
-/// for a plain form, as a page of its own — with a form that answers it once.
+/// Confirm an irreversible action with a form answered once. In the flash, it posts by
+/// htmx; on a standalone page, it posts as a plain form. That page has no flash, and the
+/// action returns a redirect or a page.
 fn confirm(
     questions: &Questions,
     layout: Layout,
@@ -488,9 +489,13 @@ fn confirm(
     let mut form = Html::new();
     form.raw("<form method=\"post\" action=\"")
         .text(&ask.path)
-        .raw("\" hx-post=\"")
-        .text(&ask.path)
-        .raw("\" hx-swap=\"none\">");
+        .raw("\"");
+    if htmx {
+        form.raw(" hx-post=\"")
+            .text(&ask.path)
+            .raw("\" hx-swap=\"none\"");
+    }
+    form.raw(">");
     csrf_field(&mut form, auth);
     form.raw("<input type=\"hidden\" name=\"op\" value=\"")
         .text(&ask.op)

@@ -1492,6 +1492,14 @@ async fn ask_with(
         "{}",
         reply.body
     );
+    // In the flash the answer posts by htmx.
+    assert!(
+        reply.body.contains(&format!(
+            "action=\"{path}\" hx-post=\"{path}\" hx-swap=\"none\">"
+        )),
+        "{}",
+        reply.body
+    );
     let asked: String = ["pid", "started", "booted", "keep_images"]
         .into_iter()
         .filter(|f| reply.body.contains(&format!("name=\"{f}\"")))
@@ -1587,6 +1595,14 @@ esac"#,
     .await;
     assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
     assert!(reply.body.contains("Stop this VM?"), "{}", reply.body);
+    // On its own page the answer posts as a plain form: no flash there for an htmx answer.
+    assert!(
+        reply
+            .body
+            .contains(&format!("<form method=\"post\" action=\"{path}\">")),
+        "{}",
+        reply.body
+    );
     assert!(
         reply
             .body
