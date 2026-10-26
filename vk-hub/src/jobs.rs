@@ -2560,6 +2560,7 @@ fn sweep_outputs(db: &crate::store::Db, dir: &Path) -> Result<()> {
 /// process ends.
 pub async fn drive(hub: Arc<Hub>) {
     tokio::spawn(write_egress(hub.clone()));
+    tokio::spawn(read_briefs(hub.clone()));
     let mut pruned = Instant::now();
     loop {
         let mut changed = hub.dispatch.subscribe();
@@ -2638,6 +2639,33 @@ async fn pack_stored(hub: &Hub) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// How often the history's briefs are read again once lost to a panic.
+const BRIEFS_EVERY: Duration = Duration::from_secs(10);
+
+/// Read the job history's briefs ([`crate::store::Db::read_job_briefs`]) in the background
+/// at startup, since a long history takes seconds. Retry after panics until the process ends.
+async fn read_briefs(hub: Arc<Hub>) {
+    loop {
+        let start = Instant::now();
+        match blocking(&hub, |db| db.read_job_briefs()).await {
+            // Read: pages served meanwhile said the history was being read. A long read is
+            // worth a line.
+            Ok(true) => {
+                if start.elapsed() >= Duration::from_secs(1) {
+                    eprintln!(
+                        "vk-hub: read the job history in {:.1}s",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                hub.jobs_changed();
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("vk-hub: {e:#}"),
+        }
+        tokio::time::sleep(BRIEFS_EVERY).await;
+    }
 }
 
 async fn prune(hub: &Hub) {
@@ -2973,7 +3001,7 @@ pub fn history(
     before: Option<u64>,
     limit: usize,
 ) -> Result<JobPage> {
-    let mut page = hub.db.job_page(filter, before, limit, crate::now_secs())?;
+    let mut page = hub.db.job_page(filter, before, limit)?;
     let state = hub.dispatch.lock();
     page.rows.retain_mut(|(_, id, row)| {
         if let Some(live) = live_row(&state, id) {

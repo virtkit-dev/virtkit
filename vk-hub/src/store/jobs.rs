@@ -7,8 +7,9 @@
 //! in submission order ([`JOB_ORDER`]), so the oldest go first and a page of history is a
 //! range read from the newest end.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -72,9 +73,6 @@ const TRIM_SCAN: u64 = 10_000;
 
 /// How many jobs' records the history keeps by default (`job_history` in `hub.toml`).
 pub const DEFAULT_JOB_HISTORY: usize = 10_000;
-
-/// Maximum number of matching jobs in a history summary, counted newest first.
-pub const SUMMARY_JOBS: usize = 10_000;
 
 /// How often, at most, requests past [`REQUEST_KEEP`] are swept.
 const REQUEST_SWEEP_SECS: u64 = 600;
@@ -426,18 +424,210 @@ pub struct JobFilter {
 
 impl JobFilter {
     pub fn matches(&self, row: &JobRow) -> bool {
-        let holds = |want: &Option<String>, have: &Option<String>| {
+        self.matches_facets(&row.facets())
+    }
+
+    fn matches_facets(&self, job: &Facets<'_>) -> bool {
+        let holds = |want: &Option<String>, have: Option<&str>| {
             want.as_deref()
-                .is_none_or(|w| have.as_deref().is_some_and(|h| contains_folded(h, w)))
+                .is_none_or(|w| have.is_some_and(|h| contains_folded(h, w)))
         };
-        self.key.as_ref().is_none_or(|k| row.key == *k)
-            && (self.node.as_ref()).is_none_or(|n| row.node.as_ref() == Some(n))
-            && (self.project.as_ref()).is_none_or(|p| row.project.as_ref() == Some(p))
-            && self.outcome.is_none_or(|o| row.outcome() == o)
-            && holds(&self.name, &row.name)
-            && holds(&self.git_ref, &row.git_ref)
-            && self.pipeline.is_none_or(|p| row.pipeline == Some(p))
-            && (!self.events || row.result.as_ref().is_some_and(|r| !r.events.is_empty()))
+        self.key.as_ref().is_none_or(|k| job.key == k)
+            && (self.node.as_deref()).is_none_or(|n| job.node == Some(n))
+            && (self.project.as_deref()).is_none_or(|p| job.project == Some(p))
+            && self.outcome.is_none_or(|o| job.outcome == o)
+            && holds(&self.name, job.name)
+            && holds(&self.git_ref, job.git_ref)
+            && self.pipeline.is_none_or(|p| job.pipeline == Some(p))
+            && (!self.events || job.events)
+    }
+}
+
+/// What a [`JobFilter`] matches a job on.
+struct Facets<'a> {
+    key: &'a str,
+    node: Option<&'a str>,
+    project: Option<&'a str>,
+    name: Option<&'a str>,
+    git_ref: Option<&'a str>,
+    pipeline: Option<u64>,
+    outcome: JobOutcome,
+    /// It reported events.
+    events: bool,
+}
+
+impl JobRow {
+    fn facets(&self) -> Facets<'_> {
+        Facets {
+            key: &self.key,
+            node: self.node.as_deref(),
+            project: self.project.as_deref(),
+            name: self.name.as_deref(),
+            git_ref: self.git_ref.as_deref(),
+            pipeline: self.pipeline,
+            outcome: self.outcome(),
+            events: self.result.as_ref().is_some_and(|r| !r.events.is_empty()),
+        }
+    }
+}
+
+/// What a page of the history reads of a job that it does not show: its [`Facets`], and what
+/// the summary counts.
+#[derive(Debug, PartialEq, Eq)]
+struct Brief {
+    id: Arc<str>,
+    revision: u64,
+    key: Arc<str>,
+    node: Option<Arc<str>>,
+    project: Option<Arc<str>>,
+    name: Option<Arc<str>>,
+    git_ref: Option<Arc<str>>,
+    pipeline: Option<u64>,
+    outcome: JobOutcome,
+    events: bool,
+    /// How long it ran, once finished.
+    ran_ms: Option<u64>,
+}
+
+impl Brief {
+    fn facets(&self) -> Facets<'_> {
+        Facets {
+            key: &self.key,
+            node: self.node.as_deref(),
+            project: self.project.as_deref(),
+            name: self.name.as_deref(),
+            git_ref: self.git_ref.as_deref(),
+            pipeline: self.pipeline,
+            outcome: self.outcome,
+            events: self.events,
+        }
+    }
+}
+
+/// Each job's [`Brief`], in history order, held in memory so pages decode only displayed
+/// records. Loaded by [`Db::read_job_briefs`], then updated on additions, changes and
+/// deletions by [`Db::commit_briefed`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Briefs {
+    by_seq: BTreeMap<u64, Brief>,
+    /// Each job's place in [`Briefs::by_seq`].
+    seq_of: HashMap<Arc<str>, u64>,
+    /// The strings the briefs share: keys, nodes, projects, names and branches repeat.
+    strings: HashSet<Arc<str>>,
+}
+
+/// How far the history's [`Briefs`] are read.
+#[derive(Debug, Default)]
+pub(super) enum BriefState {
+    /// Not yet, or lost to a panic that held them: [`Db::read_job_briefs`] reads them.
+    #[default]
+    Unread,
+    /// Being read from a snapshot: the changes committed since, applied once it is read.
+    Reading(Vec<BriefChange>),
+    Read(Briefs),
+}
+
+/// A committed write's change to the history, as [`Briefs`] take it.
+#[derive(Debug)]
+pub(super) enum BriefChange {
+    /// A job submitted, at its place in the history.
+    Place(u64, String, JobRow),
+    /// A job's record written.
+    Update(String, JobRow),
+    /// The jobs at these places dropped.
+    Drop(Vec<u64>),
+}
+
+impl Briefs {
+    fn intern(&mut self, s: &str) -> Arc<str> {
+        if let Some(s) = self.strings.get(s) {
+            return s.clone();
+        }
+        let s: Arc<str> = Arc::from(s);
+        self.strings.insert(s.clone());
+        s
+    }
+
+    fn brief(&mut self, id: Arc<str>, row: &JobRow) -> Brief {
+        let mut intern = |s: &Option<String>| s.as_deref().map(|s| self.intern(s));
+        let (node, project, name, git_ref) = (
+            intern(&row.node),
+            intern(&row.project),
+            intern(&row.name),
+            intern(&row.git_ref),
+        );
+        Brief {
+            id,
+            revision: row.revision,
+            key: self.intern(&row.key),
+            node,
+            project,
+            name,
+            git_ref,
+            pipeline: row.pipeline,
+            outcome: row.outcome(),
+            events: row.facets().events,
+            // A finished job's run does not depend on the clock.
+            ran_ms: (row.state == JobState::Finished)
+                .then(|| row.ran_ms(0))
+                .flatten(),
+        }
+    }
+
+    /// Job `id`, placed at `seq` in the history.
+    fn place(&mut self, seq: u64, id: &str, row: &JobRow) {
+        let id: Arc<str> = Arc::from(id);
+        let brief = self.brief(id.clone(), row);
+        self.by_seq.insert(seq, brief);
+        self.seq_of.insert(id, seq);
+    }
+
+    fn apply(&mut self, change: BriefChange) {
+        match change {
+            BriefChange::Place(seq, id, row) => self.place(seq, &id, &row),
+            BriefChange::Update(id, row) => {
+                // [`Db::put_job`] writes only a job in the history, at a revision not older.
+                let Some(&seq) = self.seq_of.get(id.as_str()) else {
+                    return;
+                };
+                let Some(kept) = self.by_seq.get(&seq) else {
+                    return;
+                };
+                let brief = self.brief(kept.id.clone(), &row);
+                self.by_seq.insert(seq, brief);
+            }
+            BriefChange::Drop(seqs) => {
+                for seq in &seqs {
+                    if let Some(b) = self.by_seq.remove(seq)
+                        && self.seq_of.get(&b.id) == Some(seq)
+                    {
+                        self.seq_of.remove(&b.id);
+                    }
+                }
+                // Past a drop, the strings no brief holds number at most the jobs kept.
+                if !seqs.is_empty() && self.strings.len() > self.by_seq.len() {
+                    self.strings.retain(|s| Arc::strong_count(s) > 1);
+                }
+            }
+        }
+    }
+
+    /// Every job in the history at `txn`.
+    fn read(txn: &redb::ReadTransaction) -> Result<Self> {
+        let table = txn.open_table(JOBS)?;
+        let order = txn.open_table(JOB_ORDER)?;
+        let mut briefs = Briefs::default();
+        for entry in order.iter()? {
+            let (seq, id) = entry?;
+            let Some(row) = table.get(id.value())? else {
+                continue;
+            };
+            // One that does not decode is left out rather than failing every page.
+            if let Ok(row) = decode::<JobRow>(row.value()) {
+                briefs.place(seq.value(), id.value(), &row);
+            }
+        }
+        Ok(briefs)
     }
 }
 
@@ -448,12 +638,10 @@ pub(super) fn contains_folded(haystack: &str, needle: &str) -> bool {
     n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Summary of the newest [`SUMMARY_JOBS`] matching jobs.
+/// Summary of every job a filter matches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JobSummary {
     pub matched: usize,
-    /// More jobs match than were summed up.
-    pub capped: bool,
     /// Those that ended, whichever way.
     pub finished: usize,
     pub succeeded: usize,
@@ -482,6 +670,8 @@ pub struct JobPage {
     pub summary: JobSummary,
     /// Every project in the history, sorted, for the filter's choices.
     pub projects: Vec<String>,
+    /// The history is still being read since the hub started: the page is empty meanwhile.
+    pub reading: bool,
 }
 
 /// A client request that created something, and what it was answered.
@@ -535,6 +725,7 @@ impl Db {
         let spec = self.pack_spec(redacted_spec)?;
         let txn = self.db.begin_write().context("starting a write")?;
         let spec = spec_to_store(&txn, redacted_spec, spec)?;
+        let seq;
         {
             let mut requests = txn.open_table(REQUESTS)?;
             if let Some(previous) = requests
@@ -574,12 +765,13 @@ impl Db {
             }
             txn.open_table(JOB_SPECS)?.insert(id, spec.as_slice())?;
             let mut order = txn.open_table(JOB_ORDER)?;
-            let seq = next_seq(&order, &txn.open_table(JOB_META)?)?;
+            seq = next_seq(&order, &txn.open_table(JOB_META)?)?;
             order.insert(seq, id)?;
         }
         let event = format!("{actor} submitted job {id}: {}", row.title);
         append_audit(&txn, None, actor, &event, now)?;
-        txn.commit().context("recording a job")?;
+        self.commit_briefed(txn, BriefChange::Place(seq, id.to_string(), row.clone()))
+            .context("recording a job")?;
         Ok(Submitted::New)
     }
 
@@ -659,7 +851,12 @@ impl Db {
         for (node, actor, event) in events {
             append_audit(&txn, node.as_deref(), actor, event, now)?;
         }
-        txn.commit().context("updating a job")?;
+        if written {
+            self.commit_briefed(txn, BriefChange::Update(id.to_string(), row.clone()))
+        } else {
+            txn.commit().map_err(Into::into)
+        }
+        .context("updating a job")?;
         Ok(written)
     }
 
@@ -858,77 +1055,187 @@ impl Db {
         Ok(())
     }
 
-    /// Up to `limit` matching jobs, newest first, submitted before the job at `before`.
-    /// Includes a summary of the newest [`SUMMARY_JOBS`] jobs matching `filter`.
+    /// Up to `limit` matching jobs, newest first, submitted before the job at `before`, with
+    /// a summary of every job `filter` matches and the projects of the whole history: the
+    /// history is read whole.
     pub fn job_page(
         &self,
         filter: &JobFilter,
         before: Option<u64>,
         limit: usize,
-        now: u64,
     ) -> Result<JobPage> {
-        self.job_page_summing(filter, before, limit, now, SUMMARY_JOBS)
-    }
-
-    /// [`Db::job_page`], summing up at most the newest `summed` jobs `filter` matches. The
-    /// scan stops once the page is full, its next job found, and `summed` jobs counted, so
-    /// the filter's projects are those of the jobs read.
-    fn job_page_summing(
-        &self,
-        filter: &JobFilter,
-        before: Option<u64>,
-        limit: usize,
-        now: u64,
-        summed: usize,
-    ) -> Result<JobPage> {
+        let mut page = JobPage::default();
+        let mut shown = Vec::new();
+        {
+            let held = self.read_briefs();
+            let BriefState::Read(briefs) = &*held else {
+                page.reading = true;
+                return Ok(page);
+            };
+            #[cfg(test)]
+            self.assert_briefs(briefs);
+            let mut projects = std::collections::BTreeSet::new();
+            let mut ran = Vec::new();
+            for (&seq, job) in briefs.by_seq.iter().rev() {
+                if let Some(p) = &job.project {
+                    projects.insert(p.clone());
+                }
+                if !filter.matches_facets(&job.facets()) {
+                    continue;
+                }
+                let summary = &mut page.summary;
+                summary.matched += 1;
+                if job.outcome != JobOutcome::Running {
+                    summary.finished += 1;
+                    summary.succeeded += usize::from(job.outcome == JobOutcome::Success);
+                    ran.extend(job.ran_ms);
+                }
+                if before.is_some_and(|b| seq >= b) {
+                    continue;
+                }
+                if shown.len() < limit {
+                    shown.push((seq, job.id.clone()));
+                } else if page.older.is_none() {
+                    page.older = shown.last().map(|r| r.0);
+                }
+            }
+            page.summary.median_ms = median(&mut ran);
+            page.projects = projects.iter().map(|p| p.to_string()).collect();
+        }
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(JOBS)?;
-        let order = txn.open_table(JOB_ORDER)?;
-        let mut page = JobPage::default();
-        let mut projects = std::collections::BTreeSet::new();
-        let mut ran = Vec::new();
-        for entry in order.iter()?.rev() {
-            let (seq, id) = entry?;
-            let Some(row) = table.get(id.value())? else {
+        for (seq, id) in shown {
+            // Dropped since, or one that does not decode: left out.
+            let Some(row) = table.get(&*id)? else {
                 continue;
             };
-            // One that does not decode is left out rather than failing every page.
-            let Ok(row) = decode::<JobRow>(row.value()) else {
-                continue;
-            };
-            if let Some(p) = &row.project {
-                projects.insert(p.clone());
-            }
-            if !filter.matches(&row) {
-                continue;
-            }
-            let summary = &mut page.summary;
-            if summary.matched < summed {
-                summary.matched += 1;
-                if row.state == JobState::Finished {
-                    summary.finished += 1;
-                    summary.succeeded += usize::from(row.outcome() == JobOutcome::Success);
-                    ran.extend(row.ran_ms(now));
-                }
-            } else {
-                summary.capped = true;
-            }
-            let seq = seq.value();
-            if before.is_some_and(|b| seq >= b) {
-                continue;
-            }
-            if page.rows.len() < limit {
-                page.rows.push((seq, id.value().to_string(), row));
-            } else {
-                page.older = page.rows.last().map(|r| r.0);
-                if page.summary.capped {
-                    break;
-                }
+            if let Ok(row) = decode::<JobRow>(row.value()) {
+                page.rows.push((seq, id.to_string(), row));
             }
         }
-        page.summary.median_ms = median(&mut ran);
-        page.projects = projects.into_iter().collect();
         Ok(page)
+    }
+
+    /// Read the history's [`Briefs`] from a snapshot unless already read or being read.
+    /// Release their lock during the read and apply changes committed meanwhile afterward.
+    /// Return whether they were read.
+    pub fn read_job_briefs(&self) -> Result<bool> {
+        // Checked under the read lock first: once read, a call does not hold up commits.
+        if !matches!(*self.read_briefs(), BriefState::Unread) {
+            return Ok(false);
+        }
+        let Some(txn) = self.start_reading_briefs()? else {
+            return Ok(false);
+        };
+        let _unwound = ReadingBriefs(self);
+        self.finish_reading_briefs(&txn)?;
+        Ok(true)
+    }
+
+    /// The snapshot to read the history's briefs from, now marked as being read; `None` when
+    /// they are read or being read.
+    fn start_reading_briefs(&self) -> Result<Option<redb::ReadTransaction>> {
+        let mut held = self.write_briefs();
+        if !matches!(*held, BriefState::Unread) {
+            return Ok(None);
+        }
+        // No write commits while they are held, so the snapshot misses none that is not kept.
+        let txn = self.db.begin_read().context("starting a read")?;
+        *held = BriefState::Reading(Vec::new());
+        Ok(Some(txn))
+    }
+
+    /// Read the history's briefs from `txn`, then apply the changes committed since.
+    fn finish_reading_briefs(&self, txn: &redb::ReadTransaction) -> Result<()> {
+        let read = Briefs::read(txn);
+        let mut held = self.write_briefs();
+        match (read, std::mem::take(&mut *held)) {
+            (Ok(mut briefs), BriefState::Reading(changes)) => {
+                for change in changes {
+                    briefs.apply(change);
+                }
+                *held = BriefState::Read(briefs);
+                Ok(())
+            }
+            // Lost to a panic meanwhile: the next call reads them again.
+            (Ok(_), _) => Ok(()),
+            (Err(e), _) => Err(e.context("reading the job history")),
+        }
+    }
+
+    /// Whether the history's briefs are read, and its pages served.
+    pub fn job_briefs_read(&self) -> bool {
+        matches!(*self.read_briefs(), BriefState::Read(_))
+    }
+
+    /// Forget the history's briefs, as a hub starting has none yet.
+    #[cfg(test)]
+    pub(crate) fn forget_job_briefs(&self) {
+        *self.write_briefs() = BriefState::Unread;
+    }
+
+    /// The history's [`BriefState`] to read: briefly, as a write's commit waits.
+    fn read_briefs(&self) -> RwLockReadGuard<'_, BriefState> {
+        if let Ok(held) = self.job_briefs.read() {
+            return held;
+        }
+        drop(self.write_briefs());
+        self.job_briefs
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The history's [`BriefState`] to change. A panic that held it may have left the
+    /// briefs half-changed: they are dropped, for [`Db::read_job_briefs`] to read again.
+    fn write_briefs(&self) -> RwLockWriteGuard<'_, BriefState> {
+        self.job_briefs.write().unwrap_or_else(|poisoned| {
+            let mut held = poisoned.into_inner();
+            *held = BriefState::Unread;
+            self.job_briefs.clear_poison();
+            held
+        })
+    }
+
+    /// Commit the history write `txn`, then apply its `change` to [`Briefs`] or queue it
+    /// while they are being read. Hold their lock across the commit and change to preserve
+    /// commit order and prevent pages from reading between them.
+    fn commit_briefed(&self, txn: redb::WriteTransaction, change: BriefChange) -> Result<()> {
+        let mut held = self.write_briefs();
+        txn.commit()?;
+        match &mut *held {
+            BriefState::Unread => {}
+            BriefState::Reading(changes) => changes.push(change),
+            BriefState::Read(briefs) => {
+                briefs.apply(change);
+                #[cfg(test)]
+                self.assert_briefs(briefs);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the history's briefs again, as a hub does at start: after a test wrote the
+    /// database as an older hub would have.
+    #[cfg(test)]
+    pub(super) fn reread_job_briefs(&self) {
+        *self.write_briefs() = BriefState::Unread;
+        self.read_job_briefs().unwrap();
+    }
+
+    /// The briefs kept are those the database holds now: checked on a test's history, not on
+    /// a benchmark's, too long to read again at every page.
+    #[cfg(test)]
+    fn assert_briefs(&self, briefs: &Briefs) {
+        if briefs.by_seq.len() > 10_000 {
+            return;
+        }
+        let txn = self.db.begin_read().unwrap();
+        let read = Briefs::read(&txn).unwrap();
+        assert_eq!(
+            read.by_seq, briefs.by_seq,
+            "briefs out of step with the history"
+        );
+        assert_eq!(read.seq_of, briefs.seq_of);
     }
 
     /// Job `id`'s spec as submitted, redacted, unpacked; `None` once it has expired.
@@ -966,6 +1273,7 @@ impl Db {
         };
         let holds_output = |row: &JobRow| row.settled_at.is_none() && row.expired_at.is_none();
         let txn = self.db.begin_write().context("starting a write")?;
+        let mut unplaced = Vec::new();
         let outputs = {
             let mut table = txn.open_table(JOBS)?;
             let mut specs = txn.open_table(JOB_SPECS)?;
@@ -976,7 +1284,7 @@ impl Db {
             let mut excess = order
                 .len()?
                 .saturating_sub(u64::try_from(keep).unwrap_or(u64::MAX));
-            let (mut unplaced, mut dropped) = (Vec::new(), Vec::new());
+            let mut dropped = Vec::new();
             let mut budget = excess.saturating_add(scan);
             for entry in order.iter()? {
                 if excess == 0 || budget == 0 {
@@ -1000,8 +1308,8 @@ impl Db {
                     dropped.push((id, row));
                 }
             }
-            for seq in unplaced {
-                order.remove(seq)?;
+            for seq in &unplaced {
+                order.remove(*seq)?;
             }
             let mut tails = txn.open_table(JOB_TAILS)?;
             let mut legacy = txn.open_table(LEGACY_TAILS)?;
@@ -1092,8 +1400,48 @@ impl Db {
             }
             outputs
         };
-        txn.commit().context("pruning jobs")?;
+        self.commit_briefed(txn, BriefChange::Drop(unplaced))
+            .context("pruning jobs")?;
         Ok(outputs)
+    }
+}
+
+#[cfg(test)]
+impl Db {
+    /// Write `rows` straight into the history, in order, each with its ID: a benchmark's
+    /// fill, with no request, spec or count. The history's briefs are to read again.
+    pub(crate) fn fill_history(
+        &self,
+        rows: impl IntoIterator<Item = (String, JobRow)>,
+    ) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(JOBS)?;
+            let mut order = txn.open_table(JOB_ORDER)?;
+            let first = order.last()?.map_or(0, |(k, _)| k.value() + 1);
+            for (seq, (id, row)) in (first..).zip(rows) {
+                table.insert(id.as_str(), encode(&row)?.as_slice())?;
+                order.insert(seq, id.as_str())?;
+            }
+        }
+        txn.commit()?;
+        *self.write_briefs() = BriefState::Unread;
+        Ok(())
+    }
+}
+
+/// The history's briefs being read ([`Db::read_job_briefs`]): a panic meanwhile would leave
+/// them [`BriefState::Reading`] for good, so its unwinding marks them unread, to read again.
+struct ReadingBriefs<'a>(&'a Db);
+
+impl Drop for ReadingBriefs<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut held = self.0.write_briefs();
+            if matches!(*held, BriefState::Reading(_)) {
+                *held = BriefState::Unread;
+            }
+        }
     }
 }
 
@@ -1674,6 +2022,7 @@ mod tests {
         order_jobs(&txn).unwrap();
         index_job_cache(&txn).unwrap();
         txn.commit().unwrap();
+        db.reread_job_briefs();
         assert_eq!(cache(&db), (vec![id(2), id(3)], 12));
         assert_eq!(db.job_tail(&id(1)).unwrap(), None);
         assert_eq!(
@@ -1848,7 +2197,7 @@ mod tests {
         }
         submit(&db, 12, &job(12, JobState::Running, None));
         let all = JobFilter::default();
-        let page = db.job_page(&all, None, 5, 100).unwrap();
+        let page = db.job_page(&all, None, 5).unwrap();
         let ids = |page: &JobPage| page.rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&page), [12, 11, 10, 9, 8].map(id));
         assert_eq!(page.older, Some(page.rows[4].0));
@@ -1857,16 +2206,15 @@ mod tests {
             page.summary,
             JobSummary {
                 matched: 12,
-                capped: false,
                 finished: 11,
                 succeeded: 3,
                 // n seconds each, 1 to 11.
                 median_ms: Some(6000),
             }
         );
-        let next = db.job_page(&all, Some(page.rows[4].0), 5, 100).unwrap();
+        let next = db.job_page(&all, Some(page.rows[4].0), 5).unwrap();
         assert_eq!(ids(&next), [7, 6, 5, 4, 3].map(id));
-        let last = db.job_page(&all, Some(next.rows[4].0), 5, 100).unwrap();
+        let last = db.job_page(&all, Some(next.rows[4].0), 5).unwrap();
         assert_eq!(ids(&last), [2, 1].map(id));
         assert_eq!(last.older, None);
 
@@ -1877,29 +2225,29 @@ mod tests {
             ..JobFilter::default()
         };
         assert_eq!(
-            ids(&db.job_page(&filter, None, 5, 100).unwrap()),
+            ids(&db.job_page(&filter, None, 5).unwrap()),
             [12, 6].map(id)
         );
         let failed = JobFilter {
             outcome: Some(JobOutcome::Failed),
             ..JobFilter::default()
         };
-        let page = db.job_page(&failed, None, 5, 100).unwrap();
+        let page = db.job_page(&failed, None, 5).unwrap();
         assert_eq!(ids(&page), [10, 7, 4, 1].map(id));
         assert_eq!((page.summary.matched, page.summary.succeeded), (4, 0));
-        let page = db.job_page(&failed, None, 2, 100).unwrap();
+        let page = db.job_page(&failed, None, 2).unwrap();
         assert_eq!(ids(&page), [10, 7].map(id));
-        let next = db.job_page(&failed, page.older, 2, 100).unwrap();
+        let next = db.job_page(&failed, page.older, 2).unwrap();
         assert_eq!(ids(&next), [4, 1].map(id));
         assert_eq!((next.older, next.summary.matched), (None, 4));
-        let past = db.job_page(&failed, Some(next.rows[1].0), 2, 100).unwrap();
+        let past = db.job_page(&failed, Some(next.rows[1].0), 2).unwrap();
         assert!(past.rows.is_empty());
         assert_eq!((past.older, past.summary.matched), (None, 4));
         let running = JobFilter {
             outcome: Some(JobOutcome::Running),
             ..JobFilter::default()
         };
-        let page = db.job_page(&running, None, 5, 100).unwrap();
+        let page = db.job_page(&running, None, 5).unwrap();
         assert_eq!(ids(&page), [id(12)]);
         assert_eq!(page.summary.median_ms, None);
         // Running for 88 seconds of the hub's clock.
@@ -1988,7 +2336,8 @@ mod tests {
             .insert(id(5).as_str(), b"not json".as_slice())
             .unwrap();
         txn.commit().unwrap();
-        let page = db.job_page(&all, None, 20, 100).unwrap();
+        db.reread_job_briefs();
+        let page = db.job_page(&all, None, 20).unwrap();
         assert_eq!(page.rows.len(), 11);
         assert!(!ids(&page).contains(&id(5)));
     }
@@ -2013,7 +2362,7 @@ mod tests {
             submit(&db, n, &row);
         }
         let ids = |filter: &JobFilter| {
-            let page = db.job_page(filter, None, 10, 100).unwrap();
+            let page = db.job_page(filter, None, 10).unwrap();
             assert_eq!(page.summary.matched, page.rows.len());
             page.rows.into_iter().map(|r| r.1).collect::<Vec<_>>()
         };
@@ -2050,7 +2399,7 @@ mod tests {
                 key: Some(key.into()),
                 ..JobFilter::default()
             };
-            let page = db.job_page(&filter, None, 10, 100).unwrap();
+            let page = db.job_page(&filter, None, 10).unwrap();
             page.rows.into_iter().map(|r| r.1).collect::<Vec<_>>()
         };
         assert_eq!(by(&"a".repeat(64)), [4, 2].map(id));
@@ -2120,10 +2469,9 @@ mod tests {
         );
     }
 
-    /// The summary is of the newest jobs the filter matches, up to its bound, and says when
-    /// more match; the page past them is still served.
+    /// A page deep in the history sums up every job the filter matches, as the newest does.
     #[test]
-    fn a_history_page_sums_up_a_bounded_number_of_jobs() {
+    fn a_history_page_sums_up_every_matching_job() {
         let db = Db::open_memory().unwrap();
         for n in 1..=11 {
             let failure = (n % 3 != 0).then_some(FailureClass::Script);
@@ -2132,27 +2480,56 @@ mod tests {
         submit(&db, 12, &job(12, JobState::Running, None));
         let all = JobFilter::default();
         let ids = |page: &JobPage| page.rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
-        let page = db.job_page_summing(&all, None, 2, 100, 5).unwrap();
+        let page = db.job_page(&all, None, 2).unwrap();
         assert_eq!(ids(&page), [12, 11].map(id));
         assert_eq!(page.older, Some(page.rows[1].0));
         assert_eq!(
             page.summary,
             JobSummary {
-                matched: 5,
-                capped: true,
-                finished: 4,
-                succeeded: 1,
-                // Jobs 8 to 11 ran 8 to 11 seconds: the mean of the middle two.
-                median_ms: Some(9500),
+                matched: 12,
+                finished: 11,
+                succeeded: 3,
+                // 1 to 11 seconds.
+                median_ms: Some(6000),
             }
         );
-        let deep = db
-            .job_page_summing(&all, Some(page.rows[1].0 - 4), 2, 100, 5)
-            .unwrap();
+        let deep = db.job_page(&all, Some(page.rows[1].0 - 4), 2).unwrap();
         assert_eq!(ids(&deep), [6, 5].map(id));
+        assert_eq!(deep.older, Some(deep.rows[1].0));
         assert_eq!(deep.summary, page.summary);
-        let whole = db.job_page_summing(&all, None, 2, 100, 12).unwrap();
-        assert_eq!((whole.summary.matched, whole.summary.capped), (12, false));
+    }
+
+    /// While the briefs are read, a page says so, and a job submitted or changed meanwhile is
+    /// in them once they are read.
+    #[test]
+    fn writes_made_while_the_briefs_are_read_are_kept() {
+        let db = Db::open_memory().unwrap();
+        submit(&db, 1, &job(1, JobState::Running, None));
+        submit(&db, 2, &job(2, JobState::Running, None));
+        *db.write_briefs() = BriefState::Unread;
+        let all = JobFilter::default();
+        assert!(db.job_page(&all, None, 10).unwrap().reading);
+        let txn = db.start_reading_briefs().unwrap().unwrap();
+        assert!(db.start_reading_briefs().unwrap().is_none());
+        submit(&db, 3, &job(3, JobState::Running, None));
+        let mut done = job(2, JobState::Finished, None);
+        done.revision = 2;
+        assert!(db.put_job(&id(2), &done, &[], 5).unwrap());
+        let mut settled = settled(1);
+        settled.revision = 2;
+        assert!(db.put_job(&id(1), &settled, &[], 5).unwrap());
+        // Job 1 goes, settled; jobs 2 and 3 stay, not settled or not finished.
+        db.prune_jobs(5, 0).unwrap();
+        assert!(db.job_page(&all, None, 10).unwrap().reading);
+        db.finish_reading_briefs(&txn).unwrap();
+        // Read, it is checked against the database.
+        let page = db.job_page(&all, None, 10).unwrap();
+        assert!(!page.reading);
+        assert_eq!(
+            page.rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            [3, 2].map(id)
+        );
+        assert_eq!((page.summary.matched, page.summary.finished), (2, 1));
     }
 
     /// The node's own measure of a job's run wins over the hub's timestamps.

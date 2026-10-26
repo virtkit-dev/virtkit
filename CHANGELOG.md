@@ -19,6 +19,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **The Jobs page's summary covers every matching job**, not the newest 10,000. A page of a
+  100,000-job history renders in tens of milliseconds; for a few seconds after the hub starts,
+  the page says it is still reading the history.
 - **Restricted egress answers reverse lookups of the addresses an allowed name resolved to.**
   A job allowed `corp.example.com` that resolves `git.corp.example.com` can look up its
   address while it stays pinned for the VM under a name every layer allows, without

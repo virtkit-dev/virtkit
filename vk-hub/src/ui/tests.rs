@@ -3519,6 +3519,36 @@ async fn placed_jobs_are_a_tab_of_their_own() {
     }
 }
 
+/// A Jobs page loaded while the hub reads the history says so, and polls for a reload once
+/// it is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_jobs_page_waits_for_the_history_to_be_read() {
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    hub.db.forget_job_briefs();
+    let page = get(addr, "/jobs", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("still reading the job history"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("hx-get=\"/jobs?reading=1\""),
+        "{}",
+        page.body
+    );
+    let poll = get(addr, "/jobs?reading=1", Some(&viewer)).await;
+    assert_eq!(poll.status, 204, "{}", poll.body);
+    assert_eq!(poll.header("hx-refresh"), None);
+    hub.db.read_job_briefs().unwrap();
+    let poll = get(addr, "/jobs?reading=1", Some(&viewer)).await;
+    assert_eq!(poll.status, 200, "{}", poll.body);
+    assert_eq!(poll.header("hx-refresh"), Some("true"));
+    let page = get(addr, "/jobs", Some(&viewer)).await;
+    assert!(page.body.contains("none placed yet"), "{}", page.body);
+}
+
 /// `/jobs` shows a viewer the job history newest first with what each job used, links a job
 /// to GitLab only by a plain web URL and its node to the node's page, filters by node, project
 /// and result, and pages back from the oldest job shown, keeping the filter.

@@ -1414,25 +1414,29 @@ filters match the ID. A job's name, branch and pipeline link to the page with th
 A job whose spec has no ref or pipeline matches no such filter. A key filter keeps the jobs that
 key submitted; it is kept out of sight in the form and shown above the jobs as *Key:* and the
 key's name, or the ID's first 12 characters once the key is gone, with `×` to drop it. Every
-filter is a scan of the history from its newest job, a record decoded and matched at a time,
-until the page and the summary are complete: a rare value reads the whole history, `job_history`
-records (10,000 by default), on each load of the page and, for the live newest page, at most
-twice a heartbeat (below), so its cost grows with `job_history`. `/clients`' job counts read
-none of it: the hub keeps a count of each key's jobs beside the history, updated in the writes
-that record and trim jobs and counted from the history once on a database without it, so a
-rendering of `/clients` reads a row per key and per instance, however long the history. The
-summary covers the newest 10,000 matching jobs: the count, the share of finished jobs that
-succeeded (without a result filter), and the median run time of finished jobs. The newest page
-of each filter updates live (below). Older pages stay as loaded, say so and link back to the
-newest. The filter form stays outside the live fragment so updates preserve selections in
-progress. Selections apply immediately; typing applies after a 300 ms pause. Each request
-replaces any pending request. htmx fetches the filtered page and replaces the jobs, including
-the live fragment, closing the old stream and opening the new one. The URL follows the filter
-for bookmarking or sharing. Each applied filter adds a history entry; Back and Forward reload
-that URL because htmx's history cache is disabled. *Show* or Enter applies the filter
-immediately and loads the page without JavaScript. Refused or failed requests, including expired
-sessions, trigger a full page load. Each node's page links to its jobs, and to its jobs with
-events.
+filter scans the whole history, from its newest job, on each load of the page and, for the live
+newest page, at most twice a heartbeat (below). It scans not the records but what the filters
+and the summary use of each job, held in memory: read from the database in the background when
+the hub starts (seconds for 100,000 jobs, which the page says meanwhile, reloading once done),
+then kept by the writes that record, update and trim jobs. A page decodes the records of the
+jobs it shows alone: in an optimized build (the ignored `jobs_page_bench` test measures it),
+100,000 jobs scan in tens of milliseconds and take about 25 MB of memory; 1,000,000, the most
+the history keeps, take about 250 MB and tens of seconds to read at start, while the page says
+it is reading the history. `/clients`' job counts read none of it: the hub keeps a count of each
+key's jobs beside the history, updated in the writes that record and trim jobs and counted from
+the history once on a database without it, so a rendering of `/clients` reads a row per key and
+per instance, however long the history. The summary covers every matching job: the count, the
+share of finished jobs that succeeded (without a result filter), and the median run time of
+finished jobs. The newest page of each filter updates live (below). Older pages stay as loaded,
+say so and link back to the newest. The filter form stays outside the live fragment so updates
+preserve selections in progress. Selections apply immediately; typing applies after a 300 ms
+pause. Each request replaces any pending request. htmx fetches the filtered page and replaces
+the jobs, including the live fragment, closing the old stream and opening the new one. The URL
+follows the filter for bookmarking or sharing. Each applied filter adds a history entry; Back
+and Forward reload that URL because htmx's history cache is disabled. *Show* or Enter applies
+the filter immediately and loads the page without JavaScript. Refused or failed requests,
+including expired sessions, trigger a full page load. Each node's page links to its jobs, and to
+its jobs with events.
 
 `/jobs/<id>`, for viewers and operators alike, shows a job's record: its result, failure class,
 exit code and the node's message, an Event row for each event it reported with its first
