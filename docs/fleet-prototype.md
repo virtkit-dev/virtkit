@@ -1224,9 +1224,13 @@ so a database an older hub wrote to is consistent again. The database grows by u
 `kept_output_total` (1 GiB by default) on top of the failed jobs' kept output, and its file does
 not shrink when an end is evicted or the total lowered.
 
-**Compressed storage.** Kept output a hub before compression stored as it was is compressed in
-the background after an upgrade, a few megabytes per write, counting at its stored size until
-then; redb reuses the pages it frees, but the file does not shrink.
+**Compressed storage.** Redacted specs use a zstd dictionary trained on the newest 1,000 specs
+(at most 16 MiB) once history holds 500, then retrained every 5,000 submissions. A spec of a few
+dozen kilobytes takes about one kilobyte. Each spec names its dictionary, so older specs remain
+readable after retraining. Unreferenced dictionaries are dropped, except the newest.
+After an upgrade, legacy kept output and specs are compressed in the background: a few
+megabytes of output or a few hundred specs per write. Output counts at its stored size until
+then. redb reuses freed pages, but the file does not shrink.
 
 **History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
 1,000,000), in submission order: once an hour the oldest finished ones past that count go if

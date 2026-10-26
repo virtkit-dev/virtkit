@@ -672,6 +672,8 @@ pub struct Db {
     requests_swept_at: AtomicU64,
     /// `[oidc] default_role`, used when no grant matches an OIDC sign-in.
     oidc_default_role: Option<Role>,
+    /// The job specs' dictionaries, prepared ([`packed`]).
+    spec_dicts: std::sync::Mutex<packed::SpecDicts>,
 }
 
 impl Db {
@@ -809,6 +811,8 @@ impl Db {
             .context("opening the job output tails table")?;
         txn.open_table(jobs::LEGACY_TAILS)
             .context("opening the unpacked job output tails table")?;
+        txn.open_table(packed::SPEC_DICTS)
+            .context("opening the job spec dictionaries table")?;
         txn.open_table(jobs::JOB_CACHE)
             .context("opening the job output cache table")?;
         txn.open_table(jobs::JOB_TAIL_LENS)
@@ -837,7 +841,9 @@ impl Db {
             .context("converting the API keys bound to GitLab instances")?;
         egress::share_history(&txn).context("gathering the history's egress reports")?;
         txn.commit().context("initializing the hub database")?;
+        let spec_dicts = packed::SpecDicts::load(&db).context("loading the job spec dictionary")?;
         Ok(Db {
+            spec_dicts: std::sync::Mutex::new(spec_dicts),
             db,
             egress_rules: false,
             heartbeat_synced_at: AtomicU64::new(0),
