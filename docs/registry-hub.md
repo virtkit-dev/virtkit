@@ -623,14 +623,40 @@ though within them it can claim protection.
     it grants a lock someone waited for. Without a token, a wait or a lease can run up to 24
     hours.
   - Releasing and renewing still need the owner token the registry minted, as today.
-- **Discovery.** The node gives every job using `"job"` two variables:
+- **Areas.** A namespace may have an `alias` (`vk-hub namespaces add … --alias task-cache`),
+  one repository name component, unique on the registry. On the proxy, `job/<alias>` stands
+  for the namespace's path as filled for the job, so a tool names one fixed path whatever its
+  project or protection, and protected and unprotected jobs stay apart when the path has
+  `{protection}`:
+
+  ```text
+  namespace task-cache  path = "task-cache/{gitlab}/{project_id}/{protection}"  alias = task-cache
+    read write lock     own project
+  ```
+
+  - The proxy maps `job/<alias>` at the start of an OCI path (`/v2/job/<alias>/…`), a plain
+    file's (`/dav/files/job/<alias>/…`) and a lock name's path part
+    (`name=job/<alias>/…:<key>`, decoded as the registry decodes it). The mapped URL goes
+    through the proxy's checks again. Any other path is forwarded as it is; `job/…` naming no
+    alias of the job is refused with 403 and not forwarded.
+  - Only requests are mapped. The registry answers with real names, an upload's `Location`
+    among them, which the proxy forwards unchanged, so a client continues on the real path.
+    A `PROPFIND`'s hrefs are mapped back to the alias, since a WebDAV client resolves a
+    listing against the root it asked for.
+  - No namespace's path may start with `job`. The hub refuses an alias while one stored
+    before that rule has such a path, and gives no job any alias until it moves.
+  - The hub sends a job's areas (`JobRegistry.areas`) only to a node announcing
+    `registry_areas`; on an older node `job/…` reaches the registry unmapped, which refuses it.
+- **Discovery.** The node gives every job using `"job"` three variables:
   - `VK_REGISTRY=http://registry.vk`;
   - `VK_REGISTRY_NAMESPACES`, the job's prefixes with their rights, e.g.
-    `p/gl/42=rwl images=r ci-pipeline/gl/42/1234=rwl`.
-- **In-job tools.** task-rs points its lock backend at `$VK_REGISTRY/lock/` and prefixes its
-  lock names with a namespace it may lock in. sccache uses
-  `$VK_REGISTRY/dav/files/<prefix>/…` under a namespace it may write. Neither holds a
-  credential.
+    `p/gl/42=rwl images=r ci-pipeline/gl/42/1234=rwl`;
+  - `VK_REGISTRY_AREAS`, the job's aliases with the rights on their prefix, e.g.
+    `task-cache=rwl`.
+- **In-job tools.** task-rs takes `vk: http://registry.vk/job/task-cache` as its cache:
+  entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
+  `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
+  in `key_prefix`, so it never creates `/dav/files/job/` itself). Neither holds a credential.
 
 ### 4c: pipeline caches and captures
 

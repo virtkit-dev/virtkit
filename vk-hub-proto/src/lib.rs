@@ -711,6 +711,11 @@ pub struct Inventory {
     /// does not would run the job with its own credential.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job_tokens: bool,
+    /// Whether the node's guest registry proxy maps a job's aliases
+    /// ([`dispatch::JobRegistry::areas`]): one that does not gets none, and a job's `job/…`
+    /// paths reach the registry as they are, which refuses them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registry_areas: bool,
     /// Whether the node sends each placed job's egress report ([`job::JobResult::egress`]): a job
     /// placed on one that does not has no report to show.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1448,6 +1453,7 @@ mod tests {
             labels: Vec::new(),
             registry: None,
             job_tokens: false,
+            registry_areas: false,
             egress_reports: false,
             egress_rules: false,
             egress_fallback: false,
@@ -2206,6 +2212,7 @@ mod tests {
         let mut tokens = serde_json::to_value(inventory()).unwrap();
         tokens["registry"] = json!("https://reg.example.com");
         tokens["job_tokens"] = json!(true);
+        tokens["registry_areas"] = json!(true);
         tokens["egress_reports"] = json!(true);
         tokens["egress_rules"] = json!(true);
         tokens["egress_fallback"] = json!(true);
@@ -2213,6 +2220,7 @@ mod tests {
             &Inventory {
                 registry: Some("https://reg.example.com".into()),
                 job_tokens: true,
+                registry_areas: true,
                 egress_reports: true,
                 egress_rules: true,
                 egress_fallback: true,

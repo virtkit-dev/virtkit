@@ -18,6 +18,13 @@
 //! lock API (`/lock/`) and plain files (`/dav/files/`): the registry enforces the token's
 //! grants on each. A job meant to have a token and given none gets a proxy that forwards
 //! nothing.
+//!
+//! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI or plain-file path, or
+//! before the `:` of a lock name, stands for the area's prefix, so a guest names a fixed path
+//! whatever its project or protection. Only requests are rewritten: the registry answers with
+//! the real names (an upload's `Location`, a lock's holders), which the proxy forwards too. A
+//! `PROPFIND`'s hrefs are the exception, mapped back to the alias, since a WebDAV client
+//! resolves a listing against the root it asked for.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -34,6 +41,9 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+use vk_hub_proto::dispatch::Area;
+use vk_hub_proto::token::{ALIAS_ROOT, under, valid_component, valid_prefix};
 
 use crate::oci::Creds;
 
@@ -81,6 +91,8 @@ pub struct ProxyCfg {
     /// one of the scope's paths
     root: String,
     scope: Scope,
+    /// The job's areas, mapped under [`Scope::Job`] only.
+    areas: Vec<Area>,
     /// The credential injected into every forwarded request, so the job stays
     /// credential-free — and the trust anchor `client` was built against.
     pub creds: Creds,
@@ -129,6 +141,32 @@ impl ProxyCfg {
         Ok(cfg)
     }
 
+    /// The job's areas, for [`Self::for_job`]'s proxy: refused when an alias is not one
+    /// repository name component or repeats, or a prefix is not a grant's or lies under
+    /// [`ALIAS_ROOT`], where it would be mapped again.
+    pub fn with_areas(mut self, areas: &[Area]) -> Result<Self> {
+        for (i, a) in areas.iter().enumerate() {
+            anyhow::ensure!(
+                valid_component(&a.alias),
+                "the job's area alias {:?} is not a repository name component",
+                a.alias
+            );
+            anyhow::ensure!(
+                valid_prefix(&a.prefix) && !under(ALIAS_ROOT, &a.prefix),
+                "the job's area {} names the prefix {:?}",
+                a.alias,
+                a.prefix
+            );
+            anyhow::ensure!(
+                !areas[..i].iter().any(|b| b.alias == a.alias),
+                "the job has two areas named {}",
+                a.alias
+            );
+        }
+        self.areas = areas.to_vec();
+        Ok(self)
+    }
+
     fn build(upstream: String, creds: Creds) -> Result<Self> {
         let base = reqwest::Url::parse(&upstream)
             .with_context(|| format!("parsing the registry proxy upstream {upstream:?}"))?;
@@ -161,6 +199,7 @@ impl ProxyCfg {
             base,
             root,
             scope: Scope::Oci,
+            areas: Vec::new(),
             creds,
             client: b.build().context("building the registry proxy client")?,
         })
@@ -265,6 +304,175 @@ fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
     (url.origin() == cfg.base.origin() && resolved.starts_with(prefix)).then_some(url)
 }
 
+/// What a request becomes under the job's areas.
+#[derive(Debug, PartialEq, Eq)]
+enum Mapped<'a> {
+    /// Nothing under [`ALIAS_ROOT`]: forwarded as it is.
+    Unchanged,
+    /// The path and query to forward instead, below the upstream's own path, and the area.
+    To(String, &'a Area),
+    /// `job/…` naming no area of this job.
+    Unknown,
+}
+
+/// `url` (an accepted upstream URL) under `cfg`'s areas: `job/<alias>` at the start of an
+/// OCI or plain-file path, or of a lock name's path part, becomes the area's prefix.
+fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
+    if cfg.scope != Scope::Job {
+        return Mapped::Unchanged;
+    }
+    let Some(path) = url.path().strip_prefix(cfg.root.as_str()) else {
+        return Mapped::Unchanged;
+    };
+    let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+    if path.starts_with("/lock/") {
+        return match map_lock_names(&cfg.areas, url.query().unwrap_or_default()) {
+            Ok(None) => Mapped::Unchanged,
+            Ok(Some((q, area))) => Mapped::To(format!("{path}?{q}"), area),
+            Err(()) => Mapped::Unknown,
+        };
+    }
+    for base in ["/v2/", DAV_FILES] {
+        let Some(rest) = path.strip_prefix(base) else {
+            continue;
+        };
+        return match map_name(&cfg.areas, rest, '/') {
+            Ok(None) => Mapped::Unchanged,
+            Ok(Some((name, area))) => Mapped::To(format!("{base}{name}{query}"), area),
+            Err(()) => Mapped::Unknown,
+        };
+    }
+    Mapped::Unchanged
+}
+
+/// `name` with a leading `job/<alias>`, followed by its end or `end`, replaced by the alias's
+/// prefix: `Ok(None)` when it does not start at [`ALIAS_ROOT`], `Err` for no such alias.
+fn map_name<'a>(
+    areas: &'a [Area],
+    name: &str,
+    end: char,
+) -> Result<Option<(String, &'a Area)>, ()> {
+    let Some(rest) = name.strip_prefix(ALIAS_ROOT) else {
+        return Ok(None);
+    };
+    let rest = match rest.chars().next() {
+        Some('/') => &rest[1..],
+        Some(c) if c != end => return Ok(None), // another component, as `jobs/…`
+        _ => return Err(()),                    // `job` alone names no area
+    };
+    let cut = rest.find(['/', end]).unwrap_or(rest.len());
+    let (alias, tail) = rest.split_at(cut);
+    let area = areas.iter().find(|a| a.alias == alias).ok_or(())?;
+    Ok(Some((format!("{}{tail}", area.prefix), area)))
+}
+
+/// A lock request's query with each `name=` under [`ALIAS_ROOT`] mapped, decoded as the
+/// registry decodes it and encoded again; every other pair is kept as it came, in order.
+/// `Ok(None)` when no name was mapped. The area returned is the first mapped name's.
+fn map_lock_names<'a>(areas: &'a [Area], query: &str) -> Result<Option<(String, &'a Area)>, ()> {
+    let mut first = None;
+    let mut pairs = Vec::new();
+    for pair in query.split('&') {
+        let mapped = match pair.split_once('=') {
+            Some(("name", v)) => map_name(areas, &vk_registry::percent_decode(v), ':')?,
+            _ => None,
+        };
+        match mapped {
+            Some((name, area)) => {
+                first.get_or_insert(area);
+                pairs.push(format!("name={}", vk_registry::percent_encode(&name)));
+            }
+            None => pairs.push(pair.to_string()),
+        }
+    }
+    Ok(first.map(|area| (pairs.join("&"), area)))
+}
+
+/// A 403 with `msg`.
+fn forbidden(msg: &'static [u8]) -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(
+            Full::new(Bytes::from_static(msg))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("building a refusal")
+}
+
+/// Maps a `PROPFIND` multistatus's hrefs under an area's prefix back to its alias, as the
+/// body streams: `<D:href>/dav/files/<prefix>` followed by `/` or `<` (the end of the href)
+/// becomes `<D:href>/dav/files/job/<alias>`. A prefix is lowercase alphanumerics and `._-/`,
+/// which neither XML nor the registry's percent-encoding changes, so the bytes are the text.
+struct HrefMap {
+    from: Vec<u8>,
+    to: Vec<u8>,
+    /// Bytes not sent yet: the tail a match could still start in.
+    carry: Vec<u8>,
+}
+
+impl HrefMap {
+    fn new(area: &Area) -> Self {
+        let href = |p: &str| format!("<D:href>{DAV_FILES}{p}").into_bytes();
+        HrefMap {
+            from: href(&area.prefix),
+            to: href(&format!("{ALIAS_ROOT}/{}", area.alias)),
+            carry: Vec::new(),
+        }
+    }
+
+    /// The bytes of `chunk` that can be sent now, mapped; a tail as long as the pattern waits
+    /// for the next chunk, which holds the byte after a match.
+    fn push(&mut self, chunk: &[u8]) -> Bytes {
+        self.carry.extend_from_slice(chunk);
+        self.emit(self.carry.len().saturating_sub(self.from.len()))
+    }
+
+    /// The rest, mapped, once the body has ended.
+    fn finish(&mut self) -> Bytes {
+        self.emit(self.carry.len())
+    }
+
+    /// The carry up to `upto`, mapped; a match starting before `upto` is taken whole.
+    fn emit(&mut self, upto: usize) -> Bytes {
+        let mut out = Vec::with_capacity(upto);
+        let mut i = 0;
+        while i < upto {
+            let rest = &self.carry[i..];
+            if rest.starts_with(&self.from)
+                && matches!(rest.get(self.from.len()), Some(b'/' | b'<'))
+            {
+                out.extend_from_slice(&self.to);
+                i += self.from.len();
+            } else {
+                out.push(self.carry[i]);
+                i += 1;
+            }
+        }
+        self.carry.drain(..i.min(self.carry.len()));
+        Bytes::from(out)
+    }
+
+    /// `body` with its hrefs mapped.
+    fn over<S>(self, body: S) -> impl futures::Stream<Item = reqwest::Result<Bytes>>
+    where
+        S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    {
+        use futures::StreamExt;
+        futures::stream::unfold((Box::pin(body), Some(self)), |(mut body, map)| async move {
+            let mut map = map?;
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    let out = map.push(&chunk);
+                    Some((Ok(out), (body, Some(map))))
+                }
+                Some(Err(e)) => Some((Err(e), (body, None))),
+                None => Some((Ok(map.finish()), (body, None))),
+            }
+        })
+    }
+}
+
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
 /// or ones we set ourselves).
 fn is_skipped(name: &str) -> bool {
@@ -317,6 +525,27 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(body)?);
     }
+    // The job's aliases, mapped on the resolved URL, which then goes through the same checks
+    // again: the prefix is the hub's, but the rest of the path is still the guest's.
+    let (url, area) = match map_aliases(cfg, &url) {
+        Mapped::Unchanged => (url, None),
+        Mapped::To(target, area) => match upstream_url(cfg, &target) {
+            Some(url) => (url, Some(area)),
+            None => return Ok(forbidden(b"registry proxy: an area's path is refused")),
+        },
+        Mapped::Unknown => {
+            return Ok(forbidden(
+                b"registry proxy: this job has no area of that alias",
+            ));
+        }
+    };
+    // A listing's hrefs go back to the alias the guest asked for (see the module's doc).
+    let listing = method.as_str() == "PROPFIND"
+        && url
+            .path()
+            .strip_prefix(cfg.root.as_str())
+            .is_some_and(|p| p.starts_with(DAV_FILES));
+    let hrefs = area.filter(|_| listing).map(HrefMap::new);
     // WebDAV's PROPFIND carries a body as the OCI writes do. Any other request that came
     // with one passes it on too, so the registry judges it: dropped, a MKCOL body the
     // registry refuses (RFC 4918 §9.3) would create the collection instead.
@@ -347,12 +576,21 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let status = resp.status();
     let headers = resp.headers().clone();
     // stream the upstream response back without buffering (blob pulls).
-    let body = StreamBody::new(
-        resp.bytes_stream()
-            .map_ok(Frame::data)
-            .map_err(|e| std::io::Error::other(e.to_string())),
-    )
-    .boxed();
+    let stream = resp.bytes_stream();
+    let body = match hrefs {
+        Some(map) => StreamBody::new(
+            map.over(stream)
+                .map_ok(Frame::data)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        )
+        .boxed(),
+        None => StreamBody::new(
+            stream
+                .map_ok(Frame::data)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        )
+        .boxed(),
+    };
 
     let mut out = Response::builder().status(status);
     for (k, v) in headers.iter() {
@@ -579,6 +817,133 @@ mod tests {
             let (status, _, path) = status_and_auth(proxy, "GET", target, &seen).await;
             assert_eq!(status, 403, "{target}");
             assert_eq!(path, "", "{target} must not be forwarded");
+        }
+    }
+
+    fn area(alias: &str, prefix: &str) -> Area {
+        Area {
+            alias: alias.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// `job/<alias>` reaches the area's prefix, for OCI, plain files and locks; a path not
+    /// under `job/` is forwarded as it is, and an alias the job lacks is refused unforwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_reaches_its_areas_by_alias() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
+            .unwrap()
+            .with_areas(&[area("task-cache", "task-cache/gl/42/protected")])
+            .unwrap();
+        let proxy = spawn_blocking(cfg).unwrap();
+        for (method, target, want) in [
+            (
+                "GET",
+                "/v2/job/task-cache/manifests/latest",
+                "/v2/task-cache/gl/42/protected/manifests/latest",
+            ),
+            (
+                "GET",
+                "/v2/job/task-cache/ns/blobs/sha256:aa",
+                "/v2/task-cache/gl/42/protected/ns/blobs/sha256:aa",
+            ),
+            (
+                "PUT",
+                "/dav/files/job/task-cache/a/b",
+                "/dav/files/task-cache/gl/42/protected/a/b",
+            ),
+            (
+                "PROPFIND",
+                "/dav/files/job/task-cache",
+                "/dav/files/task-cache/gl/42/protected",
+            ),
+            ("GET", "/v2/jobs/x/manifests/1", "/v2/jobs/x/manifests/1"),
+            (
+                "GET",
+                "/v2/task-cache/gl/42/protected/manifests/1",
+                "/v2/task-cache/gl/42/protected/manifests/1",
+            ),
+        ] {
+            let (status, auth, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 200, "{method} {target}");
+            assert_eq!(auth, "Bearer vkt_job", "{method} {target}");
+            assert_eq!(path, want, "{method} {target}");
+        }
+        for target in [
+            "/v2/job/other/manifests/1",
+            "/v2/job/manifests/1",
+            "/v2/job",
+            "/dav/files/job/",
+            "/lock/acquire?name=job/other:k",
+            "/lock/acquire?name=job:k",
+        ] {
+            let (status, _, path) = status_and_auth(proxy, "GET", target, &seen).await;
+            assert_eq!(status, 403, "{target}");
+            assert_eq!(path, "", "{target} must not be forwarded");
+        }
+    }
+
+    /// Lock names are mapped as the registry decodes them, in order, the other pairs kept.
+    #[test]
+    fn lock_names_map_their_path_part() {
+        let areas = [area("task-cache", "task-cache/gl/42/protected")];
+        assert_eq!(
+            map_lock_names(&areas, "name=p%2Fgl%2F42%3Ak&ttl=30"),
+            Ok(None)
+        );
+        let (q, a) = map_lock_names(
+            &areas,
+            "name=job%2Ftask-cache%2Fgcc-13%3Abuild%3Aabc&name=other%3Ak&ttl=30",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            q,
+            "name=task-cache%2Fgl%2F42%2Fprotected%2Fgcc-13%3Abuild%3Aabc&name=other%3Ak&ttl=30"
+        );
+        assert_eq!(a.alias, "task-cache");
+        let (q, _) = map_lock_names(&areas, "name=job/task-cache:k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(q, "name=task-cache%2Fgl%2F42%2Fprotected%3Ak");
+        assert_eq!(map_lock_names(&areas, "name=job%2Fnope%3Ak"), Err(()));
+    }
+
+    /// Areas the hub could not have meant are refused before the proxy starts.
+    #[test]
+    fn invalid_areas_are_refused() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let job = || ProxyCfg::for_job(&registry("127.0.0.1:1".parse().unwrap()), Some("t"));
+        for areas in [
+            vec![area("Bad", "p")],
+            vec![area("a/b", "p")],
+            vec![area("a", "")],
+            vec![area("a", "job/x")],
+            vec![area("a", "p"), area("a", "q")],
+        ] {
+            assert!(job().unwrap().with_areas(&areas).is_err(), "{areas:?}");
+        }
+        assert!(job().unwrap().with_areas(&[area("a", "p/x")]).is_ok());
+    }
+
+    /// A listing's hrefs under the area's prefix go back to the alias, wherever the chunks
+    /// split; others, and a prefix that only starts a longer component, are left alone.
+    #[test]
+    fn listing_hrefs_map_back_to_the_alias() {
+        let body = "<D:href>/dav/files/t/gl/1/</D:href><D:href>/dav/files/t/gl/1/a</D:href>\
+                    <D:href>/dav/files/t/gl/10/a</D:href><D:href>/dav/files/t/gl/1</D:href>";
+        let want = "<D:href>/dav/files/job/c/</D:href><D:href>/dav/files/job/c/a</D:href>\
+                    <D:href>/dav/files/t/gl/10/a</D:href><D:href>/dav/files/job/c</D:href>";
+        for size in [1, 2, 7, 25, body.len()] {
+            let mut map = HrefMap::new(&area("c", "t/gl/1"));
+            let mut out = Vec::new();
+            for chunk in body.as_bytes().chunks(size) {
+                out.extend_from_slice(&map.push(chunk));
+            }
+            out.extend_from_slice(&map.finish());
+            assert_eq!(String::from_utf8(out).unwrap(), want, "chunks of {size}");
         }
     }
 

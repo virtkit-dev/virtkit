@@ -2620,8 +2620,9 @@ enum GuestProxy<'a> {
     None,
     /// The node's own `[registry]` credential (`proxy_guests`).
     Node,
-    /// The job's token, or nothing at all when it has none (`guest_credential = "job"`).
-    Job(Option<&'a str>),
+    /// The job's token and areas, or nothing at all when it has none
+    /// (`guest_credential = "job"`).
+    Job(Option<&'a vk_hub_proto::dispatch::JobRegistry>),
 }
 
 /// The proxy a job given `job` registry access gets under the node's `rg`. Under `"job"` the
@@ -2632,7 +2633,7 @@ fn guest_proxy<'a>(
 ) -> GuestProxy<'a> {
     match rg {
         Some(rg) if rg.guest_credential == GuestCredential::Job => match rg.lends_job_token() {
-            true => GuestProxy::Job(job.map(|r| r.token.as_str())),
+            true => GuestProxy::Job(job),
             false => GuestProxy::None,
         },
         Some(rg) if rg.proxy_guests => GuestProxy::Node,
@@ -2698,7 +2699,10 @@ fn spawn_switch(
         guest_proxy(cfg.registry.as_ref(), ctx.job_registry.as_ref()),
         &cfg.registry,
     ) {
-        (GuestProxy::Job(token), Some(rg)) => Some(crate::regproxy::ProxyCfg::for_job(rg, token)?),
+        (GuestProxy::Job(job), Some(rg)) => Some(
+            crate::regproxy::ProxyCfg::for_job(rg, job.map(|r| r.token.as_str()))?
+                .with_areas(job.map_or(&[], |r| r.areas.as_slice()))?,
+        ),
         (GuestProxy::Node, Some(rg)) => Some(crate::regproxy::ProxyCfg::from_registry(rg)?),
         _ => None,
     };
@@ -4662,12 +4666,13 @@ mod tests {
             grants: Vec::new(),
             cache_repo: None,
             pipeline_prefix: None,
+            areas: vec![],
         };
         let remote_job =
             rg("repo = \"reg.example/t\"\nguest_credential = \"job\"\nproxy_guests = true\n");
         assert_eq!(
             guest_proxy(Some(&remote_job), Some(&job)),
-            GuestProxy::Job(Some("vkt_x.y"))
+            GuestProxy::Job(Some(&job))
         );
         assert_eq!(guest_proxy(Some(&remote_job), None), GuestProxy::Job(None));
         let local_job =

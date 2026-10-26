@@ -117,6 +117,20 @@ pub struct JobRegistry {
     /// Reserved for pipeline caches and captures: nodes do not read it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_prefix: Option<String>,
+    /// The job's areas: on its guest registry proxy, `job/<alias>` stands for the area's
+    /// prefix. Sent only to a node announcing
+    /// [`Inventory::registry_areas`](crate::Inventory::registry_areas).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub areas: Vec<Area>,
+}
+
+/// An alias a job reaches one of its prefixes by, whatever its project or protection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Area {
+    /// One repository name component.
+    pub alias: String,
+    /// The prefix it stands for, a grant's.
+    pub prefix: String,
 }
 
 impl std::fmt::Debug for JobRegistry {
@@ -128,6 +142,7 @@ impl std::fmt::Debug for JobRegistry {
             .field("grants", &self.grants)
             .field("cache_repo", &self.cache_repo)
             .field("pipeline_prefix", &self.pipeline_prefix)
+            .field("areas", &self.areas)
             .finish()
     }
 }
@@ -549,6 +564,7 @@ mod tests {
             }],
             cache_repo: Some("ci-cache/gl/42/protected".into()),
             pipeline_prefix: Some("ci-pipeline/gl/42/7".into()),
+            areas: vec![],
         };
         let wire = json!({
             "registry_id": id("r"),

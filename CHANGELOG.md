@@ -9,6 +9,13 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-registry` deletes manifests**: `DELETE /v2/<name>/manifests/<tag>` drops the tag, and
   by digest every tag of the repository on that digest and its membership there, with write
   access, answering 202. The bytes wait for the gc. It used to answer 405.
+- **Jobs reach their storage areas by a fixed alias**: `vk-hub namespaces add … --alias
+  task-cache` names a namespace, and on `registry.vk` a job's `job/task-cache` stands for that
+  namespace's path as filled for it, for OCI content, plain files and lock names alike. A tool
+  configures one path, `http://registry.vk/job/task-cache`, whatever the job's project or
+  protection. `VK_REGISTRY_AREAS` lists a job's aliases with their rights. No namespace's
+  path may start with `job` any more; one stored before keeps aliases off until it moves.
+  Nodes before this release get no aliases.
 
 ### Fixed
 

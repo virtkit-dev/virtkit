@@ -263,6 +263,7 @@ mod tests {
                 grants: Vec::new(),
                 cache_repo: None,
                 pipeline_prefix: None,
+                areas: vec![],
             }),
             egress: None,
         };

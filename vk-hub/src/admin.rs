@@ -166,6 +166,9 @@ enum Call {
         name: String,
         path: String,
         retention_days: Option<u64>,
+        /// Absent from an older client: no alias.
+        #[serde(default)]
+        alias: Option<String>,
         grants: Vec<String>,
     },
     RemoveNamespace {
@@ -661,6 +664,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             name,
             path,
             retention_days,
+            alias,
             grants,
         } => {
             let grants = grants
@@ -672,6 +676,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 name,
                 path,
                 retention_days,
+                alias,
                 grants,
                 created_at: crate::now_secs(),
                 created_by: actor.clone(),
@@ -1064,6 +1069,7 @@ impl Client {
         name: &str,
         path: &str,
         retention_days: Option<u64>,
+        alias: Option<&str>,
         grants: Vec<String>,
     ) -> Result<crate::store::NamespaceRow> {
         self.call(Call::PutNamespace {
@@ -1071,6 +1077,7 @@ impl Client {
             name: name.to_string(),
             path: path.to_string(),
             retention_days,
+            alias: alias.map(str::to_string),
             grants,
         })
     }

@@ -869,6 +869,7 @@ mod tests {
             grants: Vec::new(),
             cache_repo: Some("ci-cache/gl/42/protected".into()),
             pipeline_prefix: None,
+            areas: vec![],
         };
         let job = JobStart {
             job: "j".into(),

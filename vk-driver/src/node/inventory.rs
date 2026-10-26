@@ -90,6 +90,8 @@ pub fn inventory(cfg: &Config) -> Inventory {
         // This node uses a job's registry token wherever the hub sends one: its caches and,
         // under `guest_credential = "job"`, its guest's proxy.
         job_tokens: true,
+        // Its guest registry proxy maps `job/<alias>` to the job's areas.
+        registry_areas: true,
         // Each placed job's result carries its egress report.
         egress_reports: true,
         // A placed job's start may carry the hub's egress layer, which its switches enforce in

@@ -45,6 +45,11 @@ pub const MAX_LABEL_LEN: usize = 128;
 /// Where the files of `/dav/files/` are stored as repositories.
 pub const FILES_REPO: &str = "files";
 
+/// The first path component of a job's aliases on its guest registry proxy: `job/<alias>`
+/// stands for the prefix the alias names ([`crate::dispatch::Area`]). No namespace's path
+/// may start with it, so an alias never hides a real repository.
+pub const ALIAS_ROOT: &str = "job";
+
 /// A token's claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,7 +166,7 @@ fn valid_path(path: &str) -> bool {
 }
 
 /// Whether `c` is a repository name component, OCI's `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*`.
-fn valid_component(c: &str) -> bool {
+pub fn valid_component(c: &str) -> bool {
     let alnum = |x: &u8| x.is_ascii_lowercase() || x.is_ascii_digit();
     let mut rest = c.as_bytes();
     loop {
