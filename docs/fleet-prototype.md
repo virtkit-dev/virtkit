@@ -1234,10 +1234,11 @@ then. redb reuses freed pages, but the file does not shrink.
 
 **History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
 1,000,000), in submission order: once an hour the oldest finished ones past that count go if
-they were settled or are past those 30 days; a job not finished, or finished and not yet
-settled, stays however old. Retrying the create of a job gone from the history answers 410
-`not_found`. A record says when the job was submitted, when a node accepted it and when it
-ended, how it ended, and what the node reported it used (see
+they were settled or are past those 30 days, at most 1,000 per write, write after write until
+the history fits; a job not finished, or finished and not yet settled, stays however old.
+Retrying the create of a job gone from the history answers 410 `not_found`. A record says when
+the job was submitted, when a node accepted it and when it ended, how it ended, and what the
+node reported it used (see
 [Result](gitlab-dispatch.md#hub--node-protocol-version-3)): wall-clock time, CPU time and peak
 memory of its VM, and the guest's vCPUs and memory. Records with no place in the order — from a
 hub before the history, or one run since — join its newest end, by when they were submitted,

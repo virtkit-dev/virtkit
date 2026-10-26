@@ -2871,14 +2871,14 @@ async fn a_job_expired_or_dropped_from_the_history_says_so() {
     // Never settled, past its keep.
     let later = now_secs() + 31 * 86_400;
     assert_eq!(
-        hub.db.prune_jobs(later, 100).unwrap(),
+        hub.db.prune_jobs(later, 100).unwrap().outputs,
         std::slice::from_ref(&job.id)
     );
     let resp = api(addr, "GET", &output, Some(&key), None).await;
     assert_eq!((resp.status, resp.code()), (404, ErrorCode::NotFound));
 
     // Dropped from the history.
-    assert!(hub.db.prune_jobs(later, 0).unwrap().is_empty());
+    assert!(hub.db.prune_jobs(later, 0).unwrap().outputs.is_empty());
     let resp = api(
         addr,
         "POST",

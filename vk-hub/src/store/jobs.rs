@@ -71,6 +71,10 @@ const JOB_KEEP: u64 = 30 * 86_400;
 /// oldest jobs cannot go yet is trimmed further on later passes, not read whole on each.
 const TRIM_SCAN: u64 = 10_000;
 
+/// How many jobs one trim of the history drops at most, so that lowering its count by far
+/// trims it in many short writes ([`Pruned::more`]) rather than one long one.
+const TRIM_DROP: u64 = 1_000;
+
 /// How many jobs' records the history keeps by default (`job_history` in `hub.toml`).
 pub const DEFAULT_JOB_HISTORY: usize = 10_000;
 
@@ -1256,16 +1260,17 @@ impl Db {
     /// never settled, but not its kept output. The IDs whose output files go: the jobs dropped
     /// and the jobs expired that still held output.
     ///
-    /// Trimming reads from the oldest job as far as the excess goes, and at most
-    /// [`TRIM_SCAN`] jobs past it; expiring, from
+    /// Trimming drops at most [`TRIM_DROP`] jobs, and reads from the oldest job as far as
+    /// that goes and at most [`TRIM_SCAN`] jobs past it; expiring, from
     /// [`EXPIRED_BELOW`] up to the first job submitted within [`JOB_KEEP`], since none
     /// submitted later can have ended before it.
-    pub fn prune_jobs(&self, now: u64, keep: usize) -> Result<Vec<String>> {
-        self.prune_jobs_scanning(now, keep, TRIM_SCAN)
+    pub fn prune_jobs(&self, now: u64, keep: usize) -> Result<Pruned> {
+        self.prune_jobs_scanning(now, keep, TRIM_DROP, TRIM_SCAN)
     }
 
-    /// [`Db::prune_jobs`], trimming past at most `scan` jobs that cannot go yet.
-    fn prune_jobs_scanning(&self, now: u64, keep: usize, scan: u64) -> Result<Vec<String>> {
+    /// [`Db::prune_jobs`], dropping at most `drop` jobs and trimming past at most `scan`
+    /// that cannot go yet.
+    fn prune_jobs_scanning(&self, now: u64, keep: usize, drop: u64, scan: u64) -> Result<Pruned> {
         let past_keep = |t: u64| now.saturating_sub(t) > JOB_KEEP;
         let expires = |row: &JobRow| {
             row.state == JobState::Finished
@@ -1273,6 +1278,7 @@ impl Db {
         };
         let holds_output = |row: &JobRow| row.settled_at.is_none() && row.expired_at.is_none();
         let txn = self.db.begin_write().context("starting a write")?;
+        let more;
         let mut unplaced = Vec::new();
         let outputs = {
             let mut table = txn.open_table(JOBS)?;
@@ -1281,9 +1287,10 @@ impl Db {
             let mut meta = txn.open_table(JOB_META)?;
             let mut outputs = Vec::new();
 
-            let mut excess = order
+            let over = order
                 .len()?
                 .saturating_sub(u64::try_from(keep).unwrap_or(u64::MAX));
+            let mut excess = over.min(drop);
             let mut dropped = Vec::new();
             let mut budget = excess.saturating_add(scan);
             for entry in order.iter()? {
@@ -1308,6 +1315,7 @@ impl Db {
                     dropped.push((id, row));
                 }
             }
+            more = over > drop && excess == 0;
             for seq in &unplaced {
                 order.remove(*seq)?;
             }
@@ -1402,7 +1410,7 @@ impl Db {
         };
         self.commit_briefed(txn, BriefChange::Drop(unplaced))
             .context("pruning jobs")?;
-        Ok(outputs)
+        Ok(Pruned { outputs, more })
     }
 }
 
@@ -1443,6 +1451,15 @@ impl Drop for ReadingBriefs<'_> {
             }
         }
     }
+}
+
+/// What a trim of the history ([`Db::prune_jobs`]) did.
+#[derive(Debug, Default)]
+pub struct Pruned {
+    /// The IDs whose output files go.
+    pub outputs: Vec<String>,
+    /// It dropped as many jobs as one trim may and more are past the count: trim again.
+    pub more: bool,
 }
 
 /// Retained tails and their bookkeeping within one write transaction.
@@ -1803,10 +1820,10 @@ mod tests {
         finished.finished_at = Some(20);
         db.put_job(&id, &finished, &[], 20).unwrap();
         assert!(db.unfinished_jobs().unwrap().is_empty());
-        assert!(db.prune_jobs(20 + JOB_KEEP, 10).unwrap().is_empty());
+        assert!(db.prune_jobs(20 + JOB_KEEP, 10).unwrap().outputs.is_empty());
         // Unsettled past its keep: its output and spec go, its record stays in the history.
         assert_eq!(
-            db.prune_jobs(21 + JOB_KEEP, 10).unwrap(),
+            db.prune_jobs(21 + JOB_KEEP, 10).unwrap().outputs,
             std::slice::from_ref(&id)
         );
         let expired = db.job(&id).unwrap().unwrap();
@@ -2113,20 +2130,20 @@ mod tests {
             submit(&db, n, &settled(n));
         }
         // Settled, the dropped jobs held no output.
-        assert!(db.prune_jobs(11, 6).unwrap().is_empty());
+        assert!(db.prune_jobs(11, 6).unwrap().outputs.is_empty());
         assert_eq!(listed(&db), [10, 9, 8, 7, 3, 1].map(id));
         assert!(db.job_spec(&id(2)).unwrap().is_none());
         assert!(db.job_spec(&id(7)).unwrap().is_some());
-        assert!(db.prune_jobs(11, 6).unwrap().is_empty());
+        assert!(db.prune_jobs(11, 6).unwrap().outputs.is_empty());
         assert_eq!(placed(&db), 6);
         // Past its keep, the unsettled one goes, its output with it.
-        assert_eq!(db.prune_jobs(7 + JOB_KEEP, 5).unwrap(), [id(3)]);
+        assert_eq!(db.prune_jobs(7 + JOB_KEEP, 5).unwrap().outputs, [id(3)]);
         assert_eq!(listed(&db), [10, 9, 8, 7, 1].map(id));
         // Once it finishes and is settled, the running one goes first.
         let mut done = settled(1);
         done.revision = 2;
         assert!(db.put_job(&id(1), &done, &[], 12).unwrap());
-        assert!(db.prune_jobs(12, 4).unwrap().is_empty());
+        assert!(db.prune_jobs(12, 4).unwrap().outputs.is_empty());
         assert_eq!(listed(&db), [10, 9, 8, 7].map(id));
     }
 
@@ -2135,7 +2152,7 @@ mod tests {
     fn a_write_racing_the_trim_does_not_bring_a_job_back() {
         let db = Db::open_memory().unwrap();
         submit(&db, 1, &settled(1));
-        assert!(db.prune_jobs(3, 0).unwrap().is_empty());
+        assert!(db.prune_jobs(3, 0).unwrap().outputs.is_empty());
         let mut late = settled(1);
         late.revision = 2;
         assert!(!db.put_job(&id(1), &late, &[], 4).unwrap());
@@ -2154,7 +2171,7 @@ mod tests {
         submit(&db, 3, &settled(3));
         submit(&db, 4, &job(4, JobState::Finished, None));
         let now = 10 + JOB_KEEP;
-        let mut outputs = db.prune_jobs(now, 100).unwrap();
+        let mut outputs = db.prune_jobs(now, 100).unwrap().outputs;
         outputs.sort();
         assert_eq!(outputs, [id(1), id(4)]);
         for n in [1, 3, 4] {
@@ -2163,7 +2180,7 @@ mod tests {
         }
         assert!(db.job_spec(&id(2)).unwrap().is_some());
         assert_eq!(expired_below(&db), Some(1));
-        assert!(db.prune_jobs(now + 1, 100).unwrap().is_empty());
+        assert!(db.prune_jobs(now + 1, 100).unwrap().outputs.is_empty());
         // A write prepared before it expired leaves it expired.
         let mut late = job(1, JobState::Finished, None);
         late.revision = 2;
@@ -2175,7 +2192,12 @@ mod tests {
         done.finished_at = Some(now);
         done.settled_at = Some(now);
         assert!(db.put_job(&id(2), &done, &[], now).unwrap());
-        assert!(db.prune_jobs(now + JOB_KEEP + 1, 100).unwrap().is_empty());
+        assert!(
+            db.prune_jobs(now + JOB_KEEP + 1, 100)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
         assert!(db.job_spec(&id(2)).unwrap().is_none());
         assert_eq!(expired_below(&db), Some(4));
         assert_eq!(listed(&db), [4, 3, 2, 1].map(id));
@@ -2532,6 +2554,22 @@ mod tests {
         assert_eq!((page.summary.matched, page.summary.finished), (2, 1));
     }
 
+    /// One trim drops a bounded number of jobs and says when more are past the count; the
+    /// next goes on.
+    #[test]
+    fn a_trim_drops_a_bounded_number_of_jobs() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=5 {
+            submit(&db, n, &settled(n));
+        }
+        let pruned = db.prune_jobs_scanning(11, 1, 2, TRIM_SCAN).unwrap();
+        assert!(pruned.more);
+        assert_eq!(listed(&db), [5, 4, 3].map(id));
+        assert!(!db.prune_jobs_scanning(11, 1, 2, TRIM_SCAN).unwrap().more);
+        assert_eq!(listed(&db), [5].map(id));
+        assert!(!db.prune_jobs_scanning(11, 1, 2, TRIM_SCAN).unwrap().more);
+    }
+
     /// The node's own measure of a job's run wins over the hub's timestamps.
     #[test]
     fn a_jobs_run_is_the_nodes_measure_when_it_sent_one() {
@@ -2597,9 +2635,14 @@ mod tests {
         for n in 1..=2 {
             submit(&db, n, &settled(n));
         }
-        assert!(db.prune_jobs(10 + JOB_KEEP, 100).unwrap().is_empty());
+        assert!(
+            db.prune_jobs(10 + JOB_KEEP, 100)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
         assert_eq!(expired_below(&db), Some(2));
-        assert!(db.prune_jobs(10 + JOB_KEEP, 0).unwrap().is_empty());
+        assert!(db.prune_jobs(10 + JOB_KEEP, 0).unwrap().outputs.is_empty());
         assert_eq!(placed(&db), 0);
         submit(&db, 3, &job(3, JobState::Finished, None));
         assert_eq!(seq_of(&db, 3), 2);
@@ -2610,7 +2653,7 @@ mod tests {
         txn.commit().unwrap();
         assert_eq!(seq_of(&db, 3), 2);
         assert_eq!(
-            db.prune_jobs(10 + JOB_KEEP, 100).unwrap(),
+            db.prune_jobs(10 + JOB_KEEP, 100).unwrap().outputs,
             [id(3)],
             "expired, not skipped"
         );
@@ -2624,9 +2667,19 @@ mod tests {
             submit(&db, n, &job(n, JobState::Running, None));
         }
         submit(&db, 4, &settled(4));
-        assert!(db.prune_jobs_scanning(11, 1, 0).unwrap().is_empty());
+        assert!(
+            db.prune_jobs_scanning(11, 1, TRIM_DROP, 0)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
         assert_eq!(placed(&db), 4);
-        assert!(db.prune_jobs_scanning(11, 1, 1).unwrap().is_empty());
+        assert!(
+            db.prune_jobs_scanning(11, 1, TRIM_DROP, 1)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
         assert_eq!(listed(&db), [3, 2, 1].map(id));
     }
 }

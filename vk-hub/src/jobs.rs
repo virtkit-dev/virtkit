@@ -171,7 +171,7 @@ const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// How often the database's job specs and kept output are packed ([`pack`]).
 const PACK_EVERY: Duration = Duration::from_secs(3600);
 
-/// Pause between packing steps so other hub writes do not queue behind them.
+/// Pause between packing or history-trimming steps so other hub writes do not queue behind them.
 const PACK_PAUSE: Duration = Duration::from_millis(100);
 
 /// How often at most a running job's record is written for a newer egress report alone, by
@@ -2560,17 +2560,13 @@ fn sweep_outputs(db: &crate::store::Db, dir: &Path) -> Result<()> {
 /// process ends.
 pub async fn drive(hub: Arc<Hub>) {
     tokio::spawn(write_egress(hub.clone()));
+    tokio::spawn(trim(hub.clone()));
     tokio::spawn(read_briefs(hub.clone()));
-    let mut pruned = Instant::now();
     loop {
         let mut changed = hub.dispatch.subscribe();
         let mut node_changed = hub.subscribe();
         if let Err(e) = step(&hub).await {
             eprintln!("vk-hub: placing jobs: {e:#}");
-        }
-        if pruned.elapsed() >= PRUNE_EVERY {
-            pruned = Instant::now();
-            prune(&hub).await;
         }
         tokio::select! {
             _ = changed.changed() => {}
@@ -2641,6 +2637,17 @@ async fn pack_stored(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
+/// Every [`PRUNE_EVERY`], until the process ends: trim the history to its count, one bounded
+/// step after another, and drop outputs past their keep.
+async fn trim(hub: Arc<Hub>) {
+    loop {
+        tokio::time::sleep(PRUNE_EVERY).await;
+        while prune(&hub).await {
+            tokio::time::sleep(PACK_PAUSE).await;
+        }
+    }
+}
+
 /// How often the history's briefs are read again once lost to a panic.
 const BRIEFS_EVERY: Duration = Duration::from_secs(10);
 
@@ -2668,19 +2675,21 @@ async fn read_briefs(hub: Arc<Hub>) {
     }
 }
 
-async fn prune(hub: &Hub) {
+/// Trim the history once and report whether to trim again.
+async fn prune(hub: &Hub) -> bool {
     let keep = hub.dispatch.history;
-    let gone = match blocking(hub, move |db| db.prune_jobs(crate::now_secs(), keep)).await {
-        Ok(gone) => gone,
+    let pruned = blocking(hub, move |db| db.prune_jobs(crate::now_secs(), keep)).await;
+    let pruned = match pruned {
+        Ok(pruned) => pruned,
         Err(e) => {
             eprintln!("vk-hub: pruning jobs: {e:#}");
-            return;
+            return false;
         }
     };
-    // `gone` names only the jobs that held output: a settled job trimmed is not in it.
+    // `outputs` lists only jobs that held output; settled jobs are excluded.
     hub.jobs_changed();
     if let Some(dir) = hub.dispatch.output_dir.clone() {
-        for id in gone {
+        for id in pruned.outputs {
             // A dropped job's output, or an unsettled one's past its keep. Stopped before
             // this, the hub deletes them when it next starts.
             let path = output_path(&dir, &id);
@@ -2691,6 +2700,7 @@ async fn prune(hub: &Hub) {
             }
         }
     }
+    pruned.more
 }
 
 /// One pass of [`drive`].
