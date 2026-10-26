@@ -210,11 +210,7 @@ impl Hub {
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             instances: crate::clients::Instances::default(),
             client_changes: watch::Sender::new(0),
-            dispatch: crate::jobs::Dispatch::new(
-                None,
-                crate::jobs::DEFAULT_LOST_AFTER,
-                crate::store::DEFAULT_JOB_HISTORY,
-            ),
+            dispatch: crate::jobs::Dispatch::new(None, crate::jobs::DEFAULT_LOST_AFTER, None),
             token_keys: Arc::new(crate::tokens::Keys::new(
                 None,
                 crate::tokens::DEFAULT_MAX_JOB_TOKEN,
@@ -229,12 +225,13 @@ impl Hub {
     }
 
     /// This hub, placing jobs and keeping their output in `dir`, losing a job whose node has
-    /// been unreachable for `lost_after`, and keeping the records of the newest `history`.
+    /// been unreachable for `lost_after`, and keeping the records of the newest `history`
+    /// ([`crate::jobs::history_count`]).
     pub fn with_jobs(
         mut self,
         dir: std::path::PathBuf,
         lost_after: Duration,
-        history: usize,
+        history: Option<usize>,
     ) -> Result<Self> {
         crate::jobs::output_dir(&dir)?;
         self.dispatch = crate::jobs::Dispatch::new(Some(dir), lost_after, history);

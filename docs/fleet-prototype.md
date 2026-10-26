@@ -1233,10 +1233,12 @@ compression stored as they were are compressed in the background after an upgrad
 megabytes per write, counting at their stored size until then; redb reuses the pages they free,
 but the file does not shrink.
 
-**History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
-1,000,000), in submission order: once an hour the oldest finished ones past that count go if
-they were settled or are past those 30 days; a job not finished, or finished and not yet
-settled, stays however old. Retrying the create of a job gone from the history answers 410
+**History.** The hub keeps the records of the newest `job_history` jobs (100,000 by default, 1
+to 1,000,000), in submission order. An operator can set that count on the Jobs page, audited;
+it is kept in the database, applies at once and wins over `job_history` until cleared there.
+Once an hour, and as soon as the count is set, the oldest finished jobs past that count go if
+they were settled or are past those 30 days, at most 1,000 per write, write after write until
+the history fits; a job not finished, or finished and not yet settled, stays however old. Retrying the create of a job gone from the history answers 410
 `not_found`. A record says when the job was submitted, when a node accepted it and when it
 ended, how it ended, and what the node reported it used (see
 [Result](gitlab-dispatch.md#hub--node-protocol-version-3)): wall-clock time, CPU time and peak
@@ -1415,14 +1417,17 @@ filters match the ID. A job's name, branch and pipeline link to the page with th
 A job whose spec has no ref or pipeline matches no such filter. A key filter keeps the jobs that
 key submitted; it is kept out of sight in the form and shown above the jobs as *Key:* and the
 key's name, or the ID's first 12 characters once the key is gone, with `×` to drop it. Every
-filter is a scan of the history from its newest job, a record decoded and matched at a time,
-until the page and the summary are complete: a rare value reads the whole history, `job_history`
-records (10,000 by default), on each load of the page and, for the live newest page, at most
-twice a heartbeat (below), so its cost grows with `job_history`. `/clients`' job counts read
+filter scans the whole history, from its newest job, on each load of the page and, for the live
+newest page, at most twice a heartbeat (below). It scans not the records but what the filters
+and the summary use of each job, held in memory: read from the database in the background when
+the hub starts (a few seconds for 100,000 jobs, which the page says meanwhile, reloading once done), then kept
+by the writes that record, update and trim jobs. A page decodes the records of the jobs it
+shows alone: 100,000 jobs scan in tens of milliseconds and take about 25 MB of memory.
+`/clients`' job counts read
 none of it: the hub keeps a count of each key's jobs beside the history, updated in the writes
 that record and trim jobs and counted from the history once on a database without it, so a
 rendering of `/clients` reads a row per key and per instance, however long the history. The
-summary covers the newest 10,000 matching jobs: the count, the share of finished jobs that
+summary covers every matching job: the count, the share of finished jobs that
 succeeded (without a result filter), and the median run time of finished jobs. The newest page
 of each filter updates live (below). Older pages stay as loaded, say so and link back to the
 newest. The filter form stays outside the live fragment so updates preserve selections in

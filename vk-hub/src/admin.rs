@@ -949,11 +949,13 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                     events: true,
                     ..Default::default()
                 };
-                (crate::jobs::history(hub, &filter, None, limit)?
-                    .rows
-                    .into_iter())
-                .map(|(_, id, row)| (id, row))
-                .collect()
+                let page = crate::jobs::history(hub, &filter, None, limit)?;
+                if page.reading {
+                    bail!("the hub is still reading the job history: try again shortly");
+                }
+                (page.rows.into_iter())
+                    .map(|(_, id, row)| (id, row))
+                    .collect()
             } else {
                 crate::jobs::listing(hub, limit)?
             };

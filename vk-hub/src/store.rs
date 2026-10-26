@@ -69,8 +69,8 @@ pub use egress_rules::{
 };
 pub use gitlabs::{GitlabRefused, GitlabRow, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
-    DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow, NoAccess,
-    PREPARE_STAGE, RegistryAccess, RequestRow, SUMMARY_JOBS, Submitted,
+    DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow,
+    MAX_JOB_HISTORY, NoAccess, PREPARE_STAGE, RegistryAccess, RequestRow, Submitted,
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
@@ -674,6 +674,8 @@ pub struct Db {
     oidc_default_role: Option<Role>,
     /// The job specs' dictionaries, prepared ([`packed`]).
     spec_dicts: std::sync::Mutex<packed::SpecDicts>,
+    /// What a page of the job history reads of each job ([`jobs::Briefs`]).
+    job_briefs: std::sync::RwLock<jobs::BriefState>,
 }
 
 impl Db {
@@ -842,14 +844,20 @@ impl Db {
         egress::share_history(&txn).context("gathering the history's egress reports")?;
         txn.commit().context("initializing the hub database")?;
         let spec_dicts = packed::SpecDicts::load(&db).context("loading the job spec dictionary")?;
-        Ok(Db {
+        let db = Db {
             spec_dicts: std::sync::Mutex::new(spec_dicts),
+            job_briefs: std::sync::RwLock::default(),
             db,
             egress_rules: false,
             heartbeat_synced_at: AtomicU64::new(0),
             requests_swept_at: AtomicU64::new(0),
             oidc_default_role: None,
-        })
+        };
+        // A test reads the history's pages as soon as it opens the database; the hub reads
+        // them in the background ([`crate::jobs::drive`]).
+        #[cfg(test)]
+        db.read_job_briefs()?;
+        Ok(db)
     }
 
     /// [`Db::create_token_for`] a node.

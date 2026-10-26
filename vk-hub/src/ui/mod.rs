@@ -385,6 +385,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     users::action(req, ui, site).await
                 } else if path == clients::PATH {
                     clients::action(req, ui, site).await
+                } else if path == jobs::PATH {
+                    jobs::action(req, ui).await
                 } else if path == egress::ACTION_PATH {
                     egress::action(req, ui).await
                 } else if path == egress::RULES_ACTION_PATH {

@@ -2,7 +2,8 @@
 //! first, a page at a time, filtered by API key, node, GitLab project, result, job name, branch
 //! and pipeline, with what each used on its node where the node reported it
 //! ([`vk_hub_proto::job::JobUsage`]) and a line summing up every job the filter matches.
-//! Read only. Each job's result links to its page, `/jobs/<id>`: its record and its output as
+//! Operators set how many jobs the history keeps, over `job_history` ([`action`]). Each
+//! job's result links to its page, `/jobs/<id>`: its record and its output as
 //! far as the hub holds or kept it, followed while it runs ([`super::job_output`]), for when
 //! GitLab's trace is cut, late or out of reach.
 //!
@@ -18,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use hyper::header::{HeaderMap, HeaderValue};
-use hyper::{Response, StatusCode};
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::client::JobState;
 
 use super::html::Html;
@@ -28,10 +30,11 @@ use super::job_output::{self, Output};
 use super::pages::{self, bytes, mib};
 use super::sse::Source;
 use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
+use crate::jobs::HistorySource;
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
-    JobFilter, JobOutcome, JobPage, JobRow, NamespaceRow, NoAccess, RegistryAccess, Role,
-    SUMMARY_JOBS,
+    JobFilter, JobOutcome, JobPage, JobRow, MAX_JOB_HISTORY, NamespaceRow, NoAccess,
+    RegistryAccess, Role,
 };
 
 /// The page.
@@ -65,6 +68,9 @@ pub(super) async fn get(
     swap: bool,
 ) -> Result<Response<Body>> {
     let query = decode_form(query.unwrap_or("").as_bytes());
+    if field(&query, READING).is_some() {
+        return reading(ui).await;
+    }
     let mut filter = JobFilter::default();
     for name in FIELDS {
         if let Some(value) = field(&query, name) {
@@ -73,8 +79,10 @@ pub(super) async fn get(
     }
     let before = field(&query, "before").and_then(|b| b.parse().ok());
     let hub = ui.hub.clone();
+    let kept = blocking(move || crate::jobs::history_count(&hub)).await?;
+    let hub = ui.hub.clone();
     let wanted = filter.clone();
-    let main = match before {
+    let mut main = match before {
         None => {
             let renders = renders.clone();
             let (newest, key_name) = blocking(move || {
@@ -113,7 +121,103 @@ pub(super) async fn get(
             )
         }
     };
+    history_form(&mut main, auth, kept);
     Ok(page(fleet::layout("Jobs", PATH, auth, &main)))
+}
+
+/// The query of a page waiting for the history to be read ([`reading`]).
+const READING: &str = "reading";
+
+/// `GET /jobs?reading=1`, polled by a page loaded while the history is read since the hub
+/// started: nothing yet, then a full reload, for the filter's choices to be filled too.
+async fn reading(ui: &Ui) -> Result<Response<Body>> {
+    let hub = ui.hub.clone();
+    let mut resp = Response::new(Body::default());
+    if blocking(move || Ok(hub.db.job_briefs_read())).await? {
+        resp.headers_mut()
+            .insert("hx-refresh", HeaderValue::from_static("true"));
+    } else {
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+    }
+    Ok(resp)
+}
+
+/// The form's operations: set the history's count, or clear the count set.
+const SET_HISTORY: &str = "set-history";
+const CLEAR_HISTORY: &str = "clear-history";
+
+/// How many jobs the history keeps and where that comes from, outside the live fragment, with
+/// an operator's form setting it: a plain POST to [`action`].
+fn history_form(h: &mut Html, auth: &Auth, (count, source): (usize, HistorySource)) {
+    h.raw("<section><h2>History</h2><p>The history keeps the newest ")
+        .text(thousands(count))
+        .raw(match source {
+            HistorySource::Default => " jobs, by default.",
+            HistorySource::Config => " jobs, as <code>job_history</code> in hub.toml sets it.",
+            HistorySource::Ui => " jobs, as set here, over hub.toml.",
+        })
+        .raw("</p>");
+    if auth.session.role >= Role::Operator {
+        history_op(h, auth, SET_HISTORY);
+        h.raw("<label>Jobs kept <input type=\"number\" name=\"count\" min=\"1\" max=\"")
+            .text(MAX_JOB_HISTORY)
+            .raw("\" value=\"")
+            .text(count)
+            .raw("\" required></label><button>Save</button></form>");
+        if source == HistorySource::Ui {
+            history_op(h, auth, CLEAR_HISTORY);
+            h.raw("<button>Use hub.toml</button></form>");
+        }
+        h.raw("<p class=\"sub\">It applies at once: a lower count drops the oldest finished ")
+            .raw("jobs in the background, a step at a time.</p>");
+    }
+    h.raw("</section>");
+}
+
+/// The start of a form posting `op` to [`action`].
+fn history_op(h: &mut Html, auth: &Auth, op: &'static str) {
+    h.raw("<form class=\"act\" method=\"post\" action=\"")
+        .raw(PATH)
+        .raw("\">");
+    pages::csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"")
+        .raw(op)
+        .raw("\">");
+}
+
+/// `POST /jobs`: an operator sets how many jobs the history keeps (`set-history` with a
+/// `count`), or clears that so `job_history` applies (`clear-history`), as the session's
+/// principal; back to the page.
+pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(message(status, text)),
+    };
+    let count = match field(&form, "op") {
+        Some(SET_HISTORY) => {
+            let count = field(&form, "count").and_then(|c| c.trim().parse::<u64>().ok());
+            match count.filter(|n| (1..=MAX_JOB_HISTORY).contains(n)) {
+                Some(n) => Some(usize::try_from(n)?),
+                None => {
+                    let max = thousands(usize::try_from(MAX_JOB_HISTORY)?);
+                    return Ok(message(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Refused: the history keeps 1 to {max} jobs."),
+                    ));
+                }
+            }
+        }
+        Some(CLEAR_HISTORY) => None,
+        _ => return Ok(message(StatusCode::BAD_REQUEST, "No such action.")),
+    };
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    blocking(move || crate::jobs::set_history(&hub, &principal, count)).await?;
+    let mut resp = Response::new(Body::default());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static(PATH));
+    Ok(resp)
 }
 
 fn key(value: &str) -> Option<String> {
@@ -391,6 +495,15 @@ fn fragment(
         .iter()
         .map(|(id, name)| (id.as_str(), name.as_str()))
         .collect();
+    if jobs.reading {
+        h.raw("<p class=\"empty\" role=\"status\" hx-get=\"")
+            .raw(PATH)
+            .raw("?")
+            .raw(READING)
+            .raw("=1\" hx-trigger=\"every 2s\" hx-swap=\"none\">The hub is still reading ")
+            .raw("the job history: the page reloads once it has.</p>");
+        return h;
+    }
     let s = &jobs.summary;
     if s.matched == 0 {
         h.raw(if *filter == JobFilter::default() {
@@ -401,17 +514,12 @@ fn fragment(
         });
         return h;
     }
-    h.raw("<p class=\"sub\" role=\"status\">");
-    if s.capped {
-        h.raw("the latest ")
-            .text(thousands(SUMMARY_JOBS))
-            .raw(" jobs");
-    } else {
-        h.text(s.matched).raw(match s.matched {
+    h.raw("<p class=\"sub\" role=\"status\">")
+        .text(thousands(s.matched))
+        .raw(match s.matched {
             1 => " job",
             _ => " jobs",
         });
-    }
     // Filtered on a result, every finished job either succeeded or did not.
     if filter.outcome.is_none()
         && let Some(rate) = s.succeeded.saturating_mul(100).checked_div(s.finished)
@@ -1405,6 +1513,106 @@ fn dash_or(s: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A finished job's record as a busy fleet's are, 1.5 KB of JSON on average: usage, and
+    /// for every other job an egress report and a registry token. `n` varies its project
+    /// (40), name (200), node (8), branch, pipeline and outcome (one in ten fails, one in
+    /// fifty is canceled).
+    fn bench_job(n: u64) -> JobRow {
+        let mut row: JobRow = serde_json::from_str(include_str!("bench_job.json")).unwrap();
+        let project = format!("group/project-{}", n % 40);
+        let name = format!("build: [variant-{}]", n % 200);
+        row.request_id = format!("{n:032x}");
+        row.title = format!("GitLab job {n} of {project} ({name})");
+        row.project = Some(project);
+        row.name = Some(name);
+        row.git_ref = Some(format!("release-{}", n % 25));
+        row.pipeline = Some(500_000 + n / 20);
+        row.node = Some(format!("{:032x}", n % 8));
+        row.created_at = 1_700_000_000 + n * 30;
+        row.started_at = Some(row.created_at + 5);
+        row.finished_at = Some(row.created_at + 600 + n % 300);
+        row.settled_at = row.finished_at;
+        if let Some(result) = row.result.as_mut() {
+            result.failure = match n % 50 {
+                0 => Some(vk_hub_proto::job::FailureClass::Canceled),
+                m if m % 10 == 1 => Some(vk_hub_proto::job::FailureClass::Script),
+                _ => None,
+            };
+            if let Some(usage) = result.usage.as_mut() {
+                usage.wall_ms = 600_000 + (n % 300) * 1000;
+            }
+            if n.is_multiple_of(2) {
+                result.egress = None;
+                row.registry_access = None;
+            }
+        }
+        row
+    }
+
+    /// How long a hub takes to read a 100,000-job history at start, then the newest page of
+    /// it to render, unfiltered and filtered. Measure an optimized build,
+    /// which `./dev.sh` builds under a profile of another name than `release`:
+    /// `./dev.sh test -p vk-hub --bin vk-hub --config 'profile.opt.inherits="release"'
+    /// --profile opt jobs_page_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn jobs_page_bench() {
+        let dir = std::env::temp_dir().join(format!("vk-hub-jobs-bench-{}", std::process::id()));
+        let db = Arc::new(crate::store::Db::open(&dir.join("hub.db")).unwrap());
+        for chunk in (0..100_000u64).collect::<Vec<_>>().chunks(10_000) {
+            db.fill_history(chunk.iter().map(|&n| (format!("{n:032x}"), bench_job(n))))
+                .unwrap();
+        }
+        let start = Instant::now();
+        db.read_job_briefs().unwrap();
+        println!(
+            "JOBS PAGE reading the history at start: {:?}",
+            start.elapsed()
+        );
+        let hub = Hub::new(db, None);
+        let filters = [
+            ("unfiltered", JobFilter::default()),
+            (
+                "project",
+                JobFilter {
+                    project: Some("group/project-7".into()),
+                    ..JobFilter::default()
+                },
+            ),
+            (
+                "failed",
+                JobFilter {
+                    outcome: Some(JobOutcome::Failed),
+                    ..JobFilter::default()
+                },
+            ),
+            (
+                "name substring",
+                JobFilter {
+                    name: Some("VARIANT-17]".into()),
+                    ..JobFilter::default()
+                },
+            ),
+            (
+                "matching nothing",
+                JobFilter {
+                    project: Some("group/none".into()),
+                    ..JobFilter::default()
+                },
+            ),
+        ];
+        for (what, filter) in filters {
+            read(&hub, &filter).unwrap();
+            let runs = 5;
+            let start = Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(read(&hub, &filter).unwrap());
+            }
+            println!("JOBS PAGE {what}: {:?}", start.elapsed() / runs);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A job's events show on its page, each with its whole detail escaped, and beside its
     /// result in the jobs table, the details on hover; a job without any shows neither.

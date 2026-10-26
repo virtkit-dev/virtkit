@@ -14,8 +14,9 @@
 //! release_repository = "https://github.com/virtkit-dev/virtkit"
 //! # How long a node holding a placed job may be unreachable before the job is lost.
 //! job_lost_after_secs = 300
-//! # How many placed jobs' records the job history keeps, newest first.
-//! job_history = 10000
+//! # How many placed jobs' records the job history keeps, newest first, until an operator
+//! # sets it on the web UI's Jobs page.
+//! job_history = 100000
 //! # How much of the end of a failed job's output is kept, with its record, once its producer
 //! # settles it; "0" keeps none.
 //! kept_failure_output = "256K"
@@ -72,13 +73,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 
+use crate::store::MAX_JOB_HISTORY;
+
 /// Where the hub listens when the config names no address: loopback only, since with no TLS
 /// that is the one place it may serve.
 pub const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8443);
-
-/// The most jobs' records `job_history` may keep: each is a few kilobytes in the database.
-const MAX_JOB_HISTORY: u64 = 1_000_000;
 
 /// The most of a failed job's output `kept_failure_output` may keep: the database holds it for
 /// every failed job in the history, and the admin socket's reply carries it whole.
@@ -103,8 +103,8 @@ pub struct HubConfig {
     pub release_source: Option<crate::fetch::Source>,
     /// How long a node holding a placed job may be unreachable before the job is lost.
     pub job_lost_after: std::time::Duration,
-    /// How many placed jobs' records the job history keeps.
-    pub job_history: usize,
+    /// How many placed jobs' records the job history keeps; `None` when unset.
+    pub job_history: Option<usize>,
     /// How many bytes from the end of a failed job's output are kept once it is settled.
     pub kept_failure_output: u64,
     /// Bytes retained from the end of any other finished job's output once settled, capped
@@ -322,8 +322,8 @@ impl HubConfig {
             Some(secs) => bail!("job_lost_after_secs {secs}: expected 1 to 86400"),
         };
         let job_history = match f.job_history {
-            None => crate::store::DEFAULT_JOB_HISTORY,
-            Some(n @ 1..=MAX_JOB_HISTORY) => usize::try_from(n)?,
+            None => None,
+            Some(n @ 1..=MAX_JOB_HISTORY) => Some(usize::try_from(n)?),
             Some(n) => bail!("job_history {n}: expected 1 to {MAX_JOB_HISTORY}"),
         };
         let kept_failure_output = match f.kept_failure_output.as_deref() {
@@ -746,8 +746,8 @@ mod tests {
     fn the_job_history_keeps_one_to_a_million_jobs() {
         let keep =
             |extra: &str| parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.job_history);
-        assert_eq!(keep("").unwrap(), crate::store::DEFAULT_JOB_HISTORY);
-        assert_eq!(keep("job_history = 500\n").unwrap(), 500);
+        assert_eq!(keep("").unwrap(), None);
+        assert_eq!(keep("job_history = 500\n").unwrap(), Some(500));
         for bad in ["0", "1000001", "-1"] {
             assert!(keep(&format!("job_history = {bad}\n")).is_err(), "{bad}");
         }

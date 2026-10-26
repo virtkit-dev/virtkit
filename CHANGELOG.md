@@ -6,19 +6,18 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- **`vk-registry` deletes manifests**: `DELETE /v2/<name>/manifests/<tag>` drops the tag, and
-  by digest every tag of the repository on that digest and its membership there, with write
-  access, answering 202. The bytes wait for the gc. It used to answer 405.
-- **Jobs reach their storage areas by a fixed alias**: `vk-hub namespaces add … --alias
-  task-cache` names a namespace, and on `registry.vk` a job's `job/task-cache` stands for that
-  namespace's path as filled for it, for OCI content, plain files and lock names alike. A tool
-  configures one path, `http://registry.vk/job/task-cache`, whatever the job's project or
-  protection. `VK_REGISTRY_AREAS` lists a job's aliases with their rights. No namespace's
-  path may start with `job` any more; one stored before keeps aliases off until it moves.
-  Nodes before this release get no aliases.
-
 ### Changed
 
+- **The job history keeps 100,000 jobs by default**, up from 10,000.
+- **The Jobs page's summary covers every matching job**, not the newest 10,000. Its filters
+  scan what they use of each job, kept in memory, and read only the records of the jobs shown:
+  a page of a 100,000-job history renders in tens of milliseconds.
+
+- **The hub stores kept job output and job specs compressed**: kept output takes about 8 times
+  less room in its database, and job specs, compressed with a dictionary the hub trains on the
+  newest of them, about 40 times less. What an earlier hub stored is compressed in the
+  background after the upgrade; the database file does not shrink, but the room freed is
+  reused.
 - **`kept_output_total` counts the kept output of jobs that did not fail as stored,
   compressed**, so the default 1 GiB holds about 8 times more of it. `kept_output` and
   `kept_failure_output` still bound each job's output as it reads, uncompressed.

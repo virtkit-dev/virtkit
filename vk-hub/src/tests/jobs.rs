@@ -88,11 +88,7 @@ async fn serve_undriven_with(
     let hub = Arc::new(configure(
         Hub::new(db, None)
             .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
-            .with_jobs(
-                dir.join("jobs"),
-                lost_after,
-                crate::store::DEFAULT_JOB_HISTORY,
-            )
+            .with_jobs(dir.join("jobs"), lost_after, None)
             .unwrap(),
     ));
     crate::jobs::recover(&hub).await.unwrap();
@@ -2871,14 +2867,14 @@ async fn a_job_expired_or_dropped_from_the_history_says_so() {
     // Never settled, past its keep.
     let later = now_secs() + 31 * 86_400;
     assert_eq!(
-        hub.db.prune_jobs(later, 100).unwrap(),
+        hub.db.prune_jobs(later, 100).unwrap().outputs,
         std::slice::from_ref(&job.id)
     );
     let resp = api(addr, "GET", &output, Some(&key), None).await;
     assert_eq!((resp.status, resp.code()), (404, ErrorCode::NotFound));
 
     // Dropped from the history.
-    assert!(hub.db.prune_jobs(later, 0).unwrap().is_empty());
+    assert!(hub.db.prune_jobs(later, 0).unwrap().outputs.is_empty());
     let resp = api(
         addr,
         "POST",
@@ -4358,11 +4354,7 @@ async fn start_keeping(
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
-        .with_jobs(
-            dir.join("jobs"),
-            Duration::from_secs(60),
-            crate::store::DEFAULT_JOB_HISTORY,
-        )
+        .with_jobs(dir.join("jobs"), Duration::from_secs(60), None)
         .unwrap()
         .keeping_failure_output(keep)
         .keeping_output(bytes, total);
