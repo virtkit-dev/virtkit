@@ -24,6 +24,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk dev code` picks up where it left off after the host sleeps**: the guest SSH server no
+  longer hangs up on a command run without a tty when its connection drops, as sshd does not.
+  The VS Code server its bootstrap leaves running now survives, and the reconnecting window
+  finds its terminals and extensions where it left them. A session on a tty is still hung up
+  on.
 - **The guest registry proxy passes on a request body of any method**, so a `MKCOL` with a
   body reaches the registry, which refuses it (415). The proxy used to drop it, and the
   collection was created as if the request had none.
