@@ -25,14 +25,24 @@ const RELAY_ID: &str = "fedcba9876543210fedcba9876543210";
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
+/// Read the relay's next text frame and ping while waiting, as a hub does. The relay
+/// disconnects after three silent 1s heartbeat intervals, which a loaded host can
+/// spend between frames.
 async fn next(ws: &mut Ws) -> String {
-    loop {
-        match within("a frame from the relay", ws.next()).await {
-            Some(Ok(Message::Text(t))) => return t.as_str().to_owned(),
-            Some(Ok(_)) => {}
-            other => panic!("the relay ended the session: {other:?}"),
+    let mut ping = tokio::time::interval(std::time::Duration::from_millis(500));
+    within("a frame from the relay", async {
+        loop {
+            tokio::select! {
+                frame = ws.next() => match frame {
+                    Some(Ok(Message::Text(t))) => return t.as_str().to_owned(),
+                    Some(Ok(_)) => {}
+                    other => panic!("the relay ended the session: {other:?}"),
+                },
+                _ = ping.tick() => ws.send(Message::Ping(Vec::new().into())).await.unwrap(),
+            }
         }
-    }
+    })
+    .await
 }
 
 async fn send(ws: &mut Ws, msg: &impl serde::Serialize) {

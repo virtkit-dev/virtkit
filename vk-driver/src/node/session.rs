@@ -1078,7 +1078,7 @@ mod tests {
                 if node.core.unrecorded().is_empty() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                hub_pause(&mut ws, Duration::from_millis(50)).await;
             }
             stop.send(true).unwrap();
             while hub_receive(&mut ws).await.is_some() {}
@@ -1251,7 +1251,7 @@ mod tests {
                 if log.exists() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                hub_pause(&mut ws, Duration::from_millis(50)).await;
             }
             hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
             assert_eq!(next_of(&mut ws, ack_of).await.outcome, Outcome::Accepted);
@@ -1372,13 +1372,34 @@ mod tests {
         assert!(format!("{err:#}").contains("busy"), "{err:#}");
     }
 
-    /// The next message of a kind `pick` accepts, skipping the rest.
+    /// A real hub pings at the requested interval. A node disconnects after
+    /// [`MISSED_HEARTBEATS`] silent intervals: 3s with 1s heartbeats, which a
+    /// loaded host can spend between messages.
+    const HUB_PING: Duration = Duration::from_millis(500);
+
+    async fn hub_ping(ws: &mut HubSide) {
+        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+    }
+
+    /// Wait `d`, then ping so poll-loop pauses do not look like a silent hub.
+    async fn hub_pause(ws: &mut HubSide, d: Duration) {
+        tokio::time::sleep(d).await;
+        hub_ping(ws).await;
+    }
+
+    /// Skip messages `pick` rejects and ping the node while waiting, as a hub does.
     async fn next_of<T>(ws: &mut HubSide, pick: impl Fn(NodeMsg) -> Option<T>) -> T {
+        let quiet = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut ping = tokio::time::interval(HUB_PING);
         loop {
-            let msg = tokio::time::timeout(Duration::from_secs(10), hub_receive(ws))
-                .await
-                .expect("the node went quiet")
-                .expect("the node closed the session");
+            let msg = tokio::select! {
+                msg = hub_receive(ws) => msg.expect("the node closed the session"),
+                _ = ping.tick() => {
+                    hub_ping(ws).await;
+                    continue;
+                }
+                () = tokio::time::sleep_until(quiet) => panic!("the node went quiet"),
+            };
             if let Some(t) = pick(msg) {
                 return t;
             }
@@ -1472,7 +1493,7 @@ mod tests {
                 if !jobs_dir.exists() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                hub_pause(&mut ws, Duration::from_millis(50)).await;
             }
             assert!(!jobs_dir.exists());
             stop.send(true).unwrap();
