@@ -68,11 +68,13 @@ decides fleet-wide which runner's request gets the room a node frees:
   and the loop queues again.
 - **Arbitrated.** The hub offers room to the waiting tickets and the queued jobs of each
   placement together: a job at its `place_within_secs` deadline first, then a job holding its
-  reservation, then the tenant holding the least (tenants weigh the same for now), the oldest
-  first. A ticket waits while its relay holds its `concurrent` or its runner its `limit` —
-  counting its tickets offered, granted or claimed and its jobs, those its heartbeat counts
-  without an admission included — while its runner backs off, and until the relay's current
-  session has sent a heartbeat listing every request it holds.
+  reservation, then the tenant holding the least for its `weight`, the oldest first. Shares are
+  not set aside: room an idle tenant leaves goes to the others. A ticket waits while its tenant
+  holds its `cap`, its relay its `concurrent` or its runner its `limit` — counting its tickets
+  offered, granted or claimed and its jobs, those its heartbeat counts without an admission
+  included — while its runner backs off, and until the relay's current session has sent a
+  heartbeat listing every request it holds. A job submitted without an admission waits on its
+  tenant's `cap` too.
 - **Bounded discovery.** A request of a runner that took no job in the last `busy_secs` is a
   probe, GitLab likely having nothing for it: at most `probe_limit` probes are out fleet-wide,
   one per runner. An `empty` or `error` outcome backs the runner off for

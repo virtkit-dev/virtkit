@@ -35,6 +35,9 @@ All notable changes to virtkit will be documented in this file.
   API gains queued reservations (`queue: true`), their tickets at
   `/v1/reservations/tickets/<ticket>`, and `POST /v1/reservations/<id>/claim` and
   `/v1/reservations/<admission>/outcome`.
+- **Capacity tenants share the fleet by `weight` up to a `cap`.** The hub hands room to the
+  tenant using the least for its weight and holds a tenant at its cap of requests and jobs; a
+  tenant's unused share goes to the others.
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
   Replacements are audited and checked against the shown digest to prevent lost updates.
 

@@ -794,3 +794,171 @@ async fn the_tenant_holding_less_is_granted_first() {
     assert_eq!(answer.status, 202, "{answer:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Claim `grant` of ticket `ticket` and report that a job took it, as `key`'s relay.
+async fn take_job(addr: SocketAddr, key: &str, ticket: &str, grant: &ReservationGrant) {
+    assert_eq!(claim(addr, key, grant).await.status, 204);
+    let reply = outcome(addr, key, ticket, ticket, "job").await;
+    assert_eq!(reply.status, 204, "{reply:?}");
+}
+
+/// Cap tenant `tests` at `cap` admissions and jobs.
+fn cap_tests(hub: &Hub, cap: u32) {
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.tenants.get_mut("tests").unwrap().cap = Some(cap);
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+}
+
+/// Settle job `id` as `key`'s relay, once it finished.
+async fn settle(addr: SocketAddr, key: &str, id: &str) {
+    view_until(addr, key, id, |v| v.state == JobState::Finished).await;
+    let path = format!("/v1/jobs/{id}/settle");
+    let reply = api(addr, "POST", &path, Some(key), None).await;
+    assert_eq!(reply.status, 204, "{reply:?}");
+}
+
+#[tokio::test]
+async fn a_claimed_admission_stays_charged_to_its_tenant_cap() {
+    let dir = scratch("capacity-cap");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    cap_tests(&hub, 1);
+    let mut node = ready_node(addr, &hub, 8192).await;
+    let first = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &first, &mut node).await;
+    assert_eq!(claim(addr, &key, &grant).await.status, 204);
+    // Claimed, its runner asks GitLab under it: the tenant's one slot is taken.
+    let second = queue(addr, &key, 2).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    let reply = poll(addr, &key, &second, 0).await;
+    assert_eq!(reply.status, 202, "{reply:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_job_keeps_its_admission_charged_until_settled() {
+    let dir = scratch("capacity-settle");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    cap_tests(&hub, 1);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let first = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &first, &mut node).await;
+    take_job(addr, &key, &first, &grant).await;
+    let mut body = job_body(10, Some(&grant.reservation), 30);
+    body["admission"] = json!(first);
+    let reply = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(reply.status, 201, "{reply:?}");
+    let job = reply.json::<JobView>().id;
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected job start")
+    };
+    assert_eq!(start.job, job);
+    node.send(NodeJobMsg::Job {
+        job: job.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &job, |view| view.state == JobState::Running).await;
+    let second = queue(addr, &key, 2).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    // Finished, the job holds its admission until its relay settles it.
+    node.send(NodeJobMsg::Result {
+        job: job.clone(),
+        result: result(None, 0),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });
+    view_until(addr, &key, &job, |view| view.state == JobState::Finished).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    settle(addr, &key, &job).await;
+    let next = accept_ticket(addr, &key, &second, &mut node).await;
+    assert_eq!(next.admission.as_deref(), Some(second.as_str()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn direct_submissions_obey_the_tenant_cap() {
+    let dir = scratch("capacity-direct-cap");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    cap_tests(&hub, 1);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let first = running_job(addr, &key, &mut node, 1).await;
+    let reply = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(2, None, 30)),
+    )
+    .await;
+    assert_eq!(reply.status, 201, "{reply:?}");
+    let second = reply.json::<JobView>().id;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &second),
+        Some("tenant cap")
+    );
+    node.send(NodeJobMsg::Result {
+        job: first.clone(),
+        result: result(None, 0),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: first.clone() });
+    settle(addr, &key, &first).await;
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected the second job's start")
+    };
+    assert_eq!(start.job, second);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn weighted_tenants_go_by_load_per_weight() {
+    let dir = scratch("capacity-weighted");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    // Three requests waiting per runner.
+    relay_limits(&hub, &key, 64, 3);
+    add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.tenants.get_mut("tests").unwrap().weight = 2;
+    policy.tenants.insert(
+        "other".into(),
+        crate::policy::Tenant {
+            weight: 1,
+            cap: None,
+            projects: Vec::new(),
+        },
+    );
+    for mapping in &mut policy.runners {
+        if mapping.runner_id == 43 {
+            mapping.tenant = "other".into();
+        }
+    }
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    ready_relay(&hub, &key);
+    let mut node = ready_node(addr, &hub, 32768).await;
+    crate::ops::set_ceiling(&hub, "u", &node.id, Some(1)).unwrap();
+    let a1 = queue(addr, &key, 1).await;
+    let b1 = queue_for(addr, &key, 2, "other").await;
+    let b2 = queue_for(addr, &key, 3, "other").await;
+    let a2 = queue(addr, &key, 4).await;
+    let a3 = queue(addr, &key, 5).await;
+    // Add one slot at a time: oldest first when idle, then `other` holding none,
+    // then `tests` (jobs/weight 1/2 < 1/1), then the older request at equal shares,
+    // then `tests` (2/2 < 2/1).
+    for (slots, ticket) in (1..).zip([&a1, &b1, &a2, &b2, &a3]) {
+        crate::ops::set_ceiling(&hub, "u", &node.id, Some(slots)).unwrap();
+        crate::jobs::testing::step(&hub).await;
+        let grant = accept_ticket(addr, &key, ticket, &mut node).await;
+        assert_eq!(grant.admission.as_deref(), Some(ticket.as_str()));
+        take_job(addr, &key, ticket, &grant).await;
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

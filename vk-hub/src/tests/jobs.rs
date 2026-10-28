@@ -703,6 +703,15 @@ fn heard(hub: &Hub, id: &str) -> bool {
         .is_some_and(|r| r.heartbeat.is_some() && r.inventory.is_some_and(|i| !i.labels.is_empty()))
 }
 
+/// Why `gl` runner `runner_id`'s request waits after a placement pass.
+async fn reason_now(hub: &Hub, runner_id: u64) -> Option<&'static str> {
+    crate::jobs::testing::step(hub).await;
+    let snapshot = crate::jobs::arbitration_snapshot(hub).unwrap();
+    snapshot
+        .get(&("gl".to_string(), runner_id))
+        .and_then(|v| v.reason)
+}
+
 async fn wait_until(mut cond: impl FnMut() -> bool) {
     for _ in 0..1000 {
         if cond() {

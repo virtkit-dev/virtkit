@@ -464,7 +464,7 @@ struct LiveJob {
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
     /// Why arbitration last passed it over while nodes may have had room for it: a limit of
-    /// its relay or runner. Told when it ends at its deadline.
+    /// its tenant, relay or runner. Told when it ends at its deadline.
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
@@ -5499,6 +5499,11 @@ pub(crate) mod testing {
     /// When `node` last used image `key`, as the hub remembers it.
     pub fn warm_at(hub: &Hub, key: &str, node: &str) -> Option<u64> {
         (hub.dispatch.lock().warm.get(key)).and_then(|nodes| nodes.get(node).copied())
+    }
+
+    /// Why arbitration last passed live job `id` over, as [`LiveJob::blocked`] says.
+    pub fn job_blocked(hub: &Hub, id: &str) -> Option<&'static str> {
+        hub.dispatch.lock().jobs.get(id).and_then(|j| j.blocked)
     }
 
     /// How many reservations the hub holds.

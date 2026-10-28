@@ -264,13 +264,7 @@ impl Loads {
         row: &JobRow,
         add: bool,
     ) {
-        let tenant = match &row.scheduling {
-            Some(identity) => Some(identity.tenant.as_str()),
-            None => legacy_tenant(policy, row),
-        };
-        if let Some(tenant) = tenant {
-            count(&mut self.tenant, tenant.to_owned(), add);
-        }
+        count(&mut self.tenant, job_tenant(policy, row).to_owned(), add);
         count(&mut self.relay, row.key.clone(), add);
         if row.admission.is_none() {
             count(&mut self.unadmitted_relay, row.key.clone(), add);
@@ -312,6 +306,15 @@ impl Loads {
             .copied()
             .unwrap_or(0)
             .saturating_add(held.saturating_sub(charged))
+    }
+}
+
+/// The tenant the job of `row` is charged to: its scheduling identity's; recorded without one,
+/// the tenant listing its project, else the policy's fallback.
+fn job_tenant<'a>(policy: &'a crate::policy::Policy, row: &'a JobRow) -> &'a str {
+    match &row.scheduling {
+        Some(identity) => identity.tenant.as_str(),
+        None => legacy_tenant(policy, row).unwrap_or(policy.fallback.as_str()),
     }
 }
 
@@ -373,6 +376,11 @@ struct Candidate {
     reserved: bool,
     /// A job at its deadline: placed now or ended.
     due: bool,
+}
+
+/// `a` against `b` by their tenants' load per weight, the lower first.
+fn share(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    (u128::from(a.load) * u128::from(b.weight)).cmp(&(u128::from(b.load) * u128::from(a.weight)))
 }
 
 /// One arbitration pass over the tickets and the queued jobs: forget what lapsed, reconcile
@@ -753,11 +761,15 @@ fn arbitrate(
                 blocked(state, id, "awaiting relay reconciliation");
                 continue;
             }
-            if policy.tenant(&ticket.identity.tenant).is_none() {
+            let Some(tenant) = policy.tenant(&ticket.identity.tenant) else {
                 blocked(state, id, "tenant unavailable");
                 continue;
-            }
+            };
             let load = loads.tenant_load(&ticket.identity.tenant);
+            if tenant.cap.is_some_and(|cap| load >= u64::from(cap)) {
+                blocked(state, id, "tenant cap");
+                continue;
+            }
             if loads.relay_load(relays, &ticket.key) >= u64::from(ticket.identity.concurrent) {
                 blocked(state, id, "relay concurrent limit");
                 continue;
@@ -833,8 +845,7 @@ fn arbitrate(
                 class: ticket.identity.class,
                 probe,
                 load,
-                // Tenant weights do not apply yet: every tenant weighs the same.
-                weight: 1,
+                weight: tenant.weight,
                 tenant_probe,
                 runner_probe: last_probe,
                 arrived: ticket.created,
@@ -884,23 +895,30 @@ fn arbitrate(
             }
             tried.extend(excluded.iter().cloned());
             let identity = row.scheduling.as_ref();
-            let tenant_name = identity.map_or(policy.fallback.as_str(), |i| i.tenant.as_str());
+            let tenant_name = job_tenant(policy, &row);
             let class = identity.map_or(crate::policy::Class::Normal, |i| i.class);
-            // Tenant weights do not apply yet: every tenant weighs the same.
-            let weight = 1;
+            let tenant = policy.tenant(tenant_name);
+            let weight = tenant.map_or(1, |t| t.weight);
             let load = loads.tenant_load(tenant_name);
-            if row.admission.is_none()
-                && let Some(relay) = relays.row(&row.key)
-            {
-                let gate = match &relay.inventory {
-                    None => Some("its relay's inventory is unknown"),
-                    Some(inventory)
+            // A job on an admission was held to these when the admission was offered.
+            if row.admission.is_none() {
+                let relay = relays.row(&row.key);
+                let gate = match relay.map(|relay| &relay.inventory) {
+                    _ if tenant
+                        .and_then(|t| t.cap)
+                        .is_some_and(|cap| load >= u64::from(cap)) =>
+                    {
+                        Some("tenant cap")
+                    }
+                    None => None,
+                    Some(None) => Some("its relay's inventory is unknown"),
+                    Some(Some(inventory))
                         if loads.relay_load(relays, &row.key)
                             >= u64::from(inventory.concurrent) =>
                     {
                         Some("relay concurrent limit")
                     }
-                    Some(inventory) => match identity.and_then(|i| i.runner_id) {
+                    Some(Some(inventory)) => match identity.and_then(|i| i.runner_id) {
                         None => None,
                         Some(runner_id) => match inventory
                             .runners
@@ -993,18 +1011,12 @@ fn arbitrate(
             b.due
                 .cmp(&a.due)
                 .then_with(|| rank(a).cmp(&rank(b)))
-                .then_with(|| {
-                    (u128::from(a.load) * u128::from(b.weight))
-                        .cmp(&(u128::from(b.load) * u128::from(a.weight)))
-                })
+                .then_with(|| share(a, b))
                 .then_with(|| a.id.cmp(&b.id))
         });
         let Some(first) = eligible.first() else { break };
         let tied = eligible.iter().take_while(|e| {
-            e.due == first.due
-                && rank(e) == rank(first)
-                && u128::from(e.load) * u128::from(first.weight)
-                    == u128::from(first.load) * u128::from(e.weight)
+            e.due == first.due && rank(e) == rank(first) && share(e, first).is_eq()
         });
         let probes = tied
             .clone()
@@ -1128,4 +1140,39 @@ fn arbitrate(
         }
     }
     Ok(moved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Class;
+
+    fn candidate() -> Candidate {
+        Candidate {
+            id: String::new(),
+            node: String::new(),
+            class: Class::Normal,
+            probe: false,
+            load: 0,
+            weight: 1,
+            tenant_probe: None,
+            runner_probe: None,
+            arrived: Instant::now(),
+            job: false,
+            reserved: false,
+            due: false,
+        }
+    }
+
+    #[test]
+    fn shares_compare_load_per_weight() {
+        let tenant = |load, weight| Candidate {
+            load,
+            weight,
+            ..candidate()
+        };
+        assert!(share(&tenant(1, 2), &tenant(1, 1)).is_lt());
+        assert!(share(&tenant(2, 2), &tenant(1, 1)).is_eq());
+        assert!(share(&tenant(3, 2), &tenant(1, 1)).is_gt());
+    }
 }
