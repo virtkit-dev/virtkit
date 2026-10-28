@@ -1739,6 +1739,13 @@ so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
 
 Below the GitLab servers, *Approved projects* lists the projects whose jobs run, by instance,
 with when and by whom each was approved; a server's count of approved projects links there.
+Pending, rejected and approved projects in Connections link to
+`/clients/projects/<instance>/<project ID>`, visible to viewers and operators. The page shows
+its path, ID, instance, approval, last decision-maker, when the hub first heard of it, its first
+refused job and refusal count. It links to jobs with the same path and to observed traffic.
+Operators use the same decision buttons as on Connections, posting plain forms to `/clients`.
+Responses redirect to the project page, or to Connections after forgetting it. Job pages also
+link to their projects.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require

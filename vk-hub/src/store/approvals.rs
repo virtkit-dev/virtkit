@@ -698,6 +698,16 @@ impl Db {
         Ok(out)
     }
 
+    /// Project `id` of instance `gitlab`, if the hub has a record of it.
+    pub fn gitlab_project(&self, gitlab: &str, id: u64) -> Result<Option<ProjectRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(GITLAB_PROJECTS)?;
+        table
+            .get((gitlab, id))?
+            .map(|g| decode(g.value()))
+            .transpose()
+    }
+
     /// Those of `ids` of instance `gitlab` that are approved, with their paths, in one read.
     pub fn approved_projects(&self, gitlab: &str, ids: &[u64]) -> Result<Vec<(u64, String)>> {
         let txn = self.db.begin_read().context("starting a read")?;
@@ -1061,6 +1071,18 @@ mod tests {
             1
         );
         assert_eq!(db.gitlab_projects(Some("gl")).unwrap().len(), 1);
+        assert_eq!(db.gitlab_project("gl", 4).unwrap(), None);
+        let kept = db.gitlab_project("gl", 9).unwrap().unwrap();
+        assert_eq!(
+            (kept.state, kept.decided_by.as_deref()),
+            (ProjectState::Approved, Some("u"))
+        );
+        assert_eq!(db.gitlab_project("other", 9).unwrap(), None);
+        let other = db.gitlab_project("other", 4).unwrap().unwrap();
+        assert_eq!(
+            (other.state, other.decided_by.as_deref()),
+            (ProjectState::Rejected, Some("v"))
+        );
         // Removing the instance forgets its projects, not another's.
         db.remove_gitlab("gl", "u", 6).unwrap();
         db.add_gitlab("gl", "https://gl.example", "u", 7).unwrap();

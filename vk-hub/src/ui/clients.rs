@@ -30,8 +30,9 @@
 //! what it decides on, so the fragment's updates leave one being filled in alone.
 //!
 //! Below the servers, *Approved projects* lists the projects whose jobs run, by instance, for
-//! operators to reject or forget. Rejecting or forgetting an approved project is asked first
-//! ([`actions::ask_first`]): its next jobs are refused.
+//! operators to reject or forget. Pending, rejected and approved projects link to their pages
+//! ([`super::projects`]), whose buttons post here. Rejecting or forgetting an approved project
+//! requires confirmation ([`actions::ask_first`]): its next jobs are refused.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -397,9 +398,9 @@ fn server_button(h: &mut Html, op: &'static str, url: &str, label: &'static str)
 /// largest form a page posts.
 const MAX_LISTED_PROJECTS: usize = 500;
 
-/// Instance `gitlab`'s `projects` in `state`, each with its path and ID: for one
-/// pending or rejected, its first job refused and the relay that submitted it, since when and
-/// how many of its jobs were refused; for one approved, when and by whom. For an operator, a
+/// Instance `gitlab`'s `projects` in `state`, with linked paths and IDs. Pending and rejected
+/// projects show their first refused job, submitting relay, first-seen time and refusal count;
+/// approved projects show when and by whom they were approved. For an operator, a
 /// form ticking some of them to approve, reject or forget together, each where it changes
 /// something.
 fn projects_form(
@@ -439,14 +440,17 @@ fn projects_form(
                 .text(p.id)
                 .raw("\"></td>");
         }
-        table.raw("<td>");
+        table
+            .raw("<td><a href=\"")
+            .text(super::projects::path(gitlab, p.id))
+            .raw("\">");
         if p.row.path.is_empty() {
             table.raw("<span class=\"sub\">path not known</span>");
         } else {
             table.node(&p.row.path);
         }
         table
-            .raw("</td><td class=\"num\">")
+            .raw("</a></td><td class=\"num\">")
             .text(p.id)
             .raw("</td><td>");
         if approved {
@@ -522,7 +526,7 @@ fn projects_form(
 
 /// The buttons deciding on projects in `state`, each where it changes something: approve,
 /// reject and forget.
-fn decide_buttons(h: &mut Html, state: ProjectState) {
+pub(super) fn decide_buttons(h: &mut Html, state: ProjectState) {
     if state != ProjectState::Approved {
         h.raw("<button class=\"primary\" name=\"op\" value=\"")
             .raw(APPROVE_PROJECTS)
@@ -549,7 +553,7 @@ fn decided_cells(h: &mut Html, row: &ProjectRow) {
 }
 
 /// The relay `id` names, by hostname, or marked removed; `-` for none.
-fn relay_cell(h: &mut Html, relays: &[RelayView], id: Option<&str>) {
+pub(super) fn relay_cell(h: &mut Html, relays: &[RelayView], id: Option<&str>) {
     match id {
         Some(id) => match relays.iter().find(|r| r.id == id) {
             Some(r) => h.node(&r.row.hostname),
@@ -1481,11 +1485,15 @@ async fn decide_server(
     Ok(fleet::said_so(&said))
 }
 
+/// What a project's page posts as `from`, for its decision to lead back to it.
+pub(super) const FROM_PROJECT: &str = "project";
+
 /// Approve, reject or forget the projects of instance `gitlab` `form` ticks (`project`, or
 /// `projects` as a list once asked), as `vk-hub gitlabs projects approve|reject|forget` do,
 /// only while the instance is still at the `url` the form showed; approving or rejecting keeps
 /// the path recorded. Rejecting or forgetting an approved project is asked first: its next jobs
-/// are refused, while those under way go on.
+/// are refused, while those under way go on. Posted from a project's page (`from`), it names
+/// that one project, and a plain form's answer leads back to its page unless it was forgotten.
 async fn decide_projects(
     ui: &Ui,
     site: &FleetSite,
@@ -1526,6 +1534,26 @@ async fn decide_projects(
             "Tick at least one project.",
         ));
     }
+    let from_page = field(form, "from") == Some(FROM_PROJECT);
+    if from_page && ids.len() != 1 {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::BAD_REQUEST,
+            "Refused: a project's page decides on that project alone.",
+        ));
+    }
+    if from_page && !crate::store::valid_gitlab_name(&gitlab) {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::BAD_REQUEST,
+            "Refused: not a GitLab instance's name.",
+        ));
+    }
+    let back = if from_page {
+        super::projects::path(&gitlab, ids[0])
+    } else {
+        PATH.to_string()
+    };
     // Of the projects to reject or forget, those approved as asked about: the store refuses the
     // decision should they have changed since.
     let mut asked_approved = None;
@@ -1562,6 +1590,9 @@ async fn decide_projects(
                         .join(","),
                 ),
             ];
+            if from_page {
+                asked.push(("from", FROM_PROJECT.to_string()));
+            }
             // Asked about these: the answer is refused should which are approved change since.
             let approved_ids = (approved.iter().map(|(id, _)| id.to_string()))
                 .collect::<Vec<_>>()
@@ -1569,7 +1600,7 @@ async fn decide_projects(
             asked.push(("approved", approved_ids));
             let ask = actions::Ask {
                 path: PATH.to_string(),
-                back: PATH.to_string(),
+                back: back.clone(),
                 op: op.to_string(),
                 what: if op == REJECT_PROJECTS {
                     "Reject these approved projects? Their next jobs are refused until an \
@@ -1648,7 +1679,8 @@ async fn decide_projects(
         );
     }
     if !htmx {
-        return Ok(see_other(PATH));
+        // A forgotten project has no page left to go back to.
+        return Ok(see_other(if op == FORGET_PROJECTS { PATH } else { &back }));
     }
     Ok(fleet::said_so(&format!(
         "{} {n} project(s) of {gitlab}.",
@@ -1660,12 +1692,15 @@ async fn decide_projects(
     )))
 }
 
-/// A redirect to `to`, after a plain form's post.
-fn see_other(to: &'static str) -> Response<Body> {
+/// Redirect after a plain-form post to a hub path, falling back to Connections if `to` is an
+/// invalid header value. Paths built from checked names are valid header values.
+fn see_other(to: &str) -> Response<Body> {
     let mut resp = Response::new(Body::default());
     *resp.status_mut() = StatusCode::SEE_OTHER;
-    resp.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static(to));
+    resp.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(to).unwrap_or(HeaderValue::from_static(PATH)),
+    );
     resp
 }
 

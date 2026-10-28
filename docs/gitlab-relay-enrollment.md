@@ -164,7 +164,7 @@ A refused submission retried under the same request ID counts once.
   reported it and when, and for a project its path, first job and how many jobs failed waiting.
   Rows of one group can be selected together for a bulk approve; no rule such as `acme/**`
   approves projects no one has looked at, at the cost of each new project's first job.
-  Approved projects are listed below the servers.
+  Approved projects are listed below the servers, and each project has a page of its own.
 - **CLI.** `vk-hub gitlabs pending`, `gitlabs approve <url> --name <name>`, `gitlabs projects
   approve <gitlab> <id>[:<path>] …`, `reject`, `forget`. `gitlabs add <name> <url>` and
   `projects approve` also work before anything is pending.

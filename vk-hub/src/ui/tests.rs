@@ -8574,7 +8574,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         "data-check=\"all\"",
         "<td><input id=\"pick-pending-gl-42\" hx-preserve=\"true\" type=\"checkbox\" \
          name=\"project\" value=\"42\" aria-label=\"42\"></td>\
-         <td>acme/web</td><td class=\"num\">42</td><td><a \
+         <td><a href=\"/clients/projects/gl/42\">acme/web</a></td><td class=\"num\">42</td><td><a \
          href=\"https://gitlab.example.com/acme/web/-/jobs/142\"",
         ">#142</a></td><td>relay-1</td><td><time",
         "name=\"op\" value=\"approve-projects\">Approve</button>",
@@ -8644,14 +8644,17 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     );
     let rejected = event.split("<h2>Rejected</h2>").nth(1).unwrap();
     let rejected = rejected.split("<h2>GitLab servers</h2>").next().unwrap();
-    assert!(rejected.contains("acme/api"), "{rejected}");
+    assert!(
+        rejected.contains("<a href=\"/clients/projects/gl/43\">acme/api</a>"),
+        "{rejected}"
+    );
     assert!(!rejected.contains("reject-projects"), "{rejected}");
     let approved = event.split("<h2>Approved projects</h2>").nth(1).unwrap();
     let approved = approved.split("<h2>Relays</h2>").next().unwrap();
     for want in [
         "<h3 id=\"projects-approved-gl\">",
         "<td><input id=\"pick-approved-gl-42\"",
-        "<td>acme/web</td><td class=\"num\">42</td>\
+        "<td><a href=\"/clients/projects/gl/42\">acme/web</a></td><td class=\"num\">42</td>\
          <td><time",
         "name=\"op\" value=\"reject-projects\">Reject</button>",
         "name=\"op\" value=\"forget-projects\">Forget</button>",
@@ -8664,7 +8667,10 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     let page = get(addr, "/clients", Some(&viewer)).await.body;
     let listed = page.split("<h2>Approved projects</h2>").nth(1).unwrap();
     let listed = listed.split("<h2>Relays</h2>").next().unwrap();
-    assert!(listed.contains("<td>acme/web</td>"), "{listed}");
+    assert!(
+        listed.contains("<td><a href=\"/clients/projects/gl/42\">acme/web</a></td>"),
+        "{listed}"
+    );
     assert!(!listed.contains("<form"), "{listed}");
     // A list of projects that does not parse is refused.
     for projects in ["42,x", ""] {
@@ -8894,6 +8900,240 @@ async fn deciding_against_approved_projects_is_asked_first() {
         reply.body
     );
     assert_eq!(state(42), None);
+}
+
+/// Project pages under Connections show the approval record and links to jobs and observed
+/// traffic to viewers and operators. Only operators get decision buttons. Rejecting or
+/// forgetting an approved project requires confirmation. Plain forms redirect to the project,
+/// or Connections after forgetting it. Job pages link to their projects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_page_shows_and_decides_one_project() {
+    use crate::store::{Decision, ProjectRef, ProjectState};
+    let (addr, hub, origin) = start_fleet().await;
+    let now = crate::now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "u", now)
+        .unwrap();
+    let refs = [
+        ProjectRef {
+            id: 42,
+            path: Some("acme/web".into()),
+        },
+        ProjectRef { id: 44, path: None },
+    ];
+    hub.db
+        .decide_projects("gl", &refs, Decision::Approve, "alice", now)
+        .unwrap();
+    let state = |id: u64| hub.db.gitlab_project("gl", id).unwrap().map(|p| p.state);
+    let page_of = "/clients/projects/gl/42";
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, page_of, Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        // The hub's only instance goes unnamed.
+        "<h1>acme/web</h1>",
+        "<a href=\"/clients\" aria-current=\"page\">Connections",
+        "<tr><th>GitLab ID</th><td>42</td></tr>",
+        "<strong>gl</strong> https://gitlab.example.com",
+        "<span class=\"badge ok\">approved</span>",
+        "<tr><th>Last decided</th><td><time",
+        " by alice</td>",
+        "<tr><th>Jobs refused</th><td>0</td></tr>",
+        "<a href=\"/jobs?project=acme%2Fweb\">Jobs with this path</a>",
+        "<a href=\"/egress?tab=observed&amp;project=gitlab%3Agl%3A42\">Observed traffic</a>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("name=\"op\""), "{}", page.body);
+    assert!(!page.body.contains("First job refused"), "{}", page.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        "/clients",
+        &format!("_csrf={viewer_csrf}&op=reject-projects&gitlab=gl&project=42&from=project"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    // Known by ID alone: no path, and no jobs to look for by one.
+    let page = get(addr, "/clients/projects/gl/44", Some(&viewer)).await;
+    assert!(page.body.contains("<h1>project 44</h1>"), "{}", page.body);
+    assert!(
+        page.body
+            .contains("<tr><th>Path</th><td><span class=\"sub\">not known</span>"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("Jobs with this path"), "{}", page.body);
+    // Pending since a relay's job of it was refused: the job, and the relay that submitted it.
+    let relay = bound_relay(&hub, "aa", "https://gitlab.example.com");
+    let job = crate::store::GateJob {
+        server_url: "https://gitlab.example.com",
+        project_id: 45,
+        project_path: "acme/new",
+        job_id: 145,
+        job_url: Some("https://gitlab.example.com/acme/new/-/jobs/145"),
+    };
+    hub.db
+        .gate_job(&relay, &job, (&"ab".repeat(16), "d"), now)
+        .unwrap();
+    let page = get(addr, "/clients/projects/gl/45", Some(&viewer)).await;
+    for want in [
+        "<span class=\"badge warn\">pending</span>",
+        "<tr><th>First job refused</th><td><a href=\"https://gitlab.example.com/acme/new/-/jobs/145\"",
+        ">#145</a>, submitted by relay relay-1</td>",
+        "<tr><th>Jobs refused</th><td>1</td></tr>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("Last decided"), "{}", page.body);
+    for path in [
+        "/clients/projects/gl/43",
+        "/clients/projects/gl/042",
+        "/clients/projects/gl/+42",
+        "/clients/projects/gl/0",
+        "/clients/projects/GL/42",
+        "/clients/projects/gl/42/",
+        "/clients/projects/gl",
+    ] {
+        assert_eq!(get(addr, path, Some(&viewer)).await.status, 404, "{path}");
+    }
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, page_of, Some(&operator)).await.body;
+    for want in [
+        "<h2>Decide</h2><form method=\"post\" action=\"/clients\">",
+        "<input type=\"hidden\" name=\"url\" value=\"https://gitlab.example.com\">\
+         <input type=\"hidden\" name=\"project\" value=\"42\">\
+         <input type=\"hidden\" name=\"from\" value=\"project\">",
+        "name=\"op\" value=\"reject-projects\">Reject</button>",
+        "name=\"op\" value=\"forget-projects\">Forget</button>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("approve-projects"), "{page}");
+    let pending = get(addr, "/clients/projects/gl/45", Some(&operator))
+        .await
+        .body;
+    for want in [
+        "name=\"op\" value=\"approve-projects\">Approve</button>",
+        "name=\"op\" value=\"reject-projects\">Reject</button>",
+    ] {
+        assert!(pending.contains(want), "{want}: {pending}");
+    }
+    let post = |form: String| {
+        let (origin, operator) = (origin.clone(), operator.clone());
+        async move { post_action(addr, &origin, &operator, "/clients", &form, false).await }
+    };
+    let gl = "gitlab=gl&url=https%3A%2F%2Fgitlab.example.com";
+
+    // Rejecting it, approved, is asked first, and nothing changes until answered.
+    let reply = post(format!(
+        "_csrf={csrf}&op=reject-projects&{gl}&project=42&from=project"
+    ))
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "<h1>Confirm</h1>",
+        "Reject these approved projects?",
+        "<p>Approved, of <strong>gl</strong>: acme/web <code>42</code></p>",
+        "name=\"projects\" value=\"42\"",
+        "name=\"approved\" value=\"42\"",
+        "<a href=\"/clients/projects/gl/42\">Cancel</a>",
+        // The confirmation page has no flash: it submits a plain form and redirects.
+        "<form method=\"post\" action=\"/clients\">",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert_eq!(state(42), Some(ProjectState::Approved));
+    let nonce = hidden(&reply.body, "nonce");
+    let confirmed = format!(
+        "_csrf={csrf}&op=reject-projects&{gl}&projects=42&approved=42&from=project&nonce={nonce}\
+         &confirm=yes"
+    );
+    let reply = post(confirmed).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some(page_of));
+    assert_eq!(state(42), Some(ProjectState::Rejected));
+    audited(
+        &hub,
+        "rejected project(s) 42 (acme/web) of GitLab instance gl",
+    )
+    .await;
+    let page = get(addr, page_of, Some(&operator)).await.body;
+    assert!(
+        page.contains("<span class=\"badge bad\">rejected</span>"),
+        "{page}"
+    );
+    assert!(!page.contains("reject-projects"), "{page}");
+
+    // Approving it again is not asked, and leads back.
+    let reply = post(format!(
+        "_csrf={csrf}&op=approve-projects&{gl}&project=42&from=project"
+    ))
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some(page_of));
+    assert_eq!(state(42), Some(ProjectState::Approved));
+    // A page decides on its project alone, at the instance it showed.
+    let reply = post(format!(
+        "_csrf={csrf}&op=approve-projects&{gl}&project=42&project=44&from=project"
+    ))
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = post(format!(
+        "_csrf={csrf}&op=approve-projects&gitlab=GL&url=x&project=42&from=project"
+    ))
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("not a GitLab instance&#39;s name"),
+        "{}",
+        reply.body
+    );
+    let stale = "gitlab=gl&url=https%3A%2F%2Felsewhere.example";
+    let reply = post(format!(
+        "_csrf={csrf}&op=approve-projects&{stale}&project=44&from=project"
+    ))
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+
+    // Forgotten once asked: its page is gone, so the answer leads to Connections.
+    let reply = post(format!(
+        "_csrf={csrf}&op=forget-projects&{gl}&project=42&from=project"
+    ))
+    .await;
+    assert!(
+        reply.body.contains("Forget these approved projects?"),
+        "{}",
+        reply.body
+    );
+    let nonce = hidden(&reply.body, "nonce");
+    let reply = post(format!(
+        "_csrf={csrf}&op=forget-projects&{gl}&projects=42&approved=42&from=project&nonce={nonce}\
+         &confirm=yes"
+    ))
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(state(42), None);
+    assert_eq!(get(addr, page_of, Some(&operator)).await.status, 404);
+
+    // A job of a project links its page.
+    let mut row = history_job(1, "acme/api");
+    row.gitlab = Some("gl".into());
+    row.project_id = Some(44);
+    let id = format!("{:032x}", 1);
+    hub.db
+        .submit_job(&id, &row, "1", b"{}", "key gitlab", now)
+        .unwrap();
+    let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+    assert!(
+        page.contains("<tr><th>Project</th><td><a href=\"/clients/projects/gl/44\">acme/api</a>"),
+        "{page}"
+    );
 }
 
 /// A placed job's page shows rights per storage area in plain words, with token details

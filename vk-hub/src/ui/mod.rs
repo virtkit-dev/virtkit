@@ -79,6 +79,7 @@ mod multipart;
 mod oidc;
 mod operations;
 mod pages;
+mod projects;
 mod registries;
 mod sse;
 mod users;

@@ -1288,7 +1288,24 @@ pub(super) fn record(
         pages::kv(h, "Event", &event.to_string());
     }
     pages::kv_node(h, "Title", &j.title);
-    pages::kv_node(h, "Project", j.project.as_deref().unwrap_or("-"));
+    let mut cell = Html::new();
+    match (&j.gitlab, j.project_id) {
+        // Its page, under the instance and ID the approval gate knows it by.
+        (Some(gitlab), Some(id)) if crate::store::valid_gitlab_name(gitlab) => {
+            cell.raw("<a href=\"")
+                .text(super::projects::path(gitlab, id))
+                .raw("\">");
+            match &j.project {
+                Some(project) => cell.node(project),
+                None => cell.raw("project ").text(id),
+            };
+            cell.raw("</a>");
+        }
+        _ => {
+            cell.node(j.project.as_deref().unwrap_or("-"));
+        }
+    }
+    pages::kv_html(h, "Project", &cell);
     if j.git_ref.is_some() || j.commit.is_some() {
         // The branch and the commit it ran, abbreviated with the full commit on hover.
         let mut cell = Html::new();
