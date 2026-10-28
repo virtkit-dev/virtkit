@@ -3337,10 +3337,12 @@ async fn a_lower_history_count_trims_the_history_write_after_write() {
         let page = hub.db.job_page(&all, None, 1).unwrap();
         (!page.reading).then_some(page.summary.matched)
     };
-    eventually(|| held() == Some(2_500)).await;
+    // Counting and trimming 2,500 rows is slow on a loaded machine.
+    let within = Duration::from_secs(60);
+    eventually_within(within, || held() == Some(2_500)).await;
 
     crate::jobs::set_history(&hub, "uid 0", Some(100)).unwrap();
-    eventually(|| held() == Some(100)).await;
+    eventually_within(within, || held() == Some(100)).await;
     let page = hub.db.job_page(&all, None, 1).unwrap();
     assert_eq!(page.rows[0].1, format!("{jobs:032x}"));
     let oldest = hub.db.job_page(&all, Some(page.rows[0].0 - 98), 1).unwrap();

@@ -277,8 +277,13 @@ async fn closed(ws: &mut Client, within: Duration) {
 /// Poll `cond` until it holds, for effects a session applies after its reply. Some are paced
 /// to the next heartbeat (a report the session holds back), and a loaded machine stretches
 /// that and the write after it, so the deadline is several heartbeats away.
-async fn eventually(mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+async fn eventually(cond: impl FnMut() -> bool) {
+    eventually_within(Duration::from_secs(10), cond).await
+}
+
+/// [`eventually`] with its own deadline, for conditions that take more than a few heartbeats.
+async fn eventually_within(within: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
     while !cond() {
         assert!(
             tokio::time::Instant::now() < deadline,
