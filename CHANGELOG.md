@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   Upgrade the hub, map the runners with `vk-hub capacity-policy set`, then upgrade the
   relays. Until then a relay takes no new jobs but finishes and settles those it holds; a job
   it took from GitLab and had not yet submitted fails.
+- **`vk-gitlab` refuses a configuration with `concurrent` or a runner's `request_concurrency`
+  above 128, or more than 64 runners.** The hub ends the session of a relay that reports more
+  runners or a larger `request_concurrency`.
 - **New relay jobs require a project listed for their runner's tenant** in the capacity
   policy. Production runners also require a pipeline of one of the project's production
   branches.

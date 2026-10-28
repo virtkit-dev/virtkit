@@ -152,6 +152,17 @@ async fn serve(
                             refuse(ws, RefusalCode::Protocol, reason).await;
                             bail!("{reason}");
                         }
+                        let over = |n: u32| {
+                            usize::try_from(n)
+                                .map_or(true, |n| n > vk_hub_proto::gitlab::MAX_ADMISSIONS)
+                        };
+                        if i.runners.len() > vk_hub_proto::gitlab::MAX_RUNNERS
+                            || i.runners.iter().any(|r| over(r.request_concurrency))
+                        {
+                            let reason = "relay inventory exceeds the hub's runner or request limit";
+                            refuse(ws, RefusalCode::Protocol, reason).await;
+                            bail!("{reason}");
+                        }
                         i.make_display_safe();
                         inventory = true;
                         RelayWrite::Inventory(i)

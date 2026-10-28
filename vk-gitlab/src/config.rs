@@ -3,7 +3,7 @@
 //! pool, node labels and envelope its jobs get; see `docs/gitlab-dispatch.md`).
 //!
 //! ```toml
-//! concurrent = 8            # jobs at once, over all runners
+//! concurrent = 8            # jobs at once, over all runners (at most 128)
 //! check_interval = 3        # seconds between job requests while idle
 //!
 //! state_dir = "/var/lib/vk-gitlab"   # each runner's taken jobs
@@ -18,7 +18,7 @@
 //! labels = ["large-memory"]
 //! envelope = { mem = "16G", cpus = 8, disk = "16G" }
 //! limit = 4                 # jobs at once for this runner (0 = no limit)
-//! request_concurrency = 1   # job requests in flight at once
+//! request_concurrency = 1   # job requests in flight at once (at most 128)
 //! ```
 
 use std::collections::HashSet;
@@ -40,7 +40,8 @@ pub const DEFAULT_UNHEALTHY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Jobs running at once over all runners (gitlab-runner's `concurrent`). Default 1.
+    /// Jobs running at once over all runners (gitlab-runner's `concurrent`). Default 1, at most
+    /// [`MAX_ADMISSIONS`](vk_hub_proto::gitlab::MAX_ADMISSIONS).
     #[serde(default = "one")]
     pub concurrent: usize,
     /// Seconds between job requests while there is nothing to do. Default 3.
@@ -63,6 +64,7 @@ pub struct Config {
     /// The GitLab server the runners take jobs from; required with runners.
     #[serde(default)]
     pub gitlab: Option<GitlabConfig>,
+    /// At most [`MAX_RUNNERS`](vk_hub_proto::gitlab::MAX_RUNNERS).
     #[serde(default)]
     pub runners: Vec<RunnerConfig>,
 }
@@ -112,7 +114,8 @@ pub struct RunnerConfig {
     /// Jobs at once for this runner; 0 means only `concurrent` applies.
     #[serde(default)]
     pub limit: usize,
-    /// Job requests in flight at once; at least 1.
+    /// Job requests in flight at once; at least 1, at most
+    /// [`MAX_ADMISSIONS`](vk_hub_proto::gitlab::MAX_ADMISSIONS).
     #[serde(default)]
     pub request_concurrency: usize,
     /// Overrides the global `check_interval` for this runner, in seconds.
@@ -272,6 +275,12 @@ impl Config {
         if cfg.concurrent == 0 {
             bail!("concurrent must be at least 1");
         }
+        if cfg.concurrent > vk_hub_proto::gitlab::MAX_ADMISSIONS {
+            bail!("concurrent exceeds the hub's admission limit");
+        }
+        if cfg.runners.len() > vk_hub_proto::gitlab::MAX_RUNNERS {
+            bail!("too many runners for the hub session");
+        }
         cfg.state_dir = Some(
             base.join(
                 cfg.state_dir
@@ -306,6 +315,9 @@ impl Config {
             } else {
                 format!("runner {:?}", r.name)
             };
+            if r.request_concurrency() > vk_hub_proto::gitlab::MAX_ADMISSIONS {
+                bail!("{which}: request_concurrency exceeds the hub's admission limit");
+            }
             r.resolved_token = match (&r.token, &r.token_file) {
                 (Some(t), None) => Secret::new(t.trim()),
                 (None, Some(file)) => {
@@ -430,6 +442,30 @@ mod tests {
                 disk_bytes: 16 << 30
             }
         );
+    }
+
+    #[test]
+    fn limits_past_the_hubs_are_refused() {
+        let runner = |n: usize, extra: &str| {
+            format!("[[runners]]\nname = \"r{n}\"\ntoken = \"glrt-{n}\"\n{extra}")
+        };
+        let config = |concurrent: usize, runners: &str| {
+            format!(
+                "concurrent = {concurrent}\n[gitlab]\nurl = \"https://gitlab.example.com\"\n{runners}"
+            )
+        };
+        let max = vk_hub_proto::gitlab::MAX_ADMISSIONS;
+        assert!(parse(&config(max, &runner(0, ""))).is_ok());
+        let e = parse(&config(max + 1, &runner(0, ""))).unwrap_err();
+        assert!(e.to_string().contains("concurrent"), "{e:#}");
+        let extra = format!("request_concurrency = {}", max + 1);
+        let e = parse(&config(1, &runner(0, &extra))).unwrap_err();
+        assert!(e.to_string().contains("request_concurrency"), "{e:#}");
+        let runners = |n| (0..n).map(|i| runner(i, "")).collect::<String>();
+        let most = vk_hub_proto::gitlab::MAX_RUNNERS;
+        assert!(parse(&config(1, &runners(most))).is_ok());
+        let e = parse(&config(1, &runners(most + 1))).unwrap_err();
+        assert!(e.to_string().contains("too many runners"), "{e:#}");
     }
 
     #[test]

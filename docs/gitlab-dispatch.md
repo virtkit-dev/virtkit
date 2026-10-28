@@ -107,6 +107,10 @@ envelope = { mem = "16G", cpus = 8, disk = "16G" }
 request_concurrency = 1
 ```
 
+`concurrent` and each runner's `request_concurrency` are at most 128, and a daemon has at most
+64 runners: vk-gitlab refuses a configuration past them, and the hub ends the session of a
+relay whose inventory lists more runners or a larger `request_concurrency`.
+
 GitLab's job response does not carry the job's tags, and GitLab only gives a runner jobs
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
 of that class registered in GitLab and its pool and labels here. A pool is a set of nodes the

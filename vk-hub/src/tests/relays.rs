@@ -286,3 +286,64 @@ async fn a_relay_naming_no_plain_http_server_is_refused() {
         assert_eq!(hub.db.relay(&id).unwrap().unwrap().server_url, None);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_past_the_hub_s_runner_or_request_limits_is_refused() {
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let id = enrolled_relay(addr, &hub, &key).await;
+    let runner = |n: usize, request_concurrency| gl::Runner {
+        name: format!("runner-{n}"),
+        runner_id: Some(u64::try_from(n).unwrap() + 1),
+        placement: Default::default(),
+        limit: None,
+        request_concurrency,
+        verified: true,
+    };
+    let at_limits = |inventory: &mut Inventory| {
+        inventory.runners = (0..gl::MAX_RUNNERS).map(|n| runner(n, 1)).collect();
+        inventory.runners[0].request_concurrency = u32::try_from(gl::MAX_ADMISSIONS).unwrap();
+    };
+    let mut over_runners = inventory("https://gitlab.example.com");
+    at_limits(&mut over_runners);
+    over_runners.runners.push(runner(gl::MAX_RUNNERS, 1));
+    let mut over_requests = inventory("https://gitlab.example.com");
+    at_limits(&mut over_requests);
+    over_requests.runners[0].request_concurrency += 1;
+    for (what, over) in [("runners", over_runners), ("requests", over_requests)] {
+        let mut ws = dial_relay(addr).await;
+        assert!(matches!(
+            open_relay(&mut ws, &id, &key).await,
+            HubMsg::Welcome { .. }
+        ));
+        tell(&mut ws, &RelayMsg::Inventory(over)).await;
+        let HubRelayMsg::Refused { code, .. } = hear(&mut ws).await else {
+            panic!("expected a refusal past the {what} limit");
+        };
+        assert_eq!(code, RefusalCode::Protocol, "{what}");
+        assert!(
+            hub.db.relay(&id).unwrap().unwrap().inventory.is_none(),
+            "{what}"
+        );
+    }
+    // At the limits, the inventory is taken.
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    let mut inventory = inventory("https://gitlab.example.com");
+    at_limits(&mut inventory);
+    tell(&mut ws, &RelayMsg::Inventory(inventory)).await;
+    for _ in 0..1000 {
+        let row = hub.db.relay(&id).unwrap().unwrap();
+        if row
+            .inventory
+            .is_some_and(|i| i.runners.len() == gl::MAX_RUNNERS)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the inventory at the limits was not taken");
+}
