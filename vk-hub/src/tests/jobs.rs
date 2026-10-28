@@ -215,7 +215,15 @@ fn jobs_key(hub: &Hub) -> String {
         crate::policy::Tenant {
             weight: 1,
             cap: None,
-            projects: vec![],
+            // [`spec`]'s project, and the one the approval tests' [`bound_body`] uses.
+            projects: [PROJECT_ID, 42]
+                .into_iter()
+                .map(|id| crate::policy::Project {
+                    gitlab: "gl".into(),
+                    id,
+                    production_branches: vec![],
+                })
+                .collect(),
         },
     );
     if !policy
@@ -925,9 +933,10 @@ async fn each_unresolvable_runner_is_refused_with_its_reason() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A new job is refused unless it names its runner and is that runner's.
+/// New jobs must name their runner, belong to that runner, and use a project listed for
+/// its tenant.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_job_must_be_its_runner_s() {
+async fn a_new_job_must_be_its_runner_s_and_of_its_tenant_s_projects() {
     let dir = scratch("job-identity");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
@@ -953,6 +962,23 @@ async fn a_new_job_must_be_its_runner_s() {
         "{resp:?}"
     );
 
+    let mut body = job_body(3, None, 30);
+    body["spec"]["job"]["project_id"] = json!(999);
+    let resp = submit(body).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::Forbidden),
+        "{resp:?}"
+    );
+
+    let mut body = job_body(4, None, 30);
+    body["spec"]["job"]["project_id"] = json!(0);
+    let resp = submit(body).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (400, ErrorCode::Invalid),
+        "{resp:?}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1006,6 +1032,60 @@ async fn accepted_job_replays_after_its_runner_is_unverified() {
     let again = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
     assert_eq!(again.status, 201, "{again:?}");
     assert_eq!(first.json::<JobView>().id, again.json::<JobView>().id);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn production_runner_requires_a_mapped_project_and_branch() {
+    let dir = scratch("production-identity");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut policy = hub.db.capacity_policy().unwrap();
+    let expected = policy.digest().unwrap();
+    policy
+        .runners
+        .iter_mut()
+        .find(|r| r.runner_id == 42)
+        .unwrap()
+        .class = crate::policy::Class::Production;
+    policy
+        .tenants
+        .get_mut("tests")
+        .unwrap()
+        .projects
+        .iter_mut()
+        .find(|p| p.id == PROJECT_ID)
+        .unwrap()
+        .production_branches
+        .push("main".into());
+    hub.db
+        .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
+        .unwrap();
+    let mut body = job_body(1, None, 30);
+    body["spec"]["sources"]["ref"] = json!("main");
+    body["spec"]["sources"]["refspecs"] = json!(["+refs/heads/main:refs/remotes/origin/main"]);
+    // A merge request's pipeline, then another branch's.
+    let mut wrong = body.clone();
+    wrong["spec"]["sources"]["refspecs"] =
+        json!(["+refs/merge-requests/1/head:refs/merge-requests/1/head"]);
+    let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(wrong)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::Forbidden),
+        "{resp:?}"
+    );
+    let mut wrong = body.clone();
+    wrong["spec"]["sources"]["ref"] = json!("feature");
+    wrong["spec"]["sources"]["refspecs"] =
+        json!(["+refs/heads/feature:refs/remotes/origin/feature"]);
+    let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(wrong)).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::Forbidden),
+        "{resp:?}"
+    );
+    let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

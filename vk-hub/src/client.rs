@@ -457,10 +457,15 @@ fn query_number(query: &str, name: &str) -> Result<Option<u64>, ApiError> {
 }
 
 /// Who a relay's request schedules for: the GitLab runner it names, as its relay's inventory
-/// verified it.
+/// verified it, and the tenant the capacity policy maps that runner to.
 #[derive(Clone)]
 struct SchedulingIdentity {
+    tenant: String,
+    class: crate::policy::Class,
+    gitlab: String,
     runner_id: u64,
+    /// The policy used to resolve this identity and check its jobs.
+    policy: Arc<crate::policy::Policy>,
 }
 
 fn identity_refused(message: &str) -> ApiError {
@@ -544,7 +549,7 @@ async fn resolve_identity(
             identity_refused(&format!("runner {runner:?} has no GitLab runner ID"))
         })?;
         let policy = db.capacity_policy()?;
-        policy
+        let mapping = policy
             .runners
             .iter()
             .find(|r| r.gitlab == gitlab && r.runner_id == runner_id)
@@ -554,7 +559,14 @@ async fn resolve_identity(
                      the capacity policy"
                 ))
             })?;
-        Ok(Some(SchedulingIdentity { runner_id }))
+        let (tenant, class) = (mapping.tenant.clone(), mapping.class);
+        Ok(Some(SchedulingIdentity {
+            tenant,
+            class,
+            gitlab,
+            runner_id,
+            policy: Arc::new(policy),
+        }))
     })
     .await
     .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
@@ -566,12 +578,43 @@ async fn resolve_identity(
     resolved
 }
 
-/// Whether `spec` is a job `identity` may run: its own runner's.
+/// Check that `spec` belongs to `identity`'s runner and a project listed for its tenant.
+/// Production runners also require a pipeline of one of the project's production branches.
 fn check_job_identity(identity: &SchedulingIdentity, spec: &JobSpec) -> Result<(), ApiError> {
     let JobSpec::GitlabCi(ci) = spec;
+    if ci.job.project_id == 0 {
+        return Err(ApiError::invalid("job project ID is missing"));
+    }
     if identity.runner_id != ci.job.runner_id {
         return Err(identity_refused(
             "job runner does not match the relay runner",
+        ));
+    }
+    let project = identity
+        .policy
+        .tenants
+        .get(&identity.tenant)
+        .and_then(|t| {
+            t.projects
+                .iter()
+                .find(|p| p.gitlab == identity.gitlab && p.id == ci.job.project_id)
+        })
+        .ok_or_else(|| {
+            identity_refused(&format!(
+                "project {}/{} is not one of tenant {:?}'s projects",
+                identity.gitlab, ci.job.project_id, identity.tenant
+            ))
+        })?;
+    if identity.class == crate::policy::Class::Production
+        && !crate::policy::branch_name(&ci.sources).is_some_and(|branch| {
+            project
+                .production_branches
+                .iter()
+                .any(|p| crate::subject::glob_match(p, branch))
+        })
+    {
+        return Err(identity_refused(
+            "job is not an approved production branch pipeline",
         ));
     }
     Ok(())

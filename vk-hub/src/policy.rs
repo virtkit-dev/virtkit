@@ -42,6 +42,40 @@ pub struct Project {
     pub production_branches: Vec<String>,
 }
 
+/// The branch a job's pipeline runs for, when its sources fetch that branch and nothing
+/// else: the branch's own refspec once, and at most its pipeline's ref at the job's commit.
+/// `None` for a tag, a merge request, or any other refspec.
+pub fn branch_name(sources: &vk_hub_proto::job::Sources) -> Option<&str> {
+    if sources.ref_type != vk_hub_proto::job::RefType::Branch {
+        return None;
+    }
+    let branch = &sources.git_ref;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let mut branches = 0;
+    let mut commits = 0;
+    for spec in &sources.refspecs {
+        if spec == &refspec {
+            branches += 1;
+        } else if let Some((sha, pipeline)) = spec
+            .strip_prefix('+')
+            .and_then(|s| s.split_once(":refs/pipelines/"))
+            && sha == sources.sha
+            && matches!(sha.len(), 40 | 64)
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            && decimal_id(pipeline)
+        {
+            commits += 1;
+        } else {
+            return None;
+        }
+    }
+    (branches == 1 && commits <= 1).then_some(branch)
+}
+
+fn decimal_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tenant {
@@ -282,6 +316,81 @@ mod tests {
             slots: 1,
         });
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn a_branch_pipeline_is_named_and_anything_else_is_not() {
+        use vk_hub_proto::job::{RefType, Sources};
+        let sha = "a".repeat(40);
+        let branch = "+refs/heads/main:refs/remotes/origin/main".to_owned();
+        let pipeline = |sha: &str, id: &str| format!("+{sha}:refs/pipelines/{id}");
+        let sources = |ref_type, sha: &str, refspecs: Vec<String>| Sources {
+            git_ref: "main".into(),
+            ref_type,
+            sha: sha.into(),
+            refspecs,
+            ..Sources::default()
+        };
+        let sha256 = "b".repeat(64);
+        for (refspecs, sha, ref_type, named) in [
+            (vec![branch.clone()], sha.as_str(), RefType::Branch, true),
+            (
+                vec![branch.clone(), pipeline(&sha, "12")],
+                &sha,
+                RefType::Branch,
+                true,
+            ),
+            (
+                vec![branch.clone(), pipeline(&sha256, "12")],
+                &sha256,
+                RefType::Branch,
+                true,
+            ),
+            (vec![branch.clone()], &sha, RefType::Tag, false),
+            (
+                vec![branch.clone(), branch.clone()],
+                &sha,
+                RefType::Branch,
+                false,
+            ),
+            (vec![pipeline(&sha, "12")], &sha, RefType::Branch, false),
+            (
+                vec![branch.clone(), pipeline(&"c".repeat(40), "12")],
+                &sha,
+                RefType::Branch,
+                false,
+            ),
+            (
+                vec![branch.clone(), pipeline(&sha[..12], "12")],
+                &sha[..12],
+                RefType::Branch,
+                false,
+            ),
+            (
+                vec![branch.clone(), pipeline(&sha, "1x")],
+                &sha,
+                RefType::Branch,
+                false,
+            ),
+            (
+                vec![branch.clone(), pipeline(&sha, "1"), pipeline(&sha, "2")],
+                &sha,
+                RefType::Branch,
+                false,
+            ),
+            (
+                vec![
+                    branch.clone(),
+                    "+refs/merge-requests/1/head:refs/merge-requests/1/head".into(),
+                ],
+                &sha,
+                RefType::Branch,
+                false,
+            ),
+        ] {
+            let s = sources(ref_type, sha, refspecs.clone());
+            assert_eq!(branch_name(&s), named.then_some("main"), "{refspecs:?}");
+        }
     }
 
     #[test]
