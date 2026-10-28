@@ -962,3 +962,57 @@ async fn weighted_tenants_go_by_load_per_weight() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn a_production_probe_burst_owes_normal_work_a_turn() {
+    let dir = scratch("capacity-probe-turn");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    for (name, id) in [("prod1", 43), ("prod2", 44), ("prod3", 45)] {
+        add_runner(&hub, &key, name, id, crate::policy::Class::Production);
+    }
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.production_probe_burst = 2;
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    ready_relay(&hub, &key);
+    // A hub starts owing normal work its turn: of two probes, the normal one goes first.
+    let p1 = queue_for(addr, &key, 1, "prod1").await;
+    let n1 = queue(addr, &key, 2).await;
+    let mut node = ready_node(addr, &hub, 32768).await;
+    crate::ops::set_ceiling(&hub, "u", &node.id, Some(1)).unwrap();
+    let n1_grant = accept_ticket(addr, &key, &n1, &mut node).await;
+    assert_eq!(claim(addr, &key, &n1_grant).await.status, 204);
+    let n2 = queue(addr, &key, 3).await;
+    let reply = outcome(addr, &key, &n1, &n1, "job").await;
+    assert_eq!(reply.status, 204, "{reply:?}");
+    // Add one slot at a time: two production probes, then normal work's owed turn.
+    let mut slots = 1;
+    let mut next = async |ticket: &str, node: &mut FakeNode| {
+        slots += 1;
+        crate::ops::set_ceiling(&hub, "u", &node.id, Some(slots)).unwrap();
+        crate::jobs::testing::step(&hub).await;
+        let grant = accept_ticket(addr, &key, ticket, node).await;
+        assert_eq!(grant.admission.as_deref(), Some(ticket));
+        take_job(addr, &key, ticket, &grant).await;
+    };
+    next(&p1, &mut node).await;
+    // n1's job starts on its own reservation: normal work, but no turn taken.
+    let mut body = job_body(10, Some(&n1_grant.reservation), 30);
+    body["admission"] = json!(n1);
+    let reply = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(reply.status, 201, "{reply:?}");
+    let job = reply.json::<JobView>().id;
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected n1's job to start")
+    };
+    assert_eq!(start.job, job);
+    let p2 = queue_for(addr, &key, 4, "prod2").await;
+    next(&p2, &mut node).await;
+    let p3 = queue_for(addr, &key, 5, "prod3").await;
+    next(&n2, &mut node).await;
+    let reply = poll(addr, &key, &p3, 0).await;
+    assert_eq!(reply.status, 202, "{reply:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

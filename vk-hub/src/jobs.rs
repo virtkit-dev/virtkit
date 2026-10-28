@@ -237,6 +237,8 @@ struct State {
     /// since when. They count against the probe budget until the node answers, or for
     /// [`scheduler::ABANDONED_PROBE_GRACE`].
     abandoned_probes: HashMap<String, ((String, u64), Instant)>,
+    /// Whose turn it is between production probes and normal work.
+    turns: scheduler::Turns,
     /// Jobs not finished.
     jobs: HashMap<String, LiveJob>,
     /// Jobs ended here whose final row the database may not hold yet: a reader is served

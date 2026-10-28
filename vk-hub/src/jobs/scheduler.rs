@@ -378,9 +378,76 @@ struct Candidate {
     due: bool,
 }
 
+/// Where `e` ranks among the candidates of a placement, lowest first: a job holding its
+/// reservation, then production work other than probes, then production probes ahead of normal
+/// work, except while normal work is `owed` a turn ([`Turns`]).
+fn rank(e: &Candidate, owed: bool) -> u8 {
+    use crate::policy::Class;
+    match (e.reserved, e.class, e.probe) {
+        (true, _, _) => 0,
+        (false, Class::Production, false) => 1,
+        (false, Class::Normal, _) if owed => 2,
+        (false, Class::Production, true) => 3,
+        (false, Class::Normal, _) => 4,
+    }
+}
+
 /// `a` against `b` by their tenants' load per weight, the lower first.
 fn share(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     (u128::from(a.load) * u128::from(b.weight)).cmp(&(u128::from(b.load) * u128::from(a.weight)))
+}
+
+/// Whose turn it is between production probes and normal work.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Turns {
+    /// Production probes offered since normal work was last granted room.
+    production_probes: u32,
+    /// Whether normal work goes ahead of production probes: after `production_probe_burst` of
+    /// them, until normal work is granted room. A hub starts owing it, so a restart lets normal
+    /// work in first: production probes never wait on more than one turn of it.
+    normal_owed: bool,
+}
+
+impl Default for Turns {
+    fn default() -> Self {
+        Turns {
+            production_probes: 0,
+            normal_owed: true,
+        }
+    }
+}
+
+impl Turns {
+    /// Whether eligible normal work without its own reservation is owed a turn.
+    fn owed(&self, eligible: &[Candidate]) -> bool {
+        self.normal_owed
+            && eligible
+                .iter()
+                .any(|e| !e.reserved && e.class == crate::policy::Class::Normal)
+    }
+
+    /// Record a grant by class, probe status and reservation status.
+    /// `burst` is the policy's `production_probe_burst`; work on its reservation takes no turn.
+    fn granted(&mut self, class: crate::policy::Class, probe: bool, reserved: bool, burst: u32) {
+        if reserved {
+            return;
+        }
+        match class {
+            crate::policy::Class::Normal => {
+                *self = Turns {
+                    production_probes: 0,
+                    normal_owed: false,
+                }
+            }
+            crate::policy::Class::Production if probe => {
+                self.production_probes = self.production_probes.saturating_add(1);
+                if self.production_probes >= burst {
+                    self.normal_owed = true;
+                }
+            }
+            crate::policy::Class::Production => {}
+        }
+    }
 }
 
 /// One arbitration pass over the tickets and the queued jobs: forget what lapsed, reconcile
@@ -1001,11 +1068,8 @@ fn arbitrate(
         if eligible.is_empty() {
             break;
         }
-        // Class does not rank yet: a job holding its reservation goes first, then the rest.
-        let rank = |e: &Candidate| match (e.reserved, e.class) {
-            (true, _) => 0,
-            (false, _) => 1,
-        };
+        let owed = state.turns.owed(&eligible);
+        let rank = |e: &Candidate| rank(e, owed);
         // A job at its deadline goes before all, or it ends unplaced this pass.
         eligible.sort_by(|a, b| {
             b.due
@@ -1038,10 +1102,21 @@ fn arbitrate(
         let Candidate {
             id,
             node,
+            class,
             probe,
             job,
             ..
         } = chosen.clone();
+        if owed && class == crate::policy::Class::Normal {
+            let passed: Vec<String> = eligible
+                .iter()
+                .filter(|e| !e.job && e.probe && e.class == crate::policy::Class::Production)
+                .map(|e| e.id.clone())
+                .collect();
+            for id in passed {
+                blocked(state, &id, "normal turn owed");
+            }
+        }
         placed += 1;
         if job {
             let before = state.jobs.get(&id).map(|j| j.row.clone());
@@ -1057,6 +1132,16 @@ fn arbitrate(
                 writes.push(write);
             } else {
                 skipped_jobs.insert(id.clone());
+            }
+            // Started, it takes its turn unless it started on its own reservation.
+            if let Some(started) = state
+                .jobs
+                .get(&id)
+                .filter(|j| j.row.state == JobState::Starting)
+            {
+                let on_reservation = started.reservation.is_some();
+                let burst = policy.production_probe_burst;
+                state.turns.granted(class, false, on_reservation, burst);
             }
             // Its charge as placed, or ended, in place of its charge as queued.
             let after = state.jobs.get(&id).map(|j| j.row.clone());
@@ -1138,6 +1223,8 @@ fn arbitrate(
                 state.demand.entry(key).or_default().last_probe = Some(now);
             }
         }
+        let burst = policy.production_probe_burst;
+        state.turns.granted(class, probe, false, burst);
     }
     Ok(moved)
 }
@@ -1147,20 +1234,37 @@ mod tests {
     use super::*;
     use crate::policy::Class;
 
-    fn candidate() -> Candidate {
+    fn candidate(class: Class, probe: bool, reserved: bool) -> Candidate {
         Candidate {
             id: String::new(),
             node: String::new(),
-            class: Class::Normal,
-            probe: false,
+            class,
+            probe,
             load: 0,
             weight: 1,
             tenant_probe: None,
             runner_probe: None,
             arrived: Instant::now(),
-            job: false,
-            reserved: false,
+            job: reserved,
+            reserved,
             due: false,
+        }
+    }
+
+    #[test]
+    fn production_ranks_ahead_of_normal_but_for_a_turn_owed() {
+        let probe = candidate(Class::Production, true, false);
+        let known = candidate(Class::Production, false, false);
+        let normal = candidate(Class::Normal, true, false);
+        let reserved = candidate(Class::Normal, false, true);
+        // Not owed: production probes ahead of normal work.
+        assert!(rank(&probe, false) < rank(&normal, false));
+        // Owed: normal work ahead of production probes, not of other production work.
+        assert!(rank(&normal, true) < rank(&probe, true));
+        assert!(rank(&known, true) < rank(&normal, true));
+        // A job on its reservation, ahead of all.
+        for owed in [false, true] {
+            assert!(rank(&reserved, owed) < rank(&known, owed));
         }
     }
 
@@ -1169,10 +1273,41 @@ mod tests {
         let tenant = |load, weight| Candidate {
             load,
             weight,
-            ..candidate()
+            ..candidate(Class::Normal, false, false)
         };
         assert!(share(&tenant(1, 2), &tenant(1, 1)).is_lt());
         assert!(share(&tenant(2, 2), &tenant(1, 1)).is_eq());
         assert!(share(&tenant(3, 2), &tenant(1, 1)).is_gt());
+    }
+
+    #[test]
+    fn normal_work_is_owed_a_turn_after_a_burst_of_production_probes() {
+        let mut turns = Turns::default();
+        // A hub starts owing it.
+        assert!(turns.normal_owed);
+        turns.granted(Class::Normal, true, false, 3);
+        assert!(!turns.normal_owed);
+        for _ in 0..2 {
+            turns.granted(Class::Production, true, false, 3);
+            assert!(!turns.normal_owed);
+        }
+        // Production work other than probes does not count.
+        turns.granted(Class::Production, false, false, 3);
+        assert!(!turns.normal_owed);
+        turns.granted(Class::Production, true, false, 3);
+        assert!(turns.normal_owed);
+        // A reserved normal job neither pays the debt nor counts as normal waiting.
+        turns.granted(Class::Normal, false, true, 3);
+        assert!(turns.normal_owed);
+        assert!(!turns.owed(&[candidate(Class::Normal, false, true)]));
+        assert!(turns.owed(&[candidate(Class::Normal, false, false)]));
+        turns.granted(Class::Normal, false, false, 3);
+        assert_eq!(
+            turns,
+            Turns {
+                production_probes: 0,
+                normal_owed: false,
+            }
+        );
     }
 }
