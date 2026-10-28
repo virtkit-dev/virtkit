@@ -177,17 +177,35 @@ async fn serve(
     match (method.as_str(), segs.as_slice()) {
         ("POST", ["v1", "capacity"]) => {
             let ask = parse!(CapacityRequest);
+            // As the hub: a relay names its runner.
+            let Some(runner) = ask.runner.clone() else {
+                return error(
+                    403,
+                    ErrorCode::Forbidden,
+                    "a relay must name its runner",
+                    None,
+                );
+            };
             let wait = Duration::from_secs(u64::from(ask.wait_secs.min(60)));
-            match hub.capacity(&ask.placement, ask.after, wait).await {
+            match hub.capacity(&runner, &ask.placement, ask.after, wait).await {
                 Ok(c) => json(200, &c),
                 Err(e) => dispatch_error(e),
             }
         }
         ("POST", ["v1", "reservations"]) => {
             let ask = parse!(ReservationRequest);
+            // As the hub: a relay names its runner.
+            let Some(runner) = ask.runner.clone() else {
+                return error(
+                    403,
+                    ErrorCode::Forbidden,
+                    "a relay must name its runner",
+                    None,
+                );
+            };
             let lease = Duration::from_secs(u64::from(ask.lease_secs));
             match hub
-                .reserve(&ask.request_id, &ask.placement, lease, wait)
+                .reserve(&runner, &ask.request_id, &ask.placement, lease, wait)
                 .await
             {
                 Ok(r) => json(
@@ -231,6 +249,7 @@ async fn serve(
             let vk_hub_proto::job::JobSpec::GitlabCi(ci) = &ask.spec;
             let sub = Submission {
                 request_id: ask.request_id,
+                runner: ask.runner,
                 placement: ask.placement,
                 reservation: ask.reservation,
                 place_within: Duration::from_secs(u64::from(ask.place_within_secs)),

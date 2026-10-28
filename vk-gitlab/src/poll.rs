@@ -883,7 +883,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         // Then capacity: while the hub reports no room, GitLab is not asked, and the job
         // stays pending for another runner.
         let capacity = tokio::select! {
-            c = shared.dispatcher.capacity(&placement, capacity_revision, hub.wait) => c,
+            c = shared.dispatcher.capacity(&name, &placement, capacity_revision, hub.wait) => c,
             () = wait_true(&mut stop) => return,
         };
         match capacity {
@@ -908,7 +908,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         let sent = Instant::now();
         let request_id = new_request_id();
         let reserved = tokio::select! {
-            r = shared.dispatcher.reserve(&request_id, &placement, hub.lease, hub.wait) => r,
+            r = shared.dispatcher.reserve(&name, &request_id, &placement, hub.lease, hub.wait) => r,
             () = wait_true(&mut stop) => return,
         };
         let mut held = match reserved {
@@ -1302,6 +1302,7 @@ async fn run_job<D: Dispatcher>(
         gitlab_job: job.id,
         job_token: job.token.expose().to_owned(),
         request_id: new_request_id(),
+        runner: Some(runner.cfg.name.clone()),
         reservation,
         place_within_secs: u32::try_from(shared.options.hub.place_within.as_secs())
             .unwrap_or(u32::MAX),
@@ -1349,6 +1350,7 @@ async fn submit_recorded<D: Dispatcher>(
     let mut abort = shared.shutdown.abort.clone();
     let submission = Submission {
         request_id: rec.request_id.clone(),
+        runner: rec.runner.clone(),
         placement: rec.placement.clone(),
         reservation: rec.reservation.clone(),
         place_within: Duration::from_secs(u64::from(rec.place_within_secs)),

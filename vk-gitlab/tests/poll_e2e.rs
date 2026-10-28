@@ -67,6 +67,12 @@ async fn job_runs_and_reports(via: Via) {
         panic!("{calls:?}")
     };
     assert_eq!(sub.reservation.as_deref(), Some(reservation.as_str()));
+    assert_eq!(sub.runner.as_deref(), Some("r1"));
+    let runners = h.hub.runners();
+    assert!(
+        !runners.is_empty() && runners.iter().all(|r| r == "r1"),
+        "{runners:?}"
+    );
     assert_eq!(sub.placement.pool, "p1");
     assert_eq!(sub.placement.labels, ["big"]);
     assert_eq!(sub.placement.envelope.mem_mib, 8192);

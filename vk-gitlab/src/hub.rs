@@ -424,12 +424,13 @@ fn timeout_for(wait: Duration) -> Duration {
 impl Dispatcher for HubClient {
     async fn capacity(
         &self,
+        runner: &str,
         placement: &Placement,
         after: Option<u64>,
         wait: Duration,
     ) -> DispatchResult<Capacity> {
         let body = CapacityRequest {
-            runner: None,
+            runner: Some(runner.to_owned()),
             placement: placement.clone(),
             after,
             wait_secs: wait_secs(wait),
@@ -448,13 +449,14 @@ impl Dispatcher for HubClient {
 
     async fn reserve(
         &self,
+        runner: &str,
         request_id: &str,
         placement: &Placement,
         lease: Duration,
         wait: Duration,
     ) -> DispatchResult<Reservation> {
         let body = ReservationRequest {
-            runner: None,
+            runner: Some(runner.to_owned()),
             queue: false,
             request_id: request_id.to_owned(),
             placement: placement.clone(),
@@ -515,7 +517,7 @@ impl Dispatcher for HubClient {
             ));
         }
         let body = JobSubmission {
-            runner: None,
+            runner: submission.runner,
             admission: None,
             request_id: submission.request_id,
             placement: submission.placement,

@@ -53,6 +53,7 @@ fn record(h: &Harness, id: i64, phase: Phase, hub_job: Option<String>) -> JobRec
         gitlab_job: id,
         job_token: format!("jt-{id}"),
         request_id: request_id(id),
+        runner: Some("test".into()),
         reservation: None,
         place_within_secs: 1,
         hub_job,
@@ -71,6 +72,7 @@ async fn submitted(h: &Harness, id: i64, reservation: Option<String>) -> String 
     h.hub
         .submit(Submission {
             request_id: request_id(id),
+            runner: Some("test".into()),
             placement: p1(),
             reservation,
             place_within: Duration::from_secs(1),
@@ -533,7 +535,7 @@ async fn a_key_the_hub_did_not_enroll_is_refused() {
         retry: HubRetry::default(),
     });
     let err = client
-        .capacity(&p1(), None, Duration::ZERO)
+        .capacity("test", &p1(), None, Duration::ZERO)
         .await
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");

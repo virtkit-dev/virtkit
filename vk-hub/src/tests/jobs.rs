@@ -171,6 +171,15 @@ fn jobs_key(hub: &Hub) -> String {
     };
     let inventory = vk_hub_proto::gitlab::Inventory {
         hostname: "relay-1".into(),
+        concurrent: 64,
+        runners: vec![vk_hub_proto::gitlab::Runner {
+            name: "test".into(),
+            runner_id: Some(42),
+            placement: placement(),
+            limit: None,
+            request_concurrency: 1,
+            verified: true,
+        }],
         server: vk_hub_proto::gitlab::Server {
             url: GITLAB_URL.into(),
             ..Default::default()
@@ -199,6 +208,31 @@ fn jobs_key(hub: &Hub) -> String {
             now_secs(),
         )
         .unwrap();
+    let mut policy = hub.db.capacity_policy().unwrap();
+    let expected = policy.digest().unwrap();
+    policy.tenants.insert(
+        "tests".into(),
+        crate::policy::Tenant {
+            weight: 1,
+            cap: None,
+            projects: vec![],
+        },
+    );
+    if !policy
+        .runners
+        .iter()
+        .any(|r| r.gitlab == "gl" && r.runner_id == 42)
+    {
+        policy.runners.push(crate::policy::RunnerMapping {
+            gitlab: "gl".into(),
+            runner_id: 42,
+            tenant: "tests".into(),
+            class: crate::policy::Class::Normal,
+        });
+    }
+    hub.db
+        .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
+        .unwrap();
     format!("relay:{id}:{}", vk_hub_proto::to_hex(&seed))
 }
 
@@ -211,6 +245,14 @@ fn actor_of(key: &str) -> String {
         .next()
         .unwrap();
     format!("relay {id}")
+}
+
+fn relay_id(key: &str) -> &str {
+    key.strip_prefix("relay:")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
 }
 
 /// The headers authenticating a request as [`jobs_key`]'s relay or with an API key.
@@ -337,12 +379,19 @@ fn reservation_body(n: u8, wait_secs: u32) -> Value {
     })
 }
 
+fn relay_reservation_body(n: u8, wait_secs: u32) -> Value {
+    let mut body = reservation_body(n, wait_secs);
+    body["runner"] = json!("test");
+    body
+}
+
 fn spec(gitlab_id: u64) -> JobSpec {
     let mut ci = CiJob {
         server_url: "https://gitlab.example.com".into(),
         ..CiJob::default()
     };
     ci.job.id = gitlab_id;
+    ci.job.runner_id = 42;
     ci.job.project_path = "group/project".into();
     ci.job.project_id = PROJECT_ID;
     ci.job.name = "test".into();
@@ -356,6 +405,7 @@ fn spec(gitlab_id: u64) -> JobSpec {
 
 fn job_body(n: u8, reservation: Option<&str>, place_within_secs: u32) -> Value {
     let mut body = json!({
+        "runner": "test",
         "request_id": request_id(n),
         "placement": placement(),
         "place_within_secs": place_within_secs,
@@ -633,18 +683,22 @@ async fn view_until(
 }
 
 /// Reserve on `node`, answering its offer: the grant.
-async fn reserve_on(addr: SocketAddr, key: &str, node: &mut FakeNode, n: u8) -> ReservationGrant {
+async fn reserve_on(
+    addr: SocketAddr,
+    key: &str,
+    node: &mut FakeNode,
+    n: u8,
+    runner: Option<&str>,
+) -> ReservationGrant {
     let key = key.to_string();
-    let ask = tokio::spawn(async move {
-        api(
-            addr,
-            "POST",
-            "/v1/reservations",
-            Some(&key),
-            Some(reservation_body(n, 5)),
-        )
-        .await
-    });
+    let mut body = reservation_body(n, 5);
+    if let Some(runner) = runner {
+        body["runner"] = json!(runner);
+    }
+    let ask =
+        tokio::spawn(
+            async move { api(addr, "POST", "/v1/reservations", Some(&key), Some(body)).await },
+        );
     let HubJobMsg::Offer { reservation, .. } = node.job().await else {
         panic!("expected an offer");
     };
@@ -700,6 +754,259 @@ fn result(failure: Option<FailureClass>, output_len: u64) -> JobResult {
         events: Vec::new(),
         egress: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capacity_checks_the_explicit_runner_identity() {
+    let dir = scratch("runner-identity");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = relay_id(&key);
+    let inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    let capacity = |runner: Option<&str>| {
+        let mut body = json!({"placement": placement()});
+        if let Some(runner) = runner {
+            body["runner"] = json!(runner);
+        }
+        body
+    };
+    let missing = api(
+        addr,
+        "POST",
+        "/v1/capacity",
+        Some(&key),
+        Some(capacity(None)),
+    )
+    .await;
+    assert_eq!(
+        (missing.status, missing.code()),
+        (403, ErrorCode::Forbidden)
+    );
+    let missing = api(
+        addr,
+        "POST",
+        "/v1/reservations",
+        Some(&key),
+        Some(reservation_body(1, 0)),
+    )
+    .await;
+    assert_eq!(
+        (missing.status, missing.code()),
+        (403, ErrorCode::Forbidden)
+    );
+
+    let api_key = plain_key(&hub);
+    let named = api(
+        addr,
+        "POST",
+        "/v1/capacity",
+        Some(&api_key),
+        Some(capacity(Some("test"))),
+    )
+    .await;
+    assert_eq!((named.status, named.code()), (403, ErrorCode::Forbidden));
+    let named = api(
+        addr,
+        "POST",
+        "/v1/reservations",
+        Some(&api_key),
+        Some(relay_reservation_body(1, 0)),
+    )
+    .await;
+    assert_eq!((named.status, named.code()), (403, ErrorCode::Forbidden));
+
+    let mut unverified = inventory.clone();
+    unverified.runners[0].verified = false;
+    let mut zero = inventory.clone();
+    zero.runners[0].runner_id = Some(0);
+    let mut duplicate = inventory.clone();
+    duplicate.runners.push(duplicate.runners[0].clone());
+    for invalid in [unverified, zero, duplicate] {
+        hub.db
+            .record_relay(id, crate::store::RelayWrite::Inventory(invalid), now_secs())
+            .unwrap();
+        let resp = api(
+            addr,
+            "POST",
+            "/v1/capacity",
+            Some(&key),
+            Some(capacity(Some("test"))),
+        )
+        .await;
+        assert_eq!((resp.status, resp.code()), (403, ErrorCode::Forbidden));
+    }
+    hub.db
+        .record_relay(
+            id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/capacity",
+        Some(&key),
+        Some(capacity(Some("test"))),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Each way a relay's runner can fail to resolve is refused with its own reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_unresolvable_runner_is_refused_with_its_reason() {
+    let dir = scratch("runner-reasons");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = relay_id(&key);
+    let inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    let ask = |runner: &str, placement: Placement| {
+        let (key, runner) = (key.clone(), runner.to_owned());
+        async move {
+            api(
+                addr,
+                "POST",
+                "/v1/capacity",
+                Some(&key),
+                Some(json!({"runner": runner, "placement": placement})),
+            )
+            .await
+        }
+    };
+    let refused = |resp: &Resp, reason: &str| {
+        assert_eq!(
+            (resp.status, resp.code()),
+            (403, ErrorCode::Forbidden),
+            "{resp:?}"
+        );
+        let message = resp.json::<vk_hub_proto::client::ClientError>().error;
+        assert!(message.contains(reason), "{message}");
+    };
+    let missing = api(
+        addr,
+        "POST",
+        "/v1/capacity",
+        Some(&key),
+        Some(json!({"placement": placement()})),
+    )
+    .await;
+    refused(&missing, "upgrade vk-gitlab");
+    refused(&ask("other", placement()).await, "absent");
+    let mut other = placement();
+    other.envelope.cpus += 1;
+    refused(&ask("test", other).await, "placement differs");
+
+    let mut no_id = inventory.clone();
+    no_id.runners[0].runner_id = None;
+    hub.db
+        .record_relay(id, crate::store::RelayWrite::Inventory(no_id), now_secs())
+        .unwrap();
+    refused(&ask("test", placement()).await, "no GitLab runner ID");
+    hub.db
+        .record_relay(
+            id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+
+    let mut policy = hub.db.capacity_policy().unwrap();
+    let expected = policy.digest().unwrap();
+    policy.runners.retain(|r| r.runner_id != 42);
+    hub.db
+        .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
+        .unwrap();
+    refused(
+        &ask("test", placement()).await,
+        "gl/42 is mapped to no capacity tenant",
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A new job is refused unless it names its runner and is that runner's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_job_must_be_its_runner_s() {
+    let dir = scratch("job-identity");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let submit = |body: Value| {
+        let key = key.clone();
+        async move { api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await }
+    };
+    let mut body = job_body(1, None, 30);
+    body.as_object_mut().unwrap().remove("runner");
+    let resp = submit(body).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::Forbidden),
+        "{resp:?}"
+    );
+
+    let mut body = job_body(2, None, 30);
+    body["spec"]["job"]["runner_id"] = json!(43);
+    let resp = submit(body).await;
+    assert_eq!(
+        (resp.status, resp.code()),
+        (403, ErrorCode::Forbidden),
+        "{resp:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Granted reservations and accepted jobs replay after their runner becomes unverified.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_granted_reservation_replays_after_its_runner_is_unverified() {
+    let dir = scratch("reservation-replay");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
+    let id = relay_id(&key);
+    let mut inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    inventory.runners[0].verified = false;
+    hub.db
+        .record_relay(
+            id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+    let mut body = reservation_body(1, 5);
+    body["runner"] = json!("test");
+    let again = api(addr, "POST", "/v1/reservations", Some(&key), Some(body)).await;
+    assert_eq!(
+        (again.status, again.json::<ReservationGrant>()),
+        (201, grant),
+        "{again:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_job_replays_after_its_runner_is_unverified() {
+    let dir = scratch("identity-replay");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let body = job_body(1, None, 30);
+    let first = api(addr, "POST", "/v1/jobs", Some(&key), Some(body.clone())).await;
+    assert_eq!(first.status, 201, "{first:?}");
+    let id = relay_id(&key);
+    let mut inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    inventory.runners[0].verified = false;
+    hub.db
+        .record_relay(
+            id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
+    let again = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(again.status, 201, "{again:?}");
+    assert_eq!(first.json::<JobView>().id, again.json::<JobView>().id);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -800,7 +1107,7 @@ async fn a_relay_signs_each_request() {
     let dir = scratch("relay-signed");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
-    let ask = serde_json::to_vec(&json!({"placement": placement()})).unwrap();
+    let ask = serde_json::to_vec(&json!({"runner": "test", "placement": placement()})).unwrap();
     let signed = |path: &str, body: &[u8]| auth_headers(&key, "POST", path, body);
     let resp = send_raw(
         addr,
@@ -1239,7 +1546,7 @@ async fn capacity_long_polls_until_it_moves_and_counts_only_version_3_nodes() {
         "POST",
         "/v1/capacity",
         Some(&key),
-        Some(json!({"placement": placement()})),
+        Some(json!({"runner": "test", "placement": placement()})),
     )
     .await;
     let first: Capacity = resp.json();
@@ -1255,7 +1562,7 @@ async fn capacity_long_polls_until_it_moves_and_counts_only_version_3_nodes() {
         "POST",
         "/v1/capacity",
         Some(&key),
-        Some(json!({"placement": placement(), "after": first.revision, "wait_secs": 1})),
+        Some(json!({"runner": "test", "placement": placement(), "after": first.revision, "wait_secs": 1})),
     )
     .await;
     assert_eq!(resp.json::<Capacity>(), first);
@@ -1269,7 +1576,7 @@ async fn capacity_long_polls_until_it_moves_and_counts_only_version_3_nodes() {
                 "POST",
                 "/v1/capacity",
                 Some(&key),
-                Some(json!({"placement": placement(), "after": first.revision, "wait_secs": 30})),
+                Some(json!({"runner": "test", "placement": placement(), "after": first.revision, "wait_secs": 30})),
             )
             .await;
             (resp.json::<Capacity>(), started.elapsed())
@@ -1303,7 +1610,7 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
                 "POST",
                 "/v1/reservations",
                 Some(&key),
-                Some(reservation_body(1, 5)),
+                Some(relay_reservation_body(1, 5)),
             )
             .await
         })
@@ -1365,14 +1672,14 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
         "POST",
         "/v1/reservations",
         Some(&key),
-        Some(reservation_body(1, 5)),
+        Some(relay_reservation_body(1, 5)),
     )
     .await;
     assert_eq!(
         (resp.status, resp.json::<ReservationGrant>()),
         (201, grant.clone())
     );
-    let mut other = reservation_body(1, 5);
+    let mut other = relay_reservation_body(1, 5);
     other["lease_secs"] = json!(30);
     let resp = api(addr, "POST", "/v1/reservations", Some(&key), Some(other)).await;
     assert_eq!((resp.status, resp.code()), (409, ErrorCode::Conflict));
@@ -1458,7 +1765,7 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
     .await;
 
     // Released: the node is told, and a release of one gone is 204 too.
-    let grant = reserve_on(addr, &key, &mut big, 2).await;
+    let grant = reserve_on(addr, &key, &mut big, 2, Some("test")).await;
     let resp = api(
         addr,
         "DELETE",
@@ -1493,7 +1800,7 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
                 "POST",
                 "/v1/reservations",
                 Some(&key),
-                Some(reservation_body(3, 1)),
+                Some(relay_reservation_body(3, 1)),
             )
             .await
         })
@@ -1535,7 +1842,7 @@ async fn a_version_2_node_is_never_offered_work() {
         "POST",
         "/v1/reservations",
         Some(&key),
-        Some(reservation_body(1, 1)),
+        Some(relay_reservation_body(1, 1)),
     )
     .await;
     assert_eq!((resp.status, resp.code()), (503, ErrorCode::NoCapacity));
@@ -1570,7 +1877,7 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
-    let grant = reserve_on(addr, &key, &mut node, 1).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -3026,7 +3333,7 @@ async fn a_refused_start_gives_its_reservation_back_and_a_canceled_one_ends() {
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
-    let grant = reserve_on(addr, &key, &mut node, 1).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -3169,7 +3476,7 @@ async fn a_session_replaced_or_ended_ends_its_reservations() {
     let id = new_node(addr, &hub, &node_key).await;
     let mut first = connect(addr, &id, &node_key, V3, 16384, Some(Held::default())).await;
     wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
-    let grant = reserve_on(addr, &key, &mut first, 1).await;
+    let grant = reserve_on(addr, &key, &mut first, 1, Some("test")).await;
     let held = |r: &str| Held {
         reservations: vec![HeldReservation {
             reservation: r.to_string(),
@@ -3219,7 +3526,7 @@ async fn a_session_replaced_or_ended_ends_its_reservations() {
 
     // The session ends: so does its reservation, released when the node is back.
     wait_until(|| heard(&hub, &id)).await;
-    let grant = reserve_on(addr, &key, &mut second, 2).await;
+    let grant = reserve_on(addr, &key, &mut second, 2, Some("test")).await;
     drop(second);
     wait_until(|| crate::jobs::testing::reservations(&hub) == 0).await;
     let resp = renew(grant.reservation.clone()).await;
@@ -3362,7 +3669,7 @@ async fn a_reservation_stops_offering_at_its_wait() {
             "POST",
             "/v1/reservations",
             Some(&key),
-            Some(reservation_body(1, 1)),
+            Some(relay_reservation_body(1, 1)),
         )
         .await
     });
@@ -3384,7 +3691,7 @@ async fn a_queued_job_ended_gives_its_reservation_back() {
     let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
-    let grant = reserve_on(addr, &key, &mut node, 1).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -3440,7 +3747,7 @@ async fn a_start_on_a_reservation_counts_against_room_until_a_heartbeat_shows_it
             .fits
     };
     assert_eq!(fits().await, 2);
-    let grant = reserve_on(addr, &key, &mut node, 1).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     assert_eq!(fits().await, 1);
     let resp = api(
         addr,
@@ -3486,7 +3793,7 @@ async fn a_node_at_its_ceiling_is_placed_nothing_until_a_job_ends() {
     };
     assert_eq!(fits().await, 2);
     // A reservation and a job fill it.
-    reserve_on(addr, &key, &mut node, 1).await;
+    reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     assert_eq!(fits().await, 1);
     let first = running_job(addr, &key, &mut node, 2).await;
     assert_eq!(fits().await, 0);
@@ -3496,7 +3803,7 @@ async fn a_node_at_its_ceiling_is_placed_nothing_until_a_job_ends() {
         "POST",
         "/v1/reservations",
         Some(&key),
-        Some(reservation_body(3, 1)),
+        Some(relay_reservation_body(3, 1)),
     )
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
@@ -3569,7 +3876,7 @@ async fn a_node_running_its_own_runner_is_offered_nothing() {
         "POST",
         "/v1/reservations",
         Some(&key),
-        Some(reservation_body(1, 1)),
+        Some(relay_reservation_body(1, 1)),
     )
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
@@ -3605,14 +3912,14 @@ async fn a_node_s_own_limit_caps_what_it_is_placed_with_the_ceiling() {
     crate::ops::set_ceiling(&hub, "uid 0", &node.id, None).unwrap();
     report_placed(&hub, &node, limit(1)).await;
     // Full at one: nothing more is offered.
-    reserve_on(addr, &key, &mut node, 1).await;
+    reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     assert_eq!(fits().await, 0);
     let resp = api(
         addr,
         "POST",
         "/v1/reservations",
         Some(&key),
-        Some(reservation_body(2, 1)),
+        Some(relay_reservation_body(2, 1)),
     )
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
@@ -3651,10 +3958,10 @@ async fn placed_work_goes_to_the_least_loaded_node() {
     let mut full = ready_node(addr, &hub, 2048).await;
     // Both empty: the roomier first. Then each goes to the one with the smaller share of
     // placed work and of its CPUs, on a tie the roomier.
-    reserve_on(addr, &key, &mut big, 1).await;
-    reserve_on(addr, &key, &mut small, 2).await;
-    reserve_on(addr, &key, &mut big, 3).await;
-    reserve_on(addr, &key, &mut small, 4).await;
+    reserve_on(addr, &key, &mut big, 1, Some("test")).await;
+    reserve_on(addr, &key, &mut small, 2, Some("test")).await;
+    reserve_on(addr, &key, &mut big, 3, Some("test")).await;
+    reserve_on(addr, &key, &mut small, 4, Some("test")).await;
     // Starts are ordered the same.
     running_job(addr, &key, &mut big, 5).await;
     for node in [&mut big, &mut small, &mut full] {
@@ -3713,7 +4020,7 @@ async fn a_job_goes_to_a_lightly_loaded_node_holding_its_image() {
     view_until(addr, &key, &first.id, |v| v.state == JobState::Finished).await;
     let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
     // A reservation goes to the less loaded `cold`; the job submitted on it, to `warm`.
-    let grant = reserve_on(addr, &key, &mut cold, 2).await;
+    let grant = reserve_on(addr, &key, &mut cold, 2, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -3766,7 +4073,7 @@ async fn a_job_goes_to_a_lightly_loaded_node_holding_its_image() {
         }
     );
     // Its image pulled: it starts on its reservation.
-    let grant = reserve_on(addr, &key, &mut cold, 4).await;
+    let grant = reserve_on(addr, &key, &mut cold, 4, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -3839,7 +4146,7 @@ async fn a_restarted_hub_still_knows_which_node_holds_a_job_s_image() {
     let mut warm = connect_warm(addr).await;
     wait_until(|| crate::jobs::testing::linked(&hub, &warm_id) && heard(&hub, &warm_id)).await;
     let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
-    let grant = reserve_on(addr, &key, &mut cold, 2).await;
+    let grant = reserve_on(addr, &key, &mut cold, 2, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -4000,7 +4307,7 @@ async fn a_node_refusing_at_its_ceiling_is_passed_over() {
                 "POST",
                 "/v1/reservations",
                 Some(&key),
-                Some(reservation_body(1, 5)),
+                Some(relay_reservation_body(1, 5)),
             )
             .await
         })
@@ -4088,7 +4395,7 @@ async fn a_job_on_a_reservation_with_no_placement_window_starts() {
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
-    let grant = reserve_on(addr, &key, &mut node, 1).await;
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     let resp = api(
         addr,
         "POST",
@@ -5156,7 +5463,7 @@ async fn a_job_under_egress_rules_takes_its_layer_to_a_node_that_enforces_them()
             "POST",
             "/v1/capacity",
             Some(&key),
-            Some(json!({"placement": placement()})),
+            Some(json!({"runner": "test", "placement": placement()})),
         )
         .await
         .json::<Capacity>()

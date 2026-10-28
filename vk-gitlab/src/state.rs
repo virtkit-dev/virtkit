@@ -45,6 +45,9 @@ pub struct JobRecord {
     pub job_token: String,
     /// The hub `request_id` the job is (to be) submitted with.
     pub request_id: String,
+    /// The runner it was taken for, as [`Submission::runner`](crate::dispatch::Submission).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
     /// The original reservation and `place_within`: resubmitting the same `request_id`
     /// requires the same body, or the hub returns a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,6 +282,7 @@ mod tests {
             gitlab_job: id,
             job_token: format!("tok-{id}"),
             request_id: "1".repeat(32),
+            runner: None,
             reservation: None,
             place_within_secs: 300,
             hub_job: None,

@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **The hub takes new work only from relay runners mapped to a capacity tenant**: each
+  request names its runner, which must be verified with GitLab and mapped by its runner ID.
+  Upgrade the hub, map the runners with `vk-hub capacity-policy set`, then upgrade the
+  relays. Until then a relay takes no new jobs but finishes and settles those it holds; a job
+  it took from GitLab and had not yet submitted fails.
+
 ### Added
 
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.

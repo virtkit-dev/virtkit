@@ -456,6 +456,127 @@ fn query_number(query: &str, name: &str) -> Result<Option<u64>, ApiError> {
     Ok(None)
 }
 
+/// Who a relay's request schedules for: the GitLab runner it names, as its relay's inventory
+/// verified it.
+#[derive(Clone)]
+struct SchedulingIdentity {
+    runner_id: u64,
+}
+
+fn identity_refused(message: &str) -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, ErrorCode::Forbidden, message)
+}
+
+/// Log each identity refusal once per relay to avoid repeating it every check interval.
+/// Messages can contain runner names; clear the remembered refusals at the bound.
+fn say_refused_once(relay: &str, error: &ApiError) {
+    const MAX_SAID: usize = 1024;
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+    if said.len() >= MAX_SAID {
+        said.clear();
+    }
+    if said.insert((relay.to_owned(), error.message.clone())) {
+        eprintln!("vk-hub: relay {relay}: {}", error.message);
+    }
+}
+
+/// The identity a request schedules under: `None` for an API key, which names no runner; for
+/// a relay, the runner it names, refused unless that runner is in its inventory once,
+/// verified with a GitLab ID, of the request's placement, and mapped to a tenant.
+async fn resolve_identity(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    runner: Option<&str>,
+    placement: &Placement,
+) -> Result<Option<SchedulingIdentity>, ApiError> {
+    if !principal.is_relay() {
+        return if runner.is_some() {
+            Err(identity_refused("an API key cannot name a relay runner"))
+        } else {
+            Ok(None)
+        };
+    }
+    let (db, id, runner, placement) = (
+        hub.db.clone(),
+        principal.id.clone(),
+        runner.map(str::to_owned),
+        placement.clone(),
+    );
+    let relay = id.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let runner = runner.ok_or_else(|| {
+            identity_refused("a relay must name its runner: upgrade vk-gitlab on the relay")
+        })?;
+        let (row, status) = db
+            .relay_with_status(&id)?
+            .ok_or_else(|| identity_refused("the relay is no longer enrolled"))?;
+        let gitlab = status
+            .filter(|s| s.state.approved())
+            .and_then(|s| s.name)
+            .ok_or_else(|| identity_refused("the relay's GitLab server is not approved"))?;
+        let inventory = row
+            .inventory
+            .ok_or_else(|| identity_refused("the relay has no inventory"))?;
+        let mut matching = inventory.runners.iter().filter(|r| r.name == runner);
+        let found = matching.next().ok_or_else(|| {
+            identity_refused(&format!(
+                "runner {runner:?} is absent from the relay's inventory"
+            ))
+        })?;
+        if matching.next().is_some() {
+            return Err(identity_refused(&format!(
+                "runner {runner:?} appears more than once in the relay's inventory"
+            )));
+        }
+        if !found.verified {
+            return Err(identity_refused(&format!(
+                "runner {runner:?} is not verified with GitLab"
+            )));
+        }
+        if found.placement != placement {
+            return Err(identity_refused(&format!(
+                "runner {runner:?}'s placement differs from the request's"
+            )));
+        }
+        let runner_id = found.runner_id.filter(|id| *id != 0).ok_or_else(|| {
+            identity_refused(&format!("runner {runner:?} has no GitLab runner ID"))
+        })?;
+        let policy = db.capacity_policy()?;
+        policy
+            .runners
+            .iter()
+            .find(|r| r.gitlab == gitlab && r.runner_id == runner_id)
+            .ok_or_else(|| {
+                identity_refused(&format!(
+                    "runner {gitlab}/{runner_id} is mapped to no capacity tenant: add it to \
+                     the capacity policy"
+                ))
+            })?;
+        Ok(Some(SchedulingIdentity { runner_id }))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    if let Err(e) = &resolved
+        && e.status == StatusCode::FORBIDDEN
+    {
+        say_refused_once(&relay, e);
+    }
+    resolved
+}
+
+/// Whether `spec` is a job `identity` may run: its own runner's.
+fn check_job_identity(identity: &SchedulingIdentity, spec: &JobSpec) -> Result<(), ApiError> {
+    let JobSpec::GitlabCi(ci) = spec;
+    if identity.runner_id != ci.job.runner_id {
+        return Err(identity_refused(
+            "job runner does not match the relay runner",
+        ));
+    }
+    Ok(())
+}
+
 async fn capacity(
     body: &[u8],
     hub: &Hub,
@@ -463,6 +584,7 @@ async fn capacity(
 ) -> Result<Response<Body>, ApiError> {
     let (ask, _) = parse_json::<CapacityRequest>(body)?;
     check_placement(&ask.placement, principal)?;
+    resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement).await?;
     let deadline = Instant::now() + wait_for(ask.wait_secs);
     loop {
         let mut changed = hub.dispatch.subscribe();
@@ -546,6 +668,7 @@ async fn reserve(
             None => Err(conflict()),
         };
     }
+    resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement).await?;
     let grant = jobs::reserve(
         hub,
         principal,
@@ -678,6 +801,10 @@ async fn submit(
             }
         },
         None => {
+            let identity = resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement)
+                .await?
+                .ok_or_else(|| identity_refused("job has no relay runner"))?;
+            check_job_identity(&identity, &ask.spec)?;
             let gitlab = gate(hub, principal, &ask, &digest, now).await?;
             jobs::room_for_job(hub)?;
             gitlab

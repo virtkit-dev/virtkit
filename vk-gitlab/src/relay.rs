@@ -337,6 +337,7 @@ mod tests {
             gitlab_job: 1,
             job_token: "jt".into(),
             request_id: "1".repeat(32),
+            runner: None,
             reservation: None,
             place_within_secs: 1,
             hub_job: None,

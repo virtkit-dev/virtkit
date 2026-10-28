@@ -34,6 +34,9 @@ pub struct Submission {
     /// 32 hex digits for idempotent submission: reusing the ID after a restart returns
     /// the same job.
     pub request_id: String,
+    /// The relay runner the job was taken for, by its config name; `None` on a job recorded
+    /// before relays named their runners, resubmitted as recorded so the body matches.
+    pub runner: Option<String>,
     pub placement: Placement,
     /// The reservation the job was requested under; `None` when it was lost meanwhile, and
     /// the hub then places the job afresh within `place_within`.
@@ -136,6 +139,7 @@ pub trait Dispatcher: Send + Sync + 'static {
     /// when `None`), or after `wait`.
     fn capacity(
         &self,
+        runner: &str,
         placement: &Placement,
         after: Option<u64>,
         wait: Duration,
@@ -144,6 +148,7 @@ pub trait Dispatcher: Send + Sync + 'static {
     /// `POST /v1/reservations`: an envelope on a node, held for `lease`.
     fn reserve(
         &self,
+        runner: &str,
         request_id: &str,
         placement: &Placement,
         lease: Duration,
@@ -239,6 +244,8 @@ mod fake {
         refuse_renew: Option<DispatchError>,
         /// Job ID → reads of its view (`GET /v1/jobs/<id>`) started.
         view_reads: HashMap<String, usize>,
+        /// The runner each capacity and reservation request named, in order.
+        runners: Vec<String>,
     }
 
     impl Inner {
@@ -361,6 +368,11 @@ mod fake {
             self.lock().view_reads.get(id).copied().unwrap_or(0)
         }
 
+        /// The runner each capacity and reservation request named, in order.
+        pub fn runners(&self) -> Vec<String> {
+            self.lock().runners.clone()
+        }
+
         pub fn calls(&self) -> Vec<FakeCall> {
             self.lock().calls.clone()
         }
@@ -436,10 +448,12 @@ mod fake {
     impl Dispatcher for FakeDispatcher {
         async fn capacity(
             &self,
+            runner: &str,
             placement: &Placement,
             after: Option<u64>,
             wait: Duration,
         ) -> DispatchResult<Capacity> {
+            self.lock().runners.push(runner.to_owned());
             let pool = placement.pool.clone();
             let answer = |i: &mut Inner| Capacity {
                 revision: i.capacity_revision,
@@ -460,11 +474,13 @@ mod fake {
 
         async fn reserve(
             &self,
+            runner: &str,
             _request_id: &str,
             placement: &Placement,
             lease: Duration,
             _wait: Duration,
         ) -> DispatchResult<Reservation> {
+            self.lock().runners.push(runner.to_owned());
             let id = self.change(|i| {
                 if i.fits(&placement.pool) == 0 {
                     return None;
