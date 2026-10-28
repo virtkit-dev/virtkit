@@ -41,6 +41,7 @@ use crate::rollout::{
     DeleteRule, Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState,
 };
 
+mod admissions;
 mod approvals;
 mod audit;
 mod clients;
@@ -58,6 +59,7 @@ mod relays;
 mod token_keys;
 mod tools;
 
+pub use admissions::StoredAdmission;
 pub use approvals::{
     Decision, Gate, GateJob, ProjectRef, ProjectRow, ProjectState, ProjectView, Refusal,
     RejectedGitlab,
@@ -72,7 +74,8 @@ pub use egress_rules::{
 pub use gitlabs::{GitlabRefused, GitlabRow, normalize_gitlab_url, valid_gitlab_name};
 pub use jobs::{
     DEFAULT_JOB_HISTORY, EgressRulesApplied, JobFilter, JobOutcome, JobPage, JobRow,
-    MAX_JOB_HISTORY, NoAccess, PREPARE_STAGE, RegistryAccess, RequestRow, Submitted,
+    MAX_JOB_HISTORY, NoAccess, PREPARE_STAGE, RegistryAccess, RequestRow, SchedulingIdentity,
+    Submitted,
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
@@ -775,6 +778,8 @@ impl Db {
         txn.open_table(NODES).context("opening the nodes table")?;
         txn.open_table(policy::CAPACITY_POLICY)
             .context("opening the capacity policy table")?;
+        txn.open_table(admissions::ADMISSIONS)
+            .context("opening the admissions table")?;
         txn.open_table(TOKENS).context("opening the tokens table")?;
         txn.open_table(registries::REGISTRIES)
             .context("opening the registries table")?;

@@ -142,6 +142,21 @@ impl Db {
         }
     }
 
+    /// Replace the policy unconditionally, audited as `actor`'s.
+    #[cfg(test)]
+    pub fn set_capacity_policy(&self, policy: &Policy, actor: &str, now: u64) -> Result<()> {
+        validate(policy)?;
+        let bytes = encode(policy)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(CAPACITY_POLICY)?;
+            table.insert("policy", bytes.as_slice())?;
+        }
+        append_audit(&txn, None, actor, "changed capacity policy", now)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Replace the policy if its digest is still `expected`, audited in the same transaction.
     /// Returns whether it changed: the same policy again writes nothing.
     pub fn replace_capacity_policy_if(

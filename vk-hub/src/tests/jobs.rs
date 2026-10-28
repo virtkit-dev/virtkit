@@ -30,6 +30,9 @@ use vk_hub_proto::{
 use super::*;
 use crate::store::{KeyPolicy, NoAccess, RegistryAccess, Scope};
 
+mod capacity;
+mod capacity_recovery;
+
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };
 
@@ -147,8 +150,17 @@ const GITLAB_URL: &str = "https://gitlab.example.com";
 const PROJECT_ID: u64 = 7;
 
 /// A relay enrolled with `hub` and bound to [`GITLAB_URL`], approved as instance `gl` with
-/// project [`PROJECT_ID`]: its credential for [`api`], `relay:<id>:<seed hex>`.
+/// project [`PROJECT_ID`], connected ([`connect_relay`]): its credential for [`api`],
+/// `relay:<id>:<seed hex>`. Its `concurrent` is 64 and its runner's `request_concurrency` 1,
+/// as vk-gitlab's defaults ([`relay_limits`]).
 fn jobs_key(hub: &Hub) -> String {
+    let key = enrolled_key(hub);
+    connect_relay(hub, relay_id(&key));
+    key
+}
+
+/// [`jobs_key`]'s relay before it ever connects.
+fn enrolled_key(hub: &Hub) -> String {
     let seed: [u8; 32] = vk_hub_proto::from_hex_lower(&random_hex(32).unwrap()).unwrap();
     let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
     let public = vk_hub_proto::to_hex(ring::signature::KeyPair::public_key(&pair).as_ref());
@@ -209,10 +221,10 @@ fn jobs_key(hub: &Hub) -> String {
         )
         .unwrap();
     let mut policy = hub.db.capacity_policy().unwrap();
-    let expected = policy.digest().unwrap();
-    policy.tenants.insert(
-        "tests".into(),
-        crate::policy::Tenant {
+    policy
+        .tenants
+        .entry("tests".into())
+        .or_insert_with(|| crate::policy::Tenant {
             weight: 1,
             cap: None,
             // [`spec`]'s project, and the one the approval tests' [`bound_body`] uses.
@@ -224,13 +236,8 @@ fn jobs_key(hub: &Hub) -> String {
                     production_branches: vec![],
                 })
                 .collect(),
-        },
-    );
-    if !policy
-        .runners
-        .iter()
-        .any(|r| r.gitlab == "gl" && r.runner_id == 42)
-    {
+        });
+    if policy.runner("gl", 42).is_none() {
         policy.runners.push(crate::policy::RunnerMapping {
             gitlab: "gl".into(),
             runner_id: 42,
@@ -239,9 +246,55 @@ fn jobs_key(hub: &Hub) -> String {
         });
     }
     hub.db
-        .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
+        .set_capacity_policy(&policy, "tests", now_secs())
         .unwrap();
     format!("relay:{id}:{}", vk_hub_proto::to_hex(&seed))
+}
+
+/// Have relay `id` open a session at relay protocol 2 and send a heartbeat in it listing no
+/// admission, as a relay does on connecting.
+fn connect_relay(hub: &Hub, id: &str) {
+    let (session, _) = hub.open_session(id);
+    hub.db
+        .record_relay_session(id, "test", 2, now_secs(), || true)
+        .unwrap();
+    let inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    let runners = inventory
+        .runners
+        .iter()
+        .map(|runner| vk_hub_proto::gitlab::RunnerLoad {
+            name: runner.name.clone(),
+            ..Default::default()
+        })
+        .collect();
+    hub.db
+        .record_relay_from_session(
+            id,
+            crate::store::RelayWrite::Heartbeat(vk_hub_proto::gitlab::Heartbeat { runners }),
+            now_secs(),
+            Some(session),
+            || true,
+        )
+        .unwrap();
+    hub.heartbeat_stored(id, session, tokio::time::Instant::now());
+}
+
+/// Set the concurrency limits of [`jobs_key`]'s relay: its `concurrent` and its runner's
+/// `request_concurrency`, past the defaults of 64 and 1 for a test that needs more.
+fn relay_limits(hub: &Hub, key: &str, concurrent: u32, request_concurrency: u32) {
+    let id = relay_id(key);
+    let mut inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
+    inventory.concurrent = concurrent;
+    for runner in &mut inventory.runners {
+        runner.request_concurrency = request_concurrency;
+    }
+    hub.db
+        .record_relay(
+            id,
+            crate::store::RelayWrite::Inventory(inventory),
+            now_secs(),
+        )
+        .unwrap();
 }
 
 /// What the audit log calls the relay of credential `key`, from [`jobs_key`].
@@ -962,8 +1015,20 @@ async fn a_new_job_must_be_its_runner_s_and_of_its_tenant_s_projects() {
         "{resp:?}"
     );
 
+    // Approved on the hub, but not one of the tenant's projects.
+    let other = crate::store::ProjectRef::parse("999:group/other").unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[other],
+            crate::store::Decision::Approve,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
     let mut body = job_body(3, None, 30);
     body["spec"]["job"]["project_id"] = json!(999);
+    body["spec"]["job"]["project_path"] = json!("group/other");
     let resp = submit(body).await;
     assert_eq!(
         (resp.status, resp.code()),
@@ -1061,11 +1126,12 @@ async fn production_runner_requires_a_mapped_project_and_branch() {
     hub.db
         .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
         .unwrap();
-    let mut body = job_body(1, None, 30);
+    let mut body = job_body(3, None, 30);
     body["spec"]["sources"]["ref"] = json!("main");
     body["spec"]["sources"]["refspecs"] = json!(["+refs/heads/main:refs/remotes/origin/main"]);
     // A merge request's pipeline, then another branch's.
     let mut wrong = body.clone();
+    wrong["request_id"] = json!(format!("{:032}", 1));
     wrong["spec"]["sources"]["refspecs"] =
         json!(["+refs/merge-requests/1/head:refs/merge-requests/1/head"]);
     let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(wrong)).await;
@@ -1075,6 +1141,7 @@ async fn production_runner_requires_a_mapped_project_and_branch() {
         "{resp:?}"
     );
     let mut wrong = body.clone();
+    wrong["request_id"] = json!(format!("{:032}", 2));
     wrong["spec"]["sources"]["ref"] = json!("feature");
     wrong["spec"]["sources"]["refspecs"] =
         json!(["+refs/heads/feature:refs/remotes/origin/feature"]);
@@ -1086,6 +1153,118 @@ async fn production_runner_requires_a_mapped_project_and_branch() {
     );
     let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
     assert_eq!(resp.status, 201, "{resp:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What a relay asks of the hub that takes capacity: a capacity reading, a reservation
+/// queued and one not, and a new job; each as `key`'s, with request number `n` and up.
+async fn acquisitions(addr: SocketAddr, key: &str, n: u8) -> Vec<(&'static str, Resp)> {
+    let mut queued = relay_reservation_body(n, 0);
+    queued["queue"] = json!(true);
+    let asks = [
+        (
+            "capacity",
+            "/v1/capacity",
+            json!({"runner": "test", "placement": placement()}),
+        ),
+        (
+            "reservation",
+            "/v1/reservations",
+            relay_reservation_body(n + 1, 0),
+        ),
+        ("queued reservation", "/v1/reservations", queued),
+        ("job", "/v1/jobs", job_body(n + 2, None, 30)),
+    ];
+    let mut out = Vec::new();
+    for (what, path, body) in asks {
+        out.push((what, api(addr, "POST", path, Some(key), Some(body)).await));
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_one_relay_can_settle_held_work_but_cannot_acquire() {
+    let dir = scratch("legacy-relay-settle");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let job = running_job(addr, &key, &mut node, 1).await;
+    let canceled = running_job(addr, &key, &mut node, 2).await;
+    hub.db
+        .record_relay_session(relay_id(&key), "legacy", 1, now_secs(), || true)
+        .unwrap();
+    for (what, resp) in acquisitions(addr, &key, 3).await {
+        assert_eq!(
+            (resp.status, resp.code()),
+            (403, ErrorCode::Forbidden),
+            "{what}: {resp:?}"
+        );
+    }
+    // It has no ticket to poll.
+    let path = format!("/v1/reservations/tickets/{}", "0".repeat(32));
+    let resp = api(addr, "GET", &path, Some(&key), None).await;
+    assert_eq!(resp.status, 410, "{resp:?}");
+    // What it holds it still replays, reads, cancels and settles.
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(1, None, 30)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    assert_eq!(resp.json::<JobView>().id, job);
+    let path = format!("/v1/jobs/{job}/output?offset=0");
+    let resp = api(addr, "GET", &path, Some(&key), None).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let resp = api(
+        addr,
+        "POST",
+        &format!("/v1/jobs/{canceled}/cancel"),
+        Some(&key),
+        Some(json!({"mode": "immediate"})),
+    )
+    .await;
+    assert_eq!(resp.status, 202, "{resp:?}");
+    assert_eq!(
+        node.job().await,
+        HubJobMsg::Cancel {
+            job: canceled,
+            mode: vk_hub_proto::client::CancelMode::Immediate,
+        }
+    );
+    node.send(NodeJobMsg::Result {
+        job: job.clone(),
+        result: result(None, 0),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });
+    view_until(addr, &key, &job, |v| v.state == JobState::Finished).await;
+    let resp = api(
+        addr,
+        "POST",
+        &format!("/v1/jobs/{job}/settle"),
+        Some(&key),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 204, "{resp:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A relay that never opened a session has said no protocol: it acquires nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_never_connected_cannot_acquire() {
+    let dir = scratch("unconnected-relay");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = enrolled_key(&hub);
+    for (what, resp) in acquisitions(addr, &key, 1).await {
+        assert_eq!(
+            (resp.status, resp.code()),
+            (403, ErrorCode::Forbidden),
+            "{what}: {resp:?}"
+        );
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1675,6 +1854,49 @@ async fn capacity_long_polls_until_it_moves_and_counts_only_version_3_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn simultaneous_reservations_account_for_an_offer_before_selecting_again() {
+    let dir = scratch("simultaneous-reservations");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    relay_limits(&hub, &key, 64, 2);
+    let mut node = ready_node(addr, &hub, envelope().mem_mib).await;
+    let ask = |n, wait_secs| {
+        let key = key.clone();
+        tokio::spawn(async move {
+            api(
+                addr,
+                "POST",
+                "/v1/reservations",
+                Some(&key),
+                Some(relay_reservation_body(n, wait_secs)),
+            )
+            .await
+        })
+    };
+    // Asked at once: whichever is offered the node's one envelope first, the other is not
+    // offered it too. The one offered is accepted well within its wait, the other gives up.
+    let (first, second) = (ask(1, 10), ask(2, 2));
+    let HubJobMsg::Offer { reservation, .. } = node.job().await else {
+        panic!("expected an offer");
+    };
+    node.quiet(Duration::from_millis(200)).await;
+    node.send(NodeJobMsg::OfferReply {
+        reservation,
+        reply: OfferReply::Accepted { lease_secs: 90 },
+    });
+    let mut answers = [first.await.unwrap(), second.await.unwrap()];
+    answers.sort_unstable_by_key(|a| a.status);
+    assert_eq!(answers[0].status, 201, "{:?}", answers[0]);
+    assert_eq!(
+        (answers[1].status, answers[1].code()),
+        (503, ErrorCode::NoCapacity),
+        "{:?}",
+        answers[1]
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_expires() {
     let dir = scratch("reserve");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
@@ -1899,10 +2121,10 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
     }
     let resp = ask.await.unwrap();
     assert_eq!((resp.status, resp.code()), (503, ErrorCode::NoCapacity));
-    assert!(
+    assert_eq!(
         resp.json::<vk_hub_proto::client::ClientError>()
-            .retry_after_secs
-            .is_some()
+            .retry_after_secs,
+        Some(5)
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -3775,7 +3997,12 @@ async fn a_queued_job_ended_gives_its_reservation_back() {
     let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
+    // The placement loop offers the reservation; stopped once it is granted, the job
+    // submitted on the grant stays queued.
+    let driver = tokio::spawn(crate::jobs::drive(hub.clone()));
     let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
     let resp = api(
         addr,
         "POST",
@@ -3882,12 +4109,13 @@ async fn a_node_at_its_ceiling_is_placed_nothing_until_a_job_ends() {
     let first = running_job(addr, &key, &mut node, 2).await;
     assert_eq!(fits().await, 0);
     assert_eq!(crate::jobs::placed_on(&hub, &node.id), 2);
+    // Asked with an API key, whose requests the relay's own limits do not hold back.
     let resp = api(
         addr,
         "POST",
         "/v1/reservations",
-        Some(&key),
-        Some(relay_reservation_body(3, 1)),
+        Some(&plain_key(&hub)),
+        Some(reservation_body(3, 1)),
     )
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
@@ -3995,15 +4223,15 @@ async fn a_node_s_own_limit_caps_what_it_is_placed_with_the_ceiling() {
     assert_eq!(fits().await, 1);
     crate::ops::set_ceiling(&hub, "uid 0", &node.id, None).unwrap();
     report_placed(&hub, &node, limit(1)).await;
-    // Full at one: nothing more is offered.
+    // Full at one: nothing more is offered, to the relay or to an API key.
     reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     assert_eq!(fits().await, 0);
     let resp = api(
         addr,
         "POST",
         "/v1/reservations",
-        Some(&key),
-        Some(relay_reservation_body(2, 1)),
+        Some(&plain_key(&hub)),
+        Some(reservation_body(2, 1)),
     )
     .await;
     assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
@@ -4036,16 +4264,19 @@ async fn placed_work_goes_to_the_least_loaded_node() {
     let dir = scratch("spread");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
+    // Four grants held at once: an API key's, as a relay runner probes for one at a time
+    // (the queued spread is [`capacity::queued_grants_go_to_the_least_loaded_node`]).
+    let reservation_key = plain_key(&hub);
     // Memory for eight envelopes, for four, and for none.
     let mut big = ready_node(addr, &hub, 32768).await;
     let mut small = ready_node(addr, &hub, 16384).await;
     let mut full = ready_node(addr, &hub, 2048).await;
     // Both empty: the roomier first. Then each goes to the one with the smaller share of
     // placed work and of its CPUs, on a tie the roomier.
-    reserve_on(addr, &key, &mut big, 1, Some("test")).await;
-    reserve_on(addr, &key, &mut small, 2, Some("test")).await;
-    reserve_on(addr, &key, &mut big, 3, Some("test")).await;
-    reserve_on(addr, &key, &mut small, 4, Some("test")).await;
+    reserve_on(addr, &reservation_key, &mut big, 1, None).await;
+    reserve_on(addr, &reservation_key, &mut small, 2, None).await;
+    reserve_on(addr, &reservation_key, &mut big, 3, None).await;
+    reserve_on(addr, &reservation_key, &mut small, 4, None).await;
     // Starts are ordered the same.
     running_job(addr, &key, &mut big, 5).await;
     for node in [&mut big, &mut small, &mut full] {
@@ -4227,6 +4458,7 @@ async fn a_restarted_hub_still_knows_which_node_holds_a_job_s_image() {
     drop(warm);
     // Restarted over the same database: `warm` comes back, `cold` is new and less loaded.
     let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    connect_relay(&hub, relay_id(&key));
     let mut warm = connect_warm(addr).await;
     wait_until(|| crate::jobs::testing::linked(&hub, &warm_id) && heard(&hub, &warm_id)).await;
     let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
@@ -5199,6 +5431,23 @@ fn a_commit_is_hex_or_nothing() {
 /// Approve project `id_path`, `<id>[:<path>]`, of instance `gl`.
 fn approve(hub: &Hub, id_path: &str) {
     let project = crate::store::ProjectRef::parse(id_path).unwrap();
+    let id: u64 = id_path.split(':').next().unwrap().parse().unwrap();
+    let mut policy = hub.db.capacity_policy().unwrap();
+    if let Some(tenant) = policy.tenants.get_mut("tests")
+        && !tenant
+            .projects
+            .iter()
+            .any(|p| p.gitlab == "gl" && p.id == id)
+    {
+        tenant.projects.push(crate::policy::Project {
+            gitlab: "gl".into(),
+            id,
+            production_branches: vec![],
+        });
+    }
+    hub.db
+        .set_capacity_policy(&policy, "tests", now_secs())
+        .unwrap();
     hub.db
         .decide_projects(
             "gl",
@@ -5257,16 +5506,7 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         (resp.status, resp.code()),
         (403, ErrorCode::ApprovalPending)
     );
-    let project = crate::store::ProjectRef::parse("42").unwrap();
-    hub.db
-        .decide_projects(
-            "gl",
-            &[project],
-            crate::store::Decision::Approve,
-            "u",
-            now_secs(),
-        )
-        .unwrap();
+    approve(&hub, "42");
     let resp = submit(key.clone(), bound_body(2, 42, "wab/core", 600)).await;
     assert_eq!(resp.status, 201, "{resp:?}");
     let view: JobView = resp.json();

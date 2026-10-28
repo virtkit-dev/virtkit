@@ -42,6 +42,7 @@ pub async fn run(
     drop(permit);
     if let Err(r) = welcomed {
         hub.close_session(&relay.id, session);
+        crate::jobs::relay_disconnected(&hub, &relay.id, session);
         return turn_away(&mut ws, peer, r).await;
     }
     eprintln!(
@@ -52,6 +53,7 @@ pub async fn run(
     hub.clients_changed();
     let ended = serve(&mut ws, &hub, &relay, session, &ending).await;
     hub.close_session(&relay.id, session);
+    crate::jobs::relay_disconnected(&hub, &relay.id, session);
     hub.changed(&relay.id);
     hub.clients_changed();
     match ended {
@@ -222,6 +224,7 @@ async fn store(
     // The Connections page follows what a relay is and does; its load, it shows once a
     // heartbeat regardless.
     let shown = !matches!(write, RelayWrite::Heartbeat(_));
+    let received = tokio::time::Instant::now();
     let live = hub.clone();
     let written = tokio::task::spawn_blocking(move || {
         db.record_relay_from_session(&id, write, now, Some(session), || {
@@ -233,6 +236,9 @@ async fn store(
         // Superseded by a newer session: nothing was stored.
         Ok(false) => Ok(None),
         Ok(true) => {
+            if !shown {
+                hub.heartbeat_stored(&relay.id, session, received);
+            }
             hub.changed(&relay.id);
             if shown {
                 hub.clients_changed();

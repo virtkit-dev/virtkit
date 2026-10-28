@@ -4,14 +4,15 @@
 //! job-taking half of gitlab-runner's `commands/multi.go` and of
 //! `commands/health_helper.go`.
 //!
-//! Each runner runs `request_concurrency` request loops. A loop waits for a free slot under
-//! `concurrent` and the runner's `limit`, waits until the hub reports capacity on the
-//! runner's placement, reserves an envelope on a node, takes the slot, and only then asks
-//! GitLab for a job, renewing the reservation while the request is out; a request in flight
-//! is never aborted. An empty answer gives the slot and the reservation back, so an idle
-//! loop holds neither between requests. The loops of a runner start at most one request
-//! per `check_interval` between them, as gitlab-runner feeds each runner once per interval
-//! — except right after a job arrives (unless `strict_check_interval`).
+//! Each runner runs `request_concurrency` request loops. A loop queues at the hub without
+//! a local slot, then takes a slot and claims its grant before asking GitLab for a job.
+//! It renews the reservation while the request is out; a request in flight is never aborted.
+//! The relay reports whether the grant found a job, found none, failed, or was given up,
+//! retrying a report the hub did not take until it does or no longer knows the admission.
+//! An empty answer gives the slot and reservation back, so an idle loop holds neither. The
+//! loops of a runner start at most one request per `check_interval` between them, as
+//! gitlab-runner feeds each runner once per interval — except right after a job arrives
+//! (unless `strict_check_interval`).
 //!
 //! A job is submitted on its reservation and committed to GitLab (`state=running`, the
 //! second phase of `two_phase_job_commit`) once a node accepted it; one that cannot be
@@ -21,8 +22,8 @@
 //!
 //! Each job is recorded in its runner's state file from the moment it is taken until it is
 //! settled. On start, the recorded jobs of every runner resume before any runner requests a
-//! job: they run whether or not `concurrent` and `limit` leave them a slot, and new requests
-//! wait until they do.
+//! job: they run whether or not `concurrent` and `limit` leave them a slot. New loops can
+//! queue, but can fetch a job only after taking a slot.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
+use vk_hub_proto::client::AdmissionOutcome;
 use vk_hub_proto::stamp;
 
 use crate::api::{
@@ -40,7 +42,7 @@ use crate::backoff::{Backoff, hex, random_bytes};
 use crate::config::{Config, RunnerConfig};
 use crate::dispatch::{
     CancelMode, DispatchError, Dispatcher, ErrorKind, FailureClass, HubJobState, JobResult,
-    JobSpec, JobView, Reservation, Submission,
+    JobSpec, JobView, QueueAnswer, Reservation, Submission,
 };
 use crate::failure::{FailureReason, FailureReasonMapper, JobState};
 use crate::job::Job;
@@ -212,6 +214,113 @@ impl HubErrors {
     }
 }
 
+/// The most admission outcomes a runner keeps for the hub; past it, the oldest is dropped,
+/// and the hub reclaims its admission once a heartbeat no longer lists it.
+const MAX_PENDING_OUTCOMES: usize = vk_hub_proto::gitlab::MAX_ADMISSIONS;
+
+/// The admission outcomes a runner has yet to get to the hub, oldest first, at most one per
+/// admission: its latest, which is what the hub must end up with. Held in memory, across
+/// sessions; a restarted relay reconciles its admissions through its heartbeats instead.
+#[derive(Default)]
+struct Outcomes {
+    pending: Mutex<std::collections::VecDeque<(String, AdmissionOutcome)>>,
+    added: Notify,
+}
+
+impl Outcomes {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(String, AdmissionOutcome)>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues `outcome` for admission `id`, in place of one still queued for it.
+    fn push(&self, runner: &str, id: &str, outcome: AdmissionOutcome) {
+        let mut pending = self.lock();
+        if let Some(slot) = pending.iter_mut().find(|(a, _)| a == id) {
+            slot.1 = outcome;
+        } else {
+            if pending.len() >= MAX_PENDING_OUTCOMES
+                && let Some((dropped, _)) = pending.pop_front()
+            {
+                log::warn!(runner = runner, admission = dropped.as_str(); "Too many admission outcomes the hub has not taken; dropping the oldest");
+            }
+            pending.push_back((id.to_owned(), outcome));
+        }
+        drop(pending);
+        self.added.notify_one();
+    }
+
+    /// Forgets `delivered` unless a later outcome replaced it meanwhile.
+    fn delivered(&self, delivered: &(String, AdmissionOutcome)) {
+        let mut pending = self.lock();
+        if let Some(at) = pending.iter().position(|p| p == delivered) {
+            pending.remove(at);
+        }
+    }
+
+    /// Moves `failed` behind the others, so one the hub keeps refusing holds none up.
+    fn requeue(&self, failed: &(String, AdmissionOutcome)) {
+        let mut pending = self.lock();
+        if let Some(at) = pending.iter().position(|p| p == failed)
+            && let Some(p) = pending.remove(at)
+        {
+            pending.push_back(p);
+        }
+    }
+
+    /// Whether every outcome reached the hub, or was given up.
+    fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+}
+
+/// Delivers `runner`'s admission outcomes to the hub, oldest first, until the task is
+/// aborted: each until the hub takes it, answers that it knows no such admission (404,
+/// 410), refuses it as conflicting with the admission's state (409), or refuses it as
+/// malformed. A failure is retried after a backoff.
+async fn deliver_outcomes<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
+    let name = runner.cfg.name.as_str();
+    let hub = &shared.options.hub;
+    let mut backoff = Backoff::new(
+        hub.retry_pause,
+        HUB_ERROR_BACKOFF_MAX.max(hub.retry_pause),
+        2.0,
+        true,
+    );
+    loop {
+        let next = runner.outcomes.lock().front().cloned();
+        let Some(next) = next else {
+            runner.outcomes.added.notified().await;
+            continue;
+        };
+        let (id, outcome) = (next.0.as_str(), next.1);
+        match shared.dispatcher.outcome(id, outcome).await {
+            Ok(()) => {
+                backoff.reset();
+                runner.outcomes.delivered(&next);
+            }
+            Err(e) if matches!(e.kind, ErrorKind::NotFound | ErrorKind::ReservationGone) => {
+                log::info!(runner = name, admission = id, error = e.to_string().as_str(); "The hub no longer knows the admission; its outcome is dropped");
+                runner.outcomes.delivered(&next);
+            }
+            Err(e) if e.kind == ErrorKind::Conflict => {
+                log::warn!(runner = name, admission = id, error = e.to_string().as_str(); "The hub refused the admission outcome as conflicting with its state; dropping it");
+                runner.outcomes.delivered(&next);
+            }
+            Err(e) if e.kind == ErrorKind::Invalid => {
+                log::error!(runner = name, admission = id, error = e.to_string().as_str(); "The hub refused the admission outcome as malformed; dropping it");
+                runner.outcomes.delivered(&next);
+            }
+            Err(e) => {
+                log::warn!(runner = name, admission = id, error = e.to_string().as_str(); "Reporting the admission outcome failed; reporting it again");
+                runner.outcomes.requeue(&next);
+                tokio::time::sleep(e.retry_after.unwrap_or_else(|| backoff.next_delay())).await;
+            }
+        }
+    }
+}
+
 /// Port of gitlab-runner's `healthHelper`, for one runner.
 struct Health {
     failures: u32,
@@ -339,6 +448,8 @@ struct Runner {
     server_url: String,
     /// The CA bundle GitLab is verified against, passed to jobs (`CI_SERVER_TLS_CA_FILE`).
     server_ca_pem: Option<String>,
+    /// What came of its admissions, on the way to the hub.
+    outcomes: Outcomes,
 }
 
 impl Runner {
@@ -396,6 +507,11 @@ impl Runner {
             }
         });
         verified
+    }
+
+    /// Queues what came of admission `id` for the hub; [`deliver_outcomes`] sends it.
+    fn report_outcome(&self, id: &str, outcome: AdmissionOutcome) {
+        self.outcomes.push(&self.cfg.name, id, outcome);
     }
 
     /// Reports what the runner is doing.
@@ -515,6 +631,41 @@ pub fn client_for(
     .with_context(|| format!("runner {:?}", cfg.name))
 }
 
+/// Open and validate every runner's state before reporting held jobs to the hub.
+pub struct PreparedState {
+    status: Arc<Status>,
+    relay_id: String,
+    files: Vec<(String, StateFile)>,
+}
+
+pub fn prepare_state(
+    config: &Config,
+    relay_id: &str,
+    status: Arc<Status>,
+) -> Result<PreparedState> {
+    let state_dir = config
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_STATE_DIR));
+    let mut files = Vec::with_capacity(config.runners.len());
+    for runner in &config.runners {
+        let file = StateFile::open(&state_dir.join(format!("{}.json", runner.name)))?;
+        check_relay(&file, relay_id)?;
+        let records = file.records();
+        status.runner(&runner.name, |r| {
+            r.jobs = u32::try_from(records.len()).unwrap_or(u32::MAX);
+            r.job_admissions = records.iter().filter_map(|j| j.admission.clone()).collect();
+        });
+        files.push((runner.name.clone(), file));
+    }
+    warn_unowned_state_files(&state_dir, &config.runners);
+    Ok(PreparedState {
+        status,
+        relay_id: relay_id.to_owned(),
+        files,
+    })
+}
+
 /// Polls every configured runner until `shutdown` stops it and the running jobs end, its jobs
 /// submitted as the relay `relay` enrolled. A runner asks GitLab for jobs only while `status`
 /// says the hub approved the server; the jobs it already holds run either way.
@@ -522,11 +673,25 @@ pub async fn run<D: Dispatcher>(
     config: &Config,
     system_id: &str,
     relay: &Enrollment,
-    status: Arc<Status>,
+    prepared: PreparedState,
     dispatcher: Arc<D>,
     options: RunOptions,
     shutdown: Shutdown,
 ) -> Result<()> {
+    let PreparedState {
+        status,
+        relay_id,
+        files,
+    } = prepared;
+    if relay_id != relay.relay_id
+        || files.len() != config.runners.len()
+        || files
+            .iter()
+            .zip(&config.runners)
+            .any(|((name, _), cfg)| name != &cfg.name)
+    {
+        anyhow::bail!("prepared runner state does not match the configuration");
+    }
     let shared = Arc::new(Shared {
         dispatcher,
         hub: relay.hub.clone(),
@@ -537,13 +702,9 @@ pub async fn run<D: Dispatcher>(
         shutdown,
         options,
     });
-    let state_dir = config
-        .state_dir
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_STATE_DIR));
     // Every runner is built before any loop starts: a bad one fails the whole run.
     let mut runners = Vec::with_capacity(config.runners.len());
-    for cfg in &config.runners {
+    for (cfg, (_, state)) in config.runners.iter().zip(files) {
         let client = client_for(
             config.gitlab_url(),
             cfg,
@@ -551,8 +712,6 @@ pub async fn run<D: Dispatcher>(
             runner_info(),
             shared.options.retry.clone(),
         )?;
-        let state = StateFile::open(&state_dir.join(format!("{}.json", cfg.name)))?;
-        check_relay(&state, &relay.relay_id)?;
         let server_ca_pem = match &cfg.tls_ca_file {
             Some(f) => Some(
                 std::fs::read_to_string(f)
@@ -572,9 +731,15 @@ pub async fn run<D: Dispatcher>(
             status: Arc::clone(&status),
             server_url: config.gitlab_url().to_owned(),
             server_ca_pem,
+            outcomes: Outcomes::default(),
         }));
     }
-    warn_unowned_state_files(&state_dir, &config.runners);
+    // Every runner's outcomes, its resumed jobs' included, reach the hub until the loop ends.
+    let mut delivering = tokio::task::JoinSet::new();
+    for runner in &runners {
+        delivering.spawn(deliver_outcomes(Arc::clone(&shared), Arc::clone(runner)));
+    }
+    let delivered = runners.clone();
     // Jobs from before a restart come first, every runner's: they are taken already, and
     // hold their slots ahead of any new request.
     let mut requesting = Vec::with_capacity(runners.len());
@@ -586,11 +751,7 @@ pub async fn run<D: Dispatcher>(
         if refused {
             log::error!(runner = name; "GitLab refuses the runner's token; the runner requests no jobs");
         }
-        let records = runner.state.records();
-        status.runner(name, |r| {
-            r.jobs = u32::try_from(records.len()).unwrap_or(u32::MAX)
-        });
-        for rec in records {
+        for rec in runner.state.records() {
             log::info!(runner = name, job = rec.gitlab_job, phase = format!("{:?}", rec.phase).as_str(); "Resuming a job from the state file");
             let mut running = RunningJob::new(Arc::clone(&shared), acquire_slots(&shared, &runner));
             let (shared2, runner2) = (Arc::clone(&shared), Arc::clone(&runner));
@@ -628,6 +789,18 @@ pub async fn run<D: Dispatcher>(
         }
         done.await;
     }
+    // The outcomes still on their way get the shutdown's grace; any left, the hub reclaims
+    // from the next session's heartbeats.
+    let flushed = tokio::time::timeout(shared.options.hub.settle_wait, async {
+        while delivered.iter().any(|r| !r.outcomes.is_empty()) {
+            tokio::time::sleep(shared.options.hub.retry_pause).await;
+        }
+    })
+    .await;
+    if flushed.is_err() {
+        log::warn!("Stopped with admission outcomes the hub has not taken");
+    }
+    delivering.abort_all();
     Ok(())
 }
 
@@ -671,15 +844,6 @@ fn warn_unowned_state_files(dir: &std::path::Path, runners: &[RunnerConfig]) {
 struct Slots {
     _concurrent: OwnedSemaphorePermit,
     _limit: Option<OwnedSemaphorePermit>,
-}
-
-/// Whether a slot is free now; [`acquire_slots`] decides.
-fn slots_free<D>(shared: &Shared<D>, runner: &Runner) -> bool {
-    shared.concurrent.available_permits() > 0
-        && runner
-            .limit
-            .as_ref()
-            .is_none_or(|sem| sem.available_permits() > 0)
 }
 
 /// A running job: its slots, and its count in `running_jobs`. Dropped when the job's task
@@ -826,6 +990,24 @@ async fn release<D: Dispatcher>(shared: &Shared<D>, held: Option<Held>) {
     }
 }
 
+/// Returns `held`'s admission unused, and releases its reservation.
+async fn give_back<D: Dispatcher>(shared: &Shared<D>, runner: &Runner, held: Option<Held>) {
+    if let Some(id) = held
+        .as_ref()
+        .and_then(|h| h.reservation.admission.as_deref())
+    {
+        runner.report_outcome(id, AdmissionOutcome::Released);
+    }
+    release(shared, held).await;
+}
+
+/// Gives up ticket `id`, logging a failure: the hub drops a ticket nobody polls.
+async fn cancel_ticket<D: Dispatcher>(shared: &Shared<D>, id: &str) {
+    if let Err(e) = shared.bounded(shared.dispatcher.cancel_ticket(id)).await {
+        log::warn!(ticket = id, error = e.to_string().as_str(); "Cancelling the ticket failed");
+    }
+}
+
 fn pause_for(e: &DispatchError, fallback: Duration) -> Duration {
     e.retry_after.unwrap_or(fallback)
 }
@@ -835,7 +1017,6 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
     let name = runner.cfg.name.clone();
     let placement = runner.cfg.placement();
     let hub = shared.options.hub.clone();
-    let mut capacity_revision: Option<u64> = None;
     loop {
         if shared.shutdown.stopping() {
             return;
@@ -861,18 +1042,6 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             }
             continue;
         }
-        // A free slot first: a loop waiting for one asks neither the hub nor GitLab.
-        let job_done = shared.job_done.notified();
-        if !slots_free(&shared, &runner) {
-            log::debug!(runner = name.as_str(); "No free slot; not requesting a job");
-            tokio::select! {
-                () = tokio::time::sleep(runner.check_interval) => {}
-                () = job_done => {}
-                () = wait_true(&mut stop) => return,
-            }
-            continue;
-        }
-        drop(job_done);
         let pace = runner.claim_poll();
         if !pace.is_zero() {
             tokio::select! {
@@ -880,49 +1049,114 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
                 () = wait_true(&mut stop) => return,
             }
         }
-        // Then capacity: while the hub reports no room, GitLab is not asked, and the job
-        // stays pending for another runner.
-        let capacity = tokio::select! {
-            c = shared.dispatcher.capacity(&name, &placement, capacity_revision, hub.wait) => c,
-            () = wait_true(&mut stop) => return,
-        };
-        match capacity {
-            Ok(c) => {
-                capacity_revision = Some(c.revision);
-                if c.fits == 0 {
-                    runner.report(RunnerState::WaitingCapacity, None);
-                    continue;
-                }
-            }
-            Err(e) => {
-                log::warn!(runner = name.as_str(), error = e.to_string().as_str(); "Asking the hub for capacity failed");
-                capacity_revision = None;
-                tokio::select! {
-                    () = tokio::time::sleep(pause_for(&e, runner.check_interval)) => {}
-                    () = wait_true(&mut stop) => return,
-                }
-                continue;
-            }
-        }
-        // Then a reservation.
-        let sent = Instant::now();
+        runner.report(RunnerState::WaitingCapacity, None);
         let request_id = new_request_id();
-        let reserved = tokio::select! {
-            r = shared.dispatcher.reserve(&name, &request_id, &placement, hub.lease, hub.wait) => r,
-            () = wait_true(&mut stop) => return,
+        let mut sent = Instant::now();
+        let queued = tokio::select! {
+            r = shared.dispatcher.queue(&name, &request_id, &placement, hub.lease, hub.wait) => r,
+            () = wait_true(&mut stop) => {
+                // The hub may have queued the request before its answer reached us. Reuse
+                // the ID to find that ticket and cancel it, bounded during shutdown.
+                let cleanup = async {
+                    match shared.dispatcher.queue(&name, &request_id, &placement, hub.lease, hub.wait).await {
+                        Ok(QueueAnswer::Ticket(id)) => {
+                            if let Err(e) = shared.dispatcher.cancel_ticket(&id).await {
+                                log::warn!(ticket = id.as_str(), error = e.to_string().as_str(); "Cancelling the ticket failed");
+                            }
+                        }
+                        Ok(QueueAnswer::Grant(grant)) => {
+                            if let Some(id) = &grant.admission {
+                                runner.report_outcome(id, AdmissionOutcome::Released);
+                            }
+                            if let Err(e) = shared.dispatcher.release(&grant.id).await {
+                                log::warn!(reservation = grant.id.as_str(), error = e.to_string().as_str(); "Releasing the reservation failed");
+                            }
+                        }
+                        Err(e) => log::warn!(runner = name.as_str(), error = e.to_string().as_str(); "Could not recover the ticket during shutdown"),
+                    }
+                };
+                if tokio::time::timeout(hub.settle_wait, cleanup).await.is_err() {
+                    log::warn!(runner = name.as_str(); "Timed out cancelling the ticket during shutdown");
+                }
+                return;
+            },
         };
-        let mut held = match reserved {
-            Ok(reservation) => {
-                log::debug!(runner = name.as_str(), reservation = reservation.id.as_str(), node = reservation.node.as_str(); "Reserved an envelope");
-                Some(Held {
-                    reservation,
-                    since: sent,
-                    retry_at: None,
-                })
+        // Then the ticket, polled until it is granted. A poll that got no answer is tried
+        // again: the hub keeps a ticket queued for as long as it is polled.
+        let mut answer = queued;
+        let mut ticket: Option<String> = None;
+        let mut poll_errors = Backoff::new(
+            hub.retry_pause,
+            HUB_ERROR_BACKOFF_MAX.max(hub.retry_pause),
+            2.0,
+            true,
+        );
+        let granted = loop {
+            let id = match answer {
+                Ok(QueueAnswer::Grant(reservation)) => break Ok(reservation),
+                Ok(QueueAnswer::Ticket(id)) => id,
+                Err(e) => match ticket.take() {
+                    Some(id)
+                        if matches!(
+                            e.kind,
+                            ErrorKind::Transport | ErrorKind::Unavailable | ErrorKind::Internal
+                        ) =>
+                    {
+                        let pause = e.retry_after.unwrap_or_else(|| poll_errors.next_delay());
+                        log::warn!(runner = name.as_str(), ticket = id.as_str(), error = e.to_string().as_str(); "Polling the ticket failed; polling it again");
+                        tokio::select! {
+                            () = tokio::time::sleep(pause) => {}
+                            () = wait_true(&mut stop) => {
+                                cancel_ticket(&shared, &id).await;
+                                return;
+                            }
+                        }
+                        id
+                    }
+                    Some(id) => {
+                        // A ticket the hub still knows is given up; one it lost needs nothing.
+                        if !matches!(e.kind, ErrorKind::NotFound | ErrorKind::ReservationGone) {
+                            cancel_ticket(&shared, &id).await;
+                        }
+                        break Err(e);
+                    }
+                    None => break Err(e),
+                },
+            };
+            sent = Instant::now();
+            answer = tokio::select! {
+                r = shared.dispatcher.poll_ticket(&id, hub.wait) => r,
+                () = wait_true(&mut stop) => {
+                    cancel_ticket(&shared, &id).await;
+                    return;
+                },
+            };
+            if answer.is_ok() {
+                poll_errors.reset();
             }
+            ticket = Some(id);
+        };
+        let mut held = match granted {
+            Ok(reservation) => Some(Held {
+                reservation,
+                since: sent,
+                retry_at: None,
+            }),
             Err(e) => {
-                log::info!(runner = name.as_str(), error = e.to_string().as_str(); "No reservation");
-                capacity_revision = None;
+                if e.kind == ErrorKind::Forbidden {
+                    // The hub refuses the runner itself (its identity, its server's approval):
+                    // shown on the hub, where the operator can act on it.
+                    log::warn!(runner = name.as_str(), error = e.to_string().as_str(); "The hub refuses the runner's reservations");
+                    runner.report(
+                        RunnerState::Unhealthy,
+                        Some(format!(
+                            "the hub refuses the runner's reservations: {}",
+                            e.message
+                        )),
+                    );
+                } else {
+                    log::info!(runner = name.as_str(), error = e.to_string().as_str(); "No reservation");
+                }
                 tokio::select! {
                     () = tokio::time::sleep(pause_for(&e, runner.check_interval)) => {}
                     () = wait_true(&mut stop) => return,
@@ -930,40 +1164,88 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
                 continue;
             }
         };
+        let admission = held.as_ref().and_then(|h| h.reservation.admission.clone());
+        if admission.is_none() {
+            log::warn!(runner = name.as_str(); "Hub grant has no admission ID");
+            give_back(&shared, &runner, held).await;
+            tokio::select! {
+                () = tokio::time::sleep(runner.check_interval) => {}
+                () = wait_true(&mut stop) => return,
+            }
+            continue;
+        }
         // Then the slot, which another loop may have taken meanwhile.
         let Some(slots) = acquire_slots(&shared, &runner) else {
-            release(&shared, held).await;
-            capacity_revision = None;
+            log::warn!(runner = name.as_str(); "Local slots disagree with the hub grant");
+            give_back(&shared, &runner, held).await;
+            tokio::select! {
+                () = tokio::time::sleep(runner.check_interval) => {}
+                () = wait_true(&mut stop) => return,
+            }
             continue;
         };
         if shared.shutdown.stopping() {
-            release(&shared, held).await;
+            give_back(&shared, &runner, held).await;
             return;
         }
         // The server may have lost its approval meanwhile.
         if !shared.status.approved() {
             drop(slots);
-            release(&shared, held).await;
+            give_back(&shared, &runner, held).await;
+            continue;
+        }
+        // Listed as requested before it is claimed: the hub reclaims a claimed admission
+        // that a heartbeat after the claim leaves out.
+        shared.status.runner(&name, |r| {
+            r.requests = r.requests.saturating_add(1);
+            if let Some(id) = &admission {
+                r.request_admissions.push(id.clone());
+            }
+        });
+        if let Some(h) = &held
+            && let Err(e) = shared
+                .bounded(shared.dispatcher.claim(&h.reservation.id))
+                .await
+        {
+            log::warn!(runner = name.as_str(), error = e.to_string().as_str(); "Claiming the grant failed");
+            shared.status.runner(&name, |r| {
+                r.requests = r.requests.saturating_sub(1);
+                if let Some(id) = &admission {
+                    r.request_admissions.retain(|a| a != id);
+                }
+            });
+            drop(slots);
+            give_back(&shared, &runner, held).await;
             continue;
         }
         // Then the job request, under the reservation. Never aborted: GitLab may already
         // have assigned the job.
         runner.report(RunnerState::Polling, None);
-        shared
-            .status
-            .runner(&name, |r| r.requests = r.requests.saturating_add(1));
         let result = keep_alive(&shared, &name, &mut held, runner.client.request_job()).await;
         shared.status.runner(&name, |r| {
             r.requests = r.requests.saturating_sub(1);
             r.last_answer = runner.client.last_answer();
+            if let Some(id) = &admission {
+                r.request_admissions.retain(|a| a != id);
+                if result.job.is_some() {
+                    r.pending_job_admissions.push(id.clone());
+                }
+            }
         });
         // A key GitLab rotated shows on the hub without waiting for the next verify.
         shared.status.set_spki(runner.client.spki_sha256());
         if let Ok(mut h) = runner.health.lock() {
             h.mark(result.healthy, &name);
         }
-        capacity_revision = None;
         let Some(job) = result.job else {
+            if let Some(id) = &admission {
+                let outcome = if result.empty {
+                    AdmissionOutcome::Empty
+                } else {
+                    AdmissionOutcome::Error
+                };
+                runner.report_outcome(id, outcome);
+            }
             // Nothing to do: the slot and the reservation go back until the next request.
             drop(slots);
             release(&shared, held).await;
@@ -976,7 +1258,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         let running = RunningJob::new(Arc::clone(&shared), Some(slots));
         let runner2 = Arc::clone(&runner);
         tokio::spawn(async move {
-            run_job(&running.shared, &runner2, job, reservation).await;
+            run_job(&running.shared, &runner2, job, reservation, admission).await;
             drop(running);
         });
         if !runner.cfg.strict_check_interval {
@@ -1078,9 +1360,12 @@ async fn wait_until_placed<D: Dispatcher>(shared: &Shared<D>, mut view: JobView)
         }
         if Instant::now() >= deadline {
             log::error!(hub_job = view.id.as_str(); "The hub did not report the job placed in time");
-            let _ = shared
+            if let Err(e) = shared
                 .bounded(shared.dispatcher.cancel(&view.id, CancelMode::Immediate))
-                .await;
+                .await
+            {
+                log::warn!(hub_job = view.id.as_str(), error = e.to_string().as_str(); "Cancelling the job failed");
+            }
             view.state = HubJobState::Finished;
             view.result = Some(lost(
                 "the hub did not report it placed in time".to_owned(),
@@ -1244,9 +1529,11 @@ async fn record(
     let result = tokio::task::spawn_blocking(move || change(&state))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
-    let jobs = runner.state.len();
+    let records = runner.state.records();
+    let jobs = records.len();
     runner.status.runner(&runner.cfg.name, |r| {
         r.jobs = u32::try_from(jobs).unwrap_or(u32::MAX);
+        r.job_admissions = records.iter().filter_map(|j| j.admission.clone()).collect();
     });
     if let Err(e) = result {
         log::error!(runner = runner.cfg.name.as_str(), state_file = runner.state.path().display().to_string().as_str(), error = format!("{e:#}").as_str(); "Could not record the job ({what})");
@@ -1259,6 +1546,7 @@ async fn run_job<D: Dispatcher>(
     runner: &Runner,
     job: Box<Job>,
     reservation: Option<String>,
+    admission: Option<String>,
 ) {
     let creds = JobCredentials {
         id: job.id,
@@ -1277,6 +1565,12 @@ async fn run_job<D: Dispatcher>(
         "Received a job"
     );
     if let Some((msg, reason, exit_code)) = refusal(&job) {
+        if let Some(id) = &admission {
+            runner.report_outcome(id, AdmissionOutcome::Empty);
+            shared.status.runner(&runner.cfg.name, |r| {
+                r.pending_job_admissions.retain(|a| a != id)
+            });
+        }
         if let Some(r) = &reservation {
             let _ = shared.bounded(shared.dispatcher.release(r)).await;
         }
@@ -1304,6 +1598,7 @@ async fn run_job<D: Dispatcher>(
         request_id: new_request_id(),
         runner: Some(runner.cfg.name.clone()),
         reservation,
+        admission: admission.clone(),
         place_within_secs: u32::try_from(shared.options.hub.place_within.as_secs())
             .unwrap_or(u32::MAX),
         hub_job: None,
@@ -1322,7 +1617,26 @@ async fn run_job<D: Dispatcher>(
     };
     let put = rec.clone();
     record(runner, "taken", move |s| s.put(put)).await;
+    if let Some(id) = &admission
+        && runner
+            .state
+            .records()
+            .iter()
+            .any(|j| j.admission.as_ref() == Some(id))
+    {
+        runner.status.runner(&runner.cfg.name, |r| {
+            r.pending_job_admissions.retain(|a| a != id)
+        });
+    }
+    if let Some(id) = &admission {
+        runner.report_outcome(id, AdmissionOutcome::Job);
+    }
     drive(shared, runner, rec, false).await;
+    if let Some(id) = &admission {
+        runner.status.runner(&runner.cfg.name, |r| {
+            r.pending_job_admissions.retain(|a| a != id);
+        });
+    }
 }
 
 fn trace_settings<D>(
@@ -1351,6 +1665,7 @@ async fn submit_recorded<D: Dispatcher>(
     let submission = Submission {
         request_id: rec.request_id.clone(),
         runner: rec.runner.clone(),
+        admission: rec.admission.clone(),
         placement: rec.placement.clone(),
         reservation: rec.reservation.clone(),
         place_within: Duration::from_secs(u64::from(rec.place_within_secs)),
@@ -1423,12 +1738,19 @@ async fn drive<D: Dispatcher>(
         }
     };
     let drop_record = |what: &'static str| record(runner, what, move |s| s.remove(gitlab_job));
+    // A record dropped before the hub had its job: its admission found none after all.
+    let drop_unsubmitted = |what: &'static str| {
+        if let Some(id) = &rec.admission {
+            runner.report_outcome(id, AdmissionOutcome::Empty);
+        }
+        drop_record(what)
+    };
 
     match rec.phase {
         Phase::Reported => {
             // Only the settle is left; a job the hub has not finished is canceled first.
             let Some(id) = rec.hub_job.clone() else {
-                drop_record("settled").await;
+                drop_unsubmitted("settled").await;
                 return;
             };
             match current_view(shared, &id).await {
@@ -1451,7 +1773,7 @@ async fn drive<D: Dispatcher>(
             // Failed in GitLab already: the submission again only learns the hub job, if
             // the first one made it, to cancel and settle it.
             let Some(spec) = rec.spec.take() else {
-                drop_record("dropped").await;
+                drop_unsubmitted("dropped").await;
                 return;
             };
             match submit_recorded(shared, &rec, spec).await {
@@ -1473,7 +1795,7 @@ async fn drive<D: Dispatcher>(
                 Err(e) if outcome_unknown(&e) => {
                     log::warn!(job = gitlab_job; "The hub did not answer the submission again; the next start tries once more");
                 }
-                Err(_) => drop_record("dropped").await,
+                Err(_) => drop_unsubmitted("dropped").await,
             }
             return;
         }
@@ -1488,7 +1810,7 @@ async fn drive<D: Dispatcher>(
                 FailureReason::runner_system_failure(),
             )
             .await;
-            drop_record("dropped").await;
+            drop_unsubmitted("dropped").await;
             return;
         };
         match submit_recorded(shared, &rec, spec).await {
@@ -1546,14 +1868,14 @@ async fn drive<D: Dispatcher>(
                 if unknown {
                     log::warn!(job = gitlab_job; "The hub's answer to the submission is unknown; the next start cancels the job it may have");
                 } else {
-                    drop_record("dropped").await;
+                    drop_unsubmitted("dropped").await;
                 }
                 return;
             }
         }
     } else {
         let Some(id) = rec.hub_job.clone() else {
-            drop_record("dropped").await;
+            drop_unsubmitted("dropped").await;
             return;
         };
         match current_view(shared, &id).await {

@@ -39,7 +39,10 @@ pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
 pub const SESSION_PATH: &str = "/v1/gitlab/session";
 
 /// The protocol versions of a relay's session.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 2 };
+
+/// The relay requires admission-aware scheduling, introduced in version 2.
+pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 2 };
 
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
@@ -589,6 +592,11 @@ mod tests {
             runners: vec![load; MAX_RUNNERS],
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
+        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(2));
+        assert_eq!(
+            VersionRange { min: 1, max: 1 }.negotiate(RELAY_PROTOCOL),
+            None
+        );
     }
 
     #[test]

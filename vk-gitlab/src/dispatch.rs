@@ -1,8 +1,7 @@
 //! [`Dispatcher`] exposes the vk fleet hub's client API defined in `docs/gitlab-dispatch.md`.
 //!
-//! The poll loop follows the contract: wait for [capacity](Dispatcher::capacity) on the
-//! runner's placement, [reserve](Dispatcher::reserve) an envelope, then ask GitLab for a
-//! job while renewing the reservation. [Submit](Dispatcher::submit) the job on that
+//! The poll loop [queues](Dispatcher::queue) for an envelope and claims its grant before
+//! asking GitLab for a job while renewing the reservation. [Submit](Dispatcher::submit) the job on that
 //! reservation and commit it to GitLab once the hub [reports](Dispatcher::job) node
 //! acceptance. Copy its [output](Dispatcher::output) into the trace, report the result,
 //! then [settle](Dispatcher::settle) it.
@@ -22,10 +21,17 @@ pub use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub id: String,
+    pub admission: Option<String>,
     pub node: String,
     pub envelope: Envelope,
     /// The lease the node granted, counted from when the request was sent.
     pub lease: Duration,
+}
+
+#[derive(Debug)]
+pub enum QueueAnswer {
+    Ticket(String),
+    Grant(Reservation),
 }
 
 /// A job handed to the hub. `Debug` shows which job it is, none of the spec's secrets.
@@ -37,6 +43,7 @@ pub struct Submission {
     /// The relay runner the job was taken for, by its config name; `None` on a job recorded
     /// before relays named their runners, resubmitted as recorded so the body matches.
     pub runner: Option<String>,
+    pub admission: Option<String>,
     pub placement: Placement,
     /// The reservation the job was requested under; `None` when it was lost meanwhile, and
     /// the hub then places the job afresh within `place_within`.
@@ -155,6 +162,40 @@ pub trait Dispatcher: Send + Sync + 'static {
         wait: Duration,
     ) -> impl Future<Output = DispatchResult<Reservation>> + Send;
 
+    /// `POST /v1/reservations` with `queue`: a request queued behind the fleet's scheduler,
+    /// holding nothing until it is granted. A grant may come at once, else a ticket to poll.
+    fn queue(
+        &self,
+        runner: &str,
+        request_id: &str,
+        placement: &Placement,
+        lease: Duration,
+        wait: Duration,
+    ) -> impl Future<Output = DispatchResult<QueueAnswer>> + Send;
+
+    /// `GET /v1/reservations/tickets/<id>`: returns once the ticket is granted, or after
+    /// `wait` with the ticket still queued.
+    fn poll_ticket(
+        &self,
+        ticket: &str,
+        wait: Duration,
+    ) -> impl Future<Output = DispatchResult<QueueAnswer>> + Send;
+
+    /// `DELETE /v1/reservations/tickets/<id>`: gives up a queued request, releasing its
+    /// grant if it had one.
+    fn cancel_ticket(&self, ticket: &str) -> impl Future<Output = DispatchResult<()>> + Send;
+
+    /// `POST /v1/reservations/<id>/claim`: takes a queued grant before asking GitLab for a
+    /// job, so the hub keeps its admission across lease loss and reconnects.
+    fn claim(&self, reservation: &str) -> impl Future<Output = DispatchResult<()>> + Send;
+
+    /// `POST /v1/reservations/<admission>/outcome`: what came of an admission's grant.
+    fn outcome(
+        &self,
+        admission: &str,
+        outcome: vk_hub_proto::client::AdmissionOutcome,
+    ) -> impl Future<Output = DispatchResult<()>> + Send;
+
     /// `POST /v1/reservations/<id>/renew`: extends the lease from now; answers the lease
     /// granted.
     fn renew(
@@ -222,6 +263,9 @@ mod fake {
         },
         Cancel(String, CancelMode),
         Settle(String),
+        CancelTicket(String),
+        Claim(String),
+        Outcome(String, vk_hub_proto::client::AdmissionOutcome),
     }
 
     struct FakeJob {
@@ -273,7 +317,14 @@ mod fake {
 
     /// What the hub's idempotency compares: the submission as `POST /v1/jobs` carries it.
     fn body(s: &Submission) -> serde_json::Value {
-        serde_json::json!([s.placement, s.reservation, s.place_within.as_secs(), s.spec])
+        serde_json::json!([
+            s.runner,
+            s.admission,
+            s.placement,
+            s.reservation,
+            s.place_within.as_secs(),
+            s.spec
+        ])
     }
 
     fn not_found(id: &str) -> DispatchError {
@@ -307,6 +358,12 @@ mod fake {
             };
             self.changed.notify_waiters();
             out
+        }
+
+        /// Records `call` and wakes whoever waits for one, leaving the capacity as it is.
+        fn record(&self, call: FakeCall) {
+            self.lock().calls.push(call);
+            self.changed.notify_waiters();
         }
 
         /// `f` until it gives a value; after `wait` (when given), `last` instead.
@@ -446,6 +503,46 @@ mod fake {
     }
 
     impl Dispatcher for FakeDispatcher {
+        /// Granted at once, or refused: the fake queues nothing.
+        async fn queue(
+            &self,
+            runner: &str,
+            request_id: &str,
+            placement: &Placement,
+            lease: Duration,
+            wait: Duration,
+        ) -> DispatchResult<QueueAnswer> {
+            self.reserve(runner, request_id, placement, lease, wait)
+                .await
+                .map(QueueAnswer::Grant)
+        }
+
+        async fn poll_ticket(&self, ticket: &str, _wait: Duration) -> DispatchResult<QueueAnswer> {
+            Err(DispatchError::new(
+                ErrorKind::ReservationGone,
+                format!("no ticket {ticket}"),
+            ))
+        }
+
+        async fn cancel_ticket(&self, ticket: &str) -> DispatchResult<()> {
+            self.record(FakeCall::CancelTicket(ticket.to_owned()));
+            Ok(())
+        }
+
+        async fn claim(&self, reservation: &str) -> DispatchResult<()> {
+            self.record(FakeCall::Claim(reservation.to_owned()));
+            Ok(())
+        }
+
+        async fn outcome(
+            &self,
+            admission: &str,
+            outcome: vk_hub_proto::client::AdmissionOutcome,
+        ) -> DispatchResult<()> {
+            self.record(FakeCall::Outcome(admission.to_owned(), outcome));
+            Ok(())
+        }
+
         async fn capacity(
             &self,
             runner: &str,
@@ -493,6 +590,7 @@ mod fake {
             });
             match id {
                 Some(id) => Ok(Reservation {
+                    admission: Some(id.clone()),
                     id,
                     node: "node-1".to_owned(),
                     envelope: placement.envelope,

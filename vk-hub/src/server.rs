@@ -161,6 +161,9 @@ pub struct Hub {
 struct Live {
     session: u64,
     last_heard: Instant,
+    /// When the relay heartbeat this session last stored was received, on tokio's clock as
+    /// tickets' `claimed_at` is.
+    heartbeat_received: Option<tokio::time::Instant>,
     ending: Arc<Ending>,
 }
 
@@ -456,14 +459,17 @@ impl Hub {
     pub(crate) fn open_session(&self, node_id: &str) -> (u64, Arc<Ending>) {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
         let ending = Arc::new(Ending::default());
-        let old = self.lock_live().insert(
-            node_id.to_string(),
-            Live {
-                session,
-                last_heard: Instant::now(),
-                ending: ending.clone(),
-            },
-        );
+        let old = self.dispatch.with_session_change(|| {
+            self.lock_live().insert(
+                node_id.to_string(),
+                Live {
+                    session,
+                    last_heard: Instant::now(),
+                    heartbeat_received: None,
+                    ending: ending.clone(),
+                },
+            )
+        });
         if let Some(old) = old {
             // `notify_one` stores a permit, so an old session between two awaits still sees it.
             old.ending.notify.notify_one();
@@ -477,6 +483,15 @@ impl Hub {
     pub(crate) fn kick(&self, node_id: &str) {
         if let Some(live) = self.lock_live().get(node_id) {
             live.ending.kick.notify_one();
+        }
+    }
+
+    /// End this session so the node reconnects, unless a newer session replaced it.
+    pub(crate) fn end_session(&self, node_id: &str, session: u64) {
+        if let Some(live) = self.lock_live().get(node_id)
+            && live.session == session
+        {
+            live.ending.notify.notify_one();
         }
     }
 
@@ -496,6 +511,30 @@ impl Hub {
         {
             live.last_heard = Instant::now();
         }
+    }
+
+    /// Note that `session` stored a heartbeat of its relay, received `at`.
+    pub(crate) fn heartbeat_stored(&self, node_id: &str, session: u64, at: tokio::time::Instant) {
+        if let Some(live) = self.lock_live().get_mut(node_id)
+            && live.session == session
+        {
+            live.heartbeat_received = Some(at);
+        }
+    }
+
+    /// Each relay's live session and latest stored heartbeat's receipt time.
+    /// Receipts are recorded after storage. Read them before the relay rows so no receipt
+    /// refers to a newer heartbeat than its row.
+    pub(crate) fn heartbeat_receipts(&self) -> HashMap<String, (u64, tokio::time::Instant)> {
+        self.lock_live()
+            .iter()
+            .filter_map(|(id, l)| Some((id.clone(), (l.session, l.heartbeat_received?))))
+            .collect()
+    }
+
+    /// The current session's epoch, if connected.
+    pub(crate) fn current_session(&self, node_id: &str) -> Option<u64> {
+        self.lock_live().get(node_id).map(|l| l.session)
     }
 
     /// Whether `session` is still `node_id`'s: neither superseded nor revoked.

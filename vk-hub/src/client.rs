@@ -26,8 +26,9 @@ use vk_hub_proto::client::{
     AUTHORIZATION, CAPACITY_PATH, CLIENTS_PATH, CancelRequest, CapacityRequest, ClientError,
     ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobState, JobSubmission,
     MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS, MAX_INSTANCE_LEN, MAX_OUTPUT_READ, MAX_WAIT_SECS,
-    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RELAY_HEADER,
-    RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, valid_instance,
+    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, OutcomeRequest, Placement,
+    RELAY_HEADER, RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest,
+    ReservationTicket, valid_instance,
 };
 use vk_hub_proto::job::{JobSpec, MAX_JOB_SPEC};
 use vk_hub_proto::{PUBLIC_KEY_LEN, SIGNATURE_LEN, from_hex_lower};
@@ -50,6 +51,9 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most labels a placement names.
 const MAX_LABELS: usize = 32;
+
+/// What a client is told to wait after no node accepted its unqueued reservation.
+const NO_CAPACITY_RETRY_SECS: u32 = 5;
 
 /// The longest a job may wait to be placed.
 const MAX_PLACE_WITHIN_SECS: u32 = 86_400;
@@ -324,6 +328,44 @@ async fn route(
     match (method, segments.as_slice()) {
         (Method::POST, ["v1", "capacity"]) => capacity(&body, hub, principal).await,
         (Method::POST, ["v1", "reservations"]) => reserve(&body, hub, principal).await,
+        // 201 with the grant, 202 while it waits; 410 for a ticket that ended (canceled,
+        // lapsed, refused) or that the hub does not know, as it forgets ended tickets and
+        // those of a hub before a restart; 404 for another principal's.
+        (Method::GET, ["v1", "reservations", "tickets", ticket]) => {
+            let ticket = id(ticket)?;
+            let wait = query_number(query, "wait")?.unwrap_or(0);
+            let deadline = Instant::now() + wait_for(u32::try_from(wait).unwrap_or(u32::MAX));
+            loop {
+                let mut changed = hub.dispatch.subscribe();
+                if let Some(grant) = jobs::poll_ticket(hub, principal, &ticket)? {
+                    return Ok(json(StatusCode::CREATED, &grant));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(json(StatusCode::ACCEPTED, &ReservationTicket { ticket }));
+                }
+                tokio::select! {
+                    _ = changed.changed() => {}
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+        }
+        (Method::DELETE, ["v1", "reservations", "tickets", ticket]) => {
+            jobs::cancel_ticket(hub, principal, &id(ticket)?)?;
+            Ok(empty(StatusCode::NO_CONTENT))
+        }
+        (Method::POST, ["v1", "reservations", r, "claim"]) => {
+            jobs::claim(hub, principal, &id(r)?).await?;
+            Ok(empty(StatusCode::NO_CONTENT))
+        }
+        (Method::POST, ["v1", "reservations", admission, "outcome"]) => {
+            let admission = id(admission)?;
+            let ask: OutcomeRequest = parse_json(&body)?.0;
+            if ask.admission != admission {
+                return Err(ApiError::invalid("admission ID does not match the path"));
+            }
+            jobs::outcome(hub, principal, &admission, ask.outcome).await?;
+            Ok(empty(StatusCode::NO_CONTENT))
+        }
         (Method::POST, ["v1", "reservations", r, "renew"]) => {
             let r = id(r)?;
             let ask: RenewRequest = parse_json(&body)?.0;
@@ -456,24 +498,52 @@ fn query_number(query: &str, name: &str) -> Result<Option<u64>, ApiError> {
     Ok(None)
 }
 
-/// Who a relay's request schedules for: the GitLab runner it names, as its relay's inventory
-/// verified it, and the tenant the capacity policy maps that runner to.
+async fn capacity(
+    body: &[u8],
+    hub: &Hub,
+    principal: &ApiPrincipal,
+) -> Result<Response<Body>, ApiError> {
+    let (ask, _) = parse_json::<CapacityRequest>(body)?;
+    check_placement(&ask.placement, principal)?;
+    resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement, None).await?;
+    let deadline = Instant::now() + wait_for(ask.wait_secs);
+    loop {
+        let mut changed = hub.dispatch.subscribe();
+        let mut node_changed = hub.subscribe();
+        let answer = jobs::capacity(hub, &ask.placement).await?;
+        if ask.after.is_none_or(|after| answer.revision > after) || Instant::now() >= deadline {
+            return Ok(json(StatusCode::OK, &answer));
+        }
+        tokio::select! {
+            _ = changed.changed() => {}
+            _ = node_changed.changed() => {}
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+/// Who a request schedules for, as the operator assigned it, never as its client says: an API
+/// key's tenant, or the GitLab runner a relay names, as its inventory verified it, with the
+/// tenant the capacity policy maps it to and the runner's limits.
 #[derive(Clone)]
-struct SchedulingIdentity {
-    tenant: String,
-    class: crate::policy::Class,
-    gitlab: String,
-    runner_id: u64,
-    /// The policy used to resolve this identity and check its jobs.
-    policy: Arc<crate::policy::Policy>,
+pub(crate) struct ResolvedIdentity {
+    pub tenant: String,
+    pub class: crate::policy::Class,
+    pub gitlab: Option<String>,
+    pub runner_id: Option<u64>,
+    pub runner: Option<String>,
+    pub concurrent: u32,
+    pub limit: Option<u32>,
+    pub request_concurrency: u32,
 }
 
 fn identity_refused(message: &str) -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, ErrorCode::Forbidden, message)
 }
 
-/// Log each identity refusal once per relay to avoid repeating it every check interval.
-/// Messages can contain runner names; clear the remembered refusals at the bound.
+/// Log each relay's identity refusal once despite retries every check interval.
+/// Messages can contain supplied runner names, so the deduplication set is bounded
+/// and cleared when full.
 fn say_refused_once(relay: &str, error: &ApiError) {
     const MAX_SAID: usize = 1024;
     static SAID: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
@@ -487,40 +557,63 @@ fn say_refused_once(relay: &str, error: &ApiError) {
     }
 }
 
-/// The identity a request schedules under: `None` for an API key, which names no runner; for
-/// a relay, the runner it names, refused unless that runner is in its inventory once,
-/// verified with a GitLab ID, of the request's placement, and mapped to a tenant.
+/// The identity a request schedules under, and the policy it was resolved with. An API key
+/// names no runner and gets its client tenant. A relay names a runner, refused unless its
+/// session speaks version 2, and the runner is in its inventory once, verified with a GitLab
+/// ID, of the request's placement, and mapped to a tenant: the tenant `recorded` for its
+/// admission when there is one, which the runner must still match.
 async fn resolve_identity(
     hub: &Hub,
     principal: &ApiPrincipal,
     runner: Option<&str>,
     placement: &Placement,
-) -> Result<Option<SchedulingIdentity>, ApiError> {
-    if !principal.is_relay() {
-        return if runner.is_some() {
-            Err(identity_refused("an API key cannot name a relay runner"))
-        } else {
-            Ok(None)
-        };
-    }
-    let (db, id, runner, placement) = (
+    recorded: Option<ResolvedIdentity>,
+) -> Result<(ResolvedIdentity, Arc<crate::policy::Policy>), ApiError> {
+    let (db, who, runner, placement) = (
         hub.db.clone(),
-        principal.id.clone(),
+        principal.clone(),
         runner.map(str::to_owned),
         placement.clone(),
     );
-    let relay = id.clone();
     let resolved = tokio::task::spawn_blocking(move || {
+        let policy = Arc::new(db.capacity_policy()?);
+        if !who.is_relay() {
+            if runner.is_some() {
+                return Err(identity_refused("an API key cannot name a relay runner"));
+            }
+            let (tenant, _) = policy
+                .client(&who.id)
+                .ok_or_else(|| identity_refused("the client has no capacity tenant"))?;
+            let identity = ResolvedIdentity {
+                tenant: tenant.to_owned(),
+                class: crate::policy::Class::Normal,
+                gitlab: None,
+                runner_id: None,
+                runner: None,
+                concurrent: u32::MAX,
+                limit: None,
+                request_concurrency: u32::MAX,
+            };
+            return Ok((identity, policy));
+        }
+        let (row, status) = db
+            .relay_with_status(&who.id)?
+            .ok_or_else(|| identity_refused("the relay is no longer enrolled"))?;
+        let min = vk_hub_proto::gitlab::RELAY_PROTOCOL.min;
+        if row.protocol.is_none_or(|v| v < min) && recorded.is_none() {
+            return Err(identity_refused(&format!(
+                "relay protocol version {min} is required: upgrade vk-gitlab on the relay"
+            )));
+        }
         let runner = runner.ok_or_else(|| {
             identity_refused("a relay must name its runner: upgrade vk-gitlab on the relay")
         })?;
-        let (row, status) = db
-            .relay_with_status(&id)?
-            .ok_or_else(|| identity_refused("the relay is no longer enrolled"))?;
-        let gitlab = status
+        let status = status
             .filter(|s| s.state.approved())
-            .and_then(|s| s.name)
             .ok_or_else(|| identity_refused("the relay's GitLab server is not approved"))?;
+        let gitlab = status
+            .name
+            .ok_or_else(|| identity_refused("the GitLab instance is unknown"))?;
         let inventory = row
             .inventory
             .ok_or_else(|| identity_refused("the relay has no inventory"))?;
@@ -548,61 +641,73 @@ async fn resolve_identity(
         let runner_id = found.runner_id.filter(|id| *id != 0).ok_or_else(|| {
             identity_refused(&format!("runner {runner:?} has no GitLab runner ID"))
         })?;
-        let policy = db.capacity_policy()?;
-        let mapping = policy
-            .runners
-            .iter()
-            .find(|r| r.gitlab == gitlab && r.runner_id == runner_id)
-            .ok_or_else(|| {
+        let (tenant, class) = if let Some(recorded) = recorded {
+            if recorded.gitlab.as_deref() != Some(&gitlab)
+                || recorded.runner_id != Some(runner_id)
+                || recorded.runner.as_deref() != Some(&runner)
+            {
+                return Err(identity_refused(&format!(
+                    "runner {runner:?} does not match its admission"
+                )));
+            }
+            (recorded.tenant, recorded.class)
+        } else {
+            let mapping = policy.runner(&gitlab, runner_id).ok_or_else(|| {
                 identity_refused(&format!(
                     "runner {gitlab}/{runner_id} is mapped to no capacity tenant: add it to \
                      the capacity policy"
                 ))
             })?;
-        let (tenant, class) = (mapping.tenant.clone(), mapping.class);
-        Ok(Some(SchedulingIdentity {
+            (mapping.tenant.clone(), mapping.class)
+        };
+        let identity = ResolvedIdentity {
             tenant,
             class,
-            gitlab,
-            runner_id,
-            policy: Arc::new(policy),
-        }))
+            gitlab: Some(gitlab),
+            runner_id: Some(runner_id),
+            runner: Some(runner),
+            concurrent: inventory.concurrent,
+            limit: found.limit,
+            request_concurrency: found.request_concurrency,
+        };
+        Ok((identity, policy))
     })
     .await
     .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
     if let Err(e) = &resolved
+        && principal.is_relay()
         && e.status == StatusCode::FORBIDDEN
     {
-        say_refused_once(&relay, e);
+        say_refused_once(&principal.id, e);
     }
     resolved
 }
 
-/// Check that `spec` belongs to `identity`'s runner and a project listed for its tenant.
-/// Production runners also require a pipeline of one of the project's production branches.
-fn check_job_identity(identity: &SchedulingIdentity, spec: &JobSpec) -> Result<(), ApiError> {
+/// Check that `spec` belongs to `identity`'s runner and a project listed for its tenant in
+/// `policy`, the one the identity was resolved with. Production runners also require a
+/// pipeline of one of the project's production branches.
+fn check_job_identity(
+    policy: &crate::policy::Policy,
+    identity: &ResolvedIdentity,
+    spec: &JobSpec,
+) -> Result<(), ApiError> {
     let JobSpec::GitlabCi(ci) = spec;
     if ci.job.project_id == 0 {
         return Err(ApiError::invalid("job project ID is missing"));
     }
-    if identity.runner_id != ci.job.runner_id {
-        return Err(identity_refused(
-            "job runner does not match the relay runner",
-        ));
+    if identity.runner_id != Some(ci.job.runner_id) {
+        return Err(identity_refused("job runner does not match the admission"));
     }
-    let project = identity
-        .policy
-        .tenants
-        .get(&identity.tenant)
-        .and_then(|t| {
-            t.projects
-                .iter()
-                .find(|p| p.gitlab == identity.gitlab && p.id == ci.job.project_id)
-        })
+    let gitlab = identity
+        .gitlab
+        .as_deref()
+        .ok_or_else(|| identity_refused("job has no GitLab identity"))?;
+    let project = policy
+        .project(&identity.tenant, gitlab, ci.job.project_id)
         .ok_or_else(|| {
             identity_refused(&format!(
-                "project {}/{} is not one of tenant {:?}'s projects",
-                identity.gitlab, ci.job.project_id, identity.tenant
+                "project {gitlab}/{} is not one of tenant {:?}'s projects",
+                ci.job.project_id, identity.tenant
             ))
         })?;
     if identity.class == crate::policy::Class::Production
@@ -618,30 +723,6 @@ fn check_job_identity(identity: &SchedulingIdentity, spec: &JobSpec) -> Result<(
         ));
     }
     Ok(())
-}
-
-async fn capacity(
-    body: &[u8],
-    hub: &Hub,
-    principal: &ApiPrincipal,
-) -> Result<Response<Body>, ApiError> {
-    let (ask, _) = parse_json::<CapacityRequest>(body)?;
-    check_placement(&ask.placement, principal)?;
-    resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement).await?;
-    let deadline = Instant::now() + wait_for(ask.wait_secs);
-    loop {
-        let mut changed = hub.dispatch.subscribe();
-        let mut node_changed = hub.subscribe();
-        let answer = jobs::capacity(hub, &ask.placement).await?;
-        if ask.after.is_none_or(|after| answer.revision > after) || Instant::now() >= deadline {
-            return Ok(json(StatusCode::OK, &answer));
-        }
-        tokio::select! {
-            _ = changed.changed() => {}
-            _ = node_changed.changed() => {}
-            () = tokio::time::sleep_until(deadline) => {}
-        }
-    }
 }
 
 async fn hello(
@@ -703,23 +784,96 @@ async fn reserve(
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     if let Some(before) = before {
-        let grant = (before.digest == digest)
-            .then(|| serde_json::from_value::<ReservationGrant>(before.answer).ok())
-            .flatten();
-        return match grant {
-            Some(grant) => Ok(json(StatusCode::CREATED, &grant)),
-            None => Err(conflict()),
-        };
+        if before.digest != digest {
+            return Err(conflict());
+        }
+        if let Ok(grant) = serde_json::from_value::<ReservationGrant>(before.answer.clone()) {
+            return Ok(json(StatusCode::CREATED, &grant));
+        }
+        if let Ok(ticket) = serde_json::from_value::<ReservationTicket>(before.answer) {
+            return match jobs::poll_ticket(hub, principal, &ticket.ticket)? {
+                Some(grant) => Ok(json(StatusCode::CREATED, &grant)),
+                None => Ok(json(StatusCode::ACCEPTED, &ticket)),
+            };
+        }
+        return Err(conflict());
     }
-    resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement).await?;
-    let grant = jobs::reserve(
+    let (identity, _) =
+        resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement, None).await?;
+    if ask.queue {
+        let ticket = jobs::queue_reservation(
+            hub,
+            principal,
+            jobs::QueueRequest {
+                request_id: &ask.request_id,
+                digest: &digest,
+                identity,
+                placement: ask.placement,
+                lease_secs: ask.lease_secs,
+                queued: true,
+            },
+        )?;
+        let mut guard = QueuedRequest {
+            hub,
+            principal,
+            ticket: Some(&ticket),
+        };
+        let answer = ReservationTicket {
+            ticket: ticket.clone(),
+        };
+        let row = RequestRow {
+            at: crate::now_secs(),
+            digest,
+            answer: serde_json::to_value(&answer)
+                .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?,
+        };
+        let (db, key, rid) = (hub.db.clone(), principal.id.clone(), ask.request_id.clone());
+        tokio::task::spawn_blocking(move || db.record_request(&key, &rid, &row))
+            .await
+            .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+        guard.ticket = None;
+        if let Some(grant) = jobs::poll_ticket(hub, principal, &ticket)? {
+            return Ok(json(StatusCode::CREATED, &grant));
+        }
+        return Ok(json(StatusCode::ACCEPTED, &answer));
+    }
+    let ticket = jobs::queue_reservation(
         hub,
         principal,
-        &ask.placement,
-        ask.lease_secs,
-        wait_for(ask.wait_secs),
-    )
-    .await?;
+        jobs::QueueRequest {
+            request_id: &ask.request_id,
+            digest: &digest,
+            identity,
+            placement: ask.placement,
+            lease_secs: ask.lease_secs,
+            queued: false,
+        },
+    )?;
+    let mut guard = QueuedRequest {
+        hub,
+        principal,
+        ticket: Some(&ticket),
+    };
+    let deadline = Instant::now() + wait_for(ask.wait_secs).max(jobs::offer_timeout());
+    let grant = loop {
+        let mut changed = hub.dispatch.subscribe();
+        if let Some(grant) = jobs::poll_ticket(hub, principal, &ticket)? {
+            break grant;
+        }
+        if Instant::now() >= deadline {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::NoCapacity,
+                "no node accepted the reservation in time",
+            )
+            .retry_after(NO_CAPACITY_RETRY_SECS));
+        }
+        tokio::select! {
+            _ = changed.changed() => {}
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    };
+    guard.ticket = None;
     // Unrecorded, a retry would reserve a second envelope: until the request is recorded,
     // this one goes back, also when the client hangs up and the handler is dropped.
     let unrecorded = Unrecorded {
@@ -740,6 +894,26 @@ async fn reserve(
     recorded?;
     unrecorded.disarm();
     Ok(json(StatusCode::CREATED, &grant))
+}
+
+struct QueuedRequest<'a> {
+    hub: &'a Hub,
+    principal: &'a ApiPrincipal,
+    ticket: Option<&'a str>,
+}
+
+impl Drop for QueuedRequest<'_> {
+    fn drop(&mut self) {
+        // A dropped HTTP handler must not leave a waiter or an unclaimed grant behind.
+        if let Some(ticket) = self.ticket
+            && let Err(error) = jobs::cancel_ticket(self.hub, self.principal, ticket)
+        {
+            eprintln!(
+                "vk-hub: canceling unrecorded ticket {ticket}: {}",
+                error.message
+            );
+        }
+    }
 }
 
 /// Releases a granted reservation whose request was not recorded, when dropped armed.
@@ -790,7 +964,7 @@ fn title(spec: &JobSpec) -> String {
 
 async fn submit(
     body: &[u8],
-    hub: &Hub,
+    hub: &Arc<Hub>,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
     let (ask, canonical) = parse_json::<JobSubmission>(body)?;
@@ -808,6 +982,13 @@ async fn submit(
         .is_some_and(|r| !vk_hub_proto::valid_id(r))
     {
         return Err(ApiError::invalid("reservation is not an ID"));
+    }
+    if ask
+        .admission
+        .as_ref()
+        .is_some_and(|id| !vk_hub_proto::valid_id(id))
+    {
+        return Err(ApiError::invalid("admission is not an ID"));
     }
     check_placement(&ask.placement, principal)?;
     let spec_len = serde_json::to_vec(&ask.spec)
@@ -832,6 +1013,11 @@ async fn submit(
     let seen = tokio::task::spawn_blocking(move || db.request(&key, &rid, now))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let mut scheduling = None;
+    let effective_admission = ask
+        .admission
+        .clone()
+        .or_else(|| jobs::unqueued_admission(hub, principal, ask.reservation.as_deref()));
     let gitlab = match &seen {
         Some(before) => match before.refusal() {
             Some(_) if before.digest != digest => return Err(conflict()),
@@ -844,12 +1030,56 @@ async fn submit(
             }
         },
         None => {
-            let identity = resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement)
-                .await?
-                .ok_or_else(|| identity_refused("job has no relay runner"))?;
-            check_job_identity(&identity, &ask.spec)?;
-            let gitlab = gate(hub, principal, &ask, &digest, now).await?;
-            jobs::room_for_job(hub)?;
+            // Refused from here on, the admission found no job: its charge ends now. Only the
+            // admission the job names, not one found from an unqueued reservation: that
+            // reservation's ticket times out on its own.
+            let refused = |error| refuse_admission(hub, principal, ask.admission.as_deref(), error);
+            let recorded = match effective_admission
+                .as_deref()
+                .map(|id| jobs::admission_identity(hub, principal, id))
+                .transpose()
+            {
+                Ok(recorded) => recorded,
+                Err(error) => return Err(refused(error).await),
+            };
+            let (identity, policy) = match resolve_identity(
+                hub,
+                principal,
+                ask.runner.as_deref(),
+                &ask.placement,
+                recorded,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => return Err(refused(error).await),
+            };
+            if let Err(error) = jobs::check_admission(
+                hub,
+                principal,
+                effective_admission.as_deref(),
+                ask.reservation.as_deref(),
+                &identity,
+                &ask.placement,
+            ) {
+                return Err(refused(error).await);
+            }
+            let gitlab = match gate(hub, principal, &ask, &digest, now).await {
+                Ok(gitlab) => gitlab,
+                Err(error) => return Err(refused(error).await),
+            };
+            if let Err(error) = check_job_identity(&policy, &identity, &ask.spec) {
+                return Err(refused(error).await);
+            }
+            scheduling = Some(crate::store::SchedulingIdentity {
+                tenant: identity.tenant,
+                class: identity.class,
+                gitlab: identity.gitlab,
+                runner_id: identity.runner_id,
+            });
+            if let Err(error) = jobs::room_for_job(hub) {
+                return Err(refused(error).await);
+            }
             gitlab
         }
     };
@@ -859,8 +1089,8 @@ async fn submit(
         key_name: principal.name.clone(),
         instance: principal.instance.clone(),
         request_id: ask.request_id.clone(),
-        scheduling: None,
-        admission: None,
+        scheduling,
+        admission: effective_admission.clone(),
         placement: ask.placement.clone(),
         title: title(&ask.spec),
         job_url: match &ask.spec {
@@ -914,6 +1144,11 @@ async fn submit(
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),
     };
     let redacted = serde_json::to_vec(&redacted).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    if seen.is_none()
+        && let Some(admission) = &effective_admission
+    {
+        jobs::admission_took_job(hub, principal, admission).await?;
+    }
     let (db, job, stored, actor) = (hub.db.clone(), id.clone(), row.clone(), principal.actor());
     let submitted = tokio::task::spawn_blocking(move || {
         db.submit_job(&job, &stored, &digest, &redacted, &actor, stored.created_at)
@@ -954,6 +1189,36 @@ async fn submit(
             "this admission was already used by another job",
         )),
     }
+}
+
+/// Finish queued admission `admission` as [`AdmissionOutcome::Empty`] for a submission
+/// refused with `error`, and return `error`. A refusal the relay retries (a 5xx) leaves the
+/// admission for the retry; a failure to finish it is logged, the refusal being the answer.
+///
+/// [`AdmissionOutcome::Empty`]: vk_hub_proto::client::AdmissionOutcome::Empty
+async fn refuse_admission(
+    hub: &Arc<Hub>,
+    principal: &ApiPrincipal,
+    admission: Option<&str>,
+    error: ApiError,
+) -> ApiError {
+    if let Some(id) = admission
+        && !error.status.is_server_error()
+        && let Err(e) = jobs::outcome(
+            hub,
+            principal,
+            id,
+            vk_hub_proto::client::AdmissionOutcome::Empty,
+        )
+        .await
+        && e.status != StatusCode::NOT_FOUND
+    {
+        eprintln!(
+            "vk-hub: ending admission {id} of a refused job: {}",
+            e.message
+        );
+    }
+    error
 }
 
 /// Pass `ask`, a new job of relay `principal` with a body hashing to `digest`, through the

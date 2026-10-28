@@ -6,11 +6,16 @@ All notable changes to virtkit will be documented in this file.
 
 ### Breaking
 
-- **The hub takes new work only from relay runners mapped to a capacity tenant**: each
-  request names its runner, which must be verified with GitLab and mapped by its runner ID.
-  Upgrade the hub, map the runners with `vk-hub capacity-policy set`, then upgrade the
-  relays. Until then a relay takes no new jobs but finishes and settles those it holds; a job
-  it took from GitLab and had not yet submitted fails.
+- **The hub takes new work only from relay runners mapped to a capacity tenant, over session
+  protocol 2**: each request names its runner, which must be verified with GitLab and mapped
+  by its runner ID. Upgrade the hub, map the runners with `vk-hub capacity-policy set`, then
+  upgrade the relays. An older `vk-gitlab` keeps its session with an upgraded hub and finishes
+  and settles the jobs it holds, but gets no new work; a job it took from GitLab and had not
+  yet submitted fails. An upgraded `vk-gitlab` is refused by an older hub: it asks GitLab for
+  no jobs, logs that the hub must be upgraded and dials again about every minute.
+- **API-key reservations share the fleet's capacity with GitLab runners**: each is charged
+  to the capacity tenant the policy's `clients` maps the key to, or else to its `fallback`
+  tenant, and waits its turn when that tenant uses more than others.
 - **`vk-gitlab` refuses a configuration with `concurrent` or a runner's `request_concurrency`
   above 128, or more than 64 runners.** The hub ends the session of a relay that reports more
   runners or a larger `request_concurrency`.
@@ -20,6 +25,16 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **The hub shares the fleet's capacity among GitLab runners.** A runner's job requests wait
+  in the hub's queue, holding no slot under `concurrent` or `limit`, and the hub hands room
+  to the tenant using the least, within each relay's `concurrent` and each runner's `limit`.
+  A runner that finds no job backs off, and by default one runner at a time, fleet-wide, asks
+  GitLab without having taken a job in the last minute (`probe_limit` and `busy_secs` in the
+  capacity policy). Capacity a runner is using to ask GitLab stays counted across hub and
+  relay restarts until the relay reports what came of it or no longer lists it. The client
+  API gains queued reservations (`queue: true`), their tickets at
+  `/v1/reservations/tickets/<ticket>`, and `POST /v1/reservations/<id>/claim` and
+  `/v1/reservations/<admission>/outcome`.
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
   Replacements are audited and checked against the shown digest to prevent lost updates.
 

@@ -31,7 +31,8 @@ use vk_hub_proto::client::{
     CAPACITY_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError, ErrorCode,
     JOBS_PATH, JobSubmission, JobView, MAX_OUTPUT_READ, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER,
     OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RELAY_HEADER, RESERVATIONS_PATH,
-    RenewRequest, ReservationGrant, ReservationRequest, client_request_message,
+    RenewRequest, ReservationGrant, ReservationRequest, ReservationTicket, TICKETS_PATH,
+    client_request_message,
 };
 use vk_hub_proto::dispatch::MAX_LEASE_SECS;
 use vk_hub_proto::job::MAX_JOB_SPEC;
@@ -40,7 +41,8 @@ use vk_peer::identity::Identity;
 
 use crate::backoff::Backoff;
 use crate::dispatch::{
-    DispatchError, DispatchResult, Dispatcher, ErrorKind, OutputChunk, Reservation, Submission,
+    DispatchError, DispatchResult, Dispatcher, ErrorKind, OutputChunk, QueueAnswer, Reservation,
+    Submission,
 };
 
 /// How long a request may take beyond the long poll it asks for.
@@ -107,6 +109,7 @@ impl std::fmt::Debug for HubClient {
 
 /// A successful answer, read whole.
 struct Answer {
+    status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
 }
@@ -199,7 +202,11 @@ impl HubClient {
             driver.abort();
             let (status, headers, body) = answer?;
             if status.is_success() {
-                Ok(Answer { headers, body })
+                Ok(Answer {
+                    status,
+                    headers,
+                    body,
+                })
             } else {
                 Err(error_of(status, &headers, &body))
             }
@@ -421,6 +428,40 @@ fn timeout_for(wait: Duration) -> Duration {
     wait.min(Duration::from_secs(u64::from(MAX_WAIT_SECS))) + REQUEST_SLACK
 }
 
+/// A queued reservation request's answer, told apart by its status as
+/// `vk_hub_proto::client` defines it: 201 a grant, 202 a ticket.
+fn queue_answer(answer: Answer) -> DispatchResult<QueueAnswer> {
+    let parse = |e: serde_json::Error| {
+        DispatchError::new(
+            ErrorKind::Other,
+            format!("the hub's answer does not parse: {e}"),
+        )
+    };
+    match answer.status {
+        StatusCode::CREATED => {
+            let g: ReservationGrant = serde_json::from_slice(&answer.body).map_err(parse)?;
+            Ok(QueueAnswer::Grant(Reservation {
+                id: g.reservation,
+                admission: g.admission,
+                node: g.node,
+                envelope: g.envelope,
+                lease: Duration::from_secs(u64::from(g.lease_secs)),
+            }))
+        }
+        StatusCode::ACCEPTED => {
+            let t: ReservationTicket = serde_json::from_slice(&answer.body).map_err(parse)?;
+            Ok(QueueAnswer::Ticket(t.ticket))
+        }
+        status => Err(DispatchError {
+            status: Some(status.as_u16()),
+            ..DispatchError::new(
+                ErrorKind::Other,
+                format!("the hub answered a queued request {status}, neither a grant nor a ticket"),
+            )
+        }),
+    }
+}
+
 impl Dispatcher for HubClient {
     async fn capacity(
         &self,
@@ -475,11 +516,91 @@ impl Dispatcher for HubClient {
             )
             .await?;
         Ok(Reservation {
+            admission: grant.admission,
             id: grant.reservation,
             node: grant.node,
             envelope: grant.envelope,
             lease: Duration::from_secs(u64::from(grant.lease_secs)),
         })
+    }
+
+    async fn queue(
+        &self,
+        runner: &str,
+        request_id: &str,
+        placement: &Placement,
+        lease: Duration,
+        wait: Duration,
+    ) -> DispatchResult<QueueAnswer> {
+        let body = ReservationRequest {
+            runner: Some(runner.to_owned()),
+            queue: true,
+            request_id: request_id.to_owned(),
+            placement: placement.clone(),
+            lease_secs: lease_secs(lease),
+            wait_secs: wait_secs(wait),
+        };
+        let body = Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?,
+        );
+        self.call(
+            Method::POST,
+            RESERVATIONS_PATH,
+            "",
+            Some(body),
+            timeout_for(wait),
+            false,
+            Tries::Attempts,
+            queue_answer,
+        )
+        .await
+    }
+
+    async fn poll_ticket(&self, ticket: &str, wait: Duration) -> DispatchResult<QueueAnswer> {
+        let path = format!("{TICKETS_PATH}/{}", checked_id(ticket)?);
+        let query = format!("wait={}", wait_secs(wait));
+        self.call(
+            Method::GET,
+            &path,
+            &query,
+            None,
+            timeout_for(wait),
+            false,
+            Tries::Attempts,
+            queue_answer,
+        )
+        .await
+    }
+
+    async fn cancel_ticket(&self, ticket: &str) -> DispatchResult<()> {
+        let path = format!("{TICKETS_PATH}/{}", checked_id(ticket)?);
+        self.call_empty(Method::DELETE, &path, None, Tries::Attempts)
+            .await
+    }
+
+    async fn claim(&self, reservation: &str) -> DispatchResult<()> {
+        let path = format!("{RESERVATIONS_PATH}/{}/claim", checked_id(reservation)?);
+        self.call_empty(Method::POST, &path, None, Tries::Attempts)
+            .await
+    }
+
+    async fn outcome(
+        &self,
+        admission: &str,
+        outcome: vk_hub_proto::client::AdmissionOutcome,
+    ) -> DispatchResult<()> {
+        let path = format!("{RESERVATIONS_PATH}/{}/outcome", checked_id(admission)?);
+        let body = vk_hub_proto::client::OutcomeRequest {
+            admission: admission.to_owned(),
+            outcome,
+        };
+        let body = Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?,
+        );
+        self.call_empty(Method::POST, &path, Some(body), Tries::Attempts)
+            .await
     }
 
     async fn renew(&self, reservation: &str, lease: Duration) -> DispatchResult<Duration> {
@@ -518,7 +639,7 @@ impl Dispatcher for HubClient {
         }
         let body = JobSubmission {
             runner: submission.runner,
-            admission: None,
+            admission: submission.admission,
             request_id: submission.request_id,
             placement: submission.placement,
             reservation: submission.reservation,
@@ -612,4 +733,60 @@ fn lease_secs(lease: Duration) -> u32 {
     u32::try_from(lease.as_secs())
         .unwrap_or(u32::MAX)
         .clamp(1, MAX_LEASE_SECS)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn answer(status: StatusCode, body: serde_json::Value) -> Answer {
+        Answer {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(body.to_string()),
+        }
+    }
+
+    #[test]
+    fn ticket_and_grant_answers_keep_admission_and_remaining_lease() {
+        let ticket = "a".repeat(32);
+        assert!(matches!(
+            queue_answer(answer(StatusCode::ACCEPTED, json!({"ticket": ticket}))).unwrap(),
+            QueueAnswer::Ticket(t) if t == ticket
+        ));
+        let grant = queue_answer(answer(
+            StatusCode::CREATED,
+            json!({
+                "reservation": "b".repeat(32), "admission": "c".repeat(32),
+                "node": "d".repeat(32), "lease_secs": 7,
+                "envelope": {"mem_mib": 1, "cpus": 1, "disk_bytes": 1}
+            }),
+        ))
+        .unwrap();
+        let QueueAnswer::Grant(grant) = grant else {
+            panic!("expected grant")
+        };
+        assert_eq!(grant.admission.as_deref(), Some("c".repeat(32).as_str()));
+        assert_eq!(grant.lease, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn a_queue_answer_is_told_by_its_status_not_its_body() {
+        // A grant's body under 202 is not taken for a grant, nor a ticket's under 201.
+        let grant = json!({
+            "reservation": "b".repeat(32), "node": "d".repeat(32), "lease_secs": 7,
+            "envelope": {"mem_mib": 1, "cpus": 1, "disk_bytes": 1}
+        });
+        assert!(queue_answer(answer(StatusCode::ACCEPTED, grant.clone())).is_err());
+        assert!(
+            queue_answer(answer(
+                StatusCode::CREATED,
+                json!({"ticket": "a".repeat(32)})
+            ))
+            .is_err()
+        );
+        let e = queue_answer(answer(StatusCode::OK, grant)).unwrap_err();
+        assert_eq!((e.kind, e.status), (ErrorKind::Other, Some(200)));
+    }
 }

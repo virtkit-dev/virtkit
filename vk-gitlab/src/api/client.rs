@@ -685,6 +685,7 @@ impl GitLabClient {
                 // down, the runner is not at fault. An unusable URL is the runner's own.
                 log::warn!(runner = runner.as_str(), correlation_id = cid.as_str(), status = e.to_string().as_str(); "Checking for jobs... failed");
                 return JobRequestResult {
+                    empty: false,
                     job: None,
                     healthy: !matches!(e, HttpError::Url(_)),
                 };
@@ -698,6 +699,7 @@ impl GitLabClient {
                     let ctype = header_str(&resp, "Content-Type").to_owned();
                     log::warn!(runner = runner.as_str(), correlation_id = cid.as_str(), status = format!("response is not application/json: server should return application/json. Got: {ctype}").as_str(); "Checking for jobs... failed");
                     return JobRequestResult {
+                        empty: false,
                         job: None,
                         healthy: true,
                     };
@@ -708,6 +710,7 @@ impl GitLabClient {
                     Err(e) => {
                         log::warn!(runner = runner.as_str(), correlation_id = cid.as_str(), status = e.without_url().to_string().as_str(); "Checking for jobs... failed");
                         return JobRequestResult {
+                            empty: false,
                             job: None,
                             healthy: true,
                         };
@@ -725,6 +728,7 @@ impl GitLabClient {
                             "Checking for jobs... received"
                         );
                         JobRequestResult {
+                            empty: false,
                             job: Some(Box::new(job)),
                             healthy: true,
                         }
@@ -736,6 +740,7 @@ impl GitLabClient {
                         log::error!(runner = runner.as_str(), correlation_id = cid.as_str(), status = format!("decoding json payload at {at}").as_str(); "Checking for jobs... failed");
                         self.fail_undecodable_job(&body, &at).await;
                         JobRequestResult {
+                            empty: false,
                             job: None,
                             healthy: true,
                         }
@@ -746,6 +751,7 @@ impl GitLabClient {
                 self.record_last_update(&resp);
                 log::debug!(runner = runner.as_str(), correlation_id = cid.as_str(), status = status_text(status).as_str(); "Checking for jobs... no content");
                 JobRequestResult {
+                    empty: true,
                     job: None,
                     healthy: true,
                 }
@@ -754,6 +760,7 @@ impl GitLabClient {
                 self.record_last_update(&resp);
                 log::error!(runner = runner.as_str(), correlation_id = cid.as_str(), status = status_text(status).as_str(); "Checking for jobs... forbidden");
                 JobRequestResult {
+                    empty: false,
                     job: None,
                     healthy: false,
                 }
@@ -762,6 +769,7 @@ impl GitLabClient {
                 self.record_last_update(&resp);
                 log::warn!(runner = runner.as_str(), correlation_id = cid.as_str(), status = status_text(status).as_str(); "Checking for jobs... GitLab instance currently unavailable");
                 JobRequestResult {
+                    empty: false,
                     job: None,
                     healthy: true,
                 }
@@ -777,6 +785,7 @@ impl GitLabClient {
                     "Checking for jobs... rate limited"
                 );
                 JobRequestResult {
+                    empty: false,
                     job: None,
                     healthy: true,
                 }
@@ -786,6 +795,7 @@ impl GitLabClient {
                 let text = status_message(resp, &Method::POST).await;
                 log::warn!(runner = runner.as_str(), correlation_id = cid.as_str(), status = text.as_str(); "Checking for jobs... failed");
                 JobRequestResult {
+                    empty: false,
                     job: None,
                     healthy: true,
                 }

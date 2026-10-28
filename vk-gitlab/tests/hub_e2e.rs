@@ -14,12 +14,14 @@ use std::sync::Arc;
 
 use support::fakehub::TEST_RELAY_ID;
 use support::gl::{Harness, TOKEN, Via, eventually, job_json, runner_toml, within};
-use vk_gitlab::dispatch::{CancelMode, Dispatcher, ErrorKind, FakeCall, Placement, Submission};
+use vk_gitlab::dispatch::{
+    CancelMode, Dispatcher, ErrorKind, FakeCall, Placement, QueueAnswer, Submission,
+};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::relay;
 use vk_gitlab::spec::{self, SpecContext};
 use vk_gitlab::state::{JobRecord, Phase, StateFile};
-use vk_hub_proto::client::ErrorCode;
+use vk_hub_proto::client::{AdmissionOutcome, ErrorCode};
 use vk_hub_proto::job::JobSpec;
 use vk_peer::identity::Identity;
 
@@ -53,8 +55,9 @@ fn record(h: &Harness, id: i64, phase: Phase, hub_job: Option<String>) -> JobRec
         gitlab_job: id,
         job_token: format!("jt-{id}"),
         request_id: request_id(id),
-        runner: Some("test".into()),
+        runner: Some("ci".into()),
         reservation: None,
+        admission: None,
         place_within_secs: 1,
         hub_job,
         phase,
@@ -72,7 +75,8 @@ async fn submitted(h: &Harness, id: i64, reservation: Option<String>) -> String 
     h.hub
         .submit(Submission {
             request_id: request_id(id),
-            runner: Some("test".into()),
+            runner: Some("ci".into()),
+            admission: None,
             placement: p1(),
             reservation,
             place_within: Duration::from_secs(1),
@@ -95,6 +99,169 @@ fn put(h: &Harness, runner: &str, records: Vec<JobRecord>) {
 
 fn records(path: &Path) -> Vec<JobRecord> {
     StateFile::read(path).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_ticket_releases_a_grant_whose_response_was_lost() {
+    let h = Harness::unstarted(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    let relay = relay::open(&h.state_dir).unwrap();
+    let client = HubClient::new(HubOptions {
+        hub: relay.enrollment.hub.clone(),
+        tls: relay.tls,
+        relay_id: relay.enrollment.relay_id.clone(),
+        identity: relay.identity,
+        retry: HubRetry::default(),
+    });
+    let QueueAnswer::Ticket(ticket) = client
+        .queue(
+            "r1",
+            &request_id(99),
+            &p1(),
+            Duration::from_secs(10),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a ticket");
+    };
+    let QueueAnswer::Grant(grant) = client.poll_ticket(&ticket, Duration::ZERO).await.unwrap()
+    else {
+        panic!("expected a grant");
+    };
+    let QueueAnswer::Grant(repeated) = client.poll_ticket(&ticket, Duration::ZERO).await.unwrap()
+    else {
+        panic!("expected the same grant");
+    };
+    assert_eq!(repeated.id, grant.id);
+    assert_eq!(h.hub.reservations().len(), 1);
+    client.cancel_ticket(&ticket).await.unwrap();
+    assert!(h.hub.reservations().is_empty());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_state_reports_held_admissions_before_the_session() {
+    let h = Harness::unstarted(1, Via::Http).await;
+    let mut job = record(&h, 1, Phase::Taken, None);
+    job.admission = Some("a".repeat(32));
+    put(&h, "r1", vec![job]);
+    let cfg = h.config();
+    let status = vk_gitlab::session::Status::new(&cfg, "s_test", "test");
+    assert!(vk_gitlab::poll::prepare_state(&cfg, "another-relay", Arc::clone(&status)).is_err());
+    let _prepared =
+        vk_gitlab::poll::prepare_state(&cfg, TEST_RELAY_ID, Arc::clone(&status)).unwrap();
+    let heartbeat = status.heartbeat();
+    assert_eq!(heartbeat.runners[0].jobs, 1);
+    assert_eq!(heartbeat.runners[0].job_admissions, vec!["a".repeat(32)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_runner_holds_no_slot_and_grant_is_claimed_and_reported() {
+    const OTHER: &str = "glrt-other-token";
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    h.runners = runner_toml("r1", TOKEN, "")
+        + &runner_toml("r2", OTHER, "").replace("pool = \"p1\"", "pool = \"p2\"");
+    h.gl.push_job_for(OTHER, job_json(301));
+    h.daemon = h.spawn_daemon();
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    eventually("both runners queue at zero capacity", || {
+        let requests = fake_hub.requests.lock().unwrap();
+        ["r1", "r2"].iter().all(|name| {
+            requests.iter().any(|r| {
+                r.method == "POST"
+                    && r.path == "/v1/reservations"
+                    && serde_json::from_slice::<serde_json::Value>(&r.body)
+                        .ok()
+                        .is_some_and(|v| v["runner"] == *name && v["queue"] == true)
+            })
+        })
+    })
+    .await;
+    assert_eq!(h.job_requests(), 0);
+    h.hub.set_slots("p2", 1);
+    let (job, _) = h.accepted_job(1).await;
+    eventually("grant claim and job outcome", || {
+        let requests = fake_hub.requests.lock().unwrap();
+        requests.iter().any(|r| r.path.ends_with("/claim"))
+            && requests.iter().any(|r| {
+                r.path.ends_with("/outcome")
+                    && serde_json::from_slice::<serde_json::Value>(&r.body)
+                        .ok()
+                        .is_some_and(|v| v["outcome"] == "job" && v["admission"].is_string())
+            })
+    })
+    .await;
+    h.hub.finish(&job, None, None);
+    h.final_update(301).await;
+    h.daemon.stop().await;
+    let requests = fake_hub.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.method == "DELETE" && r.path.contains("/tickets/"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_recovers_and_cancels_a_ticket_when_queue_answer_is_lost() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.delay_next_queue_response(Duration::from_secs(5));
+    h.daemon = h.spawn_daemon();
+    let request_id = || {
+        let requests = fake_hub.requests.lock().unwrap();
+        requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/v1/reservations")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .and_then(|v| v["request_id"].as_str().map(str::to_owned))
+    };
+    // The hub has queued the request; its answer is still on the way.
+    eventually("the request queued", || {
+        request_id().is_some_and(|id| fake_hub.ticket_for(&id).is_some())
+    })
+    .await;
+    h.daemon.stop().await;
+    let ticket = fake_hub.ticket_for(&request_id().unwrap()).unwrap();
+    assert_ne!(
+        Some(&ticket),
+        request_id().as_ref(),
+        "the hub's own ticket ID"
+    );
+    let requests = fake_hub.requests.lock().unwrap();
+    let posts: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path == "/v1/reservations")
+        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 2, "shutdown retries the unanswered request");
+    assert_eq!(posts[0]["request_id"], posts[1]["request_id"]);
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.method == "DELETE" && r.path == format!("/v1/reservations/tickets/{ticket}"))
+    );
+    assert_eq!(h.job_requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_gitlab_answer_reports_empty_and_releases_grant() {
+    let h = Harness::start(1, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    eventually("empty outcome", || {
+        fake_hub.requests.lock().unwrap().iter().any(|r| {
+            r.path.ends_with("/outcome")
+                && serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .is_some_and(|v| v["outcome"] == "empty")
+        })
+    })
+    .await;
+    eventually("reservation released", || h.hub.reservations().is_empty()).await;
+    h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -210,6 +377,52 @@ async fn a_taken_job_the_hub_already_has_is_attached_to() {
         h.count_calls(|c| matches!(c, FakeCall::Submit { job: 37, .. })),
         2
     );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_submission_is_replayed_without_a_runner_name() {
+    let mut h = Harness::unstarted(2, Via::Http).await;
+    let hub_id = h
+        .hub
+        .submit(Submission {
+            request_id: request_id(47),
+            runner: None,
+            admission: None,
+            placement: p1(),
+            reservation: None,
+            place_within: Duration::from_secs(1),
+            gitlab_job: 47,
+            spec: spec_for(&h, 47),
+        })
+        .await
+        .unwrap()
+        .id;
+    let mut rec = record(&h, 47, Phase::Taken, None);
+    rec.runner = None;
+    put(&h, "r1", vec![rec]);
+    h.daemon = h.spawn_daemon();
+    within(
+        "the resubmission",
+        h.hub.wait_for_call(FakeCall::Submit {
+            job: 47,
+            reservation: None,
+        }),
+    )
+    .await;
+    h.hub.accept(&hub_id);
+    eventually("the commit", || h.committed(47)).await;
+    {
+        let requests = h.http_hub.as_ref().unwrap().requests.lock().unwrap();
+        let replay = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/v1/jobs")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&replay.body).unwrap();
+        assert!(body.get("runner").is_none());
+    }
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(47).await["state"], "success");
     h.stop().await;
 }
 
@@ -540,5 +753,138 @@ async fn a_key_the_hub_did_not_enroll_is_refused() {
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
     std::fs::remove_dir_all(&other).unwrap();
+    h.stop().await;
+}
+
+/// The admission of the first queued request, once it was queued.
+fn first_admission(h: &Harness) -> Option<String> {
+    h.http_hub.as_ref().unwrap().first_ticket()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outcome_the_hub_did_not_take_is_reported_again() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    // More 503s than the client's five attempts at a call.
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        8,
+        "/v1/reservations/",
+        "/outcome",
+        503,
+        ErrorCode::Unavailable,
+        None,
+    );
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    eventually("the first admission's outcome taken", || {
+        first_admission(&h)
+            .is_some_and(|a| fake_hub.outcome_of(&a) == Some(AdmissionOutcome::Empty))
+    })
+    .await;
+    assert!(fake_hub.requests_to("/v1/reservations/") > 8);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outcome_the_hub_refuses_as_conflicting_is_dropped() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        1,
+        "/v1/reservations/",
+        "/outcome",
+        409,
+        ErrorCode::Conflict,
+        None,
+    );
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    // Later admissions' outcomes are taken, and the refused one is not reported again.
+    eventually("later admissions' outcomes taken", || {
+        fake_hub.outcomes_reported() >= 2
+    })
+    .await;
+    let first = first_admission(&h).unwrap();
+    assert_eq!(fake_hub.outcome_of(&first), None);
+    let path = format!("/v1/reservations/{first}/outcome");
+    assert_eq!(fake_hub.requests_to(&path), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_whose_claim_failed_is_given_back() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        1,
+        "/v1/reservations/",
+        "/claim",
+        409,
+        ErrorCode::Conflict,
+        None,
+    );
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    eventually("the unclaimed grant returned", || {
+        first_admission(&h)
+            .is_some_and(|a| fake_hub.outcome_of(&a) == Some(AdmissionOutcome::Released))
+    })
+    .await;
+    eventually("its reservation released", || {
+        h.count_calls(|c| matches!(c, FakeCall::Release(_))) >= 1
+    })
+    .await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_the_hub_refuses_leaves_its_admission_empty() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    h.daemon = h.spawn_daemon();
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.fail_next(1, "/v1/jobs", 403, ErrorCode::Forbidden, None);
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(40));
+    assert_eq!(h.final_update(40).await["state"], "failed");
+    let admission = first_admission(&h).unwrap();
+    // Taken under its admission, then dropped before the hub had it: no job came of it.
+    eventually("the admission reported empty", || {
+        fake_hub.outcome_of(&admission) == Some(AdmissionOutcome::Empty)
+    })
+    .await;
+    let state = h.state_dir.join("r1.json");
+    eventually("the record dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_relay_submits_under_the_admission_it_held() {
+    let mut h = Harness::unstarted(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    let admission = "ad".repeat(16);
+    // Claimed before the relay died, its job taken but not submitted.
+    h.http_hub.as_ref().unwrap().hold_admission(&admission);
+    let mut rec = record(&h, 41, Phase::Taken, None);
+    rec.runner = Some("r1".into());
+    rec.admission = Some(admission.clone());
+    put(&h, "r1", vec![rec]);
+    h.daemon = h.spawn_daemon();
+    let status = h.daemon.status.clone().unwrap();
+    let (hub_id, sub) = within("the resubmission", h.hub.wait_for_job(1)).await;
+    assert_eq!(sub.admission.as_deref(), Some(admission.as_str()));
+    let held = |status: &vk_gitlab::session::Status| {
+        status.heartbeat().runners[0]
+            .job_admissions
+            .contains(&admission)
+    };
+    assert!(held(&status), "the heartbeat lists the held admission");
+    h.hub.accept(&hub_id);
+    eventually("the commit", || h.committed(41)).await;
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(41).await["state"], "success");
+    eventually("the admission no longer held once settled", || {
+        !held(&status)
+    })
+    .await;
     h.stop().await;
 }

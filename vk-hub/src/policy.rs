@@ -172,10 +172,46 @@ impl Default for Policy {
     }
 }
 
+impl std::fmt::Display for Class {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Normal => "normal",
+            Self::Production => "production",
+        })
+    }
+}
+
 impl Policy {
     /// What `set` compares against: the sha256 of the policy as stored.
     pub fn digest(&self) -> Result<String> {
         Ok(digest_bytes(&serde_json::to_vec(self)?))
+    }
+
+    /// The mapping of the runner with GitLab runner ID `id` on instance `gitlab`, if any.
+    pub fn runner(&self, gitlab: &str, id: u64) -> Option<&RunnerMapping> {
+        self.runners
+            .iter()
+            .find(|r| r.gitlab == gitlab && r.runner_id == id)
+    }
+
+    /// Tenant `name`, if the policy has it.
+    pub fn tenant(&self, name: &str) -> Option<&Tenant> {
+        self.tenants.get(name)
+    }
+
+    /// The tenant an API client `principal` is charged to, and its name: the one `clients`
+    /// maps it to, else the fallback.
+    pub fn client(&self, principal: &str) -> Option<(&str, &Tenant)> {
+        let name = self.clients.get(principal).unwrap_or(&self.fallback);
+        self.tenant(name).map(|tenant| (name.as_str(), tenant))
+    }
+
+    /// Project `id` of instance `gitlab`, if tenant `tenant` lists it.
+    pub fn project(&self, tenant: &str, gitlab: &str, id: u64) -> Option<&Project> {
+        self.tenant(tenant)?
+            .projects
+            .iter()
+            .find(|p| p.gitlab == gitlab && p.id == id)
     }
 
     pub fn validate(&self) -> Result<()> {

@@ -162,6 +162,16 @@ async fn reservation_lost_during_the_request(via: Via) {
         sub.reservation, None,
         "a lost reservation is not submitted on"
     );
+    // The fake hub's tickets name their admissions; the in-process fake, its reservations.
+    let admission = match &h.http_hub {
+        Some(hub) => hub.first_ticket().unwrap(),
+        None => r.clone(),
+    };
+    assert_eq!(
+        sub.admission,
+        Some(admission),
+        "the job keeps its claimed admission after lease loss"
+    );
     assert_eq!(sub.place_within, Duration::from_secs(1));
     // The hub found no node within place_within.
     h.hub.finish(&hub_id, Some(FailureClass::NoCapacity), None);

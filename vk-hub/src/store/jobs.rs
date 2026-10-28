@@ -66,6 +66,27 @@ const HISTORY: &str = "history";
 /// miscounted.
 const TAIL_LENS: &str = "tail_lens";
 
+/// Remove the stored admission `row`'s job took, once the job no longer holds it: settled,
+/// expired or dropped from the history. Only an admission of `row`'s principal whose outcome
+/// is [`AdmissionOutcome::Job`](vk_hub_proto::client::AdmissionOutcome::Job) goes. `table` is
+/// the transaction's [`ADMISSIONS`](super::admissions::ADMISSIONS).
+fn retire_job_admission(table: &mut redb::Table<&str, &[u8]>, row: &JobRow) -> Result<()> {
+    let Some(id) = &row.admission else {
+        return Ok(());
+    };
+    let stored = table
+        .get(id.as_str())?
+        .map(|value| decode::<super::StoredAdmission>(value.value()))
+        .transpose()?;
+    if stored.is_some_and(|admission| {
+        admission.principal == row.key
+            && admission.outcome == Some(vk_hub_proto::client::AdmissionOutcome::Job)
+    }) {
+        table.remove(id.as_str())?;
+    }
+    Ok(())
+}
+
 /// How long a `request_id` keeps its answer.
 pub const REQUEST_KEEP: u64 = 86_400;
 
@@ -883,6 +904,11 @@ impl Db {
                     let mut row = row.clone();
                     row.expired_at = row.expired_at.or(stored.expired_at);
                     table.insert(id, encode(&row)?.as_slice())?;
+                    // Settled, the job holds its admission no more.
+                    if row.settled_at.is_some() && stored.settled_at.is_none() {
+                        let mut admissions = txn.open_table(super::admissions::ADMISSIONS)?;
+                        retire_job_admission(&mut admissions, &row)?;
+                    }
                     super::egress::reshare(&txn, id, Some(&stored), Some(&row))?;
                     super::egress::confirm(&txn, id, &row, now)?;
                     super::observed::reshare(&txn, id, Some(&stored), Some(&row))?;
@@ -1321,11 +1347,13 @@ impl Db {
         let txn = self.db.begin_write().context("starting a write")?;
         let more;
         let mut unplaced = Vec::new();
+        let mut retired = Vec::new();
         let outputs = {
             let mut table = txn.open_table(JOBS)?;
             let mut specs = txn.open_table(JOB_SPECS)?;
             let mut order = txn.open_table(JOB_ORDER)?;
             let mut meta = txn.open_table(JOB_META)?;
+            let mut admissions = txn.open_table(super::admissions::ADMISSIONS)?;
             let mut outputs = Vec::new();
 
             let over = order
@@ -1367,6 +1395,8 @@ impl Db {
             let mut uncounted: HashMap<&str, u64> = HashMap::new();
             let mut by_admission = txn.open_table(JOB_BY_ADMISSION)?;
             for (id, row) in &dropped {
+                retire_job_admission(&mut admissions, row)?;
+                retired.push((id.clone(), row.key.clone(), row.admission.clone()));
                 table.remove(id.as_str())?;
                 if let Some(admission) = &row.admission {
                     by_admission.remove((row.key.as_str(), admission.as_str()))?;
@@ -1441,6 +1471,8 @@ impl Db {
                 }
             }
             for (id, mut row) in expired {
+                retire_job_admission(&mut admissions, &row)?;
+                retired.push((id.clone(), row.key.clone(), row.admission.clone()));
                 specs.remove(id.as_str())?;
                 if holds_output(&row) {
                     outputs.push(id.clone());
@@ -1455,7 +1487,11 @@ impl Db {
         };
         self.commit_briefed(txn, BriefChange::Drop(unplaced))
             .context("pruning jobs")?;
-        Ok(Pruned { outputs, more })
+        Ok(Pruned {
+            outputs,
+            retired,
+            more,
+        })
     }
 
     /// How many jobs' records the history keeps as set from the web UI; `None` when it was
@@ -1546,6 +1582,8 @@ impl Drop for ReadingBriefs<'_> {
 pub struct Pruned {
     /// The IDs whose output files go.
     pub outputs: Vec<String>,
+    /// Finished jobs whose admission charges were retired.
+    pub retired: Vec<(String, String, Option<String>)>,
     /// It dropped as many jobs as one trim may and more are past the count: trim again.
     pub more: bool,
 }
@@ -2020,6 +2058,94 @@ mod tests {
         let digest = n.to_string();
         let new = db.submit_job(&id(n), row, &digest, b"{}", "key gitlab", n);
         assert!(matches!(new.unwrap(), Submitted::New));
+    }
+
+    #[test]
+    fn expiry_retires_finished_admissions_and_keeps_live_claims() {
+        use vk_hub_proto::client::AdmissionOutcome;
+        let db = Db::open_memory().unwrap();
+        let mut finished = job(1, JobState::Finished, None);
+        finished.admission = Some("finished".into());
+        submit(&db, 1, &finished);
+        let mut running = job(2, JobState::Running, None);
+        running.admission = Some("running".into());
+        submit(&db, 2, &running);
+        let stored = super::super::StoredAdmission {
+            principal: finished.key.clone(),
+            identity: SchedulingIdentity {
+                tenant: "t".into(),
+                class: crate::policy::Class::Normal,
+                gitlab: None,
+                runner_id: None,
+            },
+            runner: None,
+            placement: Placement::default(),
+            probe: false,
+            reservation: "r".into(),
+            outcome: Some(AdmissionOutcome::Job),
+        };
+        db.put_admission("finished", &stored).unwrap();
+        db.put_admission("running", &stored).unwrap();
+        let mut claim = stored.clone();
+        claim.outcome = None;
+        db.put_admission("claim", &claim).unwrap();
+        let pruned = db.prune_jobs(JOB_KEEP + 10, 10).unwrap();
+        assert_eq!(
+            pruned.retired,
+            vec![(id(1), finished.key.clone(), finished.admission.clone())]
+        );
+        assert!(db.admission("finished").unwrap().is_none());
+        assert!(db.admission("running").unwrap().is_some());
+        assert!(db.admission("claim").unwrap().is_some());
+        // A worker that was delayed until after pruning cannot recreate the admission.
+        assert!(
+            db.update_admission_outcome("finished", AdmissionOutcome::Job)
+                .unwrap()
+                .is_none()
+        );
+        db.restore_admission_if_present("finished", &stored)
+            .unwrap();
+        assert!(db.admission("finished").unwrap().is_none());
+
+        let mut dropped = job(3, JobState::Finished, None);
+        dropped.admission = Some("dropped".into());
+        submit(&db, 3, &dropped);
+        db.put_admission("dropped", &stored).unwrap();
+        let pruned = db.prune_jobs(JOB_KEEP + 20, 0).unwrap();
+        assert!(pruned.retired.iter().any(|(job_id, _, _)| job_id == &id(3)));
+        assert!(db.admission("dropped").unwrap().is_none());
+        assert!(db.admission("running").unwrap().is_some());
+    }
+
+    #[test]
+    fn settling_a_job_retires_its_admission() {
+        let db = Db::open_memory().unwrap();
+        let mut finished = job(1, JobState::Finished, None);
+        finished.admission = Some("admission".into());
+        submit(&db, 1, &finished);
+        let stored = super::super::StoredAdmission {
+            principal: finished.key.clone(),
+            identity: SchedulingIdentity {
+                tenant: "t".into(),
+                class: crate::policy::Class::Normal,
+                gitlab: None,
+                runner_id: None,
+            },
+            runner: None,
+            placement: Placement::default(),
+            probe: false,
+            reservation: "r".into(),
+            outcome: Some(vk_hub_proto::client::AdmissionOutcome::Job),
+        };
+        db.put_admission("admission", &stored).unwrap();
+        // Unsettled, the job still holds it; settled, it goes.
+        finished.revision += 1;
+        db.put_job(&id(1), &finished, &[], 5).unwrap();
+        assert!(db.admission("admission").unwrap().is_some());
+        finished.settled_at = Some(5);
+        finished.revision += 1;
+        db.put_job(&id(1), &finished, &[], 5).unwrap();
+        assert!(db.admission("admission").unwrap().is_none());
     }
 
     fn listed(db: &Db) -> Vec<String> {

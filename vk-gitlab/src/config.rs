@@ -18,7 +18,7 @@
 //! labels = ["large-memory"]
 //! envelope = { mem = "16G", cpus = 8, disk = "16G" }
 //! limit = 4                 # jobs at once for this runner (0 = no limit)
-//! request_concurrency = 1   # job requests in flight at once (at most 128)
+//! request_concurrency = 1   # job requests queued or in flight at once (at most 128)
 //! ```
 
 use std::collections::HashSet;
@@ -114,7 +114,7 @@ pub struct RunnerConfig {
     /// Jobs at once for this runner; 0 means only `concurrent` applies.
     #[serde(default)]
     pub limit: usize,
-    /// Job requests in flight at once; at least 1, at most
+    /// Job requests queued at the hub or in flight to GitLab at once; at least 1, at most
     /// [`MAX_ADMISSIONS`](vk_hub_proto::gitlab::MAX_ADMISSIONS).
     #[serde(default)]
     pub request_concurrency: usize,

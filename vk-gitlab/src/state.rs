@@ -52,6 +52,8 @@ pub struct JobRecord {
     /// requires the same body, or the hub returns a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
     pub place_within_secs: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_job: Option<String>,
@@ -284,6 +286,7 @@ mod tests {
             request_id: "1".repeat(32),
             runner: None,
             reservation: None,
+            admission: None,
             place_within_secs: 300,
             hub_job: None,
             phase: Phase::Taken,
@@ -294,6 +297,23 @@ mod tests {
             placement: Placement::default(),
             spec: None,
         }
+    }
+
+    #[test]
+    fn admission_survives_restart_and_old_records_read() {
+        let mut job = record(1);
+        job.runner = Some("ci".into());
+        job.admission = Some("a".repeat(32));
+        let wire = serde_json::to_value(&job).unwrap();
+        let restored: JobRecord = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.admission, job.admission);
+        assert_eq!(restored.runner, job.runner);
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("admission");
+        old.as_object_mut().unwrap().remove("runner");
+        let restored: JobRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.admission, None);
+        assert_eq!(restored.runner, None);
     }
 
     #[test]

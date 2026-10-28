@@ -83,7 +83,7 @@ async fn open_relay(ws: &mut Client, id: &str, key: &Ed25519KeyPair) -> HubMsg {
     else {
         panic!("expected a challenge");
     };
-    assert_eq!((version, versions), (1, gl::PROTOCOL));
+    assert_eq!((version, versions), (2, gl::PROTOCOL));
     let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
     let signature = key.sign(&vk_hub_proto::auth_message(
         &nonce,

@@ -377,7 +377,8 @@ impl Harness {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
                 rt.spawn(async move {
-                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, status2, d, options, shutdown).await
+                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?;
+                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, prepared, d, options, shutdown).await
                 })
             }
             Via::Http => {
@@ -394,7 +395,8 @@ impl Harness {
                     },
                 }));
                 rt.spawn(async move {
-                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, status2, d, options, shutdown).await
+                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?;
+                    poll::run(&cfg, TEST_SYSTEM_ID, &relay, prepared, d, options, shutdown).await
                 })
             }
         };

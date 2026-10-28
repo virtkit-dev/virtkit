@@ -155,6 +155,8 @@ async fn run(config: PathBuf) -> Result<()> {
     let relay = Arc::new(relay::open(&state_dir(&cfg))?);
     log::info!(hub = relay.enrollment.hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "Relaying jobs to the hub");
     let status = session::Status::new(&cfg, &system_id, &relay::hostname());
+    // Report held work in the first heartbeat, before a session can grant new work.
+    let prepared = poll::prepare_state(&cfg, &relay.enrollment.relay_id, Arc::clone(&status))?;
     let session = tokio::spawn(session::hold(Arc::clone(&relay), Arc::clone(&status)));
     let dispatcher = Arc::new(HubClient::new(HubOptions {
         hub: relay.enrollment.hub.clone(),
@@ -194,7 +196,7 @@ async fn run(config: PathBuf) -> Result<()> {
         &cfg,
         &system_id,
         &relay.enrollment,
-        status,
+        prepared,
         dispatcher,
         RunOptions::default(),
         shutdown,

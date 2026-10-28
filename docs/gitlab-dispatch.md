@@ -34,14 +34,16 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 
 ## Job flow
 
-1. `vk-gitlab` asks the hub whether the runner's [placement](#placement) has room
-   (`POST /v1/capacity`), long-polling until it does.
-2. It reserves one envelope on a node (`POST /v1/reservations`); the hub offers it to nodes
-   until one accepts.
+1. `vk-gitlab` queues a reservation request for the runner's [placement](#placement)
+   (`POST /v1/reservations`, `queue: true`) and long-polls its ticket until the hub grants it:
+   the hub has offered one envelope to a node and the node accepted.
+2. It takes a slot under `concurrent` and the runner's `limit`, and claims the grant
+   (`POST /v1/reservations/<id>/claim`).
 3. It asks GitLab for a job (`POST /api/v4/jobs/request`), renewing the reservation while the
-   request is outstanding. On 204 it renews and asks again.
+   request is outstanding, and reports the admission's outcome to the hub. On 204 it gives the
+   slot and the reservation back and queues again.
 4. On 201 it writes the job to its state file, translates the response into a spec and
-   submits it on the reservation (`POST /v1/jobs`).
+   submits it on the reservation under its admission (`POST /v1/jobs`).
 5. The hub sends the node `start`; the node journals the job, converts the reservation into
    the job's ledger entry and answers `accepted`.
 6. Seeing the job accepted, `vk-gitlab` sends GitLab `PUT /jobs/:id` `state=running` — the
@@ -56,34 +58,65 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 ## Admission and reservations
 
 GitLab hands a runner a job only when the runner asks, and a job it has handed over cannot
-move to another runner. So the daemon holds capacity before it asks, never after:
+move to another runner. So the daemon holds capacity before it asks, never after, and the hub
+decides fleet-wide which runner's request gets the room a node frees:
 
-- **Capacity first.** `POST /v1/capacity` is advisory: the hub's count, from heartbeats less
-  the reservations and starting jobs they do not show yet, of how many envelopes of the
-  placement its ready nodes could take, each node at most what its cap — the smaller of its
-  concurrency ceiling and its own `max_concurrency` — leaves past the reservations and jobs it
-  holds.
-  The daemon does not poll GitLab for a runner while it is 0, so a fleet with no room leaves
-  the job pending in GitLab for another runner.
-- **Then a reservation.** Before each job request the daemon holds a reservation. The node
-  decides it through its admission ledger at once — a reservation never waits in the
-  ledger's queue — and counts it as granted memory and disk while it lasts.
+- **Queued, not held.** Each of a runner's `request_concurrency` request loops queues a
+  reservation request and polls its ticket without holding a slot under `concurrent` or
+  `limit`. Unclaimed tickets expire after 120 seconds without a poll and end with the relay's
+  session. Only claimed tickets survive a hub restart. Polling a lost ticket returns 410,
+  and the loop queues again.
+- **Arbitrated.** The hub offers room to the waiting tickets and the queued jobs of each
+  placement together: a job at its `place_within_secs` deadline first, then a job holding its
+  reservation, then the tenant holding the least (tenants weigh the same for now), the oldest
+  first. A ticket waits while its relay holds its `concurrent` or its runner its `limit` —
+  counting its tickets offered, granted or claimed and its jobs, those its heartbeat counts
+  without an admission included — while its runner backs off, and until the relay's current
+  session has sent a heartbeat listing every request it holds.
+- **Bounded discovery.** A request of a runner that took no job in the last `busy_secs` is a
+  probe, GitLab likely having nothing for it: at most `probe_limit` probes are out fleet-wide,
+  one per runner. An `empty` or `error` outcome backs the runner off for
+  `backoff_initial_secs`, doubled with each consecutive one up to `backoff_max_secs`, ±25%; a
+  `job` outcome clears it. These are capacity policy fields (`vk-hub capacity-policy`);
+  defaults 60, 1, 1 and 60.
+- **Then a reservation.** The hub offers the ticket's envelope to a node, least loaded first
+  ([Placement](#placement)). The node decides it through its admission ledger at once — a
+  reservation never waits in the ledger's queue — and counts it as granted memory and disk
+  while it lasts. A node that refuses or does not answer within 5 seconds is skipped until
+  every fitting node was tried; they are tried again 2 seconds later. An acceptance grants
+  the ticket: `{admission, reservation, node, envelope, lease_secs}`, the lease what remains
+  of the node's.
+- **Then a claim.** The daemon takes a slot — giving the grant back as `released` when
+  another loop took it meanwhile — lists the admission in its heartbeat's
+  `request_admissions`, and claims the grant. A grant not claimed before its lease runs out
+  is released. The hub stores a claimed admission, so it outlives a hub restart.
 - **Then the job request.** The reservation's lease covers the request: a lease of
   `lease_secs` (default 90) against a job request the daemon times out at 60 seconds,
   renewed every `lease_secs / 3` while the request is outstanding. A request in flight is
   never aborted: GitLab may already have assigned the job.
-- **Then the job.** The job is submitted on the reservation at once. The node sizes the job by
-  its own rules — `MICROVM_CPUS`, `MICROVM_MEM`, the script's `# vk:` hint, history — and
-  returns what the job does not need to the ledger; a job needing more than its reservation
-  waits for the rest in the ledger, as an executor job waits today.
+- **Then the outcome.** The daemon reports what came of the admission: `job`, `empty`
+  (GitLab answered 204), `error` (the request failed) or `released` (given back without asking
+  GitLab), retrying until the hub takes it or answers 400, 404, 409 or 410. Any outcome but
+  `job` ends the admission and releases its reservation. A job's admission moves to the
+  heartbeat's `job_admissions` and is charged until the job is settled.
+- **Then the job.** The job is submitted on the reservation at once, naming its admission. The
+  node sizes the job by its own rules — `MICROVM_CPUS`, `MICROVM_MEM`, the script's `# vk:`
+  hint, history — and returns what the job does not need to the ledger; a job needing more
+  than its reservation waits for the rest in the ledger, as an executor job waits today.
 
-Idle reservations are bounded: one per outstanding job request, so one per runner at the
-default `request_concurrency` of 1, each held for at most one request plus a renewal. A
-reservation that ends mid-request — its node lost, or the node's clock ran its lease out —
-leaves a job that arrives meanwhile without one; the hub then places it afresh within its
-`place_within_secs` (vk-gitlab asks for 300 seconds), and failing that ends it `no_capacity`,
-which the daemon reports as `runner_system_failure`. That window is the only way a job taken
-from GitLab waits for capacity.
+Heartbeats reconcile claims whose outcome was lost. A claimed admission that a heartbeat of
+the claiming session, received at least 10 seconds after the claim, lists in neither list is
+reclaimed and its reservation released. After a reconnect or a hub restart the relay's first
+heartbeat of the new session decides: an admission listed as a job's is one, one not listed
+is reclaimed.
+
+Idle reservations are bounded: a runner holds at most `request_concurrency` tickets waiting,
+offered or granted, and a claimed grant lasts one request plus a renewal. A reservation that
+ends mid-request — its node lost, or the node's clock ran its lease out — leaves a job that
+arrives meanwhile without one; the hub then queues it under its admission and places it
+within its `place_within_secs` (vk-gitlab asks for 300 seconds), and failing that ends it
+`no_capacity`, which the daemon reports as `runner_system_failure`. That window is the only
+way a job taken from GitLab waits for capacity.
 
 The lease is a duration on the node's monotonic clock from its acceptance; no wall-clock time
 crosses the wire. The daemon counts it from when it sent its request, so it always believes the
@@ -175,18 +208,32 @@ secrets.
 **Session.** Besides the client API, `vk-gitlab run` holds a session with the hub at
 `/v1/gitlab/session`, as a node does, redialing it when lost: it reports its version, host,
 system ID, `concurrent`, its GitLab server's URL and the SHA-256 of its certificate's public
-key, and each runner's name, GitLab runner ID, placement, `limit` and whether GitLab took its
-token; every heartbeat, each runner's job requests outstanding, jobs held and last GitLab
+key, and each runner's name, GitLab runner ID, placement, `limit`, `request_concurrency` and
+whether GitLab took its token; every heartbeat, each runner's job requests outstanding and jobs
+held, with the admission of each (`request_admissions`, `job_admissions`), and its last GitLab
 answer; and each runner's state (`polling`, `waiting_capacity`, `server_pending`,
-`unhealthy`, `token_refused`). The hub answers with its status of the server. A runner asks
-GitLab for jobs only while that status is `approved`: not before the first status, nor while
-the server is pending, rejected or the relay `rebound`, nor once the hub refused the relay for
-good. Jobs it already holds run either way.
+`unhealthy`, `token_refused`). A change to requests, jobs or states is sent at once, within
+250 ms, besides the periodic heartbeat. The hub answers with its status of the server. A runner
+asks GitLab for jobs only while that status is `approved`: not before the first status, nor
+while the server is pending, rejected or the relay `rebound`, nor once the hub refused the
+relay for good. Jobs it already holds run either way.
+
+The session is at protocol version 2, which adds `request_concurrency` and the admission
+lists; the hub speaks 1 and 2, vk-gitlab 2 only. The hub takes new work only from a relay whose
+session is at version 2: a version-1 relay keeps its session, and replays its submissions,
+follows, cancels and settles the jobs it holds, but its capacity and reservation requests and
+its new jobs are refused 403 `forbidden`. A hub that speaks only version 1 refuses a relay's
+session for its version: the relay logs that the hub must be upgraded, asks GitLab for no
+jobs, and dials again every minute or so. Upgrade the hub first, then the relays.
 
 | Request | Body | Answer |
 |---|---|---|
 | `POST /v1/capacity` | `CapacityRequest` | 200 `Capacity` |
-| `POST /v1/reservations` | `ReservationRequest` | 201 `ReservationGrant` |
+| `POST /v1/reservations` | `ReservationRequest` | 201 `ReservationGrant`, or 202 `ReservationTicket` when queued |
+| `GET /v1/reservations/tickets/<ticket>?wait=<secs>` | — | 201 `ReservationGrant`, or 202 `ReservationTicket` while queued |
+| `DELETE /v1/reservations/tickets/<ticket>` | — | 204 |
+| `POST /v1/reservations/<id>/claim` | — | 204 |
+| `POST /v1/reservations/<admission>/outcome` | `OutcomeRequest` | 204 |
 | `POST /v1/reservations/<id>/renew` | `RenewRequest` | 200 `ReservationGrant` |
 | `DELETE /v1/reservations/<id>` | — | 204 |
 | `POST /v1/jobs` | `JobSubmission` | 201 `JobView` |
@@ -196,28 +243,55 @@ good. Jobs it already holds run either way.
 | `POST /v1/jobs/<id>/settle` | — | 204 |
 | `POST /v1/clients` | `ClientHello` | 204 (API keys of other clients; a relay is refused) |
 
-**Long polls.** `wait` on the two `GET`s, and `wait_secs` in a capacity request, hold a
-request for at most 60 seconds: a capacity answer until its `revision` passes `after`, a job
-view until its `revision` passes `after`, an output read until there are bytes past `offset`
-or the output is complete. A long poll that times out answers as a plain request would.
+**Long polls.** `wait` on the `GET`s, and `wait_secs` in a capacity request, hold a request for
+at most 60 seconds: a ticket until it is granted, a capacity answer until its `revision` passes
+`after`, a job view until its `revision` passes `after`, an output read until there are bytes
+past `offset` or the output is complete. A long poll that times out answers as a plain request
+would.
 
-**Capacity.** `{placement, after, wait_secs}` → `{revision, fits}`. `fits` counts envelopes,
-not nodes: a node with room for two counts two.
+**Capacity.** `{runner, placement, after, wait_secs}` → `{revision, fits}`. `fits` counts
+envelopes, not nodes: a node with room for two counts two. Advisory — the hub's count, from
+heartbeats less the reservations and starting jobs they do not show yet, of how many envelopes
+of the placement its ready nodes could take, each node at most what its cap leaves past the
+reservations and jobs it holds — and no longer asked by vk-gitlab, which queues instead.
 
-**Reservations.** `{request_id, placement, lease_secs, wait_secs}` → `{reservation, node,
-envelope, lease_secs}`. The hub filters the pool's nodes on labels, readiness and headroom, and
-offers the envelope to one at a time, least loaded first ([Placement](#placement)), until one
-accepts or `wait_secs` runs out (503 `no_capacity`). `renew` extends a lease from now and
-answers the lease the node granted; a reservation that lapsed, was released or whose node was
-lost answers 410 `reservation_gone`. `DELETE` releases it, and answers 204 for one already gone.
+**Reservations.** `{runner, queue, request_id, placement, lease_secs, wait_secs}` →
+`{admission, reservation, node, envelope, lease_secs}`. The request joins the hub's
+[queue](#admission-and-reservations), whose offers filter the pool's nodes on labels, readiness
+and headroom. With `queue`, the hub answers 201 with a grant if one is ready at once, else 202
+`{ticket}`; without, it waits up to `wait_secs` (at least 5 seconds) for a grant, then answers
+503 `no_capacity`. A relay names its runner. A runner may have `request_concurrency` tickets
+waiting, offered or granted, a principal 256 unended, the hub 4096; past them, and while a
+relay's session is not connected, the hub answers 503 `unavailable`. A grant's `admission` is
+what its outcome reports on and its job's submission names.
 
-**Jobs.** `{request_id, placement, reservation, place_within_secs, spec}` → `JobView`. The hub
-starts the job on the reservation's node — unless a lightly loaded node holds the job's
-built image ([placement](#placement)), when it releases the reservation and starts the job
-there; with no reservation, or one that is gone, it places the job as it places a reservation,
-for up to `place_within_secs`. A node that refuses the start leaves the job free to place
-again; a start the node may have taken is never placed twice — see [failures](#failures). The
-spec is at most 512 KiB serialized (413 `too_large`).
+`GET` on a ticket answers 202 while it waits and 201 with the grant, its `lease_secs` what is
+left of the lease, once a node accepted; 410 `reservation_gone` for a ticket that ended —
+cancelled, unpolled, refused, or granted and not claimed in time — or that the hub does not
+know. `DELETE` cancels it, releasing an offered or granted reservation; it answers 204 for a
+ticket the hub does not know, and 409 once claimed. Both answer 404 for another principal's.
+
+`claim` takes a grant for a GitLab request: 204, again for one already claimed; 410 for no such
+grant, or once its reservation or lease is gone. `outcome` takes `{admission, outcome}`,
+`outcome` one of `job`, `empty`, `error`, `released`: 204, again for the same outcome; 400 for a
+body naming another admission than the path; 404 for an admission the hub does not know or of
+another principal; 409 for an outcome the admission's state does not allow — anything but
+`released` before the claim, `error` or `released` after its job, another once it ended.
+
+`renew` extends a lease from now and answers the lease the node granted; a reservation that
+lapsed, was released or whose node was lost answers 410 `reservation_gone`. `DELETE` releases
+it, and answers 204 for one already gone.
+
+**Jobs.** `{runner, admission, request_id, placement, reservation, place_within_secs, spec}` →
+`JobView`. A job under an admission must match its runner, tenant, placement and reservation
+(403 `forbidden`), and an admission takes one job (409 `conflict`); a job on a queued
+reservation must name its admission. A new job refused with a 4xx ends its admission as
+`empty`. The hub starts the job on the reservation's node — unless a lightly loaded node holds
+the job's built image ([placement](#placement)), when it releases the reservation and starts
+the job there; with no reservation, or one that is gone, it places the job as it places a
+reservation, for up to `place_within_secs`. A node that refuses the start leaves the job free
+to place again; a start the node may have taken is never placed twice — see
+[failures](#failures). The spec is at most 512 KiB serialized (413 `too_large`).
 
 `JobView` is `{id, revision, state, node, stage, output_len, cancel, result}`: `state` is
 `queued`, `starting`, `running` or `finished`, and `result` is present once finished, with the
@@ -240,25 +314,27 @@ keeps its record.
 **Idempotency and retries.** `request_id` — 16 random bytes, hex — makes a create
 idempotent for a day: the same ID with the same body answers the first answer again, or 410
 `not_found` once the hub has dropped that job from its history; with another body, 409
-`conflict`. Renew, release, cancel and settle are idempotent by nature.
+`conflict`. A queued request retried answers its ticket, or the ticket's grant. Renew,
+release, claim, cancel and settle are idempotent by nature, as are a ticket's cancel and an
+outcome repeated.
 The daemon retries transport errors and every retryable code with backoff from 1 to 30
 seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|
-| 400 | `invalid` | unparseable body, malformed ID, a job without a project | no |
+| 400 | `invalid` | unparseable body, malformed ID, a job without a project, an outcome naming another admission than its path | no |
 | 401 | `unauthorized` | no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
-| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job | no |
+| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job; a relay below protocol 2 asking for new work; a runner or project its tenant does not allow; a job that does not match its admission | no |
 | 403 | `approval_pending` | a job of a project, or of a server, an operator has yet to approve on the hub | no: the job fails |
 | 403 | `project_rejected` | a job of a project, or of a server, an operator rejected | no: the job fails |
-| 404 | `not_found` | no such job or reservation of this relay's | no |
-| 409 | `conflict` | `request_id` reused with another body | no |
-| 410 | `reservation_gone` | lapsed, released, or its node lost | reserve again |
+| 404 | `not_found` | no such job, reservation, grant or admission of this relay's; another principal's ticket | no |
+| 409 | `conflict` | `request_id` reused with another body; an outcome the admission's state does not allow; an admission already used by a job; a claimed ticket cancelled | no |
+| 410 | `reservation_gone` | lapsed, released, or its node lost; a ticket that ended or the hub does not know | reserve again |
 | 410 | `not_found` | a create retried after its job left the hub's history | no |
 | 413 | `too_large` | spec over 512 KiB | no |
 | 500 | `internal` | — | yes |
 | 503 | `no_capacity` | no node accepted in time | yes, after `retry_after_secs` |
-| 503 | `unavailable` | hub busy or starting | yes, after `retry_after_secs` |
+| 503 | `unavailable` | hub busy or starting; the reservation queue full; the relay's session not connected; an admission being updated | yes, after `retry_after_secs` |
 
 An error body is `{error, code, retry_after_secs?}`; a code the client does not know reads as
 `other`.

@@ -91,9 +91,10 @@ shares (`vk-peer`: hello, challenge, auth bound to the TLS connection), then sen
 - **inventory**, on connect and when it changes: version, hostname, `system_id`, `concurrent`;
   the GitLab server: its URL, the SHA-256 of its TLS certificate's public key (what the operator
   checks when approving it), and its version when known (a runner token cannot ask GitLab for
-  it, so usually absent); per runner its name, GitLab runner ID, placement, `limit`, whether
-  `verify` passed. Never a token;
-- **heartbeat**: per runner, job requests outstanding, jobs held, last GitLab answer;
+  it, so usually absent); per runner its name, GitLab runner ID, placement, `limit`,
+  `request_concurrency` (version 2), whether `verify` passed. Never a token;
+- **heartbeat**: per runner, job requests outstanding, jobs held, the admission of each
+  (`request_admissions`, `job_admissions`; version 2), last GitLab answer;
 - **report**: each runner's state (`polling`, `waiting_capacity`, `server_pending`,
   `unhealthy`, `token_refused`).
 
@@ -214,11 +215,17 @@ file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
 
 `vk_hub_proto::gitlab`: enrollment at `/v1/gitlab/enroll` (its own table of pinned keys and a
 token of kind `gitlab`, so no other peer's token enrolls a relay), the session at
-`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`, `PROTOCOL` 1. The crate's rules hold: a
-released version is frozen; within it only optional fields are added; a new message or variant
-takes a new version; enums read from the wire (runner states, server status) carry an
-`#[serde(other)]` fallback. The client API keeps `/v1/` and gains the signature headers and the
-`approval_pending` and `project_rejected` codes, which an older client reads as `other`.
+`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`. The hub speaks `PROTOCOL` 1 to 2, a relay
+`RELAY_PROTOCOL` 2 only. Version 2 adds each runner's `request_concurrency` to the inventory and
+`request_admissions` and `job_admissions` to its heartbeat load; the hub takes new work only
+from a relay at version 2, and serves a version-1 relay only to settle the jobs it holds:
+replayed submissions, output, cancel and settle. A hub at version 1 refuses a version-2 relay,
+which takes no jobs and redials until the hub is upgraded, so the hub is upgraded first. The
+crate's rules hold: a released version is frozen; within it only optional fields are added; a
+new message or variant takes a new version; enums read from the wire (runner states, server
+status) carry an `#[serde(other)]` fallback. The client API keeps `/v1/` and gains the
+signature headers and the `approval_pending` and `project_rejected` codes, which an older
+client reads as `other`.
 
 ## Implementation order
 

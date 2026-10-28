@@ -305,6 +305,8 @@ impl PatchTraceResult {
 #[derive(Debug)]
 pub struct JobRequestResult {
     pub job: Option<Box<crate::job::Job>>,
+    /// GitLab answered 204: it had no job for the runner, as opposed to a request that failed.
+    pub empty: bool,
     /// False when the request says the runner itself is broken (403, unusable URL); repeated
     /// failures mark the runner unhealthy and slow its polling down.
     pub healthy: bool,

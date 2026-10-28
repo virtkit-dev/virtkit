@@ -612,10 +612,11 @@ GitLab ◀──runner API──▶ vk-gitlab ──client API──▶ vk-hub �
 | node | admission, the stages, masking, the clone, caches, dependency downloads, artifact uploads | the job's spec, its tokens and secrets, while it runs |
 
 **Admission.** GitLab cannot take a job back from a runner, so `vk-gitlab` holds capacity
-before it asks for a job, never after. It polls GitLab for a runner only while the hub reports
-room for the runner's placement; before each job request it holds a reservation on a node, its
-lease covering the request; and it submits the job it gets on that reservation, where the node
-sizes it by its own rules. Idle capacity is one reservation per outstanding job request. A job
+before it asks for a job, never after. Each job request waits in the hub's queue until the hub
+grants it a reservation on a node, arbitrating queued requests and jobs fleet-wide; the relay
+claims the grant, asks GitLab with its lease covering the request, reports the outcome, and
+submits the job it gets on that reservation, where the node sizes it by its own rules. Idle
+runners ask GitLab a bounded number at a time and back off when they find no job. A job
 arriving after its reservation ended — the node lost, or its lease out — is placed afresh,
 within a bound, and otherwise fails as `runner_system_failure`.
 

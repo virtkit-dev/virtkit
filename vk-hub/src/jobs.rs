@@ -53,7 +53,8 @@ use hyper::StatusCode;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use vk_hub_proto::client::{
-    CancelMode, Capacity, ErrorCode, JobState, JobView, Placement, ReservationGrant,
+    AdmissionOutcome, CancelMode, Capacity, ErrorCode, JobState, JobView, Placement,
+    ReservationGrant,
 };
 use vk_hub_proto::dispatch::{Activity, GuestSize};
 use vk_hub_proto::dispatch::{
@@ -64,10 +65,13 @@ use vk_hub_proto::egress::{EgressReport, HubEgress};
 use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 
-use crate::client::ApiError;
+use crate::client::{ApiError, ResolvedIdentity};
 use crate::server::{Hub, Reach};
 use crate::store::{ApiPrincipal, JobFilter, JobOutcome, JobPage, JobRow, NodeRow};
 use crate::ui::html::Style;
+
+mod scheduler;
+use scheduler::{ScheduleCtx, admission_node, schedule_tickets};
 
 /// How long a node may be unreachable while it holds a job before the job is lost, by
 /// default.
@@ -80,6 +84,10 @@ const OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const OFFER_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub fn offer_timeout() -> Duration {
+    OFFER_TIMEOUT
+}
+
 /// How long a renew waits for the node's answer.
 const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -89,9 +97,6 @@ const LINK_QUEUE: usize = 1024;
 
 /// How long before a node that refused a job's start is asked to take it again.
 const RETRY_PAUSE: Duration = Duration::from_secs(2);
-
-/// What a client is told to wait after no node accepted.
-const NO_CAPACITY_RETRY_SECS: u32 = 5;
 
 /// The most envelopes counted on one node, however small the envelope.
 const MAX_FITS: u64 = 1024;
@@ -211,7 +216,27 @@ pub struct Dispatch {
 struct State {
     /// The version-3 sessions, by node.
     links: HashMap<String, Link>,
+    /// Reservations offered or held, by ID.
     reservations: HashMap<String, Resv>,
+    /// Reservation requests arbitrated, by ticket ID, which is also their admission's.
+    tickets: HashMap<String, Ticket>,
+    /// Admission rows to remove (`None`) or advance, written by the next pass of [`step`].
+    admission_changes: Vec<(String, Option<AdmissionOutcome>)>,
+    /// Admissions whose row is being written: arbitration leaves their tickets alone.
+    pending_admissions: HashSet<String>,
+    /// Jobs whose stored admission pruning retired, expired or dropped from the history, with
+    /// their principal and admission: their tickets end once no write of the admission is
+    /// pending ([`retire_finished_jobs`]).
+    retired_jobs: HashMap<String, (String, Option<String>)>,
+    /// What each mapped relay runner's admissions came to lately, by GitLab instance and
+    /// runner ID: whether its next request probes for work or waits out a backoff.
+    demand: HashMap<(String, u64), Demand>,
+    /// When each tenant was last given a probe, so tenants take turns.
+    tenant_probe: HashMap<String, Instant>,
+    /// Probes whose offer was abandoned unanswered, by reservation: the runner probed and
+    /// since when. They count against the probe budget until the node answers, or for
+    /// [`scheduler::ABANDONED_PROBE_GRACE`].
+    abandoned_probes: HashMap<String, ((String, u64), Instant)>,
     /// Jobs not finished.
     jobs: HashMap<String, LiveJob>,
     /// Jobs ended here whose final row the database may not hold yet: a reader is served
@@ -240,6 +265,157 @@ struct State {
     warm: HashMap<String, HashMap<String, u64>>,
 }
 
+#[derive(Default)]
+struct Demand {
+    busy_until: Option<Instant>,
+    backoff_until: Option<Instant>,
+    empty_count: u32,
+    error_count: u32,
+    last_probe: Option<Instant>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct ArbitrationView {
+    pub waiting: usize,
+    pub wait_secs: Option<u64>,
+    pub offers: usize,
+    pub holds: usize,
+    pub jobs: usize,
+    pub demand: &'static str,
+    pub backoff_secs: Option<u64>,
+    pub reason: Option<&'static str>,
+}
+
+#[cfg(test)]
+pub fn arbitration_snapshot(hub: &Hub) -> Result<HashMap<(String, u64), ArbitrationView>> {
+    let state = hub.dispatch.lock();
+    let now = Instant::now();
+    let mut views: HashMap<(String, u64), ArbitrationView> = HashMap::new();
+    for ticket in state.tickets.values() {
+        let Some(key) = ticket
+            .identity
+            .gitlab
+            .clone()
+            .zip(ticket.identity.runner_id)
+        else {
+            continue;
+        };
+        let demand = state.demand.get(&key);
+        let view = views.entry(key).or_default();
+        view.backoff_secs = demand
+            .and_then(|d| d.backoff_until)
+            .filter(|at| *at > now)
+            .map(|at| at.duration_since(now).as_secs().saturating_add(1));
+        view.demand = if view.backoff_secs.is_some() {
+            if demand.is_some_and(|d| d.error_count > 0) {
+                "unhealthy"
+            } else {
+                "recently empty"
+            }
+        } else if demand.and_then(|d| d.busy_until).is_some_and(|at| at > now) {
+            "recently busy"
+        } else {
+            "unknown"
+        };
+        match ticket.phase {
+            TicketPhase::Waiting => {
+                view.waiting += 1;
+                view.wait_secs = Some(
+                    view.wait_secs
+                        .unwrap_or(0)
+                        .max(now.duration_since(ticket.created).as_secs()),
+                );
+                view.reason = ticket.blocked.or(Some("waiting for scheduling"));
+            }
+            TicketPhase::Offering { .. } => view.offers += 1,
+            TicketPhase::Granted { .. } | TicketPhase::Claimed { .. } => view.holds += 1,
+            TicketPhase::Job => view.jobs += 1,
+            TicketPhase::Finished(_) => {}
+        }
+    }
+    for job in state.jobs.values() {
+        if job
+            .row
+            .admission
+            .as_ref()
+            .is_some_and(|id| state.tickets.contains_key(id))
+        {
+            continue;
+        }
+        if let Some(identity) = &job.row.scheduling
+            && let Some(key) = identity.gitlab.clone().zip(identity.runner_id)
+        {
+            views.entry(key).or_default().jobs += 1;
+        }
+    }
+    Ok(views)
+}
+
+/// The tenant charged for a job recorded without a scheduling identity, by a hub from before
+/// capacity arbitration: the first tenant, by name, listing its project. A project several
+/// tenants list is charged once.
+fn legacy_tenant<'p>(policy: &'p crate::policy::Policy, row: &JobRow) -> Option<&'p str> {
+    let (gitlab, project) = (row.gitlab.as_ref()?, row.project_id?);
+    policy
+        .tenants
+        .iter()
+        .find(|(_, tenant)| {
+            tenant
+                .projects
+                .iter()
+                .any(|p| p.gitlab == *gitlab && p.id == project)
+        })
+        .map(|(name, _)| name.as_str())
+}
+
+const MAX_TICKETS: usize = 4096;
+const MAX_RETAINED_TICKETS: usize = 2 * MAX_TICKETS;
+const MAX_PRINCIPAL_TICKETS: usize = 256;
+const TICKET_IDLE: Duration = Duration::from_secs(2 * vk_hub_proto::client::MAX_WAIT_SECS as u64);
+
+#[derive(Clone)]
+struct Ticket {
+    key: String,
+    instance: Option<String>,
+    queued: bool,
+    request_id: String,
+    digest: String,
+    identity: ResolvedIdentity,
+    placement: Placement,
+    lease_secs: u32,
+    created: Instant,
+    polled: Instant,
+    phase: TicketPhase,
+    probe: bool,
+    reservation: Option<String>,
+    session: Option<u64>,
+    /// When it was claimed in [`Ticket::session`]: a heartbeat of that session received well
+    /// after that must list it.
+    claimed_at: Option<Instant>,
+    tried: HashSet<String>,
+    round_ended: Option<Instant>,
+    blocked: Option<&'static str>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TicketPhase {
+    Waiting,
+    Offering {
+        reservation: String,
+        since: Instant,
+    },
+    Granted {
+        reservation: String,
+        accepted: Instant,
+    },
+    Claimed {
+        reservation: String,
+    },
+    Job,
+    Finished(AdmissionOutcome),
+}
+
 /// A node's version-3 session.
 struct Link {
     session: u64,
@@ -260,6 +436,8 @@ struct Resv {
     accepted_at: u64,
     /// Bumped at each lease the node reports, for a renew waiting on its answer.
     leases: u64,
+    /// The ticket it was offered for, whose phase follows the node's answers.
+    ticket: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +463,9 @@ struct LiveJob {
     tried: HashSet<String>,
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
+    /// Why arbitration last passed it over while nodes may have had room for it: a limit of
+    /// its relay or runner. Told when it ends at its deadline.
+    blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
     /// When the node accepted the reservation it was sent on, as [`Resv::accepted_at`]: until
@@ -338,6 +519,13 @@ type Event = (Option<String>, String, String);
 const HUB: &str = "hub";
 
 impl Dispatch {
+    /// Swap a node's live session under the dispatch lock, so a pass never sees half a
+    /// change.
+    pub(crate) fn with_session_change<T>(&self, change: impl FnOnce() -> T) -> T {
+        let _state = self.lock();
+        change()
+    }
+
     /// Dispatch keeping output in `output_dir`, or none at all, and the records of the newest
     /// `history` jobs, [`DEFAULT_JOB_HISTORY`](crate::store::DEFAULT_JOB_HISTORY) for `None`.
     pub fn new(output_dir: Option<PathBuf>, lost_after: Duration, history: Option<usize>) -> Self {
@@ -802,6 +990,9 @@ pub async fn close_link(hub: &Hub, node: &str, session: u64) {
 fn end_reservations(state: &mut State, node: &str) -> usize {
     let before = state.reservations.len();
     state.reservations.retain(|_, r| r.node != node);
+    state
+        .abandoned_probes
+        .retain(|id, _| state.reservations.contains_key(id));
     before.saturating_sub(state.reservations.len())
 }
 
@@ -987,7 +1178,12 @@ fn on_offer_reply(hub: &Hub, node: &str, id: &str, reply: OfferReply) -> Vec<Hub
             OfferReply::Refused { .. } => Vec::new(),
         };
     };
-    match (&r.phase, reply) {
+    let accepted = matches!(
+        (&r.phase, &reply),
+        (ResvPhase::Offered, OfferReply::Accepted { .. })
+    );
+    let ticket = r.ticket.clone();
+    let result = match (&r.phase, reply) {
         (ResvPhase::Offered, OfferReply::Accepted { lease_secs }) => {
             r.phase = ResvPhase::Held {
                 lease_secs: lease_secs.min(MAX_LEASE_SECS),
@@ -1001,6 +1197,7 @@ fn on_offer_reply(hub: &Hub, node: &str, id: &str, reply: OfferReply) -> Vec<Hub
         }
         (ResvPhase::Abandoned, reply) => {
             state.reservations.remove(id);
+            state.abandoned_probes.remove(id);
             match reply {
                 OfferReply::Accepted { .. } => release(),
                 OfferReply::Refused { .. } => Vec::new(),
@@ -1008,7 +1205,18 @@ fn on_offer_reply(hub: &Hub, node: &str, id: &str, reply: OfferReply) -> Vec<Hub
         }
         // A second answer to one offer changes nothing.
         _ => Vec::new(),
+    };
+    if accepted
+        && let Some(ticket) = ticket.and_then(|t| state.tickets.get_mut(&t))
+        && let TicketPhase::Offering { reservation, since } = &ticket.phase
+        && reservation == id
+    {
+        ticket.phase = TicketPhase::Granted {
+            reservation: id.to_owned(),
+            accepted: *since,
+        };
     }
+    result
 }
 
 /// Keep why `node` refused its latest offer, logged when that changes: a reservation waiting
@@ -1053,10 +1261,21 @@ async fn on_lease(hub: &Hub, node: &str, id: &str, lease: LeaseState) -> Result<
                     };
                 }
                 r.leases = r.leases.wrapping_add(1);
+                let ticket = r.ticket.clone();
+                if let Some(ticket) = ticket.and_then(|t| state.tickets.get_mut(&t))
+                    && let TicketPhase::Granted {
+                        reservation,
+                        accepted,
+                    } = &mut ticket.phase
+                    && reservation == id
+                {
+                    *accepted = Instant::now();
+                }
                 return Ok(Vec::new());
             }
             LeaseState::Gone { why } => {
                 let r = state.reservations.remove(id);
+                state.abandoned_probes.remove(id);
                 r.map(|r| (r.key, why))
             }
         }
@@ -1922,133 +2141,781 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Reserve `placement`'s envelope on a node for `principal`, for `lease_secs`, offering it to
-/// one node after another for up to `wait`.
-pub async fn reserve(
+pub struct QueueRequest<'a> {
+    pub request_id: &'a str,
+    pub digest: &'a str,
+    pub identity: ResolvedIdentity,
+    pub placement: Placement,
+    pub lease_secs: u32,
+    pub queued: bool,
+}
+
+/// Make room for a new ticket without evicting a live admission or pending write.
+fn evict_finished(state: &mut State, limit: usize) -> bool {
+    while state.tickets.len() >= limit {
+        if state.admission_changes.len() >= MAX_RETAINED_TICKETS {
+            return false;
+        }
+        let oldest = state
+            .tickets
+            .iter()
+            .filter(|(id, ticket)| {
+                matches!(ticket.phase, TicketPhase::Finished(_))
+                    && !state.pending_admissions.contains(*id)
+            })
+            .min_by_key(|(id, ticket)| (ticket.polled, *id))
+            .map(|(id, _)| id.clone());
+        let Some(id) = oldest else { return false };
+        state.tickets.remove(&id);
+        state.admission_changes.push((id, None));
+    }
+    true
+}
+
+pub fn queue_reservation(
     hub: &Hub,
     principal: &ApiPrincipal,
-    placement: &Placement,
-    lease_secs: u32,
-    wait: Duration,
-) -> Result<ReservationGrant, ApiError> {
+    ask: QueueRequest<'_>,
+) -> Result<String, ApiError> {
+    let QueueRequest {
+        request_id,
+        digest,
+        identity,
+        placement,
+        lease_secs,
+        queued,
+    } = ask;
     hub.dispatch.output_dir()?;
-    let started = Instant::now();
-    let deadline = started + wait;
-    // Each offer waits at most until then: the first gets its full time, and none outlasts
-    // the request's wait by more.
-    let offers_until = deadline.max(started + OFFER_TIMEOUT);
-    let lease_secs = lease_secs.clamp(1, MAX_LEASE_SECS);
-    let mut tried = HashSet::new();
-    let mut offered = false;
-    loop {
-        let mut changed = hub.dispatch.subscribe();
-        let mut node_changed = hub.subscribe();
-        let nodes = blocking(hub, |db| db.nodes()).await?;
-        // Ranked once a round: after a refusal or a timeout, the next offer follows this order.
-        let found = {
-            let state = hub.dispatch.lock();
-            candidates(hub, &state, &nodes, placement, &tried)
+    let session = if principal.is_relay() {
+        Some(hub.current_session(&principal.id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                "relay session is not connected",
+            )
+        })?)
+    } else {
+        None
+    };
+    let id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
+    let mut state = hub.dispatch.lock();
+    if session.is_some_and(|session| !hub.is_current(&principal.id, session)) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "relay session changed",
+        ));
+    }
+    if let Some((id, ticket)) = state
+        .tickets
+        .iter()
+        .find(|(_, t)| t.key == principal.id && t.request_id == request_id)
+    {
+        return if ticket.digest == digest {
+            Ok(id.clone())
+        } else {
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::Conflict,
+                "request ID already used",
+            ))
         };
-        for (node, _) in found {
-            if offered && Instant::now() >= deadline {
-                return Err(no_capacity());
-            }
-            tried.insert(node.clone());
-            let id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
-            {
-                let mut state = hub.dispatch.lock();
-                state.reservations.insert(
-                    id.clone(),
-                    Resv {
-                        key: principal.id.clone(),
-                        instance: principal.instance.clone(),
-                        node: node.clone(),
-                        envelope: placement.envelope,
-                        phase: ResvPhase::Offered,
-                        accepted_at: 0,
-                        leases: 0,
-                    },
-                );
-                let offer = HubJobMsg::Offer {
-                    reservation: id.clone(),
-                    envelope: placement.envelope,
-                    lease_secs,
-                };
-                if !send(&state, &node, offer) {
-                    state.reservations.remove(&id);
-                    continue;
-                }
-            }
-            offered = true;
-            match offer_answer(hub, &id, offers_until).await {
-                Some(lease_secs) => {
-                    return Ok(ReservationGrant {
-                        admission: None,
-                        reservation: id,
-                        node,
-                        envelope: placement.envelope,
-                        lease_secs,
-                    });
-                }
-                None => continue,
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(no_capacity());
-        }
-        // Every node with room was asked: after a pause, and a change, ask them all again.
-        tokio::time::sleep_until(deadline.min(Instant::now() + RETRY_PAUSE)).await;
-        tokio::select! {
-            _ = changed.changed() => {}
-            _ = node_changed.changed() => {}
-            () = tokio::time::sleep_until(deadline) => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(no_capacity());
-        }
-        tried.clear();
     }
+    let waiting = state
+        .tickets
+        .values()
+        .filter(|t| {
+            t.key == principal.id
+                && t.identity.runner == identity.runner
+                && matches!(
+                    t.phase,
+                    TicketPhase::Waiting
+                        | TicketPhase::Offering { .. }
+                        | TicketPhase::Granted { .. }
+                )
+        })
+        .count();
+    let active = state
+        .tickets
+        .values()
+        .filter(|t| !matches!(t.phase, TicketPhase::Finished(_)));
+    let principal_active = active.clone().filter(|t| t.key == principal.id).count();
+    let runner_limit = usize::try_from(identity.request_concurrency)
+        .unwrap_or(usize::MAX)
+        .min(MAX_PRINCIPAL_TICKETS);
+    if active.count() >= MAX_TICKETS
+        || principal_active >= MAX_PRINCIPAL_TICKETS
+        || waiting >= runner_limit
+        || !evict_finished(&mut state, MAX_RETAINED_TICKETS)
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "reservation queue is full",
+        )
+        .retry_after(1));
+    }
+    let now = Instant::now();
+    state.tickets.insert(
+        id.clone(),
+        Ticket {
+            key: principal.id.clone(),
+            instance: principal.instance.clone(),
+            queued,
+            request_id: request_id.to_owned(),
+            digest: digest.to_owned(),
+            identity,
+            placement,
+            lease_secs: lease_secs.clamp(1, MAX_LEASE_SECS),
+            created: now,
+            polled: now,
+            phase: TicketPhase::Waiting,
+            probe: false,
+            reservation: None,
+            session,
+            claimed_at: None,
+            tried: HashSet::new(),
+            round_ended: None,
+            blocked: None,
+        },
+    );
+    drop(state);
+    hub.dispatch.bump();
+    Ok(id)
 }
 
-fn no_capacity() -> ApiError {
-    ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        ErrorCode::NoCapacity,
-        "no node accepted the reservation in time",
-    )
-    .retry_after(NO_CAPACITY_RETRY_SECS)
+pub fn poll_ticket(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    id: &str,
+) -> Result<Option<ReservationGrant>, ApiError> {
+    let mut state = hub.dispatch.lock();
+    let ticket = state.tickets.get_mut(id).ok_or_else(|| gone(id))?;
+    if ticket.key != principal.id {
+        return Err(not_found("no such ticket"));
+    }
+    if matches!(
+        ticket.phase,
+        TicketPhase::Waiting | TicketPhase::Offering { .. } | TicketPhase::Granted { .. }
+    ) {
+        ticket.polled = Instant::now();
+    }
+    let queued = ticket.queued;
+    let (reservation, accepted) = match &ticket.phase {
+        TicketPhase::Waiting | TicketPhase::Offering { .. } => return Ok(None),
+        TicketPhase::Granted {
+            reservation,
+            accepted,
+        } => (reservation.clone(), *accepted),
+        _ => return Err(gone(id)),
+    };
+    let r = state
+        .reservations
+        .get(&reservation)
+        .ok_or_else(|| gone(&reservation))?;
+    let ResvPhase::Held { lease_secs } = r.phase else {
+        return Err(gone(&reservation));
+    };
+    let elapsed = u32::try_from(accepted.elapsed().as_secs())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let remaining = lease_secs.saturating_sub(elapsed);
+    if remaining == 0 {
+        return Err(gone(&reservation));
+    }
+    Ok(Some(ReservationGrant {
+        reservation,
+        node: r.node.clone(),
+        envelope: r.envelope,
+        lease_secs: if queued { remaining } else { lease_secs },
+        admission: Some(id.to_owned()),
+    }))
 }
 
-/// Wait for the node's answer to offer `id`, for [`OFFER_TIMEOUT`] and not past `until`: the
-/// lease it granted, or `None` when it refused, went away or took too long — an offer then
-/// abandoned, released if accepted later.
-async fn offer_answer(hub: &Hub, id: &str, until: Instant) -> Option<u32> {
-    let deadline = (Instant::now() + OFFER_TIMEOUT).min(until);
-    loop {
-        let mut changed = hub.dispatch.subscribe();
+pub fn cancel_ticket(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(), ApiError> {
+    let mut state = hub.dispatch.lock();
+    if state.pending_admissions.contains(id) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "admission is being updated",
+        )
+        .retry_after(1));
+    }
+    let Some(ticket) = state.tickets.get_mut(id) else {
+        return Ok(());
+    };
+    if ticket.key != principal.id {
+        return Err(not_found("no such ticket"));
+    }
+    let reservation = match &ticket.phase {
+        TicketPhase::Offering { reservation, .. } | TicketPhase::Granted { reservation, .. } => {
+            Some(reservation.clone())
+        }
+        TicketPhase::Claimed { .. } | TicketPhase::Job => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::Conflict,
+                "admission has already been claimed",
+            ));
+        }
+        _ => None,
+    };
+    let probe = ticket
+        .probe
+        .then(|| {
+            ticket
+                .identity
+                .gitlab
+                .clone()
+                .zip(ticket.identity.runner_id)
+        })
+        .flatten();
+    let retain = ticket.queued;
+    ticket.phase = TicketPhase::Finished(AdmissionOutcome::Released);
+    ticket.probe = false;
+    if !retain {
+        state.tickets.remove(id);
+    }
+    if let Some(id) = reservation {
+        discard_ticket_reservation(&mut state, &id, probe);
+    }
+    drop(state);
+    hub.dispatch.bump();
+    Ok(())
+}
+
+fn discard_ticket_reservation(state: &mut State, id: &str, probe: Option<(String, u64)>) {
+    let Some(reservation) = state.reservations.get_mut(id) else {
+        return;
+    };
+    let node = reservation.node.clone();
+    if matches!(reservation.phase, ResvPhase::Offered) {
+        reservation.phase = ResvPhase::Abandoned;
+        if let Some(probe) = probe {
+            state
+                .abandoned_probes
+                .insert(id.to_owned(), (probe, Instant::now()));
+        }
+    } else {
+        state.reservations.remove(id);
+    }
+    send(
+        state,
+        &node,
+        HubJobMsg::Release {
+            reservation: id.to_owned(),
+        },
+    );
+}
+
+/// End a relay's outstanding offers when its session ends. Claimed admissions remain
+/// charged until the relay reports their outcome or reconciles on reconnect.
+pub fn relay_disconnected(hub: &Hub, relay: &str, session: u64) {
+    let mut state = hub.dispatch.lock();
+    let mut reservations = Vec::new();
+    for ticket in state.tickets.values_mut() {
+        if ticket.key != relay || ticket.session != Some(session) {
+            continue;
+        }
+        match &ticket.phase {
+            TicketPhase::Waiting => {
+                ticket.phase = TicketPhase::Finished(AdmissionOutcome::Released)
+            }
+            TicketPhase::Offering { reservation, .. }
+            | TicketPhase::Granted { reservation, .. } => {
+                let probe = ticket
+                    .probe
+                    .then(|| {
+                        ticket
+                            .identity
+                            .gitlab
+                            .clone()
+                            .zip(ticket.identity.runner_id)
+                    })
+                    .flatten();
+                reservations.push((reservation.clone(), probe));
+                ticket.phase = TicketPhase::Finished(AdmissionOutcome::Released);
+                ticket.probe = false;
+            }
+            TicketPhase::Claimed { reservation } => reservations.push((reservation.clone(), None)),
+            _ => {}
+        }
+    }
+    for (id, probe) in reservations {
+        discard_ticket_reservation(&mut state, &id, probe);
+    }
+    drop(state);
+    hub.dispatch.bump();
+}
+
+pub async fn claim(
+    hub: &Arc<Hub>,
+    principal: &ApiPrincipal,
+    reservation: &str,
+) -> Result<(), ApiError> {
+    let (hub, principal, reservation) = (hub.clone(), principal.clone(), reservation.to_owned());
+    tokio::task::spawn_blocking(move || claim_blocking(&hub, &principal, &reservation))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
+}
+
+fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Result<(), ApiError> {
+    let mut state = hub.dispatch.lock();
+    if state.tickets.values().any(|t| {
+        t.key == principal.id
+            && matches!(&t.phase, TicketPhase::Claimed { reservation: r } if r == reservation)
+    }) {
+        return Ok(());
+    }
+    let live = state
+        .reservations
+        .get(reservation)
+        .is_some_and(|r| r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. }));
+    let lease_deadline = state.tickets.values().find_map(|t| {
+        if t.key != principal.id {
+            return None;
+        }
+        let TicketPhase::Granted {
+            reservation: r,
+            accepted,
+        } = &t.phase
+        else {
+            return None;
+        };
+        if r != reservation {
+            return None;
+        }
+        let held = state.reservations.get(r)?;
+        let ResvPhase::Held { lease_secs } = held.phase else {
+            return None;
+        };
+        Some(*accepted + Duration::from_secs(u64::from(lease_secs.saturating_sub(1))))
+    });
+    if !live || lease_deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+        return Err(gone(reservation));
+    }
+    let (id, ticket) = state
+        .tickets
+        .iter_mut()
+        .find(|(_, t)| {
+            t.key == principal.id
+                && match &t.phase {
+                    TicketPhase::Granted { reservation: r, .. }
+                    | TicketPhase::Claimed { reservation: r } => r == reservation,
+                    _ => false,
+                }
+        })
+        .ok_or_else(|| not_found("no such grant"))?;
+    let id = id.clone();
+    let stored = crate::store::StoredAdmission {
+        principal: ticket.key.clone(),
+        identity: crate::store::SchedulingIdentity {
+            tenant: ticket.identity.tenant.clone(),
+            class: ticket.identity.class,
+            gitlab: ticket.identity.gitlab.clone(),
+            runner_id: ticket.identity.runner_id,
+        },
+        runner: ticket.identity.runner.clone(),
+        placement: ticket.placement.clone(),
+        probe: ticket.probe,
+        reservation: reservation.to_owned(),
+        outcome: None,
+    };
+    if !state.pending_admissions.insert(id.clone()) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "admission is being updated",
+        )
+        .retry_after(1));
+    }
+    drop(state);
+    let persisted = hub.db.put_admission(&id, &stored);
+    let mut state = hub.dispatch.lock();
+    if let Err(error) = persisted {
+        state.pending_admissions.remove(&id);
+        return Err(error.into());
+    }
+    let valid = lease_deadline.is_some_and(|deadline| Instant::now() < deadline)
+        && state
+            .reservations
+            .get(reservation)
+            .is_some_and(|r| r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. }))
+        && state.tickets.get(&id).is_some_and(
+            |t| matches!(&t.phase, TicketPhase::Granted { reservation: r, .. } if r == reservation),
+        );
+    if !valid {
+        let probe = state.tickets.get_mut(&id).and_then(|ticket| {
+            let probe = ticket
+                .probe
+                .then(|| {
+                    ticket
+                        .identity
+                        .gitlab
+                        .clone()
+                        .zip(ticket.identity.runner_id)
+                })
+                .flatten();
+            ticket.phase = TicketPhase::Finished(AdmissionOutcome::Released);
+            ticket.probe = false;
+            probe
+        });
+        discard_ticket_reservation(&mut state, reservation, probe);
+        drop(state);
+        let removed = hub.db.remove_admission(&id);
+        let mut state = hub.dispatch.lock();
+        state.pending_admissions.remove(&id);
+        if let Err(error) = removed {
+            eprintln!("vk-hub: removing invalid claim {id}: {error:#}");
+            state.admission_changes.push((id, None));
+        }
+        drop(state);
+        hub.dispatch.bump();
+        return Err(gone(reservation));
+    }
+    state.pending_admissions.remove(&id);
+    // Validated under this lock just above.
+    let Some(ticket) = state.tickets.get_mut(&id) else {
+        return Err(gone(reservation));
+    };
+    ticket.phase = TicketPhase::Claimed {
+        reservation: reservation.to_owned(),
+    };
+    // Claimed in the relay's current session, whose heartbeats must list it from now on.
+    if principal.is_relay() {
+        ticket.session = hub.current_session(&principal.id).or(ticket.session);
+    }
+    ticket.claimed_at = Some(Instant::now());
+    Ok(())
+}
+
+pub fn check_admission(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    admission: Option<&str>,
+    reservation: Option<&str>,
+    identity: &ResolvedIdentity,
+    placement: &Placement,
+) -> Result<(), ApiError> {
+    let state = hub.dispatch.lock();
+    if let Some(id) = admission {
+        let ticket = state
+            .tickets
+            .get(id)
+            .filter(|t| t.key == principal.id)
+            .ok_or_else(|| not_found("no such admission"))?;
+        if !(matches!(ticket.phase, TicketPhase::Claimed { .. } | TicketPhase::Job)
+            || !ticket.queued
+                && matches!(
+                    ticket.phase,
+                    TicketPhase::Granted { .. } | TicketPhase::Finished(_)
+                ))
+            || ticket.identity.tenant != identity.tenant
+            || ticket.identity.class != identity.class
+            || ticket.identity.gitlab != identity.gitlab
+            || ticket.identity.runner_id != identity.runner_id
+            || ticket.placement != *placement
+            || reservation.is_some_and(|r| ticket.reservation.as_deref() != Some(r))
         {
-            let mut state = hub.dispatch.lock();
-            match state.reservations.get(id).map(|r| r.phase.clone()) {
-                None => return None,
-                Some(ResvPhase::Held { lease_secs }) => return Some(lease_secs),
-                Some(ResvPhase::Refused(_)) | Some(ResvPhase::Abandoned) => {
-                    state.reservations.remove(id);
-                    return None;
-                }
-                Some(ResvPhase::Offered) if Instant::now() >= deadline => {
-                    if let Some(r) = state.reservations.get_mut(id) {
-                        r.phase = ResvPhase::Abandoned;
-                    }
-                    return None;
-                }
-                Some(ResvPhase::Offered) => {}
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::Forbidden,
+                "job does not match its admission",
+            ));
+        }
+    } else if reservation.is_some_and(|r| {
+        state
+            .tickets
+            .values()
+            .any(|t| t.queued && t.reservation.as_deref() == Some(r))
+    }) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "queued reservation requires its admission",
+        ));
+    }
+    Ok(())
+}
+
+pub fn admission_identity(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    id: &str,
+) -> Result<ResolvedIdentity, ApiError> {
+    let state = hub.dispatch.lock();
+    let ticket = state
+        .tickets
+        .get(id)
+        .filter(|t| {
+            t.key == principal.id
+                && (matches!(t.phase, TicketPhase::Claimed { .. } | TicketPhase::Job)
+                    || !t.queued
+                        && matches!(
+                            t.phase,
+                            TicketPhase::Granted { .. } | TicketPhase::Finished(_)
+                        ))
+        })
+        .ok_or_else(|| not_found("no such admission"))?;
+    Ok(ticket.identity.clone())
+}
+
+pub fn unqueued_admission(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    reservation: Option<&str>,
+) -> Option<String> {
+    let state = hub.dispatch.lock();
+    let reservation = reservation?;
+    state
+        .tickets
+        .iter()
+        .find(|(_, t)| {
+            !t.queued && t.key == principal.id && t.reservation.as_deref() == Some(reservation)
+        })
+        .map(|(id, _)| id.clone())
+}
+
+pub async fn admission_took_job(
+    hub: &Arc<Hub>,
+    principal: &ApiPrincipal,
+    id: &str,
+) -> Result<(), ApiError> {
+    let (hub, principal, id) = (hub.clone(), principal.clone(), id.to_owned());
+    tokio::task::spawn_blocking(move || admission_took_job_blocking(&hub, &principal, &id))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
+}
+
+fn admission_took_job_blocking(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    id: &str,
+) -> Result<(), ApiError> {
+    let mut state = hub.dispatch.lock();
+    let ticket = state.tickets.get(id).filter(|t| t.key == principal.id);
+    let Some(ticket) = ticket else {
+        return Ok(());
+    };
+    let previous = ticket.phase.clone();
+    let eligible = matches!(
+        ticket.phase,
+        TicketPhase::Granted { .. } | TicketPhase::Claimed { .. }
+    ) || !ticket.queued && matches!(ticket.phase, TicketPhase::Finished(_));
+    if !eligible {
+        return Ok(());
+    }
+    if !state.pending_admissions.insert(id.to_owned()) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "admission is being updated",
+        )
+        .retry_after(1));
+    }
+    drop(state);
+    let result = hub.db.update_admission_outcome(id, AdmissionOutcome::Job);
+    let mut state = hub.dispatch.lock();
+    let stored = match result {
+        Ok(stored) => stored,
+        Err(error) => {
+            state.pending_admissions.remove(id);
+            return Err(error.into());
+        }
+    };
+    let unchanged = state
+        .tickets
+        .get(id)
+        .is_some_and(|t| t.key == principal.id && t.phase == previous)
+        && match &previous {
+            TicketPhase::Granted { reservation, .. } => {
+                state.reservations.get(reservation).is_some_and(|r| {
+                    r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. })
+                })
+            }
+            _ => true,
+        };
+    if !unchanged {
+        drop(state);
+        let restored = match stored {
+            Some(stored) => hub.db.restore_admission_if_present(id, &stored),
+            None => Ok(()),
+        };
+        let mut state = hub.dispatch.lock();
+        state.pending_admissions.remove(id);
+        restored?;
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "admission changed while saving",
+        ));
+    }
+    state.pending_admissions.remove(id);
+    // Found unchanged under this lock just above.
+    let Some(ticket) = state.tickets.get_mut(id) else {
+        return Err(not_found("no such admission"));
+    };
+    ticket.phase = TicketPhase::Job;
+    ticket.probe = false;
+    drop(state);
+    hub.dispatch.bump();
+    Ok(())
+}
+
+pub async fn outcome(
+    hub: &Arc<Hub>,
+    principal: &ApiPrincipal,
+    id: &str,
+    outcome: AdmissionOutcome,
+) -> Result<(), ApiError> {
+    let (hub, principal, id) = (hub.clone(), principal.clone(), id.to_owned());
+    tokio::task::spawn_blocking(move || outcome_blocking(&hub, &principal, &id, outcome))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
+}
+
+fn outcome_blocking(
+    hub: &Hub,
+    principal: &ApiPrincipal,
+    id: &str,
+    outcome: AdmissionOutcome,
+) -> Result<(), ApiError> {
+    let policy = hub.db.capacity_policy()?;
+    let mut state = hub.dispatch.lock();
+    let ticket = state
+        .tickets
+        .get_mut(id)
+        .filter(|t| t.key == principal.id)
+        .ok_or_else(|| not_found("no such admission"))?;
+    let permitted = matches!(ticket.phase, TicketPhase::Claimed { .. })
+        || matches!(ticket.phase, TicketPhase::Granted { .. })
+            && outcome == AdmissionOutcome::Released
+        || matches!(ticket.phase, TicketPhase::Job)
+            && matches!(outcome, AdmissionOutcome::Job | AdmissionOutcome::Empty)
+        || matches!(ticket.phase, TicketPhase::Finished(previous) if previous == outcome);
+    if !permitted {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "admission outcome conflicts with its state",
+        ));
+    }
+    if !state.pending_admissions.insert(id.to_owned()) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "admission is being updated",
+        )
+        .retry_after(1));
+    }
+    drop(state);
+    let result = hub.db.update_admission_outcome(id, outcome);
+    let mut state = hub.dispatch.lock();
+    state.pending_admissions.remove(id);
+    result?;
+    let ticket = state
+        .tickets
+        .get_mut(id)
+        .filter(|t| t.key == principal.id)
+        .ok_or_else(|| not_found("no such admission"))?;
+    let release = (outcome != AdmissionOutcome::Job)
+        .then(|| ticket.reservation.clone())
+        .flatten();
+    match &ticket.phase {
+        TicketPhase::Claimed { .. } => {
+            ticket.phase = if outcome == AdmissionOutcome::Job {
+                TicketPhase::Job
+            } else {
+                TicketPhase::Finished(outcome)
             }
         }
-        tokio::select! {
-            _ = changed.changed() => {}
-            () = tokio::time::sleep_until(deadline) => {}
+        TicketPhase::Granted { .. } if outcome == AdmissionOutcome::Released => {
+            ticket.phase = TicketPhase::Finished(outcome);
+        }
+        TicketPhase::Job if outcome == AdmissionOutcome::Job => return Ok(()),
+        TicketPhase::Job if outcome == AdmissionOutcome::Empty => {
+            ticket.phase = TicketPhase::Finished(outcome)
+        }
+        TicketPhase::Finished(previous) if *previous == outcome => return Ok(()),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::Conflict,
+                "admission outcome conflicts with its state",
+            ));
         }
     }
+    let runner = ticket
+        .identity
+        .gitlab
+        .clone()
+        .zip(ticket.identity.runner_id);
+    ticket.probe = false;
+    if let Some(runner) = runner {
+        let demand = state.demand.entry(runner).or_default();
+        let now = Instant::now();
+        match outcome {
+            AdmissionOutcome::Job => {
+                demand.empty_count = 0;
+                demand.error_count = 0;
+                demand.backoff_until = None;
+                demand.busy_until = Some(now + Duration::from_secs(policy.busy_secs));
+            }
+            AdmissionOutcome::Empty | AdmissionOutcome::Error => {
+                demand.busy_until = None;
+                let count = match outcome {
+                    AdmissionOutcome::Empty => {
+                        demand.empty_count = demand.empty_count.saturating_add(1);
+                        demand.error_count = 0;
+                        demand.empty_count
+                    }
+                    AdmissionOutcome::Error => {
+                        demand.error_count = demand.error_count.saturating_add(1);
+                        demand.error_count
+                    }
+                    _ => 0,
+                };
+                // Admission IDs are random. Use all of their low 64 bits so the range
+                // remains spread even when the exponential backoff reaches its cap.
+                let sample = id
+                    .get(id.len().saturating_sub(16)..)
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(0);
+                let delay = backoff_delay(
+                    policy.backoff_initial_secs,
+                    policy.backoff_max_secs,
+                    count,
+                    sample,
+                );
+                demand.backoff_until = Some(now + delay);
+            }
+            AdmissionOutcome::Released => {}
+        }
+    }
+    if let Some(id) = release
+        && let Some(r) = state.reservations.remove(&id)
+    {
+        send(&state, &r.node, HubJobMsg::Release { reservation: id });
+    }
+    drop(state);
+    hub.dispatch.bump();
+    Ok(())
+}
+
+/// The backoff after the `count`th empty or failed request in a row: `initial_secs` doubled
+/// for each after the first, at most `max_secs`, then spread ±25% by `sample` without passing
+/// `max_secs`.
+fn backoff_delay(initial_secs: u64, max_secs: u64, count: u32, sample: u64) -> Duration {
+    let factor = 1u64 << count.saturating_sub(1).min(31);
+    let base = initial_secs.saturating_mul(factor).min(max_secs);
+    let base_ms = base.saturating_mul(1000);
+    let low = base_ms.saturating_sub(base_ms / 4);
+    let high = base_ms
+        .saturating_add(base_ms / 4)
+        .min(max_secs.saturating_mul(1000))
+        .max(low);
+    Duration::from_millis(low + sample % (high - low + 1))
 }
 
 fn gone(id: &str) -> ApiError {
@@ -2104,11 +2971,11 @@ pub async fn renew(
                         return Err(gone(id));
                     };
                     return Ok(ReservationGrant {
-                        admission: None,
                         reservation: id.to_string(),
                         node,
                         envelope,
                         lease_secs,
+                        admission: None,
                     });
                 }
                 Some(_) if Instant::now() >= deadline => {
@@ -2188,6 +3055,7 @@ pub fn admit(
             deadline: Instant::now() + place_within,
             tried: HashSet::new(),
             round_ended: None,
+            blocked: None,
             output_cap: limit.saturating_add(OUTPUT_SLACK).min(MAX_OUTPUT),
             reservation_accepted_at: 0,
             image_key,
@@ -2409,14 +3277,53 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
     .map_err(|e| ApiError::from(anyhow!(e)))??;
     row.settled_at = Some(crate::now_secs());
     row.revision = row.revision.saturating_add(1);
+    let admission = row.admission.clone();
     // Unaudited: a producer settles every job it ran.
     persist(hub, id, row, Vec::new()).await?;
+    if let Some(id) = admission
+        && let Some(ticket) = hub.dispatch.lock().tickets.get_mut(&id)
+        && matches!(ticket.phase, TicketPhase::Job)
+    {
+        ticket.phase = TicketPhase::Finished(AdmissionOutcome::Job);
+    }
     hub.dispatch.bump();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
 // The placement loop.
+
+/// Keep every live admission and only as many finished outcomes as fit. The store's
+/// admission rows have no completion timestamp, so its stable ID order picks the survivors.
+fn limit_recovered_admissions(
+    admissions: &mut Vec<(String, crate::store::StoredAdmission)>,
+    limit: usize,
+) -> Vec<(String, Option<AdmissionOutcome>)> {
+    let live = admissions
+        .iter()
+        .filter(|(_, row)| matches!(row.outcome, None | Some(AdmissionOutcome::Job)))
+        .count();
+    if live > MAX_TICKETS {
+        eprintln!(
+            "vk-hub: {live} claimed or job admissions recovered, past the {MAX_TICKETS} \
+             tickets the hub holds; new reservations are refused until they end"
+        );
+    }
+    let mut room = limit.saturating_sub(live);
+    let mut removed = Vec::new();
+    admissions.retain(|(id, row)| {
+        if matches!(row.outcome, None | Some(AdmissionOutcome::Job)) {
+            true
+        } else if room > 0 {
+            room -= 1;
+            true
+        } else {
+            removed.push((id.clone(), None));
+            false
+        }
+    });
+    removed
+}
 
 /// Pick the hub's jobs back up after a restart: a job no node had accepted ends lost; one
 /// running carries on, its output as stored. Output no job may read again goes.
@@ -2426,6 +3333,57 @@ pub async fn recover(hub: &Hub) -> Result<()> {
     };
     let swept = dir.clone();
     blocking(hub, move |db| sweep_outputs(db, &swept)).await?;
+    let mut admissions = blocking(hub, |db| db.admissions()).await?;
+    let removed = limit_recovered_admissions(&mut admissions, MAX_RETAINED_TICKETS);
+    if !removed.is_empty() {
+        blocking(hub, move |db| db.reconcile_admissions(&removed)).await?;
+    }
+    {
+        let mut state = hub.dispatch.lock();
+        let now = Instant::now();
+        for (id, admission) in admissions {
+            let phase = match admission.outcome {
+                None => TicketPhase::Claimed {
+                    reservation: admission.reservation.clone(),
+                },
+                Some(AdmissionOutcome::Job) => TicketPhase::Job,
+                Some(outcome) => TicketPhase::Finished(outcome),
+            };
+            let identity = ResolvedIdentity {
+                tenant: admission.identity.tenant,
+                class: admission.identity.class,
+                gitlab: admission.identity.gitlab,
+                runner_id: admission.identity.runner_id,
+                runner: admission.runner,
+                concurrent: 0,
+                limit: None,
+                request_concurrency: 0,
+            };
+            state.tickets.insert(
+                id.clone(),
+                Ticket {
+                    key: admission.principal,
+                    instance: None,
+                    queued: true,
+                    request_id: format!("recovered/{id}"),
+                    digest: String::new(),
+                    identity,
+                    placement: admission.placement,
+                    lease_secs: 0,
+                    created: now,
+                    polled: now,
+                    phase,
+                    probe: admission.probe && admission.outcome.is_none(),
+                    reservation: Some(admission.reservation),
+                    session: None,
+                    claimed_at: None,
+                    tried: HashSet::new(),
+                    round_ended: None,
+                    blocked: None,
+                },
+            );
+        }
+    }
     let rows = blocking(hub, |db| db.unfinished_jobs()).await?;
     for (id, mut row) in rows {
         row.output_len = stored_len(&dir, &id);
@@ -2442,6 +3400,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     deadline: Instant::now(),
                     tried: HashSet::new(),
                     round_ended: None,
+                    blocked: None,
                     // Its spec, and its limit, are gone: what it has stored, and the default
                     // limit's worth past it.
                     output_cap: limit.saturating_add(DEFAULT_OUTPUT_LIMIT).min(MAX_OUTPUT),
@@ -2466,6 +3425,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 deadline: Instant::now(),
                 tried: HashSet::new(),
                 round_ended: None,
+                blocked: None,
                 output_cap: 0,
                 reservation_accepted_at: 0,
                 image_key: None,
@@ -2751,6 +3711,14 @@ async fn prune(hub: &Hub) -> bool {
             return false;
         }
     };
+    {
+        let mut state = hub.dispatch.lock();
+        for (job, principal, admission) in pruned.retired {
+            state.retired_jobs.insert(job, (principal, admission));
+        }
+        retire_finished_jobs(&mut state);
+    }
+    hub.dispatch.bump();
     // `outputs` lists only jobs that held output; settled jobs are excluded.
     hub.jobs_changed();
     if let Some(dir) = hub.dispatch.output_dir.clone() {
@@ -2768,28 +3736,72 @@ async fn prune(hub: &Hub) -> bool {
     pruned.more
 }
 
+/// A pending admission write finishes before its retired ticket is removed from accounting.
+fn retire_finished_jobs(state: &mut State) {
+    let mut done = Vec::new();
+    for (job, (principal, admission)) in &state.retired_jobs {
+        if state.jobs.contains_key(job)
+            || admission
+                .as_ref()
+                .is_some_and(|id| state.pending_admissions.contains(id))
+        {
+            continue;
+        }
+        if let Some(id) = admission
+            && let Some(ticket) = state.tickets.get_mut(id)
+            && ticket.key == *principal
+            && matches!(ticket.phase, TicketPhase::Job)
+        {
+            ticket.phase = TicketPhase::Finished(AdmissionOutcome::Job);
+            ticket.probe = false;
+        }
+        done.push(job.clone());
+    }
+    for job in done {
+        state.retired_jobs.remove(&job);
+    }
+}
+
 /// One pass of [`drive`].
 async fn step(hub: &Hub) -> Result<()> {
     let queued = {
         let state = hub.dispatch.lock();
-        state.jobs.values().any(|j| j.row.state == JobState::Queued)
+        state.jobs.values().any(|j| j.row.state == JobState::Queued) || !state.tickets.is_empty()
     };
-    let (nodes, mint, rules) = if queued {
+    // Before the relay rows: a receipt is then never of a later heartbeat than a row holds.
+    let heartbeats = hub.heartbeat_receipts();
+    let (nodes, mint, rules, policy, relays) = if queued {
         let keys = hub.token_keys.clone();
         blocking(hub, move |db| {
             let rules = match db.egress_rules_on() {
                 true => Some(db.egress_rules()?),
                 false => None,
             };
-            Ok((db.nodes()?, crate::tokens::MintCtx::read(db, &keys)?, rules))
+            Ok((
+                db.nodes()?,
+                crate::tokens::MintCtx::read(db, &keys)?,
+                rules,
+                db.capacity_policy()?,
+                db.relays_with_status()?,
+            ))
         })
         .await?
     } else {
-        (Vec::new(), crate::tokens::MintCtx::default(), None)
+        (
+            Vec::new(),
+            crate::tokens::MintCtx::default(),
+            None,
+            crate::policy::Policy::default(),
+            Vec::new(),
+        )
     };
     let mut writes = Vec::new();
+    let schedule_result;
+    let mut moved = false;
+    let admission_changes;
     {
         let mut state = hub.dispatch.lock();
+        retire_finished_jobs(&mut state);
         let now = Instant::now();
         // Nodes lost while they hold a job.
         let held: HashSet<String> = state
@@ -2826,7 +3838,7 @@ async fn step(hub: &Hub) -> Result<()> {
                 }
             }
         }
-        // Queued jobs: placed, or ended past their deadline.
+        // Canceled jobs do not enter arbitration.
         let mut ids: Vec<(Instant, String)> = state
             .jobs
             .iter()
@@ -2834,46 +3846,76 @@ async fn step(hub: &Hub) -> Result<()> {
             .map(|(id, j)| (j.deadline, id.clone()))
             .collect();
         ids.sort();
-        for (deadline, id) in ids {
+        for (_, id) in &ids {
             // Canceled while its start was out, then refused or never taken: it ran nowhere.
-            let canceled = state.jobs.get(&id).is_some_and(|j| j.row.cancel.is_some());
-            if canceled {
-                if let Some(w) = finish(&mut state, &id, Some(FailureClass::Canceled), None) {
-                    writes.push((id, w.0, w.1));
-                }
-                continue;
+            let canceled = state.jobs.get(id).is_some_and(|j| j.row.cancel.is_some());
+            if canceled && let Some(w) = finish(&mut state, id, Some(FailureClass::Canceled), None)
+            {
+                writes.push((id.clone(), w.0, w.1));
             }
-            // Placed if it can be, even at its deadline: a window of 0 takes a node now.
-            let ctx = PlaceCtx {
+        }
+        let ctx = ScheduleCtx {
+            place: PlaceCtx {
                 nodes: &nodes,
                 mint: &mint,
                 rules: rules.as_ref(),
-            };
-            if let Some(w) = place(hub, &mut state, &ctx, &id, now) {
-                writes.push(w);
+                policy: &policy,
+            },
+            policy: &policy,
+            relays: &relays,
+            heartbeats: &heartbeats,
+        };
+        // With nothing queued when the pass began, nothing was read to arbitrate with: a
+        // ticket queued since is the next pass's, which its queueing wakes.
+        schedule_result = if queued {
+            schedule_tickets(hub, &mut state, &ctx, &mut writes, now).map(|m| moved = m)
+        } else {
+            Ok(())
+        };
+        // Attempt placement at the deadline before ending the job.
+        for (deadline, id) in ids {
+            let Some(job) = state
+                .jobs
+                .get(&id)
+                .filter(|j| now >= deadline && j.row.state == JobState::Queued)
+            else {
                 continue;
-            }
-            if now >= deadline {
-                let message = "no node took it within its placement window".to_string();
-                if let Some(w) = finish(
-                    &mut state,
-                    &id,
-                    Some(FailureClass::NoCapacity),
-                    Some(message),
-                ) {
-                    writes.push((id, w.0, w.1));
-                }
+            };
+            // Why arbitration last passed it over, when that was not the nodes' room.
+            let message = match job.blocked {
+                Some(why) => format!("no node took it within its placement window ({why})"),
+                None => "no node took it within its placement window".to_string(),
+            };
+            if let Some(w) = finish(
+                &mut state,
+                &id,
+                Some(FailureClass::NoCapacity),
+                Some(message),
+            ) {
+                writes.push((id, w.0, w.1));
             }
         }
+        admission_changes = state.admission_changes.clone();
     }
-    let changed = !writes.is_empty();
+    if !admission_changes.is_empty() {
+        let changes = admission_changes.clone();
+        if let Err(error) = blocking(hub, move |db| db.reconcile_admissions(&changes)).await {
+            eprintln!("vk-hub: reconciling admissions: {error:#}");
+        } else {
+            hub.dispatch
+                .lock()
+                .admission_changes
+                .drain(..admission_changes.len());
+        }
+    }
+    let changed = moved || !writes.is_empty();
     for (id, row, events) in writes {
         persist_logged(hub, &id, row, events).await;
     }
     if changed {
         hub.dispatch.bump();
     }
-    Ok(())
+    schedule_result
 }
 
 /// What [`place`] reads of the database, once per pass of [`step`].
@@ -2882,6 +3924,8 @@ struct PlaceCtx<'a> {
     mint: &'a crate::tokens::MintCtx,
     /// The egress rules and their generation, with `[jobs] egress_rules` on.
     rules: Option<&'a (u64, Vec<crate::store::EgressRuleRow>)>,
+    /// The capacity policy, for the node a job's admission may take ([`admission_node`]).
+    policy: &'a crate::policy::Policy,
 }
 
 /// The hub's egress layer for job `job` from `rules`, the claims of its spec under the GitLab
@@ -2915,6 +3959,15 @@ pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
     !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
+/// Nodes `job` may not go to under `policy`. None yet: the policy places no job by node.
+fn placement_exclusions(
+    _policy: &crate::policy::Policy,
+    _job: &LiveJob,
+    _nodes: &[(String, NodeRow)],
+) -> HashSet<String> {
+    HashSet::new()
+}
+
 /// Send queued job `id` to its reservation's node while the reservation holds, else the
 /// least loaded candidate that has not refused it ([`candidates`]). Prefer a lightly loaded
 /// candidate holding its image unless the reservation's node also holds it ([`warm_nodes`]).
@@ -2926,8 +3979,14 @@ fn place(
     ctx: &PlaceCtx<'_>,
     id: &str,
     now: Instant,
+    selected: Option<&str>,
 ) -> Option<(String, JobRow, Vec<Event>)> {
-    let PlaceCtx { nodes, mint, rules } = *ctx;
+    let PlaceCtx {
+        nodes,
+        mint,
+        rules,
+        policy,
+    } = *ctx;
     let job = state.jobs.get(id)?;
     let spec = job.spec.clone()?;
     let egress = match rules.map(|r| egress_for(job, &spec, r)) {
@@ -2942,7 +4001,15 @@ fn place(
     };
     let mint_key = job.mint_key.clone();
     let placement = job.row.placement.clone();
+    let key = job.row.key.clone();
+    let class = job
+        .row
+        .scheduling
+        .as_ref()
+        .map_or(crate::policy::Class::Normal, |i| i.class);
     let mut tried = job.tried.clone();
+    let excluded = placement_exclusions(policy, job, nodes);
+    tried.extend(excluded.iter().cloned());
     let affinity = hub.dispatch.affinity;
     let clock = crate::now_secs();
     let warm = match &job.image_key {
@@ -2960,20 +4027,34 @@ fn place(
         let x = state.reservations.get(r)?;
         let ok = matches!(x.phase, ResvPhase::Held { .. })
             && state.links.get(&x.node).is_some_and(|l| l.held)
+            && !excluded.contains(&x.node)
             && (nodes.iter()).any(|(n, row)| *n == x.node && enforces_rules(hub, row));
         ok.then(|| (r.clone(), x.node.clone(), x.envelope, x.accepted_at))
     });
-    // A reservation on a node without the image gives way to a lightly loaded node with it.
-    let given_up = reserved
-        .as_ref()
-        .filter(|(_, node, _, _)| {
-            if warm.contains(node) || warm.is_empty() {
-                return false;
+    let mut given_up = None;
+    let mut selected = selected.map(str::to_owned);
+    if let Some((reservation, node, _, _)) = &reserved
+        && !warm.is_empty()
+        && !warm.contains(node)
+    {
+        let found = candidates(hub, state, nodes, &placement, &tried);
+        let every = candidates(hub, state, nodes, &placement, &HashSet::new());
+        let light = preferred_among(state, &found);
+        for (candidate, _) in warm_first(found.clone(), &light) {
+            if !light.contains(&candidate) {
+                break;
             }
-            let found = candidates(hub, state, nodes, &placement, &tried);
-            !preferred_among(state, &found).is_empty()
-        })
-        .map(|(r, _, _, _)| r.clone());
+            let mut skip: HashSet<String> = found.iter().map(|(id, _)| id.clone()).collect();
+            skip.remove(&candidate);
+            if admission_node(policy, (&key, &placement, class), &every, &skip).as_deref()
+                == Some(&candidate)
+            {
+                selected = Some(candidate);
+                given_up = Some(reservation.clone());
+                break;
+            }
+        }
+    }
     let reserved = reserved.filter(|_| given_up.is_none());
     let mut accepted_at = 0;
     let (node, reservation, envelope) = match reserved {
@@ -2992,8 +4073,11 @@ fn place(
                 }
                 job.tried.clear();
                 job.round_ended = None;
-                tried.clear();
+                tried.clone_from(&excluded);
                 found = candidates(hub, state, nodes, &placement, &tried);
+            }
+            if let Some(selected) = &selected {
+                found.retain(|(node, _)| node == selected);
             }
             let light = preferred_among(state, &found);
             let (node, _) = warm_first(found, &light).into_iter().next()?;
@@ -3047,10 +4131,10 @@ fn place(
     });
     job.row.revision = job.row.revision.saturating_add(1);
     let row = job.row.clone();
-    if let Some(r) = given_up
-        && let Some(x) = state.reservations.remove(&r)
+    if let Some(reservation) = given_up
+        && let Some(old) = state.reservations.remove(&reservation)
     {
-        send(state, &x.node, HubJobMsg::Release { reservation: r });
+        send(state, &old.node, HubJobMsg::Release { reservation });
     }
     // Its node is in its record; only a registry token issued is audited.
     Some((id.to_string(), row, events))
@@ -3530,6 +4614,285 @@ pub(crate) fn run_text(ms: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_backoff_doubles_up_to_its_cap_with_a_quarter_of_jitter() {
+        let ms = |count, sample| backoff_delay(1, 60, count, sample).as_millis();
+        // The lowest sample takes the bottom of the range, the range's width minus one its top.
+        for (count, base) in [(0, 1000), (1, 1000), (2, 2000), (3, 4000), (6, 32_000)] {
+            assert_eq!(ms(count, 0), base * 3 / 4, "{count}");
+            let width = u64::try_from(base / 2).unwrap();
+            assert_eq!(ms(count, width), base * 5 / 4, "{count}");
+            assert_eq!(ms(count, width + 1), base * 3 / 4, "{count}");
+        }
+        // Capped at 60 s, the jitter too: 45 to 60 s.
+        for count in [7, 31, 32, u32::MAX] {
+            assert_eq!(ms(count, 0), 45_000, "{count}");
+            assert_eq!(ms(count, 15_000), 60_000, "{count}");
+            assert!(ms(count, u64::MAX) <= 60_000, "{count}");
+        }
+        assert_eq!(backoff_delay(5, 5, 9, 0), Duration::from_millis(3750));
+        assert_eq!(backoff_delay(5, 5, 9, 1250), Duration::from_secs(5));
+    }
+
+    fn ticket(phase: TicketPhase, polled: Instant) -> Ticket {
+        Ticket {
+            key: "key".into(),
+            instance: None,
+            queued: true,
+            request_id: String::new(),
+            digest: String::new(),
+            identity: ResolvedIdentity {
+                tenant: "fallback".into(),
+                class: crate::policy::Class::Normal,
+                gitlab: None,
+                runner_id: None,
+                runner: None,
+                concurrent: 1,
+                limit: None,
+                request_concurrency: 1,
+            },
+            placement: Placement::default(),
+            lease_secs: 60,
+            created: polled,
+            polled,
+            phase,
+            probe: false,
+            reservation: None,
+            session: None,
+            claimed_at: None,
+            tried: HashSet::new(),
+            round_ended: None,
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn retained_limit_evicts_finished_without_extending_it_on_poll() {
+        let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
+        let principal = ApiPrincipal {
+            id: "key".into(),
+            name: "key".into(),
+            instance: None,
+            kind: crate::store::PrincipalKind::Relay,
+        };
+        let old = Instant::now() - Duration::from_secs(10);
+        {
+            let mut state = hub.dispatch.lock();
+            state.tickets.insert(
+                "old".into(),
+                ticket(TicketPhase::Finished(AdmissionOutcome::Empty), old),
+            );
+            state.tickets.insert(
+                "pending".into(),
+                ticket(TicketPhase::Finished(AdmissionOutcome::Empty), old),
+            );
+            state.pending_admissions.insert("pending".into());
+            state
+                .tickets
+                .insert("live".into(), ticket(TicketPhase::Job, old));
+        }
+        assert!(poll_ticket(&hub, &principal, "old").is_err());
+        let mut state = hub.dispatch.lock();
+        assert_eq!(state.tickets["old"].polled, old);
+        assert!(evict_finished(&mut state, 3));
+        assert!(!state.tickets.contains_key("old"));
+        assert!(state.tickets.contains_key("pending"));
+        assert!(state.tickets.contains_key("live"));
+        assert_eq!(state.admission_changes, vec![("old".into(), None)]);
+        assert!(!evict_finished(&mut state, 2));
+    }
+
+    #[test]
+    fn expired_job_waits_for_pending_admission_write_before_releasing_charge() {
+        let mut state = State::default();
+        state
+            .tickets
+            .insert("admission".into(), ticket(TicketPhase::Job, Instant::now()));
+        state.pending_admissions.insert("admission".into());
+        state
+            .retired_jobs
+            .insert("job".into(), ("key".into(), Some("admission".into())));
+        retire_finished_jobs(&mut state);
+        assert!(matches!(state.tickets["admission"].phase, TicketPhase::Job));
+        assert!(state.retired_jobs.contains_key("job"));
+        state.pending_admissions.remove("admission");
+        retire_finished_jobs(&mut state);
+        assert!(matches!(
+            state.tickets["admission"].phase,
+            TicketPhase::Finished(AdmissionOutcome::Job)
+        ));
+        assert!(state.retired_jobs.is_empty());
+    }
+
+    /// A job recorded before capacity arbitration is charged to one tenant listing its
+    /// project, however many do, and to none when none does.
+    #[test]
+    fn a_legacy_job_is_charged_to_one_tenant() {
+        let mut policy = crate::policy::Policy::default();
+        let tenant = |id| crate::policy::Tenant {
+            weight: 1,
+            cap: None,
+            projects: vec![crate::policy::Project {
+                gitlab: "gl".into(),
+                id,
+                production_branches: Vec::new(),
+            }],
+        };
+        policy.tenants.insert("b".into(), tenant(7));
+        policy.tenants.insert("a".into(), tenant(7));
+        let row = |project_id| -> JobRow {
+            serde_json::from_value(serde_json::json!({
+                "key": "k", "key_name": "k", "request_id": "r", "created_at": 0,
+                "revision": 1, "placement": Placement::default(), "state": "running",
+                "gitlab": "gl", "project_id": project_id,
+            }))
+            .unwrap()
+        };
+        assert_eq!(legacy_tenant(&policy, &row(7)), Some("a"));
+        assert_eq!(legacy_tenant(&policy, &row(8)), None);
+    }
+
+    #[test]
+    fn recovery_limits_finished_without_dropping_claims_or_jobs() {
+        let row = crate::store::StoredAdmission {
+            principal: "relay".into(),
+            identity: crate::store::SchedulingIdentity {
+                tenant: "fallback".into(),
+                class: crate::policy::Class::Normal,
+                gitlab: Some("gl".into()),
+                runner_id: Some(1),
+            },
+            runner: Some("runner".into()),
+            placement: Placement::default(),
+            probe: false,
+            reservation: "reservation".into(),
+            outcome: None,
+        };
+        let mut rows: Vec<_> = [
+            ("a", Some(AdmissionOutcome::Empty)),
+            ("b", None),
+            ("c", Some(AdmissionOutcome::Job)),
+            ("d", Some(AdmissionOutcome::Released)),
+        ]
+        .into_iter()
+        .map(|(id, outcome)| {
+            let mut row = row.clone();
+            row.outcome = outcome;
+            (id.to_owned(), row)
+        })
+        .collect();
+        let removed = limit_recovered_admissions(&mut rows, 3);
+        assert_eq!(removed, vec![("d".into(), None)]);
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let db = crate::store::Db::open_memory().unwrap();
+        for (id, row) in &rows {
+            db.put_admission(id, row).unwrap();
+        }
+        let mut dropped = row;
+        dropped.outcome = Some(AdmissionOutcome::Released);
+        db.put_admission("d", &dropped).unwrap();
+        db.reconcile_admissions(&removed).unwrap();
+        assert!(db.admission("d").unwrap().is_none());
+        assert!(db.admission("b").unwrap().is_some());
+        assert!(db.admission("c").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn claim_does_not_hold_dispatch_lock_during_durable_write() {
+        let hub = Arc::new(Hub::new(
+            Arc::new(crate::store::Db::open_memory().unwrap()),
+            None,
+        ));
+        let principal = ApiPrincipal {
+            id: "relay".into(),
+            name: "relay".into(),
+            instance: None,
+            kind: crate::store::PrincipalKind::Relay,
+        };
+        let now = Instant::now();
+        let identity = ResolvedIdentity {
+            tenant: "fallback".into(),
+            class: crate::policy::Class::Normal,
+            gitlab: Some("gl".into()),
+            runner_id: Some(1),
+            runner: Some("runner".into()),
+            concurrent: 1,
+            limit: None,
+            request_concurrency: 1,
+        };
+        {
+            let mut state = hub.dispatch.lock();
+            state.tickets.insert(
+                "ticket".into(),
+                Ticket {
+                    key: principal.id.clone(),
+                    instance: None,
+                    queued: true,
+                    request_id: "request".into(),
+                    digest: String::new(),
+                    identity,
+                    placement: Placement::default(),
+                    lease_secs: 60,
+                    created: now,
+                    polled: now,
+                    phase: TicketPhase::Granted {
+                        reservation: "reservation".into(),
+                        accepted: now,
+                    },
+                    probe: false,
+                    reservation: Some("reservation".into()),
+                    session: Some(1),
+                    claimed_at: None,
+                    tried: HashSet::new(),
+                    round_ended: None,
+                    blocked: None,
+                },
+            );
+            state.reservations.insert(
+                "reservation".into(),
+                Resv {
+                    key: principal.id.clone(),
+                    instance: None,
+                    node: "node".into(),
+                    envelope: Envelope::default(),
+                    phase: ResvPhase::Held { lease_secs: 60 },
+                    accepted_at: 0,
+                    leases: 0,
+                    ticket: Some("ticket".into()),
+                },
+            );
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db = hub.db.clone();
+        let writer = std::thread::spawn(move || db.hold_admission_writer(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        let (worker_hub, worker_principal) = (hub.clone(), principal.clone());
+        let claim =
+            tokio::spawn(async move { claim(&worker_hub, &worker_principal, "reservation").await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !hub.dispatch.lock().pending_admissions.contains("ticket") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Disconnect changes the grant while the write is blocked. The worker must be able
+        // to observe it, retire the ticket and remove the durable claim before replying.
+        relay_disconnected(&hub, "relay", 1);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(claim.await.unwrap().is_err());
+        assert!(hub.db.admission("ticket").unwrap().is_none());
+        assert!(matches!(
+            hub.dispatch.lock().tickets["ticket"].phase,
+            TicketPhase::Finished(_)
+        ));
+    }
+
     /// The lines still open show as the terminal would: continued, then overwritten.
     #[test]
     fn the_lines_still_open_show_as_they_read() {
@@ -3851,6 +5214,7 @@ mod tests {
             deadline: Instant::now(),
             tried: HashSet::new(),
             round_ended: None,
+            blocked: None,
             output_cap: 0,
             reservation_accepted_at: 0,
             image_key: None,
@@ -3915,6 +5279,7 @@ mod tests {
             phase,
             accepted_at: 0,
             leases: 0,
+            ticket: None,
         };
         let held = || ResvPhase::Held { lease_secs: 60 };
         for (id, instance, phase) in [
@@ -4141,6 +5506,35 @@ pub(crate) mod testing {
         hub.dispatch.lock().reservations.len()
     }
 
+    /// Run one pass of the placement loop now, as [`drive`] does on a change.
+    pub async fn step(hub: &Hub) {
+        super::step(hub).await.unwrap();
+    }
+
+    /// Have the ticket offered `reservation` go unpolled past [`TICKET_IDLE`], then run a pass.
+    pub async fn age_ticket_and_step(hub: &Hub, reservation: &str) {
+        {
+            let mut state = hub.dispatch.lock();
+            let ticket = state
+                .tickets
+                .values_mut()
+                .find(|t| t.reservation.as_deref() == Some(reservation))
+                .unwrap();
+            ticket.polled = Instant::now() - TICKET_IDLE - Duration::from_secs(1);
+        }
+        super::step(hub).await.unwrap();
+    }
+
+    /// Have the probe abandoned on `reservation` go unanswered past its grace, then run a pass.
+    pub async fn age_abandoned_and_step(hub: &Hub, reservation: &str) {
+        {
+            let mut state = hub.dispatch.lock();
+            let (_, since) = state.abandoned_probes.get_mut(reservation).unwrap();
+            *since = Instant::now() - scheduler::ABANDONED_PROBE_GRACE;
+        }
+        super::step(hub).await.unwrap();
+    }
+
     /// Whether `node` has a version-3 link that has sent its `held`.
     pub fn linked(hub: &Hub, node: &str) -> bool {
         hub.dispatch.lock().links.get(node).is_some_and(|l| l.held)
@@ -4207,6 +5601,7 @@ pub(crate) mod testing {
                 phase: ResvPhase::Offered,
                 accepted_at: 0,
                 leases: 0,
+                ticket: None,
             },
         );
         hub.dispatch.bump();
@@ -4225,6 +5620,7 @@ pub(crate) mod testing {
                 phase: ResvPhase::Offered,
                 accepted_at: 0,
                 leases: 0,
+                ticket: None,
             },
         );
     }

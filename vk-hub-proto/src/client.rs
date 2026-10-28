@@ -28,6 +28,7 @@
 //! | `POST` [`RESERVATIONS_PATH`] | [`ReservationRequest`] | 201 [`ReservationGrant`], or 202 [`ReservationTicket`] when queued |
 //! | `GET` [`TICKETS_PATH`]`/<ticket>?wait=<secs>` | — | 201 [`ReservationGrant`], or 202 [`ReservationTicket`] while queued |
 //! | `DELETE` [`TICKETS_PATH`]`/<ticket>` | — | 204 |
+//! | `POST` [`RESERVATIONS_PATH`]`/<id>/claim` | — | 204 |
 //! | `POST` [`RESERVATIONS_PATH`]`/<admission>/outcome` | [`OutcomeRequest`] | 204 |
 //! | `POST` [`RESERVATIONS_PATH`]`/<id>/renew` | [`RenewRequest`] | 200 [`ReservationGrant`] |
 //! | `DELETE` [`RESERVATIONS_PATH`]`/<id>` | — | 204 |
@@ -149,9 +150,9 @@ pub struct ReservationRequest {
 /// A reservation a node holds for the client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReservationGrant {
-    /// The admission a queued grant counts against ([`valid_id`](crate::valid_id)): named by
-    /// the job submitted on it, and settled by an [`OutcomeRequest`]. `None` on a grant that
-    /// did not queue, and on a renew's answer.
+    /// The admission a grant counts against ([`valid_id`](crate::valid_id)): named by the
+    /// job submitted on it, and settled by an [`OutcomeRequest`]. `None` on a renew's answer,
+    /// and from a hub that predates admissions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission: Option<String>,
     pub reservation: String,

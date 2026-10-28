@@ -339,6 +339,7 @@ mod tests {
             request_id: "1".repeat(32),
             runner: None,
             reservation: None,
+            admission: None,
             place_within_secs: 1,
             hub_job: None,
             phase: Phase::Committed,

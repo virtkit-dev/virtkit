@@ -35,6 +35,22 @@ const BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_se
 /// A session that lasted this long starts the backoff over.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 
+/// How long a change to the report waits for more to send them in one heartbeat.
+const COALESCE: Duration = Duration::from_millis(250);
+
+/// The hub refused the session for its protocol version: the relay redials at the longest
+/// backoff, for a hub that may be upgraded meanwhile.
+#[derive(Debug)]
+pub struct VersionRefused(pub String);
+
+impl std::fmt::Display for VersionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VersionRefused {}
+
 /// One runner as the relay reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunnerStatus {
@@ -45,6 +61,9 @@ pub struct RunnerStatus {
     /// Job requests to GitLab outstanding, and jobs held.
     pub requests: u32,
     pub jobs: u32,
+    pub request_admissions: Vec<String>,
+    pub job_admissions: Vec<String>,
+    pub pending_job_admissions: Vec<String>,
     /// When GitLab last answered it, and with what status.
     pub last_answer: Option<(u64, u16)>,
 }
@@ -88,6 +107,9 @@ impl Status {
                 message: None,
                 requests: 0,
                 jobs: 0,
+                request_admissions: vec![],
+                job_admissions: vec![],
+                pending_job_admissions: vec![],
                 last_answer: None,
             })
             .collect();
@@ -147,13 +169,16 @@ impl Status {
         self.runners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Change runner `name`'s status with `f`.
+    /// Change runner `name`'s status with `f`. GitLab's last answer alone waits for the next
+    /// periodic heartbeat; any other change is sent at once.
     pub fn runner(&self, name: &str, f: impl FnOnce(&mut RunnerStatus)) {
         let mut runners = self.lock();
         if let Some(r) = runners.iter_mut().find(|r| r.runner.name == name) {
-            let before = (r.runner.clone(), r.state, r.message.clone());
+            let before = r.clone();
             f(r);
-            if before != (r.runner.clone(), r.state, r.message.clone()) {
+            let mut after = r.clone();
+            after.last_answer = before.last_answer;
+            if before != after {
                 self.changed.notify_one();
             }
         }
@@ -208,9 +233,25 @@ impl Status {
                 .map(|r| RunnerLoad {
                     name: r.runner.name.clone(),
                     requests: r.requests,
-                    jobs: r.jobs,
-                    request_admissions: vec![],
-                    job_admissions: vec![],
+                    jobs: r.jobs.saturating_add(
+                        u32::try_from(
+                            r.pending_job_admissions
+                                .iter()
+                                .filter(|id| !r.job_admissions.contains(id))
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX),
+                    ),
+                    request_admissions: r.request_admissions.clone(),
+                    job_admissions: {
+                        let mut ids = r.job_admissions.clone();
+                        for id in &r.pending_job_admissions {
+                            if !ids.contains(id) {
+                                ids.push(id.clone());
+                            }
+                        }
+                        ids
+                    },
                     last_answer_at: r.last_answer.map(|(at, _)| at),
                     last_status: r.last_answer.map(|(_, status)| status),
                 })
@@ -238,6 +279,13 @@ pub async fn hold(relay: Arc<Relay>, status: Arc<Status>) {
                 log::error!(error = format!("{e:#}").as_str(); "The hub refused this relay; no longer taking jobs from GitLab");
                 return;
             }
+            Err(e) if e.is::<VersionRefused>() => {
+                // An older hub, whose jobs would be refused: none taken until it is upgraded.
+                status.set_server(None);
+                log::error!(error = format!("{e:#}").as_str(); "The hub refused this relay's protocol; dialing again later");
+                tokio::time::sleep(vk_peer::jittered(BACKOFF.1)).await;
+                continue;
+            }
             Err(e) => {
                 log::warn!(error = format!("{e:#}").as_str(); "Session with the hub lost; dialing again")
             }
@@ -250,8 +298,17 @@ pub async fn hold(relay: Arc<Relay>, status: Arc<Status>) {
     }
 }
 
-/// A refusal from the hub as an error: [`Permanent`] when its code says so.
+/// A refusal from the hub as an error: [`Permanent`] when its code says so, and
+/// [`VersionRefused`] for a hub that speaks no relay protocol this relay does.
 fn refusal(code: RefusalCode, reason: &str) -> anyhow::Error {
+    if code == RefusalCode::Version {
+        return anyhow::Error::new(VersionRefused(format!(
+            "the hub refused the session: {} — the hub does not speak relay protocol {}: \
+             upgrade vk-hub",
+            vk_hub_proto::display_safe(reason),
+            vk_hub_proto::gitlab::RELAY_PROTOCOL.min
+        )));
+    }
     let mut message = format!(
         "the hub refused the session: {}",
         vk_hub_proto::display_safe(reason)
@@ -281,7 +338,7 @@ async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
     .await
     .map_err(|_| anyhow!("connecting to {hub} timed out"))??;
     let hello = vk_peer::session::Hello {
-        versions: vk_hub_proto::gitlab::PROTOCOL,
+        versions: vk_hub_proto::gitlab::RELAY_PROTOCOL,
         id: &relay.enrollment.relay_id,
         identity: &relay.identity,
         incarnation,
@@ -299,12 +356,20 @@ async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
     send(&mut ws, &RelayMsg::Report(sent_report.clone()), beat).await?;
     let mut heartbeat = tokio::time::interval(beat);
     let mut deadline = tokio::time::Instant::now() + quiet;
+    // When the changes noticed since the last flush go out.
+    let mut flush: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 send(&mut ws, &RelayMsg::Heartbeat(status.heartbeat()), beat).await?;
             }
             () = status.changed.notified() => {
+                // Coalesce bursts of job and runner updates into one heartbeat.
+                flush.get_or_insert_with(|| tokio::time::Instant::now() + COALESCE);
+            }
+            () = tokio::time::sleep_until(flush.unwrap_or(deadline)), if flush.is_some() => {
+                flush = None;
+                send(&mut ws, &RelayMsg::Heartbeat(status.heartbeat()), beat).await?;
                 let inventory = status.inventory();
                 if inventory != sent_inventory {
                     send(&mut ws, &RelayMsg::Inventory(inventory.clone()), beat).await?;
@@ -369,4 +434,82 @@ fn told(status: &Status, server: ServerStatus) {
 
 async fn send(ws: &mut Ws, msg: &RelayMsg, within: Duration) -> Result<()> {
     vk_peer::session::send(ws, msg, within).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status() -> Arc<Status> {
+        let cfg = Config::parse(
+            "[gitlab]\nurl = \"https://gitlab.example.com\"\n\
+             [[runners]]\nname = \"ci\"\ntoken = \"glrt-x\"\n",
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        Status::new(&cfg, "s_test", "host")
+    }
+
+    #[test]
+    fn a_version_refusal_is_retried_and_says_to_upgrade_the_hub() {
+        let e = refusal(RefusalCode::Version, "no common protocol version");
+        assert!(e.is::<VersionRefused>() && !e.is::<Permanent>(), "{e:#}");
+        let message = e.to_string();
+        assert!(
+            message.contains("relay protocol 2") && message.contains("upgrade vk-hub"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gitlabs_last_answer_alone_waits_for_the_periodic_heartbeat() {
+        let status = status();
+        let notified =
+            || tokio::time::timeout(Duration::from_millis(50), status.changed.notified());
+        status.runner("ci", |r| r.last_answer = Some((1, 200)));
+        assert!(
+            notified().await.is_err(),
+            "notified of the last answer alone"
+        );
+        status.runner("ci", |r| {
+            r.last_answer = Some((2, 204));
+            r.request_admissions.push("a".repeat(32));
+        });
+        assert!(
+            notified().await.is_ok(),
+            "not notified of a listed admission"
+        );
+    }
+
+    #[test]
+    fn heartbeat_counts_pending_jobs_once() {
+        let cfg = Config::parse(
+            r#"
+            concurrent = 4
+            [gitlab]
+            url = "https://gitlab.example.com"
+            [[runners]]
+            name = "ci"
+            token = "glrt-x"
+            pool = "ci"
+            envelope = { mem = "1G", cpus = 1, disk = "1G" }
+        "#,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let status = Status::new(&cfg, "s_test", "host");
+        status.runner("ci", |r| {
+            r.requests = 1;
+            r.request_admissions.push("a".repeat(32));
+            r.jobs = 1;
+            r.job_admissions.push("b".repeat(32));
+            r.pending_job_admissions
+                .extend(["b".repeat(32), "c".repeat(32)]);
+        });
+        let heartbeat = status.heartbeat();
+        let runner = &heartbeat.runners[0];
+        assert_eq!(runner.requests as usize, runner.request_admissions.len());
+        assert_eq!(runner.jobs as usize, runner.job_admissions.len());
+        assert_eq!(runner.jobs, 2);
+    }
 }
