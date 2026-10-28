@@ -3677,6 +3677,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         key_name: "gitlab".into(),
         instance: None,
         request_id: format!("{n:032}"),
+        scheduling: None,
+        admission: None,
         placement: Placement {
             pool: "ci".into(),
             labels: vec![],
@@ -4585,6 +4587,8 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         key_name: "gitlab".into(),
         instance: None,
         request_id: format!("{n:032}"),
+        scheduling: None,
+        admission: None,
         placement: Placement {
             pool: "ci".into(),
             labels: vec![],

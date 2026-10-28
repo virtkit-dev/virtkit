@@ -807,6 +807,8 @@ impl Db {
             .context("opening the client instances table")?;
         txn.open_table(jobs::JOBS)
             .context("opening the jobs table")?;
+        txn.open_table(jobs::JOB_BY_ADMISSION)
+            .context("opening the jobs-by-admission table")?;
         txn.open_table(tools::TOOLS)
             .context("opening the tools table")?;
         txn.open_table(jobs::JOB_SPECS)

@@ -23,6 +23,10 @@ use super::{Db, append_audit, decode, encode};
 
 /// Key: job ID. Value: JSON [`JobRow`].
 pub(super) const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
+/// Key: (principal ID, admission ID). Value: job ID.
+/// Reuse by another job returns [`Submitted::AdmissionTaken`].
+pub(super) const JOB_BY_ADMISSION: TableDefinition<(&str, &str), &str> =
+    TableDefinition::new("job_by_admission");
 /// Key: job ID. Value: the job's spec as submitted, redacted, JSON, packed
 /// ([`super::packed`]).
 pub(super) const JOB_SPECS: TableDefinition<&str, &[u8]> = TableDefinition::new("job_specs");
@@ -90,6 +94,19 @@ const REQUEST_SWEEP_SECS: u64 = 600;
 /// The stage a node prepares a job's executor in, as gitlab-runner names it.
 pub const PREPARE_STAGE: &str = "prepare_executor";
 
+/// The policy identity recorded when work is admitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulingIdentity {
+    /// The capacity tenant charged.
+    pub tenant: String,
+    /// The class it was admitted in.
+    pub class: crate::policy::Class,
+    /// The GitLab server and runner ID of the runner it was admitted for; an API-key client
+    /// has neither.
+    pub gitlab: Option<String>,
+    pub runner_id: Option<u64>,
+}
+
 /// A job the hub has taken.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRow {
@@ -101,6 +118,14 @@ pub struct JobRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     pub request_id: String,
+    /// The identity it was admitted under, charged by capacity arbitration; `None` for a job
+    /// admitted without one, or an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<SchedulingIdentity>,
+    /// The admission it took ([`valid_id`](vk_hub_proto::valid_id)), which takes no other
+    /// job; `None` as for `scheduling`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
     pub placement: Placement,
     /// What the job is, for display: GitLab's job ID, project and name.
     #[serde(default)]
@@ -711,6 +736,8 @@ pub enum Submitted {
     Again(String),
     /// The request ID was used before with another body.
     Conflict,
+    /// The job's admission is already another job's.
+    AdmissionTaken,
 }
 
 /// A request's key in [`REQUESTS`].
@@ -738,6 +765,7 @@ impl Db {
         let seq;
         {
             let mut requests = txn.open_table(REQUESTS)?;
+            let mut index = txn.open_table(JOB_BY_ADMISSION)?;
             if let Some(previous) = requests
                 .get(request.as_str())?
                 .map(|g| decode::<RequestRow>(g.value()))
@@ -752,6 +780,13 @@ impl Db {
                 } else {
                     Submitted::Conflict
                 });
+            }
+            if let Some(admission) = &row.admission {
+                let key = (row.key.as_str(), admission.as_str());
+                if index.get(key)?.is_some() {
+                    return Ok(Submitted::AdmissionTaken);
+                }
+                index.insert(key, id)?;
             }
             sweep_requests(self, &mut requests, now)?;
             let answer = RequestRow {
@@ -1330,8 +1365,12 @@ impl Db {
             let mut lens = txn.open_table(JOB_TAIL_LENS)?;
             let mut uncached = HashMap::new();
             let mut uncounted: HashMap<&str, u64> = HashMap::new();
+            let mut by_admission = txn.open_table(JOB_BY_ADMISSION)?;
             for (id, row) in &dropped {
                 table.remove(id.as_str())?;
+                if let Some(admission) = &row.admission {
+                    by_admission.remove((row.key.as_str(), admission.as_str()))?;
+                }
                 super::egress::reshare(&txn, id, Some(row), None)?;
                 super::observed::reshare(&txn, id, Some(row), None)?;
                 let n = uncounted.entry(row.key.as_str()).or_default();
@@ -1756,6 +1795,8 @@ mod tests {
             key_name: "gitlab".into(),
             instance: None,
             request_id: "1".repeat(32),
+            scheduling: None,
+            admission: None,
             placement: Placement {
                 pool: "ci".into(),
                 labels: vec![],
@@ -1791,6 +1832,56 @@ mod tests {
             egress_caps: None,
             egress: None,
         }
+    }
+
+    #[test]
+    fn scheduling_identity_survives_storage_and_older_jobs_decode_without_it() {
+        let db = Db::open_memory().unwrap();
+        let id = "a".repeat(32);
+        let mut job = row(1);
+        job.scheduling = Some(SchedulingIdentity {
+            tenant: "project".into(),
+            class: crate::policy::Class::Production,
+            gitlab: Some("gl".into()),
+            runner_id: Some(42),
+        });
+        job.admission = Some("b".repeat(32));
+        db.submit_job(&id, &job, "digest", b"{}", "relay", 10)
+            .unwrap();
+        assert_eq!(db.job(&id).unwrap(), Some(job.clone()));
+        let mut json = serde_json::to_value(&job).unwrap();
+        json.as_object_mut().unwrap().remove("scheduling");
+        json.as_object_mut().unwrap().remove("admission");
+        let older: JobRow = serde_json::from_value(json).unwrap();
+        assert_eq!(older.scheduling, None);
+        assert_eq!(older.admission, None);
+        assert_eq!(older.key, job.key);
+    }
+
+    #[test]
+    fn an_admission_takes_one_job() {
+        let db = Db::open_memory().unwrap();
+        let mut first = job(1, JobState::Queued, None);
+        first.admission = Some("admission".into());
+        submit(&db, 1, &first);
+        // Another job naming the same admission is refused, and recorded nowhere.
+        let mut second = job(2, JobState::Queued, None);
+        second.admission = first.admission.clone();
+        let again = db.submit_job(&id(2), &second, "2", b"{}", "key gitlab", 2);
+        assert!(matches!(again.unwrap(), Submitted::AdmissionTaken));
+        assert!(db.job(&id(2)).unwrap().is_none());
+        assert!(db.job_spec(&id(2)).unwrap().is_none());
+        assert!(
+            db.request(&second.key, &second.request_id, 2)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(listed(&db), vec![id(1)]);
+        // Another principal's admission of the same ID is its own.
+        let mut other = job(3, JobState::Queued, None);
+        other.key = "other".into();
+        other.admission = first.admission.clone();
+        submit(&db, 3, &other);
     }
 
     #[test]

@@ -859,6 +859,8 @@ async fn submit(
         key_name: principal.name.clone(),
         instance: principal.instance.clone(),
         request_id: ask.request_id.clone(),
+        scheduling: None,
+        admission: None,
         placement: ask.placement.clone(),
         title: title(&ask.spec),
         job_url: match &ask.spec {
@@ -946,6 +948,11 @@ async fn submit(
             Err(e) => Err(e),
         },
         Submitted::Conflict => Err(conflict()),
+        Submitted::AdmissionTaken => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "this admission was already used by another job",
+        )),
     }
 }
 

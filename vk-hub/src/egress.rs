@@ -1020,6 +1020,8 @@ pub(crate) mod testing {
             key_name: "gitlab".into(),
             instance: None,
             request_id: format!("{n:032}"),
+            scheduling: None,
+            admission: None,
             placement: Placement {
                 pool: "ci".into(),
                 labels: vec![],
