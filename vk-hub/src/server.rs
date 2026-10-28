@@ -185,10 +185,22 @@ pub enum Reach {
 impl Hub {
     /// The hub keeping its state in `db`, with its web UI at `ui_url` if it serves one.
     pub fn new(db: Arc<Db>, ui_url: Option<String>) -> Self {
+        // Session IDs start at a random 64-bit epoch, so an ID a relay's heartbeat was stored
+        // with names a session of a later start only by a negligible chance. The epoch only
+        // needs to differ across restarts, which the clock does too when the random source
+        // fails.
+        let mut epoch = [0u8; 8];
+        let next_session = if vk_peer::fill_random(&mut epoch).is_ok() {
+            u64::from_le_bytes(epoch)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        };
         Hub {
             db,
             live: Mutex::new(HashMap::new()),
-            next_session: AtomicU64::new(0),
+            next_session: AtomicU64::new(next_session),
             connections: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             handshakes: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),

@@ -39,6 +39,9 @@ pub struct RelayRow {
     pub heartbeat: Option<Heartbeat>,
     #[serde(default)]
     pub heartbeat_at: Option<u64>,
+    /// The session whose heartbeat this is.
+    #[serde(default)]
+    pub heartbeat_session: Option<u64>,
     #[serde(default)]
     pub report: Option<Report>,
     /// The URL of the GitLab server it is bound to, as [`normalize_gitlab_url`] writes it,
@@ -334,27 +337,49 @@ impl Db {
         now: u64,
         current: impl FnOnce() -> bool,
     ) -> Result<bool> {
-        self.update_relay(now, id, Durability::Immediate, |row| {
-            let current = current();
-            if current {
-                row.incarnation = Some(incarnation.to_string());
-                row.protocol = Some(version);
-                row.last_seen = Some(now);
+        let recorded = self.update_relay(now, id, Durability::Immediate, |row| {
+            if !current() {
+                return Ok(None);
             }
-            Ok((current, Vec::new()))
-        })
+            row.incarnation = Some(incarnation.to_string());
+            row.protocol = Some(version);
+            row.last_seen = Some(now);
+            row.heartbeat = None;
+            row.heartbeat_at = None;
+            row.heartbeat_session = None;
+            Ok(Some(((), Vec::new())))
+        })?;
+        Ok(recorded.is_some())
     }
 
-    /// Store what a relay's session reported, which the session made display-safe on
-    /// receipt. The first inventory binds the relay to its server, whose URL the caller has
-    /// checked [`normalize_gitlab_url`] takes. A heartbeat is made durable only as a node's
-    /// is (see [`Db::heartbeat_syncs`]).
+    /// [`Db::record_relay_from_session`] outside any session.
+    #[cfg(test)]
     pub fn record_relay(&self, id: &str, write: RelayWrite, now: u64) -> Result<()> {
+        self.record_relay_from_session(id, write, now, None, || true)
+            .map(drop)
+    }
+
+    /// Store the relay's display-safe write if `current` holds inside the write; return
+    /// whether it was stored. Superseded writes are no-ops; heartbeats carry `session`.
+    /// The first inventory binds the relay to its server. The caller must check that
+    /// [`normalize_gitlab_url`] accepts its URL. Heartbeats use the same durability policy
+    /// as node heartbeats (see [`Db::heartbeat_syncs`]).
+    pub fn record_relay_from_session(
+        &self,
+        id: &str,
+        write: RelayWrite,
+        now: u64,
+        session: Option<u64>,
+        current: impl FnOnce() -> bool,
+    ) -> Result<bool> {
         let durability = match write {
             RelayWrite::Heartbeat(_) if !self.heartbeat_syncs(now) => Durability::None,
             _ => Durability::Immediate,
         };
-        self.update_relay(now, id, durability, |row| {
+        let stored = self.update_relay(now, id, durability, |row| {
+            if !current() {
+                return Ok(None);
+            }
             row.last_seen = Some(now);
             let mut events = Vec::new();
             match write {
@@ -394,22 +419,25 @@ impl Db {
                 RelayWrite::Heartbeat(heartbeat) => {
                     row.heartbeat = Some(heartbeat);
                     row.heartbeat_at = Some(now);
+                    row.heartbeat_session = session;
                 }
                 RelayWrite::Report(report) => row.report = Some(report),
             }
-            Ok(((), events))
-        })
+            Ok(Some(((), events)))
+        })?;
+        Ok(stored.is_some())
     }
 
-    /// Read-modify-write relay `id`'s row and append the audit pairs `change` returns, in one
-    /// transaction at `durability`. [`NotEnrolled`] when the relay was removed.
+    /// Read-modify-write relay `id`'s row and append the audit pairs from `change` in one
+    /// transaction at `durability`. Return `None` without writing if `change` returns `None`.
+    /// Return [`NotEnrolled`] if the relay was removed.
     fn update_relay<R>(
         &self,
         now: u64,
         id: &str,
         durability: Durability,
-        change: impl FnOnce(&mut RelayRow) -> Result<(R, Vec<(String, String)>)>,
-    ) -> Result<R> {
+        change: impl FnOnce(&mut RelayRow) -> Result<Option<(R, Vec<(String, String)>)>>,
+    ) -> Result<Option<R>> {
         let mut txn = self.db.begin_write().context("starting a write")?;
         let out = {
             let mut table = txn.open_table(RELAYS)?;
@@ -417,7 +445,9 @@ impl Db {
                 Some(g) => decode::<RelayRow>(g.value())?,
                 None => return Err(NotEnrolled(id.to_string()).into()),
             };
-            let (out, events) = change(&mut row)?;
+            let Some((out, events)) = change(&mut row)? else {
+                return Ok(None);
+            };
             table.insert(id, encode(&row)?.as_slice())?;
             for (actor, event) in events {
                 append_audit(&txn, Some(id), &actor, &event, now)?;
@@ -427,7 +457,7 @@ impl Db {
         txn.set_durability(durability)
             .context("setting a write's durability")?;
         txn.commit().context("updating a relay")?;
-        Ok(out)
+        Ok(Some(out))
     }
 }
 
@@ -644,5 +674,42 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].spki_sha256, Some("bb".repeat(32)));
         assert_eq!(pending[0].relays.len(), 2);
+    }
+
+    /// A heartbeat is stored with its session, a superseded session stores nothing, and a new
+    /// session clears the previous one's heartbeat.
+    #[test]
+    fn a_heartbeat_is_stored_with_its_session_until_the_next_one() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db, "aa");
+        let heartbeat = || {
+            RelayWrite::Heartbeat(Heartbeat {
+                runners: vec![vk_hub_proto::gitlab::RunnerLoad {
+                    name: "ci".into(),
+                    requests: 1,
+                    ..Default::default()
+                }],
+            })
+        };
+        let before = db.relay(&id).unwrap().unwrap();
+        assert!(
+            !db.record_relay_from_session(&id, heartbeat(), 2, Some(7), || false)
+                .unwrap()
+        );
+        assert_eq!(db.relay(&id).unwrap().unwrap(), before);
+        assert!(
+            db.record_relay_from_session(&id, heartbeat(), 3, Some(7), || true)
+                .unwrap()
+        );
+        let row = db.relay(&id).unwrap().unwrap();
+        assert_eq!(row.heartbeat_session, Some(7));
+        assert_eq!(row.heartbeat_at, Some(3));
+        assert!(row.heartbeat.is_some());
+        assert!(db.record_relay_session(&id, "i", 2, 4, || true).unwrap());
+        let row = db.relay(&id).unwrap().unwrap();
+        assert_eq!(
+            (row.heartbeat, row.heartbeat_at, row.heartbeat_session),
+            (None, None, None)
+        );
     }
 }

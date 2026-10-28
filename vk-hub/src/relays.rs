@@ -165,7 +165,7 @@ async fn serve(
                         RelayWrite::Report(r)
                     }
                 };
-                if let Some(why) = store(ws, hub, relay, write).await? {
+                if let Some(why) = store(ws, hub, relay, session, write).await? {
                     return Ok(why);
                 }
                 if inventory {
@@ -200,8 +200,9 @@ async fn tell_status(
 /// Store `write`; `Some` carries why the session ends, the relay having been removed.
 async fn store(
     ws: &mut Ws,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     relay: &Peer,
+    session: u64,
     write: RelayWrite,
 ) -> Result<Option<&'static str>> {
     let db = hub.db.clone();
@@ -210,9 +211,17 @@ async fn store(
     // The Connections page follows what a relay is and does; its load, it shows once a
     // heartbeat regardless.
     let shown = !matches!(write, RelayWrite::Heartbeat(_));
-    let written = tokio::task::spawn_blocking(move || db.record_relay(&id, write, now)).await?;
+    let live = hub.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        db.record_relay_from_session(&id, write, now, Some(session), || {
+            live.is_current(&id, session)
+        })
+    })
+    .await?;
     match written {
-        Ok(()) => {
+        // Superseded by a newer session: nothing was stored.
+        Ok(false) => Ok(None),
+        Ok(true) => {
             hub.changed(&relay.id);
             if shown {
                 hub.clients_changed();
