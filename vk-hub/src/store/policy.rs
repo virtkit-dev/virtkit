@@ -67,7 +67,9 @@ fn changed<K: Ord + Clone, V: PartialEq>(
         .collect()
 }
 
-fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String {
+/// Changes between `before` and `after` for the replacement audit: tenant, runner and client
+/// names, scheduling settings and fallback. Empty when they are the same.
+pub fn policy_changes(before: &Policy, after: &Policy) -> Vec<String> {
     let tenants = changed(&before.tenants, &after.tenants);
     let by_runner = |p: &Policy| -> BTreeMap<String, crate::policy::RunnerMapping> {
         p.runners
@@ -99,11 +101,7 @@ fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String
             settings.push(name.to_owned());
         }
     }
-    let mut event = format!(
-        "changed capacity policy {} to {}",
-        crate::store::short(from),
-        crate::store::short(to)
-    );
+    let mut out = Vec::new();
     for (what, names) in [
         ("tenants", &tenants),
         ("runners", &runners),
@@ -111,14 +109,27 @@ fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String
         ("settings", &settings),
     ] {
         if !names.is_empty() {
-            event.push_str(&format!("; {what}: {}", listed(names)));
+            out.push(format!("{what}: {}", listed(names)));
         }
     }
     if before.fallback != after.fallback {
-        event.push_str(&format!(
-            "; fallback: {} to {}",
+        out.push(format!(
+            "fallback: {} to {}",
             before.fallback, after.fallback
         ));
+    }
+    out
+}
+
+fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String {
+    let mut event = format!(
+        "changed capacity policy {} to {}",
+        crate::store::short(from),
+        crate::store::short(to)
+    );
+    for change in policy_changes(before, after) {
+        event.push_str("; ");
+        event.push_str(&change);
     }
     event
 }
@@ -155,6 +166,17 @@ impl Db {
         append_audit(&txn, None, actor, "changed capacity policy", now)?;
         txn.commit()?;
         Ok(())
+    }
+
+    /// Store `bytes` as the policy row, as a later or earlier hub may have left it.
+    #[cfg(test)]
+    pub fn set_raw_capacity_policy(&self, bytes: &[u8]) {
+        let txn = self.db.begin_write().unwrap();
+        txn.open_table(CAPACITY_POLICY)
+            .unwrap()
+            .insert("policy", bytes)
+            .unwrap();
+        txn.commit().unwrap();
     }
 
     /// Replace the policy if its digest is still `expected`, audited in the same transaction.
@@ -289,14 +311,7 @@ mod tests {
         let mut stored = serde_json::to_value(Policy::default()).unwrap();
         stored.as_object_mut().unwrap().remove("busy_secs");
         let stored = serde_json::to_vec(&stored).unwrap();
-        {
-            let txn = db.db.begin_write().unwrap();
-            txn.open_table(CAPACITY_POLICY)
-                .unwrap()
-                .insert("policy", stored.as_slice())
-                .unwrap();
-            txn.commit().unwrap();
-        }
+        db.set_raw_capacity_policy(stored.as_slice());
         let shown = db.capacity_policy().unwrap().digest().unwrap();
         assert_ne!(shown, digest_bytes(&stored));
         let policy = Policy {
@@ -327,14 +342,7 @@ mod tests {
     fn an_unreadable_policy_names_its_digest_and_can_be_replaced() {
         let db = Db::open_memory().unwrap();
         let stored = br#"{"from_a_later_hub":true}"#;
-        {
-            let txn = db.db.begin_write().unwrap();
-            txn.open_table(CAPACITY_POLICY)
-                .unwrap()
-                .insert("policy", stored.as_slice())
-                .unwrap();
-            txn.commit().unwrap();
-        }
+        db.set_raw_capacity_policy(stored.as_slice());
         let digest = digest_bytes(stored);
         let err = format!("{:#}", db.capacity_policy().unwrap_err());
         assert!(err.contains(&format!("--expected {digest}")), "{err}");

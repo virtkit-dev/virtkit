@@ -33,6 +33,10 @@
 //! operators to reject or forget. Pending, rejected and approved projects link to their pages
 //! ([`super::projects`]), whose buttons post here. Rejecting or forgetting an approved project
 //! requires confirmation ([`actions::ask_first`]): its next jobs are refused.
+//!
+//! *Capacity tenants* lists the capacity policy's tenants, linking to their pages and the whole
+//! policy's ([`super::capacity`]), where operators edit them; operators add one here. Each API
+//! key shows the principal ID the policy's `clients` assigns it by.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -85,6 +89,8 @@ struct Shown {
     rejected: Vec<(String, RejectedGitlab)>,
     projects: Vec<ProjectView>,
     relays: Vec<RelayView>,
+    /// The capacity policy, or why this hub cannot read it.
+    policy: Result<crate::policy::Policy>,
 }
 
 impl Shown {
@@ -97,6 +103,7 @@ impl Shown {
             rejected: hub.db.rejected_gitlabs()?,
             projects: hub.db.gitlab_projects(None)?,
             relays: crate::relays::views(hub)?,
+            policy: hub.db.capacity_policy(),
         })
     }
 }
@@ -151,6 +158,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
         if other {
             create_form(&mut main, auth);
         } else {
+            super::capacity::add_tenant_form(&mut main, auth);
             add_relay_form(&mut main, auth);
             add_server_form(&mut main, auth);
         }
@@ -219,6 +227,7 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     }
     h.raw("</section>");
     approved_section(&mut h, shown, steer);
+    tenants_section(&mut h, shown);
     h.raw("<section><h2>Relays</h2>");
     if shown.relays.is_empty() {
         h.raw(if steer {
@@ -235,6 +244,47 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     runners_table(&mut h, &shown.relays, now);
     h.raw("</section>");
     h
+}
+
+/// *Capacity tenants*: each tenant's weight and cap, how many projects, runners and API
+/// clients it has, linking to its page and to the whole policy's.
+fn tenants_section(h: &mut Html, shown: &Shown) {
+    h.raw("<section><h2>Capacity tenants</h2>");
+    let policy = match &shown.policy {
+        Ok(policy) => policy,
+        Err(e) => {
+            super::capacity::unreadable(h, e);
+            h.raw("</section>");
+            return;
+        }
+    };
+    h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
+        .raw("<th>cap</th><th class=\"num\">projects</th><th class=\"num\">runners</th>")
+        .raw("<th class=\"num\">API clients</th></tr></thead><tbody>");
+    for (name, tenant) in &policy.tenants {
+        h.raw("<tr><td><a href=\"")
+            .text(super::capacity::tenant_path(name))
+            .raw("\">")
+            .text(name)
+            .raw("</a>");
+        if policy.fallback == *name {
+            h.raw(" <span class=\"sub\">fallback</span>");
+        }
+        h.raw("</td><td class=\"num\">")
+            .text(tenant.weight)
+            .raw("</td><td>")
+            .text(super::capacity::cap(tenant))
+            .raw("</td><td class=\"num\">")
+            .text(tenant.projects.len())
+            .raw("</td><td class=\"num\">")
+            .text(policy.runners.iter().filter(|r| r.tenant == *name).count())
+            .raw("</td><td class=\"num\">")
+            .text(policy.clients.values().filter(|t| *t == name).count())
+            .raw("</td></tr>");
+    }
+    h.raw("</tbody></table><p><a href=\"")
+        .raw(super::capacity::PATH)
+        .raw("\">The whole capacity policy</a></p></section>");
 }
 
 /// *Pending*, then *Rejected* when an operator rejected any: the servers and the projects, each
@@ -909,7 +959,8 @@ fn keys_table(h: &mut Html, rows: &[&KeyView], views: &[KeyView], now: u64, stee
     h.raw("<table class=\"grid\"><thead><tr>")
         .raw("<th>name</th><th>key</th><th>scopes</th><th>pools</th><th>largest</th>")
         .raw("<th>created</th><th>by</th><th>state</th><th>last heard</th>")
-        .raw("<th class=\"num\">instances</th><th class=\"num\">jobs</th>");
+        .raw("<th class=\"num\">instances</th><th class=\"num\">jobs</th>")
+        .raw("<th>principal ID</th>");
     if steer {
         h.raw("<th>change</th>");
     }
@@ -1028,7 +1079,7 @@ fn key_row(h: &mut Html, v: &KeyView, views: &[KeyView], now: u64) {
     } else {
         h.text(v.jobs);
     }
-    h.raw("</td>");
+    h.raw("</td><td><code>").text(&v.id).raw("</code></td>");
 }
 
 /// A button posting `op` on the key named `name`. No CSRF field: the page around the fragment
@@ -1694,7 +1745,7 @@ async fn decide_projects(
 
 /// Redirect after a plain-form post to a hub path, falling back to Connections if `to` is an
 /// invalid header value. Paths built from checked names are valid header values.
-fn see_other(to: &str) -> Response<Body> {
+pub(super) fn see_other(to: &str) -> Response<Body> {
     let mut resp = Response::new(Body::default());
     *resp.status_mut() = StatusCode::SEE_OTHER;
     resp.headers_mut().insert(
@@ -2019,6 +2070,7 @@ mod tests {
         for want in [
             "<td>gitlab</td><td><code>vkk_0123abcd…</code></td><td>jobs, capacity</td>",
             &format!("<a href=\"/jobs?key={}\">7</a>", "ab".repeat(32)),
+            &format!("<td><code>{}</code></td>", "ab".repeat(32)),
             "<span class=\"badge bad\">revoked</span>",
             "<td>jobs, capacity</td><td>ci</td><td>-</td><td><time",
             "</td><td>expires <time",

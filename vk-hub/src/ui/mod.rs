@@ -17,11 +17,12 @@
 //! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
 //! field or header. A fleet hub's are the admin socket's steering operations, of nodes and of
 //! rollouts ([`fleet`]), its releases and rollouts added and started ([`operations`]), its
-//! API keys created, revoked and removed ([`clients`]), its egress rows acknowledged and reopened
-//! and their projects muted ([`egress`]), and its OIDC grants given, changed and revoked
-//! ([`users`]); local mode's are `vk` commands ([`actions`]). A release's upload is the
-//! one post whose body is not a small form: [`operations`] reads it as it arrives, under limits
-//! of its own.
+//! API keys created, revoked and removed ([`clients`]), its capacity policy edited
+//! ([`capacity`]), its egress rows acknowledged and reopened and their projects muted
+//! ([`egress`]), and its OIDC grants given, changed and revoked ([`users`]); local mode's are
+//! `vk` commands ([`actions`]). A release's upload is the one post whose body is not a small
+//! form: [`operations`] reads it as it arrives, under limits of its own; a capacity policy
+//! edit may be larger than other forms too.
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal);
@@ -66,6 +67,7 @@ mod access;
 mod actions;
 mod assets;
 mod body;
+mod capacity;
 mod clients;
 mod dev;
 mod egress;
@@ -386,6 +388,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     users::action(req, ui, site).await
                 } else if path == clients::PATH {
                     clients::action(req, ui, site).await
+                } else if path == capacity::PATH {
+                    capacity::action(req, ui, site).await
                 } else if path == jobs::PATH {
                     jobs::action(req, ui).await
                 } else if path == egress::ACTION_PATH {

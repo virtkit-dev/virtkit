@@ -3,6 +3,7 @@
 //! of it, its first refused job and refusal count, with links to jobs and observed traffic.
 //! Operators approve, reject or forget it through the Connections action ([`super::clients`]).
 //! Rejecting or forgetting an approved project requires confirmation.
+//! [`super::capacity::project_section`] displays and edits its share of the capacity policy.
 //!
 //! The recorded path is display-safe and escaped through [`Html::node`], as on a job's page.
 
@@ -41,6 +42,8 @@ struct Shown {
     instances: Instances<String>,
     /// The relay that submitted its first job refused, while the hub has it.
     relay: Option<RelayView>,
+    /// The capacity policy, or why this hub cannot read it.
+    policy: Result<crate::policy::Policy>,
 }
 
 /// `GET /clients/projects/<instance>/<project ID>`.
@@ -63,6 +66,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             url: instance.url,
             instances: hub.db.gitlab_instances()?,
             relay,
+            policy: hub.db.capacity_policy(),
             row,
         }))
     })
@@ -137,6 +141,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             "gitlab:{gitlab}:{id}"
         )))
         .raw("\">Observed traffic</a></p>");
+    super::capacity::project_section(&mut main, &shown.policy, gitlab, id, auth)?;
     if auth.session.role >= Role::Operator {
         main.raw("<section><h2>Decide</h2><form method=\"post\" action=\"")
             .raw(clients::PATH)

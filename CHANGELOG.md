@@ -8,11 +8,12 @@ All notable changes to virtkit will be documented in this file.
 
 - **The hub takes new work only from relay runners mapped to a capacity tenant, over session
   protocol 2**: each request names its runner, which must be verified with GitLab and mapped
-  by its runner ID. Upgrade the hub, map the runners with `vk-hub capacity-policy set`, then
-  upgrade the relays. An older `vk-gitlab` keeps its session with an upgraded hub and finishes
-  and settles the jobs it holds, but gets no new work; a job it took from GitLab and had not
-  yet submitted fails. An upgraded `vk-gitlab` is refused by an older hub: it asks GitLab for
-  no jobs, logs that the hub must be upgraded and dials again about every minute.
+  by its runner ID. Upgrade the hub, map the runners on its web UI or with
+  `vk-hub capacity-policy set`, then upgrade the relays. An older `vk-gitlab` keeps its
+  session with an upgraded hub and finishes and settles the jobs it holds, but gets no new
+  work; a job it took from GitLab and had not yet submitted fails. An upgraded `vk-gitlab` is
+  refused by an older hub: it asks GitLab for no jobs, logs that the hub must be upgraded and
+  dials again about every minute.
 - **API-key reservations share the fleet's capacity with GitLab runners**: each is charged
   to the capacity tenant the policy's `clients` maps the key to, or else to its `fallback`
   tenant, and waits its turn when that tenant uses more than others.
@@ -50,8 +51,12 @@ All notable changes to virtkit will be documented in this file.
   its reservations where its jobs may go.
 - **A relay job whose project leaves its tenant's list before it is placed waits** until the
   project is listed again, or ends at its deadline saying the project is no longer listed.
-- **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
-  Replacements are audited and checked against the shown digest to prevent lost updates.
+- **The hub's capacity policy is set from its web UI or `vk-hub capacity-policy show|set`.**
+  Connections lists the tenants; operators add one there, edit a tenant and its runner mappings
+  on its page, a project's production branches and placement rules on the project's, or the
+  whole policy. The UI lists what a change changes and asks first, except to add a tenant. Every
+  change is audited and, but for adding a tenant, refused if the policy changed since it was
+  shown. Connections also shows each API key's principal ID.
 
 ## [0.98.0] - 2026-10-28
 

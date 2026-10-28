@@ -311,6 +311,50 @@ impl Policy {
             .find(|p| p.gitlab == gitlab && p.id == id)
     }
 
+    /// This policy with tenant `name` added or replaced by `tenant`, and its runner mappings
+    /// replaced by `runners`.
+    pub fn with_tenant(
+        &self,
+        name: &str,
+        tenant: Tenant,
+        runners: Vec<RunnerMapping>,
+    ) -> Result<Policy> {
+        if let Some(other) = runners.iter().find(|r| r.tenant != name) {
+            bail!(
+                "runner mapping {}/{} names tenant {:?}, not {name:?}",
+                other.gitlab,
+                other.runner_id,
+                other.tenant
+            );
+        }
+        let mut policy = self.clone();
+        policy.tenants.insert(name.to_owned(), tenant);
+        policy.runners.retain(|r| r.tenant != name);
+        policy.runners.extend(runners);
+        Ok(policy)
+    }
+
+    /// This policy with `edit` applied to project `id` of instance `gitlab` in every tenant
+    /// listing it, so its production branches and placement rules stay the same in each.
+    /// Refused unless tenant `tenant` lists it.
+    pub fn with_project(
+        &self,
+        tenant: &str,
+        gitlab: &str,
+        id: u64,
+        edit: impl Fn(&mut Project),
+    ) -> Result<Policy> {
+        if self.project(tenant, gitlab, id).is_none() {
+            bail!("tenant {tenant:?} does not list project {gitlab}/{id}");
+        }
+        let mut policy = self.clone();
+        (policy.tenants.values_mut())
+            .flat_map(|t| &mut t.projects)
+            .filter(|p| p.gitlab == gitlab && p.id == id)
+            .for_each(edit);
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.tenants.len() > MAX_TENANTS
             || self.runners.len() > MAX_RUNNERS
@@ -750,5 +794,73 @@ mod tests {
         policy.tenants.get_mut("other").unwrap().projects[0].placement_rules = vec![a];
         let err = policy.validate().unwrap_err().to_string();
         assert!(err.contains("placement rules differ"), "{err}");
+    }
+
+    #[test]
+    fn a_project_is_edited_in_every_tenant_listing_it() {
+        let mut policy = Policy::default();
+        policy.tenants.get_mut("fallback").unwrap().projects = vec![ruled(vec![])];
+        let group = policy.tenants["fallback"].clone();
+        policy.tenants.insert("group".into(), group);
+        let node = "0123456789abcdef0123456789abcdef";
+        let edited = policy
+            .with_project("group", "gl", 1, |p| {
+                p.production_branches = vec!["main".into()];
+                p.placement_rules = vec![rule(&[], &[node], &[])];
+            })
+            .unwrap();
+        edited.validate().unwrap();
+        for tenant in ["fallback", "group"] {
+            let project = edited.project(tenant, "gl", 1).unwrap();
+            assert_eq!(project.production_branches, ["main"]);
+            assert_eq!(project.placement_rules[0].nodes, [node]);
+        }
+        // Only through a tenant listing it.
+        let mut other = edited.clone();
+        other.tenants.insert(
+            "other".into(),
+            Tenant {
+                weight: 1,
+                cap: None,
+                projects: vec![],
+            },
+        );
+        assert!(other.with_project("other", "gl", 1, |_| {}).is_err());
+        assert!(edited.with_project("group", "gl", 2, |_| {}).is_err());
+    }
+
+    #[test]
+    fn a_tenant_is_replaced_with_its_runner_mappings_only() {
+        let mapping = |id, tenant: &str| RunnerMapping {
+            gitlab: "gl".into(),
+            runner_id: id,
+            tenant: tenant.into(),
+            class: Class::Normal,
+        };
+        let policy = Policy {
+            runners: vec![mapping(1, "fallback"), mapping(2, "fallback")],
+            ..Policy::default()
+        };
+        let web = Tenant {
+            weight: 3,
+            cap: Some(2),
+            projects: vec![],
+        };
+        let added = policy
+            .with_tenant("web", web.clone(), vec![mapping(3, "web")])
+            .unwrap();
+        added.validate().unwrap();
+        assert_eq!(added.tenant("web"), Some(&web));
+        assert_eq!(added.runners.len(), 3);
+        let replaced = added
+            .with_tenant("fallback", policy.tenants["fallback"].clone(), vec![])
+            .unwrap();
+        assert_eq!(replaced.runners, [mapping(3, "web")]);
+        // A mapping of another tenant is refused, not moved.
+        let err = added
+            .with_tenant("web", web, vec![mapping(1, "fallback")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gl/1"), "{err}");
     }
 }
