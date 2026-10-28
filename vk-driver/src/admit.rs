@@ -3642,12 +3642,13 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let teasers = std::cell::Cell::new(0);
         let reclaim = |need: u64| {
             asked.borrow_mut().push(need);
-            // The directory lock is free while it runs.
-            drop(
-                try_lock_dir(&dir)
-                    .unwrap()
-                    .expect("reclaim runs outside the lock"),
-            );
+            // The directory lock is free while it runs. A child another test forks shares the
+            // lock's open file until it execs, so it can look held for a moment after release.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while try_lock_dir(&dir).unwrap().is_none() {
+                assert!(Instant::now() < deadline, "reclaim runs outside the lock");
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let freed = |freed| Reclaimed {
                 freed,
                 reach: Some(freed),
