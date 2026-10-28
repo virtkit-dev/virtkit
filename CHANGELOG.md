@@ -11,9 +11,9 @@ All notable changes to virtkit will be documented in this file.
   by its runner ID. Upgrade the hub, map the runners on its web UI or with
   `vk-hub capacity-policy set`, then upgrade the relays. An older `vk-gitlab` keeps its
   session with an upgraded hub and finishes and settles the jobs it holds, but gets no new
-  work; a job it took from GitLab and had not yet submitted fails. An upgraded `vk-gitlab` is
-  refused by an older hub: it asks GitLab for no jobs, logs that the hub must be upgraded and
-  dials again about every minute.
+  work; a job it took from GitLab and had not yet submitted fails. Connections marks a relay
+  that must be upgraded. An upgraded `vk-gitlab` is refused by an older hub: it asks GitLab
+  for no jobs, logs that the hub must be upgraded and dials again about every minute.
 - **API-key reservations share the fleet's capacity with GitLab runners**: each is charged
   to the capacity tenant the policy's `clients` maps the key to, or else to its `fallback`
   tenant, and waits its turn when that tenant uses more than others.
@@ -56,7 +56,9 @@ All notable changes to virtkit will be documented in this file.
   on its page, a project's production branches and placement rules on the project's, or the
   whole policy. The UI lists what a change changes and asks first, except to add a tenant. Every
   change is audited and, but for adding a tenant, refused if the policy changed since it was
-  shown. Connections also shows each API key's principal ID.
+  shown. Connections also shows each runner's tenant and class, its requests waiting, offered
+  and held, its jobs, its demand and backoff, and what it waits for; and each API key's
+  principal ID.
 
 ## [0.98.0] - 2026-10-28
 

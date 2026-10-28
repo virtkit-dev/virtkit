@@ -283,9 +283,41 @@ async fn a_job_whose_project_is_listed_again_starts() {
         crate::jobs::testing::job_blocked(&hub, &job),
         Some("project no longer listed for its tenant")
     );
+    // Connections gives it as its runner's reason, with no request of the runner waiting.
+    let snapshot = crate::jobs::arbitration_snapshot(&hub).unwrap();
+    let view = &snapshot[&("gl".to_string(), 42)];
+    assert_eq!(
+        (view.waiting, view.jobs, view.reason),
+        (0, 1, Some("project no longer listed for its tenant"))
+    );
     list_project(&hub, true);
     crate::jobs::testing::step(&hub).await;
     assert_eq!(next_start(&mut node).await.job, job);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A pass changing why a runner's job waits wakes Connections' live updates; one changing
+/// nothing does not.
+#[tokio::test]
+async fn a_pass_changing_a_runner_s_reason_wakes_connections() {
+    let dir = scratch("placement-wakes");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let job = submit(addr, &key, job_body(1, None, 30), None).await;
+    crate::jobs::testing::step(&hub).await;
+    let mut clients = hub.subscribe_clients();
+    clients.mark_unchanged();
+    crate::jobs::testing::step(&hub).await;
+    assert!(!clients.has_changed().unwrap());
+    list_project(&hub, false);
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &job),
+        Some("project no longer listed for its tenant")
+    );
+    assert!(clients.has_changed().unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

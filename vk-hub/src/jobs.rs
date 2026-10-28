@@ -265,6 +265,9 @@ struct State {
     /// When each node last ran a job of each image key ([`image_key`]), on the hub's clock in
     /// seconds; at most [`MAX_IMAGE_KEYS`] keys.
     warm: HashMap<String, HashMap<String, u64>>,
+    /// The last [`step`]'s [`ArbitrationView`]s after [`ArbitrationView::settled`].
+    /// Changes wake Connections' live updates.
+    arbitration_shown: HashMap<(String, u64), ArbitrationView>,
 }
 
 #[derive(Default)]
@@ -276,25 +279,59 @@ struct Demand {
     last_probe: Option<Instant>,
 }
 
-#[cfg(test)]
-#[derive(Default)]
+/// What a mapped relay runner's requests and jobs are doing, as Connections shows it.
+#[derive(Default, Debug, PartialEq)]
 pub struct ArbitrationView {
+    /// Its requests waiting for room.
     pub waiting: usize,
+    /// How long its oldest waiting request has waited, in seconds.
     pub wait_secs: Option<u64>,
+    /// Its requests offered to a node.
     pub offers: usize,
+    /// Its requests granted or claimed.
     pub holds: usize,
+    /// Its jobs not finished.
     pub jobs: usize,
+    /// What its admissions came to lately: `unknown`, `recently busy`, `recently empty` or
+    /// `unhealthy`.
     pub demand: &'static str,
+    /// What is left of its backoff, in seconds.
     pub backoff_secs: Option<u64>,
+    /// Why arbitration last passed over its oldest waiting request, or, if none wait,
+    /// its oldest queued job that was passed over.
     pub reason: Option<&'static str>,
+    /// The ID of its oldest waiting request.
+    pub oldest: Option<String>,
 }
 
-#[cfg(test)]
+impl ArbitrationView {
+    /// This view without elapsed wait or remaining backoff, preserving whether backoff exists.
+    fn settled(&self) -> Self {
+        Self {
+            wait_secs: None,
+            backoff_secs: self.backoff_secs.map(|_| 0),
+            oldest: self.oldest.clone(),
+            ..*self
+        }
+    }
+}
+
+/// [`ArbitrationView`]s by GitLab instance and runner ID for runners with unfinished requests,
+/// jobs, or current demand or backoff.
 pub fn arbitration_snapshot(hub: &Hub) -> Result<HashMap<(String, u64), ArbitrationView>> {
-    let state = hub.dispatch.lock();
-    let now = Instant::now();
+    Ok(arbitration_views(&hub.dispatch.lock(), Instant::now()))
+}
+
+/// [`arbitration_snapshot`] of `state` at `now`.
+fn arbitration_views(state: &State, now: Instant) -> HashMap<(String, u64), ArbitrationView> {
     let mut views: HashMap<(String, u64), ArbitrationView> = HashMap::new();
-    for ticket in state.tickets.values() {
+    // The oldest waiting request of each runner, whose reason it shows.
+    let mut oldest: HashMap<(String, u64), (Instant, &str)> = HashMap::new();
+    for (id, ticket) in &state.tickets {
+        // Kept until evicted, a finished request no longer counts.
+        if matches!(ticket.phase, TicketPhase::Finished(_)) {
+            continue;
+        }
         let Some(key) = ticket
             .identity
             .gitlab
@@ -303,8 +340,62 @@ pub fn arbitration_snapshot(hub: &Hub) -> Result<HashMap<(String, u64), Arbitrat
         else {
             continue;
         };
-        let demand = state.demand.get(&key);
-        let view = views.entry(key).or_default();
+        let view = views.entry(key.clone()).or_default();
+        match ticket.phase {
+            TicketPhase::Waiting => {
+                view.waiting += 1;
+                let waited = now.duration_since(ticket.created).as_secs();
+                view.wait_secs = Some(view.wait_secs.unwrap_or(0).max(waited));
+                let this = (ticket.created, id.as_str());
+                if oldest.get(&key).is_none_or(|o| this < *o) {
+                    oldest.insert(key, this);
+                    view.reason = ticket.blocked.or(Some("waiting for scheduling"));
+                    view.oldest = Some(id.clone());
+                }
+            }
+            TicketPhase::Offering { .. } => view.offers += 1,
+            TicketPhase::Granted { .. } | TicketPhase::Claimed { .. } => view.holds += 1,
+            TicketPhase::Job => view.jobs += 1,
+            TicketPhase::Finished(_) => {}
+        }
+    }
+    // With no requests waiting, use the runner's oldest queued job that was passed over.
+    let mut oldest: HashMap<(String, u64), (u64, &str)> = HashMap::new();
+    for (id, job) in &state.jobs {
+        let counted = (job.row.admission.as_ref()).is_some_and(|id| state.tickets.contains_key(id));
+        if counted && job.blocked.is_none() {
+            continue;
+        }
+        let Some(key) = (job.row.scheduling.as_ref())
+            .and_then(|identity| identity.gitlab.clone().zip(identity.runner_id))
+        else {
+            continue;
+        };
+        let view = views.entry(key.clone()).or_default();
+        if !counted {
+            view.jobs += 1;
+        }
+        if view.waiting == 0
+            && job.row.state == JobState::Queued
+            && let Some(why) = job.blocked
+        {
+            let this = (job.row.created_at, id.as_str());
+            if oldest.get(&key).is_none_or(|o| this < *o) {
+                oldest.insert(key, this);
+                view.reason = Some(why);
+            }
+        }
+    }
+    // A demand or backoff still current shows with no request or job.
+    for (key, demand) in &state.demand {
+        if demand.backoff_until.is_some_and(|at| at > now)
+            || demand.busy_until.is_some_and(|at| at > now)
+        {
+            views.entry(key.clone()).or_default();
+        }
+    }
+    for (key, view) in &mut views {
+        let demand = state.demand.get(key);
         view.backoff_secs = demand
             .and_then(|d| d.backoff_until)
             .filter(|at| *at > now)
@@ -320,38 +411,8 @@ pub fn arbitration_snapshot(hub: &Hub) -> Result<HashMap<(String, u64), Arbitrat
         } else {
             "unknown"
         };
-        match ticket.phase {
-            TicketPhase::Waiting => {
-                view.waiting += 1;
-                view.wait_secs = Some(
-                    view.wait_secs
-                        .unwrap_or(0)
-                        .max(now.duration_since(ticket.created).as_secs()),
-                );
-                view.reason = ticket.blocked.or(Some("waiting for scheduling"));
-            }
-            TicketPhase::Offering { .. } => view.offers += 1,
-            TicketPhase::Granted { .. } | TicketPhase::Claimed { .. } => view.holds += 1,
-            TicketPhase::Job => view.jobs += 1,
-            TicketPhase::Finished(_) => {}
-        }
     }
-    for job in state.jobs.values() {
-        if job
-            .row
-            .admission
-            .as_ref()
-            .is_some_and(|id| state.tickets.contains_key(id))
-        {
-            continue;
-        }
-        if let Some(identity) = &job.row.scheduling
-            && let Some(key) = identity.gitlab.clone().zip(identity.runner_id)
-        {
-            views.entry(key).or_default().jobs += 1;
-        }
-    }
-    Ok(views)
+    views
 }
 
 /// The tenant charged for a job recorded without a scheduling identity, by a hub from before
@@ -3817,6 +3878,7 @@ async fn step(hub: &Hub) -> Result<()> {
     let schedule_result;
     let mut moved = false;
     let admission_changes;
+    let arbitration_changed;
     {
         let mut state = hub.dispatch.lock();
         retire_finished_jobs(&mut state);
@@ -3914,6 +3976,14 @@ async fn step(hub: &Hub) -> Result<()> {
             }
         }
         admission_changes = state.admission_changes.clone();
+        // What Connections shows of arbitration, in O(tickets + jobs) as the pass itself.
+        let mut shown = arbitration_views(&state, now);
+        shown.values_mut().for_each(|view| *view = view.settled());
+        arbitration_changed = shown != state.arbitration_shown;
+        state.arbitration_shown = shown;
+    }
+    if arbitration_changed {
+        hub.clients_changed();
     }
     if !admission_changes.is_empty() {
         let changes = admission_changes.clone();
@@ -4714,6 +4784,110 @@ mod tests {
             round_ended: None,
             blocked: None,
         }
+    }
+
+    /// A runner's reason is its oldest waiting request's, whatever order its tickets are in.
+    #[test]
+    fn a_runner_waits_for_what_its_oldest_request_waits_for() {
+        let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
+        let now = Instant::now();
+        {
+            let mut state = hub.dispatch.lock();
+            for (id, age, blocked) in [
+                ("a", 1, "runner limit"),
+                ("b", 3, "tenant cap"),
+                ("c", 2, "backoff"),
+            ] {
+                let mut t = ticket(TicketPhase::Waiting, now - Duration::from_secs(age));
+                t.identity.gitlab = Some("gl".into());
+                t.identity.runner_id = Some(42);
+                t.blocked = Some(blocked);
+                state.tickets.insert(id.into(), t);
+            }
+        }
+        let snapshot = arbitration_snapshot(&hub).unwrap();
+        let view = &snapshot[&("gl".to_string(), 42)];
+        assert_eq!(view.waiting, 3);
+        assert!(
+            view.wait_secs.is_some_and(|s| s >= 3),
+            "{:?}",
+            view.wait_secs
+        );
+        assert_eq!(view.reason, Some("tenant cap"));
+        assert_eq!(view.oldest.as_deref(), Some("b"));
+    }
+
+    /// With no requests waiting, use the oldest queued job that was passed over,
+    /// regardless of job order.
+    #[test]
+    fn a_runner_waits_for_what_its_oldest_queued_job_waits_for() {
+        let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
+        {
+            let mut state = hub.dispatch.lock();
+            for (id, created_at, blocked) in [
+                ("a", 20, Some("runner limit")),
+                ("b", 10, None),
+                ("c", 15, Some("tenant cap")),
+                ("d", 15, Some("backoff")),
+            ] {
+                let mut job = sent("n1", 1, None);
+                job.row.state = JobState::Queued;
+                job.row.node = None;
+                job.row.created_at = created_at;
+                job.row.scheduling = Some(crate::store::SchedulingIdentity {
+                    tenant: "fallback".into(),
+                    class: crate::policy::Class::Normal,
+                    gitlab: Some("gl".into()),
+                    runner_id: Some(42),
+                });
+                job.blocked = blocked;
+                state.jobs.insert(id.into(), job);
+            }
+        }
+        let snapshot = arbitration_snapshot(&hub).unwrap();
+        let view = &snapshot[&("gl".to_string(), 42)];
+        assert_eq!((view.waiting, view.jobs), (0, 4));
+        assert_eq!(view.reason, Some("tenant cap"));
+    }
+
+    /// A runner with only a finished request has nothing to show; one with no request but a
+    /// backoff, or demand, still shows it.
+    #[test]
+    fn a_runner_shows_its_demand_without_requests_and_nothing_once_finished() {
+        let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
+        let now = Instant::now();
+        {
+            let mut state = hub.dispatch.lock();
+            let mut t = ticket(TicketPhase::Finished(AdmissionOutcome::Released), now);
+            t.identity.gitlab = Some("gl".into());
+            t.identity.runner_id = Some(1);
+            state.tickets.insert("a".into(), t);
+            let backoff = Demand {
+                backoff_until: Some(now + Duration::from_secs(30)),
+                empty_count: 1,
+                ..Demand::default()
+            };
+            state.demand.insert(("gl".into(), 2), backoff);
+            let busy = Demand {
+                busy_until: Some(now + Duration::from_secs(30)),
+                ..Demand::default()
+            };
+            state.demand.insert(("gl".into(), 3), busy);
+            let past = Demand {
+                busy_until: Some(now - Duration::from_secs(1)),
+                backoff_until: Some(now - Duration::from_secs(1)),
+                ..Demand::default()
+            };
+            state.demand.insert(("gl".into(), 4), past);
+        }
+        let snapshot = arbitration_snapshot(&hub).unwrap();
+        let shown = |id: u64| snapshot.get(&("gl".to_string(), id));
+        assert!(shown(1).is_none());
+        let view = shown(2).unwrap();
+        assert_eq!((view.waiting, view.demand), (0, "recently empty"));
+        assert!(view.backoff_secs.is_some_and(|s| s > 0), "{view:?}");
+        assert_eq!(shown(3).unwrap().demand, "recently busy");
+        assert!(shown(4).is_none());
     }
 
     #[test]

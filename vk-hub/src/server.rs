@@ -358,7 +358,8 @@ impl Hub {
     /// Note that something the Connections page shows may have changed: an API key created,
     /// revoked or removed, an instance heard from anew (first since the hub started, or since
     /// memory forgot it), a hello recorded, or instances pruned; a GitLab server added, removed,
-    /// rejected or forgotten; a relay connected, disconnected, removed, or reporting anew.
+    /// rejected or forgotten; a relay connected, disconnected, removed, or reporting anew; a
+    /// pass of the placement loop changing what a runner's requests and jobs are doing.
     pub(crate) fn clients_changed(&self) {
         self.client_changes.send_modify(|n| *n = n.wrapping_add(1));
     }

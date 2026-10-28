@@ -8449,7 +8449,8 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
         "https://gitlab.example.com <span class=\"badge warn\">pending</span>",
         &format!("certificate key sha256 <code>{}</code>", "ab".repeat(32)),
         "<td>0.96.0</td><td class=\"num\">2</td><td class=\"num\">6</td>",
-        "<td>relay-1</td><td>ci</td><td>42</td><td>pool ci · large · 4096 MiB",
+        // Its server not approved: neither mapped nor unmapped.
+        "<td>relay-1</td><td>ci</td><td>42</td><td>-</td><td>-</td><td>pool ci · large · 4096 MiB",
         "<td class=\"num\">4</td><td><span class=\"badge warn\">server not approved</span>",
         "<td class=\"num\">1</td><td class=\"num\">3</td><td><time",
         " · HTTP 204</td>",
@@ -8465,7 +8466,52 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
         .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
         .unwrap();
     hub.clients_changed();
-    next_with(&mut live, "<td><strong>gl</strong></td><td>https://gitlab").await;
+    let event = next_with(&mut live, "<td><strong>gl</strong></td><td>https://gitlab").await;
+    // Its server approved: mapped to no tenant.
+    assert!(
+        event.contains("<td>42</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"),
+        "{event}"
+    );
+    // Mapped, by its approved instance's name and GitLab ID: its tenant and class.
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.runners.push(crate::policy::RunnerMapping {
+        gitlab: "gl".into(),
+        runner_id: 42,
+        tenant: "fallback".into(),
+        class: crate::policy::Class::Production,
+    });
+    hub.db.set_capacity_policy(&policy, "u", now).unwrap();
+    hub.clients_changed();
+    let event = next_with(&mut live, "production</td>").await;
+    assert!(
+        event.contains(
+            "<td>42</td><td><a href=\"/clients/tenants/fallback\">fallback</a></td>\
+             <td>production</td><td>pool ci"
+        ),
+        "{event}"
+    );
+    // No request of it is queued: nothing waits.
+    assert!(
+        event.contains("<td class=\"num\">0</td><td>-</td><td>-</td><td>-</td></tr>"),
+        "{event}"
+    );
+    assert!(
+        event.contains("<td><a href=\"/clients/tenants/fallback\">fallback</a> <span"),
+        "{event}"
+    );
+    // A session of protocol 1 gets no new jobs: the relay is marked for upgrade.
+    assert!(!event.contains("upgrade vk-gitlab"), "{event}");
+    assert!(
+        hub.db
+            .record_relay_session(&relay, "i", 1, now, || true)
+            .unwrap()
+    );
+    hub.clients_changed();
+    let event = next_with(&mut live, "upgrade vk-gitlab").await;
+    assert!(
+        event.contains("<span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span></td>"),
+        "{event}"
+    );
 
     let form = format!("_csrf={viewer_csrf}&op=remove-relay&relay={relay}");
     let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;

@@ -35,8 +35,10 @@
 //! requires confirmation ([`actions::ask_first`]): its next jobs are refused.
 //!
 //! *Capacity tenants* lists the capacity policy's tenants, linking to their pages and the whole
-//! policy's ([`super::capacity`]), where operators edit them; operators add one here. Each API
-//! key shows the principal ID the policy's `clients` assigns it by.
+//! policy's ([`super::capacity`]), where operators edit them; operators add one here. Each
+//! runner shows the tenant and class it is mapped to, and how the hub schedules it: its
+//! requests waiting, offered and held, its jobs, its demand and backoff, and why it waits.
+//! Each API key shows the principal ID the policy's `clients` assigns it by.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -91,6 +93,10 @@ struct Shown {
     relays: Vec<RelayView>,
     /// The capacity policy, or why this hub cannot read it.
     policy: Result<crate::policy::Policy>,
+    /// What each mapped runner's requests and jobs are doing, by GitLab instance and runner ID.
+    /// Read under the dispatch lock in O(tickets + jobs), with up to 8192 tickets kept, on
+    /// every render of Connections, its live updates included.
+    arbitration: HashMap<(String, u64), crate::jobs::ArbitrationView>,
 }
 
 impl Shown {
@@ -104,6 +110,7 @@ impl Shown {
             projects: hub.db.gitlab_projects(None)?,
             relays: crate::relays::views(hub)?,
             policy: hub.db.capacity_policy(),
+            arbitration: crate::jobs::arbitration_snapshot(hub)?,
         })
     }
 }
@@ -241,7 +248,7 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         relays_table(&mut h, &shown.relays, now, steer);
     }
     h.raw("</section><section><h2>Runners</h2>");
-    runners_table(&mut h, &shown.relays, now);
+    runners_table(&mut h, shown, now);
     h.raw("</section>");
     h
 }
@@ -659,8 +666,14 @@ fn relays_table(h: &mut Html, relays: &[RelayView], now: u64, steer: bool) {
                 "<span class=\"badge ok\">connected</span>"
             } else {
                 "<span class=\"badge bad\">unreachable</span>"
-            })
-            .raw("</td><td>");
+            });
+        if r.row
+            .protocol
+            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_PROTOCOL.min)
+        {
+            h.raw(" <span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span>");
+        }
+        h.raw("</td><td>");
         match r.row.last_seen {
             Some(t) => super::fleet::time_ago(h, now, t),
             None => h.raw("never"),
@@ -736,7 +749,8 @@ fn server_status(h: &mut Html, s: &ServerStatus) {
 
 /// Each relay's runners: GitLab's ID for each, where its jobs go, how many at once, whether
 /// GitLab took its token, what it is doing and its load, as the relay last said.
-fn runners_table(h: &mut Html, relays: &[RelayView], now: u64) {
+fn runners_table(h: &mut Html, shown: &Shown, now: u64) {
+    let relays = &shown.relays;
     let runners = || {
         relays.iter().flat_map(|r| {
             (r.row.inventory.iter())
@@ -749,9 +763,12 @@ fn runners_table(h: &mut Html, relays: &[RelayView], now: u64) {
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>runner</th>")
-        .raw("<th>GitLab ID</th><th>placement</th><th class=\"num\">limit</th><th>state</th>")
+        .raw("<th>GitLab ID</th><th>tenant</th><th>class</th><th>placement</th>")
+        .raw("<th class=\"num\">limit</th><th>state</th>")
         .raw("<th class=\"num\">requests</th><th class=\"num\">jobs</th>")
-        .raw("<th>last GitLab answer</th></tr></thead><tbody>");
+        .raw("<th>last GitLab answer</th><th class=\"num\">waiting</th>")
+        .raw("<th>offered / held / jobs</th><th>demand</th><th>waits for</th>")
+        .raw("</tr></thead><tbody>");
     for (r, runner) in runners() {
         let report = (r.row.report.iter())
             .flat_map(|rep| &rep.runners)
@@ -769,6 +786,30 @@ fn runners_table(h: &mut Html, relays: &[RelayView], now: u64) {
             Some(id) => h.text(id),
             None => h.raw("-"),
         };
+        // The runner as the hub schedules it: by its approved instance's name and GitLab ID.
+        let key = (r.server.as_ref())
+            .and_then(|s| s.name.clone())
+            .zip(runner.runner_id);
+        let mapping = (key.as_ref().zip(shown.policy.as_ref().ok()))
+            .and_then(|((gitlab, id), policy)| policy.runner(gitlab, *id));
+        h.raw("</td><td>");
+        match mapping {
+            Some(m) => {
+                h.raw("<a href=\"")
+                    .text(super::capacity::tenant_path(&m.tenant))
+                    .raw("\">")
+                    .text(&m.tenant)
+                    .raw("</a></td><td>")
+                    .text(m.class);
+            }
+            // Its server approved, its GitLab ID known and the policy read: it maps to none.
+            None if key.is_some() && shown.policy.is_ok() => {
+                h.raw("<span class=\"badge warn\">unmapped</span></td><td>-");
+            }
+            None => {
+                h.raw("-</td><td>-");
+            }
+        }
         h.raw("</td><td>pool ").node(&p.pool);
         if !p.labels.is_empty() {
             h.raw(" · ").node(&p.labels.join(", "));
@@ -817,9 +858,38 @@ fn runners_table(h: &mut Html, relays: &[RelayView], now: u64) {
                 h.raw("<td class=\"num\">-</td><td class=\"num\">-</td><td>-</td>");
             }
         }
+        match key.as_ref().and_then(|key| shown.arbitration.get(key)) {
+            Some(view) => arbitration_cells(h, view),
+            None => {
+                h.raw("<td class=\"num\">0</td><td>-</td><td>-</td><td>-</td>");
+            }
+        }
         h.raw("</tr>");
     }
     h.raw("</tbody></table>");
+}
+
+/// The runner's waiting, offered and held request counts, job count, oldest request's wait,
+/// recent admission outcomes, backoff, and reason its oldest request or a queued job waits.
+fn arbitration_cells(h: &mut Html, view: &crate::jobs::ArbitrationView) {
+    h.raw("<td class=\"num\">").text(view.waiting);
+    if let Some(secs) = view.wait_secs {
+        h.raw(" <span class=\"sub\">").text(secs).raw("s</span>");
+    }
+    h.raw("</td><td>")
+        .text(view.offers)
+        .raw(" / ")
+        .text(view.holds)
+        .raw(" / ")
+        .text(view.jobs)
+        .raw("</td><td>")
+        .text(view.demand);
+    if let Some(secs) = view.backoff_secs {
+        h.raw(" · backoff ").text(secs).raw("s");
+    }
+    h.raw("</td><td>")
+        .text(view.reason.unwrap_or("-"))
+        .raw("</td>");
 }
 
 /// A runner's state as a badge.
@@ -2231,6 +2301,30 @@ mod tests {
         assert_eq!(
             target(&views, "gitlab", 1000).map(|(op, k)| (op, k.len())),
             Some((KeyOp::Remove, 3))
+        );
+    }
+
+    /// A runner with a request waiting: how many and the oldest's wait, its offered, held and
+    /// jobs, its demand with its backoff, and why it waits.
+    #[test]
+    fn a_waiting_runner_shows_its_load_backoff_and_reason() {
+        let view = crate::jobs::ArbitrationView {
+            waiting: 2,
+            wait_secs: Some(12),
+            offers: 1,
+            holds: 3,
+            jobs: 4,
+            demand: "recently empty",
+            backoff_secs: Some(5),
+            reason: Some("tenant cap"),
+            oldest: Some("a".into()),
+        };
+        let mut h = Html::new();
+        arbitration_cells(&mut h, &view);
+        assert_eq!(
+            h.into_string(),
+            "<td class=\"num\">2 <span class=\"sub\">12s</span></td><td>1 / 3 / 4</td>\
+             <td>recently empty · backoff 5s</td><td>tenant cap</td>"
         );
     }
 }
