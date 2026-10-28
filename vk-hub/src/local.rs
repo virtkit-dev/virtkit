@@ -1744,16 +1744,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-hub-follow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let vk = dir.join("vk");
-        std::fs::write(
-            &vk,
-            "#!/bin/sh\n[ \"$1 $2\" = 'workloads --watch' ] || exit 9\n\
+        let vk = fake_vk(
+            &dir,
+            "[ \"$1 $2\" = 'workloads --watch' ] || exit 9\n\
              echo '{\"version\":1,\"workloads\":[],\"omitted\":3}'\n\
-             echo '{\"version\":1,\"workloads\":[],\"omitted\":4}'\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+             echo '{\"version\":1,\"workloads\":[],\"omitted\":4}'",
+        );
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
             Some("http://hub.example".into()),
