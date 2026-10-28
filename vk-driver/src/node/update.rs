@@ -1282,18 +1282,40 @@ mod tests {
         assert!(err.contains("did not finish"), "{err}");
         assert!(run_check(&argv(&["/nonexistent"]), t).await.is_err());
         // Killed with what it started, whether its own timeout or the trial's ends it.
-        for outer in [Duration::from_secs(30), Duration::from_millis(300)] {
+        for (inner, outer) in [
+            (Duration::from_secs(2), Duration::from_secs(30)),
+            (Duration::from_secs(30), Duration::from_millis(300)),
+        ] {
             let dir = scratch("validate-group");
             let pid_file = dir.join("sleeper");
             let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
             let cmd = argv(&["sh", "-c", &script]);
-            let check = run_check(&cmd, Duration::from_millis(600));
-            let _ = tokio::time::timeout(outer, check).await;
-            let pid: i32 = std::fs::read_to_string(&pid_file)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let mut check = Box::pin(run_check(&cmd, inner));
+            // A loaded host can be slow to start the shell: the trial's timeout runs from the
+            // sleeper's start, or it could end the check before there is a sleeper to kill.
+            let read_pid = || {
+                std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+            };
+            let mut ended = false;
+            let pid = loop {
+                if let Some(pid) = read_pid() {
+                    break pid;
+                }
+                tokio::select! {
+                    _ = &mut check => {
+                        ended = true;
+                        break read_pid().expect("the check ended before the sleeper started");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            };
+            if !ended {
+                let _ = tokio::time::timeout(outer, &mut check).await;
+            }
+            // Cut short by the trial: dropped, the group with it.
+            drop(check);
             // Gone, or a zombie until whoever inherited it reaps it.
             let gone = || {
                 std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |st| {
