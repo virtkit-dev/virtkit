@@ -22,7 +22,10 @@
 //! [`client_request_message`](crate::client::client_request_message).
 //!
 //! Version 1 is the first; it follows the crate's rule: only optional fields are added within
-//! a version.
+//! a version. Version 2 adds capacity arbitration: runners' `request_concurrency` in the
+//! inventory, their admission IDs in each heartbeat, and the client API's runner names,
+//! queued reservations and admission outcomes, which a relay relies on only once its session
+//! negotiated version 2.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +47,10 @@ pub const MAX_RUNNERS: usize = 64;
 
 /// The most labels a runner's placement keeps once made display-safe.
 pub const MAX_LABELS: usize = 32;
+
+/// The most admission IDs a runner's heartbeat keeps in each of its two lists once made
+/// display-safe.
+pub const MAX_ADMISSIONS: usize = 128;
 
 /// The hub's answer to a relay's enrollment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,14 +129,22 @@ pub struct Runner {
     /// How many of its jobs run at once, when limited: the runner's `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// How many job requests it keeps open with GitLab at once: the runner's
+    /// `request_concurrency`, at least 1. A version-1 inventory lacks it and means 1.
+    #[serde(default = "one")]
+    pub request_concurrency: u32,
     /// Whether GitLab took its token at the relay's last `verify`.
     pub verified: bool,
 }
 
+fn one() -> u32 {
+    1
+}
+
 impl Inventory {
     /// Apply [`display_safe`] to strings, drop the server's SPKI digest unless
-    /// [`valid_sha256`], and truncate runners to [`MAX_RUNNERS`] and their labels to
-    /// [`MAX_LABELS`].
+    /// [`valid_sha256`], truncate runners to [`MAX_RUNNERS`] and their labels to
+    /// [`MAX_LABELS`], and raise a `request_concurrency` of 0 to 1.
     pub fn make_display_safe(&mut self) {
         for s in [&mut self.version, &mut self.hostname, &mut self.system_id] {
             *s = display_safe(s);
@@ -140,6 +155,7 @@ impl Inventory {
         self.runners.truncate(MAX_RUNNERS);
         for r in &mut self.runners {
             r.name = display_safe(&r.name);
+            r.request_concurrency = r.request_concurrency.max(1);
             r.placement.pool = display_safe(&r.placement.pool);
             r.placement.labels.truncate(MAX_LABELS);
             for l in &mut r.placement.labels {
@@ -165,6 +181,13 @@ pub struct RunnerLoad {
     pub requests: u32,
     /// Jobs it holds: taken from GitLab and not yet settled.
     pub jobs: u32,
+    /// The admission of each of its `requests` ([`valid_id`](crate::valid_id)). Version 2;
+    /// empty from a version-1 relay.
+    #[serde(default)]
+    pub request_admissions: Vec<String>,
+    /// The admission of each of its `jobs`, as above.
+    #[serde(default)]
+    pub job_admissions: Vec<String>,
     /// When GitLab last answered it, and the HTTP status it answered with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_answer_at: Option<u64>,
@@ -174,10 +197,16 @@ pub struct RunnerLoad {
 
 impl Heartbeat {
     /// Truncate runners to [`MAX_RUNNERS`] and apply [`display_safe`] to their names.
+    /// Keep the first [`MAX_ADMISSIONS`] distinct valid IDs in each admission list.
     pub fn make_display_safe(&mut self) {
         self.runners.truncate(MAX_RUNNERS);
         for r in &mut self.runners {
             r.name = display_safe(&r.name);
+            for ids in [&mut r.request_admissions, &mut r.job_admissions] {
+                let mut seen = std::collections::HashSet::new();
+                ids.retain(|id| crate::valid_id(id) && seen.insert(id.clone()));
+                ids.truncate(MAX_ADMISSIONS);
+            }
         }
     }
 }
@@ -293,6 +322,7 @@ mod tests {
                 },
             },
             limit: Some(8),
+            request_concurrency: 2,
             verified: true,
         }
     }
@@ -314,7 +344,7 @@ mod tests {
                 runners: vec![runner()],
             }),
             &format!(
-                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"pool":"ci","labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"verified":true}}]}}"#,
+                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"pool":"ci","labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
                 "ab".repeat(32)
             ),
         );
@@ -324,11 +354,13 @@ mod tests {
                     name: "ci".into(),
                     requests: 1,
                     jobs: 3,
+                    request_admissions: vec![],
+                    job_admissions: vec![],
                     last_answer_at: Some(7),
                     last_status: Some(204),
                 }],
             }),
-            r#"{"type":"heartbeat","runners":[{"name":"ci","requests":1,"jobs":3,"last_answer_at":7,"last_status":204}]}"#,
+            r#"{"type":"heartbeat","runners":[{"name":"ci","requests":1,"jobs":3,"request_admissions":[],"job_admissions":[],"last_answer_at":7,"last_status":204}]}"#,
         );
         pinned(
             &RelayMsg::Report(Report {
@@ -509,6 +541,54 @@ mod tests {
         };
         i.make_display_safe();
         assert_eq!(i.server.spki_sha256, Some("ab".repeat(32)));
+    }
+
+    #[test]
+    fn heartbeat_drops_invalid_duplicate_and_excess_admissions() {
+        let ids: Vec<String> = (0..=MAX_ADMISSIONS).map(|i| format!("{i:032x}")).collect();
+        let mut heartbeat = Heartbeat {
+            runners: vec![RunnerLoad {
+                request_admissions: std::iter::once("not-an-id".to_owned())
+                    .chain(ids.iter().cloned())
+                    .collect(),
+                job_admissions: vec!["b".repeat(32), "invalid".into(), "b".repeat(32)],
+                ..RunnerLoad::default()
+            }],
+        };
+        heartbeat.make_display_safe();
+        assert_eq!(
+            heartbeat.runners[0].request_admissions,
+            ids[..MAX_ADMISSIONS]
+        );
+        assert_eq!(heartbeat.runners[0].job_admissions, vec!["b".repeat(32)]);
+    }
+
+    #[test]
+    fn a_version_1_runner_asks_one_request_at_a_time() {
+        let mut i: Inventory = serde_json::from_str(
+            r#"{"version":"0.96.0","hostname":"h","system_id":"s","concurrent":1,"server":{"url":"https://g"},"runners":[{"name":"ci","placement":{"pool":"ci","envelope":{"mem_mib":1,"cpus":1,"disk_bytes":1}},"verified":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(i.runners[0].request_concurrency, 1);
+        i.runners[0].request_concurrency = 0;
+        i.make_display_safe();
+        assert_eq!(i.runners[0].request_concurrency, 1);
+    }
+
+    #[test]
+    fn largest_heartbeat_fits_the_session_message_limit() {
+        let load = RunnerLoad {
+            name: "r".repeat(crate::MAX_DISPLAY),
+            requests: u32::try_from(MAX_ADMISSIONS).unwrap(),
+            jobs: u32::try_from(MAX_ADMISSIONS).unwrap(),
+            request_admissions: vec!["a".repeat(32); MAX_ADMISSIONS],
+            job_admissions: vec!["b".repeat(32); MAX_ADMISSIONS],
+            ..RunnerLoad::default()
+        };
+        let msg = RelayMsg::Heartbeat(Heartbeat {
+            runners: vec![load; MAX_RUNNERS],
+        });
+        assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
     }
 
     #[test]

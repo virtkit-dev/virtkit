@@ -81,6 +81,7 @@ impl Status {
                     runner_id: None,
                     placement: r.placement(),
                     limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
+                    request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
                     verified: false,
                 },
                 state: RunnerState::ServerPending,
@@ -208,6 +209,8 @@ impl Status {
                     name: r.runner.name.clone(),
                     requests: r.requests,
                     jobs: r.jobs,
+                    request_admissions: vec![],
+                    job_admissions: vec![],
                     last_answer_at: r.last_answer.map(|(at, _)| at),
                     last_status: r.last_answer.map(|(_, status)| status),
                 })

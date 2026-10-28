@@ -1983,6 +1983,7 @@ pub async fn reserve(
             match offer_answer(hub, &id, offers_until).await {
                 Some(lease_secs) => {
                     return Ok(ReservationGrant {
+                        admission: None,
                         reservation: id,
                         node,
                         envelope: placement.envelope,
@@ -2103,6 +2104,7 @@ pub async fn renew(
                         return Err(gone(id));
                     };
                     return Ok(ReservationGrant {
+                        admission: None,
                         reservation: id.to_string(),
                         node,
                         envelope,

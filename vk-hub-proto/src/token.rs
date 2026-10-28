@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SHA256_LEN, valid_id};
+use crate::{SHA256_LEN, is_false, valid_id};
 
 /// What every token starts with.
 pub const TOKEN_PREFIX: &str = "vkt_";
@@ -83,10 +83,6 @@ pub struct Grant {
     pub write: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub lock: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// What a request needs of a repository.

@@ -1,7 +1,9 @@
 //! The hub's client API: how a job producer — `vk-gitlab` first, `vk submit` later — asks
 //! for capacity, reserves it, submits jobs and follows them. HTTP/1.1 and JSON over TLS 1.3 on
 //! the hub's node listener, versioned by its `/v1/` paths under the same rule as enrollment:
-//! once released, a path's bodies only gain optional fields.
+//! once released, a path's bodies only gain optional fields. Both sides ignore fields they do
+//! not know, so a hub that predates a field drops it unseen: a relay learns what the hub acts
+//! on from its session's [`PROTOCOL`](crate::gitlab::PROTOCOL) version.
 //!
 //! Every request carries an API key as `authorization: Bearer <key>` ([`AUTHORIZATION`]); the
 //! key is the principal its jobs are recorded under, and the hub's policy for it decides the
@@ -23,7 +25,10 @@
 //! | Request | Body | Answer |
 //! |---|---|---|
 //! | `POST` [`CAPACITY_PATH`] | [`CapacityRequest`] | 200 [`Capacity`] |
-//! | `POST` [`RESERVATIONS_PATH`] | [`ReservationRequest`] | 201 [`ReservationGrant`] |
+//! | `POST` [`RESERVATIONS_PATH`] | [`ReservationRequest`] | 201 [`ReservationGrant`], or 202 [`ReservationTicket`] when queued |
+//! | `GET` [`TICKETS_PATH`]`/<ticket>?wait=<secs>` | — | 201 [`ReservationGrant`], or 202 [`ReservationTicket`] while queued |
+//! | `DELETE` [`TICKETS_PATH`]`/<ticket>` | — | 204 |
+//! | `POST` [`RESERVATIONS_PATH`]`/<admission>/outcome` | [`OutcomeRequest`] | 204 |
 //! | `POST` [`RESERVATIONS_PATH`]`/<id>/renew` | [`RenewRequest`] | 200 [`ReservationGrant`] |
 //! | `DELETE` [`RESERVATIONS_PATH`]`/<id>` | — | 204 |
 //! | `POST` [`JOBS_PATH`] | [`JobSubmission`] | 201 [`JobView`] |
@@ -33,21 +38,23 @@
 //! | `POST` [`JOBS_PATH`]`/<id>/settle` | — | 204 |
 //! | `POST` [`CLIENTS_PATH`] | [`ClientHello`] | 204 |
 //!
-//! `wait` on the two `GET`s, and `wait_secs` in a [`CapacityRequest`], make a request
-//! long-poll for at most that many seconds, capped at [`MAX_WAIT_SECS`]: a job view returns
-//! once its revision passes `after`, output once there are bytes past `offset` or the output
-//! is complete, capacity once its revision passes `after`. A long poll that times out
-//! answers as a plain request would.
+//! `wait` on the `GET`s, and `wait_secs` in a [`CapacityRequest`], make a request
+//! long-poll for at most that many seconds, capped at [`MAX_WAIT_SECS`]: a ticket returns
+//! once it is granted, a job view once its revision passes `after`, output once there are
+//! bytes past `offset` or the output is complete, capacity once its revision passes `after`.
+//! A long poll that times out answers as a plain request would.
 
 use serde::{Deserialize, Serialize};
 
 pub use crate::dispatch::CancelMode;
 use crate::job::{Envelope, JobResult, JobSpec};
-use crate::{Channel, SHA256_LEN, channel_part, part};
+use crate::{Channel, SHA256_LEN, channel_part, is_false, part};
 
 pub const CAPACITY_PATH: &str = "/v1/capacity";
 /// Followed by `/<id>` for one reservation.
 pub const RESERVATIONS_PATH: &str = "/v1/reservations";
+/// Followed by `/<ticket>` for one queued reservation request.
+pub const TICKETS_PATH: &str = "/v1/reservations/tickets";
 /// Followed by `/<id>` for one job.
 pub const JOBS_PATH: &str = "/v1/jobs";
 pub const CLIENTS_PATH: &str = "/v1/clients";
@@ -97,6 +104,10 @@ pub struct Placement {
 /// `POST` [`CAPACITY_PATH`]: is there room for this placement?
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityRequest {
+    /// The relay runner asking, by its inventory name: a relay names one of its verified
+    /// runners, an API key names none. The hub refuses a request whose runner breaks that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
     pub placement: Placement,
     /// Wait for a revision past this one; `None` answers at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +129,13 @@ pub struct Capacity {
 /// `POST` [`RESERVATIONS_PATH`]: set one envelope aside on a node of the placement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReservationRequest {
+    /// As in [`CapacityRequest::runner`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// Wait in the hub's queue instead of failing when nothing fits: the hub answers with a
+    /// [`ReservationTicket`] unless it grants at once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queue: bool,
     pub request_id: String,
     pub placement: Placement,
     /// At most [`MAX_LEASE_SECS`](crate::dispatch::MAX_LEASE_SECS).
@@ -131,12 +149,47 @@ pub struct ReservationRequest {
 /// A reservation a node holds for the client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReservationGrant {
+    /// The admission a queued grant counts against ([`valid_id`](crate::valid_id)): named by
+    /// the job submitted on it, and settled by an [`OutcomeRequest`]. `None` on a grant that
+    /// did not queue, and on a renew's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
     pub reservation: String,
     pub node: String,
     pub envelope: Envelope,
     /// The lease the node granted. It runs on the node's clock from when the node accepted,
     /// so a client counts it from when it sent its request.
     pub lease_secs: u32,
+}
+
+/// A reservation request waiting in the hub's queue, polled and cancelled at
+/// [`TICKETS_PATH`]`/<ticket>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationTicket {
+    /// The ticket's ID ([`valid_id`](crate::valid_id)), chosen by the hub.
+    pub ticket: String,
+}
+
+/// What came of an admission's grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionOutcome {
+    /// GitLab handed out a job, now submitted under the admission.
+    Job,
+    /// GitLab had no job for the runner.
+    Empty,
+    /// Asking GitLab failed.
+    Error,
+    /// The relay gave the grant back without asking GitLab.
+    Released,
+}
+
+/// `POST` [`RESERVATIONS_PATH`]`/<admission>/outcome`: settle an admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeRequest {
+    /// The admission settled; the hub refuses a body whose ID differs from the path's.
+    pub admission: String,
+    pub outcome: AdmissionOutcome,
 }
 
 /// `POST` [`RESERVATIONS_PATH`]`/<id>/renew`.
@@ -148,6 +201,12 @@ pub struct RenewRequest {
 /// `POST` [`JOBS_PATH`]: run a job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSubmission {
+    /// As in [`CapacityRequest::runner`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// The admission of the grant the job was taken under ([`ReservationGrant::admission`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
     pub request_id: String,
     pub placement: Placement,
     /// A reservation of the client's to start the job on. When it is gone, the hub places
@@ -371,6 +430,7 @@ mod tests {
     #[test]
     fn every_body_round_trips() {
         round_trip(&CapacityRequest {
+            runner: Some("ci".into()),
             placement: placement(),
             after: Some(7),
             wait_secs: 30,
@@ -380,19 +440,38 @@ mod tests {
             fits: 3,
         });
         round_trip(&ReservationRequest {
+            runner: Some("ci".into()),
+            queue: true,
             request_id: "1".repeat(32),
             placement: placement(),
             lease_secs: 90,
             wait_secs: 10,
         });
         round_trip(&ReservationGrant {
+            admission: Some("a".repeat(32)),
             reservation: "a".repeat(32),
             node: "c".repeat(32),
             envelope: placement().envelope,
             lease_secs: 90,
         });
+        round_trip(&ReservationTicket {
+            ticket: "b".repeat(32),
+        });
+        for outcome in [
+            AdmissionOutcome::Job,
+            AdmissionOutcome::Empty,
+            AdmissionOutcome::Error,
+            AdmissionOutcome::Released,
+        ] {
+            round_trip(&OutcomeRequest {
+                admission: "a".repeat(32),
+                outcome,
+            });
+        }
         round_trip(&RenewRequest { lease_secs: 90 });
         round_trip(&JobSubmission {
+            runner: Some("ci".into()),
+            admission: Some("a".repeat(32)),
             request_id: "2".repeat(32),
             placement: placement(),
             reservation: Some("a".repeat(32)),
@@ -432,6 +511,8 @@ mod tests {
     #[test]
     fn bodies_keep_their_wire_shape() {
         let request = ReservationRequest {
+            runner: None,
+            queue: false,
             request_id: "1".repeat(32),
             placement: placement(),
             lease_secs: 90,

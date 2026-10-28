@@ -429,6 +429,7 @@ impl Dispatcher for HubClient {
         wait: Duration,
     ) -> DispatchResult<Capacity> {
         let body = CapacityRequest {
+            runner: None,
             placement: placement.clone(),
             after,
             wait_secs: wait_secs(wait),
@@ -453,6 +454,8 @@ impl Dispatcher for HubClient {
         wait: Duration,
     ) -> DispatchResult<Reservation> {
         let body = ReservationRequest {
+            runner: None,
+            queue: false,
             request_id: request_id.to_owned(),
             placement: placement.clone(),
             lease_secs: lease_secs(lease),
@@ -512,6 +515,8 @@ impl Dispatcher for HubClient {
             ));
         }
         let body = JobSubmission {
+            runner: None,
+            admission: None,
             request_id: submission.request_id,
             placement: submission.placement,
             reservation: submission.reservation,

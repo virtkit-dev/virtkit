@@ -521,6 +521,11 @@ pub fn gitlab_job_url(server_url: &str, project_path: &str, job_id: &str) -> Opt
     Some(format!("{server}/{project_path}/-/jobs/{job_id}")).filter(|u| is_web_link(u))
 }
 
+/// For `skip_serializing_if` on a flag that defaults to false.
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// `s` made safe to print, cut to [`MAX_DISPLAY`] characters. Dropped: control characters
 /// and the [`invisible`] ones.
 pub fn display_safe(s: &str) -> String {

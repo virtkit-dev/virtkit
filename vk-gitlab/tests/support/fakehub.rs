@@ -193,6 +193,7 @@ async fn serve(
                 Ok(r) => json(
                     201,
                     &ReservationGrant {
+                        admission: None,
                         reservation: r.id,
                         node: r.node,
                         envelope: r.envelope,
@@ -211,6 +212,7 @@ async fn serve(
                 Ok(lease) => json(
                     200,
                     &ReservationGrant {
+                        admission: None,
                         reservation: (*id).to_owned(),
                         node: "node-1".to_owned(),
                         envelope: Default::default(),
