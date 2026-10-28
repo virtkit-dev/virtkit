@@ -1016,3 +1016,234 @@ async fn a_production_probe_burst_owes_normal_work_a_turn() {
     assert_eq!(reply.status, 202, "{reply:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Keep `entries`, placements and their slots, for production work.
+fn headroom(hub: &Hub, entries: Vec<(Placement, u32)>) {
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.headroom = entries
+        .into_iter()
+        .map(|(placement, slots)| crate::policy::Headroom { placement, slots })
+        .collect();
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn normal_work_leaves_an_overlapping_entry_its_room() {
+    let dir = scratch("capacity-headroom");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    add_runner(
+        &hub,
+        &key,
+        "production",
+        43,
+        crate::policy::Class::Production,
+    );
+    ready_relay(&hub, &key);
+    // The node fits four requests, or one of a whole node's memory, labelled or not.
+    let mut whole = placement();
+    whole.labels.clear();
+    whole.envelope.mem_mib = 16384;
+    let mut disjoint = placement();
+    disjoint.labels = vec!["not-present".into()];
+    // The requests' own entry would leave room to spare, and the disjoint one has no room
+    // anywhere to keep; a normal request would take the whole node's.
+    headroom(&hub, vec![(placement(), 1), (whole, 1), (disjoint, 1)]);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let normal = queue(addr, &key, 1).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("production headroom"));
+    let production = queue_for(addr, &key, 2, "production").await;
+    let grant = accept_ticket(addr, &key, &production, &mut node).await;
+    assert_eq!(grant.admission.as_deref(), Some(production.as_str()));
+    let reply = poll(addr, &key, &normal, 0).await;
+    assert_eq!(reply.status, 202, "{reply:?}");
+    // Without headroom, a normal request takes the room left.
+    take_job(addr, &key, &production, &grant).await;
+    headroom(&hub, Vec::new());
+    crate::jobs::testing::step(&hub).await;
+    let next = accept_ticket(addr, &key, &normal, &mut node).await;
+    assert_eq!(next.admission.as_deref(), Some(normal.as_str()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn an_entry_already_short_loses_no_more_room() {
+    let dir = scratch("capacity-headroom-short");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    // Two slots of three requests' memory: only the roomier node has any, for one.
+    let mut large = placement();
+    large.envelope.mem_mib = 12288;
+    headroom(&hub, vec![(large, 2)]);
+    let _roomy = ready_node(addr, &hub, 12288).await;
+    let mut small = ready_node(addr, &hub, 8192).await;
+    crate::ops::set_ceiling(&hub, "u", &small.id, Some(1)).unwrap();
+    // The roomier node goes first, but would lose the entry its one slot: the other takes it.
+    let first = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &first, &mut small).await;
+    assert_eq!(grant.node, small.id);
+    take_job(addr, &key, &first, &grant).await;
+    queue(addr, &key, 2).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("production headroom"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_job_kept_from_headroom_ends_saying_why() {
+    let dir = scratch("capacity-headroom-job");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    headroom(&hub, vec![(placement(), 2)]);
+    let _node = ready_node(addr, &hub, 8192).await;
+    let reply = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(1, None, 1)),
+    )
+    .await;
+    assert_eq!(reply.status, 201, "{reply:?}");
+    let id = reply.json::<JobView>().id;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &id),
+        Some("production headroom")
+    );
+    let view = view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
+    let result = view.result.unwrap();
+    assert_eq!(result.failure, Some(FailureClass::NoCapacity));
+    assert_eq!(
+        result.message.as_deref(),
+        Some("no node took it within its placement window (production headroom)")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_job_whose_reservation_cannot_take_it_is_kept_from_headroom() {
+    let dir = scratch("capacity-headroom-reserved");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let mut reserved = ready_node(addr, &hub, 16384).await;
+    let mut other = ready_node(addr, &hub, 8192).await;
+    let ticket = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &ticket, &mut reserved).await;
+    take_job(addr, &key, &ticket, &grant).await;
+    // Its node takes no work now; the other's room is all kept.
+    crate::jobs::testing::unhold(&hub, &reserved.id);
+    headroom(&hub, vec![(placement(), 2)]);
+    let mut body = job_body(2, Some(&grant.reservation), 1);
+    body["admission"] = json!(ticket);
+    let reply = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(reply.status, 201, "{reply:?}");
+    let id = reply.json::<JobView>().id;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &id),
+        Some("production headroom")
+    );
+    let view = view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
+    assert_eq!(
+        view.result.unwrap().message.as_deref(),
+        Some("no node took it within its placement window (production headroom)")
+    );
+    other.quiet(Duration::from_millis(100)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_refusal_on_the_only_node_that_keeps_headroom_is_asked_again() {
+    let dir = scratch("capacity-headroom-retry");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    // One slot of three requests' memory, on the busier node alone.
+    let mut large = placement();
+    large.envelope.mem_mib = 12288;
+    headroom(&hub, vec![(large, 1)]);
+    let mut busy = loaded_node(addr, &hub, 12288, Some(400)).await;
+    let mut idle = ready_node(addr, &hub, 8192).await;
+    queue(addr, &key, 1).await;
+    // The idle node goes first, and refuses; the busy one would lose the entry its slot.
+    for _ in 0..2 {
+        let HubJobMsg::Offer { reservation, .. } = idle.job().await else {
+            panic!("expected an offer")
+        };
+        idle.send(NodeJobMsg::OfferReply {
+            reservation,
+            reply: OfferReply::Refused {
+                reason: Refusal::Memory,
+                message: None,
+            },
+        });
+        // Not kept from the node that refused: asked again after a pause.
+        wait_reason(&hub, "no fitting node").await;
+    }
+    busy.quiet(Duration::from_millis(100)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_grant_in_the_same_pass_counts_against_headroom() {
+    let dir = scratch("capacity-headroom-pass");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    add_runner(&hub, &key, "second", 43, crate::policy::Class::Normal);
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.probe_limit = 2;
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    ready_relay(&hub, &key);
+    // Four slots, three kept: one request may go, not two.
+    headroom(&hub, vec![(placement(), 3)]);
+    let first = queue(addr, &key, 1).await;
+    queue_for(addr, &key, 2, "second").await;
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let grant = accept_ticket(addr, &key, &first, &mut node).await;
+    assert_eq!(grant.admission.as_deref(), Some(first.as_str()));
+    assert_eq!(reason_now(&hub, 43).await, Some("production headroom"));
+    node.quiet(Duration::from_millis(100)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_larger_of_two_entries_of_one_placement_holds() {
+    let dir = scratch("capacity-headroom-dedupe");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    // Four slots: one kept would leave room for three requests, three kept for one.
+    headroom(&hub, vec![(placement(), 1), (placement(), 3)]);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let first = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &first, &mut node).await;
+    take_job(addr, &key, &first, &grant).await;
+    queue(addr, &key, 2).await;
+    assert_eq!(reason_now(&hub, 42).await, Some("production headroom"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_short_entry_admits_what_leaves_its_room() {
+    let dir = scratch("capacity-headroom-short-kept");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    // Two slots of three requests' memory: the node has room for one, and keeps it with a
+    // request placed.
+    let mut large = placement();
+    large.envelope.mem_mib = 12288;
+    headroom(&hub, vec![(large, 2)]);
+    let mut node = ready_node(addr, &hub, 20480).await;
+    let ticket = queue(addr, &key, 1).await;
+    let grant = accept_ticket(addr, &key, &ticket, &mut node).await;
+    assert_eq!(grant.admission.as_deref(), Some(ticket.as_str()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

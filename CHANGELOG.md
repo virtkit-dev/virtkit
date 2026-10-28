@@ -40,7 +40,8 @@ All notable changes to virtkit will be documented in this file.
   at its cap of requests and jobs; a tenant's unused share goes to the others. Production
   runners' requests and jobs go before normal ones, normal work getting a turn after
   `production_probe_burst` production discovery polls since its last grant, and first after a
-  hub restart.
+  hub restart. The policy's `headroom` entries, at most 64, reserve fleet capacity for
+  production work.
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
   Replacements are audited and checked against the shown digest to prevent lost updates.
 

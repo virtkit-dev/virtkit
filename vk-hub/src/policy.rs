@@ -11,7 +11,7 @@ use vk_hub_proto::client::Placement;
 const MAX_TENANTS: usize = 4096;
 const MAX_RUNNERS: usize = 16384;
 const MAX_CLIENTS: usize = 16384;
-const MAX_HEADROOMS: usize = 1024;
+const MAX_HEADROOMS: usize = 64;
 const MAX_PROJECTS: usize = 16384;
 const MAX_BRANCHES: usize = 1024;
 /// The longest production branch pattern and client principal, in bytes.
@@ -457,6 +457,14 @@ mod tests {
             let err = policy.validate().unwrap_err().to_string();
             assert!(err.contains("headroom #1 (pool \"ci\")"), "{err}");
         }
+        let mut policy = Policy {
+            headroom: vec![headroom(1, 1); MAX_HEADROOMS],
+            ..Policy::default()
+        };
+        policy.validate().unwrap();
+        policy.headroom.push(headroom(1, 1));
+        let err = policy.validate().unwrap_err().to_string();
+        assert!(err.contains("size limit"), "{err}");
 
         let mut policy = Policy::default();
         policy.tenants.get_mut("fallback").unwrap().cap = Some(0);

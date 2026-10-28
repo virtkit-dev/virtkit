@@ -71,7 +71,7 @@ use crate::store::{ApiPrincipal, JobFilter, JobOutcome, JobPage, JobRow, NodeRow
 use crate::ui::html::Style;
 
 mod scheduler;
-use scheduler::{ScheduleCtx, admission_node, schedule_tickets};
+use scheduler::{Kept, ScheduleCtx, schedule_tickets};
 
 /// How long a node may be unreachable while it holds a job before the job is lost, by
 /// default.
@@ -466,7 +466,7 @@ struct LiveJob {
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
     /// Why arbitration last passed it over while nodes may have had room for it: a limit of
-    /// its tenant, relay or runner. Told when it ends at its deadline.
+    /// its tenant, relay or runner, or production headroom. Told when it ends at its deadline.
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
@@ -1582,7 +1582,7 @@ pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> 
 
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no
 /// placed work now.
-/// `placed` is the node's placed work, as [`placed`] counts it.
+/// `placed` counts work as [`placed`] does; `extra` is additional work not in the heartbeat.
 fn room(
     hub: &Hub,
     state: &State,
@@ -1590,6 +1590,7 @@ fn room(
     row: &NodeRow,
     placement: &Placement,
     placed: u64,
+    extra: Option<Envelope>,
 ) -> Option<u64> {
     let link = state.links.get(node)?;
     if !link.held || hub.reach(node) != Reach::Connected {
@@ -1639,6 +1640,9 @@ fn room(
         pending.mem_mib = pending.mem_mib.saturating_add(e.mem_mib);
         pending.disk_bytes = pending.disk_bytes.saturating_add(e.disk_bytes);
     };
+    if let Some(e) = extra {
+        add(e);
+    }
     for r in state.reservations.values().filter(|r| r.node == node) {
         match r.phase {
             ResvPhase::Offered | ResvPhase::Abandoned => add(r.envelope),
@@ -1856,13 +1860,24 @@ fn rooms<'a>(
     placement: &Placement,
     skip: &HashSet<String>,
 ) -> Vec<(&'a str, &'a NodeRow, u64, Tally)> {
-    let tallies = tallies(state);
+    rooms_with(hub, state, nodes, placement, skip, &tallies(state))
+}
+
+/// [`rooms`], given the nodes' [`tallies`].
+fn rooms_with<'a>(
+    hub: &Hub,
+    state: &'a State,
+    nodes: &'a [(String, NodeRow)],
+    placement: &Placement,
+    skip: &HashSet<String>,
+    tallies: &HashMap<&str, Tally>,
+) -> Vec<(&'a str, &'a NodeRow, u64, Tally)> {
     nodes
         .iter()
         .filter(|(id, _)| !skip.contains(id))
         .filter_map(|(id, row)| {
             let tally = tallies.get(id.as_str()).copied().unwrap_or_default();
-            let room = room(hub, state, id, row, placement, tally.placed)?;
+            let room = room(hub, state, id, row, placement, tally.placed, None)?;
             Some((id.as_str(), row, room, tally))
         })
         .collect()
@@ -3926,7 +3941,7 @@ struct PlaceCtx<'a> {
     mint: &'a crate::tokens::MintCtx,
     /// The egress rules and their generation, with `[jobs] egress_rules` on.
     rules: Option<&'a (u64, Vec<crate::store::EgressRuleRow>)>,
-    /// The capacity policy, for the node a job's admission may take ([`admission_node`]).
+    /// The capacity policy, for the node a job's admission may take ([`Kept`]).
     policy: &'a crate::policy::Policy,
 }
 
@@ -3970,6 +3985,23 @@ fn placement_exclusions(
     HashSet::new()
 }
 
+/// Reservation `id`, if a job may start on it: held by a linked node outside `excluded` that
+/// may run the hub's jobs.
+fn usable_reservation<'s>(
+    hub: &Hub,
+    state: &'s State,
+    nodes: &[(String, NodeRow)],
+    excluded: &HashSet<String>,
+    id: &str,
+) -> Option<&'s Resv> {
+    let x = state.reservations.get(id)?;
+    let ok = matches!(x.phase, ResvPhase::Held { .. })
+        && state.links.get(&x.node).is_some_and(|l| l.held)
+        && !excluded.contains(&x.node)
+        && (nodes.iter()).any(|(n, row)| *n == x.node && enforces_rules(hub, row));
+    ok.then_some(x)
+}
+
 /// Send queued job `id` to its reservation's node while the reservation holds, else the
 /// least loaded candidate that has not refused it ([`candidates`]). Prefer a lightly loaded
 /// candidate holding its image unless the reservation's node also holds it ([`warm_nodes`]).
@@ -4003,7 +4035,6 @@ fn place(
     };
     let mint_key = job.mint_key.clone();
     let placement = job.row.placement.clone();
-    let key = job.row.key.clone();
     let class = job
         .row
         .scheduling
@@ -4026,12 +4057,8 @@ fn place(
         preferred(state, nodes, found, &warm, cpus, affinity, clock)
     };
     let reserved = job.reservation.as_ref().and_then(|r| {
-        let x = state.reservations.get(r)?;
-        let ok = matches!(x.phase, ResvPhase::Held { .. })
-            && state.links.get(&x.node).is_some_and(|l| l.held)
-            && !excluded.contains(&x.node)
-            && (nodes.iter()).any(|(n, row)| *n == x.node && enforces_rules(hub, row));
-        ok.then(|| (r.clone(), x.node.clone(), x.envelope, x.accepted_at))
+        let x = usable_reservation(hub, state, nodes, &excluded, r)?;
+        Some((r.clone(), x.node.clone(), x.envelope, x.accepted_at))
     });
     let mut given_up = None;
     let mut selected = selected.map(str::to_owned);
@@ -4040,17 +4067,13 @@ fn place(
         && !warm.contains(node)
     {
         let found = candidates(hub, state, nodes, &placement, &tried);
-        let every = candidates(hub, state, nodes, &placement, &HashSet::new());
         let light = preferred_among(state, &found);
-        for (candidate, _) in warm_first(found.clone(), &light) {
+        let kept = Kept::new(hub, nodes, policy);
+        for (candidate, _) in warm_first(found, &light) {
             if !light.contains(&candidate) {
                 break;
             }
-            let mut skip: HashSet<String> = found.iter().map(|(id, _)| id.clone()).collect();
-            skip.remove(&candidate);
-            if admission_node(policy, (&key, &placement, class), &every, &skip).as_deref()
-                == Some(&candidate)
-            {
+            if kept.admits(state, (&placement, class), &candidate) {
                 selected = Some(candidate);
                 given_up = Some(reservation.clone());
                 break;
@@ -4078,6 +4101,9 @@ fn place(
                 tried.clone_from(&excluded);
                 found = candidates(hub, state, nodes, &placement, &tried);
             }
+            // Arbitration chose a node unless it used a reservation. Both checks of whether
+            // the reservation is usable hold the same lock.
+            debug_assert!(selected.is_some(), "job {id} placed without a node chosen");
             if let Some(selected) = &selected {
                 found.retain(|(node, _)| node == selected);
             }
@@ -5540,6 +5566,14 @@ pub(crate) mod testing {
             *since = Instant::now() - scheduler::ABANDONED_PROBE_GRACE;
         }
         super::step(hub).await.unwrap();
+    }
+
+    /// Have `node`'s link take no new work, as before it sends its `held`, keeping the
+    /// reservations it holds.
+    pub fn unhold(hub: &Hub, node: &str) {
+        if let Some(link) = hub.dispatch.lock().links.get_mut(node) {
+            link.held = false;
+        }
     }
 
     /// Whether `node` has a version-3 link that has sent its `held`.

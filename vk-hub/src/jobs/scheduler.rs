@@ -14,19 +14,177 @@ const UNLISTED_GRACE: Duration = Duration::from_secs(10);
 /// against the shared probe budget.
 pub(super) const ABANDONED_PROBE_GRACE: Duration = Duration::from_secs(30);
 
-/// Choose a node for `admission`, a principal's placement and class. `found` contains
-/// nodes with room in [`candidates`] order. Policy does not affect selection yet:
-/// return the first node outside `skip`.
-pub(super) fn admission_node(
-    _policy: &crate::policy::Policy,
-    _admission: (&str, &Placement, crate::policy::Class),
+/// Why [`admission_node`] found no node: none outside `skip` has room, or only nodes in `skip`
+/// (not `excluded`) would admit it: asked again after the pause.
+pub(super) const NO_FITTING_NODE: &str = "no fitting node";
+
+/// Why [`admission_node`] found no node: each with room would take the room a headroom entry
+/// keeps for production.
+pub(super) const PRODUCTION_HEADROOM: &str = "production headroom";
+
+/// Fleet room reserved by the policy's headroom entries for [`admission_node`]. Read on the
+/// first normal admission and cached until the next placement changes it ([`Kept::new`] again).
+pub(super) struct Kept<'a> {
+    hub: &'a Hub,
+    nodes: &'a [(String, NodeRow)],
+    policy: &'a crate::policy::Policy,
+    read: std::cell::OnceCell<KeptRooms>,
+}
+
+/// Fleet room for each headroom placement, merging identical placements at their greatest
+/// slot count.
+struct KeptRooms {
+    entries: Vec<KeptEntry>,
+    /// Each node's placed work, as [`placed`] counts it.
+    placed: HashMap<String, u64>,
+    /// Whether an envelope, by node index in [`Kept::nodes`] and size, leaves each entry its
+    /// slots: each node and envelope is judged once until the next placement.
+    memo: std::cell::RefCell<HashMap<(usize, u64, u32, u64), bool>>,
+}
+
+struct KeptEntry {
+    placement: Placement,
+    slots: u32,
+    /// The placement's room on each node with any, and their sum.
+    on: HashMap<String, u64>,
+    total: u64,
+}
+
+impl<'a> Kept<'a> {
+    pub(super) fn new(
+        hub: &'a Hub,
+        nodes: &'a [(String, NodeRow)],
+        policy: &'a crate::policy::Policy,
+    ) -> Self {
+        Kept {
+            hub,
+            nodes,
+            policy,
+            read: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn read(&self, state: &State) -> &KeptRooms {
+        self.read.get_or_init(|| {
+            // Share one tally pass over the dispatch state across all entries.
+            let tallies = tallies(state);
+            let mut entries: Vec<KeptEntry> = Vec::new();
+            for headroom in &self.policy.headroom {
+                if let Some(entry) = entries
+                    .iter_mut()
+                    .find(|e| e.placement == headroom.placement)
+                {
+                    entry.slots = entry.slots.max(headroom.slots);
+                    continue;
+                }
+                let found = rooms_with(
+                    self.hub,
+                    state,
+                    self.nodes,
+                    &headroom.placement,
+                    &HashSet::new(),
+                    &tallies,
+                );
+                let on: HashMap<String, u64> = found
+                    .into_iter()
+                    .map(|(node, _, room, _)| (node.to_owned(), room))
+                    .collect();
+                let total = on.values().fold(0u64, |sum, n| sum.saturating_add(*n));
+                entries.push(KeptEntry {
+                    placement: headroom.placement.clone(),
+                    slots: headroom.slots,
+                    on,
+                    total,
+                });
+            }
+            let placed = tallies
+                .into_iter()
+                .map(|(node, t)| (node.to_owned(), t.placed))
+                .collect();
+            KeptRooms {
+                entries,
+                placed,
+                memo: std::cell::RefCell::default(),
+            }
+        })
+    }
+
+    /// Whether `admission` may go to `node`: production work anywhere; normal work where it
+    /// preserves each entry's slots, or all remaining room if already short. An entry with
+    /// no room on `node` does not block it.
+    pub(super) fn admits(
+        &self,
+        state: &State,
+        admission: (&Placement, crate::policy::Class),
+        node: &str,
+    ) -> bool {
+        let (placement, class) = admission;
+        if class == crate::policy::Class::Production || self.policy.headroom.is_empty() {
+            return true;
+        }
+        let Some(at) = self.nodes.iter().position(|(id, _)| id == node) else {
+            return false;
+        };
+        let read = self.read(state);
+        let e = placement.envelope;
+        let key = (at, e.mem_mib, e.cpus, e.disk_bytes);
+        if let Some(&kept) = read.memo.borrow().get(&key) {
+            return kept;
+        }
+        let row = &self.nodes[at].1;
+        let placed = read
+            .placed
+            .get(node)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let kept = read.entries.iter().all(|entry| {
+            let before = entry.on.get(node).copied().unwrap_or(0);
+            if before == 0 {
+                return true;
+            }
+            let p = &entry.placement;
+            let after = room(self.hub, state, node, row, p, placed, Some(e)).unwrap_or(0);
+            let left = entry.total.saturating_sub(before).saturating_add(after);
+            left >= u64::from(entry.slots).min(entry.total)
+        });
+        read.memo.borrow_mut().insert(key, kept);
+        kept
+    }
+}
+
+/// Choose a node for `admission`, a placement and its class. `found` contains nodes with room
+/// in [`candidates`] order: the first outside `skip` that [`Kept::admits`] it. `Err` says why
+/// there is none: [`NO_FITTING_NODE`] too when only nodes in `skip` but not in `excluded`
+/// would admit it, so that the caller asks them again after a pause, as for nodes that all
+/// refused it; [`PRODUCTION_HEADROOM`] when none would.
+fn admission_node(
+    state: &State,
+    kept: &Kept<'_>,
+    admission: (&Placement, crate::policy::Class),
     found: &[(String, u64)],
     skip: &HashSet<String>,
-) -> Option<String> {
-    found
+    excluded: &HashSet<String>,
+) -> std::result::Result<String, &'static str> {
+    let (open, skipped): (Vec<_>, Vec<_>) = found
         .iter()
-        .find(|(node, _)| !skip.contains(node))
-        .map(|(node, _)| node.clone())
+        .map(|(node, _)| node)
+        .filter(|node| !excluded.contains(*node))
+        .partition(|node| !skip.contains(*node));
+    if open.is_empty() {
+        return Err(NO_FITTING_NODE);
+    }
+    if let Some(node) = open.iter().find(|node| kept.admits(state, admission, node)) {
+        return Ok((*node).clone());
+    }
+    if skipped
+        .iter()
+        .any(|node| kept.admits(state, admission, node))
+    {
+        Err(NO_FITTING_NODE)
+    } else {
+        Err(PRODUCTION_HEADROOM)
+    }
 }
 
 fn blocked(state: &mut State, id: &str, reason: &'static str) {
@@ -803,6 +961,7 @@ fn arbitrate(
         if placed == MAX_PLACEMENTS_PER_STEP {
             break;
         }
+        let mut kept = Kept::new(hub, nodes, policy);
         let mut eligible = Vec::new();
         let waiters: Vec<_> = state
             .tickets
@@ -880,14 +1039,11 @@ fn arbitrate(
                 blocked(state, id, "runner already probing");
                 continue;
             }
-            let admission = (
-                ticket.key.as_str(),
-                &ticket.placement,
-                ticket.identity.class,
-            );
+            let admission = (&ticket.placement, ticket.identity.class);
             let fits = found.get(hub, state, nodes, &ticket.placement);
-            let mut node = admission_node(policy, admission, fits, &ticket.tried);
-            if node.is_none()
+            let none = HashSet::new();
+            let mut node = admission_node(state, &kept, admission, fits, &ticket.tried, &none);
+            if node == Err(NO_FITTING_NODE)
                 && !ticket.tried.is_empty()
                 && let Some(live) = state.tickets.get_mut(id)
             {
@@ -895,12 +1051,15 @@ fn arbitrate(
                 if now.duration_since(ended) >= RETRY_PAUSE {
                     live.tried.clear();
                     live.round_ended = None;
-                    node = admission_node(policy, admission, fits, &HashSet::new());
+                    node = admission_node(state, &kept, admission, fits, &none, &none);
                 }
             }
-            let Some(node) = node else {
-                blocked(state, id, "no fitting node");
-                continue;
+            let node = match node {
+                Ok(node) => node,
+                Err(why) => {
+                    blocked(state, id, why);
+                    continue;
+                }
             };
             let tenant_probe = probe
                 .then(|| state.tenant_probe.get(&ticket.identity.tenant).copied())
@@ -959,6 +1118,7 @@ fn arbitrate(
                     job.reservation = None;
                 }
                 found = Found::default();
+                kept = Kept::new(hub, nodes, policy);
             }
             tried.extend(excluded.iter().cloned());
             let identity = row.scheduling.as_ref();
@@ -1015,19 +1175,16 @@ fn arbitrate(
             if let Some(job) = state.jobs.get_mut(&id) {
                 job.blocked = None;
             }
-            let reserved = reservation.as_ref().is_some_and(|r| {
-                state
-                    .reservations
-                    .get(r)
-                    .is_some_and(|r| matches!(r.phase, ResvPhase::Held { .. }))
-            });
+            let reserved = reservation
+                .as_ref()
+                .is_some_and(|r| usable_reservation(hub, state, nodes, &excluded, r).is_some());
             let node = if reserved {
                 String::new()
             } else {
-                let admission = (row.key.as_str(), &row.placement, class);
+                let admission = (&row.placement, class);
                 let fits = found.get(hub, state, nodes, &row.placement);
-                let mut chosen = admission_node(policy, admission, fits, &tried);
-                if chosen.is_none() && !tried.is_empty() {
+                let mut chosen = admission_node(state, &kept, admission, fits, &tried, &excluded);
+                if chosen == Err(NO_FITTING_NODE) && !tried.is_empty() {
                     let job = state
                         .jobs
                         .get_mut(&id)
@@ -1039,11 +1196,18 @@ fn arbitrate(
                         job.tried.clear();
                         job.round_ended = None;
                         tried.clone_from(&excluded);
-                        chosen = admission_node(policy, admission, fits, &tried);
+                        chosen = admission_node(state, &kept, admission, fits, &tried, &excluded);
                     }
                 }
-                let Some(node) = chosen else { continue };
-                node
+                match chosen {
+                    Ok(node) => node,
+                    Err(why) => {
+                        if let Some(job) = state.jobs.get_mut(&id) {
+                            job.blocked = (why == PRODUCTION_HEADROOM).then_some(why);
+                        }
+                        continue;
+                    }
+                }
             };
             let age = crate::now_secs().saturating_sub(row.created_at);
             let arrived = now

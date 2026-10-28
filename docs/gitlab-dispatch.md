@@ -79,6 +79,11 @@ decides fleet-wide which runner's request gets the room a node frees:
   included — while its runner backs off, and until the relay's current session has sent a
   heartbeat listing every request it holds. A job submitted without an admission waits on its
   tenant's `cap` too.
+- **Production headroom.** The capacity policy accepts at most 64 `headroom` entries. Each
+  reserves `slots` envelopes of its placement (pool, labels, envelope) for production work.
+  Normal work must leave the fleet that much room, or all remaining room if already short.
+  Entries are checked independently; identical placements use their greatest slot count.
+  An entry with no room on a node does not block work there.
 - **Bounded discovery.** A request of a runner that took no job in the last `busy_secs` is a
   probe, GitLab likely having nothing for it: at most `probe_limit` probes are out fleet-wide,
   one per runner. An `empty` or `error` outcome backs the runner off for
