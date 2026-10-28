@@ -58,7 +58,7 @@ All notable changes to virtkit will be documented in this file.
   change is audited and, but for adding a tenant, refused if the policy changed since it was
   shown. Connections also shows each runner's tenant and class, its requests waiting, offered
   and held, its jobs, its demand and backoff, and what it waits for; and each API key's
-  principal ID.
+  principal ID. See `docs/capacity-arbitration.md`.
 
 ## [0.98.0] - 2026-10-28
 

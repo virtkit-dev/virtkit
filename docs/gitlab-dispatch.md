@@ -59,7 +59,9 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 
 GitLab hands a runner a job only when the runner asks, and a job it has handed over cannot
 move to another runner. So the daemon holds capacity before it asks, never after, and the hub
-decides fleet-wide which runner's request gets the room a node frees:
+decides fleet-wide which runner's request gets the room a node frees, using the operator's
+capacity policy. See [capacity arbitration](capacity-arbitration.md) for configuration and
+monitoring:
 
 - **Queued, not held.** Each of a runner's `request_concurrency` request loops queues a
   reservation request and polls its ticket without holding a slot under `concurrent` or
@@ -205,7 +207,7 @@ affinity included. Rules match the ref the relay reports for the job (branch, ta
 request alike), as GitLab gives it to the relay. That ref is no trust boundary: a merge request
 from a fork whose branch is named `main` gets `main`'s rules. To confine a project's jobs, use
 a rule without `branches`. A project's placement rules must be the same, in any order, in every
-tenant that lists it.
+tenant that lists it; its page on the hub edits them in all of them at once.
 
 The hub offers a runner's request before GitLab says which project's job it takes, so rules
 cannot steer reservations: a job submitted on a reservation on a node its rules do not allow
