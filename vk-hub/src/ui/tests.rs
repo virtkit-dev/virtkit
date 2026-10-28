@@ -8637,13 +8637,44 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         event.contains("<section><h2>Pending</h2><p class=\"empty\">"),
         "{event}"
     );
+    // The count of approved projects leads to them, listed below the servers.
     assert!(
-        event.contains("<td class=\"num\">1</td>"),
+        event.contains("<td class=\"num\"><a href=\"#projects-approved-gl\">1</a></td>"),
         "approved: {event}"
     );
     let rejected = event.split("<h2>Rejected</h2>").nth(1).unwrap();
+    let rejected = rejected.split("<h2>GitLab servers</h2>").next().unwrap();
     assert!(rejected.contains("acme/api"), "{rejected}");
     assert!(!rejected.contains("reject-projects"), "{rejected}");
+    let approved = event.split("<h2>Approved projects</h2>").nth(1).unwrap();
+    let approved = approved.split("<h2>Relays</h2>").next().unwrap();
+    for want in [
+        "<h3 id=\"projects-approved-gl\">",
+        "<td><input id=\"pick-approved-gl-42\"",
+        "<td>acme/web</td><td class=\"num\">42</td>\
+         <td><time",
+        "name=\"op\" value=\"reject-projects\">Reject</button>",
+        "name=\"op\" value=\"forget-projects\">Forget</button>",
+    ] {
+        assert!(approved.contains(want), "{want}: {approved}");
+    }
+    assert!(!approved.contains("approve-projects"), "{approved}");
+    assert!(!approved.contains("acme/api"), "{approved}");
+    // A viewer sees them listed and linked, with nothing to decide.
+    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let listed = page.split("<h2>Approved projects</h2>").nth(1).unwrap();
+    let listed = listed.split("<h2>Relays</h2>").next().unwrap();
+    assert!(listed.contains("<td>acme/web</td>"), "{listed}");
+    assert!(!listed.contains("<form"), "{listed}");
+    // A list of projects that does not parse is refused.
+    for projects in ["42,x", ""] {
+        let reply = post(format!(
+            "_csrf={csrf}&op=reject-projects&{gl}&projects={projects}"
+        ))
+        .await;
+        assert_eq!(reply.status, 400, "{projects:?}: {}", reply.body);
+    }
+    assert_eq!(state(42), Some(ProjectState::Approved));
     let reply = post(format!("_csrf={csrf}&op=forget-projects&{gl}&project=43")).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(state(43), None);
@@ -8683,6 +8714,186 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     ))
     .await;
     assert_eq!(reply.status, 409, "{}", reply.body);
+
+    // An approved project ticked on the list is rejected once asked in the flash's place.
+    let reply = post(format!("_csrf={csrf}&op=reject-projects&{gl}&project=42")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Reject these approved projects?"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(state(42), Some(ProjectState::Approved));
+    let nonce = hidden(&reply.body, "nonce");
+    let reply = post(format!(
+        "_csrf={csrf}&op=reject-projects&{gl}&projects=42&approved=42&nonce={nonce}&confirm=yes"
+    ))
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Rejected 1 project(s) of gl."),
+        "{}",
+        reply.body
+    );
+    assert_eq!(state(42), Some(ProjectState::Rejected));
+}
+
+/// Rejecting or forgetting an approved project requires confirmation: in the flash for htmx,
+/// on a separate page for plain forms. Refuse the answer if the named approved set changes,
+/// whether projects gain or lose approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn deciding_against_approved_projects_is_asked_first() {
+    use crate::store::{Decision, ProjectRef, ProjectState};
+    let (addr, hub, origin) = start_fleet().await;
+    let now = crate::now_secs();
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "u", now)
+        .unwrap();
+    let refs = [
+        ProjectRef {
+            id: 42,
+            path: Some("acme/web".into()),
+        },
+        ProjectRef { id: 44, path: None },
+    ];
+    hub.db
+        .decide_projects("gl", &refs, Decision::Approve, "alice", now)
+        .unwrap();
+    let state = |id: u64| {
+        (hub.db.gitlab_projects(Some("gl")).unwrap().into_iter())
+            .find(|p| p.id == id)
+            .map(|p| p.row.state)
+    };
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let post = |form: String, htmx: bool| {
+        let (origin, operator) = (origin.clone(), operator.clone());
+        async move { post_action(addr, &origin, &operator, "/clients", &form, htmx).await }
+    };
+    let gl = "gitlab=gl&url=https%3A%2F%2Fgitlab.example.com";
+
+    // In the flash's place, and nothing changes until answered.
+    let reply = post(
+        format!("_csrf={csrf}&op=forget-projects&{gl}&project=44"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Forget these approved projects?",
+        "<p>Approved, of <strong>gl</strong>: project <code>44</code></p>",
+        "name=\"projects\" value=\"44\"",
+        "name=\"approved\" value=\"44\"",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert_eq!(state(44), Some(ProjectState::Approved));
+
+    // On a page of its own for a plain form, whose answer leads back to Connections.
+    let reply = post(
+        format!("_csrf={csrf}&op=reject-projects&{gl}&project=42&project=44"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "<h1>Confirm</h1>",
+        "Reject these approved projects?",
+        "<p>Approved, of <strong>gl</strong>: acme/web <code>42</code>, project <code>44</code></p>",
+        "name=\"projects\" value=\"42,44\"",
+        "<a href=\"/clients\">Cancel</a>",
+        "<form method=\"post\" action=\"/clients\">",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    let nonce = hidden(&reply.body, "nonce");
+    let reply = post(
+        format!(
+            "_csrf={csrf}&op=reject-projects&{gl}&projects=42,44&approved=42,44&nonce={nonce}\
+             &confirm=yes"
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(state(42), Some(ProjectState::Rejected));
+    assert_eq!(state(44), Some(ProjectState::Rejected));
+    audited(
+        &hub,
+        "rejected project(s) 42 (acme/web), 44 of GitLab instance gl",
+    )
+    .await;
+    hub.db
+        .decide_projects("gl", &refs[..1], Decision::Approve, "bob", now)
+        .unwrap();
+
+    // Asked of 42 alone, answered once 44 is approved too: refused, and nothing changes.
+    let reply = post(
+        format!("_csrf={csrf}&op=forget-projects&{gl}&project=42&project=44"),
+        true,
+    )
+    .await;
+    assert!(
+        reply.body.contains("name=\"approved\" value=\"42\""),
+        "{}",
+        reply.body
+    );
+    let nonce = hidden(&reply.body, "nonce");
+    hub.db
+        .decide_projects("gl", &refs[1..], Decision::Approve, "bob", now)
+        .unwrap();
+    let confirmed = format!(
+        "_csrf={csrf}&op=forget-projects&{gl}&projects=42,44&approved=42&nonce={nonce}&confirm=yes"
+    );
+    let reply = post(confirmed, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Refused: it changed since you were asked"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(state(42), Some(ProjectState::Approved));
+    assert_eq!(state(44), Some(ProjectState::Approved));
+
+    // Asked while approved, answered once rejected since: refused, not forgotten unasked.
+    let reply = post(
+        format!("_csrf={csrf}&op=forget-projects&{gl}&project=42"),
+        true,
+    )
+    .await;
+    let nonce = hidden(&reply.body, "nonce");
+    hub.db
+        .decide_projects("gl", &refs[..1], Decision::Reject, "bob", now)
+        .unwrap();
+    let confirmed = format!(
+        "_csrf={csrf}&op=forget-projects&{gl}&projects=42&approved=42&nonce={nonce}&confirm=yes"
+    );
+    let reply = post(confirmed, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Refused: it changed since you were asked"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(state(42), Some(ProjectState::Rejected));
+
+    // Not approved: decided on at once.
+    let reply = post(
+        format!("_csrf={csrf}&op=forget-projects&{gl}&project=42"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Forgot 1 project(s) of gl."),
+        "{}",
+        reply.body
+    );
+    assert_eq!(state(42), None);
 }
 
 /// A placed job's page shows rights per storage area in plain words, with token details

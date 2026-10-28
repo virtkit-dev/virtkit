@@ -58,7 +58,8 @@ mod token_keys;
 mod tools;
 
 pub use approvals::{
-    Decision, Gate, GateJob, ProjectRef, ProjectState, ProjectView, Refusal, RejectedGitlab,
+    Decision, Gate, GateJob, ProjectRef, ProjectRow, ProjectState, ProjectView, Refusal,
+    RejectedGitlab,
 };
 pub use audit::{AUDIT_SCAN, AuditCategory, AuditFilter, AuditFound, who as audit_who};
 pub use clients::{CLIENT_ACTIVE_SECS, ClientRow, MAX_INSTANCES_PER_KEY};

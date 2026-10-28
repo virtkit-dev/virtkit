@@ -185,6 +185,38 @@ fn instance_seen(txn: &redb::WriteTransaction, name: &str, seen: Option<&str>) -
     }
 }
 
+/// When `approved` is given, require it to match the approved subset of `ids`.
+/// Confirmation for one set of approved projects does not authorize another.
+fn approved_as_asked(
+    table: &impl ReadableTable<(&'static str, u64), &'static [u8]>,
+    gitlab: &str,
+    ids: impl IntoIterator<Item = u64>,
+    approved: Option<&[u64]>,
+) -> Result<()> {
+    let Some(approved) = approved else {
+        return Ok(());
+    };
+    let mut current = Vec::new();
+    for id in ids {
+        if let Some(g) = table.get((gitlab, id))?
+            && decode::<ProjectRow>(g.value())?.state == ProjectState::Approved
+        {
+            current.push(id);
+        }
+    }
+    let mut approved = approved.to_vec();
+    current.sort_unstable();
+    current.dedup();
+    approved.sort_unstable();
+    approved.dedup();
+    if current != approved {
+        return Err(refused(format!(
+            "which projects of {gitlab} are approved changed since you were asked; look again"
+        )));
+    }
+    Ok(())
+}
+
 /// Forget every project of instance `name`, in `txn`: its removal. How many there were.
 pub(super) fn forget_projects_of(txn: &redb::WriteTransaction, name: &str) -> Result<usize> {
     let mut table = txn.open_table(GITLAB_PROJECTS)?;
@@ -666,6 +698,22 @@ impl Db {
         Ok(out)
     }
 
+    /// Those of `ids` of instance `gitlab` that are approved, with their paths, in one read.
+    pub fn approved_projects(&self, gitlab: &str, ids: &[u64]) -> Result<Vec<(u64, String)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(GITLAB_PROJECTS)?;
+        let mut out = Vec::new();
+        for &id in ids {
+            if let Some(g) = table.get((gitlab, id))? {
+                let row = decode::<ProjectRow>(g.value())?;
+                if row.state == ProjectState::Approved {
+                    out.push((id, row.path));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Approve or reject `projects` of instance `gitlab`, audited as `actor`'s: those not
     /// known yet are added so. A path given replaces the one recorded. How many changed.
     pub fn decide_projects(
@@ -676,24 +724,34 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<usize> {
-        self.decide_projects_if((gitlab, None), projects, decision, actor, now)
+        self.decide_projects_if((gitlab, None), None, projects, decision, actor, now)
     }
 
-    /// [`Db::decide_projects`], refused unless instance `gitlab` is still at `url`.
+    /// [`Db::decide_projects`], refused unless instance `gitlab` is still at `url` and, when
+    /// `approved` is given, unless those of `projects` approved are exactly `approved`.
     pub fn decide_projects_as_seen(
         &self,
         (gitlab, url): (&str, &str),
+        approved: Option<&[u64]>,
         projects: &[ProjectRef],
         decision: Decision,
         actor: &str,
         now: u64,
     ) -> Result<usize> {
-        self.decide_projects_if((gitlab, Some(url)), projects, decision, actor, now)
+        self.decide_projects_if(
+            (gitlab, Some(url)),
+            approved,
+            projects,
+            decision,
+            actor,
+            now,
+        )
     }
 
     fn decide_projects_if(
         &self,
         (gitlab, seen): (&str, Option<&str>),
+        approved: Option<&[u64]>,
         projects: &[ProjectRef],
         decision: Decision,
         actor: &str,
@@ -707,6 +765,7 @@ impl Db {
         let mut changed = Vec::new();
         {
             let mut table = txn.open_table(GITLAB_PROJECTS)?;
+            approved_as_asked(&table, gitlab, projects.iter().map(|p| p.id), approved)?;
             let mut count = table.range((gitlab, 0)..=(gitlab, u64::MAX))?.count();
             for p in projects {
                 let old = table
@@ -769,23 +828,26 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<usize> {
-        self.forget_projects_if((gitlab, None), ids, actor, now)
+        self.forget_projects_if((gitlab, None), None, ids, actor, now)
     }
 
-    /// [`Db::forget_projects`], refused unless instance `gitlab` is still at `url`.
+    /// [`Db::forget_projects`], refused unless instance `gitlab` is still at `url` and, when
+    /// `approved` is given, unless those of `ids` approved are exactly `approved`.
     pub fn forget_projects_as_seen(
         &self,
         (gitlab, url): (&str, &str),
+        approved: Option<&[u64]>,
         ids: &[u64],
         actor: &str,
         now: u64,
     ) -> Result<usize> {
-        self.forget_projects_if((gitlab, Some(url)), ids, actor, now)
+        self.forget_projects_if((gitlab, Some(url)), approved, ids, actor, now)
     }
 
     fn forget_projects_if(
         &self,
         (gitlab, seen): (&str, Option<&str>),
+        approved: Option<&[u64]>,
         ids: &[u64],
         actor: &str,
         now: u64,
@@ -795,6 +857,7 @@ impl Db {
         let mut forgotten = Vec::new();
         {
             let mut table = txn.open_table(GITLAB_PROJECTS)?;
+            approved_as_asked(&table, gitlab, ids.iter().copied(), approved)?;
             for id in ids {
                 if let Some(old) = table.remove((gitlab, *id))? {
                     let row = decode::<ProjectRow>(old.value())?;
@@ -958,12 +1021,13 @@ mod tests {
         );
         // Decided on as seen at another URL: refused.
         let err = db
-            .forget_projects_as_seen(("gl", "https://elsewhere.example"), &[4], "u", 5)
+            .forget_projects_as_seen(("gl", "https://elsewhere.example"), None, &[4], "u", 5)
             .unwrap_err();
         assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
         let err = db
             .decide_projects_as_seen(
                 ("gl", "https://elsewhere.example"),
+                None,
                 &refs(&["4"]),
                 Decision::Approve,
                 "u",
@@ -974,8 +1038,25 @@ mod tests {
             err.to_string().contains("changed since you looked"),
             "{err:#}"
         );
+        // A confirmation for a different set of approved projects is refused.
+        let seen = ("gl", "https://gl.example");
+        let err = db
+            .forget_projects_as_seen(seen, Some(&[4]), &[4, 5], "u", 5)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed since you were asked"),
+            "{err:#}"
+        );
+        let err = db
+            .decide_projects_as_seen(seen, Some(&[]), &refs(&["9"]), Decision::Reject, "u", 5)
+            .unwrap_err();
+        assert!(err.is::<super::super::GitlabRefused>(), "{err:#}");
         assert_eq!(
-            db.forget_projects_as_seen(("gl", "https://gl.example"), &[4, 5], "u", 5)
+            db.approved_projects("gl", &[4, 5, 9]).unwrap(),
+            [(9, String::new())]
+        );
+        assert_eq!(
+            db.forget_projects_as_seen(seen, Some(&[]), &[4, 5], "u", 5)
                 .unwrap(),
             1
         );

@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The hub's Connections page lists the approved GitLab projects**: *Approved projects* shows,
+  by instance, when and by whom each was approved, with buttons for operators to reject or
+  forget them. Rejecting or forgetting an approved project now asks for confirmation first.
+
 ## [0.97.0] - 2026-10-26
 
 ### Added

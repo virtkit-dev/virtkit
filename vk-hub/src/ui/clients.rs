@@ -28,6 +28,10 @@
 //! at a time, under the name its approval gives it, and an instance's projects together, by
 //! ticking them. Each server's form and each project's box is `hx-preserve`d under an ID of
 //! what it decides on, so the fragment's updates leave one being filled in alone.
+//!
+//! Below the servers, *Approved projects* lists the projects whose jobs run, by instance, for
+//! operators to reject or forget. Rejecting or forgetting an approved project is asked first
+//! ([`actions::ask_first`]): its next jobs are refused.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -49,8 +53,8 @@ use crate::relays::RelayView;
 use crate::server::Hub;
 use crate::store::{
     ANY_POOL, CLIENT_ACTIVE_SECS, Decision, GitlabRefused, GitlabRow, KeyOp, KeyPolicy, KeyRefused,
-    KeyRow, KeysChanged, PendingGitlab, ProjectRef, ProjectState, ProjectView, RejectedGitlab,
-    Role,
+    KeyRow, KeysChanged, PendingGitlab, ProjectRef, ProjectRow, ProjectState, ProjectView,
+    RejectedGitlab, Role,
 };
 use vk_hub_proto::gitlab::{RunnerState, ServerState, ServerStatus};
 
@@ -187,13 +191,20 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
                         .filter(|r| r.row.server_url.as_deref() == Some(row.url.as_str()))
                         .count(),
                 )
-                .raw("</td><td class=\"num\">")
-                .text(
-                    (shown.projects.iter())
-                        .filter(|p| p.gitlab == *name && p.row.state == ProjectState::Approved)
-                        .count(),
-                )
-                .raw("</td>");
+                .raw("</td><td class=\"num\">");
+            let approved = (shown.projects.iter())
+                .filter(|p| p.gitlab == *name && p.row.state == ProjectState::Approved)
+                .count();
+            if approved > 0 {
+                h.raw("<a href=\"#")
+                    .text(projects_anchor(ProjectState::Approved, name))
+                    .raw("\">")
+                    .text(approved)
+                    .raw("</a>");
+            } else {
+                h.raw("0");
+            }
+            h.raw("</td>");
             if steer {
                 h.raw("<td class=\"actions\">");
                 if !bound(&shown.relays, &row.url) {
@@ -205,7 +216,9 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         }
         h.raw("</tbody></table>");
     }
-    h.raw("</section><section><h2>Relays</h2>");
+    h.raw("</section>");
+    approved_section(&mut h, shown, steer);
+    h.raw("<section><h2>Relays</h2>");
     if shown.relays.is_empty() {
         h.raw(if steer {
             "<p class=\"empty\">None yet: add one below, or with <code>vk-hub token create \
@@ -226,14 +239,7 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
 /// *Pending*, then *Rejected* when an operator rejected any: the servers and the projects, each
 /// with what an operator decides on — for an operator, the forms deciding.
 fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
-    let by_state = |state: ProjectState| {
-        let mut groups: BTreeMap<&str, Vec<&ProjectView>> = BTreeMap::new();
-        for p in shown.projects.iter().filter(|p| p.row.state == state) {
-            groups.entry(&p.gitlab).or_default().push(p);
-        }
-        groups
-    };
-    let pending = by_state(ProjectState::Pending);
+    let pending = projects_by_state(shown, ProjectState::Pending);
     h.raw("<section><h2>Pending</h2>");
     if shown.pending.is_empty() && pending.is_empty() {
         h.raw("<p class=\"empty\">Nothing waits for approval: a GitLab server a relay reports ")
@@ -287,7 +293,7 @@ fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
         projects_form(h, shown, gitlab, projects, ProjectState::Pending, steer);
     }
     h.raw("</section>");
-    let rejected = by_state(ProjectState::Rejected);
+    let rejected = projects_by_state(shown, ProjectState::Rejected);
     if shown.rejected.is_empty() && rejected.is_empty() {
         return;
     }
@@ -319,6 +325,22 @@ fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
     }
     for (gitlab, projects) in &rejected {
         projects_form(h, shown, gitlab, projects, ProjectState::Rejected, steer);
+    }
+    h.raw("</section>");
+}
+
+/// *Approved projects*, when there are any: the projects whose jobs run, by instance, and for
+/// an operator the forms rejecting or forgetting them.
+fn approved_section(h: &mut Html, shown: &Shown, steer: bool) {
+    let approved = projects_by_state(shown, ProjectState::Approved);
+    if approved.is_empty() {
+        return;
+    }
+    h.raw("<section><h2>Approved projects</h2><p class=\"sub\">Their jobs run. Rejecting one ")
+        .raw("refuses its next jobs; forgetting one has it wait for approval again at its next ")
+        .raw("job.</p>");
+    for (gitlab, projects) in &approved {
+        projects_form(h, shown, gitlab, projects, ProjectState::Approved, steer);
     }
     h.raw("</section>");
 }
@@ -375,9 +397,11 @@ fn server_button(h: &mut Html, op: &'static str, url: &str, label: &'static str)
 /// largest form a page posts.
 const MAX_LISTED_PROJECTS: usize = 500;
 
-/// Instance `gitlab`'s `projects` in `state`: each one's path and ID, its first job refused and
-/// the relay that submitted it, since when and how many of its jobs were refused. For an
-/// operator, a form ticking some of them to approve, reject (pending ones) or forget together.
+/// Instance `gitlab`'s `projects` in `state`, each with its path and ID: for one
+/// pending or rejected, its first job refused and the relay that submitted it, since when and
+/// how many of its jobs were refused; for one approved, when and by whom. For an operator, a
+/// form ticking some of them to approve, reject or forget together, each where it changes
+/// something.
 fn projects_form(
     h: &mut Html,
     shown: &Shown,
@@ -386,12 +410,18 @@ fn projects_form(
     state: ProjectState,
     steer: bool,
 ) {
+    let approved = state == ProjectState::Approved;
     let mut table = Html::new();
     table
         .raw("<table class=\"grid\"><thead><tr>")
         .raw(if steer { "<th></th>" } else { "" })
-        .raw("<th>project</th><th class=\"num\">ID</th><th>first job refused</th>")
-        .raw("<th>by relay</th><th>since</th><th class=\"num\">jobs refused</th>")
+        .raw("<th>project</th><th class=\"num\">ID</th>")
+        .raw(if approved {
+            "<th>approved</th><th>by</th>"
+        } else {
+            "<th>first job refused</th><th>by relay</th><th>since</th>\
+             <th class=\"num\">jobs refused</th>"
+        })
         .raw("</tr></thead><tbody>");
     for p in projects.iter().take(MAX_LISTED_PROJECTS) {
         table.raw("<tr>");
@@ -419,6 +449,11 @@ fn projects_form(
             .raw("</td><td class=\"num\">")
             .text(p.id)
             .raw("</td><td>");
+        if approved {
+            decided_cells(&mut table, &p.row);
+            table.raw("</td></tr>");
+            continue;
+        }
         match (p.row.first_job, &p.row.first_job_url) {
             (Some(job), url) => {
                 table.external_link(url.as_deref(), &format!("#{job}"));
@@ -428,16 +463,7 @@ fn projects_form(
             }
         }
         table.raw("</td><td>");
-        match &p.row.relay {
-            Some(id) => match shown.relays.iter().find(|r| r.id == *id) {
-                Some(r) => table.node(&r.row.hostname),
-                None => table
-                    .raw("<code>")
-                    .text(crate::rollout::short_id(id))
-                    .raw("</code> <span class=\"sub\">removed</span>"),
-            },
-            None => table.raw("-"),
-        };
+        relay_cell(&mut table, &shown.relays, p.row.relay.as_deref());
         table.raw("</td><td>");
         pages::at(&mut table, p.row.since)
             .raw("</td><td class=\"num\">")
@@ -455,7 +481,9 @@ fn projects_form(
             .text(gitlab)
             .raw("</code> lists them all.</p>");
     }
-    h.raw("<h3>Projects of <strong>")
+    h.raw("<h3 id=\"")
+        .text(projects_anchor(state, gitlab))
+        .raw("\">Projects of <strong>")
         .text(gitlab)
         .raw("</strong></h3>");
     if !steer {
@@ -481,17 +509,8 @@ fn projects_form(
         .raw("<button type=\"button\" class=\"secondary\" data-check=\"all\">All</button>")
         .raw("<button type=\"button\" class=\"secondary\" data-check=\"none\">None</button>")
         .html(&table)
-        .raw("</fieldset><button class=\"primary\" name=\"op\" value=\"")
-        .raw(APPROVE_PROJECTS)
-        .raw("\">Approve</button>");
-    if state == ProjectState::Pending {
-        form.raw("<button class=\"danger\" name=\"op\" value=\"")
-            .raw(REJECT_PROJECTS)
-            .raw("\">Reject</button>");
-    }
-    form.raw("<button class=\"secondary\" name=\"op\" value=\"")
-        .raw(FORGET_PROJECTS)
-        .raw("\">Forget</button>");
+        .raw("</fieldset>");
+    decide_buttons(&mut form, state);
     h.raw("<form method=\"post\" action=\"")
         .raw(PATH)
         .raw("\" hx-post=\"")
@@ -499,6 +518,62 @@ fn projects_form(
         .raw("\" hx-swap=\"none\">")
         .html(&form)
         .raw("</form>");
+}
+
+/// The buttons deciding on projects in `state`, each where it changes something: approve,
+/// reject and forget.
+fn decide_buttons(h: &mut Html, state: ProjectState) {
+    if state != ProjectState::Approved {
+        h.raw("<button class=\"primary\" name=\"op\" value=\"")
+            .raw(APPROVE_PROJECTS)
+            .raw("\">Approve</button>");
+    }
+    if state != ProjectState::Rejected {
+        h.raw("<button class=\"danger\" name=\"op\" value=\"")
+            .raw(REJECT_PROJECTS)
+            .raw("\">Reject</button>");
+    }
+    h.raw("<button class=\"secondary\" name=\"op\" value=\"")
+        .raw(FORGET_PROJECTS)
+        .raw("\">Forget</button>");
+}
+
+/// The two cells of when and by whom `row` was last approved or rejected, `-` where not known.
+fn decided_cells(h: &mut Html, row: &ProjectRow) {
+    match row.decided_at {
+        Some(at) => pages::at(h, at),
+        None => h.raw("-"),
+    };
+    h.raw("</td><td>")
+        .text(row.decided_by.as_deref().unwrap_or("-"));
+}
+
+/// The relay `id` names, by hostname, or marked removed; `-` for none.
+fn relay_cell(h: &mut Html, relays: &[RelayView], id: Option<&str>) {
+    match id {
+        Some(id) => match relays.iter().find(|r| r.id == id) {
+            Some(r) => h.node(&r.row.hostname),
+            None => h
+                .raw("<code>")
+                .text(crate::rollout::short_id(id))
+                .raw("</code> <span class=\"sub\">removed</span>"),
+        },
+        None => h.raw("-"),
+    };
+}
+
+/// The ID of the heading over instance `gitlab`'s projects in `state`.
+fn projects_anchor(state: ProjectState, gitlab: &str) -> String {
+    format!("projects-{}-{gitlab}", state.name())
+}
+
+/// The projects `shown` in `state`, by instance.
+fn projects_by_state(shown: &Shown, state: ProjectState) -> BTreeMap<&str, Vec<&ProjectView>> {
+    let mut groups: BTreeMap<&str, Vec<&ProjectView>> = BTreeMap::new();
+    for p in shown.projects.iter().filter(|p| p.row.state == state) {
+        groups.entry(&p.gitlab).or_default().push(p);
+    }
+    groups
 }
 
 /// Whether one of `relays` is bound to the GitLab server at `url`: while one is, the store
@@ -1037,7 +1112,7 @@ pub(super) async fn action(
             decide_server(ui, htmx, &auth, &form, op).await
         }
         Some(op @ (APPROVE_PROJECTS | REJECT_PROJECTS | FORGET_PROJECTS)) => {
-            decide_projects(ui, htmx, &auth, &form, op).await
+            decide_projects(ui, site, htmx, &auth, &form, op).await
         }
         _ => Ok(actions::refused(
             htmx,
@@ -1406,11 +1481,14 @@ async fn decide_server(
     Ok(fleet::said_so(&said))
 }
 
-/// Approve, reject or forget the projects of instance `gitlab` `form` ticks (`project`), as
-/// `vk-hub gitlabs projects approve|reject|forget` do, only while the instance is still at the
-/// `url` the form showed; approving or rejecting keeps the path recorded.
+/// Approve, reject or forget the projects of instance `gitlab` `form` ticks (`project`, or
+/// `projects` as a list once asked), as `vk-hub gitlabs projects approve|reject|forget` do,
+/// only while the instance is still at the `url` the form showed; approving or rejecting keeps
+/// the path recorded. Rejecting or forgetting an approved project is asked first: its next jobs
+/// are refused, while those under way go on.
 async fn decide_projects(
     ui: &Ui,
+    site: &FleetSite,
     htmx: bool,
     auth: &Auth,
     form: &[(String, String)],
@@ -1419,7 +1497,15 @@ async fn decide_projects(
     let gitlab = field(form, "gitlab").unwrap_or("").to_string();
     let url = field(form, "url").unwrap_or("").to_string();
     let mut ids = Vec::new();
-    for (_, id) in form.iter().filter(|(k, _)| k == "project") {
+    let listed = (form.iter())
+        .filter(|(k, _)| k == "project")
+        .map(|(_, id)| id.as_str())
+        .chain(
+            field(form, "projects")
+                .into_iter()
+                .flat_map(|ids| ids.split(',')),
+        );
+    for id in listed {
         match id.parse::<u64>() {
             Ok(id) if id > 0 => ids.push(id),
             _ => {
@@ -1431,12 +1517,77 @@ async fn decide_projects(
             }
         }
     }
+    ids.sort_unstable();
+    ids.dedup();
     if ids.is_empty() {
         return Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
             "Tick at least one project.",
         ));
+    }
+    // Of the projects to reject or forget, those approved as asked about: the store refuses the
+    // decision should they have changed since.
+    let mut asked_approved = None;
+    if op != APPROVE_PROJECTS {
+        let (hub, named, wanted) = (ui.hub.clone(), gitlab.clone(), ids.clone());
+        let approved = blocking(move || hub.db.approved_projects(&named, &wanted)).await?;
+        // Check confirmations even when no projects remain approved; refuse the answer if
+        // any were approved when asked.
+        if !approved.is_empty() || field(form, "confirm") == Some("yes") {
+            let mut detail = Html::new();
+            detail
+                .raw("<p>Approved, of <strong>")
+                .text(&gitlab)
+                .raw("</strong>: ");
+            for (n, (id, path)) in approved.iter().enumerate() {
+                if n > 0 {
+                    detail.raw(", ");
+                }
+                if path.is_empty() {
+                    detail.raw("project ");
+                } else {
+                    detail.node(path).raw(" ");
+                }
+                detail.raw("<code>").text(id).raw("</code>");
+            }
+            detail.raw("</p>");
+            let mut asked = vec![
+                ("gitlab", gitlab.clone()),
+                ("url", url.clone()),
+                (
+                    "projects",
+                    (ids.iter().map(u64::to_string))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ];
+            // Asked about these: the answer is refused should which are approved change since.
+            let approved_ids = (approved.iter().map(|(id, _)| id.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
+            asked.push(("approved", approved_ids));
+            let ask = actions::Ask {
+                path: PATH.to_string(),
+                back: PATH.to_string(),
+                op: op.to_string(),
+                what: if op == REJECT_PROJECTS {
+                    "Reject these approved projects? Their next jobs are refused until an \
+                     operator approves them again."
+                } else {
+                    "Forget these approved projects? Their next job waits for approval again, \
+                     and is refused until an operator approves them."
+                },
+                detail,
+                asked,
+            };
+            if let Some(asked) =
+                actions::ask_first(&site.questions, fleet::layout, htmx, auth, form, &ask)?
+            {
+                return Ok(asked);
+            }
+        }
+        asked_approved = Some(approved.into_iter().map(|(id, _)| id).collect::<Vec<_>>());
     }
     let (hub, principal, op_, named) = (
         ui.hub.clone(),
@@ -1450,14 +1601,25 @@ async fn decide_projects(
             .map(|&id| ProjectRef { id, path: None })
             .collect();
         let seen = (named.as_str(), url.as_str());
+        let approved = asked_approved.as_deref();
         Ok(match op_.as_str() {
-            APPROVE_PROJECTS => {
-                (hub.db).decide_projects_as_seen(seen, &refs, Decision::Approve, &principal, now)
-            }
-            REJECT_PROJECTS => {
-                (hub.db).decide_projects_as_seen(seen, &refs, Decision::Reject, &principal, now)
-            }
-            _ => (hub.db).forget_projects_as_seen(seen, &ids, &principal, now),
+            APPROVE_PROJECTS => (hub.db).decide_projects_as_seen(
+                seen,
+                approved,
+                &refs,
+                Decision::Approve,
+                &principal,
+                now,
+            ),
+            REJECT_PROJECTS => (hub.db).decide_projects_as_seen(
+                seen,
+                approved,
+                &refs,
+                Decision::Reject,
+                &principal,
+                now,
+            ),
+            _ => (hub.db).forget_projects_as_seen(seen, approved, &ids, &principal, now),
         })
     })
     .await?;

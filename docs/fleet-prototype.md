@@ -1726,13 +1726,19 @@ pinned and its session ends. All are audited. *Add a relay* issues a single-use 
 Operators decide there on what is pending or rejected, as `vk-hub gitlabs approve|reject|forget`
 and `gitlabs projects approve|reject|forget` do, audited: a server is approved under a name typed
 beside it, rejected, or its rejection forgotten; an instance's projects are ticked, with *All*
-and *None* to tick or untick them at once, then approved, rejected (pending ones) or forgotten
-together. The store's refusals — a name taken or malformed, an approved server rejected, an
-instance gone — are shown as such. These forms are in the live fragment and post with the token
-set through `hx-headers`; each server's form and each project's box is `hx-preserve`d, so one
-being filled in is kept as the tab updates. A decision on projects applies only while their
-instance is still at the URL the page showed, and an instance lists at most 500 projects per
-state there, so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
+and *None* to tick or untick them at once, then approved, rejected or forgotten together, each
+where it changes something. Rejecting or forgetting an approved project is confirmed first,
+since its next jobs are refused; those under way go on. The confirmation names the approved
+projects it asked about, and the decision is refused should those have changed since. The
+store's refusals — a name taken or malformed, an approved server rejected, an instance gone —
+are shown as such. These forms are in the live fragment and post with the token set through
+`hx-headers`; each server's form and each project's box is `hx-preserve`d, so one being filled
+in is kept as the tab updates. A decision on projects applies only while their instance is
+still at the URL the page showed, and an instance lists at most 500 projects per state there,
+so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
+
+Below the GitLab servers, *Approved projects* lists the projects whose jobs run, by instance,
+with when and by whom each was approved; a server's count of approved projects links there.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
