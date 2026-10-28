@@ -52,6 +52,7 @@ mod keys;
 mod namespaces;
 mod observed;
 mod packed;
+mod policy;
 mod registries;
 mod relays;
 mod token_keys;
@@ -772,6 +773,8 @@ impl Db {
             .begin_write()
             .context("starting the hub db's first write")?;
         txn.open_table(NODES).context("opening the nodes table")?;
+        txn.open_table(policy::CAPACITY_POLICY)
+            .context("opening the capacity policy table")?;
         txn.open_table(TOKENS).context("opening the tokens table")?;
         txn.open_table(registries::REGISTRIES)
             .context("opening the registries table")?;

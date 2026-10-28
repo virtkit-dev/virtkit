@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
+  Replacements are audited and checked against the shown digest to prevent lost updates.
+
 ## [0.98.0] - 2026-10-28
 
 ### Added

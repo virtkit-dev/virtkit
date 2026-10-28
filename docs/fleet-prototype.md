@@ -219,7 +219,8 @@ web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
 (see [the registry hub design](registry-hub.md)). Every key is optional and an
 unknown one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both
 the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
-`vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the
+`vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys`, `vk-hub jobs` and
+`vk-hub capacity-policy` reach the
 running hub through `<data_dir>/admin.sock`, open to the hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the

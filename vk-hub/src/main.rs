@@ -35,6 +35,7 @@ mod fetch;
 mod jobs;
 mod local;
 mod ops;
+mod policy;
 mod registries;
 mod relays;
 mod releases;
@@ -174,6 +175,13 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
+    },
+    /// Read or replace the capacity arbitration policy as JSON
+    CapacityPolicy {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<CapacityPolicyCmd>,
     },
     /// Add, list, approve, reject and remove the GitLab instances the hub takes jobs from,
     /// and approve their projects
@@ -493,6 +501,19 @@ enum KeysCmd {
     /// Revoke the working key of that name; with none working, remove those that no longer
     /// work
     Revoke { name: String },
+}
+
+#[derive(Subcommand)]
+enum CapacityPolicyCmd {
+    /// Print the current policy
+    Show,
+    /// Replace the policy from a JSON file
+    Set {
+        file: std::path::PathBuf,
+        /// Digest of the policy being replaced, printed by `show`
+        #[arg(long)]
+        expected: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1325,6 +1346,29 @@ async fn run(cli: Cli) -> Result<()> {
                 cmd.into(),
             )
             .await
+        }
+        Cmd::CapacityPolicy { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                match cmd.unwrap_or(CapacityPolicyCmd::Show) {
+                    CapacityPolicyCmd::Show => {
+                        let policy = client.capacity_policy()?;
+                        eprintln!("Policy digest: {}", policy.digest()?);
+                        println!("{}", serde_json::to_string_pretty(&policy)?);
+                    }
+                    CapacityPolicyCmd::Set { file, expected } => {
+                        let bytes = std::fs::read(&file)
+                            .with_context(|| format!("reading {}", file.display()))?;
+                        let policy = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("parsing {}", file.display()))?;
+                        if !client.set_capacity_policy(policy, expected)? {
+                            eprintln!("Policy unchanged");
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?
         }
         Cmd::Gitlabs { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;

@@ -189,6 +189,11 @@ enum Call {
     ResolveEgress {
         claims: crate::egress::rules::Claims,
     },
+    GetCapacityPolicy,
+    SetCapacityPolicy {
+        policy: crate::policy::Policy,
+        expected: String,
+    },
     ListGitlabs,
     /// The servers relays report that no instance has.
     PendingGitlabs,
@@ -764,6 +769,17 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(changed)?
         }
         Call::ListRejectedGitlabs => serde_json::to_value(hub.db.rejected_gitlabs()?)?,
+        Call::GetCapacityPolicy => serde_json::to_value(hub.db.capacity_policy()?)?,
+        Call::SetCapacityPolicy { policy, expected } => {
+            let changed =
+                hub.db
+                    .replace_capacity_policy_if(&policy, &expected, &actor, crate::now_secs())?;
+            if changed {
+                hub.touch();
+                hub.clients_changed();
+            }
+            serde_json::to_value(changed)?
+        }
         Call::ListProjects { gitlab } => {
             serde_json::to_value(hub.db.gitlab_projects(gitlab.as_deref())?)?
         }
@@ -1150,6 +1166,18 @@ impl Client {
 
     pub fn rejected_gitlabs(&self) -> Result<Vec<(String, crate::store::RejectedGitlab)>> {
         self.call(Call::ListRejectedGitlabs)
+    }
+
+    pub fn capacity_policy(&self) -> Result<crate::policy::Policy> {
+        self.call(Call::GetCapacityPolicy)
+    }
+
+    pub fn set_capacity_policy(
+        &self,
+        policy: crate::policy::Policy,
+        expected: String,
+    ) -> Result<bool> {
+        self.call(Call::SetCapacityPolicy { policy, expected })
     }
 
     pub fn gitlab_projects(&self, gitlab: Option<&str>) -> Result<Vec<crate::store::ProjectView>> {
@@ -1709,6 +1737,41 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_capacity_policy_is_read_and_replaced_against_its_digest() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let call =
+            |call: String| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 0);
+        let shown: crate::policy::Policy =
+            serde_json::from_value(call(r#"{"op":"get-capacity-policy"}"#.into()).unwrap())
+                .unwrap();
+        let expected = shown.digest().unwrap();
+        let mut policy = shown.clone();
+        policy.probe_limit = 3;
+        let set = |policy: &crate::policy::Policy, expected: &str| {
+            call(
+                serde_json::json!({"op": "set-capacity-policy", "policy": policy, "expected": expected})
+                    .to_string(),
+            )
+        };
+        assert_eq!(set(&policy, &expected).unwrap(), true);
+        assert_eq!(
+            set(&policy, &policy.digest().unwrap()).unwrap(),
+            false,
+            "the same policy again changes nothing"
+        );
+        let err = set(&shown, &expected).unwrap_err();
+        assert!(format!("{err:#}").contains("changed since"), "{err:#}");
+        let err =
+            call(r#"{"op":"set-capacity-policy","policy":{"probe_limt":1},"expected":""}"#.into())
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("probe_limt"), "{err:#}");
+        let now: crate::policy::Policy =
+            serde_json::from_value(call(r#"{"op":"get-capacity-policy"}"#.into()).unwrap())
+                .unwrap();
+        assert_eq!(now, policy);
     }
 
     #[test]
