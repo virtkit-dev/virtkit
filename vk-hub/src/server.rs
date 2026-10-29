@@ -281,6 +281,14 @@ impl Hub {
         self
     }
 
+    /// Give a node `within` to answer an offer before it is released and another node asked.
+    /// Call after [`Hub::with_jobs`], which sets the default.
+    #[cfg(test)]
+    pub fn answering_offers_within(mut self, within: Duration) -> Self {
+        self.dispatch.offer_timeout = within;
+        self
+    }
+
     /// Write a running job's record for a newer egress report alone at most `every`.
     /// Call after [`Hub::with_jobs`], which sets the default.
     #[cfg(test)]

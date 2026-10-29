@@ -84,10 +84,6 @@ const OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const OFFER_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn offer_timeout() -> Duration {
-    OFFER_TIMEOUT
-}
-
 /// How long a renew waits for the node's answer.
 const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -210,6 +206,8 @@ pub struct Dispatch {
     pub affinity: Affinity,
     /// How often at most a running job's record is written for a newer egress report alone.
     pub egress_write_every: Duration,
+    /// How long a node has to answer an offer; defaults to [`OFFER_TIMEOUT`].
+    pub offer_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -604,6 +602,7 @@ impl Dispatch {
             kept_output_total: DEFAULT_KEPT_OUTPUT_TOTAL,
             affinity: Affinity::default(),
             egress_write_every: DEFAULT_EGRESS_WRITE_EVERY,
+            offer_timeout: OFFER_TIMEOUT,
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()

@@ -642,7 +642,7 @@ pub(super) fn schedule_tickets(
     let relays = Relays::new(schedule.relays, schedule.heartbeats);
     let mut moved = sweep(hub, state, schedule.policy, &relays, now);
     moved |= reconcile(hub, state, &relays);
-    moved |= expire(state, now);
+    moved |= expire(state, now, hub.dispatch.offer_timeout);
     moved |= refresh(state, schedule.policy, &relays);
     moved |= arbitrate(hub, state, schedule, &relays, writes, now)?;
     Ok(moved)
@@ -790,9 +790,9 @@ fn reconcile(hub: &Hub, state: &mut State, relays: &Relays<'_>) -> bool {
     moved
 }
 
-/// Drop idle waiters, retire offers whose node refused or did not answer, and end grants
-/// whose lease ran out unclaimed. Whether a ticket changed.
-fn expire(state: &mut State, now: Instant) -> bool {
+/// Drop idle waiters, retire offers whose node refused or did not answer within
+/// `offer_timeout`, and end grants whose lease ran out unclaimed. Whether a ticket changed.
+fn expire(state: &mut State, now: Instant, offer_timeout: Duration) -> bool {
     let mut moved = false;
     let mut release = Vec::new();
     let ids: Vec<String> = state.tickets.keys().cloned().collect();
@@ -835,7 +835,7 @@ fn expire(state: &mut State, now: Instant) -> bool {
                 .reservations
                 .get(&r)
                 .is_none_or(|r| matches!(r.phase, ResvPhase::Refused(_) | ResvPhase::Abandoned));
-            if refused || now.duration_since(since) >= OFFER_TIMEOUT {
+            if refused || now.duration_since(since) >= offer_timeout {
                 let abandoned_probe = state
                     .tickets
                     .get(&id)

@@ -59,6 +59,9 @@ async fn serve_hub(
     serve_hub_with(db, dir, lost_after, |hub| hub).await
 }
 
+/// The production offer timeout, also the minimum reservation wait, used by these tests.
+const SLOW_OFFER: Duration = Duration::from_secs(5);
+
 /// A hub as [`serve_hub`]'s, configured by `configure` past its jobs' defaults.
 async fn serve_hub_with(
     db: Arc<Db>,
@@ -89,13 +92,15 @@ async fn serve_undriven_with(
 ) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
-    // The fake nodes run in the test's process: a stall of it, under load, is not their silence.
+    // Fake nodes share the test process: a stall under load does not mean a node went silent
+    // or was slow to answer an offer.
     let hub = Arc::new(configure(
         Hub::new(db, None)
             .with_quiet(Duration::from_secs(60))
             .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
             .with_jobs(dir.join("jobs"), lost_after, None)
-            .unwrap(),
+            .unwrap()
+            .answering_offers_within(SLOW_OFFER),
     ));
     crate::jobs::recover(&hub).await.unwrap();
     tokio::spawn(server::serve(listener, None, hub.clone()));
@@ -3981,7 +3986,12 @@ async fn client_connections_past_the_cap_are_told_to_retry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_stops_offering_at_its_wait() {
     let dir = scratch("reserve-wait");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    // A request waits at least as long as a node has to answer its offer: a second here.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub_with(db, &dir, Duration::from_secs(60), |hub| {
+        hub.answering_offers_within(Duration::from_secs(1))
+    })
+    .await;
     let key = jobs_key(&hub);
     let mut big = ready_node(addr, &hub, 32768).await;
     let mut small = ready_node(addr, &hub, 8192).await;

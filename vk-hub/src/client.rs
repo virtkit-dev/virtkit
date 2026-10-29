@@ -854,7 +854,7 @@ async fn reserve(
         principal,
         ticket: Some(&ticket),
     };
-    let deadline = Instant::now() + wait_for(ask.wait_secs).max(jobs::offer_timeout());
+    let deadline = Instant::now() + wait_for(ask.wait_secs).max(hub.dispatch.offer_timeout);
     let grant = loop {
         let mut changed = hub.dispatch.subscribe();
         if let Some(grant) = jobs::poll_ticket(hub, principal, &ticket)? {
