@@ -4,7 +4,7 @@ use super::*;
 use vk_hub_proto::client::ReservationTicket;
 
 /// Have `key`'s relay connected, in a session, its heartbeat listing nothing it holds.
-fn ready_relay(hub: &Hub, key: &str) {
+pub(super) fn ready_relay(hub: &Hub, key: &str) {
     if hub.current_session(relay_id(key)).is_none() {
         hub.open_session(relay_id(key));
     }

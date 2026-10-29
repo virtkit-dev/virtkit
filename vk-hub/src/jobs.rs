@@ -466,7 +466,8 @@ struct LiveJob {
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
     /// Why arbitration last passed it over while nodes may have had room for it: a limit of
-    /// its tenant, relay or runner, or production headroom. Told when it ends at its deadline.
+    /// its tenant, relay or runner, production headroom, or its project's delisting. Told when
+    /// it ends at its deadline.
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
@@ -5249,6 +5250,37 @@ mod tests {
             mint_key: None,
             egress: EgressWritten::default(),
         }
+    }
+
+    /// A relay job whose tenant stopped listing its project is held; a job recorded without a
+    /// scheduling identity, or an API key's, is not.
+    #[test]
+    fn only_a_relay_job_of_a_delisted_project_is_held() {
+        let mut policy = crate::policy::Policy::default();
+        let mut row = sent("n1", 1, None).row;
+        row.gitlab = Some("gl".into());
+        row.project_id = Some(7);
+        assert!(!scheduler::delisted(&policy, &row));
+        let relay = crate::store::SchedulingIdentity {
+            tenant: "fallback".into(),
+            class: crate::policy::Class::Normal,
+            gitlab: Some("gl".into()),
+            runner_id: Some(42),
+        };
+        row.scheduling = Some(crate::store::SchedulingIdentity {
+            gitlab: None,
+            runner_id: None,
+            ..relay.clone()
+        });
+        assert!(!scheduler::delisted(&policy, &row));
+        row.scheduling = Some(relay);
+        assert!(scheduler::delisted(&policy, &row));
+        policy.tenants.get_mut("fallback").unwrap().projects = vec![crate::policy::Project {
+            gitlab: "gl".into(),
+            id: 7,
+            production_branches: Vec::new(),
+        }];
+        assert!(!scheduler::delisted(&policy, &row));
     }
 
     /// A running job's record is due a write for its egress report once it holds one newer than

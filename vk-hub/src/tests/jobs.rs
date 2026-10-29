@@ -31,6 +31,7 @@ use super::*;
 use crate::store::{KeyPolicy, NoAccess, RegistryAccess, Scope};
 
 mod capacity;
+mod capacity_placement;
 mod capacity_recovery;
 
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };

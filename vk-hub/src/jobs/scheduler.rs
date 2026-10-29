@@ -18,6 +18,25 @@ pub(super) const ABANDONED_PROBE_GRACE: Duration = Duration::from_secs(30);
 /// (not `excluded`) would admit it: asked again after the pause.
 pub(super) const NO_FITTING_NODE: &str = "no fitting node";
 
+/// Why a queued job waits: its tenant no longer lists its project ([`delisted`]).
+const DELISTED: &str = "project no longer listed for its tenant";
+
+/// Whether `row` is a relay job whose project its tenant no longer lists (it was checked at
+/// submission). Such a job is held with its reservation, to start once the project is listed
+/// again or end at its deadline. A job recorded without a scheduling identity predates project
+/// lists and is not held.
+pub(super) fn delisted(policy: &crate::policy::Policy, row: &JobRow) -> bool {
+    row.scheduling.as_ref().is_some_and(|identity| {
+        identity
+            .gitlab
+            .as_deref()
+            .zip(row.project_id)
+            .is_some_and(|(gitlab, project)| {
+                policy.project(&identity.tenant, gitlab, project).is_none()
+            })
+    })
+}
+
 /// Why [`admission_node`] found no node: each with room would take the room a headroom entry
 /// keeps for production.
 pub(super) const PRODUCTION_HEADROOM: &str = "production headroom";
@@ -1127,6 +1146,12 @@ fn arbitrate(
             let tenant = policy.tenant(tenant_name);
             let weight = tenant.map_or(1, |t| t.weight);
             let load = loads.tenant_load(tenant_name);
+            if delisted(policy, &row) {
+                if let Some(job) = state.jobs.get_mut(&id) {
+                    job.blocked = Some(DELISTED);
+                }
+                continue;
+            }
             // A job on an admission was held to these when the admission was offered.
             if row.admission.is_none() {
                 let relay = relays.row(&row.key);

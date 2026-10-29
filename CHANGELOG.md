@@ -42,6 +42,8 @@ All notable changes to virtkit will be documented in this file.
   `production_probe_burst` production discovery polls since its last grant, and first after a
   hub restart. The policy's `headroom` entries, at most 64, reserve fleet capacity for
   production work.
+- **A relay job whose project leaves its tenant's list before it is placed waits** until the
+  project is listed again, or ends at its deadline saying the project is no longer listed.
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
   Replacements are audited and checked against the shown digest to prevent lost updates.
 

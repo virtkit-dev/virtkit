@@ -197,6 +197,12 @@ That node boots it in seconds where another spends a minute or two building the 
 submitted on a reservation on a node without the image then starts on the warm node without it,
 and the hub releases the reservation. Under heavier load the order above holds.
 
+A relay job whose project its tenant stops listing after the job was submitted is held: it
+waits, keeping any reservation it was submitted on so it starts as soon as the project is
+listed again, or until its deadline, when it ends with `project no longer listed for its
+tenant` as the reason. A job recorded by a hub from before capacity arbitration, without a
+scheduling identity, is not held.
+
 ## Daemon ↔ hub: the client API
 
 HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Bodies are
