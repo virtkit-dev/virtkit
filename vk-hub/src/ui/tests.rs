@@ -8455,7 +8455,9 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
         hub.db.record_relay(&relay, write, now).unwrap();
     }
     hub.clients_changed();
-    let event = next_with(&mut live, "relay-1").await;
+    // The stream's periodic heartbeat can render between writes. Wait for the relay's
+    // heartbeat, written last, so the event includes its inventory and report too.
+    let event = next_with(&mut live, " · HTTP 204</td>").await;
     for want in [
         "<strong>relay-1</strong> <code class=\"sub\">",
         "<span class=\"badge bad\">unreachable</span>",
