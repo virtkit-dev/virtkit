@@ -39,10 +39,16 @@ const LINES: &str = "output";
 const HELD: &str = "held";
 
 /// The most of the end of a job's output its page shows, and a stream's first step sends.
+#[cfg(not(test))]
 pub(super) const OPENING: u64 = 1 << 20;
+#[cfg(test)]
+pub(super) const OPENING: u64 = 64 << 10;
 
 /// The most of a job's output one later step reads; more is read at the next.
-const STEP: u64 = 256 << 10;
+#[cfg(not(test))]
+pub(super) const STEP: u64 = 256 << 10;
+#[cfg(test)]
+pub(super) const STEP: u64 = 16 << 10;
 
 /// What a job's page shows of its output.
 pub(super) enum Output {

@@ -5117,10 +5117,11 @@ async fn a_job_s_stream_ends_once_its_output_went() {
 /// precedes it; a later step reads a bounded stretch, the rest at the next.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
-    let dir = std::env::temp_dir().join(format!("vk-hub-ui-bounded-{}", std::process::id()));
-    let (addr, hub) = start_fleet_placing(&dir).await;
+    let scratch = Scratch::new("bounded");
+    let dir = &scratch.0;
+    let (addr, hub) = start_fleet_placing(dir).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    // 100-byte lines, stamped as a node sends them and numbered: 1.1 MiB of them.
+    // 100-byte lines, stamped as a node sends them and numbered: 1000 past the opening.
     let lines = |from: usize, to: usize| {
         (from..to)
             .map(|n| {
@@ -5130,7 +5131,7 @@ async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
             .collect::<String>()
     };
     let opening = job_output::OPENING as usize;
-    let id = running_with_output(&hub, &dir, 1, lines(0, opening / 100 + 1000).as_bytes());
+    let id = running_with_output(&hub, dir, 1, lines(0, opening / 100 + 1000).as_bytes());
     let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
     assert!(page.contains(" before this not shown</span>\n"), "{page}");
     assert!(!page.contains("line 0000000 "), "{page}");
@@ -5155,16 +5156,18 @@ async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
         "{held}"
     );
     assert!(held.contains(&format!("line {last:07} ")), "{held}");
-    // 600 KiB more: read a stretch at a time, in order.
-    let more = lines(last + 1, last + 1 + 6000);
-    more_output(&hub, &dir, &id, more.as_bytes());
+    // Several steps more: read a stretch at a time, in order.
+    let step = job_output::STEP as usize;
+    let count = 6 * step / 100;
+    let more = lines(last + 1, last + 1 + count);
+    more_output(&hub, dir, &id, more.as_bytes());
     let mut seen = Vec::new();
-    while seen.last() != Some(&(last + 5999)) {
+    while seen.last() != Some(&(last + count - 1)) {
         let event = stream.next().await.unwrap();
         if !event.starts_with("event: output\n") {
             continue;
         }
-        assert!(event.len() < 512 * 1024, "{}", event.len());
+        assert!(event.len() < 2 * step, "{}", event.len());
         seen.extend(
             event
                 .split("line ")
@@ -5172,7 +5175,7 @@ async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
                 .map(|l| l[..7].parse::<usize>().unwrap()),
         );
     }
-    assert_eq!(seen, (last..last + 6000).collect::<Vec<_>>());
+    assert_eq!(seen, (last..last + count).collect::<Vec<_>>());
 }
 
 /// `/jobs`' newest page follows the jobs as they change, filtered as the page is; an older
