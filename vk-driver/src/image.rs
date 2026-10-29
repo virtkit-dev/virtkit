@@ -2085,7 +2085,16 @@ mod tests {
         std::fs::rename(&tmp, &promoted).unwrap();
         assert!(!claimable(&promoted), "the claim holds through the rename");
         drop(claim);
-        assert!(claimable(&promoted));
+        // A child another test forks meanwhile shares the claim's open file description until
+        // it execs, so the dropped claim can briefly stay held: wait for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !claimable(&promoted) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping the claim releases the dir"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
