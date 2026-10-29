@@ -8799,9 +8799,10 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
             .state,
         vk_hub_proto::gitlab::ServerState::Rejected
     );
-    let event = next_with(&mut live, "<h2>Rejected</h2><p class=\"sub\">").await;
+    // A stale render before project 43 was forgotten also has a Rejected section.
+    let event = next_with(&mut live, "name=\"op\" value=\"forget-server\"").await;
     assert!(
-        event.contains("name=\"op\" value=\"forget-server\""),
+        event.contains("<h2>Rejected</h2><p class=\"sub\">"),
         "{event}"
     );
     let reply = post(format!("_csrf={csrf}&op=forget-server&{url}")).await;
