@@ -671,7 +671,7 @@ fn sweep(
         if let Some(reservation) = state.reservations.get(&id)
             && let Some(link) = state.links.get(&reservation.node)
         {
-            hub.end_session(&reservation.node, link.session);
+            hub.end_unanswering_session(&reservation.node, link.session);
         }
     }
     state

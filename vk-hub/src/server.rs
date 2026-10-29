@@ -176,6 +176,8 @@ pub(crate) struct Ending {
     pub(crate) notify: Notify,
     /// Set before `notify` when the node was removed rather than superseded.
     pub(crate) revoked: AtomicBool,
+    /// Set before `notify` for an unanswered offer, not a superseded session.
+    pub(crate) unanswered: AtomicBool,
     /// Notified when the node's desired state or commands changed.
     pub(crate) kick: Notify,
 }
@@ -507,11 +509,13 @@ impl Hub {
         }
     }
 
-    /// End this session so the node reconnects, unless a newer session replaced it.
-    pub(crate) fn end_session(&self, node_id: &str, session: u64) {
+    /// End the session for an unanswered offer so the node reconnects and reports what it
+    /// holds. Leave a newer session untouched.
+    pub(crate) fn end_unanswering_session(&self, node_id: &str, session: u64) {
         if let Some(live) = self.lock_live().get(node_id)
             && live.session == session
         {
+            live.ending.unanswered.store(true, Ordering::Relaxed);
             live.ending.notify.notify_one();
         }
     }

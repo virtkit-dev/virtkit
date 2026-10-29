@@ -1313,6 +1313,7 @@ mod tests {
             (RefusalCode::BadSignature, true),
             (RefusalCode::Internal, false),
             (RefusalCode::Superseded, false),
+            (RefusalCode::Protocol, false),
         ] {
             let mut f = fixture("refused").await;
             let (node, gatherer, stopped, listener, _) = f.parts();

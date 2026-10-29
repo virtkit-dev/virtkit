@@ -380,6 +380,13 @@ async fn serve(
             () = ending.notify.notified() => {
                 let (code, reason, why) = if ending.revoked.load(Ordering::Relaxed) {
                     (RefusalCode::Revoked, REMOVED, "removed")
+                } else if ending.unanswered.load(Ordering::Relaxed) {
+                    // Every node recognizes this non-permanent code and redials.
+                    (
+                        RefusalCode::Protocol,
+                        "an offer was left unanswered; reconnect and report what is held",
+                        "an offer left unanswered",
+                    )
                 } else {
                     (
                         RefusalCode::Superseded,

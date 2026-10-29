@@ -500,7 +500,12 @@ async fn unanswered_abandoned_probe_closes_node_session() {
     assert_eq!(reply.status, 204, "{reply:?}");
     assert!(matches!(node.job().await, HubJobMsg::Release { .. }));
     crate::jobs::testing::age_abandoned_and_step(&hub, &reservation).await;
-    node.ended().await;
+    // Ended for that, not as superseded, with a code every node redials on.
+    let Some(HubMsg::Refused { code, reason }) = node.ended().await else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(code, vk_hub_proto::RefusalCode::Protocol);
+    assert!(reason.contains("unanswered"), "{reason}");
     wait_until(|| crate::jobs::testing::reservations(&hub) == 0).await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
