@@ -1206,6 +1206,9 @@ async fn a_grant_in_the_same_pass_counts_against_headroom() {
     let first = queue(addr, &key, 1).await;
     queue_for(addr, &key, 2, "second").await;
     let mut node = ready_node(addr, &hub, 16384).await;
+    // As in `the_larger_of_two_entries_of_one_placement_holds`: keeps the held grant counted
+    // after a heartbeat stamped in a later second.
+    crate::ops::set_ceiling(&hub, "u", &node.id, Some(4)).unwrap();
     let grant = accept_ticket(addr, &key, &first, &mut node).await;
     assert_eq!(grant.admission.as_deref(), Some(first.as_str()));
     assert_eq!(reason_now(&hub, 43).await, Some("production headroom"));
@@ -1222,6 +1225,9 @@ async fn the_larger_of_two_entries_of_one_placement_holds() {
     // Four slots: one kept would leave room for three requests, three kept for one.
     headroom(&hub, vec![(placement(), 1), (placement(), 3)]);
     let mut node = ready_node(addr, &hub, 16384).await;
+    // The fake node's heartbeats omit the reservation. A heartbeat stamped in a later second
+    // stops the hub charging its memory; a ceiling of four keeps it counted, leaving three.
+    crate::ops::set_ceiling(&hub, "u", &node.id, Some(4)).unwrap();
     let first = queue(addr, &key, 1).await;
     let grant = accept_ticket(addr, &key, &first, &mut node).await;
     take_job(addr, &key, &first, &grant).await;
