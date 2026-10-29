@@ -7448,10 +7448,15 @@ RUN ship
         let deps: HashMap<usize, Vec<usize>> = nodes.iter().map(|&n| (n, vec![])).collect();
         let cur = AtomicUsize::new(0);
         let max = AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         run_dag(&nodes, &deps, 4, None, |_n, _done| {
             let now = cur.fetch_add(1, SeqCst) + 1;
             max.fetch_max(now, SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            // Held until another node runs beside it: with a fixed sleep a loaded host can start
+            // each only after the last ended. Serial nodes give up at the deadline.
+            while max.load(SeqCst) < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             cur.fetch_sub(1, SeqCst);
             Ok::<usize, anyhow::Error>(0)
         })
