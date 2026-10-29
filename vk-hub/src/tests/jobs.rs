@@ -1867,7 +1867,9 @@ async fn capacity_long_polls_until_it_moves_and_counts_only_version_3_nodes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn simultaneous_reservations_account_for_an_offer_before_selecting_again() {
     let dir = scratch("simultaneous-reservations");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    // No background placement pass can expire the offer while the test is slow to answer.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     relay_limits(&hub, &key, 64, 2);
     let mut node = ready_node(addr, &hub, envelope().mem_mib).await;
@@ -1884,13 +1886,15 @@ async fn simultaneous_reservations_account_for_an_offer_before_selecting_again()
             .await
         })
     };
-    // Asked at once: whichever is offered the node's one envelope first, the other is not
-    // offered it too. The one offered is accepted well within its wait, the other gives up.
+    // Both requests wait for one pass, which offers the node's one envelope to only one.
+    // That offer is accepted; the other request gives up.
     let (first, second) = (ask(1, 10), ask(2, 2));
+    wait_until(|| crate::jobs::testing::waiting(&hub) == 2).await;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(crate::jobs::testing::reservations(&hub), 1);
     let HubJobMsg::Offer { reservation, .. } = node.job().await else {
         panic!("expected an offer");
     };
-    node.quiet(Duration::from_millis(200)).await;
     node.send(NodeJobMsg::OfferReply {
         reservation,
         reply: OfferReply::Accepted { lease_secs: 90 },

@@ -5799,6 +5799,13 @@ pub(crate) mod testing {
         hub.dispatch.lock().reservations.len()
     }
 
+    /// How many requests for a reservation wait for room.
+    pub fn waiting(hub: &Hub) -> usize {
+        (hub.dispatch.lock().tickets.values())
+            .filter(|t| matches!(t.phase, TicketPhase::Waiting))
+            .count()
+    }
+
     /// Run one pass of the placement loop now, as [`drive`] does on a change.
     pub async fn step(hub: &Hub) {
         super::step(hub).await.unwrap();
