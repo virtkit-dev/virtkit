@@ -121,7 +121,7 @@ fn add_runner(hub: &Hub, key: &str, name: &str, runner_id: u64, class: crate::po
 }
 
 /// Queue request `n` of `key`'s runner `test`: its ticket.
-async fn queue(addr: SocketAddr, key: &str, n: u8) -> String {
+pub(super) async fn queue(addr: SocketAddr, key: &str, n: u8) -> String {
     queue_for(addr, key, n, "test").await
 }
 
@@ -143,7 +143,7 @@ async fn poll(addr: SocketAddr, key: &str, ticket: &str, wait: u32) -> Resp {
 
 /// Accept the offer `node` is sent for ticket `ticket`, and long-poll the ticket until it is
 /// granted.
-async fn accept_ticket(
+pub(super) async fn accept_ticket(
     addr: SocketAddr,
     key: &str,
     ticket: &str,
@@ -796,7 +796,7 @@ async fn the_tenant_holding_less_is_granted_first() {
 }
 
 /// Claim `grant` of ticket `ticket` and report that a job took it, as `key`'s relay.
-async fn take_job(addr: SocketAddr, key: &str, ticket: &str, grant: &ReservationGrant) {
+pub(super) async fn take_job(addr: SocketAddr, key: &str, ticket: &str, grant: &ReservationGrant) {
     assert_eq!(claim(addr, key, grant).await.status, 204);
     let reply = outcome(addr, key, ticket, ticket, "job").await;
     assert_eq!(reply.status, 204, "{reply:?}");

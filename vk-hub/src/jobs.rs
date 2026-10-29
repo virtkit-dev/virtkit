@@ -466,8 +466,8 @@ struct LiveJob {
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
     /// Why arbitration last passed it over while nodes may have had room for it: a limit of
-    /// its tenant, relay or runner, production headroom, or its project's delisting. Told when
-    /// it ends at its deadline.
+    /// its tenant, relay or runner, production headroom, its project's delisting or its placement
+    /// rules. Told when it ends at its deadline.
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
@@ -3977,13 +3977,34 @@ pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
     !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
-/// Nodes `job` may not go to under `policy`. None yet: the policy places no job by node.
+/// Nodes `job` may not go to under its project's placement rules: those of its tenant's
+/// listing, or of any tenant's for a job recorded without a scheduling identity.
 fn placement_exclusions(
-    _policy: &crate::policy::Policy,
-    _job: &LiveJob,
-    _nodes: &[(String, NodeRow)],
+    policy: &crate::policy::Policy,
+    job: &LiveJob,
+    nodes: &[(String, NodeRow)],
 ) -> HashSet<String> {
-    HashSet::new()
+    let project = job
+        .row
+        .gitlab
+        .as_deref()
+        .zip(job.row.project_id)
+        .and_then(|(gitlab, id)| match &job.row.scheduling {
+            Some(identity) => policy.project(&identity.tenant, gitlab, id),
+            None => policy.project_any(gitlab, id),
+        });
+    let Some(project) = project.filter(|p| !p.placement_rules.is_empty()) else {
+        return HashSet::new();
+    };
+    let git_ref = job.spec.as_deref().map(|spec| {
+        let JobSpec::GitlabCi(ci) = spec;
+        ci.sources.git_ref.as_str()
+    });
+    nodes
+        .iter()
+        .filter(|(id, row)| !project.allows_placement(git_ref, id, &row.pools))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Reservation `id`, if a job may start on it: held by a linked node outside `excluded` that
@@ -4765,6 +4786,7 @@ mod tests {
                 gitlab: "gl".into(),
                 id,
                 production_branches: Vec::new(),
+                placement_rules: Vec::new(),
             }],
         };
         policy.tenants.insert("b".into(), tenant(7));
@@ -5279,8 +5301,40 @@ mod tests {
             gitlab: "gl".into(),
             id: 7,
             production_branches: Vec::new(),
+            placement_rules: Vec::new(),
         }];
         assert!(!scheduler::delisted(&policy, &row));
+    }
+
+    /// A job recorded without a scheduling identity is held to the rules of the tenant that lists
+    /// its project, whichever that is.
+    #[test]
+    fn a_legacy_job_is_held_to_its_project_s_placement_rules() {
+        let mut policy = crate::policy::Policy::default();
+        policy.tenants.get_mut("fallback").unwrap().projects = vec![crate::policy::Project {
+            gitlab: "gl".into(),
+            id: 7,
+            production_branches: Vec::new(),
+            placement_rules: vec![crate::policy::PlacementRule {
+                branches: vec!["main".into()],
+                nodes: vec!["n1".into()],
+                pools: Vec::new(),
+            }],
+        }];
+        let mut job = sent("n1", 1, None);
+        job.row.gitlab = Some("gl".into());
+        job.row.project_id = Some(7);
+        let mut ci = vk_hub_proto::job::CiJob::default();
+        ci.sources.git_ref = "main".into();
+        job.spec = Some(Arc::new(JobSpec::GitlabCi(ci)));
+        let nodes = [
+            ("n1".to_string(), NodeRow::default()),
+            ("n2".to_string(), NodeRow::default()),
+        ];
+        assert_eq!(
+            placement_exclusions(&policy, &job, &nodes),
+            HashSet::from(["n2".to_string()])
+        );
     }
 
     /// A running job's record is due a write for its egress report once it holds one newer than

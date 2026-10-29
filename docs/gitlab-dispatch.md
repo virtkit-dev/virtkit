@@ -197,6 +197,23 @@ That node boots it in seconds where another spends a minute or two building the 
 submitted on a reservation on a node without the image then starts on the warm node without it,
 and the hub releases the reservation. Under heavier load the order above holds.
 
+A project of the capacity policy may restrict where its jobs go with `placement_rules` (at
+most 64): each rule names `nodes` (node IDs), `pools` (a node must be in one), or both (at most
+256 of each), and applies to every job of the project or, with `branches` (globs), to jobs whose
+ref matches one. A job goes only to a node every rule that applies to it allows, image
+affinity included. Rules match the ref the relay reports for the job (branch, tag or merge
+request alike), as GitLab gives it to the relay. That ref is no trust boundary: a merge request
+from a fork whose branch is named `main` gets `main`'s rules. To confine a project's jobs, use
+a rule without `branches`. A project's placement rules must be the same, in any order, in every
+tenant that lists it.
+
+The hub offers a runner's request before GitLab says which project's job it takes, so rules
+cannot steer reservations: a job submitted on a reservation on a node its rules do not allow
+has the reservation released and waits for an allowed node, ending at its `place_within_secs`
+deadline with `project placement rules` as the reason when nodes had room but none was
+allowed. Give a restricted project a runner of its own whose placement's pool holds the
+allowed nodes, so its requests are reserved where its jobs may go.
+
 A relay job whose project its tenant stops listing after the job was submitted is held: it
 waits, keeping any reservation it was submitted on so it starts as soon as the project is
 listed again, or until its deadline, when it ends with `project no longer listed for its

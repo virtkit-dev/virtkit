@@ -14,6 +14,10 @@ const MAX_CLIENTS: usize = 16384;
 const MAX_HEADROOMS: usize = 64;
 const MAX_PROJECTS: usize = 16384;
 const MAX_BRANCHES: usize = 1024;
+/// The most placement rules of a project.
+const MAX_PLACEMENT_RULES: usize = 64;
+/// The most nodes, and pools, of one placement rule.
+const MAX_RULE_TARGETS: usize = 256;
 /// The longest production branch pattern and client principal, in bytes.
 const MAX_TEXT: usize = 255;
 /// The longest backoff or busy timeout.
@@ -40,6 +44,80 @@ pub struct Project {
     pub id: u64,
     #[serde(default)]
     pub production_branches: Vec<String>,
+    /// Where its jobs may be placed: on nodes every rule that applies allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_rules: Vec<PlacementRule>,
+}
+
+/// A restriction of a project's jobs to some nodes or node pools: for jobs whose ref, as the
+/// relay reports it, matches one of `branches` (globs), or for every job when it names none.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementRule {
+    #[serde(default)]
+    pub branches: Vec<String>,
+    /// Node IDs allowed, any when empty.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    /// Pools a node must be in one of, any when empty.
+    #[serde(default)]
+    pub pools: Vec<String>,
+}
+
+impl PlacementRule {
+    /// Whether it restricts to some nodes or pools, within the policy's bounds.
+    fn valid(&self) -> bool {
+        (!self.nodes.is_empty() || !self.pools.is_empty())
+            && self.branches.len() <= MAX_BRANCHES
+            && self.nodes.len() <= MAX_RULE_TARGETS
+            && self.pools.len() <= MAX_RULE_TARGETS
+            && self
+                .branches
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= MAX_TEXT && !s.chars().any(char::is_control))
+            && self.nodes.iter().all(|s| vk_hub_proto::valid_id(s))
+            && self.pools.iter().all(|s| crate::store::valid_name(s))
+    }
+
+    /// Whether it applies to a job of `git_ref`, as the relay reports it: every rule
+    /// applies when the job's sources are unknown.
+    fn applies(&self, git_ref: Option<&str>) -> bool {
+        self.branches.is_empty()
+            || git_ref.is_none_or(|r| {
+                self.branches
+                    .iter()
+                    .any(|p| crate::subject::glob_match(p, r))
+            })
+    }
+
+    /// Whether it lets a job go to `node`, in `pools`.
+    fn allows(&self, node: &str, pools: &[String]) -> bool {
+        (self.nodes.is_empty() || self.nodes.iter().any(|n| n == node))
+            && (self.pools.is_empty() || self.pools.iter().any(|p| pools.contains(p)))
+    }
+}
+
+/// `rules`, each list sorted and deduplicated, for comparing two lists regardless of order.
+fn canonical(rules: &[PlacementRule]) -> Vec<PlacementRule> {
+    let mut rules: Vec<PlacementRule> = rules
+        .iter()
+        .map(|r| {
+            let sorted = |v: &[String]| {
+                let mut v = v.to_vec();
+                v.sort();
+                v.dedup();
+                v
+            };
+            PlacementRule {
+                branches: sorted(&r.branches),
+                nodes: sorted(&r.nodes),
+                pools: sorted(&r.pools),
+            }
+        })
+        .collect();
+    rules.sort();
+    rules.dedup();
+    rules
 }
 
 /// The branch a job's pipeline runs for, when its sources fetch that branch and nothing
@@ -74,6 +152,16 @@ pub fn branch_name(sources: &vk_hub_proto::job::Sources) -> Option<&str> {
 
 fn decimal_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl Project {
+    /// Whether a job of `git_ref`, `None` when its sources are unknown, may
+    /// go to `node`, in `pools`: every rule that applies to it allows it.
+    pub fn allows_placement(&self, git_ref: Option<&str>, node: &str, pools: &[String]) -> bool {
+        self.placement_rules
+            .iter()
+            .all(|rule| !rule.applies(git_ref) || rule.allows(node, pools))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +302,15 @@ impl Policy {
             .find(|p| p.gitlab == gitlab && p.id == id)
     }
 
+    /// Project `id` of instance `gitlab`, in whichever tenant lists it: for a job recorded
+    /// without a scheduling identity. Placement rules are the same in every tenant listing it.
+    pub fn project_any(&self, gitlab: &str, id: u64) -> Option<&Project> {
+        self.tenants
+            .values()
+            .flat_map(|t| &t.projects)
+            .find(|p| p.gitlab == gitlab && p.id == id)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.tenants.len() > MAX_TENANTS
             || self.runners.len() > MAX_RUNNERS
@@ -259,6 +356,7 @@ impl Policy {
             }
         }
         let mut branch_lists = BTreeMap::new();
+        let mut placement_lists = BTreeMap::new();
         for (name, tenant) in &self.tenants {
             if !crate::store::valid_name(name)
                 || tenant.weight == 0
@@ -275,6 +373,8 @@ impl Policy {
                 if !crate::store::valid_gitlab_name(&p.gitlab)
                     || p.id == 0
                     || !projects.insert((&p.gitlab, p.id))
+                    || p.placement_rules.len() > MAX_PLACEMENT_RULES
+                    || p.placement_rules.iter().any(|r| !r.valid())
                     || p.production_branches.len() > MAX_BRANCHES
                     || p.production_branches.iter().any(|s| {
                         s.is_empty() || s.len() > MAX_TEXT || s.chars().any(char::is_control)
@@ -292,6 +392,16 @@ impl Policy {
                 {
                     bail!(
                         "project {}/{}'s production branches differ across tenants",
+                        p.gitlab,
+                        p.id
+                    );
+                }
+                if let Some(previous) =
+                    placement_lists.insert((&p.gitlab, p.id), canonical(&p.placement_rules))
+                    && previous != canonical(&p.placement_rules)
+                {
+                    bail!(
+                        "project {}/{}'s placement rules differ across tenants",
                         p.gitlab,
                         p.id
                     );
@@ -352,6 +462,42 @@ mod tests {
             slots: 1,
         });
         assert!(policy.validate().is_err());
+    }
+
+    fn rule(branches: &[&str], nodes: &[&str], pools: &[&str]) -> PlacementRule {
+        let strings = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect();
+        PlacementRule {
+            branches: strings(branches),
+            nodes: strings(nodes),
+            pools: strings(pools),
+        }
+    }
+
+    fn ruled(rules: Vec<PlacementRule>) -> Project {
+        Project {
+            gitlab: "gl".into(),
+            id: 1,
+            production_branches: vec![],
+            placement_rules: rules,
+        }
+    }
+
+    #[test]
+    fn placement_rules_intersect_and_branch_rules_apply_to_matching_refs() {
+        let project = ruled(vec![
+            rule(&[], &["a", "b"], &["linux"]),
+            rule(&["release/*"], &["b"], &[]),
+        ]);
+        let pools = vec!["linux".into()];
+        assert!(project.allows_placement(Some("main"), "a", &pools));
+        assert!(!project.allows_placement(Some("release/1"), "a", &pools));
+        assert!(project.allows_placement(Some("release/1"), "b", &pools));
+        // A pools rule: a node outside the pool, though listed, may not take it.
+        assert!(!project.allows_placement(Some("main"), "b", &[]));
+        assert!(!project.allows_placement(Some("main"), "c", &pools));
+        // Sources unknown: held to every rule.
+        assert!(!project.allows_placement(None, "a", &pools));
+        assert!(project.allows_placement(None, "b", &pools));
     }
 
     #[test]
@@ -480,5 +626,129 @@ mod tests {
         });
         let err = policy.validate().unwrap_err().to_string();
         assert!(err.contains("gl/7"), "{err}");
+    }
+
+    #[test]
+    fn tags_and_merge_requests_are_held_to_the_rules_their_ref_matches() {
+        use vk_hub_proto::job::{RefType, Sources};
+        let project = ruled(vec![rule(&["main", "v*"], &["allowed"], &[])]);
+        let allows = |sources: &Sources, node: &str| {
+            project.allows_placement(Some(&sources.git_ref), node, &[])
+        };
+        let sha = "a".repeat(40);
+        let mut sources = Sources {
+            git_ref: "main".into(),
+            sha: sha.clone(),
+            ..Sources::default()
+        };
+        // A verified branch.
+        sources.refspecs = vec![
+            "+refs/heads/main:refs/remotes/origin/main".into(),
+            format!("+{sha}:refs/pipelines/42"),
+        ];
+        assert_eq!(branch_name(&sources), Some("main"));
+        assert!(allows(&sources, "allowed"));
+        assert!(!allows(&sources, "other"));
+        // Whatever else it fetches: held to the rules its ref matches.
+        for refspecs in [
+            vec![],
+            vec![format!("+{}:refs/pipelines/42", "b".repeat(40))],
+            vec!["+refs/pipelines/42:refs/pipelines/42".to_owned()],
+            vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+            vec!["+refs/tags/*:refs/tags/*".to_owned()],
+            vec!["+refs/merge-requests/7/head:refs/merge-requests/7/head".to_owned()],
+            vec!["+refs/merge-requests/7/merge:refs/merge-requests/7/merge".to_owned()],
+        ] {
+            sources.refspecs = refspecs;
+            assert!(allows(&sources, "allowed"), "{:?}", sources.refspecs);
+            assert!(!allows(&sources, "other"), "{:?}", sources.refspecs);
+        }
+        // A tag, with a branch's refspecs or none: held to the rules its ref matches.
+        sources.ref_type = RefType::Tag;
+        sources.git_ref = "v1".into();
+        for refspecs in [
+            vec![],
+            vec!["+refs/heads/v1:refs/remotes/origin/v1".to_owned()],
+        ] {
+            sources.refspecs = refspecs;
+            assert!(!allows(&sources, "other"), "{:?}", sources.refspecs);
+        }
+        // A ref no rule's globs match: no branch rule applies.
+        sources.git_ref = "feature".into();
+        assert!(allows(&sources, "other"));
+    }
+
+    #[test]
+    fn placement_validation_and_legacy_decode() {
+        assert!(
+            serde_json::from_str::<PlacementRule>(
+                r#"{"pools":["trusted"],"node":["ignored-typo"]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Project>(r#"{"gitlab":"gl","id":1,"placement_rule":[]}"#)
+                .is_err()
+        );
+        let project: Project = serde_json::from_str(r#"{"gitlab":"gl","id":1}"#).unwrap();
+        assert!(project.placement_rules.is_empty());
+        assert!(
+            !serde_json::to_string(&project)
+                .unwrap()
+                .contains("placement_rules")
+        );
+
+        let node = "0123456789abcdef0123456789abcdef";
+        let with = |rules: Vec<PlacementRule>| {
+            let mut policy = Policy::default();
+            policy.tenants.get_mut("fallback").unwrap().projects = vec![ruled(rules)];
+            policy
+        };
+        with(vec![rule(&["main"], &[node], &["ci"])])
+            .validate()
+            .unwrap();
+        fn many(n: usize, s: &str) -> Vec<&str> {
+            vec![s; n]
+        }
+        let long = "x".repeat(MAX_TEXT + 1);
+        for bad in [
+            vec![rule(&[], &[node], &[]); MAX_PLACEMENT_RULES + 1],
+            vec![rule(&[], &many(MAX_RULE_TARGETS + 1, node), &[])],
+            vec![rule(&[], &[], &many(MAX_RULE_TARGETS + 1, "ci"))],
+            vec![rule(&many(MAX_BRANCHES + 1, "main"), &[node], &[])],
+            vec![rule(&[""], &[node], &[])],
+            vec![rule(&[&long], &[node], &[])],
+            vec![rule(&["ma\nin"], &[node], &[])],
+            vec![rule(&[], &["not-an-id"], &[])],
+            vec![rule(&[], &[], &["not a pool"])],
+            // Neither nodes nor pools: it would restrict nothing.
+            vec![rule(&["main"], &[], &[])],
+        ] {
+            let err = with(bad.clone()).validate().unwrap_err().to_string();
+            assert!(err.contains("project gl/1"), "{bad:?}: {err}");
+        }
+        assert!(
+            with(vec![rule(&[], &[node], &[]); MAX_PLACEMENT_RULES])
+                .validate()
+                .is_ok()
+        );
+
+        // A project listed by two tenants has the same rules in both, in any order.
+        let a = rule(&[], &[node], &[]);
+        let b = rule(&["main"], &[], &["ci", "trusted"]);
+        let mut policy = with(vec![a.clone(), b.clone()]);
+        let reordered = rule(&["main"], &[], &["trusted", "ci"]);
+        policy.tenants.insert(
+            "other".into(),
+            Tenant {
+                weight: 1,
+                cap: None,
+                projects: vec![ruled(vec![reordered, a.clone()])],
+            },
+        );
+        policy.validate().unwrap();
+        policy.tenants.get_mut("other").unwrap().projects[0].placement_rules = vec![a];
+        let err = policy.validate().unwrap_err().to_string();
+        assert!(err.contains("placement rules differ"), "{err}");
     }
 }

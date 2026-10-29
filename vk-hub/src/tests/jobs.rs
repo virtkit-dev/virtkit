@@ -235,6 +235,7 @@ fn enrolled_key(hub: &Hub) -> String {
                     gitlab: "gl".into(),
                     id,
                     production_branches: vec![],
+                    placement_rules: vec![],
                 })
                 .collect(),
         });
@@ -5453,6 +5454,7 @@ fn approve(hub: &Hub, id_path: &str) {
             gitlab: "gl".into(),
             id,
             production_branches: vec![],
+            placement_rules: vec![],
         });
     }
     hub.db

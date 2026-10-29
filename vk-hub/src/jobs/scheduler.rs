@@ -37,6 +37,9 @@ pub(super) fn delisted(policy: &crate::policy::Policy, row: &JobRow) -> bool {
     })
 }
 
+/// Why a queued job waits: nodes have room, but none its project's placement rules allow.
+const PLACEMENT_RULES: &str = "project placement rules";
+
 /// Why [`admission_node`] found no node: each with room would take the room a headroom entry
 /// keeps for production.
 pub(super) const PRODUCTION_HEADROOM: &str = "production headroom";
@@ -1197,9 +1200,7 @@ fn arbitrate(
                     continue;
                 }
             }
-            if let Some(job) = state.jobs.get_mut(&id) {
-                job.blocked = None;
-            }
+            let previous = state.jobs.get_mut(&id).and_then(|job| job.blocked.take());
             let reserved = reservation
                 .as_ref()
                 .is_some_and(|r| usable_reservation(hub, state, nodes, &excluded, r).is_some());
@@ -1227,8 +1228,19 @@ fn arbitrate(
                 match chosen {
                     Ok(node) => node,
                     Err(why) => {
+                        // Every node with room is one its project's rules exclude; with none
+                        // having room, the rules stay the reason if they were the last one.
+                        let ruled_out = if fits.is_empty() {
+                            previous == Some(PLACEMENT_RULES) && !excluded.is_empty()
+                        } else {
+                            fits.iter().all(|(node, _)| excluded.contains(node))
+                        };
                         if let Some(job) = state.jobs.get_mut(&id) {
-                            job.blocked = (why == PRODUCTION_HEADROOM).then_some(why);
+                            job.blocked = if ruled_out {
+                                Some(PLACEMENT_RULES)
+                            } else {
+                                (why == PRODUCTION_HEADROOM).then_some(why)
+                            };
                         }
                         continue;
                     }

@@ -42,6 +42,12 @@ All notable changes to virtkit will be documented in this file.
   `production_probe_burst` production discovery polls since its last grant, and first after a
   hub restart. The policy's `headroom` entries, at most 64, reserve fleet capacity for
   production work.
+- **A GitLab project's jobs can be restricted to some nodes or node pools**, all of them or
+  those whose ref matches a glob, through `placement_rules` in the capacity policy (at most 64
+  rules, each of at most 256 nodes and 256 pools). Rules match the ref the relay reports for
+  the job. A job waits for a node its rules allow, giving back a reservation elsewhere, and
+  ends saying why if none takes it in time; a runner of its own, whose pool holds the allowed nodes, keeps
+  its reservations where its jobs may go.
 - **A relay job whose project leaves its tenant's list before it is placed waits** until the
   project is listed again, or ends at its deadline saying the project is no longer listed.
 - **The hub can store a capacity policy** through `vk-hub capacity-policy show` and `set`.
