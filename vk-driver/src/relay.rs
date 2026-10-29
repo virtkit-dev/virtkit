@@ -705,7 +705,15 @@ mod tests {
         .join()
         .unwrap()
         .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        // The flood's tail may still sit in the port: an answer written now could be read with
+        // it and dropped as answering nothing, ahead of `b`'s request. The relay forwards whole
+        // lines, so a byte reaching `stuck` means it has read the flood and is blocked writing it.
+        let mut byte = [0u8; 1];
+        stuck
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stuck.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
         // Meanwhile the answer to `leaving` comes early and `leaving` leaves: the relay finds
         // both at once, and drops `leaving` as it answers it.
         port.write_all(b"answer b\n").unwrap();
