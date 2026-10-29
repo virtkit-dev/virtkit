@@ -394,7 +394,7 @@ impl Health {
 /// State shared by every runner.
 struct Shared<D> {
     dispatcher: Arc<D>,
-    /// The hub's URL, for the jobs it refuses.
+    /// The enrolled hub URL, used when a job refusal has no UI link.
     hub: String,
     /// The server's status the hub sent, and what the runners are doing.
     status: Arc<Status>,
@@ -1678,26 +1678,35 @@ async fn submit_recorded<D: Dispatcher>(
     }
 }
 
-/// Why a job the hub refused for its approval fails, for its trace: the project, the hub, and
-/// what to do. A refusal for its server, which a relay polling only an approved server meets
-/// only in a race with an operator, reads as its project's.
-fn not_approved(hub: &str, kind: ErrorKind, spec: Option<&JobSpec>) -> String {
+/// The failed job's trace names its project, the approval page and what to do.
+/// Without a UI link (older hub or no UI), it uses the enrolled hub URL.
+/// A server refusal reads as a project refusal: a relay polling only an approved
+/// server meets it only in a race with an operator.
+fn not_approved(hub: &str, e: &DispatchError, spec: Option<&JobSpec>) -> String {
     let project = match spec {
         Some(JobSpec::GitlabCi(ci)) => {
             format!("project {} (ID {})", ci.job.project_path, ci.job.project_id)
         }
         None => "this job's project".to_owned(),
     };
-    if kind == ErrorKind::ProjectRejected {
-        format!(
+    let rejected = e.kind == ErrorKind::ProjectRejected;
+    match &e.approval_url {
+        Some(url) if rejected => format!(
+            "{project} was rejected on the fleet hub: {url}\nAn operator can approve it there, \
+             then retry this job."
+        ),
+        Some(url) => format!(
+            "{project} is waiting for approval on the fleet hub: {url}\nRetry this job once \
+             an operator has approved it there."
+        ),
+        None if rejected => format!(
             "{project} was rejected on the fleet hub {hub}.\nAn operator can approve it there \
              (Connections > GitLab), then retry this job."
-        )
-    } else {
-        format!(
+        ),
+        None => format!(
             "{project} is waiting for approval on the fleet hub {hub}.\nRetry this job once \
              an operator has approved it (Connections > GitLab > Pending)."
-        )
+        ),
     }
 }
 
@@ -1849,7 +1858,7 @@ async fn drive<D: Dispatcher>(
                     {
                         log::warn!(job = gitlab_job, error = e.message.as_str(); "The hub refused the job until an operator approves its project");
                         fail(
-                            not_approved(&shared.hub, e.kind, rec.spec.as_ref()),
+                            not_approved(&shared.hub, &e, rec.spec.as_ref()),
                             FailureReason::new(FailureReason::CONFIGURATION_ERROR),
                         )
                         .await;

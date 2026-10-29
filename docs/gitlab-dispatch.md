@@ -372,13 +372,23 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 | 503 | `no_capacity` | no node accepted in time | yes, after `retry_after_secs` |
 | 503 | `unavailable` | hub busy or starting; the reservation queue full; the relay's session not connected; an admission being updated | yes, after `retry_after_secs` |
 
-An error body is `{error, code, retry_after_secs?}`; a code the client does not know reads as
-`other`.
+An error body is `{error, code, retry_after_secs?, approval_url?}`. Unknown codes read as `other`;
+unknown fields are ignored. When the hub serves a web UI, `approval_pending` and
+`project_rejected` include `approval_url`: the page where an operator decides on the project's
+approval, `<ui_url>/clients/projects/<instance>/<project ID>`, or Connections,
+`<ui_url>/clients`, for its server.
 
 A job refused `approval_pending` or `project_rejected` is not held: approval is a human step.
 `vk-gitlab` releases its reservation and fails it in GitLab, uncommitted, as
 `runner_configuration_error` (`script_failure` where GitLab does not know it), its trace ending
-with what to do, as for a project pending:
+with instructions and a link, for example:
+
+```text
+ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/clients/projects/main/12
+Retry this job once an operator has approved it there.
+```
+
+Without `approval_url` (an older hub or one without a UI), the trace uses the enrolled hub URL:
 
 ```text
 ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub https://hub.example.com.

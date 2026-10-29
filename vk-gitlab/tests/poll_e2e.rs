@@ -618,19 +618,38 @@ async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
 async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
     let h = Harness::start(2, via).await;
     h.hub.set_slots("p1", 2);
-    for (id, kind, said) in [
+    let page = "https://ui.example.com:8444/clients/projects/gl/12";
+    for (id, kind, url, said) in [
         (
             60,
             ErrorKind::ApprovalPending,
-            "is waiting for approval on the fleet hub https://hub.example.com.",
+            None,
+            "is waiting for approval on the fleet hub https://hub.example.com.".to_owned(),
         ),
         (
             61,
             ErrorKind::ProjectRejected,
-            "was rejected on the fleet hub https://hub.example.com.",
+            None,
+            "was rejected on the fleet hub https://hub.example.com.".to_owned(),
+        ),
+        // A hub serving a UI links the project's page there instead of the hub as enrolled.
+        (
+            62,
+            ErrorKind::ApprovalPending,
+            Some(page),
+            format!("is waiting for approval on the fleet hub: {page}\n"),
+        ),
+        (
+            63,
+            ErrorKind::ProjectRejected,
+            Some(page),
+            format!("was rejected on the fleet hub: {page}\n"),
         ),
     ] {
-        h.hub.refuse_submit(DispatchError::new(kind, "refused"));
+        h.hub.refuse_submit(DispatchError {
+            approval_url: url.map(str::to_owned),
+            ..DispatchError::new(kind, "refused")
+        });
         let mut job = job_json(id);
         job["job_info"]["project_id"] = 12.into();
         job["features"]["failure_reasons"]
@@ -659,6 +678,6 @@ async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
         .await;
     }
     // Refused once each, not resubmitted.
-    assert_eq!(h.count_calls(|c| matches!(c, FakeCall::Submit { .. })), 2);
+    assert_eq!(h.count_calls(|c| matches!(c, FakeCall::Submit { .. })), 4);
     h.stop().await;
 }

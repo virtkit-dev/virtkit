@@ -144,9 +144,13 @@ failure mapper, which falls back to `script_failure` where GitLab does not accep
 ending with:
 
 ```text
-ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub https://hub.example.com.
-Retry this job once an operator has approved it (Connections > GitLab > Pending).
+ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/clients/projects/main/12
+Retry this job once an operator has approved it there.
 ```
+
+The refusal's `approval_url` links to the project's page on the hub's web UI. Older hubs and hubs
+without a UI omit it; the trace uses the enrolled hub URL with "(Connections > GitLab > Pending)"
+([gitlab-dispatch.md](gitlab-dispatch.md)).
 
 The job is not held: approval is a human step, and GitLab's `retry: when:
 runner_system_failure` does not retry this reason, so a pending project does not loop. A

@@ -127,6 +127,7 @@ fn error(status: u16, code: ErrorCode, msg: &str, retry_after_secs: Option<u32>)
             error: msg.to_owned(),
             code,
             retry_after_secs,
+            approval_url: None,
         },
     )
 }
@@ -153,7 +154,15 @@ fn dispatch_error(e: DispatchError) -> Resp {
         }
         _ => (500, ErrorCode::Internal),
     };
-    error(status, code, &e.message, retry)
+    json(
+        status,
+        &ClientError {
+            error: e.message,
+            code,
+            retry_after_secs: retry,
+            approval_url: e.approval_url,
+        },
+    )
 }
 
 fn query(q: &str, name: &str) -> Option<u64> {

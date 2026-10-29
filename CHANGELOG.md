@@ -60,6 +60,12 @@ All notable changes to virtkit will be documented in this file.
   and held, its jobs, its demand and backoff, and what it waits for; and each API key's
   principal ID. See `docs/capacity-arbitration.md`.
 
+### Fixed
+
+- **GitLab jobs refused pending project approval link to the project's page on the hub's web UI**,
+  where an operator can approve it, instead of the hub's node address. Hubs without a web UI
+  and older hubs still show the address given to `vk-gitlab join`.
+
 ## [0.98.0] - 2026-10-28
 
 ### Added

@@ -363,6 +363,10 @@ pub(super) fn migrate_bound_keys(txn: &redb::WriteTransaction, now: u64) -> Resu
 pub struct Refusal {
     pub code: ErrorCode,
     pub error: String,
+    /// The refused project's instance, used to link its approval page.
+    /// `None` for server refusals or records predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gitlab: Option<String>,
 }
 
 /// What a relay's GitLab job is, as the approval gate looks at it.
@@ -402,7 +406,11 @@ enum Check {
 
 fn refuse(code: ErrorCode, error: String, recorded: bool) -> Check {
     Check::Refuse {
-        refusal: Refusal { code, error },
+        refusal: Refusal {
+            code,
+            error,
+            gitlab: None,
+        },
         recorded,
     }
 }
@@ -544,6 +552,7 @@ impl Db {
                 _ if answered.digest != digest => Gate::Refused(Refusal {
                     code: ErrorCode::Conflict,
                     error: "this request_id was used before with another body".into(),
+                    gitlab: None,
                 }),
                 Some(refusal) => Gate::Refused(refusal),
                 None => Gate::Seen,
@@ -580,11 +589,13 @@ impl Db {
                                      on the hub",
                                     p.path, job.project_id
                                 ),
+                                gitlab: Some(gitlab.clone()),
                             }
                         } else {
                             Refusal {
                                 code: ErrorCode::ApprovalPending,
                                 error: pending_error(&gitlab, job.project_id, &p.path),
+                                gitlab: Some(gitlab.clone()),
                             }
                         };
                         (Gate::Refused(error), true)
@@ -602,6 +613,7 @@ impl Db {
                                 Gate::Refused(Refusal {
                                     code: ErrorCode::Forbidden,
                                     error,
+                                    gitlab: None,
                                 }),
                                 false,
                             )
@@ -630,6 +642,7 @@ impl Db {
                                 Gate::Refused(Refusal {
                                     code: ErrorCode::ApprovalPending,
                                     error,
+                                    gitlab: Some(gitlab.clone()),
                                 }),
                                 true,
                             )
@@ -1177,6 +1190,8 @@ mod tests {
         );
         let answer = db.request(&id, &rid(1), 10).unwrap().unwrap();
         assert_eq!(answer.refusal().unwrap().code, ErrorCode::ApprovalPending);
+        // A refusal of its server names no instance.
+        assert_eq!(answer.refusal().unwrap().gitlab, None);
         db.reject_gitlab("https://gl.example", "u", 2).unwrap();
         assert_eq!(db.gitlab_pending().unwrap(), 0);
         assert_eq!(
@@ -1190,11 +1205,17 @@ mod tests {
         assert_eq!(code(gate(&foreign, 3)), ErrorCode::Forbidden);
         assert!(db.request(&id, &rid(3), 10).unwrap().is_none());
         assert_eq!(code(gate(&job(0, "acme/web"), 3)), ErrorCode::Invalid);
-        // A project not known becomes pending, from its first job; each refusal counts.
+        // An unknown project becomes pending on its first job; each refusal counts.
+        // The refusal's instance is stored with the request's answer.
+        let Gate::Refused(refusal) = gate(&job(4, "acme/web"), 4) else {
+            panic!("expected a refusal");
+        };
         assert_eq!(
-            code(gate(&job(4, "acme/web"), 4)),
-            ErrorCode::ApprovalPending
+            (refusal.code, refusal.gitlab.as_deref()),
+            (ErrorCode::ApprovalPending, Some("gl"))
         );
+        let answer = db.request(&id, &rid(4), 10).unwrap().unwrap();
+        assert_eq!(answer.refusal().unwrap(), refusal);
         assert_eq!(
             code(gate(&job(4, "acme/web"), 5)),
             ErrorCode::ApprovalPending

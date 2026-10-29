@@ -1471,8 +1471,10 @@ async fn a_job_of_a_project_not_approved_is_refused_until_it_is() {
         (resp.status, resp.code()),
         (403, ErrorCode::ApprovalPending)
     );
-    let error = resp.json::<vk_hub_proto::client::ClientError>().error;
-    assert!(error.contains("acme/web (ID 42)"), "{error}");
+    let error = resp.json::<vk_hub_proto::client::ClientError>();
+    assert!(error.error.contains("acme/web (ID 42)"), "{}", error.error);
+    // The hub serves no UI to link.
+    assert_eq!(error.approval_url, None);
     let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
     assert_eq!(
         (resp.status, resp.code()),
@@ -1520,6 +1522,62 @@ async fn a_job_of_a_project_not_approved_is_refused_until_it_is() {
         (resp.status, resp.code()),
         (403, ErrorCode::ProjectRejected)
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Approval refusals link to the project's approval page at the UI's origin, including
+/// on retries; other refusals have no link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_for_approval_links_the_project_s_page_on_the_web_ui() {
+    let dir = scratch("relay-gate-ui");
+    let (addr, hub) = serve_hub_with(
+        Arc::new(Db::open_memory().unwrap()),
+        &dir,
+        Duration::from_secs(60),
+        |mut hub| {
+            hub.ui_url = Some("https://ui.example:8444".into());
+            hub
+        },
+    )
+    .await;
+    let key = jobs_key(&hub);
+    let submit = |body: Value| {
+        let key = key.clone();
+        async move { api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await }
+    };
+    let page = Some("https://ui.example:8444/clients/projects/gl/42");
+    for _ in 0..2 {
+        let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
+        let error = resp.json::<vk_hub_proto::client::ClientError>();
+        assert_eq!(
+            (error.code, error.approval_url.as_deref()),
+            (ErrorCode::ApprovalPending, page)
+        );
+    }
+    let resp = submit(bound_body(1, 42, "acme/site", 600)).await;
+    let error = resp.json::<vk_hub_proto::client::ClientError>();
+    assert_eq!(
+        (error.code, error.approval_url),
+        (ErrorCode::Conflict, None)
+    );
+    let project = crate::store::ProjectRef::parse("42").unwrap();
+    hub.db
+        .decide_projects(
+            "gl",
+            &[project],
+            crate::store::Decision::Reject,
+            "u",
+            now_secs(),
+        )
+        .unwrap();
+    let resp = submit(bound_body(2, 42, "acme/web", 600)).await;
+    let error = resp.json::<vk_hub_proto::client::ClientError>();
+    assert_eq!(
+        (error.code, error.approval_url.as_deref()),
+        (ErrorCode::ProjectRejected, page)
+    );
+    // A refusal of its server links Connections, which lists it.
+    assert_eq!(crate::ui::approval_path(None, 42), "/clients");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

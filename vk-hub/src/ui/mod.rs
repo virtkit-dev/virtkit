@@ -92,6 +92,12 @@ pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
 /// Where a sign-in link points.
 pub const LOGIN_PATH: &str = "/login";
 
+/// The approval page for instance `gitlab`'s project `id`.
+/// Without an instance (a server refusal), use Connections, which lists pending servers.
+pub fn approval_path(gitlab: Option<&str>, id: u64) -> String {
+    gitlab.map_or_else(|| clients::PATH.to_owned(), |g| projects::path(g, id))
+}
+
 /// The policy on every response. `form-action 'self'` and `frame-ancestors 'none'` too: a
 /// form cannot be pointed elsewhere, nor a page framed to be clicked through.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; \

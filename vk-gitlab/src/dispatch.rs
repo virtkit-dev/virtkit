@@ -114,6 +114,8 @@ pub struct DispatchError {
     pub status: Option<u16>,
     /// Whether that answer's body carried a `code`.
     pub coded: bool,
+    /// The hub's `approval_url`: where an operator decides on a refused job's project.
+    pub approval_url: Option<String>,
 }
 
 impl DispatchError {
@@ -124,6 +126,7 @@ impl DispatchError {
             retry_after: None,
             status: None,
             coded: false,
+            approval_url: None,
         }
     }
 }

@@ -65,6 +65,8 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
     pub retry_after: Option<u32>,
+    /// The web UI page where an operator decides on a refused job's project.
+    pub approval_url: Option<String>,
 }
 
 impl ApiError {
@@ -74,6 +76,7 @@ impl ApiError {
             code,
             message: message.into(),
             retry_after: None,
+            approval_url: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl ApiError {
                 error: self.message.clone(),
                 code: self.code,
                 retry_after_secs: self.retry_after,
+                approval_url: self.approval_url.clone(),
             },
         );
         if let Some(secs) = self.retry_after {
@@ -1021,7 +1025,10 @@ async fn submit(
     let gitlab = match &seen {
         Some(before) => match before.refusal() {
             Some(_) if before.digest != digest => return Err(conflict()),
-            Some(refusal) => return Err(refused(refusal)),
+            Some(refusal) => {
+                let JobSpec::GitlabCi(ci) = &ask.spec;
+                return Err(refused(hub, refusal, ci.job.project_id));
+            }
             None => {
                 let (db, relay) = (hub.db.clone(), principal.id.clone());
                 tokio::task::spawn_blocking(move || db.relay_gitlab(&relay))
@@ -1232,6 +1239,7 @@ async fn gate(
     now: u64,
 ) -> Result<Option<String>, ApiError> {
     let JobSpec::GitlabCi(ci) = &ask.spec;
+    let project_id = ci.job.project_id;
     let (db, relay, ci, rid, digest) = (
         hub.db.clone(),
         principal.id.clone(),
@@ -1263,20 +1271,33 @@ async fn gate(
                 hub.touch();
                 hub.clients_changed();
             }
-            Err(refused(refusal))
+            Err(refused(hub, refusal, project_id))
         }
     }
 }
 
-/// The approval gate's refusal as the client API answers it.
-fn refused(refusal: Refusal) -> ApiError {
+/// The client API error for a refused job of project `project_id`.
+/// Approval refusals link to the approval page when the hub serves a UI.
+fn refused(hub: &Hub, refusal: Refusal, project_id: u64) -> ApiError {
     let status = match refusal.code {
         ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
         ErrorCode::Invalid => StatusCode::BAD_REQUEST,
         ErrorCode::Conflict => StatusCode::CONFLICT,
         _ => StatusCode::FORBIDDEN,
     };
-    ApiError::new(status, refusal.code, refusal.error)
+    let approval_url = match refusal.code {
+        ErrorCode::ApprovalPending | ErrorCode::ProjectRejected => hub.ui_url.as_ref().map(|ui| {
+            format!(
+                "{ui}{}",
+                crate::ui::approval_path(refusal.gitlab.as_deref(), project_id)
+            )
+        }),
+        _ => None,
+    };
+    ApiError {
+        approval_url,
+        ..ApiError::new(status, refusal.code, refusal.error)
+    }
 }
 
 async fn job(

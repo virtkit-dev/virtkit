@@ -341,6 +341,11 @@ pub struct ClientError {
     /// When to try again, for [`ErrorCode::NoCapacity`] and [`ErrorCode::Unavailable`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u32>,
+    /// The hub's UI page where an operator decides on the job's project or server, for
+    /// [`ErrorCode::ApprovalPending`] and [`ErrorCode::ProjectRejected`].
+    /// Absent when the hub serves no UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +511,13 @@ mod tests {
             error: "no node took it".into(),
             code: ErrorCode::NoCapacity,
             retry_after_secs: Some(5),
+            approval_url: None,
+        });
+        round_trip(&ClientError {
+            error: "pending".into(),
+            code: ErrorCode::ApprovalPending,
+            retry_after_secs: None,
+            approval_url: Some("https://hub.example.com/clients/projects/main/12".into()),
         });
     }
 
@@ -557,10 +569,25 @@ mod tests {
             error: "gone".into(),
             code: ErrorCode::ReservationGone,
             retry_after_secs: None,
+            approval_url: None,
         };
         assert_eq!(
             serde_json::to_value(error).unwrap(),
             json!({"error": "gone", "code": "reservation_gone"})
+        );
+        let error = ClientError {
+            error: "pending".into(),
+            code: ErrorCode::ApprovalPending,
+            retry_after_secs: None,
+            approval_url: Some("https://hub.example.com/clients/projects/main/12".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "error": "pending",
+                "code": "approval_pending",
+                "approval_url": "https://hub.example.com/clients/projects/main/12",
+            })
         );
         assert_eq!(
             serde_json::to_value(hello()).unwrap(),
@@ -595,6 +622,7 @@ mod tests {
         let error: ClientError =
             serde_json::from_value(json!({"error": "later", "code": "quota_exceeded"})).unwrap();
         assert_eq!(error.code, ErrorCode::Other);
+        assert_eq!(error.approval_url, None);
         assert!(!error.code.is_retryable());
         assert!(ErrorCode::NoCapacity.is_retryable());
         for (code, wire) in [

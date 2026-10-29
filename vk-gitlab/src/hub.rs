@@ -400,6 +400,7 @@ fn error_of(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> DispatchErr
     DispatchError {
         kind,
         coded: parsed.is_some(),
+        approval_url: parsed.as_ref().and_then(|p| p.approval_url.clone()),
         message: parsed.map_or_else(|| status.to_string(), |p| p.error),
         retry_after,
         status: Some(status.as_u16()),
