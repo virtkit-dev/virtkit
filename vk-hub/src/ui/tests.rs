@@ -754,6 +754,28 @@ async fn a_form_too_large_or_too_slow_is_refused() {
     let big = format!("_csrf={csrf}&pad={}", "x".repeat(MAX_FORM));
     let reply = request(addr, "POST", "/logout", &[&cookie, &origin], &big).await;
     assert_eq!(reply.status, 413);
+    // Refused on its declared length, before any of it arrives.
+    let declared = format!("Content-Length: {}", MAX_FORM + 1);
+    let reply = request(addr, "POST", "/logout", &[&cookie, &origin, &declared], "").await;
+    assert_eq!(reply.status, 413);
+    // A chunked body is refused once reading exceeds the limit.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /logout HTTP/1.1\r\nHost: {addr}\r\n{cookie}\r\n{origin}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{big}\r\n0\r\n\r\n",
+        big.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    // What it left unread may reset the connection after its answer.
+    let _ = tokio::time::timeout(FORM_TIMEOUT * 5, stream.read_to_end(&mut resp))
+        .await
+        .unwrap();
+    assert!(
+        resp.starts_with(b"HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
     // A body announced and never sent.
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let head = format!(

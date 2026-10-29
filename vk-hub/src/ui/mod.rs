@@ -678,7 +678,15 @@ async fn read_form(
     req: Request<Incoming>,
     max: usize,
 ) -> Result<Vec<(String, String)>, (StatusCode, &'static str)> {
-    // Capped while reading: a chunked body declares no length to check up front.
+    const TOO_LARGE: (StatusCode, &str) = (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Refused: the form is too large.",
+    );
+    // Check the declared length before reading to avoid waiting for a slow oversized body.
+    // Chunked bodies declare no length and are capped while reading.
+    if hyper::body::Body::size_hint(req.body()).lower() > max as u64 {
+        return Err(TOO_LARGE);
+    }
     match tokio::time::timeout(
         FORM_TIMEOUT,
         http_body_util::Limited::new(req.into_body(), max).collect(),
@@ -686,10 +694,7 @@ async fn read_form(
     .await
     {
         Ok(Ok(b)) => Ok(decode_form(&b.to_bytes())),
-        Ok(Err(_)) => Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Refused: the form is too large.",
-        )),
+        Ok(Err(_)) => Err(TOO_LARGE),
         Err(_) => Err((
             StatusCode::REQUEST_TIMEOUT,
             "Refused: the form was too slow to arrive.",
