@@ -1049,7 +1049,7 @@ mod tests {
             // First session: desired state and a reset; the hub records nothing.
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             let first = next_of(&mut ws, report_of).await;
             assert_eq!(first.applied_generation(), None);
             assert_eq!(first.state, Some(vk_hub_proto::NodeState::Ready));
@@ -1067,7 +1067,7 @@ mod tests {
             // redelivered is answered with it, not run again.
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             let report = next_of(&mut ws, report_of).await;
             assert_eq!(report.applied_generation(), Some(1));
             assert_eq!(next_of(&mut ws, ack_of).await, ack);
@@ -1120,7 +1120,7 @@ mod tests {
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             next_of(&mut ws, report_of).await;
             assert!(*connected.borrow());
             hub_send(&mut ws, &HubMsg::Command(update)).await;
@@ -1160,7 +1160,7 @@ mod tests {
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, v4, vk_hub_proto::TOOLS).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             next_of(&mut ws, report_of).await;
             hub_send(&mut ws, &HubMsg::Command(build.clone())).await;
             assert_eq!(next_of(&mut ws, ack_of).await.outcome, Outcome::Accepted);
@@ -1174,7 +1174,7 @@ mod tests {
 
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, v3, JOBS).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             let report = next_of(&mut ws, report_of).await;
             assert_eq!(report.state, Some(vk_hub_proto::NodeState::Ready));
             assert_eq!(report.tools, None);
@@ -1237,7 +1237,7 @@ mod tests {
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             let running = next_of(&mut ws, |m| {
                 report_of(m).filter(|r| r.runner_state == Some(RunnerState::Running))
             })
