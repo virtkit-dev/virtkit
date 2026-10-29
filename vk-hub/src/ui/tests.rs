@@ -875,10 +875,13 @@ impl Events {
     }
 }
 
-/// Collect events through the first containing `want`, within a few events.
+/// Collect events through the first containing `want`, within 30s. A count limit can fail
+/// after a slow stretch: streams render each heartbeat, and pages showing an age change each
+/// render, leaving an event per second ahead of the expected one.
 async fn events_until(events: &mut Events, want: &str) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut seen = Vec::new();
-    for _ in 0..10 {
+    while tokio::time::Instant::now() < deadline {
         let event = events.next().await.unwrap();
         let found = event.contains(want);
         seen.push(event);
@@ -889,7 +892,7 @@ async fn events_until(events: &mut Events, want: &str) -> Vec<String> {
     panic!("no event with {want:?}: {seen:?}");
 }
 
-/// The stream's next event containing `want`, within a few.
+/// The stream's next event containing `want`, within 30s.
 async fn next_with(events: &mut Events, want: &str) -> String {
     events_until(events, want).await.pop().unwrap()
 }
