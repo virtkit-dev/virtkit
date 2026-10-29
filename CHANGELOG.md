@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.99.0] - 2026-10-29
+
 ### Breaking
 
 - **The hub takes new work only from relay runners mapped to a capacity tenant, over session
@@ -4883,7 +4885,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.98.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.99.0...HEAD
+[0.99.0]: https://github.com/virtkit-dev/virtkit/compare/v0.98.0...v0.99.0
 [0.98.0]: https://github.com/virtkit-dev/virtkit/compare/v0.97.0...v0.98.0
 [0.97.0]: https://github.com/virtkit-dev/virtkit/compare/v0.96.0...v0.97.0
 [0.96.0]: https://github.com/virtkit-dev/virtkit/compare/v0.95.1...v0.96.0
