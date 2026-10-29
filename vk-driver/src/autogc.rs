@@ -454,7 +454,12 @@ mod tests {
             "a wait is waited out"
         );
         drop(held);
-        assert!(matches!(lock(&dir, Duration::ZERO), Pass::Held { .. }));
+        // A child another test forks meanwhile shares the lock's open file description until
+        // it execs, so the dropped lock can briefly stay held: wait for it.
+        assert!(matches!(
+            lock(&dir, Duration::from_secs(10)),
+            Pass::Held { .. }
+        ));
 
         // A pass short of space dates it, one back above the floor clears it, and only a
         // complete one dates the interval.
