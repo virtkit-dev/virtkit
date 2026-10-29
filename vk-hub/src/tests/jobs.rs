@@ -89,8 +89,10 @@ async fn serve_undriven_with(
 ) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
+    // The fake nodes run in the test's process: a stall of it, under load, is not their silence.
     let hub = Arc::new(configure(
         Hub::new(db, None)
+            .with_quiet(Duration::from_secs(60))
             .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN)
             .with_jobs(dir.join("jobs"), lost_after, None)
             .unwrap(),

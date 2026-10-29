@@ -25,7 +25,7 @@ use vk_hub_proto::{
     PUBLIC_KEY_LEN, RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange, from_hex_lower,
 };
 
-use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
+use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub};
 use crate::store::NotEnrolled;
 
 pub(crate) type Ws = WebSocketStream<TokioIo<Upgraded>>;
@@ -369,7 +369,7 @@ async fn serve(
     ending: &Ending,
     mut jobs: Option<tokio::sync::mpsc::Receiver<vk_hub_proto::dispatch::HubJobMsg>>,
 ) -> Result<&'static str> {
-    let quiet = HEARTBEAT * MISSED_HEARTBEATS;
+    let quiet = hub.quiet;
     let mut ping = tokio::time::interval(HEARTBEAT);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;

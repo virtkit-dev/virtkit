@@ -155,6 +155,9 @@ pub struct Hub {
     pub(crate) dispatch: crate::jobs::Dispatch,
     /// The keys registry tokens are signed with.
     pub(crate) token_keys: Arc<crate::tokens::Keys>,
+    /// How long a node may go unheard before its session is dropped and it shows unreachable:
+    /// [`MISSED_HEARTBEATS`] heartbeats.
+    pub(crate) quiet: Duration,
 }
 
 /// One node's open session.
@@ -230,7 +233,16 @@ impl Hub {
                 None,
                 crate::tokens::DEFAULT_MAX_JOB_TOKEN,
             )),
+            quiet: HEARTBEAT * MISSED_HEARTBEATS,
         }
+    }
+
+    /// Drop a node's session after `quiet` of silence instead of
+    /// [`MISSED_HEARTBEATS`] heartbeats.
+    #[cfg(test)]
+    pub fn with_quiet(mut self, quiet: Duration) -> Self {
+        self.quiet = quiet;
+        self
     }
 
     /// Keep registry-token signing keys in `dir` and cap token lifetimes at `max_token`.
@@ -563,7 +575,7 @@ impl Hub {
     /// Whether `node_id` has a session whose node is still heard from.
     pub fn reach(&self, node_id: &str) -> Reach {
         match self.lock_live().get(node_id) {
-            Some(l) if l.last_heard.elapsed() <= HEARTBEAT * MISSED_HEARTBEATS => Reach::Connected,
+            Some(l) if l.last_heard.elapsed() <= self.quiet => Reach::Connected,
             _ => Reach::Unreachable,
         }
     }
