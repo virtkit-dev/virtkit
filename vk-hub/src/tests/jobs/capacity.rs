@@ -773,8 +773,11 @@ async fn the_tenant_holding_less_is_granted_first() {
         .set_capacity_policy(&policy, "u", now_secs())
         .unwrap();
     ready_relay(&hub, &key);
-    // Tenant `tests` holds a node's two slots with jobs.
+    // Tenant `tests` holds a node's two slots with jobs. Its fake heartbeats omit them;
+    // a heartbeat stamped in a later second ends the hub's pending memory charge.
+    // A ceiling of two keeps the node full.
     let mut full = ready_node(addr, &hub, 8192).await;
+    crate::ops::set_ceiling(&hub, "u", &full.id, Some(2)).unwrap();
     for n in 1..=2 {
         let ticket = queue(addr, &key, n).await;
         let grant = accept_ticket(addr, &key, &ticket, &mut full).await;
