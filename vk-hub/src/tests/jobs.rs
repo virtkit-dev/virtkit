@@ -5025,12 +5025,33 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
     assert_eq!(resp.status, 201, "{resp:?}");
     assert!(jobs.has_changed().unwrap());
 
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    // Run placement here so the job's record is written before the pass returns.
+    // The placement loop sends the start first; its later write could wake history at any point.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
     let mut jobs = hub.subscribe_jobs();
-    let id = running_job(addr, &key, &mut node, 2).await;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(2, None, 30)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    let id = resp.json::<JobView>().id;
+    crate::jobs::testing::step(&hub).await;
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    assert_eq!(start.job, id);
     assert!(jobs.has_changed().unwrap());
+    node.send(NodeJobMsg::Job {
+        job: id.clone(),
+        state: RunState::Accepted,
+    });
     // A session handles its messages in order: once this output is acknowledged, the start
     // before it is written and noted.
     node.send(output(&id, 0, b"hello\n"));
