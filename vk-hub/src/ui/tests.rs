@@ -1552,6 +1552,20 @@ async fn audited(hub: &Hub, want: &str) -> Vec<String> {
     panic!("no audit line with {want:?}: {events:?}");
 }
 
+/// Read `path` with `cookie` until it shows `want`: the background task audits its outcome
+/// before the page shows it.
+async fn page_with(addr: SocketAddr, path: &str, cookie: &str, want: &str) -> String {
+    let mut body = String::new();
+    for _ in 0..400 {
+        body = get(addr, path, Some(cookie)).await.body;
+        if body.contains(want) {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{path} never showed {want:?}: {body}");
+}
+
 /// A VM is stopped and rebooted by running `vk`, as an operator alone, once a question asked
 /// of the same `vk run` is answered once; the command and how it ended are audited and shown,
 /// and a second is refused while the first runs.
@@ -7621,13 +7635,8 @@ async fn an_operator_fetches_a_release_from_github() {
     let releases = hub.db.releases().unwrap();
     assert_eq!(releases[0].row.version, "0.85.0");
     assert_eq!(releases[0].row.added_by, principal);
-    let page = get(addr, "/operations", Some(&operator)).await;
-    assert!(
-        page.body.contains("Latest on GitHub: vk 0.85.0"),
-        "{}",
-        page.body
-    );
-    assert!(page.body.contains("Fetched vk 0.85.0"), "{}", page.body);
+    let page = page_with(addr, "/operations", &operator, "Fetched vk 0.85.0").await;
+    assert!(page.contains("Latest on GitHub: vk 0.85.0"), "{page}");
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
 
     // A viewer may not; nor a version that is not one.
@@ -7657,13 +7666,14 @@ async fn an_operator_fetches_a_release_from_github() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     audited(&hub, "failed to fetch vk 0.86.0").await;
     assert!(hub.db.releases().unwrap().is_empty());
-    let page = get(addr, "/operations", Some(&operator)).await;
-    assert!(
-        page.body.contains("Fetching vk 0.86.0 failed</span>"),
-        "{}",
-        page.body
-    );
-    assert!(page.body.contains("does not match"), "{}", page.body);
+    let page = page_with(
+        addr,
+        "/operations",
+        &operator,
+        "Fetching vk 0.86.0 failed</span>",
+    )
+    .await;
+    assert!(page.contains("does not match"), "{page}");
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
     let _ = std::fs::remove_dir_all(&dir);
 }
