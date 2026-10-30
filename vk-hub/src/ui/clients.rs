@@ -948,9 +948,11 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         if !p.labels.is_empty() {
             h.raw(" · ").node(&p.labels.join(", "));
         }
-        h.raw(" · ")
-            .text(crate::store::envelope_text(p.envelope))
-            .raw("</td><td class=\"num\">");
+        h.raw(" · ").text(crate::store::envelope_text(p.envelope));
+        if let Some(m) = mapping.filter(|m| m.confined()) {
+            h.raw(" · only ").text(super::capacity::may_use_text(m));
+        }
+        h.raw("</td><td class=\"num\">");
         match runner.limit {
             Some(n) => h.text(n),
             None => h.raw("-"),

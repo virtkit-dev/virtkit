@@ -8543,6 +8543,8 @@ async fn relays_and_their_runners_follow_their_server() {
         runner_id: 42,
         tenant: "fallback".into(),
         class: crate::policy::Class::Production,
+        nodes: Vec::new(),
+        pools: Vec::new(),
     });
     hub.db.set_capacity_policy(&policy, "u", now).unwrap();
     hub.clients_changed();
@@ -11719,6 +11721,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         runner_id: 7,
         tenant: tenant.into(),
         class: Class::Production,
+        nodes: Vec::new(),
+        pools: Vec::new(),
     };
     let runner_form = |op: &str, tenant: &str| {
         format!(
@@ -11753,6 +11757,65 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     };
     assert_eq!(saved.tenant("web"), Some(&settings));
     assert_eq!(saved.runner("gl", 7), Some(&mapping("web")));
+
+    // The nodes it may use: kept when it is made normal, and shown with those they match now.
+    let nodes_form = |nodes: &str, pools: &str| {
+        format!(
+            "_csrf={csrf}&op=capacity-runner-nodes&expected={}&tenant=web&gitlab=gl&runner=7\
+             &nodes={nodes}&pools={pools}",
+            digest()
+        )
+    };
+    let changes =
+        ["Runner gl/7: may use any node → node 0123456789abcdef0123456789abcdef or pools a, b"];
+    let form = nodes_form("0123456789abcdef0123456789abcdef", "a%0D%0Ab");
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // The same ones again, reordered and repeated, change nothing.
+    let form = nodes_form("0123456789abcdef0123456789abcdef", "b%0D%0Aa%0D%0Ab");
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let form = runner_form("capacity-runner", "web").replace("production", "normal");
+    let changes = [
+        "Runner gl/7: tenant web as production → tenant web as normal, still using \
+                    node 0123456789abcdef0123456789abcdef or pools a, b",
+    ];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let kept = hub.db.capacity_policy().unwrap();
+    let kept = kept.runner("gl", 7).unwrap();
+    assert_eq!(
+        (&kept.nodes[..], &kept.pools[..]),
+        (
+            &["0123456789abcdef0123456789abcdef".to_string()][..],
+            &["a".to_string(), "b".to_string()][..]
+        )
+    );
+    let page = get(addr, "/capacity/tenants/web", Some(&operator))
+        .await
+        .body;
+    for want in [
+        "node 0123456789abcdef0123456789abcdef or pools a, b<br><span class=\"sub\">No node of the hub's matches",
+        "value=\"capacity-runner-nodes\"",
+    ] {
+        assert!(page.contains(want), "{want}: {}", page);
+    }
+    let form = nodes_form("bad%20id", "");
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.body.contains("invalid node ID"), "{}", reply.body);
+    let form = nodes_form("", "");
+    let changes =
+        ["Runner gl/7: may use node 0123456789abcdef0123456789abcdef or pools a, b → any node"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let form = runner_form("capacity-runner", "web");
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(
+        hub.db.capacity_policy().unwrap().runner("gl", 7),
+        Some(&mapping("web"))
+    );
 
     // A project listed by two tenants: its page edits it in both.
     let mut shared = saved.clone();

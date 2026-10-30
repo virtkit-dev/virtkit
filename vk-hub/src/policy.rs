@@ -16,7 +16,7 @@ const MAX_PROJECTS: usize = 16384;
 const MAX_BRANCHES: usize = 1024;
 /// The most placement rules of a project.
 const MAX_PLACEMENT_RULES: usize = 64;
-/// The most nodes, and pools, of one placement rule.
+/// The most nodes, and pools, of one placement rule or runner mapping.
 const MAX_RULE_TARGETS: usize = 256;
 /// The longest production branch pattern and client principal, in bytes.
 const MAX_TEXT: usize = 255;
@@ -191,6 +191,27 @@ pub struct RunnerMapping {
     pub runner_id: u64,
     pub tenant: String,
     pub class: Class,
+    /// Node IDs its requests and jobs may go to, besides those of `pools`; with neither, any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// Pools whose nodes this runner may use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
+}
+
+impl RunnerMapping {
+    /// Whether its work may go to `node`, in `pools`: one of its nodes or in one of its pools,
+    /// any node when it names neither.
+    pub fn allows(&self, node: &str, pools: &[String]) -> bool {
+        (self.nodes.is_empty() && self.pools.is_empty())
+            || self.nodes.iter().any(|n| n == node)
+            || self.pools.iter().any(|p| pools.contains(p))
+    }
+
+    /// Whether it limits its work to some nodes.
+    pub fn confined(&self) -> bool {
+        !self.nodes.is_empty() || !self.pools.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +474,38 @@ impl Policy {
                     r.tenant
                 );
             }
+            if r.nodes.len() > MAX_RULE_TARGETS || r.pools.len() > MAX_RULE_TARGETS {
+                bail!(
+                    "runner mapping {}/{}: more than {MAX_RULE_TARGETS} nodes or pools",
+                    r.gitlab,
+                    r.runner_id
+                );
+            }
+            let twice = |list: &[String]| {
+                let mut seen = BTreeSet::new();
+                list.iter().find(|s| !seen.insert(*s)).cloned()
+            };
+            if let Some(target) = twice(&r.nodes).or_else(|| twice(&r.pools)) {
+                bail!(
+                    "runner mapping {}/{}: {target:?} listed twice",
+                    r.gitlab,
+                    r.runner_id
+                );
+            }
+            if let Some(node) = r.nodes.iter().find(|s| !vk_hub_proto::valid_id(s)) {
+                bail!(
+                    "runner mapping {}/{}: invalid node ID {node:?}",
+                    r.gitlab,
+                    r.runner_id
+                );
+            }
+            if let Some(pool) = r.pools.iter().find(|s| !crate::store::valid_name(s)) {
+                bail!(
+                    "runner mapping {}/{}: invalid pool name {pool:?}",
+                    r.gitlab,
+                    r.runner_id
+                );
+            }
         }
         for (principal, tenant) in &self.clients {
             if principal.is_empty()
@@ -476,6 +529,65 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runner given nodes or pools may use a node listed or in a pool listed; given
+    /// neither, any node.
+    #[test]
+    fn a_runner_may_use_its_nodes_and_its_pools_nodes() {
+        let a = "0123456789abcdef0123456789abcdef";
+        let mut mapping = RunnerMapping {
+            gitlab: "gl".into(),
+            runner_id: 1,
+            tenant: "fallback".into(),
+            class: Class::Normal,
+            nodes: Vec::new(),
+            pools: Vec::new(),
+        };
+        assert!(!mapping.confined() && mapping.allows(a, &[]));
+        mapping.nodes = vec![a.into()];
+        mapping.pools = vec!["trusted".into()];
+        let trusted = ["ci".to_string(), "trusted".to_string()];
+        assert!(mapping.allows(a, &[]));
+        assert!(mapping.allows("b", &trusted));
+        assert!(!mapping.allows("b", &["ci".into()]));
+        let mut policy = Policy::default();
+        policy.runners.push(mapping.clone());
+        policy.validate().unwrap();
+        for (bad, why) in [
+            (
+                RunnerMapping {
+                    nodes: vec![a.into(), "not an id".into()],
+                    ..mapping.clone()
+                },
+                "runner mapping gl/1: invalid node ID \"not an id\"",
+            ),
+            (
+                RunnerMapping {
+                    pools: vec!["".into()],
+                    ..mapping.clone()
+                },
+                "runner mapping gl/1: invalid pool name \"\"",
+            ),
+            (
+                RunnerMapping {
+                    nodes: vec![a.into(); MAX_RULE_TARGETS + 1],
+                    ..mapping.clone()
+                },
+                "runner mapping gl/1: more than 256 nodes or pools",
+            ),
+            (
+                RunnerMapping {
+                    pools: vec!["a".into(), "a".into()],
+                    ..mapping.clone()
+                },
+                "runner mapping gl/1: \"a\" listed twice",
+            ),
+        ] {
+            policy.runners = vec![bad];
+            let err = policy.validate().unwrap_err().to_string();
+            assert!(err.contains(why), "{err}");
+        }
+    }
 
     #[test]
     fn policy_rejects_unknown_fields_and_invalid_headroom() {
@@ -654,6 +766,8 @@ mod tests {
             runner_id: 7,
             tenant: "nobody".into(),
             class: Class::Normal,
+            nodes: Vec::new(),
+            pools: Vec::new(),
         });
         let err = policy.validate().unwrap_err().to_string();
         assert!(err.contains("gl/7"), "{err}");

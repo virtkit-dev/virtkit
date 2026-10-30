@@ -252,6 +252,8 @@ fn enrolled_key(hub: &Hub) -> String {
             runner_id: 42,
             tenant: "tests".into(),
             class: crate::policy::Class::Normal,
+            nodes: Vec::new(),
+            pools: Vec::new(),
         });
     }
     hub.db

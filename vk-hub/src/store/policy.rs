@@ -271,6 +271,8 @@ mod tests {
             runner_id: 42,
             tenant: "web".into(),
             class: Class::Production,
+            nodes: Vec::new(),
+            pools: Vec::new(),
         });
         assert!(
             db.replace_capacity_policy_if(&policy, &expected, "operator", 1)

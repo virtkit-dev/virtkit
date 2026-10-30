@@ -66,6 +66,9 @@ const REMOVE_PROJECT: &str = "capacity-remove-project";
 const MAP_RUNNER: &str = "capacity-runner";
 /// Unmap a runner from a tenant: `tenant`, [`target`] `runner`.
 const UNMAP_RUNNER: &str = "capacity-unmap-runner";
+/// Set the nodes and pools a runner mapped to a tenant may use, each one per line, any node
+/// when both are empty: `tenant`, [`target`] `runner`, `nodes`, `pools`.
+const SET_RUNNER_NODES: &str = "capacity-runner-nodes";
 /// Make a tenant the fallback: `tenant`.
 const SET_FALLBACK: &str = "capacity-fallback";
 /// Charge an API client to a tenant, or to the fallback when empty: `principal`, `tenant`.
@@ -95,6 +98,9 @@ const STALE: &str = "the capacity policy changed since this page was shown; relo
 
 /// The most changes a question lists; the rest are counted.
 const MAX_DESCRIBED: usize = 50;
+
+/// The most nodes, or pools, a page or question lists of a runner mapping; the rest are counted.
+const MAX_LISTED_TARGETS: usize = 8;
 
 /// Tenant `name`'s page.
 pub(super) fn tenant_path(name: &str) -> String {
@@ -140,6 +146,8 @@ struct Known {
     runners: Vec<KnownRunner>,
     /// Each API key's principal ID and name.
     keys: Vec<(String, String)>,
+    /// Each node's ID and pools.
+    nodes: Vec<(String, Vec<String>)>,
 }
 
 impl Known {
@@ -174,6 +182,9 @@ impl Known {
             runners,
             keys: (hub.db.api_keys_with_ids()?.into_iter())
                 .map(|(id, key)| (id, key.name))
+                .collect(),
+            nodes: (hub.db.nodes()?.into_iter())
+                .map(|(id, row)| (id, row.pools))
                 .collect(),
         })
     }
@@ -746,13 +757,16 @@ fn runners_section(
 ) {
     h.raw("<section><h2>Runners</h2><p class=\"sub\">Relay runners charged to it, by GitLab ")
         .raw("runner ID. A production runner's work goes before normal work, and takes jobs ")
-        .raw("only of its projects' production branches.</p>");
+        .raw("only of its projects' production branches. A runner given nodes or pools runs ")
+        .raw("its requests and jobs on those nodes only, the least loaded first; other nodes ")
+        .raw("are never used for it, even idle.</p>");
     let runners: Vec<_> = policy.runners.iter().filter(|r| r.tenant == name).collect();
     if runners.is_empty() {
         h.raw("<p class=\"empty\">None: it gets no relay work.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>runner</th><th>relay</th>")
-            .raw("<th>instance</th><th class=\"num\">GitLab ID</th><th>class</th>");
+            .raw("<th>instance</th><th class=\"num\">GitLab ID</th><th>class</th>")
+            .raw("<th>may use</th>");
         if steer {
             h.raw("<th></th>");
         }
@@ -770,7 +784,12 @@ fn runners_section(
                 .text(r.runner_id)
                 .raw("</td><td>")
                 .text(r.class)
-                .raw("</td>");
+                .raw("</td><td>");
+            may_use_cell(h, r, known);
+            if steer {
+                runner_nodes_form(h, name, r, auth, digest);
+            }
+            h.raw("</td>");
             if steer {
                 let key = [
                     ("tenant", name.to_owned()),
@@ -847,6 +866,82 @@ fn runners_section(
         h.raw("<button>Map runner</button></form>");
     }
     h.raw("</details></section>");
+}
+
+/// The nodes runner mapping `r` may use, and those of the hub's it allows now.
+fn may_use_cell(h: &mut Html, r: &RunnerMapping, known: &Known) {
+    if !r.confined() {
+        h.raw("any node");
+        return;
+    }
+    h.text(may_use_text(r));
+    let allowed: Vec<_> = (known.nodes.iter())
+        .filter(|(id, pools)| r.allows(id, pools))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    h.raw("<br><span class=\"sub\">");
+    if allowed.is_empty() {
+        h.raw("No node of the hub's matches: it gets no work.");
+    } else {
+        h.text(format_args!(
+            "Now {} of {} nodes: {}",
+            allowed.len(),
+            known.nodes.len(),
+            listed(&allowed)
+        ));
+    }
+    h.raw("</span>");
+}
+
+/// What runner mapping `r` may use, as a page or question says it.
+pub(super) fn may_use_text(r: &RunnerMapping) -> String {
+    let mut parts = Vec::new();
+    for (one, many, list) in [("node", "nodes", &r.nodes), ("pool", "pools", &r.pools)] {
+        if !list.is_empty() {
+            let word = if list.len() == 1 { one } else { many };
+            parts.push(format!("{word} {}", listed(list)));
+        }
+    }
+    if parts.is_empty() {
+        "any node".to_owned()
+    } else {
+        parts.join(" or ")
+    }
+}
+
+/// `items` joined, those past [`MAX_LISTED_TARGETS`] counted.
+fn listed<S: AsRef<str>>(items: &[S]) -> String {
+    let shown: Vec<_> = items
+        .iter()
+        .take(MAX_LISTED_TARGETS)
+        .map(AsRef::as_ref)
+        .collect();
+    match items.len().saturating_sub(MAX_LISTED_TARGETS) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// The nodes and pools of runner mapping `r`, in any order.
+fn may_use_sets(r: &RunnerMapping) -> (BTreeSet<&String>, BTreeSet<&String>) {
+    (r.nodes.iter().collect(), r.pools.iter().collect())
+}
+
+/// The form setting the nodes runner mapping `r`, of tenant `name`, may use.
+fn runner_nodes_form(h: &mut Html, name: &str, r: &RunnerMapping, auth: &Auth, digest: &str) {
+    h.raw("<details><summary>Change</summary>");
+    edit_form(h, auth, SET_RUNNER_NODES, digest);
+    hidden(h, "tenant", name);
+    hidden(h, "gitlab", &r.gitlab);
+    hidden(h, "runner", r.runner_id);
+    h.raw("<label>Node IDs, one per line<textarea name=\"nodes\" rows=\"3\" ")
+        .raw("spellcheck=\"false\">")
+        .text(r.nodes.join("\n"))
+        .raw("</textarea></label><label>Pools, one per line<textarea name=\"pools\" ")
+        .raw("rows=\"3\" spellcheck=\"false\">")
+        .text(r.pools.join("\n"))
+        .raw("</textarea></label><p class=\"sub\">A node listed or in a pool listed; ")
+        .raw("both empty for any node.</p><button>Save</button></form></details>");
 }
 
 /// Tenant `name`'s page around `main`.
@@ -1355,12 +1450,15 @@ fn edit(
                 back,
             )
         }
-        MAP_RUNNER | UNMAP_RUNNER => {
+        MAP_RUNNER | UNMAP_RUNNER | SET_RUNNER_NODES => {
             target(form, "runner").ok_or("invalid runner")?;
             let back = tenant_path(tenant()?);
             if op == MAP_RUNNER {
                 let fields = &["expected", "tenant", "gitlab", "runner", "class"];
                 (MAP_RUNNER, fields, back)
+            } else if op == SET_RUNNER_NODES {
+                let fields = &["expected", "tenant", "gitlab", "runner", "nodes", "pools"];
+                (SET_RUNNER_NODES, fields, back)
             } else {
                 (
                     UNMAP_RUNNER,
@@ -1491,17 +1589,36 @@ fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Poli
                 _ => bail!("a runner's class is normal or production"),
             };
             current.tenant(tenant).ok_or_else(no_tenant)?;
-            let mapping = RunnerMapping {
-                gitlab,
-                runner_id,
-                tenant: tenant.to_owned(),
-                class,
-            };
+            // A runner moved or made another class keeps the nodes it may use.
             match (policy.runners.iter_mut())
-                .find(|r| r.gitlab == mapping.gitlab && r.runner_id == runner_id)
+                .find(|r| r.gitlab == gitlab && r.runner_id == runner_id)
             {
-                Some(r) => *r = mapping,
-                None => policy.runners.push(mapping),
+                Some(r) => {
+                    r.tenant = tenant.to_owned();
+                    r.class = class;
+                }
+                None => policy.runners.push(RunnerMapping {
+                    gitlab,
+                    runner_id,
+                    tenant: tenant.to_owned(),
+                    class,
+                    nodes: Vec::new(),
+                    pools: Vec::new(),
+                }),
+            }
+        }
+        SET_RUNNER_NODES => {
+            let (gitlab, runner_id) = runner()?;
+            let r = (policy.runners.iter_mut())
+                .find(|r| r.gitlab == gitlab && r.runner_id == runner_id && r.tenant == tenant)
+                .with_context(|| {
+                    format!("runner {gitlab}/{runner_id} is not mapped to tenant {tenant:?}")
+                })?;
+            // Sorted and deduplicated, so an edit naming the same ones changes nothing.
+            for (list, field) in [(&mut r.nodes, "nodes"), (&mut r.pools, "pools")] {
+                *list = lines(value(field));
+                list.sort_unstable();
+                list.dedup();
             }
         }
         UNMAP_RUNNER => {
@@ -1722,19 +1839,43 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
     let keys: BTreeSet<_> = rb.keys().chain(ra.keys()).collect();
     for key @ (gitlab, id) in keys {
         match (rb.get(key), ra.get(key)) {
-            (None, Some(a)) => out.push(format!(
-                "Runner {gitlab}/{id}: map to tenant {} as {}",
-                a.tenant, a.class
-            )),
+            (None, Some(a)) => {
+                let using = if a.confined() {
+                    format!(", using {}", may_use_text(a))
+                } else {
+                    String::new()
+                };
+                out.push(format!(
+                    "Runner {gitlab}/{id}: map to tenant {} as {}{using}",
+                    a.tenant, a.class
+                ));
+            }
             (Some(b), None) => out.push(format!(
                 "Runner {gitlab}/{id}: unmap from tenant {}; it gets no work",
                 b.tenant
             )),
-            (Some(b), Some(a)) if b != a => out.push(format!(
-                "Runner {gitlab}/{id}: tenant {} as {} → tenant {} as {}",
-                b.tenant, b.class, a.tenant, a.class
-            )),
-            _ => {}
+            (Some(b), Some(a)) => {
+                let same_nodes = may_use_sets(b) == may_use_sets(a);
+                if (&b.tenant, b.class) != (&a.tenant, a.class) {
+                    let still = if same_nodes && a.confined() {
+                        format!(", still using {}", may_use_text(a))
+                    } else {
+                        String::new()
+                    };
+                    out.push(format!(
+                        "Runner {gitlab}/{id}: tenant {} as {} → tenant {} as {}{still}",
+                        b.tenant, b.class, a.tenant, a.class
+                    ));
+                }
+                if !same_nodes {
+                    out.push(format!(
+                        "Runner {gitlab}/{id}: may use {} → {}",
+                        may_use_text(b),
+                        may_use_text(a)
+                    ));
+                }
+            }
+            (None, None) => {}
         }
     }
     let principals: BTreeSet<_> = before.clients.keys().chain(after.clients.keys()).collect();
@@ -1908,6 +2049,40 @@ mod tests {
                 "Project gl/42: production branches none → main",
                 "Project gl/42: add placement rule (every job: nodes any, pools trusted)",
                 "Keep headroom: 1 × 512 MiB, 1 CPUs, 1610612736 bytes disk in pool ci",
+            ]
+        );
+    }
+
+    /// Reordering nodes or pools preserves allowed nodes; long lists count omitted entries.
+    /// Moving a runner preserves its restrictions and names them in the confirmation.
+    #[test]
+    fn a_runner_s_nodes_are_described_as_sets_and_cut_short() {
+        let mut before = Policy::default();
+        let web = Tenant {
+            weight: 1,
+            cap: None,
+            projects: Vec::new(),
+        };
+        before.tenants.insert("web".into(), web);
+        before.runners.push(RunnerMapping {
+            gitlab: "gl".into(),
+            runner_id: 7,
+            tenant: "fallback".into(),
+            class: Class::Normal,
+            nodes: (0..10).map(|n| format!("n{n}")).collect(),
+            pools: vec!["a".into(), "b".into()],
+        });
+        let mut after = before.clone();
+        after.runners[0].nodes.reverse();
+        after.runners[0].pools.reverse();
+        // Saved, as any reorder is, but naming no change of what it may use.
+        assert_eq!(describe(&before, &after), ["runners: gl/7"]);
+        after.runners[0].tenant = "web".into();
+        assert_eq!(
+            describe(&before, &after),
+            [
+                "Runner gl/7: tenant fallback as normal → tenant web as normal, still using \
+                 nodes n9, n8, n7, n6, n5, n4, n3, n2 and 2 more or pools b, a"
             ]
         );
     }

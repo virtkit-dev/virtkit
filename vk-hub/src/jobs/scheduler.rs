@@ -40,6 +40,9 @@ pub(super) fn delisted(policy: &crate::policy::Policy, row: &JobRow) -> bool {
 /// Why a queued job waits: nodes have room, but none its project's placement rules allow.
 const PLACEMENT_RULES: &str = "project placement rules";
 
+/// Why a request or queued job waits: nodes have room, but none its runner may use.
+const RUNNER_NODES: &str = "its runner's allowed nodes";
+
 /// Why [`admission_node`] found no node: each with room would take the room a headroom entry
 /// keeps for production.
 pub(super) const PRODUCTION_HEADROOM: &str = "production headroom";
@@ -1063,8 +1066,14 @@ fn arbitrate(
             }
             let admission = (&ticket.placement, ticket.identity.class);
             let fits = found.get(hub, state, nodes, &ticket.placement);
+            let excluded = runner_exclusions(
+                policy,
+                ticket.identity.gitlab.as_deref(),
+                ticket.identity.runner_id,
+                nodes,
+            );
             let none = HashSet::new();
-            let mut node = admission_node(state, &kept, admission, fits, &ticket.tried, &none);
+            let mut node = admission_node(state, &kept, admission, fits, &ticket.tried, &excluded);
             if node == Err(NO_FITTING_NODE)
                 && !ticket.tried.is_empty()
                 && let Some(live) = state.tickets.get_mut(id)
@@ -1073,13 +1082,16 @@ fn arbitrate(
                 if now.duration_since(ended) >= RETRY_PAUSE {
                     live.tried.clear();
                     live.round_ended = None;
-                    node = admission_node(state, &kept, admission, fits, &none, &none);
+                    node = admission_node(state, &kept, admission, fits, &none, &excluded);
                 }
             }
             let node = match node {
                 Ok(node) => node,
                 Err(why) => {
-                    blocked(state, id, why);
+                    // Unlike a job's, a request's reason is recomputed when all nodes fill.
+                    let ruled_out =
+                        !fits.is_empty() && fits.iter().all(|(node, _)| excluded.contains(node));
+                    blocked(state, id, if ruled_out { RUNNER_NODES } else { why });
                     continue;
                 }
             };
@@ -1125,7 +1137,9 @@ fn arbitrate(
             let Some(job) = state.jobs.get(&id) else {
                 continue;
             };
-            let excluded = placement_exclusions(policy, job, nodes);
+            let runner_out = job_runner_exclusions(policy, job, nodes);
+            let rules_out = rule_exclusions(policy, job, nodes);
+            let excluded: HashSet<_> = runner_out.union(&rules_out).cloned().collect();
             if reservation.as_ref().is_some_and(|r| {
                 state.reservations.get(r).is_some_and(|r| {
                     excluded.contains(&r.node) || !nodes.iter().any(|(id, _)| id == &r.node)
@@ -1228,19 +1242,23 @@ fn arbitrate(
                 match chosen {
                     Ok(node) => node,
                     Err(why) => {
-                        // Every node with room is one its project's rules exclude; with none
-                        // having room, the rules stay the reason if they were the last one.
+                        // With all nodes full, keep the previous reason while that
+                        // restriction still excludes a node. Name the project's rules when
+                        // the runner allows nodes with room but the rules exclude them all.
                         let ruled_out = if fits.is_empty() {
-                            previous == Some(PLACEMENT_RULES) && !excluded.is_empty()
+                            previous.filter(|&p| {
+                                (p == RUNNER_NODES && !runner_out.is_empty())
+                                    || (p == PLACEMENT_RULES && !rules_out.is_empty())
+                            })
+                        } else if fits.iter().all(|(node, _)| runner_out.contains(node)) {
+                            Some(RUNNER_NODES)
                         } else {
-                            fits.iter().all(|(node, _)| excluded.contains(node))
+                            (fits.iter().all(|(node, _)| excluded.contains(node)))
+                                .then_some(PLACEMENT_RULES)
                         };
                         if let Some(job) = state.jobs.get_mut(&id) {
-                            job.blocked = if ruled_out {
-                                Some(PLACEMENT_RULES)
-                            } else {
-                                (why == PRODUCTION_HEADROOM).then_some(why)
-                            };
+                            job.blocked =
+                                ruled_out.or_else(|| (why == PRODUCTION_HEADROOM).then_some(why));
                         }
                         continue;
                     }

@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Restrict a relay runner to selected nodes or pools.** Its capacity mapping accepts
+  optional `nodes` and `pools`; requests and jobs use listed nodes or nodes in listed pools,
+  least loaded first. Set these per runner on the tenant page and see current matching nodes.
+  The GitLab server's page also shows the restrictions beside each runner.
+
 ### Changed
 
 - **The hub's web UI groups its pages into sections.** The top bar shows Nodes (compute,

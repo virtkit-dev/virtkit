@@ -213,8 +213,9 @@ The hub offers a runner's request before GitLab says which project's job it take
 cannot steer reservations: a job submitted on a reservation on a node its rules do not allow
 has the reservation released and waits for an allowed node, ending at its `place_within_secs`
 deadline with `project placement rules` as the reason when nodes had room but none was
-allowed. Give a restricted project a runner of its own whose placement's pool holds the
-allowed nodes, so its requests are reserved where its jobs may go.
+allowed. Give a restricted project a runner of its own, mapped with the `nodes` and `pools` its
+rules allow (see [capacity arbitration](capacity-arbitration.md)), so its requests are reserved
+where its jobs may go.
 
 A relay job whose project its tenant stops listing after the job was submitted is held: it
 waits, keeping any reservation it was submitted on so it starts as soon as the project is

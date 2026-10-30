@@ -82,6 +82,8 @@ async fn a_claimed_admission_keeps_its_tenant_across_a_restart_and_remap() {
         runner_id: 43,
         tenant: "tests".into(),
         class: crate::policy::Class::Normal,
+        nodes: Vec::new(),
+        pools: Vec::new(),
     });
     db.set_capacity_policy(&policy, "tests", now_secs())
         .unwrap();

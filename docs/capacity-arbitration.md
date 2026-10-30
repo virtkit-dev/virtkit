@@ -15,7 +15,8 @@ reservation, is charged to a **tenant** of it:
   project's `production_branches` (globs) and `placement_rules`.
 - `runners`: each relay runner, by `{gitlab, runner_id}` — the instance's name and GitLab's
   runner ID, never the runner's name — mapped to a `tenant` and a `class`, `normal` or
-  `production`. An unmapped runner gets no work.
+  `production`, and optionally the `nodes` (IDs) and `pools` it may use. An unmapped runner
+  gets no work.
 - `clients`: API keys, by principal ID (the *principal ID* column of the web UI's *API keys*,
   under *Administration*), mapped to a tenant. A key mapped to none is charged to the `fallback`
   tenant; an API key's work is always normal. Relay runners never fall back.
@@ -47,19 +48,20 @@ A minimal policy, for project 7 of instance `gl`, its normal runner 42 and produ
 The hub rejects unknown fields at any depth, invalid names or IDs, and policies exceeding
 these bounds: 4096 tenants, 16384 runner mappings, 16384 clients, 64 headroom entries;
 16384 projects per tenant; 1024 production branches and 64 placement rules per project;
-1024 branches, 256 nodes and 256 pools per rule. A project listed by several tenants must
-have identical production branches in the same order, and identical placement rules in any
-order.
+1024 branches per rule; 256 nodes and 256 pools per rule or runner mapping. A project listed by
+several tenants must have identical production branches in the same order, and identical
+placement rules in any order.
 
 ## Setting it
 
 In the hub's web UI, *Capacity* (`/capacity`) lists tenants, linking to their pages, and
 operators add tenants there. Each tenant's page edits its weight and cap, lists projects and maps
-runners — picked among those the hub knows, or by instance and ID — and removes the tenant,
-unmapping its runners. Each project's page lists it for a tenant and edits its production branches
-and placement rules across all tenants listing it. The policy page edits the fallback tenant, API
-keys' tenants, scheduling settings and headroom, and the whole policy as JSON. Each change asks
-first, saying what it changes. Viewers see the same pages without forms.
+runners — picked among those the hub knows, or by instance and ID — sets the nodes each runner
+may use, showing which nodes that matches now, and removes the tenant, unmapping its runners.
+Each project's page lists it for a tenant and edits its production branches and placement rules
+across all tenants listing it. The policy page edits the fallback tenant, API keys' tenants,
+scheduling settings and headroom, and the whole policy as JSON. Each change asks first, saying
+what it changes. Viewers see the same pages without forms.
 
 From the hub's host, through its admin socket:
 
@@ -148,6 +150,13 @@ How the hub orders waiting requests and queued jobs is in
   production work: normal work must leave the fleet that much room for it, or all the room left
   when already short.
 
+A runner given `nodes` or `pools` runs its requests and the jobs admitted for it only on a node
+listed or in a pool listed, the least loaded of those first; other nodes are never used for it,
+even idle. Without either, it may use any node. A reservation already held on a node it may no
+longer use is released when its job arrives. Confinement follows the runner ID its relay reports
+and the runner's mapping at each pass — no trust boundary beyond the relay: unmapping a runner
+frees its jobs already admitted to any node.
+
 Placement rules restrict where a project's jobs go, by the ref the relay reports for each job —
 no trust boundary; see [placement](gitlab-dispatch.md#placement). The project's page explains
 them beside its editor.
@@ -176,6 +185,7 @@ none):
 | `production headroom` | the room left is headroom kept for production |
 | `awaiting relay reconciliation` | its relay's session has not yet listed what it holds |
 | `legacy relay jobs pending settlement` | its relay holds a job from before arbitration |
+| `its runner's allowed nodes` | nodes have room, none its runner may use |
 | `project placement rules` | a queued job: nodes have room, none its project's rules allow |
 | `project no longer listed for its tenant` | a queued job, held until listed again or its deadline |
 | `its relay's inventory is unknown`, `its runner is not in its relay's inventory` | a queued job submitted without an admission |

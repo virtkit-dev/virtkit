@@ -72,7 +72,7 @@ fn heartbeat_received(
 }
 
 /// Waits for the reason the hub gives for not granting runner 42's waiting request.
-async fn wait_reason(hub: &Hub, reason: &str) {
+pub(super) async fn wait_reason(hub: &Hub, reason: &str) {
     wait_reason_of(hub, 42, reason).await;
 }
 
@@ -94,7 +94,13 @@ async fn wait_reason_of(hub: &Hub, runner_id: u64, reason: &str) {
 
 /// Give `key`'s relay a second runner, `name` with GitLab runner ID `runner_id`, mapped to
 /// tenant `tests` in `class`.
-fn add_runner(hub: &Hub, key: &str, name: &str, runner_id: u64, class: crate::policy::Class) {
+pub(super) fn add_runner(
+    hub: &Hub,
+    key: &str,
+    name: &str,
+    runner_id: u64,
+    class: crate::policy::Class,
+) {
     let id = relay_id(key);
     let mut inventory = hub.db.relay(id).unwrap().unwrap().inventory.unwrap();
     let mut runner = inventory.runners[0].clone();
@@ -114,6 +120,8 @@ fn add_runner(hub: &Hub, key: &str, name: &str, runner_id: u64, class: crate::po
         runner_id,
         tenant: "tests".into(),
         class,
+        nodes: Vec::new(),
+        pools: Vec::new(),
     });
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
@@ -126,7 +134,7 @@ pub(super) async fn queue(addr: SocketAddr, key: &str, n: u8) -> String {
 }
 
 /// Queue request `n` of `key`'s runner `runner`: its ticket.
-async fn queue_for(addr: SocketAddr, key: &str, n: u8, runner: &str) -> String {
+pub(super) async fn queue_for(addr: SocketAddr, key: &str, n: u8, runner: &str) -> String {
     let mut body = reservation_body(n, 0);
     body["queue"] = json!(true);
     body["runner"] = json!(runner);

@@ -4046,9 +4046,43 @@ pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
     !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
-/// Nodes `job` may not go to under its project's placement rules: those of its tenant's
-/// listing, or of any tenant's for a job recorded without a scheduling identity.
+/// Nodes the runner `runner_id` of GitLab server `gitlab` may not use, under its mapping's
+/// nodes and pools: none for an API client, an unmapped runner, or one with neither list.
+fn runner_exclusions(
+    policy: &crate::policy::Policy,
+    gitlab: Option<&str>,
+    runner_id: Option<u64>,
+    nodes: &[(String, NodeRow)],
+) -> HashSet<String> {
+    let Some(mapping) = gitlab
+        .zip(runner_id)
+        .and_then(|(gitlab, id)| policy.runner(gitlab, id))
+        .filter(|m| m.confined())
+    else {
+        return HashSet::new();
+    };
+    nodes
+        .iter()
+        .filter(|(id, row)| !mapping.allows(id, &row.pools))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Nodes `job` may not go to: those its runner may not use ([`job_runner_exclusions`]), and
+/// those its project's placement rules exclude ([`rule_exclusions`]).
 fn placement_exclusions(
+    policy: &crate::policy::Policy,
+    job: &LiveJob,
+    nodes: &[(String, NodeRow)],
+) -> HashSet<String> {
+    let mut excluded = job_runner_exclusions(policy, job, nodes);
+    excluded.extend(rule_exclusions(policy, job, nodes));
+    excluded
+}
+
+/// Nodes `job`'s project's placement rules exclude, under its tenant's listing, or any
+/// tenant's for a job recorded without a scheduling identity.
+fn rule_exclusions(
     policy: &crate::policy::Policy,
     job: &LiveJob,
     nodes: &[(String, NodeRow)],
@@ -4074,6 +4108,21 @@ fn placement_exclusions(
         .filter(|(id, row)| !project.allows_placement(git_ref, id, &row.pools))
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// [`runner_exclusions`] of the runner `job` was admitted for.
+fn job_runner_exclusions(
+    policy: &crate::policy::Policy,
+    job: &LiveJob,
+    nodes: &[(String, NodeRow)],
+) -> HashSet<String> {
+    let identity = job.row.scheduling.as_ref();
+    runner_exclusions(
+        policy,
+        identity.and_then(|i| i.gitlab.as_deref()),
+        identity.and_then(|i| i.runner_id),
+        nodes,
+    )
 }
 
 /// Reservation `id`, if a job may start on it: held by a linked node outside `excluded` that
@@ -5508,6 +5557,46 @@ mod tests {
             placement_exclusions(&policy, &job, &nodes),
             HashSet::from(["n2".to_string()])
         );
+    }
+
+    /// A job admitted for a runner given nodes or pools is held to those, as well as to its
+    /// project's rules; an API key's is not.
+    #[test]
+    fn a_job_is_held_to_the_nodes_its_runner_may_use() {
+        let mut policy = crate::policy::Policy::default();
+        policy.runners.push(crate::policy::RunnerMapping {
+            gitlab: "gl".into(),
+            runner_id: 42,
+            tenant: "fallback".into(),
+            class: crate::policy::Class::Normal,
+            nodes: vec!["n1".into()],
+            pools: vec!["trusted".into()],
+        });
+        let mut job = sent("n1", 1, None);
+        job.row.scheduling = Some(crate::store::SchedulingIdentity {
+            tenant: "fallback".into(),
+            class: crate::policy::Class::Normal,
+            gitlab: Some("gl".into()),
+            runner_id: Some(42),
+        });
+        let trusted = NodeRow {
+            pools: vec!["trusted".into()],
+            ..NodeRow::default()
+        };
+        let nodes = [
+            ("n1".to_string(), NodeRow::default()),
+            ("n2".to_string(), NodeRow::default()),
+            ("n3".to_string(), trusted),
+        ];
+        assert_eq!(
+            placement_exclusions(&policy, &job, &nodes),
+            HashSet::from(["n2".to_string()])
+        );
+        if let Some(identity) = &mut job.row.scheduling {
+            identity.gitlab = None;
+            identity.runner_id = None;
+        }
+        assert!(placement_exclusions(&policy, &job, &nodes).is_empty());
     }
 
     /// A running job's record is due a write for its egress report once it holds one newer than
