@@ -92,7 +92,15 @@ p { margin: var(--s2) 0; }
   font-weight: 500;
 }
 .topbar nav a:hover { background: var(--raised); color: var(--fg); text-decoration: none; }
-.topbar nav a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.topbar nav a[aria-current] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* The current section's tabs, a row of their own under the sections. */
+.topbar nav.subnav { flex-basis: 100%; gap: var(--s1); margin: 0 0 calc(-1 * var(--s2)); }
+.topbar nav.subnav a { border-radius: 0; padding: var(--s2) var(--s3); }
+.topbar nav.subnav a[aria-current] {
+  background: none;
+  color: var(--fg);
+  border-bottom: 2px solid var(--accent);
+}
 /* Things waiting for someone, beside the entry leading to them. */
 .topbar nav .count {
   display: inline-block;

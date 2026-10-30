@@ -283,7 +283,7 @@ async fn a_job_whose_project_is_listed_again_starts() {
         crate::jobs::testing::job_blocked(&hub, &job),
         Some("project no longer listed for its tenant")
     );
-    // Connections gives it as its runner's reason, with no request of the runner waiting.
+    // The GitLab page gives it as its runner's reason, with no request of the runner waiting.
     let snapshot = crate::jobs::arbitration_snapshot(&hub).unwrap();
     let view = &snapshot[&("gl".to_string(), 42)];
     assert_eq!(
@@ -296,10 +296,10 @@ async fn a_job_whose_project_is_listed_again_starts() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A pass changing why a runner's job waits wakes Connections' live updates; one changing
+/// A pass changing why a runner's job waits wakes the GitLab page's live updates; one changing
 /// nothing does not.
 #[tokio::test]
-async fn a_pass_changing_a_runner_s_reason_wakes_connections() {
+async fn a_pass_changing_a_runner_s_reason_wakes_the_gitlab_page() {
     let dir = scratch("placement-wakes");
     let db = Arc::new(Db::open_memory().unwrap());
     let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(30)).await;

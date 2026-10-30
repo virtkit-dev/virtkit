@@ -955,7 +955,7 @@ impl Db {
         Ok((url, removed))
     }
 
-    /// How many GitLab servers and projects wait for an operator: what the Connections link
+    /// How many GitLab servers and projects wait for an operator: what the GitLab link
     /// counts.
     pub fn gitlab_pending(&self) -> Result<u64> {
         let servers = self.pending_gitlabs()?.len();

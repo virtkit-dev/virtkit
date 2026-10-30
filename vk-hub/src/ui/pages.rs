@@ -52,24 +52,56 @@ pub fn audit_query(query: Option<&str>) -> (AuditFilter, Option<u64>) {
     (filter, before)
 }
 
-/// A site's navigation: each entry's path and label, in order.
-pub type Nav = &'static [(&'static str, &'static str)];
+/// A navigation tab's path and label. `path`, `also` and their descendants belong
+/// to the tab.
+pub struct Tab {
+    pub path: String,
+    pub label: String,
+    pub also: &'static [&'static str],
+}
 
-/// Wrap `main` with the head, stylesheet and top bar. The bar shows `nav`, marks the entry
-/// for `here`, and displays the signed-in identity and role.
-pub fn frame(title: &str, here: &str, auth: &Auth, nav: Nav, main: &Html) -> Html {
+/// The tab at `path`, labelled `label`.
+pub fn tab(path: &str, label: &str) -> Tab {
+    Tab {
+        path: path.to_string(),
+        label: label.to_string(),
+        also: &[],
+    }
+}
+
+/// A section of a site's navigation: its label and its tabs, in order.
+pub struct Section {
+    pub label: &'static str,
+    pub tabs: Vec<Tab>,
+}
+
+/// A site's navigation: its sections, in order.
+pub type Nav = [Section];
+
+/// Wrap `main` with the head, stylesheet and top bar. The bar shows `nav`'s sections, each
+/// linking to its first tab, marks the one holding `here`, and displays the signed-in identity
+/// and role; below it, that section's tabs when it has several.
+pub fn frame(title: &str, here: &str, auth: &Auth, nav: &Nav, main: &Html) -> Html {
     let mut h = Html::new();
     head(&mut h, title);
-    h.raw("<body><header class=\"topbar\"><a class=\"brand\" href=\"/\">vk-hub</a><nav>");
-    let current = current(nav, here);
-    for &(path, label) in nav {
-        h.raw("<a href=\"").raw(path).raw("\"");
-        if path == current {
-            h.raw(" aria-current=\"page\"");
+    h.raw("<body><header class=\"topbar\"><a class=\"brand\" href=\"/\">vk-hub</a>")
+        .raw("<nav aria-label=\"Sections\">");
+    let (here_section, here_tab) = current(nav, here);
+    for (i, section) in nav.iter().enumerate() {
+        let Some(first) = section.tabs.first() else {
+            continue;
+        };
+        h.raw("<a href=\"").text(&first.path).raw("\"");
+        if i == here_section {
+            h.raw(if section.tabs.len() > 1 {
+                " aria-current=\"true\""
+            } else {
+                " aria-current=\"page\""
+            });
         }
-        h.raw(">").raw(label);
-        if let Some((_, n)) = auth.counts.iter().find(|(p, _)| *p == path) {
-            nav_count(&mut h, path, *n, false);
+        h.raw(">").raw(section.label);
+        if let Some(n) = section_count(section, &auth.counts) {
+            nav_count(&mut h, &section_count_id(section), n, false);
         }
         h.raw("</a>");
     }
@@ -91,18 +123,58 @@ pub fn frame(title: &str, here: &str, auth: &Auth, nav: Nav, main: &Html) -> Htm
     at(&mut h, s.expires_at);
     h.raw("</span> ");
     csrf_field(&mut h, auth);
-    h.raw("<button class=\"secondary\">Sign out</button></form></header><main>")
+    h.raw("<button class=\"secondary\">Sign out</button></form>");
+    if let Some(section) = nav.get(here_section).filter(|s| s.tabs.len() > 1) {
+        h.raw("<nav class=\"subnav\" aria-label=\"")
+            .raw(section.label)
+            .raw("\">");
+        for (i, tab) in section.tabs.iter().enumerate() {
+            h.raw("<a href=\"").text(&tab.path).raw("\"");
+            if i == here_tab {
+                h.raw(" aria-current=\"page\"");
+            }
+            h.raw(">").text(&tab.label);
+            if let Some((_, n)) = auth.counts.iter().find(|(p, _)| *p == tab.path) {
+                nav_count(&mut h, &tab_count_id(&tab.path), *n, false);
+            }
+            h.raw("</a>");
+        }
+        h.raw("</nav>");
+    }
+    h.html(&other_tab_counts(nav, here_section, &auth.counts));
+    h.raw("</header><main>")
         .html(main)
         .raw("</main></body></html>");
     h
 }
 
-/// The count beside the navigation's entry for `path`, when there are any, in an element of its
-/// own that a live page swaps in out of band (`oob`) to keep it current.
-fn nav_count(h: &mut Html, path: &str, n: u64, oob: bool) {
-    h.raw("<span id=\"nav-count")
-        .text(path.replace('/', "-"))
-        .raw("\"");
+/// The sum of `counts` for `section`'s tabs, if any of them has one.
+fn section_count(section: &Section, counts: &[(String, u64)]) -> Option<u64> {
+    let mut found = counts
+        .iter()
+        .filter(|(path, _)| section.tabs.iter().any(|t| t.path == *path))
+        .peekable();
+    found.peek()?;
+    Some(found.map(|(_, n)| n).sum())
+}
+
+/// The ID of the count beside `section` in the top bar.
+fn section_count_id(section: &Section) -> String {
+    format!(
+        "nav-count-{}",
+        section.label.to_ascii_lowercase().replace(' ', "-")
+    )
+}
+
+/// The ID of the count beside the tab at `path`.
+fn tab_count_id(path: &str) -> String {
+    format!("nav-count-tab{}", path.replace('/', "-"))
+}
+
+/// The count `n` in an element of ID `id`, empty at zero, that a live page swaps in out of
+/// band (`oob`) to keep it current.
+fn nav_count(h: &mut Html, id: &str, n: u64, oob: bool) {
+    h.raw("<span id=\"").text(id).raw("\"");
     if oob {
         h.raw(" hx-swap-oob=\"true\"");
     }
@@ -113,31 +185,69 @@ fn nav_count(h: &mut Html, path: &str, n: u64, oob: bool) {
     h.raw("</span>");
 }
 
-/// The navigation's `counts`, by path, for a live page to swap in out of band where its top bar
-/// shows them.
-pub fn counts_oob(counts: &[(&str, u64)]) -> Html {
+/// Hidden targets for the tab counts [`counts_oob`] sends of sections other than
+/// `here_section`, which show no tabs, so that a live page swaps them in quietly.
+fn other_tab_counts(nav: &Nav, here_section: usize, counts: &[(String, u64)]) -> Html {
     let mut h = Html::new();
-    for (path, n) in counts {
-        nav_count(&mut h, path, *n, true);
+    let mut ids = (nav.iter().enumerate())
+        .filter(|&(i, section)| i != here_section && section.tabs.len() > 1)
+        .flat_map(|(_, section)| &section.tabs)
+        .filter(|tab| counts.iter().any(|(path, _)| *path == tab.path))
+        .peekable();
+    if ids.peek().is_some() {
+        h.raw("<div hidden>");
+        for tab in ids {
+            nav_count(&mut h, &tab_count_id(&tab.path), 0, false);
+        }
+        h.raw("</div>");
     }
     h
 }
 
-/// The longest path in `nav` matching `here` or a parent, ignoring query and fragment.
-/// Fall back to `/` when no entry matches.
-fn current(nav: Nav, here: &str) -> &'static str {
+/// `nav`'s `counts`, by tab path, for a live page to swap in out of band where its top bar
+/// shows them: each section's sum, and the tab's own where the section shows its tabs.
+pub fn counts_oob(nav: &Nav, counts: &[(String, u64)]) -> Html {
+    let mut h = Html::new();
+    for section in nav {
+        let Some(n) = section_count(section, counts) else {
+            continue;
+        };
+        nav_count(&mut h, &section_count_id(section), n, true);
+        if section.tabs.len() > 1 {
+            for (path, n) in counts {
+                if section.tabs.iter().any(|t| t.path == *path) {
+                    nav_count(&mut h, &tab_count_id(path), *n, true);
+                }
+            }
+        }
+    }
+    h
+}
+
+/// The section and tab of `nav` holding `here`: the tab whose path, or one of its `also`,
+/// is `here` or a parent of it, the longest first, ignoring query and fragment. Fall back to
+/// the first section's first tab.
+fn current(nav: &Nav, here: &str) -> (usize, usize) {
     let here = here.split(['?', '#']).next().unwrap_or(here);
+    let under = |path: &str| {
+        path == "/"
+            || here == path
+            || here
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
     nav.iter()
-        .map(|&(path, _)| path)
-        .filter(|&path| {
-            path == "/"
-                || here == path
-                || here
-                    .strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'))
+        .enumerate()
+        .flat_map(|(s, section)| {
+            section.tabs.iter().enumerate().flat_map(move |(t, tab)| {
+                std::iter::once(tab.path.as_str())
+                    .chain(tab.also.iter().copied())
+                    .map(move |path| (s, t, path))
+            })
         })
-        .max_by_key(|path| path.len())
-        .unwrap_or("/")
+        .filter(|&(_, _, path)| under(path))
+        .max_by_key(|&(_, _, path)| path.len())
+        .map_or((0, 0), |(s, t, _)| (s, t))
 }
 
 /// htmx's configuration: nothing evaluated, no script run from a swapped fragment, no
@@ -277,7 +387,7 @@ pub struct Subject {
 ///
 /// With htmx, a choice applies at once and typing after a 300 ms pause, as on the Jobs page:
 /// the results are swapped in and the URL updated for Back and bookmarking.
-pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: Nav) -> Html {
+pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: &Nav) -> Html {
     let with_node = subjects.is_some();
     let subjects = subjects.unwrap_or_default();
     let filter = &page.filter;
@@ -766,21 +876,71 @@ mod tests {
         assert_eq!(started(1_790_755_279), "2026-09-30T08:01Z");
     }
 
-    /// The navigation marks the entry a page is under: its own, a parent's, else `/`.
+    /// A section counts the sum of its tabs'; a live page has a target for every count it is
+    /// sent, the tabs of sections it does not show included.
     #[test]
-    fn the_current_entry_is_the_nearest_above_the_page() {
-        const NAV: Nav = &[
-            ("/", "Nodes"),
-            ("/operations", "Operations"),
-            ("/audit", "Audit"),
+    fn every_count_a_live_page_is_sent_has_a_target() {
+        let nav = [
+            Section {
+                label: "Nodes",
+                tabs: vec![tab("/nodes", "Compute"), tab("/storage", "Storage")],
+            },
+            Section {
+                label: "GitLab",
+                tabs: vec![tab("/gitlab/a", "a"), tab("/gitlab/b", "b")],
+            },
         ];
-        assert_eq!(current(NAV, "/"), "/");
-        assert_eq!(current(NAV, "/node/ab"), "/");
-        assert_eq!(current(NAV, "/operations"), "/operations");
-        assert_eq!(current(NAV, "/audit/x"), "/audit");
-        assert_eq!(current(NAV, "/auditx"), "/");
-        assert_eq!(current(NAV, "/audit?node=ab"), "/audit");
-        assert_eq!(current(NAV, "/operations#rollouts"), "/operations");
+        let counts = [("/gitlab/a".to_owned(), 2), ("/gitlab/b".to_owned(), 3)];
+        assert_eq!(section_count(&nav[1], &counts), Some(5));
+        assert_eq!(section_count(&nav[0], &counts), None);
+        let sent = counts_oob(&nav, &counts).into_string();
+        for id in [
+            "nav-count-gitlab",
+            "nav-count-tab-gitlab-a",
+            "nav-count-tab-gitlab-b",
+        ] {
+            assert!(sent.contains(&format!("id=\"{id}\" hx-swap-oob")), "{sent}");
+        }
+        let elsewhere = other_tab_counts(&nav, 0, &counts).into_string();
+        assert_eq!(
+            elsewhere,
+            "<div hidden><span id=\"nav-count-tab-gitlab-a\"></span>\
+             <span id=\"nav-count-tab-gitlab-b\"></span></div>"
+        );
+        // The section shown carries its own, in its tabs.
+        assert!(other_tab_counts(&nav, 1, &counts).into_string().is_empty());
+    }
+
+    /// The navigation marks the section and tab a page is under: its own, a parent's, one
+    /// it names as `also`, else the first.
+    #[test]
+    fn the_current_tab_is_the_nearest_above_the_page() {
+        let registries = Tab {
+            also: &["/registry"],
+            ..tab("/registries", "Storage")
+        };
+        let nav = [
+            Section {
+                label: "Nodes",
+                tabs: vec![
+                    tab("/", "Compute"),
+                    registries,
+                    tab("/operations", "Updates"),
+                ],
+            },
+            Section {
+                label: "Audit",
+                tabs: vec![tab("/audit", "Audit")],
+            },
+        ];
+        assert_eq!(current(&nav, "/"), (0, 0));
+        assert_eq!(current(&nav, "/node/ab"), (0, 0));
+        assert_eq!(current(&nav, "/registry/ab"), (0, 1));
+        assert_eq!(current(&nav, "/operations"), (0, 2));
+        assert_eq!(current(&nav, "/audit/x"), (1, 0));
+        assert_eq!(current(&nav, "/auditx"), (0, 0));
+        assert_eq!(current(&nav, "/audit?node=ab"), (1, 0));
+        assert_eq!(current(&nav, "/operations#rollouts"), (0, 2));
     }
 
     /// An instant carries its exact UTC time for the script and the title, and shows the

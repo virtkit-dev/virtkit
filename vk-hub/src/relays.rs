@@ -221,7 +221,7 @@ async fn store(
     let db = hub.db.clone();
     let id = relay.id.clone();
     let now = crate::now_secs();
-    // The Connections page follows what a relay is and does; its load, it shows once a
+    // The GitLab page follows what a relay is and does; its load, it shows once a
     // heartbeat regardless.
     let shown = !matches!(write, RelayWrite::Heartbeat(_));
     let received = tokio::time::Instant::now();

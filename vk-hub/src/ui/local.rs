@@ -50,16 +50,24 @@ impl LocalSite {
     }
 }
 
-/// Local mode's navigation.
-pub(super) const NAV: pages::Nav = &[
-    ("/", "VMs"),
-    ("/dev", "Dev environments"),
-    ("/audit", "Audit"),
-];
+/// Local mode's navigation: a section per page.
+pub(super) fn nav() -> Vec<pages::Section> {
+    [
+        ("/", "VMs"),
+        ("/dev", "Dev environments"),
+        ("/audit", "Audit"),
+    ]
+    .into_iter()
+    .map(|(path, label)| pages::Section {
+        label,
+        tabs: vec![pages::tab(path, label)],
+    })
+    .collect()
+}
 
 /// The page around `main`, with local mode's navigation.
 pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html {
-    pages::frame(title, here, auth, NAV, main)
+    pages::frame(title, here, auth, &nav(), main)
 }
 
 /// Start the task that renders the VMs table once for every page listing it.
@@ -156,7 +164,7 @@ pub(super) async fn get(
             })
         })
         .await?;
-        return Ok(Some(super::page(pages::audit(auth, &audit, None, NAV))));
+        return Ok(Some(super::page(pages::audit(auth, &audit, None, &nav()))));
     }
     let Some(id) = path.strip_prefix("/vm/").filter(|id| valid_id(id)) else {
         return Ok(None);

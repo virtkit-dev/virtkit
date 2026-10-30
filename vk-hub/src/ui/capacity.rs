@@ -32,9 +32,13 @@ use crate::server::Hub;
 use crate::store::{PolicyRefused, ProjectState, ProjectView, Role, policy_changes};
 
 /// The whole policy's page, and where its editors post.
-pub(super) const PATH: &str = "/clients/capacity";
+pub(super) const PATH: &str = "/capacity";
 
-const TENANTS: &str = "/clients/tenants/";
+const TENANTS: &str = "/capacity/tenants/";
+
+/// The policy's and tenants' pages before the navigation had sections.
+const OLD_PATH: &str = "/clients/capacity";
+const OLD_TENANTS: &str = "/clients/tenants/";
 
 /// The largest edit posted: a policy the admin socket takes (64 KiB), as a browser posts it.
 /// Pretty-printed and urlencoded, with 3 bytes for each `"`, `:`, `,`, brace and bracket and 6
@@ -85,8 +89,6 @@ const REMOVE_RULE: &str = "capacity-remove-rule";
 
 /// `from`'s value on a project's page: its edits lead back there.
 const FROM_PROJECT: &str = "project";
-/// `from`'s value on the policy's page, where adding a tenant also leads back on refusal.
-const FROM_POLICY: &str = "policy";
 
 /// Why an edit based on a replaced policy is refused.
 const STALE: &str = "the capacity policy changed since this page was shown; reload it and retry";
@@ -99,6 +101,15 @@ pub(super) fn tenant_path(name: &str) -> String {
     format!("{TENANTS}{name}")
 }
 
+/// Map a policy or tenant page's `path` from before navigation sections to its current page.
+pub(super) fn moved(path: &str) -> Option<String> {
+    if path == OLD_PATH {
+        return Some(PATH.to_string());
+    }
+    let name = path.strip_prefix(OLD_TENANTS)?;
+    crate::store::valid_name(name).then(|| tenant_path(name))
+}
+
 /// The tenant named by the page at `path`.
 pub(super) fn tenant_target(path: &str) -> Option<&str> {
     let name = path.strip_prefix(TENANTS)?;
@@ -106,7 +117,7 @@ pub(super) fn tenant_target(path: &str) -> Option<&str> {
 }
 
 /// What a page says in place of a policy this hub cannot read.
-pub(super) fn unreadable(h: &mut Html, error: &anyhow::Error) {
+fn unreadable(h: &mut Html, error: &anyhow::Error) {
     h.raw("<p class=\"message\">")
         .text(format!("{error:#}"))
         .raw("</p>");
@@ -201,7 +212,7 @@ fn approval_badge(h: &mut Html, project: Option<&ProjectView>) {
     });
 }
 
-/// `GET /clients/capacity`.
+/// `GET /capacity`.
 pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let hub = ui.hub.clone();
     let (policy, known) =
@@ -224,7 +235,7 @@ pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     main.raw("<section><h2>Tenants</h2>");
     tenants_table(&mut main, &policy);
     if steer {
-        add_tenant_fields(&mut main, auth, Some(FROM_POLICY));
+        add_tenant_fields(&mut main, auth);
     }
     main.raw("</section>");
     fallback_section(&mut main, &policy, auth, &digest, steer);
@@ -250,7 +261,7 @@ pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
 
 /// Each tenant's weight and cap, and how many projects, runners and API clients it has,
 /// linking to its page.
-pub(super) fn tenants_table(h: &mut Html, policy: &Policy) {
+fn tenants_table(h: &mut Html, policy: &Policy) {
     h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
         .raw("<th>cap</th><th class=\"num\">projects</th><th class=\"num\">runners</th>")
         .raw("<th class=\"num\">API clients</th></tr></thead><tbody>");
@@ -480,7 +491,7 @@ fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, st
     h.raw("</section>");
 }
 
-/// `GET /clients/tenants/<name>`.
+/// `GET /capacity/tenants/<name>`.
 pub(super) async fn tenant_get(name: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let hub = ui.hub.clone();
     let (policy, known) =
@@ -903,23 +914,13 @@ fn button_form(
     h.raw("<button>").raw(label).raw("</button></form>");
 }
 
-/// The form adding a tenant, on Connections.
-pub(super) fn add_tenant_form(h: &mut Html, auth: &Auth) {
-    h.raw("<section><h2>Add capacity tenant</h2>");
-    add_tenant_fields(h, auth, None);
-    h.raw("</section>");
-}
-
-/// The form adding a tenant, posting `from` if a page other than Connections shows it.
-fn add_tenant_fields(h: &mut Html, auth: &Auth, from: Option<&str>) {
+/// The form adding a tenant, on the policy's page.
+fn add_tenant_fields(h: &mut Html, auth: &Auth) {
     h.raw("<form class=\"wide\" method=\"post\" action=\"")
         .raw(PATH)
         .raw("\">");
     csrf_field(h, auth);
     hidden(h, "op", ADD_TENANT);
-    if let Some(from) = from {
-        hidden(h, "from", from);
-    }
     h.raw("<label>Name <input name=\"tenant\" required></label>")
         .raw("<button>Add tenant</button></form><p class=\"sub\">Of weight 1, with no ")
         .raw("projects nor runners until its page gives it some.</p>");
@@ -1118,7 +1119,7 @@ fn placement_help(h: &mut Html) {
         .raw("takes waits, and ends at its placement deadline.</p>");
 }
 
-/// `POST /clients/capacity`: an edit of the policy, as the operator session's principal.
+/// `POST /capacity`: an edit of the policy, as the operator session's principal.
 pub(super) async fn action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -1326,14 +1327,7 @@ fn edit(
     let op = field(form, "op").unwrap_or("");
     let (op, fields, back): (_, &'static [&'static str], _) = match op {
         SET_POLICY => (SET_POLICY, &["expected", "policy"], PATH.to_owned()),
-        ADD_TENANT => {
-            let back = if field(form, "from") == Some(FROM_POLICY) {
-                PATH
-            } else {
-                super::clients::PATH
-            };
-            (ADD_TENANT, &["tenant", "from"], back.to_owned())
-        }
+        ADD_TENANT => (ADD_TENANT, &["tenant"], PATH.to_owned()),
         REMOVE_TENANT => {
             tenant()?;
             (REMOVE_TENANT, &["expected", "tenant"], PATH.to_owned())
@@ -1862,7 +1856,7 @@ fn refused_page(auth: &Auth, back: &str, status: StatusCode, why: &str) -> Respo
         .raw("</p><p><a href=\"")
         .text(back)
         .raw("\">Back</a></p>");
-    let mut resp = page(fleet::layout("Capacity policy", PATH, auth, &main));
+    let mut resp = page(fleet::layout("Capacity policy", back, auth, &main));
     *resp.status_mut() = status;
     resp
 }

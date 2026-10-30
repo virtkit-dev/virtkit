@@ -377,7 +377,7 @@ impl Hub {
         *self.jobs.borrow()
     }
 
-    /// Note that something the Connections page shows may have changed: an API key created,
+    /// Note that something the GitLab and API keys pages show may have changed: an API key created,
     /// revoked or removed, an instance heard from anew (first since the hub started, or since
     /// memory forgot it), a hello recorded, or instances pruned; a GitLab server added, removed,
     /// rejected or forgotten; a relay connected, disconnected, removed, or reporting anew; a

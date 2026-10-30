@@ -93,9 +93,12 @@ pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
 pub const LOGIN_PATH: &str = "/login";
 
 /// The approval page for instance `gitlab`'s project `id`.
-/// Without an instance (a server refusal), use Connections, which lists pending servers.
+/// Without an instance (a server refusal), use the GitLab page, which lists pending servers.
 pub fn approval_path(gitlab: Option<&str>, id: u64) -> String {
-    gitlab.map_or_else(|| clients::PATH.to_owned(), |g| projects::path(g, id))
+    gitlab.map_or_else(
+        || clients::GITLAB_PATH.to_owned(),
+        |g| projects::path(g, id),
+    )
 }
 
 /// The policy on every response. `form-action 'self'` and `frame-ancestors 'none'` too: a
@@ -375,9 +378,10 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                         .unwrap_or_else(|| ui.signed_out_page(StatusCode::UNAUTHORIZED, why)));
                 }
             };
-            // A page's navigation, not a stream's fragments.
+            // A page's navigation, not a stream's fragments nor a moved page's redirect.
             if let Site::Fleet(_) = &ui.site
                 && !path.starts_with("/events/")
+                && fleet::moved(&path, req.uri().query()).is_none()
             {
                 auth.counts = fleet::nav_counts(&ui.hub).await?;
             }
@@ -636,9 +640,9 @@ pub struct Auth {
     /// The cookie: what a sign-out ends the session by, rather than its ID, which another
     /// may share, and what a live update checks the session by on every render.
     secret: String,
-    /// The counts its page's navigation shows beside its entries, by path: things waiting
-    /// for someone, such as New egress rows. Filled for a fleet page alone.
-    pub counts: Vec<(&'static str, u64)>,
+    /// The counts its page's navigation shows beside its tabs, by path: things waiting for
+    /// someone, such as New egress rows. Filled for a fleet page alone.
+    pub counts: Vec<(String, u64)>,
 }
 
 /// The session the request's cookie names if it is live, or why there is none.

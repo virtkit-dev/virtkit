@@ -517,7 +517,7 @@ mod tests {
             error: "pending".into(),
             code: ErrorCode::ApprovalPending,
             retry_after_secs: None,
-            approval_url: Some("https://hub.example.com/clients/projects/main/12".into()),
+            approval_url: Some("https://hub.example.com/gitlab/main/projects/12".into()),
         });
     }
 
@@ -579,14 +579,14 @@ mod tests {
             error: "pending".into(),
             code: ErrorCode::ApprovalPending,
             retry_after_secs: None,
-            approval_url: Some("https://hub.example.com/clients/projects/main/12".into()),
+            approval_url: Some("https://hub.example.com/gitlab/main/projects/12".into()),
         };
         assert_eq!(
             serde_json::to_value(error).unwrap(),
             json!({
                 "error": "pending",
                 "code": "approval_pending",
-                "approval_url": "https://hub.example.com/clients/projects/main/12",
+                "approval_url": "https://hub.example.com/gitlab/main/projects/12",
             })
         );
         assert_eq!(

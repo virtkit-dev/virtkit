@@ -1545,7 +1545,7 @@ async fn a_refusal_for_approval_links_the_project_s_page_on_the_web_ui() {
         let key = key.clone();
         async move { api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await }
     };
-    let page = Some("https://ui.example:8444/clients/projects/gl/42");
+    let page = Some("https://ui.example:8444/gitlab/gl/projects/42");
     for _ in 0..2 {
         let resp = submit(bound_body(1, 42, "acme/web", 600)).await;
         let error = resp.json::<vk_hub_proto::client::ClientError>();
@@ -1576,8 +1576,8 @@ async fn a_refusal_for_approval_links_the_project_s_page_on_the_web_ui() {
         (error.code, error.approval_url.as_deref()),
         (ErrorCode::ProjectRejected, page)
     );
-    // A refusal of its server links Connections, which lists it.
-    assert_eq!(crate::ui::approval_path(None, 42), "/clients");
+    // A refusal of its server links the GitLab page, which lists it.
+    assert_eq!(crate::ui::approval_path(None, 42), "/gitlab");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

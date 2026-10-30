@@ -1,7 +1,7 @@
-//! `/clients/projects/<instance>/<project ID>`: a GitLab project's approval record, visible
+//! `/gitlab/<instance>/projects/<project ID>`: a GitLab project's approval record, visible
 //! to viewers and operators. Shows its state, who last decided it, when the hub first heard
 //! of it, its first refused job and refusal count, with links to jobs and observed traffic.
-//! Operators approve, reject or forget it through the Connections action ([`super::clients`]).
+//! Operators approve, reject or forget it through the GitLab page's action ([`super::clients`]).
 //! Rejecting or forgetting an approved project requires confirmation.
 //! [`super::capacity::project_section`] displays and edits its share of the capacity policy.
 //!
@@ -18,18 +18,32 @@ use crate::egress::blocked::{Instances, project_label};
 use crate::relays::RelayView;
 use crate::store::{ProjectRow, ProjectState, Role};
 
-/// Where a project's page is, under the Connections page that lists the projects.
-const PREFIX: &str = "/clients/projects/";
+/// Where a project's page is: under its GitLab server's, `/gitlab/<instance>/projects/<ID>`.
+const PREFIX: &str = "/gitlab/";
+
+/// Before the UI's navigation had sections: `/clients/projects/<instance>/<ID>`.
+const OLD_PREFIX: &str = "/clients/projects/";
 
 /// The page of instance `gitlab`'s project `id`.
 pub(super) fn path(gitlab: &str, id: u64) -> String {
-    format!("{PREFIX}{gitlab}/{id}")
+    format!("{PREFIX}{gitlab}/projects/{id}")
 }
 
 /// The instance and project ID a project's page at `path` names: an instance's name, and an ID
 /// written as [`path`] writes it.
 pub(super) fn target(path: &str) -> Option<(&str, u64)> {
-    let (gitlab, id) = path.strip_prefix(PREFIX)?.split_once('/')?;
+    let (gitlab, id) = path.strip_prefix(PREFIX)?.split_once("/projects/")?;
+    parse(gitlab, id)
+}
+
+/// Map a project page's `path` from before navigation sections to its current page.
+pub(super) fn moved(path: &str) -> Option<String> {
+    let (gitlab, id) = path.strip_prefix(OLD_PREFIX)?.split_once('/')?;
+    parse(gitlab, id).map(|(gitlab, id)| self::path(gitlab, id))
+}
+
+/// An instance's name and an ID written as [`path`] writes it.
+fn parse<'a>(gitlab: &'a str, id: &str) -> Option<(&'a str, u64)> {
     let n: u64 = id.parse().ok()?;
     (n > 0 && n.to_string() == id && crate::store::valid_gitlab_name(gitlab)).then_some((gitlab, n))
 }
@@ -37,7 +51,7 @@ pub(super) fn target(path: &str) -> Option<(&str, u64)> {
 /// What the page shows.
 struct Shown {
     row: ProjectRow,
-    /// The instance URL posted with a decision for the store to check, as on Connections.
+    /// The instance URL posted with a decision for the store to check, as on the GitLab page.
     url: String,
     instances: Instances<String>,
     /// The relay that submitted its first job refused, while the hub has it.
@@ -46,7 +60,7 @@ struct Shown {
     policy: Result<crate::policy::Policy>,
 }
 
-/// `GET /clients/projects/<instance>/<project ID>`.
+/// `GET /gitlab/<instance>/projects/<project ID>`.
 pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let (hub, named) = (ui.hub.clone(), gitlab.to_string());
     let shown = blocking(move || {
@@ -194,8 +208,8 @@ fn unseen(
         .text(&title)
         .raw("</h1><p class=\"sub\">The hub has not seen this project: no job of it has ")
         .raw("reached it yet. Approve it on <a href=\"")
-        .raw(clients::PATH)
-        .raw("\">Connections</a> once one has.</p>");
+        .raw(clients::GITLAB_PATH)
+        .raw("\">GitLab</a> once one has.</p>");
     super::capacity::project_section(&mut main, &Ok(policy), gitlab, id, auth)?;
     Ok(page(super::fleet::layout(
         &title,

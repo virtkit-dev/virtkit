@@ -3504,7 +3504,9 @@ async fn releases_and_rollouts_are_shown_live() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert_secure(&page);
     for want in [
-        "<a href=\"/operations\" aria-current=\"page\">Operations</a>",
+        "<nav class=\"subnav\" aria-label=\"Nodes\"><a href=\"/\">Compute</a>\
+         <a href=\"/registries\">Storage</a>\
+         <a href=\"/operations\" aria-current=\"page\">Updates</a></nav>",
         "sse-connect=\"/events/operations\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
         "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
@@ -3559,11 +3561,11 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         let page = get(addr, "/operations", Some(&cookie)).await.body;
         assert!(
             page.contains(
-                "<nav><a href=\"/\">Nodes</a><a href=\"/registries\">Registries</a>\
-                 <a href=\"/jobs\">Jobs</a><a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
-                 <a href=\"/clients\">Connections<span id=\"nav-count-clients\"></span></a>\
-                 <a href=\"/operations\" aria-current=\"page\">Operations</a>\
-                 <a href=\"/audit\">Audit</a>"
+                "<nav aria-label=\"Sections\"><a href=\"/\" aria-current=\"true\">Nodes</a>\
+                 <a href=\"/gitlab\">GitLab<span id=\"nav-count-gitlab\"></span></a>\
+                 <a href=\"/capacity\">Capacity</a><a href=\"/jobs\">Jobs</a>\
+                 <a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
+                 <a href=\"/keys\">Administration</a></nav>"
             ),
             "{page}"
         );
@@ -4155,7 +4157,7 @@ async fn the_job_history_is_filtered_by_api_key() {
     }
 }
 
-/// `/clients` shows viewers and operators alike, read only, each API key with its jobs linked
+/// `/keys` shows viewers and operators alike, read only, each API key with its jobs linked
 /// to the history filtered by it, and the instances using it, what they said shown as text and
 /// a runner's URL without its credentials; a hello or a new instance reaches an open page.
 #[tokio::test(flavor = "multi_thread")]
@@ -4164,7 +4166,7 @@ async fn api_keys_and_their_clients_are_shown_live() {
     use vk_hub_proto::client::{ClientHello, ClientRunner};
     let (addr, hub, _) = start_fleet().await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients?tab=other", Some(&viewer)).await;
+    let page = get(addr, "/keys", Some(&viewer)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body.contains("<code>vk-hub keys create</code>"),
@@ -4228,11 +4230,10 @@ async fn api_keys_and_their_clients_are_shown_live() {
 
     for role in [Role::Viewer, Role::Operator] {
         let (cookie, _) = sign_in(addr, &hub, role).await;
-        let page = get(addr, "/clients?tab=other", Some(&cookie)).await.body;
+        let page = get(addr, "/keys", Some(&cookie)).await.body;
         for want in [
-            "<a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
-             <a href=\"/clients\" aria-current=\"page\">Connections\
-             <span id=\"nav-count-clients\"></span></a>",
+            "<a href=\"/keys\" aria-current=\"true\">Administration</a>",
+            "<a href=\"/keys\" aria-current=\"page\">API keys</a>",
             "sse-connect=\"/events/clients\"",
             &format!("<a href=\"/jobs?key={id}\">1</a>"),
             "ci-1&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;&lt;img",
@@ -4272,7 +4273,7 @@ fn shown_key(body: &str) -> String {
         .collect()
 }
 
-/// An operator creates an API key from `/clients`: refused, with the reason, for a bad name or
+/// An operator creates an API key from `/keys`: refused, with the reason, for a bad name or
 /// policy, and otherwise shown once with the vk-gitlab config using it, audited without it,
 /// and never in the live fragment or a later page. A viewer gets no form and is refused, as is
 /// a post from another site or without the session's CSRF token.
@@ -4284,7 +4285,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
                 &max_mem=16G&max_cpus=8&max_disk=&ttl=30";
 
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients?tab=other", Some(&viewer)).await;
+    let page = get(addr, "/keys", Some(&viewer)).await;
     assert!(!page.body.contains("value=\"create\""), "{}", page.body);
     let form = format!("_csrf={viewer_csrf}&{good}");
     let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
@@ -4292,7 +4293,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
     assert!(reply.body.contains("operator role"), "{}", reply.body);
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
+    let page = get(addr, "/keys", Some(&operator)).await;
     for want in [
         "<form class=\"wide\" method=\"post\" action=\"/clients\">",
         "<input type=\"hidden\" name=\"op\" value=\"create\">",
@@ -4404,7 +4405,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
 
     let event = next_with(&mut live, "<td>gitlab</td>").await;
     assert!(!event.contains(&key), "{event}");
-    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
+    let page = get(addr, "/keys", Some(&operator)).await;
     assert!(page.body.contains("<td>gitlab</td>"), "{}", page.body);
     assert!(!page.body.contains(&key), "{}", page.body);
 
@@ -4443,7 +4444,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     assert!(!first.contains("hx-post"), "{first}");
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients?tab=other", Some(&operator)).await;
+    let page = get(addr, "/keys", Some(&operator)).await;
     for want in [
         &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
         "<div id=\"flash\"></div>",
@@ -4535,7 +4536,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     );
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients?tab=other"));
+    assert_eq!(reply.header("location"), Some("/keys"));
     assert!(hub.db.api_keys().unwrap().is_empty());
     audited(&hub, "removed 1 revoked or expired API key(s) named gitlab").await;
     next_with(&mut live, "none: create one below").await;
@@ -5287,8 +5288,8 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     assert_eq!(
         first,
         "event: jobs\ndata: <p class=\"empty\" role=\"status\">none match</p>\
-         <span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>\
-         <span id=\"nav-count-clients\" hx-swap-oob=\"true\"></span>\n\n"
+         <span id=\"nav-count-gitlab\" hx-swap-oob=\"true\"></span>\
+         <span id=\"nav-count-egress\" hx-swap-oob=\"true\"></span>\n\n"
     );
 
     // A job submitted after the page opened.
@@ -6551,7 +6552,7 @@ async fn oidc_session(addr: SocketAddr) -> (String, String) {
 async fn the_users_page_is_for_operators_alone() {
     let (addr, hub) = start_oidc(serde_json::json!({"sub": "s"}), &[]).await;
     let (viewer, csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let home = get(addr, "/", Some(&viewer)).await;
+    let home = get(addr, "/keys", Some(&viewer)).await;
     assert!(!home.body.contains("href=\"/users\""), "{}", home.body);
     let page = get(addr, "/users", Some(&viewer)).await;
     assert_eq!(page.status, 403, "{}", page.body);
@@ -6566,7 +6567,7 @@ async fn the_users_page_is_for_operators_alone() {
     assert!(grants(&hub).is_empty());
 
     let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
-    let home = get(addr, "/", Some(&operator)).await;
+    let home = get(addr, "/keys", Some(&operator)).await;
     assert!(
         home.body.contains("<a href=\"/users\">Users</a>"),
         "{}",
@@ -7775,7 +7776,7 @@ async fn registries_are_shown_to_all_and_steered_by_operators() {
         "{commands:?}"
     );
 
-    // A registry token, from the Registries page's form.
+    // A registry token, from the Storage page's form.
     let form = format!("_csrf={csrf}&ttl=3600&kind=registry");
     let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -7913,6 +7914,11 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
         "{overview}"
     );
     assert!(overview.contains("Store size"), "{overview}");
+    // Its own path is under the Storage tab.
+    assert!(
+        overview.contains("<a href=\"/registries\" aria-current=\"page\">Storage"),
+        "{overview}"
+    );
     let access = page(format!("/registry/{id}?tab=access")).await;
     for want in [
         "aria-current=\"page\">Job access</a>",
@@ -7992,14 +7998,15 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
     }
 }
 
-/// Connections defaults to the GitLab servers; the API keys have a tab of their own.
+/// `/gitlab` lists the GitLab servers, `/keys` the API keys; Connections' old addresses lead
+/// to them, and those of the capacity policy's and a project's pages to theirs.
 #[tokio::test(flavor = "multi_thread")]
-async fn connections_list_gitlab_servers() {
+async fn the_gitlab_page_lists_its_servers() {
     use crate::store::{KeyPolicy, Scope};
     let (addr, hub, _) = start_fleet().await;
     let now = crate::now_secs();
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
         body.contains("None yet: <code>vk-hub gitlabs add"),
         "{body}"
@@ -8018,10 +8025,11 @@ async fn connections_list_gitlab_servers() {
     hub.db
         .create_api_key("deploy", &policy, Duration::from_secs(3600), "uid 0", now)
         .unwrap();
-    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     for want in [
-        "<h1>Connections</h1>",
-        "aria-current=\"page\">GitLab</a>",
+        "<h1>GitLab</h1>",
+        "<a href=\"/gitlab\" aria-current=\"page\">GitLab\
+         <span id=\"nav-count-gitlab\"></span></a>",
         "id=\"gitlab-servers\" hx-ext=\"sse\" sse-connect=\"/events/gitlab\" \
          sse-swap=\"gitlab\"",
         "<tr><td><strong>gl</strong></td><td>https://gitlab.example.com</td>\
@@ -8032,30 +8040,41 @@ async fn connections_list_gitlab_servers() {
     }
     assert!(!body.contains("<h2>API keys</h2>"), "{body}");
     assert!(!body.contains("deploy"), "{body}");
-    // Unknown tab values select GitLab and are not reflected in the page.
-    for query in ["?tab=bogus", "?tab=%3Cscript%3E"] {
-        let body = get(addr, &format!("/clients{query}"), Some(&viewer))
-            .await
-            .body;
-        assert!(
-            body.contains("aria-current=\"page\">GitLab</a>"),
-            "{query}: {body}"
-        );
-        assert!(!body.contains("<script>"), "{query}: {body}");
+    // Connections' tabs, an unknown one the GitLab page's, and the capacity policy's and a
+    // project's pages, moved; anything else there is not a page.
+    for (from, to) in [
+        ("/clients", Some("/gitlab")),
+        ("/clients?tab=bogus", Some("/gitlab")),
+        ("/clients?tab=%3Cscript%3E", Some("/gitlab")),
+        ("/clients?tab=other", Some("/keys")),
+        ("/clients/capacity", Some("/capacity")),
+        ("/clients/tenants/web", Some("/capacity/tenants/web")),
+        ("/clients/projects/gl/42", Some("/gitlab/gl/projects/42")),
+        ("/clients/tenants/a%20b", None),
+        ("/clients/projects/gl/042", None),
+    ] {
+        let reply = get(addr, from, Some(&viewer)).await;
+        match to {
+            Some(to) => {
+                assert_eq!(reply.status, 301, "{from}: {}", reply.body);
+                assert_eq!(reply.header("location"), Some(to), "{from}");
+            }
+            None => assert_eq!(reply.status, 404, "{from}: {}", reply.body),
+        }
     }
     // A server's URL is escaped.
     hub.db
         .add_gitlab("odd", "https://<script>.example.com", "uid 0", now)
         .unwrap();
-    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
         body.contains("https://&lt;script&gt;.example.com"),
         "{body}"
     );
     assert!(!body.contains("<script>"), "{body}");
-    let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
+    let other = get(addr, "/keys", Some(&viewer)).await.body;
     assert!(
-        other.contains("aria-current=\"page\">Other API clients</a>")
+        other.contains("<h1>API keys</h1>")
             && other.contains("<h2>API keys</h2>")
             && other.contains("<tr><td>deploy</td>"),
         "{other}"
@@ -8103,7 +8122,7 @@ async fn api_keys_and_their_instances_are_on_the_other_tab() {
         .await
         .unwrap();
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let other = get(addr, "/clients?tab=other", Some(&viewer)).await.body;
+    let other = get(addr, "/keys", Some(&viewer)).await.body;
     for want in [
         "<tr><td>deploy</td><td><code>vkk_",
         "<span class=\"badge bad\">revoked</span>",
@@ -8112,10 +8131,10 @@ async fn api_keys_and_their_instances_are_on_the_other_tab() {
         assert!(other.contains(want), "{want}: {other}");
     }
     assert_eq!(other.matches("<code>s_1</code>").count(), 1, "{other}");
-    let body = get(addr, "/clients", Some(&viewer)).await.body;
+    let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(!body.contains("s_1"), "{body}");
 
-    // An operator revokes the key, and is sent back to the tab.
+    // An operator revokes the key, and is sent back to the API keys page.
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let form = format!("_csrf={csrf}&op=revoke&name=deploy");
     let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
@@ -8127,7 +8146,7 @@ async fn api_keys_and_their_instances_are_on_the_other_tab() {
     );
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients?tab=other"));
+    assert_eq!(reply.header("location"), Some("/keys"));
 }
 
 /// A relay enrolled with key `key` and bound to the GitLab server at `url`.
@@ -8170,7 +8189,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     let good = "op=add-server&name=gl&url=https%3A%2F%2FGitLab.example.com%2F";
 
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(page.contains("<code>vk-hub gitlabs add"), "{page}");
     for not in ["Add a GitLab server", "<form class=\"wide\""] {
         assert!(!page.contains(not), "{not}: {page}");
@@ -8182,7 +8201,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     }
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     for want in [
         "None yet: add one below",
         "<h2>Add a GitLab server</h2><form class=\"wide\" method=\"post\" \
@@ -8198,7 +8217,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     let form = format!("_csrf={csrf}&{good}");
     let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert_eq!(
         hub.db.gitlab("gl").unwrap().map(|g| g.url).as_deref(),
         Some("https://gitlab.example.com")
@@ -8235,7 +8254,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
         assert!(
             reply
                 .body
-                .contains("<a href=\"/clients\">Back to the GitLab servers"),
+                .contains("<a href=\"/gitlab\">Back to the GitLab servers"),
             "{}",
             reply.body
         );
@@ -8245,7 +8264,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     // While a relay is bound to it: no button, and a post is refused.
     let now = crate::now_secs();
     let relay = bound_relay(&hub, "aa", "https://gitlab.example.com");
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(!page.contains("name=\"server\""), "{page}");
     let form = format!("_csrf={csrf}&op=remove&server=gl");
     let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
@@ -8268,7 +8287,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
 
     // Asked about one server, a namesake added since is left alone.
     assert!(hub.db.remove_relay(&relay, "uid 0", now).unwrap());
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(page.contains("name=\"server\" value=\"gl\""), "{page}");
     let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
     assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
@@ -8294,7 +8313,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     );
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert!(hub.db.gitlab("gl").unwrap().is_none());
     let audit = audited(&hub, "removed GitLab instance gl").await;
     assert!(
@@ -8315,11 +8334,11 @@ async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
     use crate::store::RelayEnrollment;
     let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(!page.contains("Add a relay"), "{page}");
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
         page.contains("<h2>Add a relay</h2><form method=\"post\" action=\"/tokens\">")
             && page.contains("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">"),
@@ -8332,8 +8351,8 @@ async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
     for want in [
         "<h1>Relay enrollment token</h1>",
         "<pre>vk-gitlab join https://hub.example.com:8443 --token -</pre>",
-        "<a href=\"/clients\">Back to the GitLab tab</a>",
-        "aria-current=\"page\">Connections",
+        "<a href=\"/gitlab\">Back to the GitLab page</a>",
+        "<a href=\"/gitlab\" aria-current=\"page\">GitLab",
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
     }
@@ -8370,7 +8389,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     };
     let (addr, hub, origin) = start_fleet().await;
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
         page.contains("<h2>Relays</h2><p class=\"empty\">None yet"),
         "{page}"
@@ -8503,7 +8522,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     let event = next_with(&mut live, "production</td>").await;
     assert!(
         event.contains(
-            "<td>42</td><td><a href=\"/clients/tenants/fallback\">fallback</a></td>\
+            "<td>42</td><td><a href=\"/capacity/tenants/fallback\">fallback</a></td>\
              <td>production</td><td>pool ci"
         ),
         "{event}"
@@ -8511,10 +8530,6 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     // No request of it is queued: nothing waits.
     assert!(
         event.contains("<td class=\"num\">0</td><td>-</td><td>-</td><td>-</td></tr>"),
-        "{event}"
-    );
-    assert!(
-        event.contains("<td><a href=\"/clients/tenants/fallback\">fallback</a> <span"),
         "{event}"
     );
     // A session of protocol 1 gets no new jobs: the relay is marked for upgrade.
@@ -8536,7 +8551,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     assert_eq!(reply.status, 403, "{}", reply.body);
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
         page.contains(&format!(
             "<input type=\"hidden\" name=\"op\" value=\"remove-relay\"><input \
@@ -8552,7 +8567,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     let answer = format!("{form}&nonce={}&confirm=yes", hidden(&reply.body, "nonce"));
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert!(hub.db.relay(&relay).unwrap().is_none());
     audited(&hub, &format!("removed relay {relay}")).await;
     next_with(&mut live, "<h2>Relays</h2><p class=\"empty\">None yet").await;
@@ -8580,13 +8595,11 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         .record_relay(&relay, RelayWrite::Inventory(inventory), now)
         .unwrap();
     let count = |n: u64| {
-        format!(
-            "Connections<span id=\"nav-count-clients\"> <span class=\"count\">{n}</span></span>"
-        )
+        format!("GitLab<span id=\"nav-count-gitlab\"> <span class=\"count\">{n}</span></span>")
     };
 
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     for want in [
         count(1).as_str(),
         "<section><h2>Pending</h2><h3>GitLab servers</h3>",
@@ -8616,7 +8629,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         "hx-preserve=\"true\"",
         "name=\"op\" value=\"reject-server\"",
         // Kept current where the tab shows it.
-        "<span id=\"nav-count-clients\" hx-swap-oob=\"true\"> <span class=\"count\">1</span>",
+        "<span id=\"nav-count-gitlab\" hx-swap-oob=\"true\"> <span class=\"count\">1</span>",
     ] {
         assert!(first.contains(want), "{want}: {first}");
     }
@@ -8668,7 +8681,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         "data-check=\"all\"",
         "<td><input id=\"pick-pending-gl-42\" hx-preserve=\"true\" type=\"checkbox\" \
          name=\"project\" value=\"42\" aria-label=\"42\"></td>\
-         <td><a href=\"/clients/projects/gl/42\">acme/web</a></td><td class=\"num\">42</td><td><a \
+         <td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td><td class=\"num\">42</td><td><a \
          href=\"https://gitlab.example.com/acme/web/-/jobs/142\"",
         ">#142</a></td><td>relay-1</td><td><time",
         "name=\"op\" value=\"approve-projects\">Approve</button>",
@@ -8678,7 +8691,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     ] {
         assert!(event.contains(want), "{want}: {event}");
     }
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(page.contains(&count(2)), "{page}");
     assert!(!page.contains("type=\"checkbox\""), "{page}");
     assert!(page.contains("projects approve gl &lt;id&gt;"), "{page}");
@@ -8739,7 +8752,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     let rejected = event.split("<h2>Rejected</h2>").nth(1).unwrap();
     let rejected = rejected.split("<h2>GitLab servers</h2>").next().unwrap();
     assert!(
-        rejected.contains("<a href=\"/clients/projects/gl/43\">acme/api</a>"),
+        rejected.contains("<a href=\"/gitlab/gl/projects/43\">acme/api</a>"),
         "{rejected}"
     );
     assert!(!rejected.contains("reject-projects"), "{rejected}");
@@ -8748,7 +8761,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     for want in [
         "<h3 id=\"projects-approved-gl\">",
         "<td><input id=\"pick-approved-gl-42\"",
-        "<td><a href=\"/clients/projects/gl/42\">acme/web</a></td><td class=\"num\">42</td>\
+        "<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td><td class=\"num\">42</td>\
          <td><time",
         "name=\"op\" value=\"reject-projects\">Reject</button>",
         "name=\"op\" value=\"forget-projects\">Forget</button>",
@@ -8758,11 +8771,11 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     assert!(!approved.contains("approve-projects"), "{approved}");
     assert!(!approved.contains("acme/api"), "{approved}");
     // A viewer sees them listed and linked, with nothing to decide.
-    let page = get(addr, "/clients", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     let listed = page.split("<h2>Approved projects</h2>").nth(1).unwrap();
     let listed = listed.split("<h2>Relays</h2>").next().unwrap();
     assert!(
-        listed.contains("<td><a href=\"/clients/projects/gl/42\">acme/web</a></td>"),
+        listed.contains("<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td>"),
         "{listed}"
     );
     assert!(!listed.contains("<form"), "{listed}");
@@ -8901,7 +8914,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
         "Reject these approved projects?",
         "<p>Approved, of <strong>gl</strong>: acme/web <code>42</code>, project <code>44</code></p>",
         "name=\"projects\" value=\"42,44\"",
-        "<a href=\"/clients\">Cancel</a>",
+        "<a href=\"/gitlab\">Cancel</a>",
         "<form method=\"post\" action=\"/clients\">",
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
@@ -8916,7 +8929,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
     )
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert_eq!(state(42), Some(ProjectState::Rejected));
     assert_eq!(state(44), Some(ProjectState::Rejected));
     audited(
@@ -9020,7 +9033,7 @@ async fn a_project_page_shows_and_decides_one_project() {
         .decide_projects("gl", &refs, Decision::Approve, "alice", now)
         .unwrap();
     let state = |id: u64| hub.db.gitlab_project("gl", id).unwrap().map(|p| p.state);
-    let page_of = "/clients/projects/gl/42";
+    let page_of = "/gitlab/gl/projects/42";
 
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
     let page = get(addr, page_of, Some(&viewer)).await;
@@ -9028,7 +9041,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     for want in [
         // The hub's only instance goes unnamed.
         "<h1>acme/web</h1>",
-        "<a href=\"/clients\" aria-current=\"page\">Connections",
+        "<a href=\"/gitlab\" aria-current=\"page\">GitLab",
         "<tr><th>GitLab ID</th><td>42</td></tr>",
         "<strong>gl</strong> https://gitlab.example.com",
         "<span class=\"badge ok\">approved</span>",
@@ -9053,7 +9066,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     .await;
     assert_eq!(reply.status, 403, "{}", reply.body);
     // Known by ID alone: no path, and no jobs to look for by one.
-    let page = get(addr, "/clients/projects/gl/44", Some(&viewer)).await;
+    let page = get(addr, "/gitlab/gl/projects/44", Some(&viewer)).await;
     assert!(page.body.contains("<h1>project 44</h1>"), "{}", page.body);
     assert!(
         page.body
@@ -9074,7 +9087,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     hub.db
         .gate_job(&relay, &job, (&"ab".repeat(16), "d"), now)
         .unwrap();
-    let page = get(addr, "/clients/projects/gl/45", Some(&viewer)).await;
+    let page = get(addr, "/gitlab/gl/projects/45", Some(&viewer)).await;
     for want in [
         "<span class=\"badge warn\">pending</span>",
         "<tr><th>First job refused</th><td><a href=\"https://gitlab.example.com/acme/new/-/jobs/145\"",
@@ -9085,13 +9098,13 @@ async fn a_project_page_shows_and_decides_one_project() {
     }
     assert!(!page.body.contains("Last decided"), "{}", page.body);
     for path in [
-        "/clients/projects/gl/43",
-        "/clients/projects/gl/042",
-        "/clients/projects/gl/+42",
-        "/clients/projects/gl/0",
-        "/clients/projects/GL/42",
-        "/clients/projects/gl/42/",
-        "/clients/projects/gl",
+        "/gitlab/gl/projects/43",
+        "/gitlab/gl/projects/042",
+        "/gitlab/gl/projects/+42",
+        "/gitlab/gl/projects/0",
+        "/gitlab/GL/projects/42",
+        "/gitlab/gl/projects/42/",
+        "/gitlab/gl/projects",
     ] {
         assert_eq!(get(addr, path, Some(&viewer)).await.status, 404, "{path}");
     }
@@ -9109,7 +9122,7 @@ async fn a_project_page_shows_and_decides_one_project() {
         assert!(page.contains(want), "{want}: {page}");
     }
     assert!(!page.contains("approve-projects"), "{page}");
-    let pending = get(addr, "/clients/projects/gl/45", Some(&operator))
+    let pending = get(addr, "/gitlab/gl/projects/45", Some(&operator))
         .await
         .body;
     for want in [
@@ -9136,7 +9149,7 @@ async fn a_project_page_shows_and_decides_one_project() {
         "<p>Approved, of <strong>gl</strong>: acme/web <code>42</code></p>",
         "name=\"projects\" value=\"42\"",
         "name=\"approved\" value=\"42\"",
-        "<a href=\"/clients/projects/gl/42\">Cancel</a>",
+        "<a href=\"/gitlab/gl/projects/42\">Cancel</a>",
         // The confirmation page has no flash: it submits a plain form and redirects.
         "<form method=\"post\" action=\"/clients\">",
     ] {
@@ -9212,7 +9225,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     ))
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert_eq!(state(42), None);
     assert_eq!(get(addr, page_of, Some(&operator)).await.status, 404);
 
@@ -9226,7 +9239,7 @@ async fn a_project_page_shows_and_decides_one_project() {
         .unwrap();
     let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
     assert!(
-        page.contains("<tr><th>Project</th><td><a href=\"/clients/projects/gl/44\">acme/api</a>"),
+        page.contains("<tr><th>Project</th><td><a href=\"/gitlab/gl/projects/44\">acme/api</a>"),
         "{page}"
     );
 }
@@ -9304,7 +9317,7 @@ async fn a_job_page_says_what_registry_access_the_job_got() {
     for (id, want) in [
         (
             none(2, NoAccess::UnboundKey, None, None),
-            "no longer approved. <a href=\"/clients\">Connections</a>",
+            "no longer approved. <a href=\"/gitlab\">GitLab</a>",
         ),
         (
             none(3, NoAccess::NodeWithoutJobTokens, None, None),
@@ -11381,7 +11394,7 @@ async fn capacity_confirmed(
     form: &str,
     changes: &[&str],
 ) -> Reply {
-    let question = post_action(addr, origin, cookie, "/clients/capacity", form, false).await;
+    let question = post_action(addr, origin, cookie, "/capacity", form, false).await;
     assert!(
         question.body.contains("<h1>Confirm</h1>")
             && question.body.contains("Change the capacity policy?"),
@@ -11399,7 +11412,7 @@ async fn capacity_confirmed(
         "{form}&nonce={}&confirm=yes",
         hidden(&question.body, "nonce")
     );
-    post_action(addr, origin, cookie, "/clients/capacity", &answer, false).await
+    post_action(addr, origin, cookie, "/capacity", &answer, false).await
 }
 
 /// URL-encode the hidden inputs of the `nth` form on `page` posting `op`, as a browser does.
@@ -11446,28 +11459,28 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         .decide_projects("gl", &[project], Decision::Approve, "u", now)
         .unwrap();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients", Some(&operator)).await.body;
+    let page = get(addr, "/capacity", Some(&operator)).await.body;
     assert!(
-        page.contains("<a href=\"/clients/tenants/fallback\">fallback</a> <span"),
+        page.contains("<a href=\"/capacity/tenants/fallback\">fallback</a> <span"),
         "{page}"
     );
     assert!(page.contains("value=\"capacity-add-tenant\""), "{page}");
-    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     assert!(page.contains("No capacity tenant lists it"), "{page}");
 
     // Adding a tenant asks nothing.
     let form = format!("_csrf={csrf}&op=capacity-add-tenant&tenant=web");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
+    assert_eq!(reply.header("location"), Some("/capacity/tenants/web"));
     audited(&hub, "; tenants: web").await;
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(reply.body.contains("exists already"), "{}", reply.body);
     let form = format!("_csrf={csrf}&op=capacity-add-tenant&tenant=not%20a%20name");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(
         reply.body.contains("not a valid tenant name"),
@@ -11475,17 +11488,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         reply.body
     );
     assert!(
-        reply.body.contains("href=\"/clients\">Back</a>"),
-        "{}",
-        reply.body
-    );
-    // From the policy's page, a refusal leads back there.
-    let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
-    let form = posted_form(&page, "capacity-add-tenant", 0) + "&tenant=web";
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
-    assert_eq!(reply.status, 400, "{}", reply.body);
-    assert!(
-        reply.body.contains("href=\"/clients/capacity\">Back</a>"),
+        reply.body.contains("href=\"/capacity\">Back</a>"),
         "{}",
         reply.body
     );
@@ -11499,7 +11502,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         ),
     ] {
         let form = format!("_csrf={csrf}&{form}");
-        let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+        let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
         assert_eq!(reply.status, 400, "{}", reply.body);
         assert!(reply.body.contains(why), "{why}: {}", reply.body);
     }
@@ -11507,7 +11510,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     // The tenant's page edits its share, projects and runners, a form each, and offers the
     // projects the hub knows by their paths.
     let digest = || hub.db.capacity_policy().unwrap().digest().unwrap();
-    let page = get(addr, "/clients/tenants/web", Some(&operator))
+    let page = get(addr, "/capacity/tenants/web", Some(&operator))
         .await
         .body;
     for want in [
@@ -11534,13 +11537,13 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         ("0", "", "positive weight"),
     ] {
         let form = share_form(&shown, weight, cap);
-        let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+        let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
         assert_eq!(reply.status, 400, "{}", reply.body);
         assert!(reply.body.contains(why), "{why}: {}", reply.body);
     }
     let form = share_form(&shown, "3", "5");
     let before = hub.db.capacity_policy().unwrap();
-    let question = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let question = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     for want in [
         "<li>Tenant web: weight 1 → 3</li>",
         "<li>Tenant web: cap unbounded → 5</li>",
@@ -11550,27 +11553,11 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(hub.db.capacity_policy().unwrap(), before);
     // Without its nonce, or with a field changed since asked: refused.
     let refused = format!("{form}&confirm=yes");
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/clients/capacity",
-        &refused,
-        false,
-    )
-    .await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &refused, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     let nonce = hidden(&question.body, "nonce");
     let tampered = share_form(&shown, "4", "5") + &format!("&nonce={nonce}&confirm=yes");
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/clients/capacity",
-        &tampered,
-        false,
-    )
-    .await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &tampered, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), before);
     let reply = capacity_confirmed(
@@ -11582,10 +11569,10 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     )
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
+    assert_eq!(reply.header("location"), Some("/capacity/tenants/web"));
     audited(&hub, "; tenants: web").await;
     // The page it was made from is stale now.
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(
         reply
@@ -11597,7 +11584,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     // The same share again changes nothing and asks nothing.
     let audits = hub.db.audits(None, 100).unwrap().len();
     let same = share_form(&digest(), "3", "5");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &same, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &same, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(hub.db.audits(None, 100).unwrap().len(), audits);
 
@@ -11609,12 +11596,12 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let changes = ["Tenant web: list project gl/42"];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
+    assert_eq!(reply.header("location"), Some("/capacity/tenants/web"));
     let form = format!(
         "_csrf={csrf}&op=capacity-add-project&expected={}&tenant=web&project=gl%2F42",
         digest()
     );
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(
         reply.body.contains("lists project gl/42 already"),
@@ -11630,7 +11617,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let changes = ["Tenant web: list project gl/99"];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    let page = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    let page = get(addr, "/gitlab/gl/projects/99", Some(&operator)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
         "The hub has not seen this project",
@@ -11643,8 +11630,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     // Its page is gone with it: the removal leads to the tenant's.
-    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
-    let reply = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    assert_eq!(reply.header("location"), Some("/capacity/tenants/web"));
+    let reply = get(addr, "/gitlab/gl/projects/99", Some(&operator)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
 
     // A runner no relay reports, by instance and ID; unmapping one mapped elsewhere is refused.
@@ -11667,7 +11654,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(reply.status, 303, "{}", reply.body);
     audited(&hub, "; runners: gl/7").await;
     let form = runner_form("capacity-unmap-runner", "fallback");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(
         reply.body.contains("runner gl/7 is not mapped to tenant"),
@@ -11693,12 +11680,12 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let group = shared.tenants["web"].clone();
     shared.tenants.insert("group".into(), group);
     hub.db.set_capacity_policy(&shared, "u", now).unwrap();
-    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     for want in [
-        "<a href=\"/clients/tenants/group\">group</a>",
-        "<a href=\"/clients/tenants/web\">web</a></td><td class=\"num\">3</td><td>5</td>\
+        "<a href=\"/capacity/tenants/group\">group</a>",
+        "<a href=\"/capacity/tenants/web\">web</a></td><td class=\"num\">3</td><td>5</td>\
          <td>7 (production)</td>",
         "name=\"branches\"",
         "value=\"capacity-add-rule\"",
@@ -11716,7 +11703,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let changes = ["Project gl/42: production branches none → main, release/**"];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/projects/gl/42"));
+    assert_eq!(reply.header("location"), Some("/gitlab/gl/projects/42"));
     let saved = hub.db.capacity_policy().unwrap();
     for tenant in ["group", "web"] {
         assert_eq!(
@@ -11739,13 +11726,13 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     };
     for (branches, nodes, pools) in [("main", "", ""), ("", "x", ""), ("", "", "not a name")] {
         let form = rule_form(&saved.digest().unwrap(), branches, nodes, pools);
-        let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+        let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
         assert_eq!(reply.status, 400, "{nodes}: {}", reply.body);
         assert!(!reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
     }
     let form = rule_form(&saved.digest().unwrap(), "", node, "");
     let added = format!("Project gl/42: add placement rule (every job: nodes {node}, pools any)");
-    let question = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let question = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert!(
         question.body.contains(&format!("<li>{added}</li>")),
         "{}",
@@ -11762,15 +11749,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         "{form}&nonce={}&confirm=yes",
         hidden(&question.body, "nonce")
     );
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/clients/capacity",
-        &answer,
-        false,
-    )
-    .await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &answer, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), meanwhile);
     let form = form.replace(&saved.digest().unwrap(), &meanwhile.digest().unwrap());
@@ -11790,7 +11769,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     }
     // The same rule again is refused before it is asked.
     let form = rule_form(&saved.digest().unwrap(), "", node, "");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(
         reply.body.contains("has this rule already"),
@@ -11812,7 +11791,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         t.projects[0].placement_rules = rules;
     }
     hub.db.set_capacity_policy(&ordered, "u", now).unwrap();
-    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     let form = posted_form(&page, "capacity-remove-rule", 1);
@@ -11827,14 +11806,14 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         );
     }
     // A tenant stops listing it from the project's page, which it leads back to.
-    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     let form = posted_form(&page, "capacity-remove-project", 0);
     let changes = ["Tenant group: stop listing project gl/42"];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/projects/gl/42"));
+    assert_eq!(reply.header("location"), Some("/gitlab/gl/projects/42"));
     assert!(
         hub.db
             .capacity_policy()
@@ -11844,7 +11823,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     );
 
     // The policy's page: the fallback, API clients, scheduling and headroom, a form each.
-    let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
+    let page = get(addr, "/capacity", Some(&operator)).await.body;
     for want in [
         "value=\"capacity-fallback\"",
         "value=\"capacity-scheduling\"",
@@ -11858,7 +11837,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &policy_edit(
             "op=capacity-scheduling&probe_limit=1&production_probe_burst=1\
              &backoff_initial_secs=9&backoff_max_secs=5&busy_secs=60",
@@ -11872,29 +11851,29 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         (
             "op=capacity-fallback&tenant=web",
             "Fallback tenant: fallback → web".to_owned(),
-            "/clients/capacity",
+            "/capacity",
         ),
         (
             "op=capacity-client&principal=key-1&tenant=group",
             "API client key-1: the fallback (web) → group".to_owned(),
-            "/clients/capacity",
+            "/capacity",
         ),
         (
             "op=capacity-scheduling&probe_limit=3&production_probe_burst=1\
              &backoff_initial_secs=1&backoff_max_secs=60&busy_secs=60",
             "Probe limit: 2 → 3".to_owned(),
-            "/clients/capacity",
+            "/capacity",
         ),
         (
             "op=capacity-add-headroom&pool=trusted&labels=big&slots=2&mem_mib=1024&cpus=2\
              &disk_gib=10",
             format!("Keep headroom: {kept}"),
-            "/clients/capacity",
+            "/capacity",
         ),
         (
             "op=capacity-remove-headroom&index=0",
             format!("Stop keeping headroom: {kept}"),
-            "/clients/capacity",
+            "/capacity",
         ),
     ] {
         let form = policy_edit(fields);
@@ -11914,7 +11893,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &policy_edit(headroom),
         false,
     )
@@ -11931,7 +11910,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &policy_edit(&repeated),
         false,
     )
@@ -11951,10 +11930,10 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     });
     hub.db.set_capacity_policy(&grouped, "u", now).unwrap();
     let form = policy_edit("op=capacity-remove-tenant&tenant=web");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(reply.body.contains("is the fallback"), "{}", reply.body);
-    let page = get(addr, "/clients/tenants/group", Some(&operator))
+    let page = get(addr, "/capacity/tenants/group", Some(&operator))
         .await
         .body;
     let form = posted_form(&page, "capacity-remove-tenant", 0);
@@ -11970,7 +11949,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert!(saved.clients.is_empty());
 
     // The whole policy, as the CLI sets it.
-    let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
+    let page = get(addr, "/capacity", Some(&operator)).await.body;
     assert!(page.contains("name=\"policy\""), "{page}");
     let mut whole = saved.clone();
     whole.busy_secs = 30;
@@ -11991,7 +11970,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     ];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/clients/capacity"));
+    assert_eq!(reply.header("location"), Some("/capacity"));
     assert_eq!(hub.db.capacity_policy().unwrap(), whole);
     // Its runner mappings only reordered: nothing asked, saved or audited.
     let mut swapped = whole.clone();
@@ -12001,7 +11980,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &policy_form(&whole.digest().unwrap(), &swapped),
         false,
     )
@@ -12023,7 +12002,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &padded(64 * 1024),
         false,
     )
@@ -12038,7 +12017,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         addr,
         &origin,
         &operator,
-        "/clients/capacity",
+        "/capacity",
         &padded(6 * 64 * 1024 + 1),
         false,
     )
@@ -12049,32 +12028,29 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     // A viewer sees it all, with no form, and is refused.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
     for path in [
-        "/clients/capacity",
-        "/clients/tenants/web",
-        "/clients/projects/gl/42",
+        "/capacity",
+        "/capacity/tenants/web",
+        "/gitlab/gl/projects/42",
     ] {
         let page = get(addr, path, Some(&viewer)).await.body;
-        assert!(
-            !page.contains("/clients/capacity\"><input"),
-            "{path}: {page}"
-        );
+        assert!(!page.contains("/capacity\"><input"), "{path}: {page}");
         assert!(!page.contains("<textarea"), "{path}: {page}");
     }
-    let page = get(addr, "/clients/projects/gl/42", Some(&viewer))
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&viewer))
         .await
         .body;
     assert!(page.contains(node), "{page}");
-    let page = get(addr, "/clients/tenants/web", Some(&viewer)).await.body;
+    let page = get(addr, "/capacity/tenants/web", Some(&viewer)).await.body;
     assert!(
         page.contains("<td>gl</td><td class=\"num\">42</td>")
             && page.contains("<td class=\"num\">7</td><td>production</td>"),
         "{page}"
     );
     let form = format!("_csrf={viewer_csrf}&op=capacity-add-tenant&tenant=other");
-    let reply = post_action(addr, &origin, &viewer, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &viewer, "/capacity", &form, false).await;
     assert_eq!(reply.status, 403, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), whole);
-    let reply = get(addr, "/clients/tenants/nope", Some(&viewer)).await;
+    let reply = get(addr, "/capacity/tenants/nope", Some(&viewer)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
@@ -12084,7 +12060,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
 async fn a_tenant_page_needs_an_instance_to_add_by_id() {
     let (addr, hub, _) = start_fleet().await;
     let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/clients/tenants/fallback", Some(&operator))
+    let page = get(addr, "/capacity/tenants/fallback", Some(&operator))
         .await
         .body;
     assert_eq!(page.matches("No GitLab instance yet.").count(), 2, "{page}");
@@ -12114,10 +12090,9 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let digest = crate::policy::digest_bytes(br#"{"from_a_later_hub":true}"#);
     for path in [
-        "/clients",
-        "/clients/capacity",
-        "/clients/projects/gl/42",
-        "/clients/tenants/fallback",
+        "/capacity",
+        "/gitlab/gl/projects/42",
+        "/capacity/tenants/fallback",
     ] {
         let reply = get(addr, path, Some(&operator)).await;
         assert_eq!(reply.status, 200, "{path}: {}", reply.body);
@@ -12129,9 +12104,9 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
         assert!(!reply.body.contains("Tenants: "), "{path}: {}", reply.body);
     }
     // A project the hub has not seen is listed by no policy it can read.
-    let reply = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    let reply = get(addr, "/gitlab/gl/projects/99", Some(&operator)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
     let form = format!("_csrf={csrf}&op=capacity-add-tenant&tenant=web");
-    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
 }

@@ -1701,11 +1701,11 @@ fn not_approved(hub: &str, e: &DispatchError, spec: Option<&JobSpec>) -> String 
         ),
         None if rejected => format!(
             "{project} was rejected on the fleet hub {hub}.\nAn operator can approve it there \
-             (Connections > GitLab), then retry this job."
+             (GitLab), then retry this job."
         ),
         None => format!(
             "{project} is waiting for approval on the fleet hub {hub}.\nRetry this job once \
-             an operator has approved it (Connections > GitLab > Pending)."
+             an operator has approved it (GitLab > Pending)."
         ),
     }
 }

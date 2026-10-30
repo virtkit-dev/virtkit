@@ -8,7 +8,7 @@
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
 //! jobs placed through the client API are listed, read only, on `/jobs`, a failed one with a
 //! page of its own ([`super::jobs`]); the API keys and the client instances using them on
-//! `/clients`, where operators also create and revoke keys ([`super::clients`]).
+//! `/keys`, where operators also create and revoke keys ([`super::clients`]).
 //! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
 //! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
@@ -72,7 +72,8 @@ pub(super) struct FleetSite {
     jobs: Arc<super::jobs::Renders>,
     /// What `/egress`' pages and streams share.
     egress: Arc<super::egress::Caches>,
-    /// `/clients`' fragment, once for every viewer's page and once for every operator's.
+    /// `/gitlab`' and `/keys`' fragments, once for every viewer's page and once for every
+    /// operator's.
     clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     steered_clients_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
 }
@@ -293,7 +294,7 @@ pub(super) async fn get(
             auth,
             &audit,
             Some(&subjects),
-            nav(auth),
+            &nav(auth.session.role >= Role::Operator),
         ))));
     }
     if path == super::users::PATH {
@@ -307,8 +308,12 @@ pub(super) async fn get(
             .await
             .map(Some);
     }
-    if path == super::clients::PATH {
-        return super::clients::get(query, auth, ui).await.map(Some);
+    if let Some(to) = moved(path, query) {
+        return Ok(Some(moved_permanently(&to)));
+    }
+    if path == super::clients::GITLAB_PATH || path == super::clients::KEYS_PATH {
+        let keys = path == super::clients::KEYS_PATH;
+        return super::clients::get(keys, auth, ui).await.map(Some);
     }
     if path == super::capacity::PATH {
         return super::capacity::policy_get(auth, ui).await.map(Some);
@@ -348,6 +353,25 @@ pub(super) async fn get(
         }));
     }
     Ok(None)
+}
+
+/// The current destination of a `path` from before navigation sections, if any.
+pub(super) fn moved(path: &str, query: Option<&str>) -> Option<String> {
+    if path == super::clients::PATH {
+        return Some(super::clients::moved(query).to_string());
+    }
+    super::capacity::moved(path).or_else(|| super::projects::moved(path))
+}
+
+/// A permanent redirect to `to`, a path built from checked names.
+fn moved_permanently(to: &str) -> Response<Body> {
+    let mut resp = Response::new(Body::default());
+    *resp.status_mut() = StatusCode::MOVED_PERMANENTLY;
+    resp.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(to).unwrap_or(HeaderValue::from_static("/")),
+    );
+    resp
 }
 
 /// The nodes table, as one rendering for every nodes page.
@@ -781,29 +805,68 @@ fn back_to_operations(htmx: bool, said: &str) -> Response<Body> {
 
 /// The page around `main`, with the fleet's navigation.
 pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html {
-    pages::frame(title, here, auth, nav(auth), main)
+    pages::frame(
+        title,
+        here,
+        auth,
+        &nav(auth.session.role >= Role::Operator),
+        main,
+    )
 }
 
-/// The fleet's navigation for `auth`'s session: an operator's has the users page too.
-fn nav(auth: &Auth) -> pages::Nav {
-    if auth.session.role >= Role::Operator {
-        OPERATOR_NAV
-    } else {
-        NAV
+/// The fleet's navigation: an operator's (`users`) has the users page too.
+fn nav(users: bool) -> Vec<pages::Section> {
+    use pages::{Section, Tab, tab};
+    let one = |path: &str, label: &'static str| Section {
+        label,
+        tabs: vec![tab(path, label)],
+    };
+    let mut admin = vec![tab(super::clients::KEYS_PATH, "API keys")];
+    if users {
+        admin.push(tab(super::users::PATH, "Users"));
     }
+    admin.push(tab("/audit", "Audit"));
+    vec![
+        Section {
+            label: "Nodes",
+            tabs: vec![
+                tab("/", "Compute"),
+                Tab {
+                    // A registry's page, `/registry/<id>`.
+                    also: &["/registry"],
+                    ..tab(super::registries::PATH, "Storage")
+                },
+                tab("/operations", "Updates"),
+            ],
+        },
+        one(super::clients::GITLAB_PATH, "GitLab"),
+        one(super::capacity::PATH, "Capacity"),
+        one(super::jobs::PATH, "Jobs"),
+        one(super::egress::PATH, "Egress"),
+        Section {
+            label: "Administration",
+            tabs: admin,
+        },
+    ]
 }
 
 /// The counts the fleet's navigation shows: the New egress rows, and the GitLab servers and
 /// projects waiting for approval.
-pub(super) async fn nav_counts(hub: &Arc<Hub>) -> Result<Vec<(&'static str, u64)>> {
+pub(super) async fn nav_counts(hub: &Arc<Hub>) -> Result<Vec<(String, u64)>> {
     let hub = hub.clone();
     blocking(move || counts(&hub)).await
 }
 
-fn counts(hub: &Hub) -> Result<Vec<(&'static str, u64)>> {
+fn counts(hub: &Hub) -> Result<Vec<(String, u64)>> {
     Ok(vec![
-        (super::egress::PATH, hub.db.egress_new(crate::now_secs())?),
-        (super::clients::PATH, hub.db.gitlab_pending()?),
+        (
+            super::egress::PATH.to_string(),
+            hub.db.egress_new(crate::now_secs())?,
+        ),
+        (
+            super::clients::GITLAB_PATH.to_string(),
+            hub.db.gitlab_pending()?,
+        ),
     ])
 }
 
@@ -818,11 +881,11 @@ fn counted(hub: &Arc<Hub>, render: sse::Render) -> sse::Render {
 /// The navigation's counts alone, for a page to swap in out of band ([`counted`]).
 fn counts_oob(hub: &Arc<Hub>) -> sse::Render {
     let hub = hub.clone();
-    Arc::new(move || Ok(pages::counts_oob(&counts(&hub)?).into_string()))
+    Arc::new(move || Ok(pages::counts_oob(&nav(false), &counts(&hub)?).into_string()))
 }
 
-/// `/clients`' events, each tab's fragment followed by the navigation's counts ([`counted`]):
-/// a tab swaps in its own alone.
+/// `/gitlab`' and `/keys`' events, each page's fragment followed by the navigation's counts
+/// ([`counted`]): a page swaps in its own alone.
 fn clients_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     super::clients::events(hub, steer)
         .iter()
@@ -841,27 +904,6 @@ fn counted_events(hub: &Arc<Hub>, events: sse::Events) -> sse::Events {
         })
         .collect()
 }
-
-const NAV: pages::Nav = &[
-    ("/", "Nodes"),
-    (super::registries::PATH, "Registries"),
-    (super::jobs::PATH, "Jobs"),
-    (super::egress::PATH, "Egress"),
-    (super::clients::PATH, "Connections"),
-    ("/operations", "Operations"),
-    ("/audit", "Audit"),
-];
-
-const OPERATOR_NAV: pages::Nav = &[
-    ("/", "Nodes"),
-    (super::registries::PATH, "Registries"),
-    (super::jobs::PATH, "Jobs"),
-    (super::egress::PATH, "Egress"),
-    (super::clients::PATH, "Connections"),
-    ("/operations", "Operations"),
-    ("/audit", "Audit"),
-    (super::users::PATH, "Users"),
-];
 
 /// `/`: the nodes table.
 fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
@@ -1017,13 +1059,18 @@ fn relay_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
         .raw("<code>run</code>, <code>--ca &lt;file&gt;</code> when the hub's certificate is not ")
         .raw("one the system's roots verify, and <code>--replace</code> to enroll a relay ")
         .raw("enrolled already, as a new one. Its config names its GitLab server in ")
-        .raw("<code>[gitlab] url</code>; the server waits for approval on the GitLab tab until ")
+        .raw("<code>[gitlab] url</code>; the server waits for approval on the GitLab page until ")
         .raw("an operator gives it a name. Read on stdin, the token stays out of the shell's ")
         .raw("history and the process list.</p>")
         .raw("<p><a href=\"")
-        .raw(super::clients::PATH)
-        .raw("\">Back to the GitLab tab</a></p>");
-    layout("Relay enrollment token", super::clients::PATH, auth, &main)
+        .raw(super::clients::GITLAB_PATH)
+        .raw("\">Back to the GitLab page</a></p>");
+    layout(
+        "Relay enrollment token",
+        super::clients::GITLAB_PATH,
+        auth,
+        &main,
+    )
 }
 
 // Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs
@@ -1984,7 +2031,7 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
 fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
-    main.raw("<h1>Operations</h1><div hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
+    main.raw("<h1>Updates</h1><div hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
         .raw("sse-close=\"close\"");
     if steer {
         // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
@@ -1999,7 +2046,7 @@ fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Ht
     main.raw("<div id=\"operations\" sse-swap=\"operations\">")
         .html(&operations_fragment(ops, steer, now))
         .raw("</div></div>");
-    layout("Operations", "/operations", auth, &main)
+    layout("Updates", "/operations", auth, &main)
 }
 
 /// `/operations`' live part. With `steer`, each rollout still under way carries the buttons

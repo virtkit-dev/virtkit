@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **The hub's web UI groups its pages into sections.** The top bar shows Nodes (compute,
+  storage, updates), GitLab, Capacity, Jobs, Egress and Administration (API keys, users, audit),
+  with the current section's tabs below it. Connections is split into the GitLab and API keys
+  pages, and the capacity policy has a section of its own. Old addresses redirect, so links in
+  existing job traces still work.
 - **Edit the hub's capacity policy through forms.** Tenant pages set weight and cap,
   list projects, map runners and remove tenants. Pick projects and runners the hub knows,
   or enter their instance and ID. Project pages list projects for tenants and add or remove

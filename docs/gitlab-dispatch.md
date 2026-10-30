@@ -375,8 +375,8 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 An error body is `{error, code, retry_after_secs?, approval_url?}`. Unknown codes read as `other`;
 unknown fields are ignored. When the hub serves a web UI, `approval_pending` and
 `project_rejected` include `approval_url`: the page where an operator decides on the project's
-approval, `<ui_url>/clients/projects/<instance>/<project ID>`, or Connections,
-`<ui_url>/clients`, for its server.
+approval, `<ui_url>/gitlab/<instance>/projects/<project ID>`, or the GitLab page,
+`<ui_url>/gitlab`, for its server.
 
 A job refused `approval_pending` or `project_rejected` is not held: approval is a human step.
 `vk-gitlab` releases its reservation and fails it in GitLab, uncommitted, as
@@ -384,7 +384,7 @@ A job refused `approval_pending` or `project_rejected` is not held: approval is 
 with instructions and a link, for example:
 
 ```text
-ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/clients/projects/main/12
+ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/gitlab/main/projects/12
 Retry this job once an operator has approved it there.
 ```
 
@@ -392,7 +392,7 @@ Without `approval_url` (an older hub or one without a UI), the trace uses the en
 
 ```text
 ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub https://hub.example.com.
-Retry this job once an operator has approved it (Connections > GitLab > Pending).
+Retry this job once an operator has approved it (GitLab > Pending).
 ```
 
 GitLab's `retry: when: runner_system_failure` does not retry that reason, so a pending project

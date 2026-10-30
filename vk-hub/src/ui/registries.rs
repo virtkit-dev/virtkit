@@ -115,7 +115,7 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     .await?;
     let now = crate::now_secs();
     let mut main = Html::new();
-    main.raw("<h1>Registries</h1>");
+    main.raw("<h1>Storage</h1>");
     if views.is_empty() {
         main.raw("<p class=\"empty\">No registry has enrolled yet: an operator issues a ")
             .raw("registry token below, or with <code>vk-hub token create --kind registry</code>, ")
@@ -182,7 +182,7 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
             .raw("are, and it serves as before whether the hub is reachable or not.</p>")
             .raw("</section>");
     }
-    Ok(page(super::fleet::layout("Registries", PATH, auth, &main)))
+    Ok(page(super::fleet::layout("Storage", PATH, auth, &main)))
 }
 
 /// A registry page's views: `/registry/<id>`, `?tab=access` and `?tab=settings`.
@@ -266,9 +266,10 @@ pub(super) async fn detail(
         Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref()),
         Tab::Settings => settings(&mut main, &view, &keys, now),
     }
+    let here = format!("{DETAIL_PREFIX}{id}");
     Ok(page(super::fleet::layout(
         &view.row.hostname,
-        PATH,
+        &here,
         auth,
         &main,
     )))

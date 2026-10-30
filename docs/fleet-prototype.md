@@ -1041,9 +1041,10 @@ GitLab instances, before relays, converts them once at its first start: per inst
 knows, every project a bound key listed and every project its job history names is approved, and
 the bound keys are revoked and removed with their client instances, all audited as `hub`.
 Operators also create, revoke and remove keys, and add and remove GitLab instances, on the web
-UI's `/clients` (see [Web UI](#web-ui)). Creating, revoking and removing are audited; a key is audited as
-`key <name>`, and its jobs and reservations are its own: another key's are 404. Revoking a key
-strands its jobs under way: their client can no longer follow or settle them with it.
+UI's `/keys` and `/gitlab` (see [Web UI](#web-ui)). Creating, revoking and removing are audited;
+a key is audited as `key <name>`, and its jobs and reservations are its own: another key's are
+404. Revoking a key strands its jobs under way: their client can no longer follow or settle them
+with it.
 
 **GitLab relays.** `vk-gitlab` enrolls with the hub as a relay, with `vk-gitlab join`
 ([design](gitlab-relay-enrollment.md)). `vk-hub token create --kind
@@ -1351,11 +1352,17 @@ IPv6 address and a numeric host that is not a dotted quad are refused. `ui_url`,
 or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in through an OIDC
 provider (see [Signing in](#signing-in)).
 
+The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
+row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *Updates*, releases and
+rollouts), *GitLab*, *Capacity*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for
+operators, *Audit*). Connections' former addresses, `/clients[?tab=other]`, `/clients/capacity`,
+`/clients/tenants/<name>` and `/clients/projects/<instance>/<ID>`, redirect to their pages.
+
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
-heartbeat and workloads; the job history (`/jobs`, below); the API keys and the clients using
-them (`/clients`, *Connections*, below); and the audit log (`/audit`, 100 lines a page; the
-hub keeps the newest 100,000 rows), where an event drops the actor its who column shows and
-names each known node or registry, linked to its page. The log leaves jobs out unless asked:
+heartbeat and workloads; the job history (`/jobs`, below); the GitLab servers, and the API keys
+and the clients using them (`/gitlab` and `/keys`, below); and the audit log (`/audit`, 100 lines a
+page; the hub keeps the newest 100,000 rows), where an event drops the actor its who column shows
+and names each known node or registry, linked to its page. The log leaves jobs out unless asked:
 its filter, a query string so each view is a link, takes a category (`category=people` for
 what people did on the admin socket or in the UI, `system` for the hub, nodes, registries,
 rollouts and enrollments, `jobs` for what API keys submitted and canceled and what the hub did
@@ -1429,9 +1436,9 @@ then kept by the writes that record, update and trim jobs. A page decodes the re
 jobs it shows alone: in an optimized build (the ignored `jobs_page_bench` test measures it),
 100,000 jobs scan in tens of milliseconds and take about 25 MB of memory; 1,000,000, the most
 the history keeps, take about 250 MB and tens of seconds to read at start, while the page says
-it is reading the history. `/clients`' job counts read none of it: the hub keeps a count of each
+it is reading the history. `/keys`' job counts read none of it: the hub keeps a count of each
 key's jobs beside the history, updated in the writes that record and trim jobs and counted from
-the history once on a database without it, so a rendering of `/clients` reads a row per key and
+the history once on a database without it, so a rendering of `/keys` reads a row per key and
 per instance, however long the history. The summary covers every matching job: the count, the
 share of finished jobs that succeeded (without a result filter), and the median run time of
 finished jobs. The newest page of each filter updates live (below). Older pages stay as loaded,
@@ -1674,7 +1681,7 @@ first to refuse it, or that the job's restriction is not known; an address its r
 allowed only if a listed name's lookup resolved to it. As the node enforces it, a narrowing that
 declares one dimension allows none of the other, whatever the cap allows of it.
 
-`/clients`, *Connections* in the navigation, opens on its *GitLab* tab: each GitLab server the
+`/gitlab`, *GitLab* in the navigation, shows each GitLab server the
 hub takes jobs from (`vk-hub gitlabs`), its name and URL; then each relay (`vk-hub relays`) —
 its hostname and ID, whether it is connected, when it was last heard from, the server it is
 bound to and what the hub makes of it (the instance's name once approved, else *pending*,
@@ -1689,10 +1696,10 @@ report that no instance has, with the certificate key digest and version reporte
 reporting it since when; and, by instance, each project whose job the approval gate refused, with
 its path, ID, first job refused (linked to its GitLab page), the relay that submitted it, since
 when and how many jobs were refused. *Rejected* lists the servers rejected, when and by whom, and
-by instance the projects rejected. The navigation's *Connections* link counts the servers and
-projects pending, as *Egress* counts *New* rows. Its *Other API clients* tab
-(`/clients?tab=other`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
-instances using each. Both tabs show viewers and operators alike the
+by instance the projects rejected. The navigation's *GitLab* link counts the servers and
+projects pending, as *Egress* counts *New* rows. *Administration*'s *API keys*
+(`/keys`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
+instances using each. Both pages show viewers and operators alike the
 same things of a key and an instance. Each key shows its name, first 8
 characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
 revoked, expired or when it expires, when any of its instances was last heard from, how many
@@ -1707,15 +1714,15 @@ shows too is left out while it holds nothing: it is the
 same client, now using that key. What a client said is shown as text, and a runner's
 URL becomes a link only when it is a plain web URL without credentials.
 
-Operators create keys on the *Other API clients* tab with the same validation as `vk-hub keys
+Operators create keys on *API keys* with the same validation as `vk-hub keys
 create`: a name, scopes, comma-separated pools, optional limits on a job's memory, CPUs and disk, and a lifetime
 of 90 days (the default), 7, 30 or 365 days. Invalid names and policies get the CLI's reason.
 The form uses a plain POST outside the live fragment and returns a page showing the key once,
 with the hub's node address its client sends it to, as `Authorization: Bearer`; `vk-gitlab`
 needs none, as a relay. The key never appears in live updates, logs or audit entries.
 
-Operators add a GitLab server on the *GitLab* tab with the same validation as `vk-hub gitlabs
-add`: a name and a URL, by a plain POST back to the tab. A server no relay is bound to has a
+Operators add a GitLab server on the *GitLab* page with the same validation as `vk-hub gitlabs
+add`: a name and a URL, by a plain POST back to the page. A server no relay is bound to has a
 *Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
 applies only to the server confirmed, not to a namesake added since. Each relay has a *Remove*
 button that removes it, once confirmed, as `vk-hub relays remove` does: its key is no longer
@@ -1734,19 +1741,19 @@ projects it asked about, and the decision is refused should those have changed s
 store's refusals — a name taken or malformed, an approved server rejected, an instance gone —
 are shown as such. These forms are in the live fragment and post with the token set through
 `hx-headers`; each server's form and each project's box is `hx-preserve`d, so one being filled
-in is kept as the tab updates. A decision on projects applies only while their instance is
+in is kept as the page updates. A decision on projects applies only while their instance is
 still at the URL the page showed, and an instance lists at most 500 projects per state there,
 so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
 
 Below the GitLab servers, *Approved projects* lists the projects whose jobs run, by instance,
 with when and by whom each was approved; a server's count of approved projects links there.
-Pending, rejected and approved projects in Connections link to
-`/clients/projects/<instance>/<project ID>`, visible to viewers and operators. The page shows
+Pending, rejected and approved projects on the GitLab page link to
+`/gitlab/<instance>/projects/<project ID>`, visible to viewers and operators. The page shows
 its path, ID, instance, approval, last decision-maker, when the hub first heard of it, its first
 refused job and refusal count. It links to jobs with the same path and to observed traffic.
-Operators use the same decision buttons as on Connections, posting plain forms to `/clients`.
-Responses redirect to the project page, or to Connections after forgetting it. Job pages also
-link to their projects.
+Operators use the same decision buttons as on the GitLab page, posting plain forms to
+`/clients`. Responses redirect to the project page, or to the GitLab page after forgetting it.
+Job pages also link to their projects.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
@@ -1798,20 +1805,20 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   filled in is kept until that changes. That copy, shared by every operator, has no CSRF field: it
   posts with the token the page sets through `hx-headers` around the forms and the fragment.
 
-The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/clients` and a running
-job's page stay live over server-sent events. The hub notes every heartbeat, report, session,
-command outcome and desired-state change, by node; every release added or removed, rollout step
-and node enrolled, renamed or removed; every change to a placed job's record — submitted,
+The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/gitlab`, `/keys` and a
+running job's page stay live over server-sent events. The hub notes every heartbeat, report,
+session, command outcome and desired-state change, by node; every release added or removed, rollout
+step and node enrolled, renamed or removed; every change to a placed job's record — submitted,
 placed, accepted, at a new stage, finished, canceled or settled — and each hourly trim of the
 history; and, by job, each piece of its output stored, which wakes that job's page alone, never
 `/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
 nodes page is sent that one rendering; `/operations` likewise, once for every viewer's page and
-once for every operator's; `/clients` likewise, both its tabs' fragments in one rendering, woken
-by a key created, revoked or removed, a GitLab server added, removed, rejected or forgotten, an
-instance heard from anew, a hello recorded or instances pruned, a relay connected, disconnected,
-removed or reporting its inventory or runner states, and rendered once a heartbeat interval
-regardless while a stream is open, which moves its ages, what its instances hold and the relays'
-load. A
+once for every operator's; `/gitlab` and `/keys` likewise, both pages' fragments in one
+rendering, woken by a key created, revoked or removed, a GitLab server added, removed, rejected or
+forgotten, an instance heard from anew, a hello recorded or instances pruned, a relay connected,
+disconnected, removed or reporting its inventory or runner states, and rendered once a heartbeat
+interval regardless while a stream is open, which moves its ages, what its instances hold and the
+relays' load. A
 node's page is woken by changes to that node alone, and `/jobs` by changes to jobs alone, never
 by a heartbeat. `/jobs`' stream carries the page's filter in its URL
 (`/events/jobs?project=acme%2Fweb&result=failed`), checked as the page's query is, except that a

@@ -16,9 +16,9 @@ reservation, is charged to a **tenant** of it:
 - `runners`: each relay runner, by `{gitlab, runner_id}` — the instance's name and GitLab's
   runner ID, never the runner's name — mapped to a `tenant` and a `class`, `normal` or
   `production`. An unmapped runner gets no work.
-- `clients`: API keys, by principal ID (the *principal ID* column of Connections' *Other API
-  clients* tab), mapped to a tenant. A key mapped to none is charged to the `fallback` tenant;
-  an API key's work is always normal. Relay runners never fall back.
+- `clients`: API keys, by principal ID (the *principal ID* column of the web UI's *API keys*,
+  under *Administration*), mapped to a tenant. A key mapped to none is charged to the `fallback`
+  tenant; an API key's work is always normal. Relay runners never fall back.
 - `headroom`, `probe_limit`, `production_probe_burst`, `backoff_initial_secs`,
   `backoff_max_secs`, `busy_secs`: see [below](#scheduling).
 
@@ -53,14 +53,13 @@ order.
 
 ## Setting it
 
-In the hub's web UI, Connections' *Capacity tenants* lists tenants and links to their pages
-and the whole policy (`/clients/capacity`). Operators can add tenants there. Each tenant's
-page edits its weight and cap, lists projects and maps runners — picked among those the hub
-knows, or by instance and ID — and removes the tenant, unmapping its runners. Each project's
-page lists it for a tenant and edits its production branches and placement rules across all
-tenants listing it. The policy page edits the fallback tenant, API keys' tenants, scheduling
-settings and headroom, and the whole policy as JSON. Each change asks first, saying what it
-changes. Viewers see the same pages without forms.
+In the hub's web UI, *Capacity* (`/capacity`) lists tenants, linking to their pages, and
+operators add tenants there. Each tenant's page edits its weight and cap, lists projects and maps
+runners — picked among those the hub knows, or by instance and ID — and removes the tenant,
+unmapping its runners. Each project's page lists it for a tenant and edits its production branches
+and placement rules across all tenants listing it. The policy page edits the fallback tenant, API
+keys' tenants, scheduling settings and headroom, and the whole policy as JSON. Each change asks
+first, saying what it changes. Viewers see the same pages without forms.
 
 From the hub's host, through its admin socket:
 
@@ -86,11 +85,11 @@ project lists and placement rules as they are now.
 Capacity arbitration needs relay session protocol 2, which a `vk-gitlab` of this release speaks:
 
 1. **Upgrade the hub.** It keeps taking a protocol 1 relay's session, which follows, cancels and
-   settles the jobs it holds, but gets no capacity, reservation or new job: Connections marks
+   settles the jobs it holds, but gets no capacity, reservation or new job: the GitLab page marks
    the relay *upgrade vk-gitlab: no new jobs*. A job such a relay took from GitLab and had not
    yet submitted fails.
 2. **Map the runners.** Approve the relays' GitLab server, list each tenant's projects, and map
-   each runner by its GitLab ID, shown in Connections' *Runners*. The hub refuses a runner's
+   each runner by its GitLab ID, shown in the GitLab page's *Runners*. The hub refuses a runner's
    requests unless it is verified with GitLab, listed once in its relay's inventory with its
    GitLab ID, of the placement it requests, and mapped.
 3. **Upgrade the relays.** A relay of protocol 2 is refused by a hub that does not speak it: it
@@ -153,7 +152,7 @@ Placement rules restrict where a project's jobs go, by the ref the relay reports
 no trust boundary; see [placement](gitlab-dispatch.md#placement). The project's page explains
 them beside its editor.
 
-## Reading Connections
+## Reading the runners
 
 Each row of *Runners*, updated live as the hub's placement passes change it, shows the
 runner's tenant and class, or *unmapped* (`-` while its server is not approved), and what the

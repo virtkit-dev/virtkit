@@ -264,7 +264,7 @@ struct State {
     /// seconds; at most [`MAX_IMAGE_KEYS`] keys.
     warm: HashMap<String, HashMap<String, u64>>,
     /// The last [`step`]'s [`ArbitrationView`]s after [`ArbitrationView::settled`].
-    /// Changes wake Connections' live updates.
+    /// Changes wake the GitLab page's live updates.
     arbitration_shown: HashMap<(String, u64), ArbitrationView>,
 }
 
@@ -277,7 +277,7 @@ struct Demand {
     last_probe: Option<Instant>,
 }
 
-/// What a mapped relay runner's requests and jobs are doing, as Connections shows it.
+/// What a mapped relay runner's requests and jobs are doing, as the GitLab page shows it.
 #[derive(Default, Debug, PartialEq)]
 pub struct ArbitrationView {
     /// Its requests waiting for room.
@@ -3975,7 +3975,7 @@ async fn step(hub: &Hub) -> Result<()> {
             }
         }
         admission_changes = state.admission_changes.clone();
-        // What Connections shows of arbitration, in O(tickets + jobs) as the pass itself.
+        // What the GitLab page shows of arbitration, in O(tickets + jobs) as the pass itself.
         let mut shown = arbitration_views(&state, now);
         shown.values_mut().for_each(|view| *view = view.settled());
         arbitration_changed = shown != state.arbitration_shown;

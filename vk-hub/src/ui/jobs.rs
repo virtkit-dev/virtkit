@@ -1135,8 +1135,8 @@ fn registry_access(
                 (NoAccess::UnboundKey, _) => {
                     h.raw("Its relay was removed, or its GitLab server is no longer approved. ")
                         .raw("<a href=\"")
-                        .raw(super::clients::PATH)
-                        .raw("\">Connections</a>");
+                        .raw(super::clients::GITLAB_PATH)
+                        .raw("\">GitLab</a>");
                 }
                 (NoAccess::NodeWithoutJobTokens, _) => {
                     h.raw("Its node does not announce job tokens: it runs an older ")
@@ -1148,7 +1148,7 @@ fn registry_access(
                             .node(url)
                             .raw("</code>, an address no registry is bound to. <a href=\"")
                             .raw(super::registries::PATH)
-                            .raw("\">Registries</a>");
+                            .raw("\">Storage</a>");
                     }
                     None => {
                         h.raw("Its node names no registry.");

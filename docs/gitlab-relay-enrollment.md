@@ -25,7 +25,7 @@ later need was hung on its API key:
 
 | Need | Where it went | Why that hurts |
 |---|---|---|
-| who the daemon is | a `vkk_` key, shared by any number of daemons, told apart by a self-chosen `vk-client-instance` header | a key is a secret, not an identity; rotating it makes a new principal, so the Connections page shows each daemon twice |
+| who the daemon is | a `vkk_` key, shared by any number of daemons, told apart by a self-chosen `vk-client-instance` header | a key is a secret, not an identity; rotating it makes a new principal, so the API keys page shows each daemon twice |
 | which GitLab, which projects | `vk-hub gitlabs add`, then `keys create --gitlab --projects id:path,…` | three objects the operator keeps consistent by hand with the daemon's `[[runners]] url`; nothing says which projects actually run |
 | what the hub may place | the key's pools and largest envelope | a second policy beside the daemon's own placement |
 | presence | a hello every minute over HTTP | a poll pretending to be a session |
@@ -36,7 +36,7 @@ Nodes and registries have none of this: one token, one pinned identity, one sess
 ## Model
 
 - **The enrollment token is the operator's approval of the relay.** `vk-hub token create --kind
-  gitlab` issues it (CLI or the Connections page); spending it pins the relay's ed25519 key. From
+  gitlab` issues it (CLI or the GitLab page); spending it pins the relay's ed25519 key. From
   then on the relay is trusted like a node: it already holds the runner tokens and sees every
   job's secrets, so a hub-side ceiling on what it claims would protect little. Removing it from
   the page or with `vk-hub relays remove` revokes it; there is no pausing one short of that.
@@ -144,12 +144,12 @@ failure mapper, which falls back to `script_failure` where GitLab does not accep
 ending with:
 
 ```text
-ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/clients/projects/main/12
+ERROR: project acme/web (ID 12) is waiting for approval on the fleet hub: https://hub.example.com:8444/gitlab/main/projects/12
 Retry this job once an operator has approved it there.
 ```
 
 The refusal's `approval_url` links to the project's page on the hub's web UI. Older hubs and hubs
-without a UI omit it; the trace uses the enrolled hub URL with "(Connections > GitLab > Pending)"
+without a UI omit it; the trace uses the enrolled hub URL with "(GitLab > Pending)"
 ([gitlab-dispatch.md](gitlab-dispatch.md)).
 
 The job is not held: approval is a human step, and GitLab's `retry: when:
@@ -164,8 +164,8 @@ A refused submission retried under the same request ID counts once.
 | GitLab server | a relay reports a URL no server has | give it a name (`{gitlab}`) | its relays start polling |
 | project | a job of a project not approved for its server is submitted | by ID; the path is recorded and kept current from jobs | its jobs are accepted from every relay of that server |
 
-- **Where.** A *Pending* section on top of the Connections page's GitLab tab, and its count on
-  the Connections link, as the Egress link counts *New* items. Each row says which relay
+- **Where.** A *Pending* section on top of the GitLab page, and its count on
+  the GitLab link, as the Egress link counts *New* items. Each row says which relay
   reported it and when, and for a project its path, first job and how many jobs failed waiting.
   Rows of one group can be selected together for a bulk approve; no rule such as `acme/**`
   approves projects no one has looked at, at the cost of each new project's first job.
@@ -184,7 +184,7 @@ A refused submission retried under the same request ID counts once.
 
 A breaking release: no coexistence. vk-gitlab runs only as an enrolled relay, and GitLab-bound
 API keys go — `keys create --gitlab`/`--projects`, the key's binding and project ceiling, the
-Runner keys on the GitLab tab, and the hub's resolution of a job's server from its key. An API
+Runner keys on the GitLab page, and the hub's resolution of a job's server from its key. An API
 key's GitLab jobs are refused.
 
 The hub converts once, at its first start, so no operator state is lost: every server it knows
@@ -243,5 +243,5 @@ client reads as `other`.
    GitLab-bound keys.
 4. vk-gitlab: `join`, `leave`, the session, the signed hub client, the relay as the principal
    in state files, failing a job refused for approval; removal of its API key.
-5. UI: relays and runners on the GitLab tab, *Add relay*, the Pending section and its count,
+5. UI: relays and runners on the GitLab page, *Add relay*, the Pending section and its count,
    the Runner keys gone; land `c5d7f33b`.

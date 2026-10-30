@@ -618,7 +618,7 @@ async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
 async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
     let h = Harness::start(2, via).await;
     h.hub.set_slots("p1", 2);
-    let page = "https://ui.example.com:8444/clients/projects/gl/12";
+    let page = "https://ui.example.com:8444/gitlab/gl/projects/12";
     for (id, kind, url, said) in [
         (
             60,
