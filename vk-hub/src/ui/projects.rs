@@ -1,7 +1,7 @@
 //! `/gitlab/<instance>/projects/<project ID>`: a GitLab project's approval record, visible
 //! to viewers and operators. Shows its state, who last decided it, when the hub first heard
 //! of it, its first refused job and refusal count, with links to jobs and observed traffic.
-//! Operators approve, reject or forget it through the GitLab page's action ([`super::clients`]).
+//! Operators approve, reject or forget it through its server's page's action ([`super::clients`]).
 //! Rejecting or forgetting an approved project requires confirmation.
 //! [`super::capacity::project_section`] displays and edits its share of the capacity policy.
 //!
@@ -51,7 +51,7 @@ fn parse<'a>(gitlab: &'a str, id: &str) -> Option<(&'a str, u64)> {
 /// What the page shows.
 struct Shown {
     row: ProjectRow,
-    /// The instance URL posted with a decision for the store to check, as on the GitLab page.
+    /// The instance URL posted with a decision for the store to check, as on its server's page.
     url: String,
     instances: Instances<String>,
     /// The relay that submitted its first job refused, while the hub has it.
@@ -71,10 +71,11 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             let Ok(policy) = hub.db.capacity_policy() else {
                 return Ok(None);
             };
-            return Ok(policy
-                .project_any(&named, id)
-                .is_some()
-                .then_some(Err(policy)));
+            if policy.project_any(&named, id).is_none() {
+                return Ok(None);
+            }
+            let known = hub.db.gitlab(&named)?.is_some();
+            return Ok(Some(Err((policy, known))));
         };
         // Removing an instance forgets its projects; return no project if the instance vanished
         // between these reads.
@@ -96,7 +97,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
     .await?;
     let shown = match shown {
         Some(Ok(shown)) => shown,
-        Some(Err(policy)) => return unseen(gitlab, id, policy, auth),
+        Some(Err((policy, known))) => return unseen(gitlab, id, policy, known, auth),
         None => {
             return Ok(message(
                 StatusCode::NOT_FOUND,
@@ -195,11 +196,13 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
 }
 
 /// The page of a project the capacity policy lists but the hub holds no record of: its share
-/// alone.
+/// alone. It leads to its server's page while the hub has the server (`known`), otherwise to
+/// the servers' page.
 fn unseen(
     gitlab: &str,
     id: u64,
     policy: crate::policy::Policy,
+    known: bool,
     auth: &Auth,
 ) -> Result<Response<Body>> {
     let title = format!("{gitlab} project {id}");
@@ -207,9 +210,18 @@ fn unseen(
     main.raw("<h1>")
         .text(&title)
         .raw("</h1><p class=\"sub\">The hub has not seen this project: no job of it has ")
-        .raw("reached it yet. Approve it on <a href=\"")
-        .raw(clients::GITLAB_PATH)
-        .raw("\">GitLab</a> once one has.</p>");
+        .raw("reached it yet. ");
+    if known {
+        main.raw("Approve it on <a href=\"")
+            .text(clients::server_path(gitlab))
+            .raw("\">its server's page</a> once one has.</p>");
+    } else {
+        main.raw("The hub has no GitLab server <strong>")
+            .text(gitlab)
+            .raw("</strong> either: add or approve it on <a href=\"")
+            .raw(clients::GITLAB_PATH)
+            .raw("\">GitLab servers</a> first.</p>");
+    }
     super::capacity::project_section(&mut main, &Ok(policy), gitlab, id, auth)?;
     Ok(page(super::fleet::layout(
         &title,

@@ -1353,10 +1353,12 @@ or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in th
 provider (see [Signing in](#signing-in)).
 
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
-row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *Updates*, releases and
-rollouts), *GitLab*, *Capacity*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for
-operators, *Audit*). Connections' former addresses, `/clients[?tab=other]`, `/clients/capacity`,
-`/clients/tenants/<name>` and `/clients/projects/<instance>/<ID>`, redirect to their pages.
+row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *GitLab adapters*, the
+relays; *Updates*, releases and rollouts), *GitLab* (*Servers*, then a tab per server),
+*Capacity*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for operators, *Audit*).
+A section's link counts what waits in its tabs, each tab its own. Connections' former
+addresses, `/clients[?tab=other]`, `/clients/capacity`, `/clients/tenants/<name>` and
+`/clients/projects/<instance>/<ID>`, redirect to their pages.
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); the GitLab servers, and the API keys
@@ -1681,26 +1683,29 @@ first to refuse it, or that the job's restriction is not known; an address its r
 allowed only if a listed name's lookup resolved to it. As the node enforces it, a narrowing that
 declares one dimension allows none of the other, whatever the cap allows of it.
 
-`/gitlab`, *GitLab* in the navigation, shows each GitLab server the
-hub takes jobs from (`vk-hub gitlabs`), its name and URL; then each relay (`vk-hub relays`) —
+`/gitlab`, *GitLab* › *Servers* in the navigation, shows each GitLab server the hub takes jobs
+from (`vk-hub gitlabs`), its name, linked to its page `/gitlab/<name>`, URL and counts of relays
+and projects. A server's page shows its projects and the runners of the relays bound to it.
+`/relays`, *Nodes* › *GitLab adapters*, shows each relay (`vk-hub relays`) —
 its hostname and ID, whether it is connected, when it was last heard from, the server it is
 bound to and what the hub makes of it (the instance's name once approved, else *pending*,
 *rejected* or *reports another server*), the URL, certificate key digest and version it reports
-of that server, its version, runners and `concurrent`; then each relay's runners — GitLab's ID
+of that server, its version, runners and `concurrent`, then the runners of relays bound to no
+server the hub has. Each runner shows GitLab's ID
 for it, its pool, labels and envelope, its `limit`, its state (*polling*, *waiting for
 capacity*, *server not approved*, *unhealthy*, *token refused*, and *token not verified* when
 `verify` failed), the job requests it has outstanding, the jobs it holds, and when GitLab last
-answered it and with which HTTP status. What a relay said is shown as text. Above them,
-*Pending* lists what waits for an operator (`vk-hub gitlabs pending`): each GitLab server relays
-report that no instance has, with the certificate key digest and version reported and the relays
-reporting it since when; and, by instance, each project whose job the approval gate refused, with
-its path, ID, first job refused (linked to its GitLab page), the relay that submitted it, since
-when and how many jobs were refused. *Rejected* lists the servers rejected, when and by whom, and
-by instance the projects rejected. The navigation's *GitLab* link counts the servers and
-projects pending, as *Egress* counts *New* rows. *Administration*'s *API keys*
-(`/keys`) shows the API keys (see [Placed jobs](#placed-jobs)) and the client
-instances using each. Both pages show viewers and operators alike the
-same things of a key and an instance. Each key shows its name, first 8
+answered it and with which HTTP status. What a relay said is shown as text. On top of the servers'
+page, *Pending* lists the GitLab servers waiting for an operator (`vk-hub gitlabs pending`), each
+relays report that no instance has, with the certificate key digest and version reported and the
+relays reporting it since when; on top of a server's, each of its projects whose job the approval
+gate refused, with its path, ID, first job refused (linked to its GitLab page), the relay that
+submitted it, since when and how many jobs were refused. *Rejected* lists the servers rejected, when
+and by whom, and on a server's page its projects rejected, then *Approved projects*. The
+navigation's *GitLab* link counts the servers and projects pending, as *Egress* counts *New* rows.
+*Administration*'s *API keys* (`/keys`) shows the API keys (see [Placed jobs](#placed-jobs)) and
+the client instances using each. The servers' page, a server's, *GitLab adapters* and *API keys*
+show viewers and operators alike the same things. Each key shows its name, first 8
 characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
 revoked, expired or when it expires, when any of its instances was last heard from, how many
 instances it has, and how many of its jobs the history holds, linked to `/jobs?key=<key ID>`.
@@ -1721,38 +1726,37 @@ The form uses a plain POST outside the live fragment and returns a page showing 
 with the hub's node address its client sends it to, as `Authorization: Bearer`; `vk-gitlab`
 needs none, as a relay. The key never appears in live updates, logs or audit entries.
 
-Operators add a GitLab server on the *GitLab* page with the same validation as `vk-hub gitlabs
+Operators add a GitLab server on *GitLab* › *Servers* with the same validation as `vk-hub gitlabs
 add`: a name and a URL, by a plain POST back to the page. A server no relay is bound to has a
 *Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
-applies only to the server confirmed, not to a namesake added since. Each relay has a *Remove*
-button that removes it, once confirmed, as `vk-hub relays remove` does: its key is no longer
-pinned and its session ends. All are audited. *Add a relay* issues a single-use token of kind
-`gitlab`, valid an hour, as `vk-hub token create --kind gitlab` does, by a plain POST to
-`/tokens` answered by a page of its own showing it once with the `vk-gitlab join <hub-url>
+applies only to the server confirmed, not to a namesake added since. On *Nodes* › *GitLab adapters*,
+each relay has a *Remove* button that removes it, once confirmed, as `vk-hub relays remove` does:
+its key is no longer pinned and its session ends. All are audited. *Add a relay* issues a single-use
+token of kind `gitlab`, valid an hour, as `vk-hub token create --kind gitlab` does, by a plain POST
+to `/tokens` answered by a page of its own showing it once with the `vk-gitlab join <hub-url>
 --token -` that redeems it.
 
-Operators decide there on what is pending or rejected, as `vk-hub gitlabs approve|reject|forget`
-and `gitlabs projects approve|reject|forget` do, audited: a server is approved under a name typed
-beside it, rejected, or its rejection forgotten; an instance's projects are ticked, with *All*
-and *None* to tick or untick them at once, then approved, rejected or forgotten together, each
-where it changes something. Rejecting or forgetting an approved project is confirmed first,
-since its next jobs are refused; those under way go on. The confirmation names the approved
-projects it asked about, and the decision is refused should those have changed since. The
-store's refusals — a name taken or malformed, an approved server rejected, an instance gone —
-are shown as such. These forms are in the live fragment and post with the token set through
-`hx-headers`; each server's form and each project's box is `hx-preserve`d, so one being filled
-in is kept as the page updates. A decision on projects applies only while their instance is
-still at the URL the page showed, and an instance lists at most 500 projects per state there,
-so that ticking them all fits a form; `vk-hub gitlabs projects` lists the rest.
+Operators decide on what is pending or rejected, as `vk-hub gitlabs approve|reject|forget` and
+`gitlabs projects approve|reject|forget` do, audited: on the servers' page, a server is approved
+under a name typed beside it, rejected, or its rejection forgotten; on a server's page, its projects
+are ticked, with *All* and *None* to tick or untick them at once, then approved, rejected or
+forgotten together, each where it changes something. Rejecting or forgetting an approved project is
+confirmed first, since its next jobs are refused; those under way go on. The confirmation names the
+approved projects it asked about, and the decision is refused should those have changed since. The
+store's refusals — a name taken or malformed, an approved server rejected, an instance gone — are
+shown as such. These forms are in the live fragment and post with the token set through
+`hx-headers`; each server's form and each project's box is `hx-preserve`d, so one being filled in is
+kept as the page updates. A decision on projects applies only while their instance is still at the
+URL the page showed, and an instance lists at most 500 projects per state there, so that ticking
+them all fits a form; `vk-hub gitlabs projects` lists the rest.
 
-Below the GitLab servers, *Approved projects* lists the projects whose jobs run, by instance,
-with when and by whom each was approved; a server's count of approved projects links there.
-Pending, rejected and approved projects on the GitLab page link to
+On a server's page, *Approved projects* lists its projects whose jobs run, with when and by whom
+each was approved. Pending, rejected and approved projects there link to
 `/gitlab/<instance>/projects/<project ID>`, visible to viewers and operators. The page shows
 its path, ID, instance, approval, last decision-maker, when the hub first heard of it, its first
 refused job and refusal count. It links to jobs with the same path and to observed traffic.
-Operators use the same decision buttons as on the GitLab page, posting plain forms to
-`/clients`. Responses redirect to the project page, or to the GitLab page after forgetting it.
+Operators use the same decision buttons as on its server's page, posting plain forms to
+`/clients`. Responses redirect to the project page, or to its server's after forgetting it.
 Job pages also link to their projects.
 
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key

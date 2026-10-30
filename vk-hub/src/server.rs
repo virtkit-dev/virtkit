@@ -149,8 +149,12 @@ pub struct Hub {
     pub(crate) client_conns: Arc<Semaphore>,
     /// The client instances heard from.
     pub(crate) instances: crate::clients::Instances,
-    /// Bumped by [`Hub::clients_changed`] alone, for the clients page.
+    /// Bumped by [`Hub::clients_changed`] alone, for the keys', servers' and relays' pages (not
+    /// a server's).
     client_changes: watch::Sender<u64>,
+    /// Bumped by [`Hub::clients_changed`] and [`Hub::arbitration_changed`], for a GitLab
+    /// server's page.
+    server_changes: watch::Sender<u64>,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
     /// The keys registry tokens are signed with.
@@ -230,6 +234,7 @@ impl Hub {
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             instances: crate::clients::Instances::default(),
             client_changes: watch::Sender::new(0),
+            server_changes: watch::Sender::new(0),
             dispatch: crate::jobs::Dispatch::new(None, crate::jobs::DEFAULT_LOST_AFTER, None),
             token_keys: Arc::new(crate::tokens::Keys::new(
                 None,
@@ -377,18 +382,30 @@ impl Hub {
         *self.jobs.borrow()
     }
 
-    /// Note that something the GitLab and API keys pages show may have changed: an API key created,
-    /// revoked or removed, an instance heard from anew (first since the hub started, or since
-    /// memory forgot it), a hello recorded, or instances pruned; a GitLab server added, removed,
-    /// rejected or forgotten; a relay connected, disconnected, removed, or reporting anew; a
-    /// pass of the placement loop changing what a runner's requests and jobs are doing.
+    /// Note that something the GitLab, relays and API keys pages show may have changed: an API
+    /// key created, revoked or removed, an instance heard from anew (first since the hub
+    /// started, or since memory forgot it), a hello recorded, or instances pruned; a GitLab
+    /// server added, removed, rejected or forgotten; a relay connected, disconnected, removed,
+    /// or reporting anew.
     pub(crate) fn clients_changed(&self) {
         self.client_changes.send_modify(|n| *n = n.wrapping_add(1));
+        self.server_changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Notify GitLab server pages of changes to runners' requests and jobs from a placement pass.
+    /// Only server pages show this state.
+    pub(crate) fn arbitration_changed(&self) {
+        self.server_changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Wake on the next [`Hub::clients_changed`] only.
     pub(crate) fn subscribe_clients(&self) -> watch::Receiver<u64> {
         self.client_changes.subscribe()
+    }
+
+    /// Wake on the next [`Hub::clients_changed`] or [`Hub::arbitration_changed`].
+    pub(crate) fn subscribe_server(&self) -> watch::Receiver<u64> {
+        self.server_changes.subscribe()
     }
 
     /// Wake on the next [`Hub::changed`] of any node, or [`Hub::touch`].

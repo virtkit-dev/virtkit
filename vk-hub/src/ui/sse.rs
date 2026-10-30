@@ -628,6 +628,7 @@ mod tests {
             csrf: String::new(),
             secret,
             counts: Vec::new(),
+            gitlabs: Vec::new(),
         };
         (hub, auth)
     }

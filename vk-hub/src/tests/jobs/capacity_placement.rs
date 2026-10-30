@@ -283,7 +283,7 @@ async fn a_job_whose_project_is_listed_again_starts() {
         crate::jobs::testing::job_blocked(&hub, &job),
         Some("project no longer listed for its tenant")
     );
-    // The GitLab page gives it as its runner's reason, with no request of the runner waiting.
+    // Its server's page gives it as its runner's reason, with no request of the runner waiting.
     let snapshot = crate::jobs::arbitration_snapshot(&hub).unwrap();
     let view = &snapshot[&("gl".to_string(), 42)];
     assert_eq!(
@@ -296,10 +296,10 @@ async fn a_job_whose_project_is_listed_again_starts() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A pass changing why a runner's job waits wakes the GitLab page's live updates; one changing
-/// nothing does not.
+/// A pass changing why a runner's job waits wakes the live updates of its server's page, and of
+/// no other GitLab page; one changing nothing does not.
 #[tokio::test]
-async fn a_pass_changing_a_runner_s_reason_wakes_the_gitlab_page() {
+async fn a_pass_changing_a_runner_s_reason_wakes_its_server_s_page() {
     let dir = scratch("placement-wakes");
     let db = Arc::new(Db::open_memory().unwrap());
     let (addr, hub) = serve_undriven(db, &dir, Duration::from_secs(30)).await;
@@ -307,17 +307,20 @@ async fn a_pass_changing_a_runner_s_reason_wakes_the_gitlab_page() {
     ready_relay(&hub, &key);
     let job = submit(addr, &key, job_body(1, None, 30), None).await;
     crate::jobs::testing::step(&hub).await;
+    let mut server = hub.subscribe_server();
+    server.mark_unchanged();
     let mut clients = hub.subscribe_clients();
     clients.mark_unchanged();
     crate::jobs::testing::step(&hub).await;
-    assert!(!clients.has_changed().unwrap());
+    assert!(!server.has_changed().unwrap());
     list_project(&hub, false);
     crate::jobs::testing::step(&hub).await;
     assert_eq!(
         crate::jobs::testing::job_blocked(&hub, &job),
         Some("project no longer listed for its tenant")
     );
-    assert!(clients.has_changed().unwrap());
+    assert!(server.has_changed().unwrap());
+    assert!(!clients.has_changed().unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

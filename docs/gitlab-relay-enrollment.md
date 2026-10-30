@@ -36,7 +36,7 @@ Nodes and registries have none of this: one token, one pinned identity, one sess
 ## Model
 
 - **The enrollment token is the operator's approval of the relay.** `vk-hub token create --kind
-  gitlab` issues it (CLI or the GitLab page); spending it pins the relay's ed25519 key. From
+  gitlab` issues it (CLI or Nodes › GitLab adapters); spending it pins the relay's ed25519 key. From
   then on the relay is trusted like a node: it already holds the runner tokens and sees every
   job's secrets, so a hub-side ceiling on what it claims would protect little. Removing it from
   the page or with `vk-hub relays remove` revokes it; there is no pausing one short of that.
@@ -164,7 +164,7 @@ A refused submission retried under the same request ID counts once.
 | GitLab server | a relay reports a URL no server has | give it a name (`{gitlab}`) | its relays start polling |
 | project | a job of a project not approved for its server is submitted | by ID; the path is recorded and kept current from jobs | its jobs are accepted from every relay of that server |
 
-- **Where.** A *Pending* section on top of the GitLab page, and its count on
+- **Where.** A *Pending* section on top of the GitLab pages, and its count on
   the GitLab link, as the Egress link counts *New* items. Each row says which relay
   reported it and when, and for a project its path, first job and how many jobs failed waiting.
   Rows of one group can be selected together for a bulk approve; no rule such as `acme/**`
@@ -243,5 +243,5 @@ client reads as `other`.
    GitLab-bound keys.
 4. vk-gitlab: `join`, `leave`, the session, the signed hub client, the relay as the principal
    in state files, failing a job refused for approval; removal of its API key.
-5. UI: relays and runners on the GitLab page, *Add relay*, the Pending section and its count,
+5. UI: relays and runners on the GitLab pages, *Add relay*, the Pending section and its count,
    the Runner keys gone; land `c5d7f33b`.

@@ -1576,7 +1576,7 @@ async fn a_refusal_for_approval_links_the_project_s_page_on_the_web_ui() {
         (error.code, error.approval_url.as_deref()),
         (ErrorCode::ProjectRejected, page)
     );
-    // A refusal of its server links the GitLab page, which lists it.
+    // A refusal of its server links the servers' page, which lists it.
     assert_eq!(crate::ui::approval_path(None, 42), "/gitlab");
     std::fs::remove_dir_all(&dir).unwrap();
 }

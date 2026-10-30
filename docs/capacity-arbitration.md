@@ -85,11 +85,11 @@ project lists and placement rules as they are now.
 Capacity arbitration needs relay session protocol 2, which a `vk-gitlab` of this release speaks:
 
 1. **Upgrade the hub.** It keeps taking a protocol 1 relay's session, which follows, cancels and
-   settles the jobs it holds, but gets no capacity, reservation or new job: the GitLab page marks
+   settles the jobs it holds, but gets no capacity, reservation or new job: *GitLab adapters* marks
    the relay *upgrade vk-gitlab: no new jobs*. A job such a relay took from GitLab and had not
    yet submitted fails.
 2. **Map the runners.** Approve the relays' GitLab server, list each tenant's projects, and map
-   each runner by its GitLab ID, shown in the GitLab page's *Runners*. The hub refuses a runner's
+   each runner by its GitLab ID under *Runners* on its server's page. The hub refuses a runner's
    requests unless it is verified with GitLab, listed once in its relay's inventory with its
    GitLab ID, of the placement it requests, and mapped.
 3. **Upgrade the relays.** A relay of protocol 2 is refused by a hub that does not speak it: it

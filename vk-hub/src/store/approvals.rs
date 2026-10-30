@@ -955,18 +955,20 @@ impl Db {
         Ok((url, removed))
     }
 
-    /// How many GitLab servers and projects wait for an operator: what the GitLab link
-    /// counts.
-    pub fn gitlab_pending(&self) -> Result<u64> {
+    /// How many GitLab servers wait for an operator, and how many of each instance's
+    /// projects, by name: what the GitLab links count.
+    pub fn gitlab_pending_by_instance(&self) -> Result<(u64, BTreeMap<String, u64>)> {
         let servers = self.pending_gitlabs()?.len();
         let txn = self.db.begin_read().context("starting a read")?;
-        let mut projects = 0usize;
+        let mut projects: BTreeMap<String, u64> = BTreeMap::new();
         for entry in txn.open_table(GITLAB_PROJECTS)?.iter()? {
-            if decode::<ProjectRow>(entry?.1.value())?.state == ProjectState::Pending {
-                projects = projects.saturating_add(1);
+            let (key, value) = entry?;
+            if decode::<ProjectRow>(value.value())?.state == ProjectState::Pending {
+                let n = projects.entry(key.value().0.to_string()).or_default();
+                *n = n.saturating_add(1);
             }
         }
-        Ok(u64::try_from(servers.saturating_add(projects)).unwrap_or(u64::MAX))
+        Ok((u64::try_from(servers).unwrap_or(u64::MAX), projects))
     }
 
     /// The servers rejected, by URL.
@@ -1182,7 +1184,10 @@ mod tests {
         let rid = |n: u8| format!("{n:02x}").repeat(16);
         let gate = |job: &GateJob<'_>, n: u8| db.gate_job(&id, job, (&rid(n), "d"), 10).unwrap();
         // The server waits, counted as pending.
-        assert_eq!(db.gitlab_pending().unwrap(), 1);
+        assert_eq!(
+            db.gitlab_pending_by_instance().unwrap(),
+            (1, BTreeMap::new()),
+        );
         // Refused, the refusal kept as the request's answer.
         assert_eq!(
             code(gate(&job(4, "acme/web"), 1)),
@@ -1193,7 +1198,10 @@ mod tests {
         // A refusal of its server names no instance.
         assert_eq!(answer.refusal().unwrap().gitlab, None);
         db.reject_gitlab("https://gl.example", "u", 2).unwrap();
-        assert_eq!(db.gitlab_pending().unwrap(), 0);
+        assert_eq!(
+            db.gitlab_pending_by_instance().unwrap(),
+            (0, BTreeMap::new()),
+        );
         assert_eq!(
             code(gate(&job(4, "acme/web"), 2)),
             ErrorCode::ProjectRejected
@@ -1232,7 +1240,10 @@ mod tests {
             (p.id, p.row.state, p.row.refused),
             (4, ProjectState::Pending, 2)
         );
-        assert_eq!(db.gitlab_pending().unwrap(), 1);
+        assert_eq!(
+            db.gitlab_pending_by_instance().unwrap(),
+            (0, BTreeMap::from([("gl".to_string(), 1)])),
+        );
         assert_eq!(
             (p.row.first_job, p.row.relay.as_deref(), p.row.path.as_str()),
             (Some(104), Some(id.as_str()), "acme/web")
@@ -1247,7 +1258,10 @@ mod tests {
         let approve = [ProjectRef::parse("4").unwrap()];
         db.decide_projects("gl", &approve, Decision::Approve, "u", 6)
             .unwrap();
-        assert_eq!(db.gitlab_pending().unwrap(), 0);
+        assert_eq!(
+            db.gitlab_pending_by_instance().unwrap(),
+            (0, BTreeMap::new()),
+        );
         assert_eq!(gate(&job(4, "acme/web"), 6), Gate::Pass("gl".into()));
         assert_eq!(gate(&job(4, "acme/site"), 7), Gate::Pass("gl".into()));
         assert_eq!(

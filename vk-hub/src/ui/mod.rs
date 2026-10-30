@@ -93,7 +93,7 @@ pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
 pub const LOGIN_PATH: &str = "/login";
 
 /// The approval page for instance `gitlab`'s project `id`.
-/// Without an instance (a server refusal), use the GitLab page, which lists pending servers.
+/// Without an instance (a server refusal), use the servers' page, which lists pending servers.
 pub fn approval_path(gitlab: Option<&str>, id: u64) -> String {
     gitlab.map_or_else(
         || clients::GITLAB_PATH.to_owned(),
@@ -383,7 +383,10 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                 && !path.starts_with("/events/")
                 && fleet::moved(&path, req.uri().query()).is_none()
             {
-                auth.counts = fleet::nav_counts(&ui.hub).await?;
+                // Unlike a post's, a page has nothing to carry on with without it.
+                let nav = fleet::nav_data(&ui.hub).await?;
+                auth.counts = nav.counts;
+                auth.gitlabs = nav.gitlabs;
             }
             let swap = jobs::filter_swap(req.headers());
             get(&path, req.uri().query(), &auth, ui, swap).await
@@ -643,6 +646,9 @@ pub struct Auth {
     /// The counts its page's navigation shows beside its tabs, by path: things waiting for
     /// someone, such as New egress rows. Filled for a fleet page alone.
     pub counts: Vec<(String, u64)>,
+    /// The GitLab servers its page's navigation has a tab for, by name. Filled for a fleet
+    /// page alone.
+    pub gitlabs: Vec<String>,
 }
 
 /// The session the request's cookie names if it is live, or why there is none.
@@ -662,6 +668,7 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
             csrf,
             secret,
             counts: Vec::new(),
+            gitlabs: Vec::new(),
         })
         .ok_or(ui.texts().signed_out))
 }
@@ -764,7 +771,7 @@ async fn check_caller(
     if !from_own_page(headers, &ui.origin, false) {
         return Ok(Err((StatusCode::FORBIDDEN, CROSS_ORIGIN)));
     }
-    let auth = match authenticate(headers, ui).await? {
+    let mut auth = match authenticate(headers, ui).await? {
         Ok(auth) => auth,
         Err(why) => return Ok(Err((StatusCode::UNAUTHORIZED, why))),
     };
@@ -773,6 +780,20 @@ async fn check_caller(
             StatusCode::FORBIDDEN,
             "Refused: this needs the operator role.",
         )));
+    }
+    // For the navigation of a page answering it: a confirmation, a refusal, a token shown. An
+    // htmx post is answered in the flash, with no navigation. Unread, the navigation shows no
+    // server's tab nor count: the action goes on.
+    if let Site::Fleet(_) = &ui.site
+        && !headers.contains_key("hx-request")
+    {
+        match fleet::nav_data(&ui.hub).await {
+            Ok(nav) => {
+                auth.counts = nav.counts;
+                auth.gitlabs = nav.gitlabs;
+            }
+            Err(e) => eprintln!("vk-hub: ui: reading the navigation: {e:#}"),
+        }
     }
     Ok(Ok(auth))
 }

@@ -205,7 +205,10 @@ fn other_tab_counts(nav: &Nav, here_section: usize, counts: &[(String, u64)]) ->
 }
 
 /// `nav`'s `counts`, by tab path, for a live page to swap in out of band where its top bar
-/// shows them: each section's sum, and the tab's own where the section shows its tabs.
+/// shows them: each section's sum, and the tab's own where the section shows its tabs. Tabs
+/// stay those of the page as loaded, until it is reloaded: one added since, such as a new
+/// GitLab server's, has its count sent with no element to swap it into, which htmx reports as
+/// `htmx:oobErrorNoTarget`; one removed since stays.
 pub fn counts_oob(nav: &Nav, counts: &[(String, u64)]) -> Html {
     let mut h = Html::new();
     for section in nav {

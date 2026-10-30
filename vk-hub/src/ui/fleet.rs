@@ -108,6 +108,8 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         super::jobs::EVENT => Some(super::jobs::EVENT),
         super::clients::EVENT => Some(super::clients::EVENT),
         super::clients::GITLAB_EVENT => Some(super::clients::GITLAB_EVENT),
+        super::clients::RELAYS_EVENT => Some(super::clients::RELAYS_EVENT),
+        _ if super::clients::server_event(event).is_some() => Some(super::clients::SERVER_EVENT),
         super::egress::EVENT => Some(super::egress::EVENT),
         _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
@@ -157,18 +159,19 @@ pub(super) fn source(
                 super::egress::source(hub, &site.egress, query, steer),
             ));
         }
-        // Either tab's: one rendering of both, each tab told of its session's end in its own.
-        super::clients::EVENT | super::clients::GITLAB_EVENT => {
+        // The keys', servers' or relays' page's: one rendering of the three, each page told of
+        // its session's end in its own.
+        super::clients::EVENT | super::clients::GITLAB_EVENT | super::clients::RELAYS_EVENT => {
             let feed = if steer {
                 &site.steered_clients_feed
             } else {
                 &site.clients_feed
             };
             return Some(Source::Shared {
-                name: if event == super::clients::EVENT {
-                    super::clients::EVENT
-                } else {
-                    super::clients::GITLAB_EVENT
+                name: match event {
+                    super::clients::EVENT => super::clients::EVENT,
+                    super::clients::GITLAB_EVENT => super::clients::GITLAB_EVENT,
+                    _ => super::clients::RELAYS_EVENT,
                 },
                 feed: feed.subscribe(),
                 events: clients_events(hub, steer),
@@ -194,6 +197,13 @@ pub(super) fn source(
             });
         }
         _ => {}
+    }
+    if let Some(name) = super::clients::server_event(event) {
+        return Some(Source::Own {
+            name: super::clients::SERVER_EVENT,
+            changes: hub.subscribe_server(),
+            render: counted(hub, super::clients::server_render(hub, name, steer)),
+        });
     }
     let id = event
         .strip_prefix("node/")
@@ -294,7 +304,7 @@ pub(super) async fn get(
             auth,
             &audit,
             Some(&subjects),
-            &nav(auth.session.role >= Role::Operator),
+            &nav(auth.session.role >= Role::Operator, &auth.gitlabs),
         ))));
     }
     if path == super::users::PATH {
@@ -311,9 +321,14 @@ pub(super) async fn get(
     if let Some(to) = moved(path, query) {
         return Ok(Some(moved_permanently(&to)));
     }
-    if path == super::clients::GITLAB_PATH || path == super::clients::KEYS_PATH {
-        let keys = path == super::clients::KEYS_PATH;
-        return super::clients::get(keys, auth, ui).await.map(Some);
+    let clients = match path {
+        super::clients::KEYS_PATH => Some(super::clients::Page::Keys),
+        super::clients::GITLAB_PATH => Some(super::clients::Page::Servers),
+        super::clients::RELAYS_PATH => Some(super::clients::Page::Relays),
+        _ => super::clients::server_target(path).map(super::clients::Page::Server),
+    };
+    if let Some(at) = clients {
+        return super::clients::get(at, auth, ui).await.map(Some);
     }
     if path == super::capacity::PATH {
         return super::capacity::policy_get(auth, ui).await.map(Some);
@@ -809,13 +824,14 @@ pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html 
         title,
         here,
         auth,
-        &nav(auth.session.role >= Role::Operator),
+        &nav(auth.session.role >= Role::Operator, &auth.gitlabs),
         main,
     )
 }
 
-/// The fleet's navigation: an operator's (`users`) has the users page too.
-fn nav(users: bool) -> Vec<pages::Section> {
+/// The fleet's navigation, with a tab for each of `gitlabs`, the GitLab servers by name: an
+/// operator's (`users`) has the users page too.
+fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
     use pages::{Section, Tab, tab};
     let one = |path: &str, label: &'static str| Section {
         label,
@@ -836,10 +852,20 @@ fn nav(users: bool) -> Vec<pages::Section> {
                     also: &["/registry"],
                     ..tab(super::registries::PATH, "Storage")
                 },
+                tab(super::clients::RELAYS_PATH, "GitLab adapters"),
                 tab("/operations", "Updates"),
             ],
         },
-        one(super::clients::GITLAB_PATH, "GitLab"),
+        Section {
+            label: "GitLab",
+            tabs: std::iter::once(tab(super::clients::GITLAB_PATH, "Servers"))
+                .chain(
+                    gitlabs
+                        .iter()
+                        .map(|name| tab(&super::clients::server_path(name), name)),
+                )
+                .collect(),
+        },
         one(super::capacity::PATH, "Capacity"),
         one(super::jobs::PATH, "Jobs"),
         one(super::egress::PATH, "Egress"),
@@ -850,24 +876,34 @@ fn nav(users: bool) -> Vec<pages::Section> {
     ]
 }
 
-/// The counts the fleet's navigation shows: the New egress rows, and the GitLab servers and
-/// projects waiting for approval.
-pub(super) async fn nav_counts(hub: &Arc<Hub>) -> Result<Vec<(String, u64)>> {
+/// What the fleet's navigation shows of the database ([`NavData`]).
+pub(super) async fn nav_data(hub: &Arc<Hub>) -> Result<NavData> {
     let hub = hub.clone();
-    blocking(move || counts(&hub)).await
+    blocking(move || nav_read(&hub)).await
 }
 
-fn counts(hub: &Hub) -> Result<Vec<(String, u64)>> {
-    Ok(vec![
+/// The counts the fleet's navigation shows, by tab path — the New egress rows, the GitLab
+/// servers waiting for approval and each server's projects — and the GitLab servers by name.
+pub(super) struct NavData {
+    pub(super) counts: Vec<(String, u64)>,
+    pub(super) gitlabs: Vec<String>,
+}
+
+fn nav_read(hub: &Hub) -> Result<NavData> {
+    let (servers, mut projects) = hub.db.gitlab_pending_by_instance()?;
+    let gitlabs: Vec<String> = hub.db.gitlabs()?.into_iter().map(|(n, _)| n).collect();
+    let mut counts = vec![
         (
             super::egress::PATH.to_string(),
             hub.db.egress_new(crate::now_secs())?,
         ),
-        (
-            super::clients::GITLAB_PATH.to_string(),
-            hub.db.gitlab_pending()?,
-        ),
-    ])
+        (super::clients::GITLAB_PATH.to_string(), servers),
+    ];
+    for name in &gitlabs {
+        let n = projects.remove(name).unwrap_or(0);
+        counts.push((super::clients::server_path(name), n));
+    }
+    Ok(NavData { counts, gitlabs })
 }
 
 /// `render`, followed by the navigation's counts for the page to swap in out of band: each live
@@ -881,10 +917,13 @@ fn counted(hub: &Arc<Hub>, render: sse::Render) -> sse::Render {
 /// The navigation's counts alone, for a page to swap in out of band ([`counted`]).
 fn counts_oob(hub: &Arc<Hub>) -> sse::Render {
     let hub = hub.clone();
-    Arc::new(move || Ok(pages::counts_oob(&nav(false), &counts(&hub)?).into_string()))
+    Arc::new(move || {
+        let data = nav_read(&hub)?;
+        Ok(pages::counts_oob(&nav(false, &data.gitlabs), &data.counts).into_string())
+    })
 }
 
-/// `/gitlab`' and `/keys`' events, each page's fragment followed by the navigation's counts
+/// `/keys`', `/gitlab`' and `/relays`' events, each page's fragment followed by the navigation's counts
 /// ([`counted`]): a page swaps in its own alone.
 fn clients_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     super::clients::events(hub, steer)
@@ -1059,15 +1098,15 @@ fn relay_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
         .raw("<code>run</code>, <code>--ca &lt;file&gt;</code> when the hub's certificate is not ")
         .raw("one the system's roots verify, and <code>--replace</code> to enroll a relay ")
         .raw("enrolled already, as a new one. Its config names its GitLab server in ")
-        .raw("<code>[gitlab] url</code>; the server waits for approval on the GitLab page until ")
+        .raw("<code>[gitlab] url</code>; the server waits for approval on GitLab's Servers until ")
         .raw("an operator gives it a name. Read on stdin, the token stays out of the shell's ")
         .raw("history and the process list.</p>")
         .raw("<p><a href=\"")
-        .raw(super::clients::GITLAB_PATH)
-        .raw("\">Back to the GitLab page</a></p>");
+        .raw(super::clients::RELAYS_PATH)
+        .raw("\">Back to the GitLab adapters</a></p>");
     layout(
         "Relay enrollment token",
-        super::clients::GITLAB_PATH,
+        super::clients::RELAYS_PATH,
         auth,
         &main,
     )

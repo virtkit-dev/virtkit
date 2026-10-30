@@ -1,12 +1,14 @@
-//! `/gitlab` and `/keys`, for viewers and operators alike: the GitLab servers, the relays and
-//! their runners; and the API keys the client API takes and the client instances using each —
-//! the host, program and runners an instance's hello named, when it was last heard from and
-//! what it holds. Both pages post to `/clients`. Both pages' fragments are rendered once for all
-//! open viewers' pages and once for all operators' ([`sse::feed`]), on what
-//! [`Hub::clients_changed`] notes, and, while a page is open, once a heartbeat interval, which
-//! moves the ages, what the instances hold and the relays' load.
+//! `/keys`, `/gitlab`, `/gitlab/<name>` and `/relays`, for viewers and operators alike: the
+//! API keys the client API takes and the client instances using each — the host, program and
+//! runners an instance's hello named, when it was last heard from and what it holds; the GitLab
+//! servers; a server's projects and runners; and the relays. All four post to `/clients`. The
+//! keys', servers' and relays' fragments are rendered once for all open viewers' pages and once
+//! for all operators' ([`sse::feed`]), on what [`Hub::clients_changed`] notes; a server's page
+//! renders its own on a stream per connection, on that and on what
+//! [`Hub::arbitration_changed`] notes. Each also renders once a heartbeat interval while open,
+//! which moves the ages, what the instances hold and the relays' load.
 //!
-//! Operators create, revoke and remove keys here as `vk-hub keys create` and `vk-hub keys
+//! Operators create, revoke and remove keys on `/keys` as `vk-hub keys create` and `vk-hub keys
 //! revoke` do, as their session's principal. A key is created by a plain form outside the
 //! fragment, whose answer is a page of its own showing the key this once: it is never in a
 //! fragment, a log or the audit log. The operator's fragment carries a revoke button on each
@@ -15,30 +17,32 @@
 //! page sets through `hx-headers`, and asks first ([`actions::ask_first`]). The store acts only
 //! on the keys the operator confirmed ([`crate::store::Db::revoke_api_keys_as_seen`]).
 //!
-//! The GitLab page shows the GitLab servers, then the relays enrolled — their reach, server,
-//! what they report of it — and their runners, with what each is doing. Operators add GitLab
-//! servers there, as `vk-hub gitlabs add` does, by a plain form outside the fragment, remove
-//! one no relay is bound to, as `vk-hub gitlabs remove` does, and remove a relay, as `vk-hub
-//! relays remove` does, by buttons in the fragment that ask first.
+//! `/gitlab` lists, under *Pending*, the GitLab servers relays report that no instance has;
+//! under *Rejected*, those an operator rejected; then the servers the hub has, each linking to
+//! its page. Operators approve, reject and forget the first two, as `vk-hub gitlabs
+//! approve|reject|forget` do, one at a time and a server under the name its approval gives it;
+//! add servers, as `vk-hub gitlabs add` does, by a plain form outside the fragment; and remove
+//! one no relay is bound to, as `vk-hub gitlabs remove` does, by a button that asks first.
 //!
-//! Above them, *Pending* lists the GitLab servers relays report that no instance has, and the
-//! projects whose jobs the approval gate refused, by instance; *Rejected* those an operator
-//! rejected. Operators approve, reject and forget them there, as `vk-hub gitlabs
-//! approve|reject|forget` and `vk-hub gitlabs projects approve|reject|forget` do: a server one
-//! at a time, under the name its approval gives it, and an instance's projects together, by
-//! ticking them. Each server's form and each project's box is `hx-preserve`d under an ID of
+//! A server's page lists, under *Pending*, its projects whose jobs the approval gate refused;
+//! under *Rejected*, those an operator rejected; under *Approved projects*, those whose jobs
+//! run; then the runners of the relays bound to it. Operators approve, reject and forget its
+//! projects there together, by ticking them, as `vk-hub gitlabs projects approve|reject|forget`
+//! do. Projects link to their pages ([`super::projects`]), whose buttons post here. Rejecting
+//! or forgetting an approved project requires confirmation ([`actions::ask_first`]): its next
+//! jobs are refused. Each server's form and each project's box is `hx-preserve`d under an ID of
 //! what it decides on, so the fragment's updates leave one being filled in alone.
 //!
-//! Below the servers, *Approved projects* lists the projects whose jobs run, by instance, for
-//! operators to reject or forget. Pending, rejected and approved projects link to their pages
-//! ([`super::projects`]), whose buttons post here. Rejecting or forgetting an approved project
-//! requires confirmation ([`actions::ask_first`]): its next jobs are refused.
+//! `/relays` lists the relays enrolled — their reach, server, what they report of it — then the
+//! runners of those bound to no server the hub has, which no server's page shows. Operators add
+//! a relay by a plain form outside the fragment, and remove one, as `vk-hub relays remove` does,
+//! by a button that asks first.
 //!
 //! Each runner shows the tenant and class it is mapped to, and how the hub schedules it: its
 //! requests waiting, offered and held, its jobs, its demand and backoff, and why it waits.
 //! Each API key shows the principal ID the policy's `clients` assigns it by.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,8 +71,12 @@ use vk_hub_proto::gitlab::{RunnerState, ServerState, ServerStatus};
 /// Connections' two tabs; GET requests now redirect to the corresponding page.
 pub(super) const PATH: &str = "/clients";
 
-/// The GitLab page: the servers, their projects, relays and runners.
+/// The GitLab servers' page; each server's is under it, `/gitlab/<name>`, with its projects
+/// and runners.
 pub(super) const GITLAB_PATH: &str = "/gitlab";
+
+/// The relays' page, under Nodes.
+pub(super) const RELAYS_PATH: &str = "/relays";
 
 /// The API keys page: the keys and their instances.
 pub(super) const KEYS_PATH: &str = "/keys";
@@ -80,40 +88,116 @@ pub(super) const EVENT: &str = "clients";
 /// `vk-hub keys create`; the CLI takes any lifetime up to [`crate::store::MAX_KEY_TTL`].
 const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
 
-/// The event the GitLab page's fragment is swapped in on, and its stream's name under
-/// `/events/`. Both pages' streams carry both pages' fragments, rendered once for all of them.
+/// The event the GitLab servers' fragment is swapped in on, and its stream's name under
+/// `/events/`. The keys', servers' and relays' streams carry the three pages' fragments,
+/// rendered once for all of them.
 pub(super) const GITLAB_EVENT: &str = "gitlab";
 
-/// What the page shows: every key and its instances, the GitLab servers, those pending and
-/// those rejected, every project decided or pending, and the relays.
+/// The event the relays' fragment is swapped in on, and its stream's name under `/events/`.
+pub(super) const RELAYS_EVENT: &str = "relays";
+
+/// The event a server's fragment is swapped in on; its stream is `/events/gitlab/<name>`, of
+/// its page alone.
+pub(super) const SERVER_EVENT: &str = "gitlab-server";
+
+/// The page of GitLab server `name`.
+pub(super) fn server_path(name: &str) -> String {
+    format!("{GITLAB_PATH}/{name}")
+}
+
+/// The GitLab server a page at `path` is of, by name.
+pub(super) fn server_target(path: &str) -> Option<&str> {
+    path.strip_prefix(GITLAB_PATH)?
+        .strip_prefix('/')
+        .filter(|name| crate::store::valid_gitlab_name(name))
+}
+
+/// The GitLab server `/events/<event>` follows, `gitlab/<name>`, if it is one.
+pub(super) fn server_event(event: &str) -> Option<&str> {
+    event
+        .strip_prefix("gitlab/")
+        .filter(|name| crate::store::valid_gitlab_name(name))
+}
+
+/// A page of these: the API keys, the GitLab servers, one server, or the relays.
+#[derive(Clone, Copy)]
+pub(super) enum Page<'a> {
+    Keys,
+    Servers,
+    Server(&'a str),
+    Relays,
+}
+
+/// What a GitLab page shows: the GitLab servers, and what [`Shown::read`] reads for the page.
 struct Shown {
-    views: Vec<KeyView>,
     gitlabs: Vec<(String, GitlabRow)>,
+    /// The servers pending and rejected: the servers' page's alone.
     pending: Vec<PendingGitlab>,
     rejected: Vec<(String, RejectedGitlab)>,
+    /// Every project decided or pending for the servers' page; the server's for its page.
     projects: Vec<ProjectView>,
     relays: Vec<RelayView>,
-    /// The capacity policy, or why this hub cannot read it.
+    /// The capacity policy, or why this hub cannot read it; the default where no runner shows.
     policy: Result<crate::policy::Policy>,
     /// What each mapped runner's requests and jobs are doing, by GitLab instance and runner ID.
     /// Read under the dispatch lock in O(tickets + jobs), with up to 8192 tickets kept, on
-    /// every render of the GitLab page, its live updates included.
+    /// every render of a server's page, its live updates included; empty for the other pages.
     arbitration: HashMap<(String, u64), crate::jobs::ArbitrationView>,
 }
 
+/// The GitLab page [`Shown::read`] reads for.
+#[derive(Clone, Copy)]
+enum For<'a> {
+    Servers,
+    Server(&'a str),
+    Relays,
+}
+
 impl Shown {
-    /// Reads the database: call off the runtime.
-    fn read(hub: &Hub) -> Result<Self> {
+    /// Reads what page `page` shows: call off the runtime.
+    fn read(hub: &Hub, page: For<'_>) -> Result<Self> {
+        let servers = matches!(page, For::Servers);
+        let server = match page {
+            For::Server(name) => Some(name),
+            For::Servers | For::Relays => None,
+        };
+        let runners = !servers;
         Ok(Shown {
-            views: crate::clients::views(hub)?,
             gitlabs: hub.db.gitlabs()?,
-            pending: hub.db.pending_gitlabs()?,
-            rejected: hub.db.rejected_gitlabs()?,
-            projects: hub.db.gitlab_projects(None)?,
+            pending: if servers {
+                hub.db.pending_gitlabs()?
+            } else {
+                Vec::new()
+            },
+            rejected: if servers {
+                hub.db.rejected_gitlabs()?
+            } else {
+                Vec::new()
+            },
+            projects: match server {
+                Some(name) => hub.db.gitlab_projects(Some(name))?,
+                None if servers => hub.db.gitlab_projects(None)?,
+                None => Vec::new(),
+            },
             relays: crate::relays::views(hub)?,
-            policy: hub.db.capacity_policy(),
-            arbitration: crate::jobs::arbitration_snapshot(hub)?,
+            policy: if runners {
+                hub.db.capacity_policy()
+            } else {
+                Ok(crate::policy::Policy::default())
+            },
+            arbitration: if server.is_some() {
+                crate::jobs::arbitration_snapshot(hub)?
+            } else {
+                HashMap::new()
+            },
         })
+    }
+
+    /// The URL of GitLab server `name`, if the hub has it.
+    fn url(&self, name: &str) -> Option<&str> {
+        (self.gitlabs.iter())
+            .find(|(n, _)| n == name)
+            .map(|(_, row)| row.url.as_str())
     }
 }
 
@@ -128,63 +212,116 @@ pub(super) fn moved(query: Option<&str>) -> &'static str {
     }
 }
 
-/// `GET /gitlab`: the GitLab servers the hub takes jobs from, their projects, relays and
-/// runners; `GET /keys`: the API keys and their instances (`keys`). Each page's fragment is
-/// live, on a stream of its own.
-pub(super) async fn get(keys: bool, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    let hub = ui.hub.clone();
-    let shown = blocking(move || Shown::read(&hub)).await?;
-    let (title, here) = if keys {
-        ("API keys", KEYS_PATH)
-    } else {
-        ("GitLab", GITLAB_PATH)
+/// `GET /keys`: the API keys and their instances; `GET /gitlab`: the GitLab servers the hub
+/// takes jobs from, and those waiting for approval or rejected; `GET /gitlab/<name>`: a
+/// server's projects and runners; `GET /relays`: the relays. Each page's fragment is live, on a
+/// stream of its own. A server the hub has not is answered 404.
+pub(super) async fn get(at: Page<'_>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    let read = |page: For<'_>| {
+        let hub = ui.hub.clone();
+        let server = match page {
+            For::Server(name) => Some(name.to_string()),
+            For::Servers | For::Relays => None,
+        };
+        let servers = matches!(page, For::Servers);
+        blocking(move || {
+            let page = match &server {
+                Some(name) => For::Server(name),
+                None if servers => For::Servers,
+                None => For::Relays,
+            };
+            Shown::read(&hub, page)
+        })
+    };
+    let now = crate::now_secs();
+    let steer = auth.session.role >= Role::Operator;
+    let mut sub = None;
+    let (title, here, id, event, fragment) = match at {
+        Page::Keys => {
+            let hub = ui.hub.clone();
+            let views = blocking(move || crate::clients::views(&hub)).await?;
+            (
+                "API keys".to_string(),
+                KEYS_PATH.to_string(),
+                "clients",
+                EVENT.to_string(),
+                fragment(&views, now, steer),
+            )
+        }
+        Page::Servers => (
+            "GitLab servers".to_string(),
+            GITLAB_PATH.to_string(),
+            "gitlab-servers",
+            GITLAB_EVENT.to_string(),
+            servers_fragment(&read(For::Servers).await?, steer),
+        ),
+        Page::Server(name) => {
+            let shown = read(For::Server(name)).await?;
+            let Some(fragment) = server_fragment(&shown, name, now, steer) else {
+                return Ok(super::message(
+                    StatusCode::NOT_FOUND,
+                    "There is no such GitLab server.",
+                ));
+            };
+            sub = shown.url(name).map(str::to_string);
+            (
+                name.to_string(),
+                server_path(name),
+                "gitlab-server",
+                format!("gitlab/{name}"),
+                fragment,
+            )
+        }
+        Page::Relays => (
+            "GitLab adapters".to_string(),
+            RELAYS_PATH.to_string(),
+            "relays",
+            RELAYS_EVENT.to_string(),
+            relays_fragment(&read(For::Relays).await?, now, steer),
+        ),
+    };
+    let swap = match at {
+        Page::Server(_) => SERVER_EVENT.to_string(),
+        _ => event.clone(),
     };
     let mut main = Html::new();
-    main.raw("<h1>").raw(title).raw("</h1>");
-    let steer = auth.session.role >= Role::Operator;
+    main.raw("<h1>").text(&title).raw("</h1>");
+    if let Some(url) = sub {
+        main.raw("<p class=\"sub\">").text(url).raw("</p>");
+    }
     if steer {
         // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
         main.raw("<div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
             .text(&auth.csrf)
             .raw("&quot;}\"><div id=\"flash\"></div>");
     }
-    let now = crate::now_secs();
-    let (id, event, fragment) = if keys {
-        ("clients", EVENT, fragment(&shown.views, now, steer))
-    } else {
-        (
-            "gitlab-servers",
-            GITLAB_EVENT,
-            gitlab_fragment(&shown, now, steer),
-        )
-    };
     main.raw("<div id=\"")
         .raw(id)
         .raw("\" hx-ext=\"sse\" sse-connect=\"/events/")
-        .raw(event)
+        .text(&event)
         .raw("\" sse-swap=\"")
-        .raw(event)
+        .text(&swap)
         .raw("\" sse-close=\"close\">")
         .html(&fragment)
         .raw("</div>");
     if steer {
         main.raw("</div>");
-        if keys {
-            create_form(&mut main, auth);
-        } else {
-            add_relay_form(&mut main, auth);
-            add_server_form(&mut main, auth);
+        match at {
+            Page::Keys => create_form(&mut main, auth),
+            Page::Servers => add_server_form(&mut main, auth),
+            Page::Relays => add_relay_form(&mut main, auth),
+            Page::Server(_) => {}
         }
     }
-    Ok(page(fleet::layout(title, here, auth, &main)))
+    Ok(page(fleet::layout(&title, &here, auth, &main)))
 }
 
-/// The GitLab page: the GitLab servers the hub takes jobs from, then the relays and their
-/// runners. With `steer`, a server no relay is bound to carries the button that removes it, and
-/// each relay the one that removes it.
-fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
+/// The GitLab servers' page: those waiting for approval and rejected, then those the hub takes
+/// jobs from, each linking to its page. With `steer`, a server no relay is bound to carries the
+/// button that removes it.
+fn servers_fragment(shown: &Shown, steer: bool) -> Html {
     let mut h = Html::new();
-    pending_section(&mut h, shown, steer);
+    pending_section(&mut h, shown, None, steer);
     h.raw("<section><h2>GitLab servers</h2>");
     if shown.gitlabs.is_empty() {
         if steer {
@@ -197,15 +334,23 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         }
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th>")
-            .raw("<th class=\"num\">relays</th><th class=\"num\">projects approved</th>");
+            .raw("<th class=\"num\">relays</th><th class=\"num\">projects approved</th>")
+            .raw("<th class=\"num\">projects pending</th>");
         if steer {
             h.raw("<th>change</th>");
         }
         h.raw("</tr></thead><tbody>");
         for (name, row) in &shown.gitlabs {
-            h.raw("<tr><td><strong>")
+            let count = |state| {
+                (shown.projects.iter())
+                    .filter(|p| p.gitlab == *name && p.row.state == state)
+                    .count()
+            };
+            h.raw("<tr><td><a href=\"")
+                .text(server_path(name))
+                .raw("\"><strong>")
                 .text(name)
-                .raw("</strong></td><td>")
+                .raw("</strong></a></td><td>")
                 .text(&row.url)
                 .raw("</td><td class=\"num\">")
                 .text(
@@ -213,20 +358,11 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
                         .filter(|r| r.row.server_url.as_deref() == Some(row.url.as_str()))
                         .count(),
                 )
-                .raw("</td><td class=\"num\">");
-            let approved = (shown.projects.iter())
-                .filter(|p| p.gitlab == *name && p.row.state == ProjectState::Approved)
-                .count();
-            if approved > 0 {
-                h.raw("<a href=\"#")
-                    .text(projects_anchor(ProjectState::Approved, name))
-                    .raw("\">")
-                    .text(approved)
-                    .raw("</a>");
-            } else {
-                h.raw("0");
-            }
-            h.raw("</td>");
+                .raw("</td><td class=\"num\">")
+                .text(count(ProjectState::Approved))
+                .raw("</td><td class=\"num\">")
+                .text(count(ProjectState::Pending))
+                .raw("</td>");
             if steer {
                 h.raw("<td class=\"actions\">");
                 if !bound(&shown.relays, &row.url) {
@@ -239,7 +375,29 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         h.raw("</tbody></table>");
     }
     h.raw("</section>");
-    approved_section(&mut h, shown, steer);
+    h
+}
+
+/// Server `name`'s page: its projects waiting for approval, rejected and approved, then the
+/// runners of the relays bound to it. None when the hub has no such server.
+fn server_fragment(shown: &Shown, name: &str, now: u64, steer: bool) -> Option<Html> {
+    let url = shown.url(name)?;
+    let mut h = Html::new();
+    pending_section(&mut h, shown, Some(name), steer);
+    approved_section(&mut h, shown, name, steer);
+    h.raw("<section><h2>Runners</h2>");
+    let relays: Vec<&RelayView> = (shown.relays.iter())
+        .filter(|r| r.row.server_url.as_deref() == Some(url))
+        .collect();
+    runners_table(&mut h, shown, &relays, now);
+    h.raw("</section>");
+    Some(h)
+}
+
+/// The relays' page: each relay, with, for an operator, the button that removes it; then the
+/// runners of those bound to no server the hub has, which no server's page shows.
+fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
+    let mut h = Html::new();
     h.raw("<section><h2>Relays</h2>");
     if shown.relays.is_empty() {
         h.raw(if steer {
@@ -252,23 +410,44 @@ fn gitlab_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     } else {
         relays_table(&mut h, &shown.relays, now, steer);
     }
-    h.raw("</section><section><h2>Runners</h2>");
-    runners_table(&mut h, shown, now);
     h.raw("</section>");
+    let unbound: Vec<&RelayView> = (shown.relays.iter())
+        .filter(|r| {
+            !(shown.gitlabs.iter()).any(|(_, g)| r.row.server_url.as_deref() == Some(&g.url))
+        })
+        .filter(|r| {
+            r.row
+                .inventory
+                .as_ref()
+                .is_some_and(|i| !i.runners.is_empty())
+        })
+        .collect();
+    if !unbound.is_empty() {
+        h.raw("<section><h2>Runners waiting for their server</h2><p class=\"sub\">Their ")
+            .raw("relays are bound to no server the hub has: once the hub has theirs, they are on ")
+            .raw("its page.</p>");
+        runners_table(&mut h, shown, &unbound, now);
+        h.raw("</section>");
+    }
     h
 }
 
-/// *Pending*, then *Rejected* when an operator rejected any: the servers and the projects, each
-/// with what an operator decides on — for an operator, the forms deciding.
-fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
-    let pending = projects_by_state(shown, ProjectState::Pending);
+/// *Pending* and, when nonempty, *Rejected*: servers, or projects of `server`, with
+/// decision details and, for operators, decision forms.
+fn pending_section(h: &mut Html, shown: &Shown, server: Option<&str>, steer: bool) {
+    let of_server = |state| server.map_or_else(Vec::new, |name| projects_in(shown, name, state));
+    let pending = of_server(ProjectState::Pending);
+    let servers = server.is_none();
     h.raw("<section><h2>Pending</h2>");
-    if shown.pending.is_empty() && pending.is_empty() {
-        h.raw("<p class=\"empty\">Nothing waits for approval: a GitLab server a relay reports ")
-            .raw("and a project a relay submits a job of wait here until an operator ")
-            .raw("approves them.</p>");
+    if servers && shown.pending.is_empty() {
+        h.raw("<p class=\"empty\">No GitLab server waits for approval: one a relay reports ")
+            .raw("waits here until an operator approves it.</p>");
     }
-    if !shown.pending.is_empty() {
+    if !servers && pending.is_empty() {
+        h.raw("<p class=\"empty\">No project waits for approval: one a relay submits a job ")
+            .raw("of waits here until an operator approves it.</p>");
+    }
+    if servers && !shown.pending.is_empty() {
         h.raw("<h3>GitLab servers</h3>");
         if !steer {
             h.raw("<p class=\"sub\">An operator approves one under a name, as <code>vk-hub ")
@@ -311,18 +490,20 @@ fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
         }
         h.raw("</tbody></table>");
     }
-    for (gitlab, projects) in &pending {
-        projects_form(h, shown, gitlab, projects, ProjectState::Pending, steer);
+    if let Some(name) = server
+        && !pending.is_empty()
+    {
+        projects_form(h, shown, name, &pending, ProjectState::Pending, steer);
     }
     h.raw("</section>");
-    let rejected = projects_by_state(shown, ProjectState::Rejected);
-    if shown.rejected.is_empty() && rejected.is_empty() {
+    let rejected = of_server(ProjectState::Rejected);
+    if (!servers || shown.rejected.is_empty()) && rejected.is_empty() {
         return;
     }
     h.raw("<section><h2>Rejected</h2><p class=\"sub\">Their jobs are refused. Approving one ")
         .raw("takes the rejection back; forgetting one lets it wait for approval again at its ")
         .raw("next job.</p>");
-    if !shown.rejected.is_empty() {
+    if servers && !shown.rejected.is_empty() {
         h.raw("<h3>GitLab servers</h3><table class=\"grid\"><thead><tr><th>URL</th>")
             .raw("<th>rejected</th><th>by</th>");
         if steer {
@@ -345,25 +526,25 @@ fn pending_section(h: &mut Html, shown: &Shown, steer: bool) {
         }
         h.raw("</tbody></table>");
     }
-    for (gitlab, projects) in &rejected {
-        projects_form(h, shown, gitlab, projects, ProjectState::Rejected, steer);
+    if let Some(name) = server
+        && !rejected.is_empty()
+    {
+        projects_form(h, shown, name, &rejected, ProjectState::Rejected, steer);
     }
     h.raw("</section>");
 }
 
-/// *Approved projects*, when there are any: the projects whose jobs run, by instance, and for
-/// an operator the forms rejecting or forgetting them.
-fn approved_section(h: &mut Html, shown: &Shown, steer: bool) {
-    let approved = projects_by_state(shown, ProjectState::Approved);
+/// *Approved projects*, when `server` has any: the projects whose jobs run, and for an
+/// operator the form rejecting or forgetting them.
+fn approved_section(h: &mut Html, shown: &Shown, server: &str, steer: bool) {
+    let approved = projects_in(shown, server, ProjectState::Approved);
     if approved.is_empty() {
         return;
     }
     h.raw("<section><h2>Approved projects</h2><p class=\"sub\">Their jobs run. Rejecting one ")
         .raw("refuses its next jobs; forgetting one has it wait for approval again at its next ")
         .raw("job.</p>");
-    for (gitlab, projects) in &approved {
-        projects_form(h, shown, gitlab, projects, ProjectState::Approved, steer);
-    }
+    projects_form(h, shown, server, &approved, ProjectState::Approved, steer);
     h.raw("</section>");
 }
 
@@ -506,11 +687,6 @@ fn projects_form(
             .text(gitlab)
             .raw("</code> lists them all.</p>");
     }
-    h.raw("<h3 id=\"")
-        .text(projects_anchor(state, gitlab))
-        .raw("\">Projects of <strong>")
-        .text(gitlab)
-        .raw("</strong></h3>");
     if !steer {
         h.html(&table);
         if state == ProjectState::Pending {
@@ -540,7 +716,9 @@ fn projects_form(
         .raw(PATH)
         .raw("\" hx-post=\"")
         .raw(PATH)
-        .raw("\" hx-swap=\"none\">")
+        .raw("\" hx-swap=\"none\" aria-label=\"")
+        .raw(state.name())
+        .raw(" projects\">")
         .html(&form)
         .raw("</form>");
 }
@@ -587,18 +765,11 @@ pub(super) fn relay_cell(h: &mut Html, relays: &[RelayView], id: Option<&str>) {
     };
 }
 
-/// The ID of the heading over instance `gitlab`'s projects in `state`.
-fn projects_anchor(state: ProjectState, gitlab: &str) -> String {
-    format!("projects-{}-{gitlab}", state.name())
-}
-
-/// The projects `shown` in `state`, by instance.
-fn projects_by_state(shown: &Shown, state: ProjectState) -> BTreeMap<&str, Vec<&ProjectView>> {
-    let mut groups: BTreeMap<&str, Vec<&ProjectView>> = BTreeMap::new();
-    for p in shown.projects.iter().filter(|p| p.row.state == state) {
-        groups.entry(&p.gitlab).or_default().push(p);
-    }
-    groups
+/// Instance `gitlab`'s projects `shown` in `state`.
+fn projects_in<'a>(shown: &'a Shown, gitlab: &str, state: ProjectState) -> Vec<&'a ProjectView> {
+    (shown.projects.iter())
+        .filter(|p| p.gitlab == gitlab && p.row.state == state)
+        .collect()
 }
 
 /// Whether one of `relays` is bound to the GitLab server at `url`: while one is, the store
@@ -711,10 +882,9 @@ fn server_status(h: &mut Html, s: &ServerStatus) {
     }
 }
 
-/// Each relay's runners: GitLab's ID for each, where its jobs go, how many at once, whether
+/// The runners of `relays`: GitLab's ID for each, where its jobs go, how many at once, whether
 /// GitLab took its token, what it is doing and its load, as the relay last said.
-fn runners_table(h: &mut Html, shown: &Shown, now: u64) {
-    let relays = &shown.relays;
+fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
     let runners = || {
         relays.iter().flat_map(|r| {
             (r.row.inventory.iter())
@@ -924,27 +1094,52 @@ fn add_server_form(h: &mut Html, auth: &Auth) {
         .raw("its relays' <code>[gitlab] url</code> names.</p></section>");
 }
 
-/// The fragments, as one rendering for every page showing them: with the keys' buttons for an
-/// operator's, without for a viewer's. The API keys page's first, then the GitLab page's.
+/// The keys', servers' and relays' fragments, as one rendering for every page showing them:
+/// with the buttons for an operator's, without for a viewer's. The keys' first.
 pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
-    let other: sse::Render = {
+    let keys: sse::Render = {
         let hub = hub.clone();
         Arc::new(move || {
             let views = crate::clients::views(&hub)?;
             Ok(fragment(&views, crate::now_secs(), steer).into_string())
         })
     };
-    let gitlab: sse::Render = {
+    let servers: sse::Render = {
         let hub = hub.clone();
         Arc::new(move || {
-            let shown = Shown::read(&hub)?;
-            Ok(gitlab_fragment(&shown, crate::now_secs(), steer).into_string())
+            let shown = Shown::read(&hub, For::Servers)?;
+            Ok(servers_fragment(&shown, steer).into_string())
         })
     };
-    sse::Events::from([(EVENT, other), (GITLAB_EVENT, gitlab)])
+    let relays: sse::Render = {
+        let hub = hub.clone();
+        Arc::new(move || {
+            let shown = Shown::read(&hub, For::Relays)?;
+            Ok(relays_fragment(&shown, crate::now_secs(), steer).into_string())
+        })
+    };
+    sse::Events::from([
+        (EVENT, keys),
+        (GITLAB_EVENT, servers),
+        (RELAYS_EVENT, relays),
+    ])
 }
 
-/// The other tab: the keys, then their instances.
+/// Render server `name`'s fragment for its page's stream, or a notice if the server is gone.
+pub(super) fn server_render(hub: &Arc<Hub>, name: &str, steer: bool) -> sse::Render {
+    let (hub, name) = (hub.clone(), name.to_string());
+    Arc::new(move || {
+        let shown = Shown::read(&hub, For::Server(&name))?;
+        Ok(
+            match server_fragment(&shown, &name, crate::now_secs(), steer) {
+                Some(fragment) => fragment.into_string(),
+                None => "<p class=\"message\">The hub no longer has this GitLab server.</p>".into(),
+            },
+        )
+    })
+}
+
+/// The API keys' page: the keys, then their instances.
 fn fragment(views: &[KeyView], now: u64, steer: bool) -> Html {
     let keys: Vec<&KeyView> = views.iter().collect();
     let mut h = Html::new();
@@ -1285,7 +1480,7 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
     };
     main.raw("</code>, as <code>Authorization: Bearer &lt;key&gt;</code>. A GitLab runner ")
         .raw("needs none: <code>vk-gitlab</code> enrolls as a relay, from the GitLab ")
-        .raw("page.</p><p><a href=\"")
+        .raw("adapters page.</p><p><a href=\"")
         .raw(KEYS_PATH)
         .raw("\">Back to the API keys</a></p>");
     Ok(page(fleet::layout("API key", KEYS_PATH, auth, &main)))
@@ -1311,7 +1506,7 @@ fn refused_page(auth: &Auth, title: &str, back: &'static str, why: &str) -> Resp
 }
 
 /// Add the GitLab server `form` names, checked and audited by
-/// [`crate::store::Db::add_gitlab`] as for `vk-hub gitlabs add`, then back to the GitLab page.
+/// [`crate::store::Db::add_gitlab`] as for `vk-hub gitlabs add`, then back to the servers' page.
 /// The relays bound to it are told it is approved.
 async fn add_server(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Response<Body>> {
     let name = field(form, "name").unwrap_or("").trim().to_string();
@@ -1471,7 +1666,7 @@ async fn remove_relay(
     detail.raw("</p>");
     let ask = actions::Ask {
         path: PATH.to_string(),
-        back: GITLAB_PATH.to_string(),
+        back: RELAYS_PATH.to_string(),
         op: REMOVE_RELAY.to_string(),
         what: "Remove this relay? Its key is no longer trusted and its session ends: it takes \
                no more jobs, and can no longer follow or settle those under way. Enrolling it \
@@ -1497,7 +1692,7 @@ async fn remove_relay(
         auth.session.principal()
     );
     if !htmx {
-        return Ok(see_other(GITLAB_PATH));
+        return Ok(see_other(RELAYS_PATH));
     }
     let mut h = Html::new();
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">Removed relay ")
@@ -1642,7 +1837,7 @@ async fn decide_projects(
     let back = if from_page {
         super::projects::path(&gitlab, ids[0])
     } else {
-        GITLAB_PATH.to_string()
+        server_path(&gitlab)
     };
     // Of the projects to reject or forget, those approved as asked about: the store refuses the
     // decision should they have changed since.
@@ -1769,9 +1964,10 @@ async fn decide_projects(
         );
     }
     if !htmx {
-        // A forgotten project has no page left to go back to.
+        // A forgotten project has no page left to go back to: its server's.
+        let server = server_path(&gitlab);
         return Ok(see_other(if op == FORGET_PROJECTS {
-            GITLAB_PATH
+            &server
         } else {
             &back
         }));

@@ -3505,7 +3505,7 @@ async fn releases_and_rollouts_are_shown_live() {
     assert_secure(&page);
     for want in [
         "<nav class=\"subnav\" aria-label=\"Nodes\"><a href=\"/\">Compute</a>\
-         <a href=\"/registries\">Storage</a>\
+         <a href=\"/registries\">Storage</a><a href=\"/relays\">GitLab adapters</a>\
          <a href=\"/operations\" aria-current=\"page\">Updates</a></nav>",
         "sse-connect=\"/events/operations\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
@@ -8027,12 +8027,19 @@ async fn the_gitlab_page_lists_its_servers() {
         .unwrap();
     let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     for want in [
-        "<h1>GitLab</h1>",
-        "<a href=\"/gitlab\" aria-current=\"page\">GitLab\
+        "<h1>GitLab servers</h1>",
+        "<a href=\"/gitlab\" aria-current=\"true\">GitLab\
          <span id=\"nav-count-gitlab\"></span></a>",
+        "<nav class=\"subnav\" aria-label=\"GitLab\">\
+         <a href=\"/gitlab\" aria-current=\"page\">Servers\
+         <span id=\"nav-count-tab-gitlab\"></span></a>\
+         <a href=\"/gitlab/gl\">gl<span id=\"nav-count-tab-gitlab-gl\"></span></a>\
+         <a href=\"/gitlab/partner\">partner\
+         <span id=\"nav-count-tab-gitlab-partner\"></span></a></nav>",
         "id=\"gitlab-servers\" hx-ext=\"sse\" sse-connect=\"/events/gitlab\" \
          sse-swap=\"gitlab\"",
-        "<tr><td><strong>gl</strong></td><td>https://gitlab.example.com</td>\
+        "<tr><td><a href=\"/gitlab/gl\"><strong>gl</strong></a></td>\
+         <td>https://gitlab.example.com</td><td class=\"num\">0</td>\
          <td class=\"num\">0</td><td class=\"num\">0</td></tr>",
         "<strong>partner</strong>",
     ] {
@@ -8072,6 +8079,18 @@ async fn the_gitlab_page_lists_its_servers() {
         "{body}"
     );
     assert!(!body.contains("<script>"), "{body}");
+    // Each server has its own page; unknown servers return 404.
+    let body = get(addr, "/gitlab/odd", Some(&viewer)).await.body;
+    assert!(
+        body.contains("<h1>odd</h1><p class=\"sub\">https://&lt;script&gt;.example.com</p>")
+            && body.contains("sse-connect=\"/events/gitlab/odd\" sse-swap=\"gitlab-server\"")
+            && body.contains("<a href=\"/gitlab/odd\" aria-current=\"page\">odd"),
+        "{body}"
+    );
+    assert!(!body.contains("<script>"), "{body}");
+    for path in ["/gitlab/none", "/gitlab/GL", "/gitlab/gl/"] {
+        assert_eq!(get(addr, path, Some(&viewer)).await.status, 404, "{path}");
+    }
     let other = get(addr, "/keys", Some(&viewer)).await.body;
     assert!(
         other.contains("<h1>API keys</h1>")
@@ -8179,10 +8198,10 @@ fn bound_relay(hub: &Hub, key: &str, url: &str) -> String {
     id
 }
 
-/// An operator adds a GitLab server from the GitLab tab, refused with the CLI's reason for a
+/// An operator adds a GitLab server from the servers' page, refused with the CLI's reason for a
 /// bad name or URL or one taken, and removes one once asked, only while no relay is bound to
-/// it and only the server asked about; each is audited and the tab follows live. A viewer gets
-/// no form nor button and is refused.
+/// it and only the server asked about; each is audited, the page follows live and an open page
+/// of the server removed says it is gone. A viewer gets no form nor button and is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_adds_and_removes_gitlab_servers() {
     let (addr, hub, origin) = start_fleet().await;
@@ -8304,7 +8323,9 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(hub.db.gitlab("gl").unwrap().is_some());
 
-    // Removed once asked, back to the tab.
+    // Removed once asked, back to the tab; its page, open, says it is gone.
+    let mut live_gl = Events::open(addr, "/events/gitlab/gl", &operator).await;
+    next_with(&mut live_gl, "<h2>Runners</h2>").await;
     let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
     let answer = format!(
         "{form}&added={}&nonce={}&confirm=yes",
@@ -8323,22 +8344,24 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
         "{audit:?}"
     );
     next_with(&mut live, "None yet: add one below").await;
+    next_with(&mut live_gl, "The hub no longer has this GitLab server.").await;
     let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
-/// An operator adds a relay from the GitLab tab: a single-use relay token, shown once with the
-/// `vk-gitlab join` redeeming it, that enrolls a relay and nothing else. A viewer has no form.
+/// An operator adds a relay from the GitLab adapters' page: a single-use relay token, shown once
+/// with the `vk-gitlab join` redeeming it, that enrolls a relay and nothing else. A viewer has
+/// no form.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
+async fn an_operator_issues_a_relay_token_from_the_adapters_page() {
     use crate::store::RelayEnrollment;
     let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    let page = get(addr, "/relays", Some(&viewer)).await.body;
     assert!(!page.contains("Add a relay"), "{page}");
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    let page = get(addr, "/relays", Some(&operator)).await.body;
     assert!(
         page.contains("<h2>Add a relay</h2><form method=\"post\" action=\"/tokens\">")
             && page.contains("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">"),
@@ -8351,8 +8374,8 @@ async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
     for want in [
         "<h1>Relay enrollment token</h1>",
         "<pre>vk-gitlab join https://hub.example.com:8443 --token -</pre>",
-        "<a href=\"/gitlab\">Back to the GitLab page</a>",
-        "<a href=\"/gitlab\" aria-current=\"page\">GitLab",
+        "<a href=\"/relays\">Back to the GitLab adapters</a>",
+        "<a href=\"/relays\" aria-current=\"page\">GitLab adapters</a>",
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
     }
@@ -8377,11 +8400,12 @@ async fn an_operator_issues_a_relay_token_from_the_gitlab_tab() {
     assert_eq!(reply.status, 400, "{}", reply.body);
 }
 
-/// The GitLab tab shows each relay, what the hub makes of its server and what it reports of it,
-/// and each runner's placement, state and load, all as text; it follows a relay's reports live.
-/// An operator removes a relay once asked, audited; a viewer has no button and is refused.
+/// The GitLab adapters' page shows each relay, what the hub makes of its server and what it
+/// reports of it, and the runners of a relay whose server is not approved; its server's page
+/// then shows them. Each runner's placement, state and load are all text, followed live. An
+/// operator removes a relay once asked, audited; a viewer has no button and is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn relays_and_their_runners_are_on_the_gitlab_tab() {
+async fn relays_and_their_runners_follow_their_server() {
     use crate::store::RelayWrite;
     use vk_hub_proto::client::Placement;
     use vk_hub_proto::gitlab::{
@@ -8389,12 +8413,12 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     };
     let (addr, hub, origin) = start_fleet().await;
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    let page = get(addr, "/relays", Some(&viewer)).await.body;
     assert!(
         page.contains("<h2>Relays</h2><p class=\"empty\">None yet"),
         "{page}"
     );
-    let mut live = Events::open(addr, "/events/gitlab", &viewer).await;
+    let mut live = Events::open(addr, "/events/relays", &viewer).await;
     live.next().await.unwrap();
 
     let hostile = "<script>x</script>";
@@ -8503,7 +8527,10 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
         .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
         .unwrap();
     hub.clients_changed();
-    let event = next_with(&mut live, "<td><strong>gl</strong></td><td>https://gitlab").await;
+    let event = next_with(&mut live, "<td><strong>gl</strong></td>").await;
+    assert!(!event.contains("Runners waiting"), "{event}");
+    let mut live_server = Events::open(addr, "/events/gitlab/gl", &viewer).await;
+    let event = next_with(&mut live_server, "<td>42</td>").await;
     // Its server approved: mapped to no tenant.
     assert!(
         event.contains("<td>42</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"),
@@ -8519,7 +8546,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     });
     hub.db.set_capacity_policy(&policy, "u", now).unwrap();
     hub.clients_changed();
-    let event = next_with(&mut live, "production</td>").await;
+    let event = next_with(&mut live_server, "production</td>").await;
     assert!(
         event.contains(
             "<td>42</td><td><a href=\"/capacity/tenants/fallback\">fallback</a></td>\
@@ -8551,7 +8578,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     assert_eq!(reply.status, 403, "{}", reply.body);
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    let page = get(addr, "/relays", Some(&operator)).await.body;
     assert!(
         page.contains(&format!(
             "<input type=\"hidden\" name=\"op\" value=\"remove-relay\"><input \
@@ -8567,7 +8594,7 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     let answer = format!("{form}&nonce={}&confirm=yes", hidden(&reply.body, "nonce"));
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/gitlab"));
+    assert_eq!(reply.header("location"), Some("/relays"));
     assert!(hub.db.relay(&relay).unwrap().is_none());
     audited(&hub, &format!("removed relay {relay}")).await;
     next_with(&mut live, "<h2>Relays</h2><p class=\"empty\">None yet").await;
@@ -8578,11 +8605,12 @@ async fn relays_and_their_runners_are_on_the_gitlab_tab() {
     }
 }
 
-/// What waits for approval is on top of the GitLab tab, counted on the Connections link: a
-/// server a relay reports, with the certificate key to check, and the projects the approval
-/// gate refused, by instance. An operator approves a server under a name, rejects it or forgets
-/// its rejection, and approves, rejects or forgets the projects ticked; each is audited and the
-/// tab follows live. A viewer sees the same without a form, and is refused.
+/// What waits for approval is on top of the GitLab pages, counted on the GitLab link and its
+/// tabs: on the servers' page a server a relay reports, with the certificate key to check; on a
+/// server's page the projects the approval gate refused. An operator approves a server under a
+/// name, rejects it or forgets its rejection, and approves, rejects or forgets the projects
+/// ticked; each is audited and the pages follow live. A viewer sees the same without a form,
+/// and is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     use crate::store::{GateJob, ProjectState, RelayWrite};
@@ -8674,7 +8702,8 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         hub.db.gate_job(&relay, &job, (&rid, "d"), now).unwrap();
     }
     hub.clients_changed();
-    let event = next_with(&mut live, "acme/api").await;
+    let mut live_gl = Events::open(addr, "/events/gitlab/gl", &operator).await;
+    let event = next_with(&mut live_gl, "acme/api").await;
     for want in [
         "<input type=\"hidden\" name=\"gitlab\" value=\"gl\"><input type=\"hidden\" \
          name=\"url\" value=\"https://gitlab.example.com\"><fieldset>",
@@ -8687,12 +8716,37 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         "name=\"op\" value=\"approve-projects\">Approve</button>",
         "name=\"op\" value=\"reject-projects\">Reject</button>",
         "name=\"op\" value=\"forget-projects\">Forget</button>",
-        "<span class=\"count\">2</span>",
+        "<span id=\"nav-count-gitlab\" hx-swap-oob=\"true\"> <span class=\"count\">2</span>",
+        "<span id=\"nav-count-tab-gitlab-gl\" hx-swap-oob=\"true\"> \
+         <span class=\"count\">2</span>",
     ] {
         assert!(event.contains(want), "{want}: {event}");
     }
-    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    // A page outside GitLab has hidden targets for its tabs' counts, and keeps them current.
+    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    assert!(
+        page.contains(
+            "<div hidden><span id=\"nav-count-tab-gitlab\"></span>\
+             <span id=\"nav-count-tab-gitlab-gl\"></span></div>"
+        ),
+        "{page}"
+    );
+    let mut live_relays = Events::open(addr, "/events/relays", &viewer).await;
+    next_with(
+        &mut live_relays,
+        "<span id=\"nav-count-tab-gitlab-gl\" hx-swap-oob=\"true\"> \
+         <span class=\"count\">2</span>",
+    )
+    .await;
+    let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
     assert!(page.contains(&count(2)), "{page}");
+    assert!(
+        page.contains(
+            "<a href=\"/gitlab/gl\" aria-current=\"page\">gl<span id=\"nav-count-tab-gitlab-gl\"> \
+             <span class=\"count\">2</span></span></a>"
+        ),
+        "{page}"
+    );
     assert!(!page.contains("type=\"checkbox\""), "{page}");
     assert!(page.contains("projects approve gl &lt;id&gt;"), "{page}");
 
@@ -8739,27 +8793,31 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     };
     assert_eq!(state(42), Some(ProjectState::Approved));
     assert_eq!(state(43), Some(ProjectState::Rejected));
-    let event = next_with(&mut live, "<h2>Rejected</h2>").await;
+    let event = next_with(&mut live_gl, "<h2>Rejected</h2>").await;
     assert!(
         event.contains("<section><h2>Pending</h2><p class=\"empty\">"),
         "{event}"
     );
-    // The count of approved projects leads to them, listed below the servers.
+    // The servers' page counts its approved and pending projects.
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
-        event.contains("<td class=\"num\"><a href=\"#projects-approved-gl\">1</a></td>"),
-        "approved: {event}"
+        page.contains(
+            "<td><a href=\"/gitlab/gl\"><strong>gl</strong></a></td>\
+             <td>https://gitlab.example.com</td><td class=\"num\">1</td>\
+             <td class=\"num\">1</td><td class=\"num\">0</td></tr>"
+        ),
+        "{page}"
     );
     let rejected = event.split("<h2>Rejected</h2>").nth(1).unwrap();
-    let rejected = rejected.split("<h2>GitLab servers</h2>").next().unwrap();
+    let rejected = rejected.split("<h2>Approved projects</h2>").next().unwrap();
     assert!(
         rejected.contains("<a href=\"/gitlab/gl/projects/43\">acme/api</a>"),
         "{rejected}"
     );
     assert!(!rejected.contains("reject-projects"), "{rejected}");
     let approved = event.split("<h2>Approved projects</h2>").nth(1).unwrap();
-    let approved = approved.split("<h2>Relays</h2>").next().unwrap();
+    let approved = approved.split("<h2>Runners</h2>").next().unwrap();
     for want in [
-        "<h3 id=\"projects-approved-gl\">",
         "<td><input id=\"pick-approved-gl-42\"",
         "<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td><td class=\"num\">42</td>\
          <td><time",
@@ -8771,9 +8829,9 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     assert!(!approved.contains("approve-projects"), "{approved}");
     assert!(!approved.contains("acme/api"), "{approved}");
     // A viewer sees them listed and linked, with nothing to decide.
-    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
     let listed = page.split("<h2>Approved projects</h2>").nth(1).unwrap();
-    let listed = listed.split("<h2>Relays</h2>").next().unwrap();
+    let listed = listed.split("<h2>Runners</h2>").next().unwrap();
     assert!(
         listed.contains("<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td>"),
         "{listed}"
@@ -8902,7 +8960,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
     }
     assert_eq!(state(44), Some(ProjectState::Approved));
 
-    // On a page of its own for a plain form, whose answer leads back to Connections.
+    // On a page of its own for a plain form, whose answer leads back to its server's page.
     let reply = post(
         format!("_csrf={csrf}&op=reject-projects&{gl}&project=42&project=44"),
         false,
@@ -8914,7 +8972,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
         "Reject these approved projects?",
         "<p>Approved, of <strong>gl</strong>: acme/web <code>42</code>, project <code>44</code></p>",
         "name=\"projects\" value=\"42,44\"",
-        "<a href=\"/gitlab\">Cancel</a>",
+        "<a href=\"/gitlab/gl\">Cancel</a>",
         "<form method=\"post\" action=\"/clients\">",
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
@@ -8929,7 +8987,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
     )
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/gitlab"));
+    assert_eq!(reply.header("location"), Some("/gitlab/gl"));
     assert_eq!(state(42), Some(ProjectState::Rejected));
     assert_eq!(state(44), Some(ProjectState::Rejected));
     audited(
@@ -9041,7 +9099,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     for want in [
         // The hub's only instance goes unnamed.
         "<h1>acme/web</h1>",
-        "<a href=\"/gitlab\" aria-current=\"page\">GitLab",
+        "<a href=\"/gitlab/gl\" aria-current=\"page\">gl",
         "<tr><th>GitLab ID</th><td>42</td></tr>",
         "<strong>gl</strong> https://gitlab.example.com",
         "<span class=\"badge ok\">approved</span>",
@@ -9225,7 +9283,7 @@ async fn a_project_page_shows_and_decides_one_project() {
     ))
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/gitlab"));
+    assert_eq!(reply.header("location"), Some("/gitlab/gl"));
     assert_eq!(state(42), None);
     assert_eq!(get(addr, page_of, Some(&operator)).await.status, 404);
 
@@ -11609,6 +11667,26 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         reply.body
     );
 
+    // One of an instance the hub has not: its page leads to the servers' page.
+    let before = hub.db.capacity_policy().unwrap();
+    let mut policy = before.clone();
+    let web = policy.tenants.get_mut("web").unwrap();
+    let mut gone = web.projects[0].clone();
+    gone.gitlab = "gone".into();
+    web.projects.push(gone);
+    hub.db.set_capacity_policy(&policy, "u", now).unwrap();
+    let page = get(addr, "/gitlab/gone/projects/42", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains(
+            "The hub has no GitLab server <strong>gone</strong> either: add or approve it on \
+             <a href=\"/gitlab\">GitLab servers</a> first."
+        ),
+        "{}",
+        page.body
+    );
+    hub.db.set_capacity_policy(&before, "u", now).unwrap();
+
     // One the hub has not seen, by instance and ID: its page shows its share alone.
     let form = format!(
         "_csrf={csrf}&op=capacity-add-project&expected={}&tenant=web&gitlab=gl&project=99",
@@ -11621,6 +11699,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
         "The hub has not seen this project",
+        "Approve it on <a href=\"/gitlab/gl\">its server's page</a> once one has.",
         "value=\"capacity-add-rule\"",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
