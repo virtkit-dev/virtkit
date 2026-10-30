@@ -55,9 +55,12 @@ order.
 
 In the hub's web UI, Connections' *Capacity tenants* lists tenants and links to their pages
 and the whole policy (`/clients/capacity`). Operators can add tenants there. Each tenant's
-page edits its weight, cap, projects and runner mappings. Each project's page edits its
-production branches and placement rules across all tenants listing it. The policy page edits
-the whole policy as JSON. Viewers see the same pages without forms.
+page edits its weight and cap, lists projects and maps runners — picked among those the hub
+knows, or by instance and ID — and removes the tenant, unmapping its runners. Each project's
+page lists it for a tenant and edits its production branches and placement rules across all
+tenants listing it. The policy page edits the fallback tenant, API keys' tenants, scheduling
+settings and headroom, and the whole policy as JSON. Each change asks first, saying what it
+changes. Viewers see the same pages without forms.
 
 From the hub's host, through its admin socket:
 

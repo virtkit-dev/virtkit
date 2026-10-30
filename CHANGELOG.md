@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Edit the hub's capacity policy through forms.** Tenant pages set weight and cap,
+  list projects, map runners and remove tenants. Pick projects and runners the hub knows,
+  or enter their instance and ID. Project pages list projects for tenants and add or remove
+  placement rules individually. The policy page sets the fallback tenant, API keys' tenants,
+  scheduling and headroom; its JSON editor for the whole policy stays folded away. Each
+  change but adding a tenant still asks first, now saying what it changes. Projects listed
+  before the hub has seen them have their own pages.
+
 ## [0.99.0] - 2026-10-29
 
 ### Breaking

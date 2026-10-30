@@ -51,7 +51,16 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
     let (hub, named) = (ui.hub.clone(), gitlab.to_string());
     let shown = blocking(move || {
         let Some(row) = hub.db.gitlab_project(&named, id)? else {
-            return Ok(None);
+            // The capacity policy may list a project the hub has not seen yet: its page shows
+            // its share, for operators to set it up before its first job. An unreadable policy
+            // lists nothing: the URL stays a 404.
+            let Ok(policy) = hub.db.capacity_policy() else {
+                return Ok(None);
+            };
+            return Ok(policy
+                .project_any(&named, id)
+                .is_some()
+                .then_some(Err(policy)));
         };
         // Removing an instance forgets its projects; return no project if the instance vanished
         // between these reads.
@@ -62,20 +71,24 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             Some(relay) => crate::relays::detail(&hub, relay)?,
             None => None,
         };
-        Ok(Some(Shown {
+        Ok(Some(Ok(Shown {
             url: instance.url,
             instances: hub.db.gitlab_instances()?,
             relay,
             policy: hub.db.capacity_policy(),
             row,
-        }))
+        })))
     })
     .await?;
-    let Some(shown) = shown else {
-        return Ok(message(
-            StatusCode::NOT_FOUND,
-            "The hub holds no record of this project: never seen, or forgotten.",
-        ));
+    let shown = match shown {
+        Some(Ok(shown)) => shown,
+        Some(Err(policy)) => return unseen(gitlab, id, policy, auth),
+        None => {
+            return Ok(message(
+                StatusCode::NOT_FOUND,
+                "The hub holds no record of this project: never seen, or forgotten.",
+            ));
+        }
     };
     let r = &shown.row;
     let name = if r.path.is_empty() {
@@ -159,6 +172,31 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
         clients::decide_buttons(&mut main, r.state);
         main.raw("</form></section>");
     }
+    Ok(page(super::fleet::layout(
+        &title,
+        &path(gitlab, id),
+        auth,
+        &main,
+    )))
+}
+
+/// The page of a project the capacity policy lists but the hub holds no record of: its share
+/// alone.
+fn unseen(
+    gitlab: &str,
+    id: u64,
+    policy: crate::policy::Policy,
+    auth: &Auth,
+) -> Result<Response<Body>> {
+    let title = format!("{gitlab} project {id}");
+    let mut main = Html::new();
+    main.raw("<h1>")
+        .text(&title)
+        .raw("</h1><p class=\"sub\">The hub has not seen this project: no job of it has ")
+        .raw("reached it yet. Approve it on <a href=\"")
+        .raw(clients::PATH)
+        .raw("\">Connections</a> once one has.</p>");
+    super::capacity::project_section(&mut main, &Ok(policy), gitlab, id, auth)?;
     Ok(page(super::fleet::layout(
         &title,
         &path(gitlab, id),

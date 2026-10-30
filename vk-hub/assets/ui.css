@@ -414,6 +414,26 @@ form.wide details > div { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s
 /* The egress rule editor: each phase an explicit choice, its lists beside it. */
 form.rule fieldset { flex-basis: 100%; align-items: flex-start; }
 form.rule textarea { display: block; min-width: 18rem; font-family: var(--mono); font-size: 12.5px; }
+/* The capacity policy's editors: numbers sized to them, lists a full row each. */
+form.wide input[type="number"] { width: 7rem; }
+form.wide select { max-width: 100%; }
+form.wide label:has(textarea) { display: flex; flex-direction: column; gap: var(--s1); flex: 1 1 16rem; }
+form.wide textarea {
+  flex-basis: 100%;
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  resize: vertical;
+}
+form.inline { display: inline-flex; gap: var(--s2); align-items: center; margin: 0; }
+details.more { margin-top: var(--s3); }
+details.more > summary { color: var(--muted); cursor: pointer; }
+h4 { font-size: 0.9rem; font-weight: 600; margin: var(--s3) 0 var(--s2); }
 /* Test a job: each layer apart, in the order a destination meets them. */
 ol.layers { margin: 0 0 var(--s4); padding-left: 1.4rem; }
 ol.layers > li + li { margin-top: var(--s3); }

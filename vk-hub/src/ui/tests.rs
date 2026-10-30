@@ -10236,6 +10236,16 @@ async fn the_rules_tab_follows_the_rules_live() {
     assert!(!event.contains("<form"), "{event}");
 }
 
+/// Decode an attribute value escaped by `Html`, as a browser does.
+fn unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 /// The hidden fields of the form in `body` posting `op`, encoded to post again.
 fn form_of(body: &str, op: &str) -> String {
     let marker = format!("name=\"op\" value=\"{op}\"");
@@ -10250,13 +10260,7 @@ fn form_of(body: &str, op: &str) -> String {
         .skip(1)
     {
         let (name, rest) = input.split_once("\" value=\"").unwrap();
-        let value = rest.split('"').next().unwrap();
-        let value = value
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&amp;", "&");
+        let value = unescape(rest.split('"').next().unwrap());
         out.push(format!("{name}={}", super::jobs::percent_encode(&value)));
     }
     out.join("&")
@@ -11398,6 +11402,27 @@ async fn capacity_confirmed(
     post_action(addr, origin, cookie, "/clients/capacity", &answer, false).await
 }
 
+/// URL-encode the hidden inputs of the `nth` form on `page` posting `op`, as a browser does.
+/// Panic if the form is missing.
+fn posted_form(page: &str, op: &str, nth: usize) -> String {
+    let marker = format!("name=\"op\" value=\"{op}\"");
+    let at = (page.match_indices(&marker).nth(nth))
+        .unwrap_or_else(|| panic!("no form {op} #{nth}: {page}"))
+        .0;
+    let start = page[..at].rfind("<form").unwrap();
+    let end = at + page[at..].find("</form>").unwrap();
+    let mut fields = Vec::new();
+    for input in page[start..end]
+        .split("<input type=\"hidden\" name=\"")
+        .skip(1)
+    {
+        let (name, rest) = input.split_once("\" value=\"").unwrap();
+        let value = unescape(rest.split('"').next().unwrap());
+        fields.push(format!("{name}={}", super::jobs::percent_encode(&value)));
+    }
+    fields.join("&")
+}
+
 /// Operators add a tenant on Connections, edit it with its runner mappings on its page, and a
 /// project's production branches and placement rules on the project's, in every tenant listing
 /// it. Every edit but adding a tenant asks first, listing what changes; each is audited as the
@@ -11449,6 +11474,21 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         "{}",
         reply.body
     );
+    assert!(
+        reply.body.contains("href=\"/clients\">Back</a>"),
+        "{}",
+        reply.body
+    );
+    // From the policy's page, a refusal leads back there.
+    let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
+    let form = posted_form(&page, "capacity-add-tenant", 0) + "&tenant=web";
+    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("href=\"/clients/capacity\">Back</a>"),
+        "{}",
+        reply.body
+    );
 
     // An edit of no known kind, and one of a malformed project, are told apart.
     for (form, why) in [
@@ -11464,67 +11504,49 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         assert!(reply.body.contains(why), "{why}: {}", reply.body);
     }
 
-    // The tenant's page edits it with its runner mappings.
+    // The tenant's page edits its share, projects and runners, a form each, and offers the
+    // projects the hub knows by their paths.
+    let digest = || hub.db.capacity_policy().unwrap().digest().unwrap();
     let page = get(addr, "/clients/tenants/web", Some(&operator))
         .await
         .body;
-    assert!(page.contains("name=\"settings\""), "{page}");
-    assert!(
-        page.contains(
-            "<h2>Runners</h2><p>None.</p></section><section><h2>API clients</h2><p>None.</p>"
-        ),
-        "{page}"
-    );
+    for want in [
+        "value=\"capacity-share\"",
+        "<p class=\"empty\">None: its runners' jobs are refused.</p>",
+        "<p class=\"empty\">None: it gets no relay work.</p>",
+        "<option value=\"gl/42\">acme/web · gl #42</option>",
+        "value=\"capacity-remove-tenant\"",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("<textarea"), "{page}");
     let shown = hidden(&page, "expected");
-    assert_eq!(shown, hub.db.capacity_policy().unwrap().digest().unwrap());
-    let settings = Tenant {
-        weight: 3,
-        cap: Some(5),
-        projects: vec![Project {
-            gitlab: "gl".into(),
-            id: 42,
-            production_branches: vec!["main".into()],
-            placement_rules: vec![],
-        }],
-    };
-    let mapping = |tenant: &str| RunnerMapping {
-        gitlab: "gl".into(),
-        runner_id: 7,
-        tenant: tenant.into(),
-        class: Class::Production,
-    };
-    let tenant_form = |expected: &str, runners: &[RunnerMapping]| {
+    assert_eq!(shown, digest());
+    let share_form = |expected: &str, weight: &str, cap: &str| {
         format!(
-            "_csrf={csrf}&op=capacity-tenant&expected={expected}&tenant=web&settings={}&runners={}",
-            enc(&serde_json::to_string(&settings).unwrap()),
-            enc(&serde_json::to_string(runners).unwrap()),
+            "_csrf={csrf}&op=capacity-share&expected={expected}&tenant=web&weight={weight}\
+             &cap={cap}"
         )
     };
-    // A mapping of another tenant is refused before anything is asked.
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/clients/capacity",
-        &tenant_form(&shown, &[mapping("fallback")]),
-        false,
-    )
-    .await;
-    assert_eq!(reply.status, 400, "{}", reply.body);
-    assert!(reply.body.contains("gl/7"), "{}", reply.body);
-    let form = tenant_form(&shown, &[mapping("web")]);
+    // Refused before anything is asked.
+    for (weight, cap, why) in [
+        ("3", "x", "the cap must be a whole number"),
+        ("0", "", "positive weight"),
+    ] {
+        let form = share_form(&shown, weight, cap);
+        let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert!(reply.body.contains(why), "{why}: {}", reply.body);
+    }
+    let form = share_form(&shown, "3", "5");
     let before = hub.db.capacity_policy().unwrap();
     let question = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
-    assert!(
-        question.body.contains("<li>tenants: web</li>"),
-        "{}",
-        question.body
-    );
-    assert!(
-        question.body.contains("<li>runners: gl/7</li>"),
-        "{}",
-        question.body
-    );
+    for want in [
+        "<li>Tenant web: weight 1 → 3</li>",
+        "<li>Tenant web: cap unbounded → 5</li>",
+    ] {
+        assert!(question.body.contains(want), "{want}: {}", question.body);
+    }
     assert_eq!(hub.db.capacity_policy().unwrap(), before);
     // Without its nonce, or with a field changed since asked: refused.
     let refused = format!("{form}&confirm=yes");
@@ -11539,7 +11561,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     .await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     let nonce = hidden(&question.body, "nonce");
-    let tampered = tenant_form(&shown, &[]) + &format!("&nonce={nonce}&confirm=yes");
+    let tampered = share_form(&shown, "4", "5") + &format!("&nonce={nonce}&confirm=yes");
     let reply = post_action(
         addr,
         &origin,
@@ -11551,13 +11573,17 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     .await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), before);
-    let reply = capacity_confirmed(addr, &origin, &operator, &form, &["tenants: web"]).await;
+    let reply = capacity_confirmed(
+        addr,
+        &origin,
+        &operator,
+        &form,
+        &["Tenant web: weight 1 → 3"],
+    )
+    .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
-    let saved = hub.db.capacity_policy().unwrap();
-    assert_eq!(saved.tenant("web"), Some(&settings));
-    assert_eq!(saved.runner("gl", 7), Some(&mapping("web")));
-    audited(&hub, "; tenants: web; runners: gl/7").await;
+    audited(&hub, "; tenants: web").await;
     // The page it was made from is stale now.
     let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
@@ -11568,13 +11594,99 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         "{}",
         reply.body
     );
-    assert_eq!(hub.db.capacity_policy().unwrap(), saved);
-    // The same tenant again changes nothing and asks nothing.
+    // The same share again changes nothing and asks nothing.
     let audits = hub.db.audits(None, 100).unwrap().len();
-    let same = tenant_form(&saved.digest().unwrap(), &[mapping("web")]);
+    let same = share_form(&digest(), "3", "5");
     let reply = post_action(addr, &origin, &operator, "/clients/capacity", &same, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(hub.db.audits(None, 100).unwrap().len(), audits);
+
+    // A project picked as the picker posts it, once.
+    let form = format!(
+        "_csrf={csrf}&op=capacity-add-project&expected={}&tenant=web&project=gl%2F42",
+        digest()
+    );
+    let changes = ["Tenant web: list project gl/42"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
+    let form = format!(
+        "_csrf={csrf}&op=capacity-add-project&expected={}&tenant=web&project=gl%2F42",
+        digest()
+    );
+    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("lists project gl/42 already"),
+        "{}",
+        reply.body
+    );
+
+    // One the hub has not seen, by instance and ID: its page shows its share alone.
+    let form = format!(
+        "_csrf={csrf}&op=capacity-add-project&expected={}&tenant=web&gitlab=gl&project=99",
+        digest()
+    );
+    let changes = ["Tenant web: list project gl/99"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let page = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        "The hub has not seen this project",
+        "value=\"capacity-add-rule\"",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let form = posted_form(&page.body, "capacity-remove-project", 0);
+    let changes = ["Tenant web: stop listing project gl/99"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // Its page is gone with it: the removal leads to the tenant's.
+    assert_eq!(reply.header("location"), Some("/clients/tenants/web"));
+    let reply = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    // A runner no relay reports, by instance and ID; unmapping one mapped elsewhere is refused.
+    let mapping = |tenant: &str| RunnerMapping {
+        gitlab: "gl".into(),
+        runner_id: 7,
+        tenant: tenant.into(),
+        class: Class::Production,
+    };
+    let runner_form = |op: &str, tenant: &str| {
+        format!(
+            "_csrf={csrf}&op={op}&expected={}&tenant={tenant}&gitlab=gl&runner=7\
+             &class=production",
+            digest()
+        )
+    };
+    let changes = ["Runner gl/7: map to tenant web as production"];
+    let form = runner_form("capacity-runner", "web");
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    audited(&hub, "; runners: gl/7").await;
+    let form = runner_form("capacity-unmap-runner", "fallback");
+    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("runner gl/7 is not mapped to tenant"),
+        "{}",
+        reply.body
+    );
+    let saved = hub.db.capacity_policy().unwrap();
+    let settings = Tenant {
+        weight: 3,
+        cap: Some(5),
+        projects: vec![Project {
+            gitlab: "gl".into(),
+            id: 42,
+            production_branches: vec![],
+            placement_rules: vec![],
+        }],
+    };
+    assert_eq!(saved.tenant("web"), Some(&settings));
+    assert_eq!(saved.runner("gl", 7), Some(&mapping("web")));
 
     // A project listed by two tenants: its page edits it in both.
     let mut shared = saved.clone();
@@ -11589,7 +11701,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         "<a href=\"/clients/tenants/web\">web</a></td><td class=\"num\">3</td><td>5</td>\
          <td>7 (production)</td>",
         "name=\"branches\"",
-        "name=\"rules\"",
+        "value=\"capacity-add-rule\"",
+        "apply in every tenant listed above",
     ] {
         assert!(page.contains(want), "{want}: {page}");
     }
@@ -11600,7 +11713,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
          &branches={}",
         enc("main\r\nrelease/**\r\n")
     );
-    let reply = capacity_confirmed(addr, &origin, &operator, &form, &["tenants: group, web"]).await;
+    let changes = ["Project gl/42: production branches none → main, release/**"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(reply.header("location"), Some("/clients/projects/gl/42"));
     let saved = hub.db.capacity_policy().unwrap();
@@ -11614,31 +11728,26 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     // Placement rules: validated before asked, and refused when the policy changes between the
     // question and its answer.
     let node = "0123456789abcdef0123456789abcdef";
-    let rules_form = |rules: &str| {
+    let rule_form = |expected: &str, branches: &str, nodes: &str, pools: &str| {
         format!(
-            "_csrf={csrf}&op=capacity-placement&expected={}&tenant=web&gitlab=gl&project=42\
-             &rules={}",
-            saved.digest().unwrap(),
-            enc(rules)
+            "_csrf={csrf}&op=capacity-add-rule&expected={expected}&tenant=web&gitlab=gl\
+             &project=42&branches={}&nodes={}&pools={}",
+            enc(branches),
+            enc(nodes),
+            enc(pools)
         )
     };
-    for bad in [r#"[{"branches":["main"]}]"#, r#"[{"pool":["x"]}]"#, "nope"] {
-        let reply = post_action(
-            addr,
-            &origin,
-            &operator,
-            "/clients/capacity",
-            &rules_form(bad),
-            false,
-        )
-        .await;
-        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+    for (branches, nodes, pools) in [("main", "", ""), ("", "x", ""), ("", "", "not a name")] {
+        let form = rule_form(&saved.digest().unwrap(), branches, nodes, pools);
+        let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+        assert_eq!(reply.status, 400, "{nodes}: {}", reply.body);
         assert!(!reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
     }
-    let form = rules_form(&format!(r#"[{{"nodes":["{node}"]}}]"#));
+    let form = rule_form(&saved.digest().unwrap(), "", node, "");
+    let added = format!("Project gl/42: add placement rule (every job: nodes {node}, pools any)");
     let question = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
     assert!(
-        question.body.contains("<li>tenants: group, web</li>"),
+        question.body.contains(&format!("<li>{added}</li>")),
         "{}",
         question.body
     );
@@ -11665,7 +11774,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), meanwhile);
     let form = form.replace(&saved.digest().unwrap(), &meanwhile.digest().unwrap());
-    let reply = capacity_confirmed(addr, &origin, &operator, &form, &["tenants: group, web"]).await;
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[added.as_str()]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     let saved = hub.db.capacity_policy().unwrap();
     let rule = PlacementRule {
@@ -11679,6 +11788,186 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
             std::slice::from_ref(&rule)
         );
     }
+    // The same rule again is refused before it is asked.
+    let form = rule_form(&saved.digest().unwrap(), "", node, "");
+    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("has this rule already"),
+        "{}",
+        reply.body
+    );
+    // A rule the tenants list in another order is removed from both.
+    let pooled = |pools: [&str; 2]| PlacementRule {
+        branches: vec![],
+        nodes: vec![],
+        pools: pools.map(String::from).to_vec(),
+    };
+    let mut ordered = saved.clone();
+    for (tenant, rules) in [
+        ("web", vec![pooled(["b", "a"]), rule.clone()]),
+        ("group", vec![rule.clone(), pooled(["a", "b"])]),
+    ] {
+        let t = ordered.tenants.get_mut(tenant).unwrap();
+        t.projects[0].placement_rules = rules;
+    }
+    hub.db.set_capacity_policy(&ordered, "u", now).unwrap();
+    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+        .await
+        .body;
+    let form = posted_form(&page, "capacity-remove-rule", 1);
+    let changes = ["Project gl/42: remove placement rule (every job: nodes any, pools a, b)"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let saved = hub.db.capacity_policy().unwrap();
+    for tenant in ["group", "web"] {
+        assert_eq!(
+            saved.project(tenant, "gl", 42).unwrap().placement_rules,
+            std::slice::from_ref(&rule)
+        );
+    }
+    // A tenant stops listing it from the project's page, which it leads back to.
+    let page = get(addr, "/clients/projects/gl/42", Some(&operator))
+        .await
+        .body;
+    let form = posted_form(&page, "capacity-remove-project", 0);
+    let changes = ["Tenant group: stop listing project gl/42"];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/clients/projects/gl/42"));
+    assert!(
+        hub.db
+            .capacity_policy()
+            .unwrap()
+            .project("group", "gl", 42)
+            .is_none()
+    );
+
+    // The policy's page: the fallback, API clients, scheduling and headroom, a form each.
+    let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
+    for want in [
+        "value=\"capacity-fallback\"",
+        "value=\"capacity-scheduling\"",
+        "value=\"capacity-add-headroom\"",
+        "name=\"policy\"",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    let policy_edit = |fields: &str| format!("_csrf={csrf}&expected={}&{fields}", digest());
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients/capacity",
+        &policy_edit(
+            "op=capacity-scheduling&probe_limit=1&production_probe_burst=1\
+             &backoff_initial_secs=9&backoff_max_secs=5&busy_secs=60",
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let kept = "2 × 1024 MiB, 2 CPUs, 10 GiB disk in pool trusted [big]";
+    for (fields, change, to) in [
+        (
+            "op=capacity-fallback&tenant=web",
+            "Fallback tenant: fallback → web".to_owned(),
+            "/clients/capacity",
+        ),
+        (
+            "op=capacity-client&principal=key-1&tenant=group",
+            "API client key-1: the fallback (web) → group".to_owned(),
+            "/clients/capacity",
+        ),
+        (
+            "op=capacity-scheduling&probe_limit=3&production_probe_burst=1\
+             &backoff_initial_secs=1&backoff_max_secs=60&busy_secs=60",
+            "Probe limit: 2 → 3".to_owned(),
+            "/clients/capacity",
+        ),
+        (
+            "op=capacity-add-headroom&pool=trusted&labels=big&slots=2&mem_mib=1024&cpus=2\
+             &disk_gib=10",
+            format!("Keep headroom: {kept}"),
+            "/clients/capacity",
+        ),
+        (
+            "op=capacity-remove-headroom&index=0",
+            format!("Stop keeping headroom: {kept}"),
+            "/clients/capacity",
+        ),
+    ] {
+        let form = policy_edit(fields);
+        let reply = capacity_confirmed(addr, &origin, &operator, &form, &[change.as_str()]).await;
+        assert_eq!(reply.status, 303, "{fields}: {}", reply.body);
+        assert_eq!(reply.header("location"), Some(to));
+    }
+    // Headroom the policy keeps already is refused before it is asked.
+    let headroom = "op=capacity-add-headroom&pool=trusted&labels=big&slots=2&mem_mib=1024\
+                    &cpus=2&disk_gib=10";
+    let changes = [format!("Keep headroom: {kept}")];
+    let changes = changes.each_ref().map(String::as_str);
+    let reply =
+        capacity_confirmed(addr, &origin, &operator, &policy_edit(headroom), &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients/capacity",
+        &policy_edit(headroom),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("keeps this headroom already"),
+        "{}",
+        reply.body
+    );
+    // Labels are a set: repeated, they name the same entry.
+    let repeated = headroom.replace("labels=big", "labels=big%2Cbig");
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/clients/capacity",
+        &policy_edit(&repeated),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let changes = [format!("Stop keeping headroom: {kept}")];
+    let changes = changes.each_ref().map(String::as_str);
+    let form = policy_edit("op=capacity-remove-headroom&index=0");
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // Removing a tenant unmaps its runners and sends its API clients to the fallback; the
+    // fallback itself is not removed.
+    let mut grouped = hub.db.capacity_policy().unwrap();
+    grouped.runners.push(RunnerMapping {
+        runner_id: 9,
+        ..mapping("group")
+    });
+    hub.db.set_capacity_policy(&grouped, "u", now).unwrap();
+    let form = policy_edit("op=capacity-remove-tenant&tenant=web");
+    let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.body.contains("is the fallback"), "{}", reply.body);
+    let page = get(addr, "/clients/tenants/group", Some(&operator))
+        .await
+        .body;
+    let form = posted_form(&page, "capacity-remove-tenant", 0);
+    let changes = [
+        "Remove tenant group",
+        "Runner gl/9: unmap from tenant group; it gets no work",
+        "API client key-1: group → the fallback (web)",
+    ];
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let saved = hub.db.capacity_policy().unwrap();
+    assert!(saved.tenant("group").is_none() && saved.runner("gl", 9).is_none());
+    assert!(saved.clients.is_empty());
 
     // The whole policy, as the CLI sets it.
     let page = get(addr, "/clients/capacity", Some(&operator)).await.body;
@@ -11696,7 +11985,10 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         )
     };
     let form = policy_form(&hidden(&page, "expected"), &whole);
-    let changes = ["runners: gl/8", "settings: busy_secs"];
+    let changes = [
+        "Runner gl/8: map to tenant web as production",
+        "Busy time: 60 → 30",
+    ];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(reply.header("location"), Some("/clients/capacity"));
@@ -11774,7 +12066,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert!(page.contains(node), "{page}");
     let page = get(addr, "/clients/tenants/web", Some(&viewer)).await.body;
     assert!(
-        page.contains("gl / 42") && page.contains("gl / 7 (production)"),
+        page.contains("<td>gl</td><td class=\"num\">42</td>")
+            && page.contains("<td class=\"num\">7</td><td>production</td>"),
         "{page}"
     );
     let form = format!("_csrf={viewer_csrf}&op=capacity-add-tenant&tenant=other");
@@ -11783,6 +12076,24 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(hub.db.capacity_policy().unwrap(), whole);
     let reply = get(addr, "/clients/tenants/nope", Some(&viewer)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+/// Without a GitLab instance, a tenant's page says so where it would add a project or map a
+/// runner by ID, and has no form that cannot be posted.
+#[tokio::test]
+async fn a_tenant_page_needs_an_instance_to_add_by_id() {
+    let (addr, hub, _) = start_fleet().await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/clients/tenants/fallback", Some(&operator))
+        .await
+        .body;
+    assert_eq!(page.matches("No GitLab instance yet.").count(), 2, "{page}");
+    assert!(!page.contains("name=\"gitlab\""), "{page}");
+    assert_eq!(
+        page.matches("<form").count(),
+        page.matches("</form>").count(),
+        "{page}"
+    );
 }
 
 /// An unreadable policy leaves Connections, policy, tenant and project pages available.
@@ -11817,6 +12128,9 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
         );
         assert!(!reply.body.contains("Tenants: "), "{path}: {}", reply.body);
     }
+    // A project the hub has not seen is listed by no policy it can read.
+    let reply = get(addr, "/clients/projects/gl/99", Some(&operator)).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
     let form = format!("_csrf={csrf}&op=capacity-add-tenant&tenant=web");
     let reply = post_action(addr, &origin, &operator, "/clients/capacity", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);

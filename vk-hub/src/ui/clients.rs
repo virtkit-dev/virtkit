@@ -265,31 +265,8 @@ fn tenants_section(h: &mut Html, shown: &Shown) {
             return;
         }
     };
-    h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
-        .raw("<th>cap</th><th class=\"num\">projects</th><th class=\"num\">runners</th>")
-        .raw("<th class=\"num\">API clients</th></tr></thead><tbody>");
-    for (name, tenant) in &policy.tenants {
-        h.raw("<tr><td><a href=\"")
-            .text(super::capacity::tenant_path(name))
-            .raw("\">")
-            .text(name)
-            .raw("</a>");
-        if policy.fallback == *name {
-            h.raw(" <span class=\"sub\">fallback</span>");
-        }
-        h.raw("</td><td class=\"num\">")
-            .text(tenant.weight)
-            .raw("</td><td>")
-            .text(super::capacity::cap(tenant))
-            .raw("</td><td class=\"num\">")
-            .text(tenant.projects.len())
-            .raw("</td><td class=\"num\">")
-            .text(policy.runners.iter().filter(|r| r.tenant == *name).count())
-            .raw("</td><td class=\"num\">")
-            .text(policy.clients.values().filter(|t| *t == name).count())
-            .raw("</td></tr>");
-    }
-    h.raw("</tbody></table><p><a href=\"")
+    super::capacity::tenants_table(h, policy);
+    h.raw("<p><a href=\"")
         .raw(super::capacity::PATH)
         .raw("\">The whole capacity policy</a></p></section>");
 }
