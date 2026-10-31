@@ -10,6 +10,7 @@
 use anyhow::Result;
 use hyper::{Response, StatusCode};
 
+use super::capacity::{KnownNode, known_nodes};
 use super::clients;
 use super::html::Html;
 use super::pages::{self, csrf_field};
@@ -58,6 +59,8 @@ struct Shown {
     relay: Option<RelayView>,
     /// The capacity policy, or why this hub cannot read it.
     policy: Result<crate::policy::Policy>,
+    /// Enrolled nodes for rule descriptions and the operator's rule picker.
+    nodes: Vec<KnownNode>,
 }
 
 /// `GET /gitlab/<instance>/projects/<project ID>`.
@@ -75,7 +78,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
                 return Ok(None);
             }
             let known = hub.db.gitlab(&named)?.is_some();
-            return Ok(Some(Err((policy, known))));
+            return Ok(Some(Err((policy, known_nodes(&hub)?, known))));
         };
         // Removing an instance forgets its projects; return no project if the instance vanished
         // between these reads.
@@ -91,13 +94,16 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             instances: hub.db.gitlab_instances()?,
             relay,
             policy: hub.db.capacity_policy(),
+            nodes: known_nodes(&hub)?,
             row,
         })))
     })
     .await?;
     let shown = match shown {
         Some(Ok(shown)) => shown,
-        Some(Err((policy, known))) => return unseen(gitlab, id, policy, known, auth),
+        Some(Err((policy, nodes, known))) => {
+            return unseen(gitlab, id, policy, &nodes, known, auth);
+        }
         None => {
             return Ok(message(
                 StatusCode::NOT_FOUND,
@@ -169,7 +175,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             "gitlab:{gitlab}:{id}"
         )))
         .raw("\">Observed traffic</a></p>");
-    super::capacity::project_section(&mut main, &shown.policy, gitlab, id, auth)?;
+    super::capacity::project_section(&mut main, &shown.policy, &shown.nodes, gitlab, id, auth)?;
     if auth.session.role >= Role::Operator {
         main.raw("<section><h2>Decide</h2><form method=\"post\" action=\"")
             .raw(clients::PATH)
@@ -202,6 +208,7 @@ fn unseen(
     gitlab: &str,
     id: u64,
     policy: crate::policy::Policy,
+    nodes: &[KnownNode],
     known: bool,
     auth: &Auth,
 ) -> Result<Response<Body>> {
@@ -222,7 +229,7 @@ fn unseen(
             .raw(clients::GITLAB_PATH)
             .raw("\">GitLab servers</a> first.</p>");
     }
-    super::capacity::project_section(&mut main, &Ok(policy), gitlab, id, auth)?;
+    super::capacity::project_section(&mut main, &Ok(policy), nodes, gitlab, id, auth)?;
     Ok(page(super::fleet::layout(
         &title,
         &path(gitlab, id),

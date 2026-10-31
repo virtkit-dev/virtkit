@@ -399,7 +399,8 @@ label { color: var(--muted); }
 .filter { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-bottom: var(--s4); }
 .filter input[type="search"] { width: 11rem; }
 .filter input[type="number"] { width: 8rem; }
-.filter label.check { display: inline-flex; align-items: center; gap: var(--s1); white-space: nowrap; }
+.filter label.check, form.wide fieldset.pick label { display: inline-flex; align-items: center; gap: var(--s1); }
+.filter label.check { white-space: nowrap; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; }
 .actions form { display: flex; gap: var(--s2); align-items: center; margin: 0; }
 /* A row's actions stay a cell, their forms wrapping within it. */
@@ -416,13 +417,18 @@ form.wide fieldset {
   border-radius: 6px;
 }
 form.wide legend { color: var(--muted); padding: 0 var(--s1); }
-form.wide fieldset.nodes, form.wide details { flex-basis: 100%; }
+form.wide fieldset.nodes, form.wide fieldset.pick, form.wide details { flex-basis: 100%; }
 form.wide fieldset.nodes button { padding: 0 var(--s2); font-size: 0.85em; }
 form.wide summary { color: var(--muted); cursor: pointer; }
 form.wide details > div { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; margin-top: var(--s2); }
 /* The egress rule editor: each phase an explicit choice, its lists beside it. */
 form.rule fieldset { flex-basis: 100%; align-items: flex-start; }
 form.rule textarea { display: block; min-width: 18rem; font-family: var(--mono); font-size: 12.5px; }
+/* Node and pool pickers: a long label wraps rather than overflow. */
+form.wide fieldset.pick label { overflow-wrap: anywhere; }
+form.wide fieldset.pick input[type="text"] { min-width: 0; width: 10rem; }
+/* A runner's picker, open in its row, wraps within a readable width. */
+td details.targets { white-space: normal; max-width: 36rem; }
 /* The capacity policy's editors: numbers sized to them, lists a full row each. */
 form.wide input[type="number"] { width: 7rem; }
 form.wide select { max-width: 100%; }

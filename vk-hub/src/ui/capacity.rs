@@ -66,8 +66,8 @@ const REMOVE_PROJECT: &str = "capacity-remove-project";
 const MAP_RUNNER: &str = "capacity-runner";
 /// Unmap a runner from a tenant: `tenant`, [`target`] `runner`.
 const UNMAP_RUNNER: &str = "capacity-unmap-runner";
-/// Set the nodes and pools a runner mapped to a tenant may use, each one per line, any node
-/// when both are empty: `tenant`, [`target`] `runner`, `nodes`, `pools`.
+/// Set the nodes and pools a runner mapped to a tenant may use, each a field or line of its
+/// own, any node when both are empty: `tenant`, [`target`] `runner`, `nodes`, `pools`.
 const SET_RUNNER_NODES: &str = "capacity-runner-nodes";
 /// Make a tenant the fallback: `tenant`.
 const SET_FALLBACK: &str = "capacity-fallback";
@@ -83,8 +83,8 @@ const REMOVE_HEADROOM: &str = "capacity-remove-headroom";
 /// Set a project's production branches, one per line: `tenant`, `gitlab`, `project`,
 /// `branches`.
 const SET_BRANCHES: &str = "capacity-branches";
-/// Add a placement rule to a project, each list one per line: `tenant`, `gitlab`, `project`,
-/// `branches`, `nodes`, `pools`.
+/// Add a placement rule to a project, `branches` one per line, `nodes` and `pools` each a
+/// field or line of its own: `tenant`, `gitlab`, `project`, `branches`, `nodes`, `pools`.
 const ADD_RULE: &str = "capacity-add-rule";
 /// Remove a project's placement rule `index`, as `tenant` lists it: `tenant`, `gitlab`,
 /// `project`, `index`.
@@ -139,6 +139,15 @@ struct KnownRunner {
     relay: String,
 }
 
+/// An enrolled node for pickers and policy descriptions. Other pages only pass it back
+/// to this module.
+pub(super) struct KnownNode {
+    id: String,
+    /// Display-safe hostname, with a short ID for duplicate or missing hostnames.
+    label: String,
+    pools: Vec<String>,
+}
+
 /// What the hub knows besides the policy, named on its pages and offered by its pickers.
 struct Known {
     gitlabs: Vec<String>,
@@ -146,8 +155,7 @@ struct Known {
     runners: Vec<KnownRunner>,
     /// Each API key's principal ID and name.
     keys: Vec<(String, String)>,
-    /// Each node's ID and pools.
-    nodes: Vec<(String, Vec<String>)>,
+    nodes: Vec<KnownNode>,
 }
 
 impl Known {
@@ -183,9 +191,7 @@ impl Known {
             keys: (hub.db.api_keys_with_ids()?.into_iter())
                 .map(|(id, key)| (id, key.name))
                 .collect(),
-            nodes: (hub.db.nodes()?.into_iter())
-                .map(|(id, row)| (id, row.pools))
-                .collect(),
+            nodes: known_nodes(hub)?,
         })
     }
 
@@ -200,6 +206,37 @@ impl Known {
             .iter()
             .find(|r| r.gitlab == gitlab && r.id == id)
     }
+}
+
+/// The nodes the hub has enrolled, sorted by label. Reads the database: call off the runtime.
+pub(super) fn known_nodes(hub: &Hub) -> Result<Vec<KnownNode>> {
+    let mut nodes: Vec<_> = (hub.db.nodes()?.into_iter())
+        .map(|(id, row)| KnownNode {
+            label: vk_hub_proto::display_safe(&row.hostname),
+            id,
+            pools: row.pools,
+        })
+        .collect();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for n in &nodes {
+        *seen.entry(n.label.clone()).or_default() += 1;
+    }
+    for n in &mut nodes {
+        if n.label.is_empty() || seen.get(&n.label).is_some_and(|&c| c > 1) {
+            n.label = format!("{} ({})", n.label, crate::rollout::short_id(&n.id))
+                .trim_start()
+                .to_owned();
+        }
+    }
+    nodes.sort_by(|a, b| (&a.label, &a.id).cmp(&(&b.label, &b.id)));
+    Ok(nodes)
+}
+
+/// Node `id` as `nodes` name it, or its ID for a node the hub has not enrolled.
+fn node_label<'a>(nodes: &'a [KnownNode], id: &'a str) -> &'a str {
+    (nodes.iter())
+        .find(|n| n.id == id)
+        .map_or(id, |n| n.label.as_str())
 }
 
 /// Project `id` of `gitlab` as a page names it: its path where known, linking to its page.
@@ -787,7 +824,7 @@ fn runners_section(
                 .raw("</td><td>");
             may_use_cell(h, r, known);
             if steer {
-                runner_nodes_form(h, name, r, auth, digest);
+                runner_nodes_form(h, name, r, known, auth, digest);
             }
             h.raw("</td>");
             if steer {
@@ -874,10 +911,10 @@ fn may_use_cell(h: &mut Html, r: &RunnerMapping, known: &Known) {
         h.raw("any node");
         return;
     }
-    h.text(may_use_text(r));
+    h.text(may_use_text(r, &known.nodes));
     let allowed: Vec<_> = (known.nodes.iter())
-        .filter(|(id, pools)| r.allows(id, pools))
-        .map(|(id, _)| id.as_str())
+        .filter(|n| r.allows(&n.id, &n.pools))
+        .map(|n| n.label.as_str())
         .collect();
     h.raw("<br><span class=\"sub\">");
     if allowed.is_empty() {
@@ -893,10 +930,13 @@ fn may_use_cell(h: &mut Html, r: &RunnerMapping, known: &Known) {
     h.raw("</span>");
 }
 
-/// What runner mapping `r` may use, as a page or question says it.
-pub(super) fn may_use_text(r: &RunnerMapping) -> String {
+/// Runner mapping `r`'s allowed targets for pages and questions, with node labels from
+/// `nodes`.
+pub(super) fn may_use_text(r: &RunnerMapping, nodes: &[KnownNode]) -> String {
+    let named: Vec<_> = r.nodes.iter().map(|id| node_label(nodes, id)).collect();
+    let pools: Vec<_> = r.pools.iter().map(String::as_str).collect();
     let mut parts = Vec::new();
-    for (one, many, list) in [("node", "nodes", &r.nodes), ("pool", "pools", &r.pools)] {
+    for (one, many, list) in [("node", "nodes", &named), ("pool", "pools", &pools)] {
         if !list.is_empty() {
             let word = if list.len() == 1 { one } else { many };
             parts.push(format!("{word} {}", listed(list)));
@@ -927,21 +967,82 @@ fn may_use_sets(r: &RunnerMapping) -> (BTreeSet<&String>, BTreeSet<&String>) {
     (r.nodes.iter().collect(), r.pools.iter().collect())
 }
 
-/// The form setting the nodes runner mapping `r`, of tenant `name`, may use.
-fn runner_nodes_form(h: &mut Html, name: &str, r: &RunnerMapping, auth: &Auth, digest: &str) {
-    h.raw("<details><summary>Change</summary>");
+/// The form setting the nodes runner mapping `r`, of tenant `name`, may use. Each runner's
+/// row holds a picker of every node, folded away: fine for fleets of tens of nodes.
+fn runner_nodes_form(
+    h: &mut Html,
+    name: &str,
+    r: &RunnerMapping,
+    known: &Known,
+    auth: &Auth,
+    digest: &str,
+) {
+    h.raw("<details class=\"targets\"><summary>Change</summary>");
     edit_form(h, auth, SET_RUNNER_NODES, digest);
     hidden(h, "tenant", name);
     hidden(h, "gitlab", &r.gitlab);
     hidden(h, "runner", r.runner_id);
-    h.raw("<label>Node IDs, one per line<textarea name=\"nodes\" rows=\"3\" ")
-        .raw("spellcheck=\"false\">")
-        .text(r.nodes.join("\n"))
-        .raw("</textarea></label><label>Pools, one per line<textarea name=\"pools\" ")
-        .raw("rows=\"3\" spellcheck=\"false\">")
-        .text(r.pools.join("\n"))
-        .raw("</textarea></label><p class=\"sub\">A node listed or in a pool listed; ")
-        .raw("both empty for any node.</p><button>Save</button></form></details>");
+    targets_picker(h, &known.nodes, &r.nodes, &r.pools);
+    h.raw("<p class=\"sub\">A node ticked or in a pool ticked; none ticked for any node. At ")
+        .raw("most 256 nodes and 256 pools.</p>")
+        .raw("<button>Save</button></form></details>");
+}
+
+/// Checkboxes for known nodes by hostname and pools, with `nodes` and `pools` ticked.
+/// Keep unknown selections so a save preserves them. Allow typing pools with no nodes.
+fn targets_picker(h: &mut Html, known: &[KnownNode], nodes: &[String], pools: &[String]) {
+    /// A checkbox posting `value` as `field`, labelled by what `label` writes.
+    fn tick(h: &mut Html, field: &str, value: &str, ticked: bool, label: impl FnOnce(&mut Html)) {
+        h.raw("<label><input type=\"checkbox\" name=\"")
+            .text(field)
+            .raw("\" value=\"")
+            .text(value)
+            .raw(if ticked { "\" checked> " } else { "\"> " });
+        label(h);
+        h.raw("</label>");
+    }
+    h.raw("<fieldset class=\"pick\"><legend>Nodes</legend>");
+    for n in known {
+        tick(h, "nodes", &n.id, nodes.contains(&n.id), |h| {
+            h.text(&n.label);
+            if !n.pools.is_empty() {
+                h.raw(" <span class=\"sub\">")
+                    .text(n.pools.join(", "))
+                    .raw("</span>");
+            }
+        });
+    }
+    for id in nodes.iter().filter(|id| known.iter().all(|n| &n.id != *id)) {
+        tick(h, "nodes", id, true, |h| {
+            h.raw("<code>")
+                .text(id)
+                .raw("</code> <span class=\"sub\">not enrolled</span>");
+        });
+    }
+    if known.is_empty() && nodes.is_empty() {
+        h.raw("<span class=\"sub\">No node enrolled yet.</span>");
+    }
+    h.raw("</fieldset><fieldset class=\"pick\"><legend>Pools</legend>");
+    let mut offered: BTreeMap<&str, usize> = BTreeMap::new();
+    for pool in known.iter().flat_map(|n| &n.pools) {
+        *offered.entry(pool).or_default() += 1;
+    }
+    for pool in pools {
+        offered.entry(pool).or_default();
+    }
+    for (pool, count) in offered {
+        tick(h, "pools", pool, pools.iter().any(|p| p == pool), |h| {
+            h.text(pool).raw(" <span class=\"sub\">");
+            match count {
+                0 => h.raw("no node"),
+                1 => h.raw("1 node"),
+                n => h.text(format_args!("{n} nodes")),
+            };
+            h.raw("</span>");
+        });
+    }
+    h.raw("<label>Another <input type=\"text\" name=\"pools\" spellcheck=\"false\" ")
+        .raw("aria-label=\"Another pool\"></label></fieldset>");
 }
 
 /// Tenant `name`'s page around `main`.
@@ -1022,10 +1123,12 @@ fn add_tenant_fields(h: &mut Html, auth: &Auth) {
 }
 
 /// A project's section of its page: the tenants listing it and their runners on its instance,
-/// its production branches and its placement rules, which operators edit there.
+/// its production branches and its placement rules, which operators edit there, picking from
+/// `nodes`.
 pub(super) fn project_section(
     h: &mut Html,
     policy: &Result<Policy>,
+    nodes: &[KnownNode],
     gitlab: &str,
     id: u64,
     auth: &Auth,
@@ -1160,7 +1263,10 @@ pub(super) fn project_section(
                     .text(rule.branches.join(", "))
                     .raw("</code>");
             }
-            for list in [&rule.nodes, &rule.pools] {
+            let named: Vec<_> = (rule.nodes.iter())
+                .map(|id| node_label(nodes, id).to_owned())
+                .collect();
+            for list in [&named, &rule.pools] {
                 h.raw("</td><td>");
                 if list.is_empty() {
                     h.raw("<span class=\"sub\">any</span>");
@@ -1191,11 +1297,10 @@ pub(super) fn project_section(
         hidden(h, "gitlab", gitlab);
         hidden(h, "project", id);
         h.raw("<label>Refs, one glob per line, none for every job<textarea name=\"branches\" ")
-            .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>")
-            .raw("<label>Node IDs, one per line, none for any<textarea name=\"nodes\" ")
-            .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>")
-            .raw("<label>Pools, one per line, none for any<textarea name=\"pools\" ")
-            .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>")
+            .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>");
+        targets_picker(h, nodes, &[], &[]);
+        h.raw("<p class=\"sub\">Leave nodes, or pools, unticked for any; not both. At most ")
+            .raw("256 nodes and 256 pools.</p>")
             .raw("<button>Add rule</button></form>");
     }
     h.raw("</section>");
@@ -1231,6 +1336,7 @@ pub(super) async fn action(
         .into_iter()
         .map(|(k, v)| (k, v.replace("\r\n", "\n")))
         .collect();
+    let form = joined(form, &["nodes", "pools"]);
     let (op, fields, back) = match edit(&form) {
         Ok(edit) => edit,
         Err(why) => return Ok(refused_page(&auth, PATH, StatusCode::BAD_REQUEST, why)),
@@ -1260,8 +1366,15 @@ pub(super) async fn action(
         });
     }
     let hub = ui.hub.clone();
-    let current = match blocking(move || Ok(hub.db.capacity_policy())).await? {
-        Ok(current) => current,
+    // The enrolled nodes, to name those the question lists.
+    let read = blocking(move || {
+        Ok(hub
+            .db
+            .capacity_policy()
+            .and_then(|policy| Ok((policy, known_nodes(&hub)?))))
+    });
+    let (current, nodes) = match read.await? {
+        Ok(read) => read,
         Err(e) => {
             let why = format!("{e:#}");
             return Ok(refused_page(&auth, &back, StatusCode::CONFLICT, &why));
@@ -1284,7 +1397,7 @@ pub(super) async fn action(
     }
     let mut detail = Html::new();
     detail.raw("<ul>");
-    for change in describe(&current, &proposed) {
+    for change in describe(&current, &proposed, &nodes) {
         detail.raw("<li>").text(change).raw("</li>");
     }
     detail.raw("</ul>");
@@ -1515,6 +1628,28 @@ fn edit(
     Ok((op, fields, back))
 }
 
+/// Join repeated fields in `names` into their first occurrence, one value per line.
+/// Pickers post one field per ticked box; confirmation questions carry one per name.
+fn joined(form: Vec<(String, String)>, names: &[&str]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // First position in `out` for each of `names`.
+    let mut at: Vec<Option<usize>> = vec![None; names.len()];
+    for (k, v) in form {
+        if let Some(i) = names.iter().position(|n| *n == k) {
+            if let Some((_, first)) = at.get(i).copied().flatten().and_then(|j| out.get_mut(j)) {
+                first.push('\n');
+                first.push_str(&v);
+                continue;
+            }
+            if let Some(slot) = at.get_mut(i) {
+                *slot = Some(out.len());
+            }
+        }
+        out.push((k, v));
+    }
+    out
+}
+
 /// Trim `value`'s lines and omit empty ones.
 fn lines(value: &str) -> Vec<String> {
     (value.lines())
@@ -1742,7 +1877,7 @@ fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Poli
 
 /// What changes from `before` to `after`, a line each, as a question lists it: at most
 /// [`MAX_DESCRIBED`], the rest counted.
-fn describe(before: &Policy, after: &Policy) -> Vec<String> {
+fn describe(before: &Policy, after: &Policy, nodes: &[KnownNode]) -> Vec<String> {
     let mut out = Vec::new();
     let names: BTreeSet<_> = before.tenants.keys().chain(after.tenants.keys()).collect();
     for name in names {
@@ -1815,7 +1950,7 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
             {
                 out.push(format!(
                     "Project {gitlab}/{id}: add placement rule {}",
-                    rule_text(r)
+                    rule_text(r, nodes)
                 ));
             }
             for r in b
@@ -1825,7 +1960,7 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
             {
                 out.push(format!(
                     "Project {gitlab}/{id}: remove placement rule {}",
-                    rule_text(r)
+                    rule_text(r, nodes)
                 ));
             }
         }
@@ -1841,7 +1976,7 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
         match (rb.get(key), ra.get(key)) {
             (None, Some(a)) => {
                 let using = if a.confined() {
-                    format!(", using {}", may_use_text(a))
+                    format!(", using {}", may_use_text(a, nodes))
                 } else {
                     String::new()
                 };
@@ -1858,7 +1993,7 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
                 let same_nodes = may_use_sets(b) == may_use_sets(a);
                 if (&b.tenant, b.class) != (&a.tenant, a.class) {
                     let still = if same_nodes && a.confined() {
-                        format!(", still using {}", may_use_text(a))
+                        format!(", still using {}", may_use_text(a, nodes))
                     } else {
                         String::new()
                     };
@@ -1870,8 +2005,8 @@ fn describe(before: &Policy, after: &Policy) -> Vec<String> {
                 if !same_nodes {
                     out.push(format!(
                         "Runner {gitlab}/{id}: may use {} → {}",
-                        may_use_text(b),
-                        may_use_text(a)
+                        may_use_text(b, nodes),
+                        may_use_text(a, nodes)
                     ));
                 }
             }
@@ -1953,7 +2088,7 @@ fn list_text(list: &[String]) -> String {
     }
 }
 
-fn rule_text(r: &PlacementRule) -> String {
+fn rule_text(r: &PlacementRule, nodes: &[KnownNode]) -> String {
     let jobs = if r.branches.is_empty() {
         "every job".to_owned()
     } else {
@@ -1966,7 +2101,10 @@ fn rule_text(r: &PlacementRule) -> String {
             list.join(", ")
         }
     };
-    format!("({jobs}: nodes {}, pools {})", any(&r.nodes), any(&r.pools))
+    let named: Vec<_> = (r.nodes.iter())
+        .map(|id| node_label(nodes, id).to_owned())
+        .collect();
+    format!("({jobs}: nodes {}, pools {})", any(&named), any(&r.pools))
 }
 
 fn headroom_text(h: &Headroom) -> String {
@@ -2042,7 +2180,7 @@ mod tests {
             slots: 1,
         });
         assert_eq!(
-            describe(&before, &after),
+            describe(&before, &after, &[]),
             [
                 "Add tenant ci, of weight 2 and cap unbounded",
                 "Tenant ci: list project gl/42",
@@ -2051,6 +2189,37 @@ mod tests {
                 "Keep headroom: 1 × 512 MiB, 1 CPUs, 1610612736 bytes disk in pool ci",
             ]
         );
+    }
+
+    /// Repeated picker fields reach the edit as one value per line.
+    #[test]
+    fn repeated_picker_fields_are_joined_into_their_first() {
+        let form = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            (pairs.iter())
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let posted = form(&[
+            ("op", "x"),
+            ("nodes", ""),
+            ("scope", "a"),
+            ("nodes", "n1"),
+            ("pools", "p"),
+            ("scope", "b"),
+            ("nodes", "n2"),
+        ]);
+        // Preserve order, first position, empty values and unrelated repeated fields.
+        assert_eq!(
+            joined(posted, &["nodes", "pools"]),
+            form(&[
+                ("op", "x"),
+                ("nodes", "\nn1\nn2"),
+                ("scope", "a"),
+                ("pools", "p"),
+                ("scope", "b"),
+            ])
+        );
+        assert_eq!(lines("\nn1\nn2"), ["n1", "n2"]);
     }
 
     /// Reordering nodes or pools preserves allowed nodes; long lists count omitted entries.
@@ -2076,10 +2245,10 @@ mod tests {
         after.runners[0].nodes.reverse();
         after.runners[0].pools.reverse();
         // Saved, as any reorder is, but naming no change of what it may use.
-        assert_eq!(describe(&before, &after), ["runners: gl/7"]);
+        assert_eq!(describe(&before, &after, &[]), ["runners: gl/7"]);
         after.runners[0].tenant = "web".into();
         assert_eq!(
-            describe(&before, &after),
+            describe(&before, &after, &[]),
             [
                 "Runner gl/7: tenant fallback as normal → tenant web as normal, still using \
                  nodes n9, n8, n7, n6, n5, n4, n3, n2 and 2 more or pools b, a"

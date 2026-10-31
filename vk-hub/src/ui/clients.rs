@@ -143,6 +143,8 @@ struct Shown {
     /// Read under the dispatch lock in O(tickets + jobs), with up to 8192 tickets kept, on
     /// every render of a server's page, its live updates included; empty for the other pages.
     arbitration: HashMap<(String, u64), crate::jobs::ArbitrationView>,
+    /// Enrolled nodes for naming allowed targets wherever runners appear.
+    nodes: Vec<super::capacity::KnownNode>,
 }
 
 /// The GitLab page [`Shown::read`] reads for.
@@ -189,6 +191,11 @@ impl Shown {
                 crate::jobs::arbitration_snapshot(hub)?
             } else {
                 HashMap::new()
+            },
+            nodes: if runners {
+                super::capacity::known_nodes(hub)?
+            } else {
+                Vec::new()
             },
         })
     }
@@ -950,7 +957,8 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         }
         h.raw(" · ").text(crate::store::envelope_text(p.envelope));
         if let Some(m) = mapping.filter(|m| m.confined()) {
-            h.raw(" · only ").text(super::capacity::may_use_text(m));
+            h.raw(" · only ")
+                .text(super::capacity::may_use_text(m, &shown.nodes));
         }
         h.raw("</td><td class=\"num\">");
         match runner.limit {

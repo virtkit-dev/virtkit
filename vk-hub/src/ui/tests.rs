@@ -11759,27 +11759,47 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(saved.runner("gl", 7), Some(&mapping("web")));
 
     // The nodes it may use: kept when it is made normal, and shown with those they match now.
-    let nodes_form = |nodes: &str, pools: &str| {
-        format!(
-            "_csrf={csrf}&op=capacity-runner-nodes&expected={}&tenant=web&gitlab=gl&runner=7\
-             &nodes={nodes}&pools={pools}",
+    // A picker posts each box ticked as a field of its own.
+    let nodes_form = |nodes: &[&str], pools: &[&str]| {
+        let mut form = format!(
+            "_csrf={csrf}&op=capacity-runner-nodes&expected={}&tenant=web&gitlab=gl&runner=7",
             digest()
-        )
+        );
+        for (name, values) in [("nodes", nodes), ("pools", pools)] {
+            for value in values {
+                form.push_str(&format!("&{name}={}", enc(value)));
+            }
+        }
+        form
     };
-    let changes =
-        ["Runner gl/7: may use any node → node 0123456789abcdef0123456789abcdef or pools a, b"];
-    let form = nodes_form("0123456789abcdef0123456789abcdef", "a%0D%0Ab");
-    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    let unknown = "0123456789abcdef0123456789abcdef";
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
+        .await
+        .body;
+    assert!(page.contains("No node enrolled yet."), "{page}");
+    // Answered as a browser does: the question's own form, carrying the boxes a line each.
+    let form = nodes_form(&[unknown], &["a", "", "b"]);
+    let question = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
+    let change = format!("Runner gl/7: may use any node → node {unknown} or pools a, b");
+    assert!(
+        question.body.contains(&format!("<li>{change}</li>")),
+        "{}",
+        question.body
+    );
+    assert_eq!(unescape(&hidden(&question.body, "pools")), "a\n\nb");
+    let answer = posted_form(&question.body, "capacity-runner-nodes", 0);
+    let reply = post_action(addr, &origin, &operator, "/capacity", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    // The same ones again, reordered and repeated, change nothing.
-    let form = nodes_form("0123456789abcdef0123456789abcdef", "b%0D%0Aa%0D%0Ab");
+    // The same ones again, reordered and repeated, change nothing; lines count as boxes.
+    let form = nodes_form(&[unknown], &["b\r\na", "b"]);
     let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     let form = runner_form("capacity-runner", "web").replace("production", "normal");
-    let changes = [
-        "Runner gl/7: tenant web as production → tenant web as normal, still using \
-                    node 0123456789abcdef0123456789abcdef or pools a, b",
-    ];
+    let changes = [format!(
+        "Runner gl/7: tenant web as production → tenant web as normal, still using node \
+         {unknown} or pools a, b"
+    )];
+    let changes: Vec<_> = changes.iter().map(String::as_str).collect();
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     let kept = hub.db.capacity_policy().unwrap();
@@ -11787,7 +11807,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(
         (&kept.nodes[..], &kept.pools[..]),
         (
-            &["0123456789abcdef0123456789abcdef".to_string()][..],
+            &[unknown.to_string()][..],
             &["a".to_string(), "b".to_string()][..]
         )
     );
@@ -11795,19 +11815,78 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         .await
         .body;
     for want in [
-        "node 0123456789abcdef0123456789abcdef or pools a, b<br><span class=\"sub\">No node of the hub's matches",
-        "value=\"capacity-runner-nodes\"",
+        format!("node {unknown} or pools a, b<br><span class=\"sub\">No node of the hub's matches"),
+        "value=\"capacity-runner-nodes\"".into(),
+        // Ticked though the hub knows neither: a save keeps them.
+        format!(
+            "name=\"nodes\" value=\"{unknown}\" checked> <code>{unknown}</code> \
+             <span class=\"sub\">not enrolled</span>"
+        ),
+        "name=\"pools\" value=\"a\" checked> a <span class=\"sub\">no node</span>".into(),
     ] {
-        assert!(page.contains(want), "{want}: {}", page);
+        assert!(page.contains(&want), "{want}: {}", page);
     }
-    let form = nodes_form("bad%20id", "");
+    // Enrolled nodes are offered by hostname, sorted, told apart by short ID when two share
+    // one, and their pools with how many nodes are in each.
+    let ci = enrolled_as(&hub, "ci-1", "ab");
+    let ci_again = enrolled_as(&hub, "ci-1", "cd");
+    let build = enrolled_as(&hub, "build-2", "ef");
+    let nameless = enrolled_as(&hub, "", "12");
+    for id in [&ci, &ci_again] {
+        hub.db.set_pools(id, &["a".to_string()], "u", now).unwrap();
+    }
+    let label = |id: &str| format!("ci-1 ({})", crate::rollout::short_id(id));
+    let (ci_label, again_label) = (label(&ci), label(&ci_again));
+    let page = get(addr, "/capacity/tenants/web", Some(&operator))
+        .await
+        .body;
+    let mut order = [(&ci_label, &ci), (&again_label, &ci_again)];
+    order.sort();
+    for want in [
+        format!(
+            "name=\"nodes\" value=\"{build}\"> build-2</label><label><input type=\"checkbox\" \
+             name=\"nodes\" value=\"{}\"> {} <span class=\"sub\">a</span>",
+            order[0].1, order[0].0
+        ),
+        format!("name=\"nodes\" value=\"{ci_again}\"> {again_label} <span class=\"sub\">a</span>"),
+        "name=\"pools\" value=\"a\" checked> a <span class=\"sub\">2 nodes</span>".into(),
+        "name=\"pools\" value=\"b\" checked> b <span class=\"sub\">no node</span>".into(),
+        format!("Now 2 of 4 nodes: {}, {}", order[0].0, order[1].0),
+        // One without a hostname goes by its short ID.
+        format!(
+            "name=\"nodes\" value=\"{nameless}\"> ({})</label>",
+            crate::rollout::short_id(&nameless)
+        ),
+    ] {
+        assert!(page.contains(&want), "{want}: {}", page);
+    }
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
+        .await
+        .body;
+    let want = format!("name=\"nodes\" value=\"{ci}\"> {ci_label}");
+    assert!(page.contains(&want), "{want}: {page}");
+    let form = nodes_form(&["bad id"], &[]);
     let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(reply.body.contains("invalid node ID"), "{}", reply.body);
-    let form = nodes_form("", "");
-    let changes =
-        ["Runner gl/7: may use node 0123456789abcdef0123456789abcdef or pools a, b → any node"];
-    let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;
+    // The question names an enrolled node as pages do.
+    let form = nodes_form(&[&ci], &[]);
+    let change = format!("Runner gl/7: may use node {unknown} or pools a, b → node {ci_label}");
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[&change]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // Many nodes not enrolled: the cell counts those past the eighth and still says the pools.
+    let many: Vec<_> = (1..=10).map(|i| format!("{i:032x}")).collect();
+    let many_refs: Vec<_> = many.iter().map(String::as_str).collect();
+    let form = nodes_form(&many_refs, &["z"]);
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let page = get(addr, "/capacity/tenants/web", Some(&operator))
+        .await
+        .body;
+    let want = format!("{} and 2 more or pool z<br>", many[7]);
+    assert!(page.contains(&want), "{want}: {page}");
+    let form = nodes_form(&[], &[]);
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     let form = runner_form("capacity-runner", "web");
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &[]).await;
@@ -11918,6 +11997,26 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         "{}",
         reply.body
     );
+    // A rule picked from boxes: its nodes named by hostname in the question and the table.
+    let mut form = rule_form(&saved.digest().unwrap(), "", &ci, "a");
+    form.push_str(&format!("&nodes={build}&pools=b"));
+    let added = format!(
+        "Project gl/42: add placement rule (every job: nodes {ci_label}, build-2, pools a, b)"
+    );
+    let reply = capacity_confirmed(addr, &origin, &operator, &form, &[added.as_str()]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let picked = PlacementRule {
+        branches: vec![],
+        nodes: vec![ci.clone(), build.clone()],
+        pools: vec!["a".into(), "b".into()],
+    };
+    let rules = &hub.db.capacity_policy().unwrap().tenants["web"].projects[0].placement_rules;
+    assert!(rules.iter().any(|r| r.same_as(&picked)), "{rules:?}");
+    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
+        .await
+        .body;
+    let want = format!("<code>{ci_label}, build-2</code></td><td><code>a, b</code>");
+    assert!(page.contains(&want), "{want}: {page}");
     // A rule the tenants list in another order is removed from both.
     let pooled = |pools: [&str; 2]| PlacementRule {
         branches: vec![],

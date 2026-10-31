@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Pick a runner's nodes and pools from checkboxes.** The tenant page offers the hub's nodes
+  by hostname, and pools with their node counts, instead of text boxes for node IDs and
+  pools; a pool no node is in yet can still be typed. A placement rule on a project's page
+  picks its nodes and pools the same way. Pages and confirmation questions name a runner's or
+  rule's nodes by hostname, not by ID.
+
 ## [0.100.0] - 2026-10-31
 
 ### Added
