@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.101.0] - 2026-11-01
+
 ### Added
 
 - **Set a node's pools from its page.** The steering panel shows the pools a node is in, and
@@ -4924,7 +4926,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.100.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.101.0...HEAD
+[0.101.0]: https://github.com/virtkit-dev/virtkit/compare/v0.100.0...v0.101.0
 [0.100.0]: https://github.com/virtkit-dev/virtkit/compare/v0.99.0...v0.100.0
 [0.99.0]: https://github.com/virtkit-dev/virtkit/compare/v0.98.0...v0.99.0
 [0.98.0]: https://github.com/virtkit-dev/virtkit/compare/v0.97.0...v0.98.0
