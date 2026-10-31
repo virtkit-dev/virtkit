@@ -79,7 +79,7 @@ pub use jobs::{
 };
 pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
-    PrincipalKind, Scope, envelope_text, valid_name,
+    MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
 pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retention, resolve};
 pub use observed::{
@@ -319,6 +319,10 @@ impl UiSession {
     }
 }
 
+/// The most pools a node is in: every page and placement reads them with its row, so they
+/// are bounded.
+pub const MAX_NODE_POOLS: usize = 256;
+
 /// An enrolled node. Fields added later carry `#[serde(default)]` so rows written by an
 /// older hub still read.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -514,6 +518,18 @@ impl TokenKind {
         }
     }
 }
+
+/// A pool validation error reported to the caller.
+#[derive(Debug)]
+pub struct PoolsRefused(pub String);
+
+impl std::fmt::Display for PoolsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PoolsRefused {}
 
 /// A node's row is gone: it was never enrolled, or has been removed.
 #[derive(Debug)]
@@ -2339,15 +2355,23 @@ impl Db {
         Ok(out)
     }
 
-    /// Put node `id` in `pools`, replacing the ones it was in, audited as `actor`'s. Whether
-    /// that changed anything.
+    /// Replace node `id`'s pools with at most [`MAX_NODE_POOLS`], audited as `actor`.
+    /// Return whether the pools changed.
     pub fn set_pools(&self, id: &str, pools: &[String], actor: &str, now: u64) -> Result<bool> {
         if let Some(bad) = pools.iter().find(|p| !valid_name(p)) {
-            bail!("{bad:?} is not a pool's name");
+            return Err(PoolsRefused(format!(
+                "{bad:?} is not a pool's name: 1 to {MAX_NAME} ASCII letters, digits, '.', '_' \
+                 and '-', starting with a letter or digit"
+            ))
+            .into());
         }
         let mut pools = pools.to_vec();
         pools.sort();
         pools.dedup();
+        if pools.len() > MAX_NODE_POOLS {
+            let why = format!("a node is in at most {MAX_NODE_POOLS} pools");
+            return Err(PoolsRefused(why).into());
+        }
         self.update_txn(now, id, |row, _| {
             if row.pools == pools {
                 return Ok((false, Vec::new(), Durability::Immediate));
@@ -3826,6 +3850,24 @@ mod tests {
             panic!("expected an enrollment");
         };
         node_id
+    }
+
+    #[test]
+    fn a_node_s_pools_are_named_deduplicated_and_capped() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let pools = |n: usize| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>();
+        let err = db
+            .set_pools(&id, &pools(MAX_NODE_POOLS + 1), "u", 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 256 pools"), "{err:#}");
+        // Repeated ones count once.
+        let mut at_most = pools(MAX_NODE_POOLS);
+        at_most.push("p0".into());
+        assert!(db.set_pools(&id, &at_most, "u", 1).unwrap());
+        assert_eq!(db.node(&id).unwrap().unwrap().pools.len(), MAX_NODE_POOLS);
+        let err = db.set_pools(&id, &["a b".into()], "u", 1).unwrap_err();
+        assert!(err.to_string().contains("is not a pool's name"), "{err:#}");
     }
 
     #[test]

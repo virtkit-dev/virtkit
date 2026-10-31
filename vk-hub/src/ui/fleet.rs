@@ -33,7 +33,7 @@ use crate::ops::{self, NodeView};
 use crate::rollout::{DeleteRule, NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{
-    CommandRow, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, RolloutConflict,
+    CommandRow, MonitoringOnly, NodeRow, NotEnrolled, PoolsRefused, Release, Role, RolloutConflict,
     RolloutUndeletable,
 };
 
@@ -501,6 +501,8 @@ enum Steer {
     Ceiling(Option<u32>),
     Acquisition(Acquisition),
     Command(Operation),
+    /// The pools to put the node in, replacing those it is in.
+    Pools(Vec<String>),
 }
 
 /// What `form` asks, or why it is no action.
@@ -516,6 +518,19 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
             }
         },
         "lift-ceiling" => Steer::Ceiling(None),
+        "pools" => {
+            let mut pools: Vec<_> = field(form, "pools")
+                .unwrap_or("")
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect();
+            // Match the store's order and deduplication so the reply agrees with the page.
+            // Validation stays in the store.
+            pools.sort();
+            pools.dedup();
+            Steer::Pools(pools)
+        }
         "stop" => Steer::Acquisition(Acquisition::Stop),
         "resume" => Steer::Acquisition(Acquisition::Run),
         "drain" => Steer::Command(Operation::Drain),
@@ -606,6 +621,16 @@ pub(super) async fn node_action(
                 ops::set_ceiling(&hub, &principal, &node, ceiling).map(desired)
             }
             Steer::Acquisition(a) => ops::set_acquisition(&hub, &principal, &node, a).map(desired),
+            Steer::Pools(pools) => ops::set_pools(&hub, &principal, &node, &pools).map(|changed| {
+                if !changed {
+                    return "Already so; nothing changed.".to_string();
+                }
+                if pools.is_empty() {
+                    "Taken out of every pool.".to_string()
+                } else {
+                    format!("Now in pools {}.", pools.join(", "))
+                }
+            }),
             Steer::Command(op) => ops::command(&hub, &principal, &node, op).map(|c| {
                 format!(
                     "Issued {} (command {}); what the node makes of it shows below.",
@@ -623,6 +648,13 @@ pub(super) async fn node_action(
                 htmx,
                 StatusCode::CONFLICT,
                 &format!("Refused: {e:#}."),
+            ));
+        }
+        Err(e) if e.is::<PoolsRefused>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::BAD_REQUEST,
+                &format!("Refused: {e}."),
             ));
         }
         Err(e) if e.is::<NotEnrolled>() => {
@@ -1486,8 +1518,8 @@ impl Panel {
 
 /// Show the node's state and, given an operator's `csrf`, applicable actions with explanations.
 /// Viewers see only the state. The live fragment keeps actions current; `hx-preserve` keeps
-/// the limit input and the reset's "Keep cached images" box through updates, including edits
-/// in progress. Forms support htmx and plain submission.
+/// the limit and pools inputs and the reset's "Keep cached images" box through updates,
+/// including edits in progress. Forms support htmx and plain submission.
 fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
     let p = Panel::of(v);
     let path = format!("/node/{}/action", v.id);
@@ -1536,7 +1568,9 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
     if let Some(a) = &p.lift {
         act(h, a, "");
     }
-    h.raw("</div><div class=\"group maintenance\"><h3>Maintenance</h3><p class=\"now\">")
+    h.raw("</div>");
+    pools_group(h, v, &path, csrf);
+    h.raw("<div class=\"group maintenance\"><h3>Maintenance</h3><p class=\"now\">")
         .raw(p.maintenance)
         .raw("</p>");
     for a in &p.maintenance_acts {
@@ -1551,6 +1585,43 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
         h.raw("</div>");
     }
     h.raw("</div></section>");
+}
+
+/// The steering panel's pools: those the node is in, which placed jobs and capacity rules name
+/// it by, and, given an operator's `csrf`, their editor posting to `path`.
+fn pools_group(h: &mut Html, v: &NodeView, path: &str, csrf: Option<&str>) {
+    h.raw("<div class=\"group\"><h3>Pools</h3><p class=\"now\">");
+    if v.pools.is_empty() {
+        h.raw("In no pool");
+    } else {
+        h.raw("In pools ").text(v.pools.join(", "));
+    }
+    h.raw("</p>");
+    if let Some(csrf) = csrf {
+        pools_form(h, &v.pools, path, csrf);
+    }
+    h.raw("</div>");
+}
+
+/// The form replacing a node's `pools`, posting to `path` with the session's CSRF token
+/// `csrf`.
+fn pools_form(h: &mut Html, pools: &[String], path: &str, csrf: &str) {
+    // Filled with the pools it is in, and preserved through updates while they stay so: the
+    // ID names them, so a change of pools brings the new ones in.
+    let joined = pools.join(", ");
+    let id = pages::preserved_id("pools", &joined);
+    form_open(h, path, csrf);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"pools\">")
+        .raw("<label for=\"")
+        .text(&id)
+        .raw("\">Pools</label><input id=\"")
+        .text(&id)
+        .raw("\" type=\"text\" name=\"pools\" spellcheck=\"false\" hx-preserve=\"true\" ")
+        .raw("value=\"")
+        .text(&joined)
+        .raw("\"><button>Set pools</button><span class=\"does\">Comma- or space-separated; ")
+        .raw("they replace the node's, and empty takes it out of every pool. Placed jobs and ")
+        .raw("capacity rules name nodes by pool.</span></form>");
 }
 
 /// The opening of a steering form posting to `path`, by htmx or as a plain form, with the

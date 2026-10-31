@@ -1090,9 +1090,9 @@ one recorded. A submission whose `request_id` was seen is answered as it was fir
 the refusal — before the gate, so a retry counts once and a relay recovering an accepted job is
 not refused by a later rejection; queued and running jobs stay as they are.
 
-**Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>` sets the pools a node is in,
-audited. Labels come from the node's inventory. `vk-hub nodes` lists each node's pools and
-labels under the table.
+**Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>`, or an operator on the node's
+web page, sets the pools a node is in, at most 256, audited. Labels come from the node's
+inventory. `vk-hub nodes` lists each node's pools and labels under the table.
 
 **The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
 `/v1/jobs`. The key, or the relay and its signed time, is checked before the body is read. A body is at most 64 KiB, a job

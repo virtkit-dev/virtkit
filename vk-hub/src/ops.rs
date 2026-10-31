@@ -126,6 +126,16 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
     }
 }
 
+/// Replace node `id`'s pools as `actor`. Notify the hub's watchers only on change.
+/// Return whether the pools changed.
+pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<bool> {
+    let changed = hub.db.set_pools(id, pools, actor, crate::now_secs())?;
+    if changed {
+        hub.changed(id);
+    }
+    Ok(changed)
+}
+
 /// Cap node `id`'s concurrency at `ceiling`, or lift the cap with `None`, as `actor`.
 /// Return the new desired state, or `None` if unchanged.
 pub fn set_ceiling(

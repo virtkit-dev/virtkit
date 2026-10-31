@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Set a node's pools from its page.** The steering panel shows the pools a node is in, and
+  operators replace them there, comma- or space-separated; an empty field takes the node out
+  of every pool. A node is in at most 256 pools, from the page or `vk-hub nodes pools`.
+
 ### Changed
 
 - **Pick a runner's nodes and pools from checkboxes.** The tenant page offers the hub's nodes

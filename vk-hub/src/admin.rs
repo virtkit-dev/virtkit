@@ -928,9 +928,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(ops::set_account(hub, &actor, &email, None, false)?)?
         }
         Call::SetPools { id, pools } => {
-            let changed = hub.db.set_pools(&id, &pools, &actor, crate::now_secs())?;
-            hub.changed(&id);
-            serde_json::to_value(changed)?
+            serde_json::to_value(ops::set_pools(hub, &actor, &id, &pools)?)?
         }
         Call::CreateKey {
             name,

@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+
 use super::assets;
 use super::html::Html;
 use super::jobs::{percent_encode, thousands};
@@ -857,6 +859,13 @@ fn two_figures(value: f64) -> String {
     } else {
         format!("{value:.1}")
     }
+}
+
+/// An element ID from `kind` and the digest of `what`, stable while `what` is unchanged.
+/// This lets `hx-preserve` retain an operator's edits.
+pub(super) fn preserved_id(kind: &str, what: &str) -> String {
+    let digest = Sha256::digest(what.as_bytes());
+    format!("{kind}-{}", vk_hub_proto::to_hex(&digest[..8]))
 }
 
 #[cfg(test)]

@@ -3073,6 +3073,80 @@ async fn an_operator_steers_a_node_from_its_page() {
     steer(format!("_csrf={csrf}&op=lift-ceiling"), true).await;
     assert_eq!(desired().ceiling, None);
     assert_eq!(desired().generation, 4);
+    // Pools: shown, set comma-, space- or tab-separated, and the editor follows the change.
+    let editor = |pools: &str| {
+        format!(
+            "id=\"{}\" type=\"text\" name=\"pools\" spellcheck=\"false\" hx-preserve=\"true\" \
+             value=\"{pools}\"><button>Set pools</button>",
+            super::pages::preserved_id("pools", pools)
+        )
+    };
+    assert!(
+        page.body.contains("<p class=\"now\">In no pool</p>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(&editor("")), "{}", page.body);
+    let reply = steer(format!("_csrf={csrf}&op=pools&pools=gpu%2C+ci%09gpu"), true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    // Said as stored: sorted, once each.
+    assert!(
+        reply.body.contains("Now in pools ci, gpu."),
+        "{}",
+        reply.body
+    );
+    let pools = || hub.db.node(&node).unwrap().unwrap().pools;
+    assert_eq!(pools(), ["ci", "gpu"]);
+    // A new ID, so the browser takes the new value rather than preserve the old input.
+    let fragment = next_with(&mut live, "<p class=\"now\">In pools ci, gpu</p>").await;
+    assert!(fragment.contains(&editor("ci, gpu")), "{fragment}");
+    assert_ne!(editor(""), editor("ci, gpu"));
+    let audited = || hub.db.audits(Some(&node), 100).unwrap().len();
+    let before = audited();
+    let reply = steer(format!("_csrf={csrf}&op=pools&pools=gpu+ci"), true).await;
+    assert!(reply.body.contains("Already so"), "{}", reply.body);
+    assert_eq!(audited(), before);
+    for bad in ["bad%2Fname", &"a".repeat(65)] {
+        let reply = steer(format!("_csrf={csrf}&op=pools&pools=ci+{bad}"), true).await;
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert!(
+            reply.body.contains("is not a pool") && reply.body.contains("1 to 64"),
+            "{}",
+            reply.body
+        );
+    }
+    let many: Vec<_> = (0..=256).map(|i| format!("p{i}")).collect();
+    let reply = steer(
+        format!("_csrf={csrf}&op=pools&pools={}", many.join("+")),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.body.contains("at most 256 pools"), "{}", reply.body);
+    assert_eq!(pools(), ["ci", "gpu"]);
+    let reply = steer(format!("_csrf={csrf}&op=pools&pools="), false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(pools().is_empty());
+    assert!(
+        hub.db.audits(Some(&node), 10).unwrap().iter().any(|e| e
+            .event
+            .ends_with(&format!("took node {node} out of every pool"))),
+        "audited"
+    );
+    // A viewer sees the pools but no editor.
+    hub.db
+        .set_pools(&node, &["ci".to_string()], "u", crate::now_secs())
+        .unwrap();
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/node/{node}"), Some(&viewer))
+        .await
+        .body;
+    assert!(page.contains("<p class=\"now\">In pools ci</p>"), "{page}");
+    assert!(!page.contains("Set pools"), "{page}");
+    hub.db
+        .set_pools(&node, &[], "u", crate::now_secs())
+        .unwrap();
+
     // A ceiling of none, 0 or not a number is no action.
     for bad in ["", "&ceiling=0", "&ceiling=x"] {
         let reply = steer(format!("_csrf={csrf}&op=ceiling{bad}"), true).await;

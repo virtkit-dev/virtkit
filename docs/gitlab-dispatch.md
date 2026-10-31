@@ -160,10 +160,10 @@ relay whose inventory lists more runners or a larger `request_concurrency`.
 GitLab's job response does not carry the job's tags, and GitLab only gives a runner jobs
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
 of that class registered in GitLab and its pool and labels here. A pool is a set of nodes the
-hub's operator names (`vk-hub nodes pools <id> <a,b>`); a label is one a node declares in its
-own configuration and reports in its inventory's `labels`, absent from an older node's. The
-placement stays in the daemon's configuration, which it reports to the hub; the hub sets the
-relay no ceiling on it.
+hub's operator names (`vk-hub nodes pools <id> <a,b>`, or on the node's page); a label is one
+a node declares in its own configuration and reports in its inventory's `labels`, absent from
+an older node's. The placement stays in the daemon's configuration, which it reports to the
+hub; the hub sets the relay no ceiling on it.
 
 A node's concurrency ceiling (`vk-hub nodes ceiling`) and its own executor limit
 (`[executor.schedule] max_concurrency`, which the node reports) cap its placed work at the

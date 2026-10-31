@@ -50,7 +50,6 @@ use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
 
 use super::fleet::{self, FleetSite};
 use super::html::Html;
@@ -563,18 +562,11 @@ const APPROVE_PROJECTS: &str = "approve-projects";
 const REJECT_PROJECTS: &str = "reject-projects";
 const FORGET_PROJECTS: &str = "forget-projects";
 
-/// An ID for an element of `kind` showing `what`, from its digest: the same while it shows the
-/// same, for `hx-preserve` to keep it as an operator fills it in.
-fn preserved_id(kind: &str, what: &str) -> String {
-    let digest = Sha256::digest(what.as_bytes());
-    format!("{kind}-{}", vk_hub_proto::to_hex(&digest[..8]))
-}
-
 /// An operator's form approving the server at `url` under a name. No CSRF field: the page
 /// around the fragment sets the token as a header.
 fn approve_server_form(h: &mut Html, url: &str) {
     h.raw("<form id=\"")
-        .text(preserved_id("approve", url))
+        .text(pages::preserved_id("approve", url))
         .raw("\" hx-preserve=\"true\" method=\"post\" action=\"")
         .raw(PATH)
         .raw("\" hx-post=\"")
