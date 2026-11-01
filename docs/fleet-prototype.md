@@ -516,10 +516,12 @@ node's ID, the time and its signature over both, the release and the connection'
 node whose pinned key verifies, within five minutes of the hub's clock, and which has an update
 to that release still to finish: the hub is not a download site, and no grant sits in a command
 or the node's journal to be replayed. The body is streamed from the file, one download per
-connection; once authenticated, a download no longer counts against the connections the
-listener allows before authentication, and may hold its connection for 30 minutes past the 30
-seconds any connection gets. At most 64 downloads run at once; past that the request is
-answered HTTP 503, to be retried.
+connection. A download cut short resumes with `Range: bytes=<start>-[<end>]`: that span is
+answered 206, a start past the end 416, and any other `Range` gets the whole file, 200. Once
+authenticated, a download no longer counts against the connections the listener allows before
+authentication, and may hold its connection for 30 minutes past the 30 seconds any connection
+gets. At most 64 downloads run at once; past that the request is answered HTTP 503, to be
+retried.
 
 ## Maintenance transitions
 

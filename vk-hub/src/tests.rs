@@ -1139,10 +1139,20 @@ fn add_release(
 
 /// `GET <path>` with `headers` on `stream`, by hand: the status and the body.
 async fn get_on(
-    mut stream: Box<dyn server::Stream>,
+    stream: Box<dyn server::Stream>,
     path: &str,
     headers: &[(&str, String)],
 ) -> (u16, Vec<u8>) {
+    let (status, _, body) = get_head_on(stream, path, headers).await;
+    (status, body)
+}
+
+/// [`get_on`], with the response's head too.
+async fn get_head_on(
+    mut stream: Box<dyn server::Stream>,
+    path: &str,
+    headers: &[(&str, String)],
+) -> (u16, String, Vec<u8>) {
     let mut head = format!("GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n");
     for (k, v) in headers {
         head.push_str(&format!("{k}: {v}\r\n"));
@@ -1155,7 +1165,8 @@ async fn get_on(
     let _ = stream.read_to_end(&mut resp).await;
     let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let status = std::str::from_utf8(&resp[9..12]).unwrap().parse().unwrap();
-    (status, resp[split + 4..].to_vec())
+    let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+    (status, head, resp[split + 4..].to_vec())
 }
 
 /// [`get_on`] a new plain TCP connection.
@@ -1376,6 +1387,79 @@ async fn a_release_is_served_only_to_a_node_updating_to_it_that_signs_for_it() {
     );
     assert!(releases::remove(&hub, "uid 0", &sha).unwrap());
     assert!(!dir.join("releases").join(&sha).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A download asked from a byte gets the rest of the file, 206; one asked past its end 416.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_download_resumes_from_a_byte() {
+    let (dir, addr, hub) = start_releases("release-range", None).await;
+    let bin = fake_vk("0.84.0");
+    let sha = add_release(&hub, &dir, &bin, "0.84.0").unwrap().sha256;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    ops::update(&hub, "uid 0", &node_id, &sha, false).unwrap();
+    let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    let ranged = |range: String| {
+        let mut h = download_headers(
+            &key,
+            &node_id,
+            &sha,
+            now_secs(),
+            vk_hub_proto::Channel::Plaintext,
+        );
+        h.push(("Range", range));
+        h
+    };
+    let get = |headers: Vec<(&'static str, String)>| {
+        let path = path.clone();
+        async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            get_head_on(Box::new(stream), &path, &headers).await
+        }
+    };
+    let len = bin.len();
+    let half = len / 2;
+
+    let (status, head, body) = get(ranged(format!("bytes={half}-"))).await;
+    assert_eq!(status, 206, "{head}");
+    assert_eq!(body, bin[half..]);
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains(&format!("content-range: bytes {half}-{}/{len}", len - 1)),
+        "{head}"
+    );
+    assert!(head.contains("accept-ranges: bytes"), "{head}");
+    assert!(
+        head.contains(&format!("content-length: {}", len - half)),
+        "{head}"
+    );
+
+    let (status, _, body) = get(ranged("bytes=0-".into())).await;
+    assert_eq!((status, body.as_slice()), (206, bin.as_slice()));
+
+    let (status, _, body) = get(ranged(format!("bytes=1-{half}"))).await;
+    assert_eq!((status, body.as_slice()), (206, &bin[1..=half]));
+
+    let (status, head, _) = get(ranged(format!("bytes={len}-"))).await;
+    assert_eq!(status, 416, "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("content-range: bytes */{len}")),
+        "{head}"
+    );
+
+    // A range not served is ignored: the whole file.
+    let (status, head, body) = get(ranged("bytes=-10".into())).await;
+    assert_eq!((status, body), (200, bin.clone()));
+    assert!(
+        head.to_ascii_lowercase().contains("accept-ranges: bytes"),
+        "{head}"
+    );
+    // Still only for the node with the update.
+    let mut unsigned = ranged(format!("bytes={half}-"));
+    unsigned.retain(|(k, _)| *k == "Range");
+    assert_eq!(get(unsigned).await.0, 401);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

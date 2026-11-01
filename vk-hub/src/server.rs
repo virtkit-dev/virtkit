@@ -19,6 +19,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
@@ -1175,7 +1176,9 @@ impl Download {
 /// command that names it. `GET /v1/tools/<sha256>` serves a tools definition the same way,
 /// signed over [`vk_hub_proto::tools_download_message`], to a node with a tools build of it
 /// still to finish. A registry's and a relay's releases are served the same way, from their
-/// own paths, to one with an update to it still to finish.
+/// own paths, to one with an update to it still to finish. A single `Range` span starting at
+/// a byte returns 206 with that span so an interrupted download can resume. The file is named
+/// by its sha256 and never changes, so there is no validator for `If-Range`.
 async fn download(
     req: &Request<Incoming>,
     hub: &Hub,
@@ -1290,7 +1293,7 @@ async fn download(
         }
         Download::Tools => crate::tools::path(hub.tools_dir()?, &sha256),
     };
-    let file = match tokio::fs::File::open(&path).await {
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
@@ -1319,6 +1322,31 @@ async fn download(
             &format!("the {what}'s file is the wrong size"),
         ));
     }
+    let range = match byte_range(req.headers().get(header::RANGE), size) {
+        ByteRange::Whole => None,
+        ByteRange::Part(start, end) => Some((start, end)),
+        ByteRange::Unsatisfiable => {
+            let mut resp = error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                &format!("the range asked is past the {what}'s end"),
+            );
+            resp.headers_mut().insert(
+                header::CONTENT_RANGE,
+                header::HeaderValue::from_str(&format!("bytes */{size}"))
+                    .context("building a Content-Range")?,
+            );
+            return Ok(resp);
+        }
+    };
+    let len = match range {
+        Some((start, end)) => {
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .with_context(|| format!("seeking in {}", path.display()))?;
+            end - start + 1
+        }
+        None => size,
+    };
     let Ok(slot) = hub.downloads.clone().try_acquire_owned() else {
         return Ok(error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1334,13 +1362,17 @@ async fn download(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
     );
+    let file = file.take(len);
     eprintln!(
-        "vk-hub: {peer}: {noun} {node_id} is downloading {what} {}",
-        crate::store::short(&sha256)
+        "vk-hub: {peer}: {noun} {node_id} is downloading {what} {}{}",
+        crate::store::short(&sha256),
+        match range {
+            Some((start, end)) => format!(", bytes {start}-{end}"),
+            None => String::new(),
+        }
     );
     // The slot goes with the body, which hyper drops once it is sent or the peer is gone.
     let chunks = futures::stream::try_unfold((file, slot), |(mut file, slot)| async move {
-        use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 256 * 1024];
         let n = file.read(&mut buf).await?;
         if n == 0 {
@@ -1353,18 +1385,84 @@ async fn download(
         )))
     });
     let mut resp = Response::new(StreamBody::new(chunks).boxed());
+    if range.is_some() {
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/octet-stream"),
     );
-    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(recorded));
+    h.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(len));
+    if let Some((start, end)) = range {
+        h.insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                .context("building a Content-Range")?,
+        );
+    }
     // One download per connection: what [`DOWNLOAD_TIMEOUT`] bounds is this one.
     h.insert(
         header::CONNECTION,
         header::HeaderValue::from_static("close"),
     );
     Ok(resp)
+}
+
+/// What a download's `Range` header asks of a file.
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// The whole file: no `Range`, or one this does not serve, which RFC 9110 lets a server
+    /// ignore.
+    Whole,
+    /// Inclusive start and end for `bytes=<start>-[<end>]`; the end is clamped to the file's.
+    /// A resumed download requests `bytes=<start>-`.
+    Part(u64, u64),
+    /// A start at or past the file's end.
+    Unsatisfiable,
+}
+
+/// Parse `value` as a [`ByteRange`] for a file of `size` bytes. Only one range starting at a
+/// byte is served; suffix ranges and lists get the whole file.
+fn byte_range(value: Option<&header::HeaderValue>, size: u64) -> ByteRange {
+    // Range units are case-insensitive (RFC 9110 §14.1).
+    let Some(spec) = value
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|v| v.split_at_checked(6))
+        .filter(|(unit, _)| unit.eq_ignore_ascii_case("bytes="))
+        .map(|(_, spec)| spec)
+    else {
+        return ByteRange::Whole;
+    };
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return ByteRange::Whole;
+    };
+    let number = |s: &str| {
+        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if digits { s.parse::<u64>().ok() } else { None }
+    };
+    let (first, last) = (first.trim(), last.trim());
+    let Some(start) = number(first) else {
+        return ByteRange::Whole;
+    };
+    let end = if last.is_empty() {
+        u64::MAX
+    } else {
+        match number(last) {
+            Some(end) if end >= start => end,
+            _ => return ByteRange::Whole,
+        }
+    };
+    if start >= size {
+        ByteRange::Unsatisfiable
+    } else {
+        ByteRange::Part(start, end.min(size - 1))
+    }
 }
 
 /// `GET /v1/node`, a registry's `GET /v1/registry/session` or a relay's
@@ -1478,4 +1576,40 @@ fn error(status: StatusCode, message: &str) -> Response<Body> {
             error: message.to_string(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_from_a_byte_is_served_and_any_other_is_not() {
+        let range = |v: &str| byte_range(Some(&header::HeaderValue::from_str(v).unwrap()), 100);
+        assert_eq!(byte_range(None, 100), ByteRange::Whole);
+        assert_eq!(range("bytes=10-"), ByteRange::Part(10, 99));
+        assert_eq!(range("bytes=0-"), ByteRange::Part(0, 99));
+        assert_eq!(range("Bytes=10-"), ByteRange::Part(10, 99));
+        assert_eq!(range("bytes=10-19"), ByteRange::Part(10, 19));
+        assert_eq!(range("bytes=10-500"), ByteRange::Part(10, 99));
+        assert_eq!(range("bytes=99-"), ByteRange::Part(99, 99));
+        assert_eq!(range("bytes=100-"), ByteRange::Unsatisfiable);
+        assert_eq!(range("bytes=1000-2000"), ByteRange::Unsatisfiable);
+        // Served whole: a suffix, a list, an end before the start, not bytes, not numbers.
+        for v in [
+            "bytes=-10",
+            "bytes=0-9,20-29",
+            "bytes=20-10",
+            "items=10-",
+            "bytes=x-",
+            "bytes=+1-",
+            "bytes=99999999999999999999-",
+            "bytes=10",
+        ] {
+            assert_eq!(range(v), ByteRange::Whole, "{v}");
+        }
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=0-")), 0),
+            ByteRange::Unsatisfiable
+        );
+    }
 }
