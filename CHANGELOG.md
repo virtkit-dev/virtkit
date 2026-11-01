@@ -33,6 +33,11 @@ All notable changes to virtkit will be documented in this file.
   release's two minutes to reach the hub start once the collection under way is done.
 - **A registry stopped while installing an update finishes the install.** On its next start
   it installs the release instead of rolling it back, also when updating from 0.101.0.
+- **A registry reconnects to its hub after its hub state stops parsing.** It moves the file
+  to `<root>/hub/state.json.unreadable` and starts afresh, without manual removal.
+  Hub-set read-only mode, token keys and retention windows apply only after the hub resends
+  its desired state. A command whose outcome the hub has not stored may run again, and any
+  update trial is dropped.
 
 ## [0.101.0] - 2026-11-01
 

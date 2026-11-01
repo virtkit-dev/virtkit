@@ -1,7 +1,8 @@
 //! What a registry keeps of its hub's asks across restarts: the desired state it applied, a
 //! journal of the commands it was sent — so a command redelivered after a reconnect is
 //! answered with its outcome rather than run twice — the last gc it ran and the update in
-//! progress. One JSON file, `<root>/hub/state.json`, written whole.
+//! progress. One JSON file, `<root>/hub/state.json`, written whole; one that does not parse
+//! is set aside as `state.json.unreadable`, the latest only, for the registry to start afresh.
 
 use std::path::{Path, PathBuf};
 
@@ -104,7 +105,8 @@ impl Ledger for Persisted {
 }
 
 impl Persisted {
-    /// The state in `dir`, empty when there is none.
+    /// The state in `dir`, empty if absent. Parse failures include a [`serde_json::Error`]
+    /// in the error chain, identified by [`Persisted::unparsable`].
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(STATE_FILE);
         match vk_peer::net::read_nofollow(&path) {
@@ -122,6 +124,34 @@ impl Persisted {
         let bytes = serde_json::to_vec_pretty(self).context("encoding the hub state")?;
         vk_fs::write_atomic_durable(&path, &bytes, 0o600)
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Whether [`Persisted::load`] failed to parse the file rather than read it; a read
+    /// error may clear on retry.
+    pub fn unparsable(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.is::<serde_json::Error>())
+    }
+
+    /// Move unparsable state in `dir` to `state.json.unreadable`, replacing the previous
+    /// copy through the directory's descriptor. Saving fresh state next syncs the
+    /// directory; this rename does not.
+    pub fn set_aside(dir: &Path) -> Result<()> {
+        let fd = vk_fs::open_dir_nofollow(dir)?;
+        let (from, to) = (c"state.json", c"state.json.unreadable");
+        // SAFETY: the descriptor is live and both names are NUL-terminated.
+        let rc = unsafe {
+            libc::renameat(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                from.as_ptr(),
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                to.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("setting {} aside", dir.join(STATE_FILE).display()));
+        }
+        Ok(())
     }
 
     /// Forget requests from another hub or enrollment. Return whether state changed.

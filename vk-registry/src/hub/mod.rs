@@ -11,8 +11,9 @@
 //! Everything kept for the hub is under `<root>/hub/`, a `0700` directory: `key.pk8` (the
 //! registry's private key), `enrollment.json` (the hub's URL and the registry's ID), `ca.pem`
 //! (the CA the hub is verified against, when `join` was given one), `state.json` (what the
-//! hub asked, and the command journal) and `releases/` (an update's release, and the binary
-//! it replaces). `vk-registry leave` deletes it.
+//! hub asked, and the command journal; `state.json.unreadable` if it stopped parsing) and
+//! `releases/` (an update's release, and the binary it replaces). `vk-registry leave` deletes
+//! it.
 
 mod session;
 mod state;
@@ -405,8 +406,26 @@ fn open(dir: &Path, state: &Arc<ServerState>, ctx: &Facts) -> Result<Option<Link
     let tls = vk_peer::net::client_tls(enrollment.ca.then(|| dir.join(CA_FILE)).as_deref())?;
     let mut incarnation = [0u8; vk_hub_proto::ID_BYTES];
     vk_peer::fill_random(&mut incarnation)?;
-    let mut persisted = Persisted::load(dir)?;
-    let mut changed = persisted.adopt_issuer(&enrollment.hub, &enrollment.registry_id);
+    // Start afresh if state does not parse so the hub can steer the registry again.
+    // Saved state is lost: desired state applies only after the hub resends it,
+    // commands whose acks the hub has not stored may run again, and any trial is dropped.
+    // A release on trial runs unconfirmed and takes no update until `serve` restarts
+    // from the installed binary. Return read errors so the next attempt can retry.
+    let (mut persisted, mut changed) = match Persisted::load(dir) {
+        Ok(p) => (p, false),
+        Err(e) if Persisted::unparsable(&e) => {
+            if let Err(set) = Persisted::set_aside(dir) {
+                return Err(set.context(format!("{e:#}")));
+            }
+            eprintln!(
+                "vk-registry: hub: {e:#}; set aside as state.json.unreadable, starting afresh"
+            );
+            // Saved below, which also makes the rename durable.
+            (Persisted::default(), true)
+        }
+        Err(e) => return Err(e),
+    };
+    changed |= persisted.adopt_issuer(&enrollment.hub, &enrollment.registry_id);
     changed |= persisted.fail_interrupted();
     if let Ok(exe) = std::env::current_exe()
         && let Some(installed) =
@@ -877,18 +896,11 @@ mod tests {
 
     fn open_link(root: &Path, settings: HubSettings) -> Arc<Link> {
         let state = server_state(root);
-        let facts = Facts {
-            listen: "127.0.0.1:5000".into(),
-            tls: false,
-            mode: "shared-secret",
-            webdav: false,
-            upstreams: Vec::new(),
-            max_connections: 1,
-            settings,
-            gc_prefixes: Vec::new(),
-            config_hash: String::new(),
-        };
-        Arc::new(open(&dir(root), &state, &facts).unwrap().unwrap())
+        Arc::new(
+            open(&dir(root), &state, &facts(settings, Vec::new()))
+                .unwrap()
+                .unwrap(),
+        )
     }
 
     fn link(tag: &str, settings: HubSettings) -> Arc<Link> {
@@ -1155,6 +1167,43 @@ mod tests {
         assert!(p.entry("g").is_none());
         assert!(p.applied.is_none());
         assert!(!link.state.store.read_only());
+    }
+
+    /// A state that does not parse is set aside, and the link opens on a fresh one rather
+    /// than never: the hub could not steer the registry again otherwise.
+    #[test]
+    fn an_unreadable_state_is_set_aside_and_the_link_opens() {
+        let root = enrolled("unreadable");
+        std::fs::write(dir(&root).join("state.json"), b"{ not json").unwrap();
+        // One set aside before is replaced.
+        std::fs::write(dir(&root).join("state.json.unreadable"), b"older").unwrap();
+        let _link = open_link(&root, HubSettings::default());
+        assert_eq!(
+            std::fs::read(dir(&root).join("state.json.unreadable")).unwrap(),
+            b"{ not json"
+        );
+        let fresh = Persisted::load(&dir(&root)).unwrap();
+        assert!(fresh.issuer.is_some() && fresh.journal.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Leave state unchanged on a read error and keep the link closed: a retry may succeed.
+    #[test]
+    fn a_state_that_cannot_be_read_is_kept() {
+        let root = enrolled("unread");
+        std::fs::create_dir(dir(&root).join("state.json")).unwrap();
+        let state = server_state(&root);
+        assert!(
+            open(
+                &dir(&root),
+                &state,
+                &facts(HubSettings::default(), Vec::new())
+            )
+            .is_err()
+        );
+        assert!(dir(&root).join("state.json").is_dir());
+        assert!(!dir(&root).join("state.json.unreadable").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
