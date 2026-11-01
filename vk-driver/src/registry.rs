@@ -2505,6 +2505,17 @@ where
     retry_transfer(what, &TRANSFER_BACKOFF, attempt).await
 }
 
+/// [`with_transfer_retry`] for callers outside this module with `anyhow` errors.
+/// The reqwest or oci-client error in the chain determines retries; without either,
+/// as with `bail!`, the error is final.
+pub(crate) async fn with_anyhow_retry<T, F, Fut>(what: &str, attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    with_transfer_retry(what, attempt).await
+}
+
 /// [`with_transfer_retry`] with explicit delays, shorter in tests.
 async fn retry_transfer<T, E, F, Fut>(
     what: &str,
@@ -2671,7 +2682,7 @@ fn status_retry(status: u16) -> Retry {
 
 /// Convert back-pressure statuses to errors classified by [`Transport`], for callers
 /// that inspect statuses directly instead of using `error_for_status`.
-fn turned_away(resp: reqwest::Response) -> reqwest::Result<reqwest::Response> {
+pub(crate) fn turned_away(resp: reqwest::Response) -> reqwest::Result<reqwest::Response> {
     match status_retry(resp.status().as_u16()) {
         Retry::Pressure => resp.error_for_status(),
         _ => Ok(resp),

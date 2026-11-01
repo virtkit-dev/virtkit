@@ -610,8 +610,12 @@ with that dependency's token.
 `tar+zstd` layer, in repository `ci-cache/<gitlab host>[/<gitlab path>]/<project id>`,
 tagged with the sha256 of its key and the protection of the job's ref, so a protected and an
 unprotected job never share one, as with gitlab-runner. The last archive written wins; content addressing
-makes an unchanged cache's upload a blob probe. Caches are not shared with gitlab-runner's
-`cache.zip`s: a project moving to the fleet starts cold.
+makes an unchanged cache's upload a blob probe. Each request to the registry is retried as `vk`'s
+other registry transfers are — a lost or refused connection for up to 90 seconds, a 503 or 429
+for up to three minutes — so a registry's update does not lose a job its cache. A request that
+runs into `CACHE_REQUEST_TIMEOUT` is not retried, and like a registry still unavailable after
+its retries, leaves a warning and skips the step's other cache requests. Caches are not shared
+with gitlab-runner's `cache.zip`s: a project moving to the fleet starts cold.
 
 **A job with a registry token.** When the hub mints a token for the job's registry
 ([step 4](registry-hub.md#step-4-namespaces-and-job-tokens)), the job's start carries it,

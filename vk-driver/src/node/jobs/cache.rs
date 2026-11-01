@@ -24,6 +24,7 @@ use vk_hub_proto::job::{CachePolicy, CacheSpec};
 use super::StageCtx;
 use super::guest::{self, Selection};
 use super::transfer::{self, Capped, MAX_STAGED, create, too_large};
+use crate::registry::turned_away;
 
 /// The layer's media type: a tar of the cached paths, zstd-compressed.
 pub const LAYER_MEDIA_TYPE: &str = "application/vnd.vk.ci-cache.layer.v1.tar+zstd";
@@ -208,6 +209,26 @@ struct Store {
     base: String,
     /// Whether the repository is the hub's for the job's protection, so tags leave it out.
     hub_repo: bool,
+    /// The client's total timeout for a request, `CACHE_REQUEST_TIMEOUT`.
+    timeout: Duration,
+    /// Whether a request failed reaching the registry — connection, TLS, timeout, or turned
+    /// away — retries spent: the stage's other requests are not made, so its other keys and
+    /// caches are not waited for too.
+    gave_up: std::sync::atomic::AtomicBool,
+}
+
+/// Marks an attempt that ran into the client's total timeout: final, as that is the whole of
+/// the request's time. `answered` when it ran out reading an answer's body, the registry
+/// answering; an upload cut mid-body cannot be told from one unanswered.
+#[derive(Debug)]
+struct TotalTimeout {
+    answered: bool,
+}
+
+impl std::fmt::Display for TotalTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CACHE_REQUEST_TIMEOUT reached")
+    }
 }
 
 impl Store {
@@ -312,6 +333,7 @@ fn store(ctx: &StageCtx<'_>) -> Option<Store> {
             return None;
         }
     };
+    let timeout = request_timeout(&ctx.vars.value("CACHE_REQUEST_TIMEOUT"));
     let made = (|| {
         let cred = match &access {
             Access::Hub { token, .. } => crate::registry::Cred::Bearer {
@@ -322,12 +344,14 @@ fn store(ctx: &StageCtx<'_>) -> Option<Store> {
         Ok::<_, anyhow::Error>(Store {
             http: crate::registry::http_client_builder(rg)?
                 .connect_timeout(Duration::from_secs(30))
-                .timeout(request_timeout(&ctx.vars.value("CACHE_REQUEST_TIMEOUT")))
+                .timeout(timeout)
                 .build()
                 .context("building the registry's client")?,
             cred,
             base: cache_base(rg, &access, &ctx.job.server_url, ctx.job.job.project_id)?,
             hub_repo: matches!(access, Access::Hub { .. }),
+            timeout,
+            gave_up: Default::default(),
         })
     })();
     match made {
@@ -435,19 +459,27 @@ pub async fn archive(ctx: &StageCtx<'_>, succeeded: bool) -> Result<()> {
 /// none.
 async fn fetch(ctx: &StageCtx<'_>, store: &Store, tag: &str) -> Result<bool> {
     let url = format!("{}/manifests/{tag}", store.base);
-    let resp = store
-        .req(reqwest::Method::GET, &url)
-        .header(reqwest::header::ACCEPT, MANIFEST_MEDIA_TYPE)
-        .send()
-        .await
-        .context("asking the registry for the cache")?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let body = store
+        .retry("cache manifest", || async {
+            let resp = store
+                .req(reqwest::Method::GET, &url)
+                .header(reqwest::header::ACCEPT, MANIFEST_MEDIA_TYPE)
+                .send()
+                .await
+                .and_then(turned_away)
+                .context("asking the registry for the cache")?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !resp.status().is_success() {
+                bail!("the registry answered {} for the cache", resp.status());
+            }
+            read_capped(resp, MAX_MANIFEST).await.map(Some)
+        })
+        .await?;
+    let Some(body) = body else {
         return Ok(false);
-    }
-    if !resp.status().is_success() {
-        bail!("the registry answered {} for the cache", resp.status());
-    }
-    let body = read_capped(resp, MAX_MANIFEST).await?;
+    };
     let (digest, size) = layer_of(&body)?;
     if size > MAX_STAGED {
         bail!(
@@ -477,13 +509,22 @@ async fn fetch(ctx: &StageCtx<'_>, store: &Store, tag: &str) -> Result<bool> {
     fetched
 }
 
-/// The blob `digest` into `dest`, refused past the `size` its manifest gives.
+/// The blob `digest` into `dest`, refused past the `size` its manifest gives; a transfer cut
+/// short starts over.
 async fn download(store: &Store, digest: &str, size: u64, dest: &Path) -> Result<()> {
+    store
+        .retry("cache layer", || download_once(store, digest, size, dest))
+        .await
+}
+
+/// One attempt at [`download`].
+async fn download_once(store: &Store, digest: &str, size: u64, dest: &Path) -> Result<()> {
     let url = format!("{}/blobs/{digest}", store.base);
     let mut resp = store
         .req(reqwest::Method::GET, &url)
         .send()
         .await
+        .and_then(turned_away)
         .context("downloading the cache")?;
     if !resp.status().is_success() {
         bail!(
@@ -559,20 +600,82 @@ async fn push(
     put_blob(store, EMPTY_DIGEST, Body::Bytes(b"{}".to_vec())).await?;
     put_blob(store, digest, Body::File(packed)).await?;
     let url = format!("{}/manifests/{tag}", store.base);
-    let resp = store
-        .req(reqwest::Method::PUT, &url)
-        .header(reqwest::header::CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
-        .body(manifest(digest, size, key))
-        .send()
+    store
+        .retry("cache manifest push", || async {
+            let resp = store
+                .req(reqwest::Method::PUT, &url)
+                .header(reqwest::header::CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
+                .body(manifest(digest, size, key))
+                .send()
+                .await
+                .and_then(turned_away)
+                .context("pushing the cache's manifest")?;
+            if !resp.status().is_success() {
+                bail!(
+                    "the registry answered {} for the cache's manifest",
+                    resp.status()
+                );
+            }
+            Ok(())
+        })
         .await
-        .context("pushing the cache's manifest")?;
-    if !resp.status().is_success() {
-        bail!(
-            "the registry answered {} for the cache's manifest",
-            resp.status()
-        );
+}
+
+impl Store {
+    /// Retry a request to the cache's registry as its other transfers are: a connection
+    /// lost or refused, or the registry turning it away (a 503 or 429), is tried again with
+    /// backoff; any other answer is final. Every request here is safe to make twice: a GET,
+    /// a HEAD, a blob put under its digest, a manifest put under its tag.
+    ///
+    /// A request that runs into `CACHE_REQUEST_TIMEOUT` is not tried again: that is the
+    /// whole of its time. One that fails reaching the registry, retries spent, leaves the
+    /// stage's other requests unmade.
+    async fn retry<T, F, Fut>(&self, what: &str, mut attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        use std::sync::atomic::Ordering;
+        if self.gave_up.load(Ordering::Relaxed) {
+            bail!("{what}: skipped, the registry was unavailable to an earlier request");
+        }
+        let timeout = self.timeout;
+        let got = crate::registry::with_anyhow_retry(what, || {
+            let attempt = attempt();
+            async move {
+                let began = tokio::time::Instant::now();
+                attempt.await.map_err(|e| {
+                    // By the time taken, not the error alone: a kernel `ETIMEDOUT` on a lossy
+                    // path reads as a timeout too, and is retried. Stripped of its reqwest
+                    // error, a timed-out request reads as final.
+                    let total = e
+                        .chain()
+                        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+                        .find(|r| r.is_timeout() && !r.is_connect())
+                        .filter(|_| began.elapsed() >= timeout)
+                        .map(|r| TotalTimeout {
+                            answered: r.is_body(),
+                        });
+                    match total {
+                        Some(total) => anyhow::anyhow!("{e:#}").context(total),
+                        None => e,
+                    }
+                })
+            }
+        })
+        .await;
+        // Retries spent reaching the registry, or no answer within the timeout: give the
+        // stage up. A body still arriving at the timeout is one large cache, not the registry.
+        if let Err(e) = &got
+            && (e
+                .downcast_ref::<TotalTimeout>()
+                .is_some_and(|t| !t.answered)
+                || e.chain().any(|c| c.is::<reqwest::Error>()))
+        {
+            self.gave_up.store(true, Ordering::Relaxed);
+        }
+        got
     }
-    Ok(())
 }
 
 enum Body<'a> {
@@ -582,6 +685,15 @@ enum Body<'a> {
 
 /// Upload a blob unless the registry has it already: an unchanged cache costs a probe.
 async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
+    store
+        .retry(&format!("cache blob {digest}"), || {
+            put_blob_once(store, digest, &body)
+        })
+        .await
+}
+
+/// One attempt at [`put_blob`]: a new upload each time.
+async fn put_blob_once(store: &Store, digest: &str, body: &Body<'_>) -> Result<()> {
     let probe = store
         .req(
             reqwest::Method::HEAD,
@@ -589,6 +701,7 @@ async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
         )
         .send()
         .await
+        .and_then(turned_away)
         .context("probing the registry for the cache")?;
     if probe.status().is_success() {
         return Ok(());
@@ -601,6 +714,7 @@ async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
         .header(reqwest::header::CONTENT_LENGTH, "0")
         .send()
         .await
+        .and_then(turned_away)
         .context("starting the cache's upload")?;
     if resp.status() != reqwest::StatusCode::ACCEPTED {
         bail!(
@@ -630,7 +744,7 @@ async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
         .query(&[("digest", digest)])
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
     let req = match body {
-        Body::Bytes(b) => req.body(b),
+        Body::Bytes(b) => req.body(b.clone()),
         Body::File(path) => {
             let file = tokio::fs::File::open(path)
                 .await
@@ -642,7 +756,11 @@ async fn put_blob(store: &Store, digest: &str, body: Body<'_>) -> Result<()> {
                 ))
         }
     };
-    let resp = req.send().await.context("uploading the cache")?;
+    let resp = req
+        .send()
+        .await
+        .and_then(turned_away)
+        .context("uploading the cache")?;
     if resp.status() != reqwest::StatusCode::CREATED {
         bail!(
             "the registry answered {} to the cache's layer",
@@ -957,11 +1075,15 @@ mod tests {
     }
 
     fn test_store(url: &str) -> Store {
+        // A client needs the process's crypto provider; another test may have installed it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Store {
             http: reqwest::Client::new(),
             cred: crate::registry::Cred::None,
             base: format!("{url}/v2/ci-cache/h/1"),
             hub_repo: false,
+            timeout: Duration::from_secs(600),
+            gave_up: Default::default(),
         }
     }
 
@@ -1031,6 +1153,110 @@ mod tests {
         let url = registry_with(&right, MAX_STAGED + 1, blob).await;
         let err = fetch(&f.ctx(), &test_store(&url), "t").await.unwrap_err();
         assert!(err.to_string().contains("MiB a job may stage"), "{err}");
+    }
+
+    /// Each cache request retries across a registry restart: unanswered connections,
+    /// truncated bodies, and rejected requests.
+    #[tokio::test]
+    async fn the_caches_requests_ride_out_a_registry_restart() {
+        let f = Fixture::new("cache-retry", "https://gitlab.example");
+        let blob = b"some layer of a cache";
+        let digest = format!("sha256:{}", hex(&Sha256::digest(blob)));
+        let mut cut = answer("200 OK", &[], blob);
+        cut.truncate(cut.len() - 5);
+        let (url, seen) = gitlab(vec![Vec::new(), cut, answer("200 OK", &[], blob)]).await;
+        let dest = f.dir.join("blob");
+        download(&test_store(&url), &digest, blob.len() as u64, &dest)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), blob);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+
+        let (url, seen) = gitlab(vec![
+            answer("503 Service Unavailable", &[], b""),
+            answer("404 Not Found", &[], b""),
+            Vec::new(),
+            answer("404 Not Found", &[], b""),
+            answer(
+                "202 Accepted",
+                &[("Location", "/v2/ci-cache/h/1/blobs/uploads/u1")],
+                b"",
+            ),
+            answer("201 Created", &[], b""),
+        ])
+        .await;
+        put_blob(&test_store(&url), EMPTY_DIGEST, Body::Bytes(b"{}".to_vec()))
+            .await
+            .unwrap();
+        let lines: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.line.clone())
+            .collect();
+        // Each attempt starts over at the probe.
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(lines[3].starts_with("HEAD "), "{lines:?}");
+        assert!(lines[5].starts_with("PUT "), "{lines:?}");
+
+        let (url, seen) = gitlab(vec![
+            Vec::new(),
+            answer("404 Not Found", &[], b""),
+            answer("500 Internal Server Error", &[], b""),
+        ])
+        .await;
+        let store = test_store(&url);
+        assert!(!fetch(&f.ctx(), &store, "t").await.unwrap());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        // A registry's answer, even an error, is no reason to give the stage up.
+        fetch(&f.ctx(), &store, "t").await.unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert!(!store.gave_up.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A request that runs into its total timeout is not retried, and the stage's other
+    /// requests are not made.
+    #[tokio::test]
+    async fn a_request_timing_out_gives_the_stage_up() {
+        let f = Fixture::new("cache-timeout", "https://gitlab.example");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepts and never answers.
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let mut store = test_store(&format!("http://{addr}"));
+        store.timeout = Duration::from_millis(300);
+        store.http = reqwest::Client::builder()
+            .timeout(store.timeout)
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = fetch(&f.ctx(), &store, "t").await.unwrap_err();
+        silent.abort();
+        assert!(
+            format!("{err:#}").contains("CACHE_REQUEST_TIMEOUT"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(store.gave_up.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Once a request ran out of retries, the stage's others are not made.
+    #[tokio::test]
+    async fn a_registry_given_up_on_is_not_asked_again() {
+        let f = Fixture::new("cache-gave-up", "https://gitlab.example");
+        let (url, seen) = gitlab(vec![answer("404 Not Found", &[], b"")]).await;
+        let store = test_store(&url);
+        store
+            .gave_up
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = fetch(&f.ctx(), &store, "t").await.unwrap_err();
+        assert!(format!("{err:#}").contains("skipped"), "{err:#}");
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

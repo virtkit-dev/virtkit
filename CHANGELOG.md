@@ -69,6 +69,10 @@ All notable changes to virtkit will be documented in this file.
   falls back to building locally sooner.
 - **Pulling an OCI image rides out a registry restart.** Image and config downloads retry
   refused or cut connections rather than failing.
+- **CI caches survive a registry restart.** A fleet job's cache download and upload wait for
+  a registry that is restarting or busy, for up to a few minutes, rather than skipping the
+  cache at once. A registry that stays unavailable, or stops answering, is not waited for
+  again by that step's other caches.
 
 ## [0.101.0] - 2026-11-01
 
