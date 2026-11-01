@@ -25,7 +25,7 @@
 //! request reads or writes. `/lock/*` stops at authentication — lock names are not
 //! necessarily repo names, so there is nothing to scope-check there yet.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -229,10 +229,96 @@ pub enum Principal {
 /// login, session and key lifecycle, plus the throttled `last_used_at` bump — same
 /// per-call granularity the `Store`'s `flock` already uses.
 pub struct Db {
-    db: Database,
+    /// `None` once handed to the release updating the registry ([`Db::hand_over`]). Each call
+    /// holds a read lock while using it, so the hand-over waits for active calls.
+    db: std::sync::RwLock<Option<Database>>,
+    /// Original path for [`Db::take_back`]; `None` for an in-memory database.
+    path: Option<PathBuf>,
+}
+
+/// The accounts db was handed to the release updating this registry: the request is for the
+/// release, which now holds it.
+#[derive(Debug)]
+pub struct HandedOver;
+
+impl std::fmt::Display for HandedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the accounts db was handed to the release updating this registry")
+    }
+}
+
+impl std::error::Error for HandedOver {}
+
+/// Whether `e` is, or was caused by, [`HandedOver`].
+pub fn is_handed_over_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<HandedOver>())
+}
+
+/// The database, held open for one call.
+struct Open<'a>(std::sync::RwLockReadGuard<'a, Option<Database>>);
+
+impl std::ops::Deref for Open<'_> {
+    type Target = Database;
+
+    fn deref(&self) -> &Database {
+        // `Db::handle` hands out only a guard over `Some`.
+        self.0.as_ref().expect("an open accounts db")
+    }
 }
 
 impl Db {
+    /// The database for one call, or [`HandedOver`]. A transaction does not borrow the guard:
+    /// drop each before the guard, or [`Db::hand_over`] closes a database still in use, whose
+    /// file stays locked until that transaction ends.
+    fn handle(&self) -> Result<Open<'_>> {
+        let guard = self.db.read().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            return Err(HandedOver.into());
+        }
+        Ok(Open(guard))
+    }
+
+    /// Whether the database was handed to the release updating this registry.
+    pub fn is_handed_over(&self) -> bool {
+        self.db.read().unwrap_or_else(|e| e.into_inner()).is_none()
+    }
+
+    /// Close the database for the release updating this registry to open: once the calls
+    /// under way are done, as only one process may hold it. Later calls fail with
+    /// [`HandedOver`]. An in-memory database is refused: closing it would lose it.
+    ///
+    /// The last commit is a durable one, after the `last_used_at` bumps that are not: should it
+    /// fail, the database stays open here rather than reach the release half-written.
+    pub fn hand_over(&self) -> Result<()> {
+        if self.path.is_none() {
+            bail!("an accounts db in memory cannot be handed over");
+        }
+        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let Some(open) = db.as_ref() else {
+            return Ok(());
+        };
+        let mut txn = open.begin_write().context("starting the last write")?;
+        txn.set_durability(Durability::Immediate)
+            .context("making the last write durable")?;
+        txn.commit().context("committing the last write")?;
+        drop(db.take());
+        Ok(())
+    }
+
+    /// Open the database again: the release it was handed to did not take over.
+    pub fn take_back(&self) -> Result<()> {
+        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        if db.is_some() {
+            return Ok(());
+        }
+        let Some(path) = &self.path else {
+            bail!("an accounts db in memory is not opened again");
+        };
+        let reopened = Self::open(path)?;
+        *db = reopened.db.into_inner().unwrap_or_else(|e| e.into_inner());
+        Ok(())
+    }
+
     /// Open (creating if absent) and ensure the three tables exist.
     ///
     /// The file holds no usable credential, but it does hold who may write to the
@@ -310,7 +396,7 @@ impl Db {
                 path.display()
             )
         })?;
-        Self::init(db)
+        Self::init(db, Some(path.to_path_buf()))
     }
 
     /// In-memory store, for tests. `pub(crate)` since `browse`'s pages read a caption out
@@ -320,10 +406,10 @@ impl Db {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .context("opening an in-memory accounts db")?;
-        Self::init(db)
+        Self::init(db, None)
     }
 
-    fn init(db: Database) -> Result<Self> {
+    fn init(db: Database, path: Option<PathBuf>) -> Result<Self> {
         let txn = db
             .begin_write()
             .context("starting the accounts db's first write")?;
@@ -338,7 +424,10 @@ impl Db {
         txn.open_table(REPO_CAPTIONS)
             .context("opening the repo_captions table")?;
         txn.commit().context("initializing the accounts db")?;
-        Ok(Db { db })
+        Ok(Db {
+            db: std::sync::RwLock::new(Some(db)),
+            path,
+        })
     }
 
     /// Create the user on first login, else update its claims and touch `last_login_at`.
@@ -357,7 +446,8 @@ impl Db {
         validate_identity(issuer, subject)?;
         let key = user_key(issuer, subject);
         let now = now_secs();
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         let row = {
             let mut table = txn.open_table(USERS)?;
             let prior = table
@@ -402,7 +492,8 @@ impl Db {
     /// `vk-registry accounts` CLI.
     pub fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
         let found;
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         {
             let mut table = txn.open_table(USERS)?;
             let existing = table
@@ -423,7 +514,8 @@ impl Db {
     }
 
     pub fn get_user(&self, id: &str) -> Result<Option<User>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let table = txn.open_table(USERS)?;
         Ok(table
             .get(id)?
@@ -436,7 +528,8 @@ impl Db {
     /// linear scan, same rationale as [`Db::list_api_keys`]: this data's scale is one
     /// team/org, not a hot path.
     pub fn list_users(&self) -> Result<Vec<User>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let table = txn.open_table(USERS)?;
         let mut users = Vec::new();
         for entry in table.iter()? {
@@ -488,7 +581,8 @@ impl Db {
             created_at: now,
             expires_at,
         };
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         {
             // A session for a user that does not exist would resolve to `None` forever,
             // indistinguishable from expiry; reject it where the caller can still react.
@@ -508,7 +602,8 @@ impl Db {
     /// sweeps it.
     pub fn get_session_user(&self, id: &str) -> Result<Option<User>> {
         let key = session_key(id);
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let sessions = txn.open_table(SESSIONS)?;
         let Some(row) = sessions
             .get(key.as_str())?
@@ -520,9 +615,12 @@ impl Db {
         if row.expires_at <= now_secs() {
             drop(sessions);
             drop(txn);
+            drop(db);
             // Opportunistic: the answer is `None` whether or not the row goes away, and a
             // failed cleanup write must not turn an expired cookie into a 500.
-            if let Err(e) = self.delete_session(id) {
+            if let Err(e) = self.delete_session(id)
+                && !is_handed_over_error(&e)
+            {
                 eprintln!("vk-registry: warning: dropping an expired session: {e:#}");
             }
             return Ok(None);
@@ -539,7 +637,8 @@ impl Db {
     /// cookie. `None` if the session is unknown or expired — the same three cases
     /// [`Self::get_session_user`] collapses.
     pub fn session_csrf(&self, id: &str) -> Result<Option<String>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let sessions = txn.open_table(SESSIONS)?;
         Ok(sessions
             .get(session_key(id).as_str())?
@@ -552,7 +651,8 @@ impl Db {
     /// The caption set for `repo`, if any. Absent is the normal case: a repository with
     /// nothing said about it renders whatever `/browse` can work out for itself.
     pub fn repo_caption(&self, repo: &str) -> Result<Option<String>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let captions = txn.open_table(REPO_CAPTIONS)?;
         Ok(captions.get(repo)?.map(|g| g.value().to_string()))
     }
@@ -564,7 +664,8 @@ impl Db {
         }
         let caption = caption.trim();
         validate_caption(caption)?;
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         {
             let mut captions = txn.open_table(REPO_CAPTIONS)?;
             if caption.is_empty() {
@@ -578,7 +679,8 @@ impl Db {
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         {
             txn.open_table(SESSIONS)?.remove(session_key(id).as_str())?;
         }
@@ -601,7 +703,8 @@ impl Db {
     /// operator with no way to revoke.
     pub fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize> {
         let now = now_secs();
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         let ended = {
             let mut table = txn.open_table(SESSIONS)?;
             // Keys first: `remove` needs `&mut` and the iterator holds a shared borrow.
@@ -662,7 +765,8 @@ impl Db {
             last_used_at: None,
             revoked_at: None,
         };
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         {
             // As in `create_session`: a key owned by a user that does not exist is absent
             // from its owner's listing and so unrevokable through `revoke_api_key`, and
@@ -689,7 +793,8 @@ impl Db {
     pub fn get_api_key_by_token(&self, token: &str) -> Result<Option<ApiKey>> {
         let id = sha256_hex_raw(token.as_bytes());
         let now = now_secs();
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let table = txn.open_table(API_KEYS)?;
         let Some(row) = table
             .get(id.as_str())?
@@ -708,6 +813,7 @@ impl Db {
         }
         drop(table);
         drop(txn);
+        drop(db);
         let stale = row
             .last_used_at
             .is_none_or(|t| now.saturating_sub(t) >= LAST_USED_GRANULARITY_SECS);
@@ -718,6 +824,8 @@ impl Db {
             // 500 for a request that was properly authenticated.
             match self.touch_api_key(&id, now) {
                 Ok(()) => key.last_used_at = Some(from_secs(now)),
+                // Handed over meanwhile: the release records the next use.
+                Err(e) if is_handed_over_error(&e) => {}
                 Err(e) => eprintln!("vk-registry: warning: recording an API key's use: {e:#}"),
             }
         }
@@ -732,7 +840,8 @@ impl Db {
     /// `pub` rather than `pub(crate)`: its only caller is `tests/accounts_e2e.rs`, which
     /// is out of crate. It looks unused from inside — it is not.
     pub fn get_api_key(&self, id: &str) -> Result<Option<ApiKey>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let table = txn.open_table(API_KEYS)?;
         Ok(table
             .get(id)?
@@ -747,7 +856,8 @@ impl Db {
     /// redb 3 dropped `Eventual`, and made `None` free pages, so this no longer trades the
     /// fsync for a file that only grows.
     fn touch_api_key(&self, id: &str, now: i64) -> Result<()> {
-        let mut txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let mut txn = db.begin_write().context("starting a write")?;
         txn.set_durability(Durability::None)
             .context("relaxing durability for an api-key bump")?;
         {
@@ -782,7 +892,8 @@ impl Db {
     }
 
     fn revoke(&self, id: &str, require_owner: Option<&str>) -> Result<bool> {
-        let txn = self.db.begin_write().context("starting a write")?;
+        let db = self.handle()?;
+        let txn = db.begin_write().context("starting a write")?;
         let revoked = {
             let mut table = txn.open_table(API_KEYS)?;
             let existing = table
@@ -823,7 +934,8 @@ impl Db {
     /// already as trusted as this data gets; `/settings/keys` is what owner-scopes the
     /// listing for an ordinary session.
     pub fn list_all_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let txn = self.db.begin_read().context("starting a read")?;
+        let db = self.handle()?;
+        let txn = db.begin_read().context("starting a read")?;
         let table = txn.open_table(API_KEYS)?;
         let mut keys = Vec::new();
         for entry in table.iter()? {
@@ -1669,6 +1781,63 @@ mod tests {
         Ok(())
     }
 
+    /// A db handed over is closed — another process can open the file — and answers every
+    /// call with [`HandedOver`]; taken back, it serves what it held.
+    #[test]
+    fn a_db_handed_over_is_closed_until_taken_back() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vk-registry-db-handover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("accounts.redb");
+        let db = Db::open(&path)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
+        db.hand_over()?;
+        db.hand_over()?;
+        let e = db.get_user(&user.id).unwrap_err();
+        assert!(is_handed_over_error(&e), "{e:#}");
+        // Another process's open, as the release's: the lock is free, and taking it back fails
+        // while that one holds it.
+        let other = Db::open(&path)?;
+        assert!(other.get_user(&user.id)?.is_some());
+        assert!(db.take_back().is_err());
+        assert!(db.is_handed_over());
+        drop(other);
+        db.take_back()?;
+        db.take_back()?;
+        assert!(db.get_user(&user.id)?.is_some());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Handing over waits for the call under way to end.
+    #[test]
+    fn a_db_is_handed_over_once_the_calls_under_way_end() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vk-registry-db-waits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = std::sync::Arc::new(Db::open(&dir.join("accounts.redb"))?);
+        let call = db.handle()?;
+        let handing = {
+            let db = db.clone();
+            std::thread::spawn(move || db.hand_over())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handing.is_finished());
+        drop(call);
+        handing.join().unwrap()?;
+        assert!(db.is_handed_over());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn an_in_memory_db_is_not_handed_over() -> Result<()> {
+        let db = Db::open_memory()?;
+        assert!(db.hand_over().is_err());
+        assert!(!db.is_handed_over());
+        Ok(())
+    }
+
     /// The cookie value must not be recoverable from the db: only its hash is a key.
     #[test]
     fn a_session_id_is_stored_only_as_its_hash() -> Result<()> {
@@ -1676,7 +1845,9 @@ mod tests {
         let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let session_id = db.create_session(&user.id, Duration::from_secs(3600))?;
 
-        let txn = db.db.begin_read()?;
+        let db = db.handle()?;
+
+        let txn = db.begin_read()?;
         let table = txn.open_table(SESSIONS)?;
         let stored: Vec<String> = table
             .iter()?
@@ -1698,7 +1869,8 @@ mod tests {
         assert_eq!(db.session_csrf(&session_id)?, None);
 
         // the lookup dropped the row rather than leaving it to accumulate
-        let txn = db.db.begin_read()?;
+        let db = db.handle()?;
+        let txn = db.begin_read()?;
         assert!(txn.open_table(SESSIONS)?.is_empty()?);
         Ok(())
     }
@@ -1728,7 +1900,7 @@ mod tests {
         // Not just unresolvable: the rows are gone, and the CSRF secret behind the cookie
         // with them — a future "mark revoked instead of delete" would fail here.
         assert_eq!(db.session_csrf(&alice_second)?, None);
-        assert_eq!(db.db.begin_read()?.open_table(SESSIONS)?.len()?, 1);
+        assert_eq!(db.handle()?.begin_read()?.open_table(SESSIONS)?.len()?, 1);
         assert_eq!(db.get_session_user(&bobs)?.map(|u| u.id), Some(bob.id));
 
         // Nothing left to remove, and that is not an error — the same shape a second
@@ -1750,7 +1922,8 @@ mod tests {
         let live = db.create_session(&user.id, Duration::from_secs(3600))?;
         db.create_session(&user.id, Duration::ZERO)?;
         {
-            let txn = db.db.begin_write()?;
+            let db = db.handle()?;
+            let txn = db.begin_write()?;
             txn.open_table(SESSIONS)?
                 .insert("not-json", b"{".as_slice())?;
             txn.commit()?;
@@ -1758,7 +1931,12 @@ mod tests {
 
         assert_eq!(db.delete_sessions_for_user(&user.id)?, 1);
         assert_eq!(db.get_session_user(&live)?, None);
-        assert!(db.db.begin_read()?.open_table(SESSIONS)?.is_empty()?);
+        assert!(
+            db.handle()?
+                .begin_read()?
+                .open_table(SESSIONS)?
+                .is_empty()?
+        );
         Ok(())
     }
 
@@ -2155,7 +2333,8 @@ mod tests {
 
     /// Set `is_admin` out of band — the `accounts` CLI's job, not `upsert_user`'s.
     fn promote(db: &Db, id: &str) -> Result<()> {
-        let txn = db.db.begin_write()?;
+        let db = db.handle()?;
+        let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(USERS)?;
             let mut row: UserRow = decode(table.get(id)?.expect("the user exists").value())?;
@@ -2169,7 +2348,8 @@ mod tests {
     /// Move a key's `created_at` back by `secs`, so an ordering test does not depend on
     /// two `create_api_key` calls landing in different seconds.
     fn backdate(db: &Db, id: &str, secs: i64) -> Result<()> {
-        let txn = db.db.begin_write()?;
+        let db = db.handle()?;
+        let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(API_KEYS)?;
             let mut row: ApiKeyRow = decode(table.get(id)?.expect("the key exists").value())?;
@@ -2181,7 +2361,8 @@ mod tests {
     }
 
     fn read_revoked_at(db: &Db, id: &str) -> Result<Option<i64>> {
-        let txn = db.db.begin_read()?;
+        let db = db.handle()?;
+        let txn = db.begin_read()?;
         let table = txn.open_table(API_KEYS)?;
         let row: ApiKeyRow = decode(table.get(id)?.expect("the key exists").value())?;
         Ok(row.revoked_at)
