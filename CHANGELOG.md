@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Versions on the web UI.** The top bar shows vk-hub's version beside its name, and the
+  Storage list shows each registry's version.
+
 ## [0.101.0] - 2026-11-01
 
 ### Added

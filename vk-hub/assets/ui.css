@@ -84,6 +84,7 @@ p { margin: var(--s2) 0; }
 }
 .brand { font-weight: 700; font-size: 1.05rem; color: var(--fg); letter-spacing: -0.01em; }
 .brand:hover { text-decoration: none; }
+.brand .version { font-weight: 400; font-size: 0.8rem; color: var(--muted); }
 .topbar nav { display: flex; flex-wrap: wrap; gap: var(--s1); flex: 1 1 auto; }
 .topbar nav a {
   padding: var(--s1) var(--s3);

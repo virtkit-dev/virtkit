@@ -86,8 +86,10 @@ pub type Nav = [Section];
 pub fn frame(title: &str, here: &str, auth: &Auth, nav: &Nav, main: &Html) -> Html {
     let mut h = Html::new();
     head(&mut h, title);
-    h.raw("<body><header class=\"topbar\"><a class=\"brand\" href=\"/\">vk-hub</a>")
-        .raw("<nav aria-label=\"Sections\">");
+    h.raw("<body><header class=\"topbar\"><a class=\"brand\" href=\"/\">vk-hub")
+        .raw(" <span class=\"version\">")
+        .raw(env!("CARGO_PKG_VERSION"))
+        .raw("</span></a><nav aria-label=\"Sections\">");
     let (here_section, here_tab) = current(nav, here);
     for (i, section) in nav.iter().enumerate() {
         let Some(first) = section.tabs.first() else {

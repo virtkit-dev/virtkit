@@ -95,8 +95,8 @@ impl JobAccess {
     }
 }
 
-/// `/registries`: each registry's name and address, whether it is connected, whether jobs
-/// get access to it, and its free storage. Version, mode and ID are on its page.
+/// `/registries`: each registry's name and address, version, whether it is connected,
+/// whether jobs get access to it, and its free storage. Mode and ID are on its page.
 pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let hub = ui.hub.clone();
     let (views, access) = blocking(move || {
@@ -124,7 +124,13 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
         main.raw("<table class=\"grid\"><thead><tr>");
         header_cells(
             &mut main,
-            &["REGISTRY", "CONNECTION", "JOB ACCESS", "FREE STORAGE"],
+            &[
+                "REGISTRY",
+                "VERSION",
+                "CONNECTION",
+                "JOB ACCESS",
+                "FREE STORAGE",
+            ],
         );
         main.raw("</tr></thead><tbody>");
         for (r, access) in views.iter().zip(&access) {
@@ -141,6 +147,11 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
                 None => main.raw("no address"),
             };
             main.raw("</div></td><td>");
+            match r.row.inventory.as_ref().map(|i| i.version.trim()) {
+                Some(v) if !v.is_empty() => main.node(v),
+                _ => main.raw("-"),
+            };
+            main.raw("</td><td>");
             if r.connected {
                 main.raw("<span class=\"badge ok\">Online</span>");
             } else {

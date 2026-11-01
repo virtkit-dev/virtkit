@@ -7886,8 +7886,9 @@ async fn registries_are_shown_to_all_and_steered_by_operators() {
     );
 }
 
-/// The registries' list names each registry with its address, and says whether jobs get
-/// access to it: off, set up, needing setup, or between signing keys.
+/// The registries' list names each registry with its address and version, and says whether
+/// jobs get access to it: off, set up, needing setup, or between signing keys. The top bar
+/// shows the hub's own version.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_registries_list_says_whether_jobs_get_access() {
     use crate::store::RegistryWrite;
@@ -7898,6 +7899,7 @@ async fn the_registries_list_says_whether_jobs_get_access() {
     let unbound = enrolled_registry(&hub, "a3");
     let inventory = vk_hub_proto::registry::Inventory {
         tokens: true,
+        version: "1.2.3".into(),
         ..Default::default()
     };
     hub.db
@@ -7910,8 +7912,31 @@ async fn the_registries_list_says_whether_jobs_get_access() {
     crate::tokens::sync_registry(&hub, &unbound).unwrap();
     apply(&hub, &unbound);
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    // A registry reporting a blank version shows none.
+    let blank = enrolled_registry(&hub, "a5");
+    let inventory = vk_hub_proto::registry::Inventory {
+        version: " ".into(),
+        ..Default::default()
+    };
+    hub.db
+        .record_registry(
+            &blank,
+            RegistryWrite::Inventory(inventory),
+            crate::now_secs(),
+        )
+        .unwrap();
     let body = get(addr, "/registries", Some(&viewer)).await.body;
     for want in [
+        concat!(
+            "<span class=\"version\">",
+            env!("CARGO_PKG_VERSION"),
+            "</span>"
+        ),
+        "<th>VERSION</th>",
+        "<td>1.2.3</td>",
+        // a1 has no inventory yet; a5 reports a blank version.
+        "https://off.example.com</div></td><td>-</td>",
+        "no address</div></td><td>-</td>",
         "<th>JOB ACCESS</th>",
         "https://off.example.com",
         "<span class=\"sub\">off</span>",
@@ -7930,6 +7955,7 @@ async fn the_registries_list_says_whether_jobs_get_access() {
     let hostile = url_registry(&hub, "https://<script>.example.com", "a4");
     let inventory = vk_hub_proto::registry::Inventory {
         hostname: "<script>alert(1)</script>".into(),
+        version: "<b>9</b>".into(),
         ..Default::default()
     };
     hub.db
@@ -7941,6 +7967,7 @@ async fn the_registries_list_says_whether_jobs_get_access() {
         .unwrap();
     let body = get(addr, "/registries", Some(&viewer)).await.body;
     assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
+    assert!(body.contains("<td>&lt;b&gt;9&lt;/b&gt;</td>"), "{body}");
     assert!(!body.contains("<script>"), "{body}");
 }
 
