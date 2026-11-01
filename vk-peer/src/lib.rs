@@ -1,14 +1,15 @@
 //! What a peer of `vk-hub` needs to join it and hold a session with it: an ed25519 identity,
 //! enrollment with a single-use token, the TLS connection and the handshake every peer opens
-//! its session with, release keys, and the pieces of a self-update on trial. `vk node` and
-//! `vk-registry` are such peers; each brings its own messages after the handshake and its own
-//! state.
+//! its session with, release keys, and the pieces of a self-update on trial. `vk node`,
+//! `vk-registry` and `vk-gitlab` are such peers; each brings its own messages after the
+//! handshake and its own state.
 
 pub mod identity;
 pub mod net;
 pub mod release_key;
 pub mod session;
 pub mod token;
+pub mod trial;
 pub mod update;
 
 use std::time::Duration;

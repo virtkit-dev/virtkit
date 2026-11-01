@@ -4180,14 +4180,12 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
- "signal-hook-registry",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "vk-fs",
  "vk-hub-proto",
  "vk-peer",
- "vk-selfupdate",
 ]
 
 [[package]]
@@ -4267,6 +4265,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook-registry",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

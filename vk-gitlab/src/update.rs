@@ -1,5 +1,5 @@
 //! Updating the relay to a `vk-gitlab` release its hub holds, on trial, when `[hub] allow`
-//! lists `update`. It follows `vk-registry`'s update:
+//! lists `update`, through [`vk_peer::trial`]:
 //!
 //! 1. the release is downloaded from the hub under the relay's signature into
 //!    `<state_dir>/hub/releases/<sha256>`, checked against the command's digest and size, its
@@ -16,9 +16,10 @@
 //!
 //! Until confirmation, `vk-gitlab run` starts the unchanged installed binary, whether invoked
 //! by a person or a supervisor after a crash or hang. It counts the attempt and retries
-//! ([`on_start`]), or takes the relay back and reports rollback after [`MAX_ATTEMPTS`] or the
-//! deadline. `run` needs a restarting supervisor: the alarm ends a release that cannot reach
-//! the hub, but does not restart the relay.
+//! ([`on_start`]), or takes the relay back and reports rollback after
+//! [`MAX_ATTEMPTS`](vk_peer::trial::MAX_ATTEMPTS) or the deadline. `run` needs a restarting
+//! supervisor: the alarm ends a release that cannot reach the hub, but does not restart the
+//! relay.
 //!
 //! A relay stopping on SIGTERM or SIGINT takes no update, and one that starts stopping during
 //! an update stops rather than executing the release.
@@ -29,9 +30,7 @@
 //! `<state_dir>/hub/`: a confirmed release goes on running from `releases/`, and the next
 //! update still replaces the installed path.
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,25 +39,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use vk_hub_proto::gitlab::{Command, Operation};
 use vk_hub_proto::{CommandAck, Outcome, UpdatePhase, UpdateProgress};
-use vk_peer::update::{Binary, exec, keep_previous, own_sha256, running_is};
+use vk_peer::trial::{self, Asked, Event, Keeper, Ledger, TRIAL_WINDOW, Trial};
+use vk_peer::update::{Binary, exec};
+
+pub use vk_peer::trial::{Start, note_signals};
 
 use crate::config::HubConfig;
 use crate::poll::ShutdownHandle;
 use crate::relay::Relay;
 use crate::session::Status;
-
-/// How many times a release on trial may be started before the previous binary takes the
-/// relay back.
-pub const MAX_ATTEMPTS: u32 = 3;
-
-/// How long a release on trial has to reach the hub.
-const TRIAL_WINDOW: Duration = Duration::from_secs(120);
-
-/// The largest release a relay takes, whatever a command says.
-const MAX_RELEASE: u64 = 1 << 30;
-
-/// How long a download may take in all.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How long the job requests out to GitLab may take to end. Past it the release is executed
 /// all the same, as a restart would: a job GitLab hands to a request cut short is lost to
@@ -70,27 +59,6 @@ const STATE_FILE: &str = "update.json";
 /// The most commands the journal keeps; past it, the oldest settled ones go.
 const JOURNAL_MAX: usize = 64;
 
-fn releases_dir(dir: &Path) -> PathBuf {
-    dir.join("releases")
-}
-
-/// Set the moment SIGTERM or SIGINT arrives, before the runtime's task handling them runs:
-/// what the last check before an exec reads.
-static SIGNALLED: AtomicBool = AtomicBool::new(false);
-
-/// Note SIGTERM and SIGINT in [`SIGNALLED`] as they arrive, beside the handling `run`
-/// installs; once, before an update can start.
-pub fn note_signals() -> Result<()> {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: the action only stores to an atomic, which is async-signal-safe.
-        unsafe {
-            signal_hook_registry::register(signal, || SIGNALLED.store(true, Ordering::SeqCst))
-        }
-        .with_context(|| format!("noting signal {signal}"))?;
-    }
-    Ok(())
-}
-
 /// A command as the relay journaled it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
@@ -101,29 +69,6 @@ pub struct Entry {
     /// The outcome the hub said it stored; the ack is repeated until it matches.
     #[serde(default)]
     pub recorded: Option<Outcome>,
-}
-
-/// An update between its download and its end.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Trial {
-    /// The command that asked it.
-    pub command: String,
-    pub version: String,
-    pub sha256: String,
-    /// The installed binary, which the release replaces once it has passed, and its
-    /// `(device, inode)` when the trial began.
-    pub exe: PathBuf,
-    pub exe_id: (u64, u64),
-    /// The release, under `<state_dir>/hub/releases/`.
-    pub next: PathBuf,
-    /// The installed binary's sha256, kept there too to go back to.
-    pub previous: String,
-    /// Starts of the release so far, and when it must have reached the hub by.
-    pub attempts: u32,
-    pub deadline: u64,
-    /// The release reached the hub: what is left is installing it, which any start finishes.
-    #[serde(default)]
-    pub confirmed: bool,
 }
 
 /// What the relay keeps of its hub's commands across restarts.
@@ -143,9 +88,13 @@ pub struct Persisted {
     pub installed: Option<PathBuf>,
 }
 
-impl Persisted {
+impl Ledger for Persisted {
+    const PROGRAM: &'static str = "vk-gitlab";
+    const PEER: &'static str = "relay";
+    const SUBCOMMAND: &'static str = "run";
+
     /// The state in `dir`, empty when there is none.
-    pub fn load(dir: &Path) -> Result<Self> {
+    fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(STATE_FILE);
         match vk_peer::net::read_nofollow(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -157,7 +106,7 @@ impl Persisted {
 
     /// Write it whole, private, and its directory synced: a trial confirmed must be found so
     /// after a crash, before the release is installed.
-    pub fn save(&self, dir: &Path) -> Result<()> {
+    fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(STATE_FILE);
         let bytes = serde_json::to_vec_pretty(self).context("encoding the update state")?;
         vk_fs::write_atomic(&path, &bytes, 0o600)
@@ -167,6 +116,51 @@ impl Persisted {
             .with_context(|| format!("syncing {}", dir.display()))
     }
 
+    fn trial(&mut self) -> &mut Option<Trial> {
+        &mut self.trial
+    }
+
+    fn set_progress(&mut self, progress: UpdateProgress) {
+        self.update = Some(progress);
+    }
+
+    fn set_outcome(&mut self, id: &str, outcome: Outcome) {
+        if let Some(e) = self.journal.iter_mut().find(|e| e.id == id) {
+            e.outcome = outcome;
+        }
+    }
+
+    fn log(event: Event<'_>) {
+        match event {
+            Event::Unreadable(e) => {
+                log::error!(error = format!("{e:#}").as_str(); "Reading the update state failed; running on")
+            }
+            Event::Unwritable(e) => {
+                log::error!(error = format!("{e:#}").as_str(); "Writing the update state failed")
+            }
+            Event::Starting { version, attempt } => {
+                log::warn!(version, attempt; "Starting vk-gitlab on trial")
+            }
+            Event::RolledBack { version, why } => {
+                log::error!(version, error = why; "Update rolled back")
+            }
+            Event::ConfirmFailed(e) => {
+                log::error!(error = format!("{e:#}").as_str(); "Confirming the update failed")
+            }
+            Event::Installed { version, path } => {
+                log::info!(version, path = path.display().to_string().as_str(); "vk-gitlab installed")
+            }
+            Event::InstallFailed(e) => {
+                log::error!(error = format!("{e:#}").as_str(); "Installing the update failed")
+            }
+            Event::RunInstalledFailed(e) => {
+                log::error!(error = format!("{e:#}").as_str(); "Starting the installed release failed; running on")
+            }
+        }
+    }
+}
+
+impl Persisted {
     /// Forget what another hub or enrollment asked.
     fn adopt_issuer(&mut self, hub: &str, id: &str) -> bool {
         let issuer = (hub.to_string(), id.to_string());
@@ -208,13 +202,6 @@ impl Persisted {
                 }
                 None => break,
             }
-        }
-    }
-
-    /// Record command `id`'s new outcome.
-    fn set_outcome(&mut self, id: &str, outcome: Outcome) {
-        if let Some(e) = self.journal.iter_mut().find(|e| e.id == id) {
-            e.outcome = outcome;
         }
     }
 
@@ -271,238 +258,10 @@ impl Persisted {
     }
 }
 
-/// What `run` does on starting.
-pub enum Start {
-    Run,
-    /// Execute this binary in place of this one, `alarm(2)` armed for this deadline.
-    Exec(Binary, Option<u64>),
-}
-
 /// The previous binary's part in a trial, run by `run` before anything else, under the
-/// relay's lock: count the start and hand over to the release, or, past [`MAX_ATTEMPTS`] or
-/// the deadline, end the trial and run on as the relay's binary. The release on trial arms its
-/// own deadline. A state that cannot be read or written is logged and the relay runs: what
-/// the hub asked must never stop it.
+/// relay's lock ([`trial::on_start`]).
 pub fn on_start(state_dir: &Path, now: u64) -> Start {
-    let dir = crate::relay::dir(state_dir);
-    if !dir.is_dir() {
-        return Start::Run;
-    }
-    let mut p = match Persisted::load(&dir) {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!(error = format!("{e:#}").as_str(); "Reading the update state failed; running on");
-            return Start::Run;
-        }
-    };
-    let save = |p: &Persisted| {
-        if let Err(e) = p.save(&dir) {
-            log::error!(error = format!("{e:#}").as_str(); "Writing the update state failed");
-        }
-    };
-    let Some(trial) = p.trial.clone() else {
-        return Start::Run;
-    };
-    if trial.confirmed {
-        return finish_install(&dir, &mut p, &trial);
-    }
-    if running_is(&trial.next) {
-        vk_peer::update::alarm(Some(trial.deadline), now);
-        return Start::Run;
-    }
-    let failed = if trial.attempts >= MAX_ATTEMPTS {
-        Some(format!(
-            "the release did not reach the hub in {MAX_ATTEMPTS} starts"
-        ))
-    } else if now > trial.deadline {
-        Some("the release did not reach the hub before its deadline".to_string())
-    } else {
-        None
-    };
-    let next = match failed {
-        Some(why) => Err(why),
-        None => Binary::open(&trial.next, Some(&trial.sha256)).map_err(|e| format!("{e:#}")),
-    };
-    match next {
-        Ok(binary) => {
-            if let Some(t) = p.trial.as_mut() {
-                t.attempts += 1;
-            }
-            save(&p);
-            log::warn!(version = trial.version.as_str(), attempt = trial.attempts + 1; "Starting vk-gitlab on trial");
-            Start::Exec(binary, Some(trial.deadline))
-        }
-        Err(why) => {
-            log::error!(version = trial.version.as_str(), error = why.as_str(); "Update rolled back");
-            end(
-                &mut p,
-                &trial,
-                UpdatePhase::RolledBack,
-                Outcome::Failed {
-                    message: format!("rolled back: {why}"),
-                },
-                Some(why),
-            );
-            save(&p);
-            prune(&dir, &[&trial.previous]);
-            Start::Run
-        }
-    }
-}
-
-/// Install `trial`'s release, confirmed by the hub but not installed before the relay stopped,
-/// and end the update; then run the release, if this is another binary.
-fn finish_install(dir: &Path, p: &mut Persisted, trial: &Trial) -> Start {
-    let installed = install(trial);
-    match &installed {
-        Ok(()) => end(p, trial, UpdatePhase::Done, Outcome::Done, None),
-        Err(e) => end(
-            p,
-            trial,
-            UpdatePhase::Failed,
-            Outcome::Failed {
-                message: format!("{e:#}"),
-            },
-            Some(format!("{e:#}")),
-        ),
-    }
-    if let Err(e) = p.save(dir) {
-        log::error!(error = format!("{e:#}").as_str(); "Writing the update state failed");
-        return Start::Run;
-    }
-    let Err(e) = installed else {
-        prune(dir, &[&trial.sha256, &trial.previous]);
-        log::info!(version = trial.version.as_str(), path = trial.exe.display().to_string().as_str(); "vk-gitlab installed");
-        if own_sha256().as_deref() == Some(trial.sha256.as_str()) {
-            return Start::Run;
-        }
-        return match Binary::open(&trial.exe, Some(&trial.sha256)) {
-            Ok(binary) => Start::Exec(binary, None),
-            Err(e) => {
-                log::error!(error = format!("{e:#}").as_str(); "Starting the installed release failed; running on");
-                Start::Run
-            }
-        };
-    };
-    log::error!(error = format!("{e:#}").as_str(); "Installing the update failed");
-    Start::Run
-}
-
-/// The installed binary to record when `run` runs `exe`, `recorded` before; `None` to keep
-/// what is recorded. A binary under the hub directory `dir` is a release, never the installed
-/// one.
-fn installed_after(recorded: Option<&Path>, exe: PathBuf, dir: &Path) -> Option<PathBuf> {
-    (exe.is_file() && !vk_peer::update::under(&exe, dir) && recorded != Some(exe.as_path()))
-        .then_some(exe)
-}
-
-/// Keep only the releases named in `keep` under `dir`: the one installed and the one before
-/// it, or after a rollback the one running.
-fn prune(dir: &Path, keep: &[&str]) {
-    let Ok(entries) = std::fs::read_dir(releases_dir(dir)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !keep
-            .iter()
-            .any(|k| entry.file_name().as_encoded_bytes() == k.as_bytes())
-        {
-            // Best effort: a release left over costs only space, and the next prune retries.
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// End `trial` in `p` with `phase` and `outcome`.
-fn end(
-    p: &mut Persisted,
-    trial: &Trial,
-    phase: UpdatePhase,
-    outcome: Outcome,
-    why: Option<String>,
-) {
-    p.trial = None;
-    p.update = Some(UpdateProgress {
-        command: trial.command.clone(),
-        version: trial.version.clone(),
-        sha256: trial.sha256.clone(),
-        phase,
-        message: why,
-    });
-    p.set_outcome(&trial.command, outcome);
-}
-
-/// Install the release over `trial.exe`, unless another binary replaced it meanwhile.
-fn install(trial: &Trial) -> Result<()> {
-    let meta = std::fs::metadata(&trial.exe)
-        .with_context(|| format!("reading {}", trial.exe.display()))?;
-    if vk_peer::update::hash_file(&trial.exe).ok().as_deref() == Some(trial.sha256.as_str()) {
-        return Ok(());
-    }
-    if trial.exe_id != (meta.dev(), meta.ino()) {
-        return Err(anyhow!(
-            "{} was replaced by another binary during the trial; the release is not installed \
-             over it",
-            trial.exe.display()
-        ));
-    }
-    let mode = (std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777) | 0o100;
-    vk_peer::update::copy_published(&trial.next, &trial.exe, mode, Some(&trial.sha256))
-}
-
-/// Whether the relay may install over the installed binary `installed`: recorded, a file
-/// outside `dir`, in a directory this user can write, since the release is renamed into it.
-fn can_replace(installed: Option<&Path>, dir: &Path) -> Result<(), String> {
-    let exe = installed.ok_or_else(|| {
-        "the installed vk-gitlab is not known yet: restart vk-gitlab run from it".to_string()
-    })?;
-    if !exe.is_file() {
-        return Err(format!("{} is gone", exe.display()));
-    }
-    if vk_peer::update::under(exe, dir) {
-        return Err(format!(
-            "{} is inside the relay's hub directory; run vk-gitlab from its installed path",
-            exe.display()
-        ));
-    }
-    let parent = exe
-        .parent()
-        .ok_or_else(|| format!("{} has no directory", exe.display()))?;
-    let c_dir = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
-        .map_err(|_| format!("{} has a NUL in it", parent.display()))?;
-    // SAFETY: NUL-terminated and outlives the call.
-    if unsafe { libc::access(c_dir.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!(
-            "vk-gitlab cannot replace {}: {} is not writable by this user",
-            exe.display(),
-            parent.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Whether a relay running `own` may update to `candidate`: not to an older version unless
-/// `allow_downgrade`. Versions are `MAJOR.MINOR.PATCH`.
-fn check_version(own: &str, candidate: &str, allow_downgrade: bool) -> Result<(), String> {
-    fn fields(v: &str) -> Option<Vec<u64>> {
-        let v: Vec<u64> = v
-            .split('.')
-            .map(|f| f.parse().ok())
-            .collect::<Option<_>>()?;
-        (v.len() == 3).then_some(v)
-    }
-    match (fields(candidate), fields(own)) {
-        (Some(c), Some(o)) if c >= o || allow_downgrade => Ok(()),
-        (Some(_), Some(_)) => Err(format!(
-            "vk-gitlab {candidate} is older than this relay's {own}; [hub] allow_downgrade = \
-             true lets an update install it"
-        )),
-        _ if candidate == own => Ok(()),
-        _ => Err(format!(
-            "vk-gitlab {candidate} cannot be ordered against {own}; versions are \
-             MAJOR.MINOR.PATCH"
-        )),
-    }
+    trial::on_start::<Persisted>(&crate::relay::dir(state_dir), now)
 }
 
 /// The relay's side of the hub's commands: what it was sent and how each went, and the update
@@ -584,7 +343,8 @@ impl Updater {
         let mut changed = persisted.adopt_issuer(&relay.enrollment.hub, &relay.enrollment.relay_id);
         changed |= persisted.fail_interrupted();
         if let Ok(exe) = std::env::current_exe()
-            && let Some(installed) = installed_after(persisted.installed.as_deref(), exe, dir)
+            && let Some(installed) =
+                trial::installed_after(persisted.installed.as_deref(), exe, dir)
         {
             persisted.installed = Some(installed);
             changed = true;
@@ -606,7 +366,7 @@ impl Updater {
 
     /// Whether the relay is stopping, or was just told to.
     fn stopping(&self) -> bool {
-        self.shutdown.stopping() || SIGNALLED.load(Ordering::SeqCst)
+        self.shutdown.stopping() || trial::signalled()
     }
 
     fn persisted(&self) -> std::sync::MutexGuard<'_, Persisted> {
@@ -734,19 +494,20 @@ impl Updater {
         if self.persisted().update_under_way() {
             return Err("an update is under way already".to_string());
         }
-        if !vk_hub_proto::valid_sha256(sha256) {
-            return Err(format!("{sha256:?} is not a sha256"));
-        }
-        if *size > MAX_RELEASE {
-            return Err(format!("the release is {size} bytes, past {MAX_RELEASE}"));
-        }
-        if own_sha256().as_deref() == Some(sha256.as_str()) {
-            return Ok(Outcome::Done);
-        }
-        check_version(env!("CARGO_PKG_VERSION"), version, self.hub.allow_downgrade)?;
-        self.policy.check(sha256, version, signature.as_deref())?;
-        can_replace(self.persisted().installed.as_deref(), &self.dir)?;
-        Ok(Outcome::Accepted)
+        let installed = self.persisted().installed.clone();
+        trial::check::<Persisted>(
+            &Asked {
+                version,
+                sha256,
+                size: *size,
+                signature: signature.as_deref(),
+            },
+            env!("CARGO_PKG_VERSION"),
+            self.hub.allow_downgrade,
+            &self.policy,
+            installed.as_deref(),
+            &self.dir,
+        )
     }
 
     /// Record that the update `command` failed with `why`. A trial recorded before an exec that
@@ -755,26 +516,7 @@ impl Updater {
         let Operation::Update {
             version, sha256, ..
         } = &command.op;
-        let undone = self.change(|p| {
-            p.update = Some(UpdateProgress {
-                command: command.id.clone(),
-                version: version.clone(),
-                sha256: sha256.clone(),
-                phase: UpdatePhase::Failed,
-                message: Some(why.to_string()),
-            });
-            p.set_outcome(
-                &command.id,
-                Outcome::Failed {
-                    message: why.to_string(),
-                },
-            );
-            p.trial.take_if(|t| t.command == command.id)
-        })?;
-        if let Some(trial) = undone {
-            prune(&self.dir, &[&trial.previous]);
-        }
-        Ok(())
+        trial::failed(self, &command.id, version, sha256, why)
     }
 
     /// Carry out the update `command` was accepted for: download and check the release, keep
@@ -796,59 +538,21 @@ impl Updater {
             phase,
             message: None,
         };
-        let releases = releases_dir(&self.dir);
-        vk_peer::net::create_dir(&releases)?;
-        vk_peer::update::sweep_partial(&releases);
-        let next = releases.join(sha256);
-        if !next.is_file() {
-            let fetch = vk_peer::update::Download {
-                hub: &self.relay.enrollment.hub,
-                tls: &self.relay.tls,
-                identity: &self.relay.identity,
-                id: &self.relay.enrollment.relay_id,
-                id_header: vk_hub_proto::client::RELAY_HEADER,
-                path: vk_hub_proto::gitlab::RELEASE_PATH,
-                sign: vk_hub_proto::download_message,
-                sha256,
-                size: *size,
-                mode: 0o700,
-            };
-            tokio::time::timeout(DOWNLOAD_TIMEOUT, vk_peer::update::download(&fetch, &next))
-                .await
-                .map_err(|_| anyhow!("the download took longer than {DOWNLOAD_TIMEOUT:?}"))??;
-        }
+        let fetch = vk_peer::update::Download {
+            hub: &self.relay.enrollment.hub,
+            tls: &self.relay.tls,
+            identity: &self.relay.identity,
+            id: &self.relay.enrollment.relay_id,
+            id_header: vk_hub_proto::client::RELAY_HEADER,
+            path: vk_hub_proto::gitlab::RELEASE_PATH,
+            sign: vk_hub_proto::download_message,
+            sha256,
+            size: *size,
+            mode: 0o700,
+        };
         let installed = self.persisted().installed.clone();
-        let (dir, next2, version2, sha2, id) = (
-            self.dir.clone(),
-            next.clone(),
-            version.clone(),
-            sha256.clone(),
-            command.id.clone(),
-        );
-        let (trial, binary) = tokio::task::spawn_blocking(move || -> Result<(Trial, Binary)> {
-            let binary = Binary::open(&next2, Some(&sha2))?;
-            vk_selfupdate::smoke_test_file("vk-gitlab", binary.file(), binary.path(), &version2)?;
-            let own = own_sha256().context("reading the running binary")?;
-            keep_previous(&releases_dir(&dir), &own)?;
-            let exe = installed.context("the installed vk-gitlab is not known")?;
-            let meta =
-                std::fs::metadata(&exe).with_context(|| format!("reading {}", exe.display()))?;
-            let trial = Trial {
-                command: id,
-                version: version2,
-                sha256: sha2,
-                exe,
-                exe_id: (meta.dev(), meta.ino()),
-                next: next2,
-                previous: own,
-                attempts: 1,
-                deadline: 0,
-                confirmed: false,
-            };
-            Ok((trial, binary))
-        })
-        .await
-        .context("checking the release")??;
+        let (trial, binary) =
+            trial::stage::<Persisted>(&self.dir, &fetch, &command.id, version, installed).await?;
         if self.stopping() {
             return Err(anyhow!("the relay is stopping"));
         }
@@ -919,46 +623,26 @@ impl Updater {
         exec(binary, Some(deadline))
     }
 
-    /// The release on trial reached the hub: install it over the installed binary and report
-    /// the update done. Nothing to do when no trial runs this binary.
+    /// The release on trial reached the hub: record that it passed, install it over the
+    /// installed binary and report the update done ([`trial::confirm`]).
     pub fn confirm(&self) {
-        let trial = self.persisted().trial.clone();
-        let Some(trial) = trial.filter(|t| running_is(&t.next) && !t.confirmed) else {
-            return;
-        };
-        // Confirmed before it is installed: a relay stopped in between installs it on its next
-        // start, rather than taking the installed binary for the previous one.
-        if let Err(e) = self.change(|p| {
-            if let Some(t) = &mut p.trial {
-                t.confirmed = true;
-            }
-        }) {
-            log::error!(error = format!("{e:#}").as_str(); "Confirming the update failed");
-            return;
-        }
-        vk_peer::update::alarm(None, 0);
-        let installed = install(&trial);
-        let result = self.change(|p| match &installed {
-            Ok(()) => end(p, &trial, UpdatePhase::Done, Outcome::Done, None),
-            Err(e) => end(
-                p,
-                &trial,
-                UpdatePhase::Failed,
-                Outcome::Failed {
-                    message: format!("{e:#}"),
-                },
-                Some(format!("{e:#}")),
-            ),
-        });
-        match (installed, result) {
-            (Ok(()), Ok(())) => {
-                prune(&self.dir, &[&trial.sha256, &trial.previous]);
-                log::info!(version = trial.version.as_str(), path = trial.exe.display().to_string().as_str(); "vk-gitlab installed");
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                log::error!(error = format!("{e:#}").as_str(); "Installing the update failed")
-            }
-        }
+        trial::confirm(self);
+    }
+}
+
+impl Keeper for Updater {
+    type Ledger = Persisted;
+
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn trial(&self) -> Option<Trial> {
+        self.persisted().trial.clone()
+    }
+
+    fn change<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
+        Updater::change(self, f)
     }
 }
 
@@ -983,7 +667,7 @@ mod tests {
         }
     }
 
-    fn trial(command: &str, dir: &Path, attempts: u32, deadline: u64) -> Trial {
+    fn trial_of(command: &str, dir: &Path, attempts: u32, deadline: u64) -> Trial {
         Trial {
             command: command.into(),
             version: "9.9.9".into(),
@@ -996,15 +680,6 @@ mod tests {
             deadline,
             confirmed: false,
         }
-    }
-
-    #[test]
-    fn versions_only_go_forward_unless_allowed() {
-        assert!(check_version("0.101.0", "0.102.0", false).is_ok());
-        assert!(check_version("0.101.0", "0.101.0", false).is_ok());
-        assert!(check_version("0.101.0", "0.100.0", false).is_err());
-        assert!(check_version("0.101.0", "0.100.0", true).is_ok());
-        assert!(check_version("0.101.0", "nightly", true).is_err());
     }
 
     #[test]
@@ -1089,106 +764,10 @@ mod tests {
         // The update on trial goes on: the release confirms or the previous binary ends it.
         p.journal("t", update(), 10, Outcome::Accepted, 0);
         p.update = Some(progress("t", UpdatePhase::Validating));
-        p.trial = Some(trial("t", Path::new("/"), 1, 1));
+        p.trial = Some(trial_of("t", Path::new("/"), 1, 1));
         assert!(!p.fail_interrupted());
         assert_eq!(p.entry("t").unwrap().outcome, Outcome::Accepted);
         assert!(p.update_under_way());
-    }
-
-    #[test]
-    fn a_trial_past_its_attempts_or_deadline_is_rolled_back_on_start() {
-        for (tag, attempts, deadline) in [("attempts", MAX_ATTEMPTS, u64::MAX), ("late", 1, 0)] {
-            let root = temp(tag);
-            let dir = crate::relay::dir(&root);
-            let mut p = Persisted::default();
-            p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
-            p.trial = Some(trial("c", &dir, attempts, deadline));
-            p.save(&dir).unwrap();
-            std::fs::create_dir_all(releases_dir(&dir)).unwrap();
-            for release in ["0", "1", "2"] {
-                std::fs::write(releases_dir(&dir).join(release.repeat(64)), b"r").unwrap();
-            }
-            assert!(matches!(on_start(&root, 1), Start::Run), "{tag}");
-            let p = Persisted::load(&dir).unwrap();
-            assert!(p.trial.is_none(), "{tag}");
-            assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::RolledBack);
-            assert!(matches!(
-                p.entry("c").unwrap().outcome,
-                Outcome::Failed { .. }
-            ));
-            // Only the binary that runs again is kept.
-            let kept: Vec<_> = std::fs::read_dir(releases_dir(&dir))
-                .unwrap()
-                .map(|e| e.unwrap().file_name())
-                .collect();
-            assert_eq!(
-                kept,
-                vec![std::ffi::OsString::from("1".repeat(64))],
-                "{tag}"
-            );
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    /// A release still within its attempts and deadline is started again, the attempt counted.
-    #[test]
-    fn a_trial_within_its_attempts_starts_the_release_again() {
-        let root = temp("again");
-        let dir = crate::relay::dir(&root);
-        std::fs::create_dir_all(releases_dir(&dir)).unwrap();
-        let next = releases_dir(&dir).join("2".repeat(64));
-        std::fs::write(&next, b"release").unwrap();
-        let sha = vk_peer::update::hash_file(&next).unwrap();
-        let mut p = Persisted::default();
-        p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
-        p.trial = Some(Trial {
-            sha256: sha,
-            next: next.clone(),
-            ..trial("c", &dir, 1, u64::MAX)
-        });
-        p.save(&dir).unwrap();
-        let Start::Exec(binary, deadline) = on_start(&root, 1) else {
-            panic!("the release is not started again");
-        };
-        assert_eq!((binary.path(), deadline), (next.as_path(), Some(u64::MAX)));
-        assert_eq!(Persisted::load(&dir).unwrap().trial.unwrap().attempts, 2);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A release confirmed but stopped before it installed itself: the next start installs it,
-    /// ends the update done, and runs it rather than the binary it replaced.
-    #[test]
-    fn a_confirmed_release_is_installed_on_the_next_start() {
-        let root = temp("confirmed");
-        let dir = crate::relay::dir(&root);
-        std::fs::create_dir_all(releases_dir(&dir)).unwrap();
-        let exe = root.join("vk-gitlab");
-        std::fs::write(&exe, b"previous").unwrap();
-        let next = releases_dir(&dir).join("2".repeat(64));
-        std::fs::write(&next, b"release").unwrap();
-        let sha = vk_peer::update::hash_file(&next).unwrap();
-        let meta = std::fs::metadata(&exe).unwrap();
-        let mut p = Persisted::default();
-        p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
-        p.trial = Some(Trial {
-            sha256: sha.clone(),
-            exe: exe.clone(),
-            exe_id: (meta.dev(), meta.ino()),
-            next,
-            confirmed: true,
-            ..trial("c", &dir, MAX_ATTEMPTS, 0)
-        });
-        p.save(&dir).unwrap();
-        let Start::Exec(binary, deadline) = on_start(&root, 1) else {
-            panic!("the installed release is not run");
-        };
-        assert_eq!((binary.path(), deadline), (exe.as_path(), None));
-        assert_eq!(vk_peer::update::hash_file(&exe).unwrap(), sha);
-        let p = Persisted::load(&dir).unwrap();
-        assert!(p.trial.is_none());
-        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Done);
-        assert_eq!(p.entry("c").unwrap().outcome, Outcome::Done);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1200,35 +779,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The installed binary is the last one `run` started from outside the hub directory:
-    /// a confirmed release running from `releases/` leaves it as recorded.
+    /// The relay's own state file holds its trial: one past its attempts is rolled back there,
+    /// its command failed in the journal.
     #[test]
-    fn the_installed_binary_is_never_a_release() {
-        let root = temp("installed");
+    fn a_trial_past_its_attempts_is_rolled_back_in_the_relay_s_state() {
+        let root = temp("attempts");
         let dir = crate::relay::dir(&root);
-        std::fs::create_dir_all(releases_dir(&dir)).unwrap();
-        let installed = root.join("vk-gitlab");
-        let release = releases_dir(&dir).join("0".repeat(64));
-        for f in [&installed, &release] {
-            std::fs::write(f, b"bin").unwrap();
-        }
-        assert_eq!(
-            installed_after(None, installed.clone(), &dir),
-            Some(installed.clone())
-        );
-        assert_eq!(
-            installed_after(Some(&installed), installed.clone(), &dir),
-            None
-        );
-        assert_eq!(
-            installed_after(Some(&installed), release.clone(), &dir),
-            None
-        );
-        assert_eq!(installed_after(None, root.join("absent"), &dir), None);
-
-        assert!(can_replace(None, &dir).unwrap_err().contains("not known"));
-        assert!(can_replace(Some(&release), &dir).is_err());
-        can_replace(Some(&installed), &dir).unwrap();
+        let mut p = Persisted::default();
+        p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
+        p.trial = Some(trial_of("c", &dir, trial::MAX_ATTEMPTS, u64::MAX));
+        p.save(&dir).unwrap();
+        assert!(matches!(on_start(&root, 1), Start::Run));
+        let p = Persisted::load(&dir).unwrap();
+        assert!(p.trial.is_none());
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::RolledBack);
+        assert!(matches!(
+            p.entry("c").unwrap().outcome,
+            Outcome::Failed { .. }
+        ));
+        assert!(!p.update_under_way());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

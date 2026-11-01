@@ -40,12 +40,6 @@ vk-hub-proto = { path = "../vk-hub-proto" }
 # The relay's identity, enrollment and session with the hub, and its files written whole.
 vk-fs = { path = "../vk-fs" }
 vk-peer = { path = "../vk-peer" }
-# An update's release is checked by running its --version, as `vk update` checks one.
-vk-selfupdate = { path = "../vk-selfupdate" }
-# access(2): whether the installed binary's directory takes the release.
-libc.workspace = true
-# A stop asked during an update, seen before the release is executed.
-signal-hook-registry.workspace = true
 # The hub client: one signed HTTP/1.1 request per connection vk-peer dials.
 hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
@@ -58,6 +52,8 @@ tokio-tungstenite.workspace = true
 jemallocator.workspace = true
 
 [dev-dependencies]
+# kill(2): the SIGTERM a test stops a relay with.
+libc.workspace = true
 # The fake GitLab the integration tests run in-process.
 hyper.workspace = true
 hyper-util.workspace = true
