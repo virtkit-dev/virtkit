@@ -46,6 +46,7 @@ both!(
     limit_bounds_a_runners_jobs,
     failing_renewals_do_not_stretch_the_lease,
     stop_lets_a_running_job_finish,
+    requests_end_for_an_update_while_jobs_run_on,
     an_unhealthy_runner_backs_off,
     strict_check_interval_paces_requests_after_a_job,
     output_the_hub_lost_fails_the_job,
@@ -451,6 +452,31 @@ async fn stop_lets_a_running_job_finish(via: Via) {
         h.count_calls(|c| matches!(c, FakeCall::Cancel(..))),
         0,
         "a stop cancels nothing"
+    );
+}
+
+/// An update ends job requests while the running job continues; `stopping()` stays false.
+async fn requests_end_for_an_update_while_jobs_run_on(via: Via) {
+    let mut h = Harness::start(2, via).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(25));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let handle = h.daemon.stop_handle();
+    handle.stop_requests();
+    within("the job requests to end", handle.requests_ended()).await;
+    let requests = h.job_requests();
+    assert!(!handle.stopping());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.daemon.is_running(), "returned with a job running");
+    h.hub.push_output(&hub_id, b"done\n");
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(25).await["state"], "success");
+    h.daemon.join().await;
+    assert_eq!(h.job_requests(), requests, "asked GitLab for a job after");
+    assert_eq!(
+        h.count_calls(|c| matches!(c, FakeCall::Cancel(..))),
+        0,
+        "an update cancels nothing"
     );
 }
 

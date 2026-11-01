@@ -25,7 +25,7 @@
 //! job: they run whether or not `concurrent` and `limit` leave them a slot. New loops can
 //! queue, but can fetch a job only after taking a slot.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -81,6 +81,13 @@ fn new_request_id() -> String {
 pub struct ShutdownHandle {
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
+    /// Set by [`stop`](Self::stop) and [`abort`](Self::abort), not by
+    /// [`stop_requests`](Self::stop_requests).
+    stopping: AtomicBool,
+    /// Set once every request loop has ended.
+    requests_ended: watch::Receiver<bool>,
+    /// Jobs GitLab handed out that no state file holds yet.
+    unrecorded: watch::Receiver<usize>,
 }
 
 /// What the loop and its jobs watch.
@@ -88,28 +95,64 @@ pub struct ShutdownHandle {
 pub struct Shutdown {
     stop: watch::Receiver<bool>,
     abort: watch::Receiver<bool>,
+    requests_ended: Arc<watch::Sender<bool>>,
+    unrecorded: Arc<watch::Sender<usize>>,
 }
 
 impl ShutdownHandle {
     pub fn new() -> (Self, Shutdown) {
         let (stop_tx, stop) = watch::channel(false);
         let (abort_tx, abort) = watch::channel(false);
+        let (ended_tx, requests_ended) = watch::channel(false);
+        let (unrecorded_tx, unrecorded) = watch::channel(0);
         (
             Self {
                 stop: stop_tx,
                 abort: abort_tx,
+                stopping: AtomicBool::new(false),
+                requests_ended,
+                unrecorded,
             },
-            Shutdown { stop, abort },
+            Shutdown {
+                stop,
+                abort,
+                requests_ended: Arc::new(ended_tx),
+                unrecorded: Arc::new(unrecorded_tx),
+            },
         )
     }
 
-    /// Requests no more jobs; running jobs carry on.
+    /// Requests no more jobs; running jobs carry on, and the loop ends with them.
     pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.stop.send_replace(true);
+    }
+
+    /// Requests no more jobs, to restart the relay on another binary rather than to stop it:
+    /// it does not set [`stopping`](Self::stopping). The loop still ends once its running jobs do.
+    pub fn stop_requests(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Whether the relay is stopping: [`stop`](Self::stop) or [`abort`](Self::abort) was
+    /// called.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Waits, after [`stop`](Self::stop) or [`stop_requests`](Self::stop_requests), until every
+    /// request loop has ended and every job they took is in its runner's state file or has
+    /// ended: every job the relay holds then survives a restart.
+    pub async fn requests_ended(&self) {
+        let (mut ended, mut unrecorded) = (self.requests_ended.clone(), self.unrecorded.clone());
+        // An error only once the loop is gone, which ends its requests and jobs too.
+        let _ = ended.wait_for(|v| *v).await;
+        let _ = unrecorded.wait_for(|n| *n == 0).await;
     }
 
     /// Requests no more jobs and aborts the running ones, reporting them as interrupted.
     pub fn abort(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.stop.send_replace(true);
         self.abort.send_replace(true);
     }
@@ -121,7 +164,9 @@ async fn wait_true(rx: &mut watch::Receiver<bool>) {
 }
 
 impl Shutdown {
-    fn stopping(&self) -> bool {
+    /// Whether job requests were stopped, by [`ShutdownHandle::stop`],
+    /// [`stop_requests`](ShutdownHandle::stop_requests) or [`abort`](ShutdownHandle::abort).
+    fn requests_stopped(&self) -> bool {
         *self.stop.borrow()
     }
 }
@@ -781,6 +826,7 @@ pub async fn run<D: Dispatcher>(
         workers.spawn(reverify(Arc::clone(&shared), runner));
     }
     while workers.join_next().await.is_some() {}
+    shared.shutdown.requests_ended.send_replace(true);
     log::info!(jobs = shared.running_jobs.load(Ordering::SeqCst); "Stopped requesting jobs; waiting for running jobs");
     loop {
         let done = shared.job_done.notified();
@@ -1018,7 +1064,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
     let placement = runner.cfg.placement();
     let hub = shared.options.hub.clone();
     loop {
-        if shared.shutdown.stopping() {
+        if shared.shutdown.requests_stopped() {
             return;
         }
         // Only a server the hub approved is asked for jobs: the hub refuses the others'.
@@ -1184,7 +1230,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             }
             continue;
         };
-        if shared.shutdown.stopping() {
+        if shared.shutdown.requests_stopped() {
             give_back(&shared, &runner, held).await;
             return;
         }
@@ -1257,8 +1303,18 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             .map(|h| h.reservation.id);
         let running = RunningJob::new(Arc::clone(&shared), Some(slots));
         let runner2 = Arc::clone(&runner);
+        // Counted before the loop can end, so requests_ended waits for its record.
+        let unrecorded = Unrecorded::new(&shared.shutdown);
         tokio::spawn(async move {
-            run_job(&running.shared, &runner2, job, reservation, admission).await;
+            run_job(
+                &running.shared,
+                &runner2,
+                job,
+                reservation,
+                admission,
+                unrecorded,
+            )
+            .await;
             drop(running);
         });
         if !runner.cfg.strict_check_interval {
@@ -1524,7 +1580,7 @@ async fn record(
     runner: &Runner,
     what: &str,
     change: impl FnOnce(&StateFile) -> Result<()> + Send + 'static,
-) {
+) -> bool {
     let state = Arc::clone(&runner.state);
     let result = tokio::task::spawn_blocking(move || change(&state))
         .await
@@ -1535,18 +1591,47 @@ async fn record(
         r.jobs = u32::try_from(jobs).unwrap_or(u32::MAX);
         r.job_admissions = records.iter().filter_map(|j| j.admission.clone()).collect();
     });
-    if let Err(e) = result {
+    if let Err(e) = &result {
         log::error!(runner = runner.cfg.name.as_str(), state_file = runner.state.path().display().to_string().as_str(), error = format!("{e:#}").as_str(); "Could not record the job ({what})");
+    }
+    result.is_ok()
+}
+
+/// A job GitLab handed out, counted in [`Shutdown::unrecorded`] until its state file holds it
+/// or it has ended.
+struct Unrecorded(Option<Arc<watch::Sender<usize>>>);
+
+impl Unrecorded {
+    fn new(shutdown: &Shutdown) -> Self {
+        shutdown
+            .unrecorded
+            .send_modify(|n| *n = n.saturating_add(1));
+        Self(Some(Arc::clone(&shutdown.unrecorded)))
+    }
+
+    /// Its state file holds it.
+    fn recorded(&mut self) {
+        if let Some(count) = self.0.take() {
+            count.send_modify(|n| *n = n.saturating_sub(1));
+        }
     }
 }
 
-/// A received job: refused here, or recorded and handed to [`drive`].
+impl Drop for Unrecorded {
+    fn drop(&mut self) {
+        self.recorded();
+    }
+}
+
+/// A received job: refused here, or recorded and handed to [`drive`]. `unrecorded` counts it
+/// until it is recorded or ends.
 async fn run_job<D: Dispatcher>(
     shared: &Shared<D>,
     runner: &Runner,
     job: Box<Job>,
     reservation: Option<String>,
     admission: Option<String>,
+    mut unrecorded: Unrecorded,
 ) {
     let creds = JobCredentials {
         id: job.id,
@@ -1616,7 +1701,10 @@ async fn run_job<D: Dispatcher>(
         spec: Some(JobSpec::GitlabCi(translated.job)),
     };
     let put = rec.clone();
-    record(runner, "taken", move |s| s.put(put)).await;
+    // Unrecorded, it holds an update back until it ends, even if a later record succeeds.
+    if record(runner, "taken", move |s| s.put(put)).await {
+        unrecorded.recorded();
+    }
     if let Some(id) = &admission
         && runner
             .state
@@ -1746,7 +1834,9 @@ async fn drive<D: Dispatcher>(
             fail_uncommitted(runner, &settings, &creds, mapper, &msg, reason, 0).await;
         }
     };
-    let drop_record = |what: &'static str| record(runner, what, move |s| s.remove(gitlab_job));
+    let drop_record = |what: &'static str| async move {
+        record(runner, what, move |s| s.remove(gitlab_job)).await;
+    };
     // A record dropped before the hub had its job: its admission found none after all.
     let drop_unsubmitted = |what: &'static str| {
         if let Some(id) = &rec.admission {
@@ -2242,6 +2332,47 @@ async fn sleep_until(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `fut` completes within a few milliseconds.
+    async fn completes(fut: impl std::future::Future<Output = ()>) -> bool {
+        tokio::time::timeout(Duration::from_millis(20), fut)
+            .await
+            .is_ok()
+    }
+
+    /// The requests end only once the loops have ended and no job they took is unrecorded; a
+    /// job recorded then dropped counts down once.
+    #[tokio::test]
+    async fn requests_end_once_every_job_taken_is_recorded() {
+        let (handle, shutdown) = ShutdownHandle::new();
+        assert!(!completes(handle.requests_ended()).await, "loops still run");
+        let mut recorded = Unrecorded::new(&shutdown);
+        let unrecorded = Unrecorded::new(&shutdown);
+        shutdown.requests_ended.send_replace(true);
+        recorded.recorded();
+        drop(recorded);
+        assert_eq!(*handle.unrecorded.borrow(), 1);
+        assert!(
+            !completes(handle.requests_ended()).await,
+            "a job unrecorded"
+        );
+        drop(unrecorded);
+        assert!(completes(handle.requests_ended()).await);
+    }
+
+    /// Stopping the requests is not stopping the relay; a stop or an abort after it is.
+    #[test]
+    fn only_stop_and_abort_count_as_stopping() {
+        let (handle, shutdown) = ShutdownHandle::new();
+        handle.stop_requests();
+        assert!(shutdown.requests_stopped());
+        assert!(!handle.stopping());
+        handle.stop();
+        assert!(handle.stopping());
+        let (handle, shutdown) = ShutdownHandle::new();
+        handle.abort();
+        assert!(handle.stopping() && shutdown.requests_stopped());
+    }
 
     #[test]
     fn token_expiry_times() {
