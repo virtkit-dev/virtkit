@@ -55,6 +55,10 @@ All notable changes to virtkit will be documented in this file.
   update trial is dropped.
 - **A registry's update no longer fails when the registry reconnects before its old
   connection closes.**
+- **A release or tools download rides out a hub update or restart.** Nodes, registries and
+  GitLab adapters retry a download from the hub that could not connect, was cut off or was
+  answered busy, for up to two minutes without progress, and resume it where it stopped
+  instead of starting over; the file is still checked against its digest.
 
 ## [0.101.0] - 2026-11-01
 

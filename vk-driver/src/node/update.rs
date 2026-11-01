@@ -811,8 +811,8 @@ pub(super) struct Fetch<'a> {
     pub mode: u32,
 }
 
-/// Download `fetch` from the hub, publishing it at `dest` after validation.
-/// Only individual reads time out; callers must bound the whole transfer.
+/// Download `fetch` from the hub, publishing it at `dest` after validation, retried and
+/// resumed as [`vk_peer::update::download`] does; callers must bound the whole transfer.
 pub(super) async fn download(node: &Node, fetch: &Fetch<'_>, dest: &Path) -> Result<()> {
     let (path, sign) = fetch.kind.endpoint();
     vk_peer::update::download(

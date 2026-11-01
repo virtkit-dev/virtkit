@@ -521,7 +521,11 @@ answered 206, a start past the end 416, and any other `Range` gets the whole fil
 authenticated, a download no longer counts against the connections the listener allows before
 authentication, and may hold its connection for 30 minutes past the 30 seconds any connection
 gets. At most 64 downloads run at once; past that the request is answered HTTP 503, to be
-retried.
+retried. A peer retries a download that could not connect, was cut off, stalled for a minute,
+or was answered 5xx or 429, with backoff from 1 to 15 seconds, each up to a quarter longer, until
+two minutes pass with no byte arriving, each attempt signed afresh and resuming from the byte it
+stopped at; a hub that ignores the `Range` sends the whole file again. A 416 naming the size
+already received ends the download, the sha256 deciding; any other answer fails it.
 
 ## Maintenance transitions
 
