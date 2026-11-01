@@ -403,8 +403,9 @@ signed releases and this one is not. The registry:
 3. keeps the running binary under `<root>/hub/releases/`, waits for a gc under way, records a
    trial, and executes the release in its place, `alarm(2)` armed past a two-minute deadline.
    Open connections are dropped, as by a restart;
-4. the release, once in session with the hub, installs itself over the installed binary's
-   path by rename and reports the update done.
+4. the release, once in session with the hub, records confirmation, then installs itself
+   over the installed binary's path by rename and reports the update done; a registry stopped
+   in between finishes the install on its next start.
 
 Until then the installed binary is left as it is. Run `serve` under a supervisor that restarts
 it (`vk-registry install-service`), from a binary in a directory its user can write: the

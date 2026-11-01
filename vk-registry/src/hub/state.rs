@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::registry::{DesiredState, GcRun, Operation};
 use vk_hub_proto::{CommandAck, Outcome, UpdatePhase, UpdateProgress};
+use vk_peer::trial::{Event, Ledger};
+
+pub use vk_peer::trial::Trial;
 
 const STATE_FILE: &str = "state.json";
 
@@ -25,26 +28,6 @@ pub struct Entry {
     /// The outcome the hub said it stored; the ack is repeated until it matches.
     #[serde(default)]
     pub recorded: Option<Outcome>,
-}
-
-/// An update between its download and its end.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Trial {
-    /// The command that asked it.
-    pub command: String,
-    pub version: String,
-    pub sha256: String,
-    /// The installed binary, which the release replaces once it has passed, and its
-    /// `(device, inode)` when the trial began.
-    pub exe: PathBuf,
-    pub exe_id: (u64, u64),
-    /// The release, under `<root>/hub/releases/`.
-    pub next: PathBuf,
-    /// The installed binary's sha256, kept there too to go back to.
-    pub previous: String,
-    /// Starts of the release so far, and when it must have reached the hub by.
-    pub attempts: u32,
-    pub deadline: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -71,6 +54,55 @@ pub struct Persisted {
     pub installed: Option<PathBuf>,
 }
 
+impl Ledger for Persisted {
+    const PROGRAM: &'static str = "vk-registry";
+    const PEER: &'static str = "registry";
+    const SUBCOMMAND: &'static str = "serve";
+
+    fn load(dir: &Path) -> Result<Self> {
+        Persisted::load(dir)
+    }
+
+    fn save(&self, dir: &Path) -> Result<()> {
+        Persisted::save(self, dir)
+    }
+
+    fn trial(&mut self) -> &mut Option<Trial> {
+        &mut self.trial
+    }
+
+    fn set_progress(&mut self, progress: UpdateProgress) {
+        self.update = Some(progress);
+    }
+
+    fn set_outcome(&mut self, id: &str, outcome: Outcome) {
+        Persisted::set_outcome(self, id, outcome);
+    }
+
+    fn log(event: Event<'_>) {
+        match event {
+            Event::Unreadable(e) | Event::Unwritable(e) => eprintln!("vk-registry: hub: {e:#}"),
+            Event::Starting { version, attempt } => {
+                eprintln!(
+                    "vk-registry: hub: starting vk-registry {version} on trial (attempt {attempt})"
+                )
+            }
+            Event::RolledBack { version, why } => {
+                eprintln!("vk-registry: hub: update to {version} rolled back: {why}")
+            }
+            Event::ConfirmFailed(e) => eprintln!("vk-registry: hub: confirming the update: {e:#}"),
+            Event::Installed { version, path } => eprintln!(
+                "vk-registry: hub: vk-registry {version} installed at {}",
+                path.display()
+            ),
+            Event::InstallFailed(e) => eprintln!("vk-registry: hub: installing the update: {e:#}"),
+            Event::RunInstalledFailed(e) => {
+                eprintln!("vk-registry: hub: starting the installed release: {e:#}")
+            }
+        }
+    }
+}
+
 impl Persisted {
     /// The state in `dir`, empty when there is none.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -83,11 +115,12 @@ impl Persisted {
         }
     }
 
-    /// Write it whole, private.
+    /// Write it whole and private, then sync its directory: confirmation must survive a
+    /// crash before the release is installed.
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(STATE_FILE);
         let bytes = serde_json::to_vec_pretty(self).context("encoding the hub state")?;
-        vk_fs::write_atomic(&path, &bytes, 0o600)
+        vk_fs::write_atomic_durable(&path, &bytes, 0o600)
             .with_context(|| format!("writing {}", path.display()))
     }
 
@@ -291,6 +324,7 @@ mod tests {
             previous: "1".repeat(64),
             attempts: 1,
             deadline: 1,
+            confirmed: false,
         });
         assert!(!p.fail_interrupted());
         assert_eq!(p.entry("t").unwrap().outcome, Outcome::Accepted);

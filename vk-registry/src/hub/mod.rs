@@ -409,7 +409,8 @@ fn open(dir: &Path, state: &Arc<ServerState>, ctx: &Facts) -> Result<Option<Link
     persisted.adopt_issuer(&enrollment.hub, &enrollment.registry_id);
     let mut changed = persisted.fail_interrupted();
     if let Ok(exe) = std::env::current_exe()
-        && let Some(installed) = update::installed_after(persisted.installed.as_deref(), exe, dir)
+        && let Some(installed) =
+            vk_peer::trial::installed_after(persisted.installed.as_deref(), exe, dir)
     {
         persisted.installed = Some(installed);
         changed = true;
@@ -446,7 +447,8 @@ impl Link {
     }
 
     /// Change the persisted state with `f`, save it, and wake the session to report. Nothing
-    /// changes, in memory or on disk, when the save fails.
+    /// changes in memory when the save fails; on disk, the new state may have been published
+    /// before its directory failed to sync.
     fn update<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
         let out = {
             let mut p = self.persisted();
@@ -1176,7 +1178,8 @@ mod tests {
                 next: releases.join("0".repeat(64)),
                 previous: "1".repeat(64),
                 attempts: 1,
-                deadline: u64::MAX,
+                deadline: 1 << 40,
+                confirmed: false,
             });
         })
         .unwrap();

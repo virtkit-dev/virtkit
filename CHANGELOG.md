@@ -31,6 +31,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **A registry update waiting for a long garbage collection no longer rolls back.** The
   release's two minutes to reach the hub start once the collection under way is done.
+- **A registry stopped while installing an update finishes the install.** On its next start
+  it installs the release instead of rolling it back, also when updating from 0.101.0.
 
 ## [0.101.0] - 2026-11-01
 
