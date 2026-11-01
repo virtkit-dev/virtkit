@@ -449,7 +449,7 @@ struct Operations {
     /// The latest, newest first.
     rollouts: Vec<Rollout>,
     /// Every registry, for its version and updates.
-    registries: Vec<super::registries::Updatable>,
+    registries: Vec<super::updates::Peer>,
     /// Where releases are fetched from; `None` with fetching off.
     source: Option<String>,
     /// The latest fetch since the hub started.
@@ -2235,7 +2235,14 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         rollout(&mut h, r, steer, now);
     }
     h.raw("</section>");
-    super::registries::updates_section(&mut h, &ops.registries, &ops.releases, steer, now);
+    super::updates::section(
+        &mut h,
+        &super::registries::KIND,
+        &ops.registries,
+        &ops.releases,
+        steer,
+        now,
+    );
     h
 }
 

@@ -84,6 +84,7 @@ mod pages;
 mod projects;
 mod registries;
 mod sse;
+mod updates;
 mod users;
 
 use body::Body;

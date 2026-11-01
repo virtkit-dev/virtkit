@@ -1,8 +1,8 @@
 //! The registries the hub manages: `/registries`, each one's page at `/registry/<id>`, and an
 //! operator's steering of one, posted to `/registry/<id>/action`. The registry keeps its own
 //! UI; these pages show what it reports and what the hub asks of it. `/operations` lists their
-//! versions and updates ([`updates_section`]); an update, from there or a registry's page, is
-//! asked again first ([`actions::ask_first`]).
+//! versions and updates ([`updates`]); an update, from there or a registry's page, is asked
+//! again first ([`actions::ask_first`]).
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -14,7 +14,7 @@ use vk_hub_proto::registry::GcPolicy;
 use super::fleet::FleetSite;
 use super::html::Html;
 use super::pages::{self, end_section, header_cells, kv, kv_node, section};
-use super::{Auth, Body, Ui, actions, blocking, field, message, page};
+use super::{Auth, Body, Ui, actions, blocking, field, message, page, updates};
 use crate::egress::blocked::Instances;
 use crate::registries::{self as ops, RegistryView};
 use crate::store::{
@@ -625,7 +625,7 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
         .raw("<label><input type=\"checkbox\" name=\"dry_run\" value=\"1\"> dry run</label>");
     form(h, "gc-now", "Run gc now", &now);
     h.raw("</div><div class=\"group\"><h3>Update</h3>");
-    update_form(h, v, releases, Some(&auth.csrf));
+    updates::form(h, &KIND, &peer(v.clone(), None), releases, Some(&auth.csrf));
     h.raw(
         "</div></div><p class=\"sub\">The registry applies only what its <code>[hub] allow</code> ",
     )
@@ -634,387 +634,80 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
     );
 }
 
-/// A registry as `/operations` shows it: with the last update the hub issued it.
-pub(super) struct Updatable {
-    view: RegistryView,
-    last: Option<RegistryCommandRow>,
+/// Registry updates in [`updates`], using the lookup, checks and command issuance of
+/// `vk-hub registries update`.
+pub(super) static KIND: updates::Kind = updates::Kind {
+    noun: "registry",
+    heading: "Registries",
+    column: "REGISTRY",
+    program: Program::Registry,
+    note: "A registry downloads the release from the hub and restarts on it, dropping its open \
+           connections. One that does not come up is rolled back to the binary it ran once the \
+           registry's supervisor restarts it.",
+    question: "Update this registry? It restarts on the release, dropping its open \
+               connections. If the release does not come up, the registry goes back to the \
+               binary it ran once its supervisor restarts it.",
+    command_ttl: ops::COMMAND_TTL,
+    ops: updates::Ops {
+        find: |hub, id| {
+            Ok(ops::detail(hub, id)?.map(|(view, commands)| peer(view, last_update(commands))))
+        },
+        check: |hub, id, release| {
+            let row = hub
+                .db
+                .registry(id)?
+                .ok_or_else(|| NotEnrolled(id.to_string()))?;
+            ops::check_update(&row, release)
+        },
+        issue: |hub, actor, id, release, running| {
+            ops::update_as_shown(hub, actor, id, release, running).map(|c| c.id)
+        },
+    },
+};
+
+/// The last of `commands` that is an update.
+fn last_update(commands: Vec<RegistryCommandRow>) -> Option<RegistryCommandRow> {
+    commands
+        .into_iter()
+        .filter(|c| matches!(c.command.op, Operation::Update { .. }))
+        .max_by_key(|c| c.seq)
 }
 
-/// Every registry, with its last update command.
-pub(super) fn updatables(hub: &crate::server::Hub) -> Result<Vec<Updatable>> {
+/// Registry `v` as its update shows it, `last` the last update the hub issued it.
+fn peer(v: RegistryView, last: Option<RegistryCommandRow>) -> updates::Peer {
+    let inventory = v.row.inventory.as_ref();
+    updates::Peer {
+        page: Some(format!("{DETAIL_PREFIX}{}", v.id)),
+        action: format!("{DETAIL_PREFIX}{}/action", v.id),
+        hostname: v.row.hostname.clone(),
+        version: inventory.map(|i| i.version.clone()),
+        connected: v.connected,
+        takes_updates: ops::takes_updates(&v.row),
+        requires_signed: inventory.is_some_and(|i| i.requires_signed),
+        reported: v.row.report.as_ref().and_then(|r| r.update.clone()),
+        last: last.and_then(|c| match c.command.op {
+            Operation::Update { version, .. } => Some(updates::Issued {
+                id: c.command.id,
+                version,
+                issued_at: c.issued_at,
+                expires_at: c.command.expires_at,
+                outcome: c.outcome,
+            }),
+            Operation::Gc { .. } => None,
+        }),
+        id: v.id,
+    }
+}
+
+/// Every registry as `/operations` shows its update, with the last one the hub issued it.
+pub(super) fn updatables(hub: &crate::server::Hub) -> Result<Vec<updates::Peer>> {
     ops::views(hub)?
         .into_iter()
         .map(|view| {
-            let last = hub
-                .db
-                .registry_commands(&view.id)?
-                .into_iter()
-                .filter(|c| matches!(c.command.op, Operation::Update { .. }))
-                .max_by_key(|c| c.seq);
-            Ok(Updatable { view, last })
+            let last = last_update(hub.db.registry_commands(&view.id)?);
+            Ok(peer(view, last))
         })
         .collect()
-}
-
-/// `/operations`' section of registries, in its live fragment: each one's version, whether it
-/// lets the hub update it, and its update. With `steer`, the form updating each that does.
-/// Nothing when no registry has enrolled.
-pub(super) fn updates_section(
-    h: &mut Html,
-    registries: &[Updatable],
-    releases: &[Release],
-    steer: bool,
-    now: u64,
-) {
-    if registries.is_empty() {
-        return;
-    }
-    h.raw("<section><h2>Registries</h2><table class=\"grid\"><thead><tr>");
-    let mut headers = vec![
-        "REGISTRY",
-        "VERSION",
-        "CONNECTION",
-        "UPDATES",
-        "LAST UPDATE",
-    ];
-    if steer {
-        headers.push("UPDATE TO");
-    }
-    header_cells(h, &headers);
-    h.raw("</tr></thead><tbody>");
-    for r in registries {
-        let v = &r.view;
-        h.raw("<tr><td><a href=\"")
-            .raw(DETAIL_PREFIX)
-            .text(&v.id)
-            .raw("\">")
-            .node(&v.row.hostname)
-            .raw("</a></td><td>");
-        match &v.row.inventory {
-            Some(i) => h.node(&i.version),
-            None => h.raw("-"),
-        };
-        h.raw("</td><td>").raw(if v.connected {
-            "<span class=\"badge ok\">Online</span>"
-        } else {
-            "<span class=\"badge bad\">Offline</span>"
-        });
-        h.raw("</td><td>").raw(policy(&v.row)).raw("</td><td>");
-        update_status(h, &v.row, r.last.as_ref(), now);
-        h.raw("</td>");
-        if steer {
-            h.raw("<td>");
-            update_form(h, v, releases, None);
-            h.raw("</td>");
-        }
-        h.raw("</tr>");
-    }
-    h.raw("</tbody></table><p class=\"sub\">A registry downloads the release from the hub and ")
-        .raw("restarts on it, dropping its open connections. One that does not come up is ")
-        .raw("rolled back to the binary it ran once the registry's supervisor restarts it.</p>")
-        .raw("</section>");
-}
-
-/// Whether registry `row` lets the hub update it, and to what.
-fn policy(row: &RegistryRow) -> &'static str {
-    match (ops::takes_updates(row), &row.inventory) {
-        (None, _) | (_, None) => "not reported yet",
-        (Some(false), _) => "not allowed by its <code>[hub] allow</code>",
-        (Some(true), Some(i)) if i.requires_signed => "signed releases only",
-        (Some(true), Some(_)) => "unsigned accepted",
-    }
-}
-
-/// Registry `row`'s update: under way or how it ended, as it reports it, or the last command
-/// issued while it has not taken it, or once it refused or failed it.
-fn update_status(h: &mut Html, row: &RegistryRow, last: Option<&RegistryCommandRow>, now: u64) {
-    // What the registry reports of the last command, once it took it; of an earlier one only
-    // when the hub keeps no command.
-    let reported = row
-        .report
-        .as_ref()
-        .and_then(|r| r.update.as_ref())
-        .filter(|u| {
-            last.is_none_or(|c| {
-                u.command == c.command.id
-                    && matches!(c.outcome, Some(Outcome::Accepted | Outcome::Done))
-            })
-        });
-    match (reported, last) {
-        (Some(u), _) => {
-            h.node(&u.version)
-                .raw(" ")
-                .text(crate::store::update_phase_name(u.phase));
-            if let Some(m) = &u.message {
-                h.raw(": ").node(m);
-            }
-        }
-        (None, Some(c)) => command_line(h, c, now),
-        (None, None) => {
-            h.raw("-");
-        }
-    }
-}
-
-/// Update command `c`: the version it names, and whether the registry took it.
-fn command_line(h: &mut Html, c: &RegistryCommandRow, now: u64) {
-    if let Operation::Update { version, .. } = &c.command.op {
-        h.raw("to ").node(version).raw(": ");
-    }
-    match &c.outcome {
-        None if c.command.expires_at <= now => h.raw("expired, never taken"),
-        None => h.raw("not taken yet"),
-        Some(Outcome::Accepted) => h.raw("under way"),
-        Some(Outcome::Done) => h.raw("done"),
-        Some(Outcome::Failed { message }) => h
-            .raw("<span class=\"reason\">failed</span>: ")
-            .node(message),
-        Some(Outcome::Refused { reason }) => h
-            .raw("<span class=\"reason\">refused</span>: ")
-            .node(reason),
-        Some(Outcome::Expired) => h.raw("expired"),
-    };
-    h.raw(", issued ").html(&pages::at_html(c.issued_at));
-}
-
-/// The form updating registry `v` to one of `releases`' `vk-registry` ones, or why there is
-/// none. On a registry's page, a plain form carrying `csrf`; in `/operations`' shared fragment,
-/// without, posted by htmx with the page's token and kept while being filled in
-/// (`hx-preserve`) until its choices change.
-fn update_form(h: &mut Html, v: &RegistryView, releases: &[Release], csrf: Option<&str>) {
-    if ops::takes_updates(&v.row) == Some(false) {
-        h.raw("<span class=\"sub\">Its <code>[hub] allow</code> lacks <code>update</code>.</span>");
-        return;
-    }
-    // Those it would take: signed ones only, if it says it requires them.
-    let signed_only = v.row.inventory.as_ref().is_some_and(|i| i.requires_signed);
-    let releases: Vec<&Release> = releases
-        .iter()
-        .filter(|r| r.row.is(Program::Registry) && (!signed_only || r.row.signature.is_some()))
-        .collect();
-    if releases.is_empty() {
-        h.raw(if signed_only {
-            "<span class=\"sub\">Add a signed vk-registry release first.</span>"
-        } else {
-            "<span class=\"sub\">Add a vk-registry release first.</span>"
-        });
-        return;
-    }
-    let path = format!("{DETAIL_PREFIX}{}/action", v.id);
-    let mut form = Html::new();
-    form.raw("<input type=\"hidden\" name=\"op\" value=\"update\">")
-        .raw("<select name=\"release\" aria-label=\"Release\" required>");
-    for r in releases {
-        form.raw("<option value=\"")
-            .text(&r.sha256)
-            .raw("\">")
-            .text(&r.row.version)
-            .raw(" (")
-            .text(crate::store::short(&r.sha256))
-            .raw(if r.row.signature.is_some() {
-                ", signed)"
-            } else {
-                ")"
-            })
-            .raw("</option>");
-    }
-    form.raw("</select><button>Update</button>");
-    h.raw("<form class=\"act\" method=\"post\" action=\"")
-        .text(&path)
-        .raw("\"");
-    match csrf {
-        Some(csrf) => {
-            h.raw(">");
-            pages::csrf_input(h, csrf);
-        }
-        None => {
-            let id = pages::preserved_id("registry-update", &format!("{}{}", v.id, form.as_str()));
-            h.raw(" id=\"")
-                .text(&id)
-                .raw("\" hx-preserve=\"true\" hx-post=\"")
-                .text(&path)
-                .raw("\" hx-swap=\"none\">");
-        }
-    }
-    h.html(&form).raw("</form>");
-}
-
-/// Why a registry running `own` would refuse to update to `candidate`, as its own check
-/// decides (`check_version` in `vk-registry/src/hub/update.rs`): an older `MAJOR.MINOR.PATCH`,
-/// unless its `[hub] allow_downgrade`, or another version not of that shape.
-fn version_refusal(candidate: &str, own: &str) -> Option<&'static str> {
-    let fields = |v: &str| -> Option<Vec<u64>> {
-        let v: Vec<u64> = v
-            .split('.')
-            .map(|f| f.parse().ok())
-            .collect::<Option<_>>()?;
-        (v.len() == 3).then_some(v)
-    };
-    match (fields(candidate), fields(own)) {
-        (Some(c), Some(o)) if c < o => Some(
-            "It is older than the version the registry runs: the registry refuses it unless its \
-             <code>[hub] allow_downgrade</code> is set.",
-        ),
-        (Some(_), Some(_)) => None,
-        _ if candidate == own => None,
-        _ => Some(
-            "Its version cannot be ordered against the one the registry runs, not being \
-             <code>MAJOR.MINOR.PATCH</code>: the registry refuses it.",
-        ),
-    }
-}
-
-/// What updating registry `v` to `release` would do, for its question.
-fn update_detail(v: &RegistryView, release: &Release) -> Html {
-    let mut h = Html::new();
-    h.raw("<p>vk-registry ")
-        .text(&release.row.version)
-        .raw(" (<code>")
-        .text(crate::store::short(&release.sha256))
-        .raw("</code>")
-        .raw(if release.row.signature.is_some() {
-            ", signed"
-        } else {
-            ", unsigned"
-        })
-        .raw(") to ")
-        .node(&v.row.hostname);
-    let running = v.row.inventory.as_ref().map(|i| i.version.as_str());
-    if let Some(own) = running {
-        h.raw(", which runs ").node(own);
-    }
-    h.raw(".</p>");
-    if let Some(why) = running.and_then(|own| version_refusal(&release.row.version, own)) {
-        h.raw("<p class=\"reason\">").raw(why).raw("</p>");
-    }
-    if !v.connected {
-        h.raw("<p>The registry is offline: it gets the update once it connects, within ")
-            .text(crate::human_duration(ops::COMMAND_TTL))
-            .raw(".</p>");
-    }
-    h
-}
-
-/// `op=update` of `POST /registry/<id>/action`: update the registry to the release `form`
-/// names, once the operator has confirmed it, by the operation `vk-hub registries update` runs.
-async fn update(
-    ui: &Ui,
-    site: &FleetSite,
-    htmx: bool,
-    auth: &Auth,
-    form: &[(String, String)],
-    id: &str,
-) -> Result<Response<Body>> {
-    let sha256 = field(form, "release").unwrap_or("").to_string();
-    if !vk_hub_proto::valid_sha256(&sha256) {
-        return Ok(actions::refused(
-            htmx,
-            StatusCode::BAD_REQUEST,
-            "Refused: choose a release.",
-        ));
-    }
-    let (hub, wanted, sha) = (ui.hub.clone(), id.to_string(), sha256.clone());
-    let found = blocking(move || {
-        let Some((view, _)) = ops::detail(&hub, &wanted)? else {
-            return Ok(None);
-        };
-        let release = hub
-            .db
-            .release(&sha)?
-            .map(|row| Release { sha256: sha, row });
-        Ok::<_, anyhow::Error>(Some((view, release)))
-    })
-    .await?;
-    let Some((view, release)) = found else {
-        return Ok(actions::refused(
-            htmx,
-            StatusCode::NOT_FOUND,
-            "There is no such registry.",
-        ));
-    };
-    let Some(release) = release else {
-        return Ok(actions::refused(
-            htmx,
-            StatusCode::CONFLICT,
-            "Refused: the hub no longer holds that release.",
-        ));
-    };
-    if let Err(e) = ops::check_update(&view.row, &release) {
-        let said = vk_hub_proto::display_safe(&format!("{e:#}"));
-        return Ok(actions::refused(
-            htmx,
-            StatusCode::CONFLICT,
-            &format!("Refused: {said}."),
-        ));
-    }
-    let page = format!("{DETAIL_PREFIX}{id}");
-    let running = view.row.inventory.as_ref().map(|i| i.version.clone());
-    let ask = actions::Ask {
-        path: format!("{page}/action"),
-        back: if htmx {
-            "/operations".to_string()
-        } else {
-            page.clone()
-        },
-        op: "update".to_string(),
-        what: "Update this registry? It restarts on the release, dropping its open \
-               connections. If the release does not come up, the registry goes back to the \
-               binary it ran once its supervisor restarts it.",
-        detail: update_detail(&view, &release),
-        asked: vec![
-            ("release", release.sha256.clone()),
-            ("version", release.row.version.clone()),
-            (
-                "signature",
-                release.row.signature.clone().unwrap_or_default(),
-            ),
-            ("running", running.clone().unwrap_or_default()),
-        ],
-    };
-    if let Some(asked) = actions::ask_first(
-        &site.questions,
-        super::fleet::layout,
-        htmx,
-        auth,
-        form,
-        &ask,
-    )? {
-        return Ok(asked);
-    }
-    let (hub, principal, registry) = (ui.hub.clone(), auth.session.principal(), id.to_string());
-    let shown = release.clone();
-    let issued = blocking(move || {
-        Ok(ops::update_as_shown(
-            &hub,
-            &principal,
-            &registry,
-            &shown,
-            running.as_deref(),
-        ))
-    })
-    .await?;
-    match issued {
-        Ok(command) if htmx => Ok(super::fleet::said_so(&format!(
-            "Sent {} the update to vk-registry {} (command {}); it shows below.",
-            vk_hub_proto::display_safe(&view.row.hostname),
-            release.row.version,
-            command.id
-        ))),
-        Ok(_) => Ok(see_other(&page)),
-        Err(e) if e.is::<NotEnrolled>() => Ok(actions::refused(
-            htmx,
-            StatusCode::NOT_FOUND,
-            "There is no such registry.",
-        )),
-        Err(e) => {
-            let said = vk_hub_proto::display_safe(&format!("{e:#}"));
-            Ok(actions::refused(
-                htmx,
-                StatusCode::CONFLICT,
-                &format!("Refused: {said}."),
-            ))
-        }
-    }
 }
 
 /// A redirect to the hub's own `location`.
@@ -1172,7 +865,7 @@ pub(super) async fn action(
         Err((status, text)) => return Ok(actions::refused(htmx, status, text)),
     };
     if field(&form, "op") == Some("update") {
-        return update(ui, site, htmx, &auth, &form, id).await;
+        return updates::update(ui, site, htmx, &auth, &form, &KIND, id).await;
     }
     let act = match act(&form) {
         Ok(act) => act,
@@ -1207,34 +900,5 @@ pub(super) async fn action(
             Ok(message(StatusCode::NOT_FOUND, "There is no such registry."))
         }
         Err(e) => Ok(message(StatusCode::CONFLICT, &format!("Refused: {e:#}."))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An update is refused as the registry's own check refuses it: to an older version, or
-    /// to one that cannot be ordered against its own.
-    #[test]
-    fn a_version_the_registry_refuses_is_said() {
-        assert_eq!(version_refusal("0.90.1", "0.90.0"), None);
-        assert_eq!(version_refusal("0.90.0", "0.90.0"), None);
-        assert!(
-            version_refusal("0.89.9", "0.90.0")
-                .unwrap()
-                .contains("older")
-        );
-        assert!(
-            version_refusal("0.90", "0.90.0")
-                .unwrap()
-                .contains("cannot be ordered")
-        );
-        assert!(
-            version_refusal("0.90.0", "dev")
-                .unwrap()
-                .contains("cannot be ordered")
-        );
-        assert_eq!(version_refusal("dev", "dev"), None);
     }
 }
