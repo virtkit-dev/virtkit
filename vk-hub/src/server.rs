@@ -1189,7 +1189,7 @@ async fn download(
             db.node(&id)?.map(|r| r.public_key),
             db.updating_to(&id, &sha, now)?,
             db.release(&sha)?
-                .filter(|r| r.program() == "vk")
+                .filter(|r| r.is(crate::store::Program::Vk))
                 .map(|r| r.size),
         )),
         Download::Tools => anyhow::Ok((
@@ -1201,7 +1201,7 @@ async fn download(
             db.registry(&id)?.map(|r| r.public_key),
             db.registry_updating_to(&id, &sha, now)?,
             db.release(&sha)?
-                .filter(|r| r.program() == crate::store::REGISTRY_PROGRAM)
+                .filter(|r| r.is(crate::store::Program::Registry))
                 .map(|r| r.size),
         )),
     })

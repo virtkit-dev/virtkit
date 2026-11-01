@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::server::Hub;
-use crate::store::Release;
+use crate::store::{Program, Release};
 use crate::{local, releases};
 
 /// What `release_repository` is unless the config says otherwise.
@@ -356,10 +356,11 @@ async fn fetch(
     .await
     .with_context(|| format!("downloading vk {found}"))?;
     let (held, actor, version) = (hub.clone(), actor.to_string(), found.clone());
-    let release =
-        tokio::task::spawn_blocking(move || releases::adopt(&held, &actor, staged, &version, None))
-            .await
-            .context("adding the release")??;
+    let release = tokio::task::spawn_blocking(move || {
+        releases::adopt(&held, &actor, staged, Program::Vk, &version, None)
+    })
+    .await
+    .context("adding the release")??;
     // `vk-selfupdate` checked the download against the digest; the same file was read again.
     if release.sha256 != artifact.sha256 {
         bail!("the file held changed after it was checked against the published digest");

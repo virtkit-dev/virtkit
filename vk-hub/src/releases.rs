@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::server::Hub;
-use crate::store::{REGISTRY_PROGRAM, Release, ReleaseRow};
+use crate::store::{Program, Release, ReleaseRow};
 
 /// The largest binary the hub takes: a `vk` is a few hundred megabytes at most, even
 /// unstripped.
@@ -139,27 +139,32 @@ fn create_private(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
-/// Copy the binary at `from` into the hub as `version` of `program` (`None` for `vk`, or
-/// [`REGISTRY_PROGRAM`] for a `vk-registry` release, which only registries update to), with
+/// Parse a program name; `None` defaults to `vk`.
+pub fn program(name: Option<&str>) -> Result<Program> {
+    let Some(name) = name else {
+        return Ok(Program::Vk);
+    };
+    Program::parse(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{:?} is not a program the hub holds releases of: {}",
+            vk_hub_proto::display_safe(name),
+            Program::names()
+        )
+    })
+}
+
+/// Copy the binary at `from` into the hub as `version` of `program` — a registry updates only
+/// to a [`Program::Registry`] release, a node only to a [`Program::Vk`] one — with
 /// `signature`, audited as `actor`'s. Its sha256 names it; the file is published whole, by
 /// rename, before the row that points at it is written.
 pub fn add(
     hub: &Hub,
     actor: &str,
     from: &Path,
-    program: Option<&str>,
+    program: Program,
     version: &str,
     signature: Option<String>,
 ) -> Result<Release> {
-    let program = match program {
-        None | Some("vk") => None,
-        Some(REGISTRY_PROGRAM) => Some(REGISTRY_PROGRAM.to_string()),
-        Some(other) => bail!(
-            "{:?} is not a program the hub holds releases of: vk or {REGISTRY_PROGRAM}",
-            vk_hub_proto::display_safe(other)
-        ),
-    };
-    let named = program.as_deref().unwrap_or("vk");
     check_version(version)?;
     let signature = signature.map(|s| check_signature(&s)).transpose()?;
     releases_dir(hub)?;
@@ -185,7 +190,7 @@ pub fn add(
     }
     let (staged, mut out) = Staged::create(hub, "add")?;
     let (sha256, size) = copy_checked(&mut source, Some((&mut out, staged.path())), version)
-        .with_context(|| format!("reading {} as {named} {version}", from.display()))?;
+        .with_context(|| format!("reading {} as {program} {version}", from.display()))?;
     drop(out);
     publish(
         hub, actor, staged, &sha256, size, version, signature, program,
@@ -193,12 +198,13 @@ pub fn add(
 }
 
 /// Take the binary `staged` holds — uploaded or downloaded into it, and closed — into the hub
-/// as `version`, with `signature`, audited as `actor`'s: the same checks as [`add`], read in
-/// place, and the file renamed to its sha256.
+/// as `version` of `program`, with `signature`, audited as `actor`'s: the same checks as
+/// [`add`], read in place, and the file renamed to its sha256.
 pub fn adopt(
     hub: &Hub,
     actor: &str,
     staged: Staged,
+    program: Program,
     version: &str,
     signature: Option<String>,
 ) -> Result<Release> {
@@ -211,13 +217,15 @@ pub fn adopt(
         .open(staged.path())
         .with_context(|| format!("opening {}", staged.path().display()))?;
     let (sha256, size) = copy_checked(&mut source, None, version)
-        .with_context(|| format!("reading the binary as vk {version}"))?;
+        .with_context(|| format!("reading the binary as {program} {version}"))?;
     drop(source);
-    publish(hub, actor, staged, &sha256, size, version, signature, None)
+    publish(
+        hub, actor, staged, &sha256, size, version, signature, program,
+    )
 }
 
-/// Rename `staged`, checked to hash to `sha256`, into place as release `sha256` of `program`
-/// (`None` for `vk`), and record it.
+/// Rename `staged`, checked to hash to `sha256`, into place as release `sha256` of `program`,
+/// and record it.
 #[allow(clippy::too_many_arguments)]
 fn publish(
     hub: &Hub,
@@ -227,7 +235,7 @@ fn publish(
     size: u64,
     version: &str,
     signature: Option<String>,
-    program: Option<String>,
+    program: Program,
 ) -> Result<Release> {
     let dir = hub.releases_dir()?;
     let sha256 = sha256.to_string();
@@ -235,7 +243,7 @@ fn publish(
         version: version.to_string(),
         size,
         signature,
-        program,
+        program: program.stored(),
         added_at: crate::now_secs(),
         added_by: actor.to_string(),
     };
@@ -429,6 +437,18 @@ impl Finder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An omitted program defaults to `vk`; unknown names are refused with the supported names.
+    #[test]
+    fn a_program_is_vk_unless_named() {
+        assert_eq!(program(None).unwrap(), Program::Vk);
+        assert_eq!(program(Some("vk-registry")).unwrap(), Program::Registry);
+        let err = program(Some("nope")).unwrap_err().to_string();
+        assert!(
+            err.ends_with("is not a program the hub holds releases of: vk or vk-registry"),
+            "{err}"
+        );
+    }
 
     fn found(needle: &str, chunks: &[&[u8]]) -> bool {
         let mut f = Finder::new(needle.as_bytes());

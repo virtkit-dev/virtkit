@@ -290,7 +290,7 @@ enum ReleaseCmd {
         #[arg(long, value_name = "FILE")]
         signature: Option<PathBuf>,
         /// The program it is: vk, for nodes, or vk-registry, for registries
-        #[arg(long, default_value = "vk", value_parser = ["vk", "vk-registry"])]
+        #[arg(long, default_value = store::Program::Vk.name(), value_parser = program_names())]
         program: String,
     },
     /// Download a release's vk from the hub's release_repository and hold it
@@ -337,6 +337,11 @@ enum ToolsCmd {
         /// Its sha256, or at least the first 8 hex digits
         tools: String,
     },
+}
+
+/// `--program`'s values: the programs the hub holds releases of.
+fn program_names() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(store::Program::ALL.map(store::Program::name))
 }
 
 #[derive(Subcommand)]
@@ -1201,6 +1206,7 @@ async fn run(cli: Cli) -> Result<()> {
                     signature,
                     program,
                 } => {
+                    let runners = releases::program(Some(&program))?.runners();
                     let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
@@ -1217,11 +1223,7 @@ async fn run(cli: Cli) -> Result<()> {
                         added.row.program(),
                         added.row.version,
                         added.row.size,
-                        if added.row.program() == store::REGISTRY_PROGRAM {
-                            "registries"
-                        } else {
-                            "nodes"
-                        },
+                        runners,
                         store::short(&added.sha256)
                     );
                 }

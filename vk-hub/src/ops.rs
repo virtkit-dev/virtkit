@@ -295,7 +295,7 @@ pub fn update(hub: &Hub, actor: &str, id: &str, release: &str, force: bool) -> R
 
 /// Refuse a release of another program than `vk`: a node runs nothing else.
 fn nodes_release(release: &Release) -> Result<()> {
-    if release.row.program() != "vk" {
+    if !release.row.is(crate::store::Program::Vk) {
         bail!(
             "release {} is {} {}, not a vk a node updates to",
             crate::store::short(&release.sha256),

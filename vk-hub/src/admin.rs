@@ -588,7 +588,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             hub,
             &actor,
             &path,
-            program.as_deref(),
+            crate::releases::program(program.as_deref())?,
             &version,
             signature,
         )?)?,

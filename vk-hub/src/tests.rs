@@ -19,7 +19,7 @@ use vk_hub_proto::{
 
 use super::*;
 use crate::server::{Hub, Reach};
-use crate::store::{Db, Enrollment};
+use crate::store::{Db, Enrollment, Program};
 
 /// A test CA, and the `localhost` certificate it issued the hub, both valid until 2126.
 const TLS_CA: &[u8] = include_bytes!("testdata/tls-ca.pem");
@@ -1134,7 +1134,7 @@ fn add_release(
 ) -> anyhow::Result<store::Release> {
     let file = dir.join("vk");
     std::fs::write(&file, bin).unwrap();
-    releases::add(hub, "uid 0", &file, None, version, None)
+    releases::add(hub, "uid 0", &file, Program::Vk, version, None)
 }
 
 /// `GET <path>` with `headers` on `stream`, by hand: the status and the body.
@@ -1216,15 +1216,15 @@ async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
         .unwrap()
         .set_len(releases::MAX_RELEASE + 1)
         .unwrap();
-    let err = releases::add(&hub, "uid 0", &big, None, "0.84.0", None).unwrap_err();
+    let err = releases::add(&hub, "uid 0", &big, Program::Vk, "0.84.0", None).unwrap_err();
     assert!(format!("{err:#}").contains("past the"), "{err:#}");
-    assert!(releases::add(&hub, "uid 0", &dir, None, "0.84.0", None).is_err());
+    assert!(releases::add(&hub, "uid 0", &dir, Program::Vk, "0.84.0", None).is_err());
     // A FIFO with no writer is refused at once rather than waited on.
     let fifo = dir.join("fifo");
     let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: `c_fifo` is a NUL-terminated path, valid for the call.
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
-    let err = releases::add(&hub, "uid 0", &fifo, None, "0.84.0", None).unwrap_err();
+    let err = releases::add(&hub, "uid 0", &fifo, Program::Vk, "0.84.0", None).unwrap_err();
     assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
     std::fs::remove_file(&fifo).unwrap();
 
@@ -1256,7 +1256,7 @@ async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
             &hub,
             "uid 0",
             &file,
-            None,
+            Program::Vk,
             "0.86.0",
             Some(signature.to_string()),
         )
@@ -1281,7 +1281,7 @@ async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
         format!("{err:#}").contains("with another signature"),
         "{err:#}"
     );
-    let err = releases::add(&hub, "uid 0", &file, None, "0.86.0", None).unwrap_err();
+    let err = releases::add(&hub, "uid 0", &file, Program::Vk, "0.86.0", None).unwrap_err();
     assert!(
         format!("{err:#}").contains("with another signature"),
         "{err:#}"
@@ -1547,7 +1547,7 @@ async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
         &hub,
         "uid 0",
         &file,
-        None,
+        Program::Vk,
         "0.84.0",
         Some(signature.clone()),
     )

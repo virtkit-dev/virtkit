@@ -32,7 +32,7 @@ use crate::fetch::{self, FetchStatus, Phase};
 use crate::ops::{self, NodeView, RolloutPlan, Selection};
 use crate::releases;
 use crate::rollout::{NodeStatus, RolloutNode};
-use crate::store::{Release, Role};
+use crate::store::{Program, Release, Role};
 
 /// Where a release is uploaded to.
 pub(super) const UPLOAD_PATH: &str = "/releases/upload";
@@ -176,7 +176,12 @@ pub(super) async fn upload(
     let (hub, principal) = (ui.hub.clone(), auth.session.principal());
     let added = blocking(move || {
         Ok(releases::adopt(
-            &hub, &principal, staged, &version, signature,
+            &hub,
+            &principal,
+            staged,
+            Program::Vk,
+            &version,
+            signature,
         ))
     })
     .await?;
@@ -661,10 +666,7 @@ pub(super) fn start_rollout(
 ) {
     h.raw("<h2>Start a rollout</h2>");
     // A rollout updates nodes, so only to a vk release.
-    let releases: Vec<&Release> = releases
-        .iter()
-        .filter(|r| r.row.program() == "vk")
-        .collect();
+    let releases: Vec<&Release> = releases.iter().filter(|r| r.row.is(Program::Vk)).collect();
     let nodes: Vec<&NodeView> = nodes
         .iter()
         .filter(|n| vk_hub_proto::valid_id(&n.id))

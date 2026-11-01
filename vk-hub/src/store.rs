@@ -458,10 +458,69 @@ pub struct ReleaseRow {
 /// The program of a `vk-registry` release.
 pub const REGISTRY_PROGRAM: &str = "vk-registry";
 
+/// A program the hub holds releases of, and what runs it. Its name is what `--program` takes
+/// and what a release's row stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Program {
+    /// `vk`, which nodes run.
+    #[serde(rename = "vk")]
+    Vk,
+    /// `vk-registry`, which registries run.
+    #[serde(rename = "vk-registry")]
+    Registry,
+}
+
+impl Program {
+    pub const ALL: [Program; 2] = [Program::Vk, Program::Registry];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Program::Vk => "vk",
+            Program::Registry => REGISTRY_PROGRAM,
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Program> {
+        Self::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    /// What runs it: `nodes` or `registries`, as in `vk-hub <that> update`.
+    pub fn runners(self) -> &'static str {
+        match self {
+            Program::Vk => "nodes",
+            Program::Registry => "registries",
+        }
+    }
+
+    /// The names of every program, for a message: `vk or vk-registry`.
+    pub fn names() -> String {
+        let names: Vec<&str> = Self::ALL.iter().map(|p| p.name()).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => names.join(""),
+        }
+    }
+
+    /// The [`ReleaseRow::program`] value: absent for `vk`, as in rows predating other programs.
+    pub fn stored(self) -> Option<String> {
+        (self != Program::Vk).then(|| self.name().to_string())
+    }
+}
+
+impl std::fmt::Display for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl ReleaseRow {
     /// The program it is: `vk` or [`REGISTRY_PROGRAM`].
     pub fn program(&self) -> &str {
         self.program.as_deref().unwrap_or("vk")
+    }
+
+    pub fn is(&self, program: Program) -> bool {
+        self.program() == program.name()
     }
 }
 
@@ -3140,6 +3199,24 @@ mod tests {
     use super::*;
 
     const DAY: Duration = Duration::from_secs(86_400);
+
+    /// Each program parses, serializes and is stored by its one name; `vk` is stored absent.
+    #[test]
+    fn programs_go_by_their_names() {
+        for p in Program::ALL {
+            assert_eq!(Program::parse(p.name()), Some(p));
+            assert_eq!(serde_json::to_value(p).unwrap(), p.name());
+            assert_eq!(p.to_string(), p.name());
+        }
+        assert_eq!(Program::parse("nope"), None);
+        assert_eq!(Program::names(), "vk or vk-registry");
+        assert_eq!(Program::Vk.stored(), None);
+        assert_eq!(Program::Registry.stored().as_deref(), Some("vk-registry"));
+        assert_eq!(
+            (Program::Vk.runners(), Program::Registry.runners()),
+            ("nodes", "registries")
+        );
+    }
 
     /// Rows written before registries read as they meant then: a node's token, a vk release.
     #[test]

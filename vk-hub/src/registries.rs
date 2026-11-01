@@ -21,7 +21,7 @@ use vk_hub_proto::{HubMsg, RefusalCode};
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
 use crate::store::{
-    NotEnrolled, REGISTRY_PROGRAM, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite,
+    NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite,
 };
 
 /// The gc windows `vk-hub registries gc` and `gc-schedule`, and the web UI's forms, default to.
@@ -486,10 +486,11 @@ pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command
     // Held from the lookup to the command, so the release cannot be removed between them.
     let _held = hub.releases_lock();
     let release = hub.db.resolve_release(release)?;
-    if release.row.program() != REGISTRY_PROGRAM {
+    let registry = Program::Registry;
+    if !release.row.is(registry) {
         bail!(
-            "release {} is {} {}, not a {REGISTRY_PROGRAM} release: add one with `vk-hub release \
-             add --program {REGISTRY_PROGRAM}`",
+            "release {} is {} {}, not a {registry} release: add one with `vk-hub release add \
+             --program {registry}`",
             crate::store::short(&release.sha256),
             release.row.program(),
             release.row.version

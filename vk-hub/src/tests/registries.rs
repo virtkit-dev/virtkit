@@ -8,7 +8,7 @@ use vk_hub_proto::{CommandAck, Outcome, RefusalCode};
 
 use super::*;
 use crate::registries;
-use crate::store::TokenKind;
+use crate::store::{Program, TokenKind};
 
 fn registry_token(hub: &Hub) -> String {
     hub.db
@@ -310,7 +310,7 @@ async fn a_registry_downloads_only_the_vk_registry_release_it_updates_to() {
     let vk = add_release(&hub, &dir, &fake_vk("0.89.0"), "0.89.0").unwrap();
     let file = dir.join("vk-registry");
     std::fs::write(&file, fake_vk("0.90.0")).unwrap();
-    let release = releases::add(&hub, "uid 0", &file, Some("vk-registry"), "0.90.0", None).unwrap();
+    let release = releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.0", None).unwrap();
     assert_eq!(release.row.program(), "vk-registry");
 
     // Nodes do not update to it, nor registries to a vk.
@@ -543,7 +543,7 @@ async fn an_update_lost_by_the_registry_is_settled() {
     let id = enrolled_registry(addr, &hub, &key).await;
     let file = dir.join("vk-registry");
     std::fs::write(&file, fake_vk("0.90.0")).unwrap();
-    let release = releases::add(&hub, "uid 0", &file, Some("vk-registry"), "0.90.0", None).unwrap();
+    let release = releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.0", None).unwrap();
     let command = registries::update(&hub, "uid 0", &id, &release.sha256).unwrap();
     let running = Report {
         update: Some(UpdateProgress {
