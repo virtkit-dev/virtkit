@@ -623,8 +623,8 @@ signed this way yet: that is a step for the release workflow, with the key in CI
 ## Updating the hub
 
 With `[update] allow = true` in `hub.toml`, an operator updates the hub to a `vk-hub` release it
-holds (`vk-hub release add|fetch --program vk-hub`) with `vk-hub update --release <sha256
-prefix>`; `vk-hub update` alone prints the hub's version and how its last
+holds (`vk-hub release add|fetch --program vk-hub`) from `/operations` or with `vk-hub update
+--release <sha256 prefix>`; `vk-hub update` alone prints the hub's version and how its last
 update went. `[update] release_keys` lists the keys a release must be signed by
 (`require_signed` defaults to true with any), and an older release is refused unless
 `[update] allow_downgrade`; a release that does not read the listeners handed to it — one from
@@ -1899,6 +1899,12 @@ a held `vk-gitlab` release, posted by htmx to `/relay/<id>/action` with `op=upda
 The relay stops asking GitLab for jobs, then restarts on the release while its running jobs
 continue (`docs/gitlab-relay-enrollment.md`, "Updates"). `/relays` lists each relay's version
 and links here.
+
+With `vk-hub serve`, the **Hub** section shows its version, `[update] allow` policy and last
+update. Operators get an **Update** form to choose a held `vk-hub` release, posted to
+`/hub/action` with `op=update` and confirmed first (see [Updating the hub](#updating-the-hub)).
+Confirmation requires the hub to still run the version shown and hold the release as shown.
+The top bar shows the version that served the page.
 
 The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,

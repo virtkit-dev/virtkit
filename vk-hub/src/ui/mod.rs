@@ -73,6 +73,7 @@ mod dev;
 mod egress;
 mod fleet;
 pub mod html;
+mod hub;
 mod job_network;
 mod job_output;
 mod jobs;
@@ -436,6 +437,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     registries::action(req, ui, site, id).await
                 } else if let Some(id) = relays::action_target(&path) {
                     relays::action(req, ui, site, id).await
+                } else if path == hub::ACTION_PATH {
+                    hub::action(req, ui, site).await
                 } else {
                     Ok(message(StatusCode::NOT_FOUND, "No such action."))
                 }

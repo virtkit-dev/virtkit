@@ -7916,6 +7916,165 @@ async fn an_operator_fetches_a_release_from_github() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The fleet of [`start_fleet_releases`], updating itself as `[update] allow` says.
+async fn start_fleet_updating(allow: bool) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf) {
+    start_fleet_updating_with(crate::config::UpdateConfig {
+        allow,
+        ..Default::default()
+    })
+    .await
+}
+
+/// [`start_fleet_updating`] with `config` as its `[update]`.
+async fn start_fleet_updating_with(
+    config: crate::config::UpdateConfig,
+) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf) {
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let lock = crate::update::lock_instance(&dir.join("update")).unwrap();
+    let update = crate::update::SelfUpdate::open(&dir.join("update"), config, lock).unwrap();
+    assert!(hub.self_update.set(Arc::new(update)).is_ok());
+    (addr, hub, origin, dir)
+}
+
+/// `/operations` shows the hub's version and `[update]` policy, with an operator-only form.
+/// Other programs' releases are refused before confirmation. Once confirmed, a non-runnable
+/// release fails staging; the hub serves on and reports the failure on its page and audit log.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_updates_the_hub_from_the_updates_page() {
+    use crate::store::Program;
+    let (addr, hub, origin, dir) = start_fleet_updating(true).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(page.contains("Add a vk-hub release first."), "{page}");
+    // A release reading the listeners handed to it, which does not run all the same; and one
+    // from before handing over.
+    let file = dir.join("vk-hub");
+    let mut bin = crate::fetch::tests::fake_vk("0.200.0");
+    bin.extend_from_slice(vk_peer::handoff::ENV.as_bytes());
+    std::fs::write(&file, &bin).unwrap();
+    let sha = crate::releases::add(&hub, "uid 0", &file, Program::Hub, "0.200.0", None)
+        .unwrap()
+        .sha256;
+    std::fs::write(&file, crate::fetch::tests::fake_vk("0.199.0")).unwrap();
+    let before = crate::releases::add(&hub, "uid 0", &file, Program::Hub, "0.199.0", None)
+        .unwrap()
+        .sha256;
+    std::fs::write(&file, crate::fetch::tests::fake_vk("0.201.0")).unwrap();
+    let vk = crate::releases::add(&hub, "uid 0", &file, Program::Vk, "0.201.0", None)
+        .unwrap()
+        .sha256;
+
+    // A viewer sees the hub's version and what it takes, and no form.
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    for want in [
+        "<h2>Hub</h2>",
+        &format!("<td>this hub</td><td>{}</td>", env!("CARGO_PKG_VERSION")),
+        "unsigned accepted",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("hub-update-"), "{page}");
+    let action = "/hub/action";
+    let form = format!("_csrf={viewer_csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &viewer, action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    // An operator's offers the vk-hub releases alone.
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(
+        page.contains(&format!("hx-post=\"{action}\" hx-swap=\"none\">")),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!("<option value=\"{sha}\">0.200.0 (")),
+        "{page}"
+    );
+    assert!(
+        !page.contains(&format!("<option value=\"{vk}\">")),
+        "{page}"
+    );
+    for (release, want) in [
+        (&vk, "not a vk-hub release"),
+        (&before, "does not take over the listeners"),
+    ] {
+        let form = format!("_csrf={csrf}&op=update&release={release}");
+        let reply = post_action(addr, &origin, &operator, action, &form, true).await;
+        assert_eq!(reply.status, 409, "{want}: {}", reply.body);
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+
+    // Asked first; once confirmed, started, and failed as its release does not run.
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, action, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Update the hub?",
+        "vk-hub 0.200.0 (<code>",
+        &format!(
+            ", unsigned) to this hub, which runs {}.",
+            env!("CARGO_PKG_VERSION")
+        ),
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(crate::update::status(&hub).last.is_none());
+    let answer = posted_form(&reply.body, "update", 0);
+    // Refused, recording nothing, while a release is being added: the update would cut it.
+    let adding = hub.handover.long_call().unwrap();
+    let reply = post_action(addr, &origin, &operator, action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("being added or fetched"),
+        "{}",
+        reply.body
+    );
+    assert!(crate::update::status(&hub).last.is_none());
+    drop(adding);
+    let reply = post_action(addr, &origin, &operator, action, &form, true).await;
+    let answer = posted_form(&reply.body, "update", 0);
+    let reply = post_action(addr, &origin, &operator, action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("staging the release"), "{}", reply.body);
+    let status = crate::update::status(&hub);
+    assert!(
+        matches!(
+            &status.last,
+            Some(l) if l.version == "0.200.0" && matches!(l.outcome, Some(vk_hub_proto::Outcome::Failed { .. }))
+        ),
+        "{status:?}"
+    );
+    audited(
+        &hub,
+        &format!("{principal} asked the hub to update itself to vk-hub 0.200.0"),
+    )
+    .await;
+    audited(&hub, "the hub's update to vk-hub 0.200.0 failed").await;
+    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    assert!(
+        page.contains("to 0.200.0: <span class=\"reason\">failed</span>"),
+        "{page}"
+    );
+    // Serving as before, and free to try again.
+    assert!(!hub.handover.intake_paused());
+    assert!(
+        crate::update::check(
+            &hub,
+            &hub.db
+                .release(&sha)
+                .unwrap()
+                .map(|row| crate::store::Release {
+                    sha256: sha.clone(),
+                    row
+                })
+                .unwrap()
+        )
+        .is_ok()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A live page's stream ends as the hub hands over to a release, without the `close` event that
 /// would keep the page from opening it again, to the release.
 #[tokio::test(flavor = "multi_thread")]
@@ -7929,6 +8088,85 @@ async fn a_live_page_s_stream_ends_as_the_hub_hands_over() {
         assert!(!event.starts_with("event: close"), "{event}");
     }
     assert!(hub.handover.gate.drained(Duration::from_secs(5)).await);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An operator whose update of the hub started is told it is updating, not that it was sent.
+#[test]
+fn an_operator_is_told_the_hub_is_updating() {
+    let said =
+        (crate::ui::hub::KIND.started)("this hub", crate::store::Program::Hub, "0.2.0", "ab");
+    assert_eq!(
+        said,
+        "The hub is updating itself to vk-hub 0.2.0 (update ab); this page reconnects once it \
+         runs the release."
+    );
+}
+
+/// Confirmation describes an older release permitted by `[update] allow_downgrade` as accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hub_asks_about_an_older_release_its_setting_lets_it_take() {
+    use crate::store::Program;
+    let (addr, hub, origin, dir) = start_fleet_updating_with(crate::config::UpdateConfig {
+        allow: true,
+        allow_downgrade: true,
+        ..Default::default()
+    })
+    .await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let file = dir.join("vk-hub");
+    let mut bin = crate::fetch::tests::fake_vk("0.1.0");
+    bin.extend_from_slice(vk_peer::handoff::ENV.as_bytes());
+    std::fs::write(&file, &bin).unwrap();
+    let sha = crate::releases::add(&hub, "uid 0", &file, Program::Hub, "0.1.0", None)
+        .unwrap()
+        .sha256;
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, "/hub/action", &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("its <code>[update] allow_downgrade</code> lets it go back."),
+        "{}",
+        reply.body
+    );
+    assert!(!reply.body.contains("class=\"reason\""), "{}", reply.body);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without `[update] allow`, the hub explains and refuses updates. `vk-hub local` cannot
+/// update itself and shows no section.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hub_refuses_its_update_unless_allowed() {
+    use crate::store::Program;
+    let (addr, hub, origin, dir) = start_fleet_updating(false).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let file = dir.join("vk-hub");
+    std::fs::write(&file, crate::fetch::tests::fake_vk("0.200.0")).unwrap();
+    let sha = crate::releases::add(&hub, "uid 0", &file, Program::Hub, "0.200.0", None)
+        .unwrap()
+        .sha256;
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(
+        page.contains("not allowed by its <code>[update] allow</code>"),
+        "{page}"
+    );
+    assert!(!page.contains("hx-post=\"/hub/action\""), "{page}");
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, "/hub/action", &form, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("[update] allow is not set"),
+        "{}",
+        reply.body
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(!page.contains("<h2>Hub</h2>"), "{page}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

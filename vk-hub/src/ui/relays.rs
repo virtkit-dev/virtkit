@@ -38,6 +38,9 @@ pub(super) static KIND: updates::Kind = updates::Kind {
                its running jobs go on. If the release does not come up, the relay goes back to \
                the binary it ran once its supervisor restarts it.",
     command_ttl: ops::COMMAND_TTL,
+    allow: "<code>[hub] allow</code>, which lacks <code>update</code>",
+    allow_downgrade: "<code>[hub] allow_downgrade</code>",
+    started: updates::sent,
     ops: updates::Ops {
         find: |hub, id| {
             let Some(view) = ops::detail(hub, id)? else {
@@ -74,6 +77,7 @@ fn peer(v: RelayView, last: Option<RelayCommandRow>) -> updates::Peer {
         version: inventory.map(|i| i.version.clone()),
         connected: v.connected,
         takes_updates: ops::takes_updates(&v.row),
+        allows_downgrade: None,
         requires_signed: inventory.is_some_and(|i| i.requires_signed),
         reported: v.row.report.as_ref().and_then(|r| r.update.clone()),
         last: last.map(|c| {

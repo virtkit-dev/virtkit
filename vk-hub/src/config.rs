@@ -42,8 +42,8 @@
 //! # restrict nothing.
 //! egress_rules = true
 //!
-//! # Whether operators may update the hub to a vk-hub release it holds, with
-//! # `vk-hub update`; off unless set. The hub executes the release in its place, handing
+//! # Whether operators may update the hub to a vk-hub release it holds, from the web UI or
+//! # with `vk-hub update`; off unless set. The hub executes the release in its place, handing
 //! # it its listening sockets, and goes back to the binary it ran should the release not
 //! # come up — which needs a supervisor that restarts `vk-hub serve`.
 //! [update]

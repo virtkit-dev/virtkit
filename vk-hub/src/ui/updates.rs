@@ -1,7 +1,9 @@
-//! Shared UI for peers that install releases on the hub's command: registries and GitLab relays.
-//! Each [`Kind`] has a live `/operations` section listing versions and updates, a release
-//! form, and an update handler at the peer's action path that asks first ([`actions::ask_first`]).
-//! Each kind's module supplies peer lookup, checks and command issuance ([`Ops`]).
+//! Shared update UI for registries, GitLab relays and the hub itself. Each [`Kind`] has a
+//! live `/operations` section listing versions and updates, a release form, and an action
+//! handler requiring confirmation ([`actions::ask_first`]). Each kind's module supplies
+//! lookup, checks and command issuance ([`Ops`]).
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use hyper::header::{self, HeaderValue};
@@ -15,7 +17,7 @@ use super::{Auth, Body, Ui, actions, blocking, field};
 use crate::server::Hub;
 use crate::store::{NotEnrolled, Program, Release};
 
-/// A kind of peer that updates itself on the hub's command.
+/// What updates itself on the hub's command: a kind of peer, or the hub itself.
 pub(super) struct Kind {
     /// What one is called, in a sentence: `registry`.
     pub(super) noun: &'static str,
@@ -31,11 +33,19 @@ pub(super) struct Kind {
     pub(super) question: &'static str,
     /// How long an update waits for an offline one to connect and take it.
     pub(super) command_ttl: std::time::Duration,
+    /// The setting that keeps the hub from updating one, as it follows "not allowed by its ":
+    /// `<code>[hub] allow</code>, which lacks <code>update</code>`.
+    pub(super) allow: &'static str,
+    /// The setting that lets one go back a version: `<code>[hub] allow_downgrade</code>`.
+    pub(super) allow_downgrade: &'static str,
+    /// What an operator is told once an update started: given the one updated, the program,
+    /// version and ID.
+    pub(super) started: fn(&str, Program, &str, &str) -> String,
     /// How one's update is looked up, checked and issued.
     pub(super) ops: Ops,
 }
 
-/// A peer's reported state and last issued update.
+/// Reported state and last update for a peer or the hub, as shown in its section.
 pub(super) struct Peer {
     pub(super) id: String,
     pub(super) hostname: String,
@@ -46,8 +56,11 @@ pub(super) struct Peer {
     /// The version it last reported running.
     pub(super) version: Option<String>,
     pub(super) connected: bool,
-    /// Whether its `[hub] allow` lists `update`: `None` until it reports its inventory.
+    /// Whether its [`Kind::allow`] lets the hub update it: `None` until it reports its
+    /// inventory, or for a hub that does not update itself.
     pub(super) takes_updates: Option<bool>,
+    /// Whether its [`Kind::allow_downgrade`] is set: `None` when the hub does not know.
+    pub(super) allows_downgrade: Option<bool>,
     /// Whether it takes only signed releases.
     pub(super) requires_signed: bool,
     /// Its update as it last reported it.
@@ -65,17 +78,20 @@ pub(super) struct Issued {
     pub(super) outcome: Option<Outcome>,
 }
 
-/// How an update of a kind's peer is looked up, checked and issued.
+/// Lookup, checks and update issuance for a [`Kind`].
 pub(super) struct Ops {
-    /// The peer `id`; `None` when there is no such peer.
+    /// Find `id`; `None` if absent.
     pub(super) find: fn(&Hub, &str) -> Result<Option<Peer>>,
-    /// Why the hub refuses to update peer `id` to the release given, going by what it last
+    /// Why the hub refuses to update `id` to the release given, going by what it last
     /// reported.
     pub(super) check: fn(&Hub, &str, &Release) -> Result<()>,
-    /// Update peer `id` to the release as shown, as the actor given, while it runs the version
-    /// given; the command's ID.
-    pub(super) issue: fn(&Hub, &str, &str, &Release, Option<&str>) -> Result<String>,
+    /// Update `id` to the release as shown, as the actor given, while it runs the version
+    /// given; the update's ID.
+    pub(super) issue: Issue,
 }
+
+/// [`Ops::issue`] takes `&Arc<Hub>` so the hub's update can spawn its hand-over with a clone.
+pub(super) type Issue = fn(&Arc<Hub>, &str, &str, &Release, Option<&str>) -> Result<String>;
 
 /// The live `/operations` section for `kind`'s `peers`: versions, update permissions and
 /// update status. With `steer`, include update forms for peers that allow updates.
@@ -115,11 +131,13 @@ pub(super) fn section(
                 .raw("\">")
                 .node(&p.hostname)
                 .raw("</a>"),
-            None => h
+            // A peer by its ID too, as hostnames need not be unique; the hub by its name.
+            None if vk_hub_proto::valid_id(&p.id) => h
                 .node(&p.hostname)
                 .raw(" <code class=\"sub\">")
                 .text(crate::rollout::short_id(&p.id))
                 .raw("</code>"),
+            None => h.node(&p.hostname),
         };
         h.raw("</td><td>");
         match &p.version {
@@ -131,7 +149,9 @@ pub(super) fn section(
         } else {
             "<span class=\"badge bad\">Offline</span>"
         });
-        h.raw("</td><td>").raw(policy(p)).raw("</td><td>");
+        h.raw("</td><td>");
+        policy(h, kind, p);
+        h.raw("</td><td>");
         status(h, p, now);
         h.raw("</td>");
         if steer {
@@ -147,13 +167,13 @@ pub(super) fn section(
 }
 
 /// Whether `p` lets the hub update it, and to what.
-fn policy(p: &Peer) -> &'static str {
+fn policy(h: &mut Html, kind: &Kind, p: &Peer) {
     match p.takes_updates {
-        None => "not reported yet",
-        Some(false) => "not allowed by its <code>[hub] allow</code>",
-        Some(true) if p.requires_signed => "signed releases only",
-        Some(true) => "unsigned accepted",
-    }
+        None => h.raw("not reported yet"),
+        Some(false) => h.raw("not allowed by its ").raw(kind.allow),
+        Some(true) if p.requires_signed => h.raw("signed releases only"),
+        Some(true) => h.raw("unsigned accepted"),
+    };
 }
 
 /// Show `p`'s reported update progress or result, falling back to the last issued command
@@ -201,13 +221,20 @@ fn command_line(h: &mut Html, c: &Issued, now: u64) {
     h.raw(", issued ").html(&pages::at_html(c.issued_at));
 }
 
+/// [`Kind::started`] for a peer, which the update is sent to.
+pub(super) fn sent(peer: &str, program: Program, version: &str, command: &str) -> String {
+    format!("Sent {peer} the update to {program} {version} (command {command}); it shows below.")
+}
+
 /// Render the release form for `p` and `kind`'s program, or explain why no form is available.
 /// On a peer's page, use a plain form carrying `csrf`. In `/operations`' shared fragment,
 /// omit `csrf` and post through htmx with the page's token; `hx-preserve` keeps the input
 /// until the release choices change.
 pub(super) fn form(h: &mut Html, kind: &Kind, p: &Peer, releases: &[Release], csrf: Option<&str>) {
     if p.takes_updates == Some(false) {
-        h.raw("<span class=\"sub\">Its <code>[hub] allow</code> lacks <code>update</code>.</span>");
+        h.raw("<span class=\"sub\">Not allowed by its ")
+            .raw(kind.allow)
+            .raw(".</span>");
         return;
     }
     // Those it would take: signed ones only, if it says it requires them.
@@ -264,10 +291,10 @@ pub(super) fn form(h: &mut Html, kind: &Kind, p: &Peer, releases: &[Release], cs
 }
 
 /// Why a peer running one version refuses to update to another, as its own check decides
-/// (`check_version` in `vk-registry/src/hub/update.rs` and `vk-gitlab/src/update.rs`).
+/// ([`vk_peer::trial::check_version`], which registries, relays and the hub run).
 #[derive(Debug, PartialEq, Eq)]
 enum VersionRefusal {
-    /// An older `MAJOR.MINOR.PATCH`, unless its `[hub] allow_downgrade`.
+    /// An older `MAJOR.MINOR.PATCH`, unless its [`Kind::allow_downgrade`].
     Older,
     /// A version not ordered against its own as `MAJOR.MINOR.PATCH`, always.
     Unordered,
@@ -316,12 +343,21 @@ fn detail(kind: &Kind, p: &Peer, release: &Release) -> Html {
         .as_deref()
         .and_then(|own| version_refusal(&release.row.version, own))
     {
+        Some(VersionRefusal::Older) if p.allows_downgrade == Some(true) => {
+            h.raw("<p>It is older than the version the ")
+                .raw(kind.noun)
+                .raw(" runs; its ")
+                .raw(kind.allow_downgrade)
+                .raw(" lets it go back.</p>");
+        }
         Some(VersionRefusal::Older) => {
             h.raw("<p class=\"reason\">It is older than the version the ")
                 .raw(kind.noun)
                 .raw(" runs: the ")
                 .raw(kind.noun)
-                .raw(" refuses it unless its <code>[hub] allow_downgrade</code> is set.</p>");
+                .raw(" refuses it unless its ")
+                .raw(kind.allow_downgrade)
+                .raw(" is set.</p>");
         }
         Some(VersionRefusal::Unordered) => {
             h.raw("<p class=\"reason\">Its version cannot be ordered against the one the ")
@@ -441,11 +477,11 @@ pub(super) async fn update(
     })
     .await?;
     match issued {
-        Ok(command) if htmx => Ok(super::fleet::said_so(&format!(
-            "Sent {} the update to {} {} (command {command}); it shows below.",
-            vk_hub_proto::display_safe(&peer.hostname),
+        Ok(command) if htmx => Ok(super::fleet::said_so(&(kind.started)(
+            &vk_hub_proto::display_safe(&peer.hostname),
             kind.program,
-            release.row.version,
+            &release.row.version,
+            &command,
         ))),
         Ok(_) => Ok(see_other(&back)),
         Err(e) if e.is::<NotEnrolled>() => {

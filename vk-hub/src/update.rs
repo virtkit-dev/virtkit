@@ -1,5 +1,5 @@
 //! The hub updating itself to a `vk-hub` release it holds, on trial, without closing its
-//! listeners: `vk-hub update --release <prefix>`, once `[update] allow`.
+//! listeners: `/operations` or `vk-hub update --release <prefix>`, once `[update] allow`.
 //!
 //! 1. An update is refused while a release or tools are being added or fetched, and those are
 //!    refused from its start on ([`Handover::long_call`]): the exec would cut them, and the CLI
@@ -634,6 +634,27 @@ pub fn start(hub: &Arc<Hub>, actor: &str, release: &str) -> Result<String> {
     begin(hub, actor, &release, held)
 }
 
+/// [`start`] with `shown`, the release an operator confirmed while the hub ran `running`:
+/// refused unless the hub still holds it as shown and runs that version.
+pub fn start_as_shown(
+    hub: &Arc<Hub>,
+    actor: &str,
+    shown: &Release,
+    running: Option<&str>,
+) -> Result<String> {
+    let held = hub.releases_lock();
+    if hub.db.release(&shown.sha256)?.as_ref() != Some(&shown.row) {
+        bail!(
+            "release {} changed since it was shown; look again",
+            crate::store::short(&shown.sha256)
+        );
+    }
+    if running != Some(env!("CARGO_PKG_VERSION")) {
+        bail!("the hub's version changed since it was shown; look again");
+    }
+    begin(hub, actor, shown, held)
+}
+
 /// Start updating to `release`, the releases lock `held` until its file is copied.
 fn begin(
     hub: &Arc<Hub>,
@@ -1193,13 +1214,16 @@ pub fn audit_end(hub: &Hub) {
     }
 }
 
-/// The hub's update as `vk-hub update` shows it.
+/// The hub's update as `/operations` and `vk-hub update` show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub version: String,
     /// Whether `[update] allow` is set; `None` for a hub that does not update itself.
     pub allowed: Option<bool>,
     pub requires_signed: bool,
+    /// Whether `[update] allow_downgrade` is set.
+    #[serde(default)]
+    pub allows_downgrade: bool,
     pub update: Option<UpdateProgress>,
     pub last: Option<Requested>,
 }
@@ -1212,6 +1236,7 @@ pub fn status(hub: &Hub) -> Status {
         version: env!("CARGO_PKG_VERSION").to_string(),
         allowed: update.map(|u| u.allowed()),
         requires_signed: update.is_some_and(|u| u.requires_signed()),
+        allows_downgrade: update.is_some_and(|u| u.config.allow_downgrade),
         update: state.update,
         last: state.last,
     }

@@ -436,6 +436,7 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
         rollouts,
         registries: super::registries::updatables(hub)?,
         relays: super::relays::updatables(hub)?,
+        hub: super::hub::updatables(hub),
         source: hub.fetches.source().map(|s| s.url().to_string()),
         fetch: hub.fetches.status(),
         latest: hub.fetches.latest(),
@@ -453,6 +454,8 @@ struct Operations {
     registries: Vec<super::updates::Peer>,
     /// Every relay, for its version and updates.
     relays: Vec<super::updates::Peer>,
+    /// The hub itself, for its version and updates; none when it does not update itself.
+    hub: Vec<super::updates::Peer>,
     /// Where releases are fetched from; `None` with fetching off.
     source: Option<String>,
     /// The latest fetch since the hub started.
@@ -2251,6 +2254,14 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         &mut h,
         &super::relays::KIND,
         &ops.relays,
+        &ops.releases,
+        steer,
+        now,
+    );
+    super::updates::section(
+        &mut h,
+        &super::hub::KIND,
+        &ops.hub,
         &ops.releases,
         steer,
         now,
