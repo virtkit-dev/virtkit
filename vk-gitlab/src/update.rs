@@ -109,11 +109,8 @@ impl Ledger for Persisted {
     fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(STATE_FILE);
         let bytes = serde_json::to_vec_pretty(self).context("encoding the update state")?;
-        vk_fs::write_atomic(&path, &bytes, 0o600)
-            .with_context(|| format!("writing {}", path.display()))?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", dir.display()))
+        vk_fs::write_atomic_durable(&path, &bytes, 0o600)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     fn trial(&mut self) -> &mut Option<Trial> {

@@ -445,13 +445,28 @@ fn open_dir_flags(dir: &Path, extra: libc::c_int) -> Result<OwnedFd, anyhow::Err
 ///
 /// The directory is not fsynced: the file's own contents are, so a crash between the two
 /// costs the rename, not the data. Callers that need the name itself to survive a power cut
-/// want more than this.
+/// want [`write_atomic_durable`].
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
     write_atomic_from(
         path,
         contents,
         mode,
         Durability::Synced,
+        Publish::Replace,
+        staging_names(),
+    )
+}
+
+/// [`write_atomic`] with a directory fsync after publication, through the same descriptor.
+/// The name survives a power cut, for files that must retain their last write after a crash,
+/// such as a decision acted on immediately. A directory sync error leaves the new file
+/// published, with durability unknown.
+pub fn write_atomic_durable(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_atomic_from(
+        path,
+        contents,
+        mode,
+        Durability::Durable,
         Publish::Replace,
         staging_names(),
     )
@@ -515,11 +530,16 @@ pub fn write_atomic_streamed(
     )
 }
 
-/// Whether [`write_atomic_from`] fsyncs the staged file before publishing it.
+/// Whether [`write_atomic_from`] fsyncs the staged file before publishing it, and the
+/// directory after.
 #[derive(Clone, Copy)]
 enum Durability {
+    /// The file; the directory only after a no-replace publish, best effort.
     Synced,
+    /// Not the file; the directory as `Synced` does.
     Unsynced,
+    /// The file, then the directory after any publish; directory sync errors are reported.
+    Durable,
 }
 
 /// Whether [`write_atomic_from`] publishes over what is at the path.
@@ -587,14 +607,14 @@ fn write_atomic_with(
         let written = fill(&mut staged)
             .and_then(|()| {
                 match durability {
-                    Durability::Synced => staged.sync_all(),
+                    Durability::Synced | Durability::Durable => staged.sync_all(),
                     Durability::Unsynced => Ok(()),
                 }
                 .map_err(anyhow::Error::from)
             })
             .map_err(|e| e.context(format!("writing the staged file for {path:?}")))
             .and_then(|()| {
-                let published = match publish {
+                match publish {
                     Publish::Replace => {
                         // SAFETY: the descriptor is live and both names are NUL-terminated.
                         let rc = unsafe {
@@ -611,10 +631,9 @@ fn write_atomic_with(
                             Err(std::io::Error::last_os_error())
                         }
                     }
-                    Publish::NoReplace => rename_noreplace(parent_fd.as_fd(), &name, &final_name)
-                        .map(|()| sync_dir(parent_fd.as_fd())),
-                };
-                published.map_err(|e| anyhow!(e).context(format!("publishing {path:?}")))
+                    Publish::NoReplace => rename_noreplace(parent_fd.as_fd(), &name, &final_name),
+                }
+                .map_err(|e| anyhow!(e).context(format!("publishing {path:?}")))
             });
         if written.is_err() {
             // Best effort on the error path, through the descriptor this call opened the
@@ -622,8 +641,18 @@ fn write_atomic_with(
             // the directory; a shared one would want the `dir_admits_only_us` guard.
             // SAFETY: the descriptor is live and the name is NUL-terminated.
             let _ = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), 0) };
+            return written;
         }
-        return written;
+        return match (durability, publish) {
+            (Durability::Durable, _) => fsync_dir(parent_fd.as_fd()).map_err(|e| {
+                anyhow!(e).context(format!("{path:?} published; syncing its directory"))
+            }),
+            (_, Publish::NoReplace) => {
+                sync_dir(parent_fd.as_fd());
+                Ok(())
+            }
+            (_, Publish::Replace) => Ok(()),
+        };
     }
     bail!("found no free staging name beside {path:?} in {STAGING_ATTEMPTS} tries")
 }
@@ -676,9 +705,15 @@ fn link_noreplace(dir: BorrowedFd<'_>, from: &CString, to: &CString) -> std::io:
     Ok(())
 }
 
-/// Best-effort fsync of the directory `dir` (an `O_PATH` descriptor, which `fsync` refuses,
-/// hence the reopen), so names published in it survive a crash.
+/// Best-effort [`fsync_dir`].
 fn sync_dir(dir: BorrowedFd<'_>) {
+    // The file is already published; a failed sync risks losing its name on a power cut.
+    let _ = fsync_dir(dir);
+}
+
+/// Fsync the directory `dir` (an `O_PATH` descriptor, which `fsync` refuses, hence the
+/// reopen), so names published in it survive a crash.
+fn fsync_dir(dir: BorrowedFd<'_>) -> std::io::Result<()> {
     // SAFETY: the descriptor is live and the name is a NUL-terminated literal.
     let fd = unsafe {
         libc::openat(
@@ -687,10 +722,11 @@ fn sync_dir(dir: BorrowedFd<'_>) {
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    if fd >= 0 {
-        // SAFETY: `fd` is a fresh descriptor this call owns.
-        let _ = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }).sync_all();
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }).sync_all()
 }
 
 /// [`open_dir_nofollow`] for one name in an already-open directory, so the directory is not
@@ -1515,6 +1551,12 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
+        );
+        write_atomic_durable(&path, b"fourth", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fourth");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
