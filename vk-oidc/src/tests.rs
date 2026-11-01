@@ -443,3 +443,80 @@ fn a_client_secret_file_is_read_bounded_trimmed_and_not_through_a_symlink() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A login taken from one client is the other's to redeem, with its target and verifier and
+/// what was left of it, at most `LOGIN_TTL`; one with an unsafe target, no time left, or a
+/// state already held is not taken on. Meanwhile the first starts and redeems none.
+#[tokio::test]
+async fn logins_taken_from_one_client_are_redeemed_by_another() {
+    let addr = fake_idp(false).await;
+    let (from, to) = (client_for(addr), client_for(addr));
+    let (url, _) = from.login_url("/browse/r").await.unwrap();
+    let state = state_of(&url);
+    let mut taken = from.take_pending();
+    assert!(from.pending.lock().unwrap().is_empty());
+    assert_eq!(taken.len(), 1);
+    assert!(taken[0].left > Duration::ZERO && taken[0].left <= LOGIN_TTL);
+    // None is started or redeemed once they are taken, until some are given back.
+    let e = from.login_url("/browse").await.unwrap_err();
+    assert!(e.is::<LoginsHandedOver>(), "{e:#}");
+    let e = from
+        .exchange("the-code", &state, Some(&state))
+        .await
+        .unwrap_err();
+    assert!(e.is::<LoginsHandedOver>(), "{e:#}");
+    let pending = |state: &str, target: &str, left: Duration| Pending {
+        state: state.into(),
+        target: target.into(),
+        verifier: "v".into(),
+        left,
+    };
+    taken.push(pending("unsafe", "https://elsewhere.example/", LOGIN_TTL));
+    taken.push(pending("lapsed", DEFAULT_TARGET, Duration::ZERO));
+    taken.push(pending("long", DEFAULT_TARGET, 10 * LOGIN_TTL));
+    taken.push(pending("", DEFAULT_TARGET, LOGIN_TTL));
+    taken.push(Pending {
+        verifier: String::new(),
+        ..pending("no-verifier", DEFAULT_TARGET, LOGIN_TTL)
+    });
+    let (held, _) = to.login_url("/browse/held").await.unwrap();
+    let held = state_of(&held);
+    taken.push(pending(&held, DEFAULT_TARGET, LOGIN_TTL));
+    assert_eq!(to.restore_pending(taken), 2);
+    {
+        let pending = to.pending.lock().unwrap();
+        assert_eq!(pending.len(), 3);
+        assert!(pending["long"].expires_at <= Instant::now() + LOGIN_TTL);
+        assert_eq!(pending[&held].target, "/browse/held");
+        assert_eq!(pending[&state].target, "/browse/r");
+    }
+    let (target, _) = to.exchange("the-code", &state, Some(&state)).await.unwrap();
+    assert_eq!(target, "/browse/r");
+    assert_eq!(from.restore_pending(Vec::new()), 0);
+    from.login_url("/browse").await.unwrap();
+    let e = from
+        .exchange("the-code", &state, Some(&state))
+        .await
+        .unwrap_err();
+    assert!(!e.is::<LoginsHandedOver>(), "{e:#}");
+}
+
+/// Logins taken on past the cap drop the soonest to expire, as starting one does.
+#[tokio::test]
+async fn logins_taken_on_past_the_cap_drop_the_soonest_to_expire() {
+    let addr = fake_idp(false).await;
+    let client = client_for(addr);
+    let logins = (0..=MAX_PENDING_LOGINS)
+        .map(|i| Pending {
+            state: format!("s{i}"),
+            target: DEFAULT_TARGET.into(),
+            verifier: "v".into(),
+            left: Duration::from_secs(10 + i as u64),
+        })
+        .collect();
+    assert_eq!(client.restore_pending(logins), MAX_PENDING_LOGINS);
+    let pending = client.pending.lock().unwrap();
+    assert_eq!(pending.len(), MAX_PENDING_LOGINS);
+    assert!(!pending.contains_key("s0"));
+    assert!(pending.contains_key(&format!("s{MAX_PENDING_LOGINS}")));
+}

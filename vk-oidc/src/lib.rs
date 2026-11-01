@@ -35,9 +35,11 @@
 //! starting a second login abandons the first, and that first tab has to start over.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -110,16 +112,45 @@ struct Discovered {
     secret_in_header: bool,
 }
 
+/// An unredeemed login transferred by [`Client::take_pending`]. Contains the PKCE
+/// verifier: transfer only between processes of the same program, never to disk or
+/// the network. No `Debug`, `Clone` or `Serialize` for this reason.
+pub struct Pending {
+    pub state: String,
+    pub target: String,
+    pub verifier: String,
+    /// Remaining lifetime, capped at [`LOGIN_TTL`] on restore.
+    pub left: Duration,
+}
+
 struct PendingLogin {
     /// where to send the browser back once login completes — always one
-    /// [`Landing::is_safe`] accepts, or [`Landing::default`], because [`Client::login_url`]
-    /// is the only thing that builds this.
+    /// [`Landing::is_safe`] accepts, or [`Landing::default`], as checked where this is built:
+    /// [`Client::login_url`] and [`Client::restore_pending`].
     target: String,
     /// the PKCE verifier whose S256 challenge went to the provider
     verifier: String,
-    /// when this login stops being redeemable — [`LOGIN_TTL`] after it started. Stored as
-    /// the deadline rather than the start so there is one place the TTL is applied.
+    /// when this login stops being redeemable — at most [`LOGIN_TTL`] after it started.
+    /// Stored as the deadline rather than the start so a login handed over keeps its own.
     expires_at: Instant,
+}
+
+/// Drop the logins soonest to expire — the oldest, while [`LOGIN_TTL`] is one constant — until
+/// at most `keep` are left, rather than refuse a new one: see [`MAX_PENDING_LOGINS`]. Sorts only
+/// once the map is over `keep`, off the normal path.
+fn evict_soonest_to_expire(pending: &mut HashMap<String, PendingLogin>, keep: usize) {
+    if pending.len() <= keep {
+        return;
+    }
+    let mut by_age: Vec<(Instant, String)> = pending
+        .iter()
+        .map(|(k, p)| (p.expires_at, k.clone()))
+        .collect();
+    by_age.sort_unstable_by_key(|(t, _)| *t);
+    let excess = pending.len() - keep;
+    for (_, k) in by_age.into_iter().take(excess) {
+        pending.remove(&k);
+    }
 }
 
 /// A configured provider, ready to redirect logins to and exchange codes against.
@@ -129,10 +160,25 @@ pub struct Client {
     cfg: Config,
     landing: Landing,
     provider: tokio::sync::OnceCell<Provider>,
-    /// state → pending login. Swept opportunistically (on the next `login_url` call)
+    /// state → pending login. Swept opportunistically (by `login_url` and `restore_pending`)
     /// rather than by a background task — login volume is human-scale.
     pending: Mutex<HashMap<String, PendingLogin>>,
+    /// Set during handover ([`Client::take_pending`]). Reads and writes are ordered by
+    /// `pending`'s lock and occur only while it is held.
+    handed_over: AtomicBool,
 }
+
+/// Logins were handed to another process ([`Client::take_pending`]): this one starts none.
+#[derive(Debug)]
+pub struct LoginsHandedOver;
+
+impl std::fmt::Display for LoginsHandedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("logins were handed to another process")
+    }
+}
+
+impl std::error::Error for LoginsHandedOver {}
 
 impl Client {
     /// Build the client. No network, and no tokio runtime needed: both the HTTP client
@@ -144,6 +190,7 @@ impl Client {
             landing,
             provider: tokio::sync::OnceCell::new(),
             pending: Mutex::new(HashMap::new()),
+            handed_over: AtomicBool::new(false),
         }
     }
 
@@ -235,8 +282,8 @@ impl Client {
     /// Start a login: mint a single-use `state` and a PKCE verifier, remember where to
     /// land the browser afterwards, and return the provider's authorization URL together
     /// with the `state` the caller must put in the browser's login cookie. A `target`
-    /// that [`Landing::is_safe`] rejects is replaced here, not refused — this is the one
-    /// place a `PendingLogin` is built, so it is where that invariant belongs.
+    /// that [`Landing::is_safe`] rejects is replaced, not refused, so `PendingLogin` always
+    /// has a safe target. Fails with [`LoginsHandedOver`] during handover.
     pub async fn login_url(&self, target: &str) -> Result<(String, String)> {
         let provider = self.provider().await?;
         let state = random_token(24);
@@ -250,21 +297,11 @@ impl Client {
         {
             let now = Instant::now();
             let mut pending = self.pending.lock().unwrap();
-            pending.retain(|_, p| p.expires_at > now);
-            // Evict the soonest to expire — the oldest, while `LOGIN_TTL` is one constant
-            // — rather than refuse the new login: see [`MAX_PENDING_LOGINS`]. Only reached
-            // once the map is full, so the sort is not on the normal path.
-            if pending.len() >= MAX_PENDING_LOGINS {
-                let mut by_age: Vec<(Instant, String)> = pending
-                    .iter()
-                    .map(|(k, p)| (p.expires_at, k.clone()))
-                    .collect();
-                by_age.sort_unstable_by_key(|(t, _)| *t);
-                let excess = pending.len() + 1 - MAX_PENDING_LOGINS;
-                for (_, k) in by_age.into_iter().take(excess) {
-                    pending.remove(&k);
-                }
+            if self.handed_over.load(Ordering::Relaxed) {
+                return Err(LoginsHandedOver.into());
             }
+            pending.retain(|_, p| p.expires_at > now);
+            evict_soonest_to_expire(&mut pending, MAX_PENDING_LOGINS - 1);
             pending.insert(
                 state.clone(),
                 PendingLogin {
@@ -290,7 +327,8 @@ impl Client {
     /// Redeem an authorization `code` for the caller's claims: require the browser's
     /// cookie to name the same login as the query's `state`, consume it, exchange the
     /// code (with the PKCE verifier), then call UserInfo. Returns the original login's
-    /// `target` alongside the claims.
+    /// `target` alongside the claims. During handover, returns [`LoginsHandedOver`] for
+    /// a login this client no longer holds.
     pub async fn exchange(
         &self,
         code: &str,
@@ -307,12 +345,18 @@ impl Client {
         let provider = self.provider().await?;
         // A `remove` — the state is a 192-bit random lookup key, not a secret compared
         // byte-wise, so a map lookup leaks nothing worth timing.
-        let pending = self
-            .pending
-            .lock()
-            .unwrap()
-            .remove(state)
-            .context("unknown or already-used login state")?;
+        let pending = {
+            let mut pending = self.pending.lock().unwrap();
+            match pending.remove(state) {
+                Some(p) => p,
+                // During handover, an unknown login may belong to the receiving process;
+                // the browser can retry there.
+                None if self.handed_over.load(Ordering::Relaxed) => {
+                    return Err(LoginsHandedOver.into());
+                }
+                None => bail!("unknown or already-used login state"),
+            }
+        };
         if Instant::now() >= pending.expires_at {
             bail!("login state expired");
         }
@@ -358,6 +402,60 @@ impl Client {
         .await
         .context("calling the UserInfo endpoint")?;
         Ok((pending.target, claims))
+    }
+
+    /// Take every login started and not yet redeemed, for another process of this program to
+    /// finish ([`Client::restore_pending`]): this one redeems none of them any more.
+    /// Starting a login fails with [`LoginsHandedOver`] from then on, until
+    /// [`Client::restore_pending`] is called: none is started that nobody would redeem.
+    pub fn take_pending(&self) -> Vec<Pending> {
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        self.handed_over.store(true, Ordering::Relaxed);
+        pending
+            .drain()
+            .filter(|(_, p)| p.expires_at > now)
+            .map(|(state, p)| Pending {
+                state,
+                target: p.target,
+                verifier: p.verifier,
+                left: p.expires_at.saturating_duration_since(now),
+            })
+            .collect()
+    }
+
+    /// Take on `logins`, which another process of this program started
+    /// ([`Client::take_pending`]), for this client to redeem as if it had started them: each
+    /// for what was left of it, at most [`LOGIN_TTL`], with a target [`Landing::is_safe`]
+    /// accepts, never over a login of the same state, and within the cap on logins under way,
+    /// the soonest to expire dropped as [`Client::login_url`] drops them. Starting logins works
+    /// again from then on. Returns how many it took on.
+    pub fn restore_pending(&self, logins: Vec<Pending>) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        self.handed_over.store(false, Ordering::Relaxed);
+        pending.retain(|_, p| p.expires_at > now);
+        let landing = &self.landing;
+        let mut taken_on = Vec::new();
+        for p in logins {
+            if p.left.is_zero()
+                || p.state.is_empty()
+                || p.verifier.is_empty()
+                || !(p.target == landing.default || (landing.is_safe)(&p.target))
+            {
+                continue;
+            }
+            if let Entry::Vacant(e) = pending.entry(p.state.clone()) {
+                e.insert(PendingLogin {
+                    target: p.target,
+                    verifier: p.verifier,
+                    expires_at: now + p.left.min(LOGIN_TTL),
+                });
+                taken_on.push(p.state);
+            }
+        }
+        evict_soonest_to_expire(&mut pending, MAX_PENDING_LOGINS);
+        taken_on.iter().filter(|s| pending.contains_key(*s)).count()
     }
 
     /// Drop a pending login the provider has already refused, rather than leaving it to
