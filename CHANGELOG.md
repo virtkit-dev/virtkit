@@ -38,6 +38,8 @@ All notable changes to virtkit will be documented in this file.
   Hub-set read-only mode, token keys and retention windows apply only after the hub resends
   its desired state. A command whose outcome the hub has not stored may run again, and any
   update trial is dropped.
+- **A registry's update no longer fails when the registry reconnects before its old
+  connection closes.**
 
 ## [0.101.0] - 2026-11-01
 

@@ -747,6 +747,18 @@ async fn an_update_lost_by_the_registry_is_settled() {
     assert!(releases::remove(&hub, "uid 0", &release.sha256).is_err());
     drop(ws);
 
+    // A superseded session's first report must settle nothing. Test the store directly
+    // because opening a new session ends the old one.
+    assert!(
+        !hub.db
+            .settle_unreported_updates(&id, &Report::default(), crate::now_secs(), || false)
+            .unwrap()
+    );
+    assert_eq!(
+        hub.db.registry_commands(&id).unwrap()[0].outcome,
+        Some(Outcome::Accepted)
+    );
+
     // One opening without it settles it.
     let mut ws = session(addr, &id, &key).await;
     tell(&mut ws, &RegistryMsg::Report(Report::default())).await;

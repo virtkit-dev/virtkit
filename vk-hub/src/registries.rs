@@ -213,7 +213,7 @@ async fn serve(
                 }
                 if let Some(first) = report {
                     if let Some(r) = first {
-                        settle_unreported_updates(hub, registry, r).await?;
+                        settle_unreported_updates(hub, registry, session, r).await?;
                     }
                     steer.sync(ws, hub, registry).await?;
                 }
@@ -269,12 +269,20 @@ async fn sync_tokens(hub: &Arc<Hub>, registry: &Peer) -> Result<()> {
     tokio::task::spawn_blocking(move || crate::tokens::sync_registry(&hub, &id)).await?
 }
 
-/// Settle the accepted updates `report`, the session's first, does not name.
-async fn settle_unreported_updates(hub: &Hub, registry: &Peer, report: Report) -> Result<()> {
-    let db = hub.db.clone();
+/// Settle accepted updates missing from session `session`'s first `report` only while
+/// that session is current.
+async fn settle_unreported_updates(
+    hub: &Arc<Hub>,
+    registry: &Peer,
+    session: u64,
+    report: Report,
+) -> Result<()> {
+    let (db, live) = (hub.db.clone(), hub.clone());
     let id = registry.id.clone();
     let settled = tokio::task::spawn_blocking(move || {
-        db.settle_unreported_updates(&id, &report, crate::now_secs())
+        db.settle_unreported_updates(&id, &report, crate::now_secs(), || {
+            live.is_current(&id, session)
+        })
     })
     .await??;
     if settled {

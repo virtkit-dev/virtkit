@@ -680,13 +680,24 @@ impl Db {
     /// session, does not name: the registry lost track of them, so no final ack will come, and
     /// left live they would go again every session and keep their release on the hub. Only a
     /// session's first report tells: a later one can be sent between an update's acceptance
-    /// and its start. Whether any was settled.
-    pub fn settle_unreported_updates(&self, id: &str, report: &Report, now: u64) -> Result<bool> {
+    /// and its start. Require `current` inside the write to reject superseded sessions'
+    /// reports. Return whether any update was settled.
+    pub fn settle_unreported_updates(
+        &self,
+        id: &str,
+        report: &Report,
+        now: u64,
+        current: impl FnOnce() -> bool,
+    ) -> Result<bool> {
         let named = report.update.as_ref().map(|u| u.command.as_str());
         let outcome = Outcome::Failed {
             message: "the registry no longer reports this update".to_string(),
         };
         let txn = self.db.begin_write().context("starting a write")?;
+        if !current() {
+            txn.abort().context("dropping a write")?;
+            return Ok(false);
+        }
         let mut settled = Vec::new();
         {
             let mut table = txn.open_table(REGISTRY_COMMANDS)?;
