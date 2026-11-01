@@ -484,30 +484,72 @@ pub async fn stage<L: Ledger>(
         command.to_string(),
         version.to_string(),
     );
-    tokio::task::spawn_blocking(move || -> Result<(Trial, Binary)> {
-        let binary = Binary::open(&next, Some(&sha256))?;
-        vk_selfupdate::smoke_test_file(L::PROGRAM, binary.file(), binary.path(), &version)?;
-        let own = own_sha256().context("reading the running binary")?;
-        keep_previous(&releases, &own)?;
-        let exe =
-            installed.with_context(|| format!("the installed {} is not known", L::PROGRAM))?;
-        let meta = std::fs::metadata(&exe).with_context(|| format!("reading {}", exe.display()))?;
-        let trial = Trial {
-            command,
-            version,
-            sha256,
-            exe,
-            exe_id: (meta.dev(), meta.ino()),
-            next,
-            previous: own,
-            attempts: 1,
-            deadline: 0,
-            confirmed: false,
-        };
-        Ok((trial, binary))
+    tokio::task::spawn_blocking(move || {
+        check_release::<L>(&releases, next, sha256, command, version, installed)
     })
     .await
     .context("checking the release")?
+}
+
+/// Blocking [`stage`] for a local release at `from`. Copy into `dir`'s releases,
+/// replacing any existing copy and verifying `sha256`, instead of downloading.
+pub fn stage_file<L: Ledger>(
+    dir: &Path,
+    from: &Path,
+    sha256: &str,
+    command: &str,
+    version: &str,
+    installed: Option<PathBuf>,
+) -> Result<(Trial, Binary)> {
+    if !vk_hub_proto::valid_sha256(sha256) {
+        return Err(anyhow!("{sha256:?} is not a sha256"));
+    }
+    let releases = releases_dir(dir);
+    crate::net::create_dir(&releases)?;
+    crate::update::sweep_partial(&releases);
+    let next = releases.join(sha256);
+    // Copied every time: checking a copy already there costs a full hash, as much as copying.
+    crate::update::copy_published(from, &next, 0o700, Some(sha256))?;
+    check_release::<L>(
+        &releases,
+        next,
+        sha256.to_string(),
+        command.to_string(),
+        version.to_string(),
+        installed,
+    )
+}
+
+/// Command `command`'s trial of `next`, the release staged in `releases`, over `installed`,
+/// and `next` opened to execute: once it hashes to `sha256` and says it is `version` of the
+/// program, and the running binary is kept beside it.
+fn check_release<L: Ledger>(
+    releases: &Path,
+    next: PathBuf,
+    sha256: String,
+    command: String,
+    version: String,
+    installed: Option<PathBuf>,
+) -> Result<(Trial, Binary)> {
+    let binary = Binary::open(&next, Some(&sha256))?;
+    vk_selfupdate::smoke_test_file(L::PROGRAM, binary.file(), binary.path(), &version)?;
+    let own = own_sha256().context("reading the running binary")?;
+    keep_previous(releases, &own)?;
+    let exe = installed.with_context(|| format!("the installed {} is not known", L::PROGRAM))?;
+    let meta = std::fs::metadata(&exe).with_context(|| format!("reading {}", exe.display()))?;
+    let trial = Trial {
+        command,
+        version,
+        sha256,
+        exe,
+        exe_id: (meta.dev(), meta.ino()),
+        next,
+        previous: own,
+        attempts: 1,
+        deadline: 0,
+        confirmed: false,
+    };
+    Ok((trial, binary))
 }
 
 /// Record that the update `command`, to `version` hashing to `sha256`, failed with `why`. A
@@ -718,6 +760,35 @@ mod tests {
             deadline,
             confirmed: false,
         }
+    }
+
+    /// Copy `from` into the releases, replacing a mismatched copy, only if its sha256 matches.
+    #[test]
+    fn a_release_held_is_copied_into_the_releases() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("stage-file");
+        let releases = releases_dir(&dir);
+        std::fs::set_permissions(&releases, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let from = dir.join("held");
+        std::fs::write(&from, b"not a release").unwrap();
+        let sha256 = crate::update::hash_file(&from).unwrap();
+        let next = releases.join(&sha256);
+        let refused = |sha256: &str| {
+            stage_file::<Fake>(&dir, &from, sha256, "c1", "9.9.9", None)
+                .err()
+                .expect("refused")
+        };
+        std::fs::write(&next, b"corrupt").unwrap();
+        // Copied, then rejected: it cannot run as vk-peer.
+        let e = refused(&sha256);
+        assert!(!format!("{e:#}").contains("hashes to"), "{e:#}");
+        assert_eq!(std::fs::read(&next).unwrap(), b"not a release", "{e:#}");
+        let e = refused(&"0".repeat(64));
+        assert!(format!("{e:#}").contains("not 0000"), "{e:#}");
+        assert_eq!(kept(&dir), vec![std::ffi::OsString::from(&sha256)]);
+        let e = refused("../x");
+        assert!(format!("{e:#}").contains("not a sha256"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn kept(dir: &Path) -> Vec<std::ffi::OsString> {
