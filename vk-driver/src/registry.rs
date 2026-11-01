@@ -2252,7 +2252,7 @@ async fn pull_blob_to_file(
 
 /// [`pull_blob_to_file`] into `file`, already open: each attempt truncates and rewinds it,
 /// so the file is never reopened by path.
-async fn pull_blob_into(
+pub(crate) async fn pull_blob_into(
     client: &oci_client::Client,
     image: &OciReference,
     layer: &OciDescriptor,
@@ -2287,13 +2287,13 @@ fn check_blob_size(layer: &OciDescriptor, max: u64) -> Result<()> {
 /// An `AsyncWrite` that fails once more than `max` bytes are written to it: what keeps a
 /// blob that streams past its declared size from growing without bound before its digest
 /// can be checked.
-pub(crate) struct Capped<W> {
+struct Capped<W> {
     inner: W,
     left: u64,
 }
 
 impl<W> Capped<W> {
-    pub(crate) fn new(inner: W, max: u64) -> Self {
+    fn new(inner: W, max: u64) -> Self {
         Capped { inner, left: max }
     }
 }
@@ -2871,6 +2871,35 @@ async fn authenticate(
         }
     }
     Ok(())
+}
+
+/// Pull `image`'s manifest with transport retries, authenticating first to retry a token
+/// registry's probe. oci-client drops a failed probe and sends the request anonymously,
+/// which the registry answers 401.
+pub(crate) async fn pull_image_manifest(
+    client: &oci_client::Client,
+    image: &OciReference,
+    auth: &RegistryAuth,
+) -> oci_client::errors::Result<(OciImageManifest, String)> {
+    authenticate(client, image, auth, &[RegistryOperation::Pull]).await?;
+    with_transfer_retry(&format!("pulling the manifest of {image}"), || {
+        client.pull_image_manifest(image, auth)
+    })
+    .await
+}
+
+/// [`pull_image_manifest`] with the image's config: the manifest, its digest and the config
+/// JSON.
+pub(crate) async fn pull_manifest_and_config(
+    client: &oci_client::Client,
+    image: &OciReference,
+    auth: &RegistryAuth,
+) -> oci_client::errors::Result<(OciImageManifest, String, String)> {
+    authenticate(client, image, auth, &[RegistryOperation::Pull]).await?;
+    with_transfer_retry(&format!("pulling the config of {image}"), || {
+        client.pull_manifest_and_config(image, auth)
+    })
+    .await
 }
 
 /// Check blob existence with transport retries.

@@ -381,11 +381,10 @@ pub async fn pull_config(reference: &str, creds: &Creds) -> Result<ImageConfig> 
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
-    let (_manifest, _digest, config_json) = creds
-        .client()
-        .pull_manifest_and_config(&parsed, &creds.auth())
-        .await
-        .with_context(|| format!("pulling the config of {reference}"))?;
+    let (_manifest, _digest, config_json) =
+        crate::registry::pull_manifest_and_config(&creds.client(), &parsed, &creds.auth())
+            .await
+            .with_context(|| format!("pulling the config of {reference}"))?;
     write_cached_config(reference, &config_json);
     Ok(parse_config(&config_json))
 }
@@ -523,8 +522,7 @@ pub(crate) async fn pull_merged(
         manifest::IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     ];
     note(&format!("virtkit: pulling OCI image {reference} ..."));
-    let (manifest, _digest) = client
-        .pull_image_manifest(&reference, &auth)
+    let (manifest, _digest) = crate::registry::pull_image_manifest(&client, &reference, &auth)
         .await
         .with_context(|| format!("pulling the manifest of {reference}"))?;
     if let Some(layer) = manifest
@@ -563,19 +561,9 @@ pub(crate) async fn pull_merged(
                 let size = u64::try_from(layer.size).with_context(|| {
                     format!("layer {} declares {} bytes", layer.digest, layer.size)
                 })?;
-                let mut out = crate::registry::Capped::new(
-                    tokio::fs::File::from_std(
-                        spill
-                            .file
-                            .try_clone()
-                            .context("cloning a layer's scratch file")?,
-                    ),
-                    size,
-                );
-                client
-                    .pull_blob(&reference, &layer, &mut out)
+                crate::registry::pull_blob_into(&client, &reference, &layer, &spill.file, size)
                     .await
-                    .with_context(|| format!("pulling layer {} of {reference}", layer.digest))?;
+                    .with_context(|| format!("pulling {reference}"))?;
                 Ok::<_, anyhow::Error>((spill.file, layer.media_type))
             }))
         })
@@ -1215,5 +1203,139 @@ mod tests {
             vec![("security.capability".to_string(), cap)],
             "security.capability must survive the flatten"
         );
+    }
+
+    /// Simulate a registry restart by cutting the manifest body, then a layer body, halfway.
+    /// The image still pulls: both requests are retried, and the layer restarts from the
+    /// beginning.
+    #[tokio::test]
+    async fn a_pull_rides_out_a_registry_cutting_its_connections() {
+        use sha2::{Digest, Sha256};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut layer = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(5);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        layer.append_data(&mut h, "hello", &b"world"[..]).unwrap();
+        let layer = layer.into_inner().unwrap();
+        let digest: String = Sha256::digest(&layer)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let digest = format!("sha256:{digest}");
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "0".repeat(64)),
+                "size": 2,
+            },
+            "layers": [{
+                "mediaType": manifest::IMAGE_LAYER_MEDIA_TYPE,
+                "digest": digest,
+                "size": layer.len(),
+            }],
+        })
+        .to_string();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = served.clone();
+        std::thread::spawn(move || {
+            let (mut manifests, mut blobs) = (0, 0);
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                // A client that connects and sends nothing fails the test, not hangs it.
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                log.lock().unwrap().push(path.clone());
+                let reply = |ty: &str, len: usize, body: &[u8]| {
+                    let mut r = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {len}\r\n\
+                         Connection: close\r\n\r\n"
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(body);
+                    r
+                };
+                let out = if path.contains("/manifests/") {
+                    manifests += 1;
+                    let sent = if manifests == 1 {
+                        manifest.len() / 2
+                    } else {
+                        manifest.len()
+                    };
+                    reply(
+                        "application/vnd.oci.image.manifest.v1+json",
+                        manifest.len(),
+                        &manifest.as_bytes()[..sent],
+                    )
+                } else if path.contains("/blobs/") {
+                    blobs += 1;
+                    let sent = if blobs == 1 {
+                        layer.len() / 2
+                    } else {
+                        layer.len()
+                    };
+                    reply("application/octet-stream", layer.len(), &layer[..sent])
+                } else {
+                    reply("application/json", 2, b"{}")
+                };
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            }
+        });
+
+        let dir = creds_dir("pull-retry");
+        let creds = Creds {
+            insecure: true,
+            ..Creds::default()
+        };
+        let out = dir.join("rootfs.tar");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            pull_flatten(&format!("{addr}/img:latest"), &creds, &out, &|_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut tar = tar::Archive::new(std::fs::File::open(&out).unwrap());
+        let mut found = false;
+        for e in tar.entries().unwrap() {
+            let mut e = e.unwrap();
+            if e.path().unwrap().to_str() == Some("hello") {
+                let mut got = String::new();
+                e.read_to_string(&mut got).unwrap();
+                assert_eq!(got, "world");
+                found = true;
+            }
+        }
+        assert!(found);
+        let served = served.lock().unwrap().clone();
+        let count = |what: &str| served.iter().filter(|p| p.contains(what)).count();
+        assert_eq!(
+            (count("/manifests/"), count("/blobs/")),
+            (2, 2),
+            "{served:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

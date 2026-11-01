@@ -67,6 +67,8 @@ All notable changes to virtkit will be documented in this file.
   over 14 seconds. A registry that cannot be reached is waited for once: for a minute
   afterwards, a build's further requests to it that cannot connect fail at once, so the build
   falls back to building locally sooner.
+- **Pulling an OCI image rides out a registry restart.** Image and config downloads retry
+  refused or cut connections rather than failing.
 
 ## [0.101.0] - 2026-11-01
 
