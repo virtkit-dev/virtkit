@@ -2387,15 +2387,13 @@ fn chunk_bytes(
     Ok((offset, raw))
 }
 
-/// Maximum [`Retry::Transport`] attempts, including the first.
-const TRANSFER_ATTEMPTS: u32 = 4;
-
 /// How a failed registry request is retried; see [`with_transfer_retry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Retry {
     /// A registry answer, or a request that cannot succeed as sent: returned at once.
     Never,
-    /// Lost in transit: retried until [`TRANSFER_ATTEMPTS`] were made.
+    /// Lost in transit, or the registry not reached: retried until
+    /// [`Backoff::transport_budget`].
     Transport,
     /// The registry turning the request away for want of room — a 503 or a 429, or a
     /// connection it closed or reset before answering — retried until [`Backoff::budget`].
@@ -2404,21 +2402,37 @@ enum Retry {
 
 /// The delays between attempts.
 struct Backoff {
-    /// Initial [`Retry::Transport`] delay, doubled after each retry.
+    /// Initial [`Retry::Transport`] delay, doubled after each retry up to `cap`, sampled
+    /// from its upper half as `pressure` is.
     transport: Duration,
+    /// Time budget for [`Retry::Transport`] retries, from the start of the first failed
+    /// attempt, or from the failure of one that connected and ran longer than `long` — a
+    /// transfer that streamed a while before it was cut: the first, or up to
+    /// [`LONG_RESTARTS`] later ones.
+    transport_budget: Duration,
+    /// How long an attempt that connected must run for its failure to restart
+    /// `transport_budget`.
+    long: Duration,
     /// Initial [`Retry::Pressure`] delay, doubled after each retry up to `cap`.
     /// Sample its upper half so rejected processes do not all retry together.
     pressure: Duration,
     cap: Duration,
-    /// Time budget from the first attempt for [`Retry::Pressure`] retries.
+    /// Time budget for [`Retry::Pressure`] retries, from the first rejected attempt.
+    /// Its clock is separate from `transport_budget`, so mixed failures can consume both.
     budget: Duration,
 }
 
-/// 2 s, 4 s, 8 s in transit. A registry turning connections away is waited out for up
-/// to three minutes: it sheds load in bursts, as the jobs on a host start their pulls
-/// together, and a pull that gives up fails the CI job that wanted it. The first delay
-/// matches the `Retry-After: 2` vk-registry sends with its 503; the header itself is not
-/// read.
+/// Limit on restarting [`Backoff::transport_budget`] after long attempts: tolerate a few
+/// registry restarts during a long transfer without retrying repeated timeouts forever.
+const LONG_RESTARTS: u32 = 3;
+
+/// 1-2 s, 2-4 s, 4-8 s … up to 10-20 s in transit, for up to 90 s: long enough for a
+/// registry restarting — refusing connections, or cutting those open — to come back. A
+/// registry turning connections away is waited out for up to three minutes: it sheds load
+/// in bursts, as the jobs on a host start their pulls together, and a pull that gives up
+/// fails the CI job that wanted it. The first delay matches the `Retry-After: 2` vk-registry
+/// sends with its 503 (its `Retry-After: 1` while handing over to a release is back-pressure
+/// too); the header itself is not read.
 ///
 /// Waiting is the whole of the client's part. Both sides speak HTTP/1.1 only (this reqwest
 /// is built without h2, and vk-registry offers only `http/1.1`), so each request in flight
@@ -2427,10 +2441,45 @@ struct Backoff {
 /// kept-alive connections the registry counts too, which a slot per request does not see.
 const TRANSFER_BACKOFF: Backoff = Backoff {
     transport: Duration::from_secs(2),
+    transport_budget: Duration::from_secs(90),
+    long: Duration::from_secs(20),
     pressure: Duration::from_secs(2),
     cap: Duration::from_secs(20),
     budget: Duration::from_secs(180),
 };
+
+/// How long a registry is marked down after spending [`Backoff::transport_budget`] without
+/// connecting. Further connection failures return without retrying, so a build with an
+/// unreachable cache registry falls back to building locally after one budget rather than
+/// one per cache check. Accepted connections closed unanswered are back-pressure and never
+/// mark the registry down.
+const DOWN_FOR: Duration = Duration::from_secs(60);
+
+/// Registries marked down, keyed by `scheme://host:port`, with the time each was marked.
+static DOWN: std::sync::Mutex<BTreeMap<String, std::time::Instant>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// How long ago `authority` was taken for down, if within [`DOWN_FOR`].
+fn down_since(authority: &str) -> Option<Duration> {
+    let down = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    down.get(authority)
+        .map(|t| t.elapsed())
+        .filter(|ago| *ago < DOWN_FOR)
+}
+
+/// Clear `authority`'s down state after a response or a failure on a connected request.
+fn mark_up(authority: &str) {
+    DOWN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(authority);
+}
+
+/// Take `authority` for down from now, forgetting those that expired.
+fn mark_down(authority: String) {
+    let mut down = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    down.retain(|_, t| t.elapsed() < DOWN_FOR);
+    down.insert(authority, std::time::Instant::now());
+}
 
 /// Retry a registry request on transport failures and on the registry's back-pressure.
 ///
@@ -2443,7 +2492,8 @@ const TRANSFER_BACKOFF: Backoff = Backoff {
 /// kernel abort the socket mid-body, which a fresh connection a moment later serves fine.
 /// A registry turning requests away — answering 503 or 429, as vk-registry does past its
 /// per-client connection cap, or closing new connections — is retried for longer (see
-/// [`TRANSFER_BACKOFF`]). Any other registry *answer* — not found, unauthorized, a digest
+/// [`TRANSFER_BACKOFF`]). A registry not reached for a whole budget is not waited for again
+/// for [`DOWN_FOR`]. Any other registry *answer* — not found, unauthorized, a digest
 /// that does not match — comes back at once: repeating it would only hide it for a few
 /// seconds.
 async fn with_transfer_retry<T, E, F, Fut>(what: &str, attempt: F) -> std::result::Result<T, E>
@@ -2466,32 +2516,105 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, E>>,
 {
-    let start = tokio::time::Instant::now();
-    let (mut attempts, mut pause) = (1, backoff.transport);
+    use tokio::time::Instant;
+    // When each kind of failure started being retried; `failing` restarts after a long
+    // attempt, `first_failure` does not.
+    let (mut failing, mut turned_away) = (None::<Instant>, None::<Instant>);
+    let mut first_failure = None::<Instant>;
+    // Whether an attempt connected, and where the request went, known from a failure.
+    let mut reached = false;
+    let mut went = None::<String>;
+    let mut restarts = 0;
+    let mut pause = backoff.transport;
     let mut pressure = backoff.pressure;
     let mut waiting = false;
     loop {
+        let began = Instant::now();
         let e = match attempt().await {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                if let Some(a) = &went {
+                    mark_up(a);
+                }
+                return Ok(v);
+            }
             Err(e) => e,
         };
+        let authority = e.authority();
+        if went.is_none() {
+            went.clone_from(&authority);
+        }
         match e.retry() {
-            Retry::Transport if attempts < TRANSFER_ATTEMPTS => {
-                eprintln!(
-                    "virtkit: registry: {what}: {e:#}; retrying in {}s ({attempts}/{})",
-                    pause.as_secs(),
-                    TRANSFER_ATTEMPTS - 1
-                );
-                tokio::time::sleep(pause).await;
-                pause *= 2;
-                attempts += 1;
+            Retry::Transport => {
+                let first = *first_failure.get_or_insert(began);
+                reached |= e.connected();
+                if e.connected()
+                    && let Some(a) = &authority
+                {
+                    mark_up(a);
+                }
+                if failing.is_none()
+                    && !e.connected()
+                    && let Some(a) = &authority
+                    && let Some(ago) = down_since(a)
+                {
+                    eprintln!(
+                        "virtkit: registry: {what}: {e:#}; {a} was found unreachable {}s ago, \
+                         not retrying",
+                        ago.as_secs()
+                    );
+                    return Err(e);
+                }
+                let ran_long = e.connected() && began.elapsed() > backoff.long;
+                // A long connected attempt gets a fresh budget on failure. The first such
+                // failure starts the budget without counting as a restart.
+                let restart = failing.is_some() && ran_long && restarts < LONG_RESTARTS;
+                if restart {
+                    (restarts, pause) = (restarts + 1, backoff.transport);
+                }
+                let since = match failing {
+                    Some(since) if !restart => since,
+                    _ => {
+                        let since = if ran_long { Instant::now() } else { began };
+                        failing = Some(since);
+                        let cut = if ran_long {
+                            format!(" after {}s", began.elapsed().as_secs())
+                        } else {
+                            String::new()
+                        };
+                        eprintln!(
+                            "virtkit: registry: {what}: {e:#}{cut}; retrying with backoff for up \
+                             to {}s",
+                            backoff.transport_budget.as_secs()
+                        );
+                        since
+                    }
+                };
+                let delay = jitter(pause);
+                if since.elapsed() + delay > backoff.transport_budget {
+                    eprintln!(
+                        "virtkit: registry: {what}: still failing after {}s: {e:#}",
+                        first.elapsed().as_secs()
+                    );
+                    if !reached && let Some(a) = authority {
+                        mark_down(a);
+                    }
+                    return Err(e);
+                }
+                tokio::time::sleep(delay).await;
+                pause = (pause * 2).min(backoff.cap);
             }
             Retry::Pressure => {
+                // Turned away is answered: the registry is up.
+                reached = true;
+                if let Some(a) = &authority {
+                    mark_up(a);
+                }
+                let since = *turned_away.get_or_insert(began);
                 let delay = jitter(pressure);
-                if start.elapsed() + delay > backoff.budget {
+                if since.elapsed() + delay > backoff.budget {
                     eprintln!(
                         "virtkit: registry: {what}: still turned away after {}s: {e:#}",
-                        start.elapsed().as_secs()
+                        since.elapsed().as_secs()
                     );
                     return Err(e);
                 }
@@ -2559,6 +2682,29 @@ fn turned_away(resp: reqwest::Response) -> reqwest::Result<reqwest::Response> {
 trait Transport {
     fn retry(&self) -> Retry;
 
+    /// The reqwest error under this one, if any.
+    fn reqwest(&self) -> Option<&reqwest::Error> {
+        None
+    }
+
+    /// Whether the failed attempt had connected: false for a connection not made, and for
+    /// a failure that does not say. A total timeout that fires while connecting reads as
+    /// connected.
+    fn connected(&self) -> bool {
+        self.reqwest().is_some_and(|e| !e.is_connect())
+    }
+
+    /// The `scheme://host:port` the failed request went to, when the failure says.
+    fn authority(&self) -> Option<String> {
+        let url = self.reqwest()?.url()?;
+        Some(format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str()?,
+            url.port_or_known_default()?
+        ))
+    }
+
     /// Whether the failure is retried at all.
     fn retried(&self) -> bool {
         self.retry() != Retry::Never
@@ -2580,6 +2726,10 @@ trait Transport {
 ///
 /// A certificate the TLS client rejects is final: the next attempt is presented the same one.
 impl Transport for reqwest::Error {
+    fn reqwest(&self) -> Option<&reqwest::Error> {
+        Some(self)
+    }
+
     fn retry(&self) -> Retry {
         use std::io::ErrorKind;
         if let Some(status) = self.status() {
@@ -2645,6 +2795,13 @@ impl Transport for reqwest::Error {
 }
 
 impl Transport for OciDistributionError {
+    fn reqwest(&self) -> Option<&reqwest::Error> {
+        match self {
+            OciDistributionError::RequestError(e) => Some(e),
+            _ => None,
+        }
+    }
+
     fn retry(&self) -> Retry {
         match self {
             OciDistributionError::RequestError(e) => e.retry(),
@@ -2665,6 +2822,14 @@ impl Transport for OciDistributionError {
 /// Transparent-zstd pushes wrap reqwest errors in context. Also check OCI errors:
 /// their transparent `RequestError` wrapper omits reqwest's node from the source chain.
 impl Transport for anyhow::Error {
+    fn reqwest(&self) -> Option<&reqwest::Error> {
+        self.chain().find_map(|e| {
+            e.downcast_ref::<OciDistributionError>()
+                .and_then(Transport::reqwest)
+                .or_else(|| e.downcast_ref::<reqwest::Error>())
+        })
+    }
+
     fn retry(&self) -> Retry {
         self.chain()
             .map(|e| {
@@ -4502,13 +4667,15 @@ pub(crate) mod tests {
 
     /// Delays short enough for a test.
     const TEST_BACKOFF: Backoff = Backoff {
-        transport: Duration::ZERO,
+        transport: Duration::from_millis(2),
+        transport_budget: Duration::from_secs(1),
+        long: Duration::from_millis(4),
         pressure: Duration::from_millis(1),
         cap: Duration::from_millis(4),
         budget: Duration::from_millis(500),
     };
 
-    /// Retry transport failures up to `TRANSFER_ATTEMPTS`; registry errors are final.
+    /// Retry transport failures for their budget; registry errors are final.
     #[test]
     fn transfer_retry_repeats_transport_failures_only() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -4530,8 +4697,9 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(got, 3);
 
-            // Return the last error after TRANSFER_ATTEMPTS failures.
+            // Return the last error once the budget is spent.
             calls.store(0, Ordering::Relaxed);
+            let start = std::time::Instant::now();
             let err = retry_transfer("probe", &TEST_BACKOFF, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async { Err::<(), _>(lost().await) }
@@ -4539,7 +4707,15 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
             assert_eq!(err.retry(), Retry::Transport);
-            assert_eq!(calls.load(Ordering::Relaxed), TRANSFER_ATTEMPTS);
+            // Clear the down state so a concurrent test's `refused()` can reuse this
+            // ephemeral port without failing at once.
+            mark_up(&err.authority().unwrap());
+            assert!(calls.load(Ordering::Relaxed) > 1);
+            assert!(
+                start.elapsed() > TEST_BACKOFF.transport_budget - TEST_BACKOFF.cap,
+                "{:?}",
+                start.elapsed()
+            );
 
             // A registry answer is final on the first attempt.
             calls.store(0, Ordering::Relaxed);
@@ -4561,8 +4737,161 @@ pub(crate) mod tests {
         });
     }
 
-    /// Back-pressure is retried past `TRANSFER_ATTEMPTS`, until the budget is spent and no
-    /// longer.
+    /// After a registry stays unreachable for a whole budget, further requests temporarily
+    /// stop at their first failure. Requests to other registries still retry.
+    #[test]
+    fn a_registry_not_reached_is_not_waited_for_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        install_crypto();
+        // A port held by a live connection, which no listener can bind while it lasts.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let url = format!("http://{}/v2/", held.local_addr().unwrap());
+        block_on(async {
+            let calls = AtomicU32::new(0);
+            let fail = || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let url = &url;
+                async move { Err::<(), _>(reqwest::get(url).await.unwrap_err()) }
+            };
+            let err = retry_transfer("probe", &TEST_BACKOFF, fail)
+                .await
+                .unwrap_err();
+            assert!(!err.connected(), "{err:#}");
+            assert!(calls.load(Ordering::Relaxed) > 1);
+            assert!(down_since(&err.authority().unwrap()).is_some(), "{err:#}");
+
+            calls.store(0, Ordering::Relaxed);
+            retry_transfer("probe", &TEST_BACKOFF, fail)
+                .await
+                .unwrap_err();
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+            // Wrapped as the callers wrap it, it names the same registry.
+            let err = OciDistributionError::RequestError(reqwest::get(&url).await.unwrap_err());
+            assert_eq!(
+                err.authority(),
+                Some(format!("http://{}", held.local_addr().unwrap()))
+            );
+            let err = anyhow::Error::new(err).context("pulling");
+            assert!(err.authority().is_some_and(|a| down_since(&a).is_some()));
+
+            // Another registry is retried still.
+            calls.store(0, Ordering::Relaxed);
+            let other = retry_transfer("probe", &TEST_BACKOFF, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Err::<(), _>(refused().await) }
+            })
+            .await
+            .unwrap_err();
+            assert!(calls.load(Ordering::Relaxed) > 1);
+            mark_up(&other.authority().unwrap());
+
+            // A connection made to it again forgets it was down.
+            let authority = err.authority().unwrap();
+            mark_up(&authority);
+            assert!(down_since(&authority).is_none());
+        });
+        drop((held, listener));
+    }
+
+    /// A registry lost to transport failures — restarting, refusing connections then cutting
+    /// those it took — is retried for 90 s, the delays growing to 20 s, and no longer.
+    #[tokio::test(start_paused = true)]
+    async fn transport_failures_are_retried_for_their_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        /// A failure in transit, on a connection made (`Lost(true)`) or not.
+        #[derive(Debug)]
+        struct Lost(bool);
+        impl std::fmt::Display for Lost {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("connection lost")
+            }
+        }
+        impl Transport for Lost {
+            fn retry(&self) -> Retry {
+                Retry::Transport
+            }
+            fn connected(&self) -> bool {
+                self.0
+            }
+        }
+        let backoff = &TRANSFER_BACKOFF;
+        // A minute down, then back.
+        let start = tokio::time::Instant::now();
+        let got = retry_transfer("probe", backoff, || async move {
+            if start.elapsed() < Duration::from_secs(60) {
+                Err(Lost(false))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(got.is_ok());
+
+        let calls = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        retry_transfer("probe", backoff, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async { Err::<(), _>(Lost(false)) }
+        })
+        .await
+        .unwrap_err();
+        let took = start.elapsed();
+        assert!(
+            took > backoff.transport_budget - backoff.cap
+                && took <= backoff.transport_budget + Duration::from_millis(1),
+            "{took:?}"
+        );
+        // Delays of 1-2, 2-4, 4-8 and 8-16 s, then 10-20 s.
+        let n = calls.load(Ordering::Relaxed);
+        assert!((5..=12).contains(&n), "{n} attempts in {took:?}");
+
+        // A transfer cut after streaming for longer than the budget is still retried.
+        calls.store(0, Ordering::Relaxed);
+        let got = retry_transfer("probe", backoff, || {
+            let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+            async move {
+                if n == 1 {
+                    tokio::time::sleep(Duration::from_secs(100)).await;
+                    Err(Lost(true))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(got.ok(), Some(2));
+
+        // Repeated long failures are bounded: the first starts the budget, the next
+        // LONG_RESTARTS restart it, and the following failure exhausts it.
+        calls.store(0, Ordering::Relaxed);
+        retry_transfer("probe", backoff, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                Err::<(), _>(Lost(true))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::Relaxed), LONG_RESTARTS + 2);
+
+        // A slow failed connection attempt is not an interrupted transfer and resets no budget.
+        calls.store(0, Ordering::Relaxed);
+        retry_transfer("probe", backoff, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                Err::<(), _>(Lost(false))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// Back-pressure is retried until the budget is spent and no longer.
     #[tokio::test(start_paused = true)]
     async fn back_pressure_is_retried_for_the_budget() {
         use std::sync::atomic::{AtomicU32, Ordering};

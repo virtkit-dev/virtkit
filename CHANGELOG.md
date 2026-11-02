@@ -62,6 +62,11 @@ All notable changes to virtkit will be documented in this file.
 - **A registry certificate that fails verification is reported at once.** A pull or push no
   longer retries it three times over 14 seconds first; this includes a certificate expired or
   not yet valid by the host's clock.
+- **Registry transfers ride out a registry update or restart.** A pull or push whose registry
+  refuses connections or cuts them is retried for up to 90 seconds, rather than three times
+  over 14 seconds. A registry that cannot be reached is waited for once: for a minute
+  afterwards, a build's further requests to it that cannot connect fail at once, so the build
+  falls back to building locally sooner.
 
 ## [0.101.0] - 2026-11-01
 
