@@ -11,8 +11,8 @@ use crate::dev::plan::{Plan, Source};
 use super::boot::{alias, worktree_git_dir};
 use super::hooks::{check_requirements, stamped};
 use super::identity::{
-    LeftBehind, NotReady, VmTie, applied_on_attach, drift, generation_of, identity_of, left_behind,
-    read_identity, read_not_ready, root_identity, same_config, wrapper_digest,
+    Config, LeftBehind, NotReady, VmTie, applied_on_attach, drift, generation_of, identity_of,
+    left_behind, read_identity, read_not_ready, root_identity, same_config, wrapper_digest,
 };
 use super::session::running_vm;
 
@@ -79,15 +79,10 @@ pub enum NotReadyState {
     Abandoned { reason: String, drifted: bool },
 }
 
-/// Interpret `left` for `running` and the current `digest`/`manifest`, as a joiner does.
-/// Return `None` for another VM's marker, or one with neither a readier nor a failure.
-fn not_ready_state(
-    left: &NotReady,
-    running: VmTie,
-    digest: &str,
-    manifest: &serde_json::Value,
-) -> Option<NotReadyState> {
-    let how = left_behind(left, Some(running), digest, manifest)?;
+/// Interpret `left` for `running` and the `current` config, as a joiner does. Return `None`
+/// for another VM's marker, or one with neither a readier nor a failure.
+fn not_ready_state(left: &NotReady, running: VmTie, current: &Config) -> Option<NotReadyState> {
+    let how = left_behind(left, Some(running), current)?;
     match (left.abandoned(), left.readier) {
         (true, _) => Some(NotReadyState::Abandoned {
             reason: left.reason().to_string(),
@@ -117,14 +112,14 @@ pub struct Published {
 }
 
 pub fn status(plan: &Plan) -> Result<Status> {
-    let (current_digest, manifest) = identity_of(plan, wrapper_digest(plan).as_deref())?;
+    let current = identity_of(plan, wrapper_digest(plan).as_deref())?;
     let vm = running_vm(plan);
     let recorded = vm.as_ref().and_then(|_| read_identity(plan));
     // Without an identity, a marker naming this VM distinguishes a boot in progress
     // from one left not ready.
     let left = match (&vm, &recorded) {
         (Some(vm), None) => read_not_ready(plan).and_then(|left| {
-            let state = not_ready_state(&left, VmTie::of(vm), &current_digest, &manifest)?;
+            let state = not_ready_state(&left, VmTie::of(vm), &current)?;
             Some((left, state))
         }),
         _ => None,
@@ -137,11 +132,9 @@ pub fn status(plan: &Plan) -> Result<Status> {
             .as_ref()
             .map(|(left, _)| (&left.digest, &left.manifest)));
     let config_state = vm.as_ref().map(|_| match booted {
-        Some((digest, booted)) if same_config(digest, booted, &current_digest, &manifest) => {
-            ConfigState::Matches
-        }
+        Some((digest, booted)) if same_config(digest, booted, &current) => ConfigState::Matches,
         // What `up` applies to a running environment is not drift worth a restart.
-        Some((_, booted)) if applied_on_attach(&drift(booted, &manifest)) => {
+        Some((_, booted)) if applied_on_attach(&drift(booted, current.as_recorded(booted).1)) => {
             ConfigState::SessionOnly
         }
         Some(_) => ConfigState::Drifted,
@@ -193,7 +186,7 @@ pub fn status(plan: &Plan) -> Result<Status> {
             .map(|id| id.created_by.clone())
             .filter(|v| !v.is_empty()),
         booted_digest,
-        current_digest,
+        current_digest: current.digest.clone(),
         generation,
         create_hook_pending,
         image,
@@ -602,7 +595,9 @@ mod tests {
     fn a_marker_reads_as_a_joiner_reads_it() {
         let t = scratch("not-ready-state");
         let plan = plan_in(&t.0);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
         let vm = VmTie {
             pid: 41,
             created_secs: 7,
@@ -616,7 +611,7 @@ mod tests {
             readier,
             why: why.into(),
         };
-        let state = |left: &NotReady| not_ready_state(left, vm, &digest, &manifest);
+        let state = |left: &NotReady| not_ready_state(left, vm, &config);
         let abandoned = |reason: &str, drifted| {
             Some(NotReadyState::Abandoned {
                 reason: reason.into(),
@@ -643,10 +638,7 @@ mod tests {
         assert_eq!(state(&left(None, "")), None);
         // Another VM's marker describes nothing up.
         let other = VmTie { pid: 42, ..vm };
-        assert_eq!(
-            not_ready_state(&left(None, "x"), other, &digest, &manifest),
-            None
-        );
+        assert_eq!(not_ready_state(&left(None, "x"), other, &config), None);
         // Booted from another configuration: the freshness policy's to decide.
         let drifted = NotReady {
             digest: "a".repeat(64),
@@ -731,7 +723,9 @@ mod tests {
         };
         let plan = plan_in(&tmp);
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let (digest, manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
         let mut left = NotReady {
             vm: VmTie::of(&running_vm(&plan).unwrap()),
             digest: digest.clone(),
@@ -789,7 +783,9 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, "services:\n  devcontainer:\n    image: debian\n").unwrap();
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let (_, mut manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        let mut manifest = identity_of(&plan, wrapper_digest(&plan).as_deref())
+            .unwrap()
+            .manifest;
         manifest.as_object_mut().unwrap().remove("compose");
         let digest = crate::dev::identity::digest_of(&manifest).unwrap();
         let identity = crate::dev::Identity {

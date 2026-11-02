@@ -112,7 +112,9 @@ struct Readying {
 /// than take over a readying still under way.
 fn begin_readying(plan: &Plan) -> Result<Readying> {
     let booted = running_vm(plan).map(|vm| VmTie::of(&vm));
-    let (digest, manifest) = booted_identity_of(plan)?;
+    let super::identity::Config {
+        digest, manifest, ..
+    } = booted_identity_of(plan)?;
     let mut readying = Readying {
         booted,
         booted_secs: crate::vms::unix_now(),
@@ -966,7 +968,9 @@ fn vm_at(state_dir: &Path) -> Option<crate::vms::VmEntry> {
 mod tests {
     use super::*;
     use crate::dev::boot::ensure_state_dir;
-    use crate::dev::identity::{COMPOSE_SNAPSHOT, identity_of, mark_not_ready, read_not_ready};
+    use crate::dev::identity::{
+        COMPOSE_SNAPSHOT, Config, identity_of, mark_not_ready, read_not_ready,
+    };
     use crate::dev::plan::EnvVar;
     use crate::dev::testutil::{env_guard, plan_in, scratch};
 
@@ -1064,7 +1068,9 @@ mod tests {
             pid: 41,
             created_secs: 7,
         };
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, None).unwrap();
         let readying = |booted, booted_secs| Readying {
             booted,
             digest: digest.clone(),
@@ -1168,7 +1174,9 @@ mod tests {
             pid: 41,
             created_secs: 7,
         };
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, None).unwrap();
         let path = plan.state_dir.join(crate::dev::plan::EGRESS_FILE);
         let file = |names: &[&str]| crate::switch::EgressFile {
             allow_ip: vec![],
@@ -1239,7 +1247,7 @@ mod tests {
         let recorded: crate::dev::Identity =
             serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
         assert_eq!(recorded.created_by, own_version());
-        let (digest, _) = identity_of(&plan, None).unwrap();
+        let digest = identity_of(&plan, None).unwrap().digest;
         assert_eq!(recorded.digest, digest);
 
         // And the note is not re-read: a second attach leaves that identity in place.
@@ -1362,7 +1370,9 @@ mod tests {
         let mut plan = plan_in(&tmp);
         plan.unresolved = vec!["${localEnv:TOKEN} is not set".into()];
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, None).unwrap();
         mark_not_ready(
             &plan,
             &NotReady {
@@ -1530,8 +1540,8 @@ mod tests {
             allow_name: vec!["debian.org".into()],
             allow_ip: vec![],
         });
-        let (_, restricted) = identity_of(&held, None).unwrap();
-        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        let restricted = identity_of(&held, None).unwrap().manifest;
+        let unrestricted = identity_of(&open, None).unwrap().manifest;
         let path = open.state_dir.join(crate::dev::plan::EGRESS_FILE);
         let file = |names: &[&str]| crate::switch::EgressFile {
             allow_ip: vec![],

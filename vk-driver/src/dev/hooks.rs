@@ -369,7 +369,7 @@ mod tests {
         let mut plan = plan;
         plan.managed_dirs = vec![plan.state_dir.join("store")];
         ensure_state_dir(&plan).unwrap();
-        let (digest, _) = identity_of(&plan, None).unwrap();
+        let digest = identity_of(&plan, None).unwrap().digest;
         stamp(&plan, "create", &digest).unwrap();
         assert!(!stamped(
             &plan,

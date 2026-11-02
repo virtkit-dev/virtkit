@@ -12,7 +12,7 @@ use crate::dev::plan::{Plan, Source};
 
 use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
-    COMPOSE_SNAPSHOT, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
+    COMPOSE_SNAPSHOT, Config, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
     clear_not_ready, drift, identity_of, identity_path, left_behind, live_identity,
     note_older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
 };
@@ -667,10 +667,10 @@ fn after_takeover(joined: Joined, wanted: Wanted<'_>) -> Result<Transition> {
     Ok(match joined {
         Joined::Ready { identity, .. } => match serves(&identity, wanted) {
             Serves::Same | Serves::OnAttach => Transition::Reused,
-            Serves::NeedsRestart => bail!("{}", readied_elsewhere(&identity, wanted.digest)),
+            Serves::NeedsRestart => bail!("{}", readied_elsewhere(&identity, &wanted.digest)),
         },
         Joined::Claimed => Transition::Booted,
-        Joined::Drifted(left) => bail!("{}", refused(&left, wanted.digest)),
+        Joined::Drifted(left) => bail!("{}", refused(&left, &wanted.digest)),
         // `restart` is false in `swap`, so neither call there returns this.
         Joined::Restart(_) => bail!(
             "the environment the boot that took over left needs a restart — re-run \
@@ -712,7 +712,7 @@ enum Joined {
 fn not_ready_here(plan: &Plan, wanted: Wanted<'_>) -> Option<(NotReady, LeftBehind)> {
     let left = read_not_ready(plan).filter(NotReady::abandoned)?;
     let running = running_vm(plan).map(|vm| VmTie::of(&vm));
-    let how = left_behind(&left, running, wanted.digest, wanted.manifest)?;
+    let how = left_behind(&left, running, wanted)?;
     Some((left, how))
 }
 
@@ -721,7 +721,7 @@ fn not_ready_here(plan: &Plan, wanted: Wanted<'_>) -> Option<(NotReady, LeftBehi
 fn claim(plan: &Plan, parent_pid: u32, wanted: Wanted<'_>) -> bool {
     let Some(left) = claim_not_ready(plan, parent_pid, |left| {
         let running = running_vm(plan).map(|vm| VmTie::of(&vm));
-        left_behind(left, running, wanted.digest, wanted.manifest) == Some(LeftBehind::Claim)
+        left_behind(left, running, wanted) == Some(LeftBehind::Claim)
     }) else {
         return false;
     };
@@ -801,11 +801,7 @@ fn compose_snapshot(plan: &Plan) -> Option<PathBuf> {
 }
 
 /// Config identity from [`identity_of`], used to judge running or left-behind environments.
-#[derive(Debug, Clone, Copy)]
-struct Wanted<'a> {
-    digest: &'a str,
-    manifest: &'a serde_json::Value,
-}
+type Wanted<'a> = &'a Config;
 
 /// How a running environment serves the wanted config (see [`serves`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -822,14 +818,12 @@ enum Serves {
 
 /// Whether `running` serves `wanted` without a restart.
 fn serves(running: &Identity, wanted: Wanted<'_>) -> Serves {
-    if same_config(
-        &running.digest,
-        &running.manifest,
-        wanted.digest,
-        wanted.manifest,
-    ) {
+    if same_config(&running.digest, &running.manifest, wanted) {
         Serves::Same
-    } else if applied_on_attach(&drift(&running.manifest, wanted.manifest)) {
+    } else if applied_on_attach(&drift(
+        &running.manifest,
+        wanted.as_recorded(&running.manifest).1,
+    )) {
         Serves::OnAttach
     } else {
         Serves::NeedsRestart
@@ -955,7 +949,7 @@ fn attach_or_restart(
             "the running environment was booted from a different configuration (booted {}, \
              now {})",
             short(&running.digest),
-            short(wanted.digest)
+            short(&wanted.digest)
         )
     };
     match decision {
@@ -997,7 +991,7 @@ fn attach_or_restart(
                  the config",
                 summary()
             );
-            if let Some(note) = egress_as_booted(&running.manifest, wanted.manifest) {
+            if let Some(note) = egress_as_booted(&running.manifest, &wanted.manifest) {
                 eprintln!("virtkit: {note}");
             }
             note_older_creator(running);
@@ -1042,11 +1036,8 @@ pub async fn boot(
         run_hook(plan, "hooks.init", hook, Where::Host, &[]).await?;
     }
     let snapshot = snapshot_wrapper(plan)?;
-    let (digest, manifest) = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
-    let wanted = Wanted {
-        digest: &digest,
-        manifest: &manifest,
-    };
+    let config = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
+    let wanted: Wanted<'_> = &config;
     let as_refresh = |how| if refresh { how } else { Refresh::No };
 
     if let Some((running, vm)) = live_identity(plan) {
@@ -1110,7 +1101,7 @@ pub async fn boot(
             }
             Joined::Restart(vm) => vm,
             Joined::Drifted(left) => {
-                restart_left_behind(|| policy(plan, over), &left, wanted.digest)?;
+                restart_left_behind(|| policy(plan, over), &left, &wanted.digest)?;
                 left.vm
             }
         };
@@ -1853,9 +1844,9 @@ mod tests {
                 allow_name: names.iter().map(|n| n.to_string()).collect(),
                 allow_ip: vec![],
             });
-            identity_of(&p, None).unwrap().1
+            identity_of(&p, None).unwrap().manifest
         };
-        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        let unrestricted = identity_of(&open, None).unwrap().manifest;
         let note = |running: &serde_json::Value, wanted: &serde_json::Value| {
             egress_as_booted(running, wanted).unwrap_or_default()
         };
@@ -1952,11 +1943,10 @@ mod tests {
     fn a_ready_environment_is_attached_to_restarted_or_refused_as_its_config_and_policy_say() {
         let t = scratch("live-decision");
         let plan = plan_in(&t.0);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
         let same = recorded(&digest, manifest.clone());
@@ -2072,15 +2062,15 @@ mod tests {
         };
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, "services:\n  devcontainer:\n    image: debian\n").unwrap();
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, None).unwrap();
         let joined = recorded(&digest, manifest);
         // Edited after the joined boot's `vk run` loaded it.
         std::fs::write(file, "services:\n  devcontainer:\n    image: ubuntu\n").unwrap();
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let never = || -> Result<Drifted> { panic!("the policy was consulted") };
         assert_eq!(
             live_decision(&joined, wanted, Refresh::Joined, || true, never).unwrap(),
@@ -2137,7 +2127,9 @@ mod tests {
         let _vm = crate::dev::testutil::register_vm_as(&plan, stand_in.id());
         // Without a holder to name, the joiner would boot rather than wait.
         assert!(lock_holder(&plan.state_dir).is_some());
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
         let cfg = crate::config::Config::default();
@@ -2243,11 +2235,10 @@ mod tests {
     fn a_restart_attaches_only_to_what_the_boot_that_took_over_readied_from_its_config() {
         let t = scratch("after-takeover");
         let plan = plan_in(&t.0);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
         let after = |joined| after_takeover(joined, wanted);
@@ -2292,11 +2283,9 @@ mod tests {
         let t = scratch("restarts-live");
         let plan = plan_in(&t.0);
         ensure_state_dir(&plan).unwrap();
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let wanted = &config;
         let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
         let under = |freshness| Overrides {
             freshness: Some(freshness),
@@ -2359,11 +2348,10 @@ mod tests {
         let t = scratch("restarts-joined");
         let plan = plan_in(&t.0);
         ensure_state_dir(&plan).unwrap();
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let same = recorded(&digest, manifest.clone());
         let pid = std::process::id();
         let joined = |current: bool| {
@@ -2457,11 +2445,10 @@ mod tests {
         let plan = plan_in(&tmp);
         let _vm = crate::dev::testutil::register_vm(&plan);
         let vm = VmTie::of(&running_vm(&plan).unwrap());
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let joined = async |by_its_boot: bool| {
             let _ = std::fs::remove_file(identity_path(&plan));
             crate::dev::identity::mark_not_ready(
@@ -2608,11 +2595,10 @@ mod tests {
         ensure_state_dir(&plan).unwrap();
         let cfg = crate::config::Config::default();
         let over = Overrides::default();
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let parent = 4242;
         let try_swap = async |wait: bool, targeted: VmTie| {
             let _ = std::fs::remove_file(transition_path(&plan.state_dir, parent));
@@ -2793,11 +2779,10 @@ mod tests {
         };
         let plan = plan_in(&tmp);
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
-        let wanted = Wanted {
-            digest: &digest,
-            manifest: &manifest,
-        };
+        let config = identity_of(&plan, None).unwrap();
+        let digest = config.digest.clone();
+        let manifest = config.manifest.clone();
+        let wanted = &config;
         let pid = std::process::id();
         assert!(
             take_over(&plan, pid, wanted, true).is_none(),

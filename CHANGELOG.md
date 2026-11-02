@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A changed `${localEnv:…}` value no longer restarts a dev environment just because the
+  same text also appears elsewhere in its config**, such as in a path or an image tag.
+  `vk dev up` and `vk dev status` now judge the change only by where the value is actually
+  used, so one used in `exec-env` still applies to new sessions without a restart.
+  Environments booted by an earlier vk get this from their next boot.
+
 ## [0.102.0] - 2026-11-02
 
 ### Added

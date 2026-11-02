@@ -215,20 +215,21 @@ pub(super) enum LeftBehind {
     Drifted,
 }
 
-/// What `left` is to a joiner whose config resolves to `digest`/`manifest`, with `running`
-/// the VM now up. `None` when the marker describes another VM, or none is up: nothing to
-/// take over.
+/// What `left` is to a joiner whose config resolves to `current`, with `running` the VM now
+/// up. `None` when the marker describes another VM, or none is up: nothing to take over.
 pub(super) fn left_behind(
     left: &NotReady,
     running: Option<VmTie>,
-    digest: &str,
-    manifest: &serde_json::Value,
+    current: &Config,
 ) -> Option<LeftBehind> {
     if running != Some(left.vm) {
         return None;
     }
-    if same_config(&left.digest, &left.manifest, digest, manifest)
-        || applied_on_attach(&drift(&left.manifest, manifest))
+    if same_config(&left.digest, &left.manifest, current)
+        || applied_on_attach(&drift(
+            &left.manifest,
+            current.as_recorded(&left.manifest).1,
+        ))
     {
         Some(LeftBehind::Claim)
     } else {
@@ -309,16 +310,10 @@ pub(super) fn try_read_identity(plan: &Plan) -> Result<Option<Identity>> {
         .with_context(|| format!("parsing {}", path.display()))
 }
 
-/// The identity a plan resolves to: a stable digest, and the manifest it digests. Values
-/// that came from the host environment are reduced to a fingerprint — they still take part
-/// in drift detection, but a token never reaches a file.
-///
-/// Two passes, because a host-fed value reaches more places than the two environment
-/// scopes: the scopes are fingerprinted whole by what [`crate::dev::plan::Vars`] marked, and
-/// then every secret occurrence anywhere else in the manifest — a build argument, a task's
-/// environment, a mount source, embedded in a larger string or not — is fingerprinted in
-/// place, so it takes part in drift detection but never reaches a file.
-pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<(String, serde_json::Value)> {
+/// The identity a plan resolves to: the manifest a boot records and its digest (see
+/// [`Config`]). Every value that came from the host environment is reduced to a fingerprint:
+/// it still takes part in drift detection, but a token never reaches a file.
+pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<Config> {
     let compose = compose_source(plan).map(|file| {
         std::fs::read_to_string(file)
             .map_or(serde_json::Value::Null, |text| compose_fingerprints(&text))
@@ -329,7 +324,7 @@ pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<(String, serde_
 /// Build the boot identity from its wrapper and compose snapshots. Edits after `vk run`
 /// loaded the compose file, including during guest startup, remain drift. If an earlier vk
 /// left no compose snapshot, record none (see [`same_config`]); do not read the current file.
-pub(super) fn booted_identity_of(plan: &Plan) -> Result<(String, serde_json::Value)> {
+pub(super) fn booted_identity_of(plan: &Plan) -> Result<Config> {
     let compose = compose_source(plan).and_then(|_| read_compose_snapshot(plan));
     identity_with(plan, booted_wrapper_digest(plan).as_deref(), compose)
 }
@@ -349,12 +344,74 @@ pub(super) fn with_compose_of(
     Ok((digest_of(&manifest)?, manifest))
 }
 
+/// A plan's identity: the manifest a boot records and its digest, plus the same plan as an
+/// earlier vk recorded it, so a running environment such a vk booted is judged against what
+/// that vk would have written rather than restarted for the difference in redaction.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub digest: String,
+    pub manifest: serde_json::Value,
+    /// digest and manifest with each host value fingerprinted where it occurs inside a
+    /// string, as manifests without [`REDACTION_KEY`] were written
+    legacy: (String, serde_json::Value),
+}
+
+impl Config {
+    /// This config's digest and manifest in the form `recorded` was written in.
+    pub(super) fn as_recorded(&self, recorded: &serde_json::Value) -> (&str, &serde_json::Value) {
+        if recorded.get(REDACTION_KEY).is_some() {
+            (&self.digest, &self.manifest)
+        } else {
+            (&self.legacy.0, &self.legacy.1)
+        }
+    }
+}
+
+/// Marks a manifest whose strings were [`redact`]ed whole. A manifest without it was written
+/// by an earlier vk (see [`Config::as_recorded`]).
+const REDACTION_KEY: &str = "redaction";
+
 fn identity_with(
     plan: &Plan,
     wrapper: Option<&str>,
     compose: Option<serde_json::Value>,
-) -> Result<(String, serde_json::Value)> {
-    let mut manifest = serde_json::to_value(plan).context("serializing the plan")?;
+) -> Result<Config> {
+    let raw = serde_json::to_value(plan).context("serializing the plan")?;
+    let mut manifest = raw.clone();
+    redact(&mut manifest, &plan.secrets);
+    fingerprint_sensitive(&mut manifest, plan);
+    manifest[REDACTION_KEY] = "whole-string".into();
+    let mut legacy = raw;
+    fingerprint_sensitive(&mut legacy, plan);
+    fingerprint_secrets(&mut legacy, &plan.secrets);
+    for m in [&mut manifest, &mut legacy] {
+        // `vk run --compose` reads the compose file once, at the boot: its services and
+        // top-level entries are part of what booted, though the plan names only the file.
+        // Added after redaction: a fingerprint holds nothing to redact, and a host value that
+        // happens to occur in its hex must not turn it into another.
+        if let Some(compose) = &compose {
+            m["compose"] = compose.clone();
+        }
+        // The host-command allowlist is policy the guest runs against, so a changed one is
+        // a changed environment even though nothing in the config moved.
+        if let Some(digest) = wrapper {
+            m["host_exec_wrapper_digest"] = serde_json::Value::String(digest.to_string());
+        }
+    }
+    // Canonical only because `serde_json` writes object keys in insertion order and every
+    // map in the plan is a `BTreeMap`: no crate in the graph enables
+    // `serde_json/preserve_order`, which would reorder them under feature unification and
+    // change every digest at once.
+    Ok(Config {
+        digest: digest_of(&manifest)?,
+        manifest,
+        legacy: (digest_of(&legacy)?, legacy),
+    })
+}
+
+/// Fingerprint the whole value of each environment entry [`crate::dev::plan::Vars`] marked
+/// host-fed, including one whose host value was empty and so is in no secret.
+fn fingerprint_sensitive(manifest: &mut serde_json::Value, plan: &Plan) {
     for scope in ["container_env", "exec_env"] {
         let Some(list) = manifest.get_mut(scope).and_then(|v| v.as_array_mut()) else {
             continue;
@@ -370,23 +427,6 @@ fn identity_with(
             }
         }
     }
-    fingerprint_secrets(&mut manifest, &plan.secrets);
-    // `vk run --compose` reads the compose file once, at the boot: its services and top-level
-    // entries are part of what booted, though the plan names only the file. Added after the
-    // secrets are scrubbed, which have nothing to find in a fingerprint.
-    if let Some(compose) = compose {
-        manifest["compose"] = compose;
-    }
-    // The host-command allowlist is policy the guest runs against, so a changed one is a
-    // changed environment even though nothing in the config moved.
-    if let Some(digest) = wrapper {
-        manifest["host_exec_wrapper_digest"] = serde_json::Value::String(digest.to_string());
-    }
-    // Canonical only because `serde_json` writes object keys in insertion order and every
-    // map in the plan is a `BTreeMap`: no crate in the graph enables
-    // `serde_json/preserve_order`, which would reorder them under feature unification and
-    // change every digest at once.
-    Ok((digest_of(&manifest)?, manifest))
 }
 
 pub(super) fn digest_of(manifest: &serde_json::Value) -> Result<String> {
@@ -394,27 +434,28 @@ pub(super) fn digest_of(manifest: &serde_json::Value) -> Result<String> {
     Ok(sha256_hex(&canonical))
 }
 
-/// Whether the recorded identity matches `digest` and `manifest`. Ignore compose fingerprints
+/// Whether the recorded identity matches `current`, in the form it was recorded in: the same
+/// digest, or the same manifest once [`reconcile`]d — a string that merely held a host value
+/// reads as a fingerprint on one side only, and changes nothing. Ignore compose fingerprints
 /// when the recorded identity predates them, so upgrading vk does not restart every compose
 /// environment. Compose edits remain undetected until the next boot records fingerprints.
 pub(super) fn same_config(
     recorded_digest: &str,
     recorded: &serde_json::Value,
-    digest: &str,
-    manifest: &serde_json::Value,
+    current: &Config,
 ) -> bool {
+    let (digest, manifest) = current.as_recorded(recorded);
     if recorded_digest == digest {
         return true;
     }
-    if recorded.get("compose").is_some() {
-        return false;
+    let (mut was, mut now) = (recorded.clone(), manifest.clone());
+    if recorded.get("compose").is_none()
+        && let Some(obj) = now.as_object_mut()
+    {
+        obj.remove("compose");
     }
-    let mut without = manifest.clone();
-    let removed = without
-        .as_object_mut()
-        .and_then(|obj| obj.remove("compose"))
-        .is_some();
-    removed && digest_of(&without).is_ok_and(|d| d == recorded_digest)
+    reconcile(&mut was, &mut now);
+    was == now
 }
 
 fn compose_source(plan: &Plan) -> Option<&Path> {
@@ -588,10 +629,70 @@ fn fingerprint_hex(value: &str) -> String {
 /// The prefix every fingerprint carries.
 const FINGERPRINT: &str = "sha256:";
 
-/// Replace every secret occurrence in `manifest` with a fingerprint of it. Containment, not
-/// equality: a `${localEnv:…}` can be embedded in a URL, a path or a build argument, and the
-/// secret must not survive there either. Longest first, so a secret that contains another is
-/// replaced whole.
+/// Replace every string in `value` that holds one of `secrets` with a fingerprint of the whole
+/// string. Containment, not equality: a `${localEnv:…}` can be embedded in a URL, a path or
+/// a build argument, and the secret must not survive there either. Whole, not per
+/// occurrence, so a fingerprint is never fingerprinted again and a string reads either as it
+/// is or not at all. A string that holds a secret only by coincidence is opaque too;
+/// [`reconcile`] makes up for that.
+fn redact(value: &mut serde_json::Value, secrets: &std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(s)
+            if secrets
+                .iter()
+                .any(|secret| !secret.is_empty() && s.contains(secret.as_str())) =>
+        {
+            *s = fingerprint_hex(s);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|i| redact(i, secrets)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| redact(v, secrets)),
+        _ => {}
+    }
+}
+
+/// Make two manifests write a string they both hold the same way. [`redact`] makes a string
+/// opaque when it merely contains a host value — a state dir whose hashed name holds `abc`
+/// while a `${localEnv:…}` is `abc` — so once that value changes, the same string is a
+/// fingerprint on one side and plain on the other. Every plain string whose fingerprint
+/// either side holds becomes that fingerprint, on both sides: plain text is never recovered,
+/// and a string a changed host value really fed fingerprints differently on each side and
+/// still differs.
+fn reconcile(a: &mut serde_json::Value, b: &mut serde_json::Value) {
+    fn fingerprints(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::String(s) if s.starts_with(FINGERPRINT) => {
+                out.insert(s.clone());
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| fingerprints(i, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|v| fingerprints(v, out)),
+            _ => {}
+        }
+    }
+    fn conceal(v: &mut serde_json::Value, prints: &std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                let print = fingerprint_hex(s);
+                if prints.contains(&print) {
+                    *s = print;
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|i| conceal(i, prints)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| conceal(v, prints)),
+            _ => {}
+        }
+    }
+    let mut prints = std::collections::BTreeSet::new();
+    fingerprints(a, &mut prints);
+    fingerprints(b, &mut prints);
+    if !prints.is_empty() {
+        conceal(a, &prints);
+        conceal(b, &prints);
+    }
+}
+
+/// How an earlier vk redacted a manifest, kept to compare the environments it booted (see
+/// [`Config::as_recorded`]): every occurrence of a secret replaced with a fingerprint of it,
+/// longest first, so a secret that contains another is replaced whole.
 fn fingerprint_secrets(
     manifest: &mut serde_json::Value,
     secrets: &std::collections::BTreeSet<String>,
@@ -605,7 +706,7 @@ fn fingerprint_secrets(
     scrub_value(manifest, &ordered);
 }
 
-/// Fingerprint every `secrets` occurrence in every string reachable from `value`.
+/// Fingerprint every `secrets` occurrence in every string reachable from `value` (legacy).
 fn scrub_value(value: &mut serde_json::Value, secrets: &[&str]) {
     match value {
         serde_json::Value::String(s) => {
@@ -652,9 +753,10 @@ pub fn plan_diff(plan: &Plan) -> Result<Option<String>> {
     let recorded = read_identity(plan)
         .context("the running environment recorded no identity to compare against")?;
     let wrapper = wrapper_digest(plan);
-    let (digest, current) = identity_of(plan, wrapper.as_deref())?;
+    let config = identity_of(plan, wrapper.as_deref())?;
+    let (digest, current) = config.as_recorded(&recorded.manifest);
 
-    let groups = drift(&recorded.manifest, &current);
+    let groups = drift(&recorded.manifest, current);
     let stale = crate::vms::freshness_all(&vm) == crate::vms::Freshness::Stale;
     // The creation hook is keyed on what is materialized, not on the plan, so it can be due
     // to run again with nothing in the plan having moved at all.
@@ -670,8 +772,8 @@ pub fn plan_diff(plan: &Plan) -> Result<Option<String>> {
         // Matched without compose fingerprints (see [`same_config`]): the digest that boot
         // recorded is the one `vk dev status` reports, not this plan's.
         let shown = match (recorded.manifest.get("compose"), current.get("compose")) {
-            (None, Some(_)) => &recorded.digest,
-            _ => &digest,
+            (None, Some(_)) => recorded.digest.as_str(),
+            _ => digest,
         };
         out.push_str(&format!(
             "the running environment matches the plan ({})\n",
@@ -713,10 +815,12 @@ pub(super) fn drift(
     recorded: &serde_json::Value,
     current: &serde_json::Value,
 ) -> std::collections::BTreeMap<Effect, Vec<String>> {
+    let (mut recorded_cmp, mut current_cmp) = (recorded.clone(), current.clone());
+    reconcile(&mut recorded_cmp, &mut current_cmp);
     let mut before = std::collections::BTreeMap::new();
-    flatten(recorded, "", &mut before);
+    flatten(&recorded_cmp, "", &mut before);
     let mut after = std::collections::BTreeMap::new();
-    flatten(current, "", &mut after);
+    flatten(&current_cmp, "", &mut after);
     // A manifest recorded before the compose fingerprints took part has none to compare (see
     // [`same_config`]).
     let unrecorded_compose = recorded.get("compose").is_none();
@@ -879,7 +983,9 @@ mod tests {
 
     /// A marker for `vm`, as `after_boot` leaves it for `plan` when its readying fails.
     fn left_for(plan: &Plan, vm: VmTie) -> NotReady {
-        let (digest, manifest) = identity_of(plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(plan, None).unwrap();
         NotReady {
             vm,
             digest,
@@ -1047,9 +1153,9 @@ mod tests {
             created_secs: 7,
         };
         let left = left_for(&plan, vm);
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let config = identity_of(&plan, None).unwrap();
         assert_eq!(
-            left_behind(&left, Some(vm), &digest, &manifest),
+            left_behind(&left, Some(vm), &config),
             Some(LeftBehind::Claim)
         );
         // Another VM is up — the one a later boot put in place, or the same pid refiled —
@@ -1058,21 +1164,21 @@ mod tests {
             pid: 41,
             created_secs: 8,
         };
-        assert_eq!(left_behind(&left, Some(later), &digest, &manifest), None);
-        assert_eq!(left_behind(&left, None, &digest, &manifest), None);
+        assert_eq!(left_behind(&left, Some(later), &config), None);
+        assert_eq!(left_behind(&left, None, &config), None);
         // A change readying applies is no obstacle; one that takes a restart is drift.
         let mut session = plan.clone();
         session.exec_env[0].value = "two".into();
-        let (digest, manifest) = identity_of(&session, None).unwrap();
+        let config = identity_of(&session, None).unwrap();
         assert_eq!(
-            left_behind(&left, Some(vm), &digest, &manifest),
+            left_behind(&left, Some(vm), &config),
             Some(LeftBehind::Claim)
         );
         let mut restart = plan.clone();
         restart.mem = Some("16G".into());
-        let (digest, manifest) = identity_of(&restart, None).unwrap();
+        let config = identity_of(&restart, None).unwrap();
         assert_eq!(
-            left_behind(&left, Some(vm), &digest, &manifest),
+            left_behind(&left, Some(vm), &config),
             Some(LeftBehind::Drifted)
         );
     }
@@ -1083,7 +1189,8 @@ mod tests {
         let plan = plan_in(&t.0);
         // Unrestricted leaves no trace in the record, so an environment booted before the
         // allowlist existed still matches its config after an upgrade.
-        let (_, manifest) = identity_of(&plan, None).unwrap();
+        let config = identity_of(&plan, None).unwrap();
+        let manifest = config.manifest.clone();
         assert!(manifest.get("egress").is_none(), "{manifest}");
         // The running switch follows its lists, so editing them is host-side; turning the
         // restriction on or off is another switch, so a restart.
@@ -1096,8 +1203,12 @@ mod tests {
             allow_name: vec!["debian.org".into()],
             allow_ip: vec![],
         });
-        let (before, _) = identity_of(&plan, None).unwrap();
-        let (after, manifest) = identity_of(&held, None).unwrap();
+        let before = identity_of(&plan, None).unwrap().digest;
+        let Config {
+            digest: after,
+            manifest,
+            ..
+        } = identity_of(&held, None).unwrap();
         assert_ne!(before, after);
         assert_eq!(manifest["egress"]["allow_name"][0], "debian.org");
         assert_eq!(manifest["egress"]["mode"], "restricted");
@@ -1114,9 +1225,9 @@ mod tests {
                 allow_name: names.iter().map(|n| n.to_string()).collect(),
                 allow_ip: ips.iter().map(|n| n.to_string()).collect(),
             });
-            identity_of(&p, None).unwrap().1
+            identity_of(&p, None).unwrap().manifest
         };
-        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        let unrestricted = identity_of(&open, None).unwrap().manifest;
         // The lists drift too when they are not empty, but the mode alone makes it a restart.
         let restart = |before: &serde_json::Value, after: &serde_json::Value| {
             let groups = drift(before, after);
@@ -1167,7 +1278,8 @@ mod tests {
         let plan = plan_in(&t.0);
         let identity = |yaml: &str| {
             write_compose(&plan, yaml);
-            identity_of(&plan, None).unwrap()
+            let config = identity_of(&plan, None).unwrap();
+            (config.digest, config.manifest)
         };
         let base = "services:\n  devcontainer:\n    image: debian\n    command: [echo, a, b]\n";
         let (digest, booted) = identity(base);
@@ -1235,7 +1347,7 @@ mod tests {
                      command: [true]\n"
                 ),
             );
-            identity_of(&plan, None).unwrap().1
+            identity_of(&plan, None).unwrap().manifest
         };
         let lines: Vec<String> = drift(&identity("debian"), &identity("ubuntu"))
             .into_values()
@@ -1255,7 +1367,7 @@ mod tests {
             &plan,
             "services:\n  db:\n    environment:\n      PASSWORD: s3cret\n      TOKEN: ${TOKEN:-d3fault}\n",
         );
-        let (_, manifest) = identity_of(&plan, None).unwrap();
+        let manifest = identity_of(&plan, None).unwrap().manifest;
         let text = serde_json::to_string(&manifest).unwrap();
         assert!(
             !text.contains("s3cret") && !text.contains("d3fault"),
@@ -1271,23 +1383,30 @@ mod tests {
         std::fs::create_dir_all(&plan.state_dir).unwrap();
         let loaded = "services:\n  devcontainer:\n    image: debian\n";
         write_compose(&plan, loaded);
-        let (booted, _) = identity_of(&plan, None).unwrap();
+        let booted = identity_of(&plan, None).unwrap().digest;
         // What `vk run` writes from the text it loaded.
         write_compose_snapshot(&plan.state_dir.join(COMPOSE_SNAPSHOT), loaded).unwrap();
         // Edited while the guest was coming up.
         write_compose(&plan, "services:\n  devcontainer:\n    image: ubuntu\n");
-        let (recorded, manifest) = booted_identity_of(&plan).unwrap();
+        let Config {
+            digest: recorded,
+            manifest,
+            ..
+        } = booted_identity_of(&plan).unwrap();
         assert_eq!(recorded, booted);
-        let (now, current) = identity_of(&plan, None).unwrap();
-        assert!(!same_config(&recorded, &manifest, &now, &current));
+        assert!(!same_config(
+            &recorded,
+            &manifest,
+            &identity_of(&plan, None).unwrap()
+        ));
 
         // A boot that left no snapshot — an earlier vk's — records none, not the file now;
         // nor does one whose snapshot is unreadable.
         std::fs::write(plan.state_dir.join(COMPOSE_SNAPSHOT), "{").unwrap();
-        let (_, corrupt) = booted_identity_of(&plan).unwrap();
+        let corrupt = booted_identity_of(&plan).unwrap().manifest;
         assert!(corrupt.get("compose").is_none(), "{corrupt}");
         std::fs::remove_file(plan.state_dir.join(COMPOSE_SNAPSHOT)).unwrap();
-        let (_, unknown) = booted_identity_of(&plan).unwrap();
+        let unknown = booted_identity_of(&plan).unwrap().manifest;
         assert!(unknown.get("compose").is_none(), "{unknown}");
     }
 
@@ -1296,9 +1415,9 @@ mod tests {
         let t = scratch("compose-claim");
         let plan = plan_in(&t.0);
         write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
-        let (_, claimed) = identity_of(&plan, None).unwrap();
+        let claimed = identity_of(&plan, None).unwrap().manifest;
         write_compose(&plan, "services:\n  devcontainer:\n    image: ubuntu\n");
-        let (_, now) = identity_of(&plan, None).unwrap();
+        let now = identity_of(&plan, None).unwrap().manifest;
         let (digest, manifest) = with_compose_of(now.clone(), &claimed).unwrap();
         assert_eq!(manifest["compose"], claimed["compose"]);
         assert_eq!(digest, digest_of(&manifest).unwrap());
@@ -1314,24 +1433,28 @@ mod tests {
         let t = scratch("compose-unrecorded");
         let plan = plan_in(&t.0);
         write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
-        let (digest, current) = identity_of(&plan, None).unwrap();
+        let config = identity_of(&plan, None).unwrap();
+        let current = config.manifest.clone();
         // What a vk from before the compose fingerprints took part recorded for this config.
         let mut older = current.clone();
         older.as_object_mut().unwrap().remove("compose");
         let older_digest = digest_of(&older).unwrap();
-        assert!(same_config(&older_digest, &older, &digest, &current));
+        assert!(same_config(&older_digest, &older, &config));
         assert!(drift(&older, &current).is_empty());
         // Anything else that moved still counts.
         let mut restart = plan.clone();
         restart.mem = Some("16G".into());
-        let (moved_digest, moved) = identity_of(&restart, None).unwrap();
-        assert!(!same_config(&older_digest, &older, &moved_digest, &moved));
+        let moved_config = identity_of(&restart, None).unwrap();
+        let moved = moved_config.manifest.clone();
+        assert!(!same_config(&older_digest, &older, &moved_config));
         assert_eq!(
             drift(&older, &moved).keys().collect::<Vec<_>>(),
             [&Effect::Restart]
         );
-        // A manifest that does record them is held to its digest.
-        assert!(!same_config(&"x".repeat(64), &current, &digest, &current));
+        // A manifest that does record them is held to them.
+        let mut other = current.clone();
+        other["compose"] = serde_json::json!({});
+        assert!(!same_config(&digest_of(&other).unwrap(), &other, &config));
         // A marker an earlier vk left is taken over as one recording them would be.
         let vm = VmTie {
             pid: 41,
@@ -1343,7 +1466,7 @@ mod tests {
             ..left_for(&plan, vm)
         };
         assert_eq!(
-            left_behind(&left, Some(vm), &digest, &current),
+            left_behind(&left, Some(vm), &config),
             Some(LeftBehind::Claim)
         );
     }
@@ -1366,7 +1489,11 @@ mod tests {
         let plan = plan_in(&tmp);
         write_compose(&plan, "services:\n  devcontainer:\n    image: debian\n");
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let (digest, mut manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        let Config {
+            digest,
+            mut manifest,
+            ..
+        } = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
         manifest.as_object_mut().unwrap().remove("compose");
         let older = digest_of(&manifest).unwrap();
         assert_ne!(older, digest);
@@ -1399,7 +1526,9 @@ mod tests {
             value: "s3cret".into(),
             sensitive: true,
         }];
-        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let Config {
+            digest, manifest, ..
+        } = identity_of(&plan, None).unwrap();
         let text = serde_json::to_string(&manifest).unwrap();
         assert!(
             !text.contains("s3cret"),
@@ -1409,7 +1538,7 @@ mod tests {
 
         // A changed secret is still drift, even though its value is never stored.
         plan.exec_env[0].value = "other".into();
-        let (changed, _) = identity_of(&plan, None).unwrap();
+        let changed = identity_of(&plan, None).unwrap().digest;
         assert_ne!(digest, changed);
     }
 
@@ -1424,8 +1553,8 @@ mod tests {
             sensitive: true,
         }];
         assert_eq!(
-            identity_of(&plan, None).unwrap().0,
-            identity_of(&plan, None).unwrap().0
+            identity_of(&plan, None).unwrap().digest,
+            identity_of(&plan, None).unwrap().digest
         );
     }
 
@@ -1458,19 +1587,24 @@ mod tests {
             target: None,
             args: vec![("AUTH".into(), "Bearer s3cret".into())],
         };
-        let (_, manifest) = identity_of(&plan, None).unwrap();
+        let manifest = identity_of(&plan, None).unwrap().manifest;
         let text = serde_json::to_string(&manifest).unwrap();
         // Nowhere, embedded or not — the manifest is written to disk and shown by `--diff`.
         assert!(!text.contains("s3cret"), "{text}");
-        // The surrounding text stays, so drift is still legible.
-        assert!(text.contains("Bearer sha256:"), "{text}");
-        assert!(text.contains("/opt/sha256:"), "{text}");
+        // Each string that held it is fingerprinted whole.
+        for whole in [
+            "Bearer s3cret",
+            "/opt/s3cret/cache",
+            "postgres://u:s3cret@h/db",
+        ] {
+            assert!(text.contains(&fingerprint_hex(whole)), "{whole}: {text}");
+        }
 
         // A diff over it names the key and nothing else — not even the digests.
         let mut after = plan.clone();
         after.tasks[0].env[0].value = "other".into();
         after.secrets.insert("other".into());
-        let (_, changed) = identity_of(&after, None).unwrap();
+        let changed = identity_of(&after, None).unwrap().manifest;
         let lines: Vec<String> = drift(&manifest, &changed).into_values().flatten().collect();
         assert_eq!(
             lines,
@@ -1479,11 +1613,173 @@ mod tests {
     }
 
     #[test]
+    fn redaction_fingerprints_each_string_holding_a_secret_whole_and_once() {
+        let secrets = ["abc", "5", ""].map(String::from).into_iter().collect();
+        let mut v = serde_json::json!({
+            "path": "/x/abc/y",
+            "port": "8050",
+            "plain": "/x/y",
+            "abc": "key names are not values",
+            "list": ["abc", 5],
+        });
+        redact(&mut v, &secrets);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "path": fingerprint_hex("/x/abc/y"),
+                "port": fingerprint_hex("8050"),
+                "plain": "/x/y",
+                "abc": "key names are not values",
+                "list": [fingerprint_hex("abc"), 5],
+            })
+        );
+    }
+
+    #[test]
+    fn reconciling_conceals_a_plain_string_the_other_side_holds_as_a_fingerprint() {
+        let mut before = serde_json::json!({
+            "dir": fingerprint_hex("/s/ws-7abc"),
+            "token": fingerprint_hex("abc"),
+            "list": [fingerprint_hex("/s/ws-7abc/data")],
+            "same": "plain",
+        });
+        let mut after = serde_json::json!({
+            "dir": "/s/ws-7abc",
+            "token": fingerprint_hex("xyz"),
+            "list": ["/s/ws-7abc/data"],
+            "same": "plain",
+        });
+        let recorded = before.clone();
+        reconcile(&mut before, &mut after);
+        assert_eq!(
+            before, recorded,
+            "a fingerprint is never turned back into plain text"
+        );
+        assert_eq!(
+            after,
+            serde_json::json!({
+                "dir": fingerprint_hex("/s/ws-7abc"),
+                "token": fingerprint_hex("xyz"),
+                "list": [fingerprint_hex("/s/ws-7abc/data")],
+                "same": "plain",
+            })
+        );
+
+        // Either side may hold the fingerprint, and a plain string elsewhere on the same side
+        // is concealed with it, so the two agree key by key.
+        let mut before = serde_json::json!({ "a": "/p", "b": "/p" });
+        let mut after = serde_json::json!({ "a": fingerprint_hex("/p"), "b": "/p" });
+        reconcile(&mut before, &mut after);
+        assert_eq!(before, after);
+        assert_eq!(before["b"], fingerprint_hex("/p"));
+    }
+
+    /// The plan with `TOKEN` in `exec-env` fed `value` by the host, as `${localEnv:…}` does.
+    fn with_token(plan: &Plan, value: &str) -> Config {
+        let mut p = plan.clone();
+        p.exec_env = vec![EnvVar {
+            name: "TOKEN".into(),
+            value: value.into(),
+            sensitive: true,
+        }];
+        p.secrets.insert(value.into());
+        identity_of(&p, None).unwrap()
+    }
+
+    #[test]
+    fn a_host_value_some_path_merely_contains_is_session_drift_when_it_changes() {
+        let t = scratch("identity-coincidence");
+        let mut plan = plan_in(&t.0);
+        // The state dir's hashed name holds `abc` by chance, as CI's `ws-794884fabc194aa` did.
+        plan.state_dir = t.0.join("state/ws-794884fabc194aa");
+        plan.managed_dirs = vec![plan.state_dir.join("data")];
+        plan.mounts = vec![mount("data", plan.state_dir.join("data"), "/data")];
+        let (abc, xyz) = (with_token(&plan, "abc"), with_token(&plan, "xyz"));
+        // `abc` is what `${localEnv:…}` fed, so the boot records no string holding it.
+        assert!(
+            !serde_json::to_string(&abc.manifest)
+                .unwrap()
+                .contains("abc")
+        );
+        for (before, after) in [(&abc, &xyz), (&xyz, &abc)] {
+            let groups = drift(&before.manifest, &after.manifest);
+            let lines: Vec<&String> = groups.values().flatten().collect();
+            assert_eq!(
+                lines,
+                ["exec_env.TOKEN.value: changed (a value this host supplies)"]
+            );
+            assert!(applied_on_attach(&groups));
+        }
+    }
+
+    #[test]
+    fn what_a_host_value_fed_still_drifts_and_what_it_no_longer_feeds_does_not() {
+        let t = scratch("identity-fed");
+        let plan = plan_in(&t.0);
+        let fed = |value: &str, source: &str| {
+            let mut p = plan.clone();
+            p.mounts = vec![mount("cache", source, "/c")];
+            p.secrets.insert(value.into());
+            identity_of(&p, None).unwrap().manifest
+        };
+        // `/opt/${localEnv:X}/cache`, with `X` changed: another mount.
+        let groups = drift(&fed("abc", "/opt/abc/cache"), &fed("xyz", "/opt/xyz/cache"));
+        assert_eq!(groups.keys().collect::<Vec<_>>(), [&Effect::Restart]);
+        assert!(
+            !format!("{groups:?}").contains("abc") && !format!("{groups:?}").contains("xyz"),
+            "{groups:?}"
+        );
+        // The same text, whatever fed it, and whatever host values it holds by chance.
+        assert!(drift(&fed("abc", "/opt/abc/cache"), &fed("xyz", "/opt/abc/cache")).is_empty());
+        // `${localEnv:X:abc}` with `X=abc`, then unset: the same config, though its digest
+        // moved — `up` and `status` must not take that for drift.
+        let unset = {
+            let mut p = plan.clone();
+            p.mounts = vec![mount("cache", "/opt/abc/cache", "/c")];
+            identity_of(&p, None).unwrap()
+        };
+        let booted = fed("abc", "/opt/abc/cache");
+        let booted_digest = digest_of(&booted).unwrap();
+        assert_ne!(booted_digest, unset.digest);
+        assert!(same_config(&booted_digest, &booted, &unset));
+        assert!(drift(&fed("abc", "/opt/abcxyz"), &fed("xyz", "/opt/abcxyz")).is_empty());
+    }
+
+    #[test]
+    fn an_identity_an_earlier_vk_recorded_is_compared_in_its_own_form() {
+        let t = scratch("identity-legacy");
+        let mut plan = plan_in(&t.0);
+        plan.mounts = vec![mount("cache", "/opt/abc/cache", "/c")];
+        let config = with_token(&plan, "abc");
+        // What a vk before whole-string redaction recorded for this very plan.
+        let (old_digest, old) = config.legacy.clone();
+        assert!(old.get(REDACTION_KEY).is_none());
+        assert_eq!(
+            old["mounts"][0]["source"],
+            format!("/opt/{}/cache", fingerprint_hex("abc"))
+        );
+        assert_eq!(config.as_recorded(&old), (old_digest.as_str(), &old));
+        assert!(same_config(&old_digest, &old, &config));
+        // A new record is held to the new form.
+        assert_eq!(
+            config.as_recorded(&config.manifest),
+            (config.digest.as_str(), &config.manifest)
+        );
+        // A changed token against an old record is the session drift it always was.
+        plan.mounts.clear();
+        let (old_digest, old) = with_token(&plan, "abc").legacy;
+        let xyz = with_token(&plan, "xyz");
+        assert!(!same_config(&old_digest, &old, &xyz));
+        let groups = drift(&old, xyz.as_recorded(&old).1);
+        assert_eq!(groups.keys().collect::<Vec<_>>(), [&Effect::Session]);
+    }
+
+    #[test]
     fn the_identity_covers_the_host_command_allowlist() {
         let t = scratch("identity-wrapper");
         let plan = plan_in(&t.0);
-        let (a, _) = identity_of(&plan, Some("aaa")).unwrap();
-        let (b, _) = identity_of(&plan, Some("bbb")).unwrap();
+        let a = identity_of(&plan, Some("aaa")).unwrap().digest;
+        let b = identity_of(&plan, Some("bbb")).unwrap().digest;
         assert_ne!(a, b, "a changed allowlist is a changed environment");
     }
 
@@ -1528,7 +1824,7 @@ mod tests {
             sensitive: true,
         }];
         a.mounts = vec![mount("a", "/a", "/a"), mount("b", "/b", "/b")];
-        let (_, before) = identity_of(&a, None).unwrap();
+        let before = identity_of(&a, None).unwrap().manifest;
         let mut b = a.clone();
         b.exec_env[0].value = "two".into();
         b.mounts = vec![mount("b", "/b", "/b"), mount("c", "/c", "/c")];
@@ -1540,7 +1836,7 @@ mod tests {
             target: None,
             args: Vec::new(),
         };
-        let (_, after) = identity_of(&b, None).unwrap();
+        let after = identity_of(&b, None).unwrap().manifest;
         let effects: std::collections::BTreeMap<String, Effect> = drift(&before, &after)
             .into_iter()
             .flat_map(|(effect, lines)| {
@@ -1553,7 +1849,7 @@ mod tests {
         // Only the token changing is a drift new sessions absorb; nothing to restart for.
         let mut c = a.clone();
         c.exec_env[0].value = "two".into();
-        let (_, only_env) = identity_of(&c, None).unwrap();
+        let only_env = identity_of(&c, None).unwrap().manifest;
         let groups = drift(&before, &only_env);
         assert!(groups.keys().all(|e| *e == Effect::Session), "{groups:?}");
         assert!(drift(&before, &before).is_empty());
