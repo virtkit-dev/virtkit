@@ -46,6 +46,8 @@ pub enum Program {
     Registry,
     /// `vk-gitlab`: [`vk_hub_proto::gitlab::release_message`].
     Gitlab,
+    /// `vk-hub`: [`vk_hub_proto::hub_release_message`].
+    Hub,
 }
 
 impl Program {
@@ -54,6 +56,7 @@ impl Program {
             Program::Vk => vk_hub_proto::release_message(sha256, version),
             Program::Registry => vk_hub_proto::registry::release_message(sha256, version),
             Program::Gitlab => vk_hub_proto::gitlab::release_message(sha256, version),
+            Program::Hub => vk_hub_proto::hub_release_message(sha256, version),
         }
     }
 }
@@ -341,6 +344,12 @@ mod tests {
         assert!(registry.check(&sha, "0.102.0", Some(&signed)).is_err());
         let as_registry = sign(&key, &binary, "0.102.0", Program::Registry).unwrap();
         assert!(relay.check(&sha, "0.102.0", Some(&as_registry)).is_err());
+        // A hub's own release has its label too.
+        let hub = Policy::from_config_in("[update]", Program::Hub, keys, None).unwrap();
+        assert!(hub.check(&sha, "0.102.0", Some(&signed)).is_err());
+        let as_hub = sign(&key, &binary, "0.102.0", Program::Hub).unwrap();
+        hub.check(&sha, "0.102.0", Some(&as_hub)).unwrap();
+        assert!(relay.check(&sha, "0.102.0", Some(&as_hub)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

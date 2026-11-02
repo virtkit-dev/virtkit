@@ -42,6 +42,18 @@
 //! # restrict nothing.
 //! egress_rules = true
 //!
+//! # Whether operators may update the hub to a vk-hub release it holds, with
+//! # `vk-hub update`; off unless set. The hub executes the release in its place, handing
+//! # it its listening sockets, and goes back to the binary it ran should the release not
+//! # come up — which needs a supervisor that restarts `vk-hub serve`.
+//! [update]
+//! allow = true
+//! # The keys a release must be signed by (`vk release-key sign --program vk-hub`): with any,
+//! # an unsigned release is refused unless require_signed = false.
+//! release_keys = ["<base64 ed25519 public key>"]
+//! # An older release is refused unless this is set.
+//! allow_downgrade = false
+//!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
 //! issuer = "https://login.example.com/app/1"
@@ -119,6 +131,19 @@ pub struct HubConfig {
     pub max_job_token: std::time::Duration,
     /// `[jobs] egress_rules`: whether the hub's egress rules restrict jobs.
     pub egress_rules: bool,
+    /// `[update]`: whether, and to which releases, the hub may update itself.
+    pub update: UpdateConfig,
+}
+
+/// `[update]`, checked.
+#[derive(Debug, Default)]
+pub struct UpdateConfig {
+    /// Whether operators may update the hub.
+    pub allow: bool,
+    /// The signatures a release must carry.
+    pub policy: vk_peer::release_key::Policy,
+    /// Whether a release older than the hub's version may be installed.
+    pub allow_downgrade: bool,
 }
 
 /// The web UI's listener.
@@ -170,7 +195,18 @@ struct FileConfig {
     image_affinity_max_extra_load: Option<f64>,
     max_job_token_secs: Option<u64>,
     jobs: Option<FileJobs>,
+    update: Option<FileUpdate>,
     oidc: Option<FileOidc>,
+}
+
+/// `[update]` as written; `deny_unknown_fields` for the same reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileUpdate {
+    allow: Option<bool>,
+    release_keys: Option<Vec<String>>,
+    require_signed: Option<bool>,
+    allow_downgrade: Option<bool>,
 }
 
 /// `[jobs]` as written; `deny_unknown_fields` for the same reason.
@@ -370,6 +406,19 @@ impl HubConfig {
                 vk_hub_proto::token::MAX_TTL_SECS
             ),
         };
+        let update = match f.update {
+            Some(u) => UpdateConfig {
+                allow: u.allow.unwrap_or(false),
+                policy: vk_peer::release_key::Policy::from_config_in(
+                    "[update]",
+                    vk_peer::release_key::Program::Hub,
+                    u.release_keys.as_deref().unwrap_or_default(),
+                    u.require_signed,
+                )?,
+                allow_downgrade: u.allow_downgrade.unwrap_or(false),
+            },
+            None => UpdateConfig::default(),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -385,6 +434,7 @@ impl HubConfig {
             image_affinity,
             max_job_token,
             egress_rules: f.jobs.and_then(|j| j.egress_rules).unwrap_or(false),
+            update,
         })
     }
 
@@ -411,6 +461,12 @@ impl HubConfig {
     /// Where placed jobs' output is kept.
     pub fn jobs_dir(&self) -> PathBuf {
         self.data_dir.join("jobs")
+    }
+
+    /// Where the hub keeps its own update: its state, and the release on trial with the binary
+    /// it replaces.
+    pub fn update_dir(&self) -> PathBuf {
+        self.data_dir.join("update")
     }
 
     /// The admin socket `vk-hub token` and `vk-hub nodes` reach the running hub through.
@@ -647,6 +703,33 @@ mod tests {
 
     fn parse(text: &str) -> Result<HubConfig> {
         HubConfig::from_file(toml::from_str(text)?)
+    }
+
+    /// `[update]` defaults off. Configured keys require a signature by default; invalid keys
+    /// and required signatures without keys are refused.
+    #[test]
+    fn update_is_off_unless_allowed_and_checks_its_keys() {
+        let off = HubConfig::from_file(FileConfig::default()).unwrap().update;
+        assert!(!off.allow && !off.policy.required() && !off.allow_downgrade);
+        let key = vk_hub_proto::to_base64(&[7u8; vk_hub_proto::PUBLIC_KEY_LEN]);
+        let on: FileConfig = toml::from_str(&format!(
+            "[update]\nallow = true\nrelease_keys = [\"{key}\"]\nallow_downgrade = true\n"
+        ))
+        .unwrap();
+        let on = HubConfig::from_file(on).unwrap().update;
+        assert!(on.allow && on.policy.required() && on.allow_downgrade);
+        for (bad, want) in [
+            (
+                "[update]\nrelease_keys = [\"x\"]\n",
+                "is not an ed25519 public key",
+            ),
+            ("[update]\nrequire_signed = true\n", "needs release_keys"),
+        ] {
+            let file: FileConfig = toml::from_str(bad).unwrap();
+            let e = HubConfig::from_file(file).unwrap_err();
+            assert!(format!("{e:#}").contains(want), "{bad}: {e:#}");
+        }
+        assert!(toml::from_str::<FileConfig>("[update]\nalow = true\n").is_err());
     }
 
     #[test]

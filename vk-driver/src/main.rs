@@ -165,6 +165,8 @@ enum ReleaseProgram {
     VkRegistry,
     /// vk-gitlab, which GitLab relays run
     VkGitlab,
+    /// vk-hub, which a hub updates itself to
+    VkHub,
 }
 
 /// What `vk export` can package a raw disk image as.
@@ -287,7 +289,7 @@ enum ReleaseKeyCmd {
         #[arg(long, value_name = "FILE")]
         key: PathBuf,
     },
-    /// Sign a vk or vk-registry binary as a version, and print the signature
+    /// Sign a release binary as a version, and print the signature
     Sign {
         /// The private key `generate` wrote
         #[arg(long, value_name = "FILE")]
@@ -295,7 +297,7 @@ enum ReleaseKeyCmd {
         /// The version the binary's `--version` prints
         #[arg(long)]
         version: String,
-        /// The program it is: vk (nodes), vk-registry (registries) or vk-gitlab (relays)
+        /// The program it is: vk, vk-registry, vk-gitlab or vk-hub
         #[arg(long, value_enum, default_value_t = ReleaseProgram::Vk)]
         program: ReleaseProgram,
         /// The binary
@@ -3342,6 +3344,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     ReleaseProgram::Vk => release_key::Program::Vk,
                     ReleaseProgram::VkRegistry => release_key::Program::Registry,
                     ReleaseProgram::VkGitlab => release_key::Program::Gitlab,
+                    ReleaseProgram::VkHub => release_key::Program::Hub,
                 };
                 release_key::sign(key, binary, version, program)
             }

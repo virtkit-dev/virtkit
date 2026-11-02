@@ -474,16 +474,25 @@ pub enum Program {
     /// `vk-gitlab`, which GitLab relays run.
     #[serde(rename = "vk-gitlab")]
     Gitlab,
+    /// `vk-hub`, which the hub updates itself to.
+    #[serde(rename = "vk-hub")]
+    Hub,
 }
 
 impl Program {
-    pub const ALL: [Program; 3] = [Program::Vk, Program::Registry, Program::Gitlab];
+    pub const ALL: [Program; 4] = [
+        Program::Vk,
+        Program::Registry,
+        Program::Gitlab,
+        Program::Hub,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Program::Vk => "vk",
             Program::Registry => REGISTRY_PROGRAM,
             Program::Gitlab => "vk-gitlab",
+            Program::Hub => "vk-hub",
         }
     }
 
@@ -491,12 +500,13 @@ impl Program {
         Self::ALL.into_iter().find(|p| p.name() == name)
     }
 
-    /// What runs it: `nodes`, `registries` or `relays`, as in `vk-hub <that> update`.
+    /// What runs it: `nodes`, `registries`, `relays` or `this hub`.
     pub fn runners(self) -> &'static str {
         match self {
             Program::Vk => "nodes",
             Program::Registry => "registries",
             Program::Gitlab => "relays",
+            Program::Hub => "this hub",
         }
     }
 
@@ -510,10 +520,11 @@ impl Program {
             Program::Gitlab => {
                 format!("`vk-hub relays update <id> --release {short}` updates one to it")
             }
+            Program::Hub => format!("`vk-hub update --release {short}` updates this hub to it"),
         }
     }
 
-    /// The names of every program, for a message: `vk, vk-registry or vk-gitlab`.
+    /// The names of every program, for a message: `vk, vk-registry, vk-gitlab or vk-hub`.
     pub fn names() -> String {
         let names: Vec<&str> = Self::ALL.iter().map(|p| p.name()).collect();
         match names.split_last() {
@@ -535,7 +546,7 @@ impl std::fmt::Display for Program {
 }
 
 impl ReleaseRow {
-    /// The program it is: `vk`, [`REGISTRY_PROGRAM`] or `vk-gitlab`.
+    /// The program it is: `vk`, [`REGISTRY_PROGRAM`], `vk-gitlab` or `vk-hub`.
     pub fn program(&self) -> &str {
         self.program.as_deref().unwrap_or("vk")
     }
@@ -763,8 +774,56 @@ pub enum Enrollment {
     BadToken,
 }
 
-pub struct Db {
+/// The database, whose writes [`Db::seal`] holds while the hub hands over to a release.
+struct Store {
     db: Database,
+    /// Whether writes wait for [`Db::unseal`]; held while one begins, so none begins once
+    /// sealed.
+    sealed: std::sync::Mutex<bool>,
+    unsealed: std::sync::Condvar,
+}
+
+impl Store {
+    fn new(db: Database) -> Self {
+        Store {
+            db,
+            sealed: std::sync::Mutex::new(false),
+            unsealed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Begin a write once the database is unsealed. Every hub write must use this method,
+    /// not [`Database::begin_write`]. While sealed, it blocks the calling thread, including
+    /// runtime workers, until exec or unsealing from a blocking thread. That thread does not
+    /// depend on these blocked writes.
+    fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
+        let mut sealed = self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *sealed {
+            sealed = self
+                .unsealed
+                .wait(sealed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // Begun with the lock held: a seal waits for this write to have begun, then for it to
+        // end.
+        self.db.begin_write()
+    }
+}
+
+/// For reads: a write through [`Database::begin_write`] would not wait for the seal.
+impl std::ops::Deref for Store {
+    type Target = Database;
+
+    fn deref(&self) -> &Database {
+        &self.db
+    }
+}
+
+pub struct Db {
+    db: Store,
     /// `[jobs] egress_rules`: placed jobs, and gitlab-runner's under the Fallback, get the
     /// hub's egress layer.
     egress_rules: bool,
@@ -868,6 +927,44 @@ impl Db {
         self.oidc_default_role
     }
 
+    /// Block new writes, wait for the active write, then commit with [`Durability::Immediate`]
+    /// and quick repair. This makes earlier [`Durability::None`] writes durable and records
+    /// allocator state before exec. The release opens the file after this process's descriptors
+    /// and lock close, without a [`Database`] drop or a potentially slow repair on a large
+    /// database. Writes wait until [`Db::unseal`]; a failed seal is undone.
+    pub fn seal(&self) -> Result<()> {
+        *self
+            .db
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let sealed = (|| -> Result<()> {
+            let mut txn = self
+                .db
+                .db
+                .begin_write()
+                .context("starting the last write")?;
+            txn.set_durability(Durability::Immediate)
+                .context("making the last write durable")?;
+            txn.set_quick_repair(true);
+            txn.commit().context("committing the last write")
+        })();
+        if sealed.is_err() {
+            self.unseal();
+        }
+        sealed
+    }
+
+    /// Let writes begin again, after a [`Db::seal`] whose release was not executed.
+    pub fn unseal(&self) {
+        *self
+            .db
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.db.unsealed.notify_all();
+    }
+
     fn init(db: Database) -> Result<Self> {
         let txn = db
             .begin_write()
@@ -957,7 +1054,7 @@ impl Db {
         let db = Db {
             spec_dicts: std::sync::Mutex::new(spec_dicts),
             job_briefs: std::sync::RwLock::default(),
-            db,
+            db: Store::new(db),
             egress_rules: false,
             heartbeat_synced_at: AtomicU64::new(0),
             requests_swept_at: AtomicU64::new(0),
@@ -3231,6 +3328,8 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     const DAY: Duration = Duration::from_secs(86_400);
@@ -3244,13 +3343,14 @@ mod tests {
             assert_eq!(p.to_string(), p.name());
         }
         assert_eq!(Program::parse("nope"), None);
-        assert_eq!(Program::names(), "vk, vk-registry or vk-gitlab");
+        assert_eq!(Program::names(), "vk, vk-registry, vk-gitlab or vk-hub");
         assert_eq!(Program::Vk.stored(), None);
         assert_eq!(Program::Registry.stored().as_deref(), Some("vk-registry"));
         assert_eq!(Program::Gitlab.stored().as_deref(), Some("vk-gitlab"));
+        assert_eq!(Program::Hub.stored().as_deref(), Some("vk-hub"));
         assert_eq!(
             Program::ALL.map(Program::runners),
-            ["nodes", "registries", "relays"]
+            ["nodes", "registries", "relays", "this hub"]
         );
         assert_eq!(
             Program::Vk.next_step("abc"),
@@ -5142,6 +5242,61 @@ mod tests {
         txn.open_table(UI_SESSIONS).unwrap();
         txn.commit().unwrap();
         assert!(Db::init(old).unwrap().accounts().unwrap().is_empty());
+    }
+
+    /// A sealed database's file, copied as a release would find it once this process is gone,
+    /// opens without a repair and holds what was written at [`Durability::None`] too; one not
+    /// sealed needs the repair. Writes wait while it is sealed.
+    #[test]
+    fn a_sealed_database_reopens_without_a_repair() {
+        const T: TableDefinition<u64, u64> = TableDefinition::new("seal_test");
+        let dir = std::env::temp_dir().join(format!("vk-hub-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hub.redb");
+        let db = Arc::new(Db::open(&path).unwrap());
+        let write = |db: &Db, key: u64| {
+            let mut txn = db.db.begin_write().unwrap();
+            txn.set_durability(Durability::None).unwrap();
+            txn.open_table(T).unwrap().insert(key, key).unwrap();
+            txn.commit().unwrap();
+        };
+        // Reopen a copy of the file as it is now: whether it needed a repair, and the rows.
+        let reopen = |tag: &str| {
+            let copy = dir.join(format!("{tag}.redb"));
+            std::fs::copy(&path, &copy).unwrap();
+            let repaired = Arc::new(AtomicU64::new(0));
+            let seen = repaired.clone();
+            let reopened = Database::builder()
+                .set_repair_callback(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                })
+                .open(&copy)
+                .unwrap();
+            let txn = reopened.begin_read().unwrap();
+            let rows = match txn.open_table(T) {
+                Ok(t) => redb::ReadableTableMetadata::len(&t).unwrap(),
+                Err(_) => 0,
+            };
+            (repaired.load(Ordering::SeqCst) > 0, rows)
+        };
+        write(&db, 1);
+        assert!(
+            reopen("unsealed").0,
+            "a crash after a non-durable commit needs a repair"
+        );
+        write(&db, 2);
+        db.seal().unwrap();
+        assert_eq!(reopen("sealed"), (false, 2));
+        let writer = std::thread::spawn({
+            let db = db.clone();
+            move || write(&db, 3)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!writer.is_finished(), "a write began while sealed");
+        db.unseal();
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A sign-in gets its address's grant, else the `*` grant's viewer role — with or without

@@ -6080,6 +6080,16 @@ async fn start_oidc_with(
     grants: &[(&str, Role)],
     default_role: Option<Role>,
 ) -> (SocketAddr, Arc<Hub>) {
+    let (addr, hub, _) = start_oidc_sign_in(claims, grants, default_role).await;
+    (addr, hub)
+}
+
+/// [`start_oidc_with`], and the sign-in it serves.
+async fn start_oidc_sign_in(
+    claims: serde_json::Value,
+    grants: &[(&str, Role)],
+    default_role: Option<Role>,
+) -> (SocketAddr, Arc<Hub>, Arc<OidcSignIn>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let idp = vk_oidc::fake_idp::start(vk_oidc::fake_idp::Options {
         claims,
@@ -6103,9 +6113,10 @@ async fn start_oidc_with(
         vk_oidc::fake_idp::CLIENT_ID.into(),
         vk_oidc::fake_idp::CLIENT_SECRET.into(),
     );
-    let ui = Ui::new(hub.clone(), &origin).with_oidc(oidc);
+    let oidc = Arc::new(oidc);
+    let ui = Ui::new(hub.clone(), &origin).with_oidc(oidc.clone());
     tokio::spawn(serve(listener, None, Arc::new(ui)));
-    (addr, hub)
+    (addr, hub, oidc)
 }
 
 impl Reply {
@@ -6153,6 +6164,37 @@ async fn oidc_callback(addr: SocketAddr, state: &str, cookie: Option<&str>) -> R
     }
     let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
     request(addr, "GET", &path, &headers, "").await
+}
+
+/// While the hub hands its sign-ins over, a sign-in neither starts nor finishes here: the
+/// browser is told to retry, its login cookie kept, and finishes once they are given back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_handed_over_is_retried_not_lost() {
+    let (addr, _hub, oidc) = start_oidc_sign_in(
+        serde_json::json!({"sub": "user-42", "email": "alice@example.com", "email_verified": true}),
+        &[("alice@example.com", Role::Operator)],
+        None,
+    )
+    .await;
+    let (login, state) = start_oidc_login(addr).await;
+    let taken = oidc.take_pending();
+    assert_eq!(taken.len(), 1);
+    let reply = oidc_callback(addr, &state, Some(&login)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.header("retry-after"), Some("1"));
+    assert!(reply.set_cookies().is_empty(), "{:?}", reply.set_cookies());
+    let reply = request(
+        addr,
+        "GET",
+        "/auth/login",
+        &["Sec-Fetch-Site: same-origin"],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(oidc.restore_pending(taken), 1);
+    let reply = oidc_callback(addr, &state, Some(&login)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
 }
 
 /// The OIDC sign-in end to end: the signed-out page offers it, the provider's callback opens
@@ -7725,6 +7767,41 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     assert_eq!(reply.status, 400, "{}", reply.body);
 }
 
+/// A connection the hub accepted before it handed over, whose request comes only after, is
+/// answered before it is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_accepted_before_the_hand_over_is_answered() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
+    // Once the accept loop counts itself, waiting to accept; then the connection, accepted.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.handover.gate.live() < 1 {
+        assert!(tokio::time::Instant::now() < deadline, "not accepting");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let idle = hub.handover.gate.live();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    while hub.handover.gate.live() < idle + 1 {
+        assert!(tokio::time::Instant::now() < deadline, "not accepted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    hub.handover.gate.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stream
+        .write_all(b"GET /login HTTP/1.1\r\nHost: hub\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 "), "{answer:?}");
+    assert!(hub.handover.gate.drained(Duration::from_secs(5)).await);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An operator asks for the latest release on GitHub and fetches it from `/operations`; the
 /// page follows the fetch, which is held as the session's principal; a `vk-registry` is fetched
 /// as the program chosen. A release whose binary does not hash to its published digest is
@@ -7836,6 +7913,22 @@ async fn an_operator_fetches_a_release_from_github() {
     .await;
     assert!(page.contains("does not match"), "{page}");
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A live page's stream ends as the hub hands over to a release, without the `close` event that
+/// would keep the page from opening it again, to the release.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_page_s_stream_ends_as_the_hub_hands_over() {
+    let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    assert!(events.next().await.is_some());
+    hub.handover.gate.close();
+    while let Some(event) = events.next().await {
+        assert!(!event.starts_with("event: close"), "{event}");
+    }
+    assert!(hub.handover.gate.drained(Duration::from_secs(5)).await);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

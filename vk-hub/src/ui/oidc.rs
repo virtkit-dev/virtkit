@@ -148,6 +148,18 @@ impl OidcSignIn {
     pub fn provider(&self) -> &str {
         &self.provider
     }
+
+    /// The sign-ins under way, taken for the release the hub hands over to: none starts here
+    /// until they are given back ([`OidcSignIn::restore_pending`]).
+    pub fn take_pending(&self) -> Vec<vk_oidc::Pending> {
+        self.client.take_pending()
+    }
+
+    /// Finish `logins` as this hub's own: those it took back from a hand-over that failed, or
+    /// those the hub it replaced handed it. Returns how many it took on.
+    pub fn restore_pending(&self, logins: Vec<vk_oidc::Pending>) -> usize {
+        self.client.restore_pending(logins)
+    }
 }
 
 /// `GET /auth/login`: redirect to the provider. Another site's page may start a sign-in
@@ -162,6 +174,7 @@ pub async fn start(req: &Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     }
     let (url, state) = match oidc.client.login_url("/").await {
         Ok(v) => v,
+        Err(e) if e.is::<vk_oidc::LoginsHandedOver>() => return Ok(updating()),
         Err(e) => {
             eprintln!("vk-hub: ui: starting an OIDC sign-in failed: {e:#}");
             return Ok(message(StatusCode::BAD_GATEWAY, UNREACHABLE));
@@ -180,6 +193,18 @@ pub async fn start(req: &Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     Ok(resp)
 }
 
+/// The answer while the hub hands its sign-ins to the release it updates to: 503, to be
+/// retried in a second.
+fn updating() -> Response<Body> {
+    let mut resp = message(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The hub is updating itself. Reload this page in a moment.",
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    resp
+}
+
 /// Whether the browser reports top-level navigation, such as following a link, rather than
 /// a subresource, frame or script request.
 fn top_level_navigation(headers: &HeaderMap) -> bool {
@@ -189,12 +214,17 @@ fn top_level_navigation(headers: &HeaderMap) -> bool {
 
 /// `GET /auth/callback`: redeem the provider's code for who signed in, and open a session for
 /// them if a grant lets them in ([`crate::store::Db::create_oidc_session`]). Every answer
-/// expires the login cookie: the login it named is over either way.
+/// expires the login cookie, the login it named being over either way — but [`updating`]'s,
+/// which the browser retries on the release the hub hands its sign-ins to.
 pub async fn callback(req: &Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     let Some(oidc) = &ui.oidc else {
         return Ok(message(StatusCode::NOT_FOUND, NOT_CONFIGURED));
     };
     let mut resp = finish(req, ui, oidc).await?;
+    // [`updating`]'s answer: `finish` answers 503 for nothing else.
+    if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Ok(resp);
+    }
     resp.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&login_cookie("")).context("building the login cookie")?,
@@ -230,6 +260,7 @@ async fn finish(req: &Request<Incoming>, ui: &Ui, oidc: &OidcSignIn) -> Result<R
     };
     let claims = match oidc.client.exchange(code, state, cookie_state).await {
         Ok((_, claims)) => claims,
+        Err(e) if e.is::<vk_oidc::LoginsHandedOver>() => return Ok(updating()),
         Err(e) => {
             // The chain names endpoints and quotes the provider; it is for the log.
             eprintln!("vk-hub: ui: an OIDC sign-in failed: {e:#}");

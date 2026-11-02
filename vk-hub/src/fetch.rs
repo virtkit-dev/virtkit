@@ -1,14 +1,14 @@
 //! `vk-hub release fetch` and `/operations`' fetch form download a [`Program`]'s
-//! binary (`vk`, `vk-registry` or `vk-gitlab`) from a GitHub virtkit release and hold it as if
-//! supplied to `release add`.
+//! binary (`vk`, `vk-registry`, `vk-gitlab` or `vk-hub`) from a GitHub virtkit release and
+//! hold it as if supplied to `release add`.
 //!
 //! `vk-selfupdate` resolves and checks the release as `vk update` does, except for
 //! running the binary: https for the API and assets, no redirect leaving https
-//! ([`vk_selfupdate::client`]), the program's asset (`vk`, `vk-registry` or `vk-gitlab`) at most
-//! 512 MiB, and a sha256 matching `<asset>.sha256`. The tag must match the requested
-//! version. [`releases::adopt`] applies the usual release checks: an x86-64 ELF with
-//! that version as a standalone string. The hub never runs it ([`releases`]); the
-//! node, registry or relay runs its `--version` smoke test.
+//! ([`vk_selfupdate::client`]), the program's asset at most 512 MiB, and a sha256 matching
+//! `<asset>.sha256`. The tag must match the requested version. [`releases::adopt`] applies the
+//! usual release checks: an x86-64 ELF with that version as a standalone string. The hub runs
+//! none on fetching it ([`releases`]); the node, registry or relay, or for `vk-hub` the hub's
+//! own update, runs its `--version` smoke test.
 //!
 //! What this proves is that the hub holds the bytes the repository published as that version,
 //! intact: not who built them. A release whose binary and sidecar were replaced together — a
@@ -237,6 +237,8 @@ pub fn start(
         bail!("fetching releases is off: the hub's release_repository is \"none\"");
     };
     hub.releases_dir()?;
+    // Held until the fetch ends, whoever started it: an update of the hub would cut it.
+    let long = hub.handover.long_call()?;
     let what = version.as_deref().unwrap_or("latest").to_string();
     {
         let mut status = lock(&hub.fetches.status);
@@ -259,6 +261,7 @@ pub fn start(
     hub.touch();
     let (hub, actor) = (hub.clone(), actor.to_string());
     Ok(tokio::spawn(async move {
+        let _long = long;
         let result = match local::audit(&hub, &actor, started).await {
             Ok(()) => fetch(&hub, &actor, &source, program, version.as_deref()).await,
             Err(e) => Err(e),

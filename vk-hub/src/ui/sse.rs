@@ -344,15 +344,25 @@ pub fn stream(
     };
     let give_up = GIVE_UP.try_with(Arc::clone).ok();
     debug_assert!(give_up.is_some(), "a stream outside a connection's scope");
+    // Ended, without the `close` event, when the hub hands over to a release: the page opens
+    // its stream again, to the release.
+    let handing_over = hub_closing(&session.hub);
     tokio::spawn(async move {
         let _slot = slot;
-        if run(session, source, tx).await.is_err()
-            && let Some(give_up) = give_up
-        {
+        let stalled = tokio::select! {
+            ran = run(session, source, tx) => ran.is_err(),
+            () = handing_over => false,
+        };
+        if stalled && let Some(give_up) = give_up {
             give_up.notify_one();
         }
     });
     event_stream(Body::Stream(rx))
+}
+
+/// Once `hub` closes its gate to hand over to a release.
+fn hub_closing(hub: &Hub) -> impl std::future::Future<Output = ()> + Send + 'static {
+    hub.handover.gate.closing()
 }
 
 /// What a page's stream is answered with once its session has ended, its cookie still sent:

@@ -140,8 +140,9 @@ pub struct Ui {
     /// The live pages' streams open.
     streams: sse::Streams,
     site: Site,
-    /// Sign-in through an OIDC provider, besides the links.
-    oidc: Option<OidcSignIn>,
+    /// Sign-in through an OIDC provider, besides the links; shared with the hub's update, which
+    /// hands its sign-ins under way over.
+    oidc: Option<Arc<OidcSignIn>>,
 }
 
 /// What the pages show.
@@ -183,7 +184,7 @@ impl Ui {
     }
 
     /// The UI, also signing people in through `oidc`.
-    pub fn with_oidc(mut self, oidc: OidcSignIn) -> Self {
+    pub fn with_oidc(mut self, oidc: Arc<OidcSignIn>) -> Self {
         self.oidc = Some(oidc);
         self
     }
@@ -228,7 +229,8 @@ const SECURE_COOKIE: &str = "__Host-vk-hub";
 /// Serve the web UI on `listener` until the process ends, over TLS with `tls`.
 pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
-    crate::server::accept(listener, tls, permits, move |io, peer, _, _| {
+    let gate = ui.hub.handover.gate.clone();
+    crate::server::accept(listener, tls, permits, gate, move |io, peer, _, _| {
         serve_conn(io, ui.clone(), peer)
     })
     .await
@@ -236,17 +238,28 @@ pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ui: Arc<Ui>)
 
 async fn serve_conn(io: Io, ui: Arc<Ui>, peer: SocketAddr) {
     let give_up = Arc::new(Notify::new());
+    let gate = ui.hub.handover.gate.clone();
+    let started = vk_peer::handoff::Started::new();
     let svc = {
-        let give_up = give_up.clone();
-        service_fn(move |req| sse::GIVE_UP.scope(give_up.clone(), handle(req, ui.clone(), peer)))
+        let (give_up, started) = (give_up.clone(), started.clone());
+        service_fn(move |req| {
+            started.mark();
+            sse::GIVE_UP.scope(give_up.clone(), handle(req, ui.clone(), peer))
+        })
     };
     // The header timeout also closes a kept-alive connection gone idle, since hyper runs it
     // while waiting for the next request. Nothing bounds the connection as a whole: a page's
     // live updates are one response that lasts as long as the page is open.
-    let conn = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(PRE_AUTH_TIMEOUT)
-        .serve_connection(io, svc);
+    // Asked to end, after the request it serves or the first it makes, when the hub hands over
+    // to a release; a live page's stream ends then too ([`sse`]).
+    let conn = gate.serve(
+        http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(PRE_AUTH_TIMEOUT)
+            .serve_connection(io, svc),
+        started,
+        |c| c.graceful_shutdown(),
+    );
     let result = tokio::select! {
         result = conn => result,
         () = give_up.notified() => {

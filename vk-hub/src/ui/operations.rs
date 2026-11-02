@@ -156,6 +156,11 @@ pub(super) async fn upload(
             "Refused: another release is being uploaded; wait for it to end.",
         );
     };
+    // Held until the release is: an update of the hub would cut the upload.
+    let _long = match ui.hub.handover.long_call() {
+        Ok(long) => long,
+        Err(e) => return refuse(StatusCode::CONFLICT, &format!("Refused: {e:#}.")),
+    };
     let hub = ui.hub.clone();
     let (staged, file) = blocking(move || releases::Staged::create(&hub, "upload")).await?;
     let size = match receive(&mut form, file).await? {

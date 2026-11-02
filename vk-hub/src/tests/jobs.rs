@@ -33,6 +33,7 @@ use crate::store::{KeyPolicy, NoAccess, RegistryAccess, Scope};
 mod capacity;
 mod capacity_placement;
 mod capacity_recovery;
+mod handover;
 
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };

@@ -215,8 +215,9 @@ system unit when run as root), preserving enrollment.
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
 web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
 `kept_failure_output`, `kept_output`, `kept_output_total`, `image_affinity_max_load` and
-`image_affinity_max_extra_load` (see [Placed jobs](#placed-jobs)), and `max_job_token_secs`
-(see [the registry hub design](registry-hub.md)). Every key is optional and an
+`image_affinity_max_extra_load` (see [Placed jobs](#placed-jobs)), `max_job_token_secs`
+(see [the registry hub design](registry-hub.md)), and `[update]` (see
+[Updating the hub](#updating-the-hub)). Every key is optional and an
 unknown one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both
 the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
 `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys`, `vk-hub jobs` and
@@ -468,10 +469,12 @@ it waits for that drain.
 named by its sha256, and prints the sha256; `release list` and `release remove` show and delete
 them, unless a node is still updating to the release. Adding the same bytes and version again
 returns the existing release and restores its binary if missing or the wrong size, so a retry
-after a lost response succeeds. The hub never runs a binary it is handed: it holds the
+after a lost response succeeds. The hub runs no binary on being handed it: it holds the
 database, its TLS key and every node's pinned key, so it only reads the file, checking that it
 is an x86-64 ELF of at most 1 GiB that holds the stated version as a string of its own. The
-version is the operator's to state; running the binary is left to the node. `vk-hub nodes
+version is the operator's to state; running the binary is left to the node — but for a
+`vk-hub` release the hub is told to update itself to, which `[update] allow` must let it (see
+[Updating the hub](#updating-the-hub)). `vk-hub nodes
 update <id> --release <sha256>` issues the update, which names the release by digest and size;
 a prefix of at least 8 hex digits names a release too. `--force` allows updating without
 draining when `vk node` cannot drain the external runner. Like any command, it is refused
@@ -604,7 +607,9 @@ Signatures are made offline: `vk release-key generate --key <file>` writes an ed
 base64, and `vk release-key sign --key <file> --version <v> <binary>` prints the signature of
 the binary's sha256 and version under the label `vk-fleet release v1`; with `--program
 vk-registry` it signs a `vk-registry` release instead, under `vk-fleet registry-release v1`,
-for `vk-hub release add --program vk-registry --signature`. The tool is in `vk`, which every
+for `vk-hub release add --program vk-registry --signature`; with `--program vk-gitlab`, a relay's
+under `vk-fleet gitlab-release v1`, and with `--program vk-hub`, the hub's own under
+`vk-fleet hub-release v1`. The tool is in `vk`, which every
 node and workstation has and which already links ring, rather than in `vk-hub`: keep the key
 off the hub so a compromised hub cannot sign releases.
 
@@ -614,6 +619,65 @@ any drain, and again before the release first runs, using its current keys. With
 configured, the node rejects invalid signatures even when signatures are optional. The keys
 are pinned in the node's configuration, not in the `vk` binary. Official releases are not
 signed this way yet: that is a step for the release workflow, with the key in CI's secrets.
+
+## Updating the hub
+
+With `[update] allow = true` in `hub.toml`, an operator updates the hub to a `vk-hub` release it
+holds (`vk-hub release add|fetch --program vk-hub`) with `vk-hub update --release <sha256
+prefix>`; `vk-hub update` alone prints the hub's version and how its last
+update went. `[update] release_keys` lists the keys a release must be signed by
+(`require_signed` defaults to true with any), and an older release is refused unless
+`[update] allow_downgrade`; a release that does not read the listeners handed to it — one from
+before this — is refused whatever it says, as it could only be rolled back. `vk-hub local` does
+not update itself.
+
+An update and long operations refuse each other: `vk-hub release add|fetch`, `vk-hub tools
+add`, and web UI uploads or fetches. Exec would cut these operations and any waiting CLI.
+They remain blocked until the update executes the release or fails; the CLI explains why
+and can be run again then.
+
+The hub copies the release into `<data_dir>/update/releases/`, checks its digest, signature and
+`--version`, and keeps its own binary beside it. Then it settles its jobs: the client API
+answers new jobs and reservations 503 with `Retry-After: 5`, which relays retry, and the hub
+waits up to a minute for the jobs queued to start on a node, then places none and waits up to 30
+seconds for the starts sent to be answered — a job no node has accepted has its spec in memory
+only, and a restart would lose it. Should one be left, the update fails and the hub goes on as
+before. A reservation waiting in memory for capacity is not kept: its client gets 410 for it
+from the release, and reserves again. It then stops handling the nodes' job messages and
+placing, between two of them, stops accepting connections — the listening sockets stay open, so
+new connections wait in their backlogs — asks the connections open to end after their request,
+or their first for one that has made none yet, ends live pages' streams, which the browser opens
+again, and cuts what is still open after 5 seconds: the nodes', registries' and relays'
+sessions, which redial, and long polls, which are retried. It writes its database durably with
+its allocator state recorded, so the next open needs no repair, records the trial in
+`<data_dir>/update/state.json`, and executes the release in its place, the same process, with
+the node, web UI and admin sockets (`VK_LISTEN_FDS`), the web UI's OIDC sign-ins under way in a
+sealed memory file it inherits (`VK_HUB_LOGINS_FD`; never on disk, as each holds a PKCE
+verifier) and `alarm(2)` armed. The release takes the sockets, finishes those sign-ins at their
+callback, opens the database, recovers its jobs and serves; once it has served for 10 seconds,
+it records that it passed and installs itself over the installed binary by rename. The audit log
+has who asked and how the update ended. The listener backlog (1024) bounds what waits meanwhile:
+beyond it, connections are refused or retried by the kernel.
+
+The binary is replaced only once the release has passed. A release that fails or hangs before
+then is ended — by itself or by the alarm — and whatever starts `vk-hub serve` starts the
+previous binary, which hands over to the release again, three times in all, then takes the hub
+back and records the update rolled back; those starts bind the listeners afresh, so the hub is
+down between them. The hub therefore needs a supervisor, and its binary a directory its user
+can write, as in this unit:
+
+```ini
+[Service]
+User=vk-hub
+ExecStart=/opt/vk-hub/bin/vk-hub serve --config /etc/vk-hub/hub.toml
+Restart=always
+RestartSec=2
+```
+
+A lock in `<data_dir>/update/` prevents a second `vk-hub serve` from using the same data
+directory. It is acquired before reading update state and passed to the release with the
+listeners. On restart, an update interrupted before handover is recorded failed; a release
+the previous binary cannot execute is recorded rolled back.
 
 ## Rollouts
 

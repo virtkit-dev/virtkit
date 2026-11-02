@@ -162,6 +162,10 @@ pub struct Hub {
     /// How long a node may go unheard before its session is dropped and it shows unreachable:
     /// [`MISSED_HEARTBEATS`] heartbeats.
     pub(crate) quiet: Duration,
+    /// What lets the hub hand over to a release without refusing a connection.
+    pub(crate) handover: crate::update::Handover,
+    /// The hub's own update, when it serves as `vk-hub serve`.
+    pub(crate) self_update: std::sync::OnceLock<Arc<crate::update::SelfUpdate>>,
 }
 
 /// One node's open session.
@@ -241,6 +245,8 @@ impl Hub {
                 crate::tokens::DEFAULT_MAX_JOB_TOKEN,
             )),
             quiet: HEARTBEAT * MISSED_HEARTBEATS,
+            handover: crate::update::Handover::default(),
+            self_update: std::sync::OnceLock::new(),
         }
     }
 
@@ -692,19 +698,26 @@ pub(crate) type PreAuth = Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>;
 /// Serve nodes on `listener` until the process ends.
 pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, hub: Arc<Hub>) -> Result<()> {
     let permits = hub.connections.clone();
-    accept(listener, tls, permits, move |io, peer, exported, permit| {
-        serve_conn(io, hub.clone(), peer, exported, permit)
-    })
+    let gate = hub.handover.gate.clone();
+    accept(
+        listener,
+        tls,
+        permits,
+        gate,
+        move |io, peer, exported, permit| serve_conn(io, hub.clone(), peer, exported, permit),
+    )
     .await
 }
 
-/// Accept on `listener` until the process ends. Complete any TLS handshake within
-/// [`PRE_AUTH_TIMEOUT`] before calling `conn`, holding a permit for the connection's
-/// lifetime unless `conn` gives it up ([`PreAuth`]). Close excess connections immediately.
+/// Accept on `listener` until the process ends, while `gate` is open: closed, connections wait
+/// in the listener's backlog. Complete any TLS handshake within [`PRE_AUTH_TIMEOUT`] before
+/// calling `conn`, holding a permit for the connection's lifetime unless `conn` gives it up
+/// ([`PreAuth`]). Close excess connections immediately.
 pub(crate) async fn accept<F, Fut>(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     permits: Arc<Semaphore>,
+    gate: vk_peer::handoff::Gate,
     conn: F,
 ) -> Result<()>
 where
@@ -713,7 +726,9 @@ where
 {
     let conn = Arc::new(conn);
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // Counted from accept on, TLS handshake included: a gate drained has none of these.
+        let (accepted, live) = gate.accept(|| listener.accept()).await;
+        let (stream, peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 // EMFILE and friends persist; a bare retry would spin.
@@ -731,6 +746,7 @@ where
         let tls = tls.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
+            let _live = live;
             match tls {
                 Some(acceptor) => {
                     match tokio::time::timeout(PRE_AUTH_TIMEOUT, acceptor.accept(stream)).await {
@@ -809,7 +825,15 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
     };
     let downloading = state.downloading.clone();
     let conn_state = state.clone();
-    let svc = service_fn(move |req| handle(req, hub.clone(), peer, exported, state.clone()));
+    let hub_gate = hub.handover.gate.clone();
+    let started = vk_peer::handoff::Started::new();
+    let svc = {
+        let started = started.clone();
+        service_fn(move |req| {
+            started.mark();
+            handle(req, hub.clone(), peer, exported, state.clone())
+        })
+    };
     // `with_upgrades`: a WebSocket is an HTTP/1.1 upgrade, handed over once the 101 is out,
     // which is also when this future ends. The header timeout needs the timer — without one
     // hyper quietly applies none. The connection as a whole is bounded too: a node makes one
@@ -817,12 +841,17 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
     // held open. An authenticated download gets [`DOWNLOAD_TIMEOUT`] more, and a client
     // whose key was checked [`CLIENT_LIFETIME`]; between its requests, the header timeout
     // closes one left idle.
-    let conn = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(PRE_AUTH_TIMEOUT)
-        .serve_connection(io, svc)
-        .with_upgrades();
-    tokio::pin!(conn);
+    // Asked to end, after the request it serves or the first it makes, when the hub hands over
+    // to a release.
+    let mut conn = hub_gate.serve(
+        http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(PRE_AUTH_TIMEOUT)
+            .serve_connection(io, svc)
+            .with_upgrades(),
+        started,
+        |c| c.graceful_shutdown(),
+    );
     let ended = match tokio::time::timeout(PRE_AUTH_TIMEOUT * 3, &mut conn).await {
         Ok(ended) => Some(ended),
         Err(_) if downloading.load(Ordering::Relaxed) => {
@@ -832,7 +861,7 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
             match tokio::time::timeout(CLIENT_LIFETIME, &mut conn).await {
                 Ok(ended) => Some(ended),
                 Err(_) => {
-                    conn.as_mut().graceful_shutdown();
+                    conn.shut_down();
                     tokio::time::timeout(CLIENT_DRAIN, conn).await.ok()
                 }
             }

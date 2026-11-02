@@ -18,6 +18,7 @@
 //! capacity on nodes and have jobs placed on them through the client API
 //! (`docs/gitlab-dispatch.md`).
 
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -47,6 +48,7 @@ mod subject;
 mod tokens;
 mod tools;
 mod ui;
+mod update;
 mod workloads;
 
 use config::HubConfig;
@@ -111,7 +113,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<RelaysCmd>,
     },
-    /// Keep vk or vk-registry binaries for nodes or registries to update to
+    /// Update this hub to a vk-hub release it holds, or say how its last update went
+    ///
+    /// The hub copies and checks the release, settles its jobs — it takes no new one, waits
+    /// for those queued to start on a node and for the starts sent to be answered — stops
+    /// accepting connections, which queue meanwhile, and executes the release with its
+    /// listening sockets. The release passes once it has served a while, and is installed over
+    /// the hub's binary; one that does not is rolled back by the supervisor's next start of
+    /// `vk-hub serve`. Needs `[update] allow = true` in hub.toml.
+    Update {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The release, by a prefix of its sha256 as `vk-hub release list` shows it; without,
+        /// the hub's version and its last update
+        #[arg(long)]
+        release: Option<String>,
+    },
+    /// Keep vk, vk-registry, vk-gitlab or vk-hub binaries to update nodes, registries, relays
+    /// or this hub to
     Release {
         #[command(flatten)]
         config: ConfigArg,
@@ -289,13 +308,13 @@ enum ReleaseCmd {
         /// one
         #[arg(long, value_name = "FILE")]
         signature: Option<PathBuf>,
-        /// The program it is: vk, for nodes, vk-registry, for registries, or vk-gitlab, for
-        /// GitLab relays
+        /// The program it is: vk, for nodes, vk-registry, for registries, vk-gitlab, for GitLab
+        /// relays, or vk-hub, for this hub
         #[arg(long, default_value = store::Program::Vk.name(), value_parser = program_names())]
         program: String,
     },
-    /// Download a release's vk, vk-registry or vk-gitlab from the hub's release_repository and
-    /// hold it
+    /// Download a release's vk, vk-registry, vk-gitlab or vk-hub from the hub's
+    /// release_repository and hold it
     ///
     /// The hub downloads that program of that virtkit release (linux x86-64), requires it to
     /// hash to the sha256 the release publishes beside it and to hold the version as a string
@@ -308,8 +327,8 @@ enum ReleaseCmd {
         /// Only print which version the latest release is
         #[arg(long, conflicts_with = "version")]
         check: bool,
-        /// The program to download: vk, for nodes, vk-registry, for registries, or vk-gitlab,
-        /// for GitLab relays
+        /// The program to download: vk, for nodes, vk-registry, for registries, vk-gitlab, for
+        /// GitLab relays, or vk-hub, for this hub
         #[arg(
             long,
             default_value = store::Program::Vk.name(),
@@ -1122,6 +1141,10 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Update { config, release } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || update_blocking(&client, release)).await?
+        }
         Cmd::Relays { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || relays_blocking(&client, cmd)).await?
@@ -1716,16 +1739,34 @@ fn raise_nofile() {
     }
 }
 
-async fn serve(cfg: HubConfig) -> Result<()> {
+async fn serve(mut cfg: HubConfig) -> Result<()> {
     raise_nofile();
-    let listener = server::listen(cfg.addr).with_context(|| format!("binding {}", cfg.addr))?;
+    let update_dir = cfg.update_dir();
+    // Held until the process ends, or handed to the release it executes: one `serve` per data
+    // directory, from before its update state is read.
+    let lock = update::lock_instance(&update_dir)?;
+    // A hub updating itself: the release on trial, or the binary it replaces taking its turn,
+    // before anything is bound. The sockets a hand-over passed go on to whichever runs.
+    if let vk_peer::trial::Start::Exec(binary, deadline) = update::on_start(&update_dir) {
+        update::exec_on_start(&update_dir, &lock, &binary, deadline);
+    }
+    let self_update = update::SelfUpdate::open(&update_dir, std::mem::take(&mut cfg.update), lock)?;
+    let mut inherited = vk_peer::handoff::Inherited::from_env();
+    for problem in &inherited.problems {
+        eprintln!("vk-hub: update: {problem}");
+    }
+    let logins = update::take_logins();
+    let listener = take_or_listen(&mut inherited, "nodes", cfg.addr)
+        .with_context(|| format!("binding {}", cfg.addr))?;
+    self_update.passing.add("nodes", listener.as_fd())?;
     let tls = cfg.build_tls()?;
     let ui = match &cfg.ui {
-        Some(ui) => Some((
-            server::listen(ui.addr).with_context(|| format!("binding ui_addr {}", ui.addr))?,
-            ui.build_tls()?,
-            ui,
-        )),
+        Some(ui) => {
+            let listener = take_or_listen(&mut inherited, "ui", ui.addr)
+                .with_context(|| format!("binding ui_addr {}", ui.addr))?;
+            self_update.passing.add("ui", listener.as_fd())?;
+            Some((listener, ui.build_tls()?, ui))
+        }
         None => None,
     };
     // Read before anything is opened, so a bad secret file stops the hub at startup rather
@@ -1747,12 +1788,24 @@ async fn serve(cfg: HubConfig) -> Result<()> {
             })?;
             // The provider's HTTPS client takes the process's default rustls provider.
             let _ = rustls::crypto::ring::default_provider().install_default();
-            Some(ui::OidcSignIn::new(
+            let oidc = Arc::new(ui::OidcSignIn::new(
                 &ui.url,
                 o.issuer.clone(),
                 o.client_id.clone(),
                 secret,
-            ))
+            ));
+            let handed = logins.len();
+            let taken_on = oidc.restore_pending(logins);
+            if handed > 0 {
+                eprintln!(
+                    "vk-hub: update: finishing {taken_on} of the {handed} sign-in(s) under way \
+                     handed over"
+                );
+            }
+            // Retained for the next update's handover. This is the only setter, so it cannot
+            // already be set.
+            let _ = self_update.oidc.set(oidc.clone());
+            Some(oidc)
         }
         None => None,
     };
@@ -1832,7 +1885,16 @@ async fn serve(cfg: HubConfig) -> Result<()> {
             .keeping_output(cfg.kept_output, cfg.kept_output_total)
             .preferring_warm_images(cfg.image_affinity),
     );
+    if hub.self_update.set(Arc::new(self_update)).is_err() {
+        bail!("the hub's update was set twice");
+    }
     jobs::recover(&hub).await?;
+    // How the last update ended, once the database can say so: a release rolled back before
+    // it was open.
+    let h = hub.clone();
+    tokio::task::spawn_blocking(move || update::audit_end(&h))
+        .await
+        .context("auditing the last update")?;
     // Retires keys no token can need any more, and resends what changed while stopped; then
     // again every hour. A failure is logged: registries go on without the hub's keys.
     let h = hub.clone();
@@ -1847,7 +1909,28 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     tokio::spawn(clients::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
-    let admin = admin::bind(&cfg.admin_socket())?;
+    let admin_socket = cfg.admin_socket();
+    let admin = match inherited.take_unix("admin", &admin_socket) {
+        Some(Ok(taken)) => tokio::net::UnixListener::from_std(taken)
+            .context("serving the admin socket handed over")?,
+        Some(Err(e)) => {
+            eprintln!("vk-hub: update: the admin socket handed over: {e:#}; binding it afresh");
+            admin::bind(&admin_socket)?
+        }
+        None => admin::bind(&admin_socket)?,
+    };
+    if !inherited.left().is_empty() {
+        eprintln!(
+            "vk-hub: update: closing the sockets handed over that this hub does not serve: {}",
+            inherited.left().join(", ")
+        );
+    }
+    drop(inherited);
+    hub.self_update
+        .get()
+        .context("the hub's update was not set")?
+        .passing
+        .add_unix("admin", admin.as_fd(), &admin_socket)?;
     tokio::spawn(admin::serve(admin, hub.clone()));
     tokio::spawn(rollout::drive(hub.clone()));
     let ui = match ui {
@@ -1868,25 +1951,56 @@ async fn serve(cfg: HubConfig) -> Result<()> {
                 );
                 site = site.with_oidc(oidc);
             }
-            Some(ui::serve(listener, tls, Arc::new(site)))
+            Some(tokio::spawn(ui::serve(listener, tls, Arc::new(site))))
         }
         None => None,
     };
     eprintln!(
         "vk-hub: serving nodes on {}://{} (data in {})",
         if tls.is_some() { "https" } else { "http" },
-        cfg.addr,
+        listener.local_addr().unwrap_or(cfg.addr),
         cfg.data_dir.display()
     );
-    let nodes = server::serve(listener, tls, hub);
+    let nodes = tokio::spawn(server::serve(listener, tls, hub.clone()));
+    // Accepting now: a release on trial passes once it has served a while.
+    let (serving, watched) = tokio::sync::watch::channel(true);
+    tokio::spawn(update::confirm_after_settling(hub, watched));
     // Each serves until the process ends; the first to stop ends the hub.
-    match ui {
+    let ended = match ui {
         Some(ui) => tokio::select! {
-            result = nodes => result,
-            result = ui => result.context("serving the web UI"),
+            result = nodes => result.context("serving nodes").and_then(|r| r),
+            result = ui => result
+                .context("serving the web UI")
+                .and_then(|r| r.context("serving the web UI")),
         },
-        None => nodes.await,
+        None => nodes.await.context("serving nodes").and_then(|r| r),
+    };
+    serving.send_replace(false);
+    ended
+}
+
+/// The listener `inherited` holds as `name` for `addr`, handed over by the hub this one
+/// replaces, or else `addr` bound afresh.
+fn take_or_listen(
+    inherited: &mut vk_peer::handoff::Inherited,
+    name: &str,
+    addr: std::net::SocketAddr,
+) -> Result<tokio::net::TcpListener> {
+    match inherited.take_tcp(name, addr) {
+        Some(Ok(taken)) => {
+            eprintln!(
+                "vk-hub: update: serving the {name} listener handed over, on {}",
+                taken.local_addr().unwrap_or(addr)
+            );
+            return tokio::net::TcpListener::from_std(taken)
+                .with_context(|| format!("serving the {name} listener handed over"));
+        }
+        Some(Err(e)) => {
+            eprintln!("vk-hub: update: the {name} listener handed over: {e:#}; binding afresh");
+        }
+        None => {}
     }
+    Ok(server::listen(addr)?)
 }
 
 /// `vk-hub ui login|sessions|logout`, and `vk-hub local`'s, over the running hub's admin
@@ -2225,6 +2339,45 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
             let command = client.update_relay(&id, &release)?;
             eprintln!("vk-hub: relay {id}: issued command {}", command.id);
         }
+    }
+    Ok(())
+}
+
+/// `vk-hub update`: start the hub's update to `release`, or show how the last went.
+fn update_blocking(client: &admin::Client, release: Option<String>) -> Result<()> {
+    if let Some(release) = release {
+        let id = client.update_hub(&release)?;
+        eprintln!(
+            "vk-hub: update {id} under way; `vk-hub update` says how it went once the hub \
+             serves again"
+        );
+        return Ok(());
+    }
+    let status = client.hub_update()?;
+    println!("vk-hub {}", status.version);
+    println!(
+        "updates: {}",
+        match status.allowed {
+            None => "not by itself (vk-hub local)",
+            Some(false) => "off ([update] allow is not set)",
+            Some(true) if status.requires_signed => "on, signed releases only",
+            Some(true) => "on",
+        }
+    );
+    if let Some(u) = &status.update {
+        let mut line = format!(
+            "last update: {} {}",
+            u.version,
+            store::update_phase_name(u.phase)
+        );
+        if let Some(m) = &u.message {
+            line.push_str(": ");
+            line.push_str(m);
+        }
+        println!("{line}");
+    }
+    if let Some(last) = &status.last {
+        println!("asked by {} at {}", last.actor, utc(last.at));
     }
     Ok(())
 }

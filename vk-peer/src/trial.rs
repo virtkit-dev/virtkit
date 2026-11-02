@@ -119,6 +119,8 @@ pub trait Ledger: Sized {
     const PEER: &'static str;
     /// The subcommand that runs it: `serve`.
     const SUBCOMMAND: &'static str;
+    /// The config table its update settings are in, `allow_downgrade` among them.
+    const SETTINGS: &'static str = "[hub]";
 
     /// The state in `dir`, empty when there is none.
     fn load(dir: &Path) -> Result<Self>;
@@ -412,8 +414,9 @@ pub fn check_version<L: Ledger>(
     match (fields(candidate), fields(own)) {
         (Some(c), Some(o)) if c >= o || allow_downgrade => Ok(()),
         (Some(_), Some(_)) => Err(format!(
-            "{program} {candidate} is older than this {peer}'s {own}; [hub] allow_downgrade = \
-             true lets an update install it"
+            "{program} {candidate} is older than this {peer}'s {own}; {} allow_downgrade = \
+             true lets an update install it",
+            L::SETTINGS
         )),
         _ if candidate == own => Ok(()),
         _ => Err(format!(

@@ -1,15 +1,18 @@
 //! The binaries the hub holds for its nodes, registries and relays to update to, in
 //! `<data_dir>/releases/`, each a file named by its sha256 beside its row in the database.
 //!
-//! **The hub never runs one.** It holds the database, its TLS key and every node's pinned
-//! key, so a binary it was handed is only read: hashed, checked to be an x86-64 ELF, and
-//! checked to carry the version the operator states as a string of its own. Running it is
-//! left to the node.
+//! **The hub runs none on being handed it.** It holds the database, its TLS key and every
+//! node's pinned key, so a binary it was handed is only read: hashed, checked to be an x86-64
+//! ELF, and checked to carry the version the operator states as a string of its own. Running
+//! it is left to the node — except a `vk-hub` release an operator updates the hub itself to,
+//! which `[update] allow` must let it, and which it runs with `--version`, then in its place
+//! ([`crate::update`]).
 //!
-//! **Signature verification belongs to the node.** The hub stores optional signatures made
-//! offline with `vk release-key sign` and forwards them. Each node, or registry for a
-//! `vk-registry` release, or relay for a `vk-gitlab` one, verifies them against its configured
-//! keys; the hub holds no trusted release key.
+//! **Signature verification belongs to what runs the release.** The hub stores optional
+//! signatures made offline with `vk release-key sign` and forwards them. Each node, or registry
+//! for a `vk-registry` release, or relay for a `vk-gitlab` one, verifies them against its
+//! configured keys; the hub checks a `vk-hub` release's against `[update] release_keys`, and
+//! trusts no key for the others.
 //!
 //! A binary reaches the hub three ways, all held to the same checks: `release add` copies a
 //! file on the hub's host ([`add`]); the web UI uploads one, and `release fetch` downloads one
@@ -444,10 +447,11 @@ mod tests {
         assert_eq!(program(None).unwrap(), Program::Vk);
         assert_eq!(program(Some("vk-registry")).unwrap(), Program::Registry);
         assert_eq!(program(Some("vk-gitlab")).unwrap(), Program::Gitlab);
+        assert_eq!(program(Some("vk-hub")).unwrap(), Program::Hub);
         let err = program(Some("nope")).unwrap_err().to_string();
         assert!(
             err.ends_with(
-                "is not a program the hub holds releases of: vk, vk-registry or vk-gitlab"
+                "is not a program the hub holds releases of: vk, vk-registry, vk-gitlab or vk-hub"
             ),
             "{err}"
         );

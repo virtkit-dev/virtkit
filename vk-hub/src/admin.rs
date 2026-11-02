@@ -238,6 +238,12 @@ enum Call {
         id: String,
         release: String,
     },
+    /// Update the hub itself to the `vk-hub` release `release` names.
+    UpdateHub {
+        release: String,
+    },
+    /// The hub's own update: its version, whether it may update itself, and its last update.
+    HubUpdate,
     ListTokenKeys,
     RotateTokenKeys,
     /// Download a release's `vk` from the configured repository: `None` for the latest.
@@ -429,13 +435,18 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     UnixListener::from_std(listener).context("serving the admin socket")
 }
 
-/// Serve the admin socket until the process ends. A failed connection fails only itself.
+/// Serve the admin socket until the process ends. While the hub's gate is closed for
+/// handover, connections wait in the backlog for the release. A failed connection fails
+/// only itself.
 pub async fn serve(listener: UnixListener, hub: Arc<Hub>) {
     // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
     let own_uid = unsafe { libc::geteuid() };
     let mut refused = std::collections::HashSet::new();
+    let gate = hub.handover.gate.clone();
     loop {
-        let stream = match listener.accept().await {
+        // Counted from accept on, as the hub drains before it hands over.
+        let (accepted, live) = gate.accept(|| listener.accept()).await;
+        let stream = match accepted {
             Ok((stream, _)) => stream,
             Err(e) => {
                 eprintln!("vk-hub: admin socket accept error: {e}");
@@ -462,6 +473,7 @@ pub async fn serve(listener: UnixListener, hub: Arc<Hub>) {
         }
         let hub = hub.clone();
         tokio::spawn(async move {
+            let _live = live;
             if let Err(e) = serve_one(stream, hub, uid).await {
                 eprintln!("vk-hub: admin socket: {e:#}");
             }
@@ -485,9 +497,18 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     if body.is_empty() {
         return Ok(());
     }
-    let done = match fetch_call(&body) {
-        Some(call) => Some(dispatch_fetch(call, &hub, uid).await),
-        None => None,
+    // Held until answered: an update of the hub would cut it, so neither starts while the
+    // other runs.
+    let long = serde_json::from_slice::<Envelope>(&body)
+        .is_ok_and(|e| e.v == PROTOCOL_VERSION && is_long(&e.call));
+    let (_long, refused) = match long.then(|| hub.handover.long_call()).transpose() {
+        Ok(guard) => (guard, None),
+        Err(e) => (None, Some(e)),
+    };
+    let done = match (refused, fetch_call(&body)) {
+        (Some(e), _) => Some(Err(e)),
+        (None, Some(call)) => Some(dispatch_fetch(call, &hub, uid).await),
+        (None, None) => None,
     };
     let reply = tokio::task::spawn_blocking(move || {
         match done.unwrap_or_else(|| dispatch(&body, &hub, uid)) {
@@ -507,6 +528,19 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     .context("writing an admin reply")
 }
 
+/// Whether `call` adds or fetches a release or tools and may outlast an update's grace period.
+/// A latest-release check only reads and can be repeated. Fetches also hold their own long-call
+/// guard ([`crate::fetch::start`]), including those started by the web UI.
+fn is_long(call: &Call) -> bool {
+    matches!(
+        call,
+        Call::AddRelease { .. }
+            | Call::AddTools { .. }
+            | Call::FetchRelease { .. }
+            | Call::FetchProgramRelease { .. }
+    )
+}
+
 /// Extract calls that await network I/O on the runtime rather than a blocking thread.
 /// Leave other calls, including version mismatches, to [`dispatch`].
 fn fetch_call(body: &[u8]) -> Option<Call> {
@@ -517,7 +551,10 @@ fn fetch_call(body: &[u8]) -> Option<Call> {
     let envelope: Envelope = serde_json::from_slice(body).ok()?;
     matches!(
         envelope.call,
-        Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } | Call::LatestRelease
+        Call::FetchRelease { .. }
+            | Call::FetchProgramRelease { .. }
+            | Call::LatestRelease
+            | Call::UpdateHub { .. }
     )
     .then_some(envelope.call)
 }
@@ -530,6 +567,15 @@ async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_js
             fetch(hub, &actor, program, version).await
         }
         Call::LatestRelease => Ok(serde_json::to_value(crate::fetch::latest(hub).await?)?),
+        // Started with the hub at hand to hand over from; answered before it does.
+        Call::UpdateHub { release } => {
+            let hub = hub.clone();
+            let id =
+                tokio::task::spawn_blocking(move || crate::update::start(&hub, &actor, &release))
+                    .await
+                    .context("starting the hub's update")??;
+            Ok(serde_json::to_value(id)?)
+        }
         _ => bail!("not a fetch"),
     }
 }
@@ -853,6 +899,8 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::UpdateRelay { id, release } => {
             serde_json::to_value(crate::relays::update(hub, &actor, &id, &release)?)?
         }
+        Call::HubUpdate => serde_json::to_value(crate::update::status(hub))?,
+        Call::UpdateHub { .. } => bail!("an update of the hub is started on the runtime"),
         Call::RemoveRelay { id } => {
             let removed = crate::relays::remove(hub, &actor, &id)?;
             eprintln!(
@@ -1255,6 +1303,17 @@ impl Client {
         self.call(Call::RemoveRelay { id: id.to_string() })
     }
 
+    /// Update the hub itself: the update's ID.
+    pub fn update_hub(&self, release: &str) -> Result<String> {
+        self.call(Call::UpdateHub {
+            release: release.to_string(),
+        })
+    }
+
+    pub fn hub_update(&self) -> Result<crate::update::Status> {
+        self.call(Call::HubUpdate)
+    }
+
     pub fn update_relay(&self, id: &str, release: &str) -> Result<vk_hub_proto::gitlab::Command> {
         self.call(Call::UpdateRelay {
             id: id.to_string(),
@@ -1617,6 +1676,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A call that may run for minutes is refused, with why, while the hub updates itself; a
+    /// short one is served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_call_is_refused_while_the_hub_updates_itself() {
+        let dir = scratch("admin-long");
+        let path = dir.join("admin.sock");
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+        tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
+        hub.handover.hold_long_calls().unwrap();
+        let client = Client::connect(&path).unwrap();
+        let (added, nodes) = tokio::task::spawn_blocking(move || {
+            (
+                client.add_release(Path::new("/nonexistent"), "1.0.0", None, None),
+                client.list_nodes(),
+            )
+        })
+        .await
+        .unwrap();
+        let refused = added.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("updating itself"),
+            "{refused:#}"
+        );
+        nodes.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

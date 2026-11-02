@@ -329,6 +329,26 @@ async fn route(
             Err(ApiError::invalid(format!("{s:?} is not an ID")))
         }
     };
+    // A submission is answered whole before the hub hands over to a release, which settles
+    // the jobs it holds once none is under way; once it settles, none is taken.
+    let turn = match (&method, segments.as_slice()) {
+        (&Method::POST, ["v1", "jobs"]) => Some(hub.handover.try_turn()),
+        _ => None,
+    };
+    if (hub.handover.intake_paused() || matches!(turn, Some(None)))
+        && method == Method::POST
+        && matches!(
+            segments.as_slice(),
+            ["v1", "reservations"] | ["v1", "reservations", _, "claim"] | ["v1", "jobs"]
+        )
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "the hub is updating itself; it takes jobs again in a moment",
+        )
+        .retry_after(5));
+    }
     match (method, segments.as_slice()) {
         (Method::POST, ["v1", "capacity"]) => capacity(&body, hub, principal).await,
         (Method::POST, ["v1", "reservations"]) => reserve(&body, hub, principal).await,

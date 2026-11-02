@@ -418,6 +418,16 @@ pub fn release_message(sha256: &[u8; SHA256_LEN], version: &str) -> Vec<u8> {
     m
 }
 
+/// The signing payload for a hub's own `vk-hub` release: [`release_message`]'s fields under
+/// a distinct label, so signatures for another program cannot verify as the hub's or vice
+/// versa.
+pub fn hub_release_message(sha256: &[u8; SHA256_LEN], version: &str) -> Vec<u8> {
+    let mut m = b"vk-fleet hub-release v1\0".to_vec();
+    part(&mut m, sha256);
+    part(&mut m, version.as_bytes());
+    m
+}
+
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// `bytes` as standard, padded base64 (RFC 4648 §4).

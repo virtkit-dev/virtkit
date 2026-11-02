@@ -627,6 +627,20 @@ impl Dispatch {
         self.changes.subscribe()
     }
 
+    /// Counts of queued jobs and unanswered starts whose specs remain only in memory because
+    /// no node has accepted them.
+    pub fn waiting(&self) -> (usize, usize) {
+        let state = self.lock();
+        let count = |s: JobState| {
+            state
+                .jobs
+                .values()
+                .filter(|j| j.row.state == s && j.spec.is_some())
+                .count()
+        };
+        (count(JobState::Queued), count(JobState::Starting))
+    }
+
     fn output_dir(&self) -> Result<&Path, ApiError> {
         self.output_dir.as_deref().ok_or_else(|| {
             ApiError::new(
@@ -1095,6 +1109,8 @@ pub async fn on_node(
     session: u64,
     msg: NodeJobMsg,
 ) -> Result<Vec<HubJobMsg>> {
+    // Handled whole or not at all before the hub hands over to a release.
+    let _turn = hub.handover.turn().await;
     {
         let state = hub.dispatch.lock();
         if !state.links.get(node).is_some_and(|l| l.session == session) {
@@ -3610,8 +3626,13 @@ pub async fn drive(hub: Arc<Hub>) {
     loop {
         let mut changed = hub.dispatch.subscribe();
         let mut node_changed = hub.subscribe();
-        if let Err(e) = step(&hub).await {
-            eprintln!("vk-hub: placing jobs: {e:#}");
+        // Nothing is offered or started while the hub hands over to a release, and a pass is
+        // done with before it does.
+        if !hub.handover.placing_paused() {
+            let _turn = hub.handover.turn().await;
+            if let Err(e) = step(&hub).await {
+                eprintln!("vk-hub: placing jobs: {e:#}");
+            }
         }
         tokio::select! {
             _ = changed.changed() => {}
