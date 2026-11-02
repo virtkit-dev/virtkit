@@ -13,11 +13,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-fn temp_dir(tag: &str) -> PathBuf {
+/// A scratch directory, removed however the test ends: a failed run would otherwise leave
+/// its copies of the hub behind.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir(tag: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("vk-hub-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
 
 /// Run the built `vk-hub <args> --config <config>` and return stdout, or stderr on failure.
@@ -183,7 +200,9 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
         ),
     )
     .unwrap();
+    let hold = dir.join("hold");
     let mut child = Command::new(&installed)
+        .env("VK_HUB_TEST_HOLD_HANDOVER", &hold)
         .arg("serve")
         .arg("--config")
         .arg(&config)
@@ -312,10 +331,25 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
     });
     std::thread::sleep(Duration::from_millis(500));
     // A connection the hub accepts before it hands over, whose request comes only once it has
-    // stopped accepting.
+    // stopped accepting. The hub holds the hand-over, its release staged, until `hold` exists.
+    let update = std::thread::spawn({
+        let (config, sha) = (config.clone(), sha.clone());
+        move || cli(&config, &["update", "--release", &sha[..12]])
+    });
+    let started = Instant::now();
+    while !log.lock().unwrap().contains("; handing over") {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the hub did not start handing over: {}",
+            log.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let mut early = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    cli(&config, &["update", "--release", &sha[..12]]);
+    // The hub accepts in order: once a later connection is answered, `early` was accepted.
+    ask(port).unwrap();
+    std::fs::write(&hold, b"").unwrap();
+    update.join().unwrap();
     let started = Instant::now();
     while !log.lock().unwrap().contains("stopped accepting") {
         assert!(
@@ -413,5 +447,4 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
         exe.display()
     );
     drop(hub);
-    let _ = std::fs::remove_dir_all(&dir);
 }

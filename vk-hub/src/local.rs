@@ -533,6 +533,19 @@ impl Local {
     /// the rest read and dropped so it is never left blocked on a full pipe. What `vk` prints
     /// is the host's: a page shows it through [`crate::ui::html::Html::output`].
     pub async fn run(&self, args: &[&OsStr], timeout: Duration, stdout: Keep) -> Result<Output> {
+        self.run_until(args, tokio::time::sleep(timeout), timeout, stdout)
+            .await
+    }
+
+    /// [`Local::run`], timing out when `deadline` completes so tests can use an event.
+    /// `timeout` only labels the status.
+    async fn run_until(
+        &self,
+        args: &[&OsStr],
+        deadline: impl std::future::Future<Output = ()>,
+        timeout: Duration,
+        stdout: Keep,
+    ) -> Result<Output> {
         let mut child = tokio::process::Command::new(&self.vk)
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -564,7 +577,6 @@ impl Local {
                 a.and(b)
             };
             tokio::pin!(reading);
-            let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
             // Read as it runs, and waited for at once: its end is not its pipes' end, which a
             // process it left behind may hold for as long as it lives.
@@ -675,6 +687,18 @@ impl Local {
     /// What a command that exits started in the background is left running, as a shell
     /// leaves it, and writes on to the removed log.
     async fn run_action(&self, args: &[&OsStr], timeout: Duration) -> Result<Ran> {
+        self.run_action_until(args, tokio::time::sleep(timeout), timeout)
+            .await
+    }
+
+    /// [`Local::run_action`], timing out when `deadline` completes so tests can use an event.
+    /// `timeout` only labels the status.
+    async fn run_action_until(
+        &self,
+        args: &[&OsStr],
+        deadline: impl std::future::Future<Output = ()>,
+        timeout: Duration,
+    ) -> Result<Ran> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         match std::fs::DirBuilder::new().mode(0o700).create(&self.logs) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -706,7 +730,6 @@ impl Local {
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .context("reading its pid")?;
         let mut aside = Vec::new();
-        let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
         let mut check = tokio::time::interval(LOG_CHECK);
         let status = loop {
@@ -1326,6 +1349,13 @@ mod tests {
         vk
     }
 
+    /// Completes when `path` exists, letting a slow fake `vk` signal readiness before timeout.
+    async fn appears(path: PathBuf) {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn alive(pid: i32) -> bool {
         // A zombie has ended; only its parent, gone, would reap it.
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -1379,21 +1409,22 @@ mod tests {
         let vk = fake_vk(
             &dir,
             &format!(
-                "sleep 600 & echo $! > '{}'\necho started\nsleep 600",
-                left.0.display()
+                "sleep 600 & echo $! > '{}'\necho started\ntouch '{}'\nsleep 600",
+                left.0.display(),
+                dir.join("ready").display()
             ),
         );
         let local = Local::new(vk, dir.join("actions"));
-        let began = Instant::now();
+        // Past its time once it has printed, however slowly it starts.
         let out = local
-            .run(&[], Duration::from_secs(1), Keep::Head)
+            .run_until(
+                &[],
+                appears(dir.join("ready")),
+                Duration::from_secs(1),
+                Keep::Head,
+            )
             .await
             .unwrap();
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            began.elapsed()
-        );
         assert!(!out.ok);
         assert_eq!(out.status, "killed after 1s");
         assert_eq!(out.stdout, "started\n");
@@ -1456,10 +1487,14 @@ mod tests {
         let dir = scratch("termok");
         let vk = fake_vk(
             &dir,
-            "trap 'echo tearing down; exit 4' TERM\nwhile :; do sleep 0.1; done",
+            &format!(
+                "trap 'echo tearing down; exit 4' TERM\ntouch '{}'\nwhile :; do sleep 0.1; done",
+                dir.join("ready").display()
+            ),
         );
+        // Past its time once its trap is set, however slowly it starts.
         let ran = Local::new(vk, dir.join("actions"))
-            .run_action(&[], Duration::from_secs(1))
+            .run_action_until(&[], appears(dir.join("ready")), Duration::from_secs(1))
             .await
             .unwrap();
         assert_eq!(ran.status, "terminated after 1s, then exit status: 4");

@@ -6684,6 +6684,8 @@ mod tests {
     /// `Retry-After`, not read as the lock being held.
     #[tokio::test]
     async fn a_lock_request_waits_out_a_refusal() {
+        // The lock client is a TLS client: run alone, no other test installed the provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let limits = ConnLimits {
             handshake: Duration::from_secs(5),
             headers: Duration::from_secs(5),

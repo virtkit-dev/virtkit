@@ -86,6 +86,11 @@ const STATE_FILE: &str = "state.json";
 /// when there are none. Keep its original sign-in name for compatibility with older releases.
 const HANDED_ENV: &str = "VK_HUB_LOGINS_FD";
 
+/// In debug builds, hold hand-over after staging until the named file exists. The hub still
+/// accepts, so a test can open a connection it must answer across hand-over.
+#[cfg(debug_assertions)]
+const HOLD_ENV: &str = "VK_HUB_TEST_HOLD_HANDOVER";
+
 /// [`Handed`]'s format, which a release reads only if it knows it. Fields added since read as
 /// empty from a hub that did not write them, and a release that does not know one ignores it.
 const HANDED_FORMAT: u32 = 1;
@@ -813,6 +818,12 @@ async fn hand_over(
         trial.sha256.clone(),
     );
     let release = (version.as_str(), sha256.as_str());
+    #[cfg(debug_assertions)]
+    if let Some(hold) = std::env::var_os(HOLD_ENV).map(std::path::PathBuf::from) {
+        while !hold.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     if let Err(e) = update.change(|s| {
         s.update = Some(progress(&id, &version, &sha256, UpdatePhase::Draining));
     }) {
