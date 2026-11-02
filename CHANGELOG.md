@@ -16,6 +16,9 @@ All notable changes to virtkit will be documented in this file.
 - **Update registries from the web UI.** The Updates page shows each registry's version,
   update permissions and last update live. Update forms on this page and each registry's
   page require confirmation.
+- **vk-gitlab releases on the hub.** The hub holds `vk-gitlab` releases as it does `vk` and
+  `vk-registry` ones: `vk-hub release add|fetch --program vk-gitlab` and the Updates page's
+  upload and fetch. `vk release-key sign --program vk-gitlab` signs one.
 
 ## [0.101.0] - 2026-11-01
 

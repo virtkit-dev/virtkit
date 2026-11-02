@@ -438,17 +438,18 @@ pub struct Workloads {
     pub mem_bytes: BTreeMap<String, u64>,
 }
 
-/// A `vk` binary the hub holds for its nodes to update to.
+/// A binary the hub holds for its nodes, registries or relays to update to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRow {
     /// The version the operator stated, which the binary's `--version` must report.
     pub version: String,
     pub size: u64,
     /// A release key's ed25519 signature, base64: over [`vk_hub_proto::release_message`] for
-    /// `vk`, over [`vk_hub_proto::registry::release_message`] for [`REGISTRY_PROGRAM`].
+    /// `vk`, over [`vk_hub_proto::registry::release_message`] for [`REGISTRY_PROGRAM`], over
+    /// [`vk_hub_proto::gitlab::release_message`] for `vk-gitlab`.
     #[serde(default)]
     pub signature: Option<String>,
-    /// The program it is: `vk` for nodes when absent, or [`REGISTRY_PROGRAM`].
+    /// The program it is: `vk` for nodes when absent, else [`Program::name`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
     pub added_at: u64,
@@ -468,15 +469,19 @@ pub enum Program {
     /// `vk-registry`, which registries run.
     #[serde(rename = "vk-registry")]
     Registry,
+    /// `vk-gitlab`, which GitLab relays run.
+    #[serde(rename = "vk-gitlab")]
+    Gitlab,
 }
 
 impl Program {
-    pub const ALL: [Program; 2] = [Program::Vk, Program::Registry];
+    pub const ALL: [Program; 3] = [Program::Vk, Program::Registry, Program::Gitlab];
 
     pub fn name(self) -> &'static str {
         match self {
             Program::Vk => "vk",
             Program::Registry => REGISTRY_PROGRAM,
+            Program::Gitlab => "vk-gitlab",
         }
     }
 
@@ -484,15 +489,16 @@ impl Program {
         Self::ALL.into_iter().find(|p| p.name() == name)
     }
 
-    /// What runs it: `nodes` or `registries`, as in `vk-hub <that> update`.
+    /// What runs it: `nodes`, `registries` or `relays`, as in `vk-hub <that> update`.
     pub fn runners(self) -> &'static str {
         match self {
             Program::Vk => "nodes",
             Program::Registry => "registries",
+            Program::Gitlab => "relays",
         }
     }
 
-    /// The names of every program, for a message: `vk or vk-registry`.
+    /// The names of every program, for a message: `vk, vk-registry or vk-gitlab`.
     pub fn names() -> String {
         let names: Vec<&str> = Self::ALL.iter().map(|p| p.name()).collect();
         match names.split_last() {
@@ -514,7 +520,7 @@ impl std::fmt::Display for Program {
 }
 
 impl ReleaseRow {
-    /// The program it is: `vk` or [`REGISTRY_PROGRAM`].
+    /// The program it is: `vk`, [`REGISTRY_PROGRAM`] or `vk-gitlab`.
     pub fn program(&self) -> &str {
         self.program.as_deref().unwrap_or("vk")
     }
@@ -3209,12 +3215,13 @@ mod tests {
             assert_eq!(p.to_string(), p.name());
         }
         assert_eq!(Program::parse("nope"), None);
-        assert_eq!(Program::names(), "vk or vk-registry");
+        assert_eq!(Program::names(), "vk, vk-registry or vk-gitlab");
         assert_eq!(Program::Vk.stored(), None);
         assert_eq!(Program::Registry.stored().as_deref(), Some("vk-registry"));
+        assert_eq!(Program::Gitlab.stored().as_deref(), Some("vk-gitlab"));
         assert_eq!(
-            (Program::Vk.runners(), Program::Registry.runners()),
-            ("nodes", "registries")
+            Program::ALL.map(Program::runners),
+            ["nodes", "registries", "relays"]
         );
     }
 

@@ -1786,17 +1786,17 @@ without it.
 Above the fragment, an operator's `/operations` carries three forms, each with the same
 origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
 
-- **Upload** posts a binary, its program (`vk` or `vk-registry`), its version and optionally a
-  release key's signature (the base64 `vk release-key sign` prints) to `/releases/upload` as
-  `multipart/form-data`, a plain form. The body is read as it arrives: the CSRF token (field or
-  `X-CSRF-Token` header), the program, the version and the signature are checked before a byte
-  of the file is written, and the file is streamed to a private file in `<data_dir>/releases/`,
-  then held through `release add`'s checks. Any failure, the browser leaving included, removes
-  the file; so does `vk-hub serve` starting, for what a stopped hub left. The binary may be 1
-  GiB, the body must state its length and arrive within a minute plus its length at 256 KiB/s —
-  a little over an hour for 1 GiB, about seven and a half minutes for 100 MB — and never pause
-  for 30 seconds. One upload runs at a time, counted from when its fields pass their checks, and
-  the session must still be an operator's once the file is in.
+- **Upload** posts a binary, its program (`vk`, `vk-registry` or `vk-gitlab`), its version and
+  an optional release key signature (the base64 `vk release-key sign` prints) to
+  `/releases/upload` as a plain `multipart/form-data` form. Before writing any file bytes, it
+  checks the CSRF token (field or `X-CSRF-Token` header), program, version and signature.
+  It streams the binary to a private file in `<data_dir>/releases/`, then applies
+  `release add`'s checks. Any failure, including a browser disconnect, removes the file;
+  `vk-hub serve` also removes files left by a stopped hub at startup. The binary may be
+  1 GiB. The body must state its length and arrive within a minute plus its length at
+  256 KiB/s — a little over an hour for 1 GiB, about seven and a half minutes for 100 MB —
+  without pausing for 30 seconds. One upload runs at a time, starting when its fields pass
+  their checks. The session must still belong to an operator once the file arrives.
 - **Fetch from GitHub** posts a program and a version, `latest` by default, to `/releases/fetch`
   and starts `release fetch` in the background; the fragment shows its progress and how it
   ended. "Check the latest" asks which version that is and shows it, giving the last answer, or

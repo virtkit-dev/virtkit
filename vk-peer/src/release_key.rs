@@ -1,11 +1,11 @@
 //! Ed25519 release keys for the hub's peers (`[node] release_keys` for `vk node`, `[hub]
-//! release_keys` for `vk-registry`). `vk release-key generate`
+//! release_keys` for `vk-registry` and `vk-gitlab`). `vk release-key generate`
 //! creates a key; `vk release-key sign` signs a binary on the machine holding it. Keep the
 //! key off the hub so a compromised hub can send arbitrary bytes but cannot sign them.
 //!
 //! A signature covers the binary's sha256 and the version it is released as, under a label
-//! naming its [`Program`] — so a `vk` release never verifies as a `vk-registry` one, nor the
-//! reverse — and is written as base64, as the public keys are.
+//! naming its [`Program`] — so a release of one program never verifies as another's — and is
+//! written as base64, as the public keys are.
 
 use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -44,6 +44,8 @@ pub enum Program {
     Vk,
     /// `vk-registry`: [`vk_hub_proto::registry::release_message`].
     Registry,
+    /// `vk-gitlab`: [`vk_hub_proto::gitlab::release_message`].
+    Gitlab,
 }
 
 impl Program {
@@ -51,6 +53,7 @@ impl Program {
         match self {
             Program::Vk => vk_hub_proto::release_message(sha256, version),
             Program::Registry => vk_hub_proto::registry::release_message(sha256, version),
+            Program::Gitlab => vk_hub_proto::gitlab::release_message(sha256, version),
         }
     }
 }
@@ -316,6 +319,28 @@ mod tests {
         assert!(node.check(&sha, "0.89.0", Some(&signed)).is_err());
         let as_vk = sign(&key, &binary, "0.89.0", Program::Vk).unwrap();
         assert!(registry.check(&sha, "0.89.0", Some(&as_vk)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_relay_release_verifies_only_as_a_relays() {
+        let dir = std::env::temp_dir().join(format!("vk-release-key-gl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("release.pk8");
+        let public = generate(&key).unwrap();
+        let binary = dir.join("vk-gitlab");
+        std::fs::write(&binary, b"a vk-gitlab").unwrap();
+        let sha = vk_hub_proto::to_hex(&sha256_of(&binary).unwrap());
+        let keys = std::slice::from_ref(&public);
+        let relay = Policy::from_config_in("[hub]", Program::Gitlab, keys, None).unwrap();
+        let registry = Policy::from_config_in("[hub]", Program::Registry, keys, None).unwrap();
+
+        let signed = sign(&key, &binary, "0.102.0", Program::Gitlab).unwrap();
+        relay.check(&sha, "0.102.0", Some(&signed)).unwrap();
+        assert!(registry.check(&sha, "0.102.0", Some(&signed)).is_err());
+        let as_registry = sign(&key, &binary, "0.102.0", Program::Registry).unwrap();
+        assert!(relay.check(&sha, "0.102.0", Some(&as_registry)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,20 +1,21 @@
 //! `vk-hub release fetch` and `/operations`' fetch form download a [`Program`]'s
-//! binary (`vk` or `vk-registry`) from a GitHub virtkit release and hold it as if
+//! binary (`vk`, `vk-registry` or `vk-gitlab`) from a GitHub virtkit release and hold it as if
 //! supplied to `release add`.
 //!
 //! `vk-selfupdate` resolves and checks the release as `vk update` does, except for
 //! running the binary: https for the API and assets, no redirect leaving https
-//! ([`vk_selfupdate::client`]), the program's asset (`vk` or `vk-registry`) at most
+//! ([`vk_selfupdate::client`]), the program's asset (`vk`, `vk-registry` or `vk-gitlab`) at most
 //! 512 MiB, and a sha256 matching `<asset>.sha256`. The tag must match the requested
 //! version. [`releases::adopt`] applies the usual release checks: an x86-64 ELF with
 //! that version as a standalone string. The hub never runs it ([`releases`]); the
-//! node or registry runs its `--version` smoke test.
+//! node, registry or relay runs its `--version` smoke test.
 //!
 //! What this proves is that the hub holds the bytes the repository published as that version,
 //! intact: not who built them. A release whose binary and sidecar were replaced together — a
 //! compromised repository or account — passes. A release key's signature is what a node can
 //! trust instead: a fetched release carries none, as official releases are not signed yet, so
-//! a node or registry that requires one refuses it, as it refuses an unsigned `release add`.
+//! a node, registry or relay that requires one refuses it, as it refuses an unsigned `release
+//! add`.
 //!
 //! One fetch runs at a time, in the background; its progress and outcome are kept for the
 //! pages and audited. Asking which release is the latest is one request at a time too, and

@@ -289,16 +289,18 @@ enum ReleaseCmd {
         /// one
         #[arg(long, value_name = "FILE")]
         signature: Option<PathBuf>,
-        /// The program it is: vk, for nodes, or vk-registry, for registries
+        /// The program it is: vk, for nodes, vk-registry, for registries, or vk-gitlab, for
+        /// GitLab relays
         #[arg(long, default_value = store::Program::Vk.name(), value_parser = program_names())]
         program: String,
     },
-    /// Download a release's vk, or vk-registry, from the hub's release_repository and hold it
+    /// Download a release's vk, vk-registry or vk-gitlab from the hub's release_repository and
+    /// hold it
     ///
     /// The hub downloads that program of that virtkit release (linux x86-64), requires it to
     /// hash to the sha256 the release publishes beside it and to hold the version as a string
     /// of its own, and holds it unsigned. That proves the bytes are the ones published, not who
-    /// built them; a node or registry that requires signed releases refuses it.
+    /// built them; a node, registry or relay that requires signed releases refuses it.
     Fetch {
         /// The release's version, or `latest`
         #[arg(default_value = "latest")]
@@ -306,7 +308,8 @@ enum ReleaseCmd {
         /// Only print which version the latest release is
         #[arg(long, conflicts_with = "version")]
         check: bool,
-        /// The program to download: vk, for nodes, or vk-registry, for registries
+        /// The program to download: vk, for nodes, vk-registry, for registries, or vk-gitlab,
+        /// for GitLab relays
         #[arg(
             long,
             default_value = store::Program::Vk.name(),
@@ -1214,7 +1217,7 @@ async fn run(cli: Cli) -> Result<()> {
                     signature,
                     program,
                 } => {
-                    let runners = releases::program(Some(&program))?.runners();
+                    let held = releases::program(Some(&program))?;
                     let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
@@ -1225,14 +1228,20 @@ async fn run(cli: Cli) -> Result<()> {
                     .await??;
                     // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
                     println!("{}", added.sha256);
+                    // Relays do not update from the hub yet.
+                    let hint = match held {
+                        store::Program::Gitlab => String::new(),
+                        _ => format!(
+                            "; `vk-hub {} update <id> --release {}` updates one to it",
+                            held.runners(),
+                            store::short(&added.sha256)
+                        ),
+                    };
                     eprintln!(
-                        "vk-hub: holding {} {} ({} bytes); `vk-hub {} update <id> --release {}` \
-                         updates one to it",
+                        "vk-hub: holding {} {} ({} bytes){hint}",
                         added.row.program(),
                         added.row.version,
                         added.row.size,
-                        runners,
-                        store::short(&added.sha256)
                     );
                 }
                 ReleaseCmd::Fetch { check: true, .. } => {
@@ -1252,18 +1261,20 @@ async fn run(cli: Cli) -> Result<()> {
                     // The sha256 alone on stdout, as `release add` prints it.
                     println!("{}", fetched.sha256);
                     eprintln!(
-                        "vk-hub: holding {program} {} ({} bytes, unsigned); {}",
+                        "vk-hub: holding {program} {} ({} bytes, unsigned){}",
                         fetched.row.version,
                         fetched.row.size,
                         match program {
                             store::Program::Vk => format!(
-                                "`vk-hub rollout create --release {}` rolls it out",
+                                "; `vk-hub rollout create --release {}` rolls it out",
                                 store::short(&fetched.sha256)
                             ),
                             store::Program::Registry => format!(
-                                "`vk-hub registries update <id> --release {}` updates one to it",
+                                "; `vk-hub registries update <id> --release {}` updates one to it",
                                 store::short(&fetched.sha256)
                             ),
+                            // Relays do not update from the hub yet.
+                            store::Program::Gitlab => String::new(),
                         }
                     );
                 }

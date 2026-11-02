@@ -163,6 +163,8 @@ enum ReleaseProgram {
     Vk,
     /// vk-registry, which registries run
     VkRegistry,
+    /// vk-gitlab, which GitLab relays run
+    VkGitlab,
 }
 
 /// What `vk export` can package a raw disk image as.
@@ -293,7 +295,7 @@ enum ReleaseKeyCmd {
         /// The version the binary's `--version` prints
         #[arg(long)]
         version: String,
-        /// The program it is: vk, for nodes, or vk-registry, for registries
+        /// The program it is: vk (nodes), vk-registry (registries) or vk-gitlab (relays)
         #[arg(long, value_enum, default_value_t = ReleaseProgram::Vk)]
         program: ReleaseProgram,
         /// The binary
@@ -927,12 +929,12 @@ enum Cmd {
               value_parser = clap::value_parser!(u64).range(1..))]
         mem_secs: u64,
     },
-    /// Keys that sign vk and vk-registry releases for a fleet (experimental)
+    /// Keys that sign vk, vk-registry and vk-gitlab releases for a fleet (experimental)
     ///
     /// `generate` makes a key and prints the public half for `[node] release_keys` (or a
-    /// vk-registry's `[hub] release_keys`); `sign` signs a binary as a version, for `vk-hub
-    /// release add --signature`. Keep the key off the hub: a signature is what a node or
-    /// registry trusts when the hub itself might not be.
+    /// vk-registry's or vk-gitlab's `[hub] release_keys`); `sign` signs a binary as a version,
+    /// for `vk-hub release add --signature`. Keep the key off the hub: a signature is what a
+    /// node, registry or relay trusts when the hub itself might not be.
     #[command(hide = true)]
     ReleaseKey {
         #[command(subcommand)]
@@ -3339,6 +3341,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 let program = match program {
                     ReleaseProgram::Vk => release_key::Program::Vk,
                     ReleaseProgram::VkRegistry => release_key::Program::Registry,
+                    ReleaseProgram::VkGitlab => release_key::Program::Gitlab,
                 };
                 release_key::sign(key, binary, version, program)
             }

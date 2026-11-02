@@ -30,7 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::client::Placement;
-use crate::{RefusalCode, VersionRange, display_safe, valid_sha256};
+use crate::{RefusalCode, SHA256_LEN, VersionRange, display_safe, part, valid_sha256};
 
 /// Where a relay enrolls.
 pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
@@ -261,6 +261,15 @@ impl Report {
     }
 }
 
+/// A `vk-gitlab` release signature covers the same payload as [`crate::release_message`],
+/// under a distinct label so signatures cannot verify across programs.
+pub fn release_message(sha256: &[u8; SHA256_LEN], version: &str) -> Vec<u8> {
+    let mut m = b"vk-fleet gitlab-release v1\0".to_vec();
+    part(&mut m, sha256);
+    part(&mut m, version.as_bytes());
+    m
+}
+
 /// What the hub makes of a relay's GitLab server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -428,6 +437,15 @@ mod tests {
             (ENROLL_PATH, SESSION_PATH),
             ("/v1/gitlab/enroll", "/v1/gitlab/session")
         );
+    }
+
+    /// A relay's release is signed under a label of its own.
+    #[test]
+    fn a_relay_release_is_signed_apart() {
+        let sha = [7u8; SHA256_LEN];
+        let relay = release_message(&sha, "1.0.0");
+        assert_ne!(relay, crate::release_message(&sha, "1.0.0"));
+        assert_ne!(relay, crate::registry::release_message(&sha, "1.0.0"));
     }
 
     /// Older peers' messages still parse when optional fields are absent.
