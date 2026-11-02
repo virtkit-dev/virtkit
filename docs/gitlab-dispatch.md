@@ -359,10 +359,13 @@ release, claim, cancel and settle are idempotent by nature, as are a ticket's ca
 outcome repeated.
 The daemon retries transport errors and every retryable code with backoff from 1 to 30
 seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx — except
-job cancels. While handling a job, it retries a cancel after any failure with the same
-backoff until the hub accepts it or answers 400 or 404. Delivery runs alongside the trace;
-an immediate cancel replaces a graceful one. If the daemon stops first, its next start
-cancels reported jobs and resumes running ones.
+job cancels and settles. While handling a job, it retries a cancel or settle after any
+failure, including a refused relay, with the same backoff until accepted, 400 or 404.
+Cancel delivery runs alongside the trace; an immediate cancel replaces a graceful one.
+A settle refused with 409 is retried until the job ends. The job keeps its slot during
+settlement retries because the hub still charges its admission. When the daemon stops
+taking jobs for shutdown or update, a pending settle is left to its next start, which
+cancels and settles reported jobs and resumes running ones.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|
@@ -372,7 +375,7 @@ cancels reported jobs and resumes running ones.
 | 403 | `approval_pending` | a job of a project, or of a server, an operator has yet to approve on the hub | no: the job fails |
 | 403 | `project_rejected` | a job of a project, or of a server, an operator rejected | no: the job fails |
 | 404 | `not_found` | no such job, reservation, grant or admission of this relay's; another principal's ticket | no |
-| 409 | `conflict` | `request_id` reused with another body; an outcome the admission's state does not allow; an admission already used by a job; a claimed ticket cancelled | no |
+| 409 | `conflict` | `request_id` reused with another body; an outcome the admission's state does not allow; an admission already used by a job; a claimed ticket cancelled; a settle of a job not finished | no (a settle: yes) |
 | 410 | `reservation_gone` | lapsed, released, or its node lost; a ticket that ended or the hub does not know | reserve again |
 | 410 | `not_found` | a create retried after its job left the hub's history | no |
 | 413 | `too_large` | spec over 512 KiB | no |

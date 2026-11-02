@@ -77,6 +77,10 @@ All notable changes to virtkit will be documented in this file.
   hub to cancel a job GitLab canceled, gracefully or not, until the hub takes it, rather than
   giving up after about 15 seconds and leaving the job running on its node until the
   adapter's next restart; GitLab's trace and updates go on meanwhile.
+- **Finished GitLab jobs are closed on the hub across its restart.** The GitLab adapter
+  retries telling the hub that a job's outcome reached GitLab until accepted, instead of
+  giving up after about 15 seconds and leaving the job open until the adapter restarts.
+  A canceled job still stopping on its node is closed once it ends.
 
 ## [0.101.0] - 2026-11-01
 

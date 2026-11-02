@@ -895,6 +895,139 @@ fn job_requests(h: &Harness, hub_id: &str, what: &str) -> usize {
     h.http_hub.as_ref().unwrap().requests_to(&path)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settle_the_hub_did_not_take_is_retried() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(60));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    // More failures than the client's five attempts at a call: refused, then cut off.
+    fake_hub.fail_next_ending(4, "/v1/jobs/", "/settle", 503, ErrorCode::Unavailable, None);
+    fake_hub.fail_next_ending(4, "/v1/jobs/", "/settle", 0, ErrorCode::Unavailable, None);
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(60).await["state"], "success");
+    within(
+        "the settle",
+        h.hub.wait_for_call(FakeCall::Settle(hub_id.clone())),
+    )
+    .await;
+    assert_eq!(job_requests(&h, &hub_id, "settle"), 9);
+    let state = h.state_dir.join("r1.json");
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settle_of_a_job_the_hub_does_not_have_is_not_retried() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(61));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.fail_next_ending(1, "/v1/jobs/", "/settle", 404, ErrorCode::NotFound, None);
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(61).await["state"], "success");
+    let state = h.state_dir.join("r1.json");
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    assert_eq!(job_requests(&h, &hub_id, "settle"), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_settle_is_not_retried() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(58));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.fail_next_ending(1, "/v1/jobs/", "/settle", 400, ErrorCode::Invalid, None);
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(58).await["state"], "success");
+    eventually("the settle", || job_requests(&h, &hub_id, "settle") == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(job_requests(&h, &hub_id, "settle"), 1);
+    let state = h.state_dir.join("r1.json");
+    assert!(
+        records(&state)
+            .iter()
+            .any(|r| r.gitlab_job == 58 && r.phase == Phase::Reported),
+        "kept for the next start"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settle_of_a_job_still_running_is_sent_again_until_it_ends() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(59));
+    let (hub_id, _) = h.accepted_job(1).await;
+    // GitLab ends the job; its node does not stop it within the settle wait.
+    h.gl.set_status(59, "canceled");
+    h.hub.push_output(&hub_id, b"x\n");
+    within(
+        "an immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    eventually("the settle refused twice", || {
+        job_requests(&h, &hub_id, "settle") >= 2
+    })
+    .await;
+    let state = h.state_dir.join("r1.json");
+    assert!(
+        records(&state)
+            .iter()
+            .any(|r| r.gitlab_job == 59 && r.phase == Phase::Reported)
+    );
+    h.hub.finish(
+        &hub_id,
+        Some(vk_gitlab::dispatch::FailureClass::Canceled),
+        None,
+    );
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopping_relay_leaves_an_unsettled_job_to_its_next_start() {
+    let mut h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(62));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        1000,
+        "/v1/jobs/",
+        "/settle",
+        503,
+        ErrorCode::Unavailable,
+        None,
+    );
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(62).await["state"], "success");
+    // Past one call's five attempts: retried while the relay runs.
+    eventually("the settle retried", || {
+        job_requests(&h, &hub_id, "settle") > 5
+    })
+    .await;
+    let state = h.state_dir.join("r1.json");
+    let reported = |state: &Path| {
+        records(state)
+            .iter()
+            .any(|r| r.gitlab_job == 62 && r.phase == Phase::Reported)
+    };
+    assert!(reported(&state));
+    h.daemon.stop().await;
+    assert!(reported(&state), "kept for the next start");
+    h.http_hub.as_ref().unwrap().clear_faults();
+    h.daemon = h.spawn_daemon();
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
 /// Cancels of job `hub_id` the hub received asking for `mode`.
 fn cancels_asking(h: &Harness, hub_id: &str, mode: CancelMode) -> usize {
     let path = format!("/v1/jobs/{hub_id}/cancel");

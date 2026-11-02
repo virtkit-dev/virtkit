@@ -255,6 +255,11 @@ impl HubErrors {
         } else {
             log::warn!(hub_job = hub_job, error = e.to_string().as_str(); "{what} failed");
         }
+        self.pause(e)
+    }
+
+    /// Returns the retry delay after `e` without logging.
+    fn pause(&mut self, e: &DispatchError) -> Duration {
         e.retry_after.unwrap_or_else(|| self.backoff.next_delay())
     }
 }
@@ -1492,14 +1497,46 @@ async fn pump_output<D: Dispatcher>(
     }
 }
 
-/// Settles the job with the hub; true once it is settled, or the hub has it no more.
+/// Settles the job with the hub; true if settled or no longer known to the hub. Retries
+/// failures with backoff, including unfinished jobs (409). A malformed settle or a relay
+/// that stops taking jobs leaves the job recorded for settlement on the next start.
 async fn settle<D: Dispatcher>(shared: &Shared<D>, id: &str) -> bool {
-    match shared.bounded(shared.dispatcher.settle(id)).await {
-        Ok(()) => true,
-        Err(e) if e.kind == ErrorKind::NotFound => true,
-        Err(e) => {
-            log::warn!(hub_job = id, error = e.to_string().as_str(); "Settling the job with the hub failed; the next start settles it");
-            false
+    let mut stop = shared.shutdown.stop.clone();
+    let mut errors = HubErrors::new(&shared.options.hub);
+    // Back off waits for running jobs separately from failures.
+    let mut conflicts = HubErrors::new(&shared.options.hub);
+    let mut waited = false;
+    loop {
+        let e = match shared.bounded(shared.dispatcher.settle(id)).await {
+            Ok(()) => return true,
+            Err(e) if e.kind == ErrorKind::NotFound => return true,
+            Err(e) => e,
+        };
+        if e.kind == ErrorKind::Invalid {
+            log::error!(hub_job = id, error = e.to_string().as_str(); "The settle is malformed; not sending it again, the job stays recorded");
+            return false;
+        }
+        let pause = if e.kind == ErrorKind::Conflict {
+            // The job runs on, as its node has yet to act on a cancel: not a failure.
+            let level = if waited {
+                log::Level::Debug
+            } else {
+                log::Level::Info
+            };
+            waited = true;
+            log::log!(level, hub_job = id, error = e.to_string().as_str(); "The hub has not finished the job; settling it again later");
+            conflicts.pause(&e)
+        } else {
+            errors.failed(id, "Settling the job with the hub", &e)
+        };
+        tokio::select! {
+            biased;
+            // Stop immediately if job requests have already stopped.
+            () = wait_true(&mut stop) => {
+                log::warn!(hub_job = id, error = e.to_string().as_str(); "The relay stops taking jobs before the hub settled the job; the next start settles it");
+                return false;
+            }
+            () = tokio::time::sleep(pause) => {}
         }
     }
 }
@@ -1628,7 +1665,7 @@ async fn settle_when_over<D: Dispatcher>(shared: &Shared<D>, view: JobView) -> b
         true
     })
     .await;
-    // Over or not: a job the hub has not finished is refused, and settled on the next start.
+    // Attempt settlement even if unfinished; retries wait for the job to end.
     over == Ok(false) || settle(shared, &id).await
 }
 
