@@ -3,11 +3,14 @@
 //! and the release accepts them.
 //!
 //! - At start, a program registers each listening socket it serves in a [`Passing`], which
-//!   keeps a close-on-exec duplicate of it.
-//! - To hand over, it [`Passing::prepare`]s the duplicates, which clears their close-on-exec
-//!   flag and names them in [`ENV`], and executes the release with that variable
-//!   ([`exec_with`](crate::update::exec_with)). Should the exec fail, dropping the
-//!   [`Prepared`] makes them close-on-exec again.
+//!   keeps a close-on-exec duplicate of it, and serves through a [`Gate`]: its accept loops
+//!   wait while the gate is closed, and the connections they serve are counted.
+//! - To hand over, it closes the gate — no connection is accepted any more, those open are
+//!   asked to end ([`Graceful`]), each once it has started a request ([`Started`]), and given a
+//!   short while to ([`Gate::drained`]) — then [`Passing::prepare`]s the duplicates, which
+//!   clears their close-on-exec flag and names them in [`ENV`], and executes the release with
+//!   that variable ([`exec_with`](crate::update::exec_with)). Should the exec fail, dropping
+//!   the [`Prepared`] makes them close-on-exec again, and opening the gate serves on.
 //! - The release takes what [`ENV`] names as it starts ([`Inherited::from_env`]): each socket
 //!   inherited and still listening, of the expected family and serving where its config says,
 //!   is served as it is ([`Inherited::take_tcp`], [`Inherited::take_unix`]). A socket taken
@@ -19,14 +22,19 @@
 //! the file's identity also tells it from another socket since bound at that path.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use tokio::sync::{Notify, watch};
 
 /// The environment variable naming the sockets handed over: `name=fd[:dev:ino]`,
 /// comma-separated.
@@ -408,6 +416,216 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Whether a program's listeners accept, and the connections they serve: closed while it
+/// hands over.
+#[derive(Clone)]
+pub struct Gate {
+    inner: Arc<GateInner>,
+}
+
+struct GateInner {
+    open: watch::Sender<bool>,
+    live: AtomicUsize,
+    idle: Notify,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Gate {
+    /// An open gate.
+    pub fn new() -> Self {
+        Gate {
+            inner: Arc::new(GateInner {
+                open: watch::channel(true).0,
+                live: AtomicUsize::new(0),
+                idle: Notify::new(),
+            }),
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.inner.open.borrow()
+    }
+
+    /// Stop accepting, and ask the connections served to end.
+    pub fn close(&self) {
+        self.inner.open.send_replace(false);
+    }
+
+    /// Accept again.
+    pub fn open(&self) {
+        self.inner.open.send_replace(true);
+    }
+
+    /// Once the gate is open: at once if it is.
+    pub async fn opened(&self) {
+        let mut rx = self.inner.open.subscribe();
+        // The sender lives as long as `self`, so this cannot fail.
+        let _ = rx.wait_for(|open| *open).await;
+    }
+
+    /// Once the gate is closed: at once if it is.
+    pub fn closing(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut rx = self.inner.open.subscribe();
+        async move {
+            if rx.wait_for(|open| !*open).await.is_err() {
+                // The gate is gone, and with it the program serving through it.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Count a connection served until the guard drops. An accept loop counts itself too
+    /// while it waits to accept, and the connection it accepts from then on, so a gate drained
+    /// has neither a connection nor one about to be.
+    pub fn track(&self) -> Live {
+        self.inner.live.fetch_add(1, Ordering::SeqCst);
+        Live(self.inner.clone())
+    }
+
+    /// The connections served now, and the accept loops waiting to accept: none once drained.
+    pub fn live(&self) -> usize {
+        self.inner.live.load(Ordering::SeqCst)
+    }
+
+    /// Wait up to `within` for all served connections to end; return whether they did.
+    /// Call only after closing the gate: an accept loop counts while the gate is open.
+    pub async fn drained(&self, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            loop {
+                let idle = self.inner.idle.notified();
+                if self.live() == 0 {
+                    return;
+                }
+                idle.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The next connection `accept` accepts, once the gate is open, and the guard counting it.
+    /// The loop counts itself while it accepts, from before it looks at the gate, so a gate
+    /// closed and drained meanwhile has it accept nothing more. The `accept` future is dropped
+    /// when the gate closes, so it must be cancel-safe.
+    pub async fn accept<T, F: Future<Output = T>>(
+        &self,
+        mut accept: impl FnMut() -> F,
+    ) -> (T, Live) {
+        loop {
+            self.opened().await;
+            let _accepting = self.track();
+            if !self.is_open() {
+                continue;
+            }
+            tokio::select! {
+                biased;
+                () = self.closing() => {}
+                accepted = accept() => return (accepted, self.track()),
+            }
+        }
+    }
+
+    /// Serve `conn`, calling `shutdown` once the gate closes and `started` marks a request.
+    /// The connection is counted by the guard returned from [`Gate::accept`].
+    pub fn serve<C: Future>(
+        &self,
+        conn: C,
+        started: Started,
+        shutdown: fn(Pin<&mut C>),
+    ) -> Graceful<C> {
+        Graceful {
+            conn: Box::pin(conn),
+            closing: Box::pin(self.closing()),
+            closed: false,
+            started,
+            shutdown: Some(shutdown),
+        }
+    }
+}
+
+/// Whether a connection served through a [`Gate`] has started a request, which its service
+/// says ([`Started::mark`]). An HTTP server asked to end a connection before its first request
+/// closes it without reading that request, though the client connected before the hand-over and
+/// is owed its answer; so a connection is asked to end only once it has started one. One that
+/// never asks is ended by its server's header timeout, or cut with the rest. It is never reset:
+/// an idle keep-alive connection is ended at once, as servers do, and its client retries.
+#[derive(Clone, Default)]
+pub struct Started(Arc<std::sync::atomic::AtomicBool>);
+
+impl Started {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark the connection's request as started. Call from the service while the connection
+    /// future reads the request: [`Graceful`] checks the mark after polling that future.
+    /// Marking from another task wakes nothing.
+    pub fn mark(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A connection counted by its [`Gate`].
+pub struct Live(Arc<GateInner>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.0.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+/// A connection served through a [`Gate`] ([`Gate::serve`]): asked to end, once, when the gate
+/// closes and the connection has started a request — at once if it has, else as it starts one.
+pub struct Graceful<C> {
+    conn: Pin<Box<C>>,
+    closing: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// The gate closed.
+    closed: bool,
+    started: Started,
+    /// Taken once called.
+    shutdown: Option<fn(Pin<&mut C>)>,
+}
+
+impl<C: Future> Graceful<C> {
+    /// Ask the connection to end now, as closing the gate would.
+    pub fn shut_down(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown(self.conn.as_mut());
+        }
+    }
+}
+
+impl<C: Future> Future for Graceful<C> {
+    type Output = C::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<C::Output> {
+        let this = &mut *self;
+        if !this.closed && this.closing.as_mut().poll(cx).is_ready() {
+            this.closed = true;
+        }
+        loop {
+            // The service marks a request started as the connection reads it, here: asked to
+            // end then, the connection answers it first.
+            let out = this.conn.as_mut().poll(cx);
+            if out.is_ready() || !this.closed || this.shutdown.is_none() || !this.started.is_set() {
+                return out;
+            }
+            this.shut_down();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsFd;
@@ -623,5 +841,170 @@ mod tests {
         let many: Vec<String> = (0..=MAX_SOCKETS).map(|i| format!("s{i}=9999{i}")).collect();
         let problems = Inherited::parse(&many.join(",")).problems.join("\n");
         assert!(problems.contains("more than 16"), "{problems}");
+    }
+
+    #[test]
+    fn a_closed_gate_holds_accepts_and_ends_its_connections() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(gate_holds_accepts_and_ends_connections());
+    }
+
+    async fn gate_holds_accepts_and_ends_connections() {
+        let gate = Gate::new();
+        gate.opened().await;
+        assert!(gate.drained(Duration::from_millis(10)).await);
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A connection that ends only once asked to, counted as its accept counts it.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let conn = {
+            let (ended, live) = (ended.clone(), gate.track());
+            async move {
+                let _live = live;
+                let _ = rx.await;
+                ended.store(true, Ordering::SeqCst);
+            }
+        };
+        static ASK: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+        *lock(&ASK) = Some(tx);
+        // Under way: it has started a request.
+        let started = Started::new();
+        started.mark();
+        let served = tokio::spawn(gate.serve(conn, started, |_| {
+            if let Some(tx) = lock(&ASK).take() {
+                let _ = tx.send(());
+            }
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(gate.live(), 1);
+        assert!(!gate.drained(Duration::from_millis(20)).await);
+        gate.close();
+        assert!(gate.drained(Duration::from_secs(5)).await);
+        served.await.unwrap();
+        assert!(ended.load(Ordering::SeqCst));
+        // Closed: nothing is accepted, and the accept loop does not count once drained.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(addr).unwrap();
+        let accepting = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let (accepted, _live) = gate.accept(|| listener.accept()).await;
+                accepted.is_ok()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(gate.drained(Duration::from_millis(100)).await);
+        assert!(!accepting.is_finished());
+        gate.open();
+        assert!(accepting.await.unwrap());
+        gate.close();
+        // Closed: accepting waits until it opens again.
+        let opened = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.opened().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!opened.is_finished());
+        gate.open();
+        opened.await.unwrap();
+    }
+
+    #[test]
+    fn a_connection_is_asked_to_end_once_it_has_started_a_request() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(asked_to_end_once_started());
+    }
+
+    async fn asked_to_end_once_started() {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static ASK: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+        let gate = Gate::new();
+        let started = Started::new();
+        // A connection accepted before the gate closed, whose request comes after: it starts
+        // the request as it reads it, then ends once asked.
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ask_tx, ask_rx) = tokio::sync::oneshot::channel::<()>();
+        *lock(&ASK) = Some(ask_tx);
+        let conn = {
+            let (started, live) = (started.clone(), gate.track());
+            async move {
+                let _live = live;
+                let _ = request_rx.await;
+                started.mark();
+                let _ = ask_rx.await;
+            }
+        };
+        let served = tokio::spawn(gate.serve(conn, started, |_| {
+            ASKED.store(true, Ordering::SeqCst);
+            if let Some(tx) = lock(&ASK).take() {
+                let _ = tx.send(());
+            }
+        }));
+        tokio::task::yield_now().await;
+        gate.close();
+        // Not asked while it has asked nothing: closed unread, its request would go unanswered.
+        assert!(!gate.drained(Duration::from_millis(50)).await);
+        assert!(!ASKED.load(Ordering::SeqCst));
+        request_tx.send(()).unwrap();
+        assert!(gate.drained(Duration::from_secs(5)).await);
+        served.await.unwrap();
+        assert!(ASKED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_closed_gate_holds_a_pending_accept_and_asks_a_connection_once() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(pending_accept_and_one_ask());
+    }
+
+    async fn pending_accept_and_one_ask() {
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        let gate = Gate::new();
+        // Accepting when the gate closes: a connection coming then waits in the backlog.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepting = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let (accepted, _live) = gate.accept(|| listener.accept()).await;
+                accepted.is_ok()
+            }
+        });
+        tokio::task::yield_now().await;
+        gate.close();
+        let _queued = std::net::TcpStream::connect(addr).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!accepting.is_finished());
+        gate.open();
+        assert!(accepting.await.unwrap());
+        // Asked to end by hand, then by the gate closing: asked once.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let started = Started::new();
+        started.mark();
+        let mut served = gate.serve(
+            async move {
+                let _ = done_rx.await;
+            },
+            started,
+            |_| {
+                ASKED.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        served.shut_down();
+        gate.close();
+        let served = tokio::spawn(served);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        done_tx.send(()).unwrap();
+        served.await.unwrap();
+        assert_eq!(ASKED.load(Ordering::SeqCst), 1);
     }
 }
