@@ -4,6 +4,7 @@
 //! `vk-registry` and `vk-gitlab` are such peers; each brings its own messages after the
 //! handshake and its own state.
 
+pub mod handoff;
 pub mod identity;
 pub mod net;
 pub mod release_key;

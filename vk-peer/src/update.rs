@@ -98,6 +98,17 @@ fn alarm_secs(deadline: Option<u64>, now: u64) -> libc::c_uint {
 /// — one that hangs before, or is not a `vk` at all — is ended all the same; without one, it
 /// is disarmed.
 pub fn exec(binary: &Binary, alarm_at: Option<u64>) -> anyhow::Error {
+    exec_with(binary, alarm_at, &[])
+}
+
+/// [`exec`], with `env` set in the release's environment over what this process has. What
+/// [`crate::handoff::ENV`] names is never passed on unless `env` sets it: those descriptors
+/// are this process's, close-on-exec, unless it hands them over.
+pub fn exec_with(
+    binary: &Binary,
+    alarm_at: Option<u64>,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> anyhow::Error {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     let shown = binary.path.display();
@@ -113,7 +124,7 @@ pub fn exec(binary: &Binary, alarm_at: Option<u64>) -> anyhow::Error {
             .collect(),
     );
     let envp = cstrings(
-        std::env::vars_os()
+        release_env(std::env::vars_os(), env)
             .map(|(k, v)| {
                 let mut kv = k.into_encoded_bytes();
                 kv.push(b'=');
@@ -141,6 +152,17 @@ pub fn exec(binary: &Binary, alarm_at: Option<u64>) -> anyhow::Error {
     // Not executed: no alarm is left to end this process.
     alarm(None, 0);
     anyhow!(e).context(format!("executing {shown}"))
+}
+
+/// Overlay `env` on `inherited` for the release, dropping [`crate::handoff::ENV`] unless
+/// `env` explicitly sets it.
+fn release_env<'a>(
+    inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> + 'a,
+    env: &'a [(std::ffi::OsString, std::ffi::OsString)],
+) -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> + 'a {
+    inherited
+        .filter(|(k, _)| k != crate::handoff::ENV && env.iter().all(|(set, _)| set != k))
+        .chain(env.iter().cloned())
 }
 
 /// Whether this process runs the file at `path`: the same inode, not the same name.
@@ -438,6 +460,30 @@ pub fn sweep_partial(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_inherits_the_sockets_only_when_told_to() {
+        let kv = |k: &str, v: &str| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+        let inherited = || {
+            vec![
+                kv("PATH", "/bin"),
+                kv(crate::handoff::ENV, "a=5"),
+                kv("X", "1"),
+            ]
+        };
+        let env: Vec<_> = release_env(inherited().into_iter(), &[]).collect();
+        assert_eq!(env, vec![kv("PATH", "/bin"), kv("X", "1")]);
+        let set = [kv("X", "2"), kv(crate::handoff::ENV, "b=6")];
+        let env: Vec<_> = release_env(inherited().into_iter(), &set).collect();
+        assert_eq!(
+            env,
+            vec![
+                kv("PATH", "/bin"),
+                kv("X", "2"),
+                kv(crate::handoff::ENV, "b=6")
+            ]
+        );
+    }
 
     #[test]
     fn the_alarm_is_a_margin_past_the_trial_deadline() {
