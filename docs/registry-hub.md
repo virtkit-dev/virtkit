@@ -300,7 +300,7 @@ alone. Client changes are listed below.
 |---|---|---|---|
 | 1. Registration and monitoring | `vk-hub token create --kind registry`, then `vk-registry join` on the registry host | nothing: same URL, same mode, same keys, same UI | `vk-registry leave`, then restart `serve`; the registry runs as before. `vk-hub registries remove <id>` drops it from the hub |
 | 2. Steering | list `read-only` and `gc` in `[hub] allow`; set a gc schedule on the hub, and drop `vk-registry gc` from cron | nothing, unless the hub makes the registry read-only | drop them from `[hub] allow`, restart `serve`, and put the cron entry back; what the hub asked is no longer applied |
-| 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (either of `install-service`'s units: the `--system` one lets its account write the binary's directory when it owns it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry restarts on the new version, dropping open connections, as after a manual upgrade | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
+| 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (either of `install-service`'s units: the `--system` one lets its account write the binary's directory when it owns it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry hands over to the new version, refusing no connection; under `install-service`'s units the transfers open finish first (`[hub] update_drain_minutes`), elsewhere they are cut | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
 | 4. Hub tokens | define namespaces on the hub; `[hub] tokens = true` on the registry, `gc` in its `[hub] allow` for the hub's per-prefix windows, and `[[gc.prefix]] path = "ci-pipeline", retention_days = 2`, a window below `min_retention_days` the hub cannot set; `[registry] guest_credential = "job"` on nodes | jobs reach the registry with tokens scoped to their namespaces, guests through `registry.vk` including locks and files; other clients and their credentials keep working | `tokens = false`; nodes back to `guest_credential = "node"` |
 | 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; imported `vkr_` keys keep working, and new keys come from the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted, but holds nothing created on the hub since the import |
 | 6. Locks on the hub | to be designed | — | — |
@@ -401,11 +401,40 @@ signed releases and this one is not. The registry:
 2. downloads it from `/v1/registry/releases/<sha256>` under its own signature, checks its
    digest and size, and its `--version`;
 3. keeps the running binary under `<root>/hub/releases/`, waits for a gc under way, records a
-   trial, and executes the release in its place, `alarm(2)` armed past a two-minute deadline.
-   Open connections are dropped, as by a restart;
+   trial, and hands over to the release, `alarm(2)` armed in it past a two-minute deadline
+   (below);
 4. the release, once in session with the hub, records confirmation, then installs itself
    over the installed binary's path by rename and reports the update done; a registry stopped
    in between finishes the install on its next start.
+
+The hand-over refuses no connection: the registry stops accepting, and its listening sockets
+— the registry's and the accounts admin socket — pass to the release, new connections waiting
+in their backlog meanwhile. With them go what only one process may hold: the accounts db,
+closed for the release to open; the build-once lock table, its leases and failure records;
+the OIDC logins under way; and the hub session. The table and logins hold owner tokens and
+PKCE verifiers, so they travel through a memory file the release inherits, never the disk. A
+request this process can no longer serve meanwhile — a lock change, an accounts lookup — is
+answered 503 with `Retry-After: 1` and `Connection: close`, which the release answers on the
+next connection. Then, by what `serve` runs under:
+
+- **Under systemd** (`$NOTIFY_SOCKET` set: `install-service`'s units have `NotifyAccess=main`),
+  the release starts beside the registry, takes the sockets and handed state, reports ready,
+  and waits for permission to serve. If it is not ready within a minute, it is ended and the
+  registry takes everything back and resumes serving. The registry remains the unit's main
+  process while finishing open requests, including hours-long blob uploads and downloads, for
+  at most `[hub] update_drain_minutes` (60 by default, 1 to 1440). It then names the release
+  the main process (`MAINPID=`), waits for the manager to read it, and exits. If the release
+  ends meanwhile, the registry exits with a failure so systemd restarts it. Connections
+  accepted before hand-over receive their response and close; only those outlasting the
+  drain are cut. Each process counts its own connections against `max_connections`. The
+  release refuses further updates until the registry exits. Pending sign-ins finish on the
+  release; a sign-in whose code the registry exchanged during hand-over must start again.
+- **Otherwise** (an older unit, a container, a shell), the registry gives the requests open five
+  seconds, then executes the release in its place with the sockets. Those still open are cut.
+
+A release from before this hand-over is executed in the registry's place, handed nothing, and
+binds its socket afresh: the update drops open connections and refuses new ones until it
+serves, as these updates did before.
 
 Until then the installed binary is left as it is. Run `serve` under a supervisor that restarts
 it (`vk-registry install-service`), from a binary in a directory its user can write: the

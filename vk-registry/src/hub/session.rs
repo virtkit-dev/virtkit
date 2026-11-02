@@ -37,7 +37,16 @@ pub(super) async fn hold(link: Arc<Link>) {
             return;
         }
         let started = tokio::time::Instant::now();
-        match run(&link).await {
+        let outcome = tokio::select! {
+            outcome = run(&link) => outcome,
+            () = link.handed_over_is(true) => {
+                eprintln!("vk-registry: hub: session left to the release");
+                link.handed_over_is(false).await;
+                // Taken back: a new session at once, no backoff, as nothing failed.
+                continue;
+            }
+        };
+        match outcome {
             Ok(()) => {}
             Err(e) if e.is::<Permanent>() => {
                 eprintln!("vk-registry: hub: {e:#}; no longer reporting to it");

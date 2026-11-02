@@ -244,6 +244,9 @@ pub(crate) struct Link {
     /// Held while a gc runs, and by an update from recording its trial to its exec, so the
     /// registry never executes a release in the middle of a gc.
     gc_running: tokio::sync::Mutex<()>,
+    /// Set while an update hands the registry to its release: the session is closed, and the
+    /// state is the release's to change.
+    handed_over: tokio::sync::watch::Sender<bool>,
 }
 
 /// Hold the hub link for as long as `serve` runs: wait for an enrollment if there is none,
@@ -451,6 +454,7 @@ fn open(dir: &Path, state: &Arc<ServerState>, ctx: &Facts) -> Result<Option<Link
         policy,
         usage: Mutex::new(None),
         gc_running: tokio::sync::Mutex::new(()),
+        handed_over: tokio::sync::watch::channel(false).0,
     };
     // What the hub asked before a restart holds until it asks otherwise.
     let applied = link.persisted().applied.clone();
@@ -471,6 +475,9 @@ impl Link {
     fn update<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
         let out = {
             let mut p = self.persisted();
+            if self.is_handed_over() {
+                bail!("the registry was handed to the release updating it");
+            }
             let mut next = p.clone();
             let out = f(&mut next);
             next.save(&self.dir)?;
@@ -483,6 +490,30 @@ impl Link {
 
     fn allows(&self, what: &str) -> bool {
         self.ctx.settings.allows(what)
+    }
+
+    /// Leave the session and the state to the release updating the registry: the session
+    /// closes, and nothing is saved here until [`Link::take_back`].
+    pub(super) fn hand_over(&self) {
+        let _p = self.persisted();
+        self.handed_over.send_replace(true);
+    }
+
+    /// Hold the session and the state again: the release did not take over.
+    pub(super) fn take_back(&self) {
+        let _p = self.persisted();
+        self.handed_over.send_replace(false);
+    }
+
+    fn is_handed_over(&self) -> bool {
+        *self.handed_over.borrow()
+    }
+
+    /// Once the link is handed over, or at once if it is; with `false`, once it is taken back.
+    async fn handed_over_is(&self, value: bool) {
+        let mut rx = self.handed_over.subscribe();
+        // The sender lives as long as the link.
+        let _ = rx.wait_for(|v| *v == value).await;
     }
 
     /// The gc schedule in effect: the hub's, when its config lets it set one.
@@ -1138,6 +1169,18 @@ mod tests {
         assert!(!state.store.read_only(), "its config no longer allows it");
         restore_read_only(&dir(&root), &state, &settings);
         assert!(state.store.read_only());
+    }
+
+    /// A link handed to the release saves nothing until taken back.
+    #[test]
+    fn a_link_handed_over_saves_nothing_until_taken_back() {
+        let link = link("handed-over", HubSettings::default());
+        link.hand_over();
+        assert!(link.update(|p| p.scheduled_gc_at = Some(1)).is_err());
+        assert_eq!(Persisted::load(&link.dir).unwrap().scheduled_gc_at, None);
+        link.take_back();
+        link.update(|p| p.scheduled_gc_at = Some(1)).unwrap();
+        assert_eq!(Persisted::load(&link.dir).unwrap().scheduled_gc_at, Some(1));
     }
 
     #[test]

@@ -35,6 +35,12 @@ All notable changes to virtkit will be documented in this file.
   release_keys`. An update is refused while a release or tools are being added, uploaded or
   fetched, and those are refused while it runs. See `docs/fleet-prototype.md`, "Updating the
   hub".
+- **Update a registry without refusing a connection.** Hub-driven updates preserve build
+  locks and pending sign-ins while continuing to accept connections. Under systemd, open blob
+  uploads and downloads finish on the previous version, for at most `[hub]
+  update_drain_minutes` (60 by default); elsewhere they are cut after five seconds.
+  `install-service`'s units now set `NotifyAccess=main`: reinstall them for transfers to
+  survive an update. See `docs/registry-hub.md`, "Updates".
 
 ### Fixed
 

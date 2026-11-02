@@ -76,6 +76,17 @@ impl OidcClient {
         }
     }
 
+    /// The logins under way, taken for the release updating the registry to finish.
+    pub(crate) fn take_pending(&self) -> Vec<vk_oidc::Pending> {
+        self.inner.take_pending()
+    }
+
+    /// Finish the logins a previous process of the registry started; returns how many were
+    /// taken on: those not expired, as many as fit.
+    pub(crate) fn restore_pending(&self, logins: Vec<vk_oidc::Pending>) -> usize {
+        self.inner.restore_pending(logins)
+    }
+
     pub fn issuer(&self) -> &str {
         self.inner.issuer()
     }

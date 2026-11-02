@@ -127,7 +127,16 @@ pub struct HubSettings {
     pub min_grace_days: u64,
     /// Take the tokens the hub signs, as well as the mode's own credentials.
     pub tokens: bool,
+    /// How long, in minutes, a registry updated beside its release goes on serving the
+    /// requests it has open: the transfers under way when it handed over.
+    pub update_drain_minutes: u64,
 }
+
+/// `[hub] update_drain_minutes`'s default: an hour, for a large blob over a slow link.
+pub const DEFAULT_UPDATE_DRAIN_MINUTES: u64 = 60;
+
+/// `[hub] update_drain_minutes`'s ceiling: a day.
+const MAX_UPDATE_DRAIN_MINUTES: u64 = 24 * 60;
 
 /// `[hub] min_retention_days`'s default.
 const DEFAULT_MIN_RETENTION_DAYS: u64 = 7;
@@ -142,11 +151,17 @@ impl Default for HubSettings {
             min_retention_days: DEFAULT_MIN_RETENTION_DAYS,
             min_grace_days: crate::DEFAULT_GC_GRACE_DAYS,
             tokens: false,
+            update_drain_minutes: DEFAULT_UPDATE_DRAIN_MINUTES,
         }
     }
 }
 
 impl HubSettings {
+    /// How long a registry updated beside its release goes on serving what it has open.
+    pub fn update_drain(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.update_drain_minutes.saturating_mul(60))
+    }
+
     /// Whether the hub may do what [`vk_hub_proto::registry`]'s `ALLOW_*` value `what` names.
     pub fn allows(&self, what: &str) -> bool {
         self.allow.iter().any(|a| a == what)
@@ -276,6 +291,7 @@ struct FileHub {
     min_grace_days: Option<u64>,
     #[serde(default)]
     tokens: bool,
+    update_drain_minutes: Option<u64>,
 }
 
 /// What `admin_socket` accepts: a bool (`false` = bind none, `true` = the default path)
@@ -424,6 +440,7 @@ impl ServerConfig {
             min_retention_days,
             min_grace_days,
             tokens,
+            update_drain_minutes,
         } = &self.hub;
         let mut described = format!(
             "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub=HubSettings {{ \
@@ -434,6 +451,10 @@ impl ServerConfig {
         );
         if *tokens {
             described.push_str(" tokens=true");
+        }
+        // Only when set, so a registry that leaves it keeps the hash it had.
+        if *update_drain_minutes != DEFAULT_UPDATE_DRAIN_MINUTES {
+            described.push_str(&format!(" update_drain_minutes={update_drain_minutes}"));
         }
         // Only when set, so a registry with no `[[gc.prefix]]` keeps the hash it had.
         if !self.gc_prefixes.is_empty() {
@@ -465,6 +486,12 @@ impl ServerConfig {
             }
         }
         self.hub.release_policy()?;
+        if !(1..=MAX_UPDATE_DRAIN_MINUTES).contains(&self.hub.update_drain_minutes) {
+            bail!(
+                "[hub] update_drain_minutes = {}: 1 to {MAX_UPDATE_DRAIN_MINUTES}",
+                self.hub.update_drain_minutes
+            );
+        }
         Ok(())
     }
 
@@ -654,6 +681,9 @@ impl ServerConfig {
                 min_retention_days: h.min_retention_days.unwrap_or(DEFAULT_MIN_RETENTION_DAYS),
                 min_grace_days: h.min_grace_days.unwrap_or(crate::DEFAULT_GC_GRACE_DAYS),
                 tokens: h.tokens,
+                update_drain_minutes: h
+                    .update_drain_minutes
+                    .unwrap_or(DEFAULT_UPDATE_DRAIN_MINUTES),
             }),
             gc_prefixes: f.gc.map(|g| g.prefix).unwrap_or_default(),
         };
@@ -1820,6 +1850,43 @@ mod tests {
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
         cfg.hub.tokens = true;
         assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+    }
+
+    /// `[hub] update_drain_minutes` defaults to an hour, takes 1 to 1440, and changes the config
+    /// hash only when set to something else.
+    #[test]
+    fn the_update_drain_defaults_to_an_hour_and_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None)
+        };
+        let default = load("[hub]\nallow = [\"update\"]\n").unwrap();
+        assert_eq!(
+            default.hub.update_drain(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            load("[hub]\nupdate_drain_minutes = 1440\n")
+                .unwrap()
+                .hub
+                .update_drain_minutes,
+            1440
+        );
+        for bad in [0, 1441] {
+            let Err(e) = load(&format!("[hub]\nupdate_drain_minutes = {bad}\n")) else {
+                panic!("{bad} minutes is taken");
+            };
+            assert!(format!("{e:#}").contains("1 to 1440"), "{e:#}");
+        }
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
+        assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        cfg.hub.update_drain_minutes = 5;
+        assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With `[hub] tokens = true`, a shared secret that reads as a hub token is refused.

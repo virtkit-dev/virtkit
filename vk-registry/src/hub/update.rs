@@ -5,8 +5,9 @@
 //!    `<root>/hub/releases/<sha256>`, checked against the command's digest and size, its
 //!    signature against `[hub] release_keys`, and its `--version` against the command's;
 //! 2. the running binary is kept beside it, by its own sha256, to go back to;
-//! 3. the registry records a trial and executes the release in its place, `alarm(2)` armed
-//!    past the trial's deadline;
+//! 3. the registry records a trial and hands over to the release ([`handover`]), `alarm(2)`
+//!    armed in it past the trial's deadline: started beside the registry under systemd, which
+//!    finishes its open transfers, or executed in its place with the listening sockets;
 //! 4. the release, once in session with the hub, records confirmation, then installs itself
 //!    over the installed binary's path, by rename, and reports the update done; a registry
 //!    stopped in between finishes the install on its next start.
@@ -15,12 +16,11 @@
 //! a supervisor restarting a release that crashed or hung, or a person — starts the previous
 //! one, which counts the attempt and hands over again ([`on_start`]), or, past
 //! [`MAX_ATTEMPTS`](vk_peer::trial::MAX_ATTEMPTS) or the deadline, takes the registry back and
-//! reports the update rolled back. The connections open when the registry executes the release
-//! are dropped, as by a manual restart. So `serve` needs a supervisor that restarts it: a
-//! release that cannot reach the hub is ended by its alarm, and nothing else starts the
-//! registry again. The registry notes no signals, so a SIGTERM ends it at once, as it always
-//! has: one arriving after the exec ends the release, which a supervisor told to stop does not
-//! start again, and the next start hands over again.
+//! reports the update rolled back. So `serve` needs a supervisor that restarts it: a release
+//! that cannot reach the hub is ended by its alarm, and nothing else starts the registry
+//! again. The registry notes no signals, so a SIGTERM ends it at once, as it always has, and
+//! under systemd the release beside it with it; one arriving after an exec ends the release,
+//! which a supervisor told to stop does not start again, and the next start hands over again.
 //!
 //! The installed binary is the one `serve` last started from outside `<root>/hub/`, recorded
 //! when it opens its hub link: a confirmed release goes on running from `releases/`, and the
@@ -29,16 +29,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use vk_hub_proto::registry::{Command, Operation};
 use vk_hub_proto::{Outcome, UpdatePhase, UpdateProgress};
 use vk_peer::trial::{self, Asked, Keeper, TRIAL_WINDOW, Trial};
-use vk_peer::update::exec;
 
 pub use vk_peer::trial::Start;
 
 use super::Link;
 use super::state::Persisted;
+use crate::handover::{self, Shape};
 
 /// The previous binary's part in a trial, run by `serve` before anything else
 /// ([`trial::on_start`]).
@@ -82,6 +82,13 @@ pub(super) fn accept(link: &Link, command: &Command) -> Result<Outcome, String> 
     };
     if link.persisted().update_under_way() {
         return Err("an update is under way already".to_string());
+    }
+    if handover::overlapped() {
+        return Err(
+            "the registry this release updated is still finishing its transfers as the unit's \
+             main process"
+                .to_string(),
+        );
     }
     trial::check::<Persisted>(
         &Asked {
@@ -156,7 +163,12 @@ async fn prepare(link: &Arc<Link>, command: &Command) -> Result<()> {
     let installed = link.persisted().installed.clone();
     let (trial, binary) =
         trial::stage::<Persisted>(&link.dir, &fetch, &command.id, version, installed).await?;
-    // Held across the exec: a gc under way finishes first, and none starts after.
+    // Off the runtime: it reads the whole release.
+    let file = binary.file().try_clone().context("reading the release")?;
+    let shape = tokio::task::spawn_blocking(move || Shape::of(&file))
+        .await
+        .context("reading the release")??;
+    // Held across the hand-over: a gc under way finishes first, and none starts after.
     let _gc = link.gc_running.lock().await;
     // Start the window after gc: collection can take longer than the window.
     let trial = Trial {
@@ -168,8 +180,50 @@ async fn prepare(link: &Arc<Link>, command: &Command) -> Result<()> {
         p.trial = Some(trial);
         p.update = Some(progress(UpdatePhase::Validating));
     })?;
-    eprintln!("vk-registry: hub: executing vk-registry {version} on trial");
-    Err(exec(&binary, Some(deadline)))
+    let state = &link.state;
+    let e = match shape {
+        Shape::Plain => {
+            eprintln!("vk-registry: hub: executing vk-registry {version} on trial");
+            handover::exec_plain(&binary, deadline)
+        }
+        Shape::Exec | Shape::Overlap => {
+            // Executed, the release takes over once the requests open had their grace, which
+            // this process serves meanwhile; started beside it, the release serves them.
+            if shape == Shape::Exec {
+                handover::drain(state).await;
+            }
+            let handing = state.clone();
+            let handed =
+                match tokio::task::spawn_blocking(move || handover::hand_over(&handing)).await {
+                    Ok(handed) => handed?,
+                    // A panic in there may leave the lock table frozen and the accounts db
+                    // closed: end, as when the db cannot be opened again, for the supervisor
+                    // to start the registry afresh, which retries the release.
+                    Err(e) => {
+                        eprintln!("vk-registry: hub: handing the registry over: {e}; ending");
+                        std::process::exit(1);
+                    }
+                };
+            link.hand_over();
+            let e = if shape == Shape::Overlap {
+                eprintln!(
+                    "vk-registry: hub: starting vk-registry {version} on trial beside this \
+                     process"
+                );
+                let drain = link.ctx.settings.update_drain();
+                handover::overlap(state, &binary, deadline, handed, drain).await
+            } else {
+                eprintln!(
+                    "vk-registry: hub: executing vk-registry {version} on trial, with the \
+                     listening sockets"
+                );
+                handover::exec(state, &binary, deadline, handed).await
+            };
+            link.take_back();
+            e
+        }
+    };
+    Err(e)
 }
 
 #[cfg(test)]

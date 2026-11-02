@@ -224,6 +224,13 @@ const KEYS: &[Key] = &[
                with no secret they confine nothing [default: false]",
     },
     Key {
+        table: Table::Hub,
+        name: "update_drain_minutes",
+        help: "how long, under systemd, the registry serves the\n\
+               transfers open when an update hands over to the\n\
+               release beside it, 1 to 1440 [default: 60]",
+    },
+    Key {
         table: Table::GcPrefix,
         name: "path",
         help: "a repository prefix: its repositories, path/…, and\n\

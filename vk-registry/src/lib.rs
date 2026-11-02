@@ -3673,11 +3673,39 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     // A registry its hub is updating: the release on trial, or the binary it replaces taking
     // its turn, before anything is bound.
     if let hub::Start::Exec(binary, deadline) = hub::on_start(&cfg.root, vk_peer::now_secs()) {
-        return Err(vk_peer::update::exec(&binary, deadline));
+        // What a hand-over passed this process goes on to that binary: the sockets, named
+        // again, and the descriptors the `VK_REGISTRY_*` variables name, still open.
+        let env: Vec<_> = std::env::var_os(vk_peer::handoff::ENV)
+            .map(|v| (vk_peer::handoff::ENV.into(), v))
+            .into_iter()
+            .collect();
+        return Err(vk_peer::update::exec_with(&binary, deadline, &env));
+    }
+    // What a registry handing over to this release passed it: its sockets, its lock table.
+    let mut taken = handover::Taken::from_env();
+    for problem in &taken.problems {
+        eprintln!("vk-registry: {problem}");
+    }
+    if let Some(why) = &taken.unread {
+        // Beside the registry it updates, which then takes everything back and serves on;
+        // executed in its place, the release serves with an empty lock table rather than not
+        // at all.
+        if taken.overlapping() {
+            bail!("{why}; the registry this release was to update serves on");
+        }
+        eprintln!("vk-registry: {why}; the lock table and logins start empty");
     }
     let addr = cfg.addr;
     let facts = cfg.hub_facts();
-    let listener = listen(addr).with_context(|| format!("binding {addr}"))?;
+    let listener = match taken.sockets.take_tcp(handover::SOCKET, addr) {
+        Some(Ok(l)) => TcpListener::from_std(l).context("serving the socket handed over")?,
+        other => {
+            if let Some(Err(e)) = other {
+                eprintln!("vk-registry: the socket handed over is not used: {e:#}");
+            }
+            listen(addr).with_context(|| format!("binding {addr}"))?
+        }
+    };
     let tls = cfg.build_tls()?;
     // Resolved before `into_state` consumes the config; bound after it, because the
     // listener is only worth having once the db behind it is open.
@@ -3690,6 +3718,20 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     raise_nofile_limit(limits.connections);
     let mut state = cfg.into_state()?;
     state.tls = tls;
+    if let Some(carried) = taken.carried.take() {
+        carried.restore(&mut state);
+    }
+    {
+        use std::os::fd::AsFd;
+        state
+            .handover
+            .passing
+            .add(handover::SOCKET, listener.as_fd())?;
+    }
+    // A release started beside the registry it updates accepts nothing until told to serve.
+    if taken.overlapping() {
+        state.handover.gate.close();
+    }
     let state = Arc::new(state);
     // Accounts mode only, and the db the socket administers is the one this server holds —
     // `Authenticator` is what says whether there is one at all.
@@ -3699,13 +3741,39 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
         // stopped. Refusing to start over a socket path — a read-only directory, a file
         // somebody left at the name, another process listening there — would let the
         // convenience take the service down, which is the one thing it must not do.
-        match admin::bind(&path) {
+        let bound = match taken.sockets.take_unix(handover::ADMIN_SOCKET, &path) {
+            Some(Ok(listener)) => Ok(listener),
+            other => {
+                if let Some(Err(e)) = other {
+                    eprintln!("vk-registry: the admin socket handed over is not used: {e:#}");
+                }
+                // Binding afresh replaces the socket file the registry beside this release
+                // still serves, and keeps should this release not take over.
+                if taken.overlapping() {
+                    Err(anyhow::anyhow!(
+                        "none was handed over, and the registry this release updates holds its path"
+                    ))
+                } else {
+                    admin::bind(&path)
+                }
+            }
+        };
+        match bound {
             Ok(listener) => {
+                use std::os::fd::AsFd;
                 eprintln!(
                     "vk-registry: accounts admin socket on {} — `vk-registry accounts` \
                      needs no downtime",
                     path.display()
                 );
+                if let Err(e) =
+                    state
+                        .handover
+                        .passing
+                        .add_unix(handover::ADMIN_SOCKET, listener.as_fd(), &path)
+                {
+                    eprintln!("vk-registry: the admin socket is not handed to releases: {e:#}");
+                }
                 tokio::spawn(admin::serve_admin(
                     listener,
                     db.clone(),
@@ -3718,6 +3786,12 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
             ),
         }
     }
+    // A release started beside the registry it updates serves once that one has handed over;
+    // until then it holds the sockets and what it was handed, and takes no connection.
+    if let Err(e) = tokio::task::spawn_blocking(move || taken.prepared()).await? {
+        bail!("{e:#}; the registry this release was to update serves on");
+    }
+    state.handover.gate.open();
     hub::start(state.clone(), facts);
     serve_limited(listener, state, limits).await
 }
@@ -6170,6 +6244,9 @@ pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<Strin
             );
         }
     }
+    // `NotifyAccess=main` hands the server `$NOTIFY_SOCKET`: a hub's update then starts the
+    // release beside it and names it the main process once the transfers open have finished
+    // (`handover`), where without it the update executes the release and cuts them.
     // A hub's update renames the release over the binary, which `ProtectSystem=strict`
     // would refuse in any directory. Lifting that leaves file permissions in charge: the
     // account still writes the directory only if it owns it, as the update requires.
@@ -6195,6 +6272,7 @@ pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<Strin
          ExecStart={exe} serve {args}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
+         NotifyAccess=main\n\
          LimitNOFILE=1048576\n\
          \n\
          User={account}\n\
@@ -6251,6 +6329,7 @@ pub fn install_service(facts: &UnitFacts) -> Result<()> {
     std::fs::create_dir_all(&unit_dir)
         .with_context(|| format!("creating {}", unit_dir.display()))?;
     let unit_file = unit_dir.join(SERVICE_UNIT);
+    // `NotifyAccess=main`: as in [`system_unit`], for an update that cuts no transfer.
     let unit = format!(
         "[Unit]\n\
          Description=virtkit local OCI registry (shared microVM bundle store)\n\
@@ -6259,6 +6338,7 @@ pub fn install_service(facts: &UnitFacts) -> Result<()> {
          [Service]\n\
          ExecStart={exe} serve {args}\n\
          Restart=on-failure\n\
+         NotifyAccess=main\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
