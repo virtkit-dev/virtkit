@@ -77,8 +77,10 @@ All notable changes to virtkit will be documented in this file.
   that gets no answer or is turned away busy — a pull, a manifest or file push, an upload
   started — is retried as `vk`'s own registry transfers are, rather than failing at once with
   502. A guest whose registry stays down waits through those retries, up to a few minutes,
-  then gets the registry's last answer if it was turned away, or a 502. Upload chunks and
-  ends, deletions, new directories, lock requests and bodies over 4 MiB are still sent once.
+  then gets the registry's last answer if it was turned away, or a 502. Interrupted blob and
+  manifest pulls by digest resume where they stopped.
+  Upload chunks and ends, deletions, new directories, lock requests and bodies over 4 MiB are
+  still sent once.
 - **GitLab cancels reach the node across a hub restart.** A GitLab adapter keeps asking the
   hub to cancel a job GitLab canceled, gracefully or not, until the hub takes it, rather than
   giving up after about 15 seconds and leaving the job running on its node until the

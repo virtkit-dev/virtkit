@@ -18,8 +18,9 @@
 //! turned away, is sent again when a second one does what the first would have
 //! ([`repeatable`]), its body held for that up to [`MAX_HELD`]; once the retries are spent, the
 //! guest gets the registry's last refusal, or a 502 when the last attempt got no answer. A
-//! response cut short reaches the guest cut short, as before: once the status and headers have
-//! gone, the guest's client is the one to start over.
+//! blob or manifest addressed by digest resumes from the first unsent byte if its response
+//! is cut short ([`Resume`]). Other truncated responses reach the guest cut short: once
+//! status and headers have been sent, the guest's client must start over.
 //!
 //! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
 //! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
@@ -43,7 +44,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::TryStreamExt;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
@@ -57,8 +58,9 @@ use vk_hub_proto::token::{ALIAS_ROOT, under, valid_component, valid_prefix};
 
 use crate::oci::Creds;
 
-/// The streaming response body the proxy returns.
-type ProxyBody = BoxBody<Bytes, std::io::Error>;
+/// The proxy's streaming response body: not `Sync` because [`Resume`] holds the request
+/// for the remaining bytes across an await.
+type ProxyBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// The name the guest reaches the proxy at.
 pub const GUEST_HOST: &str = "registry.vk";
@@ -290,7 +292,7 @@ async fn handle(
         eprintln!("virtkit: registry proxy: {e:#}");
         let body = Full::new(Bytes::from_static(b"registry proxy: upstream error"))
             .map_err(|never| match never {})
-            .boxed();
+            .boxed_unsync();
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .body(body)
@@ -422,7 +424,7 @@ fn forbidden(msg: &'static [u8]) -> Response<ProxyBody> {
         .body(
             Full::new(Bytes::from_static(msg))
                 .map_err(|never| match never {})
-                .boxed(),
+                .boxed_unsync(),
         )
         .expect("building a refusal")
 }
@@ -550,7 +552,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             b"registry proxy: this method is not proxied under /dav/files/",
         ))
         .map_err(|never| match never {})
-        .boxed();
+        .boxed_unsync();
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(body)?);
@@ -618,21 +620,61 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     .context("forwarding to the upstream registry")?;
     let status = resp.status();
     let headers_out = resp.headers().clone();
+    // A digest's bytes, cut short, resume where they stopped (see [`Resume`]).
+    let resume = (method == Method::GET
+        && status == StatusCode::OK
+        && digest_addressed(path)
+        && !parts.headers.contains_key(hyper::header::RANGE)
+        && !headers_out.contains_key(hyper::header::CONTENT_ENCODING))
+    .then(|| resp.content_length())
+    .flatten();
     // stream the upstream response back without buffering (blob pulls).
     let stream = resp.bytes_stream();
-    let body = match hrefs {
-        Some(map) => StreamBody::new(
+    let body = match (hrefs, resume) {
+        (Some(map), _) => StreamBody::new(
             map.over(stream)
                 .map_ok(Frame::data)
                 .map_err(|e| std::io::Error::other(e.to_string())),
         )
-        .boxed(),
-        None => StreamBody::new(
+        .boxed_unsync(),
+        (None, Some(total)) => {
+            // The same GET, from the first byte not sent.
+            let get = request(None);
+            let what_resumed = what.clone();
+            let again = move |from: u64| {
+                let ranged = get
+                    .try_clone()
+                    .map(|rb| rb.header(hyper::header::RANGE, format!("bytes={from}-")));
+                let what = what.clone();
+                async move {
+                    crate::registry::with_anyhow_retry(&what, || {
+                        let attempt = ranged.as_ref().and_then(|rb| rb.try_clone());
+                        async move {
+                            attempt
+                                .context("cloning the resume request")?
+                                .send()
+                                .await
+                                .and_then(crate::registry::turned_away)
+                                .map_err(anyhow::Error::from)
+                        }
+                    })
+                    .await
+                }
+            };
+            let digest = headers_out.get(DIGEST_HEADER).cloned();
+            StreamBody::new(
+                Resume::new(stream, total, digest, what_resumed)
+                    .over(again)
+                    .map_ok(Frame::data),
+            )
+            .boxed_unsync()
+        }
+        (None, None) => StreamBody::new(
             stream
                 .map_ok(Frame::data)
                 .map_err(|e| std::io::Error::other(e.to_string())),
         )
-        .boxed(),
+        .boxed_unsync(),
     };
 
     let mut out = Response::builder().status(status);
@@ -679,6 +721,22 @@ fn repeatable(method: &Method, path: &str) -> bool {
     }
 }
 
+/// Whether `path`, below the upstream's own, names content by its digest — a blob, or a manifest
+/// by digest — whose bytes are the same whenever they are read.
+fn digest_addressed(path: &str) -> bool {
+    let Some(oci) = path.strip_prefix("/v2/") else {
+        return false;
+    };
+    let mut parts = oci.rsplit('/');
+    let (Some(reference), Some(kind)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    matches!(kind, "blobs" | "manifests")
+        && reference
+            .split_once(':')
+            .is_some_and(|(algorithm, hex)| !algorithm.is_empty() && !hex.is_empty())
+}
+
 /// `incoming`, held whole when it ends within `limit` bytes; past it, what was read then the
 /// rest, streamed.
 async fn held(mut incoming: Incoming, limit: usize) -> Result<Outgoing> {
@@ -711,6 +769,161 @@ fn streamed(incoming: Incoming) -> reqwest::Body {
             .into_data_stream()
             .map_err(|e| std::io::Error::other(e.to_string())),
     )
+}
+
+/// The header a registry names a blob's or manifest's digest in.
+const DIGEST_HEADER: &str = "docker-content-digest";
+
+/// Resume limit for the whole body. Each resume uses the usual registry transfer retries;
+/// multiple resumes allow for repeated registry restarts mid-pull.
+const MAX_RESUMES: u32 = 5;
+
+/// A digest's bytes, `total` of them, streamed to the guest from the upstream: cut short, they are
+/// asked for again from the first byte not sent, with a `Range` the upstream may honour (`206`)
+/// or not (`200`, the bytes already sent then skipped). Content addressed by its digest is the
+/// same bytes every time, which the guest checks against the digest anyway; an answer of
+/// another length, or naming another digest when both answers name one, ends the body with
+/// an error, as the cut would have.
+struct Resume<S> {
+    body: std::pin::Pin<Box<S>>,
+    total: u64,
+    /// The digest the first answer named, if it did.
+    digest: Option<hyper::header::HeaderValue>,
+    /// The request, for the log.
+    what: String,
+}
+
+impl<S> Resume<S>
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
+    fn new(body: S, total: u64, digest: Option<hyper::header::HeaderValue>, what: String) -> Self {
+        Resume {
+            body: Box::pin(body),
+            total,
+            digest,
+            what,
+        }
+    }
+
+    /// The bytes, asking `again(from)` for the rest when they are cut short.
+    fn over<F, Fut>(
+        self,
+        again: F,
+    ) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static
+    where
+        F: Fn(u64) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<reqwest::Response>> + Send,
+    {
+        use futures::StreamExt;
+        type Body =
+            std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static>>;
+        let Resume {
+            body,
+            total,
+            digest,
+            what,
+        } = self;
+        let state = (body as Body, 0u64, 0u64, 0u32);
+        futures::stream::unfold(Some((state, again)), move |state| {
+            let digest = digest.clone();
+            let what = what.clone();
+            async move {
+                let ends = |why: String| {
+                    eprintln!("virtkit: registry: {what}: {why}");
+                    Some((Err(std::io::Error::other(why)), None))
+                };
+                let ((mut body, mut sent, mut skip, mut resumes), again) = state?;
+                loop {
+                    let cut = match body.next().await {
+                        Some(Ok(mut chunk)) => {
+                            let skipped = skip.min(chunk.len() as u64);
+                            skip -= skipped;
+                            let chunk = chunk.split_off(skipped as usize);
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            sent += chunk.len() as u64;
+                            return Some((Ok(chunk), Some(((body, sent, skip, resumes), again))));
+                        }
+                        None if sent >= total => return None,
+                        None => anyhow::anyhow!("the upstream ended the body early"),
+                        Some(Err(e)) if crate::registry::transfer_retried(&e) => e.into(),
+                        Some(Err(e)) => return ends(format!("{e:#}")),
+                    };
+                    // A failure after all bytes were sent loses no guest data.
+                    if sent >= total {
+                        return None;
+                    }
+                    if resumes >= MAX_RESUMES {
+                        return ends(format!(
+                            "resumed {resumes} times, cut again after {sent} of {total} \
+                             bytes: {cut:#}"
+                        ));
+                    }
+                    resumes += 1;
+                    eprintln!(
+                        "virtkit: registry: {what}: cut after {sent} of {total} bytes \
+                         ({cut:#}); resuming"
+                    );
+                    let resumed = match again(sent).await {
+                        Ok(resp) => resp,
+                        Err(e) => return ends(format!("resuming: {e:#}")),
+                    };
+                    match resumed_at(&resumed, sent, total, digest.as_ref()) {
+                        Ok(from) => {
+                            skip = sent - from;
+                            body = Box::pin(resumed.bytes_stream());
+                        }
+                        Err(why) => return ends(format!("not resuming: {why}")),
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Start offset of `resp`, requested from `sent`: `sent` for a matching `206` Content-Range,
+/// or 0 for a complete `200`. Return a reason for any other response, a different length,
+/// or a digest differing from `digest`.
+fn resumed_at(
+    resp: &reqwest::Response,
+    sent: u64,
+    total: u64,
+    digest: Option<&hyper::header::HeaderValue>,
+) -> std::result::Result<u64, String> {
+    if let (Some(first), Some(now)) = (digest, resp.headers().get(DIGEST_HEADER))
+        && first != now
+    {
+        return Err(format!(
+            "the upstream now names digest {now:?}, not {first:?}"
+        ));
+    }
+    if resp.headers().contains_key(hyper::header::CONTENT_ENCODING) {
+        return Err("the upstream now encodes the body".into());
+    }
+    match resp.status() {
+        StatusCode::OK if resp.content_length() == Some(total) => Ok(0),
+        StatusCode::PARTIAL_CONTENT => {
+            let range = resp
+                .headers()
+                .get(hyper::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok());
+            let expected = format!("bytes {sent}-{}/{total}", total.saturating_sub(1));
+            let len = resp.content_length();
+            if range == Some(expected.as_str()) && len == Some(total.saturating_sub(sent)) {
+                Ok(sent)
+            } else {
+                Err(format!(
+                    "the upstream answered range {range:?} of {len:?} bytes, not {expected:?}"
+                ))
+            }
+        }
+        status => Err(format!(
+            "the upstream answered {status} with {:?} bytes, not {total}",
+            resp.content_length()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1470,13 +1683,24 @@ mod tests {
         }
     }
 
-    /// A `200` of `body`, `Content-Length` saying `len`.
+    /// A `200` of `body`, `Content-Length` saying `len`, digest-addressed.
     fn answer(len: usize, body: &[u8]) -> Act {
-        let mut bytes =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
-                .into_bytes();
+        answer_named(len, body, "sha256:ab")
+    }
+
+    /// [`answer`], naming `digest`.
+    fn answer_named(len: usize, body: &[u8], digest: &str) -> Act {
+        let mut bytes = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nDocker-Content-Digest: {digest}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes();
         bytes.extend_from_slice(body);
         Act::Write(bytes)
+    }
+
+    fn blob() -> Vec<u8> {
+        (0..100_000u32).map(|i| (i % 251) as u8).collect()
     }
 
     /// A request safe to repeat is sent again while the upstream answers nothing, as when it
@@ -1527,9 +1751,9 @@ mod tests {
         }
     }
 
-    /// Which requests are sent again.
+    /// Which requests are sent again, and which bodies resume.
     #[test]
-    fn what_is_sent_again() {
+    fn what_is_sent_again_and_resumed() {
         let get = Method::GET;
         let put = Method::PUT;
         let post = Method::POST;
@@ -1548,6 +1772,76 @@ mod tests {
             &Method::from_bytes(b"MKCOL").unwrap(),
             "/dav/files/p/x"
         ));
+        assert!(digest_addressed("/v2/app/blobs/sha256:ab"));
+        assert!(digest_addressed("/v2/team/app/manifests/sha256:ab"));
+        assert!(!digest_addressed("/v2/app/manifests/latest"));
+        assert!(!digest_addressed("/v2/app/blobs/uploads/u1"));
+        assert!(!digest_addressed("/dav/files/sha256:ab"));
+    }
+
+    /// A blob cut short resumes where it stopped, from an upstream that honours `Range` or
+    /// from one that sends it whole again; the guest gets every byte once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blob_cut_short_resumes_where_it_stopped() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let blob = blob();
+        let cut = answer(blob.len(), &blob[..30_000]);
+        let mut ranged = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+             Content-Range: bytes 30000-{}/{}\r\nConnection: close\r\n\r\n",
+            blob.len() - 30_000,
+            blob.len() - 1,
+            blob.len()
+        )
+        .into_bytes();
+        ranged.extend_from_slice(&blob[30_000..]);
+        for rest in [Act::Write(ranged), answer(blob.len(), &blob)] {
+            let (up_addr, took) = scripted_upstream(vec![cut.clone(), rest]);
+            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            let r = reqwest::Client::new()
+                .get(format!("http://{proxy}/v2/app/blobs/sha256:ab"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+            assert!(
+                r.bytes().await.unwrap() == blob,
+                "the guest got another body"
+            );
+            let took = took.lock().unwrap().clone();
+            assert_eq!(took.len(), 2);
+            assert!(!took[0].0.contains("range:"), "{}", took[0].0);
+            assert!(took[1].0.contains("range: bytes=30000-"), "{}", took[1].0);
+            assert!(took[1].0.contains("authorization: basic"), "{}", took[1].0);
+        }
+    }
+
+    /// Responses not addressed by digest remain truncated; a resumed response with another
+    /// length also fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_digest_resumes_and_only_into_the_same_bytes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let blob = blob();
+        let cut = answer(blob.len(), &blob[..30_000]);
+        let (up_addr, took) = scripted_upstream(vec![cut.clone(), answer(blob.len(), &blob)]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let r = reqwest::Client::new()
+            .get(format!("http://{proxy}/v2/app/manifests/latest"))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.bytes().await.is_err());
+        assert_eq!(took.lock().unwrap().len(), 1);
+
+        let (up_addr, took) = scripted_upstream(vec![cut, answer(5, b"other")]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let r = reqwest::Client::new()
+            .get(format!("http://{proxy}/v2/app/blobs/sha256:ab"))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.bytes().await.is_err());
+        assert_eq!(took.lock().unwrap().len(), 2);
     }
 
     /// A request turned away is sent again until the registry takes it.
@@ -1590,6 +1884,49 @@ mod tests {
         let took = took.lock().unwrap().clone();
         assert_eq!(took.len(), 1);
         assert!(took[0].1 == big, "the upstream got another body");
+    }
+
+    /// Resumes are bounded and reject a different range or digest. Guest range requests
+    /// are not resumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_digest_resumes_within_bounds() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let blob = blob();
+        let cut = answer(blob.len(), &blob[..30_000]);
+        let get = |proxy: SocketAddr, range: bool| async move {
+            let mut rb =
+                reqwest::Client::new().get(format!("http://{proxy}/v2/app/blobs/sha256:ab"));
+            if range {
+                rb = rb.header("range", "bytes=0-");
+            }
+            rb.send().await.unwrap().bytes().await
+        };
+
+        let (up_addr, took) = scripted_upstream(vec![cut.clone()]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        assert!(get(proxy, false).await.is_err());
+        assert_eq!(took.lock().unwrap().len(), 1 + MAX_RESUMES as usize);
+
+        let wrong_range = Act::Write(
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\n\
+                 Content-Range: bytes 0-9/{}\r\nConnection: close\r\n\r\n0123456789",
+                blob.len()
+            )
+            .into_bytes(),
+        );
+        let other_digest = answer_named(blob.len(), &blob, "sha256:cd");
+        for rest in [wrong_range, other_digest] {
+            let (up_addr, took) = scripted_upstream(vec![cut.clone(), rest]);
+            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            assert!(get(proxy, false).await.is_err());
+            assert_eq!(took.lock().unwrap().len(), 2);
+        }
+
+        let (up_addr, took) = scripted_upstream(vec![cut, answer(blob.len(), &blob)]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        assert!(get(proxy, true).await.is_err());
+        assert_eq!(took.lock().unwrap().len(), 1);
     }
 
     /// `--insecure` is plain HTTP, as everywhere else: it never turns certificate checks off.

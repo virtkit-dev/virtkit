@@ -2605,6 +2605,12 @@ impl Transport for Unanswered {
     }
 }
 
+/// Whether [`with_transfer_retry`] retries `e`: a connection not made, cut or turned away,
+/// for a caller outside this module that resumes a transfer itself.
+pub(crate) fn transfer_retried(e: &reqwest::Error) -> bool {
+    e.retried()
+}
+
 /// [`with_transfer_retry`] with explicit delays, shorter in tests.
 async fn retry_transfer<T, E, F, Fut>(
     what: &str,
