@@ -1769,9 +1769,12 @@ the token set through `hx-headers` and need htmx; `vk-hub keys revoke` works wit
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
 node's page shows the update's release, phase and what the node said of it, and the sha256 of
-the `vk` it runs. `/operations` lists the releases the hub holds, signed or not, and its ten
+the `vk` it runs. `/operations` lists the releases the hub holds, signed or not, its ten
 latest rollouts with their state, counts, current wave, and each node's status and profile
-by wave. Operators can pause, resume and abort active rollouts, and delete, once confirmed,
+by wave, and, once one has enrolled, the registries: each one's version, whether
+its `[hub] allow` lets the hub update it and whether it takes only signed releases, and its
+update — as it reports it, or the last command while it has not taken it or once it refused or
+failed it. Operators can pause, resume and abort active rollouts, and delete, once confirmed,
 an ended one that updated no node: every update it issued was refused or expired before it
 ran. These actions post to `/rollout/<id>/action` with the node actions' origin, CSRF and role
 checks, and run the admin socket's operation as the session's principal. Invalid state
@@ -1810,6 +1813,20 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   enrolled, renamed or removed. Its ID hashes what it offers and it is `hx-preserve`d, so one being
   filled in is kept until that changes. That copy, shared by every operator, has no CSRF field: it
   posts with the token the page sets through `hx-headers` around the forms and the fragment.
+
+In the fragment, each registry that may be updated has an **Update** form choosing a held
+`vk-registry` release, limited to signed releases when the registry requires them. It posts by
+htmx to `/registry/<id>/action` with `op=update`; the same form on a registry's page posts as a
+plain form. Both run `vk-hub registries update`'s operation after confirmation.
+The confirmation shows the release, whether it is signed, and the registry's running version.
+It warns that the registry refuses older versions unless `[hub] allow_downgrade` is set, and
+always refuses versions it cannot order against its own as `MAJOR.MINOR.PATCH`. An offline
+registry gets the update when it connects, within a day. The answer counts once, from the same
+session, and only while the registry runs the version shown. Before asking for confirmation,
+the hub refuses releases the registry's inventory says it would refuse: its `[hub] allow`
+lacks `update`, or it requires signatures and the release is unsigned. The CLI makes the same
+checks. The fragment follows registry connections, disconnections, inventory and state
+reports, and command answers, not heartbeats.
 
 The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,

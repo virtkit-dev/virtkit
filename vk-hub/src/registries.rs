@@ -29,7 +29,7 @@ pub const GC_RETENTION_DAYS: u64 = 30;
 pub const GC_GRACE_DAYS: u64 = 1;
 
 /// How long a command waits for its registry to take it.
-const COMMAND_TTL: Duration = Duration::from_secs(86_400);
+pub(crate) const COMMAND_TTL: Duration = Duration::from_secs(86_400);
 
 /// What a registry removed from the hub is told.
 const REMOVED: &str = "this registry was removed from the hub";
@@ -59,9 +59,12 @@ pub async fn run(
         registry.id, registry.hostname
     );
     hub.changed(&registry.id);
+    // `/operations` shows whether each registry is connected.
+    hub.touch();
     let ended = serve(&mut ws, &hub, &registry, session, &ending).await;
     hub.close_session(&registry.id, session);
     hub.changed(&registry.id);
+    hub.touch();
     match ended {
         Ok(why) => eprintln!(
             "vk-hub: {peer}: registry {} disconnected: {why}",
@@ -276,6 +279,7 @@ async fn settle_unreported_updates(hub: &Hub, registry: &Peer, report: Report) -
     .await??;
     if settled {
         hub.changed(&registry.id);
+        hub.touch();
     }
     Ok(())
 }
@@ -295,6 +299,8 @@ async fn acknowledge(
             .await??;
     if news {
         hub.changed(&registry.id);
+        // A command's outcome: `/operations` shows an update's; any other's renders it alike.
+        hub.touch();
     }
     send(ws, &HubRegistryMsg::Recorded(recorded)).await
 }
@@ -309,10 +315,18 @@ async fn store(
     let db = hub.db.clone();
     let id = registry.id.clone();
     let now = crate::now_secs();
+    // `/operations` shows a registry's version and update from these, not its heartbeats.
+    let updates_shown = matches!(
+        write,
+        RegistryWrite::Inventory(_) | RegistryWrite::Report(_)
+    );
     let written = tokio::task::spawn_blocking(move || db.record_registry(&id, write, now)).await?;
     match written {
         Ok(()) => {
             hub.changed(&registry.id);
+            if updates_shown {
+                hub.touch();
+            }
             Ok(None)
         }
         Err(e) if e.is::<NotEnrolled>() => {
@@ -542,11 +556,53 @@ pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command
     // Held from the lookup to the command, so the release cannot be removed between them.
     let _held = hub.releases_lock();
     let release = hub.db.resolve_release(release)?;
+    issue_update(hub, actor, id, &release, None)
+}
+
+/// [`update`] registry `id` to `shown`, the release an operator confirmed for a registry running
+/// `running` (`None`: not reported): refused unless the hub still holds the release as shown —
+/// the same version and signature, not removed and added again otherwise — and the registry
+/// still reports that version.
+pub fn update_as_shown(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    shown: &Release,
+    running: Option<&str>,
+) -> Result<Command> {
+    let _held = hub.releases_lock();
+    let held = hub.db.release(&shown.sha256)?;
+    if held.as_ref() != Some(&shown.row) {
+        bail!(
+            "release {} changed since it was shown; look again",
+            crate::store::short(&shown.sha256)
+        );
+    }
+    issue_update(hub, actor, id, shown, Some(running))
+}
+
+/// Send registry `id` the update to `release`, the releases lock held; with `running`, only
+/// while the registry reports that version.
+fn issue_update(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    release: &Release,
+    running: Option<Option<&str>>,
+) -> Result<Command> {
     let row = hub
         .db
         .registry(id)?
         .ok_or_else(|| NotEnrolled(id.to_string()))?;
-    check_update(&row, &release)?;
+    if let Some(running) = running
+        && row.inventory.as_ref().map(|i| i.version.as_str()) != running
+    {
+        bail!(
+            "registry {} changed version since it was shown; look again",
+            row.hostname
+        );
+    }
+    check_update(&row, release)?;
     issue(
         hub,
         actor,
@@ -571,6 +627,9 @@ fn issue(hub: &Hub, actor: &str, id: &str, op: Operation) -> Result<Command> {
     );
     hub.kick(id);
     hub.changed(id);
+    if matches!(command.op, Operation::Update { .. }) {
+        hub.touch();
+    }
     Ok(command)
 }
 

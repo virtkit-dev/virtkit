@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
 - **Registry update policy checked before sending.** `vk-hub registries update`
   refuses an update the registry's last inventory says it would refuse: `update` missing from
   its `[hub] allow`, or an unsigned release for one that requires signatures.
+- **Update registries from the web UI.** The Updates page shows each registry's version,
+  update permissions and last update live. Update forms on this page and each registry's
+  page require confirmation.
 
 ## [0.101.0] - 2026-11-01
 

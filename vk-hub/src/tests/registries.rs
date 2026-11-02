@@ -418,6 +418,106 @@ async fn an_update_a_registry_would_refuse_is_not_sent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What a registry reports of itself — its inventory and reports — reaches `/operations`, which
+/// follows [`Hub::touch`]; its heartbeats do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn pages_follow_registry_reports_not_heartbeats() {
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let id = enrolled_registry(addr, &hub, &key).await;
+    let mut ws = session(addr, &id, &key).await;
+    let mut touched = hub.subscribe_touched();
+    // A heartbeat, stored once the session's connecting has touched the pages, touches nothing.
+    let heartbeat = reg::Heartbeat {
+        store_free_bytes: 42,
+        ..reg::Heartbeat::default()
+    };
+    tell(&mut ws, &RegistryMsg::Heartbeat(heartbeat)).await;
+    eventually(|| {
+        hub.db
+            .registry(&id)
+            .unwrap()
+            .is_some_and(|r| r.heartbeat.is_some_and(|h| h.store_free_bytes == 42))
+    })
+    .await;
+    touched.borrow_and_update();
+    tell(&mut ws, &RegistryMsg::Heartbeat(reg::Heartbeat::default())).await;
+    eventually(|| {
+        hub.db
+            .registry(&id)
+            .unwrap()
+            .is_some_and(|r| r.heartbeat.is_some_and(|h| h.store_free_bytes == 0))
+    })
+    .await;
+    assert!(
+        !touched.has_changed().unwrap(),
+        "a heartbeat touched the pages"
+    );
+    let inventory = Inventory {
+        version: "0.90.0".into(),
+        ..Inventory::default()
+    };
+    tell(&mut ws, &RegistryMsg::Inventory(inventory)).await;
+    tokio::time::timeout(Duration::from_secs(10), touched.changed())
+        .await
+        .expect("an inventory touches the pages")
+        .unwrap();
+}
+
+/// What an operator confirmed is sent only while the hub holds the release as shown and the
+/// registry runs the version shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_confirmed_registry_update_is_sent_only_as_shown() {
+    let (dir, addr, hub) = start_releases("registry-shown", None).await;
+    let key = keypair();
+    let id = enrolled_registry(addr, &hub, &key).await;
+    let mut ws = session(addr, &id, &key).await;
+    let inventory = Inventory {
+        allow: vec![reg::ALLOW_UPDATE.to_string()],
+        ..Inventory::default()
+    };
+    tell(&mut ws, &RegistryMsg::Inventory(inventory)).await;
+    eventually(|| {
+        hub.db
+            .registry(&id)
+            .unwrap()
+            .is_some_and(|r| r.inventory.is_some())
+    })
+    .await;
+    let file = dir.join("vk-registry");
+    std::fs::write(&file, fake_vk("0.90.0")).unwrap();
+    let release = releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.0", None).unwrap();
+    // Removed and added again, signed: not the release shown.
+    assert!(releases::remove(&hub, "uid 0", &release.sha256).unwrap());
+    let signature = vk_hub_proto::to_base64(&[7u8; vk_hub_proto::SIGNATURE_LEN]);
+    releases::add(
+        &hub,
+        "uid 0",
+        &file,
+        Program::Registry,
+        "0.90.0",
+        Some(signature),
+    )
+    .unwrap();
+    let running = Some("");
+    let err = registries::update_as_shown(&hub, "uid 0", &id, &release, running).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("changed since it was shown"),
+        "{err:#}"
+    );
+    let shown = hub.db.resolve_release(&release.sha256).unwrap();
+    // Nor while the registry runs another version than the one shown.
+    let err = registries::update_as_shown(&hub, "uid 0", &id, &shown, Some("0.89.0")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("changed version since"),
+        "{err:#}"
+    );
+    assert!(hub.db.registry_commands(&id).unwrap().is_empty());
+    registries::update_as_shown(&hub, "uid 0", &id, &shown, running).unwrap();
+    assert_eq!(hub.db.registry_commands(&id).unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_a_registry_says_is_stored_display_safe() {
     let (addr, hub) = start().await;

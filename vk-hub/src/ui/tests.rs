@@ -7839,6 +7839,276 @@ async fn an_operator_fetches_a_release_from_github() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An operator updates a registry to a `vk-registry` release from `/operations`
+/// once confirmed, by the operation `vk-hub registries update` runs; a viewer sees each
+/// registry's version and update with no form. A registry that does not let the hub update it,
+/// one that takes only signed releases, and a `vk` release are refused before anything is
+/// asked; a registry's page updates it with a plain form.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_updates_a_registry_from_the_updates_page() {
+    use crate::store::{Program, RegistryEnrollment, RegistryWrite, TokenKind};
+    use vk_hub_proto::registry::{ALLOW_UPDATE, Inventory, Operation};
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let enroll = |hostname: &str, key: &str, mut inventory: Inventory| {
+        // The hostname a registry reports is the one it is shown by.
+        inventory.hostname = hostname.into();
+        let (token, _) = hub
+            .db
+            .create_token_for(
+                TokenKind::Registry,
+                Duration::from_secs(60),
+                None,
+                "uid 0",
+                crate::now_secs(),
+            )
+            .unwrap();
+        let RegistryEnrollment::Enrolled { id } = hub
+            .db
+            .enroll_registry(&token, key, hostname, "peer p", 1)
+            .unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        hub.db
+            .record_registry(&id, RegistryWrite::Inventory(inventory), crate::now_secs())
+            .unwrap();
+        id
+    };
+    let inventory = |version: &str, allow: &[&str], requires_signed: bool| Inventory {
+        version: version.into(),
+        allow: allow.iter().map(|a| a.to_string()).collect(),
+        requires_signed,
+        ..Inventory::default()
+    };
+    let id = enroll("reg-1", "aa", inventory("0.89.0", &[ALLOW_UPDATE], false));
+    let closed = enroll("reg-2", "bb", inventory("0.89.0", &["gc"], false));
+    let signed = enroll("reg-3", "cc", inventory("<b>1</b>", &[ALLOW_UPDATE], true));
+    let idle = enroll("reg-4", "dd", inventory("0.89.0", &[ALLOW_UPDATE], false));
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+
+    // No form until the hub holds a vk-registry release.
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(page.contains("Add a vk-registry release first."), "{page}");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("vk-registry");
+    std::fs::write(&file, crate::fetch::tests::fake_vk("0.90.0")).unwrap();
+    let release =
+        crate::releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.0", None).unwrap();
+    let sha = release.sha256.clone();
+
+    // A viewer sees the versions and what each registry allows, and no form.
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    for want in [
+        "<h2>Registries</h2>",
+        &format!("<a href=\"/registry/{id}\">reg-1</a></td><td>0.89.0</td>"),
+        "unsigned accepted",
+        "not allowed by its <code>[hub] allow</code>",
+        "signed releases only",
+        "<td>&lt;b&gt;1&lt;/b&gt;</td>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("registry-update-"), "{page}");
+    let action = format!("/registry/{id}/action");
+    let form = format!("_csrf={viewer_csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &viewer, &action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    // An operator's has a form for each registry that takes updates.
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    for want in [
+        &format!("hx-post=\"{action}\" hx-swap=\"none\">"),
+        &format!("<option value=\"{sha}\">0.90.0 ("),
+        "lacks <code>update</code>",
+        // The registry taking only signed releases is offered none of the unsigned ones.
+        "Add a signed vk-registry release first.",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(
+        !page.contains(&format!("hx-post=\"/registry/{closed}/action\"")),
+        "{page}"
+    );
+
+    // Not without the session's CSRF token, nor from another origin.
+    let form = format!("_csrf={viewer_csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, "http://evil.example", &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(hub.db.registry_commands(&id).unwrap().is_empty());
+
+    // Asked first, then sent once confirmed, and audited as the session's principal.
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Update this registry?",
+        "vk-registry 0.90.0 (<code>",
+        ", unsigned) to reg-1, which runs 0.89.0.",
+        "The registry is offline",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(hub.db.registry_commands(&id).unwrap().is_empty());
+    let answer = posted_form(&reply.body, "update", 0);
+    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Sent reg-1 the update to vk-registry 0.90.0"),
+        "{}",
+        reply.body
+    );
+    let commands = hub.db.registry_commands(&id).unwrap();
+    assert!(
+        matches!(&commands[..], [c] if matches!(&c.command.op, Operation::Update { sha256, .. } if *sha256 == sha)),
+        "{commands:?}"
+    );
+    audited(
+        &hub,
+        &format!("{principal} issued update to vk-registry 0.90.0 to registry {id}"),
+    )
+    .await;
+    let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    // The viewer's page follows it live.
+    let next = next_with(&mut events, "to 0.90.0: not taken yet").await;
+    assert!(!next.contains("registry-update-"), "{next}");
+
+    // Refused before anything is asked: no update allowed, a signature wanted, a vk release.
+    let vk = crate::fetch::tests::fake_vk("0.91.0");
+    let file = dir.join("vk");
+    std::fs::write(&file, &vk).unwrap();
+    let vk = crate::releases::add(&hub, "uid 0", &file, Program::Vk, "0.91.0", None).unwrap();
+    for (registry, release, want) in [
+        (&closed, &sha, "allow lacks update"),
+        (&signed, &sha, "takes only signed releases"),
+        (&id, &vk.sha256, "not a vk-registry release"),
+    ] {
+        let form = format!("_csrf={csrf}&op=update&release={release}");
+        let path = format!("/registry/{registry}/action");
+        let reply = post_action(addr, &origin, &operator, &path, &form, true).await;
+        assert_eq!(reply.status, 409, "{want}: {}", reply.body);
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    let form = format!("_csrf={csrf}&op=update&release=nope");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+
+    // An answer counts only while the registry runs the version shown, and the release is held
+    // as shown.
+    let bin = crate::fetch::tests::fake_vk("0.90.1");
+    let file = dir.join("vk-registry");
+    std::fs::write(&file, &bin).unwrap();
+    let next = crate::releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.1", None)
+        .unwrap()
+        .sha256;
+    let idle_action = format!("/registry/{idle}/action");
+    let ask = format!("_csrf={csrf}&op=update&release={next}");
+    let reply = post_action(addr, &origin, &operator, &idle_action, &ask, true).await;
+    let answer = posted_form(&reply.body, "update", 0);
+    hub.db
+        .record_registry(
+            &idle,
+            RegistryWrite::Inventory(Inventory {
+                hostname: "reg-4".into(),
+                ..inventory("0.89.1", &[ALLOW_UPDATE], false)
+            }),
+            crate::now_secs(),
+        )
+        .unwrap();
+    let reply = post_action(addr, &origin, &operator, &idle_action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("it changed since you were asked"),
+        "{}",
+        reply.body
+    );
+    let reply = post_action(addr, &origin, &operator, &idle_action, &ask, true).await;
+    let answer = posted_form(&reply.body, "update", 0);
+    assert!(crate::releases::remove(&hub, "uid 0", &next).unwrap());
+    let signature = vk_hub_proto::to_base64(&[7u8; vk_hub_proto::SIGNATURE_LEN]);
+    let program = Program::Registry;
+    crate::releases::add(&hub, "uid 0", &file, program, "0.90.1", Some(signature)).unwrap();
+    let reply = post_action(addr, &origin, &operator, &idle_action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(hub.db.registry_commands(&idle).unwrap().is_empty());
+
+    // The question says when the registry would refuse the version: an older one, or one it
+    // cannot order against its own.
+    for (running, want) in [
+        ("0.91.0", "It is older than the version the registry runs"),
+        (
+            "dev",
+            "Its version cannot be ordered against the one the registry runs",
+        ),
+    ] {
+        hub.db
+            .record_registry(
+                &idle,
+                RegistryWrite::Inventory(Inventory {
+                    hostname: "reg-4".into(),
+                    ..inventory(running, &[ALLOW_UPDATE], false)
+                }),
+                crate::now_secs(),
+            )
+            .unwrap();
+        let ask = format!("_csrf={csrf}&op=update&release={sha}");
+        let reply = post_action(addr, &origin, &operator, &idle_action, &ask, true).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    hub.db
+        .record_registry(
+            &idle,
+            RegistryWrite::Inventory(Inventory {
+                hostname: "reg-4".into(),
+                ..inventory("0.89.1", &[ALLOW_UPDATE], false)
+            }),
+            crate::now_secs(),
+        )
+        .unwrap();
+
+    // From a registry's page: a plain form, its question a page, then back to the registry.
+    let page = get(addr, &format!("/registry/{signed}"), Some(&operator))
+        .await
+        .body;
+    assert!(page.contains("<h3>Update</h3>"), "{page}");
+    let detail = get(addr, &format!("/registry/{idle}"), Some(&operator))
+        .await
+        .body;
+    let form = posted_form(&detail, "update", 0);
+    assert!(form.contains("_csrf="), "{form}");
+    let form = format!("{form}&release={next}");
+    let reply = post_action(addr, &origin, &operator, &idle_action, &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "<h1>Confirm</h1>",
+        ", signed) to reg-4, which runs 0.89.1.",
+        &format!("<a href=\"/registry/{idle}\">Cancel</a>"),
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    let answer = posted_form(&reply.body, "update", 0);
+    let reply = post_action(addr, &origin, &operator, &idle_action, &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(
+        reply.header("location"),
+        Some(format!("/registry/{idle}").as_str())
+    );
+    let commands = hub.db.registry_commands(&idle).unwrap();
+    assert!(
+        matches!(&commands[..], [c] if matches!(&c.command.op, Operation::Update { sha256, signature: Some(_), .. } if *sha256 == next)),
+        "{commands:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Viewers see registries with nothing to steer them; operators steer them with the session's
 /// CSRF token, and issue registry tokens.
 #[tokio::test(flavor = "multi_thread")]
