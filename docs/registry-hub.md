@@ -388,7 +388,9 @@ registries to a `vk`. `vk release-key sign --program vk-registry` signs one: its
 differs from a `vk` release's, so neither signature verifies as the other. The web UI's Updates
 page (`/operations`) adds one too, uploaded or fetched from GitHub, as `vk-hub release fetch
 --program vk-registry` does.
-`vk-hub registries update <id> --release <sha256 prefix>` sends it. The registry:
+`vk-hub registries update <id> --release <sha256 prefix>` sends it. The hub refuses it first
+when the registry's inventory says it would: its `[hub] allow` lacks `update`, or it takes only
+signed releases and this one is not. The registry:
 
 1. refuses it if another update is under way, if its version is older than its own (unless
    `[hub] allow_downgrade`), if its signature does not verify against `[hub] release_keys`

@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   Storage list shows each registry's version.
 - **vk-registry releases from GitHub.** `vk-hub release fetch --program vk-registry` fetches a
   release's `vk-registry`, and the Updates page uploads or fetches releases of either program.
+- **Registry update policy checked before sending.** `vk-hub registries update`
+  refuses an update the registry's last inventory says it would refuse: `update` missing from
+  its `[hub] allow`, or an unsigned release for one that requires signatures.
 
 ## [0.101.0] - 2026-11-01
 

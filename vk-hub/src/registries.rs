@@ -21,7 +21,7 @@ use vk_hub_proto::{HubMsg, RefusalCode};
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
 use crate::store::{
-    NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite,
+    NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite, Release,
 };
 
 /// The gc windows `vk-hub registries gc` and `gc-schedule`, and the web UI's forms, default to.
@@ -481,11 +481,46 @@ pub fn gc(
     )
 }
 
-/// Update registry `id` to the `vk-registry` release whose sha256 starts with `release`.
-pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command> {
-    // Held from the lookup to the command, so the release cannot be removed between them.
-    let _held = hub.releases_lock();
-    let release = hub.db.resolve_release(release)?;
+/// Whether registry `row` lets the hub update it, as it last reported: `None` until it reports
+/// its inventory.
+pub fn takes_updates(row: &RegistryRow) -> Option<bool> {
+    let inventory = row.inventory.as_ref()?;
+    Some(
+        inventory
+            .allow
+            .iter()
+            .any(|a| a == vk_hub_proto::registry::ALLOW_UPDATE),
+    )
+}
+
+/// Why registry `row` would refuse to update to `release`, going by what it last reported: its
+/// `[hub] allow` lacks `update`, or it takes only signed releases and this one is not. The
+/// registry checks again, with what the hub cannot see: its keys, its version and its binary.
+fn update_refusal(row: &RegistryRow, release: &Release) -> Option<String> {
+    let allow = vk_hub_proto::registry::ALLOW_UPDATE;
+    if takes_updates(row) == Some(false) {
+        return Some(format!(
+            "registry {} does not let the hub update it: its [hub] allow lacks {allow}",
+            row.hostname
+        ));
+    }
+    if row.inventory.as_ref().is_some_and(|i| i.requires_signed) && release.row.signature.is_none()
+    {
+        return Some(format!(
+            "registry {} takes only signed releases, and {} {} is unsigned: add it with the \
+             signature `vk release-key sign --program {}` makes",
+            row.hostname,
+            release.row.program(),
+            release.row.version,
+            Program::Registry
+        ));
+    }
+    None
+}
+
+/// Refuse to update registry `row` to `release` when it is not a `vk-registry` release, or
+/// when [`update_refusal`] says the registry would refuse it.
+pub fn check_update(row: &RegistryRow, release: &Release) -> Result<()> {
     let registry = Program::Registry;
     if !release.row.is(registry) {
         bail!(
@@ -496,6 +531,22 @@ pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command
             release.row.version
         );
     }
+    if let Some(why) = update_refusal(row, release) {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
+/// Update registry `id` to the `vk-registry` release whose sha256 starts with `release`.
+pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command> {
+    // Held from the lookup to the command, so the release cannot be removed between them.
+    let _held = hub.releases_lock();
+    let release = hub.db.resolve_release(release)?;
+    let row = hub
+        .db
+        .registry(id)?
+        .ok_or_else(|| NotEnrolled(id.to_string()))?;
+    check_update(&row, &release)?;
     issue(
         hub,
         actor,

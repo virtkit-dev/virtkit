@@ -358,6 +358,66 @@ async fn a_registry_downloads_only_the_vk_registry_release_it_updates_to() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Refuse an update before sending when the registry's inventory reports that `[hub] allow`
+/// lacks `update`, or requires signatures and the release is unsigned.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_a_registry_would_refuse_is_not_sent() {
+    let (dir, addr, hub) = start_releases("registry-refusal", None).await;
+    let key = keypair();
+    let id = enrolled_registry(addr, &hub, &key).await;
+    let mut ws = session(addr, &id, &key).await;
+    let file = dir.join("vk-registry");
+    std::fs::write(&file, fake_vk("0.90.0")).unwrap();
+    let release = releases::add(&hub, "uid 0", &file, Program::Registry, "0.90.0", None).unwrap();
+    for (allow, requires_signed, want) in [
+        (
+            vec!["gc".to_string()],
+            false,
+            "its [hub] allow lacks update",
+        ),
+        (
+            vec![reg::ALLOW_UPDATE.to_string()],
+            true,
+            "takes only signed releases",
+        ),
+    ] {
+        let inventory = Inventory {
+            allow: allow.clone(),
+            requires_signed,
+            ..Inventory::default()
+        };
+        tell(&mut ws, &RegistryMsg::Inventory(inventory)).await;
+        eventually(|| {
+            hub.db.registry(&id).unwrap().is_some_and(|r| {
+                r.inventory
+                    .as_ref()
+                    .is_some_and(|i| i.requires_signed == requires_signed && i.allow == allow)
+            })
+        })
+        .await;
+        let err = registries::update(&hub, "uid 0", &id, &release.sha256).unwrap_err();
+        assert!(format!("{err:#}").contains(want), "{err:#}");
+    }
+    assert!(hub.db.registry_commands(&id).unwrap().is_empty());
+
+    // Once it says it would take it, it is sent.
+    let inventory = Inventory {
+        allow: vec![reg::ALLOW_UPDATE.to_string()],
+        ..Inventory::default()
+    };
+    tell(&mut ws, &RegistryMsg::Inventory(inventory)).await;
+    eventually(|| {
+        hub.db
+            .registry(&id)
+            .unwrap()
+            .is_some_and(|r| r.inventory.as_ref().is_some_and(|i| !i.requires_signed))
+    })
+    .await;
+    registries::update(&hub, "uid 0", &id, &release.sha256).unwrap();
+    assert_eq!(hub.db.registry_commands(&id).unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_a_registry_says_is_stored_display_safe() {
     let (addr, hub) = start().await;
