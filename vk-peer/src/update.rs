@@ -65,12 +65,18 @@ pub fn under(path: &Path, dir: &Path) -> bool {
 
 /// Arm `alarm(2)` for [`ALARM_MARGIN`] past the trial deadline `deadline`, or disarm it.
 pub fn alarm(deadline: Option<u64>, now: u64) {
-    let secs = alarm_secs(deadline, now);
+    arm(alarm_secs(deadline, now));
+}
+
+/// Arm `alarm(2)` for `secs`, 0 disarming it. An ignored or blocked SIGALRM is inherited across
+/// exec, and would leave no deadline at all, so a non-zero `secs` resets SIGALRM to its default
+/// action, losing any handler of the caller's, and unblocks it in this thread, whose mask an
+/// exec passes on. Async-signal-safe: `signal`, `sigemptyset`, `sigaddset`, `pthread_sigmask`
+/// and `alarm` are all on POSIX's list, so a child may call it between fork and exec.
+fn arm(secs: libc::c_uint) {
     if secs != 0 {
-        // An ignored or blocked SIGALRM is inherited across exec, and would leave no deadline
-        // at all. This thread's mask is the one `fexecve` passes on.
-        // SAFETY: restores the default action, no handler of this process's is replaced, and
-        // unblocks SIGALRM in this thread through a local, initialized set.
+        // SAFETY: restores the default action and unblocks SIGALRM through a local, initialized
+        // set; no memory of the caller's is touched.
         unsafe {
             libc::signal(libc::SIGALRM, libc::SIG_DFL);
             let mut set: libc::sigset_t = std::mem::zeroed();
@@ -163,6 +169,63 @@ fn release_env<'a>(
     inherited
         .filter(|(k, _)| k != crate::handoff::ENV && env.iter().all(|(set, _)| set != k))
         .chain(env.iter().cloned())
+}
+
+/// Start `binary` as a child while this process continues serving its open resources.
+/// The child inherits this process's arguments and environment, with `env` overlaid.
+/// Like [`exec_with`], it runs the open file, which must be an ELF binary; `/proc` must
+/// be mounted. Descriptors in `keep` retain their numbers and stay open, as do other
+/// descriptors without close-on-exec. `alarm(2)` is armed for the trial deadline
+/// `alarm_at`. What [`crate::handoff::ENV`] names is passed on only if `env` sets it.
+pub fn spawn_with(
+    binary: &Binary,
+    alarm_at: Option<u64>,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    keep: &[std::os::fd::RawFd],
+) -> Result<std::process::Child> {
+    let mut args = std::env::args_os();
+    let arg0 = args
+        .next()
+        .unwrap_or_else(|| binary.path.clone().into_os_string());
+    spawn_args(binary, arg0, args, alarm_at, env, keep)
+}
+
+/// [`spawn_with`], with `arg0` and `args` in place of this process's arguments.
+fn spawn_args(
+    binary: &Binary,
+    arg0: std::ffi::OsString,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    alarm_at: Option<u64>,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    keep: &[std::os::fd::RawFd],
+) -> Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    // The child's inherited descriptor names the checked file even if its path has changed.
+    let mut cmd = std::process::Command::new(format!("/proc/self/fd/{}", binary.file.as_raw_fd()));
+    cmd.arg0(arg0)
+        .args(args)
+        .env_clear()
+        .envs(release_env(std::env::vars_os(), env));
+    let secs = alarm_secs(alarm_at, crate::now_secs());
+    let keep = keep.to_vec();
+    // SAFETY: between fork and exec the closure allocates nothing (`keep` was copied before)
+    // and calls only fcntl and `arm`, both async-signal-safe; a SIGALRM handler the child
+    // inherited would be reset by the exec anyway.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &keep {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            arm(secs);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .with_context(|| format!("starting {}", binary.path.display()))
 }
 
 /// Whether this process runs the file at `path`: the same inode, not the same name.
@@ -460,6 +523,46 @@ pub fn sweep_partial(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child runs the file opened, even once its path names another, with the descriptors
+    /// kept open and the others closed, and the environment given.
+    #[test]
+    fn a_release_spawned_runs_the_file_opened_with_the_descriptors_kept() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let dir = std::env::temp_dir().join(format!("vk-peer-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("sh");
+        std::fs::copy("/bin/sh", &sh).unwrap();
+        let binary = Binary::open(&sh, None).unwrap();
+        // Another file at the path: the child still runs the one opened.
+        std::fs::remove_file(&sh).unwrap();
+        std::fs::write(&sh, b"not a shell").unwrap();
+        // Both close-on-exec, and numbered above what the shell or its loader might open.
+        let high = || {
+            let null = std::fs::File::open("/dev/null").unwrap();
+            // SAFETY: duplicates an open descriptor into a new one owned below.
+            let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+            assert!(fd >= 200);
+            // SAFETY: just created, owned by nothing else.
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+        };
+        let (kept, closed) = (high(), high());
+        let (k, c) = (kept.as_raw_fd(), closed.as_raw_fd());
+        let script =
+            format!("test -e /proc/self/fd/{k} && ! test -e /proc/self/fd/{c} && test \"$X\" = 1");
+        let mut child = spawn_args(
+            &binary,
+            "sh".into(),
+            ["-c".into(), script.into()],
+            None,
+            &[("X".into(), "1".into())],
+            &[k],
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_release_inherits_the_sockets_only_when_told_to() {
