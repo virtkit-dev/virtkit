@@ -140,8 +140,8 @@ pub trait Keeper {
     fn dir(&self) -> &Path;
     /// The trial recorded now.
     fn trial(&self) -> Option<Trial>;
-    /// Change the state with `f` and save it; nothing changes, in memory or on disk, when the
-    /// save fails.
+    /// Change the state with `f` and save it. A failed save leaves memory unchanged,
+    /// but may have published the new state on disk.
     fn change<R>(&self, f: impl FnOnce(&mut Self::Ledger) -> R) -> Result<R>;
 }
 
@@ -253,7 +253,8 @@ pub fn on_start<L: Ledger>(dir: &Path, now: u64) -> Start {
 }
 
 /// Install `trial`'s release, confirmed by the hub but not installed before the peer stopped,
-/// and end the update; then run the release, if this is another binary.
+/// and end the update; then run the release, if this is another binary. An end that could not
+/// be saved leaves the trial to the release, which ends it on its next start or confirmation.
 fn finish_install<L: Ledger>(dir: &Path, p: &mut L, trial: &Trial) -> Start {
     let installed = install(trial);
     match &installed {
@@ -268,19 +269,22 @@ fn finish_install<L: Ledger>(dir: &Path, p: &mut L, trial: &Trial) -> Start {
             Some(format!("{e:#}")),
         ),
     }
-    if let Err(e) = p.save(dir) {
-        L::log(Event::Unwritable(&e));
-        return Start::Run;
+    let saved = p.save(dir);
+    if let Err(e) = &saved {
+        L::log(Event::Unwritable(e));
     }
     if let Err(e) = installed {
         L::log(Event::InstallFailed(&e));
         return Start::Run;
     }
-    prune(dir, &[&trial.sha256, &trial.previous]);
-    L::log(Event::Installed {
-        version: &trial.version,
-        path: &trial.exe,
-    });
+    // Unsaved, the trial is left to the release, which logs the install when it ends it.
+    if saved.is_ok() {
+        prune(dir, &[&trial.sha256, &trial.previous]);
+        L::log(Event::Installed {
+            version: &trial.version,
+            path: &trial.exe,
+        });
+    }
     if own_sha256().as_deref() == Some(trial.sha256.as_str()) {
         return Start::Run;
     }
@@ -539,27 +543,34 @@ pub fn failed<K: Keeper>(
 }
 
 /// The release on trial reached the hub: record that it passed, install it over the installed
-/// binary and report the update done. Nothing to do when no trial runs this binary.
+/// binary and report the update done. Only the trial's release confirms, wherever it runs
+/// from. Retry installation and completion if a confirmed trial's end could not be saved.
 pub fn confirm<K: Keeper>(keeper: &K) {
-    let Some(trial) = keeper
-        .trial()
-        .filter(|t| running_is(&t.next) && !t.passed())
-    else {
+    let Some(trial) = keeper.trial() else {
         return;
     };
+    if running_is(&trial.next) || own_sha256().as_deref() == Some(trial.sha256.as_str()) {
+        finish(keeper, &trial);
+    }
+}
+
+/// [`confirm`] `trial`, which this binary runs.
+fn finish<K: Keeper>(keeper: &K, trial: &Trial) {
     // Confirmed before it is installed: a peer stopped in between installs it on its next
     // start, rather than taking the installed binary for the previous one.
-    if let Err(e) = keeper.change(|p| p.trial().as_mut().map(mark_passed)) {
+    if !trial.passed()
+        && let Err(e) = keeper.change(|p| p.trial().as_mut().map(mark_passed))
+    {
         K::Ledger::log(Event::ConfirmFailed(&e));
         return;
     }
     crate::update::alarm(None, 0);
-    let installed = install(&trial);
+    let installed = install(trial);
     let result = keeper.change(|p| match &installed {
-        Ok(()) => end(p, &trial, UpdatePhase::Done, Outcome::Done, None),
+        Ok(()) => end(p, trial, UpdatePhase::Done, Outcome::Done, None),
         Err(e) => end(
             p,
-            &trial,
+            trial,
             UpdatePhase::Failed,
             Outcome::Failed {
                 message: format!("{e:#}"),
@@ -617,6 +628,9 @@ mod tests {
             }
         }
         fn save(&self, dir: &Path) -> Result<()> {
+            if dir.join("fail-saves").exists() {
+                return Err(anyhow!("the disk is full"));
+            }
             Ok(std::fs::write(
                 dir.join("state.json"),
                 serde_json::to_vec(self)?,
@@ -644,6 +658,18 @@ mod tests {
     struct Kept {
         dir: PathBuf,
         state: Mutex<Fake>,
+        /// Saves left before they fail.
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Kept {
+        fn new(dir: &Path, state: Fake) -> Self {
+            Kept {
+                dir: dir.to_path_buf(),
+                state: Mutex::new(state),
+                saves: usize::MAX.into(),
+            }
+        }
     }
 
     impl Keeper for Kept {
@@ -654,7 +680,15 @@ mod tests {
         fn trial(&self) -> Option<Trial> {
             self.state.lock().unwrap().trial.clone()
         }
+        /// Failed saves here never publish. [`confirm`] reads memory, unchanged either way;
+        /// only the next start reads disk and handles either state. [`on_start`] has no
+        /// keeper, so `fail-saves` injects its save failures.
         fn change<R>(&self, f: impl FnOnce(&mut Fake) -> R) -> Result<R> {
+            let left = self.saves.load(Ordering::SeqCst);
+            if left == 0 {
+                return Err(anyhow!("the disk is full"));
+            }
+            self.saves.store(left - 1, Ordering::SeqCst);
             let mut p = self.state.lock().unwrap();
             let mut next = p.clone();
             let out = f(&mut next);
@@ -861,13 +895,13 @@ mod tests {
         for release in ["0", "1"] {
             std::fs::write(releases_dir(&dir).join(release.repeat(64)), b"r").unwrap();
         }
-        let keeper = Kept {
-            dir: dir.clone(),
-            state: Mutex::new(Fake {
+        let keeper = Kept::new(
+            &dir,
+            Fake {
                 trial: Some(trial("c", &dir, 1, LATER)),
                 ..Fake::default()
-            }),
-        };
+            },
+        );
         failed(&keeper, "other", "9.9.9", &"0".repeat(64), "no").unwrap();
         assert!(keeper.trial().is_some());
         failed(&keeper, "c", "9.9.9", &"0".repeat(64), "exec failed").unwrap();
@@ -883,16 +917,41 @@ mod tests {
     #[test]
     fn a_trial_another_binary_runs_is_not_confirmed() {
         let dir = temp("confirm");
-        let keeper = Kept {
-            dir: dir.clone(),
-            state: Mutex::new(Fake {
+        let keeper = Kept::new(
+            &dir,
+            Fake {
                 trial: Some(trial("c", &dir, 1, LATER)),
                 ..Fake::default()
-            }),
-        };
+            },
+        );
         confirm(&keeper);
         let t = keeper.trial().unwrap();
         assert!(!t.confirmed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A release running from the installed path, rather than from `releases/`, confirms its
+    /// trial too: the install, refused over a binary replaced meanwhile, ends the update.
+    #[test]
+    fn a_release_run_from_the_installed_path_confirms() {
+        let dir = temp("from-installed");
+        let exe = dir.join("vk-fake");
+        std::fs::write(&exe, b"another").unwrap();
+        let keeper = Kept::new(
+            &dir,
+            Fake {
+                trial: Some(Trial {
+                    sha256: own_sha256().unwrap(),
+                    exe,
+                    ..trial("c", &dir, 1, LATER)
+                }),
+                ..Fake::default()
+            },
+        );
+        confirm(&keeper);
+        let p = Fake::load(&dir).unwrap();
+        assert!(p.trial.is_none());
+        assert!(matches!(p.outcome("c"), Some(Outcome::Failed { .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -953,6 +1012,53 @@ mod tests {
         }
     }
 
+    /// Confirmation installs the release and completes the update. If saving completion
+    /// fails, the trial stays confirmed; the next confirmation retries installation and completion.
+    #[test]
+    fn a_confirmation_whose_end_was_not_saved_is_finished_again() {
+        let dir = temp("unsaved");
+        let t = installable(&dir);
+        let keeper = Kept::new(
+            &dir,
+            Fake {
+                trial: Some(t.clone()),
+                ..Fake::default()
+            },
+        );
+        // The confirmation is saved, the end not.
+        keeper.saves.store(1, Ordering::SeqCst);
+        finish(&keeper, &t);
+        let kept = keeper.trial().unwrap();
+        assert!(kept.confirmed);
+        assert_eq!(crate::update::hash_file(&t.exe).unwrap(), t.sha256);
+        keeper.saves.store(usize::MAX, Ordering::SeqCst);
+        finish(&keeper, &kept);
+        let p = Fake::load(&dir).unwrap();
+        assert!(p.trial.is_none());
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Done);
+        assert_eq!(p.outcome("c"), Some(&Outcome::Done));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A confirmation that cannot be saved installs nothing: the trial goes on.
+    #[test]
+    fn a_confirmation_that_cannot_be_saved_installs_nothing() {
+        let dir = temp("unconfirmed");
+        let t = installable(&dir);
+        let keeper = Kept::new(
+            &dir,
+            Fake {
+                trial: Some(t.clone()),
+                ..Fake::default()
+            },
+        );
+        keeper.saves.store(0, Ordering::SeqCst);
+        finish(&keeper, &t);
+        assert!(!keeper.trial().unwrap().confirmed);
+        assert_eq!(std::fs::read(&t.exe).unwrap(), b"previous");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A confirmed trial, read by a previous binary from before confirmations — the same trial
     /// with no `confirmed` — is one it hands over to the release, past its attempts and
     /// deadline both, rather than rolling it back; saved by it, `confirmed` dropped, it still
@@ -987,6 +1093,35 @@ mod tests {
         let p = Fake::load(&dir).unwrap();
         assert!(p.trial.is_none());
         assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Done);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Startup runs an installed, confirmed release even if saving completion fails.
+    /// The next start ends the remaining trial.
+    #[test]
+    fn an_install_whose_end_was_not_saved_runs_the_release() {
+        let dir = temp("install-unsaved");
+        let t = Trial {
+            confirmed: true,
+            ..installable(&dir)
+        };
+        let p = Fake {
+            trial: Some(t.clone()),
+            ..Fake::default()
+        };
+        p.save(&dir).unwrap();
+        std::fs::write(dir.join("fail-saves"), b"").unwrap();
+        let Start::Exec(binary, None) = on_start::<Fake>(&dir, 1) else {
+            panic!("the installed release is not run");
+        };
+        assert_eq!(binary.path(), t.exe.as_path());
+        assert_eq!(crate::update::hash_file(&t.exe).unwrap(), t.sha256);
+        assert!(Fake::load(&dir).unwrap().trial.is_some());
+        std::fs::remove_file(dir.join("fail-saves")).unwrap();
+        assert!(matches!(on_start::<Fake>(&dir, 1), Start::Exec(_, None)));
+        let p = Fake::load(&dir).unwrap();
+        assert!(p.trial.is_none());
+        assert_eq!(p.outcome("c"), Some(&Outcome::Done));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

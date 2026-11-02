@@ -374,7 +374,7 @@ impl Updater {
     }
 
     /// Change the persisted state with `f`, save it, and wake the session to report. Nothing
-    /// changes, in memory or on disk, when the save fails.
+    /// changes in memory when the save fails; on disk, the new state may have been published.
     fn change<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
         let out = {
             let mut p = self.persisted();
