@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Plainer web UI text.** The hub's web UI explains pages, settings, errors and
+  confirmations in shorter, more direct sentences.
+
 ### Fixed
 
 - **A changed `${localEnv:…}` value no longer restarts a dev environment just because the

@@ -107,7 +107,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
         None => {
             return Ok(message(
                 StatusCode::NOT_FOUND,
-                "The hub holds no record of this project: never seen, or forgotten.",
+                "The hub has no record of this project. It never saw the project, or it forgot it.",
             ));
         }
     };
@@ -216,16 +216,16 @@ fn unseen(
     let mut main = Html::new();
     main.raw("<h1>")
         .text(&title)
-        .raw("</h1><p class=\"sub\">The hub has not seen this project: no job of it has ")
-        .raw("reached it yet. ");
+        .raw("</h1><p class=\"sub\">The hub has not seen this project yet. None of its jobs ")
+        .raw("has reached the hub. ");
     if known {
-        main.raw("Approve it on <a href=\"")
+        main.raw("Once one has, approve the project on <a href=\"")
             .text(clients::server_path(gitlab))
-            .raw("\">its server's page</a> once one has.</p>");
+            .raw("\">its server's page</a>.</p>");
     } else {
         main.raw("The hub has no GitLab server <strong>")
             .text(gitlab)
-            .raw("</strong> either: add or approve it on <a href=\"")
+            .raw("</strong> either. Add or approve that server on <a href=\"")
             .raw(clients::GITLAB_PATH)
             .raw("\">GitLab servers</a> first.</p>");
     }

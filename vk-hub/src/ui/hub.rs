@@ -22,23 +22,23 @@ pub(super) static KIND: updates::Kind = updates::Kind {
     heading: "Hub",
     column: "HUB",
     program: Program::Hub,
-    note: "The hub copies the release and settles its jobs: it takes no new job, waits for \
-           those queued to start on a node, and fails the update, changing nothing, should one \
-           be left waiting. Then it stops accepting connections, which wait, and runs the \
-           release in its place, handing it its listeners; pages and peers reconnect. A release \
-           that does not come up is rolled back to the binary the hub ran once its supervisor \
-           restarts <code>vk-hub serve</code>.",
-    question: "Update the hub? It settles its jobs and runs the release in its place, \
-               connections waiting meanwhile. If the release does not come up, the hub goes \
-               back to the binary it runs now once its supervisor restarts it.",
+    note: "The hub copies the release and settles its jobs. It takes no new job and waits for \
+           queued jobs to start on a node. If a job is left waiting, the update fails and \
+           nothing changes. Then the hub stops accepting connections, and new ones wait. It \
+           runs the release in its place and hands it its listeners. Pages and peers \
+           reconnect. If the release does not come up, the hub rolls back to the binary it ran \
+           before, once its supervisor restarts <code>vk-hub serve</code>.",
+    question: "Update the hub? The hub settles its jobs, then runs the release in its place. \
+               Connections wait meanwhile. If the release does not come up, the hub goes back \
+               to the binary it runs now, once its supervisor restarts it.",
     // Never offline: the hub serves the page.
     command_ttl: std::time::Duration::ZERO,
     allow: "<code>[update] allow</code>",
     allow_downgrade: "<code>[update] allow_downgrade</code>",
     started: |_, program, version, id| {
         format!(
-            "The hub is updating itself to {program} {version} (update {id}); this page \
-             reconnects once it runs the release."
+            "The hub is updating itself to {program} {version} (update {id}). This page \
+             reconnects once the hub runs the release."
         )
     },
     ops: updates::Ops {

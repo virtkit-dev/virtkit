@@ -8128,8 +8128,8 @@ fn an_operator_is_told_the_hub_is_updating() {
         (crate::ui::hub::KIND.started)("this hub", crate::store::Program::Hub, "0.2.0", "ab");
     assert_eq!(
         said,
-        "The hub is updating itself to vk-hub 0.2.0 (update ab); this page reconnects once it \
-         runs the release."
+        "The hub is updating itself to vk-hub 0.2.0 (update ab). This page reconnects once the \
+         hub runs the release."
     );
 }
 
@@ -8157,7 +8157,7 @@ async fn the_hub_asks_about_an_older_release_its_setting_lets_it_take() {
     assert!(
         reply
             .body
-            .contains("its <code>[update] allow_downgrade</code> lets it go back."),
+            .contains("The hub's <code>[update] allow_downgrade</code> lets it go back."),
         "{}",
         reply.body
     );
@@ -8403,10 +8403,13 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     // The question says when the registry would refuse the version: an older one, or one it
     // cannot order against its own.
     for (running, want) in [
-        ("0.91.0", "It is older than the version the registry runs"),
+        (
+            "0.91.0",
+            "This release is older than the version the registry runs",
+        ),
         (
             "dev",
-            "Its version cannot be ordered against the one the registry runs",
+            "Its version cannot be ordered against the version the registry runs",
         ),
     ] {
         hub.db
@@ -8565,7 +8568,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     for want in [
         "Update this relay?",
-        "its running jobs go on",
+        "Its running jobs go on",
         "vk-gitlab 0.90.0 (<code>",
         ", unsigned) to relay-1, which runs 0.89.0.",
         "The relay is offline",
@@ -12504,7 +12507,10 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
-    assert!(page.contains("No capacity tenant lists it"), "{page}");
+    assert!(
+        page.contains("No capacity tenant lists this project"),
+        "{page}"
+    );
 
     // Adding a tenant asks nothing.
     let form = format!("_csrf={csrf}&op=capacity-add-tenant&tenant=web");
@@ -12551,8 +12557,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
         .body;
     for want in [
         "value=\"capacity-share\"",
-        "<p class=\"empty\">None: its runners' jobs are refused.</p>",
-        "<p class=\"empty\">None: it gets no relay work.</p>",
+        "<p class=\"empty\">None. The hub refuses this tenant's runners' jobs.</p>",
+        "<p class=\"empty\">None. This tenant gets no relay work.</p>",
         "<option value=\"gl/42\">acme/web · gl #42</option>",
         "value=\"capacity-remove-tenant\"",
     ] {
@@ -12613,7 +12619,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert!(
         reply
             .body
-            .contains("the capacity policy changed since this page was shown; reload it"),
+            .contains("the capacity policy changed after this page was shown. Reload the page"),
         "{}",
         reply.body
     );
@@ -12657,8 +12663,8 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body.contains(
-            "The hub has no GitLab server <strong>gone</strong> either: add or approve it on \
-             <a href=\"/gitlab\">GitLab servers</a> first."
+            "The hub has no GitLab server <strong>gone</strong> either. Add or approve that \
+             server on <a href=\"/gitlab\">GitLab servers</a> first."
         ),
         "{}",
         page.body
@@ -12677,7 +12683,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
         "The hub has not seen this project",
-        "Approve it on <a href=\"/gitlab/gl\">its server's page</a> once one has.",
+        "Once one has, approve the project on <a href=\"/gitlab/gl\">its server's page</a>.",
         "value=\"capacity-add-rule\"",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
@@ -13156,7 +13162,7 @@ async fn operators_edit_the_capacity_policy_from_its_pages() {
     let form = posted_form(&page, "capacity-remove-tenant", 0);
     let changes = [
         "Remove tenant group",
-        "Runner gl/9: unmap from tenant group; it gets no work",
+        "Runner gl/9: unmap from tenant group, so it gets no work",
         "API client key-1: group → the fallback (web)",
     ];
     let reply = capacity_confirmed(addr, &origin, &operator, &form, &changes).await;

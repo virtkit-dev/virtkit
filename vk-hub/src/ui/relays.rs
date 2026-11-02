@@ -30,13 +30,14 @@ pub(super) static KIND: updates::Kind = updates::Kind {
     heading: "GitLab adapters",
     column: "ADAPTER",
     program: Program::Gitlab,
-    note: "A relay downloads the release, stops asking GitLab for jobs, and restarts on it once \
-           the requests out have ended; its running jobs go on, their logs resuming where \
-           GitLab has them. One that does not come up is rolled back to the binary it ran once \
-           the relay's supervisor restarts it.",
-    question: "Update this relay? It stops asking GitLab for jobs and restarts on the release; \
-               its running jobs go on. If the release does not come up, the relay goes back to \
-               the binary it ran once its supervisor restarts it.",
+    note: "A relay downloads the release and stops asking GitLab for jobs. Once its requests \
+           out to GitLab have ended, the relay restarts on the release. Its running jobs go on, \
+           and their logs resume where GitLab has them. If the release does not come up, the \
+           relay rolls back to the binary it ran before, once the relay's supervisor restarts \
+           it.",
+    question: "Update this relay? The relay stops asking GitLab for jobs and restarts on the \
+               release. Its running jobs go on. If the release does not come up, the relay goes \
+               back to the binary it ran before, once its supervisor restarts it.",
     command_ttl: ops::COMMAND_TTL,
     allow: "<code>[hub] allow</code>, which lacks <code>update</code>",
     allow_downgrade: "<code>[hub] allow_downgrade</code>",

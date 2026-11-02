@@ -223,7 +223,10 @@ fn command_line(h: &mut Html, c: &Issued, now: u64) {
 
 /// [`Kind::started`] for a peer, which the update is sent to.
 pub(super) fn sent(peer: &str, program: Program, version: &str, command: &str) -> String {
-    format!("Sent {peer} the update to {program} {version} (command {command}); it shows below.")
+    format!(
+        "Sent {peer} the update to {program} {version} (command {command}). Its progress shows \
+         below."
+    )
 }
 
 /// Render the release form for `p` and `kind`'s program, or explain why no form is available.
@@ -344,34 +347,37 @@ fn detail(kind: &Kind, p: &Peer, release: &Release) -> Html {
         .and_then(|own| version_refusal(&release.row.version, own))
     {
         Some(VersionRefusal::Older) if p.allows_downgrade == Some(true) => {
-            h.raw("<p>It is older than the version the ")
+            h.raw("<p>This release is older than the version the ")
                 .raw(kind.noun)
-                .raw(" runs; its ")
+                .raw(" runs. The ")
+                .raw(kind.noun)
+                .raw("'s ")
                 .raw(kind.allow_downgrade)
                 .raw(" lets it go back.</p>");
         }
         Some(VersionRefusal::Older) => {
-            h.raw("<p class=\"reason\">It is older than the version the ")
+            h.raw("<p class=\"reason\">This release is older than the version the ")
                 .raw(kind.noun)
-                .raw(" runs: the ")
+                .raw(" runs. The ")
                 .raw(kind.noun)
                 .raw(" refuses it unless its ")
                 .raw(kind.allow_downgrade)
                 .raw(" is set.</p>");
         }
         Some(VersionRefusal::Unordered) => {
-            h.raw("<p class=\"reason\">Its version cannot be ordered against the one the ")
+            h.raw("<p class=\"reason\">The ")
                 .raw(kind.noun)
-                .raw(" runs, not being <code>MAJOR.MINOR.PATCH</code>: the ")
+                .raw(" refuses this release. Its version cannot be ordered against the version ")
+                .raw("the ")
                 .raw(kind.noun)
-                .raw(" refuses it.</p>");
+                .raw(" runs: both must be <code>MAJOR.MINOR.PATCH</code>.</p>");
         }
         None => {}
     }
     if !p.connected {
         h.raw("<p>The ")
             .raw(kind.noun)
-            .raw(" is offline: it gets the update once it connects, within ")
+            .raw(" is offline. It gets the update if it connects within ")
             .text(crate::human_duration(kind.command_ttl))
             .raw(".</p>");
     }

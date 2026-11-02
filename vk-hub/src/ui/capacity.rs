@@ -94,7 +94,8 @@ const REMOVE_RULE: &str = "capacity-remove-rule";
 const FROM_PROJECT: &str = "project";
 
 /// Why an edit based on a replaced policy is refused.
-const STALE: &str = "the capacity policy changed since this page was shown; reload it and retry";
+const STALE: &str =
+    "the capacity policy changed after this page was shown. Reload the page and try again";
 
 /// The most changes a question lists; the rest are counted.
 const MAX_DESCRIBED: usize = 50;
@@ -266,11 +267,11 @@ pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let (policy, known) =
         blocking(move || Ok((hub.db.capacity_policy(), Known::read(&hub)?))).await?;
     let mut main = Html::new();
-    main.raw("<h1>Capacity policy</h1><p class=\"sub\">How the hub shares the fleet: each ")
-        .raw("relay runner's requests and each API key's reservations are charged to a tenant, ")
-        .raw("and the tenant holding the least for its weight goes first, up to its cap. A ")
-        .raw("runner gets work only once mapped to a tenant, and only for the projects that ")
-        .raw("tenant lists.</p>");
+    main.raw("<h1>Capacity policy</h1><p class=\"sub\">The hub shares the fleet between ")
+        .raw("tenants. Each relay runner's requests and each API key's reservations count ")
+        .raw("against a tenant. When several tenants wait, the one using the least relative to ")
+        .raw("its weight goes first, up to its cap. A runner gets work only after you map it to ")
+        .raw("a tenant, and only for that tenant's projects.</p>");
     let policy = match policy {
         Ok(policy) => policy,
         Err(e) => {
@@ -292,8 +293,8 @@ pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     headroom_section(&mut main, &policy, auth, &digest, steer);
     let json = serde_json::to_string_pretty(&policy)?;
     main.raw("<section><details class=\"fold\"><summary>The whole policy as JSON</summary>")
-        .raw("<p class=\"sub\">As <code>vk-hub capacity-policy show</code> prints it and ")
-        .raw("<code>vk-hub capacity-policy set</code> takes it.</p>");
+        .raw("<p class=\"sub\">The format <code>vk-hub capacity-policy show</code> prints ")
+        .raw("and <code>vk-hub capacity-policy set</code> takes.</p>");
     if steer {
         edit_form(&mut main, auth, SET_POLICY, &digest);
         main.raw("<textarea name=\"policy\" rows=\"24\" spellcheck=\"false\" ")
@@ -338,9 +339,9 @@ fn tenants_table(h: &mut Html, policy: &Policy) {
 }
 
 fn fallback_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
-    h.raw("<section><h2>Fallback tenant</h2><p class=\"sub\">API keys assigned no tenant ")
-        .raw("below are charged to it. Relay runners never fall back: an unmapped runner gets ")
-        .raw("no work.</p>");
+    h.raw("<section><h2>Fallback tenant</h2><p class=\"sub\">API keys with no tenant ")
+        .raw("assigned below are charged to the fallback tenant. Relay runners never fall back. ")
+        .raw("An unmapped runner gets no work.</p>");
     if !steer {
         h.raw("<p><a href=\"")
             .text(tenant_path(&policy.fallback))
@@ -376,9 +377,9 @@ fn clients_section(
     digest: &str,
     steer: bool,
 ) {
-    h.raw("<section><h2>API clients</h2><p class=\"sub\">The tenant each API key's ")
-        .raw("reservations are charged to, by its principal ID. Their work is always normal, ")
-        .raw("never production.</p>");
+    h.raw("<section><h2>API clients</h2><p class=\"sub\">The tenant that each API key's ")
+        .raw("reservations are charged to, listed by the key's principal ID. API clients' work ")
+        .raw("is always normal, never production.</p>");
     let mut rows: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for (id, name) in &known.keys {
         rows.insert(id, Some(name));
@@ -431,10 +432,12 @@ fn clients_section(
 }
 
 fn scheduling_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
-    h.raw("<section><h2>Scheduling</h2><p class=\"sub\">A runner that took no job for the ")
-        .raw("busy time probes GitLab, at most the probe limit fleet-wide. One that finds no ")
-        .raw("job backs off from the initial backoff, doubling up to the maximum. After the ")
-        .raw("production probe burst, normal work goes before the next production probe.</p>");
+    h.raw("<section><h2>Scheduling</h2><p class=\"sub\">If a runner has taken no job for the ")
+        .raw("busy time, its next request probes GitLab. The whole fleet has at most the probe ")
+        .raw("limit of probes out at once. If a runner's request finds no job, the runner backs ")
+        .raw("off for the initial backoff. Each further miss in a row doubles the wait, up to the ")
+        .raw("maximum backoff. After the production probe burst, normal work goes before the ")
+        .raw("next production probe.</p>");
     let fields: [(&'static str, &'static str, u64, &'static str); 5] = [
         ("busy_secs", "Busy time", policy.busy_secs, " s"),
         ("probe_limit", "Probe limit", policy.probe_limit.into(), ""),
@@ -482,10 +485,10 @@ fn scheduling_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, 
 
 fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
     h.raw("<section><h2>Production headroom</h2><p class=\"sub\">Room kept for production ")
-        .raw("work: normal work leaves the fleet this many envelopes of each placement, or all ")
-        .raw("the room left when already short.</p>");
+        .raw("work. Normal work must leave the fleet this many envelopes of each placement. If ")
+        .raw("the fleet is already short, normal work must leave all the room that is left.</p>");
     if policy.headroom.is_empty() {
-        h.raw("<p class=\"empty\">None: normal work may take all the room.</p>");
+        h.raw("<p class=\"empty\">None. Normal work may take all the room.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>pool</th><th>labels</th>")
             .raw("<th>envelope</th><th class=\"num\">slots</th>");
@@ -578,7 +581,7 @@ pub(super) async fn tenant_get(name: &str, auth: &Auth, ui: &Ui) -> Result<Respo
     if clients.is_empty() {
         main.raw("<p class=\"empty\">None");
         if policy.fallback == name {
-            main.raw(" assigned, but every API key assigned no tenant is charged to it");
+            main.raw(" assigned. As the fallback, it is charged for every API key with no tenant");
         }
         main.raw(".</p>");
     } else {
@@ -596,13 +599,13 @@ pub(super) async fn tenant_get(name: &str, auth: &Auth, ui: &Ui) -> Result<Respo
         }
         main.raw("</tbody></table>");
     }
-    main.raw("<p class=\"sub\">API keys are assigned on the <a href=\"")
+    main.raw("<p class=\"sub\">You assign API keys to tenants on the <a href=\"")
         .raw(PATH)
-        .raw("\">capacity policy</a>'s page.</p></section>");
+        .raw("\">capacity policy</a> page.</p></section>");
     if steer && policy.fallback != name {
         main.raw("<section class=\"steer\"><div class=\"groups\"><div class=\"group danger\">")
-            .raw("<h3>Remove tenant</h3><p class=\"does\">Its runners are unmapped and get no ")
-            .raw("work; its API keys go to the fallback tenant.</p>");
+            .raw("<h3>Remove tenant</h3><p class=\"does\">Unmaps this tenant's runners, so ")
+            .raw("they get no work. Its API keys move to the fallback tenant.</p>");
         edit_form_class(&mut main, auth, REMOVE_TENANT, &digest, "act");
         hidden(&mut main, "tenant", name);
         main.raw("<button class=\"danger\">Remove tenant</button></form></div></div></section>");
@@ -618,10 +621,10 @@ fn share_section(
     digest: &str,
     steer: bool,
 ) {
-    h.raw("<section><h2>Share</h2><p class=\"sub\">The hub hands room to the tenant holding ")
-        .raw("the least for its weight; a tenant of weight 2 gets twice the room of one of ")
-        .raw("weight 1 when both have work, and an idle tenant's share goes to the others. A cap ")
-        .raw("holds it at that many requests and jobs at once.</p>");
+    h.raw("<section><h2>Share</h2><p class=\"sub\">The hub gives room first to the tenant ")
+        .raw("using the least relative to its weight. When both have work, a tenant of weight 2 ")
+        .raw("gets twice the room of a tenant of weight 1. An idle tenant's share goes to the ")
+        .raw("others. A cap limits the tenant to that many requests and jobs at once.</p>");
     if !steer {
         h.raw("<table class=\"kv\"><tbody>");
         pages::kv(h, "Weight", &tenant.weight.to_string());
@@ -652,11 +655,11 @@ fn projects_section(
     digest: &str,
     steer: bool,
 ) {
-    h.raw("<section><h2>Projects</h2><p class=\"sub\">Its runners take jobs of these ")
-        .raw("projects only. Production branches and placement rules are set on each ")
-        .raw("project's page, the same in every tenant listing it.</p>");
+    h.raw("<section><h2>Projects</h2><p class=\"sub\">This tenant's runners take jobs of ")
+        .raw("these projects only. You set production branches and placement rules on each ")
+        .raw("project's page. They are the same in every tenant that lists the project.</p>");
     if tenant.projects.is_empty() {
-        h.raw("<p class=\"empty\">None: its runners' jobs are refused.</p>");
+        h.raw("<p class=\"empty\">None. The hub refuses this tenant's runners' jobs.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>project</th><th>instance</th>")
             .raw("<th class=\"num\">GitLab ID</th><th>approval</th><th>production branches</th>")
@@ -792,14 +795,15 @@ fn runners_section(
     digest: &str,
     steer: bool,
 ) {
-    h.raw("<section><h2>Runners</h2><p class=\"sub\">Relay runners charged to it, by GitLab ")
-        .raw("runner ID. A production runner's work goes before normal work, and takes jobs ")
-        .raw("only of its projects' production branches. A runner given nodes or pools runs ")
-        .raw("its requests and jobs on those nodes only, the least loaded first; other nodes ")
-        .raw("are never used for it, even idle.</p>");
+    h.raw("<section><h2>Runners</h2><p class=\"sub\">Relay runners charged to this tenant, ")
+        .raw("by GitLab runner ID. A production runner's work goes before normal work. A ")
+        .raw("production runner takes only jobs of its projects' production branches. If you ")
+        .raw("give a runner nodes or pools, the hub runs its requests and jobs on those nodes ")
+        .raw("only, least loaded first. The hub never uses other nodes for that runner, even ")
+        .raw("idle ones.</p>");
     let runners: Vec<_> = policy.runners.iter().filter(|r| r.tenant == name).collect();
     if runners.is_empty() {
-        h.raw("<p class=\"empty\">None: it gets no relay work.</p>");
+        h.raw("<p class=\"empty\">None. This tenant gets no relay work.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>runner</th><th>relay</th>")
             .raw("<th>instance</th><th class=\"num\">GitLab ID</th><th>class</th>")
@@ -918,7 +922,7 @@ fn may_use_cell(h: &mut Html, r: &RunnerMapping, known: &Known) {
         .collect();
     h.raw("<br><span class=\"sub\">");
     if allowed.is_empty() {
-        h.raw("No node of the hub's matches: it gets no work.");
+        h.raw("No node of the hub's matches, so this runner gets no work.");
     } else {
         h.text(format_args!(
             "Now {} of {} nodes: {}",
@@ -983,8 +987,9 @@ fn runner_nodes_form(
     hidden(h, "gitlab", &r.gitlab);
     hidden(h, "runner", r.runner_id);
     targets_picker(h, &known.nodes, &r.nodes, &r.pools);
-    h.raw("<p class=\"sub\">A node ticked or in a pool ticked; none ticked for any node. At ")
-        .raw("most 256 nodes and 256 pools.</p>")
+    h.raw("<p class=\"sub\">The runner may use any ticked node, and any node in a ticked ")
+        .raw("pool. Tick none to allow any node. You can tick at most 256 nodes and 256 ")
+        .raw("pools.</p>")
         .raw("<button>Save</button></form></details>");
 }
 
@@ -1118,8 +1123,8 @@ fn add_tenant_fields(h: &mut Html, auth: &Auth) {
     csrf_field(h, auth);
     hidden(h, "op", ADD_TENANT);
     h.raw("<label>Name <input name=\"tenant\" required></label>")
-        .raw("<button>Add tenant</button></form><p class=\"sub\">Of weight 1, with no ")
-        .raw("projects nor runners until its page gives it some.</p>");
+        .raw("<button>Add tenant</button></form><p class=\"sub\">A new tenant has weight ")
+        .raw("1 and no projects or runners. You add them on the tenant's page.</p>");
 }
 
 /// A project's section of its page: the tenants listing it and their runners on its instance,
@@ -1156,7 +1161,7 @@ pub(super) fn project_section(
         ]
     };
     if listing.is_empty() {
-        h.raw("<p>No capacity tenant lists it: its relay jobs are refused.</p>");
+        h.raw("<p>No capacity tenant lists this project, so the hub refuses its relay jobs.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
             .raw("<th>cap</th><th>runners</th>");
@@ -1221,13 +1226,14 @@ pub(super) fn project_section(
         return Ok(());
     };
     if listing.len() > 1 {
-        h.raw("<p class=\"sub\">Its production branches and placement rules apply in every ")
-            .raw("tenant listed above.</p>");
+        h.raw("<p class=\"sub\">This project's production branches and placement rules apply ")
+            .raw("in every tenant listed above.</p>");
     }
-    h.raw("<h3>Production branches</h3><p class=\"sub\">Globs, one per line: <code>*</code> ")
-        .raw("matches within a <code>/</code>-separated part, <code>**</code> across them. A ")
-        .raw("production runner's job must be a pipeline of a branch one matches, as its ")
-        .raw("sources show it; a tag or merge request pipeline never is.</p>");
+    h.raw("<h3>Production branches</h3><p class=\"sub\">Globs, one per line. <code>*</code> ")
+        .raw("matches within one <code>/</code>-separated part, and <code>**</code> matches ")
+        .raw("across parts. A production runner takes only branch pipelines. The branch, as the ")
+        .raw("job's sources show it, must match a glob. Tag and merge request pipelines never ")
+        .raw("qualify.</p>");
     if steer {
         edit_form(h, auth, SET_BRANCHES, &digest);
         hidden(h, "tenant", first);
@@ -1238,7 +1244,7 @@ pub(super) fn project_section(
             .text(project.production_branches.join("\n"))
             .raw("</textarea><button>Save branches</button></form>");
     } else if project.production_branches.is_empty() {
-        h.raw("<p class=\"empty\">None: its production runners take none of its jobs.</p>");
+        h.raw("<p class=\"empty\">None. Its production runners take none of its jobs.</p>");
     } else {
         h.raw("<pre>")
             .text(project.production_branches.join("\n"))
@@ -1247,7 +1253,7 @@ pub(super) fn project_section(
     h.raw("<h3>Placement rules</h3>");
     placement_help(h);
     if project.placement_rules.is_empty() {
-        h.raw("<p class=\"empty\">None: its jobs may go to any node.</p>");
+        h.raw("<p class=\"empty\">None. Its jobs may go to any node.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>jobs</th><th>nodes</th><th>pools</th>");
         if steer {
@@ -1296,11 +1302,11 @@ pub(super) fn project_section(
         hidden(h, "tenant", first);
         hidden(h, "gitlab", gitlab);
         hidden(h, "project", id);
-        h.raw("<label>Refs, one glob per line, none for every job<textarea name=\"branches\" ")
+        h.raw("<label>Refs, one glob per line (none for every job)<textarea name=\"branches\" ")
             .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>");
         targets_picker(h, nodes, &[], &[]);
-        h.raw("<p class=\"sub\">Leave nodes, or pools, unticked for any; not both. At most ")
-            .raw("256 nodes and 256 pools.</p>")
+        h.raw("<p class=\"sub\">Leave nodes or pools unticked to allow any, but not both. You ")
+            .raw("can tick at most 256 nodes and 256 pools.</p>")
             .raw("<button>Add rule</button></form>");
     }
     h.raw("</section>");
@@ -1309,14 +1315,17 @@ pub(super) fn project_section(
 
 /// What placement rules do, beside their editor.
 fn placement_help(h: &mut Html) {
-    h.raw("<p class=\"sub\">A job goes only to a node every rule that applies to it allows: ")
-        .raw("one of its nodes and in one of its pools, either any when empty but not both. A ")
-        .raw("rule applies to every job, or with refs (globs) to jobs whose ref matches one, ")
-        .raw("branch, tag or merge request alike, as the relay reports it; every rule applies ")
-        .raw("to a job whose ref is unknown. That ref is no trust boundary: a fork's merge ")
-        .raw("request from a branch named <code>main</code> gets <code>main</code>'s rules. To ")
-        .raw("confine every job of the project, use a rule without refs. A job no allowed node ")
-        .raw("takes waits, and ends at its placement deadline.</p>");
+    h.raw("<p class=\"sub\">A node can run a job only if every placement rule that applies ")
+        .raw("to the job allows that node. A rule allows a node that is one of its nodes and in ")
+        .raw("one of its pools. An empty list allows any, but a rule cannot leave both lists ")
+        .raw("empty. A rule without refs applies to every job of the project. A rule with refs ")
+        .raw("(globs) applies to jobs whose ref matches one of them. The ref can be a branch, a ")
+        .raw("tag or a merge request, as the relay reports it. If a job's ref is unknown, every ")
+        .raw("rule applies. The ")
+        .raw("ref is not a trust boundary: a fork's merge request from a branch named ")
+        .raw("<code>main</code> gets <code>main</code>'s rules. To confine every job of the ")
+        .raw("project, use a rule without refs. If no allowed node takes a job, the job waits, ")
+        .raw("and ends at its placement deadline.</p>");
 }
 
 /// `POST /capacity`: an edit of the policy, as the operator session's principal.
@@ -1405,7 +1414,8 @@ pub(super) async fn action(
         path: PATH.to_owned(),
         back: back.clone(),
         op: op.to_owned(),
-        what: "Change the capacity policy? Jobs it no longer allows wait or are refused.",
+        what: "Change the capacity policy? Jobs the new policy no longer allows will wait or be \
+               refused.",
         detail,
         asked: (fields.iter())
             .map(|&name| (name, field(&form, name).unwrap_or("").to_owned()))
@@ -1500,7 +1510,7 @@ fn add_tenant(
             },
         }
     }
-    let why = "the capacity policy kept changing; retry";
+    let why = "the capacity policy kept changing. Try again";
     Ok(Err((StatusCode::CONFLICT, why.into())))
 }
 
@@ -1678,7 +1688,7 @@ fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Poli
         }
         REMOVE_TENANT => {
             if current.fallback == tenant {
-                bail!("tenant {tenant:?} is the fallback: make another the fallback first");
+                bail!("tenant {tenant:?} is the fallback. Make another tenant the fallback first");
             }
             policy.tenants.remove(tenant).ok_or_else(no_tenant)?;
             policy.runners.retain(|r| r.tenant != tenant);
@@ -1721,7 +1731,7 @@ fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Poli
             let class = match value("class") {
                 "normal" => Class::Normal,
                 "production" => Class::Production,
-                _ => bail!("a runner's class is normal or production"),
+                _ => bail!("a runner's class must be normal or production"),
             };
             current.tenant(tenant).ok_or_else(no_tenant)?;
             // A runner moved or made another class keeps the nodes it may use.
@@ -1848,7 +1858,7 @@ fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Poli
                 pools: lines(value("pools")),
             };
             if rule.nodes.is_empty() && rule.pools.is_empty() {
-                bail!("a placement rule names some nodes or pools");
+                bail!("a placement rule must name some nodes or pools");
             }
             let listed = current.project(tenant, &gitlab, id);
             if listed.is_some_and(|p| p.placement_rules.iter().any(|r| r.same_as(&rule))) {
@@ -1986,7 +1996,7 @@ fn describe(before: &Policy, after: &Policy, nodes: &[KnownNode]) -> Vec<String>
                 ));
             }
             (Some(b), None) => out.push(format!(
-                "Runner {gitlab}/{id}: unmap from tenant {}; it gets no work",
+                "Runner {gitlab}/{id}: unmap from tenant {}, so it gets no work",
                 b.tenant
             )),
             (Some(b), Some(a)) => {
@@ -2288,7 +2298,7 @@ mod tests {
             add_tenant(&db, racing, "api", "u").unwrap(),
             Err((
                 StatusCode::CONFLICT,
-                "the capacity policy kept changing; retry".into()
+                "the capacity policy kept changing. Try again".into()
             ))
         );
         assert!(db.capacity_policy().unwrap().tenant("api").is_none());
