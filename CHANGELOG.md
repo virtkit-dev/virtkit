@@ -19,6 +19,13 @@ All notable changes to virtkit will be documented in this file.
 - **vk-gitlab releases on the hub.** The hub holds `vk-gitlab` releases as it does `vk` and
   `vk-registry` ones: `vk-hub release add|fetch --program vk-gitlab` and the Updates page's
   upload and fetch. `vk release-key sign --program vk-gitlab` signs one.
+- **Update GitLab adapters from the hub.** A vk-gitlab whose `[hub] allow` lists `update`
+  installs a `vk-gitlab` release the hub holds, from the Updates page's GitLab adapters section
+  or `vk-hub relays update <id> --release <sha256>`. It finishes the job requests it has out,
+  then restarts on the release with its running jobs untouched, and rolls back if the release
+  does not come back. `[hub] release_keys` makes it require releases signed with `vk
+  release-key sign --program vk-gitlab`. `vk-hub relays show` lists the updates issued and how
+  each ended.
 
 ## [0.101.0] - 2026-11-01
 

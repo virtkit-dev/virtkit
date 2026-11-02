@@ -4172,6 +4172,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jemallocator",
+ "libc",
  "log",
  "reqwest",
  "ring",
@@ -4179,12 +4180,14 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "signal-hook-registry",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "vk-fs",
  "vk-hub-proto",
  "vk-peer",
+ "vk-selfupdate",
 ]
 
 [[package]]

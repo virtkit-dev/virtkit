@@ -1828,6 +1828,14 @@ lacks `update`, or it requires signatures and the release is unsigned. The CLI m
 checks. The fragment follows registry connections, disconnections, inventory and state
 reports, and command answers, not heartbeats.
 
+The **GitLab adapters** section in the same fragment shows each relay's version, whether its
+`[hub] allow` permits updates, and its last update. Operators get an **Update** form selecting
+a held `vk-gitlab` release, posted by htmx to `/relay/<id>/action` with `op=update`. It uses
+`vk-hub relays update`'s operation, with the same checks and confirmation as a registry update.
+The relay stops asking GitLab for jobs, then restarts on the release while its running jobs
+continue (`docs/gitlab-relay-enrollment.md`, "Updates"). `/relays` lists each relay's version
+and links here.
+
 The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,
 session, command outcome and desired-state change, by node; every release added or removed, rollout

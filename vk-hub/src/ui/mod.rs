@@ -83,6 +83,7 @@ mod operations;
 mod pages;
 mod projects;
 mod registries;
+mod relays;
 mod sse;
 mod updates;
 mod users;
@@ -420,6 +421,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     fleet::rollout_action(req, ui, site, id).await
                 } else if let Some(id) = registries::action_target(&path) {
                     registries::action(req, ui, site, id).await
+                } else if let Some(id) = relays::action_target(&path) {
+                    relays::action(req, ui, site, id).await
                 } else {
                     Ok(message(StatusCode::NOT_FOUND, "No such action."))
                 }

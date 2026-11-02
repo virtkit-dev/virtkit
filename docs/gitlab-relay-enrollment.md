@@ -70,8 +70,9 @@ vk-hub token create --kind gitlab | ssh ci-relay-1 vk-gitlab join https://hub.ex
 ```
 
 `join` creates `<state_dir>/hub/` (`0700`) with the relay's key, the hub's URL, its CA and the
-relay ID, as `vk-registry join` does. `vk-gitlab leave` deletes it. A config with a `[hub]`
-table, or a runner with a `url` of its own, is refused.
+relay ID, as `vk-registry join` does. `vk-gitlab leave` deletes it. A runner with a `url` of its
+own is refused, as is a `[hub]` table naming the hub: the enrollment does. `[hub]` only says
+what the hub may do to the relay ([Updates](#updates)).
 
 - **The GitLab credential is the runner tokens (`glrt-`), as today.** They take jobs and nothing
   else; `verify` gives each runner's ID. A token that lists a runner's projects or creates
@@ -96,7 +97,7 @@ shares (`vk-peer`: hello, challenge, auth bound to the TLS connection), then sen
 - **heartbeat**: per runner, job requests outstanding, jobs held, the admission of each
   (`request_admissions`, `job_admissions`; version 2), last GitLab answer;
 - **report**: each runner's state (`polling`, `waiting_capacity`, `server_pending`,
-  `unhealthy`, `token_refused`).
+  `unhealthy`, `token_refused`), and the update under way or the last one's end.
 
 The hub binds the relay to the normalized URL of its first inventory, and answers with that
 server's **status** (`approved` with its name, `pending`, `rejected`), again whenever it changes.
@@ -108,6 +109,54 @@ another URL is told `rebound` and refused jobs until re-enrolled (`join --replac
 the relay knows a project only once GitLab gives it one of its jobs, and the hub learns it from
 that job's submission. **The first job of a project not yet approved fails** (below). An
 operator can approve a project beforehand, by ID and path.
+
+## Updates
+
+A relay whose `[hub] allow` lists `update` is updated to a `vk-gitlab` release the hub holds,
+from the hub's Updates page or `vk-hub relays update <id> --release <sha256 prefix>`:
+
+```toml
+[hub]
+allow = ["update"]
+release_keys = ["…"]      # optional: an update must then be signed by one of them
+# require_signed = true   # the default once release_keys names a key
+# allow_downgrade = false
+```
+
+The relay's inventory says whether it allows updates and needs them signed, and the hub refuses
+an update the relay would refuse before issuing it. One issued before the relay dropped
+`update` from its `allow` is still sent, and refused. A relay or hub from before updates
+(relay protocol version 3) is never sent one. Releases reach the hub as a node's do: `vk-hub
+release add <file> --program vk-gitlab --version V [--signature FILE]`, signed with `vk
+release-key sign --program vk-gitlab`, or `vk-hub release fetch --program vk-gitlab`, or the
+Updates page's upload and fetch. `vk-hub relays show <id>` lists the commands issued to a relay
+and how each ended.
+
+An update runs on trial, as a registry's does:
+
+1. the relay downloads the release from `/v1/gitlab/releases/<sha256>` under its own
+   signature, and checks its digest, size, signature (against its `[hub] release_keys`) and
+   `--version`;
+2. it keeps its running binary beside the release under `<state_dir>/hub/releases/`;
+3. it stops asking GitLab for jobs and waits for the job requests out to end and the jobs they
+   brought to be in the state files. Past ten minutes it goes on all the same, as a restart
+   would: a job GitLab hands to a request cut short then waits for GitLab's stuck-job timeout;
+4. it executes the release in its place. Running jobs are not stopped: the release resumes them
+   from the state files, as after any restart, their logs picking up where GitLab has them;
+5. the release, once in session with the hub, installs itself over the installed binary by
+   rename and reports the update done.
+
+A release has two minutes to reach the hub. One that crashes is started again by the
+supervisor, through the previous binary, at most three starts in all; one that hangs is ended
+by its alarm a minute past that deadline. Past three starts or the deadline, the previous
+binary takes the relay back and reports the update rolled back. A release that reached the hub
+records so before it installs itself, and a relay stopped in between finishes the install on
+its next start. So `vk-gitlab run` needs a supervisor that restarts it (`Restart=always` under
+systemd), from a binary in a directory its user can write. A relay stopping on SIGTERM or
+SIGINT takes no update, and one stopping during an update does not execute the release.
+
+A vk-gitlab from before updates cannot confirm a trial, so with `allow_downgrade` an update to
+one is always rolled back.
 
 ## Jobs
 
@@ -201,8 +250,8 @@ file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
 
 1. stop each vk-gitlab with SIGTERM and let it drain, until its state files are empty;
 2. upgrade the hub and vk-gitlab;
-3. per daemon: move the runners' URL to `[gitlab] url` and drop the `[hub]` table, which the
-   new vk-gitlab refuses, then `vk-hub token create --kind gitlab | vk-gitlab join <hub-url>
+3. per daemon: move the runners' URL to `[gitlab] url` and drop the `[hub]` table's URL and
+   keys, which the new vk-gitlab refuses, then `vk-hub token create --kind gitlab | vk-gitlab join <hub-url>
    --token -`, and start it.
 
 `/v1/clients` and `vk-client-instance` stay for the API keys of other clients.
@@ -219,17 +268,20 @@ file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
 
 `vk_hub_proto::gitlab`: enrollment at `/v1/gitlab/enroll` (its own table of pinned keys and a
 token of kind `gitlab`, so no other peer's token enrolls a relay), the session at
-`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`. The hub speaks `PROTOCOL` 1 to 2, a relay
-`RELAY_PROTOCOL` 2 only. Version 2 adds each runner's `request_concurrency` to the inventory and
+`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`. The hub speaks `PROTOCOL` 1 to 3, a relay
+`RELAY_PROTOCOL` 2 to 3. Version 2 adds each runner's `request_concurrency` to the inventory and
 `request_admissions` and `job_admissions` to its heartbeat load; the hub takes new work only
-from a relay at version 2, and serves a version-1 relay only to settle the jobs it holds:
-replayed submissions, output, cancel and settle. A hub at version 1 refuses a version-2 relay,
-which takes no jobs and redials until the hub is upgraded, so the hub is upgraded first. The
-crate's rules hold: a released version is frozen; within it only optional fields are added; a
-new message or variant takes a new version; enums read from the wire (runner states, server
-status) carry an `#[serde(other)]` fallback. The client API keeps `/v1/` and gains the
-signature headers and the `approval_pending` and `project_rejected` codes, which an older
-client reads as `other`.
+from a relay at version 2 or later, and serves a version-1 relay only to settle the jobs it
+holds: replayed submissions, output, cancel and settle. A hub at version 1 refuses a version-2
+relay, which takes no jobs and redials until the hub is upgraded, so the hub is upgraded first.
+The crate's rules hold: a released version is frozen; within it only optional fields are added;
+a new message or variant takes a new version; enums read from the wire (runner states, server
+status) carry an `#[serde(other)]` fallback. The client API keeps `/v1/` and gains the signature
+headers and the `approval_pending` and `project_rejected` codes, which an older client reads as
+`other`. Version 3 adds updates: `command`, `ack` and `recorded`, sent only in a session at
+version 3, and the inventory's `allow` and `requires_signed` and the report's `update`, optional
+fields a version-2 peer ignores, so either side meets an older other at version 2, without
+updates.
 
 ## Implementation order
 

@@ -255,13 +255,16 @@ asks GitLab for jobs only while that status is `approved`: not before the first 
 while the server is pending, rejected or the relay `rebound`, nor once the hub refused the
 relay for good. Jobs it already holds run either way.
 
-The session is at protocol version 2, which adds `request_concurrency` and the admission
-lists; the hub speaks 1 and 2, vk-gitlab 2 only. The hub takes new work only from a relay whose
-session is at version 2: a version-1 relay keeps its session, and replays its submissions,
-follows, cancels and settles the jobs it holds, but its capacity and reservation requests and
-its new jobs are refused 403 `forbidden`. A hub that speaks only version 1 refuses a relay's
-session for its version: the relay logs that the hub must be upgraded, asks GitLab for no
-jobs, and dials again every minute or so. Upgrade the hub first, then the relays.
+The session is at protocol version 2, which adds `request_concurrency` and the admission lists,
+or 3, which adds updates; the hub speaks 1 to 3, vk-gitlab 2 and 3. The hub takes new work only
+from a relay whose session is at version 2 or later: a version-1 relay keeps its session, and
+replays its submissions, follows, cancels and settles the jobs it holds, but its capacity and
+reservation requests and its new jobs are refused 403 `forbidden`. A hub that speaks only
+version 1 refuses a relay's session for its version: the relay logs that the hub must be
+upgraded, asks GitLab for no jobs, and dials again every minute or so. Upgrade the hub first,
+then the relays: a relay whose `[hub] allow` lists `update` is updated from the hub's Updates
+page or `vk-hub relays update`, its running jobs resumed by the release
+(`docs/gitlab-relay-enrollment.md`, "Updates").
 
 | Request | Body | Answer |
 |---|---|---|

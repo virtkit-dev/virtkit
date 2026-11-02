@@ -415,6 +415,9 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         });
     } else {
         relays_table(&mut h, &shown.relays, now, steer);
+        h.raw("<p class=\"sub\"><a href=\"/operations\">Updates</a> lists each relay's ")
+            .raw("update, and updates one whose <code>[hub] allow</code> lists ")
+            .raw("<code>update</code>.</p>");
     }
     h.raw("</section>");
     let unbound: Vec<&RelayView> = (shown.relays.iter())

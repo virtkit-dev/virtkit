@@ -55,6 +55,7 @@ mod observed;
 mod packed;
 mod policy;
 mod registries;
+mod relay_commands;
 mod relays;
 mod token_keys;
 mod tools;
@@ -90,6 +91,7 @@ pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
 };
+pub use relay_commands::{RelayCommandRow, relay_operation_name};
 pub use relays::{PendingGitlab, RelayEnrollment, RelayRow, RelayWrite};
 pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
@@ -916,6 +918,8 @@ impl Db {
             .context("opening the GitLab instances table")?;
         txn.open_table(relays::RELAYS)
             .context("opening the relays table")?;
+        txn.open_table(relay_commands::RELAY_COMMANDS)
+            .context("opening the relay commands table")?;
         txn.open_table(approvals::GITLAB_PROJECTS)
             .context("opening the GitLab projects table")?;
         txn.open_table(approvals::REJECTED_GITLABS)
@@ -1676,6 +1680,18 @@ impl Db {
                     let key = key.value();
                     bail!(
                         "registry {} is still being updated to this release (command {})",
+                        key.split_once('/').map_or(key, |(id, _)| id),
+                        row.command.id
+                    );
+                }
+            }
+            for entry in txn.open_table(relay_commands::RELAY_COMMANDS)?.iter()? {
+                let (key, value) = entry?;
+                let row = decode::<RelayCommandRow>(value.value())?;
+                if row.updates_to(sha256, now) {
+                    let key = key.value();
+                    bail!(
+                        "relay {} is still being updated to this release (command {})",
                         key.split_once('/').map_or(key, |(id, _)| id),
                         row.command.id
                     );

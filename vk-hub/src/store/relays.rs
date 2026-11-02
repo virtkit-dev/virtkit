@@ -315,6 +315,9 @@ impl Db {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(RELAYS)?.remove(id)?.is_some();
         if removed {
+            let (start, end) = super::relay_commands::command_range(id);
+            txn.open_table(super::relay_commands::RELAY_COMMANDS)?
+                .retain_in(start.as_str()..end.as_str(), |_, _| false)?;
             append_audit(
                 &txn,
                 Some(id),

@@ -876,6 +876,9 @@ async fn handle(
             )
             .await
         }
+        (&Method::GET, path) if path.starts_with(gitlab::RELEASE_PATH) => {
+            download(&req, &hub, peer, exported, &state, Download::RelayRelease).await
+        }
         (&Method::GET, path) if path.starts_with(RELEASE_PATH) => {
             download(&req, &hub, peer, exported, &state, Download::Release).await
         }
@@ -1090,6 +1093,8 @@ enum Download {
     Tools,
     /// The `vk-registry` binary a registry's update names.
     RegistryRelease,
+    /// The `vk-gitlab` binary a relay's update names.
+    RelayRelease,
 }
 
 impl Download {
@@ -1098,12 +1103,13 @@ impl Download {
             Download::Release => RELEASE_PATH,
             Download::Tools => TOOLS_PATH,
             Download::RegistryRelease => registry::RELEASE_PATH,
+            Download::RelayRelease => gitlab::RELEASE_PATH,
         }
     }
 
     fn what(self) -> &'static str {
         match self {
-            Download::Release | Download::RegistryRelease => "release",
+            Download::Release | Download::RegistryRelease | Download::RelayRelease => "release",
             Download::Tools => "tools definition",
         }
     }
@@ -1113,6 +1119,7 @@ impl Download {
         match self {
             Download::Release | Download::Tools => (vk_hub_proto::NODE_HEADER, "node"),
             Download::RegistryRelease => (registry::REGISTRY_HEADER, "registry"),
+            Download::RelayRelease => (vk_hub_proto::client::RELAY_HEADER, "relay"),
         }
     }
 
@@ -1124,7 +1131,7 @@ impl Download {
         channel: vk_hub_proto::Channel<'_>,
     ) -> Vec<u8> {
         match self {
-            Download::Release | Download::RegistryRelease => {
+            Download::Release | Download::RegistryRelease | Download::RelayRelease => {
                 vk_hub_proto::download_message(node_id, digest, at, channel)
             }
             Download::Tools => vk_hub_proto::tools_download_message(node_id, digest, at, channel),
@@ -1138,7 +1145,8 @@ impl Download {
 /// release: the hub is not a download site, and a node learns of a release only from the
 /// command that names it. `GET /v1/tools/<sha256>` serves a tools definition the same way,
 /// signed over [`vk_hub_proto::tools_download_message`], to a node with a tools build of it
-/// still to finish.
+/// still to finish. A registry's and a relay's releases are served the same way, from their
+/// own paths, to one with an update to it still to finish.
 async fn download(
     req: &Request<Incoming>,
     hub: &Hub,
@@ -1204,6 +1212,13 @@ async fn download(
                 .filter(|r| r.is(crate::store::Program::Registry))
                 .map(|r| r.size),
         )),
+        Download::RelayRelease => anyhow::Ok((
+            db.relay(&id)?.map(|r| r.public_key),
+            db.relay_updating_to(&id, &sha, now)?,
+            db.release(&sha)?
+                .filter(|r| r.is(crate::store::Program::Gitlab))
+                .map(|r| r.size),
+        )),
     })
     .await
     .context("looking a download up")??;
@@ -1236,11 +1251,12 @@ async fn download(
                 Download::RegistryRelease => {
                     "this registry has no update to that release under way"
                 }
+                Download::RelayRelease => "this relay has no update to that release under way",
             },
         ));
     };
     let path = match kind {
-        Download::Release | Download::RegistryRelease => {
+        Download::Release | Download::RegistryRelease | Download::RelayRelease => {
             crate::releases::path(hub.releases_dir()?, &sha256)
         }
         Download::Tools => crate::tools::path(hub.tools_dir()?, &sha256),

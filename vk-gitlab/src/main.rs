@@ -12,6 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vk_gitlab::config::Config;
 use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
+use vk_gitlab::update::{self, Updater};
 use vk_gitlab::{logging, relay, session, system_id};
 
 #[cfg(target_env = "musl")]
@@ -150,14 +151,35 @@ async fn run(config: PathBuf) -> Result<()> {
     }
     let system_id = system_id_for(&cfg)?;
     log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
-    // Held until the daemon exits: no join or leave meanwhile.
+    // Held until the daemon exits, or executes a release, which takes it again: no join or
+    // leave meanwhile.
     let _lock = relay::lock(&state_dir(&cfg))?;
+    // A relay its hub is updating: the release on trial, or the binary it replaces taking its
+    // turn, before anything else.
+    if let update::Start::Exec(binary, deadline) =
+        update::on_start(&state_dir(&cfg), vk_peer::now_secs())
+    {
+        return Err(vk_peer::update::exec(&binary, deadline));
+    }
     let relay = Arc::new(relay::open(&state_dir(&cfg))?);
     log::info!(hub = relay.enrollment.hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "Relaying jobs to the hub");
     let status = session::Status::new(&cfg, &system_id, &relay::hostname());
     // Report held work in the first heartbeat, before a session can grant new work.
     let prepared = poll::prepare_state(&cfg, &relay.enrollment.relay_id, Arc::clone(&status))?;
-    let session = tokio::spawn(session::hold(Arc::clone(&relay), Arc::clone(&status)));
+    let (handle, shutdown) = ShutdownHandle::new();
+    let handle = Arc::new(handle);
+    let updater = Updater::open(
+        &state_dir(&cfg),
+        Arc::clone(&relay),
+        cfg.hub.clone(),
+        Arc::clone(&status),
+        Arc::clone(&handle),
+    )?;
+    let session = tokio::spawn(session::hold(
+        Arc::clone(&relay),
+        Arc::clone(&status),
+        Arc::clone(&updater),
+    ));
     let dispatcher = Arc::new(HubClient::new(HubOptions {
         hub: relay.enrollment.hub.clone(),
         tls: Arc::clone(&relay.tls),
@@ -165,10 +187,10 @@ async fn run(config: PathBuf) -> Result<()> {
         identity: Arc::clone(&relay.identity),
         retry: Default::default(),
     }));
-    let (handle, shutdown) = ShutdownHandle::new();
     let shutdown_timeout = cfg.shutdown_timeout();
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    update::note_signals()?;
     let signals = tokio::spawn(async move {
         tokio::select! {
             _ = term.recv() => {}
@@ -202,6 +224,9 @@ async fn run(config: PathBuf) -> Result<()> {
         shutdown,
     )
     .await;
+    // An update that stopped the job requests ends the loop with the runners' last job, and
+    // executes the release from here: the relay does not end before it.
+    updater.handed_over().await;
     session.abort();
     signals.abort();
     result

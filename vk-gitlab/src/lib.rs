@@ -21,3 +21,4 @@ pub mod spec;
 pub mod state;
 pub mod system_id;
 pub mod trace;
+pub mod update;

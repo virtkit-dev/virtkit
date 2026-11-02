@@ -57,10 +57,10 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 
 /// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
 /// viewer's page and once for every operator's, each rendered once for every page showing it
-/// ([`sse::feed`]). `/operations` shows releases, rollouts and registries' updates and, for an
-/// operator, the forms that start them; it follows [`Hub::touch`] alone — which also notes a
-/// node enrolled, renamed or removed, and a registry connecting, reporting or answering an
-/// update — not every node's or registry's heartbeat.
+/// ([`sse::feed`]). `/operations` shows releases, rollouts and registries' and relays' updates
+/// and, for an operator, the forms that start them; it follows [`Hub::touch`] alone — which
+/// also notes a node enrolled, renamed or removed, and a registry or relay connecting,
+/// reporting or answering an update — not every node's, registry's or relay's heartbeat.
 pub(super) struct FleetSite {
     /// Pending confirmations.
     pub(super) questions: actions::Questions,
@@ -435,6 +435,7 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
         tools: hub.db.tools_list()?,
         rollouts,
         registries: super::registries::updatables(hub)?,
+        relays: super::relays::updatables(hub)?,
         source: hub.fetches.source().map(|s| s.url().to_string()),
         fetch: hub.fetches.status(),
         latest: hub.fetches.latest(),
@@ -450,6 +451,8 @@ struct Operations {
     rollouts: Vec<Rollout>,
     /// Every registry, for its version and updates.
     registries: Vec<super::updates::Peer>,
+    /// Every relay, for its version and updates.
+    relays: Vec<super::updates::Peer>,
     /// Where releases are fetched from; `None` with fetching off.
     source: Option<String>,
     /// The latest fetch since the hub started.
@@ -2133,16 +2136,17 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
     h.raw("</section>");
 }
 
-/// `/operations`: the releases the hub holds, its latest rollouts and its registries' updates,
-/// kept live.
+/// `/operations`: the releases the hub holds, its latest rollouts and its registries' and
+/// relays' updates, kept live.
 ///
 /// The live fragment is rendered once for every viewer and once for every operator
 /// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it on the
 /// element holding the forms, `#flash` and the fragment, as a header on every htmx request
-/// from inside it (`hx-headers`), which is how the rollouts' buttons, the registries' update
-/// forms and the live copies of the rollout form post. Those buttons need htmx; `vk-hub
-/// rollout pause|resume|abort|delete` does the same without it. An operator's page carries the
-/// forms that add a release and start a rollout above the fragment.
+/// from inside it (`hx-headers`), which is how the rollouts' buttons, the registries' and
+/// relays' update forms and the live copies of the rollout form post. Those buttons need htmx;
+/// `vk-hub rollout pause|resume|abort|delete` and `vk-hub registries|relays update` do the
+/// same without it. An operator's page carries the forms that add a release and start a
+/// rollout above the fragment.
 fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
@@ -2239,6 +2243,14 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         &mut h,
         &super::registries::KIND,
         &ops.registries,
+        &ops.releases,
+        steer,
+        now,
+    );
+    super::updates::section(
+        &mut h,
+        &super::relays::KIND,
+        &ops.relays,
         &ops.releases,
         steer,
         now,

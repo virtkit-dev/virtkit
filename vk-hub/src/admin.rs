@@ -234,6 +234,10 @@ enum Call {
     RemoveRelay {
         id: String,
     },
+    UpdateRelay {
+        id: String,
+        release: String,
+    },
     ListTokenKeys,
     RotateTokenKeys,
     /// Download a release's `vk` from the configured repository: `None` for the latest.
@@ -839,7 +843,16 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(n)?
         }
         Call::ListRelays => serde_json::to_value(crate::relays::views(hub)?)?,
-        Call::ShowRelay { id } => serde_json::to_value(crate::relays::detail(hub, &id)?)?,
+        Call::ShowRelay { id } => {
+            let shown = match crate::relays::detail(hub, &id)? {
+                Some(view) => Some((view, hub.db.relay_commands(&id)?)),
+                None => None,
+            };
+            serde_json::to_value(shown)?
+        }
+        Call::UpdateRelay { id, release } => {
+            serde_json::to_value(crate::relays::update(hub, &actor, &id, &release)?)?
+        }
         Call::RemoveRelay { id } => {
             let removed = crate::relays::remove(hub, &actor, &id)?;
             eprintln!(
@@ -1229,13 +1242,24 @@ impl Client {
         self.call(Call::ListRelays)
     }
 
-    pub fn show_relay(&self, id: &str) -> Result<Option<crate::relays::RelayView>> {
+    /// The relay, with the commands the hub issued it.
+    pub fn show_relay(
+        &self,
+        id: &str,
+    ) -> Result<Option<(crate::relays::RelayView, Vec<crate::store::RelayCommandRow>)>> {
         self.call(Call::ShowRelay { id: id.to_string() })
     }
 
     /// Whether there was such a relay to remove.
     pub fn remove_relay(&self, id: &str) -> Result<bool> {
         self.call(Call::RemoveRelay { id: id.to_string() })
+    }
+
+    pub fn update_relay(&self, id: &str, release: &str) -> Result<vk_hub_proto::gitlab::Command> {
+        self.call(Call::UpdateRelay {
+            id: id.to_string(),
+            release: release.to_string(),
+        })
     }
 
     /// Whether there was one.
@@ -2301,8 +2325,9 @@ mod tests {
             );
             client.add_gitlab("gl", "https://gl.example").unwrap();
             assert!(client.pending_gitlabs().unwrap().is_empty());
-            let shown = client.show_relay(&id).unwrap().unwrap();
+            let (shown, commands) = client.show_relay(&id).unwrap().unwrap();
             assert_eq!(shown.server.unwrap().name.as_deref(), Some("gl"));
+            assert!(commands.is_empty());
             assert!(client.remove_gitlab("gl").is_err());
             let projects = vec![crate::store::ProjectRef::parse("4:acme/web").unwrap()];
             let approve = crate::store::Decision::Approve;

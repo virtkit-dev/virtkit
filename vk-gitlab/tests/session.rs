@@ -1,6 +1,6 @@
 //! The relay's session against a fake hub speaking `/v1/gitlab/session`, as
 //! `vk-hub/src/relays.rs` does: the shared handshake, then the relay's inventory, report and
-//! heartbeats, and the server's status and a refusal from the hub.
+//! heartbeats, the server's status and a refusal from the hub, and the hub's commands.
 
 mod support;
 
@@ -11,13 +11,16 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
-use vk_gitlab::config::Config;
+use vk_gitlab::config::{Config, HubConfig};
+use vk_gitlab::poll::ShutdownHandle;
 use vk_gitlab::relay;
 use vk_gitlab::session::{self, Status};
+use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{
-    HubRelayMsg, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState, ServerState, ServerStatus,
+    Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState, ServerState,
+    ServerStatus, UPDATES,
 };
-use vk_hub_proto::{Channel, HubMsg, NodeMsg, RefusalCode};
+use vk_hub_proto::{Channel, CommandAck, HubMsg, NodeMsg, Outcome, RefusalCode};
 use vk_peer::identity::Identity;
 
 use support::gl::{eventually, temp_dir, within};
@@ -62,6 +65,25 @@ async fn next_msg(ws: &mut Ws) -> RelayMsg {
     }
 }
 
+/// Hold the session of `relay`, enrolled in `state`, whose `[hub]` is `hub`.
+fn hold(
+    state: &Path,
+    relay: Arc<relay::Relay>,
+    status: &Arc<Status>,
+    hub: HubConfig,
+) -> tokio::task::JoinHandle<()> {
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let updater = Updater::open(
+        state,
+        Arc::clone(&relay),
+        hub,
+        Arc::clone(status),
+        Arc::new(handle),
+    )
+    .unwrap();
+    tokio::spawn(session::hold(relay, Arc::clone(status), updater))
+}
+
 fn enroll(state: &Path, hub: &str) -> Vec<u8> {
     let dir = relay::dir(state);
     vk_peer::net::create_dir(&dir).unwrap();
@@ -88,7 +110,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     .unwrap();
     let status = Status::new(&cfg, "s_0123456789ab", "relay-host");
     let relay = Arc::new(relay::open(&state).unwrap());
-    let held = tokio::spawn(session::hold(relay, Arc::clone(&status)));
+    let held = hold(&state, relay, &status, HubConfig::default());
 
     let (tcp, _) = within("the relay to dial", listener.accept())
         .await
@@ -109,7 +131,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: 2,
+            version: UPDATES,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&nonce),
         },
@@ -124,7 +146,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         &incarnation,
         RELAY_PROTOCOL,
         PROTOCOL,
-        2,
+        UPDATES,
         Channel::Plaintext,
     );
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
@@ -199,18 +221,35 @@ fn relay_for(
     listener: &TcpListener,
     what: &str,
 ) -> (std::path::PathBuf, Arc<Status>, Arc<relay::Relay>) {
-    let hub = format!("http://{}", listener.local_addr().unwrap());
+    let (state, status, relay, _) = relay_with(listener, what, "");
+    (state, status, relay)
+}
+
+/// [`relay_for`], with `hub` as its config's `[hub]` table, which it returns.
+fn relay_with(
+    listener: &TcpListener,
+    what: &str,
+    hub: &str,
+) -> (
+    std::path::PathBuf,
+    Arc<Status>,
+    Arc<relay::Relay>,
+    HubConfig,
+) {
+    let url = format!("http://{}", listener.local_addr().unwrap());
     let state = temp_dir(what);
-    enroll(&state, &hub);
+    enroll(&state, &url);
     let cfg = Config::parse(
-        "concurrent = 3\n[gitlab]\nurl = \"https://gitlab.example.com/\"\n\
-         [[runners]]\nname = \"ci\"\ntoken = \"glrt-x\"\npool = \"p1\"\n",
+        &format!(
+            "concurrent = 3\n[gitlab]\nurl = \"https://gitlab.example.com/\"\n\
+             [[runners]]\nname = \"ci\"\ntoken = \"glrt-x\"\npool = \"p1\"\n[hub]\n{hub}"
+        ),
         Path::new("/"),
     )
     .unwrap();
     let status = Status::new(&cfg, "s_0123456789ab", "relay-host");
     let relay = Arc::new(relay::open(&state).unwrap());
-    (state, status, relay)
+    (state, status, relay, cfg.hub)
 }
 
 /// Takes the relay's dial and hello; the hub's answer is the caller's.
@@ -232,7 +271,7 @@ async fn welcome(listener: &TcpListener) -> Ws {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: 2,
+            version: UPDATES,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
@@ -256,7 +295,7 @@ async fn a_hub_of_another_protocol_is_dialed_again_not_given_up() {
         url: "https://gitlab.example.com".to_owned(),
         name: Some("gl".to_owned()),
     }));
-    let held = tokio::spawn(session::hold(relay, Arc::clone(&status)));
+    let held = hold(&state, relay, &status, HubConfig::default());
     let (mut ws, _) = hello(&listener).await;
     send(
         &mut ws,
@@ -281,7 +320,7 @@ async fn a_hub_of_another_protocol_is_dialed_again_not_given_up() {
 async fn a_burst_of_changes_goes_out_coalesced_while_the_hub_pings() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (state, status, relay) = relay_for(&listener, "session-burst");
-    let held = tokio::spawn(session::hold(relay, Arc::clone(&status)));
+    let held = hold(&state, relay, &status, HubConfig::default());
     let mut ws = welcome(&listener).await;
     // A change every few milliseconds for two seconds, ending with one admission listed.
     let burst = {
@@ -322,5 +361,261 @@ async fn a_burst_of_changes_goes_out_coalesced_while_the_hub_pings() {
     }
     assert!(!held.is_finished(), "the session ended during the burst");
     held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
+/// The relay's next ack of command `id`, past other messages.
+async fn ack_of(ws: &mut Ws, id: &str) -> CommandAck {
+    loop {
+        if let RelayMsg::Ack(ack) = next_msg(ws).await
+            && ack.id == id.repeat(32)
+        {
+            return ack;
+        }
+    }
+}
+
+fn update_command(id: &str, version: &str, expires_at: u64) -> HubRelayMsg {
+    HubRelayMsg::Command(Command {
+        id: id.repeat(32),
+        expires_at,
+        op: Operation::Update {
+            version: version.to_owned(),
+            sha256: "ab".repeat(32),
+            size: 1,
+            signature: None,
+        },
+    })
+}
+
+/// A relay says in its inventory whether the hub may update it; it refuses the commands its
+/// `[hub]` does not take, answers each once, from its journal when sent again, and repeats an
+/// answer until the hub has stored it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay) = relay_for(&listener, "session-commands");
+    let held = hold(&state, relay, &status, HubConfig::default());
+    let mut ws = welcome(&listener).await;
+    let far = vk_peer::now_secs() + 3600;
+    send(&mut ws, &update_command("a", "99.0.0", far)).await;
+    let ack = ack_of(&mut ws, "a").await;
+    let Outcome::Refused { reason } = &ack.outcome else {
+        panic!("{ack:?}");
+    };
+    assert!(
+        reason.contains("[hub] allow does not list update"),
+        "{reason}"
+    );
+    held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+
+    let (state, status, relay, hub) = relay_with(
+        &listener,
+        "session-commands-allowed",
+        "allow = [\"update\"]\n",
+    );
+    let held = hold(&state, relay, &status, hub);
+    let (mut ws, _) = hello(&listener).await;
+    send(
+        &mut ws,
+        &HubMsg::Challenge {
+            version: UPDATES,
+            versions: PROTOCOL,
+            nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
+        },
+    )
+    .await;
+    let NodeMsg::Auth { .. } = serde_json::from_str(&next(&mut ws).await).unwrap() else {
+        panic!("not an auth");
+    };
+    send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+    let RelayMsg::Inventory(inventory) = next_msg(&mut ws).await else {
+        panic!("not the inventory");
+    };
+    assert_eq!(inventory.allow, ["update"]);
+    assert!(!inventory.requires_signed);
+    assert!(matches!(next_msg(&mut ws).await, RelayMsg::Report(_)));
+
+    // Expired, and older than the relay: refused.
+    send(&mut ws, &update_command("b", "99.0.0", 1)).await;
+    assert_eq!(ack_of(&mut ws, "b").await.outcome, Outcome::Expired);
+    send(&mut ws, &update_command("c", "0.0.1", far)).await;
+    let older = ack_of(&mut ws, "c").await;
+    assert!(
+        matches!(&older.outcome, Outcome::Refused { reason } if reason.contains("older")),
+        "{older:?}"
+    );
+    // Sent again, it is answered from the journal, not run again.
+    send(&mut ws, &update_command("c", "99.0.0", far)).await;
+    assert_eq!(ack_of(&mut ws, "c").await, older);
+    // Not recorded yet: repeated with the next change sent.
+    status.runner("ci", |r| r.state = RunnerState::Unhealthy);
+    assert_eq!(ack_of(&mut ws, "c").await, older);
+    for id in ["b", "c"] {
+        let outcome = if id == "b" {
+            Outcome::Expired
+        } else {
+            older.outcome.clone()
+        };
+        send(
+            &mut ws,
+            &HubRelayMsg::Recorded(CommandAck {
+                id: id.repeat(32),
+                outcome,
+            }),
+        )
+        .await;
+    }
+    // Recorded: a change sends the report, and no ack after it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    status.runner("ci", |r| r.state = RunnerState::Polling);
+    loop {
+        match next_msg(&mut ws).await {
+            RelayMsg::Report(r) if r.runners[0].state == RunnerState::Polling => break,
+            RelayMsg::Ack(_) | RelayMsg::Report(_) | RelayMsg::Inventory(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    status.runner("ci", |r| r.state = RunnerState::Unhealthy);
+    loop {
+        match next_msg(&mut ws).await {
+            RelayMsg::Report(r) if r.runners[0].state == RunnerState::Unhealthy => break,
+            RelayMsg::Ack(ack) => panic!("repeated after it was recorded: {ack:?}"),
+            _ => {}
+        }
+    }
+    held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
+/// A relay that is stopping takes no update: it would come back up on the release.
+#[tokio::test]
+async fn a_stopping_relay_takes_no_update() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay, hub) =
+        relay_with(&listener, "session-stopping", "allow = [\"update\"]\n");
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let handle = Arc::new(handle);
+    let updater = Updater::open(&state, relay, hub, status, Arc::clone(&handle)).unwrap();
+    handle.stop();
+    let HubRelayMsg::Command(command) = update_command("d", "99.0.0", vk_peer::now_secs() + 3600)
+    else {
+        unreachable!();
+    };
+    let ack = updater.command(command).unwrap();
+    assert_eq!(
+        ack.outcome,
+        Outcome::Refused {
+            reason: "the relay is stopping".into()
+        }
+    );
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
+/// A hub from before updates, which meets the relay at version 2, is sent no ack: it could not
+/// read one. The relay keeps it for a hub that can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_from_before_updates_hears_no_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay, hub) =
+        relay_with(&listener, "session-old-hub", "allow = [\"update\"]\n");
+    // An answer the hub has not stored: an expired command, journaled.
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let journal = Updater::open(
+        &state,
+        Arc::clone(&relay),
+        hub.clone(),
+        Arc::clone(&status),
+        Arc::new(handle),
+    )
+    .unwrap();
+    let HubRelayMsg::Command(command) = update_command("e", "99.0.0", 1) else {
+        unreachable!();
+    };
+    assert_eq!(journal.command(command).unwrap().outcome, Outcome::Expired);
+    drop(journal);
+
+    let held = hold(&state, relay, &status, hub);
+    let (mut ws, _) = hello(&listener).await;
+    send(
+        &mut ws,
+        &HubMsg::Challenge {
+            version: 2,
+            versions: vk_hub_proto::VersionRange { min: 1, max: 2 },
+            nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
+        },
+    )
+    .await;
+    let NodeMsg::Auth { .. } = serde_json::from_str(&next(&mut ws).await).unwrap() else {
+        panic!("not an auth");
+    };
+    send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+    status.runner("ci", |r| r.state = RunnerState::Unhealthy);
+    loop {
+        match next_msg(&mut ws).await {
+            RelayMsg::Report(r) if r.runners[0].state == RunnerState::Unhealthy => break,
+            RelayMsg::Ack(ack) => panic!("an ack to a version-2 hub: {ack:?}"),
+            _ => {}
+        }
+    }
+    // Nor does it take a command there: the session ends.
+    send(&mut ws, &update_command("v2", "99.0.0", u64::MAX)).await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(t))) => {
+                    assert!(!t.as_str().contains("\"ack\""), "an ack: {t}")
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    });
+    ended.await.expect("the session did not end");
+    held.abort();
+
+    // A hub that speaks updates hears it.
+    let held = {
+        let (_, status, relay, hub) = (
+            (),
+            Arc::clone(&status),
+            Arc::new(relay::open(&state).unwrap()),
+            HubConfig {
+                allow: vec!["update".into()],
+                ..HubConfig::default()
+            },
+        );
+        hold(&state, relay, &status, hub)
+    };
+    let mut ws = welcome(&listener).await;
+    assert_eq!(ack_of(&mut ws, "e").await.outcome, Outcome::Expired);
+    held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
+/// An update state that cannot be read does not keep the relay from running: it takes no
+/// update, and leaves the file as it is.
+#[tokio::test]
+async fn an_unreadable_update_state_refuses_updates_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay, hub) =
+        relay_with(&listener, "session-corrupt", "allow = [\"update\"]\n");
+    let file = relay::dir(&state).join("update.json");
+    std::fs::write(&file, b"{ not json").unwrap();
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let updater = Updater::open(&state, relay, hub, status, Arc::new(handle)).unwrap();
+    let HubRelayMsg::Command(command) = update_command("f", "99.0.0", vk_peer::now_secs() + 3600)
+    else {
+        unreachable!();
+    };
+    let ack = updater.command(command).unwrap();
+    assert!(
+        matches!(&ack.outcome, Outcome::Refused { reason } if reason.contains("update state cannot be used")),
+        "{ack:?}"
+    );
+    // The hub's record of that answer is not kept either.
+    updater.recorded(&ack).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
     std::fs::remove_dir_all(&state).unwrap();
 }

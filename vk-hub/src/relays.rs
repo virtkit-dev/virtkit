@@ -2,22 +2,36 @@
 //! shared peer handshake, stores inventory, heartbeats and reports, and tells the relay the
 //! status of the GitLab server it is bound to, again whenever an operator changes it. See
 //! `docs/gitlab-relay-enrollment.md`.
+//!
+//! The hub issues an update only to a relay whose inventory says its `[hub] allow` lists
+//! `update`. A relay in a session at version [`UPDATES`](vk_hub_proto::gitlab::UPDATES) is sent
+//! the hub's pending commands, each once a session from its first report on, until it settles
+//! them; it downloads the release from
+//! [`vk_hub_proto::gitlab::RELEASE_PATH`] while the update is live. One from before updates is
+//! sent none.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::Message;
-use vk_hub_proto::gitlab::{HubRelayMsg, RelayMsg, ServerState, ServerStatus};
-use vk_hub_proto::{HubMsg, RefusalCode};
+use vk_hub_proto::gitlab::{
+    ALLOW_UPDATE, Command, HubRelayMsg, Operation, RelayMsg, Report, ServerState, ServerStatus,
+};
+use vk_hub_proto::{CommandAck, HubMsg, RefusalCode};
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
-use crate::store::{NotEnrolled, RelayRow, RelayWrite, normalize_gitlab_url};
+use crate::store::{NotEnrolled, Program, RelayRow, RelayWrite, Release, normalize_gitlab_url};
+
+/// How long a command waits for its relay to take it.
+pub(crate) const COMMAND_TTL: Duration = Duration::from_secs(86_400);
 
 /// What a relay removed from the hub is told.
 const REMOVED: &str = "this relay was removed from the hub";
@@ -51,11 +65,14 @@ pub async fn run(
     );
     hub.changed(&relay.id);
     hub.clients_changed();
+    // `/operations` shows whether each relay is connected.
+    hub.touch();
     let ended = serve(&mut ws, &hub, &relay, session, &ending).await;
     hub.close_session(&relay.id, session);
     crate::jobs::relay_disconnected(&hub, &relay.id, session);
     hub.changed(&relay.id);
     hub.clients_changed();
+    hub.touch();
     match ended {
         Ok(why) => eprintln!("vk-hub: {peer}: relay {} disconnected: {why}", relay.id),
         Err(e) => {
@@ -103,6 +120,11 @@ async fn serve(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut told: Option<ServerStatus> = None;
+    let mut steer = Steer {
+        // A relay from before updates could not read a command.
+        speaks_updates: relay.version >= vk_hub_proto::gitlab::UPDATES,
+        ..Steer::default()
+    };
     loop {
         tokio::select! {
             () = ending.notify.notified() => {
@@ -114,7 +136,10 @@ async fn serve(
                 refuse(ws, code, reason).await;
                 return Ok(why);
             }
-            () = ending.kick.notified() => tell_status(ws, hub, relay, &mut told).await?,
+            () = ending.kick.notified() => {
+                tell_status(ws, hub, relay, &mut told).await?;
+                steer.sync(ws, hub, relay).await?;
+            }
             _ = ping.tick() => {
                 tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
                     .await
@@ -142,6 +167,7 @@ async fn serve(
                 let msg: RelayMsg = serde_json::from_str(text.as_str())
                     .context("the relay sent a message this hub does not understand")?;
                 let mut inventory = false;
+                let mut first_report = None;
                 let write = match msg {
                     RelayMsg::Inventory(mut i) => {
                         // Refused rather than made display-safe: the URL is the server's
@@ -175,7 +201,15 @@ async fn serve(
                     }
                     RelayMsg::Report(mut r) => {
                         r.make_display_safe();
+                        if !steer.reported {
+                            steer.reported = true;
+                            first_report = Some(r.clone());
+                        }
                         RelayWrite::Report(r)
+                    }
+                    RelayMsg::Ack(ack) => {
+                        acknowledge(ws, hub, relay, ack).await?;
+                        continue;
                     }
                 };
                 if let Some(why) = store(ws, hub, relay, session, write).await? {
@@ -183,6 +217,11 @@ async fn serve(
                 }
                 if inventory {
                     tell_status(ws, hub, relay, &mut told).await?;
+                    steer.sync(ws, hub, relay).await?;
+                }
+                if let Some(report) = first_report {
+                    settle_unreported_updates(hub, relay, session, report).await?;
+                    steer.sync(ws, hub, relay).await?;
                 }
             }
         }
@@ -208,6 +247,77 @@ async fn tell_status(
         *told = Some(status);
     }
     Ok(())
+}
+
+/// What a session has sent its relay of the hub's commands.
+#[derive(Default)]
+struct Steer {
+    /// Whether the session's version has commands.
+    speaks_updates: bool,
+    /// Whether its first report came, which settles the updates it lost track of.
+    reported: bool,
+    sent_commands: HashSet<String>,
+}
+
+impl Steer {
+    /// Send the relay each pending command once a session, after its first report, if its
+    /// session's version takes them. A relay whose `[hub] allow` no longer lists what one
+    /// needs is sent it all the same, and refuses it, rather than leave it to expire.
+    async fn sync(&mut self, ws: &mut Ws, hub: &Hub, relay: &Peer) -> Result<()> {
+        if !(self.speaks_updates && self.reported) {
+            return Ok(());
+        }
+        let db = hub.db.clone();
+        let id = relay.id.clone();
+        let pending =
+            tokio::task::spawn_blocking(move || db.pending_relay_commands(&id, crate::now_secs()))
+                .await??;
+        for command in pending {
+            if self.sent_commands.insert(command.id.clone()) {
+                send(ws, &HubRelayMsg::Command(command)).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Settle the accepted updates `report`, the first of session `session`, does not name, while
+/// that session is the relay's current one.
+async fn settle_unreported_updates(
+    hub: &Arc<Hub>,
+    relay: &Peer,
+    session: u64,
+    report: Report,
+) -> Result<()> {
+    let (db, live) = (hub.db.clone(), hub.clone());
+    let id = relay.id.clone();
+    let settled = tokio::task::spawn_blocking(move || {
+        db.settle_unreported_relay_updates(&id, &report, crate::now_secs(), || {
+            live.is_current(&id, session)
+        })
+    })
+    .await??;
+    if settled {
+        hub.changed(&relay.id);
+        hub.touch();
+    }
+    Ok(())
+}
+
+/// Record the relay's command outcome and reply with [`HubRelayMsg::Recorded`].
+async fn acknowledge(ws: &mut Ws, hub: &Hub, relay: &Peer, ack: CommandAck) -> Result<()> {
+    let db = hub.db.clone();
+    let id = relay.id.clone();
+    let recorded = ack.clone();
+    let news =
+        tokio::task::spawn_blocking(move || db.record_relay_ack(&id, &ack, crate::now_secs()))
+            .await??;
+    if news {
+        hub.changed(&relay.id);
+        // A command's outcome: `/operations` shows an update's.
+        hub.touch();
+    }
+    send(ws, &HubRelayMsg::Recorded(recorded)).await
 }
 
 /// Store `write`; `Some` carries why the session ends, the relay having been removed.
@@ -242,6 +352,8 @@ async fn store(
             hub.changed(&relay.id);
             if shown {
                 hub.clients_changed();
+                // `/operations` shows a relay's version and update from these.
+                hub.touch();
             }
             Ok(None)
         }
@@ -331,6 +443,128 @@ pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
         hub.clients_changed();
     }
     Ok(removed)
+}
+
+/// Whether relay `row` lets the hub update it, as it last reported: `None` until it reports
+/// its inventory.
+pub fn takes_updates(row: &RelayRow) -> Option<bool> {
+    let inventory = row.inventory.as_ref()?;
+    Some(inventory.allow.iter().any(|a| a == ALLOW_UPDATE))
+}
+
+/// Why relay `row` would refuse to update to `release`, going by what it last reported: its
+/// `[hub] allow` lacks `update`, or it takes only signed releases and this one is not. The
+/// relay checks again, with what the hub cannot see: its keys, its version and its binary.
+pub fn update_refusal(row: &RelayRow, release: &Release) -> Option<String> {
+    if takes_updates(row) == Some(false) {
+        return Some(format!(
+            "relay {} does not let the hub update it: its [hub] allow lacks {ALLOW_UPDATE}",
+            row.hostname
+        ));
+    }
+    if row.inventory.as_ref().is_some_and(|i| i.requires_signed) && release.row.signature.is_none()
+    {
+        return Some(format!(
+            "relay {} takes only signed releases, and {} {} is unsigned: add it with the \
+             signature `vk release-key sign --program {}` makes",
+            row.hostname,
+            release.row.program(),
+            release.row.version,
+            Program::Gitlab
+        ));
+    }
+    None
+}
+
+/// Refuse to update relay `row` to `release` when it is not a `vk-gitlab` release, or when
+/// [`update_refusal`] says the relay would refuse it.
+pub fn check_update(row: &RelayRow, release: &Release) -> Result<()> {
+    let gitlab = Program::Gitlab;
+    if !release.row.is(gitlab) {
+        bail!(
+            "release {} is {} {}, not a {gitlab} release: add one with `vk-hub release add \
+             --program {gitlab}`",
+            crate::store::short(&release.sha256),
+            release.row.program(),
+            release.row.version
+        );
+    }
+    if let Some(why) = update_refusal(row, release) {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
+/// Update relay `id` to the `vk-gitlab` release whose sha256 starts with `release`.
+pub fn update(hub: &Hub, actor: &str, id: &str, release: &str) -> Result<Command> {
+    // Held from the lookup to the command, so the release cannot be removed between them.
+    let _held = hub.releases_lock();
+    let release = hub.db.resolve_release(release)?;
+    issue_update(hub, actor, id, &release, None)
+}
+
+/// [`update`] relay `id` to `shown`, the release an operator confirmed for a relay running
+/// `running` (`None`: not reported): refused unless the hub still holds the release as shown —
+/// the same version and signature, not removed and added again otherwise — and the relay
+/// still reports that version.
+pub fn update_as_shown(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    shown: &Release,
+    running: Option<&str>,
+) -> Result<Command> {
+    let _held = hub.releases_lock();
+    let held = hub.db.release(&shown.sha256)?;
+    if held.as_ref() != Some(&shown.row) {
+        bail!(
+            "release {} changed since it was shown; look again",
+            crate::store::short(&shown.sha256)
+        );
+    }
+    issue_update(hub, actor, id, shown, Some(running))
+}
+
+/// Send relay `id` the update to `release`, the releases lock held; with `running`, only while
+/// the relay reports that version.
+fn issue_update(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    release: &Release,
+    running: Option<Option<&str>>,
+) -> Result<Command> {
+    let row = hub
+        .db
+        .relay(id)?
+        .ok_or_else(|| NotEnrolled(id.to_string()))?;
+    if let Some(running) = running
+        && row.inventory.as_ref().map(|i| i.version.as_str()) != running
+    {
+        bail!(
+            "relay {} changed version since it was shown; look again",
+            row.hostname
+        );
+    }
+    check_update(&row, release)?;
+    let op = Operation::Update {
+        version: release.row.version.clone(),
+        sha256: release.sha256.clone(),
+        size: release.row.size,
+        signature: release.row.signature.clone(),
+    };
+    let command = hub
+        .db
+        .issue_relay_command(id, op, COMMAND_TTL, actor, crate::now_secs())?;
+    eprintln!(
+        "vk-hub: relay {id}: {actor} issued {} (command {})",
+        crate::store::relay_operation_name(&command.op),
+        command.id
+    );
+    hub.kick(id);
+    hub.changed(id);
+    hub.touch();
+    Ok(command)
 }
 
 /// Have the sessions of the relays bound to the server at `url` tell them its status anew,

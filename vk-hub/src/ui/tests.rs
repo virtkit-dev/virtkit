@@ -8109,6 +8109,165 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An operator updates a GitLab relay to a `vk-gitlab` release from `/operations` once
+/// confirmed, by the operation `vk-hub relays update` runs; a viewer sees each relay's version
+/// and update with no form. A relay that does not let the hub update it and a `vk` release are
+/// refused before anything is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_updates_a_relay_from_the_updates_page() {
+    use crate::store::{Program, RelayEnrollment, RelayWrite, TokenKind};
+    use vk_hub_proto::gitlab::{ALLOW_UPDATE, Inventory, Operation};
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let enroll = |hostname: &str, key: &str, version: &str, allow: &[&str]| {
+        let (token, _) = hub
+            .db
+            .create_token_for(
+                TokenKind::Gitlab,
+                Duration::from_secs(60),
+                None,
+                "uid 0",
+                crate::now_secs(),
+            )
+            .unwrap();
+        let RelayEnrollment::Enrolled { id } = hub
+            .db
+            .enroll_relay(&token, key, hostname, "peer p", 1)
+            .unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let inventory = Inventory {
+            version: version.into(),
+            hostname: hostname.into(),
+            allow: allow.iter().map(|a| a.to_string()).collect(),
+            ..Inventory::default()
+        };
+        hub.db
+            .record_relay(&id, RelayWrite::Inventory(inventory), crate::now_secs())
+            .unwrap();
+        id
+    };
+    let id = enroll("relay-1", "aa", "0.89.0", &[ALLOW_UPDATE]);
+    let closed = enroll("relay-2", "bb", "<b>1</b>", &[]);
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    for want in [
+        "<option value=\"vk-gitlab\">vk-gitlab (relays)</option>",
+        "Add a vk-gitlab release first.",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("vk-gitlab");
+    std::fs::write(&file, crate::fetch::tests::fake_vk("0.90.0")).unwrap();
+    let sha = crate::releases::add(&hub, "uid 0", &file, Program::Gitlab, "0.90.0", None)
+        .unwrap()
+        .sha256;
+
+    // A viewer sees the versions and what each relay allows, and no form.
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    for want in [
+        "<h2>GitLab adapters</h2>",
+        "<th>ADAPTER</th>",
+        &format!(
+            "relay-1 <code class=\"sub\">{}</code></td><td>0.89.0</td>",
+            crate::rollout::short_id(&id)
+        ),
+        "unsigned accepted",
+        "not allowed by its <code>[hub] allow</code>",
+        "<td>&lt;b&gt;1&lt;/b&gt;</td>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("relay-update-"), "{page}");
+    let action = format!("/relay/{id}/action");
+    let form = format!("_csrf={viewer_csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &viewer, &action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    // An operator's has a form for each relay that takes updates.
+    let page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(
+        page.contains(&format!("hx-post=\"{action}\" hx-swap=\"none\">")),
+        "{page}"
+    );
+    assert!(
+        !page.contains(&format!("hx-post=\"/relay/{closed}/action\"")),
+        "{page}"
+    );
+
+    // Asked first, then sent once confirmed, and audited as the session's principal.
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Update this relay?",
+        "its running jobs go on",
+        "vk-gitlab 0.90.0 (<code>",
+        ", unsigned) to relay-1, which runs 0.89.0.",
+        "The relay is offline",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(hub.db.relay_commands(&id).unwrap().is_empty());
+    let answer = posted_form(&reply.body, "update", 0);
+    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Sent relay-1 the update to vk-gitlab 0.90.0"),
+        "{}",
+        reply.body
+    );
+    let commands = hub.db.relay_commands(&id).unwrap();
+    assert!(
+        matches!(&commands[..], [c] if matches!(&c.command.op, Operation::Update { sha256, .. } if *sha256 == sha)),
+        "{commands:?}"
+    );
+    audited(
+        &hub,
+        &format!("{principal} issued update to vk-gitlab 0.90.0 to relay {id}"),
+    )
+    .await;
+    // The viewer's page follows it live.
+    let next = next_with(&mut events, "to 0.90.0: not taken yet").await;
+    assert!(!next.contains("relay-update-"), "{next}");
+
+    // Refused before anything is asked: no update allowed, a vk release, another action.
+    let vk = dir.join("vk");
+    std::fs::write(&vk, crate::fetch::tests::fake_vk("0.91.0")).unwrap();
+    let vk = crate::releases::add(&hub, "uid 0", &vk, Program::Vk, "0.91.0", None).unwrap();
+    for (relay, release, want) in [
+        (&closed, &sha, "allow lacks update"),
+        (&id, &vk.sha256, "not a vk-gitlab release"),
+    ] {
+        let form = format!("_csrf={csrf}&op=update&release={release}");
+        let path = format!("/relay/{relay}/action");
+        let reply = post_action(addr, &origin, &operator, &path, &form, true).await;
+        assert_eq!(reply.status, 409, "{want}: {}", reply.body);
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    let form = format!("_csrf={csrf}&op=remove");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let path = format!("/relay/{}/action", "f".repeat(32));
+    let form = format!("_csrf={csrf}&op=update&release={sha}");
+    let reply = post_action(addr, &origin, &operator, &path, &form, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    // The relays' page points at the updates.
+    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    assert!(
+        page.contains("<a href=\"/operations\">Updates</a> lists"),
+        "{page}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Viewers see registries with nothing to steer them; operators steer them with the session's
 /// CSRF token, and issue registry tokens.
 #[tokio::test(flavor = "multi_thread")]
@@ -8922,6 +9081,7 @@ async fn relays_and_their_runners_follow_their_server() {
                 verified: false,
             },
         ],
+        ..Inventory::default()
     };
     let writes = [
         RelayWrite::Inventory(inventory),
@@ -8938,6 +9098,7 @@ async fn relays_and_their_runners_follow_their_server() {
                     message: Some(hostile.into()),
                 },
             ],
+            ..Report::default()
         }),
         RelayWrite::Heartbeat(Heartbeat {
             runners: vec![RunnerLoad {

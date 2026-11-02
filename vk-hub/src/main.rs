@@ -613,6 +613,18 @@ enum RelaysCmd {
     ///
     /// It can join again only with a new token.
     Remove { id: String },
+    /// Update the relay to a vk-gitlab release the hub holds
+    ///
+    /// Needs `update` in the relay's `[hub] allow`. The relay checks the release's signature
+    /// against its own `[hub] release_keys`, stops asking GitLab for jobs, runs the release —
+    /// its running jobs resume there — and keeps it only once it is back in session with the
+    /// hub.
+    Update {
+        id: String,
+        /// The release's sha256, or at least the first 8 hex digits
+        #[arg(long)]
+        release: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1217,7 +1229,7 @@ async fn run(cli: Cli) -> Result<()> {
                     signature,
                     program,
                 } => {
-                    let held = releases::program(Some(&program))?;
+                    let runners = releases::program(Some(&program))?.runners();
                     let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
@@ -1228,20 +1240,14 @@ async fn run(cli: Cli) -> Result<()> {
                     .await??;
                     // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
                     println!("{}", added.sha256);
-                    // Relays do not update from the hub yet.
-                    let hint = match held {
-                        store::Program::Gitlab => String::new(),
-                        _ => format!(
-                            "; `vk-hub {} update <id> --release {}` updates one to it",
-                            held.runners(),
-                            store::short(&added.sha256)
-                        ),
-                    };
                     eprintln!(
-                        "vk-hub: holding {} {} ({} bytes){hint}",
+                        "vk-hub: holding {} {} ({} bytes); `vk-hub {} update <id> --release {}` \
+                         updates one to it",
                         added.row.program(),
                         added.row.version,
                         added.row.size,
+                        runners,
+                        store::short(&added.sha256)
                     );
                 }
                 ReleaseCmd::Fetch { check: true, .. } => {
@@ -1261,20 +1267,22 @@ async fn run(cli: Cli) -> Result<()> {
                     // The sha256 alone on stdout, as `release add` prints it.
                     println!("{}", fetched.sha256);
                     eprintln!(
-                        "vk-hub: holding {program} {} ({} bytes, unsigned){}",
+                        "vk-hub: holding {program} {} ({} bytes, unsigned); {}",
                         fetched.row.version,
                         fetched.row.size,
                         match program {
                             store::Program::Vk => format!(
-                                "; `vk-hub rollout create --release {}` rolls it out",
+                                "`vk-hub rollout create --release {}` rolls it out",
                                 store::short(&fetched.sha256)
                             ),
                             store::Program::Registry => format!(
-                                "; `vk-hub registries update <id> --release {}` updates one to it",
+                                "`vk-hub registries update <id> --release {}` updates one to it",
                                 store::short(&fetched.sha256)
                             ),
-                            // Relays do not update from the hub yet.
-                            store::Program::Gitlab => String::new(),
+                            store::Program::Gitlab => format!(
+                                "`vk-hub relays update <id> --release {}` updates one to it",
+                                store::short(&fetched.sha256)
+                            ),
                         }
                     );
                 }
@@ -2216,16 +2224,20 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
     match cmd.unwrap_or(RelaysCmd::List) {
         RelaysCmd::List => print!("{}", render_relays(&client.list_relays()?, now)),
         RelaysCmd::Show { id } => {
-            let Some(r) = client.show_relay(&id)? else {
+            let Some((r, commands)) = client.show_relay(&id)? else {
                 bail!("there is no relay {id}");
             };
-            print!("{}", render_relay(&r, now));
+            print!("{}", render_relay(&r, &commands, now));
         }
         RelaysCmd::Remove { id } => {
             if !client.remove_relay(&id)? {
                 bail!("there is no relay {id}");
             }
             eprintln!("vk-hub: removed relay {id}");
+        }
+        RelaysCmd::Update { id, release } => {
+            let command = client.update_relay(&id, &release)?;
+            eprintln!("vk-hub: relay {id}: issued command {}", command.id);
         }
     }
     Ok(())
@@ -2244,8 +2256,27 @@ fn render_relays(views: &[relays::RelayView], now: u64) -> String {
     out
 }
 
-/// `vk-hub relays show`.
-fn render_relay(r: &relays::RelayView, now: u64) -> String {
+/// `vk-hub relays show`: the relay, then the commands the hub issued it and how each ended.
+fn render_relay(r: &relays::RelayView, commands: &[store::RelayCommandRow], now: u64) -> String {
+    let mut out = render_relay_state(r, now);
+    for c in commands {
+        out.push_str(&format!(
+            "command {} {} at {}: {}\n",
+            c.command.id,
+            store::relay_operation_name(&c.command.op),
+            utc(c.issued_at),
+            match &c.outcome {
+                Some(o) => store::outcome_text(o),
+                None if c.command.expires_at <= now => "expired, never taken".to_string(),
+                None => "not taken yet".to_string(),
+            }
+        ));
+    }
+    out
+}
+
+/// The relay as it last reported itself, for [`render_relay`].
+fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
     let mut out = render_relays(std::slice::from_ref(r), now);
     let Some(i) = &r.row.inventory else {
         out.push_str("\nno inventory yet\n");
@@ -2265,6 +2296,30 @@ fn render_relay(r: &relays::RelayView, now: u64) -> String {
     }
     if let Some(s) = &r.server {
         out.push_str(&format!("server {}\n", relays::server_text(s)));
+    }
+    out.push_str(&format!(
+        "updates {}\n",
+        match (
+            i.allow
+                .iter()
+                .any(|a| a == vk_hub_proto::gitlab::ALLOW_UPDATE),
+            i.requires_signed,
+        ) {
+            (true, true) => "allowed, signed releases only",
+            (true, false) => "allowed",
+            (false, _) => "not allowed by its [hub] allow",
+        }
+    ));
+    if let Some(u) = r.row.report.as_ref().and_then(|rep| rep.update.as_ref()) {
+        out.push_str(&format!(
+            "update to {} {}",
+            u.version,
+            store::update_phase_name(u.phase)
+        ));
+        if let Some(m) = &u.message {
+            out.push_str(&format!(": {m}"));
+        }
+        out.push('\n');
     }
     let state = |name: &str| {
         r.row

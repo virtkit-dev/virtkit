@@ -21,16 +21,33 @@
 //! API, each request signed with its key over
 //! [`client_request_message`](crate::client::client_request_message).
 //!
+//! A relay whose config lets the hub update it (`[hub] allow = ["update"]`) says so in its
+//! inventory's `allow`. In a session at version [`UPDATES`] or later, the hub then sends it
+//! [`HubRelayMsg::Command`]s, and the relay answers each with a [`RelayMsg::Ack`], repeated
+//! until the hub answers with [`HubRelayMsg::Recorded`], and reports the update's progress in
+//! its [`Report`]. It downloads
+//! the release an [`Operation::Update`] names from [`RELEASE_PATH`], as a node does from its
+//! own: its ID, the time and its signature over [`download_message`](crate::download_message)
+//! in the [`RELAY_HEADER`](crate::client::RELAY_HEADER),
+//! [`TIME_HEADER`](crate::TIME_HEADER) and [`SIGNATURE_HEADER`](crate::SIGNATURE_HEADER)
+//! headers. A release is signed over this module's [`release_message`], not a `vk` or
+//! `vk-registry` one's.
+//!
 //! Version 1 is the first; it follows the crate's rule: only optional fields are added within
 //! a version. Version 2 adds capacity arbitration: runners' `request_concurrency` in the
 //! inventory, their admission IDs in each heartbeat, and the client API's runner names,
 //! queued reservations and admission outcomes, which a relay relies on only once its session
-//! negotiated version 2.
+//! negotiated version 2. Version 3 adds updates: the commands, acks and records, which
+//! neither side sends in a session below it, and the inventory's `allow` and
+//! `requires_signed` and the report's `update`, optional fields a version-2 peer ignores.
 
 use serde::{Deserialize, Serialize};
 
 use crate::client::Placement;
-use crate::{RefusalCode, SHA256_LEN, VersionRange, display_safe, part, valid_sha256};
+use crate::{
+    CommandAck, RefusalCode, SHA256_LEN, UpdateProgress, VersionRange, display_safe, part,
+    valid_id, valid_sha256,
+};
 
 /// Where a relay enrolls.
 pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
@@ -39,10 +56,14 @@ pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
 pub const SESSION_PATH: &str = "/v1/gitlab/session";
 
 /// The protocol versions of a relay's session.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 2 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 3 };
 
 /// The relay requires admission-aware scheduling, introduced in version 2.
-pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 2 };
+pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 3 };
+
+/// The version that adds updates: [`HubRelayMsg::Command`], [`RelayMsg::Ack`] and
+/// [`HubRelayMsg::Recorded`] are sent only in a session at it or later.
+pub const UPDATES: u32 = 3;
 
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
@@ -54,6 +75,15 @@ pub const MAX_LABELS: usize = 32;
 /// The most admission IDs a runner's heartbeat keeps in each of its two lists once made
 /// display-safe.
 pub const MAX_ADMISSIONS: usize = 128;
+
+/// Where a relay downloads a release: this, then its sha256 in lowercase hex.
+pub const RELEASE_PATH: &str = "/v1/gitlab/releases/";
+
+/// `[hub] allow`'s value letting the hub update the relay.
+pub const ALLOW_UPDATE: &str = "update";
+
+/// The most entries an inventory's `allow` keeps once made display-safe.
+pub const MAX_ALLOW: usize = 16;
 
 /// The hub's answer to a relay's enrollment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,8 +100,12 @@ pub enum RelayMsg {
     Inventory(Inventory),
     /// Every heartbeat interval the hub asked for.
     Heartbeat(Heartbeat),
-    /// What each runner is doing: on connect and whenever it changes.
+    /// What each runner is doing, and the update under way: on connect and whenever it
+    /// changes.
     Report(Report),
+    /// A command's outcome, repeated until the hub answers with [`HubRelayMsg::Recorded`].
+    /// Version [`UPDATES`].
+    Ack(CommandAck),
 }
 
 /// The hub's messages after the welcome.
@@ -81,6 +115,11 @@ pub enum HubRelayMsg {
     /// What the hub makes of the relay's GitLab server: after each inventory, and whenever
     /// an operator changes it.
     Server(ServerStatus),
+    /// Issued only to a relay whose inventory's `allow` lists what it needs
+    /// ([`Operation::allowed_by`]); one that no longer does refuses it. Version [`UPDATES`].
+    Command(Command),
+    /// The hub has stored this outcome; the relay stops repeating it. Version [`UPDATES`].
+    Recorded(CommandAck),
     /// The session is ended — the relay was removed, or a newer session took over — and the
     /// connection closes after this. Frozen as [`HubMsg::Refused`](crate::HubMsg::Refused)
     /// is, with the same JSON, so a relay reads it before or after the welcome.
@@ -102,6 +141,13 @@ pub struct Inventory {
     /// At most [`MAX_RUNNERS`].
     #[serde(default)]
     pub runners: Vec<Runner>,
+    /// What its config lets the hub do (`[hub] allow`): [`ALLOW_UPDATE`]. At most
+    /// [`MAX_ALLOW`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Whether an update must be signed by one of its own `[hub] release_keys`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_signed: bool,
 }
 
 /// The GitLab server a relay takes jobs from.
@@ -147,10 +193,14 @@ fn one() -> u32 {
 impl Inventory {
     /// Apply [`display_safe`] to strings, drop the server's SPKI digest unless
     /// [`valid_sha256`], truncate runners to [`MAX_RUNNERS`] and their labels to
-    /// [`MAX_LABELS`], and raise a `request_concurrency` of 0 to 1.
+    /// [`MAX_LABELS`], `allow` to [`MAX_ALLOW`], and raise a `request_concurrency` of 0 to 1.
     pub fn make_display_safe(&mut self) {
         for s in [&mut self.version, &mut self.hostname, &mut self.system_id] {
             *s = display_safe(s);
+        }
+        self.allow.truncate(MAX_ALLOW);
+        for a in &mut self.allow {
+            *a = display_safe(a);
         }
         self.server.url = display_safe(&self.server.url);
         self.server.spki_sha256 = self.server.spki_sha256.take().filter(|s| valid_sha256(s));
@@ -214,12 +264,17 @@ impl Heartbeat {
     }
 }
 
-/// What each of a relay's runners is doing.
+/// What each of a relay's runners is doing, and its update.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     /// At most [`MAX_RUNNERS`].
     #[serde(default)]
     pub runners: Vec<RunnerReport>,
+    /// The update in progress, or the last one's end. A relay's
+    /// [`UpdatePhase::Draining`](crate::UpdatePhase::Draining) waits for its job requests to
+    /// GitLab, not its jobs: those go on across the restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateProgress>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,12 +306,53 @@ pub enum RunnerState {
 }
 
 impl Report {
-    /// Truncate runners to [`MAX_RUNNERS`] and apply [`display_safe`] to their strings.
+    /// Truncate runners to [`MAX_RUNNERS`] and apply [`display_safe`] to their strings. Drop
+    /// the update unless its command is [`valid_id`] and its sha256 [`valid_sha256`].
     pub fn make_display_safe(&mut self) {
         self.runners.truncate(MAX_RUNNERS);
         for r in &mut self.runners {
             r.name = display_safe(&r.name);
             r.message = r.message.as_deref().map(display_safe);
+        }
+        self.update = self
+            .update
+            .take()
+            .filter(|u| valid_id(&u.command) && valid_sha256(&u.sha256));
+        if let Some(u) = &mut self.update {
+            u.version = display_safe(&u.version);
+            u.message = u.message.as_deref().map(display_safe);
+        }
+    }
+}
+
+/// A command to a relay. Its ID is one [`valid_id`] takes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    pub id: String,
+    /// After this, the relay refuses the command rather than starting it.
+    pub expires_at: u64,
+    pub op: Operation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Operation {
+    /// Install this `vk-gitlab` release, downloaded from [`RELEASE_PATH`].
+    Update {
+        version: String,
+        sha256: String,
+        size: u64,
+        /// base64 ed25519 over this module's [`release_message`], when the release is signed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+}
+
+impl Operation {
+    /// The `[hub] allow` value a relay needs to take this command.
+    pub fn allowed_by(&self) -> &'static str {
+        match self {
+            Operation::Update { .. } => ALLOW_UPDATE,
         }
     }
 }
@@ -354,6 +450,7 @@ mod tests {
                     version: Some("18.4.1".into()),
                 },
                 runners: vec![runner()],
+                ..Inventory::default()
             }),
             &format!(
                 r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"pool":"ci","labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
@@ -388,6 +485,7 @@ mod tests {
                         message: Some("403 Forbidden".into()),
                     },
                 ],
+                ..Report::default()
             }),
             r#"{"type":"report","runners":[{"name":"ci","state":"waiting_capacity"},{"name":"old","state":"token_refused","message":"403 Forbidden"}]}"#,
         );
@@ -434,9 +532,73 @@ mod tests {
             r#"{"relay_id":"r"}"#,
         );
         assert_eq!(
-            (ENROLL_PATH, SESSION_PATH),
-            ("/v1/gitlab/enroll", "/v1/gitlab/session")
+            (ENROLL_PATH, SESSION_PATH, RELEASE_PATH),
+            (
+                "/v1/gitlab/enroll",
+                "/v1/gitlab/session",
+                "/v1/gitlab/releases/"
+            )
         );
+    }
+
+    /// The update's messages, and the inventory and report fields it adds, keep their JSON.
+    #[test]
+    fn update_messages_keep_their_json() {
+        use crate::{Outcome, UpdatePhase};
+        let sha = "ab".repeat(SHA256_LEN);
+        pinned(
+            &HubRelayMsg::Command(Command {
+                id: "c".into(),
+                expires_at: 9,
+                op: Operation::Update {
+                    version: "0.102.0".into(),
+                    sha256: sha.clone(),
+                    size: 5,
+                    signature: Some("s".into()),
+                },
+            }),
+            &format!(
+                r#"{{"type":"command","id":"c","expires_at":9,"op":{{"kind":"update","version":"0.102.0","sha256":"{sha}","size":5,"signature":"s"}}}}"#
+            ),
+        );
+        let ack = CommandAck {
+            id: "c".into(),
+            outcome: Outcome::Refused { reason: "r".into() },
+        };
+        pinned(
+            &RelayMsg::Ack(ack.clone()),
+            r#"{"type":"ack","id":"c","outcome":{"state":"refused","reason":"r"}}"#,
+        );
+        pinned(
+            &HubRelayMsg::Recorded(ack),
+            r#"{"type":"recorded","id":"c","outcome":{"state":"refused","reason":"r"}}"#,
+        );
+        pinned(
+            &RelayMsg::Report(Report {
+                runners: vec![],
+                update: Some(UpdateProgress {
+                    command: "c".into(),
+                    version: "0.102.0".into(),
+                    sha256: sha.clone(),
+                    phase: UpdatePhase::Draining,
+                    message: None,
+                }),
+            }),
+            &format!(
+                r#"{{"type":"report","runners":[],"update":{{"command":"c","version":"0.102.0","sha256":"{sha}","phase":"draining"}}}}"#
+            ),
+        );
+        let inventory = Inventory {
+            allow: vec![ALLOW_UPDATE.into()],
+            requires_signed: true,
+            ..Inventory::default()
+        };
+        let wire = serde_json::to_value(RelayMsg::Inventory(inventory)).unwrap();
+        assert_eq!(wire["allow"], serde_json::json!(["update"]));
+        assert_eq!(wire["requires_signed"], serde_json::json!(true));
+        // A relay that allows nothing sends neither field, as one from before updates.
+        let wire = serde_json::to_value(RelayMsg::Inventory(Inventory::default())).unwrap();
+        assert!(wire.get("allow").is_none() && wire.get("requires_signed").is_none());
     }
 
     /// A relay's release is signed under a label of its own.
@@ -446,6 +608,38 @@ mod tests {
         let relay = release_message(&sha, "1.0.0");
         assert_ne!(relay, crate::release_message(&sha, "1.0.0"));
         assert_ne!(relay, crate::registry::release_message(&sha, "1.0.0"));
+    }
+
+    /// A report's update is dropped unless its command and sha256 are well formed, and its
+    /// strings are made fit to show.
+    #[test]
+    fn a_report_s_update_is_made_fit_to_show() {
+        use crate::UpdatePhase;
+        let progress = |command: &str, sha256: String| UpdateProgress {
+            command: command.into(),
+            version: "1\u{1b}".into(),
+            sha256,
+            phase: UpdatePhase::Failed,
+            message: Some("m\n".into()),
+        };
+        let mut r = Report {
+            runners: vec![],
+            update: Some(progress(&"0".repeat(32), "ab".repeat(SHA256_LEN))),
+        };
+        r.make_display_safe();
+        let u = r.update.unwrap();
+        assert_eq!((u.version.as_str(), u.message.as_deref()), ("1", Some("m")));
+        for bad in [
+            progress("c", "ab".repeat(SHA256_LEN)),
+            progress(&"0".repeat(32), "AB".repeat(SHA256_LEN)),
+        ] {
+            let mut r = Report {
+                runners: vec![],
+                update: Some(bad),
+            };
+            r.make_display_safe();
+            assert!(r.update.is_none());
+        }
     }
 
     /// Older peers' messages still parse when optional fields are absent.
@@ -467,6 +661,7 @@ mod tests {
                     ..Server::default()
                 },
                 runners: vec![],
+                ..Inventory::default()
             })
         );
         let runner: Runner = serde_json::from_str(
@@ -610,11 +805,15 @@ mod tests {
             runners: vec![load; MAX_RUNNERS],
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
-        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(2));
+        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(UPDATES));
         assert_eq!(
             VersionRange { min: 1, max: 1 }.negotiate(RELAY_PROTOCOL),
             None
         );
+        // A hub or a relay from before updates still meets the other at version 2.
+        let before = VersionRange { min: 1, max: 2 };
+        assert_eq!(before.negotiate(RELAY_PROTOCOL), Some(2));
+        assert_eq!(PROTOCOL.negotiate(VersionRange { min: 2, max: 2 }), Some(2));
     }
 
     #[test]
@@ -640,6 +839,7 @@ mod tests {
                 };
                 MAX_RUNNERS + 1
             ],
+            ..Report::default()
         };
         r.make_display_safe();
         assert_eq!(r.runners.len(), MAX_RUNNERS);

@@ -19,6 +19,12 @@
 //! envelope = { mem = "16G", cpus = 8, disk = "16G" }
 //! limit = 4                 # jobs at once for this runner (0 = no limit)
 //! request_concurrency = 1   # job requests queued or in flight at once (at most 128)
+//!
+//! [hub]                     # optional: what the hub this relay is enrolled with may do
+//! allow = ["update"]        # update vk-gitlab to a release the hub holds
+//! release_keys = ["…"]      # an update must be signed by one of these
+//! # require_signed = true   # the default once release_keys names a key
+//! # allow_downgrade = false # whether an update may install an older version
 //! ```
 
 use std::collections::HashSet;
@@ -67,6 +73,44 @@ pub struct Config {
     /// At most [`MAX_RUNNERS`](vk_hub_proto::gitlab::MAX_RUNNERS).
     #[serde(default)]
     pub runners: Vec<RunnerConfig>,
+    /// What the hub may do to this relay; by default nothing but run its jobs.
+    #[serde(default)]
+    pub hub: HubConfig,
+}
+
+/// `[hub]`: what the hub the relay is enrolled with may do beyond running its jobs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// What the hub may ask: `update`, to install a `vk-gitlab` release it holds.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Ed25519 public keys, base64, an update must be signed by one of.
+    #[serde(default)]
+    pub release_keys: Vec<String>,
+    /// Whether an update must be signed; by default, when `release_keys` names any.
+    #[serde(default)]
+    pub require_signed: Option<bool>,
+    /// Whether an update may install an older version.
+    #[serde(default)]
+    pub allow_downgrade: bool,
+}
+
+impl HubConfig {
+    /// Whether the hub may do what [`vk_hub_proto::gitlab`]'s `ALLOW_*` value `what` names.
+    pub fn allows(&self, what: &str) -> bool {
+        self.allow.iter().any(|a| a == what)
+    }
+
+    /// The signature policy `release_keys` and `require_signed` set for `vk-gitlab` releases.
+    pub fn release_policy(&self) -> Result<vk_peer::release_key::Policy> {
+        vk_peer::release_key::Policy::from_config_in(
+            "[hub]",
+            vk_peer::release_key::Program::Gitlab,
+            &self.release_keys,
+            self.require_signed,
+        )
+    }
 }
 
 /// `[gitlab]`: the one GitLab server of this daemon.
@@ -308,6 +352,15 @@ impl Config {
             }
             None => {}
         }
+        for a in &cfg.hub.allow {
+            if a != vk_hub_proto::gitlab::ALLOW_UPDATE {
+                bail!(
+                    "[hub] allow: {a:?} is not something the hub may do; only {:?}",
+                    vk_hub_proto::gitlab::ALLOW_UPDATE
+                );
+            }
+        }
+        cfg.hub.release_policy()?;
         let mut names = HashSet::new();
         for (i, r) in cfg.runners.iter_mut().enumerate() {
             let which = if r.name.is_empty() {
@@ -554,7 +607,16 @@ mod tests {
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\nname = \"../x\"\ntoken = \"a\"\n",
                 "runner name",
             ),
-            ("[hub]\nurl = \"https://h\"\n", "unknown field `hub`"),
+            ("[hub]\nurl = \"https://h\"\n", "unknown field `url`"),
+            ("[hub]\nallow = [\"gc\"]\n", "not something the hub may do"),
+            (
+                "[hub]\nrequire_signed = true\n",
+                "require_signed = true needs release_keys",
+            ),
+            (
+                "[hub]\nrelease_keys = [\"x\"]\n",
+                "not an ed25519 public key",
+            ),
             (
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nenvelope = { mem = \"lots\", cpus = 1, disk = \"1G\" }\n",
                 "envelope mem",

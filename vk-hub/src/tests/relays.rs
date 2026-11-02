@@ -74,7 +74,17 @@ async fn dial_relay(addr: SocketAddr) -> Client {
 
 /// Hello, challenge and auth as a relay; what the hub answered.
 async fn open_relay(ws: &mut Client, id: &str, key: &Ed25519KeyPair) -> HubMsg {
-    send(ws, &hello(id, &"1".repeat(32), gl::PROTOCOL)).await;
+    open_relay_at(ws, id, key, gl::PROTOCOL).await
+}
+
+/// [`open_relay`], speaking `ours`.
+async fn open_relay_at(
+    ws: &mut Client,
+    id: &str,
+    key: &Ed25519KeyPair,
+    ours: vk_hub_proto::VersionRange,
+) -> HubMsg {
+    send(ws, &hello(id, &"1".repeat(32), ours)).await;
     let HubMsg::Challenge {
         version,
         versions,
@@ -83,13 +93,16 @@ async fn open_relay(ws: &mut Client, id: &str, key: &Ed25519KeyPair) -> HubMsg {
     else {
         panic!("expected a challenge");
     };
-    assert_eq!((version, versions), (2, gl::PROTOCOL));
+    assert_eq!(
+        (Some(version), versions),
+        (ours.negotiate(gl::PROTOCOL), gl::PROTOCOL)
+    );
     let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
     let signature = key.sign(&vk_hub_proto::auth_message(
         &nonce,
         id,
         &"1".repeat(32),
-        gl::PROTOCOL,
+        ours,
         versions,
         version,
         vk_hub_proto::Channel::Plaintext,
@@ -135,7 +148,7 @@ fn inventory(url: &str) -> Inventory {
             url: url.into(),
             ..Server::default()
         },
-        runners: vec![],
+        ..Inventory::default()
     }
 }
 
@@ -207,6 +220,7 @@ async fn a_relay_reports_and_hears_its_server_approved() {
             state: RunnerState::ServerPending,
             message: None,
         }],
+        ..Report::default()
     };
     tell(&mut ws, &RelayMsg::Report(report.clone())).await;
     tell(&mut ws, &RelayMsg::Heartbeat(Heartbeat::default())).await;
@@ -346,4 +360,232 @@ async fn a_relay_past_the_hub_s_runner_or_request_limits_is_refused() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the inventory at the limits was not taken");
+}
+
+/// A relay's update: refused before it is sent when the relay's inventory says it would refuse
+/// it or the release is not a `vk-gitlab` one; sent only to a relay that takes updates, once a
+/// session, from its first report on; its release downloadable by that relay alone while the
+/// update is live, and kept meanwhile; its outcome recorded, audited and answered; and failed
+/// once a new session's first report no longer names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_is_sent_its_update_and_downloads_only_its_release() {
+    let (dir, addr, hub) = start_releases("relay-update", None).await;
+    let key = keypair();
+    let id = enrolled_relay(addr, &hub, &key).await;
+    let vk = add_release(&hub, &dir, &fake_vk("0.89.0"), "0.89.0").unwrap();
+    let file = dir.join("vk-gitlab");
+    std::fs::write(&file, fake_vk("0.90.0")).unwrap();
+    let release = releases::add(&hub, "uid 0", &file, Program::Gitlab, "0.90.0", None).unwrap();
+    let path = format!("{}{}", gl::RELEASE_PATH, release.sha256);
+    let headers = |sha: &str| {
+        let digest = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SHA256_LEN }>(sha).unwrap();
+        let at = now_secs();
+        let message =
+            vk_hub_proto::download_message(&id, &digest, at, vk_hub_proto::Channel::Plaintext);
+        vec![
+            (vk_hub_proto::client::RELAY_HEADER, id.clone()),
+            (vk_hub_proto::TIME_HEADER, at.to_string()),
+            (
+                vk_hub_proto::SIGNATURE_HEADER,
+                vk_hub_proto::to_hex(key.sign(&message).as_ref()),
+            ),
+        ]
+    };
+
+    // A relay from before updates, or one whose [hub] allow lacks it, takes none.
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(
+        &mut ws,
+        &RelayMsg::Inventory(inventory("https://gitlab.example.com")),
+    )
+    .await;
+    assert_eq!(hear(&mut ws).await, status(ServerState::Pending, None));
+    tell(&mut ws, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.report.is_some())
+    })
+    .await;
+    let err = relays::update(&hub, "uid 0", &id, &release.sha256).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("its [hub] allow lacks update"),
+        "{err:#}"
+    );
+    // Nor a vk, whatever it allows; nor a node a vk-gitlab.
+    let allowing = |requires_signed| Inventory {
+        allow: vec![gl::ALLOW_UPDATE.into()],
+        requires_signed,
+        ..inventory("https://gitlab.example.com")
+    };
+    tell(&mut ws, &RelayMsg::Inventory(allowing(true))).await;
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.inventory.as_ref().is_some_and(|i| i.requires_signed))
+    })
+    .await;
+    let err = relays::update(&hub, "uid 0", &id, &release.sha256).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("takes only signed releases"),
+        "{err:#}"
+    );
+    let err = relays::update(&hub, "uid 0", &id, &vk.sha256).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a vk-gitlab release"),
+        "{err:#}"
+    );
+    let node = enrolled(addr, &hub, &keypair()).await;
+    assert!(crate::ops::update(&hub, "uid 0", &node, &release.sha256, false).is_err());
+    assert!(hub.db.relay_commands(&id).unwrap().is_empty());
+
+    // Not downloadable before an update to it is under way.
+    let (code, _) = get_with(addr, &path, &headers(&release.sha256)).await;
+    assert_eq!(code, 403);
+    tell(&mut ws, &RelayMsg::Inventory(allowing(false))).await;
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.inventory.as_ref().is_some_and(|i| !i.requires_signed))
+    })
+    .await;
+    let command = relays::update(&hub, "uid 0", &id, &release.sha256[..8]).unwrap();
+    let HubRelayMsg::Command(sent) = hear(&mut ws).await else {
+        panic!("not a command");
+    };
+    assert_eq!(sent, command);
+    let (code, body) = get_with(addr, &path, &headers(&release.sha256)).await;
+    assert_eq!(code, 200);
+    assert_eq!(body, fake_vk("0.90.0"));
+    // A node's path does not serve it to a relay, nor is it removed under the update; a
+    // second update waits for the first.
+    let (code, _) = get_with(
+        addr,
+        &format!("{}{}", vk_hub_proto::RELEASE_PATH, release.sha256),
+        &headers(&release.sha256),
+    )
+    .await;
+    assert_eq!(code, 401);
+    let err = releases::remove(&hub, "uid 0", &release.sha256).unwrap_err();
+    assert!(format!("{err:#}").contains("relay"), "{err:#}");
+    assert!(relays::update(&hub, "uid 0", &id, &release.sha256).is_err());
+
+    // The relay's answer is recorded, audited and acknowledged.
+    let accepted = vk_hub_proto::CommandAck {
+        id: command.id.clone(),
+        outcome: vk_hub_proto::Outcome::Accepted,
+    };
+    tell(&mut ws, &RelayMsg::Ack(accepted.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(accepted));
+
+    // A relay from before updates can never answer: its session's first report settles the
+    // accepted update as lost, and it is sent no command, whatever its inventory says.
+    let failed = |c: &crate::store::RelayCommandRow| {
+        matches!(c.outcome, Some(vk_hub_proto::Outcome::Failed { .. }))
+    };
+    let mut old = dial_relay(addr).await;
+    let before = vk_hub_proto::VersionRange { min: 2, max: 2 };
+    assert!(matches!(
+        open_relay_at(&mut old, &id, &key, before).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut old, &RelayMsg::Inventory(allowing(false))).await;
+    assert_eq!(hear(&mut old).await, status(ServerState::Pending, None));
+    tell(&mut old, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        let commands = hub.db.relay_commands(&id).unwrap();
+        commands
+            .iter()
+            .any(|c| c.command.id == command.id && failed(c))
+    })
+    .await;
+    let fresh = relays::update(&hub, "uid 0", &id, &release.sha256).unwrap();
+    // Its next message is the server's status, not the command.
+    hub.db
+        .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now_secs())
+        .unwrap();
+    relays::server_changed(&hub, "https://gitlab.example.com").unwrap();
+    assert_eq!(
+        hear(&mut old).await,
+        status(ServerState::Approved, Some("gl"))
+    );
+
+    // A relay that no longer lists update is still sent the command, which it refuses, so
+    // the command does not wait out its time unanswered.
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(
+        &mut ws,
+        &RelayMsg::Inventory(inventory("https://gitlab.example.com")),
+    )
+    .await;
+    assert_eq!(
+        hear(&mut ws).await,
+        status(ServerState::Approved, Some("gl"))
+    );
+    tell(&mut ws, &RelayMsg::Report(Report::default())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Command(fresh.clone()));
+    let accepted = vk_hub_proto::CommandAck {
+        id: fresh.id.clone(),
+        outcome: vk_hub_proto::Outcome::Accepted,
+    };
+    tell(&mut ws, &RelayMsg::Ack(accepted.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(accepted));
+
+    // A new session whose first report does not name it: the relay lost it.
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut ws, &RelayMsg::Inventory(allowing(false))).await;
+    assert_eq!(
+        hear(&mut ws).await,
+        status(ServerState::Approved, Some("gl"))
+    );
+    tell(&mut ws, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        let commands = hub.db.relay_commands(&id).unwrap();
+        commands
+            .iter()
+            .any(|c| c.command.id == fresh.id && failed(c))
+    })
+    .await;
+    // `vk-hub relays show` lists each command and how it ended.
+    let shown = crate::render_relay(
+        &relays::detail(&hub, &id).unwrap().unwrap(),
+        &hub.db.relay_commands(&id).unwrap(),
+        now_secs(),
+    );
+    for want in [
+        "updates allowed\n",
+        &format!("command {} update to vk-gitlab 0.90.0 at ", fresh.id),
+        "failed: ",
+    ] {
+        assert!(shown.contains(want), "{want}: {shown}");
+    }
+    let (code, _) = get_with(addr, &path, &headers(&release.sha256)).await;
+    assert_eq!(code, 403);
+    let audit = hub.db.audits(Some(&id), 50).unwrap();
+    for event in [
+        "uid 0 issued update to vk-gitlab 0.90.0",
+        "accepted",
+        "no longer reports this update",
+    ] {
+        assert!(
+            audit.iter().any(|a| a.event.contains(event)),
+            "{event}: {audit:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

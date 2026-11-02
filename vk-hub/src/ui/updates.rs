@@ -1,4 +1,4 @@
-//! Shared UI for peers that install releases on the hub's command, currently registries.
+//! Shared UI for peers that install releases on the hub's command: registries and GitLab relays.
 //! Each [`Kind`] has a live `/operations` section listing versions and updates, a release
 //! form, and an update handler at the peer's action path that asks first ([`actions::ask_first`]).
 //! Each kind's module supplies peer lookup, checks and command issuance ([`Ops`]).
@@ -264,7 +264,7 @@ pub(super) fn form(h: &mut Html, kind: &Kind, p: &Peer, releases: &[Release], cs
 }
 
 /// Why a peer running one version refuses to update to another, as its own check decides
-/// (`check_version` in `vk-registry/src/hub/update.rs`).
+/// (`check_version` in `vk-registry/src/hub/update.rs` and `vk-gitlab/src/update.rs`).
 #[derive(Debug, PartialEq, Eq)]
 enum VersionRefusal {
     /// An older `MAJOR.MINOR.PATCH`, unless its `[hub] allow_downgrade`.

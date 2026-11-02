@@ -3,6 +3,12 @@
 //! the other, until the connection is lost — and dial again, backing off, unless the hub
 //! refused the relay for good.
 //!
+//! A relay whose `[hub] allow` lists `update` takes the hub's commands to update it
+//! ([`crate::update`]): in a session at version
+//! [`UPDATES`](vk_hub_proto::gitlab::UPDATES), the session answers each and repeats an answer
+//! until the hub has stored it. It reports the update's progress, and confirms a release on
+//! trial once it is in session, whatever the version.
+//!
 //! [`Status`] is what the poll loop and the session share: the server's status the hub last
 //! sent, which the loop waits on before it asks GitLab for a job, and what each runner is
 //! doing, which the session reports. The status outlives a lost session: a relay whose server
@@ -25,6 +31,7 @@ use vk_peer::session::{Permanent, Superseded, Ws};
 
 use crate::config::Config;
 use crate::relay::Relay;
+use crate::update::Updater;
 
 /// How long each step of a connection may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -126,12 +133,20 @@ impl Status {
                     version: None,
                 },
                 runners: Vec::new(),
+                allow: cfg.hub.allow.clone(),
+                // Checked when the config was read.
+                requires_signed: cfg.hub.release_policy().is_ok_and(|p| p.required()),
             },
             server: watch::channel(None).0,
             runners: Mutex::new(runners),
             spki: Mutex::new(None),
             changed: Notify::new(),
         })
+    }
+
+    /// Have the session send what changed: the report, an update's progress, acks.
+    pub fn touch(&self) {
+        self.changed.notify_one();
     }
 
     /// The status the hub last sent of the relay's server.
@@ -209,7 +224,7 @@ impl Status {
         inventory
     }
 
-    /// What each runner is doing.
+    /// What each runner is doing; the update is the session's to add.
     pub fn report(&self) -> Report {
         Report {
             runners: self
@@ -221,6 +236,7 @@ impl Status {
                     message: r.message.clone(),
                 })
                 .collect(),
+            update: None,
         }
     }
 
@@ -261,7 +277,7 @@ impl Status {
 }
 
 /// Keep a session with the hub for as long as `run` runs.
-pub async fn hold(relay: Arc<Relay>, status: Arc<Status>) {
+pub async fn hold(relay: Arc<Relay>, status: Arc<Status>, updater: Arc<Updater>) {
     let mut incarnation = [0u8; vk_hub_proto::ID_BYTES];
     if let Err(e) = vk_peer::fill_random(&mut incarnation) {
         log::error!(error = format!("{e:#}").as_str(); "No session with the hub");
@@ -271,7 +287,7 @@ pub async fn hold(relay: Arc<Relay>, status: Arc<Status>) {
     let mut backoff = BACKOFF.0;
     loop {
         let started = tokio::time::Instant::now();
-        match run(&relay, &status, &incarnation).await {
+        match run(&relay, &status, &updater, &incarnation).await {
             Ok(()) => {}
             Err(e) if e.is::<Permanent>() => {
                 // The hub no longer knows this relay: its jobs would be refused.
@@ -328,8 +344,21 @@ fn refusal(code: RefusalCode, reason: &str) -> anyhow::Error {
     }
 }
 
+/// What each runner is doing, and the update.
+fn report(status: &Status, updater: &Updater) -> Report {
+    Report {
+        update: updater.progress(),
+        ..status.report()
+    }
+}
+
 /// One session, from dial to its end.
-async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
+async fn run(
+    relay: &Relay,
+    status: &Status,
+    updater: &Arc<Updater>,
+    incarnation: &str,
+) -> Result<()> {
     let hub = &relay.enrollment.hub;
     let (mut ws, exported) = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -344,16 +373,28 @@ async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
         incarnation,
         version: env!("CARGO_PKG_VERSION"),
     };
-    let (heartbeat_secs, _version) =
+    let (heartbeat_secs, version) =
         vk_peer::session::handshake(&mut ws, &hello, exported.as_ref(), CONNECT_TIMEOUT, refusal)
             .await?;
+    // A hub from before updates could not read an ack.
+    let updates = version >= vk_hub_proto::gitlab::UPDATES;
     log::info!(hub = hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "In session with the hub");
+    // In session with the hub: an update on trial has passed.
+    let confirming = updater.clone();
+    tokio::task::spawn_blocking(move || confirming.confirm())
+        .await
+        .map_err(|e| anyhow!("confirming the update: {e}"))?;
     let beat = Duration::from_secs(u64::from(heartbeat_secs.clamp(1, 300)));
     let quiet = beat * 3;
     let mut sent_inventory = status.inventory();
     send(&mut ws, &RelayMsg::Inventory(sent_inventory.clone()), beat).await?;
-    let mut sent_report = status.report();
+    let mut sent_report = report(status, updater);
     send(&mut ws, &RelayMsg::Report(sent_report.clone()), beat).await?;
+    if updates {
+        for ack in updater.unrecorded() {
+            send(&mut ws, &RelayMsg::Ack(ack), beat).await?;
+        }
+    }
     let mut heartbeat = tokio::time::interval(beat);
     let mut deadline = tokio::time::Instant::now() + quiet;
     // When the changes noticed since the last flush go out.
@@ -375,10 +416,15 @@ async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
                     send(&mut ws, &RelayMsg::Inventory(inventory.clone()), beat).await?;
                     sent_inventory = inventory;
                 }
-                let report = status.report();
+                let report = report(status, updater);
                 if report != sent_report {
                     send(&mut ws, &RelayMsg::Report(report.clone()), beat).await?;
                     sent_report = report;
+                }
+                if updates {
+                    for ack in updater.unrecorded() {
+                        send(&mut ws, &RelayMsg::Ack(ack), beat).await?;
+                    }
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -398,6 +444,17 @@ async fn run(relay: &Relay, status: &Status, incarnation: &str) -> Result<()> {
                 deadline = tokio::time::Instant::now() + quiet;
                 match vk_peer::session::parse::<HubRelayMsg>(text.as_str())? {
                     HubRelayMsg::Server(server) => told(status, server),
+                    HubRelayMsg::Command(command) => {
+                        if !updates {
+                            bail!("the hub sent a command in a session before updates");
+                        }
+                        if !vk_hub_proto::valid_id(&command.id) {
+                            bail!("the hub sent a command with a malformed ID");
+                        }
+                        let ack = updater.command(command)?;
+                        send(&mut ws, &RelayMsg::Ack(ack), beat).await?;
+                    }
+                    HubRelayMsg::Recorded(ack) => updater.recorded(&ack)?,
                     HubRelayMsg::Refused { code, reason } => return Err(refusal(code, &reason)),
                 }
             }
