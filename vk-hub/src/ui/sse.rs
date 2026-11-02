@@ -142,7 +142,7 @@ impl Streams {
         if *n >= MAX_SESSION_STREAMS {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                "Too many live pages open for this session; close some.",
+                "This session has too many live pages open. Close some.",
             ));
         }
         let Ok(permit) = self.all.clone().try_acquire_owned() else {
@@ -151,7 +151,7 @@ impl Streams {
             }
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Too many live pages open on this hub; try again later.",
+                "This hub has too many live pages open. Try again later.",
             ));
         };
         *n += 1;

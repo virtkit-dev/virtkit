@@ -25,12 +25,12 @@ pub(super) const PATH: &str = "/users";
 const OPERATORS_ONLY: &str = "Refused: this needs the operator role.";
 
 const NO_OIDC: &str = "Refused: this hub has no [oidc] table, so nobody signs in through a \
-     provider; `vk-hub accounts` keeps grants for when it has one.";
+     provider. `vk-hub accounts` keeps grants for when the hub has one.";
 
-const LAST_OPERATOR: &str = "Refused: that would leave no address granted the operator role, \
-     and nobody could then act on the fleet after signing in through the provider. Grant \
-     another address the operator role first. Should it happen anyway, `vk-hub ui login --role \
-     operator` on the hub's host prints a sign-in link that gets an operator back in.";
+const LAST_OPERATOR: &str = "Refused: after this change, no address would have the operator \
+     role. Nobody could then act on the fleet after signing in through the provider. Grant \
+     another address the operator role first. If this happens anyway, run `vk-hub ui login \
+     --role operator` on the hub's host. It prints a sign-in link that gets an operator back in.";
 
 /// `GET /users`.
 pub(super) async fn get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
@@ -43,10 +43,13 @@ pub(super) async fn get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     main.raw("<h1>Users</h1>");
     match &ui.oidc {
         None => {
-            main.raw("<p class=\"notes\">This hub has no <code>[oidc]</code> table: nobody ")
-                .raw("signs in through a provider, only with links <code>vk-hub ui login</code> ")
-                .raw("prints. The grants below take effect once OIDC is configured; until then ")
-                .raw("<code>vk-hub accounts</code> changes them.</p>");
+            main.raw("<p class=\"notes\">This hub has no <code>[oidc]</code> table, so nobody ")
+                .raw("signs in through a provider. People sign in only with links that ")
+                .raw("<code>vk-hub ui login</code> prints. The grants below take effect once OIDC ")
+                .raw(
+                    "is configured. Until then, you change them with <code>vk-hub accounts</code>.",
+                )
+                .raw("</p>");
             main.html(&grants_section(&grants, None, None, false));
         }
         Some(oidc) => {
@@ -209,9 +212,10 @@ fn grant_form(h: &mut Html, auth: &Auth) {
         .raw("placeholder=\"name@example.com\">");
     role_select(h, Role::Viewer);
     h.raw("<button class=\"primary\">Grant</button></form>")
-        .raw("<p class=\"sub\">The address the provider signs them in with, compared ignoring ")
-        .raw("case; granting it again replaces its role. <code>*</code> grants everyone the ")
-        .raw("provider signs in that no grant names, as a viewer only.</p></section>");
+        .raw("<p class=\"sub\">Enter the address the provider signs the person in with. The ")
+        .raw("hub compares addresses ignoring case. Granting an address again replaces its role. ")
+        .raw("<code>*</code> covers everyone the provider signs in who has no grant of their ")
+        .raw("own. It can grant the viewer role only.</p></section>");
 }
 
 /// `POST /users`: set (`grant`, `change`) or revoke (`revoke`) `email`'s grant as the operator
@@ -239,7 +243,7 @@ pub(super) async fn action(
             return Ok(actions::refused(
                 htmx,
                 StatusCode::BAD_REQUEST,
-                "Refused: a role is viewer or operator.",
+                "Refused: the role must be viewer or operator.",
             ));
         }
         ("revoke", _) => None,
@@ -256,15 +260,15 @@ pub(super) async fn action(
         return Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
-            "Refused: that is not an email address: one with an @, and no spaces or control \
-             characters.",
+            "Refused: that is not an email address. An email address has an @, and no spaces \
+             or control characters.",
         ));
     };
     if email == ANYONE && role == Some(Role::Operator) {
         return Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
-            "Refused: everyone the provider signs in may be granted the viewer role only.",
+            "Refused: the grant to everyone the provider signs in can only be the viewer role.",
         ));
     }
     let hub = ui.hub.clone();
@@ -300,11 +304,11 @@ pub(super) async fn action(
             back: PATH.to_string(),
             op: op.clone(),
             what: if role.is_some() {
-                "Lower this grant? Its sessions that hold more than a sign-in now gets end at \
-                 once."
+                "Lower this grant? Sessions with more rights than the new grant allows end \
+                 immediately."
             } else {
-                "Revoke this grant? Whom it admits can no longer sign in by it, and its \
-                 sessions that hold more than a sign-in now gets end at once."
+                "Revoke this grant? People it admits can no longer use it to sign in. Their \
+                 sessions with more rights than a new sign-in would get end immediately."
             },
             detail,
             asked,
@@ -344,7 +348,7 @@ pub(super) async fn action(
     };
     let change = outcome.change;
     let mut said = match (change.previous, role) {
-        (p, r) if p == r => "Already so; nothing changed.".to_string(),
+        (p, r) if p == r => "Nothing changed: it was already set that way.".to_string(),
         (None, Some(r)) => format!("Granted {shown} the {} role.", r.name()),
         (Some(p), Some(r)) => format!(
             "Granted {shown} the {} role, replacing {}.",
@@ -355,7 +359,7 @@ pub(super) async fn action(
     };
     if change.ended > 0 {
         said.push_str(&format!(
-            " Ended {} web UI session(s) that held more than that.",
+            " Ended {} web UI session(s) with more rights than a new sign-in would get.",
             change.ended
         ));
     }

@@ -307,7 +307,7 @@ async fn handle(
         eprintln!("vk-hub: ui: {peer}: {e:#}");
         message(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Something failed on the hub; its log says what.",
+            "Something failed on the hub. See the hub's log for the cause.",
         )
     });
     if let Some(uri) = reload
@@ -939,41 +939,41 @@ struct Texts {
 const FLEET_TEXTS: Texts = Texts {
     misdirected: "This is not the address the hub's web UI is configured at (its ui_url, or \
                   ui_addr when that is unset).",
-    not_a_link: "This is not a sign-in link. `vk-hub ui login` prints one.",
-    spent_link: "This sign-in link is unknown, used or expired. `vk-hub ui login` prints a new \
-                 one.",
-    signed_out: "Not signed in. On the hub's host, `vk-hub ui login` prints a link that signs \
-                 you in.",
-    sign_in_again: "<code>vk-hub ui login</code> prints a link to sign in again.",
+    not_a_link: "This is not a sign-in link. Run `vk-hub ui login` to get one.",
+    spent_link: "This sign-in link is unknown, used or expired. Run `vk-hub ui login` to get a \
+                 new one.",
+    signed_out: "Not signed in. To sign in, run `vk-hub ui login` on the hub's host and open \
+                 the link it prints.",
+    sign_in_again: "Run <code>vk-hub ui login</code> to get a link to sign in again.",
 };
 
 const FLEET_OIDC_TEXTS: Texts = Texts {
     signed_out: "Not signed in.",
-    sign_in_again: "<a href=\"/auth/login\">Sign in again</a>, or <code>vk-hub ui login</code> \
-                    prints a link.",
+    sign_in_again: "<a href=\"/auth/login\">Sign in again</a>, or run <code>vk-hub ui \
+                    login</code> to get a link.",
     ..FLEET_TEXTS
 };
 
 const LOCAL_TEXTS: Texts = Texts {
     misdirected: "This is not the address the hub's web UI is served at.",
-    not_a_link: "This is not a sign-in link. `vk-hub local login` prints one.",
-    spent_link: "This sign-in link is unknown, used or expired. `vk-hub local login` prints a \
-                 new one.",
-    signed_out: "Not signed in. On this machine, `vk-hub local login` prints a link that signs \
-                 you in.",
-    sign_in_again: "<code>vk-hub local login</code> prints a link to sign in again.",
+    not_a_link: "This is not a sign-in link. Run `vk-hub local login` to get one.",
+    spent_link: "This sign-in link is unknown, used or expired. Run `vk-hub local login` to get \
+                 a new one.",
+    signed_out: "Not signed in. To sign in, run `vk-hub local login` on this machine and open \
+                 the link it prints.",
+    sign_in_again: "Run <code>vk-hub local login</code> to get a link to sign in again.",
 };
 
 const CONFLICTING_COOKIES: &str = "Not signed in: this browser sent more than one vk-hub \
-     session cookie, which is what a cookie planted by another site on this host looks like. \
+     session cookie. That is what a cookie planted by another site on this host looks like. \
      Clear this site's cookies and sign in again.";
 
 const CROSS_ORIGIN: &str = "Refused: this request did not come from the hub's own pages.";
 const CSRF_REFUSED: &str =
     "Refused: the form's CSRF token is missing or not this session's. Reload the page.";
 
-const ANOTHER_SITE: &str = "Refused: another site's page asked for this one. Open the hub's \
-     address yourself, or follow its own links.";
+const ANOTHER_SITE: &str = "Refused: a page on another site asked for this one. Open the \
+     hub's address yourself, or follow the hub's own links.";
 
 #[cfg(test)]
 mod tests;

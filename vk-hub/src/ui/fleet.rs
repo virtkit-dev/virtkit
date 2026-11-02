@@ -625,7 +625,7 @@ pub(super) async fn node_action(
                 pages::count(d.ceiling),
                 crate::acquisition_name(d.acquisition)
             ),
-            None => "Already so; nothing changed.".to_string(),
+            None => "Nothing changed: it was already set that way.".to_string(),
         };
         Ok(match steer {
             Steer::Ceiling(ceiling) => {
@@ -634,7 +634,7 @@ pub(super) async fn node_action(
             Steer::Acquisition(a) => ops::set_acquisition(&hub, &principal, &node, a).map(desired),
             Steer::Pools(pools) => ops::set_pools(&hub, &principal, &node, &pools).map(|changed| {
                 if !changed {
-                    return "Already so; nothing changed.".to_string();
+                    return "Nothing changed: it was already set that way.".to_string();
                 }
                 if pools.is_empty() {
                     "Taken out of every pool.".to_string()

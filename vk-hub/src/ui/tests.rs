@@ -2899,7 +2899,7 @@ async fn the_fleet_s_audit_log_leaves_jobs_out_and_is_filtered_by_person() {
     assert!(!text.contains("ended: lost"), "{text}");
     let none = get(addr, "/audit?who=key+gitlab", Some(&cookie)).await.body;
     assert!(
-        none.contains("none match; jobs are left out unless Jobs or Everything is chosen"),
+        none.contains("none match. Jobs are left out unless you choose Jobs or Everything."),
         "{none}"
     );
 }
@@ -3094,7 +3094,13 @@ async fn an_operator_steers_a_node_from_its_page() {
     );
     let reply = steer(format!("_csrf={csrf}&op=stop"), true).await;
     assert_eq!(reply.status, 200);
-    assert!(reply.body.contains("Already so"), "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Nothing changed: it was already set that way."),
+        "{}",
+        reply.body
+    );
     // A plain form goes back to the page.
     let reply = steer(format!("_csrf={csrf}&op=resume"), false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
@@ -3137,7 +3143,13 @@ async fn an_operator_steers_a_node_from_its_page() {
     let audited = || hub.db.audits(Some(&node), 100).unwrap().len();
     let before = audited();
     let reply = steer(format!("_csrf={csrf}&op=pools&pools=gpu+ci"), true).await;
-    assert!(reply.body.contains("Already so"), "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Nothing changed: it was already set that way."),
+        "{}",
+        reply.body
+    );
     assert_eq!(audited(), before);
     for bad in ["bad%2Fname", &"a".repeat(65)] {
         let reply = steer(format!("_csrf={csrf}&op=pools&pools=ci+{bad}"), true).await;
@@ -4483,7 +4495,7 @@ async fn an_operator_creates_an_api_key_shown_once() {
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert!(
         reply.body.contains(
-            "client API, at <code>https://hub.example.com:8443</code>, as \
+            "client API at <code>https://hub.example.com:8443</code>, as \
              <code>Authorization: Bearer &lt;key&gt;</code>"
         ),
         "{}",
@@ -4588,7 +4600,7 @@ async fn an_operator_revokes_then_removes_an_api_key_once_confirmed() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.header("hx-reswap"), Some("none"));
     for want in [
-        "can no longer follow or settle its jobs under way",
+        "nor follow or settle its jobs under way",
         "<button class=\"danger\">Yes, revoke</button>",
         "0 reservation(s), 0 job(s) queued or running",
     ] {
@@ -6810,7 +6822,9 @@ async fn an_operator_grants_changes_and_revokes_from_the_users_page() {
     // Sent again, it lowers nothing, so nothing is asked or done.
     let again = post_users(addr, &cookie, &answer).await;
     assert!(
-        again.body.contains("Already so; nothing changed."),
+        again
+            .body
+            .contains("Nothing changed: it was already set that way."),
         "{}",
         again.body
     );
@@ -6951,7 +6965,9 @@ async fn the_last_operator_grant_is_kept() {
         let reply = post_users(addr, &cookie, &format!("_csrf={csrf}&{form}")).await;
         assert_eq!(reply.status, 409, "{form}: {}", reply.body);
         assert!(
-            reply.body.contains("no address granted the operator role")
+            reply
+                .body
+                .contains("no address would have the operator role")
                 && reply.body.contains("vk-hub ui login --role operator"),
             "{}",
             reply.body
@@ -7005,7 +7021,7 @@ async fn a_lowered_grant_ends_its_sessions() {
     assert!(
         reply
             .body
-            .contains("Ended 2 web UI session(s) that held more than that."),
+            .contains("Ended 2 web UI session(s) with more rights than a new sign-in would get."),
         "{}",
         reply.body
     );
@@ -8990,7 +9006,7 @@ async fn the_gitlab_page_lists_its_servers() {
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
     let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
-        body.contains("None yet: <code>vk-hub gitlabs add"),
+        body.contains("None yet. An operator adds one with <code>vk-hub gitlabs add"),
         "{body}"
     );
     for (name, url) in [
@@ -9204,7 +9220,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let page = get(addr, "/gitlab", Some(&operator)).await.body;
     for want in [
-        "None yet: add one below",
+        "None yet. Add one below",
         "<h2>Add a GitLab server</h2><form class=\"wide\" method=\"post\" \
          action=\"/clients\">",
         "<input type=\"hidden\" name=\"op\" value=\"add-server\">",
@@ -9325,7 +9341,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
             .any(|e| e.contains("(operator) removed GitLab instance gl")),
         "{audit:?}"
     );
-    next_with(&mut live, "None yet: add one below").await;
+    next_with(&mut live, "None yet. Add one below").await;
     next_with(&mut live_gl, "The hub no longer has this GitLab server.").await;
     let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
@@ -10008,7 +10024,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
     assert!(
         reply
             .body
-            .contains("Refused: it changed since you were asked"),
+            .contains("Refused: it changed since you were asked. Look at it again."),
         "{}",
         reply.body
     );
@@ -10033,7 +10049,7 @@ async fn deciding_against_approved_projects_is_asked_first() {
     assert!(
         reply
             .body
-            .contains("Refused: it changed since you were asked"),
+            .contains("Refused: it changed since you were asked. Look at it again."),
         "{}",
         reply.body
     );

@@ -331,12 +331,13 @@ fn servers_fragment(shown: &Shown, steer: bool) -> Html {
     h.raw("<section><h2>GitLab servers</h2>");
     if shown.gitlabs.is_empty() {
         if steer {
-            h.raw("<p class=\"empty\">None yet: add one below or with <code>vk-hub gitlabs ")
-                .raw("add &lt;name&gt; &lt;url&gt;</code>, or approve one a relay reports.</p>");
+            h.raw("<p class=\"empty\">None yet. Add one below or with <code>vk-hub gitlabs ")
+                .raw("add &lt;name&gt; &lt;url&gt;</code>, or approve a server that a relay ")
+                .raw("reports.</p>");
         } else {
-            h.raw("<p class=\"empty\">None yet: <code>vk-hub gitlabs add &lt;name&gt; ")
-                .raw("&lt;url&gt;</code> adds one, and <code>vk-hub gitlabs approve</code> one a ")
-                .raw("relay reports.</p>");
+            h.raw("<p class=\"empty\">None yet. An operator adds one with <code>vk-hub gitlabs ")
+                .raw("add &lt;name&gt; &lt;url&gt;</code>, or approves a server that a relay ")
+                .raw("reports with <code>vk-hub gitlabs approve</code>.</p>");
         }
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>server</th><th>URL</th>")
@@ -407,17 +408,17 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     h.raw("<section><h2>Relays</h2>");
     if shown.relays.is_empty() {
         h.raw(if steer {
-            "<p class=\"empty\">None yet: add one below, or with <code>vk-hub token create \
+            "<p class=\"empty\">None yet. Add one below, or with <code>vk-hub token create \
              --kind gitlab</code> and <code>vk-gitlab join</code>.</p>"
         } else {
-            "<p class=\"empty\">None yet: an operator enrolls a <code>vk-gitlab</code> with \
+            "<p class=\"empty\">None yet. An operator enrolls a <code>vk-gitlab</code> with \
              <code>vk-hub token create --kind gitlab</code> and <code>vk-gitlab join</code>.</p>"
         });
     } else {
         relays_table(&mut h, &shown.relays, now, steer);
         h.raw("<p class=\"sub\"><a href=\"/operations\">Updates</a> lists each relay's ")
-            .raw("update, and updates one whose <code>[hub] allow</code> lists ")
-            .raw("<code>update</code>.</p>");
+            .raw("update. If a relay's <code>[hub] allow</code> lists <code>update</code>, you ")
+            .raw("can update the relay there.</p>");
     }
     h.raw("</section>");
     let unbound: Vec<&RelayView> = (shown.relays.iter())
@@ -433,8 +434,8 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         .collect();
     if !unbound.is_empty() {
         h.raw("<section><h2>Runners waiting for their server</h2><p class=\"sub\">Their ")
-            .raw("relays are bound to no server the hub has: once the hub has theirs, they are on ")
-            .raw("its page.</p>");
+            .raw("relays are bound to a server the hub does not have. Once the hub has that ")
+            .raw("server, these runners show on its page.</p>");
         runners_table(&mut h, shown, &unbound, now);
         h.raw("</section>");
     }
@@ -449,19 +450,20 @@ fn pending_section(h: &mut Html, shown: &Shown, server: Option<&str>, steer: boo
     let servers = server.is_none();
     h.raw("<section><h2>Pending</h2>");
     if servers && shown.pending.is_empty() {
-        h.raw("<p class=\"empty\">No GitLab server waits for approval: one a relay reports ")
-            .raw("waits here until an operator approves it.</p>");
+        h.raw("<p class=\"empty\">No GitLab server waits for approval. When a relay reports ")
+            .raw("a new server, the server waits here until an operator approves it.</p>");
     }
     if !servers && pending.is_empty() {
-        h.raw("<p class=\"empty\">No project waits for approval: one a relay submits a job ")
-            .raw("of waits here until an operator approves it.</p>");
+        h.raw("<p class=\"empty\">No project waits for approval. When a relay submits a job ")
+            .raw("of a project the hub does not know yet, the project waits here until an ")
+            .raw("operator approves it.</p>");
     }
     if servers && !shown.pending.is_empty() {
         h.raw("<h3>GitLab servers</h3>");
         if !steer {
-            h.raw("<p class=\"sub\">An operator approves one under a name, as <code>vk-hub ")
-                .raw("gitlabs approve &lt;url&gt; --name &lt;name&gt;</code> does, or rejects ")
-                .raw("it. Check its certificate key first.</p>");
+            h.raw("<p class=\"sub\">An operator approves a server under a name, or rejects ")
+                .raw("it. <code>vk-hub gitlabs approve &lt;url&gt; --name &lt;name&gt;</code> ")
+                .raw("does the same approval. Check the server's certificate key first.</p>");
         }
         h.raw("<table class=\"grid\"><thead><tr><th>URL</th><th>certificate key sha256</th>")
             .raw("<th>reported by</th>");
@@ -509,9 +511,9 @@ fn pending_section(h: &mut Html, shown: &Shown, server: Option<&str>, steer: boo
     if (!servers || shown.rejected.is_empty()) && rejected.is_empty() {
         return;
     }
-    h.raw("<section><h2>Rejected</h2><p class=\"sub\">Their jobs are refused. Approving one ")
-        .raw("takes the rejection back; forgetting one lets it wait for approval again at its ")
-        .raw("next job.</p>");
+    h.raw("<section><h2>Rejected</h2><p class=\"sub\">Their jobs are refused. Approving a ")
+        .raw("rejected server or project takes the rejection back. Forgetting a rejection makes ")
+        .raw("the server or project wait for approval again at its next job.</p>");
     if servers && !shown.rejected.is_empty() {
         h.raw("<h3>GitLab servers</h3><table class=\"grid\"><thead><tr><th>URL</th>")
             .raw("<th>rejected</th><th>by</th>");
@@ -550,9 +552,9 @@ fn approved_section(h: &mut Html, shown: &Shown, server: &str, steer: bool) {
     if approved.is_empty() {
         return;
     }
-    h.raw("<section><h2>Approved projects</h2><p class=\"sub\">Their jobs run. Rejecting one ")
-        .raw("refuses its next jobs; forgetting one has it wait for approval again at its next ")
-        .raw("job.</p>");
+    h.raw("<section><h2>Approved projects</h2><p class=\"sub\">Their jobs run. Rejecting a ")
+        .raw("project refuses its next jobs. Forgetting a project makes it wait for approval ")
+        .raw("again at its next job.</p>");
     projects_form(h, shown, server, &approved, ProjectState::Approved, steer);
     h.raw("</section>");
 }
@@ -695,7 +697,7 @@ fn projects_form(
             h.raw("<p class=\"sub\">An operator approves them, as <code>vk-hub gitlabs ")
                 .raw("projects approve ")
                 .text(gitlab)
-                .raw(" &lt;id&gt;…</code> does; a job then needs retrying in GitLab.</p>");
+                .raw(" &lt;id&gt;…</code> does. After that, retry the job in GitLab.</p>");
         }
         return;
     }
@@ -1069,9 +1071,9 @@ fn add_relay_form(h: &mut Html, auth: &Auth) {
     h.raw("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">")
         .raw("<input type=\"hidden\" name=\"ttl\" value=\"3600\">")
         .raw("<button class=\"primary\">Issue a relay token, valid an hour</button></form>")
-        .raw("<p class=\"sub\">Single-use: a <code>vk-gitlab</code> redeems it with ")
-        .raw("<code>vk-gitlab join</code>, as <code>vk-hub token create --kind gitlab</code> ")
-        .raw("issues one. Shown a single time.</p></section>");
+        .raw("<p class=\"sub\">The token works once. A <code>vk-gitlab</code> redeems it with ")
+        .raw("<code>vk-gitlab join</code>, like a token from <code>vk-hub token create --kind ")
+        .raw("gitlab</code>. The token is shown a single time.</p></section>");
 }
 
 /// The op adding a GitLab server.
@@ -1093,10 +1095,11 @@ fn add_server_form(h: &mut Html, auth: &Auth) {
         .raw("<input id=\"gitlab-url\" type=\"url\" name=\"url\" autocomplete=\"off\" ")
         .raw("spellcheck=\"false\" required placeholder=\"https://gitlab.example.com\">")
         .raw("<button class=\"primary\">Add</button></form>")
-        .raw("<p class=\"sub\">As <code>vk-hub gitlabs add</code>, it approves the server ")
-        .raw("before a relay reports it: the name is what registry namespaces and egress rules ")
-        .raw("call the server, lowercase letters, digits and <code>-</code>; the URL is the one ")
-        .raw("its relays' <code>[gitlab] url</code> names.</p></section>");
+        .raw("<p class=\"sub\">Like <code>vk-hub gitlabs add</code>, this approves the ")
+        .raw("server before a relay reports it. The name is what registry namespaces and egress ")
+        .raw("rules call the server. It uses lowercase letters, digits and <code>-</code>. The ")
+        .raw("URL is the one the server's relays name in their <code>[gitlab] url</code>.</p>")
+        .raw("</section>");
 }
 
 /// The keys', servers' and relays' fragments, as one rendering for every page showing them:
@@ -1367,12 +1370,12 @@ fn create_form(h: &mut Html, auth: &Auth) {
             .raw(" days</option>");
     }
     h.raw("</select><button class=\"primary\">Create</button></form>")
-        .raw("<p class=\"sub\">As <code>vk-hub keys create</code>: scope <code>jobs</code> is ")
-        .raw("the client API but job submission, which takes an enrolled relay; ")
-        .raw("<code>capacity</code> only asks for room. Pools are ")
-        .raw("comma-separated, <code>*</code> for any. A job's largest memory and disk take ")
-        .raw("<code>&lt;n&gt;K|M|G|T</code>; memory at least <code>1M</code>. A limit left ")
-        .raw("empty is unbounded. The key is shown a single time.</p></section>");
+        .raw("<p class=\"sub\">This works like <code>vk-hub keys create</code>. Scope ")
+        .raw("<code>jobs</code> gives the client API except job submission, which needs an ")
+        .raw("enrolled relay. Scope <code>capacity</code> only asks for room. Separate pools ")
+        .raw("with commas, or use <code>*</code> for any. Give a job's largest memory and disk ")
+        .raw("as <code>&lt;n&gt;K|M|G|T</code>. Memory must be at least <code>1M</code>. A ")
+        .raw("limit left empty is unbounded. The key is shown a single time.</p></section>");
 }
 
 /// `POST /clients`: create (`create`), revoke (`revoke`) or remove (`remove`) a key, or add
@@ -1475,17 +1478,17 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
         .text(&row.name)
         .raw("</strong> works until ");
     pages::at(&mut main, row.expires_at)
-        .raw(". It is shown this once: copy it now.</p><pre>")
+        .raw(". It is shown only this once, so copy it now.</p><pre>")
         .text(&key)
-        .raw("</pre><p>Keep it where only its holder reads it. A client sends it to the hub's ")
-        .raw("client API, at <code>");
+        .raw("</pre><p>Store it where only its holder can read it. A client sends it to the ")
+        .raw("hub's client API at <code>");
     match &ui.hub.node_url {
         Some(url) => main.text(url),
         None => main.raw("&lt;hub-url&gt;"),
     };
     main.raw("</code>, as <code>Authorization: Bearer &lt;key&gt;</code>. A GitLab runner ")
-        .raw("needs none: <code>vk-gitlab</code> enrolls as a relay, from the GitLab ")
-        .raw("adapters page.</p><p><a href=\"")
+        .raw("does not need a key. Instead, <code>vk-gitlab</code> enrolls as a relay, from ")
+        .raw("the GitLab adapters page.</p><p><a href=\"")
         .raw(KEYS_PATH)
         .raw("\">Back to the API keys</a></p>");
     Ok(page(fleet::layout("API key", KEYS_PATH, auth, &main)))
@@ -1582,9 +1585,9 @@ async fn remove_server(
         path: PATH.to_string(),
         back: GITLAB_PATH.to_string(),
         op: "remove".to_string(),
-        what: "Remove this GitLab server? Its projects' approvals go with it, and a relay that \
-               reports it again waits for approval; its name stays taken until its jobs leave \
-               the history.",
+        what: "Remove this GitLab server? Its projects' approvals are removed with it. If a \
+               relay reports the server again, the server waits for approval. The server's \
+               name stays taken until its jobs leave the history.",
         detail,
         asked: vec![
             ("server", name.clone()),
@@ -1673,9 +1676,10 @@ async fn remove_relay(
         path: PATH.to_string(),
         back: RELAYS_PATH.to_string(),
         op: REMOVE_RELAY.to_string(),
-        what: "Remove this relay? Its key is no longer trusted and its session ends: it takes \
-               no more jobs, and can no longer follow or settle those under way. Enrolling it \
-               again takes a new token and `vk-gitlab join --replace`.",
+        what: "Remove this relay? The hub stops trusting the relay's key and ends its \
+               session. The relay takes no more jobs, and can no longer follow or settle jobs \
+               under way. To enroll it again, you need a new token and `vk-gitlab join \
+               --replace`.",
         detail,
         asked: vec![("relay", id.clone())],
     };
@@ -1829,7 +1833,7 @@ async fn decide_projects(
         return Ok(actions::refused(
             htmx,
             StatusCode::BAD_REQUEST,
-            "Refused: a project's page decides on that project alone.",
+            "Refused: a project's page can decide only on that one project.",
         ));
     }
     if from_page && !crate::store::valid_gitlab_name(&gitlab) {
@@ -2038,7 +2042,7 @@ async fn revoke(
         return Ok(actions::refused(
             htmx,
             StatusCode::CONFLICT,
-            "Refused: it changed since you looked; look again.",
+            "Refused: it changed since you looked. Look at it again.",
         ));
     }
     let (reservations, jobs) =
@@ -2074,17 +2078,17 @@ async fn revoke(
         op: op.name().to_string(),
         what: match (op, keys.len()) {
             (KeyOp::Revoke, _) => {
-                "Revoke this API key? It stops working at once: whatever holds it can reserve \
-                 and place nothing more, and can no longer follow or settle its jobs under \
-                 way."
+                "Revoke this API key? The key stops working immediately. Whoever holds it can \
+                 no longer reserve or place anything, nor follow or settle its jobs under way."
             }
             (KeyOp::Remove, 1) => {
-                "Remove this API key, which no longer works? Its client instances go with it \
-                 and its name is free again; its jobs stay in the history."
+                "Remove this API key, which no longer works? Its client instances are removed \
+                 with it, and its name becomes free again. Its jobs stay in the history."
             }
             (KeyOp::Remove, _) => {
-                "Remove these API keys, which no longer work? Their client instances go with \
-                 them and their name is free again; their jobs stay in the history."
+                "Remove these API keys, which no longer work? Their client instances are \
+                 removed with them, and their name becomes free again. Their jobs stay in the \
+                 history."
             }
         },
         detail,
@@ -2107,7 +2111,7 @@ async fn revoke(
             return Ok(actions::refused(
                 htmx,
                 StatusCode::CONFLICT,
-                "Refused: it changed since you were asked; look again.",
+                "Refused: it changed since you were asked. Look at it again.",
             ));
         }
         Err(e) => return Err(e),

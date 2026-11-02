@@ -324,7 +324,7 @@ pub fn sign_in(token: &str) -> Html {
     h.raw("<body><main><form class=\"message\" method=\"post\" action=\"/login\">")
         .raw("<input type=\"hidden\" name=\"t\" value=\"")
         .text(token)
-        .raw("\"><p>This link signs this browser in to the hub's web UI, once.</p>")
+        .raw("\"><p>This link signs this browser in to the hub's web UI. It works only once.</p>")
         .raw("<button>Sign in</button></form></main></body></html>");
     h
 }
@@ -339,8 +339,8 @@ pub fn sign_in_with(text: &str, provider: &str) -> Html {
         .text(text)
         .raw("</p><a class=\"button\" href=\"/auth/login\">Sign in with ")
         .text(provider)
-        .raw("</a><p>Or, on the hub's host, <code>vk-hub ui login</code> prints a link ")
-        .raw("that signs you in.</p></div></main></body></html>");
+        .raw("</a><p>Or run <code>vk-hub ui login</code> on the hub's host and open the link ")
+        .raw("it prints.</p></div></main></body></html>");
     h
 }
 
@@ -351,12 +351,13 @@ pub fn refused(identity: &str, unverified: bool) -> Html {
     head(&mut h, "Sign in");
     h.raw("<body><main><p class=\"message\">You signed in as ")
         .text(identity)
-        .raw(", who may not use this hub's web UI. Its operator lets people in by email, ")
-        .raw("with <code>vk-hub accounts grant</code>");
+        .raw(", but this identity may not use this hub's web UI. The hub's operator grants ")
+        .raw("access by email address, with <code>vk-hub accounts grant</code>.");
     if unverified {
-        h.raw(", but your provider marks your email unverified");
+        h.raw(" Your provider marks your email unverified, so the hub does not check it ")
+            .raw("against the grants.");
     }
-    h.raw(".</p></main></body></html>");
+    h.raw("</p></main></body></html>");
     h
 }
 
@@ -374,7 +375,7 @@ pub fn signed_in() -> Html {
 /// site's, says how to sign in again.
 pub fn signed_out_fragment(sign_in: &'static str) -> Html {
     let mut h = Html::new();
-    h.raw("<p class=\"message\">Signed out: this page no longer updates. ")
+    h.raw("<p class=\"message\">Signed out. This page no longer updates. ")
         .raw(sign_in)
         .raw("</p>");
     h
@@ -418,7 +419,7 @@ pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: &
         if !found.rows.is_empty() {
             main.raw(", ").text(found.rows.len()).raw(" matching");
         }
-        main.raw("; there are older ones.</p>");
+        main.raw(". Older lines exist.</p>");
     }
     if found.rows.is_empty() {
         let unfiltered = *filter == AuditFilter::default() && page.before.is_none();
@@ -427,8 +428,8 @@ pub fn audit(auth: &Auth, page: &AuditPage, subjects: Option<&[Subject]>, nav: &
             _ if unfiltered && !with_node => "<p class=\"empty\">nothing yet</p>",
             _ if page.before.is_some() => "<p class=\"empty\">no older lines match</p>",
             _ if with_node && filter.category == AuditCategory::NotJobs => {
-                "<p class=\"empty\" role=\"status\">none match; jobs are left out unless \
-                 Jobs or Everything is chosen</p>"
+                "<p class=\"empty\" role=\"status\">none match. Jobs are left out unless \
+                 you choose Jobs or Everything.</p>"
             }
             _ => "<p class=\"empty\" role=\"status\">none match</p>",
         });

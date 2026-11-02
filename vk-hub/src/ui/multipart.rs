@@ -153,10 +153,10 @@ where
                         break;
                     }
                     if self.buf.len() > MAX_PREAMBLE + self.delimiter.len() {
-                        return Err(Refusal::Malformed("no boundary starts it"));
+                        return Err(Refusal::Malformed("it has no opening boundary"));
                     }
                     if !self.fill().await? {
-                        return Err(Refusal::Malformed("no boundary starts it"));
+                        return Err(Refusal::Malformed("it has no opening boundary"));
                     }
                 },
                 State::Boundary => {
@@ -187,7 +187,9 @@ where
                     .split_once("\r\n")
                     .ok_or(Refusal::Malformed("a boundary line does not end"))?;
                 if !line.bytes().all(|b| b == b' ' || b == b'\t') {
-                    return Err(Refusal::Malformed("a boundary line goes on past it"));
+                    return Err(Refusal::Malformed(
+                        "a boundary line has text after the boundary",
+                    ));
                 }
                 return Ok(rest
                     .split("\r\n")
