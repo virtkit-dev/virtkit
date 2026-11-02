@@ -9,7 +9,6 @@
 //! under it, its outcome reported under its own ID, and once (but for a job found empty).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +36,7 @@ pub struct Fault {
     pub path_prefix: String,
     /// What the path ends with, `""` for any.
     pub path_suffix: String,
+    /// The answer's status; 0 cuts the connection without one.
     pub status: u16,
     pub code: ErrorCode,
     pub retry_after_secs: Option<u32>,
@@ -137,6 +137,7 @@ fn dispatch_error(e: DispatchError) -> Resp {
         .retry_after
         .map(|d| u32::try_from(d.as_secs()).unwrap_or(1));
     let (status, code) = match e.kind {
+        ErrorKind::Invalid => (400, ErrorCode::Invalid),
         ErrorKind::NotFound => (404, ErrorCode::NotFound),
         ErrorKind::Conflict => (409, ErrorCode::Conflict),
         ErrorKind::ReservationGone => (410, ErrorCode::ReservationGone),
@@ -545,7 +546,7 @@ impl FakeHub {
                                     serde_json::from_slice(&body).unwrap();
                                 *key.lock().unwrap() =
                                     Some(vk_hub_proto::from_hex(&ask.public_key).unwrap());
-                                return Ok::<_, Infallible>(json(
+                                return Ok::<_, std::io::Error>(json(
                                     200,
                                     &vk_hub_proto::gitlab::EnrollResponse {
                                         relay_id: TEST_RELAY_ID.to_owned(),
@@ -584,6 +585,9 @@ impl FakeHub {
                                 }
                             };
                             if let Some(f) = fault {
+                                if f.status == 0 {
+                                    return Err(std::io::Error::other("connection cut"));
+                                }
                                 let mut r = error(f.status, f.code, "injected", f.retry_after_secs);
                                 if let Some(s) = f.retry_after_secs {
                                     r.headers_mut()
@@ -662,7 +666,8 @@ impl FakeHub {
         *self.queue_response_delay.lock().unwrap() = Some(delay);
     }
 
-    /// Answers the next `n` requests under `path_prefix` with `status` and `code`.
+    /// Answers the next `n` requests under `path_prefix` with `status` and `code`; status 0
+    /// cuts their connection instead.
     pub fn fail_next(
         &self,
         n: usize,
@@ -675,7 +680,7 @@ impl FakeHub {
     }
 
     /// Answers the next `n` requests under `path_prefix` whose path ends with `path_suffix`
-    /// with `status` and `code`.
+    /// with `status` and `code`; status 0 cuts their connection instead.
     pub fn fail_next_ending(
         &self,
         n: usize,

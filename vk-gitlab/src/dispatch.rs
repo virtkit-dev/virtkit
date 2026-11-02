@@ -247,7 +247,7 @@ pub trait Dispatcher: Send + Sync + 'static {
 pub use fake::{FakeCall, FakeDispatcher};
 
 mod fake {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     use tokio::sync::Notify;
@@ -289,6 +289,10 @@ mod fake {
         calls: Vec<FakeCall>,
         refuse_submit: Option<DispatchError>,
         refuse_renew: Option<DispatchError>,
+        /// What the next cancels fail with, in order.
+        refuse_cancels: VecDeque<DispatchError>,
+        /// Cancels wait while set, once recorded.
+        hold_cancels: bool,
         /// Job ID → reads of its view (`GET /v1/jobs/<id>`) started.
         view_reads: HashMap<String, usize>,
         /// The runner each capacity and reservation request named, in order.
@@ -406,6 +410,17 @@ mod fake {
         /// Makes the next renewals fail with `err`, or succeed again with `None`.
         pub fn refuse_renew(&self, err: Option<DispatchError>) {
             self.lock().refuse_renew = err;
+        }
+
+        /// Makes the next cancels fail with `errs`, one each.
+        pub fn refuse_cancels(&self, errs: impl IntoIterator<Item = DispatchError>) {
+            self.lock().refuse_cancels.extend(errs);
+        }
+
+        /// Holds the cancels asked from now on, once recorded, until called with `false`.
+        pub fn hold_cancels(&self, held: bool) {
+            self.lock().hold_cancels = held;
+            self.changed.notify_waiters();
         }
 
         /// Cuts a job's output back to `len` bytes, as a hub that lost some of it would.
@@ -737,9 +752,12 @@ mod fake {
         }
 
         async fn cancel(&self, id: &str, mode: CancelMode) -> DispatchResult<JobView> {
-            self.lock()
-                .calls
-                .push(FakeCall::Cancel(id.to_owned(), mode));
+            self.record(FakeCall::Cancel(id.to_owned(), mode));
+            self.poll(None, |i| (!i.hold_cancels).then_some(()), |_| ())
+                .await;
+            if let Some(err) = self.lock().refuse_cancels.pop_front() {
+                return Err(err);
+            }
             self.update(id, |j| {
                 if j.view.state != HubJobState::Finished
                     && j.view.cancel != Some(CancelMode::Immediate)

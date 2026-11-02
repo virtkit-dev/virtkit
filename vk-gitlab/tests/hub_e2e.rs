@@ -21,7 +21,7 @@ use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::relay;
 use vk_gitlab::spec::{self, SpecContext};
 use vk_gitlab::state::{JobRecord, Phase, StateFile};
-use vk_hub_proto::client::{AdmissionOutcome, ErrorCode};
+use vk_hub_proto::client::{AdmissionOutcome, CancelRequest, ErrorCode};
 use vk_hub_proto::job::JobSpec;
 use vk_peer::identity::Identity;
 
@@ -886,5 +886,237 @@ async fn a_restarted_relay_submits_under_the_admission_it_held() {
         !held(&status)
     })
     .await;
+    h.stop().await;
+}
+
+/// Requests to the hub for job `hub_id` whose path ends with `what`.
+fn job_requests(h: &Harness, hub_id: &str, what: &str) -> usize {
+    let path = format!("/v1/jobs/{hub_id}/{what}");
+    h.http_hub.as_ref().unwrap().requests_to(&path)
+}
+
+/// Cancels of job `hub_id` the hub received asking for `mode`.
+fn cancels_asking(h: &Harness, hub_id: &str, mode: CancelMode) -> usize {
+    let path = format!("/v1/jobs/{hub_id}/cancel");
+    h.http_hub
+        .as_ref()
+        .unwrap()
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.path == path
+                && serde_json::from_slice::<CancelRequest>(&r.body).is_ok_and(|c| c.mode == mode)
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_graceful_cancel_the_hub_did_not_take_is_sent_again() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(63));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.fail_next_ending(
+        1000,
+        "/v1/jobs/",
+        "/cancel",
+        503,
+        ErrorCode::Unavailable,
+        None,
+    );
+    h.gl.set_status(63, "canceling");
+    eventually("a cancel refused", || {
+        job_requests(&h, &hub_id, "cancel") >= 1
+    })
+    .await;
+    // The job's output reaches GitLab while the cancel is retried.
+    h.hub.push_output(&hub_id, b"still running\n");
+    eventually("the output in the trace", || {
+        h.gl.log(63) == "still running\n"
+    })
+    .await;
+    let refused = job_requests(&h, &hub_id, "cancel");
+    // Past the hub client's own five attempts: the cancel itself is sent again.
+    eventually("the cancel retried", || {
+        job_requests(&h, &hub_id, "cancel") > refused.max(5)
+    })
+    .await;
+    fake_hub.clear_faults();
+    within(
+        "the graceful cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Graceful)),
+    )
+    .await;
+    // Taken: not sent again, though GitLab still asks.
+    let sent = job_requests(&h, &hub_id, "cancel");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(job_requests(&h, &hub_id, "cancel"), sent);
+    h.gl.clear_status(63);
+    h.hub.finish(
+        &hub_id,
+        Some(vk_gitlab::dispatch::FailureClass::Canceled),
+        None,
+    );
+    assert_eq!(h.final_update(63).await["state"], "failed");
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_immediate_cancel_replaces_a_graceful_one_not_taken() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(64));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    fake_hub.fail_next_ending(
+        1000,
+        "/v1/jobs/",
+        "/cancel",
+        0,
+        ErrorCode::Unavailable,
+        None,
+    );
+    h.gl.set_status(64, "canceling");
+    eventually("a graceful cancel cut off", || {
+        cancels_asking(&h, &hub_id, CancelMode::Graceful) >= 1
+    })
+    .await;
+    // GitLab then ends the job.
+    h.gl.set_status(64, "canceled");
+    h.hub.push_output(&hub_id, b"x\n");
+    eventually("an immediate cancel cut off", || {
+        cancels_asking(&h, &hub_id, CancelMode::Immediate) >= 1
+    })
+    .await;
+    fake_hub.clear_faults();
+    within(
+        "the immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    h.hub.finish(
+        &hub_id,
+        Some(vk_gitlab::dispatch::FailureClass::Canceled),
+        None,
+    );
+    within(
+        "the settle",
+        h.hub.wait_for_call(FakeCall::Settle(hub_id.clone())),
+    )
+    .await;
+    assert!(
+        !h.hub
+            .calls()
+            .contains(&FakeCall::Cancel(hub_id, CancelMode::Graceful)),
+        "the graceful cancel was replaced, not sent after"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_not_placed_in_time_is_canceled_until_the_hub_takes_it() {
+    let mut h = Harness::unstarted(2, Via::Http).await;
+    // Room for the cut cancels before the job's settle wait ends.
+    h.options.hub.settle_wait = Duration::from_secs(10);
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        8,
+        "/v1/jobs/",
+        "/cancel",
+        0,
+        ErrorCode::Unavailable,
+        None,
+    );
+    h.gl.push_job(job_json(65));
+    // Never accepted: past place_within, failed in GitLab and canceled on the hub.
+    let (hub_id, _) = within("a submitted job", h.hub.wait_for_job(1)).await;
+    let fin = h.final_update(65).await;
+    assert_eq!(fin["failure_reason"], "runner_system_failure");
+    assert!(h.gl.log(65).contains("did not report it placed in time"));
+    assert!(!h.committed(65));
+    within(
+        "the immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    assert_eq!(cancels_asking(&h, &hub_id, CancelMode::Immediate), 9);
+    h.hub.finish(
+        &hub_id,
+        Some(vk_gitlab::dispatch::FailureClass::Canceled),
+        None,
+    );
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    let state = h.state_dir.join("r1.json");
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_immediate_cancel_the_hub_did_not_take_is_sent_again() {
+    let mut h = Harness::unstarted(2, Via::Http).await;
+    // Room for the cut cancels before the job's settle wait ends.
+    h.options.hub.settle_wait = Duration::from_secs(10);
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(66));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        8,
+        "/v1/jobs/",
+        "/cancel",
+        0,
+        ErrorCode::Unavailable,
+        None,
+    );
+    // GitLab ends the job.
+    h.gl.set_status(66, "canceled");
+    h.hub.push_output(&hub_id, b"x\n");
+    within(
+        "the immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    assert_eq!(cancels_asking(&h, &hub_id, CancelMode::Immediate), 9);
+    h.hub.finish(
+        &hub_id,
+        Some(vk_gitlab::dispatch::FailureClass::Canceled),
+        None,
+    );
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    let state = h.state_dir.join("r1.json");
+    eventually("the job dropped", || records(&state).is_empty()).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_of_a_job_the_hub_does_not_have_is_not_retried() {
+    let h = Harness::start(2, Via::Http).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(67));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.http_hub.as_ref().unwrap().fail_next_ending(
+        1,
+        "/v1/jobs/",
+        "/cancel",
+        404,
+        ErrorCode::NotFound,
+        None,
+    );
+    h.gl.set_status(67, "canceling");
+    eventually("the cancel", || job_requests(&h, &hub_id, "cancel") == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(job_requests(&h, &hub_id, "cancel"), 1);
+    h.gl.clear_status(67);
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(67).await["state"], "success");
     h.stop().await;
 }

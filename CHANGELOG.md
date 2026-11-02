@@ -73,6 +73,10 @@ All notable changes to virtkit will be documented in this file.
   a registry that is restarting or busy, for up to a few minutes, rather than skipping the
   cache at once. A registry that stays unavailable, or stops answering, is not waited for
   again by that step's other caches.
+- **GitLab cancels reach the node across a hub restart.** A GitLab adapter keeps asking the
+  hub to cancel a job GitLab canceled, gracefully or not, until the hub takes it, rather than
+  giving up after about 15 seconds and leaving the job running on its node until the
+  adapter's next restart; GitLab's trace and updates go on meanwhile.
 
 ## [0.101.0] - 2026-11-01
 

@@ -1382,13 +1382,15 @@ enum Placed {
     Accepted(JobView),
     /// Ended before a node accepted it (not placed in time, or the hub lost it).
     Unplaced(JobView),
+    /// The hub reported neither placement nor completion in time; cancellation is still needed.
+    TimedOut(JobView),
     /// The runner aborted its jobs first; the job as last seen.
     Interrupted(JobView),
 }
 
 /// Follows a submitted job until a node accepts it or it ends. The hub ends a job it could
 /// not place within `place_within`; a hub that says nothing for that long and one more
-/// `wait` leaves the job unplaced.
+/// `wait` times it out ([`Placed::TimedOut`]).
 async fn wait_until_placed<D: Dispatcher>(shared: &Shared<D>, mut view: JobView) -> Placed {
     let mut abort = shared.shutdown.abort.clone();
     let hub = &shared.options.hub;
@@ -1416,18 +1418,7 @@ async fn wait_until_placed<D: Dispatcher>(shared: &Shared<D>, mut view: JobView)
         }
         if Instant::now() >= deadline {
             log::error!(hub_job = view.id.as_str(); "The hub did not report the job placed in time");
-            if let Err(e) = shared
-                .bounded(shared.dispatcher.cancel(&view.id, CancelMode::Immediate))
-                .await
-            {
-                log::warn!(hub_job = view.id.as_str(), error = e.to_string().as_str(); "Cancelling the job failed");
-            }
-            view.state = HubJobState::Finished;
-            view.result = Some(lost(
-                "the hub did not report it placed in time".to_owned(),
-                0,
-            ));
-            continue;
+            return Placed::TimedOut(view);
         }
         let next = tokio::select! {
             v = shared.dispatcher.job(&view.id, Some(view.revision), hub.wait) => v,
@@ -1511,6 +1502,102 @@ async fn settle<D: Dispatcher>(shared: &Shared<D>, id: &str) -> bool {
             false
         }
     }
+}
+
+/// Whether `mode` is stronger than `than`. Immediate overrides graceful; the protocol
+/// treats `Other` as immediate.
+fn stronger(mode: CancelMode, than: Option<CancelMode>) -> bool {
+    match than {
+        None => true,
+        Some(CancelMode::Graceful) => mode != CancelMode::Graceful,
+        Some(CancelMode::Immediate | CancelMode::Other) => false,
+    }
+}
+
+/// Delivers the strongest cancel in `wanted`, retrying failures with backoff until accepted,
+/// missing (404), or malformed (400). A stronger request replaces the pending call or wait.
+/// The hub retains accepted cancels, forwards them to the node, and accepts duplicates as
+/// no-ops. Ends when the job is missing, or nothing remains to send and `wanted`'s sender is
+/// gone. The caller drops it when the job no longer needs canceling.
+async fn deliver_cancel<D: Dispatcher>(
+    shared: &Shared<D>,
+    id: &str,
+    mut wanted: watch::Receiver<Option<CancelMode>>,
+) {
+    let mut errors = HubErrors::new(&shared.options.hub);
+    let mut sent = None;
+    loop {
+        let want = *wanted.borrow_and_update();
+        let Some(mode) = want.filter(|m| stronger(*m, sent)) else {
+            if wanted.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let answer = tokio::select! {
+            r = shared.bounded(shared.dispatcher.cancel(id, mode)) => r,
+            () = stronger_asked(&mut wanted, mode) => continue,
+        };
+        match answer {
+            Ok(_) => {
+                errors.ok();
+                sent = Some(mode);
+            }
+            Err(e) if e.kind == ErrorKind::NotFound => {
+                log::info!(hub_job = id, error = e.to_string().as_str(); "The hub no longer has the job; it is not canceled");
+                return;
+            }
+            Err(e) if e.kind == ErrorKind::Invalid => {
+                // Not sent again; a stronger one still is.
+                log::error!(hub_job = id, error = e.to_string().as_str(); "The cancel is malformed; not sending it again");
+                sent = Some(mode);
+            }
+            Err(e) => {
+                let pause = errors.failed(id, "Canceling the job", &e);
+                tokio::select! {
+                    () = tokio::time::sleep(pause) => {}
+                    () = stronger_asked(&mut wanted, mode) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Resolves once `wanted` asks for a cancel stronger than `mode`; never once its sender is
+/// gone.
+async fn stronger_asked(wanted: &mut watch::Receiver<Option<CancelMode>>, mode: CancelMode) {
+    loop {
+        if wanted.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        if wanted.borrow().is_some_and(|m| stronger(m, Some(mode))) {
+            return;
+        }
+    }
+}
+
+/// Runs `main` to its end, with `side` making progress alongside until either ends.
+async fn alongside<T>(main: impl Future<Output = T>, side: impl Future<Output = ()>) -> T {
+    let mut main = std::pin::pin!(main);
+    tokio::select! {
+        // `main` first: its result wins when both are ready.
+        biased;
+        t = &mut main => return t,
+        () = side => {}
+    }
+    main.await
+}
+
+/// Runs `main` while canceling the hub job `id` with `mode`, as [`deliver_cancel`] does,
+/// until `main` ends.
+async fn while_canceling<D: Dispatcher, T>(
+    shared: &Shared<D>,
+    id: &str,
+    mode: CancelMode,
+    main: impl Future<Output = T>,
+) -> T {
+    let (_want, wanted) = watch::channel(Some(mode));
+    alongside(main, deliver_cancel(shared, id, wanted)).await
 }
 
 /// Follows a job until the hub reports it over, for at most `settle_wait`, then settles it;
@@ -1856,12 +1943,14 @@ async fn drive<D: Dispatcher>(
                 Err(Aborted) => {}
                 Ok(None) => drop_record("settled").await,
                 Ok(Some(v)) => {
-                    if v.state != HubJobState::Finished {
-                        let _ = shared
-                            .bounded(shared.dispatcher.cancel(&id, CancelMode::Immediate))
-                            .await;
-                    }
-                    if settle_when_over(shared, v).await {
+                    let finished = v.state == HubJobState::Finished;
+                    let settled = settle_when_over(shared, v);
+                    let settled = if finished {
+                        settled.await
+                    } else {
+                        while_canceling(shared, &id, CancelMode::Immediate, settled).await
+                    };
+                    if settled {
                         drop_record("settled").await;
                     }
                 }
@@ -1884,10 +1973,9 @@ async fn drive<D: Dispatcher>(
                     rec.phase = Phase::Reported;
                     let put = rec.clone();
                     record(runner, "reported", move |s| s.put(put)).await;
-                    let _ = shared
-                        .bounded(shared.dispatcher.cancel(&v.id, CancelMode::Immediate))
-                        .await;
-                    if settle_when_over(shared, v).await {
+                    let id = v.id.clone();
+                    let settled = settle_when_over(shared, v);
+                    if while_canceling(shared, &id, CancelMode::Immediate, settled).await {
                         drop_record("settled").await;
                     }
                 }
@@ -2011,7 +2099,7 @@ async fn drive<D: Dispatcher>(
     };
     let hub_id = view.id.clone();
 
-    let mut graceful_sent = false;
+    let mut cancel = None;
     let view = if rec.phase == Phase::Committed {
         view
     } else {
@@ -2033,16 +2121,30 @@ async fn drive<D: Dispatcher>(
                 report_then_settle(runner, gitlab_job, settle(shared, &hub_id)).await;
                 return;
             }
-            Placed::Interrupted(v) => {
-                let _ = shared
-                    .bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Immediate))
+            Placed::TimedOut(v) => {
+                let failed = async {
+                    fail(
+                        "Job failed (system failure): the fleet could not place the job: \
+                         the hub did not report it placed in time"
+                            .to_owned(),
+                        FailureReason::runner_system_failure(),
+                    )
                     .await;
-                fail(
-                    "Job failed: aborted: the runner is shutting down".to_owned(),
-                    FailureReason::new(FailureReason::RUNNER_INTERRUPTED),
-                )
-                .await;
-                report_then_settle(runner, gitlab_job, settle_when_over(shared, v)).await;
+                    report_then_settle(runner, gitlab_job, settle_when_over(shared, v)).await;
+                };
+                while_canceling(shared, &hub_id, CancelMode::Immediate, failed).await;
+                return;
+            }
+            Placed::Interrupted(v) => {
+                let failed = async {
+                    fail(
+                        "Job failed: aborted: the runner is shutting down".to_owned(),
+                        FailureReason::new(FailureReason::RUNNER_INTERRUPTED),
+                    )
+                    .await;
+                    report_then_settle(runner, gitlab_job, settle_when_over(shared, v)).await;
+                };
+                while_canceling(shared, &hub_id, CancelMode::Immediate, failed).await;
                 return;
             }
         };
@@ -2053,10 +2155,8 @@ async fn drive<D: Dispatcher>(
             .await;
         if update.state == UpdateState::Abort {
             log::warn!(job = gitlab_job, hub_job = hub_id.as_str(); "GitLab refused the job's commit; canceling it");
-            let _ = shared
-                .bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Immediate))
-                .await;
-            report_then_settle(runner, gitlab_job, settle_when_over(shared, view)).await;
+            let reported = report_then_settle(runner, gitlab_job, settle_when_over(shared, view));
+            while_canceling(shared, &hub_id, CancelMode::Immediate, reported).await;
             return;
         }
         rec.phase = Phase::Committed;
@@ -2065,15 +2165,13 @@ async fn drive<D: Dispatcher>(
         })
         .await;
         if update.cancel_requested {
-            graceful_sent = true;
-            let _ = shared
-                .bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Graceful))
-                .await;
+            log::info!(job = gitlab_job; "GitLab requested the job to be canceled");
+            cancel = Some(CancelMode::Graceful);
         }
         log::info!(job = gitlab_job, hub_job = hub_id.as_str(), node = view.node.as_deref().unwrap_or(""); "Job committed");
         view
     };
-    follow(shared, runner, rec, view, mapper, resumed, graceful_sent).await;
+    follow(shared, runner, rec, view, mapper, resumed, cancel).await;
 }
 
 /// The runner aborted its jobs.
@@ -2131,7 +2229,7 @@ async fn prefill<D: Dispatcher>(
 }
 
 /// A committed job: its output copied into the trace, GitLab's cancel and abort relayed,
-/// its outcome reported, and the job settled.
+/// its outcome reported, and the job settled. `cancel` is a cancel GitLab asked for already.
 async fn follow<D: Dispatcher>(
     shared: &Shared<D>,
     runner: &Runner,
@@ -2139,7 +2237,7 @@ async fn follow<D: Dispatcher>(
     view: JobView,
     mapper: FailureReasonMapper,
     resumed: bool,
-    mut graceful_sent: bool,
+    cancel: Option<CancelMode>,
 ) {
     let gitlab_job = rec.gitlab_job;
     let hub_id = view.id.clone();
@@ -2201,6 +2299,19 @@ async fn follow<D: Dispatcher>(
     };
     // Boxed instead of `pin!` so the future can be dropped when the loop ends.
     let mut view_poll = Box::pin(poll_view(view.revision, view_at));
+    // The strongest cancel asked for, delivered alongside the rest of the job until it lands.
+    let (want_cancel, wanted) = watch::channel(cancel);
+    let ask_cancel = |mode| {
+        want_cancel.send_if_modified(|w| {
+            let more = stronger(mode, *w);
+            if more {
+                *w = Some(mode);
+            }
+            more
+        })
+    };
+    let mut cancel_call = std::pin::pin!(deliver_cancel(shared, &hub_id, wanted));
+    let mut cancel_ended = false;
     loop {
         if output_done && view.state == HubJobState::Finished {
             break;
@@ -2210,10 +2321,8 @@ async fn follow<D: Dispatcher>(
                 output_done = true;
                 if let Err(e) = r {
                     log::error!(job = gitlab_job, error = e.to_string().as_str(); "The hub lost the job's output");
-                    if view.state != HubJobState::Finished
-                        && let Err(e) = shared.bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Immediate)).await
-                    {
-                        log::warn!(job = gitlab_job, hub_job = hub_id.as_str(), error = e.to_string().as_str(); "Canceling the job failed");
+                    if view.state != HubJobState::Finished {
+                        ask_cancel(CancelMode::Immediate);
                     }
                     view.state = HubJobState::Finished;
                     view.result.get_or_insert(lost(e.message, trace.len() as u64));
@@ -2245,12 +2354,11 @@ async fn follow<D: Dispatcher>(
                     aborted_by_gitlab = true;
                     break;
                 }
-                if r.cancel && !graceful_sent {
-                    graceful_sent = true;
+                if r.cancel && ask_cancel(CancelMode::Graceful) {
                     log::info!(job = gitlab_job; "GitLab requested the job to be canceled");
-                    let _ = shared.bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Graceful)).await;
                 }
             }
+            () = &mut cancel_call, if !cancel_ended => cancel_ended = true,
             _ = tick.tick() => {
                 let sent = trace.sent() as u64;
                 if sent != rec.trace_offset && offset_saved.elapsed() >= shared.options.trace_offset_interval {
@@ -2262,7 +2370,7 @@ async fn follow<D: Dispatcher>(
             () = wait_true(&mut abort), if !interrupted => {
                 interrupted = true;
                 abort_deadline = Some(Instant::now() + hub.settle_wait);
-                let _ = shared.bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Immediate)).await;
+                ask_cancel(CancelMode::Immediate);
             }
             () = sleep_until(abort_deadline) => {
                 log::warn!(job = gitlab_job, hub_job = hub_id.as_str(); "The hub did not report the aborted job ended; reporting it interrupted");
@@ -2276,11 +2384,22 @@ async fn follow<D: Dispatcher>(
     if aborted_by_gitlab {
         // GitLab ended the job: stop it now and write nothing more.
         log::warn!(job = gitlab_job; "GitLab ended the job; canceling it");
-        let _ = shared
-            .bounded(shared.dispatcher.cancel(&hub_id, CancelMode::Immediate))
-            .await;
-        trace.finish().await;
-        report_then_settle(runner, gitlab_job, settle_when_over(shared, view)).await;
+        ask_cancel(CancelMode::Immediate);
+    }
+    // An immediate cancel goes on alongside the reporting and the settle until it lands; a
+    // graceful one is moot once the job finished.
+    let cancel_left = !cancel_ended && *want_cancel.borrow() == Some(CancelMode::Immediate);
+    let cancel_call = async {
+        if cancel_left {
+            cancel_call.as_mut().await;
+        }
+    };
+    if aborted_by_gitlab {
+        let reported = async {
+            trace.finish().await;
+            report_then_settle(runner, gitlab_job, settle_when_over(shared, view)).await;
+        };
+        alongside(reported, cancel_call).await;
         return;
     }
 
@@ -2288,37 +2407,40 @@ async fn follow<D: Dispatcher>(
         .result
         .clone()
         .unwrap_or_else(|| lost("the hub gave no result".to_owned(), trace.len() as u64));
-    let reported = if interrupted {
-        trace
-            .fail(FailureReason::new(FailureReason::RUNNER_INTERRUPTED), 0)
-            .await
-    } else {
-        match result.failure {
-            None => trace.success().await,
-            Some(class) => {
-                trace
-                    .fail(FailureReason::from(class), result.exit_code.unwrap_or(0))
-                    .await
+    let reported = async {
+        let reported = if interrupted {
+            trace
+                .fail(FailureReason::new(FailureReason::RUNNER_INTERRUPTED), 0)
+                .await
+        } else {
+            match result.failure {
+                None => trace.success().await,
+                Some(class) => {
+                    trace
+                        .fail(FailureReason::from(class), result.exit_code.unwrap_or(0))
+                        .await
+                }
+            }
+        };
+        match reported {
+            Ok(()) => {
+                // Unfinished only once the abort's deadline passed: the hub would refuse the
+                // settle, which the next start makes.
+                let settled =
+                    async { view.state == HubJobState::Finished && settle(shared, &hub_id).await };
+                report_then_settle(runner, gitlab_job, settled).await;
+            }
+            // Not settled: the hub keeps the output, and a restarted daemon reports it again.
+            Err(e) => {
+                log::error!(job = gitlab_job, error = e.to_string().as_str(); "Could not report the job's final state");
+                let sent = trace.sent() as u64;
+                if sent != rec.trace_offset {
+                    save_offset(sent).await;
+                }
             }
         }
     };
-    match reported {
-        Ok(()) => {
-            // Unfinished only once the abort's deadline passed: the hub would refuse the
-            // settle, which the next start makes.
-            let settled =
-                async { view.state == HubJobState::Finished && settle(shared, &hub_id).await };
-            report_then_settle(runner, gitlab_job, settled).await;
-        }
-        // Not settled: the hub keeps the output, and a restarted daemon reports it again.
-        Err(e) => {
-            log::error!(job = gitlab_job, error = e.to_string().as_str(); "Could not report the job's final state");
-            let sent = trace.sent() as u64;
-            if sent != rec.trace_offset {
-                save_offset(sent).await;
-            }
-        }
-    }
+    alongside(reported, cancel_call).await;
     log::info!(job = gitlab_job, runner = runner.cfg.name.as_str(); "Job finished");
 }
 
@@ -2400,6 +2522,19 @@ mod tests {
             "2026-10-09T12:10:43.123456Z 00O \x1b[31;1mERROR: one\n\
              2026-10-09T12:10:43.123456Z 00O two\x1b[0;m\n"
         );
+    }
+
+    #[test]
+    fn an_immediate_cancel_overrides_a_graceful_one() {
+        use CancelMode::{Graceful, Immediate, Other};
+        assert!(stronger(Graceful, None));
+        assert!(stronger(Immediate, None));
+        assert!(stronger(Immediate, Some(Graceful)));
+        assert!(!stronger(Graceful, Some(Graceful)));
+        assert!(!stronger(Graceful, Some(Immediate)));
+        assert!(!stronger(Immediate, Some(Immediate)));
+        assert!(!stronger(Graceful, Some(Other)));
+        assert!(!stronger(Immediate, Some(Other)));
     }
 
     // The behaviour of gitlab-runner's commands/health_helper.go: unhealthy after the

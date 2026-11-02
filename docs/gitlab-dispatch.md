@@ -358,7 +358,11 @@ idempotent for a day: the same ID with the same body answers the first answer ag
 release, claim, cancel and settle are idempotent by nature, as are a ticket's cancel and an
 outcome repeated.
 The daemon retries transport errors and every retryable code with backoff from 1 to 30
-seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
+seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx — except
+job cancels. While handling a job, it retries a cancel after any failure with the same
+backoff until the hub accepts it or answers 400 or 404. Delivery runs alongside the trace;
+an immediate cancel replaces a graceful one. If the daemon stops first, its next start
+cancels reported jobs and resumes running ones.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|

@@ -36,6 +36,9 @@ both!(
     reservation_lost_during_the_request,
     gitlab_cancel_is_graceful_and_reported,
     gitlab_abort_cancels_now_and_writes_nothing_more,
+    a_cancel_refused_as_malformed_is_not_sent_again,
+    an_immediate_cancel_replaces_a_graceful_one_mid_call,
+    a_graceful_cancel_not_taken_ends_with_the_job,
     failure_classes_reach_gitlab_mapped,
     unsupported_jobs_fail_before_submission,
     a_job_the_hub_refuses_is_a_system_failure,
@@ -232,6 +235,97 @@ async fn gitlab_abort_cancels_now_and_writes_nothing_more(via: Via) {
         h.updates(8).iter().all(|b| b["state"] == "running"),
         "no final state after GitLab ended the job"
     );
+    h.stop().await;
+}
+
+/// Cancels of job `hub_id` the hub was asked for.
+fn cancels(h: &Harness, hub_id: &str) -> usize {
+    h.hub
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, FakeCall::Cancel(id, _) if id == hub_id))
+        .count()
+}
+
+async fn a_cancel_refused_as_malformed_is_not_sent_again(via: Via) {
+    let h = Harness::start(2, via).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(41));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.hub
+        .refuse_cancels([DispatchError::new(ErrorKind::Invalid, "malformed")]);
+    h.gl.set_status(41, "canceling");
+    within(
+        "a graceful cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Graceful)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cancels(&h, &hub_id), 1);
+    // An immediate one is still sent.
+    h.gl.set_status(41, "canceled");
+    h.hub.push_output(&hub_id, b"x\n");
+    within(
+        "an immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    h.hub.finish(&hub_id, Some(FailureClass::Canceled), None);
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    h.stop().await;
+}
+
+async fn an_immediate_cancel_replaces_a_graceful_one_mid_call(via: Via) {
+    let h = Harness::start(2, via).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(42));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.hub.hold_cancels(true);
+    h.gl.set_status(42, "canceling");
+    within(
+        "a graceful cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Graceful)),
+    )
+    .await;
+    // GitLab ends the job while the graceful cancel is unanswered.
+    h.gl.set_status(42, "canceled");
+    h.hub.push_output(&hub_id, b"x\n");
+    within(
+        "an immediate cancel",
+        h.hub
+            .wait_for_call(FakeCall::Cancel(hub_id.clone(), CancelMode::Immediate)),
+    )
+    .await;
+    h.hub.hold_cancels(false);
+    h.hub.finish(&hub_id, Some(FailureClass::Canceled), None);
+    within("the settle", h.hub.wait_for_call(FakeCall::Settle(hub_id))).await;
+    h.stop().await;
+}
+
+async fn a_graceful_cancel_not_taken_ends_with_the_job(via: Via) {
+    let h = Harness::start(2, via).await;
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(43));
+    let (hub_id, _) = h.accepted_job(1).await;
+    h.hub.refuse_cancels(
+        std::iter::repeat_with(|| DispatchError::new(ErrorKind::Unavailable, "busy")).take(1000),
+    );
+    h.gl.set_status(43, "canceling");
+    eventually("a graceful cancel retried", || cancels(&h, &hub_id) >= 2).await;
+    h.gl.clear_status(43);
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(43).await["state"], "success");
+    within(
+        "the settle",
+        h.hub.wait_for_call(FakeCall::Settle(hub_id.clone())),
+    )
+    .await;
+    let sent = cancels(&h, &hub_id);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cancels(&h, &hub_id), sent, "no cancel once the job ended");
     h.stop().await;
 }
 
