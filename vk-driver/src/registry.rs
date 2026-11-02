@@ -2577,6 +2577,8 @@ trait Transport {
 /// listening — and neither is a body cut short, which is the lossy path above. An idle
 /// pooled connection the registry closes as a request goes out on it reads as back-pressure
 /// too, and is retried all the same.
+///
+/// A certificate the TLS client rejects is final: the next attempt is presented the same one.
 impl Transport for reqwest::Error {
     fn retry(&self) -> Retry {
         use std::io::ErrorKind;
@@ -2603,6 +2605,16 @@ impl Transport for reqwest::Error {
                     _ => {}
                 }
                 transport = true;
+                // A certificate the TLS client rejects, which tokio-rustls wraps in an
+                // `io::Error`, is presented again on the next attempt. An expired or
+                // not-yet-valid one is too, so a host whose clock is off fails at once.
+                if matches!(
+                    e.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+                    Some(rustls::Error::InvalidCertificate(_))
+                ) {
+                    return Retry::Never;
+                }
                 // `source` skips the error an `io::Error` wraps, as hyper-util's connect error
                 // wraps tokio-rustls's handshake EOF.
                 io = e
@@ -2614,7 +2626,7 @@ impl Transport for reqwest::Error {
         if self.is_timeout() {
             Retry::Transport
         } else if self.is_connect() {
-            // A connection not made is retried whatever lies under it.
+            // Retry connection failures regardless of cause, except certificates rejected above.
             if closed {
                 Retry::Pressure
             } else {
@@ -4381,6 +4393,58 @@ pub(crate) mod tests {
             url: "https://registry/v2/".into(),
         };
         assert_eq!(too_many.retry(), Retry::Pressure);
+    }
+
+    /// A certificate the client does not trust is final: the registry presents it again.
+    #[test]
+    fn an_untrusted_certificate_is_final() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        // vk-registry's test certificate for `localhost`, from a private CA no platform root
+        // store trusts.
+        const TLS_CERT: &[u8] = include_bytes!("../../vk-registry/src/testdata/tls-cert.pem");
+        const TLS_KEY: &[u8] = include_bytes!("../../vk-registry/src/testdata/tls-key.pem");
+        install_crypto();
+        let certs = CertificateDer::pem_slice_iter(TLS_CERT)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(TLS_KEY).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut conn = rustls::ServerConnection::new(config).unwrap();
+            // The handshake fails when the client rejects the certificate.
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut stream).is_err() {
+                    break;
+                }
+            }
+        });
+        block_on(async {
+            let client = reqwest::Client::builder()
+                .resolve("localhost", addr)
+                .build()
+                .unwrap();
+            let err = client
+                .get(format!("https://localhost:{}/v2/", addr.port()))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(err.is_connect(), "{err:#}");
+            assert_eq!(err.retry(), Retry::Never, "{err:#}");
+            assert_eq!(
+                OciDistributionError::RequestError(err).retry(),
+                Retry::Never
+            );
+        });
+        server.join().unwrap();
     }
 
     /// HTTP status errors, invalid JSON, invalid HTTP and malformed chunks are final.
