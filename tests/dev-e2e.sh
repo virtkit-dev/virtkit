@@ -189,15 +189,18 @@ status_is "not running" && ok "status: not running" || bad "status did not say '
 
 echo
 echo "== 3. up boots it, and runs the hooks on both sides =="
-export E2E_TOKEN=abc
+# Not hex and not alphanumeric-only: a host-fed value is fingerprinted wherever it occurs in
+# the identity, so one that can occur in the hashed state-dir name or the mktemp path would
+# turn a path into drift.
+export E2E_TOKEN=tok-abc
 if vkd up > "$WORK/up.txt" 2>&1; then ok "dev up booted the environment"; else bad "dev up failed"; cat "$WORK/up.txt"; exit 1; fi
 [ -f "$WS/init-marker" ] && ok "hooks.init ran on the host" || bad "hooks.init left no marker in the workspace"
 status_is "running \(pid [0-9]+\)" && ok "status: running" || bad "status did not report the running VM"
 grep -q '"running": true' <<<"$(vkd status --json)" && ok "status --json: running true" || bad "status --json did not say running"
 vkd exec -- test -f /data/created && ok "hooks.create ran in the guest" || bad "hooks.create left no /data/created"
 vkd exec -- test -f /tmp/started && ok "hooks.start ran in the guest" || bad "hooks.start left no /tmp/started"
-said "$(vkd exec -- sh -c 'echo $E2E_TOKEN')" abc \
-  && ok "exec-env delivered \${localEnv:E2E_TOKEN} as abc" || bad "exec did not see E2E_TOKEN=abc"
+said "$(vkd exec -- sh -c 'echo $E2E_TOKEN')" tok-abc \
+  && ok "exec-env delivered \${localEnv:E2E_TOKEN} as tok-abc" || bad "exec did not see E2E_TOKEN=tok-abc"
 said "$(vkd exec --dir / -- pwd)" / && ok "exec --dir / runs in /" || bad "exec --dir / did not run in /"
 [ "$(vkd exec -- echo clean 2>/dev/null)" = clean ] \
   && ok "exec stdout carries the command's output alone" || bad "exec stdout carried more than the command's output"
@@ -250,20 +253,21 @@ grep -q "published$" <<<"$(vkd endpoints)" && ok "the endpoint survives a second
 
 echo
 echo "== 5. a changed host value is session-only =="
-export E2E_TOKEN=xyz
+export E2E_TOKEN=tok-xyz
 drift=$(vkd up 2>&1)
 grep -q "only in what attaching applies" <<<"$drift" && ok "up reports the change as applied by attaching" || { bad "up did not call the change session-only"; echo "$drift"; }
 grep -q "booting" <<<"$drift" && bad "up rebooted for a session-only change" || ok "nothing rebooted"
-said "$(vkd exec -- sh -c 'echo $E2E_TOKEN')" xyz \
-  && ok "the next exec session sees E2E_TOKEN=xyz" || bad "exec still saw the old E2E_TOKEN"
+said "$(vkd exec -- sh -c 'echo $E2E_TOKEN')" tok-xyz \
+  && ok "the next exec session sees E2E_TOKEN=tok-xyz" || bad "exec still saw the old E2E_TOKEN"
 grep -q "changed since the boot only in what attaching applies" <<<"$(vkd status)" \
   && ok "status shows the session-only drift" || bad "status hid the session-only drift"
-grep -q "session-only" <<<"$(vkd plan --diff)" \
-  && ok "plan --diff classifies it as session-only" || bad "plan --diff did not classify the drift"
+plan_diff=$(vkd plan --diff)
+grep -q "session-only" <<<"$plan_diff" && ! grep -qE "restart-required|image rebuild" <<<"$plan_diff" \
+  && ok "plan --diff classifies it as session-only" || { bad "plan --diff did not classify the drift"; echo "$plan_diff"; }
 # ssh passes its arguments verbatim and the remote shell re-parses them, so ask for the
 # variable with a command that needs no quoting of its own.
-said "$(vkd ssh -- printenv E2E_TOKEN 2>/dev/null)" xyz \
-  && ok "an ssh session gets exec-env too" || bad "ssh did not see E2E_TOKEN=xyz"
+said "$(vkd ssh -- printenv E2E_TOKEN 2>/dev/null)" tok-xyz \
+  && ok "an ssh session gets exec-env too" || bad "ssh did not see E2E_TOKEN=tok-xyz"
 grep -q '^Host ' <<<"$(vkd ssh-config)" && ok "ssh-config prints a Host stanza" || bad "ssh-config printed no Host line"
 # VS Code Remote-SSH connects with bare `ssh` and copies its server with bare `scp`, with
 # nowhere to pass a config: each OpenSSH connection tool must reach the VM through the
@@ -273,8 +277,8 @@ for tool in ssh scp sftp; do
   [ -x "$STATE/bin/$tool" ] && ok "the run ships a $tool shim" || bad "no executable $tool shim in $STATE/bin"
 done
 shimmed() { PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" "$@"; }
-said "$(shimmed ssh "$alias" printenv E2E_TOKEN 2>/dev/null)" xyz \
-  && ok "bare ssh through the shim reaches the VM" || bad "bare ssh through the shim did not see E2E_TOKEN=xyz"
+said "$(shimmed ssh "$alias" printenv E2E_TOKEN 2>/dev/null)" tok-xyz \
+  && ok "bare ssh through the shim reaches the VM" || bad "bare ssh through the shim did not see E2E_TOKEN=tok-xyz"
 # scp treats a channel that ends without an exit status as a failed copy, so its own exit
 # status is the check here, not the file alone — repeated, since the guest once lost the
 # race between that status and its close only some of the time.
@@ -404,7 +408,7 @@ grep -q created <<<"$after" && ok "hooks.create re-ran for the recreated directo
 echo
 echo "== 7. a reuse task runs in the running environment =="
 out=$(vkd task hello) && rc=0 || rc=$?
-said "$out" hello-xyz && ok "the reuse task ran with the environment's exec-env" || { bad "task hello printed no hello-xyz"; echo "$out"; }
+said "$out" hello-tok-xyz && ok "the reuse task ran with the environment's exec-env" || { bad "task hello printed no hello-tok-xyz"; echo "$out"; }
 [ "$rc" -eq 3 ] && ok "task hello reproduces its exit status (3)" || bad "task hello returned $rc, want 3"
 # An ephemeral task is independent of the running environment: it gets a VM of its own,
 # and the one that is up is neither used nor disturbed. Run for real again in step 9, with
