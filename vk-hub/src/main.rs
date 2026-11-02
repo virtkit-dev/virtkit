@@ -1229,7 +1229,8 @@ async fn run(cli: Cli) -> Result<()> {
                     signature,
                     program,
                 } => {
-                    let runners = releases::program(Some(&program))?.runners();
+                    // Reject misspelt programs before asking the hub.
+                    let checked = releases::program(Some(&program))?;
                     let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
@@ -1241,13 +1242,11 @@ async fn run(cli: Cli) -> Result<()> {
                     // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
                     println!("{}", added.sha256);
                     eprintln!(
-                        "vk-hub: holding {} {} ({} bytes); `vk-hub {} update <id> --release {}` \
-                         updates one to it",
+                        "vk-hub: holding {} {} ({} bytes); {}",
                         added.row.program(),
                         added.row.version,
                         added.row.size,
-                        runners,
-                        store::short(&added.sha256)
+                        checked.next_step(store::short(&added.sha256))
                     );
                 }
                 ReleaseCmd::Fetch { check: true, .. } => {
@@ -1270,20 +1269,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "vk-hub: holding {program} {} ({} bytes, unsigned); {}",
                         fetched.row.version,
                         fetched.row.size,
-                        match program {
-                            store::Program::Vk => format!(
-                                "`vk-hub rollout create --release {}` rolls it out",
-                                store::short(&fetched.sha256)
-                            ),
-                            store::Program::Registry => format!(
-                                "`vk-hub registries update <id> --release {}` updates one to it",
-                                store::short(&fetched.sha256)
-                            ),
-                            store::Program::Gitlab => format!(
-                                "`vk-hub relays update <id> --release {}` updates one to it",
-                                store::short(&fetched.sha256)
-                            ),
-                        }
+                        program.next_step(store::short(&fetched.sha256))
                     );
                 }
                 ReleaseCmd::List => {

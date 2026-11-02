@@ -500,6 +500,19 @@ impl Program {
         }
     }
 
+    /// An install command and description for messages about this program's release `short`.
+    pub fn next_step(self, short: &str) -> String {
+        match self {
+            Program::Vk => format!("`vk-hub rollout create --release {short}` rolls it out"),
+            Program::Registry => {
+                format!("`vk-hub registries update <id> --release {short}` updates one to it")
+            }
+            Program::Gitlab => {
+                format!("`vk-hub relays update <id> --release {short}` updates one to it")
+            }
+        }
+    }
+
     /// The names of every program, for a message: `vk, vk-registry or vk-gitlab`.
     pub fn names() -> String {
         let names: Vec<&str> = Self::ALL.iter().map(|p| p.name()).collect();
@@ -3238,6 +3251,10 @@ mod tests {
         assert_eq!(
             Program::ALL.map(Program::runners),
             ["nodes", "registries", "relays"]
+        );
+        assert_eq!(
+            Program::Vk.next_step("abc"),
+            "`vk-hub rollout create --release abc` rolls it out"
         );
     }
 
