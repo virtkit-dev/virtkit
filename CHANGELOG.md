@@ -27,6 +27,11 @@ All notable changes to virtkit will be documented in this file.
   release-key sign --program vk-gitlab`. `vk-hub relays show` lists the updates issued and how
   each ended.
 
+### Fixed
+
+- **A registry update waiting for a long garbage collection no longer rolls back.** The
+  release's two minutes to reach the hub start once the collection under way is done.
+
 ## [0.101.0] - 2026-11-01
 
 ### Added

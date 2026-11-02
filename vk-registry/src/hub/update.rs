@@ -430,16 +430,21 @@ async fn prepare(link: &Arc<Link>, command: &Command) -> Result<()> {
             next: next2,
             previous: own,
             attempts: 1,
-            deadline: vk_peer::now_secs() + TRIAL_WINDOW.as_secs(),
+            deadline: 0,
         };
         Ok((trial, binary))
     })
     .await
     .context("checking the release")??;
     let (trial, binary) = trial;
-    let deadline = trial.deadline;
     // Held across the exec: a gc under way finishes first, and none starts after.
     let _gc = link.gc_running.lock().await;
+    // Start the window after gc: collection can take longer than the window.
+    let trial = Trial {
+        deadline: vk_peer::now_secs() + TRIAL_WINDOW.as_secs(),
+        ..trial
+    };
+    let deadline = trial.deadline;
     link.update(|p| {
         p.trial = Some(trial);
         p.update = Some(progress(UpdatePhase::Validating));
