@@ -7,6 +7,7 @@
 pub mod handoff;
 pub mod identity;
 pub mod net;
+pub mod notify;
 pub mod release_key;
 pub mod session;
 pub mod token;
