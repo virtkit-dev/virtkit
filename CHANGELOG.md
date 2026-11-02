@@ -85,6 +85,10 @@ All notable changes to virtkit will be documented in this file.
   reply now reports that the question was answered, rather than answered or expired.
   A confirmation refused because its target changed remains answerable once the original
   state is restored.
+- **Web UI actions ride out a hub restart.** Buttons and forms report when the hub is
+  unreachable during a restart, update or proxy failure, and retry for up to a minute before
+  offering a retry button. Actions clicked meanwhile follow in order. Release uploads are
+  not retried.
 
 ## [0.101.0] - 2026-11-01
 

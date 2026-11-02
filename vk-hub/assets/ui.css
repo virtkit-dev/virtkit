@@ -465,7 +465,9 @@ ol.layers > li + li { margin-top: var(--s3); }
   border-radius: 6px;
 }
 #flash.error { background: var(--bad-soft); border-left-color: var(--bad); }
+#flash.warn { background: var(--warn-soft); border-left-color: var(--warn); }
 #flash form { display: inline-flex; gap: var(--s2); margin: var(--s2) 0 0; }
+#flash > button { margin-left: var(--s2); }
 
 /* Rollouts. */
 .rollout h3 { margin-top: 0; }

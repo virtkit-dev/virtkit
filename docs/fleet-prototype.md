@@ -1433,6 +1433,18 @@ A section's link counts what waits in its tabs, each tab its own. Connections' f
 addresses, `/clients[?tab=other]`, `/clients/capacity`, `/clients/tenants/<name>` and
 `/clients/projects/<instance>/<ID>`, redirect to their pages.
 
+A button or form the pages post through htmx that the hub does not answer — the connection
+refused or cut while the hub restarts or hands over to a release, or a 502, 503 or 504 from a
+proxy in front of it — says so in the page's status line and is sent again, the same fields,
+after 1, 2, 4, then every 8 seconds, for a minute; then a button, or the next click, sends it
+again. Posts are sent in the order they were made, one at a time: while one waits, a post made
+meanwhile waits behind it. A post is sent again only when no answer came, so the hub may have
+taken the first: each of those posts sets a state, issues a node command again (a reboot or
+reset sent twice may run twice), starts what is refused while under way, or answers a
+confirmation, which the hub takes once and says so the second time. A second copy may then be
+told what the first did, such as a project approved already. Plain form posts, such as a
+release's upload, are left to the browser.
+
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; the job history (`/jobs`, below); the GitLab servers, and the API keys
 and the clients using them (`/gitlab` and `/keys`, below); and the audit log (`/audit`, 100 lines a

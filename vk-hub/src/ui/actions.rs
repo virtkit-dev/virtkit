@@ -629,7 +629,8 @@ fn confirm(
     Ok(super::page(layout("Confirm", &ask.back, auth, &main)))
 }
 
-/// A refused action: for htmx, the line saying why, swapped in on its own.
+/// An htmx refusal swaps in only its reason. `retry.js` uses that line to distinguish
+/// the hub's 502, 503 or 504 responses from a gateway's.
 pub(super) fn refused(htmx: bool, status: StatusCode, text: &str) -> Response<Body> {
     if !htmx {
         return super::message(status, text);

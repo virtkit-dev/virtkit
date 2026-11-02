@@ -575,6 +575,7 @@ async fn assets_are_served_for_good_under_their_hash() {
         (assets::TIME, include_str!("../../assets/time.js")),
         (assets::FOLLOW, include_str!("../../assets/follow.js")),
         (assets::CHECKS, include_str!("../../assets/checks.js")),
+        (assets::RETRY, include_str!("../../assets/retry.js")),
     ] {
         let reply = get(addr, assets::url(name), None).await;
         assert_eq!(reply.status, 200);
@@ -1101,8 +1102,8 @@ async fn pages_load_only_the_embedded_scripts() {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert!(body.contains("\"allowEval\":false"), "{body}");
         assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 5, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 5, "{body}");
+        assert_eq!(body.matches("<script").count(), 6, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 6, "{body}");
         // The script that shows times in the browser's zone, run once the page is read.
         let time = format!(
             "<script src=\"{}\" defer></script>",
@@ -2706,13 +2707,29 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
     assert_only_embedded_scripts(&body);
 }
 
+/// Check the page requirements for `retry.js`: htmx posts have a `#flash` for status,
+/// and uploads use plain forms. Handlers remain responsible for accepting a second copy.
+fn assert_htmx_posts_resendable(body: &str) {
+    if body.contains("hx-post") {
+        assert!(body.contains("<div id=\"flash\""), "{body}");
+    }
+    for form in body.split("<form").skip(1) {
+        let tag = form.split('>').next().unwrap_or_default();
+        assert!(
+            !(tag.contains("hx-post") && tag.contains("multipart")),
+            "{tag}"
+        );
+    }
+}
+
 /// `body` loads its script from the hub alone, configured to evaluate nothing, and has no
 /// inline script, style or event handler.
 fn assert_only_embedded_scripts(body: &str) {
+    assert_htmx_posts_resendable(body);
     assert!(body.contains("\"allowEval\":false"), "{body}");
     assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-    assert_eq!(body.matches("<script").count(), 5, "{body}");
-    assert_eq!(body.matches("<script src=\"/assets/").count(), 5, "{body}");
+    assert_eq!(body.matches("<script").count(), 6, "{body}");
+    assert_eq!(body.matches("<script src=\"/assets/").count(), 6, "{body}");
     // The script that shows times in the browser's zone, run once the page is read.
     let time = format!(
         "<script src=\"{}\" defer></script>",
@@ -2725,6 +2742,12 @@ fn assert_only_embedded_scripts(body: &str) {
         assets::url(assets::FOLLOW)
     );
     assert!(body.contains(&follow), "{body}");
+    // The one that sends a post the hub did not answer again.
+    let retry = format!(
+        "<script src=\"{}\" defer></script>",
+        assets::url(assets::RETRY)
+    );
+    assert!(body.contains(&retry), "{body}");
     // The hub's time, by which the script measures ages.
     let now = body
         .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
@@ -7121,6 +7144,7 @@ async fn an_operator_uploads_a_release() {
     );
     // Fetching is off: no form for it.
     assert!(!page.body.contains("Fetch from GitHub"), "{}", page.body);
+    assert_htmx_posts_resendable(&page.body);
 
     let bin = crate::fetch::tests::fake_vk("0.85.0");
     let reply = post_upload(
