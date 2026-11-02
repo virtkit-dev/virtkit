@@ -221,7 +221,7 @@ mod tests {
     fn a_trial_past_its_attempts_is_rolled_back_on_start() {
         let (root, dir) = temp("attempts");
         let mut p = Persisted::default();
-        p.journal("c", update(), u64::MAX, Outcome::Accepted);
+        p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
         p.trial = Some(trial(&dir, trial::MAX_ATTEMPTS));
         p.save(&dir).unwrap();
         assert!(matches!(on_start(&root, 1), Start::Run));
@@ -255,7 +255,7 @@ mod tests {
         let sha = vk_peer::update::hash_file(&next).unwrap();
         let meta = std::fs::metadata(&exe).unwrap();
         let mut p = Persisted::default();
-        p.journal("c", update(), u64::MAX, Outcome::Accepted);
+        p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
         p.trial = Some(Trial {
             sha256: sha.clone(),
             exe: exe.clone(),

@@ -406,8 +406,8 @@ fn open(dir: &Path, state: &Arc<ServerState>, ctx: &Facts) -> Result<Option<Link
     let mut incarnation = [0u8; vk_hub_proto::ID_BYTES];
     vk_peer::fill_random(&mut incarnation)?;
     let mut persisted = Persisted::load(dir)?;
-    persisted.adopt_issuer(&enrollment.hub, &enrollment.registry_id);
-    let mut changed = persisted.fail_interrupted();
+    let mut changed = persisted.adopt_issuer(&enrollment.hub, &enrollment.registry_id);
+    changed |= persisted.fail_interrupted();
     if let Ok(exe) = std::env::current_exe()
         && let Some(installed) =
             vk_peer::trial::installed_after(persisted.installed.as_deref(), exe, dir)
@@ -600,7 +600,7 @@ impl Link {
             }
         };
         let (id, op) = (command.id.clone(), command.op.clone());
-        self.update(|p| p.journal(&id, op.clone(), command.expires_at, outcome.clone()))?;
+        self.update(|p| p.journal(&id, op.clone(), command.expires_at, outcome.clone(), now))?;
         if outcome == Outcome::Accepted {
             match op {
                 Operation::Gc {
@@ -1003,7 +1003,15 @@ mod tests {
         assert!(matches!(refused.outcome, Outcome::Refused { .. }));
         // Accepted, then cut short by the restart.
         first
-            .update(|p| p.journal("cut", gc_command("cut", 30).op, u64::MAX, Outcome::Accepted))
+            .update(|p| {
+                p.journal(
+                    "cut",
+                    gc_command("cut", 30).op,
+                    u64::MAX,
+                    Outcome::Accepted,
+                    0,
+                )
+            })
             .unwrap();
         drop(first);
 
@@ -1052,7 +1060,7 @@ mod tests {
                 signature: None,
             },
         };
-        link.update(|p| p.journal("u", update("u").op, u64::MAX, Outcome::Accepted))
+        link.update(|p| p.journal("u", update("u").op, u64::MAX, Outcome::Accepted, 0))
             .unwrap();
         let ack = link.command(update("v")).unwrap();
         let Outcome::Refused { reason } = ack.outcome else {
@@ -1168,7 +1176,7 @@ mod tests {
             std::fs::write(releases.join(release.repeat(64)), b"r").unwrap();
         }
         link.update(|p| {
-            p.journal("u", command.op.clone(), u64::MAX, Outcome::Accepted);
+            p.journal("u", command.op.clone(), u64::MAX, Outcome::Accepted, 0);
             p.trial = Some(state::Trial {
                 command: "u".into(),
                 version: "9.9.9".into(),

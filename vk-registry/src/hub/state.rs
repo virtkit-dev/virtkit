@@ -124,16 +124,18 @@ impl Persisted {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Forget what another hub or enrollment asked.
-    pub fn adopt_issuer(&mut self, hub: &str, id: &str) {
+    /// Forget requests from another hub or enrollment. Return whether state changed.
+    pub fn adopt_issuer(&mut self, hub: &str, id: &str) -> bool {
         let issuer = (hub.to_string(), id.to_string());
-        if self.issuer.as_ref() != Some(&issuer) {
-            *self = Persisted {
-                issuer: Some(issuer),
-                installed: self.installed.take(),
-                ..Persisted::default()
-            };
+        if self.issuer.as_ref() == Some(&issuer) {
+            return false;
         }
+        *self = Persisted {
+            issuer: Some(issuer),
+            installed: self.installed.take(),
+            ..Persisted::default()
+        };
+        true
     }
 
     /// The journaled entry for command `id`.
@@ -141,9 +143,17 @@ impl Persisted {
         self.journal.iter().find(|e| e.id == id)
     }
 
-    /// Journal a command with its first outcome, dropping the oldest settled entries past
-    /// [`JOURNAL_MAX`].
-    pub fn journal(&mut self, id: &str, op: Operation, expires_at: u64, outcome: Outcome) {
+    /// Journal a command's first outcome at `now`. Past [`JOURNAL_MAX`], drop the oldest
+    /// ended entries the hub stored or that have expired. Pruned expired commands are
+    /// refused as expired if redelivered.
+    pub fn journal(
+        &mut self,
+        id: &str,
+        op: Operation,
+        expires_at: u64,
+        outcome: Outcome,
+        now: u64,
+    ) {
         self.journal.push(Entry {
             id: id.to_string(),
             op,
@@ -153,7 +163,8 @@ impl Persisted {
         });
         while self.journal.len() > JOURNAL_MAX {
             let settled = self.journal.iter().position(|e| {
-                e.recorded.as_ref() == Some(&e.outcome) && e.outcome != Outcome::Accepted
+                e.outcome != Outcome::Accepted
+                    && (e.recorded.as_ref() == Some(&e.outcome) || e.expires_at <= now)
             });
             match settled {
                 Some(i) => {
@@ -221,6 +232,13 @@ impl Persisted {
             e.recorded = Some(ack.outcome.clone());
         }
     }
+
+    /// Whether recording `ack` would change state. False for an ack already stored or a
+    /// command not journaled.
+    pub fn records(&self, ack: &CommandAck) -> bool {
+        self.entry(&ack.id)
+            .is_some_and(|e| e.recorded.as_ref() != Some(&ack.outcome))
+    }
 }
 
 #[cfg(test)]
@@ -238,13 +256,21 @@ mod tests {
     #[test]
     fn an_ack_is_repeated_until_the_hub_stores_it() {
         let mut p = Persisted::default();
-        p.journal("a", gc(), 10, Outcome::Accepted);
+        p.journal("a", gc(), 10, Outcome::Accepted, 0);
         assert_eq!(p.unrecorded().len(), 1);
-        p.recorded(&CommandAck {
+        let ack = CommandAck {
             id: "a".into(),
             outcome: Outcome::Accepted,
-        });
+        };
+        assert!(p.records(&ack));
+        p.recorded(&ack);
         assert!(p.unrecorded().is_empty());
+        // Stored already, or never journaled: nothing to save.
+        assert!(!p.records(&ack));
+        assert!(!p.records(&CommandAck {
+            id: "b".into(),
+            outcome: Outcome::Done,
+        }));
         p.set_outcome("a", Outcome::Done);
         assert_eq!(p.unrecorded()[0].outcome, Outcome::Done);
     }
@@ -252,12 +278,26 @@ mod tests {
     #[test]
     fn another_hub_s_asks_are_forgotten() {
         let mut p = Persisted::default();
-        p.adopt_issuer("https://a", "1");
-        p.journal("x", gc(), 10, Outcome::Done);
-        p.adopt_issuer("https://a", "1");
+        assert!(p.adopt_issuer("https://a", "1"));
+        p.journal("x", gc(), 10, Outcome::Done, 0);
+        assert!(!p.adopt_issuer("https://a", "1"));
         assert!(p.entry("x").is_some());
-        p.adopt_issuer("https://b", "1");
+        assert!(p.adopt_issuer("https://b", "1"));
         assert!(p.entry("x").is_none());
+    }
+
+    /// Unrecorded entries are pruned only once expired; commands under way stay.
+    #[test]
+    fn the_journal_drops_expired_entries_the_hub_never_stored() {
+        let mut p = Persisted::default();
+        p.journal("accepted", gc(), 10, Outcome::Accepted, 0);
+        p.journal("live", gc(), 1000, Outcome::Done, 0);
+        for i in 0..JOURNAL_MAX {
+            p.journal(&i.to_string(), gc(), 10, Outcome::Done, 100);
+        }
+        assert_eq!(p.journal.len(), JOURNAL_MAX);
+        assert!(p.entry("accepted").is_some() && p.entry("live").is_some());
+        assert!(p.entry("0").is_none() && p.entry("1").is_none());
     }
 
     #[test]
@@ -265,7 +305,7 @@ mod tests {
         let mut p = Persisted::default();
         for i in 0..JOURNAL_MAX + 10 {
             let id = i.to_string();
-            p.journal(&id, gc(), 10, Outcome::Done);
+            p.journal(&id, gc(), 10, Outcome::Done, 0);
             p.recorded(&CommandAck {
                 id,
                 outcome: Outcome::Done,
@@ -291,9 +331,9 @@ mod tests {
             message: None,
         };
         let mut p = Persisted::default();
-        p.journal("gc", gc(), 10, Outcome::Accepted);
-        p.journal("u", update(), 10, Outcome::Accepted);
-        p.journal("done", gc(), 10, Outcome::Done);
+        p.journal("gc", gc(), 10, Outcome::Accepted, 0);
+        p.journal("u", update(), 10, Outcome::Accepted, 0);
+        p.journal("done", gc(), 10, Outcome::Done, 0);
         p.update = Some(progress("u"));
         assert!(p.update_under_way());
         assert!(p.fail_interrupted());
@@ -309,7 +349,7 @@ mod tests {
         assert!(!p.fail_interrupted());
 
         // The update on trial goes on: the release confirms or the previous binary ends it.
-        p.journal("t", update(), 10, Outcome::Accepted);
+        p.journal("t", update(), 10, Outcome::Accepted, 0);
         p.update = Some(UpdateProgress {
             phase: UpdatePhase::Validating,
             ..progress("t")

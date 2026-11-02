@@ -193,7 +193,10 @@ async fn run(link: &Arc<Link>) -> Result<()> {
                         send(&mut ws, &RegistryMsg::Ack(ack), beat).await?;
                     }
                     HubRegistryMsg::Recorded(ack) => {
-                        link.update(|p| p.recorded(&ack))?;
+                        // An ack stored twice costs no second save.
+                        if link.persisted().records(&ack) {
+                            link.update(|p| p.recorded(&ack))?;
+                        }
                     }
                     HubRegistryMsg::Refused { code, reason } => {
                         return Err(refused(link, code, &reason));
