@@ -70,12 +70,24 @@ pub struct Trial {
     pub next: PathBuf,
     /// The installed binary's sha256, kept there too to go back to.
     pub previous: String,
-    /// Starts of the release so far, and when it must have reached the hub by.
+    /// Release starts, reset to zero on confirmation, and the deadline to reach the hub.
     pub attempts: u32,
     pub deadline: u64,
     /// The release reached the hub: what is left is installing it, which any start finishes.
+    /// [`Trial::passed`] recognizes confirmation even if a previous binary drops this field.
     #[serde(default)]
     pub confirmed: bool,
+}
+
+/// No deadline: the passed marker survives saves by binaries that ignore `confirmed`.
+const PASSED: u64 = u64::MAX;
+
+impl Trial {
+    /// Whether the release reached the hub, using the deadline if an older binary dropped
+    /// `confirmed`.
+    pub fn passed(&self) -> bool {
+        self.confirmed || self.deadline == PASSED
+    }
 }
 
 /// What [`on_start`] and [`confirm`] tell the peer's log.
@@ -187,7 +199,7 @@ pub fn on_start<L: Ledger>(dir: &Path, now: u64) -> Start {
     let Some(trial) = p.trial().clone() else {
         return Start::Run;
     };
-    if trial.confirmed {
+    if trial.passed() {
         return finish_install(dir, &mut p, &trial);
     }
     if running_is(&trial.next) {
@@ -531,17 +543,13 @@ pub fn failed<K: Keeper>(
 pub fn confirm<K: Keeper>(keeper: &K) {
     let Some(trial) = keeper
         .trial()
-        .filter(|t| running_is(&t.next) && !t.confirmed)
+        .filter(|t| running_is(&t.next) && !t.passed())
     else {
         return;
     };
     // Confirmed before it is installed: a peer stopped in between installs it on its next
     // start, rather than taking the installed binary for the previous one.
-    if let Err(e) = keeper.change(|p| {
-        if let Some(t) = p.trial() {
-            t.confirmed = true;
-        }
-    }) {
+    if let Err(e) = keeper.change(|p| p.trial().as_mut().map(mark_passed)) {
         K::Ledger::log(Event::ConfirmFailed(&e));
         return;
     }
@@ -571,11 +579,22 @@ pub fn confirm<K: Keeper>(keeper: &K) {
     }
 }
 
+/// Confirm, clear attempts and remove the deadline so binaries that ignore `confirmed`
+/// retry the release instead of rolling it back. Their saves preserve the passed marker.
+fn mark_passed(trial: &mut Trial) {
+    trial.confirmed = true;
+    trial.attempts = 0;
+    trial.deadline = PASSED;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// A distant deadline distinct from the passed marker.
+    const LATER: u64 = 1 << 40;
 
     /// A peer's state with nothing but its trial and its commands' outcomes.
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -692,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_trial_past_its_attempts_or_deadline_is_rolled_back_on_start() {
-        for (tag, attempts, deadline) in [("attempts", MAX_ATTEMPTS, u64::MAX), ("late", 1, 0)] {
+        for (tag, attempts, deadline) in [("attempts", MAX_ATTEMPTS, LATER), ("late", 1, 0)] {
             let dir = temp(tag);
             let p = Fake {
                 trial: Some(trial("c", &dir, attempts, deadline)),
@@ -728,7 +747,7 @@ mod tests {
             trial: Some(Trial {
                 sha256: sha,
                 next: next.clone(),
-                ..trial("c", &dir, 1, u64::MAX)
+                ..trial("c", &dir, 1, LATER)
             }),
             ..Fake::default()
         };
@@ -736,7 +755,7 @@ mod tests {
         let Start::Exec(binary, deadline) = on_start::<Fake>(&dir, 1) else {
             panic!("the release is not started again");
         };
-        assert_eq!((binary.path(), deadline), (next.as_path(), Some(u64::MAX)));
+        assert_eq!((binary.path(), deadline), (next.as_path(), Some(LATER)));
         assert_eq!(Fake::load(&dir).unwrap().trial.unwrap().attempts, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -750,7 +769,7 @@ mod tests {
         let p = Fake {
             trial: Some(Trial {
                 next,
-                ..trial("c", &dir, 1, u64::MAX)
+                ..trial("c", &dir, 1, LATER)
             }),
             ..Fake::default()
         };
@@ -810,7 +829,7 @@ mod tests {
                 exe: exe.clone(),
                 next,
                 confirmed: true,
-                ..trial("c", &dir, 1, u64::MAX)
+                ..trial("c", &dir, 1, LATER)
             }),
             ..Fake::default()
         };
@@ -845,7 +864,7 @@ mod tests {
         let keeper = Kept {
             dir: dir.clone(),
             state: Mutex::new(Fake {
-                trial: Some(trial("c", &dir, 1, u64::MAX)),
+                trial: Some(trial("c", &dir, 1, LATER)),
                 ..Fake::default()
             }),
         };
@@ -867,7 +886,7 @@ mod tests {
         let keeper = Kept {
             dir: dir.clone(),
             state: Mutex::new(Fake {
-                trial: Some(trial("c", &dir, 1, u64::MAX)),
+                trial: Some(trial("c", &dir, 1, LATER)),
                 ..Fake::default()
             }),
         };
@@ -916,5 +935,58 @@ mod tests {
             "next":"/y","previous":"11","attempts":1,"deadline":5}"#;
         let t: Trial = serde_json::from_str(old).unwrap();
         assert!(!t.confirmed);
+    }
+
+    /// A trial whose installed binary and release are real files: `exe` the installed one.
+    fn installable(dir: &Path) -> Trial {
+        let exe = dir.join("vk-fake");
+        std::fs::write(&exe, b"previous").unwrap();
+        let next = releases_dir(dir).join("2".repeat(64));
+        std::fs::write(&next, b"release").unwrap();
+        let meta = std::fs::metadata(&exe).unwrap();
+        Trial {
+            sha256: crate::update::hash_file(&next).unwrap(),
+            exe,
+            exe_id: (meta.dev(), meta.ino()),
+            next,
+            ..trial("c", dir, 1, 100)
+        }
+    }
+
+    /// A confirmed trial, read by a previous binary from before confirmations — the same trial
+    /// with no `confirmed` — is one it hands over to the release, past its attempts and
+    /// deadline both, rather than rolling it back; saved by it, `confirmed` dropped, it still
+    /// reads as passed, and the next start installs the release.
+    #[test]
+    fn a_trial_a_previous_binary_saved_without_its_confirmation_still_passed() {
+        let dir = temp("older");
+        let mut t = Trial {
+            attempts: MAX_ATTEMPTS,
+            ..installable(&dir)
+        };
+        mark_passed(&mut t);
+        // The previous binary's own test: hand over unless past its attempts or deadline.
+        let now = 1 << 40;
+        assert!(t.attempts < MAX_ATTEMPTS && now <= t.deadline);
+        // It counts the start and saves the trial without the field it does not know.
+        t.attempts += 1;
+        let mut seen = serde_json::to_value(&t).unwrap();
+        seen.as_object_mut().unwrap().remove("confirmed");
+        let resaved: Trial = serde_json::from_value(seen).unwrap();
+        assert!(!resaved.confirmed && resaved.passed());
+        let p = Fake {
+            trial: Some(resaved),
+            ..Fake::default()
+        };
+        p.save(&dir).unwrap();
+        let Start::Exec(binary, None) = on_start::<Fake>(&dir, now) else {
+            panic!("the passed release is not installed and run");
+        };
+        assert_eq!(binary.path(), t.exe.as_path());
+        assert_eq!(crate::update::hash_file(&t.exe).unwrap(), t.sha256);
+        let p = Fake::load(&dir).unwrap();
+        assert!(p.trial.is_none());
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Done);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

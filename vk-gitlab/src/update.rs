@@ -650,6 +650,9 @@ impl Keeper for Updater {
 mod tests {
     use super::*;
 
+    /// A distant deadline distinct from the passed marker.
+    const LATER: u64 = 1 << 40;
+
     fn temp(tag: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("vk-gitlab-update-{tag}-{}", std::process::id()));
@@ -787,7 +790,7 @@ mod tests {
         let dir = crate::relay::dir(&root);
         let mut p = Persisted::default();
         p.journal("c", update(), u64::MAX, Outcome::Accepted, 0);
-        p.trial = Some(trial_of("c", &dir, trial::MAX_ATTEMPTS, u64::MAX));
+        p.trial = Some(trial_of("c", &dir, trial::MAX_ATTEMPTS, LATER));
         p.save(&dir).unwrap();
         assert!(matches!(on_start(&root, 1), Start::Run));
         let p = Persisted::load(&dir).unwrap();
