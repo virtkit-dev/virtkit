@@ -1367,6 +1367,7 @@ async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
 
     // Mirror: accounts mode, empty store, everything routed upstream.
@@ -1471,6 +1472,7 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let client = no_redirect_client();
 
@@ -1690,6 +1692,7 @@ async fn deleting_a_manifest_on_an_open_server() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let client = no_redirect_client();
     let status = async |method: reqwest::Method, path: String| {
@@ -1744,7 +1747,7 @@ fn spawn_admin_socket(state: &Arc<ServerState>, dir: &std::path::Path) -> std::p
         &vk_registry::config::default_accounts_db(&dir.join("store")),
     );
     let listener = admin::bind(&socket).unwrap();
-    tokio::spawn(admin::serve_admin(listener, db));
+    tokio::spawn(admin::serve_admin(listener, db, Default::default()));
     socket
 }
 
@@ -2183,6 +2186,7 @@ async fn a_cross_site_write_is_refused_on_an_open_server() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let client = no_redirect_client();
     let acquire = format!("{url}/lock/acquire?name=k&wait=0");

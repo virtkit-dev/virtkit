@@ -923,6 +923,7 @@ impl ServerConfig {
             tls: None,
             webdav: self.webdav,
             tokens: Default::default(),
+            handover: Default::default(),
         })
     }
 }

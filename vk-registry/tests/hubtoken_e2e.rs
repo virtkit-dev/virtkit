@@ -91,6 +91,7 @@ fn shared_with(
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     if tokens {
         state.tokens.open(AUD, vec![signer.public().clone()]);

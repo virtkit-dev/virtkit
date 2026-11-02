@@ -891,6 +891,7 @@ mod tests {
             tls: None,
             webdav: false,
             tokens: Default::default(),
+            handover: Default::default(),
         })
     }
 

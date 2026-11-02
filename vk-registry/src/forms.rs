@@ -60,6 +60,8 @@ pub(crate) fn csrf_of(db: &Db, session_id: Option<&str>) -> Option<String> {
     let id = session_id?;
     match db.session_csrf(id) {
         Ok(v) => v,
+        // After handover, `csrf_rejected` returns 503; pages without the secret omit forms.
+        Err(e) if crate::accounts::is_handed_over_error(&e) => None,
         // The page renders fine without it; the forms on it will simply be refused, and
         // the log says why.
         Err(e) => {
@@ -69,7 +71,11 @@ pub(crate) fn csrf_of(db: &Db, session_id: Option<&str>) -> Option<String> {
     }
 }
 
+/// Return 503 after db handover: the token may still match the transferred session's secret.
 pub(crate) fn csrf_rejected(db: &Db, user: &User, session_id: Option<&str>) -> Response<Body> {
+    if db.is_handed_over() {
+        return crate::updating();
+    }
     html::error(
         StatusCode::FORBIDDEN,
         Some(&Principal::Session(user.clone())),
@@ -89,7 +95,12 @@ pub(crate) fn too_large(db: &Db, user: &User, session_id: Option<&str>) -> Respo
     )
 }
 
+/// A 503 instead when the db was handed to the release updating the registry, which answers
+/// the client's next request.
 pub(crate) fn server_error(db: &Db, user: &User, session_id: Option<&str>) -> Response<Body> {
+    if db.is_handed_over() {
+        return crate::updating();
+    }
     html::error(
         StatusCode::INTERNAL_SERVER_ERROR,
         Some(&Principal::Session(user.clone())),
@@ -112,6 +123,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-forms-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Db::open(&dir.join("registry.db")).unwrap()
+    }
+
+    #[test]
+    fn a_db_handed_over_is_answered_503() {
+        let db = store_for("handed");
+        let user = db
+            .upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)
+            .unwrap();
+        let session = db
+            .create_session(&user.id, Duration::from_secs(3600))
+            .unwrap();
+        db.hand_over().unwrap();
+        for resp in [
+            csrf_rejected(&db, &user, Some(&session)),
+            server_error(&db, &user, Some(&session)),
+        ] {
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(resp.headers()[hyper::header::RETRY_AFTER], "1");
+        }
+        db.take_back().unwrap();
+        assert_eq!(
+            server_error(&db, &user, Some(&session)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

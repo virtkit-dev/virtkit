@@ -62,6 +62,7 @@ async fn batch_probe_answers_every_tag_in_order() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let http = reqwest::Client::new();
     let exists = format!("{url}{}", vk_registry::EXISTS_PATH);

@@ -119,6 +119,8 @@ async fn login(client: &OidcClient, query: &str, secure: bool) -> Result<Respons
     let target = query_param(query, "target").unwrap_or_default();
     let (url, state) = match client.inner.login_url(&target).await {
         Ok(v) => v,
+        // Handed to the release updating the registry, which starts it on the next connection.
+        Err(e) if e.is::<vk_oidc::LoginsHandedOver>() => return Ok(crate::updating()),
         Err(e) => return Ok(upstream_failure("starting a login", &e)),
     };
     let mut res = redirect(&url)?;
@@ -175,6 +177,9 @@ async fn callback(
         .await
     {
         Ok(v) => v,
+        // Handed to the release updating the registry, with the login under way: the browser
+        // reaches the release by asking again, its login cookie kept.
+        Err(e) if e.is::<vk_oidc::LoginsHandedOver>() => return Ok(crate::updating()),
         Err(e) => {
             // The chain names endpoints and quotes provider text; it goes to the log,
             // not to an unauthenticated caller.
@@ -208,6 +213,16 @@ async fn callback(
         .and_then(|user| db.create_session(&user.id, accounts::SESSION_TTL));
     let session_id = match session {
         Ok(id) => id,
+        Err(e) if accounts::is_handed_over_error(&e) => {
+            // Db handover during exchange: the code is spent, so sign-in must restart.
+            return done_with_login(
+                html_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The registry was updating. Sign in again.",
+                ),
+                secure,
+            );
+        }
         Err(e) => {
             eprintln!("vk-registry: refusing an OIDC identity: {e:#}");
             return done_with_login(
@@ -263,6 +278,7 @@ async fn logout(
     // browser, so no `?` may escape to `handle`'s JSON 500 with an error chain in it.
     let expected = match db.session_csrf(&id) {
         Ok(v) => v,
+        Err(e) if accounts::is_handed_over_error(&e) => return Ok(crate::updating()),
         Err(e) => return Ok(internal_failure("reading a session's CSRF secret", &e)),
     };
     // The session is already gone — expired, or ended in another tab. There is nothing
@@ -287,8 +303,10 @@ async fn logout(
             "This sign-out request did not come from a page this server rendered.",
         ));
     }
-    if let Err(e) = db.delete_session(&id) {
-        return Ok(internal_failure("ending a session", &e));
+    match db.delete_session(&id) {
+        Ok(()) => {}
+        Err(e) if accounts::is_handed_over_error(&e) => return Ok(crate::updating()),
+        Err(e) => return Ok(internal_failure("ending a session", &e)),
     }
     let target = client
         .inner

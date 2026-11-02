@@ -366,7 +366,14 @@ impl std::fmt::Display for Peer {
 /// Takes the accounts db and nothing else — no `ServerState`, so the content store,
 /// the relay upstreams and the lock authority are all out of reach from here by
 /// construction.
-pub async fn serve_admin(listener: std::os::unix::net::UnixListener, db: Arc<Db>) {
+///
+/// Accepts through `gate`, which the registry closes when it hands over to a release: the
+/// request under way on a connection is answered, and none is accepted after.
+pub async fn serve_admin(
+    listener: std::os::unix::net::UnixListener,
+    db: Arc<Db>,
+    gate: vk_peer::handoff::Gate,
+) {
     let listener = match UnixListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
@@ -380,7 +387,8 @@ pub async fn serve_admin(listener: std::os::unix::net::UnixListener, db: Arc<Db>
     // is not allowed to use it could otherwise fill the journal at accept rate.
     let mut refused = std::collections::HashSet::new();
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (accepted, live) = gate.accept(|| listener.accept()).await;
+        let (stream, _addr) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("vk-registry: admin socket accept error: {e}");
@@ -417,6 +425,7 @@ pub async fn serve_admin(listener: std::os::unix::net::UnixListener, db: Arc<Db>
         }
         let db = db.clone();
         tokio::spawn(async move {
+            let _live = live;
             if let Err(e) = serve_one(stream, db, peer).await {
                 eprintln!("vk-registry: admin socket: {e:#}");
             }
@@ -783,7 +792,7 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(serve_admin(listener, db));
+                rt.block_on(serve_admin(listener, db, Default::default()));
             });
             Server { dir, socket }
         }

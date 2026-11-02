@@ -97,6 +97,7 @@ async fn relay_caches_digest_not_tag() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let up_url = spawn(up_state);
 
@@ -117,6 +118,7 @@ async fn relay_caches_digest_not_tag() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let mirror_url = spawn(mirror_state);
     let http = reqwest::Client::new();
@@ -190,6 +192,7 @@ async fn multi_lock_is_atomic_all_or_nothing() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
@@ -265,6 +268,7 @@ async fn lock_client_authenticates_with_basic() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let ttl = Duration::from_secs(30);
@@ -308,6 +312,7 @@ async fn lock_client_authenticates_with_bearer() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let ttl = Duration::from_secs(30);
@@ -347,6 +352,7 @@ async fn lock_client_round_trips_against_the_server() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
@@ -415,6 +421,7 @@ async fn bearer_auth_gates_everything_including_the_probe() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -499,6 +506,7 @@ async fn basic_auth_gates_and_challenges() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -715,6 +723,7 @@ async fn relay_does_not_leak_upstream_credentials_to_the_client() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let mirror_url = spawn(mirror_state);
     let http = reqwest::Client::new();
@@ -758,6 +767,7 @@ async fn lock_api_build_once_over_http() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -1066,6 +1076,7 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     });
     let open_url = spawn(open);
     let url = open_url.clone();
@@ -1257,6 +1268,7 @@ fn mirror_of(up_addr: std::net::SocketAddr, dir: &std::path::Path) -> Arc<Server
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     })
 }
 
@@ -1533,6 +1545,7 @@ async fn a_blob_head_is_never_relayed() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
 
     let mirror_dir = tmp("head-mirror");
@@ -1551,6 +1564,7 @@ async fn a_blob_head_is_never_relayed() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let http = reqwest::Client::new();
     let hex = bdigest.trim_start_matches("sha256:");
@@ -1617,6 +1631,7 @@ async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
     let http = reqwest::Client::new();
 
@@ -1721,6 +1736,7 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
         tls: None,
         webdav: true,
         tokens: Default::default(),
+        handover: Default::default(),
     }));
 
     // This client is built without any compression feature, so it sends no

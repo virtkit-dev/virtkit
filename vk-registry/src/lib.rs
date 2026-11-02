@@ -52,6 +52,7 @@ pub mod client;
 pub mod config;
 pub(crate) mod dav;
 pub(crate) mod forms;
+pub mod handover;
 pub(crate) mod html;
 pub mod hub;
 pub mod hubtoken;
@@ -107,6 +108,8 @@ pub struct ServerState {
     pub webdav: bool,
     /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
     pub tokens: hubtoken::TokenGate,
+    /// The listeners served through, to hand to a release.
+    pub handover: handover::Handover,
 }
 
 impl ServerState {
@@ -3703,7 +3706,11 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
                      needs no downtime",
                     path.display()
                 );
-                tokio::spawn(admin::serve_admin(listener, db.clone()));
+                tokio::spawn(admin::serve_admin(
+                    listener,
+                    db.clone(),
+                    state.handover.gate.clone(),
+                ));
             }
             Err(e) => eprintln!(
                 "vk-registry: warning: no accounts admin socket: {e:#}; `vk-registry \
@@ -3988,7 +3995,8 @@ async fn serve_refusing(
         };
         // A failed accept (out of descriptors, a client that reset before it was accepted) is
         // that one connection's, not the server's: wait a moment and keep serving.
-        let (stream, peer) = match listener.accept().await {
+        let (accepted, live) = state.handover.gate.accept(|| listener.accept()).await;
+        let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(e) => {
                 eprintln!("vk-registry: accept: {e}");
@@ -4018,7 +4026,7 @@ async fn serve_refusing(
             if let Ok(permit) = refusals.clone().try_acquire_owned() {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = (permit, live);
                     refuse(stream, &state, limits).await;
                 });
             }
@@ -4026,7 +4034,7 @@ async fn serve_refusing(
         };
         let state = state.clone();
         tokio::spawn(async move {
-            let _slots = (slot, peer_slot, state.store.count_connection());
+            let _slots = (slot, peer_slot, state.store.count_connection(), live);
             match &state.tls {
                 Some(acceptor) => {
                     match tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await {
@@ -4118,19 +4126,28 @@ where
     .await;
 }
 
-/// Serve one HTTP/1 connection over any transport (plain TCP or TLS).
+/// Serve one HTTP/1 connection over plain TCP or TLS. On [`handover`], finish the current
+/// request, even an hours-long transfer, then close. Close idle connections immediately;
+/// connections without a request yet close after their first response.
 async fn serve_conn<I>(io: I, state: Arc<ServerState>, limits: ConnLimits)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let svc = service_fn(move |req| handle(req, state.clone()));
+    let gate = state.handover.gate.clone();
+    let started = vk_peer::handoff::Started::new();
+    let svc = {
+        let started = started.clone();
+        service_fn(move |req| {
+            started.mark();
+            handle(req, state.clone())
+        })
+    };
     // hyper requires a timer to enforce the header read timeout.
-    match http1::Builder::new()
+    let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(limits.headers)
-        .serve_connection(io, svc)
-        .await
-    {
+        .serve_connection(io, svc);
+    match gate.serve(conn, started, |c| c.graceful_shutdown()).await {
         // The header timeout also ends every kept-alive connection left idle, so logging it
         // would log every pooled client every 30 s.
         Err(e) if e.is_timeout() => {}
@@ -4227,6 +4244,9 @@ async fn handle(
     let has_body = !hyper::body::Body::is_end_stream(req.body());
     let tls = state.tls.is_some();
     let resp = route(req, state).await.unwrap_or_else(|e| {
+        if accounts::is_handed_over_error(&e) {
+            return updating();
+        }
         eprintln!("vk-registry: {method} {path}: {e:#}");
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4235,6 +4255,17 @@ async fn handle(
         )
     });
     Ok(with_hsts(closing_after_refusal(resp, has_body), tls))
+}
+
+/// The answer to a request that needs what this process handed to the release updating the
+/// registry: the release serves the client's next connection, which `Connection: close` has it
+/// open.
+pub(crate) fn updating() -> Response<Body> {
+    ask_again(error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNAVAILABLE",
+        "this registry is updating; retry",
+    ))
 }
 
 /// `resp`, a 503 for what the release updating the registry now serves, with `Retry-After: 1`
@@ -4356,6 +4387,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         Authenticator::Accounts { db, .. } => {
             let resolved = match accounts::resolve_principal(db, &req, state.cookies_are_secure()) {
                 Ok(p) => p,
+                Err(e) if accounts::is_handed_over_error(&e) => return Ok(updating()),
                 Err(e) => {
                     eprintln!("vk-registry: resolving a credential: {e:#}");
                     return Ok(if is_human {
@@ -6298,6 +6330,7 @@ mod tests {
             tls,
             webdav: false,
             tokens: Default::default(),
+            handover: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6736,6 +6769,7 @@ mod tests {
                 tls: acceptor,
                 webdav: false,
                 tokens: Default::default(),
+                handover: Default::default(),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

@@ -4977,6 +4977,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         Registry::for_share(url, true, None, String::new(), None, None, None)
     }
@@ -5024,6 +5025,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let rg = Registry::for_share(url, true, None, String::new(), None, None, None);
         assert_eq!(
@@ -5058,6 +5060,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let rg = Registry::for_share(url, true, None, String::new(), None, None, None);
         // Over the client's 4 MiB PATCH size, so the upload takes several.
@@ -5170,6 +5173,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         // plain HTTP on loopback, which `for_share`'s `insecure` flag is for. The directory
         // push is the path that reaches `push_file`, and it goes through a `Config`.
@@ -5418,6 +5422,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         for marker in [None, Some("systemd"), Some("generic-cpio")] {
@@ -5475,6 +5480,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         for rg in [&local, &remote] {
@@ -5515,6 +5521,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         // Manifest PUT returns a `Location` URL. Callers need the digest to pin
@@ -5550,6 +5557,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             tokens: Default::default(),
+            handover: Default::default(),
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         // A dense parent, then an untouched overlay with one dirty cluster: the diff

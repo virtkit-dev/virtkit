@@ -1660,7 +1660,11 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(vk_registry::admin::serve_admin(listener, db));
+            rt.block_on(vk_registry::admin::serve_admin(
+                listener,
+                db,
+                Default::default(),
+            ));
         });
 
         let (ops, origin) = open_accounts_ops(&store_at(&dir)).unwrap();
