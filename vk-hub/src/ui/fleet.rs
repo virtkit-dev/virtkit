@@ -523,7 +523,7 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
             Some(Ok(n)) if n > 0 => Steer::Ceiling(Some(n)),
             _ => {
                 return Err(
-                    "Refused: a ceiling is a number of jobs, at least 1. To take none, \
+                    "Refused: a ceiling is a number of jobs, at least 1. To take no jobs, \
                      stop acquisition.",
                 );
             }
@@ -598,13 +598,13 @@ pub(super) async fn node_action(
             back,
             op: "reset".into(),
             what: if images {
-                "Reset this node? It drains, stops what its past jobs left running, deletes \
-                 their job directories and its idle host checkouts, and evicts its idle cached \
-                 images, which later jobs pull or build again."
+                "Reset this node? The node drains and stops processes left by its past jobs. \
+                 It deletes their job directories and its idle host checkouts. It also evicts \
+                 its idle cached images, which later jobs pull or build again."
             } else {
-                "Reset this node? It drains, stops what its past jobs left running, and \
-                 deletes their job directories and its idle host checkouts. Its cached images \
-                 are kept."
+                "Reset this node? The node drains and stops processes left by its past jobs. \
+                 It deletes their job directories and its idle host checkouts. It keeps its \
+                 cached images."
             },
             detail: Html::new(),
             asked: vec![("keep_images", if images { "no" } else { "yes" }.into())],
@@ -644,7 +644,7 @@ pub(super) async fn node_action(
             }),
             Steer::Command(op) => ops::command(&hub, &principal, &node, op).map(|c| {
                 format!(
-                    "Issued {} (command {}); what the node makes of it shows below.",
+                    "Issued {} (command {}). The node's response shows below.",
                     crate::store::operation_name(&c.op),
                     c.id
                 )
@@ -806,7 +806,7 @@ async fn delete_rollout(
         path,
         back: "/operations".to_string(),
         op: "delete".into(),
-        what: "Delete this rollout? It updated no node. Its audit lines stay.",
+        what: "Delete this rollout? The rollout updated no node. Its audit log lines are kept.",
         detail,
         asked: Vec::new(),
     };
@@ -1017,8 +1017,9 @@ fn token_form(h: &mut Html, auth: &Auth) {
     }
     h.raw("</select></label>")
         .raw("<button class=\"primary\">Issue an enrollment token</button></form>")
-        .raw("<p class=\"sub\">Single-use: the node redeems it with <code>vk node join</code>, ")
-        .raw("which pins the node's key. Shown a single time.</p></section>");
+        .raw("<p class=\"sub\">Single-use. The node redeems the token with ")
+        .raw("<code>vk node join</code>, which pins the node's key. The token is shown only ")
+        .raw("once.</p></section>");
 }
 
 /// `POST /tokens`: issue a single-use enrollment token, audited as the operator's session
@@ -1076,12 +1077,13 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     let mut main = Html::new();
     main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ");
     pages::at(&mut main, expires_at)
-        .raw(". It is shown this once: copy it now.</p><pre>")
+        .raw(". It is shown only once, so copy it now.</p><pre>")
         .text(&token)
-        .raw("</pre><p>On the node, as root, run this, then paste the token and press Enter ")
-        .raw("(it is read on stdin): it sets the host up for ")
-        .raw("the user the node runs as — created if need be, given <code>/dev/kvm</code> and ")
-        .raw("the state dir — enrolls it, and runs the node as a service:</p><pre>");
+        .raw("</pre><p>On the node, run the command below as root, then paste the token and ")
+        .raw("press Enter. The command reads the token on stdin. It sets up the host for the ")
+        .raw("user the node runs as. If needed, it creates that user. It gives the user ")
+        .raw("<code>/dev/kvm</code> and the state dir. Then it enrolls the node and runs it as ")
+        .raw("a service:</p><pre>");
     let url = |h: &mut Html| {
         match &ui.hub.node_url {
             Some(url) => h.text(url),
@@ -1091,14 +1093,14 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     main.raw("vk node join ");
     url(&mut main);
     main.raw(" --token - --user gitlab-runner --service</pre>")
-        .raw("<p class=\"sub\">Add <code>--replace</code> for a host already enrolled: its old ")
-        .raw("identity is moved aside and <code>join</code> prints the old node's ID, to ")
-        .raw("remove with <code>vk-hub nodes remove &lt;id&gt;</code> on the hub. As the user ")
-        .raw("itself, without root: ")
-        .raw("<code>vk node join ");
+        .raw("<p class=\"sub\">If the host is already enrolled, add <code>--replace</code>. ")
+        .raw("<code>join</code> then moves the old identity aside and prints the old node's ")
+        .raw("ID. Remove that node with <code>vk-hub nodes remove &lt;id&gt;</code> on the hub. ")
+        .raw("To enroll without root, run <code>vk node join ");
     url(&mut main);
-    main.raw(" --token -</code>, then <code>vk node service install</code>. Read on stdin, ")
-        .raw("the token stays out of the shell's history and the process list.</p>")
+    main.raw(" --token -</code> as the user itself, then <code>vk node service install</code>. ")
+        .raw("Because the token is read on stdin, it stays out of the shell's history and the ")
+        .raw("process list.</p>")
         .raw("<p><a href=\"/\">Back to the nodes</a></p>");
     Ok(page(layout("Enrollment token", "/", &auth, &main)))
 }
@@ -1108,17 +1110,18 @@ fn registry_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
     let mut main = Html::new();
     main.raw("<h1>Registry enrollment token</h1><p>Single-use, valid until ");
     pages::at(&mut main, expires_at)
-        .raw(". It is shown this once: copy it now.</p><pre>")
+        .raw(". It is shown only once, so copy it now.</p><pre>")
         .text(token)
-        .raw("</pre><p>On the registry's host, as the user <code>vk-registry serve</code> runs ")
-        .raw("as, run this, then paste the token and press Enter:</p><pre>vk-registry join ");
+        .raw("</pre><p>On the registry's host, run this as the user that runs ")
+        .raw("<code>vk-registry serve</code>, then paste the token and press Enter:</p>")
+        .raw("<pre>vk-registry join ");
     match &ui.hub.node_url {
         Some(url) => main.text(url),
         None => main.raw("&lt;hub-url&gt;"),
     };
-    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as for ")
+    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as you would for ")
         .raw("<code>serve</code>. A running <code>serve</code> connects within a minute. ")
-        .raw("<code>vk-registry leave</code> undoes it.</p>")
+        .raw("<code>vk-registry leave</code> undoes the enrollment.</p>")
         .raw("<p><a href=\"/registries\">Back to the registries</a></p>");
     layout("Registry enrollment token", "/registries", auth, &main)
 }
@@ -1129,21 +1132,24 @@ fn relay_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
     let mut main = Html::new();
     main.raw("<h1>Relay enrollment token</h1><p>Single-use, valid until ");
     pages::at(&mut main, expires_at)
-        .raw(". It is shown this once: copy it now.</p><pre>")
+        .raw(". It is shown only once, so copy it now.</p><pre>")
         .text(token)
-        .raw("</pre><p>On the relay's host, as the user <code>vk-gitlab run</code> runs as, ")
-        .raw("run this, then paste the token and press Enter:</p><pre>vk-gitlab join ");
+        .raw("</pre><p>On the relay's host, run this as the user that runs ")
+        .raw("<code>vk-gitlab run</code>, then paste the token and press Enter:</p>")
+        .raw("<pre>vk-gitlab join ");
     match &ui.hub.node_url {
         Some(url) => main.text(url),
         None => main.raw("&lt;hub-url&gt;"),
     };
-    main.raw(" --token -</pre><p class=\"sub\">Add <code>--config</code> as for ")
-        .raw("<code>run</code>, <code>--ca &lt;file&gt;</code> when the hub's certificate is not ")
-        .raw("one the system's roots verify, and <code>--replace</code> to enroll a relay ")
-        .raw("enrolled already, as a new one. Its config names its GitLab server in ")
-        .raw("<code>[gitlab] url</code>; the server waits for approval on GitLab's Servers until ")
-        .raw("an operator gives it a name. Read on stdin, the token stays out of the shell's ")
-        .raw("history and the process list.</p>")
+    main.raw(" --token -</pre><p class=\"sub\">You can add these options:</p><ul>")
+        .raw("<li><code>--config</code>, as you would for <code>run</code>.</li>")
+        .raw("<li><code>--ca &lt;file&gt;</code>, if the system's roots do not verify the hub's ")
+        .raw("certificate.</li>")
+        .raw("<li><code>--replace</code>, to enroll an already enrolled relay as a new one.</li>")
+        .raw("</ul><p class=\"sub\">The relay's config names its GitLab server in ")
+        .raw("<code>[gitlab] url</code>. That server waits for approval on GitLab's Servers ")
+        .raw("until an operator gives it a name. Because the token is read on stdin, it stays ")
+        .raw("out of the shell's history and the process list.</p>")
         .raw("<p><a href=\"")
         .raw(super::clients::RELAYS_PATH)
         .raw("\">Back to the GitLab adapters</a></p>");
@@ -1214,8 +1220,9 @@ fn state_badge(v: &NodeView) -> &'static str {
 fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
     let mut h = Html::new();
     if nodes.is_empty() {
-        h.raw("<p class=\"empty\">No node has enrolled yet: an operator issues a token for ")
-            .raw("<code>vk node join</code> below, or with <code>vk-hub token create</code>.</p>");
+        h.raw("<p class=\"empty\">No node has enrolled yet. To enroll one, an operator issues ")
+            .raw("a token for <code>vk node join</code> below, or with ")
+            .raw("<code>vk-hub token create</code>.</p>");
         return h;
     }
     h.raw("<table class=\"grid\"><thead><tr>");
@@ -1311,7 +1318,7 @@ struct Act {
 const PAUSE: Act = Act {
     op: "stop",
     label: "Pause intake",
-    does: "Take no new jobs; the running ones finish.",
+    does: "Take no new jobs. The running jobs finish.",
 };
 const RESUME: Act = Act {
     op: "resume",
@@ -1336,13 +1343,13 @@ const STAY_DRAINED: Act = Act {
 const UNDRAIN: Act = Act {
     op: "undrain",
     label: "Undrain",
-    does: "Back in service: take jobs again.",
+    does: "Return to service and take jobs again.",
 };
 const QUARANTINE: Act = Act {
     op: "quarantine",
     label: "Quarantine",
-    does: "Take the node out of service until it is released: no jobs, no updates, no \
-           resets. For a node you no longer trust.",
+    does: "Take the node out of service until you release it. The node takes no jobs, \
+           updates or resets. Use this for a node you no longer trust.",
 };
 const RELEASE: Act = Act {
     op: "release",
@@ -1352,9 +1359,9 @@ const RELEASE: Act = Act {
 const RESET: Act = Act {
     op: "reset",
     label: "Reset",
-    does: "Drain, stop what past jobs left running, delete their job directories and the \
-           idle checkouts, and evict the idle cached images unless \"Keep cached images\" is \
-           ticked. Asked again first.",
+    does: "Cleans the node, after asking you to confirm: drains it, stops processes left by \
+           past jobs, deletes their job directories and idle checkouts, and evicts idle cached \
+           images unless \"Keep cached images\" is ticked.",
 };
 
 /// A node page's steering, by group: where the node stands on each thing an operator
@@ -1422,7 +1429,7 @@ impl Panel {
             }
             // A node that does not say whether it runs one may run the hub's jobs beside it.
             Some(why) if external_runner => {
-                format!("Not taking the hub's jobs{why}; the external runner may still take jobs")
+                format!("Not taking the hub's jobs{why}. The external runner may still take jobs")
             }
             Some(why) => format!("Not taking new jobs{why}"),
         };
@@ -1486,12 +1493,12 @@ impl Panel {
         }
         let note = match (external, external_runner) {
             (true, true) => Some(
-                "Its runner is external: pausing intake, draining and quarantining do not stop \
-                 it, and it may still take jobs. A reset is refused.",
+                "This node's runner is external. Pausing intake, draining and quarantining do \
+                 not stop the runner, and it may still take jobs. Resets are refused.",
             ),
             (true, false) => Some(
-                "With [node] runner = \"external\", a reset is refused; a host with no runner \
-                 says so with runner = \"none\".",
+                "This node sets [node] runner = \"external\", so resets are refused. A host \
+                 with no runner should say so with runner = \"none\".",
             ),
             (false, _) => None,
         };
@@ -1504,7 +1511,7 @@ impl Panel {
             // Said only by a hub that places jobs.
             own_runner: own_runner.filter(|_| v.placed.is_some()).map(|why| {
                 format!(
-                    "Takes none of the hub's jobs: this host runs its own gitlab-runner with the \
+                    "Takes none of the hub's jobs. This host runs its own gitlab-runner with the \
                      vk executor ({why})"
                 )
             }),
@@ -1573,8 +1580,8 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
             .raw("<label for=\"ceiling\">Max concurrent jobs</label>")
             .raw("<input id=\"ceiling\" type=\"number\" name=\"ceiling\" min=\"1\" required ")
             .raw("hx-preserve=\"true\"><button>Set the limit</button><span class=\"does\">")
-            .raw("Run at most this many jobs at once on this node: its runner's, or those ")
-            .raw("the hub places here.</span></form>");
+            .raw("Run at most this many jobs at once on this node. The limit applies to the ")
+            .raw("node's runner's jobs, or to the jobs the hub places here.</span></form>");
     }
     if let Some(a) = &p.lift {
         act(h, a, "");
@@ -1630,9 +1637,9 @@ fn pools_form(h: &mut Html, pools: &[String], path: &str, csrf: &str) {
         .raw("\" type=\"text\" name=\"pools\" spellcheck=\"false\" hx-preserve=\"true\" ")
         .raw("value=\"")
         .text(&joined)
-        .raw("\"><button>Set pools</button><span class=\"does\">Comma- or space-separated; ")
-        .raw("they replace the node's, and empty takes it out of every pool. Placed jobs and ")
-        .raw("capacity rules name nodes by pool.</span></form>");
+        .raw("\"><button>Set pools</button><span class=\"does\">Comma- or space-separated. ")
+        .raw("The list replaces the node's pools. An empty list takes the node out of every ")
+        .raw("pool. Placed jobs and capacity rules name nodes by pool.</span></form>");
 }
 
 /// The opening of a steering form posting to `path`, by htmx or as a plain form, with the
@@ -1709,7 +1716,8 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         kv(
             &mut h,
             "Takes no placed jobs",
-            "it does not enforce the hub's egress rules, which [jobs] egress_rules turns on",
+            "the hub's egress rules are on ([jobs] egress_rules), and this node does not \
+             enforce them",
         );
     }
     if let Some(why) = &v.last_refusal {
@@ -1906,8 +1914,8 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             h,
             "Steering",
             &format!(
-                "none: the node speaks fleet protocol version {version}, so the hub monitors it \
-                 and cannot steer it; update its vk"
+                "none. The node speaks fleet protocol version {version}, so the hub can monitor \
+                 it but not steer it. Update the node's vk"
             ),
         );
         end_section(h);
@@ -2179,8 +2187,8 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     h.raw("<section><h2>Releases</h2>");
     operations::fetch_line(&mut h, ops.fetch.as_ref(), ops.latest.as_ref());
     if ops.releases.is_empty() {
-        h.raw("<p class=\"empty\">none: <code>vk-hub release add</code> copies a vk or ")
-            .raw("vk-registry binary into the hub</p>");
+        h.raw("<p class=\"empty\">none. <code>vk-hub release add</code> copies a vk or ")
+            .raw("vk-registry binary into the hub.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>program</th>")
             .raw("<th>version</th><th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
@@ -2211,8 +2219,8 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     }
     h.raw("</section><section><h2>CI tools</h2>");
     if ops.tools.is_empty() {
-        h.raw("<p class=\"empty\">none: <code>vk-hub tools add</code> packs a build context ")
-            .raw("into the hub, and <code>vk-hub nodes tools</code> has nodes build it</p>");
+        h.raw("<p class=\"empty\">none. <code>vk-hub tools add</code> packs a build context ")
+            .raw("into the hub. <code>vk-hub nodes tools</code> then has nodes build it.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
             .raw("<th>files</th><th>size</th><th>added</th><th>by</th></tr></thead><tbody>");
@@ -2237,7 +2245,7 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     }
     h.raw("</section><section><h2>Rollouts</h2>");
     if ops.rollouts.is_empty() {
-        h.raw("<p class=\"empty\">none yet: <code>vk-hub rollout create</code> starts one</p>");
+        h.raw("<p class=\"empty\">none yet. <code>vk-hub rollout create</code> starts one.</p>");
     }
     for r in &ops.rollouts {
         rollout(&mut h, r, steer, now);
@@ -2528,7 +2536,7 @@ mod tests {
         let p = Panel::of(&v);
         assert_eq!(
             p.intake,
-            "Not taking the hub's jobs while drained; the external runner may still take jobs"
+            "Not taking the hub's jobs while drained. The external runner may still take jobs"
         );
         assert_eq!(
             p.limit,
@@ -2542,8 +2550,8 @@ mod tests {
         assert_eq!(
             p.note,
             Some(
-                "Its runner is external: pausing intake, draining and quarantining do not stop \
-                 it, and it may still take jobs. A reset is refused."
+                "This node's runner is external. Pausing intake, draining and quarantining do \
+                 not stop the runner, and it may still take jobs. Resets are refused."
             )
         );
         assert_eq!(p.own_runner, None);
@@ -2555,7 +2563,7 @@ mod tests {
         });
         assert_eq!(
             Panel::of(&v).intake,
-            "Not taking the hub's jobs: intake paused; the external runner may still take jobs"
+            "Not taking the hub's jobs: intake paused. The external runner may still take jobs"
         );
         // A node that says it runs no gitlab-runner of its own runs only the hub's jobs.
         if let Some(r) = v.report.as_mut() {
@@ -2566,8 +2574,8 @@ mod tests {
         assert_eq!(
             p.note,
             Some(
-                "With [node] runner = \"external\", a reset is refused; a host with no runner \
-                 says so with runner = \"none\"."
+                "This node sets [node] runner = \"external\", so resets are refused. A host \
+                 with no runner should say so with runner = \"none\"."
             )
         );
         // One that runs none says so, and is steered like a managed one.
@@ -2615,7 +2623,7 @@ mod tests {
         assert_eq!(
             p.own_runner.as_deref(),
             Some(
-                "Takes none of the hub's jobs: this host runs its own gitlab-runner with the vk \
+                "Takes none of the hub's jobs. This host runs its own gitlab-runner with the vk \
                  executor (gitlab-runner.service runs the vk custom executor)"
             )
         );

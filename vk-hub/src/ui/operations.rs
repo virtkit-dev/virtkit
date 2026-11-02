@@ -110,7 +110,7 @@ pub(super) async fn upload(
     let Some(boundary) = header("content-type").and_then(multipart::boundary) else {
         return refuse(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Refused: a release is uploaded as multipart/form-data, as the form sends it.",
+            "Refused: upload the release as multipart/form-data, as the form sends it.",
         );
     };
     let Some(length) = header("content-length").and_then(|l| l.parse::<u64>().ok()) else {
@@ -153,7 +153,7 @@ pub(super) async fn upload(
     let Some(_slot) = site.uploading.take() else {
         return refuse(
             StatusCode::CONFLICT,
-            "Refused: another release is being uploaded; wait for it to end.",
+            "Refused: another release is being uploaded. Wait for that upload to end.",
         );
     };
     // Held until the release is: an update of the hub would cut the upload.
@@ -278,12 +278,12 @@ fn said_of(refusal: &Refusal) -> String {
     match refusal {
         Refusal::TooLarge => too_large(),
         Refusal::Slow => format!(
-            "Refused: the upload was too slow; it has to arrive at {}/s or faster, and never \
+            "Refused: the upload was too slow. It must arrive at {}/s or faster, and never \
              pause for {}.",
             pages::bytes(MIN_RATE),
             crate::human_duration(UPLOAD_IDLE)
         ),
-        Refusal::Malformed(why) => format!("Refused: this is not the form's upload: {why}."),
+        Refusal::Malformed(why) => format!("Refused: this upload does not match the form: {why}."),
         Refusal::Broken => "The upload broke off.".to_string(),
     }
 }
@@ -367,7 +367,7 @@ pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Resp
                 Ok(()) => Ok(done(
                     htmx,
                     &format!(
-                        "Fetching {program} {what} from {source}; how it goes shows below and \
+                        "Fetching {program} {what} from {source}. Its progress shows below and \
                          in the audit log."
                     ),
                 )),
@@ -441,7 +441,7 @@ pub(super) async fn create_rollout(
         Ok(r) => Ok(done(
             htmx,
             &format!(
-                "Started rollout {} of vk {}; it shows below.",
+                "Started rollout {} of vk {}. The rollout shows below.",
                 crate::rollout::short_id(&r.id),
                 r.row.version
             ),
@@ -562,7 +562,7 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
         .raw(if release.row.signature.is_some() {
             ", signed"
         } else {
-            ", unsigned: a node that requires signed releases refuses it"
+            ", unsigned, so nodes that require signed releases refuse it"
         })
         .raw(") to ")
         .text(to_update.len())
@@ -576,9 +576,11 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
         })
         .raw(", batches of ")
         .text(plan.batch)
-        .raw(". It pauses at a failure, and aborts past ")
+        .raw(". Up to ")
         .text(plan.max_failures)
-        .raw(". A node has ")
+        .raw(" failed node(s) pause the rollout. If more than ")
+        .text(plan.max_failures)
+        .raw(" nodes fail, the rollout aborts. Each node has ")
         .text(crate::human_duration(Duration::from_secs(
             plan.drain_timeout_secs,
         )))
@@ -588,7 +590,7 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
         )))
         .raw(" to update")
         .raw(if plan.force {
-            "; a node whose runner is external is updated without a drain"
+            ". Nodes whose runner is external update without a drain"
         } else {
             ""
         })
@@ -642,8 +644,8 @@ pub(super) fn forms(
         .raw(", sent at ")
         .text(pages::bytes(MIN_RATE))
         .raw(
-            "/s or faster. The hub checks that it is an x86-64 ELF holding the version as a \
-               string of its own; the node or registry runs it.</p>",
+            "/s or faster. The hub checks that the file is an x86-64 ELF binary that contains \
+               its own version string. The node or registry then runs it.</p>",
         );
     if let Some(source) = source {
         h.raw("<form class=\"wide\" method=\"post\" action=\"")
@@ -659,8 +661,8 @@ pub(super) fn forms(
             .raw("<p class=\"sub\">From <code>")
             .text(source)
             .raw(
-                "</code>: the program's binary is held once it hashes to the sha256 published \
-                   beside it, unsigned.</p>",
+                "</code>. The hub keeps the program's binary only if it matches the sha256 \
+                   published beside it. The release is kept unsigned.</p>",
             );
     }
     h.raw("</section><section id=\"start-rollout\" sse-swap=\"")
@@ -750,8 +752,8 @@ pub(super) fn start_rollout(
         .raw("value=\"1\" required size=\"4\"></label>")
         .raw("<label>Failed nodes tolerated <input type=\"number\" name=\"max_failures\" ")
         .raw("min=\"0\" value=\"0\" required size=\"4\"></label>")
-        .raw("<span class=\"sub\">Each failure up to this many pauses the rollout; one more ")
-        .raw("aborts it.</span>")
+        .raw("<span class=\"sub\">Each failure up to this many pauses the rollout. One more ")
+        .raw("failure aborts it.</span>")
         .raw("<details><summary>Advanced</summary><div>")
         .raw("<label>Node timeout <input name=\"node_timeout\" value=\"30m\" required ")
         .raw("size=\"5\"></label>")
@@ -803,7 +805,7 @@ pub(super) fn fetch_line(
                     .raw(program)
                     .raw(" ")
                     .text(asked)
-                    .raw(": asking which release it is");
+                    .raw(": finding out which release that is");
             }
             Phase::Downloading { version } => {
                 h.raw("Fetching ")

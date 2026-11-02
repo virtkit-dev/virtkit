@@ -124,10 +124,10 @@ pub(super) async fn vm_action(
         what: match (w.kind, op) {
             (_, "reboot") => "Reboot this VM? Its guest restarts on the same disks.",
             (WorkloadKind::Dev, _) => {
-                "Stop this environment? Its guest powers off; its state stays for the next \
-                 start."
+                "Stop this environment? The guest powers off. The environment's state is kept \
+                 for the next start."
             }
-            _ => "Stop this VM? Its guest powers off, and it is gone until run again.",
+            _ => "Stop this VM? The guest powers off, and the VM is gone until you run it again.",
         },
         detail: Html::new(),
         // The `vk run` it was asked about: its pid, and when it started, which tells two
@@ -226,7 +226,7 @@ pub(super) async fn dev_action(
             return Ok(refused(
                 htmx,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "`vk dev list` failed; the hub's log says how.",
+                "`vk dev list` failed. See the hub's log for the cause.",
             ));
         }
     };
@@ -241,7 +241,7 @@ pub(super) async fn dev_action(
         return Ok(refused(
             htmx,
             StatusCode::BAD_REQUEST,
-            "Not an action this environment takes as it stands.",
+            "This environment does not offer that action in its current state.",
         ));
     };
     if op != "start" {
@@ -250,12 +250,12 @@ pub(super) async fn dev_action(
             back: "/dev".to_string(),
             what: match op.as_str() {
                 "gc" => {
-                    "Remove this environment's state — its storage, keys and identity? It is \
-                     not running, and this cannot be undone."
+                    "Remove this environment's state, including its storage, keys and identity? \
+                     The environment is not running. This cannot be undone."
                 }
                 _ => {
-                    "Stop this environment? Its guest powers off; its state stays for the next \
-                     start."
+                    "Stop this environment? The guest powers off. The environment's state is \
+                     kept for the next start."
                 }
             },
             op,
@@ -321,15 +321,16 @@ async fn run(
             return Ok(refused(
                 htmx,
                 StatusCode::CONFLICT,
-                "Refused: something is already being done to it; wait for that to end.",
+                "Refused: another action on this VM or environment is already running. Wait for \
+                 it to end.",
             ));
         }
         Err(NotStarted::Unaudited) => {
             return Ok(refused(
                 htmx,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Refused: the audit log could not be written, so nothing was run; the hub's log \
-                 says why.",
+                "Nothing was run: the hub could not write the audit log. See the hub's log for \
+                 the cause.",
             ));
         }
     };
@@ -345,9 +346,9 @@ async fn run(
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">Started <code>")
         .node(&command)
         .raw(if live {
-            "</code>; how it ends shows below and in the audit log.</div>"
+            "</code>. Its result shows below and in the audit log.</div>"
         } else {
-            "</code>; reload the page for how it ends, which the audit log records too.</div>"
+            "</code>. Reload the page to see its result. The audit log records it too.</div>"
         });
     Ok(swap_none(super::html_response(StatusCode::OK, h)))
 }
@@ -402,10 +403,11 @@ pub(super) struct Ask {
 }
 
 /// Why an answer does not count.
-const UNKNOWN: &str = "Refused: this was asked too long ago, or of another session; ask again.";
-const CHANGED: &str = "Refused: it changed since you were asked; look again.";
-const ANSWERED: &str = "Refused: this was answered already, and is not done twice; the page \
-                        and the audit log show whether it ran.";
+const UNKNOWN: &str = "Refused: this question was asked too long ago, or of another session. \
+                       Start the action again.";
+const CHANGED: &str = "Refused: it changed since you were asked. Look at it again.";
+const ANSWERED: &str = "Refused: this question was answered already, and its action is not done \
+                        twice. The page and the audit log show whether it ran.";
 
 impl Questions {
     pub(super) fn new() -> Self {

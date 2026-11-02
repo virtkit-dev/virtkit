@@ -1696,7 +1696,7 @@ esac"#,
     assert!(
         reply
             .body
-            .contains("answered already, and is not done twice"),
+            .contains("answered already, and its action is not done twice"),
         "{}",
         reply.body
     );
@@ -1729,7 +1729,11 @@ esac"#,
     let confirmed = ask(addr, &origin, &cookie, &csrf, &path, "stop").await;
     let reply = post_action(addr, &origin, &cookie, &path, &confirmed, true).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
-    assert!(reply.body.contains("already being done"), "{}", reply.body);
+    assert!(
+        reply.body.contains("is already running. Wait for"),
+        "{}",
+        reply.body
+    );
     let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
     assert!(page.body.contains(", running since "), "{}", page.body);
     std::fs::write(vk.parent().unwrap().join("go"), "").unwrap();
@@ -1996,7 +2000,7 @@ esac"#,
         reply.body
     );
     // `/dev` is read as it loads, not kept live.
-    assert!(reply.body.contains("reload the page"), "{}", reply.body);
+    assert!(reply.body.contains("Reload the page"), "{}", reply.body);
     audited(
         &hub,
         "`vk dev up --workspace=/src/app --environment=dev` on dev environment app-1111 succeeded",
@@ -2190,7 +2194,7 @@ esac"#,
     let reply = post_action(addr, &origin, &cookie, &path, &confirmed, true).await;
     assert_eq!(reply.status, 500, "{}", reply.body);
     assert!(
-        reply.body.contains("audit log could not be written"),
+        reply.body.contains("could not write the audit log"),
         "{}",
         reply.body
     );
@@ -3373,8 +3377,9 @@ async fn a_version_1_node_s_page_offers_no_steering() {
     assert_eq!(page.status, 200);
     assert!(!page.body.contains(&path), "{}", page.body);
     assert!(
-        page.body
-            .contains("speaks fleet protocol version 1, so the hub monitors it"),
+        page.body.contains(
+            "speaks fleet protocol version 1, so the hub can monitor it but not steer it"
+        ),
         "{}",
         page.body
     );
