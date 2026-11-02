@@ -1755,7 +1755,14 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
     for problem in &inherited.problems {
         eprintln!("vk-hub: update: {problem}");
     }
-    let logins = update::take_logins();
+    let (logins, questions) = update::take_handed();
+    if !questions.is_empty() {
+        eprintln!(
+            "vk-hub: update: taking over {} question(s) asked before the update",
+            questions.len()
+        );
+    }
+    self_update.questions.restore(questions);
     let listener = take_or_listen(&mut inherited, "nodes", cfg.addr)
         .with_context(|| format!("binding {}", cfg.addr))?;
     self_update.passing.add("nodes", listener.as_fd())?;

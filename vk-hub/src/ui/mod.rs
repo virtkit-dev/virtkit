@@ -89,6 +89,7 @@ mod sse;
 mod updates;
 mod users;
 
+pub use actions::{HandedQuestion, Questions};
 use body::Body;
 pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
 

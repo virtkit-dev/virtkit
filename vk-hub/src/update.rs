@@ -20,10 +20,11 @@
 //!    the peers' sessions, which redial.
 //! 4. It seals its database ([`Db::seal`](crate::store::Db::seal)), records the trial, and
 //!    executes the release with its listening sockets ([`vk_peer::handoff`]) and the web UI's
-//!    OIDC sign-ins under way ([`take_logins`]), `alarm(2)` armed past the trial's deadline.
-//! 5. The release takes the sockets and sign-ins, opens the database, recovers its jobs and
-//!    serves; once it has served for [`SETTLE`] it records that it passed, installs itself over
-//!    the installed binary's path, and the update is done.
+//!    OIDC sign-ins under way and questions asked first ([`take_handed`]), `alarm(2)` armed past
+//!    the trial's deadline.
+//! 5. The release takes the sockets, sign-ins and questions, opens the database, recovers its
+//!    jobs and serves; once it has served for [`SETTLE`] it records that it passed, installs
+//!    itself over the installed binary's path, and the update is done.
 //!
 //! A release that does not get as far is ended by its alarm or its own failure; whatever
 //! starts `vk-hub serve` then — a supervisor, `Restart=always` — starts the previous binary,
@@ -81,15 +82,18 @@ const LOCK_FILE: &str = "serve.lock";
 /// The file the state is kept in, under the update directory.
 const STATE_FILE: &str = "state.json";
 
-/// The environment variable naming the memory file a hub hands its OIDC sign-ins under way
-/// over in ([`Logins`]): empty when it hands none.
-const LOGINS_ENV: &str = "VK_HUB_LOGINS_FD";
+/// Names the memory file carrying pending OIDC sign-ins and questions ([`Handed`]); empty
+/// when there are none. Keep its original sign-in name for compatibility with older releases.
+const HANDED_ENV: &str = "VK_HUB_LOGINS_FD";
 
-/// [`Logins`]' format, which a release reads only if it knows it.
-const LOGINS_FORMAT: u32 = 1;
+/// [`Handed`]'s format, which a release reads only if it knows it. Fields added since read as
+/// empty from a hub that did not write them, and a release that does not know one ignores it.
+const HANDED_FORMAT: u32 = 1;
 
-/// The most of [`Logins`] a release reads: far more than the sign-ins a hub keeps under way.
-const MAX_LOGINS: u64 = 4 << 20;
+/// The most of [`Handed`] a release reads: far more than the sign-ins a hub keeps under way.
+/// Questions, which may each hold a capacity policy's edit, are handed over newest first within
+/// it.
+const MAX_HANDED: u64 = 4 << 20;
 
 /// What `update/state.json` holds: the installed binary, the trial under way, the update in
 /// progress or the last one's end, and the last one asked.
@@ -312,6 +316,9 @@ pub struct SelfUpdate {
     pub passing: Passing,
     /// The web UI's OIDC sign-in, whose sign-ins under way are handed over.
     pub oidc: OnceLock<Arc<crate::ui::OidcSignIn>>,
+    /// The web UI's questions asked first, handed over so that an answer the release gets
+    /// counts.
+    pub questions: Arc<crate::ui::Questions>,
     /// Set from an update's start to its exec or failure.
     busy: AtomicBool,
 }
@@ -360,6 +367,7 @@ impl SelfUpdate {
             lock,
             passing: Passing::new(),
             oidc: OnceLock::new(),
+            questions: Arc::default(),
             busy: AtomicBool::new(false),
         };
         let cut_short = {
@@ -592,8 +600,8 @@ pub fn exec_on_start(
         .map(|v| (vk_peer::handoff::ENV.into(), v))
         .into_iter()
         .collect();
-    // The sign-ins handed over ([`LOGINS_ENV`]) pass on as this process inherited them: their
-    // file is still open, taken only once `serve` goes on.
+    // The sign-ins and questions handed over ([`HANDED_ENV`]) pass on as this process
+    // inherited them: their file is still open, taken only once `serve` goes on.
     env.push((LOCK_ENV.into(), lock.as_raw_fd().to_string().into()));
     let e = match inheritable(lock, true) {
         Ok(()) => vk_peer::update::exec_with(binary, deadline, &env),
@@ -944,17 +952,25 @@ fn execute(
             .into(),
     );
     let oidc = update.oidc.get();
-    let logins = Logins::taken(oidc.map(|o| o.take_pending()).unwrap_or_default());
-    // Without them the update goes on: a sign-in under way is started again at worst.
-    let carried = match logins.carry() {
+    // Newest first, so that those left behind are the oldest.
+    let (mut handed, left_behind) = Handed::taken(
+        oidc.map(|o| o.take_pending()).unwrap_or_default(),
+        update.questions.take(),
+    );
+    // Without them the update goes on: a sign-in under way is started again at worst, and a
+    // question asked again.
+    let carried = match handed.carry() {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("vk-hub: update: the sign-ins under way are not handed over: {e:#}");
+            eprintln!(
+                "vk-hub: update: the sign-ins under way and questions asked are not handed \
+                 over: {e:#}"
+            );
             None
         }
     };
     let logins_env = (
-        LOGINS_ENV.into(),
+        HANDED_ENV.into(),
         carried.as_ref().map_or_else(Default::default, |f| {
             std::os::fd::AsRawFd::as_raw_fd(f).to_string().into()
         }),
@@ -972,24 +988,33 @@ fn execute(
         eprintln!("vk-hub: update: {e:#}");
     }
     drop(carried);
+    // Those left behind age with the rest.
+    handed.questions.extend(left_behind);
+    let (logins, questions) = handed.into_parts();
     if let Some(oidc) = oidc {
-        oidc.restore_pending(logins.pending());
+        oidc.restore_pending(logins);
     }
+    update.questions.restore(questions);
     drop(prepared);
     hub.db.unseal();
     e
 }
 
-/// The web UI's OIDC sign-ins under way, as a hub hands them to the release it executes: in a
-/// sealed memory file the release inherits ([`LOGINS_ENV`]), never on disk, as each holds a PKCE
-/// verifier. A release from before this does not take it, and keeps it open unread, as its
-/// children do: the verifiers of sign-ins it cannot finish. No `Debug`, for the verifiers.
+/// What the web UI has under way, as a hub hands it to the release it executes: its OIDC sign-ins
+/// and its questions asked first ([`crate::ui::Questions`]), in a sealed memory file the release
+/// inherits ([`HANDED_ENV`]), never on disk, as each sign-in holds a PKCE verifier and each
+/// question the CSRF token of its session. A release from before sign-ins were handed over does
+/// not take it, and keeps it open unread, as its children do: the verifiers of sign-ins it
+/// cannot finish. One from before questions were handed over reads the sign-ins and ignores
+/// the rest. No `Debug`, for the verifiers and tokens.
 #[derive(Serialize, Deserialize)]
-struct Logins {
+struct Handed {
     format: u32,
     /// When they were handed over, Unix milliseconds: the time the exec took is off each.
     at_ms: u64,
     logins: Vec<Login>,
+    #[serde(default)]
+    questions: Vec<crate::ui::HandedQuestion>,
 }
 
 /// A sign-in under way ([`vk_oidc::Pending`]).
@@ -1001,14 +1026,18 @@ struct Login {
     left_ms: u64,
 }
 
-/// Whether [`take_logins`] has run: the memory file is owned once.
-static LOGINS_TAKEN: AtomicBool = AtomicBool::new(false);
+/// Whether [`take_handed`] has run: the memory file is owned once.
+static HANDED_TAKEN: AtomicBool = AtomicBool::new(false);
 
-impl Logins {
-    /// `pending`, taken now.
-    fn taken(pending: Vec<vk_oidc::Pending>) -> Self {
-        Logins {
-            format: LOGINS_FORMAT,
+impl Handed {
+    /// Take `pending` and as many `questions`, in order, as fit within [`MAX_HANDED`].
+    /// Return the remaining questions for the hub to restore if hand-over fails.
+    fn taken(
+        pending: Vec<vk_oidc::Pending>,
+        questions: Vec<crate::ui::HandedQuestion>,
+    ) -> (Self, Vec<crate::ui::HandedQuestion>) {
+        let mut handed = Handed {
+            format: HANDED_FORMAT,
             at_ms: unix_ms(),
             logins: pending
                 .into_iter()
@@ -1019,13 +1048,34 @@ impl Logins {
                     left_ms: u64::try_from(p.left.as_millis()).unwrap_or(u64::MAX),
                 })
                 .collect(),
+            questions: Vec::new(),
+        };
+        let mut room = MAX_HANDED.saturating_sub(json_len(&handed));
+        let total = questions.len();
+        let mut questions = questions.into_iter();
+        while let Some(q) = questions.next() {
+            // A comma between two.
+            let need = json_len(&q).saturating_add(1);
+            if need > room {
+                let left: Vec<_> = std::iter::once(q).chain(questions).collect();
+                eprintln!(
+                    "vk-hub: update: handing over the newest {} of {total} questions asked: the \
+                     rest do not fit",
+                    total - left.len()
+                );
+                return (handed, left);
+            }
+            room -= need;
+            handed.questions.push(q);
         }
+        (handed, Vec::new())
     }
 
-    /// The sign-ins, each less the time since they were taken.
-    fn pending(self) -> Vec<vk_oidc::Pending> {
+    /// The sign-ins and questions, each less the time since they were taken.
+    fn into_parts(self) -> (Vec<vk_oidc::Pending>, Vec<crate::ui::HandedQuestion>) {
         let since = unix_ms().saturating_sub(self.at_ms);
-        self.logins
+        let logins = self
+            .logins
             .into_iter()
             .map(|l| vk_oidc::Pending {
                 state: l.state,
@@ -1033,21 +1083,31 @@ impl Logins {
                 verifier: l.verifier,
                 left: Duration::from_millis(l.left_ms.saturating_sub(since)),
             })
-            .collect()
+            .collect();
+        let questions = self
+            .questions
+            .into_iter()
+            .filter(|q| q.left_ms > since)
+            .map(|q| crate::ui::HandedQuestion {
+                left_ms: q.left_ms - since,
+                ..q
+            })
+            .collect();
+        (logins, questions)
     }
 
     /// A sealed memory file holding them, close-on-exec until handed over; `None` for none.
     fn carry(&self) -> Result<Option<std::fs::File>> {
         use std::io::Write;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        if self.logins.is_empty() {
+        if self.logins.is_empty() && self.questions.is_empty() {
             return Ok(None);
         }
         let bytes = serde_json::to_vec(self).context("encoding them")?;
         // SAFETY: memfd_create takes a NUL-terminated name and returns a new descriptor.
         let raw = unsafe {
             libc::memfd_create(
-                c"vk-hub-logins".as_ptr(),
+                c"vk-hub-handed".as_ptr(),
                 libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
             )
         };
@@ -1066,26 +1126,26 @@ impl Logins {
         Ok(Some(file))
     }
 
-    /// What `file`, a memory file [`Logins::carry`] sealed, holds.
+    /// What `file`, a memory file [`Handed::carry`] sealed, holds.
     fn read(file: &std::fs::File) -> Result<Self> {
         use std::io::Read;
         let mut bytes = Vec::new();
         // From its start, whatever read it before through the same open file.
         std::io::Seek::rewind(&mut &*file).context("reading it")?;
-        file.take(MAX_LOGINS + 1)
+        file.take(MAX_HANDED + 1)
             .read_to_end(&mut bytes)
             .context("reading it")?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LOGINS {
-            bail!("it is larger than {MAX_LOGINS} bytes");
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_HANDED {
+            bail!("it is larger than {MAX_HANDED} bytes");
         }
         #[derive(Deserialize)]
         struct Format {
             format: u32,
         }
         let format: Format = serde_json::from_slice(&bytes).context("parsing it")?;
-        if format.format != LOGINS_FORMAT {
+        if format.format != HANDED_FORMAT {
             bail!(
-                "it is in format {}, and this release reads {LOGINS_FORMAT}",
+                "it is in format {}, and this release reads {HANDED_FORMAT}",
                 format.format
             );
         }
@@ -1093,7 +1153,7 @@ impl Logins {
     }
 }
 
-/// Whether `fd` is a memory file sealed against writes, as [`Logins::carry`] leaves one: not the
+/// Whether `fd` is a memory file sealed against writes, as [`Handed::carry`] leaves one: not the
 /// lock file, nor any other file a number left in the environment could name.
 fn sealed(fd: std::os::fd::RawFd) -> bool {
     // SAFETY: F_GET_SEALS reads a descriptor's seals and touches no memory; it fails on a
@@ -1102,46 +1162,54 @@ fn sealed(fd: std::os::fd::RawFd) -> bool {
     seals >= 0 && seals & libc::F_SEAL_WRITE != 0
 }
 
+/// JSON length in bytes, or `u64::MAX` if encoding fails.
+fn json_len(v: &impl Serialize) -> u64 {
+    serde_json::to_vec(v).map_or(u64::MAX, |b| u64::try_from(b.len()).unwrap_or(u64::MAX))
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Take the previous hub's pending OIDC sign-ins ([`LOGINS_ENV`]), subtracting elapsed time
-/// from each expiry. Only the first call takes them and closes the memory file. Like
-/// [`vk_peer::handoff::ENV`], the variable remains in the environment but each handover replaces
-/// it, so no release receives a stale descriptor. [`exec_on_start`] runs before this and
-/// passes it on while the file is still open.
-pub fn take_logins() -> Vec<vk_oidc::Pending> {
+/// Take the previous hub's OIDC sign-ins and questions ([`HANDED_ENV`]), subtracting elapsed
+/// time from their remaining lifetimes. Only the first call takes them and closes the memory
+/// file. Like [`vk_peer::handoff::ENV`], the variable stays in the environment but each
+/// hand-over replaces it, so no release receives a stale descriptor. [`exec_on_start`] runs
+/// first and passes it on while the file is still open.
+pub fn take_handed() -> (Vec<vk_oidc::Pending>, Vec<crate::ui::HandedQuestion>) {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-    if LOGINS_TAKEN.swap(true, Ordering::SeqCst) {
-        return Vec::new();
+    if HANDED_TAKEN.swap(true, Ordering::SeqCst) {
+        return Default::default();
     }
-    let Some(value) = std::env::var(LOGINS_ENV).ok().filter(|v| !v.is_empty()) else {
-        return Vec::new();
+    let Some(value) = std::env::var(HANDED_ENV).ok().filter(|v| !v.is_empty()) else {
+        return Default::default();
     };
     let fd = match value.parse::<RawFd>() {
         Ok(fd) if fd > 2 => fd,
         _ => {
-            eprintln!("vk-hub: update: {LOGINS_ENV}={value:?} is not a descriptor; ignored");
-            return Vec::new();
+            eprintln!("vk-hub: update: {HANDED_ENV}={value:?} is not a descriptor; ignored");
+            return Default::default();
         }
     };
     if !sealed(fd) {
         eprintln!(
-            "vk-hub: update: {LOGINS_ENV}: descriptor {fd} is not a sealed memory file; ignored"
+            "vk-hub: update: {HANDED_ENV}: descriptor {fd} is not a sealed memory file; ignored"
         );
-        return Vec::new();
+        return Default::default();
     }
     // SAFETY: open, and a sealed memory file, which neither a socket handed over nor the lock
     // is; the hub this one replaces passed it for this process to own, once.
     let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    match Logins::read(&file) {
-        Ok(logins) => logins.pending(),
+    match Handed::read(&file) {
+        Ok(handed) => handed.into_parts(),
         Err(e) => {
-            eprintln!("vk-hub: update: the sign-ins under way handed over: {e:#}; dropped");
-            Vec::new()
+            eprintln!(
+                "vk-hub: update: the sign-ins under way and questions asked handed over: {e:#}; \
+                 dropped"
+            );
+            Default::default()
         }
     }
 }
@@ -1271,23 +1339,43 @@ mod tests {
         assert!(handover.long_call().is_ok());
     }
 
-    /// The sign-ins under way go in a sealed memory file, read back less the time since; a file
-    /// that is not one is not read, and none goes when there are none.
+    /// The sign-ins under way and questions asked go in a sealed memory file, read back less
+    /// the time since; a file that is not one is not read, and none goes when there are none.
     #[test]
-    fn sign_ins_under_way_are_handed_over_in_a_sealed_memory_file() {
+    fn sign_ins_and_questions_are_handed_over_in_a_sealed_memory_file() {
         use std::io::Write;
         use std::os::fd::AsRawFd;
-        assert!(Logins::taken(Vec::new()).carry().unwrap().is_none());
-        let logins = Logins::taken(vec![vk_oidc::Pending {
-            state: "the-state".into(),
-            target: "/".into(),
-            verifier: "the-verifier".into(),
-            left: Duration::from_secs(60),
-        }]);
-        let file = logins.carry().unwrap().unwrap();
+        assert!(
+            Handed::taken(Vec::new(), Vec::new())
+                .0
+                .carry()
+                .unwrap()
+                .is_none()
+        );
+        let question = || crate::ui::HandedQuestion {
+            nonce: "the-nonce".into(),
+            session: "the-csrf".into(),
+            path: "/rollouts".into(),
+            op: "create".into(),
+            asked: vec![("release".into(), "abc".into())],
+            answered: false,
+            left_ms: 60_000,
+        };
+        let (only_question, _) = Handed::taken(Vec::new(), vec![question()]);
+        assert!(only_question.carry().unwrap().is_some());
+        let (handed, _) = Handed::taken(
+            vec![vk_oidc::Pending {
+                state: "the-state".into(),
+                target: "/".into(),
+                verifier: "the-verifier".into(),
+                left: Duration::from_secs(60),
+            }],
+            vec![question()],
+        );
+        let file = handed.carry().unwrap().unwrap();
         assert!(sealed(file.as_raw_fd()));
         assert!((&file).write_all(b"more").is_err());
-        let back = Logins::read(&file).unwrap().pending();
+        let (back, questions) = Handed::read(&file).unwrap().into_parts();
         assert_eq!(back.len(), 1);
         let (p, left) = (&back[0], back[0].left);
         assert_eq!(
@@ -1295,11 +1383,50 @@ mod tests {
             ("the-state", "/", "the-verifier")
         );
         assert!(left <= Duration::from_secs(60) && left > Duration::from_secs(50));
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].left_ms <= 60_000 && questions[0].left_ms > 50_000);
+        let q = &questions[0];
+        assert_eq!(
+            (
+                q.nonce.as_str(),
+                q.session.as_str(),
+                q.path.as_str(),
+                q.op.as_str()
+            ),
+            ("the-nonce", "the-csrf", "/rollouts", "create")
+        );
+        assert_eq!(q.asked, question().asked);
+        assert!(!q.answered);
         // Read again from its start.
-        assert_eq!(Logins::read(&file).unwrap().logins.len(), 1);
+        assert_eq!(Handed::read(&file).unwrap().logins.len(), 1);
         let plain = std::fs::File::open("/proc/self/exe").unwrap();
         assert!(!sealed(plain.as_raw_fd()));
         assert!(!sealed(-1));
+    }
+
+    /// What a hub from before questions were handed over writes reads with none; questions
+    /// past what a release reads, in the order given, stay behind with the hub.
+    #[test]
+    fn questions_past_the_limit_stay_behind() {
+        let old = br#"{"format":1,"at_ms":0,"logins":[]}"#;
+        let handed: Handed = serde_json::from_slice(old).unwrap();
+        assert!(handed.questions.is_empty());
+        let big = |nonce: &str| crate::ui::HandedQuestion {
+            nonce: nonce.into(),
+            session: String::new(),
+            path: String::new(),
+            op: String::new(),
+            asked: vec![("policy".into(), "x".repeat(1 << 20))],
+            answered: false,
+            left_ms: 1,
+        };
+        let questions: Vec<_> = (0..6).map(|i| big(&i.to_string())).collect();
+        let (handed, left) = Handed::taken(Vec::new(), questions);
+        let kept: Vec<_> = handed.questions.iter().map(|q| q.nonce.as_str()).collect();
+        assert_eq!(kept, ["0", "1", "2"]);
+        let left: Vec<_> = left.iter().map(|q| q.nonce.as_str()).collect();
+        assert_eq!(left, ["3", "4", "5"]);
+        assert!(json_len(&handed) <= MAX_HANDED);
     }
 
     /// A release takes over the listeners when it names where it reads them from, wherever
@@ -1470,14 +1597,14 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             std::fs::File::open(&path).unwrap()
         };
-        let large = vec![b' '; usize::try_from(MAX_LOGINS).unwrap() + 1];
-        let e = Logins::read(&file(&large)).err().unwrap();
+        let large = vec![b' '; usize::try_from(MAX_HANDED).unwrap() + 1];
+        let e = Handed::read(&file(&large)).err().unwrap();
         assert!(format!("{e:#}").contains("larger than"), "{e:#}");
         let other = format!(
             r#"{{"format":{},"at_ms":0,"logins":[]}}"#,
-            LOGINS_FORMAT + 1
+            HANDED_FORMAT + 1
         );
-        let e = Logins::read(&file(other.as_bytes())).err().unwrap();
+        let e = Handed::read(&file(other.as_bytes())).err().unwrap();
         assert!(format!("{e:#}").contains("in format"), "{e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }

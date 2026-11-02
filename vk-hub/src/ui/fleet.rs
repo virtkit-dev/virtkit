@@ -62,8 +62,8 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 /// also notes a node enrolled, renamed or removed, and a registry or relay connecting,
 /// reporting or answering an update — not every node's, registry's or relay's heartbeat.
 pub(super) struct FleetSite {
-    /// Pending confirmations.
-    pub(super) questions: actions::Questions,
+    /// Pending confirmations, shared with the hub's update, which hands them over.
+    pub(super) questions: Arc<actions::Questions>,
     /// Whether a release is being uploaded.
     pub(super) uploading: operations::Uploading,
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
@@ -82,7 +82,8 @@ pub(super) struct FleetSite {
 impl FleetSite {
     pub(super) fn new(hub: &Arc<Hub>) -> Self {
         FleetSite {
-            questions: actions::Questions::new(),
+            questions: (hub.self_update.get())
+                .map_or_else(Default::default, |u| u.questions.clone()),
             uploading: operations::Uploading::new(),
             nodes_feed: sse::feed(hub.subscribe(), counted_events(hub, nodes_events(hub))),
             operations_feed: sse::feed(

@@ -657,13 +657,15 @@ again, and cuts what is still open after 5 seconds: the nodes', registries' and 
 sessions, which redial, and long polls, which are retried. It writes its database durably with
 its allocator state recorded, so the next open needs no repair, records the trial in
 `<data_dir>/update/state.json`, and executes the release in its place, the same process, with
-the node, web UI and admin sockets (`VK_LISTEN_FDS`), the web UI's OIDC sign-ins under way in a
-sealed memory file it inherits (`VK_HUB_LOGINS_FD`; never on disk, as each holds a PKCE
-verifier) and `alarm(2)` armed. The release takes the sockets, finishes those sign-ins at their
-callback, opens the database, recovers its jobs and serves; once it has served for 10 seconds,
-it records that it passed and installs itself over the installed binary by rename. The audit log
-has who asked and how the update ended. The listener backlog (1024) bounds what waits meanwhile:
-beyond it, connections are refused or retried by the kernel.
+the node, web UI and admin sockets (`VK_LISTEN_FDS`), the web UI's OIDC sign-ins under way and
+the questions it asked before an action in a sealed memory file it inherits
+(`VK_HUB_LOGINS_FD`; never on disk, as each holds a PKCE verifier or a session's CSRF token)
+and `alarm(2)` armed. The release takes the sockets, finishes those sign-ins at their callback,
+takes those questions, so that their answers count, opens the database, recovers its jobs and
+serves; once it has served for 10 seconds, it records that it passed and installs itself over
+the installed binary by rename. The audit log has who asked and how the update ended. The
+listener backlog (1024) bounds what waits meanwhile: beyond it, connections are refused or
+retried by the kernel.
 
 The binary is replaced only once the release has passed. A release that fails or hangs before
 then is ended — by itself or by the alarm — and whatever starts `vk-hub serve` starts the

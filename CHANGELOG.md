@@ -29,12 +29,12 @@ All notable changes to virtkit will be documented in this file.
 - **Update the hub in place.** With `[update] allow = true`, the Updates page's Hub section or
   `vk-hub update --release <prefix>` updates the hub to a `vk-hub` release it holds (`vk-hub
   release add|fetch --program vk-hub`) without refusing a connection: clients wait the few
-  seconds it takes, no queued job is lost, live pages reconnect and web UI sign-ins under way
-  finish. A release that does not come up is rolled back by the hub's supervisor restarting
-  `vk-hub serve`. `vk release-key sign --program vk-hub` signs releases for `[update]
-  release_keys`. An update is refused while a release or tools are being added, uploaded or
-  fetched, and those are refused while it runs. See `docs/fleet-prototype.md`, "Updating the
-  hub".
+  seconds it takes, no queued job is lost, live pages reconnect, web UI sign-ins under way
+  finish and pending confirmations can be answered after the update. A release that does not
+  come up is rolled back by the hub's supervisor restarting `vk-hub serve`. `vk release-key
+  sign --program vk-hub` signs releases for `[update] release_keys`. An update is refused
+  while a release or tools are being added, uploaded or fetched, and those are refused while
+  it runs. See `docs/fleet-prototype.md`, "Updating the hub".
 - **Update a registry without refusing a connection.** Hub-driven updates preserve build
   locks and pending sign-ins while continuing to accept connections. Under systemd, open blob
   uploads and downloads finish on the previous version, for at most `[hub]

@@ -2,7 +2,8 @@
 //! with different bytes. Clients connecting throughout receive complete replies, including a
 //! client that sends its request after the hub stops accepting. The process stays the same,
 //! runs the release, passes its trial and replaces the installed copy. The release completes
-//! a web UI sign-in started before the update.
+//! a web UI sign-in started before the update, and takes the answer to a question asked
+//! before it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -90,6 +91,31 @@ fn http(port: u16, request: &str) -> (String, String) {
     let answer = String::from_utf8_lossy(&answer).into_owned();
     let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
     (head.to_string(), body.to_string())
+}
+
+/// An htmx post of the web UI's form `body` to `path` on `port`, with the session cookie
+/// `session`: the answer's head and body.
+fn post(port: u16, path: &str, session: Option<&str>, body: &str) -> (String, String) {
+    let cookie = session.map_or_else(String::new, |c| format!("Cookie: {c}\r\n"));
+    http(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Site: same-origin\r\n\
+             HX-Request: true\r\n{cookie}Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+/// The value of the hidden field `name` in `html`.
+fn field(html: &str, name: &str) -> String {
+    let at = format!("name=\"{name}\" value=\"");
+    let start = html
+        .find(&at)
+        .unwrap_or_else(|| panic!("no {name} in {html}"))
+        + at.len();
+    html[start..].split('"').next().unwrap().to_string()
 }
 
 /// Kills the hub however the test ends.
@@ -237,6 +263,37 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
     let state = login.split_once('=').unwrap().1.to_string();
     assert!(!state.is_empty(), "{head}");
 
+    // A question asked before the update: revoking another's grant, from an operator's session.
+    cli(
+        &config,
+        &["accounts", "grant", "bob@example.com", "--role", "viewer"],
+    );
+    let link = cli(&config, &["ui", "login", "--role", "operator"]);
+    let token = link.trim().split_once("?t=").unwrap().1.to_string();
+    let (head, body) = post(ui_port, "/login", None, &format!("t={token}"));
+    let session = head
+        .lines()
+        .filter_map(|l| l.strip_prefix("set-cookie: "))
+        .find(|c| c.starts_with("__Host-vk-hub="))
+        .and_then(|c| c.split(';').next())
+        .unwrap_or_else(|| panic!("no session: {head}\n{body}"))
+        .to_string();
+    let (_, page) = http(
+        ui_port,
+        &format!(
+            "GET /users HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\n\
+             Cookie: {session}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    let csrf = field(&page, "_csrf");
+    let revoke = format!("_csrf={csrf}&op=revoke&email=bob%40example.com");
+    let (head, asked) = post(ui_port, "/users", Some(&session), &revoke);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{asked}");
+    let confirmed = format!(
+        "{revoke}&previous=viewer&confirm=yes&nonce={}",
+        field(&asked, "nonce")
+    );
+
     // A client asking all along, each request on a new connection.
     let stop = Arc::new(AtomicBool::new(false));
     let client = std::thread::spawn({
@@ -317,6 +374,13 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
         "{head}\n{body}\n{}",
         log.lock().unwrap()
     );
+    // The question asked before the update, answered.
+    let (head, body) = post(ui_port, "/users", Some(&session), &confirmed);
+    assert!(
+        head.starts_with("HTTP/1.1 200") && body.contains("Revoked the grant of bob@example.com"),
+        "{head}\n{body}\n{}",
+        log.lock().unwrap()
+    );
     // Served by the release a while longer.
     std::thread::sleep(Duration::from_secs(1));
     stop.store(true, Ordering::SeqCst);
@@ -333,6 +397,10 @@ fn the_hub_updates_itself_without_refusing_a_connection() {
     assert!(log.contains("installed vk-hub"), "{log}");
     assert!(
         log.contains("finishing 1 of the 1 sign-in(s) under way handed over"),
+        "{log}"
+    );
+    assert!(
+        log.contains("taking over 1 question(s) asked before the update"),
         "{log}"
     );
     // The same process, now running the release, installed over the installed copy.

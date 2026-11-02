@@ -354,8 +354,10 @@ async fn run(
 
 /// The questions asked, by the nonce each one's form carries: unanswered, or answered and kept
 /// until they would have expired, so that an answer posted again — a page resending a post
-/// whose reply was lost — is told it was answered rather than asked too long ago.
-pub(super) struct Questions(Mutex<HashMap<String, Question>>);
+/// whose reply was lost — is told it was answered rather than asked too long ago. A hub
+/// updating itself hands them to the release it executes ([`Questions::take`]).
+#[derive(Default)]
+pub struct Questions(Mutex<HashMap<String, Question>>);
 
 struct Question {
     /// The CSRF token of the session it was asked of.
@@ -363,7 +365,7 @@ struct Question {
     path: String,
     op: String,
     /// What it was asked about, as its form's hidden fields have it; emptied once answered.
-    asked: Asked,
+    asked: Vec<(String, String)>,
     at: Instant,
     answered: bool,
 }
@@ -371,6 +373,20 @@ struct Question {
 /// What a question is asked about, as `(field, value)`: what must be as it was for its answer
 /// to count.
 pub(super) type Asked = Vec<(&'static str, String)>;
+
+/// A question as a hub hands it to the release it executes: its nonce, and the time it has
+/// left rather than when it was asked, an [`Instant`] meaning nothing to another process. No
+/// `Debug`: `session` is the CSRF token of the session it was asked of.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HandedQuestion {
+    pub nonce: String,
+    pub session: String,
+    pub path: String,
+    pub op: String,
+    pub asked: Vec<(String, String)>,
+    pub answered: bool,
+    pub left_ms: u64,
+}
 
 /// A question an action asks first.
 pub(super) struct Ask {
@@ -393,12 +409,18 @@ const ANSWERED: &str = "Refused: this was answered already, and is not done twic
 
 impl Questions {
     pub(super) fn new() -> Self {
-        Questions(Mutex::new(HashMap::new()))
+        Self::default()
     }
 
     /// Keep `q`, and return the nonce its form answers it by.
     fn ask(&self, q: Question) -> Result<String> {
         let nonce = crate::random_hex(16)?;
+        self.keep(nonce.clone(), q);
+        Ok(nonce)
+    }
+
+    /// Keep `q` under `nonce`, dropping those expired and, past [`MAX_QUESTIONS`], the oldest.
+    fn keep(&self, nonce: String, q: Question) {
         let mut kept = self.lock();
         kept.retain(|_, q| q.at.elapsed() < QUESTION_LIFE);
         if kept.len() >= MAX_QUESTIONS
@@ -409,8 +431,7 @@ impl Questions {
         {
             kept.remove(&oldest);
         }
-        kept.insert(nonce.clone(), q);
-        Ok(nonce)
+        kept.insert(nonce, q);
     }
 
     /// Answer the question `nonce` if it was asked of `session` for `op` on `path` about
@@ -439,12 +460,58 @@ impl Questions {
         if q.answered {
             return Err(ANSWERED);
         }
-        if !posted || q.asked != *asked {
+        let same = (q.asked.iter().map(|(f, v)| (f.as_str(), v.as_str())))
+            .eq(asked.iter().map(|(f, v)| (*f, v.as_str())));
+        if !posted || !same {
             return Err(CHANGED);
         }
         q.answered = true;
         q.asked = Vec::new();
         Ok(())
+    }
+
+    /// Every question live, taken for the release the hub hands over to: none is answered
+    /// here until they are given back ([`Questions::restore`]).
+    pub fn take(&self) -> Vec<HandedQuestion> {
+        let taken = std::mem::take(&mut *self.lock());
+        let mut handed: Vec<_> = taken
+            .into_iter()
+            .filter_map(|(nonce, q)| {
+                let left = QUESTION_LIFE.checked_sub(q.at.elapsed())?;
+                Some(HandedQuestion {
+                    nonce,
+                    session: q.session,
+                    path: q.path,
+                    op: q.op,
+                    asked: q.asked,
+                    answered: q.answered,
+                    left_ms: u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+                })
+            })
+            .collect();
+        // Newest first: what a hand-over keeps when it cannot carry them all.
+        handed.sort_by_key(|q| std::cmp::Reverse(q.left_ms));
+        handed
+    }
+
+    /// Restore questions after a failed hand-over or accept them from the previous hub.
+    /// Each keeps its remaining lifetime, capped at [`QUESTION_LIFE`].
+    pub fn restore(&self, handed: Vec<HandedQuestion>) {
+        for h in handed {
+            let left = Duration::from_millis(h.left_ms).min(QUESTION_LIFE);
+            // Asked before this host's clock began, at worst: given its whole life again.
+            let at =
+                (Instant::now().checked_sub(QUESTION_LIFE - left)).unwrap_or_else(Instant::now);
+            let q = Question {
+                session: h.session,
+                path: h.path,
+                op: h.op,
+                asked: h.asked,
+                at,
+                answered: h.answered,
+            };
+            self.keep(h.nonce, q);
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Question>> {
@@ -506,7 +573,9 @@ fn confirm(
         session: auth.csrf.clone(),
         path: ask.path.clone(),
         op: ask.op.clone(),
-        asked: ask.asked.clone(),
+        asked: (ask.asked.iter())
+            .map(|(field, value)| ((*field).to_string(), value.clone()))
+            .collect(),
         at: Instant::now(),
         answered: false,
     })?;
@@ -710,7 +779,7 @@ mod tests {
             session: session.into(),
             path: "/vm/x/action".into(),
             op: "stop".into(),
-            asked: pid(),
+            asked: vec![("pid".into(), "7".into())],
             at,
             answered: false,
         }
@@ -771,6 +840,74 @@ mod tests {
             Err(UNKNOWN)
         );
         assert_eq!(qs.lock().len(), 1);
+    }
+
+    /// Questions taken for a hand-over come back, answered or not, with the time they had
+    /// left; one with none left is not handed over.
+    #[test]
+    fn questions_are_handed_over_with_the_time_they_have_left() {
+        let qs = Questions::new();
+        let answered = qs.ask(question("a", Instant::now())).unwrap();
+        qs.answer(&answered, "a", "/vm/x/action", "stop", &pid(), true)
+            .unwrap();
+        let earlier = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        let open = qs.ask(question("a", earlier)).unwrap();
+        if let Some(long_ago) = Instant::now().checked_sub(QUESTION_LIFE) {
+            qs.lock().insert("expired".into(), question("a", long_ago));
+        }
+        let handed = qs.take();
+        assert!(qs.lock().is_empty());
+        assert_eq!(handed.len(), 2);
+        assert_eq!(handed[0].nonce, answered, "newest first");
+        assert!(handed[0].answered && handed[0].asked.is_empty());
+        assert!(!handed[1].answered);
+        assert!(handed[1].left_ms <= (QUESTION_LIFE - Duration::from_secs(60)).as_millis() as u64);
+        let back = Questions::new();
+        back.restore(handed);
+        assert_eq!(
+            back.answer(&answered, "a", "/vm/x/action", "stop", &pid(), true),
+            Err(ANSWERED)
+        );
+        assert_eq!(
+            back.answer(&open, "a", "/vm/x/action", "stop", &pid(), true),
+            Ok(())
+        );
+        let at = back.lock()[&open].at;
+        assert!(
+            at.elapsed() >= Duration::from_secs(59),
+            "{:?}",
+            at.elapsed()
+        );
+    }
+
+    /// A question handed over lives for what it has left, at most [`QUESTION_LIFE`]; one with
+    /// nothing left is not answerable.
+    #[test]
+    fn a_question_handed_over_lives_at_most_its_life() {
+        let handed = |nonce: &str, left_ms| HandedQuestion {
+            nonce: nonce.into(),
+            session: "a".into(),
+            path: "/vm/x/action".into(),
+            op: "stop".into(),
+            asked: vec![("pid".into(), "7".into())],
+            answered: false,
+            left_ms,
+        };
+        let qs = Questions::new();
+        qs.restore(vec![handed("long", u64::MAX), handed("none", 0)]);
+        assert!(qs.lock()["long"].at.elapsed() < QUESTION_LIFE);
+        if Instant::now().checked_sub(QUESTION_LIFE).is_some() {
+            assert_eq!(
+                qs.answer("none", "a", "/vm/x/action", "stop", &pid(), true),
+                Err(UNKNOWN)
+            );
+        }
+        assert_eq!(
+            qs.answer("long", "a", "/vm/x/action", "stop", &pid(), true),
+            Ok(())
+        );
     }
 
     /// Past [`MAX_QUESTIONS`], the oldest question goes first.
