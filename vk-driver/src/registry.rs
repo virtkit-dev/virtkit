@@ -2516,6 +2516,95 @@ where
     with_transfer_retry(what, attempt).await
 }
 
+/// [`with_transfer_retry`] for callers outside this module that send their own requests.
+/// Retry 503 and 429 responses as back-pressure. When the budget is exhausted, return
+/// the last response unchanged for the caller to forward.
+pub(crate) async fn with_request_retry<F, Fut>(
+    what: &str,
+    attempt: F,
+) -> reqwest::Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    request_retry(what, &TRANSFER_BACKOFF, attempt).await
+}
+
+/// [`with_request_retry`] with explicit delays, shorter in tests.
+async fn request_retry<F, Fut>(
+    what: &str,
+    backoff: &Backoff,
+    mut attempt: F,
+) -> reqwest::Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    let tried = retry_transfer(what, backoff, || {
+        let sent = attempt();
+        async move {
+            match sent.await {
+                Ok(resp) if status_retry(resp.status().as_u16()) == Retry::Pressure => {
+                    Err(Unanswered::TurnedAway(resp))
+                }
+                Ok(resp) => Ok(resp),
+                Err(e) => Err(Unanswered::Failed(e)),
+            }
+        }
+    })
+    .await;
+    match tried {
+        Ok(resp) | Err(Unanswered::TurnedAway(resp)) => Ok(resp),
+        Err(Unanswered::Failed(e)) => Err(e),
+    }
+}
+
+/// A failed or refused attempt from [`request_retry`]. Keep refusal responses so the last
+/// can be returned unchanged when the retry budget is exhausted.
+enum Unanswered {
+    Failed(reqwest::Error),
+    TurnedAway(reqwest::Response),
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::Failed(e) => write!(f, "{e:#}"),
+            Unanswered::TurnedAway(resp) => write!(f, "the registry answered {}", resp.status()),
+        }
+    }
+}
+
+impl Transport for Unanswered {
+    fn retry(&self) -> Retry {
+        match self {
+            Unanswered::Failed(e) => e.retry(),
+            Unanswered::TurnedAway(_) => Retry::Pressure,
+        }
+    }
+
+    fn reqwest(&self) -> Option<&reqwest::Error> {
+        match self {
+            Unanswered::Failed(e) => Some(e),
+            Unanswered::TurnedAway(_) => None,
+        }
+    }
+
+    fn connected(&self) -> bool {
+        match self {
+            Unanswered::Failed(e) => e.connected(),
+            Unanswered::TurnedAway(_) => true,
+        }
+    }
+
+    fn authority(&self) -> Option<String> {
+        match self {
+            Unanswered::Failed(e) => e.authority(),
+            Unanswered::TurnedAway(resp) => authority_of(resp.url()),
+        }
+    }
+}
+
 /// [`with_transfer_retry`] with explicit delays, shorter in tests.
 async fn retry_transfer<T, E, F, Fut>(
     what: &str,
@@ -2689,6 +2778,16 @@ pub(crate) fn turned_away(resp: reqwest::Response) -> reqwest::Result<reqwest::R
     }
 }
 
+/// `url`'s `scheme://host:port`, by which a registry is noted down or up.
+fn authority_of(url: &reqwest::Url) -> Option<String> {
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme(),
+        url.host_str()?,
+        url.port_or_known_default()?
+    ))
+}
+
 /// Classify failures for [`with_transfer_retry`].
 trait Transport {
     fn retry(&self) -> Retry;
@@ -2707,13 +2806,7 @@ trait Transport {
 
     /// The `scheme://host:port` the failed request went to, when the failure says.
     fn authority(&self) -> Option<String> {
-        let url = self.reqwest()?.url()?;
-        Some(format!(
-            "{}://{}:{}",
-            url.scheme(),
-            url.host_str()?,
-            url.port_or_known_default()?
-        ))
+        authority_of(self.reqwest()?.url()?)
     }
 
     /// Whether the failure is retried at all.
@@ -4774,6 +4867,55 @@ pub(crate) mod tests {
                 OciDistributionError::UnauthorizedError { .. }
             ));
             assert_eq!(calls.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    /// Retry refusals until success or budget exhaustion, then return the last response
+    /// unchanged rather than converting it to an error.
+    #[test]
+    fn a_request_turned_away_is_retried_then_returned_as_answered() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        install_crypto();
+        // Answers each connection 503, but 200 from the `ok_from`th on.
+        let serve = |ok_from: u32| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = std::sync::Arc::new(AtomicU32::new(0));
+            let counted = served.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { break };
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf);
+                    let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+                    let answer: &[u8] = if n >= ok_from {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    } else {
+                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n\
+                          Content-Length: 4\r\nConnection: close\r\n\r\nbusy"
+                    };
+                    let _ = conn.write_all(answer);
+                }
+            });
+            (format!("http://{addr}/v2/"), served)
+        };
+        block_on(async {
+            let client = reqwest::Client::new();
+            let (url, served) = serve(3);
+            let resp = request_retry("probe", &TEST_BACKOFF, || client.get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            assert_eq!(served.load(Ordering::Relaxed), 3);
+
+            let (url, served) = serve(u32::MAX);
+            let resp = request_retry("probe", &TEST_BACKOFF, || client.get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 503);
+            assert_eq!(resp.text().await.unwrap(), "busy");
+            assert!(served.load(Ordering::Relaxed) > 1);
         });
     }
 

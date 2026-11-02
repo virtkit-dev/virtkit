@@ -73,6 +73,12 @@ All notable changes to virtkit will be documented in this file.
   a registry that is restarting or busy, for up to a few minutes, rather than skipping the
   cache at once. A registry that stays unavailable, or stops answering, is not waited for
   again by that step's other caches.
+- **A job's registry proxy rides out a registry restart.** A request through `registry.vk`
+  that gets no answer or is turned away busy — a pull, a manifest or file push, an upload
+  started — is retried as `vk`'s own registry transfers are, rather than failing at once with
+  502. A guest whose registry stays down waits through those retries, up to a few minutes,
+  then gets the registry's last answer if it was turned away, or a 502. Upload chunks and
+  ends, deletions, new directories, lock requests and bodies over 4 MiB are still sent once.
 - **GitLab cancels reach the node across a hub restart.** A GitLab adapter keeps asking the
   hub to cancel a job GitLab canceled, gracefully or not, until the hub takes it, rather than
   giving up after about 15 seconds and leaving the job running on its node until the

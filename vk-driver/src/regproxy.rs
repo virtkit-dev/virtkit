@@ -12,6 +12,15 @@
 //! the proxy never buffers a whole blob in memory, and no response has a deadline: a lock
 //! acquire long-polls for as long as the registry holds it.
 //!
+//! The registry restarting — refusing connections, cutting them, or turning requests away — is
+//! ridden out as other registry transfers ride it out ([`crate::registry::with_request_retry`]),
+//! sharing their note of a registry found unreachable: a request that gets no answer, or is
+//! turned away, is sent again when a second one does what the first would have
+//! ([`repeatable`]), its body held for that up to [`MAX_HELD`]; once the retries are spent, the
+//! guest gets the registry's last refusal, or a 502 when the last attempt got no answer. A
+//! response cut short reaches the guest cut short, as before: once the status and headers have
+//! gone, the guest's client is the one to start over.
+//!
 //! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
 //! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
 //! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
@@ -560,12 +569,9 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             ));
         }
     };
+    let path = url.path().strip_prefix(cfg.root.as_str()).unwrap_or("");
     // A listing's hrefs go back to the alias the guest asked for (see the module's doc).
-    let listing = method.as_str() == "PROPFIND"
-        && url
-            .path()
-            .strip_prefix(cfg.root.as_str())
-            .is_some_and(|p| p.starts_with(DAV_FILES));
+    let listing = method.as_str() == "PROPFIND" && path.starts_with(DAV_FILES);
     let hrefs = area.filter(|_| listing).map(HrefMap::new);
     // OCI writes and WebDAV PROPFIND always stream a body upstream, even when empty.
     // Forward other bodies for the registry to validate: dropping a MKCOL body
@@ -574,28 +580,44 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
         || method.as_str() == "PROPFIND"
         || !hyper::body::Body::is_end_stream(&incoming);
-
-    let mut rb = cfg.client.request(method, url);
-    for (k, v) in parts.headers.iter() {
-        if !is_skipped(&k.as_str().to_ascii_lowercase()) {
+    let headers: Vec<_> = parts
+        .headers
+        .iter()
+        .filter(|(k, _)| !is_skipped(&k.as_str().to_ascii_lowercase()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let sent = match (repeatable(&method, path), bodyful) {
+        (true, false) => Outgoing::Whole(Bytes::new()),
+        (true, true) => held(incoming, MAX_HELD).await?,
+        (false, false) => Outgoing::Once(None),
+        (false, true) => Outgoing::Once(Some(streamed(incoming))),
+    };
+    let request = |body: Option<reqwest::Body>| {
+        let mut rb = cfg.client.request(method.clone(), url.clone());
+        for (k, v) in &headers {
             rb = rb.header(k, v);
         }
+        rb = cfg.creds.apply(rb);
+        match body {
+            Some(body) => rb.body(body),
+            None => rb,
+        }
+    };
+    let what = format!("proxy {method} {}", url.path());
+    let resp = match sent {
+        // Sent again until the upstream answers, as other registry transfers are.
+        Outgoing::Whole(bytes) => {
+            crate::registry::with_request_retry(&what, || {
+                request(bodyful.then(|| bytes.clone().into())).send()
+            })
+            .await
+        }
+        // Not safe to repeat, or read once from the guest: sent once.
+        Outgoing::Once(body) => request(body).send().await,
     }
-    rb = cfg.creds.apply(rb);
-    if bodyful {
-        // stream the guest's request body upstream without buffering (blob uploads).
-        let stream = incoming
-            .into_data_stream()
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        rb = rb.body(reqwest::Body::wrap_stream(stream));
-    }
-
-    let resp = rb
-        .send()
-        .await
-        .context("forwarding to the upstream registry")?;
+    .context("forwarding to the upstream registry")?;
     let status = resp.status();
-    let headers = resp.headers().clone();
+    let headers_out = resp.headers().clone();
     // stream the upstream response back without buffering (blob pulls).
     let stream = resp.bytes_stream();
     let body = match hrefs {
@@ -614,12 +636,81 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     };
 
     let mut out = Response::builder().status(status);
-    for (k, v) in headers.iter() {
+    for (k, v) in headers_out.iter() {
         if !is_skipped(&k.as_str().to_ascii_lowercase()) {
             out = out.header(k, v);
         }
     }
     out.body(body).map_err(Into::into)
+}
+
+/// The most of a guest's request body held to be sent again: an OCI manifest's 4 MiB, which
+/// registries cap manifests at, and far more than a listing's query or a small file.
+const MAX_HELD: usize = 4 << 20;
+
+/// An upstream request with its whole body held for safe retries, or a single attempt
+/// with an optional streamed body.
+enum Outgoing {
+    Whole(Bytes),
+    Once(Option<reqwest::Body>),
+}
+
+/// Whether a request to `path`, relative to the upstream root, can be repeated after
+/// a refused connection, a connection cut before the response, or a 503/429.
+/// Repeating it must have the same effect even if the first request reached the registry:
+/// reads, manifest PUTs by tag or digest, whole-file PUTs, and upload starts (which leave
+/// the first upload unused). Excludes upload chunks (`PATCH`), upload completion (`PUT`
+/// under `blobs/uploads/`, whose upload is then gone), deletions, collection creation,
+/// and all `/lock/` requests regardless of method. A retried PUT lands last, like a
+/// later PUT from another writer.
+fn repeatable(method: &Method, path: &str) -> bool {
+    if path.starts_with("/lock/") {
+        return false;
+    }
+    let oci = path.strip_prefix("/v2/");
+    match method.as_str() {
+        "GET" | "HEAD" | "OPTIONS" | "PROPFIND" => true,
+        "PUT" => {
+            oci.is_some_and(|p| p.rsplit('/').nth(1) == Some("manifests"))
+                || path.starts_with(DAV_FILES)
+        }
+        "POST" => oci.is_some_and(|p| p.ends_with("/blobs/uploads/")),
+        _ => false,
+    }
+}
+
+/// `incoming`, held whole when it ends within `limit` bytes; past it, what was read then the
+/// rest, streamed.
+async fn held(mut incoming: Incoming, limit: usize) -> Result<Outgoing> {
+    if hyper::body::Body::size_hint(&incoming).lower() > limit as u64 {
+        return Ok(Outgoing::Once(Some(streamed(incoming))));
+    }
+    let (mut read, mut size) = (Vec::new(), 0);
+    while size <= limit {
+        let Some(frame) = incoming.frame().await else {
+            return Ok(Outgoing::Whole(Bytes::from(read.concat())));
+        };
+        let frame = frame.context("reading the guest's request body")?;
+        if let Ok(data) = frame.into_data() {
+            size += data.len();
+            read.push(data);
+        }
+    }
+    let rest = incoming
+        .into_data_stream()
+        .map_err(|e| std::io::Error::other(e.to_string()));
+    let read = futures::stream::iter(read.into_iter().map(Ok::<_, std::io::Error>));
+    let all = futures::StreamExt::chain(read, rest);
+    Ok(Outgoing::Once(Some(reqwest::Body::wrap_stream(all))))
+}
+
+/// `incoming`, streamed upstream without buffering (blob uploads).
+fn streamed(incoming: Incoming) -> reqwest::Body {
+    reqwest::Body::wrap_stream(
+        incoming
+            .into_data_stream()
+            .map_err(|e| std::io::Error::other(e.to_string())),
+    )
 }
 
 #[cfg(test)]
@@ -1294,6 +1385,211 @@ mod tests {
             });
         });
         (addr, seen)
+    }
+
+    /// Actions for [`scripted_upstream`], one request per connection. The last action
+    /// repeats.
+    #[derive(Clone)]
+    enum Act {
+        /// Close it once the request's head is read, answering nothing.
+        Close,
+        /// Write these bytes, then close it.
+        Write(Vec<u8>),
+    }
+
+    /// A request [`scripted_upstream`] took: its head and its body.
+    type Took = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Execute `script` in connection order and record each request.
+    fn scripted_upstream(script: Vec<Act>) -> (SocketAddr, Took) {
+        use std::io::{Read, Write};
+        let took = Took::default();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = took.clone();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { break };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    if let Some(at) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(at + 4);
+                    }
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let chunked = head.contains("transfer-encoding: chunked");
+                while if chunked {
+                    !req[head_end..].ends_with(b"0\r\n\r\n")
+                } else {
+                    req.len() < head_end + len
+                } {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = if chunked {
+                    dechunked(&req[head_end..])
+                } else {
+                    req[head_end..].to_vec()
+                };
+                t.lock().unwrap().push((head, body));
+                match script.get(i).or(script.last()) {
+                    Some(Act::Write(bytes)) => {
+                        let _ = conn.write_all(bytes);
+                    }
+                    Some(Act::Close) | None => {}
+                }
+            }
+        });
+        (addr, took)
+    }
+
+    /// The data of a chunked body.
+    fn dechunked(mut raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let at = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size = usize::from_str_radix(std::str::from_utf8(&raw[..at]).unwrap(), 16).unwrap();
+            if size == 0 {
+                return out;
+            }
+            out.extend_from_slice(&raw[at + 2..at + 2 + size]);
+            raw = &raw[at + 2 + size + 2..];
+        }
+    }
+
+    /// A `200` of `body`, `Content-Length` saying `len`.
+    fn answer(len: usize, body: &[u8]) -> Act {
+        let mut bytes =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+                .into_bytes();
+        bytes.extend_from_slice(body);
+        Act::Write(bytes)
+    }
+
+    /// A request safe to repeat is sent again while the upstream answers nothing, as when it
+    /// restarts: the guest gets the answer once it comes, its body as sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_safe_to_repeat_is_sent_again_until_answered() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let client = reqwest::Client::new();
+        let r = client
+            .put(format!("http://{proxy}/v2/app/manifests/latest"))
+            .body("{\"manifest\":1}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.text().await.unwrap(), "ok");
+        let took = took.lock().unwrap().clone();
+        assert_eq!(took.len(), 2, "{took:?}");
+        for (head, body) in &took {
+            assert!(head.starts_with("put /v2/app/manifests/latest "), "{head}");
+            assert!(head.contains("authorization: basic"), "{head}");
+            assert_eq!(body, b"{\"manifest\":1}");
+        }
+    }
+
+    /// Upload chunks are sent once: repeating one finds the upload advanced. Bodyless
+    /// deletions are also sent once: repeating one finds nothing to delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_chunk_or_a_deletion_is_sent_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        for (method, target, body) in [
+            (reqwest::Method::PATCH, "/v2/app/blobs/uploads/u1", "chunk"),
+            (reqwest::Method::DELETE, "/v2/app/manifests/sha256:ab", ""),
+        ] {
+            let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
+            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            let r = client
+                .request(method.clone(), format!("http://{proxy}{target}"))
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 502, "{method}");
+            assert_eq!(took.lock().unwrap().len(), 1, "{method}");
+        }
+    }
+
+    /// Which requests are sent again.
+    #[test]
+    fn what_is_sent_again() {
+        let get = Method::GET;
+        let put = Method::PUT;
+        let post = Method::POST;
+        assert!(repeatable(&get, "/v2/app/blobs/sha256:ab"));
+        assert!(repeatable(&Method::HEAD, "/v2/app/manifests/latest"));
+        assert!(repeatable(&put, "/v2/app/manifests/latest"));
+        assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab"));
+        assert!(repeatable(&put, "/dav/files/p/x"));
+        assert!(repeatable(&post, "/v2/app/blobs/uploads/"));
+        assert!(!repeatable(&put, "/v2/app/blobs/uploads/u1"));
+        assert!(!repeatable(&Method::PATCH, "/v2/app/blobs/uploads/u1"));
+        assert!(!repeatable(&Method::DELETE, "/v2/app/manifests/sha256:ab"));
+        assert!(!repeatable(&post, "/lock/acquire"));
+        assert!(!repeatable(&get, "/lock/acquire"));
+        assert!(!repeatable(
+            &Method::from_bytes(b"MKCOL").unwrap(),
+            "/dav/files/p/x"
+        ));
+    }
+
+    /// A request turned away is sent again until the registry takes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_turned_away_is_sent_again() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let busy = Act::Write(
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 4\r\n\
+              Connection: close\r\n\r\nbusy"
+                .to_vec(),
+        );
+        let (up_addr, took) = scripted_upstream(vec![busy, answer(2, b"ok")]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let r = reqwest::get(format!("http://{proxy}/v2/app/manifests/latest"))
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.text().await.unwrap(), "ok");
+        assert_eq!(took.lock().unwrap().len(), 2);
+    }
+
+    /// Bodies over the buffering limit stream upstream whole, once, even when the request
+    /// would otherwise be retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_past_what_is_held_is_sent_once_whole() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let big: Vec<u8> = (0..MAX_HELD + 10).map(|i| (i % 253) as u8).collect();
+        // Streamed by the guest, so its size is known only once read.
+        let chunks: Vec<std::io::Result<Vec<u8>>> =
+            big.chunks(1 << 16).map(|c| Ok(c.to_vec())).collect();
+        let r = reqwest::Client::new()
+            .put(format!("http://{proxy}/v2/app/manifests/latest"))
+            .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 502);
+        let took = took.lock().unwrap().clone();
+        assert_eq!(took.len(), 1);
+        assert!(took[0].1 == big, "the upstream got another body");
     }
 
     /// `--insecure` is plain HTTP, as everywhere else: it never turns certificate checks off.
