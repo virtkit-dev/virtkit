@@ -4223,6 +4223,22 @@ async fn handle(
     Ok(with_hsts(closing_after_refusal(resp, has_body), tls))
 }
 
+/// `resp`, a 503 for what the release updating the registry now serves, with `Retry-After: 1`
+/// and `Connection: close`, for the client to ask again on a new connection, which the release
+/// answers.
+pub(crate) fn ask_again(mut resp: Response<Body>) -> Response<Body> {
+    let headers = resp.headers_mut();
+    headers.insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    headers.insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    resp
+}
+
 /// `resp`, with `Connection: close` when it refuses a request that came with a body. A
 /// refusal can answer before that body is read through, and hyper then drops the connection
 /// after writing a head that still offered keep-alive, so a client pools it and sees its

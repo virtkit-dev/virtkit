@@ -181,16 +181,23 @@ impl LockClient {
         Ok(body.renewed)
     }
 
-    /// Release every name in the batch owned by `owner`; returns how many were released.
+    /// Release every name in the batch owned by `owner`; return the count released.
+    /// Retry 503s within [`BUSY_WINDOW`]: an unreleased lock blocks peers until expiry.
     pub async fn release_all(&self, names: &[String], owner: &str) -> Result<usize> {
         let query = self.name_query(names);
-        let resp = self
-            .auth(self.client.post(self.url("release")))
-            .query(&query)
-            .header("x-vk-lock-owner", owner)
-            .send()
-            .await
-            .context("releasing lock(s)")?;
+        let start = tokio::time::Instant::now();
+        let resp = loop {
+            let resp = self
+                .auth(self.client.post(self.url("release")))
+                .query(&query)
+                .header("x-vk-lock-owner", owner)
+                .send()
+                .await
+                .context("releasing lock(s)")?;
+            if !wait_out(&resp, start, BUSY_WINDOW).await {
+                break resp;
+            }
+        };
         if !resp.status().is_success() {
             anyhow::bail!("releasing lock(s): status {}", resp.status());
         }
@@ -272,16 +279,23 @@ impl LockClient {
     /// Record that `name` just failed to build under `pipeline`'s watch, so a peer sees it
     /// via [`Self::recent_failure`] and fails fast instead of repeating the same doomed
     /// build. Best-effort: a transport error is swallowed — a missed record only costs a
-    /// future re-attempt, never a correctness issue.
+    /// future re-attempt, never a correctness issue. Retry 503s within [`BUSY_WINDOW`].
     pub async fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
         let ttl_s = ttl.as_secs().to_string();
-        let _ = self
-            .auth(self.client.post(self.url("fail")))
-            .query(&[("name", name), ("ttl", ttl_s.as_str())])
-            .header("x-vk-lock-pipeline", pipeline)
-            .body(reason.to_string())
-            .send()
-            .await;
+        let start = tokio::time::Instant::now();
+        loop {
+            let sent = self
+                .auth(self.client.post(self.url("fail")))
+                .query(&[("name", name), ("ttl", ttl_s.as_str())])
+                .header("x-vk-lock-pipeline", pipeline)
+                .body(reason.to_string())
+                .send()
+                .await;
+            match sent {
+                Ok(resp) if wait_out(&resp, start, BUSY_WINDOW).await => {}
+                _ => return,
+            }
+        }
     }
 
     /// A still-live failure record for `name` under `pipeline`. `None` for no record, a

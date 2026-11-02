@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +22,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+use serde::{Deserialize, Serialize};
 
 use vk_hub_proto::token::Claims;
 
@@ -88,6 +90,9 @@ pub enum Refusal {
     Held(Vec<Blocker>),
     /// The principal would hold more than [`MAX_TOKEN_LOCKS`] live locks: waiting does not help.
     TooMany,
+    /// The table was handed to the release updating this registry ([`LockManager::hand_over`]):
+    /// asking again reaches it.
+    HandedOver,
 }
 
 /// A recorded build failure for one content-key, scoped to the pipeline that hit it — see
@@ -123,6 +128,44 @@ pub struct LockManager {
     /// mutual-exclusion primitive, so it never entangles with `task`'s reuse of `/lock/*` for
     /// its own (unrelated) locking. See [`LockManager::record_failure`].
     failed: Mutex<FailTable>,
+    /// Set once the table is handed over, under both mutexes, and read under the one a change
+    /// takes: from then on nothing here changes, and the release holds the locks.
+    handed_over: AtomicBool,
+}
+
+/// The lock table as one process hands it to the next ([`LockManager::hand_over`],
+/// [`LockManager::restore`]): leases and failure records with what is left of them, as a
+/// process's `Instant`s mean nothing to another. It holds the owner tokens, so it travels
+/// only through a descriptor the release inherits, never a file.
+///
+/// No `Debug`, for the owner tokens.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    held: Vec<HeldEntry>,
+    failed: Vec<FailEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeldEntry {
+    name: String,
+    owner: String,
+    holder: String,
+    /// What is left of the lease.
+    left_ms: u64,
+    principal: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FailEntry {
+    name: String,
+    pipeline: String,
+    reason: String,
+    age_ms: u64,
+    ttl_ms: u64,
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Default for LockManager {
@@ -142,7 +185,109 @@ impl LockManager {
             held: Mutex::new(HashMap::new()),
             freed: Notify::new(),
             failed: Mutex::new(FailTable::default()),
+            handed_over: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the table was handed over: requests that would change it are for the release.
+    pub fn is_handed_over(&self) -> bool {
+        self.handed_over.load(Ordering::SeqCst)
+    }
+
+    /// Freeze and snapshot the table for the release taking over. Stop granting, renewing
+    /// and releasing leases; answer waiting acquisitions as handed over so their clients
+    /// retry against the release.
+    pub fn hand_over(&self) -> Snapshot {
+        let now = Instant::now();
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        self.handed_over.store(true, Ordering::SeqCst);
+        let snapshot = Snapshot {
+            held: held
+                .iter()
+                .filter(|(_, h)| h.expires > now)
+                .map(|(name, h)| HeldEntry {
+                    name: name.clone(),
+                    owner: h.owner.clone(),
+                    holder: h.holder.clone(),
+                    left_ms: millis(h.expires - now),
+                    principal: h.principal.clone(),
+                })
+                .collect(),
+            failed: failed
+                .records
+                .iter()
+                .filter(|(_, r)| now.duration_since(r.recorded_at) < r.ttl)
+                .map(|((name, pipeline), r)| FailEntry {
+                    name: name.clone(),
+                    pipeline: pipeline.clone(),
+                    reason: r.reason.clone(),
+                    age_ms: millis(now.duration_since(r.recorded_at)),
+                    ttl_ms: millis(r.ttl),
+                })
+                .collect(),
+        };
+        drop((held, failed));
+        self.freed.notify_waiters();
+        snapshot
+    }
+
+    /// Change the table again: the release it was handed to did not take over.
+    pub fn take_back(&self) {
+        self.handed_over.store(false, Ordering::SeqCst);
+    }
+
+    /// The table a previous process handed over `since` ago. Leases keep what was left of
+    /// them then, less `since`, cut to [`MAX_LEASE_TTL`]; failure records their age, plus
+    /// `since`, and their ttl, cut to [`MAX_FAIL_TTL`]; the youngest [`MAX_FAIL_RECORDS`] are
+    /// kept. The snapshot comes from a previous process of this registry, which held the same
+    /// caps, so the leases and reasons are not capped again.
+    pub fn restore(snapshot: Snapshot, since: Duration) -> Self {
+        let m = Self::new();
+        let now = Instant::now();
+        {
+            let mut held = m.held.lock().unwrap_or_else(|e| e.into_inner());
+            for h in snapshot.held {
+                let left = Duration::from_millis(h.left_ms).saturating_sub(since);
+                if left.is_zero() {
+                    continue;
+                }
+                held.insert(
+                    h.name,
+                    Held {
+                        owner: h.owner,
+                        holder: h.holder,
+                        expires: now + left.min(MAX_LEASE_TTL),
+                        principal: h.principal,
+                    },
+                );
+            }
+        }
+        let mut table = m.failed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failed = snapshot.failed;
+        // The youngest kept, then inserted oldest first, so the order of eviction survives.
+        failed.sort_by_key(|f| f.age_ms);
+        failed.truncate(MAX_FAIL_RECORDS);
+        for f in failed.into_iter().rev() {
+            let ttl = Duration::from_millis(f.ttl_ms).min(Duration::from_secs(MAX_FAIL_TTL));
+            let age = Duration::from_millis(f.age_ms).saturating_add(since);
+            let Some(recorded_at) = now.checked_sub(age).filter(|_| age < ttl) else {
+                continue;
+            };
+            let seq = table.next_seq;
+            table.next_seq += 1;
+            table.records.insert(
+                (f.name, f.pipeline),
+                FailRecord {
+                    seq,
+                    reason: f.reason,
+                    recorded_at,
+                    ttl,
+                },
+            );
+        }
+        drop(table);
+        m
     }
 
     /// Record that `name` (a build stage's content-key) just failed to build under
@@ -152,9 +297,25 @@ impl LockManager {
     /// always gets a fresh attempt, so there is no separate "clear" operation. Upserts (a
     /// later failure under the same pipeline replaces an earlier one; another pipeline's is
     /// left alone) and prunes every lapsed record while it's at it; past
-    /// [`MAX_FAIL_RECORDS`] live ones, the oldest is evicted.
+    /// [`MAX_FAIL_RECORDS`] live ones, the oldest is evicted. Records nothing once the table is
+    /// handed over.
     pub fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
+        self.try_record_failure(name, pipeline, reason, ttl);
+    }
+
+    /// [`LockManager::record_failure`]: `false`, recording nothing, once the table is handed
+    /// over.
+    pub fn try_record_failure(
+        &self,
+        name: &str,
+        pipeline: &str,
+        reason: &str,
+        ttl: Duration,
+    ) -> bool {
         let mut table = self.failed.lock().unwrap();
+        if self.is_handed_over() {
+            return false;
+        }
         let FailTable {
             records: map,
             next_seq,
@@ -182,6 +343,7 @@ impl LockManager {
                 ttl,
             },
         );
+        true
     }
 
     /// A still-live failure record for `name` recorded under `pipeline`, `None` if there is
@@ -217,6 +379,9 @@ impl LockManager {
         principal: Option<&str>,
     ) -> Result<String, Refusal> {
         let mut map = self.held.lock().unwrap();
+        if self.is_handed_over() {
+            return Err(Refusal::HandedOver);
+        }
         let now = Instant::now();
         // drop every lapsed lease so the table can't grow without bound from names whose
         // holder died and never reacquired (release is otherwise the only path that prunes).
@@ -278,6 +443,9 @@ impl LockManager {
             match self.try_take_all(names, ttl, holder, not_after, principal) {
                 Ok(owner) => return Ok(owner),
                 Err(Refusal::TooMany) => return Err(Refusal::TooMany),
+                // A waiter too: answered "held", a client would stop waiting and build
+                // without the lock; asked again, the release grants or holds it.
+                Err(Refusal::HandedOver) => return Err(Refusal::HandedOver),
                 Err(Refusal::Held(blockers)) => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -297,8 +465,13 @@ impl LockManager {
                         .saturating_duration_since(now)
                         .min(MAX_POLL)
                         .max(Duration::from_millis(20));
+                    let freed = self.freed.notified();
+                    // Handed over since the try: the release has the table.
+                    if self.is_handed_over() {
+                        continue;
+                    }
                     tokio::select! {
-                        _ = self.freed.notified() => {}
+                        _ = freed => {}
                         _ = tokio::time::sleep(sleep) => {}
                     }
                 }
@@ -308,7 +481,7 @@ impl LockManager {
 
     /// Renew every name in the batch still held by `owner`, for `ttl` cut at `not_after`;
     /// returns the count renewed (a heartbeat treats fewer than the batch size as "lost the
-    /// batch").
+    /// batch"); 0 once the table is handed over.
     pub fn renew_all(
         &self,
         names: &[String],
@@ -316,7 +489,22 @@ impl LockManager {
         ttl: Duration,
         not_after: Option<Instant>,
     ) -> usize {
+        self.try_renew_all(names, owner, ttl, not_after)
+            .unwrap_or(0)
+    }
+
+    /// [`LockManager::renew_all`]: `None`, renewing nothing, once the table is handed over.
+    pub fn try_renew_all(
+        &self,
+        names: &[String],
+        owner: &str,
+        ttl: Duration,
+        not_after: Option<Instant>,
+    ) -> Option<usize> {
         let mut map = self.held.lock().unwrap();
+        if self.is_handed_over() {
+            return None;
+        }
         let now = Instant::now();
         let mut n = 0;
         for name in names {
@@ -328,12 +516,21 @@ impl LockManager {
                 n += 1;
             }
         }
-        n
+        Some(n)
     }
 
-    /// Release every name in the batch held by `owner`, waking waiters; returns the count.
+    /// Release every name in the batch held by `owner`, waking waiters; returns the count, 0
+    /// once the table is handed over.
     pub fn release_all(&self, names: &[String], owner: &str) -> usize {
+        self.try_release_all(names, owner).unwrap_or(0)
+    }
+
+    /// [`LockManager::release_all`]: `None`, releasing nothing, once the table is handed over.
+    pub fn try_release_all(&self, names: &[String], owner: &str) -> Option<usize> {
         let mut map = self.held.lock().unwrap();
+        if self.is_handed_over() {
+            return None;
+        }
         let mut n = 0;
         for name in names {
             if map
@@ -348,7 +545,7 @@ impl LockManager {
             drop(map);
             self.freed.notify_waiters();
         }
-        n
+        Some(n)
     }
 
     // ---- single-lock convenience: a batch of one ----
@@ -491,6 +688,7 @@ pub async fn route(
                     });
                     Ok(json(StatusCode::TOO_MANY_REQUESTS, &body.to_string()))
                 }
+                Err(Refusal::HandedOver) => Ok(handed_over()),
                 Err(Refusal::Held(blockers)) => {
                     let blockers: Vec<_> = blockers
                         .iter()
@@ -510,7 +708,9 @@ pub async fn route(
                     r#"{"error":"missing owner"}"#,
                 ));
             };
-            let n = mgr.renew_all(&names, &owner, ttl, limit.0);
+            let Some(n) = mgr.try_renew_all(&names, &owner, ttl, limit.0) else {
+                return Ok(handed_over());
+            };
             let body = serde_json::json!({
                 "renewed": n, "of": names.len(), "ttl": limit.cut(lease(ttl)).as_secs(),
             });
@@ -528,7 +728,9 @@ pub async fn route(
                     r#"{"error":"missing owner"}"#,
                 ));
             };
-            let n = mgr.release_all(&names, &owner);
+            let Some(n) = mgr.try_release_all(&names, &owner) else {
+                return Ok(handed_over());
+            };
             Ok(json(
                 StatusCode::OK,
                 &serde_json::json!({"released": n}).to_string(),
@@ -570,7 +772,9 @@ pub async fn route(
             // Cut once the body is in, so a slow one cannot stretch it past the token.
             let ttl = limit.cut(fail_ttl(&query));
             for name in &names {
-                mgr.record_failure(name, &pipeline, &reason, ttl);
+                if !mgr.try_record_failure(name, &pipeline, &reason, ttl) {
+                    return Ok(handed_over());
+                }
             }
             Ok(json(StatusCode::OK, r#"{"recorded":true}"#))
         }
@@ -705,6 +909,15 @@ fn fail_ttl(query: &str) -> Duration {
             .unwrap_or(DEFAULT_FAIL_TTL)
             .min(MAX_FAIL_TTL),
     )
+}
+
+/// The answer to a change asked of a table handed over: the release serves the next
+/// connection, and `Connection: close` has the client make one.
+fn handed_over() -> Response<Body> {
+    crate::ask_again(json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":"this registry is updating; retry"}"#,
+    ))
 }
 
 fn json(status: StatusCode, body: &str) -> Response<Body> {
@@ -1227,5 +1440,100 @@ mod tests {
             "must bail once over cap instead of draining every frame, polled {} of {total_frames}",
             polled.get()
         );
+    }
+
+    /// Handover refuses grants, renewals, releases and failure records, waking waiting
+    /// acquisitions immediately to retry against the release. Restore preserves leases
+    /// less elapsed time; taking the table back permits changes again.
+    #[tokio::test]
+    async fn a_table_handed_over_changes_no_more_and_restores_whole() {
+        let m = std::sync::Arc::new(LockManager::new());
+        let a = ["a".to_string()];
+        let owner = m
+            .acquire_all(
+                &a,
+                Duration::from_secs(30),
+                "one",
+                now_plus(Duration::ZERO),
+                None,
+                Some("job"),
+            )
+            .await
+            .ok()
+            .unwrap();
+        m.record_failure("k", "p", "broke", Duration::from_secs(600));
+        let waiting = {
+            let m = m.clone();
+            let a = a.clone();
+            tokio::spawn(async move {
+                m.acquire_all(
+                    &a,
+                    Duration::from_secs(30),
+                    "two",
+                    now_plus(Duration::from_secs(60)),
+                    None,
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = m.hand_over();
+        match tokio::time::timeout(Duration::from_secs(5), waiting).await {
+            Ok(Ok(Err(Refusal::HandedOver))) => {}
+            _ => panic!("the acquisition waiting was not answered as handed over"),
+        }
+        let b = ["b".to_string()];
+        assert!(matches!(
+            m.acquire_all(
+                &b,
+                Duration::from_secs(30),
+                "x",
+                now_plus(Duration::ZERO),
+                None,
+                None
+            )
+            .await,
+            Err(Refusal::HandedOver)
+        ));
+        assert_eq!(
+            m.try_renew_all(&a, &owner, Duration::from_secs(30), None),
+            None
+        );
+        assert_eq!(m.try_release_all(&a, &owner), None);
+        assert!(!m.try_record_failure("k2", "p", "r", Duration::from_secs(60)));
+
+        let restored = LockManager::restore(snapshot, Duration::from_secs(10));
+        assert_eq!(restored.holder("a").as_deref(), Some("one"));
+        {
+            let held = restored.held.lock().unwrap();
+            let left = held["a"].expires.saturating_duration_since(Instant::now());
+            assert!(left <= Duration::from_secs(20), "{left:?}");
+            assert_eq!(held["a"].principal.as_deref(), Some("job"));
+        }
+        let failure = restored.recent_failure("k", "p").unwrap();
+        assert_eq!(failure.reason, "broke");
+        assert!(failure.age >= Duration::from_secs(10));
+        assert_eq!(
+            restored.try_renew_all(&a, &owner, Duration::from_secs(30), None),
+            Some(1)
+        );
+
+        m.take_back();
+        assert_eq!(m.try_release_all(&a, &owner), Some(1));
+    }
+
+    /// A lease or failure record whose time ran out in between is not restored.
+    #[test]
+    fn what_lapsed_in_between_is_not_restored() {
+        let m = LockManager::new();
+        assert!(
+            m.try_take_all(&["a".to_string()], Duration::from_secs(1), "h", None, None)
+                .is_ok()
+        );
+        m.record_failure("k", "p", "r", Duration::from_secs(1));
+        let restored = LockManager::restore(m.hand_over(), Duration::from_secs(5));
+        assert_eq!(restored.holder("a"), None);
+        assert!(restored.recent_failure("k", "p").is_none());
     }
 }
