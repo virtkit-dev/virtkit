@@ -43,7 +43,7 @@ const UP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// How long a question stays answerable.
 const QUESTION_LIFE: Duration = Duration::from_secs(10 * 60);
 
-/// The most questions kept unanswered; the oldest goes first.
+/// The most questions kept, answered or not; the oldest goes first.
 const MAX_QUESTIONS: usize = 1024;
 
 /// What an action on `w` is keyed by: a dev environment's name, which `/dev` acts on too, or
@@ -352,7 +352,9 @@ async fn run(
     Ok(swap_none(super::html_response(StatusCode::OK, h)))
 }
 
-/// The questions asked and not yet answered, by the nonce each one's form carries.
+/// The questions asked, by the nonce each one's form carries: unanswered, or answered and kept
+/// until they would have expired, so that an answer posted again — a page resending a post
+/// whose reply was lost — is told it was answered rather than asked too long ago.
 pub(super) struct Questions(Mutex<HashMap<String, Question>>);
 
 struct Question {
@@ -360,9 +362,10 @@ struct Question {
     session: String,
     path: String,
     op: String,
-    /// What it was asked about, as its form's hidden fields have it.
+    /// What it was asked about, as its form's hidden fields have it; emptied once answered.
     asked: Asked,
     at: Instant,
+    answered: bool,
 }
 
 /// What a question is asked about, as `(field, value)`: what must be as it was for its answer
@@ -381,6 +384,12 @@ pub(super) struct Ask {
     pub(super) detail: Html,
     pub(super) asked: Asked,
 }
+
+/// Why an answer does not count.
+const UNKNOWN: &str = "Refused: this was asked too long ago, or of another session; ask again.";
+const CHANGED: &str = "Refused: it changed since you were asked; look again.";
+const ANSWERED: &str = "Refused: this was answered already, and is not done twice; the page \
+                        and the audit log show whether it ran.";
 
 impl Questions {
     pub(super) fn new() -> Self {
@@ -404,19 +413,38 @@ impl Questions {
         Ok(nonce)
     }
 
-    /// The question `nonce` answers, if it was asked of `session` for `op` on `path` and has
-    /// not expired: taken, so it is answered once. One asked of another is left to it.
-    fn answer(&self, nonce: &str, session: &str, path: &str, op: &str) -> Option<Question> {
+    /// Answer the question `nonce` if it was asked of `session` for `op` on `path` about
+    /// `asked`, the form `posted` it so, it has not expired and was not answered yet: marked
+    /// answered, so it is answered once. One asked of another is left to it; one asked about
+    /// something else is left unanswered. One answered already says so before anything else
+    /// is compared, as what it acted on may have changed since.
+    fn answer(
+        &self,
+        nonce: &str,
+        session: &str,
+        path: &str,
+        op: &str,
+        asked: &Asked,
+        posted: bool,
+    ) -> Result<(), &'static str> {
         let mut kept = self.lock();
-        let q = kept.get(nonce)?;
+        let q = kept.get_mut(nonce).ok_or(UNKNOWN)?;
         if q.at.elapsed() >= QUESTION_LIFE {
             kept.remove(nonce);
-            return None;
+            return Err(UNKNOWN);
         }
         if q.session != session || q.path != path || q.op != op {
-            return None;
+            return Err(UNKNOWN);
         }
-        kept.remove(nonce)
+        if q.answered {
+            return Err(ANSWERED);
+        }
+        if !posted || q.asked != *asked {
+            return Err(CHANGED);
+        }
+        q.answered = true;
+        q.asked = Vec::new();
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Question>> {
@@ -456,17 +484,12 @@ fn answered(
     form: &[(String, String)],
     ask: &Ask,
 ) -> Result<(), &'static str> {
-    let q = super::field(form, "nonce")
-        .and_then(|nonce| questions.answer(nonce, &auth.csrf, &ask.path, &ask.op))
-        .ok_or("Refused: this was answered already, or asked too long ago; ask again.")?;
+    let nonce = super::field(form, "nonce").ok_or(UNKNOWN)?;
     let posted = ask
         .asked
         .iter()
         .all(|(field, value)| super::field(form, field) == Some(value.as_str()));
-    if q.asked != ask.asked || !posted {
-        return Err("Refused: it changed since you were asked; look again.");
-    }
-    Ok(())
+    questions.answer(nonce, &auth.csrf, &ask.path, &ask.op, &ask.asked, posted)
 }
 
 /// Confirm an irreversible action with a form answered once. In the flash, it posts by
@@ -485,6 +508,7 @@ fn confirm(
         op: ask.op.clone(),
         asked: ask.asked.clone(),
         at: Instant::now(),
+        answered: false,
     })?;
     let mut form = Html::new();
     form.raw("<form method=\"post\" action=\"")
@@ -677,33 +701,76 @@ mod tests {
         assert!(vm_ops(&w).is_empty() && vm_command(&w, "stop").is_none());
     }
 
+    fn pid() -> Asked {
+        vec![("pid", "7".into())]
+    }
+
     fn question(session: &str, at: Instant) -> Question {
         Question {
             session: session.into(),
             path: "/vm/x/action".into(),
             op: "stop".into(),
-            asked: vec![("pid", "7".into())],
+            asked: pid(),
             at,
+            answered: false,
         }
     }
 
     /// A question is answered once, by the session it was asked of, for what it asked, and
-    /// only while it lives; one asked of another session is left to it.
+    /// only while it lives; one asked of another session, or answered about something else, is
+    /// left to be answered. Answered again, it says so.
     #[test]
     fn a_question_is_answered_once_and_by_its_own_session() {
         let qs = Questions::new();
         let nonce = qs.ask(question("a", Instant::now())).unwrap();
-        assert!(qs.answer(&nonce, "b", "/vm/x/action", "stop").is_none());
-        assert!(qs.answer(&nonce, "a", "/vm/y/action", "stop").is_none());
-        assert!(qs.answer(&nonce, "a", "/vm/x/action", "reboot").is_none());
-        assert!(qs.answer(&nonce, "a", "/vm/x/action", "stop").is_some());
-        assert!(qs.answer(&nonce, "a", "/vm/x/action", "stop").is_none());
+        assert_eq!(
+            qs.answer(&nonce, "b", "/vm/x/action", "stop", &pid(), true),
+            Err(UNKNOWN)
+        );
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/y/action", "stop", &pid(), true),
+            Err(UNKNOWN)
+        );
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "reboot", &pid(), true),
+            Err(UNKNOWN)
+        );
+        // Asked about another, it stays to be answered.
+        let other = vec![("pid", "8".to_string())];
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "stop", &other, true),
+            Err(CHANGED)
+        );
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "stop", &pid(), false),
+            Err(CHANGED)
+        );
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "stop", &pid(), true),
+            Ok(())
+        );
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "stop", &pid(), true),
+            Err(ANSWERED)
+        );
+        // Answered, it says so even once what it acted on has changed.
+        assert_eq!(
+            qs.answer(&nonce, "a", "/vm/x/action", "stop", &other, false),
+            Err(ANSWERED)
+        );
+        assert_eq!(
+            qs.answer("nope", "a", "/vm/x/action", "stop", &pid(), true),
+            Err(UNKNOWN)
+        );
         let Some(long_ago) = Instant::now().checked_sub(QUESTION_LIFE) else {
             return;
         };
-        let nonce = qs.ask(question("a", long_ago)).unwrap();
-        assert!(qs.answer(&nonce, "a", "/vm/x/action", "stop").is_none());
-        assert!(qs.lock().is_empty());
+        let expired = qs.ask(question("a", long_ago)).unwrap();
+        assert_eq!(
+            qs.answer(&expired, "a", "/vm/x/action", "stop", &pid(), true),
+            Err(UNKNOWN)
+        );
+        assert_eq!(qs.lock().len(), 1);
     }
 
     /// Past [`MAX_QUESTIONS`], the oldest question goes first.
@@ -718,7 +785,13 @@ mod tests {
             .map(|_| qs.ask(question("a", Instant::now())).unwrap())
             .collect();
         assert_eq!(qs.lock().len(), MAX_QUESTIONS);
-        assert!(qs.answer(&first, "old", "/vm/x/action", "stop").is_none());
-        assert!(qs.answer(&rest[0], "a", "/vm/x/action", "stop").is_some());
+        assert!(
+            qs.answer(&first, "old", "/vm/x/action", "stop", &pid(), true)
+                .is_err()
+        );
+        assert!(
+            qs.answer(&rest[0], "a", "/vm/x/action", "stop", &pid(), true)
+                .is_ok()
+        );
     }
 }

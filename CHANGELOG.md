@@ -81,6 +81,10 @@ All notable changes to virtkit will be documented in this file.
   retries telling the hub that a job's outcome reached GitLab until accepted, instead of
   giving up after about 15 seconds and leaving the job open until the adapter restarts.
   A canceled job still stopping on its node is closed once it ends.
+- **Repeated web UI confirmations say they were already answered.** Retrying after a lost
+  reply now reports that the question was answered, rather than answered or expired.
+  A confirmation refused because its target changed remains answerable once the original
+  state is restored.
 
 ## [0.101.0] - 2026-11-01
 

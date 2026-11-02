@@ -1692,7 +1692,13 @@ esac"#,
     // Answered once: the same form again runs nothing.
     let reply = post_action(addr, &origin, &cookie, &path, &confirmed, true).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
-    assert!(reply.body.contains("answered already"), "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("answered already, and is not done twice"),
+        "{}",
+        reply.body
+    );
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "stop -- 4242\n");
     let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
     assert!(
