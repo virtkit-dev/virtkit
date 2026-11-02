@@ -293,12 +293,12 @@ enum ReleaseCmd {
         #[arg(long, default_value = store::Program::Vk.name(), value_parser = program_names())]
         program: String,
     },
-    /// Download a release's vk from the hub's release_repository and hold it
+    /// Download a release's vk, or vk-registry, from the hub's release_repository and hold it
     ///
-    /// The hub downloads the vk of that virtkit release (linux x86-64), requires it to hash to
-    /// the sha256 the release publishes beside it and to hold the version as a string of its
-    /// own, and holds it unsigned. That proves the bytes are the ones published, not who built
-    /// them; a node that requires signed releases refuses it.
+    /// The hub downloads that program of that virtkit release (linux x86-64), requires it to
+    /// hash to the sha256 the release publishes beside it and to hold the version as a string
+    /// of its own, and holds it unsigned. That proves the bytes are the ones published, not who
+    /// built them; a node or registry that requires signed releases refuses it.
     Fetch {
         /// The release's version, or `latest`
         #[arg(default_value = "latest")]
@@ -306,6 +306,14 @@ enum ReleaseCmd {
         /// Only print which version the latest release is
         #[arg(long, conflicts_with = "version")]
         check: bool,
+        /// The program to download: vk, for nodes, or vk-registry, for registries
+        #[arg(
+            long,
+            default_value = store::Program::Vk.name(),
+            value_parser = program_names(),
+            conflicts_with = "check"
+        )]
+        program: String,
     },
     /// List the releases the hub holds
     List,
@@ -1232,20 +1240,31 @@ async fn run(cli: Cli) -> Result<()> {
                         tokio::task::spawn_blocking(move || client.latest_release()).await??;
                     println!("{latest}");
                 }
-                ReleaseCmd::Fetch { version, .. } => {
+                ReleaseCmd::Fetch {
+                    version, program, ..
+                } => {
                     let version = fetch::wanted(&version)?;
+                    let program = releases::program(Some(&program))?;
                     let fetched = tokio::task::spawn_blocking(move || {
-                        client.fetch_release(version.as_deref())
+                        client.fetch_release(program, version.as_deref())
                     })
                     .await??;
                     // The sha256 alone on stdout, as `release add` prints it.
                     println!("{}", fetched.sha256);
                     eprintln!(
-                        "vk-hub: holding vk {} ({} bytes, unsigned); `vk-hub rollout create \
-                         --release {}` rolls it out",
+                        "vk-hub: holding {program} {} ({} bytes, unsigned); {}",
                         fetched.row.version,
                         fetched.row.size,
-                        store::short(&fetched.sha256)
+                        match program {
+                            store::Program::Vk => format!(
+                                "`vk-hub rollout create --release {}` rolls it out",
+                                store::short(&fetched.sha256)
+                            ),
+                            store::Program::Registry => format!(
+                                "`vk-hub registries update <id> --release {}` updates one to it",
+                                store::short(&fetched.sha256)
+                            ),
+                        }
                     );
                 }
                 ReleaseCmd::List => {

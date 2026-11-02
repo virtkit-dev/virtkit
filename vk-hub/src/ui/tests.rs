@@ -7054,7 +7054,8 @@ async fn post_upload(
 }
 
 /// An operator uploads a release from `/operations`: it is checked and held as the session's
-/// principal, the audit log says so, and nothing is left staged.
+/// principal, the audit log says so, and nothing is left staged. The form chooses its program;
+/// an unknown one is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_uploads_a_release() {
     let (addr, hub, origin, dir) = start_fleet_releases(None).await;
@@ -7136,6 +7137,62 @@ async fn an_operator_uploads_a_release() {
             .any(|r| r.row.version == "0.86.0" && r.row.signature.as_deref() == Some(&signature)),
         "{releases:?}"
     );
+
+    // As the program chosen.
+    assert!(
+        page.body
+            .contains("<option value=\"vk-registry\">vk-registry (registries)</option>"),
+        "{}",
+        page.body
+    );
+    let bin = crate::fetch::tests::fake_vk("0.90.0");
+    let upload = |program: &'static str| {
+        let (operator, csrf, origin, bin) =
+            (operator.clone(), csrf.clone(), origin.clone(), bin.clone());
+        async move {
+            post_upload(
+                addr,
+                &origin,
+                &operator,
+                &[
+                    ("_csrf", csrf.as_bytes()),
+                    ("program", program.as_bytes()),
+                    ("version", b"0.90.0"),
+                    ("file", &bin),
+                ],
+                &[],
+            )
+            .await
+        }
+    };
+    let reply = upload("nope").await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("not a program the hub holds"),
+        "{}",
+        reply.body
+    );
+    let reply = upload("vk-registry").await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let release = hub
+        .db
+        .releases()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.row.version == "0.90.0")
+        .unwrap();
+    assert!(
+        release.row.is(crate::store::Program::Registry),
+        "{release:?}"
+    );
+    audited(
+        &hub,
+        &format!(
+            "{principal} added release {} as vk-registry 0.90.0",
+            crate::store::short(&release.sha256)
+        ),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7669,13 +7726,18 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
 }
 
 /// An operator asks for the latest release on GitHub and fetches it from `/operations`; the
-/// page follows the fetch, which is held as the session's principal. A release whose binary
-/// does not hash to its published digest is refused, and the page says so.
+/// page follows the fetch, which is held as the session's principal; a `vk-registry` is fetched
+/// as the program chosen. A release whose binary does not hash to its published digest is
+/// refused, and the page says so.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_fetches_a_release_from_github() {
     use crate::fetch::tests::{FakeRelease, fake_github, fake_vk};
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
+    let mut published = FakeRelease::new("v0.85.0", fake_vk("0.85.0"));
+    let mut registry = fake_vk("0.85.0");
+    registry.extend_from_slice(b"vk-registry\0");
+    published.registry = Some(registry);
+    let api = fake_github(published).await;
     let (addr, hub, origin, dir) = start_fleet_releases(Some(&api)).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
@@ -7714,8 +7776,29 @@ async fn an_operator_fetches_a_release_from_github() {
     assert_eq!(releases[0].row.version, "0.85.0");
     assert_eq!(releases[0].row.added_by, principal);
     let page = page_with(addr, "/operations", &operator, "Fetched vk 0.85.0").await;
-    assert!(page.contains("Latest on GitHub: vk 0.85.0"), "{page}");
+    assert!(page.contains("Latest on GitHub: 0.85.0"), "{page}");
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+
+    // The program chosen: its own asset, held as its release; an unknown program is refused.
+    let form = format!("_csrf={csrf}&op=fetch&version=latest&program=vk-registry");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Fetching vk-registry latest from"),
+        "{}",
+        reply.body
+    );
+    page_with(addr, "/operations", &operator, "Fetched vk-registry 0.85.0").await;
+    let releases = hub.db.releases().unwrap();
+    assert!(
+        releases
+            .iter()
+            .any(|r| r.row.is(crate::store::Program::Registry) && r.row.version == "0.85.0"),
+        "{releases:?}"
+    );
+    let form = format!("_csrf={csrf}&op=fetch&program=nope");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
 
     // A viewer may not; nor a version that is not one.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;

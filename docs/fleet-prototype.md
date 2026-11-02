@@ -482,22 +482,23 @@ ed25519 signature in base64, and `release list` shows which releases are signed.
 bytes again requires the same signature, including its absence: remove the release to change
 its signature.
 
-`vk-hub release fetch [<version>|latest]` downloads a published release instead, from
-`release_repository` in `hub.toml`: `https://github.com/virtkit-dev/virtkit` by default, another
-`https://<host>/<owner>/<repo>` — a repository on a GitHub Enterprise Server, whose API is
-`/api/v3` on that host — or `"none"`, which turns fetching off. The hub resolves the release
-through GitHub's REST API, downloads its `vk` asset (the static linux x86-64 binary) over https,
+`vk-hub release fetch [<version>|latest] [--program vk|vk-registry]` downloads a published
+release instead, from `release_repository` in `hub.toml`:
+`https://github.com/virtkit-dev/virtkit` by default, another `https://<host>/<owner>/<repo>` — a
+repository on a GitHub Enterprise Server, whose API is `/api/v3` on that host — or `"none"`,
+which turns fetching off. The hub resolves the release through GitHub's REST API, downloads the
+program's asset (`vk` by default, or `vk-registry`: the static linux x86-64 binary) over https,
 refusing any redirect off it, and holds it only once it hashes to the sha256 the release
-publishes beside it in `vk.sha256`, the tag is the version asked for, and the binary passes the
-checks above; it is held unsigned, as `vk-hub release add` without `--signature` holds one. This
-is the code `vk update` replaces a binary with (`vk-selfupdate`), short of running the binary,
-which the hub never does. The asset may be at most 512 MiB, each read must arrive within 30
-seconds, the fetch's requests within 30 minutes in all, and one fetch runs at a time. The
-`HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment of `vk-hub serve` applies. `--check`
-prints which version the latest release is, and downloads nothing; asked again within 30
-seconds, it gives the last answer, or the last failure, as GitHub allows an unauthenticated
-caller 60 requests an hour. The fetch, and a failure with its reason, are audited, and the
-release added is audited as a `release add` is.
+publishes beside it in `vk.sha256` (or `vk-registry.sha256`), the tag is the version asked for,
+and the binary passes the checks above; it is held unsigned, as `vk-hub release add` without
+`--signature` holds one. This is the code `vk update` replaces a binary with (`vk-selfupdate`),
+short of running the binary, which the hub never does. The asset may be at most 512 MiB, each
+read must arrive within 30 seconds, the fetch's requests within 30 minutes in all, and one fetch
+runs at a time. The `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment of `vk-hub serve`
+applies. `--check` prints which version the latest release is, and downloads nothing; asked
+again within 30 seconds, it gives the last answer, or the last failure, as GitHub allows an
+unauthenticated caller 60 requests an hour. The fetch, and a failure with its reason, are
+audited, and the release added is audited as a `release add` is.
 
 What a fetch proves is that the hub holds the bytes the repository published as that version,
 intact: not who built them. A repository or account compromised to publish another binary
@@ -1782,21 +1783,22 @@ without it.
 Above the fragment, an operator's `/operations` carries three forms, each with the same
 origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
 
-- **Upload** posts a `vk` binary, its version and optionally a release key's signature (the
-  base64 `vk release-key sign` prints) to `/releases/upload` as `multipart/form-data`, a plain
-  form. The body is read as it arrives: the CSRF token (field or `X-CSRF-Token` header), the
-  version and the signature are checked before a byte of the file is written, and the file is
-  streamed to a private file in `<data_dir>/releases/`, then held through `release add`'s
-  checks. Any failure, the browser leaving included, removes the file; so does `vk-hub serve`
-  starting, for what a stopped hub left. The binary may be 1 GiB, the body must state its length
-  and arrive within a minute plus its length at 256 KiB/s — a little over an hour for 1 GiB,
-  about seven and a half minutes for 100 MB — and never pause for 30 seconds. One upload runs at
-  a time, counted from when its fields pass their checks, and the session must still be an
-  operator's once the file is in.
-- **Fetch from GitHub** posts a version, `latest` by default, to `/releases/fetch` and starts
-  `release fetch` in the background; the fragment shows its progress and how it ended. "Check
-  the latest" asks which version that is and shows it, giving the last answer, or the last
-  failure, again within 30 seconds. The form is absent with `release_repository = "none"`.
+- **Upload** posts a binary, its program (`vk` or `vk-registry`), its version and optionally a
+  release key's signature (the base64 `vk release-key sign` prints) to `/releases/upload` as
+  `multipart/form-data`, a plain form. The body is read as it arrives: the CSRF token (field or
+  `X-CSRF-Token` header), the program, the version and the signature are checked before a byte
+  of the file is written, and the file is streamed to a private file in `<data_dir>/releases/`,
+  then held through `release add`'s checks. Any failure, the browser leaving included, removes
+  the file; so does `vk-hub serve` starting, for what a stopped hub left. The binary may be 1
+  GiB, the body must state its length and arrive within a minute plus its length at 256 KiB/s —
+  a little over an hour for 1 GiB, about seven and a half minutes for 100 MB — and never pause
+  for 30 seconds. One upload runs at a time, counted from when its fields pass their checks, and
+  the session must still be an operator's once the file is in.
+- **Fetch from GitHub** posts a program and a version, `latest` by default, to `/releases/fetch`
+  and starts `release fetch` in the background; the fragment shows its progress and how it
+  ended. "Check the latest" asks which version that is and shows it, giving the last answer, or
+  the last failure, again within 30 seconds. The form is absent with `release_repository =
+  "none"`.
 - **Start a rollout** takes a held release, the nodes to update — all checked to start with, with
   All and None to check or uncheck them at once — and `rollout create`'s options, the timeouts,
   per-profile canaries and external runners folded under "Advanced", and posts to `/rollouts`. It

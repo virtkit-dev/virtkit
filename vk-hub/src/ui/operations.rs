@@ -1,12 +1,13 @@
-//! Operators upload releases, fetch them from GitHub ([`crate::fetch`]) and start rollouts
-//! from `/operations`, alongside controls for active rollouts. Starting a rollout requires
-//! confirmation of its plan ([`actions::ask_first`]). Each uses the admin socket's operations
-//! — `release add`'s checks, `release fetch`, `rollout create` — as the session's principal.
+//! Operators upload releases of each [`Program`], fetch them from GitHub ([`crate::fetch`]) and
+//! start rollouts from `/operations`, alongside controls for active rollouts. Starting a
+//! rollout requires confirmation of its plan ([`actions::ask_first`]). Each uses the admin
+//! socket's operations — `release add`'s checks, `release fetch`, `rollout create` — as the
+//! session's principal.
 //!
 //! **An upload** is a plain form post, `multipart/form-data` read as it arrives
-//! ([`multipart`]): the CSRF token, the version and the signature come first — and are checked
-//! before a byte of the file is written — then the file, streamed to a private file in the
-//! releases directory, which is removed on any failure, the client leaving included. The
+//! ([`multipart`]): the CSRF token, the program, the version and the signature come first — and
+//! are checked before a byte of the file is written — then the file, streamed to a private file
+//! in the releases directory, which is removed on any failure, the client leaving included. The
 //! body may be at most [`MAX_UPLOAD`] past its form fields, must say its length, and must
 //! arrive within [`UPLOAD_GRACE`] plus its length at [`MIN_RATE`], never going quiet for
 //! [`UPLOAD_IDLE`]: the 10 seconds a form has would cut off any binary. One upload at a time,
@@ -134,6 +135,10 @@ pub(super) async fn upload(
     if !super::csrf_ok(fields.csrf.or(header_token), &auth) {
         return refuse(StatusCode::FORBIDDEN, super::CSRF_REFUSED);
     }
+    let program = match releases::program(fields.program.as_deref()) {
+        Ok(program) => program,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, &format!("Refused: {e:#}.")),
+    };
     let version = fields.version.unwrap_or_default().trim().to_string();
     if let Err(e) = releases::check_version(&version) {
         return refuse(StatusCode::BAD_REQUEST, &format!("Refused: {e:#}."));
@@ -176,12 +181,7 @@ pub(super) async fn upload(
     let (hub, principal) = (ui.hub.clone(), auth.session.principal());
     let added = blocking(move || {
         Ok(releases::adopt(
-            &hub,
-            &principal,
-            staged,
-            Program::Vk,
-            &version,
-            signature,
+            &hub, &principal, staged, program, &version, signature,
         ))
     })
     .await?;
@@ -196,6 +196,7 @@ pub(super) async fn upload(
 #[derive(Default)]
 struct Fields {
     csrf: Option<String>,
+    program: Option<String>,
     version: Option<String>,
     signature: Option<String>,
 }
@@ -212,6 +213,7 @@ where
         let slot = match part.name.as_str() {
             "file" if part.file => return Ok(fields),
             "_csrf" => &mut fields.csrf,
+            "program" => &mut fields.program,
             "version" => &mut fields.version,
             "signature" => &mut fields.signature,
             _ => return Err(Refusal::Malformed("it has a field the form does not")),
@@ -298,8 +300,8 @@ fn done(htmx: bool, said: &str) -> Response<Body> {
     }
 }
 
-/// `POST /releases/fetch`: `op=fetch` starts fetching `version` (or the latest) in the
-/// background, which `/operations` follows; `op=check` asks the repository which release is
+/// `POST /releases/fetch`: `op=fetch` starts fetching `program`'s `version` (or the latest) in
+/// the background, which `/operations` follows; `op=check` asks the repository which release is
 /// the latest.
 pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -340,17 +342,28 @@ pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Resp
                     ));
                 }
             };
+            let program = match releases::program(field(&form, "program")) {
+                Ok(program) => program,
+                Err(e) => {
+                    return Ok(actions::refused(
+                        htmx,
+                        StatusCode::BAD_REQUEST,
+                        &format!("Refused: {e:#}."),
+                    ));
+                }
+            };
             let what = version.clone().unwrap_or_else(|| "latest".into());
             let (hub, principal) = (ui.hub.clone(), auth.session.principal());
             // Dropped, not awaited: the fetch runs on, and the page follows it.
             let started =
-                blocking(move || Ok(fetch::start(&hub, &principal, version).map(drop))).await?;
+                blocking(move || Ok(fetch::start(&hub, &principal, program, version).map(drop)))
+                    .await?;
             match started {
                 Ok(()) => Ok(done(
                     htmx,
                     &format!(
-                        "Fetching vk {what} from {source}; how it goes shows below and in the \
-                         audit log."
+                        "Fetching {program} {what} from {source}; how it goes shows below and \
+                         in the audit log."
                     ),
                 )),
                 Err(e) => Ok(actions::refused(
@@ -613,18 +626,19 @@ pub(super) fn forms(
         .raw("\" enctype=\"multipart/form-data\">");
     // Before the file: the hub checks them before it writes a byte of it.
     csrf_field(h, auth);
+    program_select(h);
     h.raw("<label>Version <input name=\"version\" required size=\"10\" ")
         .raw("placeholder=\"0.85.0\"></label>")
         .raw("<label>Signature <input name=\"signature\" size=\"24\" ")
         .raw("placeholder=\"optional: vk release-key sign\"></label>")
-        .raw("<label>vk binary <input type=\"file\" name=\"file\" required></label>")
+        .raw("<label>Binary <input type=\"file\" name=\"file\" required></label>")
         .raw("<button class=\"primary\">Upload</button></form><p class=\"sub\">At most ")
         .text(pages::bytes(MAX_UPLOAD))
         .raw(", sent at ")
         .text(pages::bytes(MIN_RATE))
         .raw(
             "/s or faster. The hub checks that it is an x86-64 ELF holding the version as a \
-               string of its own; the node runs it.</p>",
+               string of its own; the node or registry runs it.</p>",
         );
     if let Some(source) = source {
         h.raw("<form class=\"wide\" method=\"post\" action=\"")
@@ -633,14 +647,15 @@ pub(super) fn forms(
             .raw(FETCH_PATH)
             .raw("\" hx-swap=\"none\">");
         csrf_field(h, auth);
+        program_select(h);
         h.raw("<label>Version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
             .raw("<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>")
             .raw("<button name=\"op\" value=\"check\">Check the latest</button></form>")
             .raw("<p class=\"sub\">From <code>")
             .text(source)
             .raw(
-                "</code>: its vk is held once it hashes to the sha256 published beside it, \
-                   unsigned.</p>",
+                "</code>: the program's binary is held once it hashes to the sha256 published \
+                   beside it, unsigned.</p>",
             );
     }
     h.raw("</section><section id=\"start-rollout\" sse-swap=\"")
@@ -648,6 +663,21 @@ pub(super) fn forms(
         .raw("\">");
     start_rollout(h, releases, nodes, Some(&auth.csrf));
     h.raw("</section>");
+}
+
+/// A form's choice of [`Program`], `vk` first.
+fn program_select(h: &mut Html) {
+    h.raw("<label>Program <select name=\"program\">");
+    for p in Program::ALL {
+        h.raw("<option value=\"")
+            .raw(p.name())
+            .raw("\">")
+            .raw(p.name())
+            .raw(" (")
+            .raw(p.runners())
+            .raw(")</option>");
+    }
+    h.raw("</select></label>");
 }
 
 /// The event an operator's `/operations` stream sends the form that starts a rollout as.
@@ -753,7 +783,7 @@ pub(super) fn fetch_line(
     }
     h.raw("<p class=\"sub\">");
     if let Some((version, at)) = latest {
-        h.raw("Latest on GitHub: vk ")
+        h.raw("Latest on GitHub: ")
             .node(version)
             .raw(", as of ")
             .html(&pages::at_html(*at))
@@ -761,14 +791,19 @@ pub(super) fn fetch_line(
     }
     if let Some(s) = status {
         let asked = s.asked.as_deref().unwrap_or("latest");
+        let program = s.program.name();
         match &s.phase {
             Phase::Resolving => {
-                h.raw("Fetching vk ")
+                h.raw("Fetching ")
+                    .raw(program)
+                    .raw(" ")
                     .text(asked)
                     .raw(": asking which release it is");
             }
             Phase::Downloading { version } => {
-                h.raw("Fetching vk ")
+                h.raw("Fetching ")
+                    .raw(program)
+                    .raw(" ")
                     .text(asked)
                     .raw(": downloading and checking ")
                     .node(version);
@@ -778,7 +813,9 @@ pub(super) fn fetch_line(
                 sha256,
                 at,
             } => {
-                h.raw("Fetched vk ")
+                h.raw("Fetched ")
+                    .raw(program)
+                    .raw(" ")
                     .node(version)
                     .raw(" (<code>")
                     .text(crate::store::short(sha256))
@@ -786,7 +823,9 @@ pub(super) fn fetch_line(
                     .html(&pages::at_html(*at));
             }
             Phase::Failed { reason, at } => {
-                h.raw("<span class=\"reason\">Fetching vk ")
+                h.raw("<span class=\"reason\">Fetching ")
+                    .raw(program)
+                    .raw(" ")
                     .text(asked)
                     .raw(" failed</span> at ")
                     .html(&pages::at_html(*at))

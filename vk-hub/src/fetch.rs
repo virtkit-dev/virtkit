@@ -1,20 +1,20 @@
-//! `vk-hub release fetch` and `/operations`' fetch form: the hub downloads the `vk` of a
-//! virtkit release published on GitHub and holds it as if `release add` had been given it.
+//! `vk-hub release fetch` and `/operations`' fetch form download a [`Program`]'s
+//! binary (`vk` or `vk-registry`) from a GitHub virtkit release and hold it as if
+//! supplied to `release add`.
 //!
-//! The release is resolved, and its `vk` downloaded and checked, by `vk-selfupdate` — the code
-//! `vk update` replaces a binary with — so a fetch passes the same gates an update does short
-//! of running the binary: the API and the assets over https, no redirect leaving it
-//! ([`vk_selfupdate::client`]), the release's `vk` asset at most 512 MiB, and the bytes
-//! hashing to the sha256 the release publishes beside them in `vk.sha256`. The tag must be
-//! the version asked for, and [`releases::adopt`] then checks what every release added is
-//! checked for: an x86-64 ELF holding that version as a string of its own. The hub never runs
-//! it ([`releases`]); each node's `--version` is the smoke test.
+//! `vk-selfupdate` resolves and checks the release as `vk update` does, except for
+//! running the binary: https for the API and assets, no redirect leaving https
+//! ([`vk_selfupdate::client`]), the program's asset (`vk` or `vk-registry`) at most
+//! 512 MiB, and a sha256 matching `<asset>.sha256`. The tag must match the requested
+//! version. [`releases::adopt`] applies the usual release checks: an x86-64 ELF with
+//! that version as a standalone string. The hub never runs it ([`releases`]); the
+//! node or registry runs its `--version` smoke test.
 //!
 //! What this proves is that the hub holds the bytes the repository published as that version,
 //! intact: not who built them. A release whose binary and sidecar were replaced together — a
 //! compromised repository or account — passes. A release key's signature is what a node can
 //! trust instead: a fetched release carries none, as official releases are not signed yet, so
-//! a node that requires one refuses it, as it refuses an unsigned `release add`.
+//! a node or registry that requires one refuses it, as it refuses an unsigned `release add`.
 //!
 //! One fetch runs at a time, in the background; its progress and outcome are kept for the
 //! pages and audited. Asking which release is the latest is one request at a time too, and
@@ -33,9 +33,6 @@ use crate::{local, releases};
 
 /// What `release_repository` is unless the config says otherwise.
 pub const DEFAULT_SOURCE: &str = "https://github.com/virtkit-dev/virtkit";
-
-/// The release asset fetched: `vk`, the static linux-x86_64 binary.
-const ASSET: &str = "vk";
 
 /// How long a fetch's requests may take in all: `vk-selfupdate` bounds each read to 30
 /// seconds, not a download that trickles. Checking what arrived is not counted: it is the
@@ -126,6 +123,8 @@ impl Source {
 /// A fetch, as the pages show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchStatus {
+    /// The program whose binary is fetched.
+    pub program: Program,
     /// The version asked for; `None` for the latest.
     pub asked: Option<String>,
     pub by: String,
@@ -138,7 +137,7 @@ pub struct FetchStatus {
 pub enum Phase {
     /// Asking the repository which release that is.
     Resolving,
-    /// Downloading and checking its `vk`.
+    /// Downloading and checking its binary.
     Downloading {
         version: String,
     },
@@ -225,11 +224,12 @@ pub fn wanted(version: &str) -> Result<Option<String>> {
     Ok(Some(version.to_string()))
 }
 
-/// Start fetching `version`'s `vk` — the latest release's for `None` — as `actor`, in the
-/// background; what it comes to resolves the handle, and is kept for the pages.
+/// Fetch `version` of `program` (`None` means latest) as `actor` in the background.
+/// Resolve the handle with the outcome and keep it for the pages.
 pub fn start(
     hub: &Arc<Hub>,
     actor: &str,
+    program: Program,
     version: Option<String>,
 ) -> Result<tokio::task::JoinHandle<Result<Release>>> {
     let Some(source) = hub.fetches.source().cloned() else {
@@ -243,19 +243,23 @@ pub fn start(
             return Err(Busy.into());
         }
         *status = Some(FetchStatus {
+            program,
             asked: version.clone(),
             by: actor.to_string(),
             started_at: crate::now_secs(),
             phase: Phase::Resolving,
         });
     }
-    let started = format!("{actor} started fetching vk {what} from {}", source.url());
+    let started = format!(
+        "{actor} started fetching {program} {what} from {}",
+        source.url()
+    );
     eprintln!("vk-hub: {started}");
     hub.touch();
     let (hub, actor) = (hub.clone(), actor.to_string());
     Ok(tokio::spawn(async move {
         let result = match local::audit(&hub, &actor, started).await {
-            Ok(()) => fetch(&hub, &actor, &source, version.as_deref()).await,
+            Ok(()) => fetch(&hub, &actor, &source, program, version.as_deref()).await,
             Err(e) => Err(e),
         };
         let now = crate::now_secs();
@@ -268,7 +272,7 @@ pub fn start(
             Err(e) => {
                 let reason = vk_hub_proto::display_safe(&format!("{e:#}"));
                 let event = format!(
-                    "{actor} failed to fetch vk {what} from {}: {reason}",
+                    "{actor} failed to fetch {program} {what} from {}: {reason}",
                     source.url()
                 );
                 eprintln!("vk-hub: {event}");
@@ -304,18 +308,20 @@ async fn fetch(
     hub: &Arc<Hub>,
     actor: &str,
     source: &Source,
+    program: Program,
     version: Option<&str>,
 ) -> Result<Release> {
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
     let client = vk_selfupdate::client(concat!("vk-hub/", env!("CARGO_PKG_VERSION")))?;
+    let asset = program.name();
     let resolved = within(
         deadline,
-        vk_selfupdate::artifacts_in(&client, &source.repo, version, &[ASSET]),
+        vk_selfupdate::artifacts_in(&client, &source.repo, version, &[asset]),
     )
     .await?;
-    let Some(artifact) = resolved.artifacts.into_iter().find(|a| a.name == ASSET) else {
+    let Some(artifact) = resolved.artifacts.into_iter().find(|a| a.name == asset) else {
         bail!(
-            "release {} publishes no {ASSET}",
+            "release {} publishes no {asset}",
             vk_hub_proto::display_safe(&resolved.version)
         );
     };
@@ -336,7 +342,7 @@ async fn fetch(
         },
     );
     let (held, sha256, version) = (hub.clone(), artifact.sha256.clone(), found.clone());
-    let holding = tokio::task::spawn_blocking(move || holding(&held, sha256, &version))
+    let holding = tokio::task::spawn_blocking(move || holding(&held, sha256, program, &version))
         .await
         .context("looking for the release")??;
     let staged = match holding {
@@ -354,10 +360,10 @@ async fn fetch(
         ),
     )
     .await
-    .with_context(|| format!("downloading vk {found}"))?;
+    .with_context(|| format!("downloading {program} {found}"))?;
     let (held, actor, version) = (hub.clone(), actor.to_string(), found.clone());
     let release = tokio::task::spawn_blocking(move || {
-        releases::adopt(&held, &actor, staged, Program::Vk, &version, None)
+        releases::adopt(&held, &actor, staged, program, &version, None)
     })
     .await
     .context("adding the release")??;
@@ -368,12 +374,13 @@ async fn fetch(
     Ok(release)
 }
 
-/// Release `sha256` if it is held already as `version`, its file intact: nothing to download.
-/// Otherwise a name to download it to; a missing or wrong-size file is downloaded again, and
-/// `adopt` restores it.
-fn holding(hub: &Hub, sha256: String, version: &str) -> Result<Holding> {
+/// Release `sha256` if it is held already as `version` of `program`, its file intact: nothing
+/// to download. Otherwise a name to download it to; a missing or wrong-size file is downloaded
+/// again, and `adopt` restores it.
+fn holding(hub: &Hub, sha256: String, program: Program, version: &str) -> Result<Holding> {
     let held = releases::path(hub.releases_dir()?, &sha256);
     if let Some(row) = hub.db.release(&sha256)?
+        && row.is(program)
         && row.version == version
         && row.signature.is_none()
         && std::fs::metadata(&held).is_ok_and(|m| m.is_file() && m.len() == row.size)
@@ -422,12 +429,12 @@ pub async fn latest(hub: &Hub) -> Result<String> {
     Ok(version)
 }
 
-/// Ask `source` which release is the latest.
+/// Ask `source` which release is the latest, whatever programs it publishes.
 async fn ask_latest(source: &Source) -> Result<String> {
     let client = vk_selfupdate::client(concat!("vk-hub/", env!("CARGO_PKG_VERSION")))?;
     let resolved = tokio::time::timeout(
         CHECK_TIMEOUT,
-        vk_selfupdate::artifacts_in(&client, &source.repo, None, &[ASSET]),
+        vk_selfupdate::artifacts_in(&client, &source.repo, None, &[]),
     )
     .await
     .map_err(|_| {
@@ -437,12 +444,6 @@ async fn ask_latest(source: &Source) -> Result<String> {
             crate::human_duration(CHECK_TIMEOUT)
         )
     })??;
-    if resolved.artifacts.is_empty() {
-        bail!(
-            "the latest release, {}, publishes no {ASSET}",
-            vk_hub_proto::display_safe(&resolved.version)
-        );
-    }
     Ok(vk_hub_proto::display_safe(&resolved.version))
 }
 
@@ -478,12 +479,14 @@ pub mod tests {
     #[derive(Clone)]
     pub struct FakeRelease {
         pub tag: String,
-        /// The `vk` asset's bytes.
+        /// The `vk` asset's bytes; none published when empty.
         pub vk: Vec<u8>,
         /// The digest its sidecar publishes; `vk`'s own unless a test says otherwise.
         pub sha256: String,
         /// The download sends half of `vk`, then nothing more.
         pub stall: bool,
+        /// The `vk-registry` asset's bytes, published beside `vk` with their own digest.
+        pub registry: Option<Vec<u8>>,
     }
 
     impl FakeRelease {
@@ -494,6 +497,7 @@ pub mod tests {
                 vk,
                 sha256,
                 stall: false,
+                registry: None,
             }
         }
     }
@@ -535,16 +539,34 @@ pub mod tests {
                 .unwrap()
         };
         let repo = "/repos/virtkit-dev/virtkit/releases";
+        let registry_sidecar = |bin: &[u8]| {
+            format!(
+                "{}  vk-registry\n",
+                vk_hub_proto::to_hex(&Sha256::digest(bin))
+            )
+        };
         if path == format!("{repo}/latest") || path == format!("{repo}/tags/{}", r.tag) {
             let sidecar = format!("{}  vk\n", r.sha256);
-            let json = format!(
-                r#"{{"tag_name":"{tag}","assets":[
-                    {{"name":"vk","browser_download_url":"http://{addr}/dl/vk","size":{size}}},
-                    {{"name":"vk.sha256","browser_download_url":"http://{addr}/dl/vk.sha256","size":{sidecar_size}}}]}}"#,
-                tag = r.tag,
+            let registry = r.registry.as_ref().map_or(String::new(), |bin| {
+                format!(
+                    r#",{{"name":"vk-registry","browser_download_url":"http://{addr}/dl/vk-registry","size":{}}},
+                    {{"name":"vk-registry.sha256","browser_download_url":"http://{addr}/dl/vk-registry.sha256","size":{}}}"#,
+                    bin.len(),
+                    registry_sidecar(bin).len()
+                )
+            });
+            let vk = format!(
+                r#"{{"name":"vk","browser_download_url":"http://{addr}/dl/vk","size":{size}}},
+                    {{"name":"vk.sha256","browser_download_url":"http://{addr}/dl/vk.sha256","size":{sidecar_size}}}"#,
                 size = r.vk.len(),
                 sidecar_size = sidecar.len(),
             );
+            let assets = match (r.vk.is_empty(), registry.strip_prefix(',')) {
+                (true, Some(registry)) => registry.to_string(),
+                (true, None) => String::new(),
+                (false, _) => format!("{vk}{registry}"),
+            };
+            let json = format!(r#"{{"tag_name":"{tag}","assets":[{assets}]}}"#, tag = r.tag);
             return reply(200, json.into_bytes());
         }
         match path {
@@ -556,6 +578,13 @@ pub mod tests {
             }
             "/dl/vk" => reply(200, r.vk.clone()),
             "/dl/vk.sha256" => reply(200, format!("{}  vk\n", r.sha256).into_bytes()),
+            "/dl/vk-registry" if r.registry.is_some() => {
+                reply(200, r.registry.clone().unwrap_or_default())
+            }
+            "/dl/vk-registry.sha256" if r.registry.is_some() => reply(
+                200,
+                registry_sidecar(r.registry.as_deref().unwrap_or_default()).into_bytes(),
+            ),
             _ => reply(404, br#"{"message":"Not Found"}"#.to_vec()),
         }
     }
@@ -624,7 +653,11 @@ pub mod tests {
         let api = fake_github(FakeRelease::new("v0.85.0", bin.clone())).await;
         let (hub, dir) = hub_fetching_from(&api, "ok");
         assert_eq!(latest(&hub).await.unwrap(), "0.85.0");
-        let release = start(&hub, "uid 7", None).unwrap().await.unwrap().unwrap();
+        let release = start(&hub, "uid 7", Program::Vk, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(release.row.version, "0.85.0");
         assert_eq!(release.row.signature, None);
         assert_eq!(release.sha256, vk_hub_proto::to_hex(&Sha256::digest(&bin)));
@@ -635,7 +668,7 @@ pub mod tests {
             hub.fetches.status().unwrap().phase,
             Phase::Done { .. }
         ));
-        let again = start(&hub, "uid 7", Some("0.85.0".into()))
+        let again = start(&hub, "uid 7", Program::Vk, Some("0.85.0".into()))
             .unwrap()
             .await
             .unwrap()
@@ -643,7 +676,11 @@ pub mod tests {
         assert_eq!(again, release);
         // A held release whose file went missing is downloaded again, restoring it.
         std::fs::remove_file(releases::path(&dir.join("releases"), &release.sha256)).unwrap();
-        let restored = start(&hub, "uid 7", None).unwrap().await.unwrap().unwrap();
+        let restored = start(&hub, "uid 7", Program::Vk, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(restored, release);
         let held = std::fs::read(releases::path(&dir.join("releases"), &release.sha256)).unwrap();
         assert_eq!(held, bin);
@@ -663,6 +700,82 @@ pub mod tests {
         ] {
             assert!(events.contains(&want), "{want}: {events:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `vk-registry` is fetched from the same release as its own asset, and held as a
+    /// registry's release; a release publishing none is refused, saying so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registry_release_is_fetched_as_its_own_asset() {
+        installed();
+        let mut registry = fake_vk("0.85.0");
+        registry.extend_from_slice(b"vk-registry\0");
+        let mut release = FakeRelease::new("v0.85.0", fake_vk("0.85.0"));
+        release.registry = Some(registry.clone());
+        let api = fake_github(release).await;
+        let (hub, dir) = hub_fetching_from(&api, "registry");
+        let held = start(&hub, "uid 7", Program::Registry, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(held.row.is(Program::Registry), "{held:?}");
+        assert_eq!(
+            held.sha256,
+            vk_hub_proto::to_hex(&Sha256::digest(&registry))
+        );
+        let status = hub.fetches.status().unwrap();
+        assert_eq!(status.program, Program::Registry);
+        let vk = start(&hub, "uid 7", Program::Vk, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(vk.row.is(Program::Vk), "{vk:?}");
+        assert_eq!(hub.db.releases().unwrap().len(), 2);
+        let events: Vec<String> = hub
+            .db
+            .audits(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        let want =
+            format!("uid 7 started fetching vk-registry latest from {api}/virtkit-dev/virtkit");
+        assert!(events.contains(&want), "{events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
+        let (hub, dir) = hub_fetching_from(&api, "no-registry");
+        let err = start(&hub, "uid 7", Program::Registry, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("publishes no vk-registry"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A release publishing only a vk-registry has a latest version all the same.
+        let mut release = FakeRelease::new("v0.86.0", Vec::new());
+        release.registry = Some(fake_vk("0.86.0"));
+        let api = fake_github(release).await;
+        let (hub, dir) = hub_fetching_from(&api, "registry-only");
+        assert_eq!(latest(&hub).await.unwrap(), "0.86.0");
+        let held = start(&hub, "uid 7", Program::Registry, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.row.version, "0.86.0");
+        let err = start(&hub, "uid 7", Program::Vk, None)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("publishes no vk"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -687,7 +800,7 @@ pub mod tests {
         ] {
             let api = fake_github(release).await;
             let (hub, dir) = hub_fetching_from(&api, case);
-            let err = start(&hub, "uid 7", asked.map(str::to_string))
+            let err = start(&hub, "uid 7", Program::Vk, asked.map(str::to_string))
                 .unwrap()
                 .await
                 .unwrap()
@@ -721,7 +834,7 @@ pub mod tests {
         stalled.stall = true;
         let api = fake_github(stalled).await;
         let (hub, dir) = hub_fetching_from(&api, "stall");
-        let err = start(&hub, "uid 7", None)
+        let err = start(&hub, "uid 7", Program::Vk, None)
             .unwrap()
             .await
             .unwrap()
@@ -759,8 +872,8 @@ pub mod tests {
         installed();
         let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
         let (hub, dir) = hub_fetching_from(&api, "busy");
-        let first = start(&hub, "uid 7", None).unwrap();
-        let second = start(&hub, "uid 7", None);
+        let first = start(&hub, "uid 7", Program::Vk, None).unwrap();
+        let second = start(&hub, "uid 7", Program::Vk, None);
         // Unless the first was already over.
         if !matches!(hub.fetches.status().unwrap().phase, Phase::Done { .. }) {
             assert!(second.unwrap_err().is::<Busy>());
@@ -771,7 +884,7 @@ pub mod tests {
                 .with_releases(dir.join("off"))
                 .with_release_source(None),
         );
-        let err = start(&off, "uid 7", None).unwrap_err();
+        let err = start(&off, "uid 7", Program::Vk, None).unwrap_err();
         assert!(format!("{err:#}").contains("off"), "{err:#}");
         assert!(latest(&off).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);

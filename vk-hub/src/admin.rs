@@ -31,7 +31,8 @@ use crate::registries::RegistryView;
 use crate::rollout::{DeleteRule, Rollout, RolloutAction};
 use crate::server::Hub;
 use crate::store::{
-    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, TokenKind, Tools, UiSession,
+    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Program, Release, Role, TokenKind, Tools,
+    UiSession,
 };
 use vk_hub_proto::registry::{
     Command as RegistryCommand, DesiredState as RegistryDesired, GcPolicy,
@@ -238,6 +239,13 @@ enum Call {
     /// Download a release's `vk` from the configured repository: `None` for the latest.
     FetchRelease {
         version: Option<String>,
+    },
+    /// Download `program`'s binary from the configured release repository.
+    /// A separate operation makes older hubs refuse the request; adding a field to
+    /// [`Call::FetchRelease`] would make them ignore it and fetch `vk`.
+    FetchProgramRelease {
+        version: Option<String>,
+        program: Program,
     },
     /// The latest release the configured repository publishes.
     LatestRelease,
@@ -505,7 +513,7 @@ fn fetch_call(body: &[u8]) -> Option<Call> {
     let envelope: Envelope = serde_json::from_slice(body).ok()?;
     matches!(
         envelope.call,
-        Call::FetchRelease { .. } | Call::LatestRelease
+        Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } | Call::LatestRelease
     )
     .then_some(envelope.call)
 }
@@ -513,19 +521,30 @@ fn fetch_call(body: &[u8]) -> Option<Call> {
 async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_json::Value> {
     let actor = format!("uid {uid}");
     match call {
-        Call::FetchRelease { version } => {
-            let version = match version {
-                Some(v) => crate::fetch::wanted(&v)?,
-                None => None,
-            };
-            let release = crate::fetch::start(hub, &actor, version)?
-                .await
-                .context("fetching the release")??;
-            Ok(serde_json::to_value(release)?)
+        Call::FetchRelease { version } => fetch(hub, &actor, Program::Vk, version).await,
+        Call::FetchProgramRelease { version, program } => {
+            fetch(hub, &actor, program, version).await
         }
         Call::LatestRelease => Ok(serde_json::to_value(crate::fetch::latest(hub).await?)?),
         _ => bail!("not a fetch"),
     }
+}
+
+/// Fetch `program`'s `version`, `None` for the latest, as `actor`, and wait until it is held.
+async fn fetch(
+    hub: &Arc<Hub>,
+    actor: &str,
+    program: Program,
+    version: Option<String>,
+) -> Result<serde_json::Value> {
+    let version = match version {
+        Some(v) => crate::fetch::wanted(&v)?,
+        None => None,
+    };
+    let release = crate::fetch::start(hub, actor, program, version)?
+        .await
+        .context("fetching the release")??;
+    Ok(serde_json::to_value(release)?)
 }
 
 pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
@@ -839,7 +858,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             );
             serde_json::to_value(row)?
         }
-        Call::FetchRelease { .. } | Call::LatestRelease => {
+        Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } | Call::LatestRelease => {
             bail!("a fetch is served on its own path")
         }
         Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
@@ -1359,10 +1378,13 @@ impl Client {
         })
     }
 
-    /// Fetch `version`'s `vk`, `None` for the latest release's, waiting until it is held.
-    pub fn fetch_release(&self, version: Option<&str>) -> Result<Release> {
-        self.call(Call::FetchRelease {
-            version: version.map(str::to_string),
+    /// Fetch `version`'s `program`, `None` for the latest release's, waiting until it is held.
+    pub fn fetch_release(&self, program: Program, version: Option<&str>) -> Result<Release> {
+        let version = version.map(str::to_string);
+        self.call(match program {
+            // The operation every hub knows.
+            Program::Vk => Call::FetchRelease { version },
+            _ => Call::FetchProgramRelease { version, program },
         })
     }
 
@@ -1527,7 +1549,7 @@ impl Client {
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
         let timeout = match call {
             Call::AddRelease { .. } | Call::AddTools { .. } => ADD_TIMEOUT,
-            Call::FetchRelease { .. } => FETCH_WAIT,
+            Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } => FETCH_WAIT,
             Call::LatestRelease => CHECK_WAIT,
             _ => IO_TIMEOUT,
         };
@@ -1662,6 +1684,26 @@ mod tests {
         assert!(bind(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fetch of another program than `vk` is an operation of its own, which a hub from
+    /// before it refuses rather than fetching `vk`; one of `vk` is the operation every hub knows.
+    #[test]
+    fn a_fetch_of_another_program_is_an_operation_of_its_own() {
+        let vk = serde_json::to_value(Call::FetchRelease { version: None }).unwrap();
+        assert_eq!(
+            vk,
+            serde_json::json!({"op": "fetch-release", "version": null})
+        );
+        let registry = serde_json::to_value(Call::FetchProgramRelease {
+            version: Some("0.90.0".into()),
+            program: Program::Registry,
+        })
+        .unwrap();
+        assert_eq!(
+            registry,
+            serde_json::json!({"op": "fetch-program-release", "version": "0.90.0", "program": "vk-registry"})
+        );
     }
 
     /// The tools calls, as the CLI sends them: added from a directory, issued to one node and

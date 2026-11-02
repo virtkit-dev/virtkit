@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **Versions on the web UI.** The top bar shows vk-hub's version beside its name, and the
   Storage list shows each registry's version.
+- **vk-registry releases from GitHub.** `vk-hub release fetch --program vk-registry` fetches a
+  release's `vk-registry`, and the Updates page uploads or fetches releases of either program.
 
 ## [0.101.0] - 2026-11-01
 

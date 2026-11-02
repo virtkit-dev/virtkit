@@ -385,7 +385,9 @@ nothing more.
 **Updates.** `vk-hub release add <file> --version V --program vk-registry [--signature FILE]`
 holds a `vk-registry` binary as `vk-hub` holds `vk` ones; nodes never update to it, nor
 registries to a `vk`. `vk release-key sign --program vk-registry` signs one: its message
-differs from a `vk` release's, so neither signature verifies as the other.
+differs from a `vk` release's, so neither signature verifies as the other. The web UI's Updates
+page (`/operations`) adds one too, uploaded or fetched from GitHub, as `vk-hub release fetch
+--program vk-registry` does.
 `vk-hub registries update <id> --release <sha256 prefix>` sends it. The registry:
 
 1. refuses it if another update is under way, if its version is older than its own (unless
