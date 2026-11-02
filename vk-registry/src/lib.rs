@@ -1615,11 +1615,25 @@ impl Store {
         self.flock_at(".lock", op)
     }
 
+    /// Serialize WebDAV's `files/` path checks and namespace changes across processes.
+    /// Acquire before [`Store::lock_shared`], never while holding it.
+    pub(crate) fn lock_namespace(&self) -> Result<LockGuard> {
+        self.flock_at(".files.lock", libc::LOCK_EX)
+    }
+
     fn flock_at(&self, name: &str, op: libc::c_int) -> Result<LockGuard> {
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
         let path = self.root.join(name);
-        let f =
-            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        // Do not truncate or follow a symlink at the lock name. Leave the mode to the umask
+        // for stores shared by a group.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: the fd is owned by `f`, which the guard keeps alive; flock returns
         // 0 or -1/errno and, without `LOCK_NB`, blocks until the lock is granted.
         if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {

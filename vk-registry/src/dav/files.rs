@@ -43,10 +43,21 @@ const TOUCH_AFTER: Duration = Duration::from_secs(3600);
 /// store lock, never while holding it. `/v2/` writes into `files/` do not take this lock.
 static NAMESPACE: Mutex<()> = Mutex::new(());
 
-/// Hold [`NAMESPACE`]. It guards no data, so a holder that panicked left nothing
-/// inconsistent behind and a poisoned lock is taken as it is.
-fn namespace() -> std::sync::MutexGuard<'static, ()> {
-    NAMESPACE.lock().unwrap_or_else(PoisonError::into_inner)
+/// The namespace held, in this process and against any other serving the store: a registry
+/// and the release it hands over to serve it together for a while.
+struct Namespace {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _store: crate::LockGuard,
+}
+
+/// Hold [`NAMESPACE`], then the store's namespace lock. Accept a poisoned mutex: it guards
+/// no data that a panic could leave inconsistent.
+fn namespace(store: &Store) -> Result<Namespace> {
+    let process = NAMESPACE.lock().unwrap_or_else(PoisonError::into_inner);
+    Ok(Namespace {
+        _process: process,
+        _store: store.lock_namespace()?,
+    })
 }
 
 /// What a `files/` path names once the store has been looked at.
@@ -520,7 +531,7 @@ async fn put(
     tokio::task::spawn_blocking(move || -> Result<Response<Body>> {
         let mut staging = staging;
         let staged = store.stage_promotion(&hex, &staging.path)?;
-        let _namespace = namespace();
+        let _namespace = namespace(&store)?;
         // shared store lock (vs. an exclusive gc) across the promote and the manifest that
         // references it; see Store::lock_shared. A `MKCOL` or another `PUT` may have changed
         // the path while the body streamed, so it is checked again.
@@ -628,7 +639,7 @@ where
 /// path is already mapped (a directory or a tag), or 409 when a tag is above it. Checked and
 /// created under [`NAMESPACE`].
 fn mkcol(store: &Store, segs: &[String], href: &str) -> Result<Response<Body>> {
-    let _namespace = namespace();
+    let _namespace = namespace(store)?;
     match resolve(store, segs)? {
         Some(_) => Ok(method_not_allowed(href, ALLOWED_FILES)),
         None if under_object(store, segs)? => Ok(parent_is_object(href)),
@@ -662,7 +673,7 @@ fn delete(
     let deadline = std::time::Instant::now() + DELETE_LOCK_WAIT;
     let mut backoff = Duration::from_millis(10);
     loop {
-        let namespace = namespace();
+        let namespace = namespace(store)?;
         let Some(node) = resolve_for(store, authz, accounts::Action::Read, segs, collection)?
         else {
             return Ok(not_found(href));
@@ -712,6 +723,26 @@ fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The namespace held here is held against another process's open of the store: the
+    /// lock file another descriptor cannot take until it is released.
+    #[test]
+    fn the_namespace_is_held_against_other_processes() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("vk-reg-files-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let try_lock = || {
+            let file = std::fs::File::open(dir.join(".files.lock")).unwrap();
+            // SAFETY: flock on a descriptor `file` owns.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        };
+        let held = namespace(&store).unwrap();
+        assert!(!try_lock());
+        drop(held);
+        assert!(try_lock());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Verify the streaming size cap with a small limit and multiple frames, and the digest
     /// of what went through.
