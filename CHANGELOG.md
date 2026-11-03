@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Update the guest kernel to Linux 6.18.60 LTS.
+
 ### Fixed
 
 - **A job no longer hangs on its shared checkout when a burst of file accesses fills the
