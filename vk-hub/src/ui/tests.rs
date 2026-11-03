@@ -3795,7 +3795,7 @@ async fn placed_jobs_are_a_tab_of_their_own() {
             page.contains(
                 "<nav aria-label=\"Sections\"><a href=\"/\" aria-current=\"true\">Nodes</a>\
                  <a href=\"/gitlab\">GitLab<span id=\"nav-count-gitlab\"></span></a>\
-                 <a href=\"/capacity\">Capacity</a><a href=\"/jobs\">Jobs</a>\
+                 <a href=\"/lanes\">Lanes</a><a href=\"/jobs\">Jobs</a>\
                  <a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
                  <a href=\"/keys\">Administration</a></nav>"
             ),
@@ -9233,9 +9233,10 @@ async fn the_gitlab_page_lists_its_servers() {
         ("/clients?tab=bogus", Some("/gitlab")),
         ("/clients?tab=%3Cscript%3E", Some("/gitlab")),
         ("/clients?tab=other", Some("/keys")),
-        ("/clients/capacity", Some("/capacity")),
-        ("/clients/tenants/web", Some("/capacity")),
-        ("/capacity/tenants/web", Some("/capacity")),
+        ("/clients/capacity", Some("/lanes")),
+        ("/clients/tenants/web", Some("/lanes")),
+        ("/capacity", Some("/lanes")),
+        ("/capacity/tenants/web", Some("/lanes")),
         ("/clients/projects/gl/42", Some("/gitlab/gl/projects/42")),
         ("/clients/projects/gl/042", None),
     ] {
@@ -9733,7 +9734,7 @@ async fn relays_and_their_runners_follow_their_server() {
     let event = next_with(&mut live_server, "production</td>").await;
     assert!(
         event.contains(
-            "<td>42</td><td><a href=\"/capacity\">weight 2</a></td>\
+            "<td>42</td><td><a href=\"/lanes\">weight 2</a></td>\
              <td>production</td><td>pool ci"
         ),
         "{event}"
@@ -12639,16 +12640,16 @@ async fn observed_traffic_is_compared_with_the_rules() {
     );
 }
 
-/// Post `form`, confirm the edit and return the reply. Panic unless the confirmation lists
-/// each of `changes`.
-async fn capacity_confirmed(
+/// Post `form` to the lanes' page, answer its question as the browser would and return the
+/// reply. Panic unless the question lists each of `changes`.
+async fn lanes_confirmed(
     addr: SocketAddr,
     origin: &str,
     cookie: &str,
     form: &str,
     changes: &[&str],
 ) -> Reply {
-    let question = post_action(addr, origin, cookie, "/capacity", form, false).await;
+    let question = post_action(addr, origin, cookie, "/lanes", form, false).await;
     assert!(
         question.body.contains("<h1>Confirm</h1>")
             && question.body.contains("Change the capacity policy?"),
@@ -12662,11 +12663,11 @@ async fn capacity_confirmed(
             question.body
         );
     }
-    let answer = format!(
-        "{form}&nonce={}&confirm=yes",
-        hidden(&question.body, "nonce")
-    );
-    post_action(addr, origin, cookie, "/capacity", &answer, false).await
+    let op = (form.split('&'))
+        .find_map(|pair| pair.strip_prefix("op="))
+        .unwrap();
+    let answer = posted_form(&question.body, op, 0);
+    post_action(addr, origin, cookie, "/lanes", &answer, false).await
 }
 
 /// URL-encode the hidden inputs of the `nth` form on `page` posting `op`, as a browser does.
@@ -12690,12 +12691,13 @@ fn posted_form(page: &str, op: &str, nth: usize) -> String {
     fields.join("&")
 }
 
-/// The policy's page lists its lanes, and a project's page the lanes that may run it.
-/// Operators set the whole policy there, asked first what changes; each change is audited,
+/// The lanes' page lists each lane with what it holds, and a project's page the lanes that
+/// may run it. Operators map a runner, edit its lane, keep and release production headroom,
+/// unmap it and replace the whole policy there, each asked first what changes, audited,
 /// refused when the policy changed since the page was shown, and validated before it is
-/// asked. Viewers see the policy and cannot change it.
+/// asked. Viewers see the lanes and cannot change them.
 #[tokio::test]
-async fn operators_set_the_capacity_policy_from_its_page() {
+async fn operators_edit_lanes_from_their_page() {
     use super::jobs::percent_encode as enc;
     use crate::policy::{Lane, LaneId, LaneProject};
     let (addr, hub, origin) = start_fleet().await;
@@ -12711,11 +12713,40 @@ async fn operators_set_the_capacity_policy_from_its_page() {
         .decide_projects("gl", &[project], crate::store::Decision::Approve, "u", now)
         .unwrap();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/capacity", Some(&operator)).await.body;
-    assert!(page.contains("<td>other API keys</td>"), "{page}");
-    let current = hub.db.capacity_policy().unwrap();
-    let mut policy = current.clone();
-    policy.lanes.push(Lane {
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
+    assert!(
+        page.contains(
+            "<tr><td>Other API keys</td><td>normal</td><td class=\"num\">1</td>\
+             <td class=\"num\">-</td><td>any node</td><td>-</td><td class=\"num\">0</td>\
+             <td class=\"num\">0</td><td class=\"actions\"><a href=\"/lanes?edit=default\">Edit\
+             </a></td></tr>"
+        ),
+        "{page}"
+    );
+    let edit = get(addr, "/lanes?edit=runner%2Fgl%2F7", Some(&operator))
+        .await
+        .body;
+    assert!(edit.contains("<h1>Runner 7</h1>"), "{edit}");
+    assert!(edit.contains("No lane yet"), "{edit}");
+    assert!(edit.contains("name=\"branches.42\""), "{edit}");
+    let digest = hub.db.capacity_policy().unwrap().digest().unwrap();
+    let save = |expected: &str, rest: &str| {
+        format!("_csrf={csrf}&op=save&expected={expected}&lane=runner%2Fgl%2F7&{rest}")
+    };
+    // A production lane without branches: refused before it is asked.
+    let invalid = save(
+        &digest,
+        "class=production&weight=1&max_slots=&projects=listed&project=42&branches.42=",
+    );
+    let reply = post_action(addr, &origin, &operator, "/lanes", &invalid, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let mapped = save(
+        &digest,
+        "class=normal&weight=3&max_slots=&projects=listed&project=42&branches.42=main",
+    );
+    let reply = lanes_confirmed(addr, &origin, &operator, &mapped, &["lanes: runner gl/7"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let lane = Lane {
         weight: 3,
         projects: Some(vec![LaneProject {
             gitlab: "gl".into(),
@@ -12726,38 +12757,9 @@ async fn operators_set_the_capacity_policy_from_its_page() {
             gitlab: "gl".into(),
             id: 7,
         })
-    });
-    let json = serde_json::to_string(&policy).unwrap();
-    let form = |expected: &str, json: &str| {
-        format!(
-            "_csrf={csrf}&op=capacity-policy&expected={expected}&policy={}",
-            enc(json)
-        )
     };
-    let digest = current.digest().unwrap();
-    // Invalid: refused before it is asked.
-    let mut invalid = policy.clone();
-    invalid.lanes.push(invalid.lanes[1].clone());
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/capacity",
-        &form(&digest, &serde_json::to_string(&invalid).unwrap()),
-        false,
-    )
-    .await;
-    assert_eq!(reply.status, 400, "{}", reply.body);
-    let reply = capacity_confirmed(
-        addr,
-        &origin,
-        &operator,
-        &form(&digest, &json),
-        &["lanes: runner gl/7"],
-    )
-    .await;
-    assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(hub.db.capacity_policy().unwrap(), policy);
+    let policy = hub.db.capacity_policy().unwrap();
+    assert_eq!(policy.runner("gl", 7), Some(&lane));
     let audits = hub.db.audits(None, 10).unwrap();
     assert!(
         audits
@@ -12766,39 +12768,124 @@ async fn operators_set_the_capacity_policy_from_its_page() {
         "{audits:?}"
     );
     // Its digest changed: the same form again is stale.
-    let reply = post_action(
-        addr,
-        &origin,
-        &operator,
-        "/capacity",
-        &form(&digest, &json),
-        false,
-    )
-    .await;
+    let reply = post_action(addr, &origin, &operator, "/lanes", &mapped, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
-    let page = get(addr, "/capacity", Some(&operator)).await.body;
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
     assert!(
         page.contains(
-            "<td>runner gl/7</td><td>normal</td><td class=\"num\">3</td><td>-</td>\
-                       <td>any node</td><td>42 · main</td>"
+            "<tr><td>Runner 7</td><td>normal</td><td class=\"num\">3</td><td class=\"num\">-\
+             </td><td>any node</td><td>acme/web · main</td>"
         ),
         "{page}"
     );
-    let page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
+    let project_page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     assert!(
-        page.contains("<td>runner gl/7</td><td>normal</td><td>main</td><td>any node</td>"),
-        "{page}"
+        project_page.contains("<td>Runner 7</td><td>normal</td><td>main</td><td>any node</td>"),
+        "{project_page}"
     );
+    // Production headroom, kept and released.
+    let digest = policy.digest().unwrap();
+    let keep = format!(
+        "_csrf={csrf}&op=add&expected={digest}&slots=1&pool=ci&labels=&mem_mib=1024&cpus=2\
+         &disk_gib=0"
+    );
+    let reply = lanes_confirmed(addr, &origin, &operator, &keep, &["settings: headroom"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let policy = hub.db.capacity_policy().unwrap();
+    assert_eq!(policy.headroom.len(), 1);
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
+    let release = posted_form(&page, "remove", 0);
+    assert!(release.contains("headroom=0"), "{release}");
+    let reply = lanes_confirmed(addr, &origin, &operator, &release, &["settings: headroom"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let policy = hub.db.capacity_policy().unwrap();
+    assert!(policy.headroom.is_empty());
+    // Unmapped.
+    let edit = get(addr, "/lanes?edit=runner%2Fgl%2F7", Some(&operator))
+        .await
+        .body;
+    let unmap = posted_form(&edit, "unmap", 0);
+    let reply = lanes_confirmed(addr, &origin, &operator, &unmap, &["lanes: runner gl/7"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let policy = hub.db.capacity_policy().unwrap();
+    assert_eq!(policy.runner("gl", 7), None);
+    // The whole policy, replaced; probe and backoff settings only with the CLI.
+    let mut probes = policy.clone();
+    probes.probe_limit = 2;
+    let refused = format!(
+        "_csrf={csrf}&op=replace&expected={}&policy={}",
+        policy.digest().unwrap(),
+        enc(&serde_json::to_string(&probes).unwrap())
+    );
+    let reply = post_action(addr, &origin, &operator, "/lanes", &refused, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let mut whole = policy.clone();
+    whole.lanes.push(lane);
+    let json = serde_json::to_string_pretty(&whole).unwrap();
+    let replace = format!(
+        "_csrf={csrf}&op=replace&expected={}&policy={}",
+        policy.digest().unwrap(),
+        enc(&json)
+    );
+    let reply = lanes_confirmed(addr, &origin, &operator, &replace, &["lanes: runner gl/7"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(hub.db.capacity_policy().unwrap(), whole);
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/capacity", Some(&viewer)).await.body;
-    assert!(!page.contains("value=\"capacity-policy\""), "{page}");
-    assert!(page.contains("<pre>"), "{page}");
+    for path in ["/lanes", "/lanes?edit=runner%2Fgl%2F7"] {
+        let page = get(addr, path, Some(&viewer)).await.body;
+        assert!(page.contains("<td>Runner 7</td>"), "{page}");
+        assert!(!page.contains("name=\"op\""), "{page}");
+        assert!(!page.contains("?edit="), "{page}");
+        assert!(page.contains("<pre>"), "{page}");
+    }
 }
 
-/// An unreadable policy leaves Connections, policy and project pages available. They show the
-/// error and replacement digest for the CLI; the editor refuses changes.
+/// A policy held since its conversion lists the rules that did not convert. Editing a lane
+/// leaves it held; activating it ends the hold.
+#[tokio::test]
+async fn a_held_policy_stays_held_until_activated() {
+    let (addr, hub, origin) = start_fleet().await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let policy = hub.db.capacity_policy().unwrap();
+    hub.db
+        .set_capacity_conversion(&crate::store::ConversionNote {
+            unconverted: vec!["project gl/7, branches main: nodes n1 (runner gl/42)".into()],
+            ..Default::default()
+        });
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
+    assert!(page.contains("<h2>Not active</h2>"), "{page}");
+    assert!(
+        page.contains("<li>project gl/7, branches main: nodes n1 (runner gl/42)</li>"),
+        "{page}"
+    );
+    let edit = format!(
+        "_csrf={csrf}&op=save&expected={}&lane=default&weight=2&max_slots=",
+        policy.digest().unwrap()
+    );
+    let reply = lanes_confirmed(addr, &origin, &operator, &edit, &["lanes: other API keys"]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(hub.db.capacity_policy_state().unwrap().1);
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
+    let activate = posted_form(&page, "activate", 0);
+    let reply = lanes_confirmed(
+        addr,
+        &origin,
+        &operator,
+        &activate,
+        &["Activate the policy"],
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(!hub.db.capacity_policy_state().unwrap().1);
+    let page = get(addr, "/lanes", Some(&operator)).await.body;
+    assert!(!page.contains("Not active"), "{page}");
+    assert!(!page.contains("value=\"activate\""), "{page}");
+}
+
+/// An unreadable policy leaves Connections, the lanes' and project pages available. They show
+/// the error and replacement digest for the CLI; edits are refused.
 #[tokio::test]
 async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
     let (addr, hub, origin) = start_fleet().await;
@@ -12814,7 +12901,7 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
         .set_raw_capacity_policy(br#"{"from_a_later_hub":true}"#);
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let digest = crate::policy::digest_bytes(br#"{"from_a_later_hub":true}"#);
-    for path in ["/capacity", "/gitlab/gl/projects/42"] {
+    for path in ["/lanes", "/gitlab/gl/projects/42"] {
         let reply = get(addr, path, Some(&operator)).await;
         assert_eq!(reply.status, 200, "{path}: {}", reply.body);
         assert!(
@@ -12826,7 +12913,7 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
     // A project the hub has not seen is listed by no policy it can read.
     let reply = get(addr, "/gitlab/gl/projects/99", Some(&operator)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
-    let form = format!("_csrf={csrf}&op=capacity-policy&expected={digest}&policy=%7B%7D");
-    let reply = post_action(addr, &origin, &operator, "/capacity", &form, false).await;
+    let form = format!("_csrf={csrf}&op=replace&expected={digest}&policy=%7B%7D");
+    let reply = post_action(addr, &origin, &operator, "/lanes", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
 }

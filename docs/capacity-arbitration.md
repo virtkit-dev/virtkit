@@ -50,9 +50,15 @@ policies exceeding these bounds: 32769 lanes, 64 headroom entries; 16384 project
 
 ## Setting it
 
-In the hub's web UI, *Capacity* (`/capacity`) lists the lanes, headroom and scheduling settings,
-and operators replace the whole policy as JSON there, asked first what changes. Each project's
-page lists the lanes that may run it.
+In the hub's web UI, *Lanes* (`/lanes`; `/capacity` redirects there) lists each lane with the
+slots it holds and the work it has waiting, and the production headroom. Operators edit a lane
+there — class, weight, max slots, nodes, projects and branches — map a runner the hub sees
+without a lane, add a lane for an API key, unmap or remove one, and keep or release headroom.
+Each edit saves the whole policy against the digest the page showed, asked first what changes.
+The whole policy can also be replaced as JSON there; the probe and backoff settings are changed
+with `capacity-policy set` only. A policy held since its conversion lists the placement rules
+that did not convert; other edits leave it held, and *Activate* (or replacing the whole policy)
+ends the hold. Each project's page lists the lanes that may run it.
 
 From the hub's host, through its admin socket:
 

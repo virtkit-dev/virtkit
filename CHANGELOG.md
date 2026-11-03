@@ -13,6 +13,10 @@ All notable changes to virtkit will be documented in this file.
   its policy once and keeps the original; placement rules it cannot express hold the converted
   policy until an operator sets it again. `capacity-policy set` still accepts the earlier format
   for this release.
+- **Lanes page.** *Capacity* is now *Lanes* (`/lanes`; old links redirect). Each lane shows the
+  slots it holds and its waiting work, and is edited on its own: map a runner, add an API key
+  lane, change weight, max slots, nodes, projects and branches, or unmap it. Production headroom
+  is edited there too. A converted policy that is not active yet is activated from the page.
 - **Queued jobs follow lane changes.** A queued job whose runner is unmapped, or whose project or
   branch its lane no longer allows, waits until allowed again or its deadline.
 

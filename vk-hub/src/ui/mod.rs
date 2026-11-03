@@ -18,7 +18,7 @@
 //! field or header. A fleet hub's are the admin socket's steering operations, of nodes and of
 //! rollouts ([`fleet`]), its releases and rollouts added and started ([`operations`]), its
 //! API keys created, revoked and removed ([`clients`]), its capacity policy edited
-//! ([`capacity`]), its egress rows acknowledged and reopened and their projects muted
+//! ([`lanes`]), its egress rows acknowledged and reopened and their projects muted
 //! ([`egress`]), and its OIDC grants given, changed and revoked ([`users`]); local mode's are
 //! `vk` commands ([`actions`]). A release's upload is the one post whose body is not a small
 //! form: [`operations`] reads it as it arrives, under limits of its own; a capacity policy
@@ -67,7 +67,6 @@ mod access;
 mod actions;
 mod assets;
 mod body;
-mod capacity;
 mod clients;
 mod dev;
 mod egress;
@@ -77,6 +76,7 @@ mod hub;
 mod job_network;
 mod job_output;
 mod jobs;
+mod lanes;
 mod local;
 mod multipart;
 mod oidc;
@@ -418,8 +418,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     users::action(req, ui, site).await
                 } else if path == clients::PATH {
                     clients::action(req, ui, site).await
-                } else if path == capacity::PATH {
-                    capacity::action(req, ui, site).await
+                } else if path == lanes::PATH {
+                    lanes::action(req, ui, site).await
                 } else if path == jobs::PATH {
                     jobs::action(req, ui).await
                 } else if path == egress::ACTION_PATH {

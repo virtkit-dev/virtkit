@@ -370,8 +370,8 @@ pub(super) async fn get(
     if let Some(at) = clients {
         return super::clients::get(at, auth, ui).await.map(Some);
     }
-    if path == super::capacity::PATH {
-        return super::capacity::policy_get(auth, ui).await.map(Some);
+    if path == super::lanes::PATH {
+        return super::lanes::get(query, auth, ui).await.map(Some);
     }
     if let Some((gitlab, id)) = super::projects::target(path) {
         return super::projects::get(gitlab, id, auth, ui).await.map(Some);
@@ -418,7 +418,7 @@ pub(super) fn moved(path: &str, query: Option<&str>) -> Option<String> {
     {
         return Some(format!("{UPDATES_PATH}{rest}"));
     }
-    super::capacity::moved(path).or_else(|| super::projects::moved(path))
+    super::lanes::moved(path).or_else(|| super::projects::moved(path))
 }
 
 /// A permanent redirect to `to`, a path built from checked names.
@@ -958,7 +958,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                 )
                 .collect(),
         },
-        one(super::capacity::PATH, "Capacity"),
+        one(super::lanes::PATH, "Lanes"),
         one(super::jobs::PATH, "Jobs"),
         one(super::egress::PATH, "Egress"),
         Section {

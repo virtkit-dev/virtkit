@@ -413,6 +413,40 @@ fn arbitration_views(state: &State, now: Instant) -> HashMap<(String, u64), Arbi
     views
 }
 
+/// What a lane holds and has waiting, as the lanes page shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaneLoad {
+    /// Slots it holds: requests offered, granted or claimed, and its jobs charged.
+    pub held: u64,
+    /// Its requests waiting for room and its jobs queued.
+    pub waiting: usize,
+}
+
+/// [`LaneLoad`]s by lane, for lanes holding or waiting for anything.
+pub fn lane_loads(hub: &Hub) -> HashMap<crate::policy::LaneId, LaneLoad> {
+    let state = hub.dispatch.lock();
+    let mut loads: HashMap<crate::policy::LaneId, LaneLoad> = HashMap::new();
+    for ticket in state.tickets.values() {
+        let load = loads.entry(ticket.identity.lane.clone()).or_default();
+        if scheduler::holds(&ticket.phase) {
+            load.held += 1;
+        } else if matches!(ticket.phase, TicketPhase::Waiting) {
+            load.waiting += 1;
+        }
+    }
+    for job in state.jobs.values() {
+        let load = loads.entry(job_lane(&job.row)).or_default();
+        if scheduler::charged(&state, &job.row) {
+            load.held += 1;
+        }
+        if job.row.state == JobState::Queued && job.row.cancel.is_none() {
+            load.waiting += 1;
+        }
+    }
+    loads.retain(|_, l| *l != LaneLoad::default());
+    loads
+}
+
 /// The lane `row`'s job is charged to and held to: its scheduling identity's, or the default
 /// lane for a job recorded before capacity arbitration.
 fn job_lane(row: &JobRow) -> crate::policy::LaneId {

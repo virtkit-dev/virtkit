@@ -223,7 +223,7 @@ fn blocked(state: &mut State, id: &str, reason: &'static str) {
 }
 
 /// Whether a ticket in `phase` holds capacity: offered, granted, claimed or taken by a job.
-fn holds(phase: &TicketPhase) -> bool {
+pub(super) fn holds(phase: &TicketPhase) -> bool {
     matches!(
         phase,
         TicketPhase::Offering { .. }
@@ -489,7 +489,7 @@ impl Loads {
 
 /// Whether the job of `row` is charged as a job: placed, or queued on an admission, unless
 /// its admission's ticket still holds the capacity.
-fn charged(state: &State, row: &JobRow) -> bool {
+pub(super) fn charged(state: &State, row: &JobRow) -> bool {
     !(row.state == JobState::Queued && row.admission.is_none())
         && !row
             .admission

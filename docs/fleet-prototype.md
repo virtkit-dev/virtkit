@@ -1428,10 +1428,11 @@ provider (see [Signing in](#signing-in)).
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
 row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *GitLab adapters*, the
 relays; *Updates*, releases and the versions running; *Rollouts*, every rollout), *GitLab* (*Servers*, then a tab per server),
-*Capacity*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for operators, *Audit*).
+*Lanes*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for operators, *Audit*).
 A section's link counts what waits in its tabs, each tab its own. Connections' former
 addresses, `/clients[?tab=other]`, `/clients/capacity`, `/clients/tenants/<name>` and
-`/clients/projects/<instance>/<ID>`, redirect to their pages.
+`/clients/projects/<instance>/<ID>`, redirect to their pages, as do `/capacity` and
+`/capacity/tenants/<name>` to *Lanes*.
 
 A button or form the pages post through htmx that the hub does not answer — the connection
 refused or cut while the hub restarts or hands over to a release, or a 502, 503 or 504 from a

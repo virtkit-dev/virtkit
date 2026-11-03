@@ -143,7 +143,7 @@ struct Shown {
     /// every render of a server's page, its live updates included; empty for the other pages.
     arbitration: HashMap<(String, u64), crate::jobs::ArbitrationView>,
     /// Enrolled nodes for naming allowed targets wherever runners appear.
-    nodes: Vec<super::capacity::KnownNode>,
+    nodes: Vec<super::lanes::KnownNode>,
 }
 
 /// The GitLab page [`Shown::read`] reads for.
@@ -192,7 +192,7 @@ impl Shown {
                 HashMap::new()
             },
             nodes: if runners {
-                super::capacity::known_nodes(hub)?
+                super::lanes::known_nodes(hub)?
             } else {
                 Vec::new()
             },
@@ -934,7 +934,7 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         match mapping {
             Some(m) => {
                 h.raw("<a href=\"")
-                    .raw(super::capacity::PATH)
+                    .raw(super::lanes::PATH)
                     .raw("\">weight ")
                     .text(m.weight);
                 if let Some(max) = m.max_slots {
@@ -957,7 +957,7 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         h.raw(" · ").text(crate::store::envelope_text(p.envelope));
         if let Some(m) = mapping.filter(|m| m.confined()) {
             h.raw(" · only ")
-                .text(super::capacity::may_use_text(m, &shown.nodes));
+                .text(super::lanes::may_use_text(m, &shown.nodes));
         }
         h.raw("</td><td class=\"num\">");
         match runner.limit {

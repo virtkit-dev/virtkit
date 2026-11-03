@@ -307,6 +307,17 @@ impl Db {
         txn.commit().unwrap();
     }
 
+    /// Store `note` as what converting the policy left to review.
+    #[cfg(test)]
+    pub fn set_capacity_conversion(&self, note: &ConversionNote) {
+        let txn = self.db.begin_write().unwrap();
+        txn.open_table(CAPACITY_POLICY)
+            .unwrap()
+            .insert(CONVERSION, encode(note).unwrap().as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
     /// The policy row kept from before the conversion to lanes.
     #[cfg(test)]
     pub fn capacity_policy_backup(&self) -> Option<Vec<u8>> {
@@ -325,6 +336,29 @@ impl Db {
         expected: &str,
         actor: &str,
         now: u64,
+    ) -> Result<bool> {
+        self.replace_policy_if(policy, expected, actor, now, true)
+    }
+
+    /// [`Db::replace_capacity_policy_if`], leaving a policy held since its conversion held:
+    /// an edit of part of it, made while the rest is still under review.
+    pub fn edit_capacity_policy_if(
+        &self,
+        policy: &Policy,
+        expected: &str,
+        actor: &str,
+        now: u64,
+    ) -> Result<bool> {
+        self.replace_policy_if(policy, expected, actor, now, false)
+    }
+
+    fn replace_policy_if(
+        &self,
+        policy: &Policy,
+        expected: &str,
+        actor: &str,
+        now: u64,
+        activate: bool,
     ) -> Result<bool> {
         validate(policy)?;
         let txn = self.db.begin_write()?;
@@ -351,7 +385,7 @@ impl Db {
                 .get(CONVERSION)?
                 .map(|row| decode::<ConversionNote>(row.value()))
                 .transpose()?;
-            let held = note.as_ref().is_some_and(ConversionNote::held);
+            let held = activate && note.as_ref().is_some_and(ConversionNote::held);
             let next = policy.digest()?;
             audit = match current {
                 Some(current) if current == *policy && !held => return Ok(false),
@@ -373,12 +407,14 @@ impl Db {
             };
             let before = current_lanes(&table)?;
             match note.map(|mut note| {
-                note.unconverted.clear();
+                if activate {
+                    note.unconverted.clear();
+                }
                 note.shared
                     .retain(|(id, _)| before.as_ref().and_then(|b| b.lane(id)) == policy.lane(id));
                 note
             }) {
-                Some(note) if !note.shared.is_empty() => {
+                Some(note) if !note.shared.is_empty() || note.held() => {
                     table.insert(CONVERSION, encode(&note)?.as_slice())?;
                 }
                 _ => {
@@ -615,9 +651,32 @@ mod tests {
         assert!(held);
         let note = db.capacity_conversion().unwrap().unwrap();
         assert!(note.unconverted[0].contains("project gl/7"), "{note:?}");
+        // Edited, unchanged: nothing written. Changed: still held.
+        assert!(
+            !db.edit_capacity_policy_if(&policy, &note.to, "operator", 2)
+                .unwrap()
+        );
+        let mut edited = policy.clone();
+        edited.lanes[0].weight = 2;
+        assert!(
+            db.edit_capacity_policy_if(&edited, &note.to, "operator", 2)
+                .unwrap()
+        );
+        assert!(db.capacity_policy_state().unwrap().1);
+        let note = db.capacity_conversion().unwrap().unwrap();
+        assert!(!note.unconverted.is_empty(), "{note:?}");
+        let audits = db.audits(None, 10).unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.event.contains("lanes: runner gl/42") && !a.event.contains("activated")),
+            "{audits:?}"
+        );
+        let policy = edited;
+        let current = policy.digest().unwrap();
         // Set again, unchanged: activated, audited.
         assert!(
-            db.replace_capacity_policy_if(&policy, &note.to, "operator", 2)
+            db.replace_capacity_policy_if(&policy, &current, "operator", 2)
                 .unwrap()
         );
         assert!(!db.capacity_policy_state().unwrap().1);
