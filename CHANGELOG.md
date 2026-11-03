@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A job blocked on its shared checkout recovers in more cases.** Another missed
+  notification of a host reply is now detected: the request completes within about
+  20 seconds instead of blocking the job until it times out, and the job reports a
+  virtio-fs stall.
+
 ## [0.102.3] - 2026-11-03
 
 ### Changed

@@ -131,6 +131,20 @@ mod tests {
         );
     }
 
+    /// The warning for a driver whose callbacks stayed off behind completions counts too.
+    #[test]
+    fn callbacks_left_off_is_a_stall_event() {
+        let log = "[2026-11-03T10:49:12.000000Z WARN  krun_devices::virtio::fs::worker] \
+            virtio-fs /builds/git/wab: queue 1: used_event 0 with next_used 4242 for 10s \
+            (avail_idx 4242; msix enabled: v0 unmasked gsi 28 routed, v1 unmasked gsi 29 \
+            routed; config vector 0, queue vectors 0x1; intx isr 0x0): callbacks off or index \
+            wrapped, suspected lost interrupt, signalling again\n";
+        let events = from_vmm_reader(log.as_bytes());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, JobEventKind::VirtioFsStall);
+        assert_eq!(events[0].count, 1);
+    }
+
     #[test]
     fn repeats_at_debug_alone_are_no_event() {
         let debug = STALL.replace("Z WARN  ", "Z DEBUG ");

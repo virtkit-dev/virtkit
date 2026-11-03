@@ -388,14 +388,25 @@ impl UsedPosition {
     /// `next_used`, as `virtqueue_enable_cb_delayed` sets it, asks for an entry not yet
     /// published; a lag past half the index space reads as such. A `used_event` of 0 is what
     /// Linux (since 5.13) writes when it disables callbacks, so it cannot be told from a
-    /// threshold: a genuine stall exactly at a `used_event` of 0, once per 65536 completions,
-    /// goes undetected.
+    /// threshold; [`Self::callbacks_off`] reads it instead.
     pub(crate) fn unconsumed(&self) -> u16 {
         if self.used_event.0 == 0 {
             return 0;
         }
         let ahead = (self.next_used - self.used_event).0;
         if ahead < 0x8000 { ahead } else { 0 }
+    }
+
+    /// A `used_event` of 0 with `next_used` past 0: the driver turned its callbacks
+    /// off, or re-armed at an index that wrapped to 0 and has completions since. Linux writes
+    /// 0 only in `virtqueue_disable_cb_split` and its last consumed index whenever it turns
+    /// callbacks back on, and virtio-fs keeps them off only while it drains the ring. Still
+    /// there once the ring has been idle a while, the driver may hold completions it will not
+    /// be signalled for; how many, the device cannot tell. A `next_used` wrapped to
+    /// exactly 0 reads as a fresh ring instead, so callbacks left off right there, once per
+    /// 65536 completions, go undetected.
+    pub(crate) fn callbacks_off(&self) -> bool {
+        self.used_event.0 == 0 && self.next_used.0 != 0
     }
 }
 
@@ -1363,13 +1374,17 @@ pub(crate) mod tests {
     }
 
     /// Linux writes a `used_event` of 0 when it disables callbacks: completions published since
-    /// do not read as unconsumed.
+    /// do not read as unconsumed, but as callbacks off, past any number of them.
     #[test]
     fn a_used_event_of_zero_reads_as_callbacks_off() {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
         let mut q = vq.create_queue();
         q.set_event_idx(true);
+        // A fresh ring: nothing published, the driver's `used_event` still at its initial 0.
+        let used = q.unconsumed_used(m).unwrap().unwrap();
+        assert!(!used.callbacks_off());
+
         for i in 0..100 {
             q.add_used(m, i % 16, 1).unwrap();
         }
@@ -1377,6 +1392,19 @@ pub(crate) mod tests {
 
         let used = q.unconsumed_used(m).unwrap().unwrap();
         assert_eq!((used.used_event.0, used.next_used.0), (0, 100));
+        assert_eq!(used.unconsumed(), 0);
+        assert!(used.callbacks_off());
+
+        // Past half the index space, where a lag reads as nothing unconsumed.
+        for i in 100..0x9000u32 {
+            q.add_used(m, (i % 16) as u16, 1).unwrap();
+        }
+        assert!(q.unconsumed_used(m).unwrap().unwrap().callbacks_off());
+
+        // Back on, re-armed at its last consumed index.
+        vq.avail.event.set(0x9000);
+        let used = q.unconsumed_used(m).unwrap().unwrap();
+        assert!(!used.callbacks_off());
         assert_eq!(used.unconsumed(), 0);
     }
 

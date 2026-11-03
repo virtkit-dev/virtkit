@@ -156,6 +156,9 @@ struct Stall {
     lost_kick: Option<u16>,
     /// Completions past the driver's `used_event`: an interrupt it did not get.
     lost_interrupt: Option<u16>,
+    /// A `used_event` of 0 behind published entries (callbacks left off, or re-armed at a
+    /// wrapped index of 0): completions the driver may not be signalled for.
+    callbacks_off: bool,
     /// The same positions as the stall last reported: the recovery did not clear it.
     repeat: bool,
 }
@@ -172,12 +175,14 @@ impl StallWatch {
         let pending = now.avail.pending();
         let lost_kick = Some(pending).filter(|&n| n > 0 && n <= queue_size);
         let lost_interrupt = now.used.map(|u| u.unconsumed()).filter(|&n| n > 0);
-        if lost_kick.is_none() && lost_interrupt.is_none() {
+        let callbacks_off = now.used.is_some_and(|u| u.callbacks_off());
+        if lost_kick.is_none() && lost_interrupt.is_none() && !callbacks_off {
             return None;
         }
         Some(Stall {
             lost_kick,
             lost_interrupt,
+            callbacks_off,
             repeat: self.reported.replace(now) == Some(now),
         })
     }
@@ -477,6 +482,21 @@ impl FsWorker {
                 );
                 self.interrupt.signal_used_queue();
             }
+            if let (true, Some(used)) = (stall.callbacks_off, now.used) {
+                // Signalled again whatever it holds: a driver with nothing new ignores it.
+                log!(
+                    level,
+                    "virtio-fs {}: queue {queue_index}: used_event 0 with next_used {} for {}s \
+                     (avail_idx {}; {}): callbacks off or index wrapped, suspected lost \
+                     interrupt, signalling again",
+                    self.label,
+                    used.next_used,
+                    STALL_CHECK.as_secs(),
+                    avail.avail_idx,
+                    self.interrupt.describe(),
+                );
+                self.interrupt.signal_used_queue();
+            }
         }
     }
 
@@ -538,10 +558,14 @@ impl FsWorker {
 fn describe_used(used: &Result<Option<UsedPosition>, QueueError>) -> String {
     match used {
         Ok(Some(used)) => format!(
-            "used_event {}, next_used {}, {} unconsumed",
+            "used_event {}, next_used {}, {}",
             used.used_event,
             used.next_used,
-            used.unconsumed()
+            if used.callbacks_off() {
+                "callbacks off".to_string()
+            } else {
+                format!("{} unconsumed", used.unconsumed())
+            }
         ),
         Ok(None) => "used ring unknown without EVENT_IDX".to_string(),
         Err(e) => format!("used ring unreadable: {e}"),
@@ -579,6 +603,7 @@ mod tests {
         Stall {
             lost_kick,
             lost_interrupt,
+            callbacks_off: false,
             repeat,
         }
     }
@@ -615,6 +640,39 @@ mod tests {
         let no_event_idx = ring(4, 4, None);
         assert_eq!(watch.observe(no_event_idx, 16), None);
         assert_eq!(watch.observe(no_event_idx, 16), None);
+        // A fresh ring: the driver's `used_event` at 0 with nothing published yet.
+        let fresh = ring(0, 0, Some((0, 0)));
+        assert_eq!(watch.observe(fresh, 16), None);
+        assert_eq!(watch.observe(fresh, 16), None);
+    }
+
+    /// A `used_event` of 0 behind published entries, the driver's callbacks left off, reads
+    /// as nothing unconsumed: a stall of its own.
+    #[test]
+    fn callbacks_left_off_behind_completions_are_a_stall() {
+        let mut watch = StallWatch::default();
+        let stuck = ring(9, 9, Some((0, 9)));
+        assert_eq!(watch.observe(stuck, 16), None);
+        let expected = |repeat| Stall {
+            lost_kick: None,
+            lost_interrupt: None,
+            callbacks_off: true,
+            repeat,
+        };
+        assert_eq!(watch.observe(stuck, 16), Some(expected(false)));
+        assert_eq!(watch.observe(stuck, 16), Some(expected(true)));
+
+        // Alongside a lost kick: both recoveries run.
+        let mut watch = StallWatch::default();
+        let both = ring(11, 9, Some((0, 9)));
+        assert_eq!(watch.observe(both, 16), None);
+        assert_eq!(
+            watch.observe(both, 16),
+            Some(Stall {
+                lost_kick: Some(2),
+                ..expected(false)
+            })
+        );
     }
 
     #[test]

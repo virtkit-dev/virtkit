@@ -461,15 +461,23 @@ signals again. Each warning also gives the transport's interrupt state: for virt
 enabled and function mask, per vector its mask, PBA bit, GSI and whether its route is installed,
 the vectors the driver mapped and the ISR; for virtio-mmio its interrupt status. A stall that
 comes back at the same positions, the recovery not getting through, is logged at debug level
-until the ring moves. A `used_event` of 0 reads as nothing unconsumed:
-Linux (since 5.13) writes 0 there when it disables callbacks, so a real stall exactly there,
-once per 65536 completions, goes undetected. While bus mastering is off neither ring is read.
+until the ring moves. A `used_event` of 0 behind published entries is a stall of its own:
+Linux (since 5.13) writes 0 there when it disables callbacks and its last consumed index when it
+turns them back on, and virtio-fs keeps them off only while it drains the ring, so a ring left
+there is a driver that stopped draining, or one whose interrupt was lost right after its index
+wrapped to 0. Neither tells the device how many completions are unconsumed. The worker logs `…
+callbacks off or index wrapped, suspected lost interrupt` and signals again; a driver with nothing
+new ignores it. A guest whose vCPUs stay descheduled for 10-20s mid-drain warns the same way, as it
+already does with callbacks on.
+A ring whose `next_used` wrapped to exactly 0 reads as fresh, so callbacks left off right there,
+once per 65536 completions, still go undetected. While bus mastering is off neither ring is read.
 An idle share costs one wakeup per 10s. Covered by
 `stall_check_reads_unpopped_chains_and_unconsumed_completions`,
 `after_a_lost_interrupt_later_completions_ask_for_none`,
 `a_used_event_of_zero_reads_as_callbacks_off`, `stall_check_reads_nothing_with_bus_mastering_off`,
 `a_stall_needs_two_checks_on_an_unmoved_ring`, `a_moving_ring_never_stalls`,
-`an_idle_ring_never_stalls`, `more_chains_pending_than_the_queue_holds_are_not_a_lost_kick`,
+`an_idle_ring_never_stalls`, `callbacks_left_off_behind_completions_are_a_stall`,
+`more_chains_pending_than_the_queue_holds_are_not_a_lost_kick`,
 `a_stall_the_recovery_does_not_clear_is_warned_once` and
 `describe_names_masks_pending_bits_and_routes`.
 
