@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.102.2] - 2026-11-03
+
 ### Changed
 
 - **Fetch all programs at once.** The Updates page fetches every program's release from
@@ -5049,7 +5051,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.102.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.102.2...HEAD
+[0.102.2]: https://github.com/virtkit-dev/virtkit/compare/v0.102.1...v0.102.2
 [0.102.1]: https://github.com/virtkit-dev/virtkit/compare/v0.102.0...v0.102.1
 [0.102.0]: https://github.com/virtkit-dev/virtkit/compare/v0.101.0...v0.102.0
 [0.101.0]: https://github.com/virtkit-dev/virtkit/compare/v0.100.0...v0.101.0
