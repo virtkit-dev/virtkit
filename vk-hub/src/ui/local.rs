@@ -261,7 +261,7 @@ impl ViewCache {
                 }
             }
             _ => {
-                let why = "Not read: other pages are reading their VMs; reload in a moment.";
+                let why = "Other pages are reading their VMs right now. Reload in a moment.";
                 Read {
                     at: None,
                     views: Arc::new(Views::none(why)),
@@ -310,8 +310,8 @@ enum View {
 async fn views(local: &Local, w: &Workload) -> Views {
     let Some(dir) = exact_state_dir(w) else {
         return Views::none(
-            "Not read: the listing cannot show this VM's state dir exactly; run `vk logs` on it \
-             from a shell.",
+            "Not read. The listing cannot show this VM's state dir exactly. Run `vk logs` on \
+             the VM from a shell.",
         );
     };
     let run = |args: Vec<&'static str>, keep: Keep| {
@@ -338,8 +338,8 @@ async fn views(local: &Local, w: &Workload) -> Views {
     let egress = async {
         match run(vec!["egress-report"], Keep::Head).await {
             View::Text { text, .. } if text.trim().is_empty() => View::Absent(
-                "Nothing recorded: a CI job's switch records what it refuses and what the job \
-                 contacts, and a `vk run --audit-egress` what its VM contacts.",
+                "Nothing recorded. A CI job's switch records what it refuses and what the job \
+                 contacts. A `vk run --audit-egress` records what its VM contacts.",
             ),
             v => v,
         }
@@ -373,21 +373,21 @@ fn recording(kind: WorkloadKind, dir: &Path) -> Result<String, &'static str> {
             let file = match std::fs::File::open(dir.join("atop.dir")) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err("Not recording: a CI job records itself when its runner's \
+                    return Err("Not recording. A CI job records itself when its runner's \
                                 `[executor] atop` is set.");
                 }
-                Err(_) => return Err("Not read: its job dir's `atop.dir` cannot be read."),
+                Err(_) => return Err("Not read. The job dir's `atop.dir` cannot be read."),
             };
             let mut raw = Vec::new();
             if file.take(ATOP_DIR_MAX + 1).read_to_end(&mut raw).is_err() {
-                return Err("Not read: its job dir's `atop.dir` cannot be read.");
+                return Err("Not read. The job dir's `atop.dir` cannot be read.");
             }
             if raw.len() as u64 > ATOP_DIR_MAX {
-                return Err("Not read: its job dir's `atop.dir` is too long to be a path.");
+                return Err("Not read. The job dir's `atop.dir` is too long to be a path.");
             }
             let at = Path::new(OsStr::from_bytes(raw.strip_suffix(b"\n").unwrap_or(&raw)));
             if !at.is_absolute() {
-                return Err("Not read: its job dir's `atop.dir` names no absolute path.");
+                return Err("Not read. The job dir's `atop.dir` does not name an absolute path.");
             }
             at.to_path_buf()
         }
@@ -395,7 +395,7 @@ fn recording(kind: WorkloadKind, dir: &Path) -> Result<String, &'static str> {
     };
     let Some(text) = at.to_str() else {
         return Err(
-            "Not read: the archive its job dir names is not UTF-8, and `vk atop` takes text.",
+            "Not read. The archive path in the job dir is not UTF-8, and `vk atop` takes text.",
         );
     };
     if !["atop.log", "atop.log.zst"]
@@ -403,10 +403,10 @@ fn recording(kind: WorkloadKind, dir: &Path) -> Result<String, &'static str> {
         .any(|log| at.join(log).is_file())
     {
         return Err(match kind {
-            WorkloadKind::CiJob => "Nothing recorded yet in the archive its job dir names.",
+            WorkloadKind::CiJob => "Nothing recorded yet in the archive that the job dir names.",
             _ => {
-                "Not recording: a VM records itself when booted with `vk run --atop`, and \
-                 `vk atop <dir>` attaches a sampler to one that does not."
+                "Not recording. Boot the VM with `vk run --atop` to record it, or run \
+                 `vk atop <dir>` to attach a sampler to a running VM."
             }
         });
     }
@@ -591,10 +591,10 @@ fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, local: &Local, view
         }
         main.raw("</section>");
     }
-    main.raw("<p class=\"sub\">The console, atop and egress are read as the page loads; ")
+    main.raw("<p class=\"sub\">The console, atop and egress are shown as of page load. ")
         .raw("<a href=\"/vm/")
         .text(id)
-        .raw("\">reload</a> for newer.</p>");
+        .raw("\">Reload</a> to update.</p>");
     layout(&crate::workloads::owner(w), "/", auth, &main)
 }
 

@@ -169,7 +169,10 @@ fn history_form(
     match source {
         HistorySource::Default => h.raw(" jobs, by default."),
         HistorySource::Config => h.raw(" jobs, as <code>job_history</code> in hub.toml sets it."),
-        HistorySource::Ui => h.raw(" jobs, as set here, over ").text(&fallback).raw("."),
+        HistorySource::Ui => h
+            .raw(" jobs, as set here. This overrides ")
+            .text(&fallback)
+            .raw("."),
     };
     h.raw("</p>");
     if auth.session.role >= Role::Operator {
@@ -185,8 +188,8 @@ fn history_form(
                 .text(&fallback)
                 .raw("</button></form>");
         }
-        h.raw("<p class=\"sub\">It applies at once: a lower count drops the oldest finished ")
-            .raw("jobs in the background, a step at a time.</p>");
+        h.raw("<p class=\"sub\">Takes effect immediately. If you lower the count, the hub ")
+            .raw("gradually deletes the oldest finished jobs in the background.</p>");
     }
     h.raw("</section>");
 }
@@ -219,7 +222,7 @@ pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
                     let max = thousands(usize::try_from(MAX_JOB_HISTORY)?);
                     return Ok(message(
                         StatusCode::BAD_REQUEST,
-                        &format!("Refused: the history keeps 1 to {max} jobs."),
+                        &format!("Refused. The history must keep between 1 and {max} jobs."),
                     ));
                 }
             }
@@ -460,9 +463,9 @@ fn history(
     // follows the filter.
     key_chip(&mut h, filter, key_name);
     if paged {
-        h.raw("<p class=\"sub\">Older jobs, as they stood when this page was loaded; <a href=\"");
+        h.raw("<p class=\"sub\">Older jobs, shown as of page load. <a href=\"");
         href(&mut h, filter, None);
-        h.raw("\">the newest</a> are kept up to date.</p>")
+        h.raw("\">The newest jobs</a> stay up to date.</p>")
             .html(shown);
     } else {
         h.raw("<div id=\"jobs\" hx-ext=\"sse\" sse-connect=\"/events/jobs");
@@ -518,14 +521,15 @@ fn fragment(
             .raw("?")
             .raw(READING)
             .raw("=1\" hx-trigger=\"every 2s\" hx-swap=\"none\">The hub is still reading ")
-            .raw("the job history: the page reloads once it has.</p>");
+            .raw("the job history. The page reloads when the hub is done.</p>");
         return h;
     }
     let s = &jobs.summary;
     if s.matched == 0 {
         h.raw(if *filter == JobFilter::default() {
-            "<p class=\"empty\">none placed yet: a <code>vk-gitlab</code> enrolled as a relay \
-             places them, or a client with a key from <code>vk-hub keys create</code></p>"
+            "<p class=\"empty\">none placed yet. The hub places jobs for a <code>vk-gitlab</code> \
+             enrolled as a relay, or for a client with a key from <code>vk-hub keys \
+             create</code></p>"
         } else {
             "<p class=\"empty\" role=\"status\">none match</p>"
         });
@@ -1133,47 +1137,49 @@ fn registry_access(
             h.raw("<p><span class=\"badge warn\">Unavailable</span></p><p>");
             match (reason, id) {
                 (NoAccess::UnboundKey, _) => {
-                    h.raw("Its relay was removed, or its GitLab server is no longer approved. ")
+                    h.raw("This job's relay was removed, or its GitLab server is no longer approved. ")
                         .raw("<a href=\"")
                         .raw(super::clients::GITLAB_PATH)
                         .raw("\">GitLab</a>");
                 }
                 (NoAccess::NodeWithoutJobTokens, _) => {
-                    h.raw("Its node does not announce job tokens: it runs an older ")
-                        .raw("<code>vk</code>, or has sent no inventory yet.");
+                    h.raw("This job's node does not announce job tokens. It runs an older ")
+                        .raw("<code>vk</code>, or has not sent its inventory yet.");
                 }
                 (NoAccess::UnknownRegistry, _) => match url {
                     Some(url) => {
-                        h.raw("Its node reaches its registry at <code>")
+                        h.raw("This job's node reaches its registry at <code>")
                             .node(url)
-                            .raw("</code>, an address no registry is bound to. <a href=\"")
+                            .raw("</code>, but no registry is bound to that address. <a href=\"")
                             .raw(super::registries::PATH)
                             .raw("\">Storage</a>");
                     }
                     None => {
-                        h.raw("Its node names no registry.");
+                        h.raw("This job's node does not name a registry.");
                     }
                 },
                 (NoAccess::RegistryTakesNoTokens, Some(id)) => {
                     registry_link(h, id, "?tab=access");
-                    h.raw(" does not take the hub's tokens: <code>[hub] tokens = true</code> ")
-                        .raw("in its config turns it on.");
+                    h.raw(" does not take the hub's tokens. To turn this on, set ")
+                        .raw("<code>[hub] tokens = true</code> in the registry's config.");
                 }
                 (NoAccess::NoAppliedKey, Some(id)) => {
                     registry_link(h, id, "?tab=settings");
-                    h.raw(" had applied no signing key yet.");
+                    h.raw(" had not applied a signing key yet.");
                 }
                 (NoAccess::MintFailed, _) => {
-                    h.raw("Minting its token failed: the hub's log says why.");
+                    h.raw(
+                        "The hub failed to mint this job's token. See the hub's log for the cause.",
+                    );
                 }
                 _ => {
-                    h.raw("The hub gave it none.");
+                    h.raw("The hub gave this job no registry access.");
                 }
             }
             h.raw("</p>");
         }
         RegistryAccess::Unknown => {
-            h.raw("<p>The hub gave it none.</p>");
+            h.raw("<p>The hub gave this job no registry access.</p>");
         }
     }
     h.raw("</section>");
@@ -1474,8 +1480,8 @@ fn network_cell(h: &mut Html, id: &str, j: &JobRow) {
             h.raw("<span class=\"sub\" title=\"Nothing reported yet\">pending</span>");
         }
         Network::Unavailable => {
-            h.raw("<span class=\"sub\" title=\"Its node sent no egress report: this does not ")
-                .raw("mean the job made no network attempts\">unavailable</span>");
+            h.raw("<span class=\"sub\" title=\"The job's node sent no egress report. This does ")
+                .raw("not mean the job made no network attempts.\">unavailable</span>");
         }
         Network::Reported(report) => {
             let summary = Summary::of(report);
@@ -2148,7 +2154,8 @@ mod tests {
         record(&mut h, &j, &HashMap::new(), None, Shown::default(), 1030);
         let html = h.into_string();
         assert!(
-            html.contains("<h2>Registry access</h2>") && html.contains("Minting its token failed"),
+            html.contains("<h2>Registry access</h2>")
+                && html.contains("The hub failed to mint this job's token"),
             "{html}"
         );
     }

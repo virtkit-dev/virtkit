@@ -41,12 +41,12 @@ pub(super) fn section(h: &mut Html, j: &JobRow, node: Option<&str>, shown: Shown
     match network {
         Network::NotRun => {}
         Network::Pending if reports => {
-            h.raw("<p class=\"sub\">Nothing reported yet: its node reports the job's egress as ")
-                .raw("it runs, or when it ends.</p>");
+            h.raw("<p class=\"sub\">Nothing reported yet. The job's node reports its egress ")
+                .raw("while the job runs, or when the job ends.</p>");
         }
         Network::Pending => {
             unavailable(h);
-            h.raw("<p>Its node does not announce egress reporting.</p>");
+            h.raw("<p>This job's node does not announce egress reporting.</p>");
         }
         Network::Unavailable => {
             unavailable(h);
@@ -137,11 +137,12 @@ fn refusals(
     fold(h, report.refusals.len(), true);
     h.text(&label).raw("</summary>");
     if summary.refusals > 0 {
-        h.raw("<p>The job failed egress validation, before its script ran.</p>");
+        h.raw("<p>The job failed egress validation before its script ran.</p>");
     }
     if summary.unreachable > 0 {
-        h.raw("<p>A warning is an entry the job kept that a layer above leaves nothing of: ")
-            .raw("every layer is checked when the job runs, and that one refuses it.</p>");
+        h.raw("<p>A warning means that a layer above leaves nothing of an entry the job kept. ")
+            .raw("When the job runs, the node checks every layer, so that layer above refuses ")
+            .raw("the entry.</p>");
     }
     h.raw("<ul class=\"access\">");
     for r in &report.refusals {
@@ -205,7 +206,7 @@ fn denials(
     let (label, note) = match outcome {
         EgressOutcome::WouldBlock => (
             "Would block",
-            "The switch allowed these attempts in dry-run mode; the allowlist would otherwise \
+            "The switch allowed these attempts in dry-run mode. Otherwise, the allowlist would \
              have blocked them.",
         ),
         _ => (
@@ -326,7 +327,7 @@ fn omitted(h: &mut Html, tally: &Tally) {
     if tally.omitted > 0 {
         h.raw("<p class=\"sub\">")
             .text(tally.omitted)
-            .raw(" more attempts not listed, past the report's bounds.</p>");
+            .raw(" more attempts are past the report's bounds and not listed.</p>");
     }
 }
 
@@ -337,7 +338,7 @@ fn check(h: &mut Html, c: &Check, node: Option<&str>) {
             h.raw("<code>").text(key).raw("</code> on ");
             match node {
                 Some(name) => h.raw("node ").node(name),
-                None => h.raw("its node"),
+                None => h.raw("the job's node"),
             };
         }
         Check::Variable { service, variable } => {
@@ -540,8 +541,9 @@ mod tests {
             "<span class=\"badge bad\">Declaration refused</span> \
              <a href=\"/egress?state=all&amp;project=key%3Ak\">On the Egress page</a>",
             "Declaration refused: 1, warnings: 2</summary>",
-            "The job failed egress validation, before its script ran.",
-            "A warning is an entry the job kept that a layer above leaves nothing of",
+            "The job failed egress validation before its script ran.",
+            "A warning means that a layer above leaves nothing of an entry the job kept. When \
+             the job runs, the node checks every layer, so that layer above refuses the entry.",
             "<code>MICROVM_BUILD_EGRESS_ALLOW_NAME</code> <code>pypi.org</code></a> · Build · \
              job: outside the node&#39;s cap: kept, but its lookups are refused",
             "<code>MICROVM_EGRESS_ALLOW_NAME</code> <code>pypi.org/simple</code></a> · Run · \

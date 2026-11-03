@@ -61,10 +61,10 @@ impl JobAccess {
             return JobAccess::Off;
         }
         if row.url.is_none() {
-            return JobAccess::SetupNeeded("no address bound: nodes cannot name it");
+            return JobAccess::SetupNeeded("no address bound, so nodes cannot name it");
         }
         let Some(signing) = crate::tokens::signing_key(keys, row) else {
-            return JobAccess::SetupNeeded("it has applied no signing key yet");
+            return JobAccess::SetupNeeded("the registry has not applied a signing key yet");
         };
         if keys
             .last()
@@ -123,9 +123,10 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let mut main = Html::new();
     main.raw("<h1>Storage</h1>");
     if views.is_empty() {
-        main.raw("<p class=\"empty\">No registry has enrolled yet: an operator issues a ")
-            .raw("registry token below, or with <code>vk-hub token create --kind registry</code>, ")
-            .raw("for <code>vk-registry join</code> on the registry's host.</p>");
+        main.raw("<p class=\"empty\">No registry has enrolled yet. To enroll one, an operator ")
+            .raw("issues a registry token below, or with <code>vk-hub token create --kind ")
+            .raw("registry</code>. Then run <code>vk-registry join</code> with the token on the ")
+            .raw("registry's host.</p>");
     } else {
         main.raw("<table class=\"grid\"><thead><tr>");
         header_cells(
@@ -194,9 +195,10 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
         main.raw("<input type=\"hidden\" name=\"kind\" value=\"registry\">")
             .raw("<input type=\"hidden\" name=\"ttl\" value=\"3600\">")
             .raw("<button class=\"primary\">Issue a registry token, valid an hour</button>")
-            .raw("</form><p class=\"sub\">Single-use: the registry redeems it with ")
-            .raw("<code>vk-registry join</code>. Its database, keys and UI are left as they ")
-            .raw("are, and it serves as before whether the hub is reachable or not.</p>")
+            .raw("</form><p class=\"sub\">The token works once. The registry redeems it with ")
+            .raw("<code>vk-registry join</code>. Joining leaves the registry's database, keys ")
+            .raw("and UI as they are. The registry keeps serving as before, whether or not the ")
+            .raw("hub is reachable.</p>")
             .raw("</section>");
     }
     Ok(page(super::fleet::layout("Storage", PATH, auth, &main)))
@@ -300,8 +302,9 @@ pub(super) async fn detail(
 /// instance by the hub's `instances` ([`super::access::who`]).
 fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances: Instances<&str>) {
     if !v.row.takes_tokens() {
-        h.raw("<p class=\"callout\">Jobs get no access here: the registry does not take the ")
-            .raw("hub's tokens. <code>[hub] tokens = true</code> in its config turns it on.</p>");
+        h.raw("<p class=\"callout\">Jobs get no access here, because the registry does not take ")
+            .raw("the hub's tokens. To turn access on, set <code>[hub] tokens = true</code> in ")
+            .raw("the registry's config.</p>");
     }
     let cleanup = namespaces.iter().any(|n| n.retention_days.is_some());
     // Only a registry that reported its inventory says what its `[hub] allow` lists.
@@ -316,16 +319,15 @@ fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances
             .any(|f| f == vk_hub_proto::registry::REFUSED_PREFIX_RETENTION)
     });
     if cleanup && lacks_gc {
-        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is not applied:")
-            .raw(
-                "</strong> the registry's <code>[hub] allow</code> does not list <code>gc</code>, ",
-            )
-            .raw("so it keeps its own windows. List it there, or set <code>[[gc.prefix]]</code> ")
-            .raw("in its config.</p>");
+        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is off for this ")
+            .raw("registry.</strong> Its <code>[hub] allow</code> does not list <code>gc</code>, ")
+            .raw("so it keeps its own cleanup windows. Add <code>gc</code> there, or set ")
+            .raw("<code>[[gc.prefix]]</code> in the registry's config.</p>");
     } else if refused {
-        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is not applied:")
-            .raw("</strong> the registry refused a cleanup window (shorter than its floor, or ")
-            .raw("invalid). A shorter one needs <code>[[gc.prefix]]</code> in its own config.</p>");
+        h.raw("<p class=\"callout warn\"><strong>Cleanup after inactivity is not applied.")
+            .raw("</strong> The registry refused a cleanup window that was shorter than its ")
+            .raw("floor, or invalid. For a shorter window, set <code>[[gc.prefix]]</code> in the ")
+            .raw("registry's own config.</p>");
     }
     let areas: Vec<_> = namespaces
         .iter()
@@ -389,7 +391,7 @@ fn settings(h: &mut Html, v: &RegistryView, keys: &[TokenKeyRow], now: u64) {
         None => kv(
             h,
             "Bound to",
-            "none: nodes cannot name it, so their jobs get no access",
+            "none, so nodes cannot name it and their jobs get no access",
         ),
     }
     end_section(h);
@@ -521,7 +523,7 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
         &match desired.and_then(|d| d.read_only) {
             Some(true) => "read-only".to_string(),
             Some(false) => "writable".to_string(),
-            None => "nothing: as its config has it".to_string(),
+            None => "nothing, so its config decides".to_string(),
         },
     );
     kv(
@@ -550,7 +552,7 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
         }
         if gc.blobs_leased > 0 {
             text.push_str(&format!(
-                "; {} blobs kept, read by running builds",
+                "; {} blobs kept because running builds read them",
                 gc.blobs_leased
             ));
         }
@@ -641,12 +643,12 @@ pub(super) static KIND: updates::Kind = updates::Kind {
     heading: "Registries",
     column: "REGISTRY",
     program: Program::Registry,
-    note: "A registry downloads the release from the hub and restarts on it, dropping its open \
-           connections. One that does not come up is rolled back to the binary it ran once the \
-           registry's supervisor restarts it.",
-    question: "Update this registry? It restarts on the release, dropping its open \
-               connections. If the release does not come up, the registry goes back to the \
-               binary it ran once its supervisor restarts it.",
+    note: "A registry downloads the release from the hub and restarts on it, which drops its \
+           open connections. If the release does not come up, the registry rolls back to the \
+           binary it ran before, once the registry's supervisor restarts it.",
+    question: "Update this registry? The registry restarts on the release, which drops its \
+               open connections. If the release does not come up, the registry goes back to the \
+               binary it ran before, once its supervisor restarts it.",
     command_ttl: ops::COMMAND_TTL,
     allow: "<code>[hub] allow</code>, which lacks <code>update</code>",
     allow_downgrade: "<code>[hub] allow_downgrade</code>",
@@ -828,8 +830,8 @@ fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
                 number("grace_days"),
             ) else {
                 return Err(
-                    "Refused: the interval, retention and grace are whole numbers, at \
-                            least 1.",
+                    "Refused. The interval, retention and grace must be whole numbers of \
+                     at least 1.",
                 );
             };
             Act::Schedule(Some(GcPolicy {
@@ -842,7 +844,9 @@ fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
             let (Some(retention_days), Some(grace_days)) =
                 (number("retention_days"), number("grace_days"))
             else {
-                return Err("Refused: the retention and grace are whole numbers, at least 1.");
+                return Err(
+                    "Refused. The retention and grace must be whole numbers of at least 1.",
+                );
             };
             Act::GcNow {
                 retention_days,

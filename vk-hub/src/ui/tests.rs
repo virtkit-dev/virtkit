@@ -1273,7 +1273,7 @@ esac"#,
     );
     let page = get(addr, &format!("/vm/{}", ids[3]), Some(&cookie)).await;
     assert!(
-        page.body.contains("names no absolute path"),
+        page.body.contains("does not name an absolute path"),
         "{}",
         page.body
     );
@@ -3761,8 +3761,9 @@ async fn an_operator_sets_the_job_history_from_the_jobs_page() {
     );
     let page = get(addr, "/jobs", Some(&operator)).await;
     assert!(
-        page.body
-            .contains("keeps the newest 2,500 jobs, as set here, over the default of 100,000."),
+        page.body.contains(
+            "keeps the newest 2,500 jobs, as set here. This overrides the default of 100,000."
+        ),
         "{}",
         page.body
     );
@@ -4250,7 +4251,7 @@ async fn the_job_history_is_filtered_by_api_key() {
         "{page}"
     );
     assert!(
-        page.contains(&format!("<a href=\"/jobs?key={key}\">the newest</a>")),
+        page.contains(&format!("<a href=\"/jobs?key={key}\">The newest jobs</a>")),
         "{page}"
     );
 
@@ -4885,7 +4886,7 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         "<tr><th>Failure class</th><td>system failure</td></tr>",
         "<tr><th>Message</th><td>the VM &lt;did&gt; not boot</td></tr>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
-        "<h2>End of its output</h2>",
+        "<h2>End of the output</h2>",
         "<pre class=\"log\"><span class=\"l\"><time title=\"2026-10-09T12:10:43.123456Z\">\
          12:10:43</time> <span class=\"t\"><span class=\"c-f1\">&lt;script&gt;alert(1)&lt;/script&gt;\
          </span></span></span>\n</pre>",
@@ -4911,11 +4912,11 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         .await
         .body;
     assert!(page.contains("<span class=\"badge ok\""), "{page}");
-    assert!(!page.contains("End of its output"), "{page}");
+    assert!(!page.contains("End of the output"), "{page}");
     // A job settled that succeeded: its output went, GitLab has it.
     assert!(
         page.contains(
-            "<p class=\"empty\">dropped once its producer had it: \
+            "<p class=\"empty\">dropped once the job's producer received it: \
              <a href=\"https://gitlab.example.com/acme/web/-/jobs/2\" target=\"_blank\" \
              rel=\"noopener noreferrer\">GitLab has it</a></p>"
         ),
@@ -4927,8 +4928,9 @@ async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
         .await
         .body;
     for want in [
-        "<h2>End of its output</h2><p class=\"sub\">The last 9 B, masked as the node streamed \
-         it, kept while the hub's cache of finished jobs' output has room.</p>",
+        "<h2>End of the output</h2><p class=\"sub\">The last 9 B of output, as the node \
+         streamed it with secrets masked. The hub keeps it only while its cache of finished \
+         jobs' output has room.</p>",
         "<span class=\"t\">all good</span>",
     ] {
         assert!(page.contains(want), "{want}: {page}");
@@ -5382,8 +5384,8 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     assert!(!page.contains("sse-connect"), "{page}");
     assert!(
         page.contains(
-            "<div id=\"jobs-results\"><p class=\"sub\">Older jobs, as they stood when this page \
-             was loaded; <a href=\"/jobs?result=failed\">the newest</a>"
+            "<div id=\"jobs-results\"><p class=\"sub\">Older jobs, shown as of page load. \
+             <a href=\"/jobs?result=failed\">The newest jobs</a> stay up to date.</p>"
         ),
         "{page}"
     );
@@ -10390,7 +10392,7 @@ async fn a_job_page_says_what_registry_access_the_job_got() {
                 None,
                 Some("http://10.0.0.9:5000"),
             ),
-            "<code>http://10.0.0.9:5000</code>, an address no registry is bound to",
+            "<code>http://10.0.0.9:5000</code>, but no registry is bound to that address",
         ),
         (
             none(5, NoAccess::RegistryTakesNoTokens, Some(&registry), None),
@@ -10398,11 +10400,11 @@ async fn a_job_page_says_what_registry_access_the_job_got() {
         ),
         (
             none(6, NoAccess::NoAppliedKey, Some(&registry), None),
-            "?tab=settings\">reg-1</a> had applied no signing key yet",
+            "?tab=settings\">reg-1</a> had not applied a signing key yet",
         ),
         (
             none(7, NoAccess::MintFailed, None, None),
-            "Minting its token failed",
+            "The hub failed to mint this job's token. See the hub's log for the cause.",
         ),
     ] {
         let body = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
@@ -11250,7 +11252,11 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     let tab = get(addr, "/egress?tab=rules", Some(&viewer)).await.body;
     assert!(!tab.contains("Hub rules are off"), "{tab}");
     assert!(
-        tab.contains("<p class=\"callout warn\">No Fallback is enforced: every job no enforced"),
+        tab.contains(
+            "<p class=\"callout warn\">No enforced Fallback rule. While hub rules are on, jobs \
+             that no enforced rule matches have no network access. This includes every job run \
+             by a node&#39;s own gitlab-runner, which only ever uses the Fallback rule.</p>"
+        ),
         "{tab}"
     );
     assert!(

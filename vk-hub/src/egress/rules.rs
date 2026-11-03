@@ -23,19 +23,22 @@ pub struct Rules {
 
 impl Rules {
     /// What to warn of, if anything: rules that restrict nothing, or rules on with no enforced
-    /// Fallback, under which every job no rule selects, gitlab-runner's all, reaches nothing.
+    /// Fallback, under which every job no enforced rule selects, gitlab-runner's all, reaches
+    /// nothing. Lowercase and without a final period: the CLI prints it after `warning: `.
     pub fn warning(&self) -> Option<&'static str> {
         let fallback = self
             .rules
             .iter()
             .any(|r| r.name == crate::store::DEFAULT_RULE && r.mode == RuleMode::Enforce);
         match (self.enabled, fallback) {
-            (false, _) if !self.rules.is_empty() => {
-                Some("these rules restrict nothing until hub.toml sets [jobs] egress_rules = true")
-            }
+            (false, _) if !self.rules.is_empty() => Some(
+                "these rules restrict nothing yet. They apply once hub.toml sets [jobs] \
+                     egress_rules = true",
+            ),
             (true, false) => Some(
-                "no Fallback is enforced: every job no enforced rule selects, gitlab-runner's \
-                 all, may reach nothing",
+                "no enforced Fallback rule. While hub rules are on, jobs that no enforced rule \
+                 matches have no network access. This includes every job run by a node's own \
+                 gitlab-runner, which only ever uses the Fallback rule",
             ),
             _ => None,
         }

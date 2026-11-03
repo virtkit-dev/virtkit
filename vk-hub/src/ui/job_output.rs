@@ -64,13 +64,13 @@ pub(super) enum Output {
 pub(super) fn section(h: &mut Html, j: &JobRow, output: &Output, live: bool) {
     match output {
         Output::Kept(tail) => {
-            h.raw("<section><h2>End of its output</h2><p class=\"sub\">The last ")
+            h.raw("<section><h2>End of the output</h2><p class=\"sub\">The last ")
                 .text(bytes(tail.len() as u64))
-                .raw(", masked as the node streamed it");
+                .raw(" of output, as the node streamed it with secrets masked.");
             if j.outcome() != JobOutcome::Failed {
-                h.raw(", kept while the hub's cache of finished jobs' output has room");
+                h.raw(" The hub keeps it only while its cache of finished jobs' output has room.");
             }
-            h.raw(".</p><pre class=\"log\">");
+            h.raw("</p><pre class=\"log\">");
             for line in crate::jobs::readable(tail) {
                 line_html(h, &line);
                 h.raw("\n");
@@ -82,13 +82,13 @@ pub(super) fn section(h: &mut Html, j: &JobRow, output: &Output, live: bool) {
             if j.outcome() == JobOutcome::Failed {
                 h.raw("none kept");
             } else if j.settled_at.is_some() {
-                h.raw("dropped once its producer had it");
+                h.raw("dropped once the job's producer received it");
                 if j.job_url.as_deref().is_some_and(vk_hub_proto::is_web_link) {
                     h.raw(": ")
                         .external_link(j.job_url.as_deref(), "GitLab has it");
                 }
             } else if j.expired_at.is_some() {
-                h.raw("dropped, never taken by its producer");
+                h.raw("dropped. The job's producer never took it");
             } else {
                 h.raw("none held");
             }
@@ -100,11 +100,9 @@ pub(super) fn section(h: &mut Html, j: &JobRow, output: &Output, live: bool) {
 
 /// The output the hub holds: its lines, then those still open in a place of their own.
 fn held(h: &mut Html, stretch: &Stretch, live: bool) {
-    h.raw("<section><h2>Output</h2><p class=\"sub\">As the node masked it");
-    if live {
-        h.raw(", followed as it comes");
-    }
-    h.raw(".</p>");
+    h.raw("<section><h2>Output</h2><p class=\"sub\">");
+    h.raw(if live { "Live output" } else { "Output" });
+    h.raw(", with secrets masked by the node.</p>");
     if live {
         // A stream's first event replaces the lines; the rest are appended.
         h.raw("<span hidden sse-swap=\"")

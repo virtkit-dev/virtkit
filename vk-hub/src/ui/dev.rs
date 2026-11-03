@@ -98,7 +98,7 @@ impl DevList {
     pub(super) async fn get(&self, local: &Local, hub: &Hub, fresh: Duration) -> Rows {
         let Ok(mut held) = tokio::time::timeout(LIST_WAIT, self.0.lock()).await else {
             return Arc::new(Err(
-                "Not read: another page is listing them; reload in a moment.".to_string(),
+                "Another page is listing them right now. Reload in a moment.".to_string(),
             ));
         };
         let change = *hub.subscribe().borrow();
@@ -171,7 +171,7 @@ pub(super) async fn page(auth: &Auth, ui: &Ui, site: &LocalSite) -> Response<Bod
         }
         Ok(rows) => table(&mut main, rows, &site.local, steer.then_some(auth)),
     }
-    main.raw("<p class=\"sub\">Read as the page loads; <a href=\"/dev\">reload</a> for newer.</p>");
+    main.raw("<p class=\"sub\">Shown as of page load. <a href=\"/dev\">Reload</a> to update.</p>");
     super::page(super::local::layout(
         "Dev environments",
         "/dev",
