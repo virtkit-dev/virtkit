@@ -607,7 +607,12 @@ fn confirm(
         .raw("\"><input type=\"hidden\" name=\"confirm\" value=\"yes\">")
         .raw("<button class=\"danger\">Yes, ")
         .text(&ask.op)
-        .raw("</button></form>");
+        .raw("</button>");
+    if htmx {
+        // Empties the flash (`checks.js`): the action has not run.
+        form.raw("<button type=\"button\" class=\"secondary\" data-dismiss>Cancel</button>");
+    }
+    form.raw("</form>");
     if htmx {
         let mut h = Html::new();
         h.raw("<div id=\"flash\" hx-swap-oob=\"true\" class=\"error\">")

@@ -51,6 +51,15 @@
       button.addEventListener("click", again);
       flash.appendChild(button);
     }
+    // Dismissing hides the message alone (`checks.js`): the posts still wait, and a retry
+    // shows it again.
+    var close = document.createElement("button");
+    close.type = "button";
+    close.className = "secondary";
+    close.setAttribute("data-dismiss", "");
+    close.setAttribute("aria-label", "Dismiss");
+    close.textContent = "\u00d7";
+    flash.appendChild(close);
   }
 
   function send() {

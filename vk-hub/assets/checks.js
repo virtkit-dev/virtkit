@@ -1,12 +1,40 @@
 // vk-hub web UI: a button with `data-check="all"` or `data-check="none"` checks or unchecks
-// every checkbox of its fieldset, such as the nodes a rollout updates. Listening on the
-// document, it serves fieldsets swapped in later too. Without this script the boxes are
-// checked one by one.
+// every checkbox of its fieldset, such as the nodes a rollout updates. A `data-dismiss`
+// button, such as a question's Cancel, empties `#flash`; every message swapped into `#flash`
+// gets one, as the flash stays pinned to the window until dismissed. Listening on the
+// document, it serves what is swapped in later too. Without this script the boxes are
+// checked one by one and a message stays until replaced.
 // Loaded as a file: the policy allows no inline script, and nothing here evaluates code.
 (function () {
   "use strict";
 
+  function flash() {
+    return document.getElementById("flash");
+  }
+
+  function closable() {
+    var f = flash();
+    if (f === null || f.firstChild === null || f.querySelector("[data-dismiss]") !== null) {
+      return;
+    }
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.setAttribute("data-dismiss", "");
+    button.setAttribute("aria-label", "Dismiss");
+    button.textContent = "\u00d7";
+    f.appendChild(button);
+  }
+  document.addEventListener("htmx:oobAfterSwap", closable);
+  document.addEventListener("htmx:afterSwap", closable);
+
   document.addEventListener("click", function (e) {
+    var dismiss = e.target instanceof Element ? e.target.closest("[data-dismiss]") : null;
+    if (dismiss !== null && flash() !== null && flash().contains(dismiss)) {
+      flash().className = "";
+      flash().textContent = "";
+      return;
+    }
     var button = e.target instanceof Element ? e.target.closest("button[data-check]") : null;
     var fieldset = button === null ? null : button.closest("fieldset");
     if (fieldset === null) {

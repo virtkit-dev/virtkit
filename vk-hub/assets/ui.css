@@ -454,15 +454,26 @@ h4 { font-size: 0.9rem; font-weight: 600; margin: var(--s3) 0 var(--s2); }
 ol.layers { margin: 0 0 var(--s4); padding-left: 1.4rem; }
 ol.layers > li + li { margin-top: var(--s3); }
 
-/* What an action said, or the question it asks first. */
+/* What an action said, or the question it asks first: pinned to the bottom of the window,
+   wherever the button was, until dismissed or replaced. A long one, such as a rollout's plan,
+   scrolls within. */
 #flash:empty { display: none; }
 #flash {
+  position: fixed;
+  bottom: var(--s4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: max-content;
+  max-width: min(48rem, calc(100vw - 32px));
+  max-height: calc(100vh - 2 * var(--s4));
+  overflow-y: auto;
   padding: var(--s3) var(--s4);
-  margin: 0 0 var(--s4);
   background: var(--accent-soft);
   border: 1px solid var(--line);
   border-left: 4px solid var(--accent);
   border-radius: 6px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
 }
 #flash.error { background: var(--bad-soft); border-left-color: var(--bad); }
 #flash.warn { background: var(--warn-soft); border-left-color: var(--warn); }

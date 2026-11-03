@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Confirmations stay in view.** Questions show at the bottom of the window, wherever the
+  button was, with a Cancel button.
+
 ## [0.102.2] - 2026-11-03
 
 ### Changed
