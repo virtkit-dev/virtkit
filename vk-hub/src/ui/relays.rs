@@ -1,4 +1,4 @@
-//! GitLab relay updates: the `/operations` section ([`updates`]) and `/relay/<id>/action`
+//! GitLab relay updates: the `/updates` section ([`updates`]) and `/relay/<id>/action`
 //! handler, using the same operation as `vk-hub relays update`. The relay list is on `/relays`
 //! ([`super::clients`]).
 
@@ -95,7 +95,7 @@ fn peer(v: RelayView, last: Option<RelayCommandRow>) -> updates::Peer {
     }
 }
 
-/// Every relay as `/operations` shows its update, with the last one the hub issued it.
+/// Every relay as `/updates` shows its update, with the last one the hub issued it.
 pub(super) fn updatables(hub: &Hub) -> Result<Vec<updates::Peer>> {
     ops::views(hub)?
         .into_iter()

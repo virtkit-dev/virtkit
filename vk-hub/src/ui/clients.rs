@@ -13,7 +13,7 @@
 //! fragment, whose answer is a page of its own showing the key this once: it is never in a
 //! fragment, a log or the audit log. The operator's fragment carries a revoke button on each
 //! working key, and a remove button on the newest of those that no longer work under a name no
-//! working key holds, removing them all; as on `/operations`, it posts with the CSRF token the
+//! working key holds, removing them all; as on `/updates`, it posts with the CSRF token the
 //! page sets through `hx-headers`, and asks first ([`actions::ask_first`]). The store acts only
 //! on the keys the operator confirmed ([`crate::store::Db::revoke_api_keys_as_seen`]).
 //!
@@ -416,7 +416,7 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         });
     } else {
         relays_table(&mut h, &shown.relays, now, steer);
-        h.raw("<p class=\"sub\"><a href=\"/operations\">Updates</a> lists each relay's ")
+        h.raw("<p class=\"sub\"><a href=\"/updates\">Updates</a> lists each relay's ")
             .raw("update. If a relay's <code>[hub] allow</code> lists <code>update</code>, you ")
             .raw("can update the relay there.</p>");
     }

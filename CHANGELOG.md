@@ -8,6 +8,7 @@ All notable changes to virtkit will be documented in this file.
 
 - **Confirmations stay in view.** Questions show at the bottom of the window, wherever the
   button was, with a Cancel button.
+- **Updates page at `/updates`.** The old `/operations` links redirect there.
 
 ## [0.102.2] - 2026-11-03
 

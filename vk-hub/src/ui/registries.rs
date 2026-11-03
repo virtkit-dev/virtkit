@@ -1,6 +1,6 @@
 //! The registries the hub manages: `/registries`, each one's page at `/registry/<id>`, and an
 //! operator's steering of one, posted to `/registry/<id>/action`. The registry keeps its own
-//! UI; these pages show what it reports and what the hub asks of it. `/operations` lists their
+//! UI; these pages show what it reports and what the hub asks of it. `/updates` lists their
 //! versions and updates ([`updates`]); an update, from there or a registry's page, is asked
 //! again first ([`actions::ask_first`]).
 
@@ -631,9 +631,7 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
     h.raw(
         "</div></div><p class=\"sub\">The registry applies only what its <code>[hub] allow</code> ",
     )
-    .raw(
-        "lists. <a href=\"/operations\">Updates</a> lists every registry's version.</p></section>",
-    );
+    .raw("lists. <a href=\"/updates\">Updates</a> lists every registry's version.</p></section>");
 }
 
 /// Registry updates in [`updates`], using the lookup, checks and command issuance of
@@ -705,7 +703,7 @@ fn peer(v: RegistryView, last: Option<RegistryCommandRow>) -> updates::Peer {
     }
 }
 
-/// Every registry as `/operations` shows its update, with the last one the hub issued it.
+/// Every registry as `/updates` shows its update, with the last one the hub issued it.
 pub(super) fn updatables(hub: &crate::server::Hub) -> Result<Vec<updates::Peer>> {
     ops::views(hub)?
         .into_iter()
@@ -860,7 +858,7 @@ fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
 
 /// `POST /registry/<id>/action`: an operator's steering of a registry, as the session's
 /// principal; back to the registry's page. An update is asked again first, and may be posted
-/// by htmx from `/operations` ([`update`]).
+/// by htmx from `/updates` ([`update`]).
 pub(super) async fn action(
     req: Request<Incoming>,
     ui: &Ui,

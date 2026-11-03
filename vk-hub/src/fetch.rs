@@ -1,4 +1,4 @@
-//! `vk-hub release fetch` and `/operations`' fetch form download a [`Program`]'s
+//! `vk-hub release fetch` and `/updates`' fetch form download a [`Program`]'s
 //! binary (`vk`, `vk-registry`, `vk-gitlab` or `vk-hub`) from a GitHub virtkit release and
 //! hold it as if supplied to `release add`.
 //!

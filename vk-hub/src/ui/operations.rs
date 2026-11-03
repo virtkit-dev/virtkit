@@ -1,5 +1,5 @@
 //! Operators upload releases of each [`Program`], fetch them from GitHub ([`crate::fetch`]) and
-//! start rollouts from `/operations`, alongside controls for active rollouts. Starting a
+//! start rollouts from `/updates`, alongside controls for active rollouts. Starting a
 //! rollout requires confirmation of its plan ([`actions::ask_first`]). Each uses the admin
 //! socket's operations — `release add`'s checks, `release fetch`, `rollout create` — as the
 //! session's principal.
@@ -92,7 +92,7 @@ impl Drop for UploadSlot<'_> {
     }
 }
 
-/// `POST /releases/upload`: a plain form, answered with `/operations` once the release is
+/// `POST /releases/upload`: a plain form, answered with `/updates` once the release is
 /// held, or a page saying why not.
 pub(super) async fn upload(
     req: Request<Incoming>,
@@ -291,12 +291,14 @@ fn said_of(refusal: &Refusal) -> String {
 fn back_to_operations() -> Response<Body> {
     let mut resp = Response::new(Body::default());
     *resp.status_mut() = StatusCode::SEE_OTHER;
-    resp.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static("/operations"));
+    resp.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_static(super::fleet::UPDATES_PATH),
+    );
     resp
 }
 
-/// For htmx, `said` in the flash; else back to `/operations`.
+/// For htmx, `said` in the flash; else back to `/updates`.
 fn done(htmx: bool, said: &str) -> Response<Body> {
     if htmx {
         said_so(said)
@@ -306,7 +308,7 @@ fn done(htmx: bool, said: &str) -> Response<Body> {
 }
 
 /// `POST /releases/fetch`: `op=fetch` starts fetching `program`'s `version` (or the latest),
-/// or every program's with `program=all`, in the background, which `/operations` follows; `op=check` asks the repository which release is
+/// or every program's with `program=all`, in the background, which `/updates` follows; `op=check` asks the repository which release is
 /// the latest.
 pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -431,7 +433,7 @@ pub(super) async fn create_rollout(
     };
     let ask = actions::Ask {
         path: ROLLOUT_PATH.to_string(),
-        back: "/operations".to_string(),
+        back: super::fleet::UPDATES_PATH.to_string(),
         op: "create".to_string(),
         what: "Start this rollout? Each wave's nodes drain, update and come back before the \
                next wave starts.",
@@ -625,7 +627,7 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
     h
 }
 
-/// An operator's forms on `/operations`, outside the live fragment so an update never clears
+/// An operator's forms on `/updates`, outside the live fragment so an update never clears
 /// one being filled in: upload a release and fetch one. Then the section that starts a
 /// rollout, which the page's stream keeps current on its own ([`start_rollout`]).
 pub(super) fn forms(
@@ -702,11 +704,11 @@ fn program_select(h: &mut Html, all: bool) {
     h.raw("</select></label>");
 }
 
-/// The event an operator's `/operations` stream sends the form that starts a rollout as.
+/// The event an operator's `/updates` stream sends the form that starts a rollout as.
 pub(super) const START_ROLLOUT: &str = "start-rollout";
 
 /// Render `<section id="start-rollout">`: the rollout form, or why it is unavailable.
-/// An operator's `/operations` stream sends it as [`START_ROLLOUT`] on connect and when
+/// An operator's `/updates` stream sends it as [`START_ROLLOUT`] on connect and when
 /// its choices change: a vk release added or removed, a node enrolled, renamed or removed.
 /// The shared copy omits `csrf` and posts with the page's `hx-headers` token. The form's ID
 /// hashes its choices so `hx-preserve` keeps a form being filled in until they change.
@@ -794,7 +796,7 @@ pub(super) fn start_rollout(
 }
 
 /// The fetch under way or last ended, and the latest release last asked about: a line of
-/// `/operations`' live fragment.
+/// `/updates`' live fragment.
 pub(super) fn fetch_line(
     h: &mut Html,
     status: Option<&FetchStatus>,

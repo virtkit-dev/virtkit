@@ -3599,13 +3599,13 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
     id
 }
 
-/// `/operations` lists the releases, signed or not, and the rollouts node by node, what nodes
+/// `/updates` lists the releases, signed or not, and the rollouts node by node, what nodes
 /// said as text, live; a viewer's page has no buttons and no CSRF token.
 #[tokio::test(flavor = "multi_thread")]
 async fn releases_and_rollouts_are_shown_live() {
     let (addr, hub, _) = start_fleet().await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await;
+    let page = get(addr, "/updates", Some(&viewer)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body.contains("<code>vk-hub release add</code>"),
@@ -3620,13 +3620,13 @@ async fn releases_and_rollouts_are_shown_live() {
 
     let hostile = "ci<script>alert(1)</script>";
     let id = rollout_of(&hub, hostile);
-    let page = get(addr, "/operations", Some(&viewer)).await;
+    let page = get(addr, "/updates", Some(&viewer)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert_secure(&page);
     for want in [
         "<nav class=\"subnav\" aria-label=\"Nodes\"><a href=\"/\">Compute</a>\
          <a href=\"/registries\">Storage</a><a href=\"/relays\">GitLab adapters</a>\
-         <a href=\"/operations\" aria-current=\"page\">Updates</a></nav>",
+         <a href=\"/updates\" aria-current=\"page\">Updates</a></nav>",
         "sse-connect=\"/events/operations\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
         "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
@@ -3671,14 +3671,14 @@ async fn releases_and_rollouts_are_shown_live() {
     assert!(next.contains("aborted by uid 0"), "{next}");
 }
 
-/// Placed jobs have a tab of their own, right after the nodes, and `/operations` no longer
+/// Placed jobs have a tab of their own, right after the nodes, and `/updates` no longer
 /// lists them.
 #[tokio::test(flavor = "multi_thread")]
 async fn placed_jobs_are_a_tab_of_their_own() {
     let (addr, hub, _) = start_fleet().await;
     for role in [Role::Viewer, Role::Operator] {
         let (cookie, _) = sign_in(addr, &hub, role).await;
-        let page = get(addr, "/operations", Some(&cookie)).await.body;
+        let page = get(addr, "/updates", Some(&cookie)).await.body;
         assert!(
             page.contains(
                 "<nav aria-label=\"Sections\"><a href=\"/\" aria-current=\"true\">Nodes</a>\
@@ -5527,7 +5527,7 @@ async fn the_rollout_form_follows_what_it_offers() {
     let node = hub.db.nodes().unwrap()[0].0.clone();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
 
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     let form = rollout_form_id(&page.body);
     // The section and the fragment are inside the element setting the header.
@@ -5636,7 +5636,7 @@ async fn the_rollout_form_follows_what_it_offers() {
 async fn the_rollout_section_says_live_what_a_rollout_lacks() {
     let (addr, hub, _) = start_fleet().await;
     let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     let section = page.body.split("id=\"start-rollout\"").nth(1).unwrap();
     assert!(section.contains("Add a vk release first."), "{section}");
 
@@ -5669,7 +5669,7 @@ async fn the_rollout_section_says_live_what_a_rollout_lacks() {
     );
 }
 
-/// An operator's `/operations` pauses, resumes and aborts a rollout as the session's
+/// An operator's `/updates` pauses, resumes and aborts a rollout as the session's
 /// principal, which the audit log records, and its live fragment follows; a change the
 /// rollout's state does not allow is refused saying why.
 #[tokio::test(flavor = "multi_thread")]
@@ -5681,7 +5681,7 @@ async fn an_operator_steers_a_rollout_from_operations() {
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
     let path = format!("/rollout/{id}/action");
 
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
         &format!("action=\"{path}\" hx-post=\"{path}\""),
@@ -5760,7 +5760,7 @@ async fn an_operator_steers_a_rollout_from_operations() {
     assert_eq!(state(), RolloutState::Running);
     let reply = steer(&format!("_csrf={csrf}&op=abort"), false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/operations"));
+    assert_eq!(reply.header("location"), Some("/updates"));
     assert!(matches!(state(), RolloutState::Aborted { .. }));
     let aborted = next_with(&mut live, ">aborted<").await;
     // Its nodes were refused or never started: deleting it is all that is left.
@@ -5809,7 +5809,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
                 .steer_rollout(&id, action, "uid 0", crate::now_secs())
                 .unwrap();
         }
-        let page = get(addr, "/operations", Some(&operator)).await;
+        let page = get(addr, "/updates", Some(&operator)).await;
         assert!(!page.body.contains(button), "{}", page.body);
         let reply = post_action(addr, &origin, &operator, &path(&id), &delete, true).await;
         assert_eq!(reply.status, 409, "{}", reply.body);
@@ -5825,10 +5825,10 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     hub.db
         .steer_rollout(&id, RolloutAction::Abort, "uid 0", crate::now_secs())
         .unwrap();
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert!(page.body.contains(button), "{}", page.body);
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await;
+    let page = get(addr, "/updates", Some(&viewer)).await;
     assert!(!page.body.contains(button), "{}", page.body);
     let form = format!("_csrf={viewer_csrf}&op=delete");
     let reply = post_action(addr, &origin, &viewer, &path(&id), &form, true).await;
@@ -5863,7 +5863,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     assert!(hub.db.rollout(&id).unwrap().is_none());
     let gone = next_with(&mut live, "none yet").await;
     assert!(!gone.contains(&heading(&id)), "{gone}");
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert!(!page.body.contains(&heading(&id)), "{}", page.body);
     let line = format!("{principal} deleted rollout {} of vk 0.85.0", &id[..8]);
     let audit: Vec<String> = hub
@@ -5933,7 +5933,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
         hub.db
             .create_rollout(&kept, &ended(state, status), "uid 0")
             .unwrap();
-        let page = get(addr, "/operations", Some(&operator)).await;
+        let page = get(addr, "/updates", Some(&operator)).await;
         assert!(page.body.contains(&heading(&kept)), "{}", page.body);
         assert!(!page.body.contains(&path(&kept)), "{}", page.body);
         let reply = post_action(addr, &origin, &operator, &path(&kept), &delete, true).await;
@@ -5948,7 +5948,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     let expired = "b0".repeat(16);
     let row = ended(aborted(), failed("the update expired before it ran", false));
     hub.db.create_rollout(&expired, &row, "uid 0").unwrap();
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert!(page.body.contains(&path(&expired)), "{}", page.body);
     let reply = post_action(addr, &origin, &operator, &path(&expired), &delete, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -7147,7 +7147,7 @@ async fn post_upload(
     request_bytes(addr, "POST", operations::UPLOAD_PATH, &headers, &body).await
 }
 
-/// An operator uploads a release from `/operations`: it is checked and held as the session's
+/// An operator uploads a release from `/updates`: it is checked and held as the session's
 /// principal, the audit log says so, and nothing is left staged. The form chooses its program;
 /// an unknown one is refused.
 #[tokio::test(flavor = "multi_thread")]
@@ -7155,7 +7155,7 @@ async fn an_operator_uploads_a_release() {
     let (addr, hub, origin, dir) = start_fleet_releases(None).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
         page.body.contains(
@@ -7184,7 +7184,7 @@ async fn an_operator_uploads_a_release() {
     )
     .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/operations"));
+    assert_eq!(reply.header("location"), Some("/updates"));
     let releases = hub.db.releases().unwrap();
     assert_eq!(releases.len(), 1);
     let release = &releases[0];
@@ -7410,7 +7410,7 @@ async fn an_upload_is_refused_and_leaves_nothing_behind() {
     .await;
     assert_eq!(reply.status, 415, "{}", reply.body);
     // A viewer's page offers none of the forms.
-    let page = get(addr, "/operations", Some(&viewer)).await;
+    let page = get(addr, "/updates", Some(&viewer)).await;
     for absent in [
         "/releases/upload",
         "/releases/fetch",
@@ -7573,7 +7573,7 @@ async fn one_upload_at_a_time() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An operator starts a rollout from `/operations` once they have answered the question that
+/// An operator starts a rollout from `/updates` once they have answered the question that
 /// says which nodes it updates in which waves; the answer counts once, from the same session,
 /// and only while the plan is still what was shown.
 #[tokio::test(flavor = "multi_thread")]
@@ -7618,7 +7618,7 @@ async fn an_operator_starts_a_rollout_once_confirmed() {
     hub.db.add_release(&sha, &row, "uid 0").unwrap();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     for want in [
         "action=\"/rollouts\" hx-post=\"/rollouts\"",
         &format!("<option value=\"{sha}\">vk 0.85.0 (abababababab)</option>"),
@@ -7855,7 +7855,7 @@ async fn a_connection_accepted_before_the_hand_over_is_answered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An operator asks for the latest release on GitHub and fetches it from `/operations`; the
+/// An operator asks for the latest release on GitHub and fetches it from `/updates`; the
 /// page follows the fetch, which is held as the session's principal; a `vk-registry` is fetched
 /// as the program chosen. A release whose binary does not hash to its published digest is
 /// refused, and the page says so.
@@ -7871,7 +7871,7 @@ async fn an_operator_fetches_a_release_from_github() {
     let (addr, hub, origin, dir) = start_fleet_releases(Some(&api)).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
-    let page = get(addr, "/operations", Some(&operator)).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
     for want in [
         "action=\"/releases/fetch\" hx-post=\"/releases/fetch\"",
         "<input name=\"version\" value=\"latest\"",
@@ -7905,7 +7905,7 @@ async fn an_operator_fetches_a_release_from_github() {
     let releases = hub.db.releases().unwrap();
     assert_eq!(releases[0].row.version, "0.85.0");
     assert_eq!(releases[0].row.added_by, principal);
-    let page = page_with(addr, "/operations", &operator, "Fetched vk 0.85.0").await;
+    let page = page_with(addr, "/updates", &operator, "Fetched vk 0.85.0").await;
     assert!(page.contains("Latest on GitHub: 0.85.0"), "{page}");
     assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
 
@@ -7918,7 +7918,7 @@ async fn an_operator_fetches_a_release_from_github() {
         "{}",
         reply.body
     );
-    page_with(addr, "/operations", &operator, "Fetched vk-registry 0.85.0").await;
+    page_with(addr, "/updates", &operator, "Fetched vk-registry 0.85.0").await;
     let releases = hub.db.releases().unwrap();
     assert!(
         releases
@@ -7931,7 +7931,7 @@ async fn an_operator_fetches_a_release_from_github() {
     assert_eq!(reply.status, 400, "{}", reply.body);
 
     // Every program at once, the form's default: one failing does not stop the others.
-    let form_page = get(addr, "/operations", Some(&operator)).await.body;
+    let form_page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(
         form_page.contains("<option value=\"all\" selected>all programs</option>"),
         "{form_page}"
@@ -7945,13 +7945,7 @@ async fn an_operator_fetches_a_release_from_github() {
         reply.body
     );
     // vk-hub, fetched last, is not published.
-    let page_all = page_with(
-        addr,
-        "/operations",
-        &operator,
-        "Fetching vk-hub latest failed",
-    )
-    .await;
+    let page_all = page_with(addr, "/updates", &operator, "Fetching vk-hub latest failed").await;
     for want in [
         "Fetching every program latest, asked by",
         "<li>Fetched vk 0.85.0",
@@ -7991,7 +7985,7 @@ async fn an_operator_fetches_a_release_from_github() {
     assert!(hub.db.releases().unwrap().is_empty());
     let page = page_with(
         addr,
-        "/operations",
+        "/updates",
         &operator,
         "Fetching vk 0.86.0 failed</span>",
     )
@@ -8001,7 +7995,7 @@ async fn an_operator_fetches_a_release_from_github() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `/operations` lists the newest releases, with a link to the page listing them all.
+/// `/updates` lists the newest releases, with a link to the page listing them all.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_updates_page_lists_the_newest_releases_and_links_to_all() {
     use crate::store::Program;
@@ -8014,13 +8008,13 @@ async fn the_updates_page_lists_the_newest_releases_and_links_to_all() {
         std::fs::write(&file, crate::fetch::tests::fake_vk(&version)).unwrap();
         crate::releases::add(&hub, "uid 0", &file, Program::Vk, &version, None).unwrap();
     }
-    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    let page = get(addr, "/updates", Some(&viewer)).await.body;
     assert_eq!(page.matches("<td>vk</td>").count(), 10, "{page}");
     assert!(
-        page.contains("<a class=\"button\" href=\"/operations/releases\">Show all 12 releases</a>"),
+        page.contains("<a class=\"button\" href=\"/updates/releases\">Show all 12 releases</a>"),
         "{page}"
     );
-    let all = get(addr, "/operations/releases", Some(&viewer)).await;
+    let all = get(addr, "/updates/releases", Some(&viewer)).await;
     assert_eq!(all.status, 200, "{}", all.body);
     assert_eq!(all.body.matches("<td>vk</td>").count(), 12, "{}", all.body);
     let _ = std::fs::remove_dir_all(&dir);
@@ -8046,7 +8040,7 @@ async fn start_fleet_updating_with(
     (addr, hub, origin, dir)
 }
 
-/// `/operations` shows the hub's version and `[update]` policy, with an operator-only form.
+/// `/updates` shows the hub's version and `[update]` policy, with an operator-only form.
 /// Other programs' releases are refused before confirmation. Once confirmed, a non-runnable
 /// release fails staging; the hub serves on and reports the failure on its page and audit log.
 #[tokio::test(flavor = "multi_thread")]
@@ -8055,7 +8049,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
     let (addr, hub, origin, dir) = start_fleet_updating(true).await;
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(page.contains("Add a vk-hub release first."), "{page}");
     // A release reading the listeners handed to it, which does not run all the same; and one
     // from before handing over.
@@ -8077,7 +8071,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
 
     // A viewer sees the hub's version and what it takes, and no form.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    let page = get(addr, "/updates", Some(&viewer)).await.body;
     for want in [
         "<h2>Hub</h2>",
         &format!("<td>this hub</td><td>{}</td>", env!("CARGO_PKG_VERSION")),
@@ -8092,7 +8086,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
     assert_eq!(reply.status, 403, "{}", reply.body);
 
     // An operator's offers the vk-hub releases alone.
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(
         page.contains(&format!("hx-post=\"{action}\" hx-swap=\"none\">")),
         "{page}"
@@ -8161,7 +8155,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
     )
     .await;
     audited(&hub, "the hub's update to vk-hub 0.200.0 failed").await;
-    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    let page = get(addr, "/updates", Some(&viewer)).await.body;
     assert!(
         page.contains("to 0.200.0: <span class=\"reason\">failed</span>"),
         "{page}"
@@ -8257,7 +8251,7 @@ async fn the_hub_refuses_its_update_unless_allowed() {
     let sha = crate::releases::add(&hub, "uid 0", &file, Program::Hub, "0.200.0", None)
         .unwrap()
         .sha256;
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(
         page.contains("not allowed by its <code>[update] allow</code>"),
         "{page}"
@@ -8275,12 +8269,12 @@ async fn the_hub_refuses_its_update_unless_allowed() {
 
     let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
     let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(!page.contains("<h2>Hub</h2>"), "{page}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An operator updates a registry to a `vk-registry` release from `/operations`
+/// An operator updates a registry to a `vk-registry` release from `/updates`
 /// once confirmed, by the operation `vk-hub registries update` runs; a viewer sees each
 /// registry's version and update with no form. A registry that does not let the hub update it,
 /// one that takes only signed releases, and a `vk` release are refused before anything is
@@ -8329,7 +8323,7 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
 
     // No form until the hub holds a vk-registry release.
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(page.contains("Add a vk-registry release first."), "{page}");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("vk-registry");
@@ -8340,7 +8334,7 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
 
     // A viewer sees the versions and what each registry allows, and no form.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    let page = get(addr, "/updates", Some(&viewer)).await.body;
     for want in [
         "<h2>Registries</h2>",
         &format!("<a href=\"/registry/{id}\">reg-1</a></td><td>0.89.0</td>"),
@@ -8358,7 +8352,7 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     assert_eq!(reply.status, 403, "{}", reply.body);
 
     // An operator's has a form for each registry that takes updates.
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     for want in [
         &format!("hx-post=\"{action}\" hx-swap=\"none\">"),
         &format!("<option value=\"{sha}\">0.90.0 ("),
@@ -8553,7 +8547,7 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An operator updates a GitLab relay to a `vk-gitlab` release from `/operations` once
+/// An operator updates a GitLab relay to a `vk-gitlab` release from `/updates` once
 /// confirmed, by the operation `vk-hub relays update` runs; a viewer sees each relay's version
 /// and update with no form. A relay that does not let the hub update it and a `vk` release are
 /// refused before anything is asked.
@@ -8595,7 +8589,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     let closed = enroll("relay-2", "bb", "<b>1</b>", &[]);
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     for want in [
         "<option value=\"vk-gitlab\">vk-gitlab (relays)</option>",
         "Add a vk-gitlab release first.",
@@ -8611,7 +8605,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
 
     // A viewer sees the versions and what each relay allows, and no form.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    let page = get(addr, "/updates", Some(&viewer)).await.body;
     for want in [
         "<h2>GitLab adapters</h2>",
         "<th>ADAPTER</th>",
@@ -8632,7 +8626,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     assert_eq!(reply.status, 403, "{}", reply.body);
 
     // An operator's has a form for each relay that takes updates.
-    let page = get(addr, "/operations", Some(&operator)).await.body;
+    let page = get(addr, "/updates", Some(&operator)).await.body;
     assert!(
         page.contains(&format!("hx-post=\"{action}\" hx-swap=\"none\">")),
         "{page}"
@@ -8706,7 +8700,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     // The relays' page points at the updates.
     let page = get(addr, "/relays", Some(&viewer)).await.body;
     assert!(
-        page.contains("<a href=\"/operations\">Updates</a> lists"),
+        page.contains("<a href=\"/updates\">Updates</a> lists"),
         "{page}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -9104,9 +9098,12 @@ async fn the_gitlab_page_lists_its_servers() {
     }
     assert!(!body.contains("<h2>API keys</h2>"), "{body}");
     assert!(!body.contains("deploy"), "{body}");
-    // Connections' tabs, an unknown one the GitLab page's, and the capacity policy's and a
-    // project's pages, moved; anything else there is not a page.
+    // Old Connections, capacity, project and Updates URLs redirect to their pages, an unknown
+    // Connections tab to the GitLab page's; anything else there is not a page.
     for (from, to) in [
+        ("/operations", Some("/updates")),
+        ("/operations/releases", Some("/updates/releases")),
+        ("/operations/bogus", None),
         ("/clients", Some("/gitlab")),
         ("/clients?tab=bogus", Some("/gitlab")),
         ("/clients?tab=%3Cscript%3E", Some("/gitlab")),

@@ -418,7 +418,7 @@ async fn an_update_a_registry_would_refuse_is_not_sent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// What a registry reports of itself — its inventory and reports — reaches `/operations`, which
+/// What a registry reports of itself — its inventory and reports — reaches `/updates`, which
 /// follows [`Hub::touch`]; its heartbeats do not.
 #[tokio::test(flavor = "multi_thread")]
 async fn pages_follow_registry_reports_not_heartbeats() {

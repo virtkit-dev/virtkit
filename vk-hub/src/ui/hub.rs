@@ -1,4 +1,4 @@
-//! Hub updates: the `/operations` section ([`updates`]) and `/hub/action` handler, using the
+//! Hub updates: the `/updates` section ([`updates`]) and `/hub/action` handler, using the
 //! same update path as `vk-hub update` ([`crate::update`]).
 
 use anyhow::Result;
@@ -74,7 +74,7 @@ fn peer(hub: &Hub) -> updates::Peer {
     }
 }
 
-/// The hub, as `/operations` shows its update: none for a hub that does not update itself.
+/// The hub, as `/updates` shows its update: none for a hub that does not update itself.
 pub(super) fn updatables(hub: &Hub) -> Vec<updates::Peer> {
     let peer = peer(hub);
     if peer.takes_updates.is_none() {

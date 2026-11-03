@@ -1,5 +1,5 @@
 //! Shared update UI for registries, GitLab relays and the hub itself. Each [`Kind`] has a
-//! live `/operations` section listing versions and updates, a release form, and an action
+//! live `/updates` section listing versions and updates, a release form, and an action
 //! handler requiring confirmation ([`actions::ask_first`]). Each kind's module supplies
 //! lookup, checks and command issuance ([`Ops`]).
 
@@ -93,7 +93,7 @@ pub(super) struct Ops {
 /// [`Ops::issue`] takes `&Arc<Hub>` so the hub's update can spawn its hand-over with a clone.
 pub(super) type Issue = fn(&Arc<Hub>, &str, &str, &Release, Option<&str>) -> Result<String>;
 
-/// The live `/operations` section for `kind`'s `peers`: versions, update permissions and
+/// The live `/updates` section for `kind`'s `peers`: versions, update permissions and
 /// update status. With `steer`, include update forms for peers that allow updates.
 /// Render nothing when `peers` is empty.
 pub(super) fn section(
@@ -230,7 +230,7 @@ pub(super) fn sent(peer: &str, program: Program, version: &str, command: &str) -
 }
 
 /// Render the release form for `p` and `kind`'s program, or explain why no form is available.
-/// On a peer's page, use a plain form carrying `csrf`. In `/operations`' shared fragment,
+/// On a peer's page, use a plain form carrying `csrf`. In `/updates`' shared fragment,
 /// omit `csrf` and post through htmx with the page's token; `hx-preserve` keeps the input
 /// until the release choices change.
 pub(super) fn form(h: &mut Html, kind: &Kind, p: &Peer, releases: &[Release], csrf: Option<&str>) {
@@ -385,7 +385,7 @@ fn detail(kind: &Kind, p: &Peer, release: &Release) -> Html {
 }
 
 /// `op=update` posted to peer `id`'s action path: update it to the release `form` names, once
-/// the operator has confirmed it, by `kind`'s [`Ops`]. Back to `/operations` from there, or to
+/// the operator has confirmed it, by `kind`'s [`Ops`]. Back to `/updates` from there, or to
 /// the peer's page from its plain form.
 pub(super) async fn update(
     ui: &Ui,
@@ -442,7 +442,7 @@ pub(super) async fn update(
     }
     let back = match &peer.page {
         Some(page) if !htmx => page.clone(),
-        _ => "/operations".to_string(),
+        _ => super::fleet::UPDATES_PATH.to_string(),
     };
     let ask = actions::Ask {
         path: peer.action.clone(),
@@ -510,7 +510,8 @@ fn see_other(location: &str) -> Response<Body> {
     *resp.status_mut() = StatusCode::SEE_OTHER;
     resp.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static("/operations")),
+        HeaderValue::from_str(location)
+            .unwrap_or(HeaderValue::from_static(super::fleet::UPDATES_PATH)),
     );
     resp
 }

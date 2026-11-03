@@ -939,11 +939,7 @@ mod tests {
         let nav = [
             Section {
                 label: "Nodes",
-                tabs: vec![
-                    tab("/", "Compute"),
-                    registries,
-                    tab("/operations", "Updates"),
-                ],
+                tabs: vec![tab("/", "Compute"), registries, tab("/updates", "Updates")],
             },
             Section {
                 label: "Audit",
@@ -953,11 +949,11 @@ mod tests {
         assert_eq!(current(&nav, "/"), (0, 0));
         assert_eq!(current(&nav, "/node/ab"), (0, 0));
         assert_eq!(current(&nav, "/registry/ab"), (0, 1));
-        assert_eq!(current(&nav, "/operations"), (0, 2));
+        assert_eq!(current(&nav, "/updates"), (0, 2));
         assert_eq!(current(&nav, "/audit/x"), (1, 0));
         assert_eq!(current(&nav, "/auditx"), (0, 0));
         assert_eq!(current(&nav, "/audit?node=ab"), (1, 0));
-        assert_eq!(current(&nav, "/operations#rollouts"), (0, 2));
+        assert_eq!(current(&nav, "/updates#rollouts"), (0, 2));
     }
 
     /// An instant carries its exact UTC time for the script and the title, and shows the

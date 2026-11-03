@@ -5,7 +5,7 @@
 //! to where the node stands ([`Panel`]). A reset, which deletes what the node's past jobs
 //! left, is confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering
 //! controls.
-//! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
+//! Operators add releases and start rollouts from `/updates` ([`super::operations`]); the
 //! jobs placed through the client API are listed, read only, on `/jobs`, a failed one with a
 //! page of its own ([`super::jobs`]); the API keys and the client instances using them on
 //! `/keys`, where operators also create and revoke keys ([`super::clients`]).
@@ -52,12 +52,12 @@ const TOKEN_TTLS: [(u64, &str); 4] = [
     (7 * 86_400, "7 days"),
 ];
 
-/// The rollouts `/operations` shows, newest first.
+/// The rollouts `/updates` shows, newest first.
 const OPERATIONS_ROLLOUTS: usize = 10;
 
-/// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
+/// What the fleet's pages keep: the nodes table, and `/updates`' fragment once for every
 /// viewer's page and once for every operator's, each rendered once for every page showing it
-/// ([`sse::feed`]). `/operations` shows releases, rollouts and registries' and relays' updates
+/// ([`sse::feed`]). `/updates` shows releases, rollouts and registries' and relays' updates
 /// and, for an operator, the forms that start them; it follows [`Hub::touch`] alone — which
 /// also notes a node enrolled, renamed or removed, and a registry or relay connecting,
 /// reporting or answering an update — not every node's, registry's or relay's heartbeat.
@@ -130,7 +130,7 @@ fn job_event(event: &str) -> Option<&str> {
 }
 
 /// A fleet `/events/<event>[?<query>]` stream for `auth`'s page. Operators see rollout buttons
-/// on `/operations` and node steering actions rendered per stream with the session's CSRF
+/// on `/updates` and node steering actions rendered per stream with the session's CSRF
 /// token. `/jobs`' and `/egress`' streams follow the filter in `query`; a job's page's,
 /// `job/<id>`, its output.
 pub(super) fn source(
@@ -255,7 +255,7 @@ pub(super) async fn get(
         let views = blocking(move || crate::ops::node_views(&hub)).await?;
         return Ok(Some(page(nodes(auth, &views, now))));
     }
-    if path == "/operations" {
+    if path == UPDATES_PATH {
         let steer = auth.session.role >= Role::Operator;
         let (ops, nodes) = blocking(move || {
             // The forms' nodes, for an operator's page alone.
@@ -272,10 +272,10 @@ pub(super) async fn get(
     if path == ALL_RELEASES_PATH {
         let releases = blocking(move || hub.db.releases()).await?;
         let mut main = Html::new();
-        main.raw("<h1>Releases</h1><p><a href=\"/operations\">Back to updates</a></p><section>");
+        main.raw("<h1>Releases</h1><p><a href=\"/updates\">Back to updates</a></p><section>");
         releases_table(&mut main, &releases);
         main.raw("</section>");
-        return Ok(Some(page(layout("Releases", "/operations", auth, &main))));
+        return Ok(Some(page(layout("Releases", UPDATES_PATH, auth, &main))));
     }
     if path == "/audit" {
         let (filter, before) = pages::audit_query(query);
@@ -385,6 +385,12 @@ pub(super) fn moved(path: &str, query: Option<&str>) -> Option<String> {
     if path == super::clients::PATH {
         return Some(super::clients::moved(query).to_string());
     }
+    // Old links to the Updates page and its full release list.
+    if let Some(rest) = path.strip_prefix("/operations")
+        && (rest.is_empty() || rest == "/releases")
+    {
+        return Some(format!("{UPDATES_PATH}{rest}"));
+    }
     super::capacity::moved(path).or_else(|| super::projects::moved(path))
 }
 
@@ -409,7 +415,7 @@ fn nodes_events(hub: &Arc<Hub>) -> sse::Events {
     sse::Events::from([("nodes", render)])
 }
 
-/// `/operations`' fragment, as one rendering for every page showing it: with the rollouts'
+/// `/updates`' fragment, as one rendering for every page showing it: with the rollouts'
 /// buttons for an operator's, without for a viewer's. An operator's has the form that starts
 /// a rollout beside it, as its own event ([`operations::start_rollout`]).
 fn operations_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
@@ -435,7 +441,7 @@ fn operations_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     sse::Events::from([("operations", fragment), (operations::START_ROLLOUT, form)])
 }
 
-/// What `/operations` shows.
+/// What `/updates` shows.
 fn read_operations(hub: &Hub) -> Result<Operations> {
     let mut rollouts = ops::rollouts(hub)?;
     rollouts.truncate(OPERATIONS_ROLLOUTS);
@@ -452,7 +458,7 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
     })
 }
 
-/// What `/operations` shows.
+/// What `/updates` shows.
 struct Operations {
     releases: Vec<Release>,
     /// The tools definitions held, newest first.
@@ -716,7 +722,7 @@ pub(super) fn action_rollout(path: &str) -> Option<&str> {
 
 /// `POST /rollout/<id>/action`: pause, resume, abort or delete as the operator session's
 /// principal, using the admin socket's operation. Like node actions, return a status message
-/// for htmx or redirect to `/operations`.
+/// for htmx or redirect to `/updates`.
 pub(super) async fn rollout_action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -812,7 +818,7 @@ async fn delete_rollout(
         .raw(".</p>");
     let ask = actions::Ask {
         path,
-        back: "/operations".to_string(),
+        back: UPDATES_PATH.to_string(),
         op: "delete".into(),
         what: "Delete this rollout? The rollout updated no node. Its audit log lines are kept.",
         detail,
@@ -857,13 +863,13 @@ fn refused_to_delete(htmx: bool, kept: &RolloutUndeletable) -> Response<Body> {
     actions::refused(htmx, StatusCode::CONFLICT, &format!("Refused: {kept}."))
 }
 
-/// For htmx, `said` in the flash; for a plain form, a redirect back to `/operations`.
+/// For htmx, `said` in the flash; for a plain form, a redirect back to `/updates`.
 fn back_to_operations(htmx: bool, said: &str) -> Response<Body> {
     if !htmx {
         let mut resp = Response::new(Body::default());
         *resp.status_mut() = StatusCode::SEE_OTHER;
         resp.headers_mut()
-            .insert(header::LOCATION, HeaderValue::from_static("/operations"));
+            .insert(header::LOCATION, HeaderValue::from_static(UPDATES_PATH));
         return resp;
     }
     said_so(said)
@@ -904,7 +910,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                     ..tab(super::registries::PATH, "Storage")
                 },
                 tab(super::clients::RELAYS_PATH, "GitLab adapters"),
-                tab("/operations", "Updates"),
+                tab(UPDATES_PATH, "Updates"),
             ],
         },
         Section {
@@ -2156,7 +2162,7 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
     h.raw("</section>");
 }
 
-/// `/operations`: the releases the hub holds, its latest rollouts and its registries' and
+/// `/updates`: the releases the hub holds, its latest rollouts and its registries' and
 /// relays' updates, kept live.
 ///
 /// The live fragment is rendered once for every viewer and once for every operator
@@ -2185,14 +2191,17 @@ fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Ht
     main.raw("<div id=\"operations\" sse-swap=\"operations\">")
         .html(&operations_fragment(ops, steer, now))
         .raw("</div></div>");
-    layout("Updates", "/operations", auth, &main)
+    layout("Updates", UPDATES_PATH, auth, &main)
 }
 
-/// How many releases, newest first, `/operations` lists; [`ALL_RELEASES_PATH`] lists them all.
+/// How many releases, newest first, `/updates` lists; [`ALL_RELEASES_PATH`] lists them all.
 const RELEASES_SHOWN: usize = 10;
 
 /// The page listing every release the hub holds.
-const ALL_RELEASES_PATH: &str = "/operations/releases";
+const ALL_RELEASES_PATH: &str = "/updates/releases";
+
+/// The Updates page.
+pub(super) const UPDATES_PATH: &str = "/updates";
 
 /// A table of `releases`, in the order given.
 fn releases_table(h: &mut Html, releases: &[Release]) {
@@ -2224,7 +2233,7 @@ fn releases_table(h: &mut Html, releases: &[Release]) {
     h.raw("</tbody></table>");
 }
 
-/// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
+/// `/updates`' live part. With `steer`, each rollout still under way carries the buttons
 /// that steer it, and each ended one that updated no node the one that deletes it.
 fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     let mut h = Html::new();

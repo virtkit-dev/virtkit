@@ -629,7 +629,7 @@ signed this way yet: that is a step for the release workflow, with the key in CI
 ## Updating the hub
 
 With `[update] allow = true` in `hub.toml`, an operator updates the hub to a `vk-hub` release it
-holds (`vk-hub release add|fetch --program vk-hub`) from `/operations` or with `vk-hub update
+holds (`vk-hub release add|fetch --program vk-hub`) from `/updates` or with `vk-hub update
 --release <sha256 prefix>`; `vk-hub update` alone prints the hub's version and how its last
 update went. `[update] release_keys` lists the keys a release must be signed by
 (`require_signed` defaults to true with any), and an older release is refused unless
@@ -818,7 +818,7 @@ The node's report carries the build's phase (`downloading`, `building`, `install
 or `failed`, with the reason and the last 40 lines of a failed build's output), and its inventory
 the tools current: the definition, its label, the first line each tool printed for `--version`,
 and whether `[executor] tools_dir` names them. `vk-hub nodes` notes both under its table, a node's
-page shows them under Versions and Steering, `/operations` lists the definitions held, and the
+page shows them under Versions and Steering, `/updates` lists the definitions held, and the
 audit log has each phase as the node reports it.
 
 Whoever registers a definition can put any binary into every job VM of the nodes that build it: a
@@ -1847,14 +1847,14 @@ Job pages also link to their projects.
 Each working key has a *Revoke* button. When no key of a name works, the newest inactive key
 has a *Remove* button that removes them all, as `vk-hub keys revoke <name>` does. Both require
 confirmation; revocation warns that the key's client can no longer follow or settle ongoing jobs.
-The actions apply only to the keys confirmed. As on `/operations`, the buttons post with
+The actions apply only to the keys confirmed. As on `/updates`, the buttons post with
 the token set through `hx-headers` and need htmx; `vk-hub keys revoke` works without it.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
 node's page shows the update's release, phase and what the node said of it, and the sha256 of
-the `vk` it runs. `/operations` lists the ten newest releases the hub holds, signed or not,
-with a link to `/operations/releases` listing them all, its ten latest rollouts with their
+the `vk` it runs. `/updates` lists the ten newest releases the hub holds, signed or not,
+with a link to `/updates/releases` listing them all, its ten latest rollouts with their
 state, counts, current wave, and each node's status and profile by wave, and, once one has enrolled, the registries: each one's version, whether
 its `[hub] allow` lets the hub update it and whether it takes only signed releases, and its
 update — as it reports it, or the last command while it has not taken it or once it refused or
@@ -1867,7 +1867,7 @@ supplies its session's CSRF token through `hx-headers`, as JSON that htmx parses
 evaluating. The buttons require htmx; `vk-hub rollout pause|resume|abort|delete` works
 without it.
 
-Above the fragment, an operator's `/operations` carries three forms, each with the same
+Above the fragment, an operator's `/updates` carries three forms, each with the same
 origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
 
 - **Upload** posts a binary, its program (`vk`, `vk-registry` or `vk-gitlab`), its version and
@@ -1927,14 +1927,14 @@ update. Operators get an **Update** form to choose a held `vk-hub` release, post
 Confirmation requires the hub to still run the version shown and hold the release as shown.
 The top bar shows the version that served the page.
 
-The nodes table, a node's page, `/operations`, `/jobs`' newest page, `/gitlab`, `/keys` and a
+The nodes table, a node's page, `/updates`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,
 session, command outcome and desired-state change, by node; every release added or removed, rollout
 step and node enrolled, renamed or removed; every change to a placed job's record — submitted,
 placed, accepted, at a new stage, finished, canceled or settled — and each hourly trim of the
 history; and, by job, each piece of its output stored, which wakes that job's page alone, never
 `/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
-nodes page is sent that one rendering; `/operations` likewise, once for every viewer's page and
+nodes page is sent that one rendering; `/updates` likewise, once for every viewer's page and
 once for every operator's; `/gitlab` and `/keys` likewise, both pages' fragments in one
 rendering, woken by a key created, revoked or removed, a GitLab server added, removed, rejected or
 forgotten, an instance heard from anew, a hello recorded or instances pruned, a relay connected,
@@ -1994,7 +1994,7 @@ VM IDs `vk workloads` derives, checked the same way, and dev environment names, 
 `[A-Za-z0-9._-]` not starting with `.` or `-` — are the only values in an attribute htmx reads
 or a link the hub builds to its own pages. The one link to elsewhere is a CI job's page on
 GitLab, which a node names for a job on its host and the hub records for a placed job from
-its spec: shown on a node's page, local mode's VMs and `/operations`, it becomes an `href`
+its spec: shown on a node's page, local mode's VMs and `/updates`, it becomes an `href`
 only when it is a plain web URL — `https://` or `http://`, as GitLab on a private network is
 often served, with a host, no userinfo, printable ASCII without quotes, angle brackets,
 backslashes or backticks, at most 256 bytes — checked again as the page is built, escaped,

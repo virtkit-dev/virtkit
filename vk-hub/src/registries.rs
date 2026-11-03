@@ -59,7 +59,7 @@ pub async fn run(
         registry.id, registry.hostname
     );
     hub.changed(&registry.id);
-    // `/operations` shows whether each registry is connected.
+    // `/updates` shows whether each registry is connected.
     hub.touch();
     let ended = serve(&mut ws, &hub, &registry, session, &ending).await;
     hub.close_session(&registry.id, session);
@@ -307,7 +307,7 @@ async fn acknowledge(
             .await??;
     if news {
         hub.changed(&registry.id);
-        // A command's outcome: `/operations` shows an update's; any other's renders it alike.
+        // A command's outcome: `/updates` shows an update's; any other's renders it alike.
         hub.touch();
     }
     send(ws, &HubRegistryMsg::Recorded(recorded)).await
@@ -323,7 +323,7 @@ async fn store(
     let db = hub.db.clone();
     let id = registry.id.clone();
     let now = crate::now_secs();
-    // `/operations` shows a registry's version and update from these, not its heartbeats.
+    // `/updates` shows a registry's version and update from these, not its heartbeats.
     let updates_shown = matches!(
         write,
         RegistryWrite::Inventory(_) | RegistryWrite::Report(_)

@@ -1,5 +1,5 @@
 //! The hub updating itself to a `vk-hub` release it holds, on trial, without closing its
-//! listeners: `/operations` or `vk-hub update --release <prefix>`, once `[update] allow`.
+//! listeners: `/updates` or `vk-hub update --release <prefix>`, once `[update] allow`.
 //!
 //! 1. An update is refused while a release or tools are being added or fetched, and those are
 //!    refused from its start on ([`Handover::long_call`]): the exec would cut them, and the CLI
@@ -1293,7 +1293,7 @@ pub fn audit_end(hub: &Hub) {
     }
 }
 
-/// The hub's update as `/operations` and `vk-hub update` show it.
+/// The hub's update as `/updates` and `vk-hub update` show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub version: String,

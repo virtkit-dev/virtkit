@@ -65,7 +65,7 @@ pub async fn run(
     );
     hub.changed(&relay.id);
     hub.clients_changed();
-    // `/operations` shows whether each relay is connected.
+    // `/updates` shows whether each relay is connected.
     hub.touch();
     let ended = serve(&mut ws, &hub, &relay, session, &ending).await;
     hub.close_session(&relay.id, session);
@@ -314,7 +314,7 @@ async fn acknowledge(ws: &mut Ws, hub: &Hub, relay: &Peer, ack: CommandAck) -> R
             .await??;
     if news {
         hub.changed(&relay.id);
-        // A command's outcome: `/operations` shows an update's.
+        // A command's outcome: `/updates` shows an update's.
         hub.touch();
     }
     send(ws, &HubRelayMsg::Recorded(recorded)).await
@@ -352,7 +352,7 @@ async fn store(
             hub.changed(&relay.id);
             if shown {
                 hub.clients_changed();
-                // `/operations` shows a relay's version and update from these.
+                // `/updates` shows a relay's version and update from these.
                 hub.touch();
             }
             Ok(None)
