@@ -10583,7 +10583,7 @@ async fn the_egress_page_lists_denials_by_destination_and_project() {
         "{body}"
     );
     assert!(body.contains("main (protected)"), "{body}");
-    assert!(body.contains("effect on it is unknown"), "{body}");
+    assert!(body.contains("effect on that result is unknown"), "{body}");
     let (at_a, at_b) = (body.find(&a).unwrap(), body.find(&b).unwrap());
     assert!(at_b < at_a, "the latest first: {body}");
     let unknown = format!("/egress/rows/{}", "0".repeat(32));
@@ -10929,7 +10929,10 @@ async fn an_operator_triages_and_mutes_egress_rows() {
     let row_page = format!("/egress/rows/{crates}");
 
     let seen = get(addr, &row_page, Some(&viewer)).await.body;
-    assert!(seen.contains("New: no one has acknowledged it."), "{seen}");
+    assert!(
+        seen.contains("New. No one has acknowledged it yet."),
+        "{seen}"
+    );
     assert!(!seen.contains("/egress/action"), "{seen}");
     let form = format!("_csrf={viewer_csrf}&row={crates}&op=acknowledge");
     let refused = post_action(addr, &origin, &viewer, "/egress/action", &form, false).await;
@@ -10963,7 +10966,7 @@ async fn an_operator_triages_and_mutes_egress_rows() {
     // A later job of the project reopens it.
     egress_job(&hub, 3, 42, &node, blocked_report("crates.io", 1));
     let page = get(addr, &row_page, Some(&operator)).await.body;
-    assert!(page.contains("New again: acknowledged by"), "{page}");
+    assert!(page.contains("New again. Acknowledged by"), "{page}");
 
     // Muting project 7 takes its row out of the inbox and the count, not out of the page.
     let pypi_page = format!("/egress/rows/{pypi}");
@@ -11174,8 +11177,9 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     assert!(!list.contains("Fallback</strong>"), "{tab}");
     assert!(
         fallback.contains(
-            "<strong>Fallback</strong></a></td><td>Jobs no enforced rule selects, and every \
-             gitlab-runner job</td><td>No external access</td><td>debian.org</td>"
+            "<strong>Fallback</strong></a></td><td>Jobs that no enforced rule selects, and \
+             every job of a node&#39;s own gitlab-runner</td><td>No external access</td>\
+             <td>debian.org</td>"
         ),
         "{tab}"
     );
@@ -11185,8 +11189,8 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     for step in [
         "<span class=\"badge\">To do</span> <span class=\"sub\">no job reported a phase \
          completely in the last 30 days</span>",
-        "<span class=\"badge warn\">Check</span> <span class=\"sub\">enforced but narrowed: \
-         turning rules on restricts every job no enforced rule selects</span>",
+        "<span class=\"badge warn\">Check</span> <span class=\"sub\">enforced but narrowed. \
+         Turning rules on restricts every job that no enforced rule selects</span>",
         "<span class=\"badge\">To do</span> <span class=\"sub\">hub rules are off</span>",
         "<span class=\"sub\">in dry-run, last 7 days: wab-release: 1 job · 1 would block</span>",
         "<span class=\"sub\">1 project rules enforced, 1 in dry-run</span>",
@@ -11251,8 +11255,9 @@ async fn the_rules_tab_lists_the_rules_in_plain_words() {
     );
     assert!(
         tab.contains(
-            "<span class=\"badge warn\">Check</span> <span class=\"sub\">hub rules are on with \
-             no enforced Fallback"
+            "<span class=\"badge warn\">Check</span> <span class=\"sub\">hub rules are on, but \
+             there is no enforced Fallback. Jobs that no enforced rule matches have no network \
+             access."
         ),
         "{tab}"
     );
@@ -11452,8 +11457,8 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     assert_eq!(bad.status, 400, "{}", bad.body);
     assert!(
         bad.body.contains(
-            "A branch or tag pattern needs \u{201c}Protected only\u{201d}: anyone who can push \
-             can name a branch release/*."
+            "A branch or tag pattern needs \u{201c}Protected only\u{201d}, because anyone who \
+             can push can create a branch named release/*."
         ),
         "{}",
         bad.body
@@ -11482,7 +11487,7 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     assert_eq!(preview.status, 200, "{}", preview.body);
     let body = &preview.body;
     assert!(body.contains("<h2>Preview: add rule acme</h2>"), "{body}");
-    assert!(body.contains("Hub rules are off: saved, this change restricts nothing"));
+    assert!(body.contains("Hub rules are off. If you save this change, it restricts nothing"));
     assert!(
         body.contains(&format!(
             "<td class=\"num\"><a href=\"/jobs/{job}\" title=\"Their latest job\">1</a></td>\
@@ -11495,7 +11500,7 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     );
     assert!(
         body.contains(
-            "<li>Run: 1 of 1 job whose access it changes reported this phase completely</li>\
+            "<li>Run: 1 of 1 job affected by the change reported this phase completely</li>\
              <li>Build: <span class=\"badge warn\">Insufficient evidence</span>"
         ),
         "{body}"
@@ -11536,7 +11541,7 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     assert!(
         stale
             .body
-            .contains("The rules changed since your preview: preview the change again.")
+            .contains("The rules changed since your preview. Preview the change again.")
     );
     assert!(
         !hub.db
@@ -11601,14 +11606,14 @@ async fn an_operator_changes_the_egress_rules_through_preview_and_save() {
     assert!(
         preview
             .body
-            .contains("Insufficient evidence: no job whose access it changes reported"),
+            .contains("Not enough evidence. No affected job has reported traffic yet"),
         "{}",
         preview.body
     );
     assert!(
         preview
             .body
-            .contains("In dry-run this rule blocks nothing.")
+            .contains("In dry-run, this rule blocks nothing.")
     );
 
     // Removed through its preview too.
@@ -11724,7 +11729,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
         .body;
     assert!(!page.contains("Propose allowing"), "{page}");
     assert!(
-        page.contains("an operator may propose a rule allowing it"),
+        page.contains("An operator can propose a rule that allows it."),
         "{page}"
     );
     let page = get(addr, &format!("/egress/rows/{deb}"), Some(&operator))
@@ -11826,7 +11831,7 @@ async fn a_hub_rule_s_denial_is_proposed_for_its_project_and_confirmed_by_a_late
     assert_eq!(saved.header("location"), Some(back.as_str()));
     let page = get(addr, &back, Some(&operator)).await.body;
     assert!(
-        page.contains("Saved: its allow awaits a later job"),
+        page.contains("Saved. The allow now waits for a later job"),
         "{page}"
     );
     assert!(
@@ -12017,7 +12022,7 @@ async fn test_a_job_shows_each_layer_apart() {
         "{page}"
     );
     assert!(
-        page.contains("It does not report its caps: node limits not evaluated."),
+        page.contains("It does not report its caps, so node limits are not evaluated."),
         "{page}"
     );
     assert!(
@@ -12032,8 +12037,8 @@ async fn test_a_job_shows_each_layer_apart() {
     assert!(
         page.contains(
             "<p class=\"callout warn\">Run: MICROVM_EGRESS_ALLOW_NAME partner.example.net \
-             (outside the hub&#39;s rules). The node keeps them and warns of them; that layer \
-             refuses what they list when the job runs.</p>"
+             (outside the hub&#39;s rules). The node keeps these entries and warns about them. \
+             When the job runs, the layer named beside each entry refuses what it lists.</p>"
         ),
         "{page}"
     );
@@ -12072,7 +12077,7 @@ async fn test_a_job_shows_each_layer_apart() {
             "<tr><td>Build</td><td>job</td><td>not evaluated</td><td>Allowed by Fallback · \
              debian.org</td><td></td><td>Not known</td><td>—</td><td><span class=\"badge\">Not \
              refused by any layer known</span> <span class=\"sub\">The node&#39;s cap and the \
-             job&#39;s restriction are not known; overall reachability cannot be determined.\
+             job&#39;s restriction are not known, so overall reachability cannot be determined.\
              </span>"
         ),
         "{page}"
@@ -12259,7 +12264,10 @@ async fn node_caps_are_shown_and_evaluated() {
         "{tab}"
     );
     assert!(
-        tab.contains("Hub-observed jobs only; other workloads on the node may use them"),
+        tab.contains(
+            "Only jobs that the hub observes count. Other workloads on the node may use these \
+             entries"
+        ),
         "{tab}"
     );
     assert!(
@@ -12289,16 +12297,16 @@ async fn node_caps_are_shown_and_evaluated() {
     );
     assert!(
         page.contains(
-            "A service that declares its own lists is held to them as well as to the job's, each \
-             checked on its own: it may reach only what both allow."
+            "A service with its own lists must pass both its own lists and the job's. It can \
+             reach only what both allow."
         ),
         "{page}"
     );
     assert!(
         page.contains(
             "<p class=\"callout warn\">Run: MICROVM_EGRESS_ALLOW_NAME partner.example.net \
-             (outside the node&#39;s cap). The node keeps them and warns of them; that layer \
-             refuses what they list when the job runs"
+             (outside the node&#39;s cap). The node keeps these entries and warns about them. \
+             When the job runs, the layer named beside each entry refuses what it lists"
         ),
         "{page}"
     );
@@ -12325,7 +12333,7 @@ async fn node_caps_are_shown_and_evaluated() {
     assert!(
         page.contains(
             "<tr><td>Build</td><td>job</td><td>Unrestricted</td><td>Unrestricted</td><td></td>\
-             <td>Blocked: only MICROVM_BUILD_EGRESS_ALLOW_IP is declared, so its VM may reach \
+             <td>Blocked: only MICROVM_BUILD_EGRESS_ALLOW_IP is declared, so its VM can reach \
              no domains</td><td>—</td><td><span class=\"badge bad\">Blocked: only \
              MICROVM_BUILD_EGRESS_ALLOW_IP is declared</span>"
         ),
@@ -12374,7 +12382,7 @@ async fn observed_traffic_is_compared_with_the_rules() {
 
     let page = get(addr, p42, Some(&viewer)).await.body;
     assert!(
-        page.contains("No saved rules: once on, the hub would allow nothing"),
+        page.contains("No saved rules. Once rules are on, the hub would allow nothing"),
         "{page}"
     );
 
@@ -12420,7 +12428,7 @@ async fn observed_traffic_is_compared_with_the_rules() {
     );
     assert!(!list.contains("<code>debian.org</code> · "), "{list}");
     assert!(
-        list.contains("No reported use does not prove an entry unnecessary"),
+        list.contains("An entry with no reported use may still be needed"),
         "{list}"
     );
 

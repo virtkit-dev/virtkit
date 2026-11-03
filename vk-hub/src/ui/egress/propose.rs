@@ -115,7 +115,7 @@ fn load(hub: &Hub, ask: &Ask) -> Result<Result<Proposing, String>> {
         From::Row(id) => {
             let Some((row, jobs)) = super::kept(hub, id)? else {
                 return Ok(Err(
-                    "There is no such row: no job of the history shares it.".into(),
+                    "There is no such row. No job in the history shares it.".into(),
                 ));
             };
             let jobs: Vec<&crate::store::JobRow> = jobs.iter().collect();
@@ -127,7 +127,7 @@ fn load(hub: &Hub, ask: &Ask) -> Result<Result<Proposing, String>> {
         From::Contact { subject, contact } => {
             let Some(phase) = ask.phase.and_then(proposal::phase_key) else {
                 return Ok(Err(
-                    "A proposal from Observed traffic names its phase.".into()
+                    "A proposal from Observed traffic must name its phase.".into()
                 ));
             };
             let filter = ObservedFilter {
@@ -140,7 +140,9 @@ fn load(hub: &Hub, ask: &Ask) -> Result<Result<Proposing, String>> {
                 .find(|u| u.contact == *contact && u.phase == phase)
             else {
                 return Ok(Err(
-                    "Its jobs no longer reached that destination in that phase.".into(),
+                    "The project's jobs in the history no longer show that destination in \
+                     that phase."
+                        .into(),
                 ));
             };
             let project = hub
@@ -195,7 +197,7 @@ pub(super) async fn get(ask: Ask, auth: &Auth, ui: &Ui) -> Result<Response<Body>
     if auth.session.role < Role::Operator {
         return Ok(message(
             StatusCode::FORBIDDEN,
-            "Proposing an egress rule takes an operator.",
+            "Only an operator can propose an egress rule.",
         ));
     }
     let (hub, wanted) = (ui.hub.clone(), ask.clone());
@@ -270,16 +272,16 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
         .iter()
         .map(|ph| crate::egress::phase_text(*ph).to_ascii_lowercase())
         .collect();
-    h.raw("in the ").text(phases.join(" and ")).raw(" phase");
+    h.raw("in the ").text(phases.join(" and ")).raw(" phase.");
     match &p.row {
         Some(id) => {
-            h.raw(": <a href=\"")
+            h.raw(" See <a href=\"")
                 .raw(ROW_PREFIX)
                 .text(id)
                 .raw("\">its Blocked row</a>.");
         }
         None => {
-            h.raw("; the rules saved now leave it outside for some of them: ")
+            h.raw(" The rules saved now leave it outside for some of these jobs. See ")
                 .raw("<a href=\"")
                 .text(super::observed::subject_href(&seed.subject))
                 .raw("\">its Observed traffic</a>.");
@@ -302,15 +304,18 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
                 .node(&seed.entry.text)
                 .raw("</code> allows ")
                 .node(&seed.entry.text)
-                .raw(" and its subdomains. Nothing broader is proposed: a broader entry is ")
-                .raw("yours to type, and allows destinations absent from these reports.");
+                .raw(" and its subdomains. Nothing broader is proposed. You can type a broader ")
+                .raw("entry yourself, but it also allows destinations that these reports do not ")
+                .raw("show.");
         }
     }
-    h.raw(" Another layer — a node's cap, the job's own narrowing — may still refuse it.</p>");
+    h.raw(" Another layer, such as a node's cap or the job's own narrowing, may still refuse ")
+        .raw("it.</p>");
 
     let Some(chosen) = chosen else {
-        h.raw("<p class=\"empty\">No rule can take it: none that applies to these jobs lacks ")
-            .raw("it in this phase, and a new rule selects a GitLab project only.</p>");
+        h.raw("<p class=\"empty\">No rule can take this entry. Every rule that applies to these ")
+            .raw("jobs already allows it in this phase, and a new rule can select only a GitLab ")
+            .raw("project.</p>");
         return h;
     };
     let mut draft = match &chosen {
@@ -328,14 +333,15 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
                     .text(rule_name(r))
                     .raw(" applies to ")
                     .text(super::lower(&applies_to(r, instances)))
-                    .raw(": the entry is allowed to every job it selects, not only these.</p>");
+                    .raw(". The entry would be allowed to every job that this rule selects, not ")
+                    .raw("only these jobs.</p>");
             }
             if r.mode == RuleMode::DryRun {
                 h.raw("<p class=\"callout\">")
                     .text(rule_name(r))
-                    .raw(" is in dry-run: saved, it no longer reports this destination as Would ")
-                    .raw("block, and blocks nothing until enforced. Enforcing it is the editor's ")
-                    .raw("Mode, previewed like any change.</p>");
+                    .raw(" is in dry-run. Once you save, it no longer reports this destination ")
+                    .raw("as Would block, and it still blocks nothing until enforced. To enforce ")
+                    .raw("it, set the editor's Mode and preview that like any change.</p>");
             }
             d
         }
@@ -345,20 +351,18 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
                 _ => Base::Entry,
             };
             if base == Base::Fallback {
-                h.raw("<p class=\"callout warn\">Starting from the Fallback copies its lists to ")
-                    .raw("every job of this project the rule selects, protected refs included, ")
-                    .raw("beside what any enforced rule allows them.</p>");
+                h.raw("<p class=\"callout warn\">Starting from the Fallback copies the ")
+                    .raw("Fallback's lists to every job of this project that the rule selects, ")
+                    .raw("protected refs included. Those jobs keep what any other enforced rule ")
+                    .raw("allows them as well.</p>");
             }
             if proposal::mixed(seed, rules) {
-                h.raw("<p class=\"callout warn\">An enforced rule selects some of these jobs and ")
-                    .raw(
-                        "the Fallback alone applies to others: rules add up, so starting from the ",
-                    )
-                    .raw(
-                        "Fallback adds its lists to the former, and starting from the entry alone ",
-                    )
-                    .raw("takes the Fallback's from the latter once enforced. The preview shows ")
-                    .raw("both.</p>");
+                h.raw("<p class=\"callout warn\">An enforced rule selects some of these jobs, ")
+                    .raw("and only the Fallback applies to the others. Rules add up. If you start ")
+                    .raw("from the Fallback, the jobs that an enforced rule selects also get the ")
+                    .raw("Fallback's lists. If you start from the entry alone, the jobs that only ")
+                    .raw("the Fallback applies to lose the Fallback's lists once the new rule is ")
+                    .raw("enforced. The preview shows both.</p>");
             }
             let (run, build) = proposal::new_phases(seed, rules, phase, base);
             let (projects, project_path, project_id) = match &subject.projects {
@@ -397,13 +401,11 @@ fn proposal_page(ask: &Ask, p: &Proposing, auth: &Auth) -> Html {
             h.raw("A new rule, in dry-run");
         }
     }
-    h.raw("</h3><p class=\"sub\">Prefilled: review it, then Preview changes. Save, from the ")
-        .raw("preview, is refused if the rules change in between.");
+    h.raw("</h3><p class=\"sub\">Prefilled. Review it, then choose Preview changes. The ")
+        .raw("preview's Save is refused if the rules change in between.");
     if p.row.is_some() {
-        h.raw(
-            " Saved, the row's triage moves to Allow saved, awaiting confirmation, if the rules ",
-        )
-        .raw("as saved allow it to its project's latest job.");
+        h.raw(" If the saved rules allow the destination to the project's latest job, saving ")
+            .raw("moves the row's triage to Allow saved, awaiting confirmation.");
     }
     h.raw("</p>");
     editor(&mut h, &draft, &p.gitlabs, auth);

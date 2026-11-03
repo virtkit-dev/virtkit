@@ -633,8 +633,8 @@ fn listing_page(filter: &Filter, l: &Listing, subjects: &[(String, String)], aut
     h.raw("<h1>Egress</h1>");
     tabs(&mut h, Tab::Blocked, filter.subject.as_ref());
     unreported_callout(&mut h, &l.unreported);
-    h.raw("<p class=\"sub\">What the jobs of the history were refused, by destination and ")
-        .raw("project, as their nodes reported it.</p>");
+    h.raw("<p class=\"sub\">Refusals that nodes reported for jobs in the history, by ")
+        .raw("destination and project.</p>");
     mutes_note(&mut h, &l.mutes, l.instances.as_deref(), auth);
     filter_form(&mut h, filter, subjects, l.instances.as_deref());
     // Replaced whole by the filter's form, live part and all, so the old stream closes and the
@@ -687,12 +687,13 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
             "The switch blocked these attempts. Their effect on the jobs' results is unknown."
         }
         View::WouldBlock => {
-            "A dry-run allowlist would have blocked these attempts; the switch carried them."
+            "A dry-run allowlist would have blocked these attempts. The switch let them through."
         }
         View::Refused => {
-            "Each of these declarations was found at validation, before its job's script ran: \
-             nothing was attempted. An invalid one failed its job; one outside a layer above did \
-             not, and that layer refuses what it lists when the job runs."
+            "The node found each of these declarations when it validated the job, before the \
+             job's script ran. Nothing was attempted. An invalid declaration failed its job. \
+             A declaration outside a layer above did not fail its job, but that layer refuses \
+             what the declaration lists when the job runs."
         }
     });
     h.raw("</p>");
@@ -700,7 +701,7 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
         h.raw(match (l.any, l.cut) {
             (false, _) => "<p class=\"empty\">nothing refused yet</p>",
             (true, true) => {
-                "<p class=\"empty\" role=\"status\">none among the latest rows read: narrow \
+                "<p class=\"empty\" role=\"status\">none among the latest rows read. Narrow \
                  the filter to see older ones</p>"
             }
             (true, false) => "<p class=\"empty\" role=\"status\">none match</p>",
@@ -721,13 +722,14 @@ fn results(h: &mut Html, filter: &Filter, l: &Listing) {
         Some(c) if !c.partial && c.n > shown => {
             h.raw("<p class=\"sub\">")
                 .text(c.n - shown)
-                .raw(" more, older: narrow the filter to see them.</p>");
+                .raw(" older rows are not shown. Narrow the filter to see them.</p>");
         }
         _ if l.more => {
-            h.raw("<p class=\"sub\">More, older: narrow the filter to see them.</p>");
+            h.raw("<p class=\"sub\">More older rows are not shown. Narrow the filter to see ")
+                .raw("them.</p>");
         }
         _ if l.cut => {
-            h.raw("<p class=\"sub\">Only the latest rows were read: narrow the filter to see ")
+            h.raw("<p class=\"sub\">Only the latest rows were read. Narrow the filter to see ")
                 .raw("older ones.</p>");
         }
         _ => {}
@@ -797,10 +799,10 @@ fn unreported_callout(h: &mut Html, nodes: &[(String, String)]) {
             .raw("</a>");
     }
     h.raw(match nodes.len() {
-        1 => ": it does not announce egress reporting, so what its jobs",
-        _ => ": they do not announce egress reporting, so what their jobs",
+        1 => ". This node does not announce egress reporting, so this page cannot list its jobs'",
+        _ => ". These nodes do not announce egress reporting, so this page cannot list their jobs'",
     })
-    .raw(" were refused is not listed here. A newer <code>vk</code> reports it.</p>");
+    .raw(" refusals. A newer <code>vk</code> reports them.</p>");
 }
 
 /// The mutes in force, each with its reason and end, when there are any: their rows are out of
@@ -820,7 +822,7 @@ fn mutes_note(
         .map(|(subject, m)| (subject, m, relabel(subject, &m.who, instances)))
         .collect();
     mutes.sort_by(|a, b| (&a.2, a.0).cmp(&(&b.2, b.0)));
-    h.raw("<div class=\"callout\"><p>Muted, out of the inbox and its count, not out of the record:</p><ul>");
+    h.raw("<div class=\"callout\"><p>Muted. Their rows are left out of the inbox and its count, but stay in the record:</p><ul>");
     for (subject, m, who) in &mutes {
         h.raw("<li>");
         let shown = Filter {
@@ -1067,7 +1069,7 @@ fn state_badge(h: &mut Html, row: &BlockedRow, triage: Triage, muted: Option<&Mu
             h.raw(if allowed {
                 "<span class=\"badge\" title=\"By "
             } else {
-                "<span class=\"badge warn\" title=\"No longer allowed by the rules saved now; by "
+                "<span class=\"badge warn\" title=\"The rules saved now no longer allow it. By "
             })
             .text(by)
             .raw("\">Allow saved, awaiting confirmation</span>");
@@ -1158,7 +1160,7 @@ pub(super) async fn row(
     let Some(detail) = detail else {
         return Ok(message(
             StatusCode::NOT_FOUND,
-            "There is no such row: no job of the history shares it.",
+            "There is no such row. No job in the history shares it.",
         ));
     };
     let main = row_page(id, &detail, auth);
@@ -1265,9 +1267,9 @@ fn row_page(id: &str, d: &RowDetail, auth: &Auth) -> Html {
         })
         .collect();
     pages::kv_node(&mut h, "Refs", &refs.join(", "));
-    h.raw("</tbody></table><p class=\"sub\">VMs and refs of its latest ")
+    h.raw("</tbody></table><p class=\"sub\">VMs and refs come from the latest ")
         .text(kept.len())
-        .raw(" jobs kept; protection as GitLab reported it.</p></section>");
+        .raw(" kept jobs of this row. Protection is as GitLab reported it.</p></section>");
 
     triage(&mut h, id, d, auth);
     let jobs: Vec<&JobRow> = kept.iter().map(|(j, _)| *j).collect();
@@ -1309,7 +1311,7 @@ fn what_to_change(h: &mut Html, kept: &[(&JobRow, Evidence)], names: &HashMap<St
     }
     h.raw("<section><h2>What to change</h2>");
     if checks.is_empty() {
-        h.raw("<p>Nothing to point at: the evidence below is all there is.</p></section>");
+        h.raw("<p>The hub cannot point to a place to change. The evidence below is all there is.</p></section>");
         return;
     }
     h.raw("<ul class=\"access\">");
@@ -1341,7 +1343,7 @@ fn what_to_change(h: &mut Html, kept: &[(&JobRow, Evidence)], names: &HashMap<St
             }
             Check::HubRules { .. } => {
                 h.text(capital(&c.text()))
-                    .raw(": <code>vk-hub egress</code> shows and changes them; the evidence ")
+                    .raw(": <code>vk-hub egress</code> shows and changes them. The evidence ")
                     .raw("below is what they refused");
             }
             Check::Nothing(why) => {
@@ -1351,8 +1353,8 @@ fn what_to_change(h: &mut Html, kept: &[(&JobRow, Evidence)], names: &HashMap<St
         }
         h.raw("</li>");
     }
-    h.raw("</ul><p class=\"sub\">From its latest jobs kept. Changing one layer may not be ")
-        .raw("enough: another may refuse it too.</p></section>");
+    h.raw("</ul><p class=\"sub\">Based on the latest kept jobs of this row. Changing one ")
+        .raw("layer may not be enough, because another layer may refuse it too.</p></section>");
 }
 
 /// `s` with its first letter capitalized.
@@ -1382,9 +1384,11 @@ fn lower(s: &str) -> String {
 fn row_jobs(h: &mut Html, view: View, d: &RowDetail) {
     h.raw("<section><h2>Latest jobs</h2><p class=\"sub\">")
         .raw(if view == View::Refused {
-            "An invalid declaration failed each of them; one outside a layer above did not."
+            "If the declaration is invalid, it failed each of these jobs. If it is only \
+             outside a layer above, it did not fail them."
         } else {
-            "Each job's result is shown as it ended; the denial's effect on it is unknown."
+            "Each job's result is shown as the job ended. The denial's effect on that result \
+             is unknown."
         })
         .raw("</p><table class=\"grid\"><thead><tr><th>job</th><th>ended</th><th>ref</th>")
         .raw("<th>node</th><th>");
@@ -1495,16 +1499,16 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
                 if row.phases.contains_key(key) && !has {
                     h.raw("<li>")
                         .raw(label)
-                        .raw(": refused in this phase too, with no allow saved for it.</li>");
+                        .raw(": also refused in this phase, and no allow is saved for it.</li>");
                 }
             }
             h.raw("</ul><p>A later job of this ")
                 .raw(what)
-                .raw(" placed under an allow's generation, the rule saved applying to it, that ")
-                .raw(
-                    "reaches the destination in that phase, refused it by no VM and reporting the ",
-                )
-                .raw("phase completely, confirms it.");
+                .raw(" confirms an allow if all of these hold:</p><ul class=\"access\">")
+                .raw("<li>the job was placed under the allow's rules generation or a later one;")
+                .raw("</li><li>the saved rule applied to the job;</li><li>the job reached the ")
+                .raw("destination in that phase;</li><li>no VM of the job was refused it;</li>")
+                .raw("<li>the job reported that phase completely.</li></ul><p>");
         }
         (_, Some(a)) if !row.is_new() => {
             h.raw("Acknowledged by ").text(&a.by).raw(" ");
@@ -1512,20 +1516,20 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
             h.raw(".");
         }
         (_, Some(a)) => {
-            h.raw("New again: acknowledged by ").text(&a.by).raw(" ");
+            h.raw("New again. Acknowledged by ").text(&a.by).raw(" ");
             pages::at(h, a.at);
-            h.raw(", and a job has added to it since.");
+            h.raw(", but a job has added to it since.");
         }
         _ => {
-            h.raw("New: no one has acknowledged it.");
+            h.raw("New. No one has acknowledged it yet.");
         }
     }
     if !row.is_new() {
-        h.raw(" A job that adds to it makes it New again");
+        h.raw(" If a job adds to this row, the row becomes New again.");
         if !row.allows.is_empty() {
-            h.raw(", unless it was placed before the allow of each phase it was refused it in");
+            h.raw(" The only exception is a job placed before the allow was saved for every ")
+                .raw("phase in which that job was refused.");
         }
-        h.raw(".");
     }
     h.raw("</p>");
     if steer {
@@ -1571,8 +1575,8 @@ fn triage(h: &mut Html, id: &str, d: &RowDetail, auth: &Auth) {
     }
     h.raw("<p class=\"sub\">A mute takes every row of this ")
         .raw(what)
-        .raw(" out of the inbox and the navigation's count: they stay here under Muted, and on ")
-        .raw("their jobs' pages.</p></section>");
+        .raw(" out of the inbox and the navigation's count. The rows stay here under Muted, ")
+        .raw("and on their jobs' pages.</p></section>");
 }
 
 /// An allow saved, and how it stands: confirmed or awaiting, and whether the rules saved now
@@ -1615,7 +1619,7 @@ fn allow_item(
     } else if dry {
         h.raw(" <span class=\"sub\">Rule ")
             .text(&a.rule)
-            .raw(" is in dry-run: it would allow it once enforced.</span>");
+            .raw(" is in dry-run. It would allow this destination once enforced.</span>");
     }
     h.raw("</li>");
 }
@@ -1624,12 +1628,13 @@ fn allow_item(
 /// saved leaving its destination refused, its triage unchanged.
 fn saved_callout(h: &mut Html, row: &BlockedRow, phase: vk_hub_proto::egress::EgressPhase) {
     if row.allows.iter().any(|a| a.phase == phase) {
-        h.raw("<p class=\"callout\" role=\"status\">Saved: its allow awaits a later job's ")
-            .raw("report.</p>");
+        h.raw("<p class=\"callout\" role=\"status\">Saved. The allow now waits for a later ")
+            .raw("job's report.</p>");
     } else {
-        h.raw("<p class=\"callout warn\" role=\"status\">Saved, but the rules as saved do ")
-            .raw("not allow it to this project's latest job in that phase: a rule in dry-run, or ")
-            .raw("one that does not select that job. Its triage is unchanged.</p>");
+        h.raw("<p class=\"callout warn\" role=\"status\">Saved, but the saved rules do not ")
+            .raw("allow this destination to this project's latest job in that phase. The rule ")
+            .raw("may be in dry-run, or may not select that job. The row's triage is ")
+            .raw("unchanged.</p>");
     }
 }
 
@@ -1651,10 +1656,12 @@ fn proposal_section(h: &mut Html, id: &str, d: &RowDetail, jobs: &[&JobRow], aut
                     });
                     h.raw(" ");
                 }
-                h.raw("</p><p class=\"sub\">It opens the rule editor prefilled with this exact ")
-                    .raw("destination. Nothing is saved but through Preview → Save.</p>");
+                h.raw("</p><p class=\"sub\">This opens the rule editor, prefilled with this ")
+                    .raw("exact destination. Nothing is saved until you go through Preview → ")
+                    .raw("Save.</p>");
             } else {
-                h.raw("<p>A hub rule refused it: an operator may propose a rule allowing it.</p>");
+                h.raw("<p>A hub rule refused it. An operator can propose a rule that allows ")
+                    .raw("it.</p>");
             }
         }
         Err(why) => {
@@ -1787,7 +1794,7 @@ pub(super) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
     if !found {
         return Ok(message(
             StatusCode::NOT_FOUND,
-            "There is no such row: no job of the history shares it.",
+            "There is no such row. No job in the history shares it.",
         ));
     }
     ui.hub.egress_changed();

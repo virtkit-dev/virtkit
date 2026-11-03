@@ -120,7 +120,7 @@ pub(super) fn source(hub: &Arc<Hub>, caches: &Arc<Caches>, q: Query) -> Source {
                 Some(name) => match l.rules.rules.iter().find(|r| r.name == *name) {
                     Some(r) => rule_results(&mut h, &l, r),
                     None => {
-                        h.raw("<p class=\"empty\" role=\"status\">There is no such rule: it ")
+                        h.raw("<p class=\"empty\" role=\"status\">There is no such rule. It ")
                             .raw("may have been removed.</p>");
                     }
                 },
@@ -171,7 +171,7 @@ pub(super) async fn get(
             let Some(rule) = listing.rules.rules.iter().find(|r| r.name == *name) else {
                 return Ok(message(
                     StatusCode::NOT_FOUND,
-                    "There is no such rule: it may have been removed.",
+                    "There is no such rule. It may have been removed.",
                 ));
             };
             rule_page(&listing, rule, auth)
@@ -196,7 +196,8 @@ pub(super) fn rule_name(r: &EgressRuleRow) -> &str {
 pub(super) fn applies_to(r: &EgressRuleRow, instances: Instances<&str>) -> String {
     match &r.subject {
         Some(s) => access::who(s, instances),
-        None => "Jobs no enforced rule selects, and every gitlab-runner job".to_string(),
+        None => "Jobs that no enforced rule selects, and every job of a node's own gitlab-runner"
+            .to_string(),
     }
 }
 
@@ -204,7 +205,7 @@ pub(super) fn applies_to(r: &EgressRuleRow, instances: Instances<&str>) -> Strin
 pub(super) fn state_callout(h: &mut Html, rules: &Rules) {
     if !rules.enabled {
         h.raw("<div class=\"callout\"><p><strong>Hub rules are off.</strong> Saved rules ")
-            .raw("restrict nothing yet: they apply once <code>hub.toml</code> sets ")
+            .raw("restrict nothing yet. They apply once <code>hub.toml</code> sets ")
             .raw("<code>[jobs] egress_rules = true</code>. Node caps and jobs' own ")
             .raw("restrictions still apply. <a href=\"")
             .raw(PATH)
@@ -222,9 +223,9 @@ fn tab_page(l: &Listing, auth: &Auth) -> Html {
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, Tab::Rules, None);
-    h.raw("<p class=\"sub\">What jobs may reach, by project, ref and protection, in each phase. ")
-        .raw("Matching enforced rules add up: a rule cannot remove access another allows. Node ")
-        .raw("caps and jobs' own restrictions still apply.</p>");
+    h.raw("<p class=\"sub\">What jobs can reach in each phase, by project, ref and protection. ")
+        .raw("Enforced rules that match a job add up, so a rule cannot remove access that another ")
+        .raw("rule allows. Node caps and jobs' own restrictions still apply.</p>");
     if auth.session.role >= Role::Operator {
         h.raw("<p class=\"actions\"><a href=\"")
             .raw(PATH)
@@ -269,14 +270,15 @@ fn tab_results(h: &mut Html, l: &Listing) {
             h.raw("</tbody></table>");
         }
         None => {
-            h.raw("<p class=\"empty\">no Fallback: once rules are on, a job no enforced rule ")
-                .raw("selects, and every gitlab-runner job, may reach nothing</p>");
+            h.raw("<p class=\"empty\">No Fallback rule. While hub rules are on, jobs that no ")
+                .raw("enforced rule matches have no network access. This includes every job run ")
+                .raw("by a node's own gitlab-runner, which only ever uses the Fallback rule.</p>");
         }
     }
     if l.used.recent.capped {
-        h.raw("<p class=\"sub\">Recent jobs: the latest ")
+        h.raw("<p class=\"sub\">Recent jobs: only the latest ")
             .text(RECENT_SCAN)
-            .raw(" of the last 7 days.</p>");
+            .raw(" jobs of the last 7 days were read.</p>");
     }
     node_caps(h, &l.nodes, &l.used.cap_use);
     rollout(h, l);
@@ -302,9 +304,9 @@ fn node_caps(h: &mut Html, nodes: &[(String, NodeRow)], u: &CapUse) {
         return;
     }
     h.raw("<section id=\"caps\"><h2>Node caps</h2><p class=\"sub\">Each node's own ")
-        .raw("<code>[egress]</code> and <code>[egress.build]</code>, as it reports them: what ")
-        .raw("its jobs may ever reach, whatever the hub's rules allow. A hub rule cannot widen ")
-        .raw("them.</p><table class=\"grid\"><thead><tr><th>node</th><th>run</th><th>build</th>")
+        .raw("<code>[egress]</code> and <code>[egress.build]</code>, as the node reports them. ")
+        .raw("They set the most that the node's jobs can ever reach, whatever the hub's rules ")
+        .raw("allow. A hub rule cannot widen them.</p><table class=\"grid\"><thead><tr><th>node</th><th>run</th><th>build</th>")
         .raw("<th>last 30 days</th></tr></thead><tbody>");
     for (id, n) in &nodes {
         h.raw("<tr><td><a href=\"/node/")
@@ -324,7 +326,7 @@ fn node_caps(h: &mut Html, nodes: &[(String, NodeRow)], u: &CapUse) {
                 continue;
             }
             None => {
-                h.raw("<td colspan=\"3\">not reported: a newer <code>vk</code> reports them</td></tr>");
+                h.raw("<td colspan=\"3\">not reported. A newer <code>vk</code> reports them</td></tr>");
                 continue;
             }
         };
@@ -391,7 +393,7 @@ pub(super) fn caps_unused(h: &mut Html, nodes: &[&(String, NodeRow)], u: &CapUse
                 Some(day) => h
                     .raw("no observed use since ")
                     .text(super::observed::date(day))
-                    .raw(", its first job kept under these caps"),
+                    .raw(", the date of its first kept job under these caps"),
                 None => h.raw("no observed use in 30 days"),
             };
             match used {
@@ -412,12 +414,12 @@ pub(super) fn caps_unused(h: &mut Html, nodes: &[&(String, NodeRow)], u: &CapUse
     if !any {
         return;
     }
-    h.raw("</ul><p class=\"sub\">Hub-observed jobs only; other workloads on the node may use ")
-        .raw("them, its gitlab-runner's jobs among them.");
+    h.raw("</ul><p class=\"sub\">Only jobs that the hub observes count. Other workloads on ")
+        .raw("the node may use these entries, including the jobs of its gitlab-runner.");
     if u.capped {
         h.raw(" The job history was read only in part.");
     }
-    h.raw(" No reported use does not prove an entry unnecessary; nothing is removed ")
+    h.raw(" An entry with no reported use may still be needed. Nothing is removed ")
         .raw("automatically.</p></div>");
 }
 
@@ -440,19 +442,19 @@ fn rollout(h: &mut Html, l: &Listing) {
         (0, 0) => Step::ToDo("no job reported a phase completely in the last 30 days".into()),
         (run, build) if run == 0 || build == 0 => Step::ToDo(format!(
             "in the last 30 days, {run} jobs reported their run phase completely and {build} \
-             their build phase: both phases need reports"
+             their build phase. Both phases need reports"
         )),
         (run, build) => {
             let text = format!(
                 "in the last 30 days, {run} jobs reported their run phase completely and {build} \
-                 their build phase; {} sent no report",
+                 their build phase. {} sent no report",
                 u.silent
             );
             if l.unreported_nodes == 0 {
                 Step::Done(text)
             } else {
                 Step::Warn(format!(
-                    "{text}; {} nodes taking placed jobs do not report",
+                    "{text}. {} nodes that take placed jobs do not report",
                     l.unreported_nodes
                 ))
             }
@@ -466,16 +468,17 @@ fn rollout(h: &mut Html, l: &Listing) {
         Some(f) if unrestricted(f) => Step::Done("enforced, unrestricted in both phases".into()),
         Some(_) if l.rules.enabled => Step::Done("enforced, and already narrowed".into()),
         Some(_) => Step::Warn(
-            "enforced but narrowed: turning rules on restricts every job no enforced rule \
-             selects"
+            "enforced but narrowed. Turning rules on restricts every job that no enforced \
+             rule selects"
                 .into(),
         ),
     };
     let on = match (l.rules.enabled, enforced_fallback) {
         (true, Some(_)) => Step::Done("hub rules are on".into()),
         (true, None) => Step::Warn(
-            "hub rules are on with no enforced Fallback: every job no enforced rule selects, \
-             gitlab-runner's all, may reach nothing"
+            "hub rules are on, but there is no enforced Fallback. Jobs that no enforced rule \
+             matches have no network access. This includes every job run by a node's own \
+             gitlab-runner, which only ever uses the Fallback rule"
                 .into(),
         ),
         (false, _) => Step::ToDo("hub rules are off".into()),
@@ -783,6 +786,6 @@ fn entries_use(h: &mut Html, u: &RuleUse, r: &EgressRuleRow, key: &'static str, 
     if let Some(n) = u.unreported.get(&r.name).filter(|n| **n > 0) {
         h.raw("<p class=\"sub\">")
             .text(n)
-            .raw(" jobs it applies to sent no report in the last 30 days.</p>");
+            .raw(" jobs this rule applies to sent no report in the last 30 days.</p>");
     }
 }

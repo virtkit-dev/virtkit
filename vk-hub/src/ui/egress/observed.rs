@@ -264,9 +264,10 @@ pub(super) async fn get(
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, super::Tab::Observed, q.subject.as_ref());
     unreported_callout(&mut h, &listing.unreported);
-    h.raw("<p class=\"sub\">What the jobs of the history reached, by destination and project, ")
-        .raw("as their nodes reported it: allowed, or carried while a dry-run allowlist would ")
-        .raw("have blocked it. A DNS entry is a lookup, not proof of a connection.</p>");
+    h.raw("<p class=\"sub\">Destinations that jobs in the history reached, by project, as ")
+        .raw("reported by their nodes. Each contact was either allowed, or let through while a ")
+        .raw("dry-run allowlist would have blocked it. A DNS entry is a lookup, not proof of a ")
+        .raw("connection.</p>");
     filter_form(&mut h, &q, &listing.subjects, listing.instances.as_deref());
     h.raw("<div id=\"")
         .raw(RESULTS)
@@ -441,15 +442,16 @@ fn projects(h: &mut Html, q: &Query, l: &Listing) {
         super::super::pages::at(h, s.latest_at);
         h.raw("</td></tr>");
     }
-    h.raw("</tbody></table><p class=\"sub\">Jobs and destinations count every phase and ref, ")
-        .raw("destinations phase by phase; coverage follows the filter.</p>");
+    h.raw("</tbody></table><p class=\"sub\">Jobs and destinations count every phase and ref. ")
+        .raw("A destination counts once per phase it was used in. Coverage follows the ")
+        .raw("filter.</p>");
 }
 
 /// Why some contacts are not listed.
 fn dropped_text(n: u64) -> String {
     format!(
-        "{n} contacts of its jobs are not listed: the project reached the {MAX_OBSERVED_CONTACTS} \
-         destinations kept of it."
+        "{n} contacts of its jobs are not listed. The hub keeps at most \
+         {MAX_OBSERVED_CONTACTS} destinations per project, and this project reached that limit."
     )
 }
 
@@ -500,10 +502,10 @@ fn project(
         h.raw("</ul>");
     }
     if let Some(day) = p.coverage.since_day {
-        h.raw("<p class=\"sub\">From its jobs since ")
+        h.raw("<p class=\"sub\">From this project's jobs since ")
             .text(date(day))
-            .raw(", as long as the job history keeps them. No contact in it does not prove a ")
-            .raw("destination unnecessary.</p>");
+            .raw(", as long as the job history keeps them. A destination with no contact here ")
+            .raw("may still be needed.</p>");
     }
     if let Some((_, s)) = summary.as_ref().filter(|(_, s)| s.dropped > 0) {
         h.raw("<p class=\"callout warn\">")
@@ -524,7 +526,7 @@ fn project(
     let since = today.saturating_sub(RECENT_DAYS - 1);
     h.raw("<table class=\"grid\"><thead><tr><th>destination</th><th>phase</th>")
         .raw("<th class=\"num\">jobs</th><th class=\"num\">attempts</th><th>first seen</th>")
-        .raw("<th>last seen</th><th class=\"num\" title=\"The days a job first used it on, in the last 30\">days, last 30</th><th>refs</th>")
+        .raw("<th>last seen</th><th class=\"num\" title=\"The number of days in the last 30 on which a job first used it\">days, last 30</th><th>refs</th>")
         .raw("<th>latest job</th><th>also refused</th><th>under current rules</th></tr>")
         .raw("</thead><tbody>");
     for u in uses.iter().take(PAGE_ROWS) {
@@ -535,7 +537,7 @@ fn project(
         }
         if u.contact.outcome == vk_hub_proto::egress::EgressOutcome::WouldBlock {
             h.raw(" <span class=\"badge warn\" title=\"A dry-run allowlist would have blocked ")
-                .raw("it; the switch carried it.\">would block</span>");
+                .raw("it. The switch let it through.\">would block</span>");
         }
         let phase = PHASES
             .iter()
@@ -608,11 +610,12 @@ fn project(
     if let Some(more) = uses.len().checked_sub(PAGE_ROWS).filter(|n| *n > 0) {
         h.raw("<p class=\"sub\">")
             .text(more)
-            .raw(" more, used longer ago: narrow the filter to see them.</p>");
+            .raw(" more, used longer ago. Narrow the filter to see them.</p>");
     }
-    h.raw("<p class=\"sub\">Times are its nodes' clocks. Also refused: the project's rows of ")
-        .raw("the same destination on the Blocked tab, in any phase. Under current rules: as ")
-        .raw("the rules saved now would treat each of its refs, not as its jobs ran.</p>");
+    h.raw("<p class=\"sub\">Times come from the nodes' clocks. The also refused column ")
+        .raw("links the project's rows for the same destination on the Blocked tab, in any ")
+        .raw("phase. The under current rules column shows how the rules saved now would treat ")
+        .raw("each ref, not how the jobs ran.</p>");
 }
 
 /// A destination's refs, the most jobs first: `main (protected) ×12, topic ×3, 2 more`.
@@ -654,7 +657,8 @@ fn compared(
             "<span class=\"badge warn\">Outside current hub rules</span> <span class=\"sub\">no \
              rules saved</span>"
         } else {
-            "<span class=\"sub\">No saved rules: once on, the hub would allow nothing</span>"
+            "<span class=\"sub\">No saved rules. Once rules are on, the hub would allow \
+             nothing</span>"
         });
         return true;
     }
@@ -793,11 +797,13 @@ pub(super) fn caution(h: &mut Html, u: &RuleUse) {
     let dropped: u64 = u.dropped.values().sum();
     if dropped > 0 {
         h.text(dropped)
-            .raw(" contacts of these projects were not kept, past their bound. ");
+            .raw(" contacts of these projects were not kept because the projects reached ")
+            .raw("their bound. ");
     }
     if u.capped {
         h.raw("Observed traffic was read only in part. ");
     }
-    h.raw("Only placed jobs report, never gitlab-runner's. No reported use does not prove an ")
-        .raw("entry unnecessary; nothing is removed automatically.</p>");
+    h.raw("Only jobs that the hub places report, never the jobs of a node's own ")
+        .raw("gitlab-runner. An entry with no reported use may still be needed. Nothing is ")
+        .raw("removed automatically.</p>");
 }

@@ -270,7 +270,7 @@ impl Draft {
         }
         let pattern = |s: &str, what: &str| {
             if s.contains(|c: char| c.is_whitespace() || c == ',') {
-                Err(format!("{what} has no spaces or commas."))
+                Err(format!("{what} cannot contain spaces or commas."))
             } else {
                 Ok(())
             }
@@ -297,16 +297,16 @@ impl Draft {
         }
         if matches!(self.projects.as_str(), "path" | "id") && self.gitlab.is_empty() {
             return Err(
-                "Choose the GitLab instance of a project path or ID: paths and IDs \
-                        repeat across instances."
+                "Choose the GitLab instance of a project path or ID. The same paths and IDs \
+                        can exist on several instances."
                     .into(),
             );
         }
         if !self.git_ref.is_empty() {
             if self.protection != "protected" {
                 return Err(format!(
-                    "A branch or tag pattern needs \u{201c}Protected only\u{201d}: anyone who \
-                     can push can name a branch {}.",
+                    "A branch or tag pattern needs \u{201c}Protected only\u{201d}, because \
+                     anyone who can push can create a branch named {}.",
                     self.git_ref
                 ));
             }
@@ -454,10 +454,9 @@ pub(super) fn editor(h: &mut Html, d: &Draft, gitlabs: &[String], auth: &Auth) {
             .raw("_ips\" rows=\"3\" spellcheck=\"false\">")
             .text(&p.ips)
             .raw("</textarea></label><span class=\"sub\">With Allow listed destinations, ")
-            .raw("an empty list allows none of its kind. A domain also allows every host under ")
-            .raw(
-                "it; an IP range is a CIDR, optionally with <code>:port</code>.</span></fieldset>",
-            );
+            .raw("an empty list allows nothing of its kind. A domain also allows every host ")
+            .raw("under it. An IP range is a CIDR, optionally with <code>:port</code>.</span>")
+            .raw("</fieldset>");
     }
     h.raw("<label>Mode <select name=\"mode\">");
     for (mode, label) in [
@@ -521,8 +520,9 @@ fn subject_fields(h: &mut Html, d: &Draft, gitlabs: &[String]) {
     h.raw("</select></label><label>Branch or tag pattern <input type=\"text\" name=\"git_ref\" ")
         .raw("placeholder=\"release/*\" autocomplete=\"off\" value=\"")
         .text(&d.git_ref)
-        .raw("\"></label><span class=\"sub\"><code>*</code> stays within a path component, ")
-        .raw("<code>**</code> crosses them. A branch or tag pattern needs Protected only.")
+        .raw("\"></label><span class=\"sub\"><code>*</code> matches within one path ")
+        .raw("component. <code>**</code> matches across components. A branch or tag pattern ")
+        .raw("needs Protected only.")
         .raw("</span></fieldset>");
 }
 
@@ -556,7 +556,7 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
     if save && generation.is_none() {
         return Ok(message(
             StatusCode::BAD_REQUEST,
-            "A change is saved from its preview.",
+            "A change can only be saved from its preview.",
         ));
     }
     let hub = ui.hub.clone();
@@ -576,7 +576,7 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
             if old(name).is_none() {
                 return Ok(message(
                     StatusCode::NOT_FOUND,
-                    "There is no such rule: it may have been removed.",
+                    "There is no such rule. It may have been removed.",
                 ));
             }
             (Edit::Remove(name.clone()), None)
@@ -584,10 +584,10 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
         Asked::Put(d) => {
             let refused = match (d.new, old(&d.name)) {
                 (true, Some(_)) => Some(format!(
-                    "There is a rule named {} already: change it on its page.",
+                    "A rule named {} already exists. Change it on its page.",
                     d.name
                 )),
-                (false, None) => Some("There is no such rule: it may have been removed.".into()),
+                (false, None) => Some("There is no such rule. It may have been removed.".into()),
                 _ => None,
             };
             let made = match refused {
@@ -659,7 +659,7 @@ pub(in crate::ui) async fn action(req: Request<Incoming>, ui: &Ui) -> Result<Res
             Ok(see_other(&rule_href(&d.name)))
         }
         Err(e) if e.downcast_ref::<RulesChanged>().is_some() => {
-            let why = "The rules changed since your preview: preview the change again.";
+            let why = "The rules changed since your preview. Preview the change again.";
             let d = match edit {
                 Edit::Put(r) => Draft {
                     new: rules.rules.iter().all(|o| o.name != r.name),
@@ -819,19 +819,21 @@ fn preview_page(
         h.raw("<p class=\"sub\">Proposed for <a href=\"")
             .raw(super::ROW_PREFIX)
             .text(&d.from_row)
-            .raw("\">a Blocked row</a>: saved, its triage moves to Allow saved, awaiting ")
-            .raw("confirmation, if the rules as saved allow its destination to its project's ")
-            .raw("latest job.</p>");
+            .raw("\">a Blocked row</a>. If the saved rules allow the row's destination to its ")
+            .raw("project's latest job, saving moves the row's triage to Allow saved, awaiting ")
+            .raw("confirmation.</p>");
     }
     if !rules.enabled {
-        h.raw("<p class=\"callout\">Hub rules are off: saved, this change restricts nothing ")
-            .raw("until <code>[jobs] egress_rules = true</code>. Below is what it would do with ")
-            .raw("them on.</p>");
+        h.raw("<p class=\"callout\">Hub rules are off. If you save this change, it restricts ")
+            .raw(
+                "nothing until <code>[jobs] egress_rules = true</code>. Below is what it would do ",
+            )
+            .raw("with hub rules on.</p>");
     }
     if p.as_enforced {
-        h.raw("<p class=\"callout\">In dry-run this rule blocks nothing. Below is what it would ")
-            .raw("change once enforced; while hub rules are on, what jobs reach that it would ")
-            .raw("refuse is reported as Would block.</p>");
+        h.raw("<p class=\"callout\">In dry-run, this rule blocks nothing. Below is what it ")
+            .raw("would change once enforced. While hub rules are on, traffic that this rule ")
+            .raw("would refuse is reported as Would block.</p>");
     }
     if let Edit::Put(r) = edit {
         h.raw("<table class=\"kv\"><tbody>");
@@ -871,7 +873,7 @@ fn preview_page(
             Edit::Remove(_) => "Remove",
             Edit::Put(_) => "Save",
         })
-        .raw("</button> <span class=\"sub\">Saved only if the rules are as previewed.</span>")
+        .raw("</button> <span class=\"sub\">Saved only if the rules have not changed since this preview.</span>")
         .raw("</form>");
     match asked {
         Asked::Put(d) => {
@@ -906,14 +908,16 @@ fn jobs_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
     h.raw("<p class=\"sub\">From the history's latest ")
         .text(jobs_text(p.jobs_read as u64));
     if p.jobs_capped {
-        h.raw(", which holds more");
+        h.raw(" (the history holds more)");
     }
+    h.raw(".");
     if p.more_groups > 0 {
-        h.raw("; ")
+        h.raw(" ")
             .text(p.more_groups)
-            .raw(" more groups not listed");
+            .raw(" more groups are not listed.");
     }
-    h.raw(". Entries added may allow nothing new where another entry already did.</p></section>");
+    h.raw(" An added entry may allow nothing new if another entry already allowed the same ")
+        .raw("destination.</p></section>");
 }
 
 fn group_row(h: &mut Html, g: &Group, instances: Instances<&str>) {
@@ -971,8 +975,8 @@ fn group_row(h: &mut Html, g: &Group, instances: Instances<&str>) {
 fn lost_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
     h.raw("<section><h3>Observed destinations it would block</h3>");
     if p.affected.is_empty() {
-        h.raw("<p class=\"callout warn\">Insufficient evidence: no job whose access it changes ")
-            .raw("reported, so what they would lose is unknown.</p>");
+        h.raw("<p class=\"callout warn\">Not enough evidence. No affected job has reported ")
+            .raw("traffic yet, so the hub cannot tell what access they would lose.</p>");
     }
     h.raw("<ul class=\"access\">");
     for (key, label) in [("run", "Run: "), ("build", "Build: ")] {
@@ -981,28 +985,28 @@ fn lost_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
         };
         h.raw("<li>").raw(label);
         if e.complete == 0 {
-            h.raw("<span class=\"badge warn\">Insufficient evidence</span> no job whose access ")
-                .raw("it changes reported this phase completely, so what they would lose is ")
-                .raw("unknown");
+            h.raw("<span class=\"badge warn\">Insufficient evidence</span> no affected job ")
+                .raw("reported this phase completely, so the hub cannot tell what access they ")
+                .raw("would lose");
         } else {
             h.text(e.complete)
                 .raw(" of ")
                 .text(jobs_text(e.ran))
-                .raw(" whose access it changes reported this phase completely");
+                .raw(" affected by the change reported this phase completely");
         }
         h.raw("</li>");
     }
     if p.affected_unreported > 0 {
         h.raw("<li>")
             .text(jobs_text(p.affected_unreported))
-            .raw(" whose access it changes sent no report</li>");
+            .raw(" affected by the change sent no report</li>");
     }
     h.raw("</ul>");
     if p.dropped > 0 {
         h.raw("<p class=\"callout warn\">Incomplete: ")
             .text(p.dropped)
-            .raw(" destinations used by the projects whose access it changes were not kept, ")
-            .raw("past each project's bound, so they are not listed here.</p>");
+            .raw(" destinations used by the affected projects are not listed here. The hub ")
+            .raw("did not keep them because their projects reached their bound.</p>");
     }
     if p.lost.is_empty() && p.maybe_lost.is_empty() {
         h.raw("<p class=\"empty\">none of the destinations reported</p>");
@@ -1022,7 +1026,7 @@ fn lost_section(h: &mut Html, p: &Preview, instances: Instances<&str>) {
         more(h, p.more_maybe_lost);
     }
     if p.observed_capped {
-        h.raw("<p class=\"sub\">Observed traffic was read only in part: there is more than a ")
+        h.raw("<p class=\"sub\">Observed traffic was read only in part. There is more than a ")
             .raw("preview reads.</p>");
     }
     h.raw("<p class=\"sub\">From Observed traffic, as long as the job history keeps it.</p>")
@@ -1115,7 +1119,7 @@ mod tests {
         lost_section(&mut h, &Preview { dropped: 4, ..p }, Instances::None);
         let out = h.into_string();
         assert!(
-            out.contains("Incomplete: 4 destinations used by the projects whose access"),
+            out.contains("Incomplete: 4 destinations used by the affected projects are not"),
             "{out}"
         );
     }

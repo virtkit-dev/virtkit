@@ -159,8 +159,9 @@ pub(super) async fn get(q: Query, auth: &Auth, ui: &Ui) -> Result<Response<Body>
     let mut h = Html::new();
     h.raw("<h1>Egress</h1>");
     super::tabs(&mut h, Tab::Test, None);
-    h.raw("<p class=\"sub\">What a job would get, and why: each layer apart, then the result ")
-        .raw("per phase. A destination is reachable only if every layer allows it.</p>");
+    h.raw("<p class=\"sub\">What a job would get, and why. Each layer is shown separately, ")
+        .raw("then the result per phase. A destination is reachable only if every layer allows ")
+        .raw("it.</p>");
     form(&mut h, &q, &l);
     if q.asks() {
         result(&mut h, &q, &l);
@@ -292,7 +293,7 @@ fn result(h: &mut Html, q: &Query, l: &Listing) {
             });
         }
         None => {
-            h.raw("A job of no GitLab instance: only the Fallback applies to it.");
+            h.raw("A job of no GitLab instance. Only the Fallback applies to it.");
         }
     }
     if let Some(t) = &l.job {
@@ -343,7 +344,7 @@ fn cap_phase(c: &EgressCaps, phase: EgressPhase) -> Option<&HubPhase> {
 fn node_layer(h: &mut Html, q: &Query, l: &Listing) {
     h.raw("<li><strong>Node cap</strong>");
     let Some((id, n)) = node(q, l) else {
-        h.raw(": no node chosen: node limits not evaluated.</li>");
+        h.raw(": no node chosen, so node limits are not evaluated.</li>");
         return;
     };
     h.raw(" (<a href=\"/node/")
@@ -363,17 +364,17 @@ fn node_layer(h: &mut Html, q: &Query, l: &Listing) {
     let c = match reported {
         Some(NodeEgressCaps::Listed(c)) => c,
         Some(NodeEgressCaps::TooLarge) => {
-            h.raw(" <span class=\"sub\">Its caps are too large to report: node limits not ")
-                .raw("evaluated.</span></li>");
+            h.raw(" <span class=\"sub\">Its caps are too large to report, so node limits are ")
+                .raw("not evaluated.</span></li>");
             return;
         }
         Some(NodeEgressCaps::Other) => {
-            h.raw(" <span class=\"sub\">It reports its caps in a form this hub cannot read: ")
-                .raw("node limits not evaluated.</span></li>");
+            h.raw(" <span class=\"sub\">It reports its caps in a form this hub cannot read, ")
+                .raw("so node limits are not evaluated.</span></li>");
             return;
         }
         None => {
-            h.raw(" <span class=\"sub\">It does not report its caps: node limits not ")
+            h.raw(" <span class=\"sub\">It does not report its caps, so node limits are not ")
                 .raw("evaluated. A newer <code>vk</code> reports them.</span></li>");
             return;
         }
@@ -395,8 +396,8 @@ fn node_layer(h: &mut Html, q: &Query, l: &Listing) {
                 h.raw("<p class=\"sub\">The caps the job was placed under.</p>");
             }
             Some(_) => {
-                h.raw("<p class=\"sub\">The job was placed under other caps: they changed ")
-                    .raw("since.</p>");
+                h.raw("<p class=\"sub\">The job was placed under other caps. The caps have ")
+                    .raw("changed since.</p>");
             }
             None => {}
         }
@@ -434,8 +435,9 @@ fn names(h: &mut Html, list: &[String]) {
 fn hub_layer(h: &mut Html, l: &Listing, layer: &HubEgress) {
     h.raw("<li><strong>Hub rules</strong>");
     if !l.rules.enabled {
-        h.raw(" <span class=\"badge\">Off</span> <span class=\"sub\">Not enforced: as the ")
-            .raw("saved rules would apply once <code>[jobs] egress_rules = true</code>.</span>");
+        h.raw(" <span class=\"badge\">Off</span> <span class=\"sub\">Not enforced. This shows ")
+            .raw("how the saved rules would apply once <code>[jobs] egress_rules = true</code>.")
+            .raw("</span>");
     }
     h.raw("<p>Under current rules: ");
     let fallback = layer.rules == [DEFAULT_RULE];
@@ -563,11 +565,11 @@ fn unreachable_text(
 fn job_layer(h: &mut Html, l: &Listing, layer: &HubEgress, caps: Option<&EgressCaps>) {
     h.raw("<li><strong>Job restriction</strong>");
     let Some(t) = &l.job else {
-        h.raw(": not known: its CI configuration decides it.</li>");
+        h.raw(": not known. The job's CI configuration decides it.</li>");
         return;
     };
     let Some(ci) = &t.spec else {
-        h.raw(": not known: the job's spec is no longer kept.</li>");
+        h.raw(": not known, because the job's spec is no longer kept.</li>");
         return;
     };
     let mut any = false;
@@ -613,7 +615,8 @@ fn job_layer(h: &mut Html, l: &Listing, layer: &HubEgress, caps: Option<&EgressC
     }
     if narrowing::dry_run_requested(&ci.variables) {
         h.raw("<p class=\"sub\"><code>MICROVM_EGRESS_DRY_RUN</code> asks for a dry-run run ")
-            .raw("phase, which the node grants only where its cap restricts no run phase.</p>");
+            .raw("phase. The node grants it only if the node's cap does not restrict the run ")
+            .raw("phase.</p>");
     }
     if !services.is_empty() {
         h.raw("<p class=\"sub\">").raw(SERVICES_OWN).raw("</p>");
@@ -628,18 +631,19 @@ fn job_layer(h: &mut Html, l: &Listing, layer: &HubEgress, caps: Option<&EgressC
             .raw(label)
             .raw(": ")
             .node(&warned.join(", "))
-            .raw(". The node keeps them and warns of them; that layer refuses what they list")
+            .raw(". The node keeps these entries and warns about them. When the job runs, ")
+            .raw("the layer named beside each entry refuses what it lists")
             .raw(if l.rules.enabled {
-                " when the job runs.</p>"
+                ".</p>"
             } else {
-                " when the job runs, a hub rule's once hub rules are on.</p>"
+                ". The hub's rules do so only once hub rules are on.</p>"
             });
     }
-    h.raw("<p class=\"sub\">The node's cap, the hub's rules and the job's own lists are each ")
-        .raw("checked on its own when the job runs: a destination is reachable only if every one ")
-        .raw("allows it. Within each, a dimension not declared allows none once the other is. An ")
-        .raw("invalid entry fails the job; one outside a layer above is kept, and the node warns ")
-        .raw("of it.</p></li>");
+    h.raw("<p class=\"sub\">When the job runs, the node checks its cap, the hub's rules and ")
+        .raw("the job's own lists separately. A destination is reachable only if all of them ")
+        .raw("allow it. Within each layer, once one dimension (domains or IP ranges) is ")
+        .raw("declared, an undeclared dimension allows nothing. An invalid entry fails the job. ")
+        .raw("An entry outside a layer above is kept, and the node warns about it.</p></li>");
 }
 
 /// The invalid entries of the job's declarations of `phase`, and in the run phase its services',
@@ -773,9 +777,9 @@ fn says_text(says: &Says, dimension: &str) -> String {
         Says::Allows(v) => format!("Allowed by {v}"),
         Says::Refuses(v) => format!("Blocked by {v}"),
         Says::Undeclared { declared, by_name } => format!(
-            "Blocked: only {declared} is declared, so its VM may reach no {dimension}{}",
+            "Blocked: only {declared} is declared, so its VM can reach no {dimension}{}",
             if *by_name {
-                " but what a declared name's lookup resolved to"
+                " except what a declared name's lookup resolved to"
             } else {
                 ""
             }
@@ -978,14 +982,14 @@ fn outcome(
                         .raw("<span class=\"sub\">")
                         .text(capital(&unknown.join(" and ")))
                         .raw(if unknown.len() == 1 { " is" } else { " are" })
-                        .raw(" not known; overall reachability cannot be determined.</span>");
+                        .raw(" not known, so overall reachability cannot be determined.</span>");
                 }
                 _ => {
                     h.raw("<span class=\"badge\">Allowed by every layer</span>");
                 }
             }
             if !l.rules.enabled && matches!(hub_verdict, Verdict::Outside) {
-                h.raw(" <span class=\"sub\">Hub rules on, it would be blocked by them.</span>");
+                h.raw(" <span class=\"sub\">With hub rules on, they would block it.</span>");
             }
             h.raw("</td></tr>");
         }
@@ -1005,6 +1009,6 @@ fn dry_run_summaries(h: &mut Html, layer: &HubEgress, phase: EgressPhase) {
 }
 
 /// What the page says of services declaring their own filter.
-const SERVICES_OWN: &str = "A service that declares its own lists is held to them as well as to \
-     the job's, each checked on its own: it may reach only what both allow. Services that \
-     declare none are held to the job's alone.";
+const SERVICES_OWN: &str = "A service with its own lists must pass both its own lists and the \
+     job's. It can reach only what both allow. A service without its own lists must pass only the \
+     job's lists.";
