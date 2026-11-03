@@ -1,0 +1,111 @@
+virtiofs: queue a request the full virtqueue refused under the ring lock
+
+A request virtqueue_add_sgs() refuses with -ENOSPC goes to the queue's
+queued_reqs list, from where virtio_fs_requests_done_work() has
+dispatch_work resend it once completions have made room: nothing else
+ever looks at that list. virtio_fs_enqueue_req() dropped fsvq->lock
+before returning the error, and virtio_fs_send_req() and
+virtio_fs_request_dispatch_work() took it again to queue the request.
+If done_work runs entirely in that window, it reaps every completion,
+empties the ring, finds queued_reqs empty and schedules nothing. The
+request is then queued with nothing in flight and waits until another
+request on the same queue completes. The sender can be interrupted in
+that window; host contention that delays its vCPU widens the window.
+
+CI jobs blocked for hours in a lone READDIR from a parallel tree walker
+over an overlayfs whose lower layer is the virtio-fs share. Overlay
+lists a merged directory with an unbounded count, so each READDIR
+carries a max_pages buffer of order-0 pages: 259 descriptors with
+max_pages at 256, and four concurrent listings overflow a 1024-entry
+ring without INDIRECT_DESC. The device was idle; any further request
+on the share freed the blocked request.
+send_forget_request() already queues a refused FORGET under the lock
+held during submission. Queue requests under that lock too, so
+done_work's reap and queued_reqs check, which both take the lock,
+cannot both run between the failed add and queueing. The callers
+return on -ENOSPC instead of queueing.
+
+Once queued and unlocked, the request belongs to dispatch_work, which
+may resend and end it before virtio_fs_enqueue_req() returns. Free the
+bounce buffer before queueing and leave the request untouched on
+-ENOSPC. dispatch_work allocates a new bounce buffer on resend.
+
+Fixes: 106e4df1206b ("virtio-fs: improved request latencies when Virtio queue is full")
+
+Candidate for upstream submission; carried here until then. Re-check
+applicability on every kernel bump (fs/fuse/virtio_fs.c,
+virtio_fs_enqueue_req, virtio_fs_send_req,
+virtio_fs_request_dispatch_work).
+
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -593,12 +593,9 @@ static void virtio_fs_request_dispatch_work(struct work_struct *work)
+ 		ret = virtio_fs_enqueue_req(fsvq, req, true, GFP_KERNEL);
+ 		memalloc_nofs_restore(flags);
+ 		if (ret < 0) {
+-			if (ret == -ENOSPC) {
+-				spin_lock(&fsvq->lock);
+-				list_add_tail(&req->list, &fsvq->queued_reqs);
+-				spin_unlock(&fsvq->lock);
++			/* Still full: queued again, retried on the next completion. */
++			if (ret == -ENOSPC)
+ 				return;
+-			}
+ 			req->out.h.error = ret;
+ 			spin_lock(&fsvq->lock);
+ 			dec_in_flight_req(fsvq);
+@@ -1438,6 +1435,22 @@ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
+ 	vq = fsvq->vq;
+ 	ret = virtqueue_add_sgs(vq, sgs, out_sgs, in_sgs, req, GFP_ATOMIC);
+ 	if (ret < 0) {
++		if (ret == -ENOSPC) {
++			/*
++			 * Virtqueue full: queue the request for dispatch_work
++			 * under this lock. done_work reaps and then checks
++			 * queued_reqs under it too, so it either sees this
++			 * request or a later completion reschedules
++			 * dispatch_work. Once the lock is dropped, dispatch_work
++			 * may resend and end the request: free its bounce
++			 * buffer now and leave req alone from here on.
++			 */
++			kfree(req->argbuf);
++			req->argbuf = NULL;
++			list_add_tail(&req->list, &fsvq->queued_reqs);
++			if (!in_flight)
++				inc_in_flight_req(fsvq);
++		}
+ 		spin_unlock(&fsvq->lock);
+ 		goto out;
+ 	}
+@@ -1462,7 +1475,7 @@ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
+ 		virtqueue_notify(vq);
+ 
+ out:
+-	if (ret < 0 && req->argbuf) {
++	if (ret < 0 && ret != -ENOSPC && req->argbuf) {
+ 		kfree(req->argbuf);
+ 		req->argbuf = NULL;
+ 	}
+@@ -1497,17 +1510,12 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 	fsvq = &fs->vqs[queue_id];
+ 	ret = virtio_fs_enqueue_req(fsvq, req, false, GFP_ATOMIC);
+ 	if (ret < 0) {
+-		if (ret == -ENOSPC) {
+-			/*
+-			 * Virtqueue full. Retry submission from worker
+-			 * context as we might be holding fc->bg_lock.
+-			 */
+-			spin_lock(&fsvq->lock);
+-			list_add_tail(&req->list, &fsvq->queued_reqs);
+-			inc_in_flight_req(fsvq);
+-			spin_unlock(&fsvq->lock);
++		/*
++		 * Virtqueue full: queued for retry from worker context
++		 * because the caller might hold fc->bg_lock.
++		 */
++		if (ret == -ENOSPC)
+ 			return;
+-		}
+ 		req->out.h.error = ret;
+ 		pr_err("virtio-fs: virtio_fs_enqueue_req() failed %d\n", ret);
+ 

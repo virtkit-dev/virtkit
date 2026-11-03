@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A job no longer hangs on its shared checkout when a burst of file accesses fills the
+  VM's request queue.** If the queue emptied before a refused request was queued for retry,
+  the job stalled until something else used the share or it timed out. Refused requests
+  are now always resent once the queue has room.
 - **A job blocked on its shared checkout recovers in more cases.** Another missed
   notification of a host reply is now detected: the request completes within about
   20 seconds instead of blocking the job until it times out, and the job reports a
