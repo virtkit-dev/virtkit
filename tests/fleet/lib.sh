@@ -172,6 +172,9 @@ hub_start() {
 
 hub_kill() {
   "$VK" exec "$RUN" -- sh -c "kill -9 \$(pidof $HUB_BIN)"
+  # kill returns before the process is gone, and until then its admin socket answers: a hub
+  # started meanwhile refuses the data directory as served.
+  wait_for 30 "$VK" exec "$RUN" -- sh -c "! pidof $HUB_BIN" || fail "$HUB_BIN outlived kill -9"
 }
 
 # hub_audit <id>: node <id>'s lines of the audit log.
