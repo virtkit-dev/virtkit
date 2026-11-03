@@ -3599,8 +3599,9 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
     id
 }
 
-/// `/updates` lists the releases, signed or not, and the rollouts node by node, what nodes
-/// said as text, live; a viewer's page has no buttons and no CSRF token.
+/// `/updates` lists the releases, signed or not, and the rollouts under way node by node, live,
+/// what nodes said as text; `/updates/rollouts` lists every rollout. A viewer's pages have no
+/// buttons and no CSRF token.
 #[tokio::test(flavor = "multi_thread")]
 async fn releases_and_rollouts_are_shown_live() {
     let (addr, hub, _) = start_fleet().await;
@@ -3612,10 +3613,12 @@ async fn releases_and_rollouts_are_shown_live() {
         "{}",
         page.body
     );
+    let history = get(addr, "/updates/rollouts", Some(&viewer)).await;
+    assert_eq!(history.status, 200, "{}", history.body);
     assert!(
-        page.body.contains("<code>vk-hub rollout create</code>"),
+        history.body.contains("<code>vk-hub rollout create</code>"),
         "{}",
-        page.body
+        history.body
     );
 
     let hostile = "ci<script>alert(1)</script>";
@@ -3626,8 +3629,9 @@ async fn releases_and_rollouts_are_shown_live() {
     for want in [
         "<nav class=\"subnav\" aria-label=\"Nodes\"><a href=\"/\">Compute</a>\
          <a href=\"/registries\">Storage</a><a href=\"/relays\">GitLab adapters</a>\
-         <a href=\"/updates\" aria-current=\"page\">Updates</a></nav>",
-        "sse-connect=\"/events/operations\"",
+         <a href=\"/updates\" aria-current=\"page\">Updates</a>\
+         <a href=\"/updates/rollouts\">Rollouts</a></nav>",
+        "sse-connect=\"/events/updates\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
         "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
         "<td>0.86.0</td><td>3.0 MiB</td><td>yes</td>",
@@ -3649,11 +3653,21 @@ async fn releases_and_rollouts_are_shown_live() {
     assert!(!page.body.contains("hx-headers"), "{}", page.body);
     assert!(!page.body.contains("start-rollout"), "{}", page.body);
 
-    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let mut events = Events::open(addr, "/events/updates", &viewer).await;
     let first = events.next().await.unwrap();
-    assert!(first.starts_with("event: operations\ndata: "), "{first}");
-    assert!(!first.contains("hx-post"), "{first}");
-    assert!(!first.contains("start-rollout"), "{first}");
+    assert!(first.starts_with("event: updates\ndata: "), "{first}");
+    // Every part, without a control.
+    let parts = events_until(&mut events, "event: update-tools\n").await;
+    assert!(
+        parts[0].starts_with("event: update-peers\n")
+            && parts[1].starts_with("event: update-nodes\n"),
+        "{parts:?}"
+    );
+    assert!(parts[1].contains(">running<"), "{parts:?}");
+    for part in std::iter::once(&first).chain(&parts) {
+        assert!(!part.contains("hx-post"), "{part}");
+        assert!(!part.contains("start-rollout"), "{part}");
+    }
     // A release removed and a rollout steered, by the operations the admin socket runs,
     // reach a viewer's page.
     assert!(crate::releases::remove(&hub, "uid 0", &"cd".repeat(32)).unwrap());
@@ -3666,9 +3680,107 @@ async fn releases_and_rollouts_are_shown_live() {
         }
     }
     assert!(gone, "release 0.86.0 still shown");
+    // Ended, it leaves `/updates` for the history alone.
+    let mut history = Events::open(addr, "/events/rollouts", &viewer).await;
+    let first = history.next().await.unwrap();
+    assert!(first.starts_with("event: rollouts\ndata: "), "{first}");
+    assert!(first.contains(">running<"), "{first}");
+    assert!(!first.contains("hx-post"), "{first}");
     crate::ops::steer_rollout(&hub, "uid 0", &id, crate::rollout::RolloutAction::Abort).unwrap();
-    let next = next_with(&mut events, ">aborted<").await;
+    let next = next_with(&mut history, ">aborted<").await;
     assert!(next.contains("aborted by uid 0"), "{next}");
+    // And leaves an open Updates page.
+    let heading = format!("<code>{}</code> vk 0.85.0", &id[..8]);
+    loop {
+        let nodes = next_with(&mut events, "event: update-nodes\n").await;
+        if !nodes.contains(&heading) {
+            break;
+        }
+    }
+    let page = get(addr, "/updates", Some(&viewer)).await;
+    assert!(!page.body.contains(&heading), "{}", page.body);
+}
+
+/// An old Updates page reconnecting to `/events/operations` is told to reload. A session's end
+/// on `/updates` and `/updates/rollouts` shows pinned to the window, wherever the page is
+/// scrolled.
+#[tokio::test(flavor = "multi_thread")]
+async fn updates_streams_tell_old_pages_to_reload_and_pin_a_session_end() {
+    let (addr, hub, origin) = start_fleet().await;
+    let (viewer, csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut old = Events::open(addr, "/events/operations", &viewer).await;
+    let first = old.next().await.unwrap();
+    assert!(first.starts_with("event: operations\ndata: "), "{first}");
+    assert!(
+        first.contains("<a href=\"/updates\">reload it</a>"),
+        "{first}"
+    );
+    drop(old);
+
+    for page in ["/updates", "/updates/rollouts"] {
+        let body = get(addr, page, Some(&viewer)).await.body;
+        assert!(
+            body.contains("sse-close=\"close\"><div id=\"live-end\" sse-swap=\"live-end\"></div>"),
+            "{page}: {body}"
+        );
+    }
+    let mut updates = live(addr, "/events/updates", &viewer).await;
+    let mut rollouts = live(addr, "/events/rollouts", &viewer).await;
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[&format!("Cookie: {viewer}"), &format!("Origin: {origin}")],
+        &format!("_csrf={csrf}"),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    for stream in [&mut updates, &mut rollouts] {
+        let last = next_with(stream, "Signed out").await;
+        assert!(last.starts_with("event: live-end\n"), "{last}");
+        assert_eq!(
+            stream.next().await.as_deref(),
+            Some("event: close\ndata: \n\n")
+        );
+    }
+}
+
+/// `/updates` lists the releases, the fetch form above them and the upload folded behind a
+/// button, then the nodes as the hub, adapters and registries are listed — each with what the
+/// newest rollout to reach it did — and the rollout form under them, then the CI tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_updates_page_lists_nodes_and_folds_the_upload() {
+    let (addr, hub, _) = start_fleet().await;
+    let id = rollout_of(&hub, "ci-1");
+    let node = hub.db.nodes().unwrap()[0].0.clone();
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let body = get(addr, "/updates", Some(&operator)).await.body;
+    let at = |what: &str| body.find(what).expect(what);
+    assert!(at("<h2>Releases</h2>") < at("<div id=\"updates\" sse-swap=\"updates\">"));
+    assert!(
+        at("<div id=\"updates\" sse-swap=\"updates\">")
+            < at("<details class=\"upload\"><summary class=\"button\">Upload a binary</summary>")
+    );
+    assert!(at("Upload a binary") < at("<section><h2>Nodes</h2>"));
+    assert!(at("<section><h2>Nodes</h2>") < at("<th>NODE</th>"));
+    assert!(at("<th>LAST UPDATE</th>") < at("id=\"start-rollout\""));
+    assert!(at("id=\"start-rollout\"") < at("href=\"/updates/rollouts\">Rollout history</a>"));
+    assert!(at("Rollout history") < at("<h2>CI tools</h2>"));
+    let row = format!(
+        "<a href=\"/node/{node}\">ci-1</a></td><td>-</td>\
+         <td><span class=\"badge bad\">Offline</span></td><td>by rollout</td>\
+         <td>to 0.85.0: <span class=\"reason\">failed</span>: refused: ci-1 \
+         (rollout <code>{}</code>)</td>",
+        &id[..8]
+    );
+    assert!(body.contains(&row), "{row}: {body}");
+    // The rollout under way, under the nodes.
+    assert!(at("<th>LAST UPDATE</th>") < at(&format!("<code>{}</code> vk 0.85.0", &id[..8])));
+    // A viewer has neither form.
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let body = get(addr, "/updates", Some(&viewer)).await.body;
+    assert!(!body.contains("Upload a binary"), "{body}");
+    assert!(body.contains(&row), "{row}: {body}");
 }
 
 /// Placed jobs have a tab of their own, right after the nodes, and `/updates` no longer
@@ -5530,10 +5642,13 @@ async fn the_rollout_form_follows_what_it_offers() {
     let page = get(addr, "/updates", Some(&operator)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     let form = rollout_form_id(&page.body);
-    // The section and the fragment are inside the element setting the header.
+    // The form, under the nodes, and the parts are inside the element setting the header.
     let at = |what: &str| page.body.find(what).expect(what);
-    assert!(at("hx-headers=") < at("<section id=\"start-rollout\" sse-swap=\"start-rollout\">"));
-    assert!(at("id=\"start-rollout\"") < at("<div id=\"operations\" sse-swap=\"operations\">"));
+    assert!(at("hx-headers=") < at("<div id=\"updates\" sse-swap=\"updates\">"));
+    assert!(at("<div id=\"update-nodes\" sse-swap=\"update-nodes\">") < at("id=\"start-rollout\""));
+    assert!(
+        at("<div id=\"start-rollout\" sse-swap=\"start-rollout\">") < at("id=\"update-tools\"")
+    );
     assert!(
         page.body.ends_with("</div></div></main></body></html>"),
         "{}",
@@ -5544,12 +5659,12 @@ async fn the_rollout_form_follows_what_it_offers() {
     assert!(section.contains("hx-preserve=\"true\""), "{section}");
     assert!(!section.contains("name=\"select\""), "{section}");
 
-    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let mut live = Events::open(addr, "/events/updates", &operator).await;
     let first = live.next().await.unwrap();
-    assert!(first.starts_with("event: operations\ndata: "), "{first}");
-    let offered = live.next().await.unwrap();
+    assert!(first.starts_with("event: updates\ndata: "), "{first}");
+    let offered = next_with(&mut live, "event: start-rollout\n").await;
     assert!(
-        offered.starts_with("event: start-rollout\ndata: <h2>Start a rollout</h2>"),
+        offered.starts_with("event: start-rollout\ndata: <h3>Start a rollout</h3>"),
         "{offered}"
     );
     assert_eq!(rollout_form_id(&offered), form, "{offered}");
@@ -5577,7 +5692,7 @@ async fn the_rollout_form_follows_what_it_offers() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(reply.body.contains("Start this rollout?"), "{}", reply.body);
 
-    // A rollout steered changes the fragment, not the form: it is not sent again.
+    // Steering a rollout changes the nodes' part without sending the form again.
     crate::ops::steer_rollout(
         &hub,
         "uid 0",
@@ -5595,11 +5710,12 @@ async fn the_rollout_form_follows_what_it_offers() {
     .unwrap();
     seen.extend(events_until(&mut live, ">running<").await);
     assert!(
-        seen.iter().all(|e| e.starts_with("event: operations\n")),
+        seen.iter()
+            .all(|e| !e.starts_with("event: start-rollout\n")),
         "{seen:?}"
     );
     // A stream of its own still starts with the form: what one stream left out is per stream.
-    let mut other = Events::open(addr, "/events/operations", &operator).await;
+    let mut other = Events::open(addr, "/events/updates", &operator).await;
     let again = next_with(&mut other, "event: start-rollout\n").await;
     assert_eq!(rollout_form_id(&again), form, "{again}");
     drop(other);
@@ -5640,7 +5756,7 @@ async fn the_rollout_section_says_live_what_a_rollout_lacks() {
     let section = page.body.split("id=\"start-rollout\"").nth(1).unwrap();
     assert!(section.contains("Add a vk release first."), "{section}");
 
-    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let mut live = Events::open(addr, "/events/updates", &operator).await;
     let first = next_with(&mut live, "event: start-rollout\n").await;
     assert!(first.contains("Add a vk release first."), "{first}");
 
@@ -5691,11 +5807,19 @@ async fn an_operator_steers_a_rollout_from_operations() {
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
-    // The fragment, shared by every operator's page, carries no session's token.
-    let fragment = page.body.split("id=\"operations\"").nth(1).unwrap();
+    // The nodes' part, shared by every operator's page, carries no session's token.
+    let fragment = page.body.split("id=\"update-nodes\"").nth(1).unwrap();
+    let fragment = fragment.split("id=\"start-rollout\"").next().unwrap();
     assert!(!fragment.contains(&csrf), "{fragment}");
 
-    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let nodes = next_with(
+        &mut Events::open(addr, "/events/updates", &operator).await,
+        "event: update-nodes\n",
+    )
+    .await;
+    assert!(nodes.contains("hx-post"), "{nodes}");
+    // The history follows it too, and keeps it once ended.
+    let mut live = Events::open(addr, "/events/rollouts", &operator).await;
     let first = live.next().await.unwrap();
     assert!(first.contains("hx-post"), "{first}");
 
@@ -5760,7 +5884,8 @@ async fn an_operator_steers_a_rollout_from_operations() {
     assert_eq!(state(), RolloutState::Running);
     let reply = steer(&format!("_csrf={csrf}&op=abort"), false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/updates"));
+    // To the history, which still lists it, ended.
+    assert_eq!(reply.header("location"), Some("/updates/rollouts"));
     assert!(matches!(state(), RolloutState::Aborted { .. }));
     let aborted = next_with(&mut live, ">aborted<").await;
     // Its nodes were refused or never started: deleting it is all that is left.
@@ -5809,7 +5934,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
                 .steer_rollout(&id, action, "uid 0", crate::now_secs())
                 .unwrap();
         }
-        let page = get(addr, "/updates", Some(&operator)).await;
+        let page = get(addr, "/updates/rollouts", Some(&operator)).await;
         assert!(!page.body.contains(button), "{}", page.body);
         let reply = post_action(addr, &origin, &operator, &path(&id), &delete, true).await;
         assert_eq!(reply.status, 409, "{}", reply.body);
@@ -5825,16 +5950,16 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     hub.db
         .steer_rollout(&id, RolloutAction::Abort, "uid 0", crate::now_secs())
         .unwrap();
-    let page = get(addr, "/updates", Some(&operator)).await;
+    let page = get(addr, "/updates/rollouts", Some(&operator)).await;
     assert!(page.body.contains(button), "{}", page.body);
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/updates", Some(&viewer)).await;
+    let page = get(addr, "/updates/rollouts", Some(&viewer)).await;
     assert!(!page.body.contains(button), "{}", page.body);
     let form = format!("_csrf={viewer_csrf}&op=delete");
     let reply = post_action(addr, &origin, &viewer, &path(&id), &form, true).await;
     assert_eq!(reply.status, 403, "{}", reply.body);
 
-    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let mut live = Events::open(addr, "/events/rollouts", &operator).await;
     let first = live.next().await.unwrap();
     assert!(first.contains(&heading(&id)), "{first}");
     let reply = post_action(addr, &origin, &operator, &path(&id), &delete, true).await;
@@ -5863,7 +5988,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     assert!(hub.db.rollout(&id).unwrap().is_none());
     let gone = next_with(&mut live, "none yet").await;
     assert!(!gone.contains(&heading(&id)), "{gone}");
-    let page = get(addr, "/updates", Some(&operator)).await;
+    let page = get(addr, "/updates/rollouts", Some(&operator)).await;
     assert!(!page.body.contains(&heading(&id)), "{}", page.body);
     let line = format!("{principal} deleted rollout {} of vk 0.85.0", &id[..8]);
     let audit: Vec<String> = hub
@@ -5933,7 +6058,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
         hub.db
             .create_rollout(&kept, &ended(state, status), "uid 0")
             .unwrap();
-        let page = get(addr, "/updates", Some(&operator)).await;
+        let page = get(addr, "/updates/rollouts", Some(&operator)).await;
         assert!(page.body.contains(&heading(&kept)), "{}", page.body);
         assert!(!page.body.contains(&path(&kept)), "{}", page.body);
         let reply = post_action(addr, &origin, &operator, &path(&kept), &delete, true).await;
@@ -5948,7 +6073,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
     let expired = "b0".repeat(16);
     let row = ended(aborted(), failed("the update expired before it ran", false));
     hub.db.create_rollout(&expired, &row, "uid 0").unwrap();
-    let page = get(addr, "/updates", Some(&operator)).await;
+    let page = get(addr, "/updates/rollouts", Some(&operator)).await;
     assert!(page.body.contains(&path(&expired)), "{}", page.body);
     let reply = post_action(addr, &origin, &operator, &path(&expired), &delete, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -7875,7 +8000,7 @@ async fn an_operator_fetches_a_release_from_github() {
     for want in [
         "action=\"/releases/fetch\" hx-post=\"/releases/fetch\"",
         "<input name=\"version\" value=\"latest\"",
-        "<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>",
+        "<button class=\"primary\" name=\"op\" value=\"fetch\">Fetch from GitHub</button>",
         &format!("From <code>{api}/virtkit-dev/virtkit</code>"),
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
@@ -8185,7 +8310,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
 async fn a_live_page_s_stream_ends_as_the_hub_hands_over() {
     let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let mut events = Events::open(addr, "/events/updates", &viewer).await;
     assert!(events.next().await.is_some());
     hub.handover.gate.close();
     while let Some(event) = events.next().await {
@@ -8389,7 +8514,7 @@ async fn an_operator_updates_a_registry_from_the_updates_page() {
     }
     assert!(hub.db.registry_commands(&id).unwrap().is_empty());
     let answer = posted_form(&reply.body, "update", 0);
-    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let mut events = Events::open(addr, "/events/updates", &viewer).await;
     let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
@@ -8651,7 +8776,7 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     }
     assert!(hub.db.relay_commands(&id).unwrap().is_empty());
     let answer = posted_form(&reply.body, "update", 0);
-    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let mut events = Events::open(addr, "/events/updates", &viewer).await;
     let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(

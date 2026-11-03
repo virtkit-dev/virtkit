@@ -627,17 +627,31 @@ fn plan_detail(plan: &RolloutPlan, release: &Release, nodes: &[RolloutNode]) -> 
     h
 }
 
-/// An operator's forms on `/updates`, outside the live fragment so an update never clears
-/// one being filled in: upload a release and fetch one. Then the section that starts a
-/// rollout, which the page's stream keeps current on its own ([`start_rollout`]).
-pub(super) fn forms(
-    h: &mut Html,
-    auth: &Auth,
-    releases: &[Release],
-    nodes: &[NodeView],
-    source: Option<&str>,
-) {
-    h.raw("<section><h2>Add a release</h2><form class=\"wide\" method=\"post\" action=\"")
+/// The form that fetches a release from `source`, on an operator's `/updates`.
+pub(super) fn fetch_form(h: &mut Html, auth: &Auth, source: &str) {
+    h.raw("<form class=\"wide\" method=\"post\" action=\"")
+        .raw(FETCH_PATH)
+        .raw("\" hx-post=\"")
+        .raw(FETCH_PATH)
+        .raw("\" hx-swap=\"none\">");
+    csrf_field(h, auth);
+    program_select(h, true);
+    h.raw("<label>Version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
+        .raw("<button class=\"primary\" name=\"op\" value=\"fetch\">Fetch from GitHub</button>")
+        .raw("<button name=\"op\" value=\"check\">Check the latest</button></form>")
+        .raw("<p class=\"sub\">From <code>")
+        .text(source)
+        .raw(
+            "</code>. The hub keeps the program's binary only if it matches the sha256 \
+               published beside it. The release is kept unsigned.</p>",
+        );
+}
+
+/// The form that uploads a release, on an operator's `/updates`: folded behind a button, as
+/// fetching is the usual way.
+pub(super) fn upload_form(h: &mut Html, auth: &Auth) {
+    h.raw("<details class=\"upload\"><summary class=\"button\">Upload a binary</summary>")
+        .raw("<form class=\"wide\" method=\"post\" action=\"")
         .raw(UPLOAD_PATH)
         .raw("\" enctype=\"multipart/form-data\">");
     // Before the file: the hub checks them before it writes a byte of it.
@@ -654,31 +668,8 @@ pub(super) fn forms(
         .text(pages::bytes(MIN_RATE))
         .raw(
             "/s or faster. The hub checks that the file is an x86-64 ELF binary that contains \
-               its own version string. The node or registry then runs it.</p>",
+               its own version string. The node or registry then runs it.</p></details>",
         );
-    if let Some(source) = source {
-        h.raw("<form class=\"wide\" method=\"post\" action=\"")
-            .raw(FETCH_PATH)
-            .raw("\" hx-post=\"")
-            .raw(FETCH_PATH)
-            .raw("\" hx-swap=\"none\">");
-        csrf_field(h, auth);
-        program_select(h, true);
-        h.raw("<label>Version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
-            .raw("<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>")
-            .raw("<button name=\"op\" value=\"check\">Check the latest</button></form>")
-            .raw("<p class=\"sub\">From <code>")
-            .text(source)
-            .raw(
-                "</code>. The hub keeps the program's binary only if it matches the sha256 \
-                   published beside it. The release is kept unsigned.</p>",
-            );
-    }
-    h.raw("</section><section id=\"start-rollout\" sse-swap=\"")
-        .raw(START_ROLLOUT)
-        .raw("\">");
-    start_rollout(h, releases, nodes, Some(&auth.csrf));
-    h.raw("</section>");
 }
 
 /// The fetch form's choice of every [`Program`] at once.
@@ -707,7 +698,7 @@ fn program_select(h: &mut Html, all: bool) {
 /// The event an operator's `/updates` stream sends the form that starts a rollout as.
 pub(super) const START_ROLLOUT: &str = "start-rollout";
 
-/// Render `<section id="start-rollout">`: the rollout form, or why it is unavailable.
+/// Render what `<div id="start-rollout">` holds: the rollout form, or why it is unavailable.
 /// An operator's `/updates` stream sends it as [`START_ROLLOUT`] on connect and when
 /// its choices change: a vk release added or removed, a node enrolled, renamed or removed.
 /// The shared copy omits `csrf` and posts with the page's `hx-headers` token. The form's ID
@@ -718,7 +709,7 @@ pub(super) fn start_rollout(
     nodes: &[NodeView],
     csrf: Option<&str>,
 ) {
-    h.raw("<h2>Start a rollout</h2>");
+    h.raw("<h3>Start a rollout</h3>");
     // A rollout updates nodes, so only to a vk release.
     let releases: Vec<&Release> = releases.iter().filter(|r| r.row.is(Program::Vk)).collect();
     let nodes: Vec<&NodeView> = nodes
@@ -796,7 +787,7 @@ pub(super) fn start_rollout(
 }
 
 /// The fetch under way or last ended, and the latest release last asked about: a line of
-/// `/updates`' live fragment.
+/// `/updates`' releases part.
 pub(super) fn fetch_line(
     h: &mut Html,
     status: Option<&FetchStatus>,

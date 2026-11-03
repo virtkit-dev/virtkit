@@ -119,9 +119,9 @@ p { margin: var(--s2) 0; }
 .who .until { color: var(--muted); font-size: 0.9em; }
 
 main { padding: var(--s5); max-width: 110rem; margin: 0 auto; }
-main > section, main > div > section, #detail > section, #operations > section,
-#clients > section, #gitlab-servers > section, #gitlab-server > section, #relays > section,
-.rollout {
+main > section, main > div > section, #detail > section, #update-peers > section,
+#update-tools > section, #clients > section, #gitlab-servers > section,
+#gitlab-server > section, #relays > section, .rollout {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -370,7 +370,7 @@ pre.log .cut { display: block; color: var(--log-muted); padding-left: calc(4.5em
 
 /* Controls. */
 button, input, select { font: inherit; color: inherit; }
-button, a.button {
+button, a.button, summary.button {
   padding: 0.3rem 0.85rem;
   border-radius: 6px;
   border: 1px solid var(--line);
@@ -380,8 +380,14 @@ button, a.button {
   cursor: pointer;
   white-space: nowrap;
 }
-button:hover, a.button:hover { background: var(--raised); }
+button:hover, a.button:hover, summary.button:hover { background: var(--raised); }
 a.button { display: inline-block; text-decoration: none; }
+/* The release upload, opened from a button. */
+summary.button { display: inline-block; list-style: none; }
+summary.button::-webkit-details-marker { display: none; }
+details.upload { margin-top: var(--s3); }
+details.upload[open] > summary.button { background: var(--raised); }
+details.upload > form { margin-top: var(--s3); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 button.primary:hover { filter: brightness(1.08); }
 button.secondary { background: transparent; }
@@ -456,9 +462,9 @@ ol.layers > li + li { margin-top: var(--s3); }
 
 /* What an action said, or the question it asks first: pinned to the bottom of the window,
    wherever the button was, until dismissed or replaced. A long one, such as a rollout's plan,
-   scrolls within. */
-#flash:empty { display: none; }
-#flash {
+   scrolls within. A live page's session end shows there too. */
+#flash:empty, #live-end:empty { display: none; }
+#flash, #live-end {
   position: fixed;
   bottom: var(--s4);
   left: 50%;
@@ -511,8 +517,8 @@ ol.layers > li + li { margin-top: var(--s3); }
   .topbar { padding: var(--s2) var(--s4); gap: var(--s2); }
   .who .until { display: none; }
   main { padding: var(--s3); }
-  main > section, main > div > section, #detail > section, #operations > section,
-  .rollout { padding: var(--s3); }
+  main > section, main > div > section, #detail > section, #update-peers > section,
+  #update-tools > section, .rollout { padding: var(--s3); }
   table.grid { display: block; overflow-x: auto; }
   /* The jobs table keeps its fixed layout; its section scrolls instead, as every grid does in
      a narrow window. */

@@ -9,6 +9,11 @@ All notable changes to virtkit will be documented in this file.
 - **Confirmations stay in view.** Questions show at the bottom of the window, wherever the
   button was, with a Cancel button.
 - **Updates page at `/updates`.** The old `/operations` links redirect there.
+- **Updates page regrouped.** Fetch sits with the release list; upload opens from a button.
+  The hub, GitLab adapters, registries and nodes show their versions and last updates in
+  matching tables, and a rollout starts under the nodes.
+- **Rollouts tab.** The rollout history moved to a tab of its own. The Updates page
+  shows only rollouts in progress.
 
 ## [0.102.2] - 2026-11-03
 

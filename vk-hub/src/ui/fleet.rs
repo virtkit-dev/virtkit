@@ -12,7 +12,7 @@
 //! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
 //! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -52,14 +52,11 @@ const TOKEN_TTLS: [(u64, &str); 4] = [
     (7 * 86_400, "7 days"),
 ];
 
-/// The rollouts `/updates` shows, newest first.
-const OPERATIONS_ROLLOUTS: usize = 10;
-
-/// What the fleet's pages keep: the nodes table, and `/updates`' fragment once for every
-/// viewer's page and once for every operator's, each rendered once for every page showing it
-/// ([`sse::feed`]). `/updates` shows releases, rollouts and registries' and relays' updates
-/// and, for an operator, the forms that start them; it follows [`Hub::touch`] alone — which
-/// also notes a node enrolled, renamed or removed, and a registry or relay connecting,
+/// What the fleet's pages keep: the nodes table, and `/updates`' and `/updates/rollouts`' parts
+/// once for every viewer's page and once for every operator's, each rendered once for every
+/// page showing it ([`sse::feed`]). `/updates` shows releases, what runs them and their
+/// updates and, for an operator, the forms that start them; both follow [`Hub::touch`] alone —
+/// which also notes a node enrolled, renamed or removed, and a registry or relay connecting,
 /// reporting or answering an update — not every node's, registry's or relay's heartbeat.
 pub(super) struct FleetSite {
     /// Pending confirmations, shared with the hub's update, which hands them over.
@@ -67,8 +64,10 @@ pub(super) struct FleetSite {
     /// Whether a release is being uploaded.
     pub(super) uploading: operations::Uploading,
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
-    operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
-    steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    updates_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    steered_updates_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    rollouts_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    steered_rollouts_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     /// `/jobs`' newest pages, by filter.
     jobs: Arc<super::jobs::Renders>,
     /// What `/egress`' pages and streams share.
@@ -86,13 +85,21 @@ impl FleetSite {
                 .map_or_else(Default::default, |u| u.questions.clone()),
             uploading: operations::Uploading::new(),
             nodes_feed: sse::feed(hub.subscribe(), counted_events(hub, nodes_events(hub))),
-            operations_feed: sse::feed(
+            updates_feed: sse::feed(
                 hub.subscribe_touched(),
-                counted_events(hub, operations_events(hub, false)),
+                counted_events(hub, updates_events(hub, false)),
             ),
-            steered_operations_feed: sse::feed(
+            steered_updates_feed: sse::feed(
                 hub.subscribe_touched(),
-                counted_events(hub, operations_events(hub, true)),
+                counted_events(hub, updates_events(hub, true)),
+            ),
+            rollouts_feed: sse::feed(
+                hub.subscribe_touched(),
+                counted_events(hub, rollouts_events(hub, false)),
+            ),
+            steered_rollouts_feed: sse::feed(
+                hub.subscribe_touched(),
+                counted_events(hub, rollouts_events(hub, true)),
             ),
             jobs: Arc::default(),
             egress: Arc::default(),
@@ -106,7 +113,9 @@ impl FleetSite {
 pub(super) fn event_name(event: &str) -> Option<&'static str> {
     match event {
         "nodes" => Some("nodes"),
-        "operations" => Some("operations"),
+        UPDATES_EVENT => Some(UPDATES_EVENT),
+        ROLLOUTS_EVENT => Some(ROLLOUTS_EVENT),
+        OLD_UPDATES_EVENT => Some(OLD_UPDATES_EVENT),
         super::jobs::EVENT => Some(super::jobs::EVENT),
         super::clients::EVENT => Some(super::clients::EVENT),
         super::clients::GITLAB_EVENT => Some(super::clients::GITLAB_EVENT),
@@ -186,16 +195,41 @@ pub(super) fn source(
                 events: counted_events(hub, nodes_events(hub)),
             });
         }
-        "operations" => {
+        UPDATES_EVENT => {
             let feed = if steer {
-                &site.steered_operations_feed
+                &site.steered_updates_feed
             } else {
-                &site.operations_feed
+                &site.updates_feed
             };
             return Some(Source::Shared {
-                name: "operations",
+                name: LIVE_END_EVENT,
                 feed: feed.subscribe(),
-                events: counted_events(hub, operations_events(hub, steer)),
+                events: counted_events(hub, updates_events(hub, steer)),
+            });
+        }
+        OLD_UPDATES_EVENT => {
+            let render: sse::Render = Arc::new(|| {
+                Ok(format!(
+                    "<p class=\"empty\">The hub was updated since this page was loaded: \
+                     <a href=\"{UPDATES_PATH}\">reload it</a>.</p>"
+                ))
+            });
+            return Some(Source::Own {
+                name: OLD_UPDATES_EVENT,
+                changes: hub.subscribe_touched(),
+                render,
+            });
+        }
+        ROLLOUTS_EVENT => {
+            let feed = if steer {
+                &site.steered_rollouts_feed
+            } else {
+                &site.rollouts_feed
+            };
+            return Some(Source::Shared {
+                name: LIVE_END_EVENT,
+                feed: feed.subscribe(),
+                events: counted_events(hub, rollouts_events(hub, steer)),
             });
         }
         _ => {}
@@ -257,17 +291,13 @@ pub(super) async fn get(
     }
     if path == UPDATES_PATH {
         let steer = auth.session.role >= Role::Operator;
-        let (ops, nodes) = blocking(move || {
-            // The forms' nodes, for an operator's page alone.
-            let nodes = if steer {
-                crate::ops::node_views(&hub)?
-            } else {
-                Vec::new()
-            };
-            Ok((read_operations(&hub)?, nodes))
-        })
-        .await?;
-        return Ok(Some(page(operations(auth, &ops, &nodes, now))));
+        let parts = blocking(move || read_updates(&hub, steer, now)).await?;
+        return Ok(Some(page(updates_page(auth, &parts))));
+    }
+    if path == ROLLOUTS_PATH {
+        let steer = auth.session.role >= Role::Operator;
+        let part = blocking(move || rollouts_part(&hub, steer, now)).await?;
+        return Ok(Some(page(rollouts_page(auth, &part))));
     }
     if path == ALL_RELEASES_PATH {
         let releases = blocking(move || hub.db.releases()).await?;
@@ -415,68 +445,74 @@ fn nodes_events(hub: &Arc<Hub>) -> sse::Events {
     sse::Events::from([("nodes", render)])
 }
 
-/// `/updates`' fragment, as one rendering for every page showing it: with the rollouts'
-/// buttons for an operator's, without for a viewer's. An operator's has the form that starts
-/// a rollout beside it, as its own event ([`operations::start_rollout`]).
-fn operations_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
-    let fragment: sse::Render = {
-        let hub = hub.clone();
+/// `/updates`' parts, as one rendering for every page showing them: with the update forms
+/// and rollouts' buttons for an operator's, without for a viewer's. An operator's has the form
+/// that starts a rollout too ([`operations::start_rollout`]). A rendering calls the parts in
+/// order: the first reads what they share ([`Held`]), the others reuse it.
+fn updates_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
+    let held: Arc<Mutex<Option<Held>>> = Arc::default();
+    let first: sse::Render = {
+        let (hub, held) = (hub.clone(), held.clone());
         Arc::new(move || {
-            let ops = read_operations(&hub)?;
-            Ok(operations_fragment(&ops, steer, crate::now_secs()).into_string())
+            let read = Held::read(&hub)?;
+            let part = releases_part(&hub, &read.releases);
+            *held.lock().unwrap_or_else(PoisonError::into_inner) = Some(read);
+            Ok(part.into_string())
         })
     };
-    if !steer {
-        return sse::Events::from([("operations", fragment)]);
+    let part = |f: fn(&Hub, &Held, bool, u64) -> Result<Html>| -> sse::Render {
+        let (hub, held) = (hub.clone(), held.clone());
+        Arc::new(move || {
+            let kept = held.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            let read = match kept {
+                Some(read) => read,
+                None => Held::read(&hub)?,
+            };
+            Ok(f(&hub, &read, steer, crate::now_secs())?.into_string())
+        })
+    };
+    let mut events: Vec<(&'static str, sse::Render)> = vec![
+        (UPDATES_EVENT, first),
+        (PEERS_EVENT, part(peers_part)),
+        (NODES_EVENT, part(nodes_part)),
+        (TOOLS_EVENT, part(|hub, _, _, _| tools_part(hub))),
+    ];
+    if steer {
+        events.push((
+            operations::START_ROLLOUT,
+            part(|_, held, _, _| {
+                let mut h = Html::new();
+                operations::start_rollout(&mut h, &held.releases, &held.views, None);
+                Ok(h)
+            }),
+        ));
     }
-    let form: sse::Render = {
-        let hub = hub.clone();
-        Arc::new(move || {
-            let nodes = crate::ops::node_views(&hub)?;
-            let mut h = Html::new();
-            operations::start_rollout(&mut h, &hub.db.releases()?, &nodes, None);
-            Ok(h.into_string())
+    events.into()
+}
+
+/// What `/updates`' parts share: the releases held and the nodes.
+#[derive(Clone)]
+struct Held {
+    releases: Arc<[Release]>,
+    views: Arc<[NodeView]>,
+}
+
+impl Held {
+    fn read(hub: &Hub) -> Result<Held> {
+        Ok(Held {
+            releases: hub.db.releases()?.into(),
+            views: crate::ops::node_views(hub)?.into(),
         })
-    };
-    sse::Events::from([("operations", fragment), (operations::START_ROLLOUT, form)])
+    }
 }
 
-/// What `/updates` shows.
-fn read_operations(hub: &Hub) -> Result<Operations> {
-    let mut rollouts = ops::rollouts(hub)?;
-    rollouts.truncate(OPERATIONS_ROLLOUTS);
-    Ok(Operations {
-        releases: hub.db.releases()?,
-        tools: hub.db.tools_list()?,
-        rollouts,
-        registries: super::registries::updatables(hub)?,
-        relays: super::relays::updatables(hub)?,
-        hub: super::hub::updatables(hub),
-        source: hub.fetches.source().map(|s| s.url().to_string()),
-        fetch: hub.fetches.status(),
-        latest: hub.fetches.latest(),
-    })
-}
-
-/// What `/updates` shows.
-struct Operations {
-    releases: Vec<Release>,
-    /// The tools definitions held, newest first.
-    tools: Vec<crate::store::Tools>,
-    /// The latest, newest first.
-    rollouts: Vec<Rollout>,
-    /// Every registry, for its version and updates.
-    registries: Vec<super::updates::Peer>,
-    /// Every relay, for its version and updates.
-    relays: Vec<super::updates::Peer>,
-    /// The hub itself, for its version and updates; none when it does not update itself.
-    hub: Vec<super::updates::Peer>,
-    /// Where releases are fetched from; `None` with fetching off.
-    source: Option<String>,
-    /// The latest fetch since the hub started.
-    fetch: Option<crate::fetch::FetchStatus>,
-    /// The latest release the repository named when last asked, and when.
-    latest: Option<(String, u64)>,
+/// `/updates/rollouts`' list, one rendering for every page showing it, with the rollouts'
+/// buttons for an operator's.
+fn rollouts_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
+    let hub = hub.clone();
+    let render: sse::Render =
+        Arc::new(move || Ok(rollouts_part(&hub, steer, crate::now_secs())?.into_string()));
+    sse::Events::from([(ROLLOUTS_EVENT, render)])
 }
 
 /// Node `id`'s page fragment, with its steering actions given `csrf`, or the line saying it
@@ -780,7 +816,7 @@ pub(super) async fn rollout_action(
         }
         Some(Err(e)) => return Err(e),
     };
-    Ok(back_to_operations(htmx, &said))
+    Ok(back_to_rollouts(htmx, &said))
 }
 
 /// `op=delete` of `POST /rollout/<id>/action`: delete an ended rollout that updated no node,
@@ -818,7 +854,7 @@ async fn delete_rollout(
         .raw(".</p>");
     let ask = actions::Ask {
         path,
-        back: UPDATES_PATH.to_string(),
+        back: ROLLOUTS_PATH.to_string(),
         op: "delete".into(),
         what: "Delete this rollout? The rollout updated no node. Its audit log lines are kept.",
         detail,
@@ -856,20 +892,21 @@ async fn delete_rollout(
             Err(e) => return Err(e),
         },
     };
-    Ok(back_to_operations(htmx, &said))
+    Ok(back_to_rollouts(htmx, &said))
 }
 
 fn refused_to_delete(htmx: bool, kept: &RolloutUndeletable) -> Response<Body> {
     actions::refused(htmx, StatusCode::CONFLICT, &format!("Refused: {kept}."))
 }
 
-/// For htmx, `said` in the flash; for a plain form, a redirect back to `/updates`.
-fn back_to_operations(htmx: bool, said: &str) -> Response<Body> {
+/// For htmx, `said` in the flash; for a plain form, a redirect to the rollouts' history, which
+/// lists the rollout acted on, ended or not, unless it was deleted.
+fn back_to_rollouts(htmx: bool, said: &str) -> Response<Body> {
     if !htmx {
         let mut resp = Response::new(Body::default());
         *resp.status_mut() = StatusCode::SEE_OTHER;
         resp.headers_mut()
-            .insert(header::LOCATION, HeaderValue::from_static(UPDATES_PATH));
+            .insert(header::LOCATION, HeaderValue::from_static(ROLLOUTS_PATH));
         return resp;
     }
     said_so(said)
@@ -911,6 +948,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                 },
                 tab(super::clients::RELAYS_PATH, "GitLab adapters"),
                 tab(UPDATES_PATH, "Updates"),
+                tab(ROLLOUTS_PATH, "Rollouts"),
             ],
         },
         Section {
@@ -2162,46 +2200,159 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
     h.raw("</section>");
 }
 
-/// `/updates`: the releases the hub holds, its latest rollouts and its registries' and
-/// relays' updates, kept live.
+/// `/updates`' parts, rendered, each swapped in on its own ([`updates_events`]), and what an
+/// operator's forms offer.
+struct UpdatesParts {
+    releases: Html,
+    peers: Html,
+    nodes: Html,
+    tools: Html,
+    held: Held,
+    /// Where releases are fetched from; `None` with fetching off.
+    source: Option<String>,
+}
+
+/// Read and render `/updates`' parts.
+fn read_updates(hub: &Hub, steer: bool, now: u64) -> Result<UpdatesParts> {
+    let held = Held::read(hub)?;
+    Ok(UpdatesParts {
+        releases: releases_part(hub, &held.releases),
+        peers: peers_part(hub, &held, steer, now)?,
+        nodes: nodes_part(hub, &held, steer, now)?,
+        tools: tools_part(hub)?,
+        held,
+        source: hub.fetches.source().map(|s| s.url().to_string()),
+    })
+}
+
+/// `/updates`: the releases the hub holds, then what runs them — the hub, its GitLab adapters,
+/// its registries and its nodes, each with its version and last update — and the CI tools
+/// definitions, kept live.
 ///
-/// The live fragment is rendered once for every viewer and once for every operator
-/// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it on the
-/// element holding the forms, `#flash` and the fragment, as a header on every htmx request
-/// from inside it (`hx-headers`), which is how the rollouts' buttons, the registries' and
-/// relays' update forms and the live copies of the rollout form post. Those buttons need htmx;
-/// `vk-hub rollout pause|resume|abort|delete` and `vk-hub registries|relays update` do the
-/// same without it. An operator's page carries the forms that add a release and start a
-/// rollout above the fragment.
-fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
+/// The live parts are rendered once for every viewer and once for every operator
+/// ([`sse::feed`]), so they carry no session's CSRF token: an operator's page sets it on the
+/// element holding the forms, `#flash` and the parts, as a header on every htmx request from
+/// inside it (`hx-headers`), which is how the rollouts' buttons, the update forms and the live
+/// copies of the rollout form post. Those buttons need htmx; `vk-hub rollout
+/// pause|resume|abort|delete` and `vk-hub registries|relays update` do the same without it. An
+/// operator's page carries the forms that fetch or upload a release beside the releases,
+/// outside the live parts so an update never clears one being filled in, and the one that
+/// starts a rollout under the nodes, a part of its own kept while filled in
+/// ([`operations::start_rollout`]). A session's end shows pinned to the window
+/// ([`LIVE_END_EVENT`]), wherever the page is scrolled to.
+fn updates_page(auth: &Auth, parts: &UpdatesParts) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
-    main.raw("<h1>Updates</h1><div hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
-        .raw("sse-close=\"close\"");
-    if steer {
-        // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
-        main.raw(" hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
-            .text(&auth.csrf)
-            .raw("&quot;}\">");
-        operations::forms(&mut main, auth, &ops.releases, nodes, ops.source.as_deref());
-        main.raw("<div id=\"flash\"></div>");
-    } else {
-        main.raw(">");
+    main.raw("<h1>Updates</h1>");
+    live_open(&mut main, auth, UPDATES_EVENT);
+    main.raw("<section><h2>Releases</h2>");
+    if steer && let Some(source) = &parts.source {
+        operations::fetch_form(&mut main, auth, source);
     }
-    main.raw("<div id=\"operations\" sse-swap=\"operations\">")
-        .html(&operations_fragment(ops, steer, now))
-        .raw("</div></div>");
+    swapped(&mut main, UPDATES_EVENT, &parts.releases);
+    if steer {
+        operations::upload_form(&mut main, auth);
+    }
+    main.raw("</section>");
+    swapped(&mut main, PEERS_EVENT, &parts.peers);
+    main.raw("<section><h2>Nodes</h2>");
+    swapped(&mut main, NODES_EVENT, &parts.nodes);
+    if steer {
+        main.raw("<div id=\"")
+            .raw(operations::START_ROLLOUT)
+            .raw("\" sse-swap=\"")
+            .raw(operations::START_ROLLOUT)
+            .raw("\">");
+        operations::start_rollout(
+            &mut main,
+            &parts.held.releases,
+            &parts.held.views,
+            Some(&auth.csrf),
+        );
+        main.raw("</div>");
+    }
+    main.raw("<p class=\"sub\"><a href=\"")
+        .raw(ROLLOUTS_PATH)
+        .raw("\">Rollout history</a></p></section>");
+    swapped(&mut main, TOOLS_EVENT, &parts.tools);
+    main.raw("</div>");
     layout("Updates", UPDATES_PATH, auth, &main)
 }
+
+/// Open the element following `/events/<event>`: for an operator, with the session's CSRF
+/// token as a header on its htmx requests, and the flash its actions answer in; for anyone,
+/// where the stream says the session ended ([`LIVE_END_EVENT`]).
+fn live_open(h: &mut Html, auth: &Auth, event: &'static str) {
+    h.raw("<div hx-ext=\"sse\" sse-connect=\"/events/")
+        .raw(event)
+        .raw("\" sse-close=\"close\"");
+    let steer = auth.session.role >= Role::Operator;
+    if steer {
+        // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
+        h.raw(" hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
+            .text(&auth.csrf)
+            .raw("&quot;}\"");
+    }
+    h.raw("><div id=\"")
+        .raw(LIVE_END_EVENT)
+        .raw("\" sse-swap=\"")
+        .raw(LIVE_END_EVENT)
+        .raw("\"></div>");
+    if steer {
+        h.raw("<div id=\"flash\"></div>");
+    }
+}
+
+/// `part`, in the element its stream's `event` swaps.
+fn swapped(h: &mut Html, event: &'static str, part: &Html) {
+    h.raw("<div id=\"")
+        .raw(event)
+        .raw("\" sse-swap=\"")
+        .raw(event)
+        .raw("\">")
+        .html(part)
+        .raw("</div>");
+}
+
+/// `/updates/rollouts`: every rollout, newest first, kept live; an operator's with the buttons
+/// that steer them ([`updates_page`] says how they post).
+fn rollouts_page(auth: &Auth, part: &Html) -> Html {
+    let mut main = Html::new();
+    main.raw("<h1>Rollouts</h1>");
+    live_open(&mut main, auth, ROLLOUTS_EVENT);
+    swapped(&mut main, ROLLOUTS_EVENT, part);
+    main.raw("</div>");
+    layout("Rollouts", ROLLOUTS_PATH, auth, &main)
+}
+
+/// The Updates page.
+pub(super) const UPDATES_PATH: &str = "/updates";
+
+/// The rollouts' history.
+pub(super) const ROLLOUTS_PATH: &str = "/updates/rollouts";
+
+/// The events `/updates`' stream sends its parts as, in page order: the releases first.
+const UPDATES_EVENT: &str = "updates";
+const PEERS_EVENT: &str = "update-peers";
+const NODES_EVENT: &str = "update-nodes";
+const TOOLS_EVENT: &str = "update-tools";
+
+/// The event `/updates/rollouts`' stream sends the rollouts as.
+const ROLLOUTS_EVENT: &str = "rollouts";
+
+/// The event `/updates`' and `/updates/rollouts`' streams say a session ended in: an element
+/// pinned to the window, as their parts span the page.
+const LIVE_END_EVENT: &str = "live-end";
+
+/// The stream Updates pages followed before `/updates`, `/events/operations`: one reconnecting
+/// to a hub updated since is told to reload.
+const OLD_UPDATES_EVENT: &str = "operations";
 
 /// How many releases, newest first, `/updates` lists; [`ALL_RELEASES_PATH`] lists them all.
 const RELEASES_SHOWN: usize = 10;
 
 /// The page listing every release the hub holds.
 const ALL_RELEASES_PATH: &str = "/updates/releases";
-
-/// The Updates page.
-pub(super) const UPDATES_PATH: &str = "/updates";
 
 /// A table of `releases`, in the order given.
 fn releases_table(h: &mut Html, releases: &[Release]) {
@@ -2233,34 +2384,164 @@ fn releases_table(h: &mut Html, releases: &[Release]) {
     h.raw("</tbody></table>");
 }
 
-/// `/updates`' live part. With `steer`, each rollout still under way carries the buttons
-/// that steer it, and each ended one that updated no node the one that deletes it.
-fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
+/// The releases: the fetch under way or last ended, then the newest of `releases`.
+fn releases_part(hub: &Hub, releases: &[Release]) -> Html {
     let mut h = Html::new();
-    h.raw("<section><h2>Releases</h2>");
-    operations::fetch_line(&mut h, ops.fetch.as_ref(), ops.latest.as_ref());
-    if ops.releases.is_empty() {
+    operations::fetch_line(
+        &mut h,
+        hub.fetches.status().as_ref(),
+        hub.fetches.latest().as_ref(),
+    );
+    if releases.is_empty() {
         h.raw("<p class=\"empty\">none. <code>vk-hub release add</code> copies a vk or ")
             .raw("vk-registry binary into the hub.</p>");
     } else {
-        let shown = ops.releases.len().min(RELEASES_SHOWN);
-        releases_table(&mut h, ops.releases.get(..shown).unwrap_or_default());
-        if ops.releases.len() > shown {
+        let shown = releases.len().min(RELEASES_SHOWN);
+        releases_table(&mut h, releases.get(..shown).unwrap_or_default());
+        if releases.len() > shown {
             h.raw("<p><a class=\"button\" href=\"")
                 .raw(ALL_RELEASES_PATH)
                 .raw("\">Show all ")
-                .text(ops.releases.len())
+                .text(releases.len())
                 .raw(" releases</a></p>");
         }
     }
-    h.raw("</section><section><h2>CI tools</h2>");
-    if ops.tools.is_empty() {
+    h
+}
+
+/// The hub, its GitLab adapters and its registries, each with its version and updates; with
+/// `steer`, the forms that update them.
+fn peers_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
+    let mut h = Html::new();
+    for (kind, peers) in [
+        (&super::hub::KIND, super::hub::updatables(hub)),
+        (&super::relays::KIND, super::relays::updatables(hub)?),
+        (
+            &super::registries::KIND,
+            super::registries::updatables(hub)?,
+        ),
+    ] {
+        super::updates::section(&mut h, kind, &peers, &held.releases, steer, now);
+    }
+    Ok(h)
+}
+
+/// The nodes as the hub, adapters and registries are shown, then the rollouts under way; with
+/// `steer`, the buttons that steer them.
+fn nodes_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
+    let rollouts = ops::rollouts(hub)?;
+    let mut h = Html::new();
+    node_versions(&mut h, &held.views, &rollouts);
+    for r in rollouts.iter().filter(|r| r.row.state.active()) {
+        rollout(&mut h, r, steer, now);
+    }
+    Ok(h)
+}
+
+/// Every rollout, newest first; with `steer`, the buttons that steer them.
+fn rollouts_part(hub: &Hub, steer: bool, now: u64) -> Result<Html> {
+    let rollouts = ops::rollouts(hub)?;
+    let mut h = Html::new();
+    if rollouts.is_empty() {
+        h.raw("<p class=\"empty\">none yet. <code>vk-hub rollout create</code> starts one.</p>");
+    }
+    for r in &rollouts {
+        rollout(&mut h, r, steer, now);
+    }
+    Ok(h)
+}
+
+/// The nodes' table: [`super::updates::section`]'s columns but the update form, as a node
+/// updates by rollout.
+fn node_versions(h: &mut Html, nodes: &[NodeView], rollouts: &[Rollout]) {
+    if nodes.is_empty() {
+        h.raw("<p class=\"empty\">No node has enrolled yet.</p>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr>");
+    pages::header_cells(
+        h,
+        &["NODE", "VERSION", "CONNECTION", "UPDATES", "LAST UPDATE"],
+    );
+    h.raw("</tr></thead><tbody>");
+    for n in nodes {
+        h.raw("<tr><td>");
+        if vk_hub_proto::valid_id(&n.id) {
+            h.raw("<a href=\"/node/")
+                .text(&n.id)
+                .raw("\">")
+                .node(&n.hostname)
+                .raw("</a>");
+        } else {
+            h.node(&n.hostname);
+        }
+        h.raw("</td><td>");
+        match &n.vk {
+            Some(v) => h.node(v),
+            None => h.raw("-"),
+        };
+        h.raw("</td><td>").raw(if n.connected {
+            "<span class=\"badge ok\">Online</span>"
+        } else {
+            "<span class=\"badge bad\">Offline</span>"
+        });
+        h.raw("</td><td>").raw(match n.protocol {
+            Some(v) if v < vk_hub_proto::STEERING => "monitored only: no rollout updates it",
+            _ => "by rollout",
+        });
+        h.raw("</td><td>");
+        last_rollout(h, &n.id, rollouts);
+        h.raw("</td></tr>");
+    }
+    h.raw(
+        "</tbody></table><p class=\"sub\">A rollout updates the nodes chosen, a batch at a \
+           time, draining each first.</p>",
+    );
+}
+
+/// What the newest rollout to reach node `id` did to it: one that skipped it does not count,
+/// nor one that ended with it still pending.
+fn last_rollout(h: &mut Html, id: &str, rollouts: &[Rollout]) {
+    let found = rollouts.iter().find_map(|r| {
+        r.row
+            .nodes
+            .iter()
+            .find(|n| n.id == id && !matches!(n.status, NodeStatus::Skipped { .. }))
+            .filter(|n| r.row.state.active() || n.status != NodeStatus::Pending)
+            .map(|n| (r, n))
+    });
+    let Some((r, n)) = found else {
+        h.raw("-");
+        return;
+    };
+    h.raw("to ").node(&r.row.version).raw(": ");
+    match &n.status {
+        NodeStatus::Pending | NodeStatus::Skipped { .. } => h.raw("pending"),
+        NodeStatus::Updating { since, .. } => {
+            h.raw("under way, issued ").html(&pages::at_html(*since))
+        }
+        NodeStatus::Succeeded { at } => h.raw("done ").html(&pages::at_html(*at)),
+        NodeStatus::Failed { reason, .. } => {
+            h.raw("<span class=\"reason\">failed</span>: ").node(reason)
+        }
+    };
+    h.raw(" (rollout <code>")
+        .text(crate::rollout::short_id(&r.id))
+        .raw("</code>)");
+}
+
+/// The CI tools definitions held, newest first.
+fn tools_part(hub: &Hub) -> Result<Html> {
+    let tools = hub.db.tools_list()?;
+    let mut h = Html::new();
+    h.raw("<section><h2>CI tools</h2>");
+    if tools.is_empty() {
         h.raw("<p class=\"empty\">none. <code>vk-hub tools add</code> packs a build context ")
             .raw("into the hub. <code>vk-hub nodes tools</code> then has nodes build it.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
             .raw("<th>files</th><th>size</th><th>added</th><th>by</th></tr></thead><tbody>");
-        for t in &ops.tools {
+        for t in &tools {
             h.raw("<tr><td><code title=\"")
                 .text(&t.sha256)
                 .raw("\">")
@@ -2279,39 +2560,8 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         }
         h.raw("</tbody></table>");
     }
-    h.raw("</section><section><h2>Rollouts</h2>");
-    if ops.rollouts.is_empty() {
-        h.raw("<p class=\"empty\">none yet. <code>vk-hub rollout create</code> starts one.</p>");
-    }
-    for r in &ops.rollouts {
-        rollout(&mut h, r, steer, now);
-    }
     h.raw("</section>");
-    super::updates::section(
-        &mut h,
-        &super::registries::KIND,
-        &ops.registries,
-        &ops.releases,
-        steer,
-        now,
-    );
-    super::updates::section(
-        &mut h,
-        &super::relays::KIND,
-        &ops.relays,
-        &ops.releases,
-        steer,
-        now,
-    );
-    super::updates::section(
-        &mut h,
-        &super::hub::KIND,
-        &ops.hub,
-        &ops.releases,
-        steer,
-        now,
-    );
-    h
+    Ok(h)
 }
 
 /// One rollout: what it updates to and how, its state, and each node by wave.

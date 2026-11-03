@@ -1427,7 +1427,7 @@ provider (see [Signing in](#signing-in)).
 
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
 row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *GitLab adapters*, the
-relays; *Updates*, releases and rollouts), *GitLab* (*Servers*, then a tab per server),
+relays; *Updates*, releases and the versions running; *Rollouts*, every rollout), *GitLab* (*Servers*, then a tab per server),
 *Capacity*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for operators, *Audit*).
 A section's link counts what waits in its tabs, each tab its own. Connections' former
 addresses, `/clients[?tab=other]`, `/clients/capacity`, `/clients/tenants/<name>` and
@@ -1854,12 +1854,15 @@ The nodes table and `vk-hub nodes` show an update under way beside the node's st
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
 node's page shows the update's release, phase and what the node said of it, and the sha256 of
 the `vk` it runs. `/updates` lists the ten newest releases the hub holds, signed or not,
-with a link to `/updates/releases` listing them all, its ten latest rollouts with their
-state, counts, current wave, and each node's status and profile by wave, and, once one has enrolled, the registries: each one's version, whether
-its `[hub] allow` lets the hub update it and whether it takes only signed releases, and its
+with a link to `/updates/releases` listing them all; then, in one shape, the hub, its GitLab
+adapters and its registries, each with its version, whether its `[hub] allow` (the hub's
+`[update] allow`) lets the hub update it and whether it takes only signed releases, and its
 update — as it reports it, or the last command while it has not taken it or once it refused or
-failed it. Operators can pause, resume and abort active rollouts, and delete, once confirmed,
-an ended one that updated no node: every update it issued was refused or expired before it
+failed it; then the nodes, each with its version and what the newest rollout to reach it did,
+the rollouts under way with their state, counts, current wave, and each node's status and
+profile by wave; then the CI tools definitions. `/updates/rollouts` lists every rollout the same way.
+Operators can pause, resume and abort active rollouts, and delete, once confirmed, an ended
+one that updated no node: every update it issued was refused or expired before it
 ran. These actions post to `/rollout/<id>/action` with the node actions' origin, CSRF and role
 checks, and run the admin socket's operation as the session's principal. Invalid state
 transitions return 409. The shared fragment carries no session token: the surrounding page
@@ -1867,8 +1870,10 @@ supplies its session's CSRF token through `hx-headers`, as JSON that htmx parses
 evaluating. The buttons require htmx; `vk-hub rollout pause|resume|abort|delete` works
 without it.
 
-Above the fragment, an operator's `/updates` carries three forms, each with the same
-origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
+An operator's `/updates` carries three forms, each with the same origin, CSRF and role
+checks, run as the session's principal; a viewer's carries none. Fetch sits above the
+releases and Upload is folded behind a button below them, both outside the live parts; Start
+a rollout sits under the nodes, a live part of its own.
 
 - **Upload** posts a binary, its program (`vk`, `vk-registry` or `vk-gitlab`), its version and
   an optional release key signature (the base64 `vk release-key sign` prints) to
@@ -1882,7 +1887,7 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   without pausing for 30 seconds. One upload runs at a time, starting when its fields pass
   their checks. The session must still belong to an operator once the file arrives.
 - **Fetch from GitHub** posts a program and a version, `latest` by default, to `/releases/fetch`
-  and starts `release fetch` in the background; the fragment shows its progress and how it
+  and starts `release fetch` in the background; the releases show its progress and how it
   ended. The program defaults to all programs: each is fetched in turn from the same release,
   the latest resolved once, and one failing does not stop the others. "Check the latest" asks
   which version that is and shows it, giving the last answer, or the last failure, again within
@@ -1934,8 +1939,8 @@ step and node enrolled, renamed or removed; every change to a placed job's recor
 placed, accepted, at a new stage, finished, canceled or settled — and each hourly trim of the
 history; and, by job, each piece of its output stored, which wakes that job's page alone, never
 `/jobs`. The nodes table is the same for everyone, so one task renders it on a change and every
-nodes page is sent that one rendering; `/updates` likewise, once for every viewer's page and
-once for every operator's; `/gitlab` and `/keys` likewise, both pages' fragments in one
+nodes page is sent that one rendering; `/updates` and `/updates/rollouts` likewise, once for
+every viewer's page and once for every operator's, `/updates` as one event per part; `/gitlab` and `/keys` likewise, both pages' fragments in one
 rendering, woken by a key created, revoked or removed, a GitLab server added, removed, rejected or
 forgotten, an instance heard from anew, a hello recorded or instances pruned, a relay connected,
 disconnected, removed or reporting its inventory or runner states, and rendered once a heartbeat
