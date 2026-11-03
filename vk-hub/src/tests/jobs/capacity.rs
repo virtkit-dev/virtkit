@@ -92,8 +92,9 @@ async fn wait_reason_of(hub: &Hub, runner_id: u64, reason: &str) {
     panic!("the request never waited for {reason:?}");
 }
 
-/// Give `key`'s relay a second runner, `name` with GitLab runner ID `runner_id`, mapped to
-/// tenant `tests` in `class`.
+/// Give `key`'s relay a second runner, `name` with GitLab runner ID `runner_id`, with a lane
+/// of `class` and weight 1: a normal lane listing runner 42's projects, a production lane
+/// none.
 pub(super) fn add_runner(
     hub: &Hub,
     key: &str,
@@ -115,13 +116,17 @@ pub(super) fn add_runner(
         )
         .unwrap();
     let mut policy = hub.db.capacity_policy().unwrap();
-    policy.runners.push(crate::policy::RunnerMapping {
-        gitlab: "gl".into(),
-        runner_id,
-        tenant: "tests".into(),
+    let projects = match class {
+        crate::policy::Class::Normal => lane_42(&mut policy).projects.clone(),
+        crate::policy::Class::Production => Some(Vec::new()),
+    };
+    policy.lanes.push(crate::policy::Lane {
         class,
-        nodes: Vec::new(),
-        pools: Vec::new(),
+        projects,
+        ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
+            gitlab: "gl".into(),
+            id: runner_id,
+        })
     });
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
@@ -308,7 +313,7 @@ async fn unmapped_runner_is_refused_before_an_offer() {
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     let mut policy = hub.db.capacity_policy().unwrap();
-    policy.runners.clear();
+    policy.lanes.retain(|l| l.runner.is_none());
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
         .unwrap();
@@ -763,30 +768,13 @@ async fn a_runner_at_its_limit_waits() {
 }
 
 #[tokio::test]
-async fn the_tenant_holding_less_is_granted_first() {
-    let dir = scratch("capacity-tenants");
+async fn the_lane_holding_less_is_granted_first() {
+    let dir = scratch("capacity-lanes");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
-    let mut policy = hub.db.capacity_policy().unwrap();
-    policy.tenants.insert(
-        "other".into(),
-        crate::policy::Tenant {
-            weight: 1,
-            cap: None,
-            projects: Vec::new(),
-        },
-    );
-    for mapping in &mut policy.runners {
-        if mapping.runner_id == 43 {
-            mapping.tenant = "other".into();
-        }
-    }
-    hub.db
-        .set_capacity_policy(&policy, "u", now_secs())
-        .unwrap();
     ready_relay(&hub, &key);
-    // Tenant `tests` holds a node's two slots with jobs. Its fake heartbeats omit them;
+    // Runner 42's lane holds a node's two slots with jobs. Its fake heartbeats omit them;
     // a heartbeat stamped in a later second ends the hub's pending memory charge.
     // A ceiling of two keeps the node full.
     let mut full = ready_node(addr, &hub, 8192).await;
@@ -798,7 +786,7 @@ async fn the_tenant_holding_less_is_granted_first() {
         let reply = outcome(addr, &key, &ticket, &ticket, "job").await;
         assert_eq!(reply.status, 204, "{reply:?}");
     }
-    // Both tenants wait, `tests` first; one slot frees up and goes to `other`.
+    // Both lanes wait, 42's first; one slot frees up and goes to `other`'s.
     let tests = queue(addr, &key, 3).await;
     wait_reason_of(&hub, 42, "no fitting node").await;
     let other = queue_for(addr, &key, 4, "other").await;
@@ -818,10 +806,10 @@ pub(super) async fn take_job(addr: SocketAddr, key: &str, ticket: &str, grant: &
     assert_eq!(reply.status, 204, "{reply:?}");
 }
 
-/// Cap tenant `tests` at `cap` admissions and jobs.
-fn cap_tests(hub: &Hub, cap: u32) {
+/// Hold runner 42's lane to `max` slots.
+fn cap_tests(hub: &Hub, max: u32) {
     let mut policy = hub.db.capacity_policy().unwrap();
-    policy.tenants.get_mut("tests").unwrap().cap = Some(cap);
+    lane_42(&mut policy).max_slots = Some(max);
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
         .unwrap();
@@ -836,7 +824,7 @@ async fn settle(addr: SocketAddr, key: &str, id: &str) {
 }
 
 #[tokio::test]
-async fn a_claimed_admission_stays_charged_to_its_tenant_cap() {
+async fn a_claimed_admission_stays_charged_to_its_lane() {
     let dir = scratch("capacity-cap");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
@@ -846,9 +834,9 @@ async fn a_claimed_admission_stays_charged_to_its_tenant_cap() {
     let first = queue(addr, &key, 1).await;
     let grant = accept_ticket(addr, &key, &first, &mut node).await;
     assert_eq!(claim(addr, &key, &grant).await.status, 204);
-    // Claimed, its runner asks GitLab under it: the tenant's one slot is taken.
+    // Claimed, its runner asks GitLab under it: the lane's one slot is taken.
     let second = queue(addr, &key, 2).await;
-    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    assert_eq!(reason_now(&hub, 42).await, Some("lane at max slots"));
     let reply = poll(addr, &key, &second, 0).await;
     assert_eq!(reply.status, 202, "{reply:?}");
     std::fs::remove_dir_all(&dir).unwrap();
@@ -880,7 +868,7 @@ async fn a_job_keeps_its_admission_charged_until_settled() {
     });
     view_until(addr, &key, &job, |view| view.state == JobState::Running).await;
     let second = queue(addr, &key, 2).await;
-    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    assert_eq!(reason_now(&hub, 42).await, Some("lane at max slots"));
     // Finished, the job holds its admission until its relay settles it.
     node.send(NodeJobMsg::Result {
         job: job.clone(),
@@ -888,7 +876,7 @@ async fn a_job_keeps_its_admission_charged_until_settled() {
     });
     assert_eq!(node.job().await, HubJobMsg::Recorded { job: job.clone() });
     view_until(addr, &key, &job, |view| view.state == JobState::Finished).await;
-    assert_eq!(reason_now(&hub, 42).await, Some("tenant cap"));
+    assert_eq!(reason_now(&hub, 42).await, Some("lane at max slots"));
     settle(addr, &key, &job).await;
     let next = accept_ticket(addr, &key, &second, &mut node).await;
     assert_eq!(next.admission.as_deref(), Some(second.as_str()));
@@ -896,7 +884,7 @@ async fn a_job_keeps_its_admission_charged_until_settled() {
 }
 
 #[tokio::test]
-async fn direct_submissions_obey_the_tenant_cap() {
+async fn direct_submissions_obey_the_lane_s_max_slots() {
     let dir = scratch("capacity-direct-cap");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
@@ -917,7 +905,7 @@ async fn direct_submissions_obey_the_tenant_cap() {
     crate::jobs::testing::step(&hub).await;
     assert_eq!(
         crate::jobs::testing::job_blocked(&hub, &second),
-        Some("tenant cap")
+        Some("lane at max slots")
     );
     node.send(NodeJobMsg::Result {
         job: first.clone(),
@@ -933,7 +921,7 @@ async fn direct_submissions_obey_the_tenant_cap() {
 }
 
 #[tokio::test]
-async fn weighted_tenants_go_by_load_per_weight() {
+async fn weighted_lanes_go_by_load_per_weight() {
     let dir = scratch("capacity-weighted");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
@@ -941,20 +929,7 @@ async fn weighted_tenants_go_by_load_per_weight() {
     relay_limits(&hub, &key, 64, 3);
     add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
     let mut policy = hub.db.capacity_policy().unwrap();
-    policy.tenants.get_mut("tests").unwrap().weight = 2;
-    policy.tenants.insert(
-        "other".into(),
-        crate::policy::Tenant {
-            weight: 1,
-            cap: None,
-            projects: Vec::new(),
-        },
-    );
-    for mapping in &mut policy.runners {
-        if mapping.runner_id == 43 {
-            mapping.tenant = "other".into();
-        }
-    }
+    lane_42(&mut policy).weight = 2;
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
         .unwrap();

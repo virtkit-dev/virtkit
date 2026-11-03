@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Capacity lanes replace tenants and project placement rules (breaking).** Each GitLab
+  runner, each API key given one, and the other API keys together are a lane with its own
+  weight, slot limit, allowed nodes, and projects with optional branch filters. A lane's nodes
+  apply when room is granted, before GitLab hands a job over. On first start the hub converts
+  its policy once and keeps the original; placement rules it cannot express hold the converted
+  policy until an operator sets it again. `capacity-policy set` still accepts the earlier format
+  for this release.
+- **Queued jobs follow lane changes.** A queued job whose runner is unmapped, or whose project or
+  branch its lane no longer allows, waits until allowed again or its deadline.
+
 ## [0.102.4] - 2026-11-04
 
 ### Changed

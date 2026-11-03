@@ -1,42 +1,16 @@
-//! Project placement over the client and node protocols.
+//! Lane placement over the client and node protocols.
 
 use super::capacity::{
     accept_ticket, add_runner, queue, queue_for, ready_relay, take_job, wait_reason,
 };
 use super::*;
-use crate::policy::PlacementRule;
 
-/// Give [`spec`]'s project, in tenant `tests`, the placement `rules`.
-fn rules(hub: &Hub, rules: Vec<PlacementRule>) {
-    let mut policy = hub.db.capacity_policy().unwrap();
-    let project = policy
-        .tenants
-        .get_mut("tests")
-        .unwrap()
-        .projects
-        .iter_mut()
-        .find(|p| p.id == PROJECT_ID)
-        .unwrap();
-    project.placement_rules = rules;
-    hub.db
-        .set_capacity_policy(&policy, "u", now_secs())
-        .unwrap();
-}
-
-fn rule(branches: &[&str], nodes: &[&str], pools: &[&str]) -> PlacementRule {
-    PlacementRule {
-        branches: branches.iter().map(|s| (*s).into()).collect(),
-        nodes: nodes.iter().map(|s| (*s).into()).collect(),
-        pools: pools.iter().map(|s| (*s).into()).collect(),
-    }
-}
-
-/// Let every mapped runner use only `nodes` and nodes in `pools`.
+/// Let every runner lane use only `nodes` and nodes in `pools`; any node with neither.
 fn confine(hub: &Hub, nodes: &[&str], pools: &[&str]) {
     let mut policy = hub.db.capacity_policy().unwrap();
-    for r in &mut policy.runners {
-        r.nodes = nodes.iter().map(|s| (*s).into()).collect();
-        r.pools = pools.iter().map(|s| (*s).into()).collect();
+    let targets: Vec<String> = nodes.iter().chain(pools).map(|s| (*s).into()).collect();
+    for lane in policy.lanes.iter_mut().filter(|l| l.runner.is_some()) {
+        lane.nodes = (!targets.is_empty()).then(|| targets.clone());
     }
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
@@ -75,111 +49,13 @@ async fn submit(addr: SocketAddr, key: &str, mut body: Value, admission: Option<
 }
 
 #[tokio::test]
-async fn a_branch_rule_picks_the_machine_of_its_branches_alone() {
-    let dir = scratch("placement-branch-routing");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
-    let key = jobs_key(&hub);
-    ready_relay(&hub, &key);
-    let mut ordinary = ready_node(addr, &hub, 16384).await;
-    let mut release = ready_node(addr, &hub, 16384).await;
-    rules(
-        &hub,
-        vec![rule(&["main", "release/**"], &[&release.id], &[])],
-    );
-    for (n, branch) in [(1, "main"), (2, "release/x")] {
-        let job = submit(addr, &key, on_branch(job_body(n, None, 30), branch), None).await;
-        assert_eq!(next_start(&mut release).await.job, job, "{branch}");
-    }
-    // No rule applies to `feature`: it goes to the less loaded node, `release` holding two jobs.
-    let job = submit(
-        addr,
-        &key,
-        on_branch(job_body(3, None, 30), "feature"),
-        None,
-    )
-    .await;
-    assert_eq!(next_start(&mut ordinary).await.job, job);
-    release.quiet(Duration::from_millis(100)).await;
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[tokio::test]
-async fn a_reservation_on_a_disallowed_node_is_released_for_an_allowed_one() {
-    let dir = scratch("placement-reservation");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
-    let key = jobs_key(&hub);
-    ready_relay(&hub, &key);
-    let mut wrong = ready_node(addr, &hub, 16384).await;
-    let (admission, grant) = admitted(addr, &key, &mut wrong, 1).await;
-    let mut right = ready_node(addr, &hub, 16384).await;
-    hub.db
-        .set_pools(&right.id, &["ci".into(), "trusted".into()], "u", now_secs())
-        .unwrap();
-    // Every rule that applies allows it: a trusted pool, and the one node.
-    rules(
-        &hub,
-        vec![rule(&[], &[], &["trusted"]), rule(&[], &[&right.id], &[])],
-    );
-    let body = job_body(2, Some(&grant.reservation), 30);
-    let job = submit(addr, &key, body, Some(&admission)).await;
-    assert_eq!(
-        wrong.job().await,
-        HubJobMsg::Release {
-            reservation: grant.reservation
-        }
-    );
-    let start = next_start(&mut right).await;
-    assert_eq!(start.job, job);
-    assert_eq!(start.reservation, None);
-    assert_eq!(crate::jobs::testing::reservations(&hub), 0);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[tokio::test]
-async fn rules_intersect_and_a_job_no_node_satisfies_ends_saying_why() {
-    let dir = scratch("placement-branch");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
-    let key = jobs_key(&hub);
-    ready_relay(&hub, &key);
-    let mut wrong = ready_node(addr, &hub, 16384).await;
-    let (admission, grant) = admitted(addr, &key, &mut wrong, 1).await;
-    let mut right = ready_node(addr, &hub, 16384).await;
-    // Every job to one node, `main` jobs to another: no node allows a `main` job.
-    rules(
-        &hub,
-        vec![
-            rule(&[], &[&wrong.id], &[]),
-            rule(&["main"], &[&right.id], &[]),
-        ],
-    );
-    let body = on_branch(job_body(2, Some(&grant.reservation), 1), "main");
-    let job = submit(addr, &key, body, Some(&admission)).await;
-    assert_eq!(
-        wrong.job().await,
-        HubJobMsg::Release {
-            reservation: grant.reservation
-        }
-    );
-    let ended = view_until(addr, &key, &job, |v| v.state == JobState::Finished).await;
-    let result = ended.result.unwrap();
-    assert_eq!(result.failure, Some(FailureClass::NoCapacity));
-    assert_eq!(
-        result.message.as_deref(),
-        Some("no node took it within its placement window (project placement rules)")
-    );
-    assert_eq!(crate::jobs::testing::reservations(&hub), 0);
-    right.quiet(Duration::from_millis(100)).await;
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[tokio::test]
-async fn a_pool_rule_holds_jobs_to_nodes_in_the_pool() {
+async fn a_lane_s_pool_holds_its_jobs_to_nodes_in_the_pool() {
     let dir = scratch("placement-pool");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     let mut idle = ready_node(addr, &hub, 16384).await;
-    // Busier, so it would go last but for the rule.
+    // Busier, so it would go last but for the lane's nodes.
     let mut trusted = loaded_node(addr, &hub, 16384, Some(400)).await;
     hub.db
         .set_pools(
@@ -189,17 +65,17 @@ async fn a_pool_rule_holds_jobs_to_nodes_in_the_pool() {
             now_secs(),
         )
         .unwrap();
-    rules(&hub, vec![rule(&[], &[], &["trusted"])]);
+    confine(&hub, &[], &["trusted"]);
     let job = submit(addr, &key, job_body(1, None, 30), None).await;
     assert_eq!(next_start(&mut trusted).await.job, job);
     idle.quiet(Duration::from_millis(100)).await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Without rules the job would go to the warm node, releasing its reservation, as in
+/// Unconfined, the job would go to the warm node, releasing its reservation, as in
 /// `a_job_goes_to_a_lightly_loaded_node_holding_its_image` in `tests/jobs.rs`.
 #[tokio::test]
-async fn image_affinity_cannot_escape_project_rules() {
+async fn image_affinity_cannot_escape_a_lane_s_nodes() {
     let dir = scratch("placement-affinity");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
@@ -223,10 +99,10 @@ async fn image_affinity_cannot_escape_project_rules() {
     let path = format!("/v1/jobs/{first}/settle");
     let reply = api(addr, "POST", &path, Some(&key), None).await;
     assert_eq!(reply.status, 204, "{reply:?}");
-    // A job reserved on another node, which alone the rules allow, stays there.
+    // A job reserved on another node, which alone its lane allows, stays there.
     let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
     let (admission, grant) = admitted(addr, &key, &mut cold, 2).await;
-    rules(&hub, vec![rule(&[], &[&cold.id], &[])]);
+    confine(&hub, &[&cold.id], &[]);
     let body = job_body_with_image(3, Some(&grant.reservation), image);
     let job = submit(addr, &key, body, Some(&admission)).await;
     let start = next_start(&mut cold).await;
@@ -245,42 +121,93 @@ async fn a_job_whose_project_is_delisted_is_held_saying_why() {
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
-    // Submitted while listed, with no node to take it yet; then its tenant drops the project.
+    // Submitted while listed, with no node to take it yet; then its lane drops the project.
     let job = submit(addr, &key, job_body(1, None, 2), None).await;
     list_project(&hub, false);
     let mut node = ready_node(addr, &hub, 16384).await;
     crate::jobs::testing::step(&hub).await;
     assert_eq!(
         crate::jobs::testing::job_blocked(&hub, &job),
-        Some("project no longer listed for its tenant")
+        Some("no longer allowed by its lane")
     );
     let ended = view_until(addr, &key, &job, |v| v.state == JobState::Finished).await;
     assert_eq!(
         ended.result.unwrap().message.as_deref(),
-        Some(
-            "no node took it within its placement window (project no longer listed for its tenant)"
-        )
+        Some("no node took it within its placement window (no longer allowed by its lane)")
     );
     node.quiet(Duration::from_millis(100)).await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// List [`spec`]'s project for tenant `tests`, or with `listed` false no longer.
-fn list_project(hub: &Hub, listed: bool) {
+/// List [`spec`]'s project for runner 42's lane, with `branches` if any, or with `listed`
+/// false no longer.
+fn list_project_on(hub: &Hub, listed: bool, branches: Option<&[&str]>) {
     let mut policy = hub.db.capacity_policy().unwrap();
-    let tests = policy.tenants.get_mut("tests").unwrap();
-    tests.projects.retain(|p| p.id != PROJECT_ID);
+    let projects = lane_42(&mut policy).projects.get_or_insert_default();
+    projects.retain(|p| p.id != PROJECT_ID);
     if listed {
-        tests.projects.push(crate::policy::Project {
+        projects.push(crate::policy::LaneProject {
             gitlab: "gl".into(),
             id: PROJECT_ID,
-            production_branches: vec![],
-            placement_rules: vec![],
+            branches: branches.map(|b| b.iter().map(|s| (*s).to_owned()).collect()),
         });
     }
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
         .unwrap();
+}
+
+fn list_project(hub: &Hub, listed: bool) {
+    list_project_on(hub, listed, None);
+}
+
+#[tokio::test]
+async fn a_job_of_a_branch_its_lane_no_longer_allows_is_held() {
+    let dir = scratch("placement-branch-narrowed");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let job = submit(addr, &key, on_branch(job_body(1, None, 30), "dev"), None).await;
+    list_project_on(&hub, true, Some(&["main"]));
+    let mut node = ready_node(addr, &hub, 16384).await;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &job),
+        Some("no longer allowed by its lane")
+    );
+    list_project_on(&hub, true, Some(&["main", "dev"]));
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(next_start(&mut node).await.job, job);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_job_of_a_runner_unmapped_is_held() {
+    let dir = scratch("placement-unmapped");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let job = submit(addr, &key, job_body(1, None, 30), None).await;
+    let mut policy = hub.db.capacity_policy().unwrap();
+    let lane = lane_42(&mut policy).clone();
+    policy.lanes.retain(|l| l.runner.is_none());
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    let mut node = ready_node(addr, &hub, 16384).await;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &job),
+        Some("no longer allowed by its lane")
+    );
+    node.quiet(Duration::from_millis(100)).await;
+    policy.lanes.push(lane);
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(next_start(&mut node).await.job, job);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -295,14 +222,14 @@ async fn a_job_whose_project_is_listed_again_starts() {
     crate::jobs::testing::step(&hub).await;
     assert_eq!(
         crate::jobs::testing::job_blocked(&hub, &job),
-        Some("project no longer listed for its tenant")
+        Some("no longer allowed by its lane")
     );
     // Its server's page gives it as its runner's reason, with no request of the runner waiting.
     let snapshot = crate::jobs::arbitration_snapshot(&hub).unwrap();
     let view = &snapshot[&("gl".to_string(), 42)];
     assert_eq!(
         (view.waiting, view.jobs, view.reason),
-        (0, 1, Some("project no longer listed for its tenant"))
+        (0, 1, Some("no longer allowed by its lane"))
     );
     list_project(&hub, true);
     crate::jobs::testing::step(&hub).await;
@@ -331,7 +258,7 @@ async fn a_pass_changing_a_runner_s_reason_wakes_its_server_s_page() {
     crate::jobs::testing::step(&hub).await;
     assert_eq!(
         crate::jobs::testing::job_blocked(&hub, &job),
-        Some("project no longer listed for its tenant")
+        Some("no longer allowed by its lane")
     );
     assert!(server.has_changed().unwrap());
     assert!(!clients.has_changed().unwrap());
@@ -339,40 +266,11 @@ async fn a_pass_changing_a_runner_s_reason_wakes_its_server_s_page() {
 }
 
 #[tokio::test]
-async fn the_rules_reason_lasts_while_nodes_are_full_and_goes_with_the_rules() {
-    let dir = scratch("placement-sticky");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
-    let key = jobs_key(&hub);
-    ready_relay(&hub, &key);
-    let mut node = ready_node(addr, &hub, 16384).await;
-    crate::ops::set_ceiling(&hub, "u", &node.id, Some(1)).unwrap();
-    // Only a node that is not there may take the project's jobs.
-    rules(
-        &hub,
-        vec![rule(&[], &["0123456789abcdef0123456789abcdef"], &[])],
-    );
-    let job = submit(addr, &key, job_body(1, None, 30), None).await;
-    crate::jobs::testing::step(&hub).await;
-    let blocked = || crate::jobs::testing::job_blocked(&hub, &job);
-    assert_eq!(blocked(), Some("project placement rules"));
-    // A runner request, which rules do not restrict, fills the node: the reason stays the rules.
-    let ticket = queue(addr, &key, 2).await;
-    accept_ticket(addr, &key, &ticket, &mut node).await;
-    crate::jobs::testing::step(&hub).await;
-    assert_eq!(blocked(), Some("project placement rules"));
-    // Without rules, the node is merely full.
-    rules(&hub, Vec::new());
-    crate::jobs::testing::step(&hub).await;
-    assert_eq!(blocked(), None);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[tokio::test]
-async fn the_runner_s_reason_lasts_while_nodes_are_full_and_goes_with_its_nodes() {
+async fn the_lane_s_reason_lasts_while_nodes_are_full_and_goes_with_its_nodes() {
     let dir = scratch("placement-runner-sticky");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
-    // Its runner may use only a node that is not there; another runner, any node.
+    // Its lane may use only a node that is not there; another runner's, any node.
     confine(&hub, &["0123456789abcdef0123456789abcdef"], &[]);
     add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
     ready_relay(&hub, &key);
@@ -381,12 +279,12 @@ async fn the_runner_s_reason_lasts_while_nodes_are_full_and_goes_with_its_nodes(
     let job = submit(addr, &key, job_body(1, None, 30), None).await;
     crate::jobs::testing::step(&hub).await;
     let blocked = || crate::jobs::testing::job_blocked(&hub, &job);
-    assert_eq!(blocked(), Some("its runner's allowed nodes"));
-    // The other runner's request fills the node: the reason stays its runner's nodes.
+    assert_eq!(blocked(), Some("its lane's allowed nodes"));
+    // The other runner's request fills the node: the reason stays its lane's nodes.
     let ticket = queue_for(addr, &key, 2, "other").await;
     accept_ticket(addr, &key, &ticket, &mut node).await;
     crate::jobs::testing::step(&hub).await;
-    assert_eq!(blocked(), Some("its runner's allowed nodes"));
+    assert_eq!(blocked(), Some("its lane's allowed nodes"));
     // Free to use any node, it merely finds the node full.
     confine(&hub, &[], &[]);
     crate::jobs::testing::step(&hub).await;
@@ -394,41 +292,8 @@ async fn the_runner_s_reason_lasts_while_nodes_are_full_and_goes_with_its_nodes(
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The node its runner may use has room, but its project's rules allow only another: the rules
-/// are the reason, until they go, though the runner still may not use the other node.
 #[tokio::test]
-async fn the_rules_reason_goes_with_the_rules_under_a_runner_s_nodes() {
-    let dir = scratch("placement-runner-rules");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
-    let key = jobs_key(&hub);
-    add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
-    ready_relay(&hub, &key);
-    let mut full = ready_node(addr, &hub, 16384).await;
-    crate::ops::set_ceiling(&hub, "u", &full.id, Some(1)).unwrap();
-    let ticket = queue_for(addr, &key, 2, "other").await;
-    let grant = accept_ticket(addr, &key, &ticket, &mut full).await;
-    take_job(addr, &key, &ticket, &grant).await;
-    let mut usable = ready_node(addr, &hub, 16384).await;
-    crate::ops::set_ceiling(&hub, "u", &usable.id, Some(1)).unwrap();
-    // Runner 43 too, but its tickets go to `usable` alone, which it may use.
-    confine(&hub, &[&usable.id], &[]);
-    rules(&hub, vec![rule(&[], &[&full.id], &[])]);
-    let job = submit(addr, &key, job_body(1, None, 30), None).await;
-    crate::jobs::testing::step(&hub).await;
-    let blocked = || crate::jobs::testing::job_blocked(&hub, &job);
-    assert_eq!(blocked(), Some("project placement rules"));
-    let ticket = queue_for(addr, &key, 3, "other").await;
-    accept_ticket(addr, &key, &ticket, &mut usable).await;
-    crate::jobs::testing::step(&hub).await;
-    assert_eq!(blocked(), Some("project placement rules"));
-    rules(&hub, Vec::new());
-    crate::jobs::testing::step(&hub).await;
-    assert_eq!(blocked(), None);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[tokio::test]
-async fn a_runner_s_requests_go_only_to_nodes_it_may_use() {
+async fn a_lane_s_requests_go_only_to_nodes_it_may_use() {
     let dir = scratch("placement-runner-request");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
@@ -445,7 +310,7 @@ async fn a_runner_s_requests_go_only_to_nodes_it_may_use() {
     // No node is in its pool: the request waits for one.
     confine(&hub, &[], &["nowhere"]);
     let ticket = queue(addr, &key, 1).await;
-    wait_reason(&hub, "its runner's allowed nodes").await;
+    wait_reason(&hub, "its lane's allowed nodes").await;
     confine(&hub, &[], &["trusted"]);
     accept_ticket(addr, &key, &ticket, &mut trusted).await;
     idle.quiet(Duration::from_millis(100)).await;
@@ -454,7 +319,7 @@ async fn a_runner_s_requests_go_only_to_nodes_it_may_use() {
 }
 
 #[tokio::test]
-async fn a_runner_s_job_leaves_a_reservation_on_a_node_it_may_not_use() {
+async fn a_lane_s_job_leaves_a_reservation_on_a_node_it_may_no_longer_use() {
     let dir = scratch("placement-runner-job");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);

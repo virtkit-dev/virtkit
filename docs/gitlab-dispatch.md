@@ -74,13 +74,13 @@ monitoring:
   work — except that after `production_probe_burst` production probes (default 1) since normal
   work was last granted room, normal work is owed the next turn ahead of production probes. A
   hub starts owing it that turn, so after a restart normal work goes first. Within each, the
-  tenant holding the least for its `weight` goes first, the oldest first. Shares are not set
-  aside: room an idle tenant leaves goes to the others. A ticket waits while its tenant holds
-  its `cap`, its relay its `concurrent` or its runner its `limit` — counting its tickets
+  lane holding the least for its `weight` goes first, the oldest first. Shares are not set
+  aside: room an idle lane leaves goes to the others. A ticket waits while its lane holds
+  its `max_slots`, its relay its `concurrent` or its runner its `limit` — counting its tickets
   offered, granted or claimed and its jobs, those its heartbeat counts without an admission
   included — while its runner backs off, and until the relay's current session has sent a
   heartbeat listing every request it holds. A job submitted without an admission waits on its
-  tenant's `cap` too.
+  lane's `max_slots` too.
 - **Production headroom.** The capacity policy accepts at most 64 `headroom` entries. Each
   reserves `slots` envelopes of its placement (pool, labels, envelope) for production work.
   Normal work must leave the fleet that much room, or all remaining room if already short.
@@ -199,29 +199,18 @@ That node boots it in seconds where another spends a minute or two building the 
 submitted on a reservation on a node without the image then starts on the warm node without it,
 and the hub releases the reservation. Under heavier load the order above holds.
 
-A project of the capacity policy may restrict where its jobs go with `placement_rules` (at
-most 64): each rule names `nodes` (node IDs), `pools` (a node must be in one), or both (at most
-256 of each), and applies to every job of the project or, with `branches` (globs), to jobs whose
-ref matches one. A job goes only to a node every rule that applies to it allows, image
-affinity included. Rules match the ref the relay reports for the job (branch, tag or merge
-request alike), as GitLab gives it to the relay. That ref is no trust boundary: a merge request
-from a fork whose branch is named `main` gets `main`'s rules. To confine a project's jobs, use
-a rule without `branches`. A project's placement rules must be the same, in any order, in every
-tenant that lists it; its page on the hub edits them in all of them at once.
+A lane of the capacity policy may restrict where its work goes with `nodes`: node IDs and pool
+names (at most 256). Room is granted only on those nodes, and the job submitted on it runs there;
+a queued job may move among them, image affinity included. A queued job whose reservation is on
+a node its lane no longer allows has the reservation released and waits for an allowed node,
+ending at its `place_within_secs` deadline with `its lane's allowed nodes` as the reason when
+nodes had room but none was allowed (see [capacity arbitration](capacity-arbitration.md)).
 
-The hub offers a runner's request before GitLab says which project's job it takes, so rules
-cannot steer reservations: a job submitted on a reservation on a node its rules do not allow
-has the reservation released and waits for an allowed node, ending at its `place_within_secs`
-deadline with `project placement rules` as the reason when nodes had room but none was
-allowed. Give a restricted project a runner of its own, mapped with the `nodes` and `pools` its
-rules allow (see [capacity arbitration](capacity-arbitration.md)), so its requests are reserved
-where its jobs may go.
-
-A relay job whose project its tenant stops listing after the job was submitted is held: it
-waits, keeping any reservation it was submitted on so it starts as soon as the project is
-listed again, or until its deadline, when it ends with `project no longer listed for its
-tenant` as the reason. A job recorded by a hub from before capacity arbitration, without a
-scheduling identity, is not held.
+A relay job its lane no longer allows after it was submitted — the runner unmapped, its project
+no longer listed, or its branch no longer matching the project's `branches` — is held: it waits,
+keeping any reservation it was submitted on so it starts as soon as it is allowed again, or
+until its deadline, when it ends with `no longer allowed by its lane` as the reason. A job
+recorded by a hub from before capacity arbitration, without a scheduling identity, is not held.
 
 ## Daemon ↔ hub: the client API
 
@@ -323,7 +312,7 @@ lapsed, was released or whose node was lost answers 410 `reservation_gone`. `DEL
 it, and answers 204 for one already gone.
 
 **Jobs.** `{runner, admission, request_id, placement, reservation, place_within_secs, spec}` →
-`JobView`. A job under an admission must match its runner, tenant, placement and reservation
+`JobView`. A job under an admission must match its runner, lane, placement and reservation
 (403 `forbidden`), and an admission takes one job (409 `conflict`); a job on a queued
 reservation must name its admission. A new job refused with a 4xx ends its admission as
 `empty`. The hub starts the job on the reservation's node — unless a lightly loaded node holds
@@ -371,7 +360,7 @@ cancels and settles reported jobs and resumes running ones.
 |---|---|---|---|
 | 400 | `invalid` | unparseable body, malformed ID, a job without a project, an outcome naming another admission than its path | no |
 | 401 | `unauthorized` | no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
-| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job; a relay below protocol 2 asking for new work; a runner or project its tenant does not allow; a job that does not match its admission | no |
+| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job; a relay below protocol 2 asking for new work; a runner without a lane, or a project or branch its lane does not allow; a job that does not match its admission | no |
 | 403 | `approval_pending` | a job of a project, or of a server, an operator has yet to approve on the hub | no: the job fails |
 | 403 | `project_rejected` | a job of a project, or of a server, an operator rejected | no: the job fails |
 | 404 | `not_found` | no such job, reservation, grant or admission of this relay's; another principal's ticket | no |

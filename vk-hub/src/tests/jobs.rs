@@ -230,37 +230,42 @@ fn enrolled_key(hub: &Hub) -> String {
         )
         .unwrap();
     let mut policy = hub.db.capacity_policy().unwrap();
-    policy
-        .tenants
-        .entry("tests".into())
-        .or_insert_with(|| crate::policy::Tenant {
-            weight: 1,
-            cap: None,
-            // [`spec`]'s project, and the one the approval tests' [`bound_body`] uses.
-            projects: [PROJECT_ID, 42]
-                .into_iter()
-                .map(|id| crate::policy::Project {
-                    gitlab: "gl".into(),
-                    id,
-                    production_branches: vec![],
-                    placement_rules: vec![],
-                })
-                .collect(),
-        });
     if policy.runner("gl", 42).is_none() {
-        policy.runners.push(crate::policy::RunnerMapping {
-            gitlab: "gl".into(),
-            runner_id: 42,
-            tenant: "tests".into(),
-            class: crate::policy::Class::Normal,
-            nodes: Vec::new(),
-            pools: Vec::new(),
+        policy.lanes.push(crate::policy::Lane {
+            // [`spec`]'s project, and the one the approval tests' [`bound_body`] uses.
+            projects: Some(
+                [PROJECT_ID, 42]
+                    .into_iter()
+                    .map(|id| crate::policy::LaneProject {
+                        gitlab: "gl".into(),
+                        id,
+                        branches: None,
+                    })
+                    .collect(),
+            ),
+            ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
+                gitlab: "gl".into(),
+                id: 42,
+            })
         });
     }
     hub.db
         .set_capacity_policy(&policy, "tests", now_secs())
         .unwrap();
     format!("relay:{id}:{}", vk_hub_proto::to_hex(&seed))
+}
+
+/// The lane of runner 42 of instance `gl`, which [`spec`]'s jobs run on.
+pub(super) fn lane_42(policy: &mut crate::policy::Policy) -> &mut crate::policy::Lane {
+    policy
+        .lanes
+        .iter_mut()
+        .find(|l| {
+            l.runner
+                .as_ref()
+                .is_some_and(|r| r.gitlab == "gl" && r.id == 42)
+        })
+        .unwrap()
 }
 
 /// Have relay `id` open a session at relay protocol 2 and send a heartbeat in it listing no
@@ -996,21 +1001,21 @@ async fn each_unresolvable_runner_is_refused_with_its_reason() {
 
     let mut policy = hub.db.capacity_policy().unwrap();
     let expected = policy.digest().unwrap();
-    policy.runners.retain(|r| r.runner_id != 42);
+    policy.lanes.retain(|l| l.runner.is_none());
     hub.db
         .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
         .unwrap();
     refused(
         &ask("test", placement()).await,
-        "gl/42 is mapped to no capacity tenant",
+        "gl/42 has no capacity lane",
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// New jobs must name their runner, belong to that runner, and use a project listed for
-/// its tenant.
+/// its lane.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_job_must_be_its_runner_s_and_of_its_tenant_s_projects() {
+async fn a_new_job_must_be_its_runner_s_and_of_its_lane_s_projects() {
     let dir = scratch("job-identity");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let key = jobs_key(&hub);
@@ -1036,7 +1041,7 @@ async fn a_new_job_must_be_its_runner_s_and_of_its_tenant_s_projects() {
         "{resp:?}"
     );
 
-    // Approved on the hub, but not one of the tenant's projects.
+    // Approved on the hub, but not one of the lane's projects.
     let other = crate::store::ProjectRef::parse("999:group/other").unwrap();
     hub.db
         .decide_projects(
@@ -1128,22 +1133,13 @@ async fn production_runner_requires_a_mapped_project_and_branch() {
     let key = jobs_key(&hub);
     let mut policy = hub.db.capacity_policy().unwrap();
     let expected = policy.digest().unwrap();
-    policy
-        .runners
-        .iter_mut()
-        .find(|r| r.runner_id == 42)
-        .unwrap()
-        .class = crate::policy::Class::Production;
-    policy
-        .tenants
-        .get_mut("tests")
-        .unwrap()
-        .projects
-        .iter_mut()
-        .find(|p| p.id == PROJECT_ID)
-        .unwrap()
-        .production_branches
-        .push("main".into());
+    let lane = lane_42(&mut policy);
+    lane.class = crate::policy::Class::Production;
+    lane.projects = Some(vec![crate::policy::LaneProject {
+        gitlab: "gl".into(),
+        id: PROJECT_ID,
+        branches: Some(vec!["main".into()]),
+    }]);
     hub.db
         .replace_capacity_policy_if(&policy, &expected, "tests", now_secs())
         .unwrap();
@@ -5542,17 +5538,17 @@ fn approve(hub: &Hub, id_path: &str) {
     let project = crate::store::ProjectRef::parse(id_path).unwrap();
     let id: u64 = id_path.split(':').next().unwrap().parse().unwrap();
     let mut policy = hub.db.capacity_policy().unwrap();
-    if let Some(tenant) = policy.tenants.get_mut("tests")
-        && !tenant
-            .projects
-            .iter()
-            .any(|p| p.gitlab == "gl" && p.id == id)
+    if let Some(projects) = policy
+        .lanes
+        .iter_mut()
+        .find(|l| l.runner.as_ref().is_some_and(|r| r.id == 42))
+        .and_then(|l| l.projects.as_mut())
+        && !projects.iter().any(|p| p.id == id)
     {
-        tenant.projects.push(crate::policy::Project {
+        projects.push(crate::policy::LaneProject {
             gitlab: "gl".into(),
             id,
-            production_branches: vec![],
-            placement_rules: vec![],
+            branches: None,
         });
     }
     hub.db

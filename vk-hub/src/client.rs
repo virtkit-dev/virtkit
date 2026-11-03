@@ -547,11 +547,11 @@ async fn capacity(
 }
 
 /// Who a request schedules for, as the operator assigned it, never as its client says: an API
-/// key's tenant, or the GitLab runner a relay names, as its inventory verified it, with the
-/// tenant the capacity policy maps it to and the runner's limits.
+/// key's lane, or the GitLab runner a relay names, as its inventory verified it, with its lane
+/// in the capacity policy and the runner's limits.
 #[derive(Clone)]
 pub(crate) struct ResolvedIdentity {
-    pub tenant: String,
+    pub lane: crate::policy::LaneId,
     pub class: crate::policy::Class,
     pub gitlab: Option<String>,
     pub runner_id: Option<u64>,
@@ -582,10 +582,10 @@ fn say_refused_once(relay: &str, error: &ApiError) {
 }
 
 /// The identity a request schedules under, and the policy it was resolved with. An API key
-/// names no runner and gets its client tenant. A relay names a runner, refused unless its
-/// session speaks version 2, and the runner is in its inventory once, verified with a GitLab
-/// ID, of the request's placement, and mapped to a tenant: the tenant `recorded` for its
-/// admission when there is one, which the runner must still match.
+/// names no runner and gets its own lane, else the default lane. A relay names a runner,
+/// refused unless its session speaks version 2, and the runner is in its inventory once,
+/// verified with a GitLab ID, of the request's placement, and has a lane: the identity
+/// `recorded` for its admission when there is one, which the runner must still match.
 async fn resolve_identity(
     hub: &Hub,
     principal: &ApiPrincipal,
@@ -605,11 +605,11 @@ async fn resolve_identity(
             if runner.is_some() {
                 return Err(identity_refused("an API key cannot name a relay runner"));
             }
-            let (tenant, _) = policy
+            let (lane, _) = policy
                 .client(&who.id)
-                .ok_or_else(|| identity_refused("the client has no capacity tenant"))?;
+                .ok_or_else(|| identity_refused("the API key has no capacity lane"))?;
             let identity = ResolvedIdentity {
-                tenant: tenant.to_owned(),
+                lane,
                 class: crate::policy::Class::Normal,
                 gitlab: None,
                 runner_id: None,
@@ -665,7 +665,7 @@ async fn resolve_identity(
         let runner_id = found.runner_id.filter(|id| *id != 0).ok_or_else(|| {
             identity_refused(&format!("runner {runner:?} has no GitLab runner ID"))
         })?;
-        let (tenant, class) = if let Some(recorded) = recorded {
+        let (lane, class) = if let Some(recorded) = recorded {
             if recorded.gitlab.as_deref() != Some(&gitlab)
                 || recorded.runner_id != Some(runner_id)
                 || recorded.runner.as_deref() != Some(&runner)
@@ -674,18 +674,24 @@ async fn resolve_identity(
                     "runner {runner:?} does not match its admission"
                 )));
             }
-            (recorded.tenant, recorded.class)
+            (recorded.lane, recorded.class)
         } else {
-            let mapping = policy.runner(&gitlab, runner_id).ok_or_else(|| {
+            let lane = policy.runner(&gitlab, runner_id).ok_or_else(|| {
                 identity_refused(&format!(
-                    "runner {gitlab}/{runner_id} is mapped to no capacity tenant: add it to \
-                     the capacity policy"
+                    "runner {gitlab}/{runner_id} has no capacity lane: add one to the capacity \
+                     policy"
                 ))
             })?;
-            (mapping.tenant.clone(), mapping.class)
+            (
+                crate::policy::LaneId::Runner {
+                    gitlab: gitlab.clone(),
+                    id: runner_id,
+                },
+                lane.class,
+            )
         };
         let identity = ResolvedIdentity {
-            tenant,
+            lane,
             class,
             gitlab: Some(gitlab),
             runner_id: Some(runner_id),
@@ -707,9 +713,9 @@ async fn resolve_identity(
     resolved
 }
 
-/// Check that `spec` belongs to `identity`'s runner and a project listed for its tenant in
-/// `policy`, the one the identity was resolved with. Production runners also require a
-/// pipeline of one of the project's production branches.
+/// Check that `spec` belongs to `identity`'s runner and that its lane in `policy`, the one the
+/// identity was resolved with, may run it: of a project it lists, and a branch pipeline of a
+/// branch it allows when it filters that project's branches.
 fn check_job_identity(
     policy: &crate::policy::Policy,
     identity: &ResolvedIdentity,
@@ -726,22 +732,17 @@ fn check_job_identity(
         .gitlab
         .as_deref()
         .ok_or_else(|| identity_refused("job has no GitLab identity"))?;
-    let project = policy
-        .project(&identity.tenant, gitlab, ci.job.project_id)
-        .ok_or_else(|| {
-            identity_refused(&format!(
-                "project {gitlab}/{} is not one of tenant {:?}'s projects",
-                ci.job.project_id, identity.tenant
-            ))
-        })?;
-    if identity.class == crate::policy::Class::Production
-        && !crate::policy::branch_name(&ci.sources).is_some_and(|branch| {
-            project
-                .production_branches
-                .iter()
-                .any(|p| crate::subject::glob_match(p, branch))
-        })
-    {
+    let lane = policy
+        .lane(&identity.lane)
+        .ok_or_else(|| identity_refused(&format!("{} has no capacity lane", identity.lane)))?;
+    if let Some(why) = lane.refuses_job(gitlab, ci.job.project_id, Some(&ci.sources)) {
+        return Err(identity_refused(&why));
+    }
+    // Admitted as production, it stays held to branches its lane lists for its project, even
+    // if the lane has since become normal.
+    let filtered =
+        (lane.projects.iter().flatten()).any(|p| p.id == ci.job.project_id && p.branches.is_some());
+    if identity.class == crate::policy::Class::Production && !filtered {
         return Err(identity_refused(
             "job is not an approved production branch pipeline",
         ));
@@ -1099,7 +1100,7 @@ async fn submit(
                 return Err(refused(error).await);
             }
             scheduling = Some(crate::store::SchedulingIdentity {
-                tenant: identity.tenant,
+                lane: identity.lane,
                 class: identity.class,
                 gitlab: identity.gitlab,
                 runner_id: identity.runner_id,

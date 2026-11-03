@@ -229,8 +229,8 @@ struct State {
     /// What each mapped relay runner's admissions came to lately, by GitLab instance and
     /// runner ID: whether its next request probes for work or waits out a backoff.
     demand: HashMap<(String, u64), Demand>,
-    /// When each tenant was last given a probe, so tenants take turns.
-    tenant_probe: HashMap<String, Instant>,
+    /// When each lane was last given a probe, so lanes take turns.
+    lane_probe: HashMap<crate::policy::LaneId, Instant>,
     /// Probes whose offer was abandoned unanswered, by reservation: the runner probed and
     /// since when. They count against the probe budget until the node answers, or for
     /// [`scheduler::ABANDONED_PROBE_GRACE`].
@@ -413,21 +413,12 @@ fn arbitration_views(state: &State, now: Instant) -> HashMap<(String, u64), Arbi
     views
 }
 
-/// The tenant charged for a job recorded without a scheduling identity, by a hub from before
-/// capacity arbitration: the first tenant, by name, listing its project. A project several
-/// tenants list is charged once.
-fn legacy_tenant<'p>(policy: &'p crate::policy::Policy, row: &JobRow) -> Option<&'p str> {
-    let (gitlab, project) = (row.gitlab.as_ref()?, row.project_id?);
-    policy
-        .tenants
-        .iter()
-        .find(|(_, tenant)| {
-            tenant
-                .projects
-                .iter()
-                .any(|p| p.gitlab == *gitlab && p.id == project)
-        })
-        .map(|(name, _)| name.as_str())
+/// The lane `row`'s job is charged to and held to: its scheduling identity's, or the default
+/// lane for a job recorded before capacity arbitration.
+fn job_lane(row: &JobRow) -> crate::policy::LaneId {
+    row.scheduling
+        .as_ref()
+        .map_or(crate::policy::LaneId::Default, |i| i.lane.clone())
 }
 
 const MAX_TICKETS: usize = 4096;
@@ -525,8 +516,8 @@ struct LiveJob {
     /// When the last node it could go to refused it.
     round_ended: Option<Instant>,
     /// Why arbitration last passed it over while nodes may have had room for it: a limit of
-    /// its tenant, relay or runner, production headroom, its project's delisting or its placement
-    /// rules. Told when it ends at its deadline.
+    /// its lane, relay or runner, production headroom, its lane's nodes or its delisting. Told
+    /// when it ends at its deadline.
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
@@ -2605,7 +2596,7 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
     let stored = crate::store::StoredAdmission {
         principal: ticket.key.clone(),
         identity: crate::store::SchedulingIdentity {
-            tenant: ticket.identity.tenant.clone(),
+            lane: ticket.identity.lane.clone(),
             class: ticket.identity.class,
             gitlab: ticket.identity.gitlab.clone(),
             runner_id: ticket.identity.runner_id,
@@ -2705,7 +2696,7 @@ pub fn check_admission(
                     ticket.phase,
                     TicketPhase::Granted { .. } | TicketPhase::Finished(_)
                 ))
-            || ticket.identity.tenant != identity.tenant
+            || ticket.identity.lane != identity.lane
             || ticket.identity.class != identity.class
             || ticket.identity.gitlab != identity.gitlab
             || ticket.identity.runner_id != identity.runner_id
@@ -3444,7 +3435,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 Some(outcome) => TicketPhase::Finished(outcome),
             };
             let identity = ResolvedIdentity {
-                tenant: admission.identity.tenant,
+                lane: admission.identity.lane,
                 class: admission.identity.class,
                 gitlab: admission.identity.gitlab,
                 runner_id: admission.identity.runner_id,
@@ -3869,7 +3860,7 @@ async fn step(hub: &Hub) -> Result<()> {
     };
     // Before the relay rows: a receipt is then never of a later heartbeat than a row holds.
     let heartbeats = hub.heartbeat_receipts();
-    let (nodes, mint, rules, policy, relays) = if queued {
+    let (nodes, mint, rules, (policy, policy_held), relays) = if queued {
         let keys = hub.token_keys.clone();
         blocking(hub, move |db| {
             let rules = match db.egress_rules_on() {
@@ -3880,7 +3871,7 @@ async fn step(hub: &Hub) -> Result<()> {
                 db.nodes()?,
                 crate::tokens::MintCtx::read(db, &keys)?,
                 rules,
-                db.capacity_policy()?,
+                db.capacity_policy_state()?,
                 db.relays_with_status()?,
             ))
         })
@@ -3890,7 +3881,7 @@ async fn step(hub: &Hub) -> Result<()> {
             Vec::new(),
             crate::tokens::MintCtx::default(),
             None,
-            crate::policy::Policy::default(),
+            (crate::policy::Policy::default(), false),
             Vec::new(),
         )
     };
@@ -3962,6 +3953,7 @@ async fn step(hub: &Hub) -> Result<()> {
                 policy: &policy,
             },
             policy: &policy,
+            held: policy_held,
             relays: &relays,
             heartbeats: &heartbeats,
         };
@@ -4067,83 +4059,29 @@ pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
     !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
-/// Nodes the runner `runner_id` of GitLab server `gitlab` may not use, under its mapping's
-/// nodes and pools: none for an API client, an unmapped runner, or one with neither list.
-fn runner_exclusions(
+/// Nodes `lane` may not use: none when the policy lacks it or it names no nodes.
+fn lane_exclusions(
     policy: &crate::policy::Policy,
-    gitlab: Option<&str>,
-    runner_id: Option<u64>,
+    lane: &crate::policy::LaneId,
     nodes: &[(String, NodeRow)],
 ) -> HashSet<String> {
-    let Some(mapping) = gitlab
-        .zip(runner_id)
-        .and_then(|(gitlab, id)| policy.runner(gitlab, id))
-        .filter(|m| m.confined())
-    else {
+    let Some(lane) = policy.lane(lane).filter(|l| l.confined()) else {
         return HashSet::new();
     };
     nodes
         .iter()
-        .filter(|(id, row)| !mapping.allows(id, &row.pools))
+        .filter(|(id, row)| !lane.allows_node(id, &row.pools))
         .map(|(id, _)| id.clone())
         .collect()
 }
 
-/// Nodes `job` may not go to: those its runner may not use ([`job_runner_exclusions`]), and
-/// those its project's placement rules exclude ([`rule_exclusions`]).
-fn placement_exclusions(
+/// Nodes `job` may not go to: those its lane may not use ([`lane_exclusions`]).
+fn job_exclusions(
     policy: &crate::policy::Policy,
     job: &LiveJob,
     nodes: &[(String, NodeRow)],
 ) -> HashSet<String> {
-    let mut excluded = job_runner_exclusions(policy, job, nodes);
-    excluded.extend(rule_exclusions(policy, job, nodes));
-    excluded
-}
-
-/// Nodes `job`'s project's placement rules exclude, under its tenant's listing, or any
-/// tenant's for a job recorded without a scheduling identity.
-fn rule_exclusions(
-    policy: &crate::policy::Policy,
-    job: &LiveJob,
-    nodes: &[(String, NodeRow)],
-) -> HashSet<String> {
-    let project = job
-        .row
-        .gitlab
-        .as_deref()
-        .zip(job.row.project_id)
-        .and_then(|(gitlab, id)| match &job.row.scheduling {
-            Some(identity) => policy.project(&identity.tenant, gitlab, id),
-            None => policy.project_any(gitlab, id),
-        });
-    let Some(project) = project.filter(|p| !p.placement_rules.is_empty()) else {
-        return HashSet::new();
-    };
-    let git_ref = job.spec.as_deref().map(|spec| {
-        let JobSpec::GitlabCi(ci) = spec;
-        ci.sources.git_ref.as_str()
-    });
-    nodes
-        .iter()
-        .filter(|(id, row)| !project.allows_placement(git_ref, id, &row.pools))
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-/// [`runner_exclusions`] of the runner `job` was admitted for.
-fn job_runner_exclusions(
-    policy: &crate::policy::Policy,
-    job: &LiveJob,
-    nodes: &[(String, NodeRow)],
-) -> HashSet<String> {
-    let identity = job.row.scheduling.as_ref();
-    runner_exclusions(
-        policy,
-        identity.and_then(|i| i.gitlab.as_deref()),
-        identity.and_then(|i| i.runner_id),
-        nodes,
-    )
+    lane_exclusions(policy, &job_lane(&job.row), nodes)
 }
 
 /// Reservation `id`, if a job may start on it: held by a linked node outside `excluded` that
@@ -4202,7 +4140,7 @@ fn place(
         .as_ref()
         .map_or(crate::policy::Class::Normal, |i| i.class);
     let mut tried = job.tried.clone();
-    let excluded = placement_exclusions(policy, job, nodes);
+    let excluded = job_exclusions(policy, job, nodes);
     tried.extend(excluded.iter().cloned());
     let affinity = hub.dispatch.affinity;
     let clock = crate::now_secs();
@@ -4831,7 +4769,7 @@ mod tests {
             request_id: String::new(),
             digest: String::new(),
             identity: ResolvedIdentity {
-                tenant: "fallback".into(),
+                lane: crate::policy::LaneId::Default,
                 class: crate::policy::Class::Normal,
                 gitlab: None,
                 runner_id: None,
@@ -4864,7 +4802,7 @@ mod tests {
             let mut state = hub.dispatch.lock();
             for (id, age, blocked) in [
                 ("a", 1, "runner limit"),
-                ("b", 3, "tenant cap"),
+                ("b", 3, "lane at max slots"),
                 ("c", 2, "backoff"),
             ] {
                 let mut t = ticket(TicketPhase::Waiting, now - Duration::from_secs(age));
@@ -4882,7 +4820,7 @@ mod tests {
             "{:?}",
             view.wait_secs
         );
-        assert_eq!(view.reason, Some("tenant cap"));
+        assert_eq!(view.reason, Some("lane at max slots"));
         assert_eq!(view.oldest.as_deref(), Some("b"));
     }
 
@@ -4896,7 +4834,7 @@ mod tests {
             for (id, created_at, blocked) in [
                 ("a", 20, Some("runner limit")),
                 ("b", 10, None),
-                ("c", 15, Some("tenant cap")),
+                ("c", 15, Some("lane at max slots")),
                 ("d", 15, Some("backoff")),
             ] {
                 let mut job = sent("n1", 1, None);
@@ -4904,7 +4842,7 @@ mod tests {
                 job.row.node = None;
                 job.row.created_at = created_at;
                 job.row.scheduling = Some(crate::store::SchedulingIdentity {
-                    tenant: "fallback".into(),
+                    lane: crate::policy::LaneId::Default,
                     class: crate::policy::Class::Normal,
                     gitlab: Some("gl".into()),
                     runner_id: Some(42),
@@ -4916,7 +4854,7 @@ mod tests {
         let snapshot = arbitration_snapshot(&hub).unwrap();
         let view = &snapshot[&("gl".to_string(), 42)];
         assert_eq!((view.waiting, view.jobs), (0, 4));
-        assert_eq!(view.reason, Some("tenant cap"));
+        assert_eq!(view.reason, Some("lane at max slots"));
     }
 
     /// A runner with only a finished request has nothing to show; one with no request but a
@@ -5017,33 +4955,16 @@ mod tests {
         assert!(state.retired_jobs.is_empty());
     }
 
-    /// A job recorded before capacity arbitration is charged to one tenant listing its
-    /// project, however many do, and to none when none does.
+    /// A job recorded before capacity arbitration is charged to the default lane.
     #[test]
-    fn a_legacy_job_is_charged_to_one_tenant() {
-        let mut policy = crate::policy::Policy::default();
-        let tenant = |id| crate::policy::Tenant {
-            weight: 1,
-            cap: None,
-            projects: vec![crate::policy::Project {
-                gitlab: "gl".into(),
-                id,
-                production_branches: Vec::new(),
-                placement_rules: Vec::new(),
-            }],
-        };
-        policy.tenants.insert("b".into(), tenant(7));
-        policy.tenants.insert("a".into(), tenant(7));
-        let row = |project_id| -> JobRow {
-            serde_json::from_value(serde_json::json!({
-                "key": "k", "key_name": "k", "request_id": "r", "created_at": 0,
-                "revision": 1, "placement": Placement::default(), "state": "running",
-                "gitlab": "gl", "project_id": project_id,
-            }))
-            .unwrap()
-        };
-        assert_eq!(legacy_tenant(&policy, &row(7)), Some("a"));
-        assert_eq!(legacy_tenant(&policy, &row(8)), None);
+    fn a_legacy_job_is_charged_to_the_default_lane() {
+        let row: JobRow = serde_json::from_value(serde_json::json!({
+            "key": "k", "key_name": "k", "request_id": "r", "created_at": 0,
+            "revision": 1, "placement": Placement::default(), "state": "running",
+            "gitlab": "gl", "project_id": 7,
+        }))
+        .unwrap();
+        assert_eq!(job_lane(&row), crate::policy::LaneId::Default);
     }
 
     #[test]
@@ -5051,7 +4972,7 @@ mod tests {
         let row = crate::store::StoredAdmission {
             principal: "relay".into(),
             identity: crate::store::SchedulingIdentity {
-                tenant: "fallback".into(),
+                lane: crate::policy::LaneId::Default,
                 class: crate::policy::Class::Normal,
                 gitlab: Some("gl".into()),
                 runner_id: Some(1),
@@ -5108,7 +5029,7 @@ mod tests {
         };
         let now = Instant::now();
         let identity = ResolvedIdentity {
-            tenant: "fallback".into(),
+            lane: crate::policy::LaneId::Default,
             class: crate::policy::Class::Normal,
             gitlab: Some("gl".into()),
             runner_id: Some(1),
@@ -5517,85 +5438,75 @@ mod tests {
         }
     }
 
-    /// A relay job whose tenant stopped listing its project is held; a job recorded without a
-    /// scheduling identity, or an API key's, is not.
+    /// A relay job its lane no longer allows is held: unmapped, its project or branch no longer
+    /// listed. A job recorded without a scheduling identity, or an API key's, is not.
     #[test]
-    fn only_a_relay_job_of_a_delisted_project_is_held() {
+    fn only_a_relay_job_its_lane_no_longer_allows_is_held() {
+        use crate::policy::{Lane, LaneId, LaneProject};
         let mut policy = crate::policy::Policy::default();
         let mut row = sent("n1", 1, None).row;
         row.gitlab = Some("gl".into());
         row.project_id = Some(7);
-        assert!(!scheduler::delisted(&policy, &row));
+        assert!(!scheduler::delisted(&policy, &row, None));
+        let lane = LaneId::Runner {
+            gitlab: "gl".into(),
+            id: 42,
+        };
         let relay = crate::store::SchedulingIdentity {
-            tenant: "fallback".into(),
+            lane: lane.clone(),
             class: crate::policy::Class::Normal,
             gitlab: Some("gl".into()),
             runner_id: Some(42),
         };
         row.scheduling = Some(crate::store::SchedulingIdentity {
+            lane: LaneId::Default,
             gitlab: None,
             runner_id: None,
             ..relay.clone()
         });
-        assert!(!scheduler::delisted(&policy, &row));
+        assert!(!scheduler::delisted(&policy, &row, None));
+        // Unmapped.
         row.scheduling = Some(relay);
-        assert!(scheduler::delisted(&policy, &row));
-        policy.tenants.get_mut("fallback").unwrap().projects = vec![crate::policy::Project {
+        assert!(scheduler::delisted(&policy, &row, None));
+        policy.lanes.push(Lane::new(&lane));
+        assert!(!scheduler::delisted(&policy, &row, None));
+        let project = |branches: Option<Vec<String>>| LaneProject {
             gitlab: "gl".into(),
             id: 7,
-            production_branches: Vec::new(),
-            placement_rules: Vec::new(),
-        }];
-        assert!(!scheduler::delisted(&policy, &row));
+            branches,
+        };
+        policy.lanes[1].projects = Some(vec![]);
+        assert!(scheduler::delisted(&policy, &row, None));
+        policy.lanes[1].projects = Some(vec![project(Some(vec!["main".into()]))]);
+        assert!(!scheduler::delisted(&policy, &row, None));
+        let sha = "a".repeat(40);
+        let on = |branch: &str| vk_hub_proto::job::Sources {
+            git_ref: branch.into(),
+            sha: sha.clone(),
+            refspecs: vec![format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")],
+            ..vk_hub_proto::job::Sources::default()
+        };
+        assert!(!scheduler::delisted(&policy, &row, Some(&on("main"))));
+        assert!(scheduler::delisted(&policy, &row, Some(&on("dev"))));
     }
 
-    /// A job recorded without a scheduling identity is held to the rules of the tenant that lists
-    /// its project, whichever that is.
+    /// A job is held to the nodes its lane may use; one recorded without a scheduling identity
+    /// to the default lane's.
     #[test]
-    fn a_legacy_job_is_held_to_its_project_s_placement_rules() {
-        let mut policy = crate::policy::Policy::default();
-        policy.tenants.get_mut("fallback").unwrap().projects = vec![crate::policy::Project {
+    fn a_job_is_held_to_the_nodes_its_lane_may_use() {
+        use crate::policy::{Lane, LaneId};
+        let lane = LaneId::Runner {
             gitlab: "gl".into(),
-            id: 7,
-            production_branches: Vec::new(),
-            placement_rules: vec![crate::policy::PlacementRule {
-                branches: vec!["main".into()],
-                nodes: vec!["n1".into()],
-                pools: Vec::new(),
-            }],
-        }];
-        let mut job = sent("n1", 1, None);
-        job.row.gitlab = Some("gl".into());
-        job.row.project_id = Some(7);
-        let mut ci = vk_hub_proto::job::CiJob::default();
-        ci.sources.git_ref = "main".into();
-        job.spec = Some(Arc::new(JobSpec::GitlabCi(ci)));
-        let nodes = [
-            ("n1".to_string(), NodeRow::default()),
-            ("n2".to_string(), NodeRow::default()),
-        ];
-        assert_eq!(
-            placement_exclusions(&policy, &job, &nodes),
-            HashSet::from(["n2".to_string()])
-        );
-    }
-
-    /// A job admitted for a runner given nodes or pools is held to those, as well as to its
-    /// project's rules; an API key's is not.
-    #[test]
-    fn a_job_is_held_to_the_nodes_its_runner_may_use() {
+            id: 42,
+        };
         let mut policy = crate::policy::Policy::default();
-        policy.runners.push(crate::policy::RunnerMapping {
-            gitlab: "gl".into(),
-            runner_id: 42,
-            tenant: "fallback".into(),
-            class: crate::policy::Class::Normal,
-            nodes: vec!["n1".into()],
-            pools: vec!["trusted".into()],
+        policy.lanes.push(Lane {
+            nodes: Some(vec!["trusted".into()]),
+            ..Lane::new(&lane)
         });
         let mut job = sent("n1", 1, None);
         job.row.scheduling = Some(crate::store::SchedulingIdentity {
-            tenant: "fallback".into(),
+            lane,
             class: crate::policy::Class::Normal,
             gitlab: Some("gl".into()),
             runner_id: Some(42),
@@ -5605,19 +5516,20 @@ mod tests {
             ..NodeRow::default()
         };
         let nodes = [
-            ("n1".to_string(), NodeRow::default()),
+            ("n1".to_string(), trusted),
             ("n2".to_string(), NodeRow::default()),
-            ("n3".to_string(), trusted),
         ];
         assert_eq!(
-            placement_exclusions(&policy, &job, &nodes),
+            job_exclusions(&policy, &job, &nodes),
             HashSet::from(["n2".to_string()])
         );
-        if let Some(identity) = &mut job.row.scheduling {
-            identity.gitlab = None;
-            identity.runner_id = None;
-        }
-        assert!(placement_exclusions(&policy, &job, &nodes).is_empty());
+        job.row.scheduling = None;
+        assert!(job_exclusions(&policy, &job, &nodes).is_empty());
+        policy.lanes[0].nodes = Some(vec!["trusted".into()]);
+        assert_eq!(
+            job_exclusions(&policy, &job, &nodes),
+            HashSet::from(["n2".to_string()])
+        );
     }
 
     /// A running job's record is due a write for its egress report once it holds one newer than

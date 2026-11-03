@@ -191,6 +191,8 @@ enum Call {
         claims: crate::egress::rules::Claims,
     },
     GetCapacityPolicy,
+    /// What converting the stored policy to lanes left to review.
+    GetCapacityConversion,
     SetCapacityPolicy {
         policy: crate::policy::Policy,
         expected: String,
@@ -841,6 +843,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         }
         Call::ListRejectedGitlabs => serde_json::to_value(hub.db.rejected_gitlabs()?)?,
         Call::GetCapacityPolicy => serde_json::to_value(hub.db.capacity_policy()?)?,
+        Call::GetCapacityConversion => serde_json::to_value(hub.db.capacity_conversion()?)?,
         Call::SetCapacityPolicy { policy, expected } => {
             let changed =
                 hub.db
@@ -1250,6 +1253,10 @@ impl Client {
 
     pub fn capacity_policy(&self) -> Result<crate::policy::Policy> {
         self.call(Call::GetCapacityPolicy)
+    }
+
+    pub fn capacity_conversion(&self) -> Result<Option<crate::store::ConversionNote>> {
+        self.call(Call::GetCapacityConversion)
     }
 
     pub fn set_capacity_policy(

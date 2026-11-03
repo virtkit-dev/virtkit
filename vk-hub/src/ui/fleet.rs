@@ -373,9 +373,6 @@ pub(super) async fn get(
     if path == super::capacity::PATH {
         return super::capacity::policy_get(auth, ui).await.map(Some);
     }
-    if let Some(name) = super::capacity::tenant_target(path) {
-        return super::capacity::tenant_get(name, auth, ui).await.map(Some);
-    }
     if let Some((gitlab, id)) = super::projects::target(path) {
         return super::projects::get(gitlab, id, auth, ui).await.map(Some);
     }

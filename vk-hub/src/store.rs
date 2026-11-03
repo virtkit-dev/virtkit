@@ -86,7 +86,7 @@ pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retent
 pub use observed::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,
 };
-pub use policy::{PolicyRefused, policy_changes};
+pub use policy::{ConversionNote, PolicyRefused, policy_changes};
 pub use registries::{
     RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
@@ -1049,6 +1049,8 @@ impl Db {
         approvals::migrate_bound_keys(&txn, crate::now_secs())
             .context("converting the API keys bound to GitLab instances")?;
         egress::share_history(&txn).context("gathering the history's egress reports")?;
+        policy::convert_stored(&txn, crate::now_secs())
+            .context("converting the capacity policy to lanes")?;
         txn.commit().context("initializing the hub database")?;
         let spec_dicts = packed::SpecDicts::load(&db).context("loading the job spec dictionary")?;
         let db = Db {

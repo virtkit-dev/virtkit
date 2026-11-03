@@ -116,16 +116,62 @@ const REQUEST_SWEEP_SECS: u64 = 600;
 pub const PREPARE_STAGE: &str = "prepare_executor";
 
 /// The policy identity recorded when work is admitted.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchedulingIdentity {
-    /// The capacity tenant charged.
-    pub tenant: String,
+    /// The capacity lane charged.
+    pub lane: crate::policy::LaneId,
     /// The class it was admitted in.
     pub class: crate::policy::Class,
     /// The GitLab server and runner ID of the runner it was admitted for; an API-key client
     /// has neither.
     pub gitlab: Option<String>,
     pub runner_id: Option<u64>,
+}
+
+/// [`SchedulingIdentity`] as stored. A tenant-format hub wrote `tenant` and no `lane`: read
+/// back, such a row names its runner's lane, or the default lane. Written, `tenant` holds the
+/// lane's name too, so a rolled-back hub can still read the row.
+#[derive(Serialize, Deserialize)]
+struct StoredIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane: Option<crate::policy::LaneId>,
+    #[serde(default)]
+    tenant: Option<String>,
+    class: crate::policy::Class,
+    gitlab: Option<String>,
+    runner_id: Option<u64>,
+}
+
+impl Serialize for SchedulingIdentity {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        StoredIdentity {
+            lane: Some(self.lane.clone()),
+            tenant: Some(self.lane.to_string()),
+            class: self.class,
+            gitlab: self.gitlab.clone(),
+            runner_id: self.runner_id,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for SchedulingIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = StoredIdentity::deserialize(d)?;
+        let lane = s.lane.unwrap_or_else(|| match (&s.gitlab, s.runner_id) {
+            (Some(gitlab), Some(id)) => crate::policy::LaneId::Runner {
+                gitlab: gitlab.clone(),
+                id,
+            },
+            _ => crate::policy::LaneId::Default,
+        });
+        Ok(SchedulingIdentity {
+            lane,
+            class: s.class,
+            gitlab: s.gitlab,
+            runner_id: s.runner_id,
+        })
+    }
 }
 
 /// A job the hub has taken.
@@ -1878,7 +1924,7 @@ mod tests {
         let id = "a".repeat(32);
         let mut job = row(1);
         job.scheduling = Some(SchedulingIdentity {
-            tenant: "project".into(),
+            lane: crate::policy::LaneId::Default,
             class: crate::policy::Class::Production,
             gitlab: Some("gl".into()),
             runner_id: Some(42),
@@ -2073,7 +2119,7 @@ mod tests {
         let stored = super::super::StoredAdmission {
             principal: finished.key.clone(),
             identity: SchedulingIdentity {
-                tenant: "t".into(),
+                lane: crate::policy::LaneId::Default,
                 class: crate::policy::Class::Normal,
                 gitlab: None,
                 runner_id: None,
@@ -2126,7 +2172,7 @@ mod tests {
         let stored = super::super::StoredAdmission {
             principal: finished.key.clone(),
             identity: SchedulingIdentity {
-                tenant: "t".into(),
+                lane: crate::policy::LaneId::Default,
                 class: crate::policy::Class::Normal,
                 gitlab: None,
                 runner_id: None,

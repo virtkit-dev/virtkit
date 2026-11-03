@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::{Db, append_audit, decode, encode};
-use crate::policy::{Policy, digest_bytes};
+use serde::{Deserialize, Serialize};
+
+use super::{Db, StoredAdmission, append_audit, decode, encode};
+use crate::policy::{Lane, LaneId, Policy, digest_bytes};
 
 pub(super) const CAPACITY_POLICY: TableDefinition<&str, &[u8]> =
     TableDefinition::new("capacity_policy");
@@ -67,18 +69,15 @@ fn changed<K: Ord + Clone, V: PartialEq>(
         .collect()
 }
 
-/// Changes between `before` and `after` for the replacement audit: tenant, runner and client
-/// names, scheduling settings and fallback. Empty when they are the same.
+/// Changes between `before` and `after` for the replacement audit: lanes and scheduling
+/// settings. Empty when they are the same.
 pub fn policy_changes(before: &Policy, after: &Policy) -> Vec<String> {
-    let tenants = changed(&before.tenants, &after.tenants);
-    let by_runner = |p: &Policy| -> BTreeMap<String, crate::policy::RunnerMapping> {
-        p.runners
-            .iter()
-            .map(|r| (format!("{}/{}", r.gitlab, r.runner_id), r.clone()))
+    let by_id = |p: &Policy| -> BTreeMap<String, Lane> {
+        (p.lanes.iter())
+            .filter_map(|l| Some((l.id()?.to_string(), l.clone())))
             .collect()
     };
-    let runners = changed(&by_runner(before), &by_runner(after));
-    let clients = changed(&before.clients, &after.clients);
+    let lanes = changed(&by_id(before), &by_id(after));
     let mut settings = Vec::new();
     for (name, differs) in [
         ("headroom", before.headroom != after.headroom),
@@ -102,21 +101,10 @@ pub fn policy_changes(before: &Policy, after: &Policy) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    for (what, names) in [
-        ("tenants", &tenants),
-        ("runners", &runners),
-        ("clients", &clients),
-        ("settings", &settings),
-    ] {
+    for (what, names) in [("lanes", &lanes), ("settings", &settings)] {
         if !names.is_empty() {
             out.push(format!("{what}: {}", listed(names)));
         }
-    }
-    if before.fallback != after.fallback {
-        out.push(format!(
-            "fallback: {} to {}",
-            before.fallback, after.fallback
-        ));
     }
     out
 }
@@ -132,6 +120,121 @@ fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String
         event.push_str(&change);
     }
     event
+}
+
+/// The row of the policy stored before the conversion to lanes, kept as it was for a rollback.
+const V1_BACKUP: &str = "policy.v1.bak";
+/// The row of the [`ConversionNote`] left by that conversion.
+const CONVERSION: &str = "conversion";
+
+/// What converting the stored policy to lanes left for an operator to review.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversionNote {
+    /// The digests of the policy converted, kept as [`V1_BACKUP`], and of the conversion.
+    pub from: String,
+    pub to: String,
+    /// Lanes each given the whole share of a tenant several lanes took, with its name: until
+    /// the lane is next changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<(LaneId, String)>,
+    /// Placement rules the lanes could not express, with the lanes they applied to: while
+    /// any is listed, the policy is held, granting no new capacity, until an operator sets a
+    /// policy again, unchanged or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconverted: Vec<String>,
+}
+
+impl ConversionNote {
+    /// Whether the policy is proposed, not active: no new capacity is granted.
+    pub fn held(&self) -> bool {
+        !self.unconverted.is_empty()
+    }
+}
+
+/// Convert a policy stored in the earlier format of tenants to lanes, once: keep the original
+/// as [`V1_BACKUP`], store the lanes with a [`ConversionNote`], and rewrite the scheduling
+/// identity of admissions and jobs not finished to name their lane. A policy that does not
+/// convert is left as it is: the hub reports it unreadable until an operator replaces it.
+pub(super) fn convert_stored(txn: &redb::WriteTransaction, now: u64) -> Result<()> {
+    let mut table = txn.open_table(CAPACITY_POLICY)?;
+    let Some(bytes) = table.get("policy")?.map(|row| row.value().to_vec()) else {
+        return Ok(());
+    };
+    let earlier = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .is_ok_and(|v| v.is_object() && v.get("version").is_none());
+    if !earlier {
+        return Ok(());
+    }
+    let converted = match crate::policy::convert_v1(&bytes) {
+        Ok(converted) => converted,
+        Err(e) => {
+            eprintln!("vk-hub: the stored capacity policy does not convert to lanes: {e:#}");
+            return Ok(());
+        }
+    };
+    let (from, to) = (digest_bytes(&bytes), converted.policy.digest()?);
+    let note = ConversionNote {
+        from: from.clone(),
+        to: to.clone(),
+        shared: converted.shared.clone(),
+        unconverted: converted.unconverted.clone(),
+    };
+    table.insert(V1_BACKUP, bytes.as_slice())?;
+    table.insert("policy", encode(&converted.policy)?.as_slice())?;
+    table.insert(CONVERSION, encode(&note)?.as_slice())?;
+    drop(table);
+    rewrite_identities(txn, &converted.policy)?;
+    let mut event = format!(
+        "converted capacity policy {} to lanes {}",
+        crate::store::short(&from),
+        crate::store::short(&to)
+    );
+    if note.held() {
+        event.push_str(&format!(
+            "; held until activated: {} placement rules do not convert",
+            note.unconverted.len()
+        ));
+    }
+    append_audit(txn, None, "hub", &event, now)?;
+    for warning in converted.warnings() {
+        eprintln!("vk-hub: capacity policy conversion: {warning}");
+    }
+    Ok(())
+}
+
+/// Have each admission and job not finished name its lane: a runner's, an API key's own or
+/// the default lane.
+fn rewrite_identities(txn: &redb::WriteTransaction, policy: &Policy) -> Result<()> {
+    let mut admissions = txn.open_table(super::admissions::ADMISSIONS)?;
+    let mut rows = Vec::new();
+    for entry in admissions.iter()? {
+        let (id, row) = entry?;
+        rows.push((
+            id.value().to_owned(),
+            decode::<StoredAdmission>(row.value())?,
+        ));
+    }
+    for (id, mut row) in rows {
+        let identity = &mut row.identity;
+        if identity.gitlab.is_none() && identity.runner_id.is_none() {
+            identity.lane = (policy.client(&row.principal)).map_or(LaneId::Default, |(id, _)| id);
+        }
+        admissions.insert(id.as_str(), encode(&row)?.as_slice())?;
+    }
+    let mut jobs = txn.open_table(super::jobs::JOBS)?;
+    let mut rows = Vec::new();
+    for entry in jobs.iter()? {
+        let (id, row) = entry?;
+        let row = decode::<super::JobRow>(row.value())?;
+        if row.state != vk_hub_proto::client::JobState::Finished && row.scheduling.is_some() {
+            rows.push((id.value().to_owned(), row));
+        }
+    }
+    // Decoded, a job's identity names its runner's lane; only a relay submits jobs.
+    for (id, row) in rows {
+        jobs.insert(id.as_str(), encode(&row)?.as_slice())?;
+    }
+    Ok(())
 }
 
 impl Db {
@@ -153,6 +256,30 @@ impl Db {
         }
     }
 
+    /// What converting the stored policy to lanes left to review, until an operator has.
+    pub fn capacity_conversion(&self) -> Result<Option<ConversionNote>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CAPACITY_POLICY)?;
+        table
+            .get(CONVERSION)?
+            .map(|row| decode(row.value()))
+            .transpose()
+    }
+
+    /// The policy and whether it is held, granting no new capacity ([`ConversionNote::held`]),
+    /// read together.
+    pub fn capacity_policy_state(&self) -> Result<(Policy, bool)> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CAPACITY_POLICY)?;
+        let held = match table.get(CONVERSION)? {
+            Some(row) => decode::<ConversionNote>(row.value())?.held(),
+            None => false,
+        };
+        drop(table);
+        drop(txn);
+        Ok((self.capacity_policy()?, held))
+    }
+
     /// Replace the policy unconditionally, audited as `actor`'s.
     #[cfg(test)]
     pub fn set_capacity_policy(&self, policy: &Policy, actor: &str, now: u64) -> Result<()> {
@@ -162,6 +289,7 @@ impl Db {
         {
             let mut table = txn.open_table(CAPACITY_POLICY)?;
             table.insert("policy", bytes.as_slice())?;
+            table.remove(CONVERSION)?;
         }
         append_audit(&txn, None, actor, "changed capacity policy", now)?;
         txn.commit()?;
@@ -179,8 +307,18 @@ impl Db {
         txn.commit().unwrap();
     }
 
+    /// The policy row kept from before the conversion to lanes.
+    #[cfg(test)]
+    pub fn capacity_policy_backup(&self) -> Option<Vec<u8>> {
+        let txn = self.db.begin_read().unwrap();
+        let table = txn.open_table(CAPACITY_POLICY).unwrap();
+        table.get(V1_BACKUP).unwrap().map(|r| r.value().to_vec())
+    }
+
     /// Replace the policy if its digest is still `expected`, audited in the same transaction.
-    /// Returns whether it changed: the same policy again writes nothing.
+    /// Returns whether it changed: the same policy again writes nothing, unless it activates a
+    /// policy held since its conversion. A lane changed is no longer flagged as sharing a
+    /// tenant's share.
     pub fn replace_capacity_policy_if(
         &self,
         policy: &Policy,
@@ -209,16 +347,44 @@ impl Db {
             if digest != expected && shown.as_deref() != Some(expected) {
                 return Err(PolicyRefused::Conflict.into());
             }
+            let note = table
+                .get(CONVERSION)?
+                .map(|row| decode::<ConversionNote>(row.value()))
+                .transpose()?;
+            let held = note.as_ref().is_some_and(ConversionNote::held);
             let next = policy.digest()?;
             audit = match current {
-                Some(current) if current == *policy => return Ok(false),
-                Some(current) => policy_audit(&current, policy, &digest, &next),
+                Some(current) if current == *policy && !held => return Ok(false),
+                Some(current) if current == *policy => {
+                    format!("activated capacity policy {}", crate::store::short(&next))
+                }
+                Some(current) => {
+                    let mut event = policy_audit(&current, policy, &digest, &next);
+                    if held {
+                        event.push_str("; activated");
+                    }
+                    event
+                }
                 None => format!(
                     "replaced unreadable capacity policy {} with {}",
                     crate::store::short(&digest),
                     crate::store::short(&next)
                 ),
             };
+            let before = current_lanes(&table)?;
+            match note.map(|mut note| {
+                note.unconverted.clear();
+                note.shared
+                    .retain(|(id, _)| before.as_ref().and_then(|b| b.lane(id)) == policy.lane(id));
+                note
+            }) {
+                Some(note) if !note.shared.is_empty() => {
+                    table.insert(CONVERSION, encode(&note)?.as_slice())?;
+                }
+                _ => {
+                    table.remove(CONVERSION)?;
+                }
+            }
             let bytes = encode(policy)?;
             table.insert("policy", bytes.as_slice())?;
         }
@@ -228,10 +394,24 @@ impl Db {
     }
 }
 
+/// The policy `table` stores, if readable.
+fn current_lanes(table: &redb::Table<&str, &[u8]>) -> Result<Option<Policy>> {
+    Ok(table
+        .get("policy")?
+        .and_then(|row| decode::<Policy>(row.value()).ok()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Class, RunnerMapping, Tenant};
+    use crate::policy::{Class, LaneProject};
+
+    fn runner(id: u64) -> Lane {
+        Lane::new(&LaneId::Runner {
+            gitlab: "gl".into(),
+            id,
+        })
+    }
 
     #[test]
     fn audit_names_changed_scheduling_settings() {
@@ -246,10 +426,7 @@ mod tests {
         assert!(event.contains("headroom"));
         assert!(event.contains("probe_limit"));
         assert!(!event.contains("busy_secs"));
-        assert!(
-            !event.contains("tenants") && !event.contains("fallback"),
-            "{event}"
-        );
+        assert!(!event.contains("lanes"), "{event}");
     }
 
     #[test]
@@ -258,21 +435,12 @@ mod tests {
         let initial = db.capacity_policy().unwrap();
         let expected = initial.digest().unwrap();
         let mut policy = initial.clone();
-        policy.tenants.insert(
-            "web".into(),
-            Tenant {
-                weight: 2,
-                cap: Some(4),
-                projects: vec![],
-            },
-        );
-        policy.runners.push(RunnerMapping {
-            gitlab: "gl".into(),
-            runner_id: 42,
-            tenant: "web".into(),
+        policy.lanes.push(Lane {
             class: Class::Production,
-            nodes: Vec::new(),
-            pools: Vec::new(),
+            weight: 2,
+            max_slots: Some(4),
+            projects: Some(vec![]),
+            ..runner(42)
         });
         assert!(
             db.replace_capacity_policy_if(&policy, &expected, "operator", 1)
@@ -292,7 +460,7 @@ mod tests {
             Some(PolicyRefused::Conflict)
         ));
         let mut invalid = policy.clone();
-        invalid.runners.push(invalid.runners[0].clone());
+        invalid.lanes.push(invalid.lanes[1].clone());
         let error = db
             .replace_capacity_policy_if(&invalid, &policy.digest().unwrap(), "operator", 3)
             .unwrap_err();
@@ -303,7 +471,7 @@ mod tests {
         assert_eq!(db.capacity_policy().unwrap(), policy);
         let audits = db.audits(None, 100).unwrap();
         assert_eq!(audits.len(), 1);
-        assert!(audits[0].event.contains("web") && audits[0].event.contains("gl/42"));
+        assert!(audits[0].event.contains("runner gl/42"), "{audits:?}");
     }
 
     #[test]
@@ -332,8 +500,8 @@ mod tests {
         let mut after = before.clone();
         for i in 0..AUDIT_NAMES + 5 {
             after
-                .clients
-                .insert(format!("key-{i:02}"), "fallback".into());
+                .lanes
+                .push(Lane::new(&LaneId::Key(format!("key-{i:02}"))));
         }
         let event = policy_audit(&before, &after, &"a".repeat(64), &"b".repeat(64));
         assert!(event.contains("and 5 more"), "{event}");
@@ -343,7 +511,7 @@ mod tests {
     #[test]
     fn an_unreadable_policy_names_its_digest_and_can_be_replaced() {
         let db = Db::open_memory().unwrap();
-        let stored = br#"{"from_a_later_hub":true}"#;
+        let stored = br#"{"version":3,"from_a_later_hub":true}"#;
         db.set_raw_capacity_policy(stored.as_slice());
         let digest = digest_bytes(stored);
         let err = format!("{:#}", db.capacity_policy().unwrap_err());
@@ -358,6 +526,155 @@ mod tests {
         assert!(
             audits[0].event.contains("replaced unreadable"),
             "{audits:?}"
+        );
+    }
+
+    /// A database whose policy row is `v1`, reopened by this hub.
+    fn reopened(v1: serde_json::Value, setup: impl FnOnce(&Db)) -> (Db, Vec<u8>, impl Drop) {
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vk-hub-lanes-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hub.redb");
+        let bytes = serde_json::to_vec(&v1).unwrap();
+        let db = Db::open(&path).unwrap();
+        db.set_raw_capacity_policy(&bytes);
+        setup(&db);
+        drop(db);
+        (Db::open(&path).unwrap(), bytes, Gone(dir))
+    }
+
+    #[test]
+    fn a_stored_earlier_policy_is_converted_once_and_kept() {
+        let v1 = serde_json::json!({
+            "tenants": {
+                "fallback": { "weight": 1 },
+                "web": { "weight": 2, "projects": [{ "gitlab": "gl", "id": 7 }] }
+            },
+            "runners": [{ "gitlab": "gl", "runner_id": 42, "tenant": "web", "class": "normal" }],
+            "clients": { "ci-bot": "web" }
+        });
+        let (db, bytes, _dir) = reopened(v1, |_| {});
+        let policy = db.capacity_policy().unwrap();
+        let lane = policy.runner("gl", 42).unwrap();
+        assert_eq!(lane.weight, 2);
+        assert_eq!(
+            lane.projects,
+            Some(vec![LaneProject {
+                gitlab: "gl".into(),
+                id: 7,
+                branches: None
+            }])
+        );
+        assert_eq!(db.capacity_policy_backup(), Some(bytes.clone()));
+        let note = db.capacity_conversion().unwrap().unwrap();
+        assert!(!note.held());
+        assert_eq!(note.from, digest_bytes(&bytes));
+        assert_eq!(note.to, policy.digest().unwrap());
+        assert_eq!(note.shared.len(), 2, "{note:?}");
+        assert!(!db.capacity_policy_state().unwrap().1);
+        let audits = db.audits(None, 10).unwrap();
+        assert!(
+            audits[0].event.contains(crate::store::short(&note.from))
+                && audits[0].event.contains(crate::store::short(&note.to)),
+            "{audits:?}"
+        );
+        // Saving the policy with one shared lane changed clears that lane's flag alone.
+        let mut changed = policy.clone();
+        changed
+            .lanes
+            .iter_mut()
+            .find(|l| l.key.is_some())
+            .unwrap()
+            .weight = 1;
+        db.replace_capacity_policy_if(&changed, &note.to, "operator", 2)
+            .unwrap();
+        let note = db.capacity_conversion().unwrap().unwrap();
+        assert_eq!(note.shared.len(), 1, "{note:?}");
+    }
+
+    #[test]
+    fn a_conversion_with_rules_left_over_is_held_until_set_again() {
+        let node = "0123456789abcdef0123456789abcdef";
+        let v1 = serde_json::json!({
+            "tenants": {
+                "fallback": { "weight": 1 },
+                "web": { "weight": 1, "projects": [{ "gitlab": "gl", "id": 7,
+                    "placement_rules": [{ "branches": ["main"], "nodes": [node] }] }] }
+            },
+            "runners": [{ "gitlab": "gl", "runner_id": 42, "tenant": "web", "class": "normal" }]
+        });
+        let (db, _, _dir) = reopened(v1, |_| {});
+        let (policy, held) = db.capacity_policy_state().unwrap();
+        assert!(held);
+        let note = db.capacity_conversion().unwrap().unwrap();
+        assert!(note.unconverted[0].contains("project gl/7"), "{note:?}");
+        // Set again, unchanged: activated, audited.
+        assert!(
+            db.replace_capacity_policy_if(&policy, &note.to, "operator", 2)
+                .unwrap()
+        );
+        assert!(!db.capacity_policy_state().unwrap().1);
+        assert!(db.capacity_conversion().unwrap().is_none());
+        let audits = db.audits(None, 10).unwrap();
+        assert!(audits[0].event.contains("activated"), "{audits:?}");
+    }
+
+    #[test]
+    fn in_flight_identities_are_rewritten_to_their_lanes() {
+        let v1 = serde_json::json!({
+            "tenants": { "fallback": { "weight": 1 }, "web": { "weight": 1 } },
+            "runners": [{ "gitlab": "gl", "runner_id": 42, "tenant": "web", "class": "normal" }],
+            "clients": { "ci-bot": "web" }
+        });
+        let admission = |principal: &str, runner: Option<u64>| {
+            serde_json::json!({
+                "principal": principal,
+                "identity": { "tenant": "web", "class": "normal",
+                              "gitlab": runner.map(|_| "gl"), "runner_id": runner },
+                "runner": runner.map(|_| "r"),
+                "placement": vk_hub_proto::client::Placement::default(),
+                "probe": false,
+                "reservation": "b".repeat(32)
+            })
+        };
+        let rows = [
+            ("a".repeat(32), admission("relay", Some(42))),
+            ("c".repeat(32), admission("ci-bot", None)),
+            ("d".repeat(32), admission("other", None)),
+        ];
+        let (db, _, _dir) = reopened(v1, |db| {
+            let txn = db.db.begin_write().unwrap();
+            {
+                let mut table = txn
+                    .open_table(super::super::admissions::ADMISSIONS)
+                    .unwrap();
+                for (id, row) in &rows {
+                    let bytes = serde_json::to_vec(row).unwrap();
+                    table.insert(id.as_str(), bytes.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        });
+        let lanes: Vec<_> = (db.admissions().unwrap().into_iter())
+            .map(|(_, a)| a.identity.lane)
+            .collect();
+        assert_eq!(
+            lanes,
+            [
+                LaneId::Runner {
+                    gitlab: "gl".into(),
+                    id: 42
+                },
+                LaneId::Key("ci-bot".into()),
+                LaneId::Default
+            ]
         );
     }
 }

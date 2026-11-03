@@ -170,7 +170,7 @@ mod tests {
         let mut admission = StoredAdmission {
             principal: "relay".into(),
             identity: SchedulingIdentity {
-                tenant: "project".into(),
+                lane: crate::policy::LaneId::Default,
                 class: Class::Production,
                 gitlab: Some("https://gitlab.example".into()),
                 runner_id: Some(42),

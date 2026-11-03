@@ -38,9 +38,9 @@
 //! a relay by a plain form outside the fragment, and remove one, as `vk-hub relays remove` does,
 //! by a button that asks first.
 //!
-//! Each runner shows the tenant and class it is mapped to, and how the hub schedules it: its
+//! Each runner shows its lane's weight and class, and how the hub schedules it: its
 //! requests waiting, offered and held, its jobs, its demand and backoff, and why it waits.
-//! Each API key shows the principal ID the policy's `clients` assigns it by.
+//! Each API key shows the principal ID its lane names it by.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -901,7 +901,7 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>runner</th>")
-        .raw("<th>GitLab ID</th><th>tenant</th><th>class</th><th>placement</th>")
+        .raw("<th>GitLab ID</th><th>lane</th><th>class</th><th>placement</th>")
         .raw("<th class=\"num\">limit</th><th>state</th>")
         .raw("<th class=\"num\">requests</th><th class=\"num\">jobs</th>")
         .raw("<th>last GitLab answer</th><th class=\"num\">waiting</th>")
@@ -934,11 +934,13 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
         match mapping {
             Some(m) => {
                 h.raw("<a href=\"")
-                    .text(super::capacity::tenant_path(&m.tenant))
-                    .raw("\">")
-                    .text(&m.tenant)
-                    .raw("</a></td><td>")
-                    .text(m.class);
+                    .raw(super::capacity::PATH)
+                    .raw("\">weight ")
+                    .text(m.weight);
+                if let Some(max) = m.max_slots {
+                    h.raw(", max ").text(max);
+                }
+                h.raw("</a></td><td>").text(m.class);
             }
             // Its server approved, its GitLab ID known and the policy read: it maps to none.
             None if key.is_some() && shown.policy.is_ok() => {

@@ -18,30 +18,34 @@ pub(super) const ABANDONED_PROBE_GRACE: Duration = Duration::from_secs(30);
 /// (not `excluded`) would admit it: asked again after the pause.
 pub(super) const NO_FITTING_NODE: &str = "no fitting node";
 
-/// Why a queued job waits: its tenant no longer lists its project ([`delisted`]).
-const DELISTED: &str = "project no longer listed for its tenant";
+/// Why a queued job waits: its lane no longer allows it ([`delisted`]).
+const DELISTED: &str = "no longer allowed by its lane";
 
-/// Whether `row` is a relay job whose project its tenant no longer lists (it was checked at
-/// submission). Such a job is held with its reservation, to start once the project is listed
-/// again or end at its deadline. A job recorded without a scheduling identity predates project
-/// lists and is not held.
-pub(super) fn delisted(policy: &crate::policy::Policy, row: &JobRow) -> bool {
-    row.scheduling.as_ref().is_some_and(|identity| {
-        identity
-            .gitlab
-            .as_deref()
-            .zip(row.project_id)
-            .is_some_and(|(gitlab, project)| {
-                policy.project(&identity.tenant, gitlab, project).is_none()
-            })
-    })
+/// Whether `row` is a relay job its lane no longer allows: unmapped, or no longer listing its
+/// project, or, with `sources`, its branch. Allowed when submitted, such a job is held with its
+/// reservation, to start once allowed again or end at its deadline. A job recorded without a
+/// scheduling identity predates lanes and is not held.
+pub(super) fn delisted(
+    policy: &crate::policy::Policy,
+    row: &JobRow,
+    sources: Option<&vk_hub_proto::job::Sources>,
+) -> bool {
+    let Some(identity) = &row.scheduling else {
+        return false;
+    };
+    let (Some(gitlab), Some(project)) = (identity.gitlab.as_deref(), row.project_id) else {
+        return false;
+    };
+    policy
+        .lane(&identity.lane)
+        .is_none_or(|lane| lane.refuses_job(gitlab, project, sources).is_some())
 }
 
-/// Why a queued job waits: nodes have room, but none its project's placement rules allow.
-const PLACEMENT_RULES: &str = "project placement rules";
+/// Why a request or queued job waits: nodes have room, but none its lane may use.
+const LANE_NODES: &str = "its lane's allowed nodes";
 
-/// Why a request or queued job waits: nodes have room, but none its runner may use.
-const RUNNER_NODES: &str = "its runner's allowed nodes";
+/// Why work waits while the policy converted to lanes awaits an operator's activation.
+const HELD: &str = "capacity policy awaiting activation";
 
 /// Why [`admission_node`] found no node: each with room would take the room a headroom entry
 /// keeps for production.
@@ -252,6 +256,8 @@ pub(super) type RelayStates = [(
 pub(super) struct ScheduleCtx<'a> {
     pub(super) place: PlaceCtx<'a>,
     pub(super) policy: &'a crate::policy::Policy,
+    /// Whether the policy is held, granting no new capacity ([`crate::store::ConversionNote`]).
+    pub(super) held: bool,
     pub(super) relays: &'a RelayStates,
     /// [`Hub::heartbeat_receipts`], read before `relays`.
     pub(super) heartbeats: &'a HashMap<String, (u64, Instant)>,
@@ -370,19 +376,17 @@ impl<'a> Relays<'a> {
     }
 }
 
-/// What tenants, relays and relay runners hold as arbitration charges it, read once a pass and
+/// What lanes, relays and relay runners hold as arbitration charges it, read once a pass and
 /// kept up to date as it places work.
 #[derive(Default)]
 struct Loads {
-    tenant: HashMap<String, u64>,
+    lane: HashMap<crate::policy::LaneId, u64>,
     relay: HashMap<String, u64>,
     runner: HashMap<(String, String), u64>,
     /// Of the jobs charged, those without an admission, by relay and by relay runner: the rest
     /// of those a relay's heartbeat counts are charged on top ([`Loads::relay_load`]).
     unadmitted_relay: HashMap<String, u64>,
     unadmitted_runner: HashMap<(String, String), u64>,
-    /// Live jobs recorded without a scheduling identity or a GitLab project, by principal.
-    legacy: HashMap<String, u64>,
     /// Runners with a probe out, abandoned or not.
     probing: HashSet<(String, u64)>,
     /// Probes out fleet-wide, abandoned or not.
@@ -400,7 +404,7 @@ fn count<K: std::hash::Hash + Eq>(map: &mut HashMap<K, u64>, key: K, add: bool) 
 }
 
 impl Loads {
-    fn new(state: &State, policy: &crate::policy::Policy, relays: &Relays<'_>) -> Self {
+    fn new(state: &State, relays: &Relays<'_>) -> Self {
         let mut loads = Loads {
             probing: state
                 .abandoned_probes
@@ -415,10 +419,7 @@ impl Loads {
         }
         for job in state.jobs.values() {
             if charged(state, &job.row) {
-                loads.charge_job(policy, relays, &job.row, true);
-            }
-            if legacy(&job.row) {
-                count(&mut loads.legacy, job.row.key.clone(), true);
+                loads.charge_job(relays, &job.row, true);
             }
         }
         loads
@@ -432,7 +433,7 @@ impl Loads {
                 self.probing.insert(runner);
             }
         }
-        count(&mut self.tenant, ticket.identity.tenant.clone(), true);
+        count(&mut self.lane, ticket.identity.lane.clone(), true);
         count(&mut self.relay, ticket.key.clone(), true);
         if let Some(runner) = &ticket.identity.runner {
             count(&mut self.runner, (ticket.key.clone(), runner.clone()), true);
@@ -440,14 +441,8 @@ impl Loads {
     }
 
     /// Charge the job of `row`, or with `add` false take its charge back.
-    fn charge_job(
-        &mut self,
-        policy: &crate::policy::Policy,
-        relays: &Relays<'_>,
-        row: &JobRow,
-        add: bool,
-    ) {
-        count(&mut self.tenant, job_tenant(policy, row).to_owned(), add);
+    fn charge_job(&mut self, relays: &Relays<'_>, row: &JobRow, add: bool) {
+        count(&mut self.lane, job_lane(row), add);
         count(&mut self.relay, row.key.clone(), add);
         if row.admission.is_none() {
             count(&mut self.unadmitted_relay, row.key.clone(), add);
@@ -463,8 +458,8 @@ impl Loads {
         }
     }
 
-    fn tenant_load(&self, tenant: &str) -> u64 {
-        self.tenant.get(tenant).copied().unwrap_or(0)
+    fn lane_load(&self, lane: &crate::policy::LaneId) -> u64 {
+        self.lane.get(lane).copied().unwrap_or(0)
     }
 
     /// What relay `key` holds: what is charged to it, and the jobs its heartbeat counts
@@ -492,15 +487,6 @@ impl Loads {
     }
 }
 
-/// The tenant the job of `row` is charged to: its scheduling identity's; recorded without one,
-/// the tenant listing its project, else the policy's fallback.
-fn job_tenant<'a>(policy: &'a crate::policy::Policy, row: &'a JobRow) -> &'a str {
-    match &row.scheduling {
-        Some(identity) => identity.tenant.as_str(),
-        None => legacy_tenant(policy, row).unwrap_or(policy.fallback.as_str()),
-    }
-}
-
 /// Whether the job of `row` is charged as a job: placed, or queued on an admission, unless
 /// its admission's ticket still holds the capacity.
 fn charged(state: &State, row: &JobRow) -> bool {
@@ -509,14 +495,6 @@ fn charged(state: &State, row: &JobRow) -> bool {
             .admission
             .as_ref()
             .is_some_and(|id| state.tickets.get(id).is_some_and(|t| holds(&t.phase)))
-}
-
-/// Whether the job of `row` was recorded without a scheduling identity or a GitLab project
-/// and placed: its relay's tickets wait for it to settle.
-fn legacy(row: &JobRow) -> bool {
-    row.scheduling.is_none()
-        && row.node.is_some()
-        && (row.gitlab.is_none() || row.project_id.is_none())
 }
 
 /// Each placement's nodes with room ([`candidates`], skipping none), until the next placement
@@ -552,7 +530,7 @@ struct Candidate {
     probe: bool,
     load: u64,
     weight: u32,
-    tenant_probe: Option<Instant>,
+    lane_probe: Option<Instant>,
     runner_probe: Option<Instant>,
     arrived: Instant,
     job: bool,
@@ -575,7 +553,7 @@ fn rank(e: &Candidate, owed: bool) -> u8 {
     }
 }
 
-/// `a` against `b` by their tenants' load per weight, the lower first.
+/// `a` against `b` by their lanes' load per weight, the lower first.
 fn share(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     (u128::from(a.load) * u128::from(b.weight)).cmp(&(u128::from(b.load) * u128::from(a.weight)))
 }
@@ -652,7 +630,7 @@ pub(super) fn schedule_tickets(
 }
 
 /// Forget abandoned probes past [`ABANDONED_PROBE_GRACE`], ending their node's session, the
-/// tickets of relays gone, and the arbitration history of runners and tenants the policy no
+/// tickets of relays gone, and the arbitration history of runners and lanes the policy no
 /// longer names. Whether a ticket went.
 fn sweep(
     hub: &Hub,
@@ -681,8 +659,8 @@ fn sweep(
         .demand
         .retain(|(gitlab, runner), _| policy.runner(gitlab, *runner).is_some());
     state
-        .tenant_probe
-        .retain(|tenant, _| policy.tenant(tenant).is_some());
+        .lane_probe
+        .retain(|lane, _| policy.lane(lane).is_some());
     let removed: Vec<_> = state
         .tickets
         .iter()
@@ -938,11 +916,14 @@ fn refresh(state: &mut State, policy: &crate::policy::Policy, relays: &Relays<'_
                     }
                     Some((inventory, runner))
                 });
-            if let (Some((inventory, runner)), Some(mapping)) =
+            if let (Some((inventory, runner)), Some(lane)) =
                 (current, policy.runner(gitlab, runner_id))
             {
-                ticket.identity.tenant.clone_from(&mapping.tenant);
-                ticket.identity.class = mapping.class;
+                ticket.identity.lane = crate::policy::LaneId::Runner {
+                    gitlab: gitlab.clone(),
+                    id: runner_id,
+                };
+                ticket.identity.class = lane.class;
                 ticket.identity.concurrent = inventory.concurrent;
                 ticket.identity.limit = runner.limit;
                 ticket.identity.request_concurrency = runner.request_concurrency;
@@ -950,8 +931,8 @@ fn refresh(state: &mut State, policy: &crate::policy::Policy, relays: &Relays<'_
             } else {
                 false
             }
-        } else if let Some((name, _)) = policy.client(&ticket.key) {
-            ticket.identity.tenant = name.to_owned();
+        } else if let Some((lane, _)) = policy.client(&ticket.key) {
+            ticket.identity.lane = lane;
             true
         } else {
             false
@@ -965,7 +946,8 @@ fn refresh(state: &mut State, policy: &crate::policy::Policy, relays: &Relays<'_
 }
 
 /// Offer capacity to waiting tickets and place queued jobs, one placement at a time, the
-/// tenant holding the least for its weight first. Whether a ticket was offered capacity.
+/// lane holding the least for its weight first. Whether a ticket was offered capacity. While
+/// the policy is held, nothing: work waits saying why.
 fn arbitrate(
     hub: &Hub,
     state: &mut State,
@@ -976,8 +958,23 @@ fn arbitrate(
 ) -> Result<bool> {
     let (ctx, policy) = (&schedule.place, schedule.policy);
     let nodes = ctx.nodes;
+    if schedule.held {
+        let waiting: Vec<String> = (state.tickets.iter())
+            .filter(|(_, t)| matches!(t.phase, TicketPhase::Waiting))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in waiting {
+            blocked(state, &id, HELD);
+        }
+        for job in state.jobs.values_mut() {
+            if job.row.state == JobState::Queued {
+                job.blocked = Some(HELD);
+            }
+        }
+        return Ok(false);
+    }
     let probe_limit = usize::try_from(policy.probe_limit).unwrap_or(usize::MAX);
-    let mut loads = Loads::new(state, policy, relays);
+    let mut loads = Loads::new(state, relays);
     let mut found = Found::default();
     let mut moved = false;
     let mut skipped_jobs = HashSet::new();
@@ -995,12 +992,6 @@ fn arbitrate(
             .map(|(id, t)| (id.clone(), t.clone()))
             .collect();
         for (id, ticket) in &waiters {
-            if ticket.identity.runner.is_some()
-                && loads.legacy.get(&ticket.key).is_some_and(|&n| n > 0)
-            {
-                blocked(state, id, "legacy relay jobs pending settlement");
-                continue;
-            }
             // Heard from in the relay's current session, its heartbeat lists what it holds.
             if ticket.identity.runner.is_some()
                 && !(relays.listed.contains_key(ticket.key.as_str())
@@ -1012,13 +1003,13 @@ fn arbitrate(
                 blocked(state, id, "awaiting relay reconciliation");
                 continue;
             }
-            let Some(tenant) = policy.tenant(&ticket.identity.tenant) else {
-                blocked(state, id, "tenant unavailable");
+            let Some(lane) = policy.lane(&ticket.identity.lane) else {
+                blocked(state, id, "lane unavailable");
                 continue;
             };
-            let load = loads.tenant_load(&ticket.identity.tenant);
-            if tenant.cap.is_some_and(|cap| load >= u64::from(cap)) {
-                blocked(state, id, "tenant cap");
+            let load = loads.lane_load(&ticket.identity.lane);
+            if lane.max_slots.is_some_and(|max| load >= u64::from(max)) {
+                blocked(state, id, "lane at max slots");
                 continue;
             }
             if loads.relay_load(relays, &ticket.key) >= u64::from(ticket.identity.concurrent) {
@@ -1066,12 +1057,7 @@ fn arbitrate(
             }
             let admission = (&ticket.placement, ticket.identity.class);
             let fits = found.get(hub, state, nodes, &ticket.placement);
-            let excluded = runner_exclusions(
-                policy,
-                ticket.identity.gitlab.as_deref(),
-                ticket.identity.runner_id,
-                nodes,
-            );
+            let excluded = lane_exclusions(policy, &ticket.identity.lane, nodes);
             let none = HashSet::new();
             let mut node = admission_node(state, &kept, admission, fits, &ticket.tried, &excluded);
             if node == Err(NO_FITTING_NODE)
@@ -1091,22 +1077,22 @@ fn arbitrate(
                     // Unlike a job's, a request's reason is recomputed when all nodes fill.
                     let ruled_out =
                         !fits.is_empty() && fits.iter().all(|(node, _)| excluded.contains(node));
-                    blocked(state, id, if ruled_out { RUNNER_NODES } else { why });
+                    blocked(state, id, if ruled_out { LANE_NODES } else { why });
                     continue;
                 }
             };
-            let tenant_probe = probe
-                .then(|| state.tenant_probe.get(&ticket.identity.tenant).copied())
+            let lane_probe = probe
+                .then(|| state.lane_probe.get(&ticket.identity.lane).copied())
                 .flatten();
-            blocked(state, id, "waiting for tenant share");
+            blocked(state, id, "waiting for lane share");
             eligible.push(Candidate {
                 id: id.clone(),
                 node,
                 class: ticket.identity.class,
                 probe,
                 load,
-                weight: tenant.weight,
-                tenant_probe,
+                weight: lane.weight,
+                lane_probe,
                 runner_probe: last_probe,
                 arrived: ticket.created,
                 job: false,
@@ -1137,9 +1123,11 @@ fn arbitrate(
             let Some(job) = state.jobs.get(&id) else {
                 continue;
             };
-            let runner_out = job_runner_exclusions(policy, job, nodes);
-            let rules_out = rule_exclusions(policy, job, nodes);
-            let excluded: HashSet<_> = runner_out.union(&rules_out).cloned().collect();
+            let excluded = job_exclusions(policy, job, nodes);
+            let sources = job.spec.as_deref().map(|spec| {
+                let JobSpec::GitlabCi(ci) = spec;
+                ci.sources.clone()
+            });
             if reservation.as_ref().is_some_and(|r| {
                 state.reservations.get(r).is_some_and(|r| {
                     excluded.contains(&r.node) || !nodes.iter().any(|(id, _)| id == &r.node)
@@ -1158,12 +1146,12 @@ fn arbitrate(
             }
             tried.extend(excluded.iter().cloned());
             let identity = row.scheduling.as_ref();
-            let tenant_name = job_tenant(policy, &row);
+            let lane_id = job_lane(&row);
             let class = identity.map_or(crate::policy::Class::Normal, |i| i.class);
-            let tenant = policy.tenant(tenant_name);
-            let weight = tenant.map_or(1, |t| t.weight);
-            let load = loads.tenant_load(tenant_name);
-            if delisted(policy, &row) {
+            let lane = policy.lane(&lane_id);
+            let weight = lane.map_or(1, |l| l.weight);
+            let load = loads.lane_load(&lane_id);
+            if delisted(policy, &row, sources.as_ref()) {
                 if let Some(job) = state.jobs.get_mut(&id) {
                     job.blocked = Some(DELISTED);
                 }
@@ -1173,11 +1161,11 @@ fn arbitrate(
             if row.admission.is_none() {
                 let relay = relays.row(&row.key);
                 let gate = match relay.map(|relay| &relay.inventory) {
-                    _ if tenant
-                        .and_then(|t| t.cap)
-                        .is_some_and(|cap| load >= u64::from(cap)) =>
+                    _ if lane
+                        .and_then(|l| l.max_slots)
+                        .is_some_and(|max| load >= u64::from(max)) =>
                     {
-                        Some("tenant cap")
+                        Some("lane at max slots")
                     }
                     None => None,
                     Some(None) => Some("its relay's inventory is unknown"),
@@ -1242,19 +1230,13 @@ fn arbitrate(
                 match chosen {
                     Ok(node) => node,
                     Err(why) => {
-                        // With all nodes full, keep the previous reason while that
-                        // restriction still excludes a node. Name the project's rules when
-                        // the runner allows nodes with room but the rules exclude them all.
+                        // With all nodes full, keep the previous reason while the lane's nodes
+                        // still exclude a node.
                         let ruled_out = if fits.is_empty() {
-                            previous.filter(|&p| {
-                                (p == RUNNER_NODES && !runner_out.is_empty())
-                                    || (p == PLACEMENT_RULES && !rules_out.is_empty())
-                            })
-                        } else if fits.iter().all(|(node, _)| runner_out.contains(node)) {
-                            Some(RUNNER_NODES)
+                            previous.filter(|&p| p == LANE_NODES && !excluded.is_empty())
                         } else {
                             (fits.iter().all(|(node, _)| excluded.contains(node)))
-                                .then_some(PLACEMENT_RULES)
+                                .then_some(LANE_NODES)
                         };
                         if let Some(job) = state.jobs.get_mut(&id) {
                             job.blocked =
@@ -1276,7 +1258,7 @@ fn arbitrate(
                 probe: false,
                 load,
                 weight,
-                tenant_probe: None,
+                lane_probe: None,
                 runner_probe: None,
                 arrived,
                 job: true,
@@ -1304,7 +1286,7 @@ fn arbitrate(
         let probes = tied
             .clone()
             .filter(|e| e.probe)
-            .min_by_key(|e| (e.tenant_probe, e.runner_probe, e.arrived, &e.id));
+            .min_by_key(|e| (e.lane_probe, e.runner_probe, e.arrived, &e.id));
         let known = tied.filter(|e| !e.probe).min_by_key(|e| (e.arrived, &e.id));
         let chosen = match (probes, known) {
             (Some(probe), Some(known)) => {
@@ -1365,13 +1347,10 @@ fn arbitrate(
             // Its charge as placed, or ended, in place of its charge as queued.
             let after = state.jobs.get(&id).map(|j| j.row.clone());
             for (row, add) in [(before, false), (after, true)] {
-                if let Some(row) = row {
-                    if charged(state, &row) {
-                        loads.charge_job(policy, relays, &row, add);
-                    }
-                    if legacy(&row) {
-                        count(&mut loads.legacy, row.key.clone(), add);
-                    }
+                if let Some(row) = row
+                    && charged(state, &row)
+                {
+                    loads.charge_job(relays, &row, add);
                 }
             }
             found = Found::default();
@@ -1388,7 +1367,7 @@ fn arbitrate(
             .as_ref()
             .zip(ticket.identity.runner_id)
             .map(|(g, r)| (g.clone(), r));
-        let tenant_name = ticket.identity.tenant.clone();
+        let lane = ticket.identity.lane.clone();
         let (key, instance, envelope, lease_secs) = (
             ticket.key.clone(),
             ticket.instance.clone(),
@@ -1437,7 +1416,7 @@ fn arbitrate(
         }
         found = Found::default();
         if probe {
-            state.tenant_probe.insert(tenant_name, now);
+            state.lane_probe.insert(lane, now);
             if let Some(key) = demand_key {
                 state.demand.entry(key).or_default().last_probe = Some(now);
             }
@@ -1461,7 +1440,7 @@ mod tests {
             probe,
             load: 0,
             weight: 1,
-            tenant_probe: None,
+            lane_probe: None,
             runner_probe: None,
             arrived: Instant::now(),
             job: reserved,
@@ -1489,14 +1468,14 @@ mod tests {
 
     #[test]
     fn shares_compare_load_per_weight() {
-        let tenant = |load, weight| Candidate {
+        let lane = |load, weight| Candidate {
             load,
             weight,
             ..candidate(Class::Normal, false, false)
         };
-        assert!(share(&tenant(1, 2), &tenant(1, 1)).is_lt());
-        assert!(share(&tenant(2, 2), &tenant(1, 1)).is_eq());
-        assert!(share(&tenant(3, 2), &tenant(1, 1)).is_gt());
+        assert!(share(&lane(1, 2), &lane(1, 1)).is_lt());
+        assert!(share(&lane(2, 2), &lane(1, 1)).is_eq());
+        assert!(share(&lane(3, 2), &lane(1, 1)).is_gt());
     }
 
     #[test]

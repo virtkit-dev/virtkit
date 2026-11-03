@@ -542,9 +542,11 @@ enum KeysCmd {
 
 #[derive(Subcommand)]
 enum CapacityPolicyCmd {
-    /// Print the current policy
+    /// Print the current policy, and on stderr what its conversion to lanes left to review
     Show,
-    /// Replace the policy from a JSON file
+    /// Replace the policy from a JSON file. A policy of the earlier format of tenants is
+    /// converted to lanes and printed, refused if its placement rules do not convert exactly.
+    /// Setting a policy activates one held since its conversion.
     Set {
         file: std::path::PathBuf,
         /// Digest of the policy being replaced, printed by `show`
@@ -1405,13 +1407,52 @@ async fn run(cli: Cli) -> Result<()> {
                     CapacityPolicyCmd::Show => {
                         let policy = client.capacity_policy()?;
                         eprintln!("Policy digest: {}", policy.digest()?);
+                        if let Some(note) = client.capacity_conversion()? {
+                            if note.held() {
+                                eprintln!(
+                                    "Held: converted to lanes, it grants no new capacity until \
+                                     set again. Placement rules that do not convert:"
+                                );
+                                for rule in &note.unconverted {
+                                    eprintln!("  {rule}");
+                                }
+                            }
+                            for (lane, tenant) in &note.shared {
+                                eprintln!(
+                                    "Review: {lane} took the whole share of tenant {tenant:?}, \
+                                     shared with other lanes"
+                                );
+                            }
+                        }
                         println!("{}", serde_json::to_string_pretty(&policy)?);
                     }
                     CapacityPolicyCmd::Set { file, expected } => {
                         let bytes = std::fs::read(&file)
                             .with_context(|| format!("reading {}", file.display()))?;
-                        let policy = serde_json::from_slice(&bytes)
-                            .with_context(|| format!("parsing {}", file.display()))?;
+                        let policy = match crate::policy::parse(&bytes)
+                            .with_context(|| format!("parsing {}", file.display()))?
+                        {
+                            crate::policy::Parsed::Current(policy) => policy,
+                            crate::policy::Parsed::Converted(converted) => {
+                                if !converted.exact() {
+                                    for rule in &converted.unconverted {
+                                        eprintln!("{rule}");
+                                    }
+                                    bail!(
+                                        "{} uses placement rules that do not convert to lanes: \
+                                         set each lane's nodes in a policy of version {}",
+                                        file.display(),
+                                        crate::policy::VERSION
+                                    );
+                                }
+                                eprintln!("Converted {} to lanes:", file.display());
+                                for warning in converted.warnings() {
+                                    eprintln!("Review: {warning}");
+                                }
+                                println!("{}", serde_json::to_string_pretty(&converted.policy)?);
+                                converted.policy
+                            }
+                        };
                         if !client.set_capacity_policy(policy, expected)? {
                             eprintln!("Policy unchanged");
                         }

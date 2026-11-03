@@ -3,7 +3,7 @@
 //! of it, its first refused job and refusal count, with links to jobs and observed traffic.
 //! Operators approve, reject or forget it through its server's page's action ([`super::clients`]).
 //! Rejecting or forgetting an approved project requires confirmation.
-//! [`super::capacity::project_section`] displays and edits its share of the capacity policy.
+//! [`super::capacity::project_section`] lists the capacity lanes that may run its jobs.
 //!
 //! The recorded path is display-safe and escaped through [`Html::node`], as on a job's page.
 
@@ -74,7 +74,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             let Ok(policy) = hub.db.capacity_policy() else {
                 return Ok(None);
             };
-            if policy.project_any(&named, id).is_none() {
+            if !policy.lists_project(&named, id) {
                 return Ok(None);
             }
             let known = hub.db.gitlab(&named)?.is_some();
@@ -175,7 +175,7 @@ pub(super) async fn get(gitlab: &str, id: u64, auth: &Auth, ui: &Ui) -> Result<R
             "gitlab:{gitlab}:{id}"
         )))
         .raw("\">Observed traffic</a></p>");
-    super::capacity::project_section(&mut main, &shown.policy, &shown.nodes, gitlab, id, auth)?;
+    super::capacity::project_section(&mut main, &shown.policy, &shown.nodes, gitlab, id);
     if auth.session.role >= Role::Operator {
         main.raw("<section><h2>Decide</h2><form method=\"post\" action=\"")
             .raw(clients::PATH)
@@ -229,7 +229,7 @@ fn unseen(
             .raw(clients::GITLAB_PATH)
             .raw("\">GitLab servers</a> first.</p>");
     }
-    super::capacity::project_section(&mut main, &Ok(policy), nodes, gitlab, id, auth)?;
+    super::capacity::project_section(&mut main, &Ok(policy), nodes, gitlab, id);
     Ok(page(super::fleet::layout(
         &title,
         &path(gitlab, id),

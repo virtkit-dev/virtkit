@@ -1,126 +1,51 @@
-//! Capacity policy pages for viewers and operators: the whole policy at [`PATH`], tenants at
-//! [`tenant_path`], and each project's share on its page ([`project_section`]). Operators edit
-//! them with a form per change, each beside what it changes, posted to [`PATH`]: a tenant's
-//! share, the projects it lists and the runners mapped to it; a project's production branches
-//! and placement rules in every tenant listing it; the fallback tenant, API clients'
-//! assignments, scheduling settings and headroom; or, folded away, the whole policy in
-//! `vk-hub capacity-policy set` format. Pickers offer the projects, runners and API keys the hub
-//! knows; a folded form takes a project or runner it has not seen yet by instance and ID.
-//!
-//! Adding a tenant uses the current policy and rereads once if another edit stores first.
-//! Other edits use the displayed policy and are refused as stale if its digest has changed.
-//! Each edit uses the CLI's validation and [`crate::store::Db::replace_capacity_policy_if`],
-//! which rechecks the digest and audits changes in the same transaction.
-//! All but adding a tenant ask first ([`actions::ask_first`]), saying what would change
-//! ([`describe`]): any of them may keep jobs from running.
+//! The capacity policy's page at [`PATH`]: its lanes, production headroom and scheduling
+//! settings, and, for operators, the whole policy in `vk-hub capacity-policy set` format,
+//! replaced against the digest shown ([`crate::store::Db::replace_capacity_policy_if`]) after
+//! a question saying what changes ([`actions::ask_first`]). A policy held since its conversion
+//! to lanes is activated by setting it again, changed or not. Each project's page lists the
+//! lanes that may run it ([`project_section`]).
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Display;
+use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use vk_hub_proto::client::Placement;
-use vk_hub_proto::job::Envelope;
 
 use super::fleet::{self, FleetSite};
 use super::html::Html;
 use super::pages::{self, csrf_field};
-use super::{Auth, Body, Ui, actions, blocking, field, message, page};
-use crate::policy::{Class, Headroom, PlacementRule, Policy, Project, RunnerMapping, Tenant};
+use super::{Auth, Body, Ui, actions, blocking, field, page};
+use crate::policy::{Lane, Policy};
 use crate::server::Hub;
-use crate::store::{PolicyRefused, ProjectState, ProjectView, Role, policy_changes};
+use crate::store::{ConversionNote, PolicyRefused, Role, policy_changes};
 
-/// The whole policy's page, and where its editors post.
+/// The policy's page, and where its editor posts.
 pub(super) const PATH: &str = "/capacity";
 
-const TENANTS: &str = "/capacity/tenants/";
-
-/// The policy's and tenants' pages before the navigation had sections.
+/// Pages of the policy's tenants, and the policy's and tenants' pages before the navigation
+/// had sections: all lead to [`PATH`].
+const OLD_TENANTS: &str = "/capacity/tenants/";
 const OLD_PATH: &str = "/clients/capacity";
-const OLD_TENANTS: &str = "/clients/tenants/";
+const OLDER_TENANTS: &str = "/clients/tenants/";
 
-/// The largest edit posted: a policy the admin socket takes (64 KiB), as a browser posts it.
-/// Pretty-printed and urlencoded, with 3 bytes for each `"`, `:`, `,`, brace and bracket and 6
-/// for each CRLF, a policy grows about 2.9 times for runner mappings and 4 for nested short
-/// branch globs. Each of [`actions`]' questions holds the edit it asks about: up to
-/// `MAX_QUESTIONS` (1024) times this, 384 MiB, all of operators.
+/// The largest edit posted: a policy the admin socket takes (64 KiB), as a browser posts it,
+/// pretty-printed and urlencoded.
 const MAX_FORM: usize = 6 * 64 * 1024;
 
 /// Replace the whole policy: `policy`.
 const SET_POLICY: &str = "capacity-policy";
-/// Add a tenant of weight 1 with no projects nor runners: `tenant`.
-const ADD_TENANT: &str = "capacity-add-tenant";
-/// Remove a tenant other than the fallback, unmapping its runners and sending its API clients
-/// to the fallback: `tenant`.
-const REMOVE_TENANT: &str = "capacity-remove-tenant";
-/// Set a tenant's weight and cap, none when empty: `tenant`, `weight`, `cap`.
-const SET_SHARE: &str = "capacity-share";
-/// List a project for a tenant, with the branches and rules other tenants list it with:
-/// `tenant`, [`target`] `project`, `from`.
-const ADD_PROJECT: &str = "capacity-add-project";
-/// Stop listing a project for a tenant: `tenant`, [`target`] `project`, `from`.
-const REMOVE_PROJECT: &str = "capacity-remove-project";
-/// Map a runner to a tenant as a class, wherever it was mapped: `tenant`, [`target`]
-/// `runner`, `class`.
-const MAP_RUNNER: &str = "capacity-runner";
-/// Unmap a runner from a tenant: `tenant`, [`target`] `runner`.
-const UNMAP_RUNNER: &str = "capacity-unmap-runner";
-/// Set the nodes and pools a runner mapped to a tenant may use, each a field or line of its
-/// own, any node when both are empty: `tenant`, [`target`] `runner`, `nodes`, `pools`.
-const SET_RUNNER_NODES: &str = "capacity-runner-nodes";
-/// Make a tenant the fallback: `tenant`.
-const SET_FALLBACK: &str = "capacity-fallback";
-/// Charge an API client to a tenant, or to the fallback when empty: `principal`, `tenant`.
-const SET_CLIENT: &str = "capacity-client";
-/// Set the scheduling settings: `probe_limit`, `production_probe_burst`,
-/// `backoff_initial_secs`, `backoff_max_secs`, `busy_secs`.
-const SET_SCHEDULING: &str = "capacity-scheduling";
-/// Add a headroom entry: `pool`, `labels`, `slots`, `mem_mib`, `cpus`, `disk_gib`.
-const ADD_HEADROOM: &str = "capacity-add-headroom";
-/// Remove headroom entry `index`.
-const REMOVE_HEADROOM: &str = "capacity-remove-headroom";
-/// Set a project's production branches, one per line: `tenant`, `gitlab`, `project`,
-/// `branches`.
-const SET_BRANCHES: &str = "capacity-branches";
-/// Add a placement rule to a project, `branches` one per line, `nodes` and `pools` each a
-/// field or line of its own: `tenant`, `gitlab`, `project`, `branches`, `nodes`, `pools`.
-const ADD_RULE: &str = "capacity-add-rule";
-/// Remove a project's placement rule `index`, as `tenant` lists it: `tenant`, `gitlab`,
-/// `project`, `index`.
-const REMOVE_RULE: &str = "capacity-remove-rule";
-
-/// `from`'s value on a project's page: its edits lead back there.
-const FROM_PROJECT: &str = "project";
 
 /// Why an edit based on a replaced policy is refused.
 const STALE: &str =
     "the capacity policy changed after this page was shown. Reload the page and try again";
 
-/// The most changes a question lists; the rest are counted.
-const MAX_DESCRIBED: usize = 50;
-
-/// The most nodes, or pools, a page or question lists of a runner mapping; the rest are counted.
+/// The most nodes, or pools, a page lists of a lane; the rest are counted.
 const MAX_LISTED_TARGETS: usize = 8;
 
-/// Tenant `name`'s page.
-pub(super) fn tenant_path(name: &str) -> String {
-    format!("{TENANTS}{name}")
-}
-
-/// Map a policy or tenant page's `path` from before navigation sections to its current page.
+/// Map a page's `path` from before lanes or navigation sections to its current page.
 pub(super) fn moved(path: &str) -> Option<String> {
-    if path == OLD_PATH {
-        return Some(PATH.to_string());
-    }
-    let name = path.strip_prefix(OLD_TENANTS)?;
-    crate::store::valid_name(name).then(|| tenant_path(name))
-}
-
-/// The tenant named by the page at `path`.
-pub(super) fn tenant_target(path: &str) -> Option<&str> {
-    let name = path.strip_prefix(TENANTS)?;
-    crate::store::valid_name(name).then_some(name)
+    (path == OLD_PATH || path.starts_with(OLD_TENANTS) || path.starts_with(OLDER_TENANTS))
+        .then(|| PATH.to_string())
 }
 
 /// What a page says in place of a policy this hub cannot read.
@@ -130,83 +55,11 @@ fn unreadable(h: &mut Html, error: &anyhow::Error) {
         .raw("</p>");
 }
 
-/// A runner a relay reports, by its approved instance's name and GitLab ID.
-struct KnownRunner {
-    gitlab: String,
-    id: u64,
-    /// Its name in the relay's config.
-    name: String,
-    /// The relay's host.
-    relay: String,
-}
-
-/// An enrolled node for pickers and policy descriptions. Other pages only pass it back
-/// to this module.
+/// An enrolled node for policy descriptions. Other pages only pass it back to this module.
 pub(super) struct KnownNode {
     id: String,
     /// Display-safe hostname, with a short ID for duplicate or missing hostnames.
     label: String,
-    pools: Vec<String>,
-}
-
-/// What the hub knows besides the policy, named on its pages and offered by its pickers.
-struct Known {
-    gitlabs: Vec<String>,
-    projects: Vec<ProjectView>,
-    runners: Vec<KnownRunner>,
-    /// Each API key's principal ID and name.
-    keys: Vec<(String, String)>,
-    nodes: Vec<KnownNode>,
-}
-
-impl Known {
-    /// Reads the database: call off the runtime.
-    fn read(hub: &Hub) -> Result<Self> {
-        let mut runners = Vec::new();
-        for relay in crate::relays::views(hub)? {
-            let Some(gitlab) = relay.server.as_ref().and_then(|s| s.name.clone()) else {
-                continue;
-            };
-            for runner in relay.row.inventory.iter().flat_map(|i| &i.runners) {
-                if let Some(id) = runner.runner_id {
-                    runners.push(KnownRunner {
-                        gitlab: gitlab.clone(),
-                        id,
-                        name: runner.name.clone(),
-                        relay: relay.row.hostname.clone(),
-                    });
-                }
-            }
-        }
-        runners.sort_by(|a, b| (&a.gitlab, a.id).cmp(&(&b.gitlab, b.id)));
-        runners.dedup_by(|a, b| (&a.gitlab, a.id) == (&b.gitlab, b.id));
-        Ok(Known {
-            gitlabs: hub
-                .db
-                .gitlabs()?
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect(),
-            projects: hub.db.gitlab_projects(None)?,
-            runners,
-            keys: (hub.db.api_keys_with_ids()?.into_iter())
-                .map(|(id, key)| (id, key.name))
-                .collect(),
-            nodes: known_nodes(hub)?,
-        })
-    }
-
-    fn project(&self, gitlab: &str, id: u64) -> Option<&ProjectView> {
-        self.projects
-            .iter()
-            .find(|p| p.gitlab == gitlab && p.id == id)
-    }
-
-    fn runner(&self, gitlab: &str, id: u64) -> Option<&KnownRunner> {
-        self.runners
-            .iter()
-            .find(|r| r.gitlab == gitlab && r.id == id)
-    }
 }
 
 /// The nodes the hub has enrolled, sorted by label. Reads the database: call off the runtime.
@@ -215,7 +68,6 @@ pub(super) fn known_nodes(hub: &Hub) -> Result<Vec<KnownNode>> {
         .map(|(id, row)| KnownNode {
             label: vk_hub_proto::display_safe(&row.hostname),
             id,
-            pools: row.pools,
         })
         .collect();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
@@ -233,270 +85,139 @@ pub(super) fn known_nodes(hub: &Hub) -> Result<Vec<KnownNode>> {
     Ok(nodes)
 }
 
-/// Node `id` as `nodes` name it, or its ID for a node the hub has not enrolled.
+/// Node `id` as `nodes` name it, or as given for a pool or a node the hub has not enrolled.
 fn node_label<'a>(nodes: &'a [KnownNode], id: &'a str) -> &'a str {
     (nodes.iter())
         .find(|n| n.id == id)
         .map_or(id, |n| n.label.as_str())
 }
 
-/// Project `id` of `gitlab` as a page names it: its path where known, linking to its page.
-fn project_link(h: &mut Html, known: &Known, gitlab: &str, id: u64) {
-    h.raw("<a href=\"")
-        .text(super::projects::path(gitlab, id))
-        .raw("\">");
-    match known.project(gitlab, id).filter(|p| !p.row.path.is_empty()) {
-        Some(p) => h.node(&p.row.path),
-        None => h.text(format_args!("project {id}")),
+/// The nodes `lane` may use, as a page names them.
+pub(super) fn may_use_text(lane: &Lane, nodes: &[KnownNode]) -> String {
+    let Some(targets) = &lane.nodes else {
+        return "any node".to_owned();
     };
-    h.raw("</a>");
+    let shown: Vec<_> = (targets.iter())
+        .take(MAX_LISTED_TARGETS)
+        .map(|t| node_label(nodes, t))
+        .collect();
+    match targets.len().saturating_sub(MAX_LISTED_TARGETS) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
 }
 
-fn approval_badge(h: &mut Html, project: Option<&ProjectView>) {
-    h.raw(match project.map(|p| p.row.state) {
-        Some(ProjectState::Approved) => "<span class=\"badge ok\">approved</span>",
-        Some(ProjectState::Pending) => "<span class=\"badge warn\">pending</span>",
-        Some(ProjectState::Rejected) => "<span class=\"badge bad\">rejected</span>",
-        None => "<span class=\"badge\">never seen</span>",
-    });
-}
-
-/// `GET /capacity`.
-pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    let hub = ui.hub.clone();
-    let (policy, known) =
-        blocking(move || Ok((hub.db.capacity_policy(), Known::read(&hub)?))).await?;
-    let mut main = Html::new();
-    main.raw("<h1>Capacity policy</h1><p class=\"sub\">The hub shares the fleet between ")
-        .raw("tenants. Each relay runner's requests and each API key's reservations count ")
-        .raw("against a tenant. When several tenants wait, the one using the least relative to ")
-        .raw("its weight goes first, up to its cap. A runner gets work only after you map it to ")
-        .raw("a tenant, and only for that tenant's projects.</p>");
-    let policy = match policy {
-        Ok(policy) => policy,
-        Err(e) => {
-            unreadable(&mut main, &e);
-            return Ok(page(fleet::layout("Capacity policy", PATH, auth, &main)));
-        }
+/// The projects, and their branches, `lane` may run.
+fn projects_text(lane: &Lane) -> String {
+    let Some(projects) = &lane.projects else {
+        return if lane.runner.is_some() {
+            "any".to_owned()
+        } else {
+            "-".to_owned()
+        };
     };
-    let steer = auth.session.role >= Role::Operator;
-    let digest = policy.digest()?;
-    main.raw("<section><h2>Tenants</h2>");
-    tenants_table(&mut main, &policy);
-    if steer {
-        add_tenant_fields(&mut main, auth);
+    if projects.is_empty() {
+        return "none".to_owned();
     }
-    main.raw("</section>");
-    fallback_section(&mut main, &policy, auth, &digest, steer);
-    clients_section(&mut main, &policy, &known, auth, &digest, steer);
-    scheduling_section(&mut main, &policy, auth, &digest, steer);
-    headroom_section(&mut main, &policy, auth, &digest, steer);
-    let json = serde_json::to_string_pretty(&policy)?;
-    main.raw("<section><details class=\"fold\"><summary>The whole policy as JSON</summary>")
-        .raw("<p class=\"sub\">The format <code>vk-hub capacity-policy show</code> prints ")
-        .raw("and <code>vk-hub capacity-policy set</code> takes.</p>");
-    if steer {
-        edit_form(&mut main, auth, SET_POLICY, &digest);
-        main.raw("<textarea name=\"policy\" rows=\"24\" spellcheck=\"false\" ")
-            .raw("aria-label=\"Policy (JSON)\">")
-            .text(json)
-            .raw("</textarea><button>Replace the whole policy</button></form>");
-    } else {
-        main.raw("<pre>").text(json).raw("</pre>");
-    }
-    main.raw("</details></section>");
-    Ok(page(fleet::layout("Capacity policy", PATH, auth, &main)))
+    (projects.iter())
+        .map(|p| match &p.branches {
+            None => format!("{} · all", p.id),
+            Some(b) => format!("{} · {}", p.id, b.join(", ")),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-/// Each tenant's weight and cap, and how many projects, runners and API clients it has,
-/// linking to its page.
-fn tenants_table(h: &mut Html, policy: &Policy) {
-    h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
-        .raw("<th>cap</th><th class=\"num\">projects</th><th class=\"num\">runners</th>")
-        .raw("<th class=\"num\">API clients</th></tr></thead><tbody>");
-    for (name, tenant) in &policy.tenants {
-        h.raw("<tr><td><a href=\"")
-            .text(tenant_path(name))
-            .raw("\">")
-            .text(name)
-            .raw("</a>");
-        if policy.fallback == *name {
-            h.raw(" <span class=\"sub\">fallback</span>");
+fn lane_name(lane: &Lane) -> String {
+    lane.id()
+        .map_or_else(|| "?".to_owned(), |id| id.to_string())
+}
+
+/// What converting the policy to lanes left to review.
+fn conversion_section(h: &mut Html, note: &ConversionNote) {
+    h.raw("<section><h2>Converted policy</h2>");
+    if note.held() {
+        h.raw("<p class=\"message\">This policy is proposed, not active: the hub grants no new ")
+            .raw("capacity until an operator sets it, changed or not. Running work continues. ")
+            .raw("These placement rules do not convert; set the nodes of their lanes:</p><ul>");
+        for rule in &note.unconverted {
+            h.raw("<li>").text(rule).raw("</li>");
         }
-        h.raw("</td><td class=\"num\">")
-            .text(tenant.weight)
+        h.raw("</ul>");
+    }
+    if !note.shared.is_empty() {
+        h.raw("<p class=\"sub\">These lanes each took the whole weight and max slots of a ")
+            .raw("tenant they shared: lower them.</p><ul>");
+        for (id, tenant) in &note.shared {
+            h.raw("<li>")
+                .text(id)
+                .raw(" (tenant ")
+                .text(tenant)
+                .raw(")</li>");
+        }
+        h.raw("</ul>");
+    }
+    h.raw("</section>");
+}
+
+fn lanes_table(h: &mut Html, policy: &Policy, nodes: &[KnownNode]) {
+    if policy.lanes.is_empty() {
+        h.raw("<p class=\"empty\">No lanes: the hub grants no capacity.</p>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>lane</th><th>class</th>")
+        .raw("<th class=\"num\">weight</th><th>max slots</th><th>nodes</th>")
+        .raw("<th>projects · branches</th></tr></thead><tbody>");
+    for lane in &policy.lanes {
+        h.raw("<tr><td>")
+            .text(lane_name(lane))
             .raw("</td><td>")
-            .text(cap(tenant))
+            .text(lane.class)
             .raw("</td><td class=\"num\">")
-            .text(tenant.projects.len())
-            .raw("</td><td class=\"num\">")
-            .text(policy.runners.iter().filter(|r| r.tenant == *name).count())
-            .raw("</td><td class=\"num\">")
-            .text(policy.clients.values().filter(|t| *t == name).count())
+            .text(lane.weight)
+            .raw("</td><td>")
+            .text(
+                lane.max_slots
+                    .map_or_else(|| "-".to_owned(), |n| n.to_string()),
+            )
+            .raw("</td><td>")
+            .text(may_use_text(lane, nodes))
+            .raw("</td><td>")
+            .text(projects_text(lane))
             .raw("</td></tr>");
     }
     h.raw("</tbody></table>");
 }
 
-fn fallback_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
-    h.raw("<section><h2>Fallback tenant</h2><p class=\"sub\">API keys with no tenant ")
-        .raw("assigned below are charged to the fallback tenant. Relay runners never fall back. ")
-        .raw("An unmapped runner gets no work.</p>");
-    if !steer {
-        h.raw("<p><a href=\"")
-            .text(tenant_path(&policy.fallback))
-            .raw("\">")
-            .text(&policy.fallback)
-            .raw("</a></p></section>");
-        return;
-    }
-    edit_form(h, auth, SET_FALLBACK, digest);
-    h.raw("<label>Tenant <select name=\"tenant\">");
-    tenant_options(h, policy, &policy.fallback);
-    h.raw("</select></label><button>Save fallback</button></form></section>");
-}
-
-/// An `<option>` of each tenant, `selected` the one selected.
-fn tenant_options(h: &mut Html, policy: &Policy, selected: &str) {
-    for name in policy.tenants.keys() {
-        h.raw("<option value=\"").text(name).raw("\"");
-        if name == selected {
-            h.raw(" selected");
-        }
-        h.raw(">").text(name).raw("</option>");
-    }
-}
-
-/// API keys and the tenants they are charged to, including policy assignments for keys the
-/// hub no longer has.
-fn clients_section(
-    h: &mut Html,
-    policy: &Policy,
-    known: &Known,
-    auth: &Auth,
-    digest: &str,
-    steer: bool,
-) {
-    h.raw("<section><h2>API clients</h2><p class=\"sub\">The tenant that each API key's ")
-        .raw("reservations are charged to, listed by the key's principal ID. API clients' work ")
-        .raw("is always normal, never production.</p>");
-    let mut rows: BTreeMap<&str, Option<&str>> = BTreeMap::new();
-    for (id, name) in &known.keys {
-        rows.insert(id, Some(name));
-    }
-    for principal in policy.clients.keys() {
-        rows.entry(principal).or_insert(None);
-    }
-    if rows.is_empty() {
-        h.raw("<p class=\"empty\">No API key yet.</p>");
-    } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>key</th><th>principal ID</th>")
-            .raw("<th>tenant</th></tr></thead><tbody>");
-        for (principal, name) in &rows {
-            h.raw("<tr><td>");
-            match name {
-                Some(name) => h.text(name),
-                None => h.raw("<span class=\"sub\">not a key the hub has</span>"),
-            };
-            h.raw("</td><td><code>")
-                .text(principal)
-                .raw("</code></td><td>");
-            let assigned = policy.clients.get(*principal);
-            if steer {
-                edit_form_class(h, auth, SET_CLIENT, digest, "inline");
-                hidden(h, "principal", principal);
-                h.raw("<select name=\"tenant\" aria-label=\"Tenant\"><option value=\"\">")
-                    .text(format_args!("the fallback ({})", policy.fallback))
-                    .raw("</option>");
-                tenant_options(h, policy, assigned.map_or("", String::as_str));
-                h.raw("</select><button>Save</button></form>");
-            } else {
-                match assigned {
-                    Some(tenant) => h
-                        .raw("<a href=\"")
-                        .text(tenant_path(tenant))
-                        .raw("\">")
-                        .text(tenant)
-                        .raw("</a>"),
-                    None => h
-                        .raw("<span class=\"sub\">the fallback, ")
-                        .text(&policy.fallback)
-                        .raw("</span>"),
-                };
-            }
-            h.raw("</td></tr>");
-        }
-        h.raw("</tbody></table>");
-    }
-    h.raw("</section>");
-}
-
-fn scheduling_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
-    h.raw("<section><h2>Scheduling</h2><p class=\"sub\">If a runner has taken no job for the ")
-        .raw("busy time, its next request probes GitLab. The whole fleet has at most the probe ")
-        .raw("limit of probes out at once. If a runner's request finds no job, the runner backs ")
-        .raw("off for the initial backoff. Each further miss in a row doubles the wait, up to the ")
-        .raw("maximum backoff. After the production probe burst, normal work goes before the ")
-        .raw("next production probe.</p>");
-    let fields: [(&'static str, &'static str, u64, &'static str); 5] = [
-        ("busy_secs", "Busy time", policy.busy_secs, " s"),
-        ("probe_limit", "Probe limit", policy.probe_limit.into(), ""),
+fn scheduling_section(h: &mut Html, policy: &Policy) {
+    h.raw("<section><h2>Scheduling</h2><table class=\"kv\"><tbody>");
+    for (label, value) in [
+        ("Busy time", format!("{} s", policy.busy_secs)),
+        ("Probe limit", policy.probe_limit.to_string()),
         (
-            "production_probe_burst",
             "Production probe burst",
-            policy.production_probe_burst.into(),
-            "",
+            policy.production_probe_burst.to_string(),
         ),
         (
-            "backoff_initial_secs",
             "Initial backoff",
-            policy.backoff_initial_secs,
-            " s",
+            format!("{} s", policy.backoff_initial_secs),
         ),
-        (
-            "backoff_max_secs",
-            "Maximum backoff",
-            policy.backoff_max_secs,
-            " s",
-        ),
-    ];
-    if !steer {
-        h.raw("<table class=\"kv\"><tbody>");
-        for (_, label, value, unit) in fields {
-            pages::kv(h, label, &format!("{value}{unit}"));
-        }
-        h.raw("</tbody></table></section>");
-        return;
+        ("Maximum backoff", format!("{} s", policy.backoff_max_secs)),
+    ] {
+        pages::kv(h, label, &value);
     }
-    edit_form(h, auth, SET_SCHEDULING, digest);
-    for (name, label, value, unit) in fields {
-        h.raw("<label>")
-            .raw(label)
-            .raw(" <input type=\"number\" min=\"1\" required name=\"")
-            .raw(name)
-            .raw("\" value=\"")
-            .text(value)
-            .raw("\">")
-            .raw(unit)
-            .raw("</label>");
-    }
-    h.raw("<button>Save scheduling</button></form></section>");
+    h.raw("</tbody></table></section>");
 }
 
-fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
-    h.raw("<section><h2>Production headroom</h2><p class=\"sub\">Room kept for production ")
-        .raw("work. Normal work must leave the fleet this many envelopes of each placement. If ")
-        .raw("the fleet is already short, normal work must leave all the room that is left.</p>");
+fn headroom_section(h: &mut Html, policy: &Policy) {
+    h.raw("<section><h2>Production headroom</h2><p class=\"sub\">Room only production lanes ")
+        .raw("may take.</p>");
     if policy.headroom.is_empty() {
         h.raw("<p class=\"empty\">None. Normal work may take all the room.</p>");
     } else {
         h.raw("<table class=\"grid\"><thead><tr><th>pool</th><th>labels</th>")
-            .raw("<th>envelope</th><th class=\"num\">slots</th>");
-        if steer {
-            h.raw("<th></th>");
-        }
-        h.raw("</tr></thead><tbody>");
-        for (i, entry) in policy.headroom.iter().enumerate() {
+            .raw("<th>envelope</th><th class=\"num\">slots</th></tr></thead><tbody>");
+        for entry in &policy.headroom {
             let p = &entry.placement;
             h.raw("<tr><td>")
                 .text(&p.pool)
@@ -510,825 +231,124 @@ fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, st
                 .text(crate::store::envelope_text(p.envelope))
                 .raw("</td><td class=\"num\">")
                 .text(entry.slots)
-                .raw("</td>");
-            if steer {
-                h.raw("<td class=\"actions\">");
-                button_form(
-                    h,
-                    auth,
-                    REMOVE_HEADROOM,
-                    digest,
-                    &[("index", i.to_string())],
-                    "Remove",
-                );
-                h.raw("</td>");
-            }
-            h.raw("</tr>");
+                .raw("</td></tr>");
         }
         h.raw("</tbody></table>");
-    }
-    if steer {
-        h.raw("<h3>Keep room</h3>");
-        edit_form(h, auth, ADD_HEADROOM, digest);
-        h.raw("<label>Slots <input type=\"number\" name=\"slots\" min=\"1\" value=\"1\" ")
-            .raw("required></label><label>Pool <input name=\"pool\" required></label>")
-            .raw("<label>Labels <input name=\"labels\" placeholder=\"comma- or space-separated\">")
-            .raw("</label><label>Memory <input type=\"number\" name=\"mem_mib\" min=\"1\" ")
-            .raw("required> MiB</label><label>CPUs <input type=\"number\" name=\"cpus\" ")
-            .raw("min=\"1\" required></label><label>Disk <input type=\"number\" ")
-            .raw("name=\"disk_gib\" min=\"0\" value=\"0\" required> GiB</label>")
-            .raw("<button>Add headroom</button></form>");
     }
     h.raw("</section>");
 }
 
-/// `GET /capacity/tenants/<name>`.
-pub(super) async fn tenant_get(name: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+/// `GET /capacity`.
+pub(super) async fn policy_get(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let hub = ui.hub.clone();
-    let (policy, known) =
-        blocking(move || Ok((hub.db.capacity_policy(), Known::read(&hub)?))).await?;
+    let (policy, note, nodes) = blocking(move || {
+        Ok((
+            hub.db.capacity_policy(),
+            hub.db.capacity_conversion()?,
+            known_nodes(&hub)?,
+        ))
+    })
+    .await?;
     let mut main = Html::new();
-    main.raw("<h1>Tenant ").text(name);
+    main.raw("<h1>Capacity policy</h1><p class=\"sub\">Each runner, API key, and the other ")
+        .raw("API keys together, is a lane. When several lanes wait, the one holding the least ")
+        .raw("for its weight goes first, up to its max slots. A runner gets work only once it ")
+        .raw("has a lane, only on that lane's nodes and only for its projects.</p>");
     let policy = match policy {
         Ok(policy) => policy,
         Err(e) => {
-            main.raw("</h1>");
             unreadable(&mut main, &e);
-            return Ok(tenant_page(name, auth, &main));
+            return Ok(page(fleet::layout("Capacity policy", PATH, auth, &main)));
         }
     };
-    let Some(tenant) = policy.tenant(name) else {
-        return Ok(message(StatusCode::NOT_FOUND, "No such capacity tenant."));
-    };
-    if policy.fallback == name {
-        main.raw(" <span class=\"badge\">fallback</span>");
+    if let Some(note) = &note {
+        conversion_section(&mut main, note);
     }
-    main.raw("</h1><p><a href=\"")
-        .raw(PATH)
-        .raw("\">Capacity policy</a></p>");
+    main.raw("<section><h2>Lanes</h2>");
+    lanes_table(&mut main, &policy, &nodes);
+    main.raw("</section>");
+    headroom_section(&mut main, &policy);
+    scheduling_section(&mut main, &policy);
     let steer = auth.session.role >= Role::Operator;
     let digest = policy.digest()?;
-    share_section(&mut main, name, tenant, auth, &digest, steer);
-    projects_section(
-        &mut main, name, tenant, &policy, &known, auth, &digest, steer,
-    );
-    runners_section(&mut main, name, &policy, &known, auth, &digest, steer);
-    main.raw("<section><h2>API clients</h2>");
-    let clients: Vec<_> = (policy.clients.iter())
-        .filter(|(_, t)| *t == name)
-        .map(|(principal, _)| principal)
-        .collect();
-    if clients.is_empty() {
-        main.raw("<p class=\"empty\">None");
-        if policy.fallback == name {
-            main.raw(" assigned. As the fallback, it is charged for every API key with no tenant");
-        }
-        main.raw(".</p>");
+    let json = serde_json::to_string_pretty(&policy)?;
+    main.raw("<section><h2>The whole policy</h2><p class=\"sub\">The format ")
+        .raw("<code>vk-hub capacity-policy show</code> prints and ")
+        .raw("<code>vk-hub capacity-policy set</code> takes.</p>");
+    if steer {
+        main.raw("<form class=\"wide\" method=\"post\" action=\"")
+            .raw(PATH)
+            .raw("\">");
+        csrf_field(&mut main, auth);
+        main.raw("<input type=\"hidden\" name=\"op\" value=\"")
+            .raw(SET_POLICY)
+            .raw("\"><input type=\"hidden\" name=\"expected\" value=\"")
+            .text(&digest)
+            .raw("\"><textarea name=\"policy\" rows=\"24\" spellcheck=\"false\" ")
+            .raw("aria-label=\"Policy (JSON)\">")
+            .text(json)
+            .raw("</textarea><button>Set the policy</button></form>");
     } else {
-        main.raw("<table class=\"grid\"><thead><tr><th>key</th><th>principal ID</th></tr>")
-            .raw("</thead><tbody>");
-        for principal in clients {
-            main.raw("<tr><td>");
-            match known.keys.iter().find(|(id, _)| id == principal) {
-                Some((_, key)) => main.text(key),
-                None => main.raw("<span class=\"sub\">not a key the hub has</span>"),
-            };
-            main.raw("</td><td><code>")
-                .text(principal)
-                .raw("</code></td></tr>");
-        }
-        main.raw("</tbody></table>");
+        main.raw("<pre>").text(json).raw("</pre>");
     }
-    main.raw("<p class=\"sub\">You assign API keys to tenants on the <a href=\"")
-        .raw(PATH)
-        .raw("\">capacity policy</a> page.</p></section>");
-    if steer && policy.fallback != name {
-        main.raw("<section class=\"steer\"><div class=\"groups\"><div class=\"group danger\">")
-            .raw("<h3>Remove tenant</h3><p class=\"does\">Unmaps this tenant's runners, so ")
-            .raw("they get no work. Its API keys move to the fallback tenant.</p>");
-        edit_form_class(&mut main, auth, REMOVE_TENANT, &digest, "act");
-        hidden(&mut main, "tenant", name);
-        main.raw("<button class=\"danger\">Remove tenant</button></form></div></div></section>");
-    }
-    Ok(tenant_page(name, auth, &main))
+    main.raw("</section>");
+    Ok(page(fleet::layout("Capacity policy", PATH, auth, &main)))
 }
 
-fn share_section(
-    h: &mut Html,
-    name: &str,
-    tenant: &Tenant,
-    auth: &Auth,
-    digest: &str,
-    steer: bool,
-) {
-    h.raw("<section><h2>Share</h2><p class=\"sub\">The hub gives room first to the tenant ")
-        .raw("using the least relative to its weight. When both have work, a tenant of weight 2 ")
-        .raw("gets twice the room of a tenant of weight 1. An idle tenant's share goes to the ")
-        .raw("others. A cap limits the tenant to that many requests and jobs at once.</p>");
-    if !steer {
-        h.raw("<table class=\"kv\"><tbody>");
-        pages::kv(h, "Weight", &tenant.weight.to_string());
-        pages::kv(h, "Cap", &cap(tenant));
-        h.raw("</tbody></table></section>");
-        return;
-    }
-    edit_form(h, auth, SET_SHARE, digest);
-    hidden(h, "tenant", name);
-    h.raw("<label>Weight <input type=\"number\" name=\"weight\" min=\"1\" required value=\"")
-        .text(tenant.weight)
-        .raw("\"></label><label>Cap <input type=\"number\" name=\"cap\" min=\"1\" ")
-        .raw("placeholder=\"unbounded\" value=\"");
-    if let Some(cap) = tenant.cap {
-        h.text(cap);
-    }
-    h.raw("\"></label><button>Save share</button></form></section>");
-}
-
-#[allow(clippy::too_many_arguments)]
-fn projects_section(
-    h: &mut Html,
-    name: &str,
-    tenant: &Tenant,
-    policy: &Policy,
-    known: &Known,
-    auth: &Auth,
-    digest: &str,
-    steer: bool,
-) {
-    h.raw("<section><h2>Projects</h2><p class=\"sub\">This tenant's runners take jobs of ")
-        .raw("these projects only. You set production branches and placement rules on each ")
-        .raw("project's page. They are the same in every tenant that lists the project.</p>");
-    if tenant.projects.is_empty() {
-        h.raw("<p class=\"empty\">None. The hub refuses this tenant's runners' jobs.</p>");
-    } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>project</th><th>instance</th>")
-            .raw("<th class=\"num\">GitLab ID</th><th>approval</th><th>production branches</th>")
-            .raw("<th class=\"num\">placement rules</th>");
-        if steer {
-            h.raw("<th></th>");
-        }
-        h.raw("</tr></thead><tbody>");
-        for p in &tenant.projects {
-            h.raw("<tr><td>");
-            project_link(h, known, &p.gitlab, p.id);
-            h.raw("</td><td>")
-                .text(&p.gitlab)
-                .raw("</td><td class=\"num\">")
-                .text(p.id)
-                .raw("</td><td>");
-            approval_badge(h, known.project(&p.gitlab, p.id));
-            h.raw("</td><td>");
-            if p.production_branches.is_empty() {
-                h.raw("<span class=\"sub\">none</span>");
-            } else {
-                h.raw("<code>")
-                    .text(p.production_branches.join(", "))
-                    .raw("</code>");
-            }
-            h.raw("</td><td class=\"num\">")
-                .text(p.placement_rules.len())
-                .raw("</td>");
-            if steer {
-                h.raw("<td class=\"actions\">");
-                button_form(
-                    h,
-                    auth,
-                    REMOVE_PROJECT,
-                    digest,
-                    &[
-                        ("tenant", name.to_owned()),
-                        ("gitlab", p.gitlab.clone()),
-                        ("project", p.id.to_string()),
-                    ],
-                    "Remove",
-                );
-                h.raw("</td>");
-            }
-            h.raw("</tr>");
-        }
-        h.raw("</tbody></table>");
-    }
-    if !steer {
-        h.raw("</section>");
-        return;
-    }
-    h.raw("<h3>Add a project</h3>");
-    let listed = |p: &ProjectView| policy.project(name, &p.gitlab, p.id).is_some();
-    let mut offered: Vec<_> = known.projects.iter().filter(|p| !listed(p)).collect();
-    offered.sort_by(|a, b| (&a.gitlab, &a.row.path, a.id).cmp(&(&b.gitlab, &b.row.path, b.id)));
-    if !offered.is_empty() {
-        edit_form(h, auth, ADD_PROJECT, digest);
-        hidden(h, "tenant", name);
-        h.raw("<select name=\"project\" aria-label=\"Project\" required>");
-        for p in offered {
-            h.raw("<option value=\"")
-                .text(format_args!("{}/{}", p.gitlab, p.id))
-                .raw("\">");
-            if p.row.path.is_empty() {
-                h.text(format_args!("project {}", p.id));
-            } else {
-                h.node(&p.row.path);
-            }
-            h.text(format_args!(" · {} #{}", p.gitlab, p.id))
-                .raw(match p.row.state {
-                    ProjectState::Approved => "",
-                    ProjectState::Pending => " (pending approval)",
-                    ProjectState::Rejected => " (rejected)",
-                })
-                .raw("</option>");
-        }
-        h.raw("</select><button>Add project</button></form>");
-    }
-    h.raw("<details class=\"more\"><summary>A project the hub has not seen</summary>");
-    if by_id_form(
-        h,
-        auth,
-        known,
-        ADD_PROJECT,
-        digest,
-        name,
-        "project",
-        "Project ID",
-    ) {
-        h.raw("<button>Add project</button></form>");
-    }
-    h.raw("</details></section>");
-}
-
-/// A form posting `op` for tenant `name`, with a picker of known instances and an ID entered
-/// in `id_field`. Returns whether it opened a form, left open; no known instance means no form.
-#[allow(clippy::too_many_arguments)]
-fn by_id_form(
-    h: &mut Html,
-    auth: &Auth,
-    known: &Known,
-    op: &'static str,
-    digest: &str,
-    name: &str,
-    id_field: &'static str,
-    id_label: &'static str,
-) -> bool {
-    if known.gitlabs.is_empty() {
-        h.raw("<p class=\"empty\">No GitLab instance yet.</p>");
-        return false;
-    }
-    edit_form(h, auth, op, digest);
-    hidden(h, "tenant", name);
-    h.raw("<label>GitLab instance <select name=\"gitlab\" required>");
-    for gitlab in &known.gitlabs {
-        h.raw("<option>").text(gitlab).raw("</option>");
-    }
-    h.raw("</select></label><label>")
-        .raw(id_label)
-        .raw(" <input type=\"number\" name=\"")
-        .raw(id_field)
-        .raw("\" min=\"1\" required></label>");
-    true
-}
-
-fn runners_section(
-    h: &mut Html,
-    name: &str,
-    policy: &Policy,
-    known: &Known,
-    auth: &Auth,
-    digest: &str,
-    steer: bool,
-) {
-    h.raw("<section><h2>Runners</h2><p class=\"sub\">Relay runners charged to this tenant, ")
-        .raw("by GitLab runner ID. A production runner's work goes before normal work. A ")
-        .raw("production runner takes only jobs of its projects' production branches. If you ")
-        .raw("give a runner nodes or pools, the hub runs its requests and jobs on those nodes ")
-        .raw("only, least loaded first. The hub never uses other nodes for that runner, even ")
-        .raw("idle ones.</p>");
-    let runners: Vec<_> = policy.runners.iter().filter(|r| r.tenant == name).collect();
-    if runners.is_empty() {
-        h.raw("<p class=\"empty\">None. This tenant gets no relay work.</p>");
-    } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>runner</th><th>relay</th>")
-            .raw("<th>instance</th><th class=\"num\">GitLab ID</th><th>class</th>")
-            .raw("<th>may use</th>");
-        if steer {
-            h.raw("<th></th>");
-        }
-        h.raw("</tr></thead><tbody>");
-        for r in &runners {
-            let seen = known.runner(&r.gitlab, r.runner_id);
-            h.raw("<tr><td>");
-            match seen {
-                Some(seen) => h.node(&seen.name).raw("</td><td>").node(&seen.relay),
-                None => h.raw("<span class=\"sub\">no relay reports it</span></td><td>-"),
-            };
-            h.raw("</td><td>")
-                .text(&r.gitlab)
-                .raw("</td><td class=\"num\">")
-                .text(r.runner_id)
-                .raw("</td><td>")
-                .text(r.class)
-                .raw("</td><td>");
-            may_use_cell(h, r, known);
-            if steer {
-                runner_nodes_form(h, name, r, known, auth, digest);
-            }
-            h.raw("</td>");
-            if steer {
-                let key = [
-                    ("tenant", name.to_owned()),
-                    ("gitlab", r.gitlab.clone()),
-                    ("runner", r.runner_id.to_string()),
-                ];
-                h.raw("<td class=\"actions\">");
-                let (other, label) = match r.class {
-                    Class::Normal => ("production", "Make production"),
-                    Class::Production => ("normal", "Make normal"),
-                };
-                let mut fields = key.to_vec();
-                fields.push(("class", other.to_owned()));
-                button_form(h, auth, MAP_RUNNER, digest, &fields, label);
-                button_form(h, auth, UNMAP_RUNNER, digest, &key, "Unmap");
-                h.raw("</td>");
-            }
-            h.raw("</tr>");
-        }
-        h.raw("</tbody></table>");
-    }
-    if !steer {
-        h.raw("</section>");
-        return;
-    }
-    h.raw("<h3>Map a runner</h3>");
-    let offered: Vec<_> = (known.runners.iter())
-        .filter(|k| {
-            policy
-                .runner(&k.gitlab, k.id)
-                .is_none_or(|m| m.tenant != name)
-        })
-        .collect();
-    let class_select = |h: &mut Html| {
-        h.raw("<select name=\"class\" aria-label=\"Class\"><option>normal</option>")
-            .raw("<option>production</option></select>");
-    };
-    if !offered.is_empty() {
-        edit_form(h, auth, MAP_RUNNER, digest);
-        hidden(h, "tenant", name);
-        h.raw("<select name=\"runner\" aria-label=\"Runner\" required>");
-        for k in offered {
-            h.raw("<option value=\"")
-                .text(format_args!("{}/{}", k.gitlab, k.id))
-                .raw("\">")
-                .node(&k.name)
-                .raw(" on ")
-                .node(&k.relay)
-                .text(format_args!(" · {} #{}", k.gitlab, k.id));
-            match policy.runner(&k.gitlab, k.id) {
-                Some(m) => h.text(format_args!(" (moves from {})", m.tenant)),
-                None => h.raw(" (unmapped)"),
-            };
-            h.raw("</option>");
-        }
-        h.raw("</select>");
-        class_select(h);
-        h.raw("<button>Map runner</button></form>");
-    } else if known.runners.is_empty() {
-        h.raw("<p class=\"empty\">No relay reports a runner with its GitLab ID yet.</p>");
-    }
-    h.raw("<details class=\"more\"><summary>A runner no relay reports</summary>");
-    if by_id_form(
-        h,
-        auth,
-        known,
-        MAP_RUNNER,
-        digest,
-        name,
-        "runner",
-        "Runner ID",
-    ) {
-        class_select(h);
-        h.raw("<button>Map runner</button></form>");
-    }
-    h.raw("</details></section>");
-}
-
-/// The nodes runner mapping `r` may use, and those of the hub's it allows now.
-fn may_use_cell(h: &mut Html, r: &RunnerMapping, known: &Known) {
-    if !r.confined() {
-        h.raw("any node");
-        return;
-    }
-    h.text(may_use_text(r, &known.nodes));
-    let allowed: Vec<_> = (known.nodes.iter())
-        .filter(|n| r.allows(&n.id, &n.pools))
-        .map(|n| n.label.as_str())
-        .collect();
-    h.raw("<br><span class=\"sub\">");
-    if allowed.is_empty() {
-        h.raw("No node of the hub's matches, so this runner gets no work.");
-    } else {
-        h.text(format_args!(
-            "Now {} of {} nodes: {}",
-            allowed.len(),
-            known.nodes.len(),
-            listed(&allowed)
-        ));
-    }
-    h.raw("</span>");
-}
-
-/// Runner mapping `r`'s allowed targets for pages and questions, with node labels from
-/// `nodes`.
-pub(super) fn may_use_text(r: &RunnerMapping, nodes: &[KnownNode]) -> String {
-    let named: Vec<_> = r.nodes.iter().map(|id| node_label(nodes, id)).collect();
-    let pools: Vec<_> = r.pools.iter().map(String::as_str).collect();
-    let mut parts = Vec::new();
-    for (one, many, list) in [("node", "nodes", &named), ("pool", "pools", &pools)] {
-        if !list.is_empty() {
-            let word = if list.len() == 1 { one } else { many };
-            parts.push(format!("{word} {}", listed(list)));
-        }
-    }
-    if parts.is_empty() {
-        "any node".to_owned()
-    } else {
-        parts.join(" or ")
-    }
-}
-
-/// `items` joined, those past [`MAX_LISTED_TARGETS`] counted.
-fn listed<S: AsRef<str>>(items: &[S]) -> String {
-    let shown: Vec<_> = items
-        .iter()
-        .take(MAX_LISTED_TARGETS)
-        .map(AsRef::as_ref)
-        .collect();
-    match items.len().saturating_sub(MAX_LISTED_TARGETS) {
-        0 => shown.join(", "),
-        more => format!("{} and {more} more", shown.join(", ")),
-    }
-}
-
-/// The nodes and pools of runner mapping `r`, in any order.
-fn may_use_sets(r: &RunnerMapping) -> (BTreeSet<&String>, BTreeSet<&String>) {
-    (r.nodes.iter().collect(), r.pools.iter().collect())
-}
-
-/// The form setting the nodes runner mapping `r`, of tenant `name`, may use. Each runner's
-/// row holds a picker of every node, folded away: fine for fleets of tens of nodes.
-fn runner_nodes_form(
-    h: &mut Html,
-    name: &str,
-    r: &RunnerMapping,
-    known: &Known,
-    auth: &Auth,
-    digest: &str,
-) {
-    h.raw("<details class=\"targets\"><summary>Change</summary>");
-    edit_form(h, auth, SET_RUNNER_NODES, digest);
-    hidden(h, "tenant", name);
-    hidden(h, "gitlab", &r.gitlab);
-    hidden(h, "runner", r.runner_id);
-    targets_picker(h, &known.nodes, &r.nodes, &r.pools);
-    h.raw("<p class=\"sub\">The runner may use any ticked node, and any node in a ticked ")
-        .raw("pool. Tick none to allow any node. You can tick at most 256 nodes and 256 ")
-        .raw("pools.</p>")
-        .raw("<button>Save</button></form></details>");
-}
-
-/// Checkboxes for known nodes by hostname and pools, with `nodes` and `pools` ticked.
-/// Keep unknown selections so a save preserves them. Allow typing pools with no nodes.
-fn targets_picker(h: &mut Html, known: &[KnownNode], nodes: &[String], pools: &[String]) {
-    /// A checkbox posting `value` as `field`, labelled by what `label` writes.
-    fn tick(h: &mut Html, field: &str, value: &str, ticked: bool, label: impl FnOnce(&mut Html)) {
-        h.raw("<label><input type=\"checkbox\" name=\"")
-            .text(field)
-            .raw("\" value=\"")
-            .text(value)
-            .raw(if ticked { "\" checked> " } else { "\"> " });
-        label(h);
-        h.raw("</label>");
-    }
-    h.raw("<fieldset class=\"pick\"><legend>Nodes</legend>");
-    for n in known {
-        tick(h, "nodes", &n.id, nodes.contains(&n.id), |h| {
-            h.text(&n.label);
-            if !n.pools.is_empty() {
-                h.raw(" <span class=\"sub\">")
-                    .text(n.pools.join(", "))
-                    .raw("</span>");
-            }
-        });
-    }
-    for id in nodes.iter().filter(|id| known.iter().all(|n| &n.id != *id)) {
-        tick(h, "nodes", id, true, |h| {
-            h.raw("<code>")
-                .text(id)
-                .raw("</code> <span class=\"sub\">not enrolled</span>");
-        });
-    }
-    if known.is_empty() && nodes.is_empty() {
-        h.raw("<span class=\"sub\">No node enrolled yet.</span>");
-    }
-    h.raw("</fieldset><fieldset class=\"pick\"><legend>Pools</legend>");
-    let mut offered: BTreeMap<&str, usize> = BTreeMap::new();
-    for pool in known.iter().flat_map(|n| &n.pools) {
-        *offered.entry(pool).or_default() += 1;
-    }
-    for pool in pools {
-        offered.entry(pool).or_default();
-    }
-    for (pool, count) in offered {
-        tick(h, "pools", pool, pools.iter().any(|p| p == pool), |h| {
-            h.text(pool).raw(" <span class=\"sub\">");
-            match count {
-                0 => h.raw("no node"),
-                1 => h.raw("1 node"),
-                n => h.text(format_args!("{n} nodes")),
-            };
-            h.raw("</span>");
-        });
-    }
-    h.raw("<label>Another <input type=\"text\" name=\"pools\" spellcheck=\"false\" ")
-        .raw("aria-label=\"Another pool\"></label></fieldset>");
-}
-
-/// Tenant `name`'s page around `main`.
-fn tenant_page(name: &str, auth: &Auth, main: &Html) -> Response<Body> {
-    page(fleet::layout(
-        &format!("Tenant {name}"),
-        &tenant_path(name),
-        auth,
-        main,
-    ))
-}
-
-/// A tenant's cap, as shown.
-pub(super) fn cap(tenant: &Tenant) -> String {
-    tenant
-        .cap
-        .map_or_else(|| "unbounded".into(), |n| n.to_string())
-}
-
-/// A form posting `op` to [`PATH`] against the policy of digest `expected`, left open.
-fn edit_form(h: &mut Html, auth: &Auth, op: &'static str, expected: &str) {
-    edit_form_class(h, auth, op, expected, "wide");
-}
-
-/// [`edit_form`] of class `class`.
-fn edit_form_class(
-    h: &mut Html,
-    auth: &Auth,
-    op: &'static str,
-    expected: &str,
-    class: &'static str,
-) {
-    h.raw("<form class=\"")
-        .raw(class)
-        .raw("\" method=\"post\" action=\"")
-        .raw(PATH)
-        .raw("\">");
-    csrf_field(h, auth);
-    hidden(h, "op", op);
-    hidden(h, "expected", expected);
-}
-
-/// A hidden field.
-fn hidden(h: &mut Html, name: &'static str, value: impl Display) {
-    h.raw("<input type=\"hidden\" name=\"")
-        .raw(name)
-        .raw("\" value=\"")
-        .text(value)
-        .raw("\">");
-}
-
-/// A form of one button `label`, posting `op` with `fields`.
-fn button_form(
-    h: &mut Html,
-    auth: &Auth,
-    op: &'static str,
-    expected: &str,
-    fields: &[(&'static str, String)],
-    label: &'static str,
-) {
-    edit_form_class(h, auth, op, expected, "act");
-    for (name, value) in fields {
-        hidden(h, name, value);
-    }
-    h.raw("<button>").raw(label).raw("</button></form>");
-}
-
-/// The form adding a tenant, on the policy's page.
-fn add_tenant_fields(h: &mut Html, auth: &Auth) {
-    h.raw("<form class=\"wide\" method=\"post\" action=\"")
-        .raw(PATH)
-        .raw("\">");
-    csrf_field(h, auth);
-    hidden(h, "op", ADD_TENANT);
-    h.raw("<label>Name <input name=\"tenant\" required></label>")
-        .raw("<button>Add tenant</button></form><p class=\"sub\">A new tenant has weight ")
-        .raw("1 and no projects or runners. You add them on the tenant's page.</p>");
-}
-
-/// A project's section of its page: the tenants listing it and their runners on its instance,
-/// its production branches and its placement rules, which operators edit there, picking from
-/// `nodes`.
+/// A project's section of its page: the lanes that may run it, by listing it or any project
+/// of its instance.
 pub(super) fn project_section(
     h: &mut Html,
     policy: &Result<Policy>,
     nodes: &[KnownNode],
     gitlab: &str,
     id: u64,
-    auth: &Auth,
-) -> Result<()> {
+) {
     h.raw("<section><h2>Capacity</h2>");
     let policy = match policy {
         Ok(policy) => policy,
         Err(e) => {
             unreadable(h, e);
             h.raw("</section>");
-            return Ok(());
+            return;
         }
     };
-    let steer = auth.session.role >= Role::Operator;
-    let digest = policy.digest()?;
-    let listing: Vec<_> = (policy.tenants.iter())
-        .filter_map(|(name, t)| Some((name, t, policy.project(name, gitlab, id)?)))
+    let lanes: Vec<_> = (policy.lanes.iter())
+        .filter(|l| l.runner.as_ref().is_some_and(|r| r.gitlab == gitlab))
+        .filter_map(|l| match &l.projects {
+            None => Some((l, None)),
+            Some(ps) => ps
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| (l, Some(p.branches.as_ref()))),
+        })
         .collect();
-    let project_fields = |tenant: &str| {
-        vec![
-            ("tenant", tenant.to_owned()),
-            ("gitlab", gitlab.to_owned()),
-            ("project", id.to_string()),
-            ("from", FROM_PROJECT.to_owned()),
-        ]
-    };
-    if listing.is_empty() {
-        h.raw("<p>No capacity tenant lists this project, so the hub refuses its relay jobs.</p>");
-    } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>tenant</th><th class=\"num\">weight</th>")
-            .raw("<th>cap</th><th>runners</th>");
-        if steer {
-            h.raw("<th></th>");
-        }
-        h.raw("</tr></thead><tbody>");
-        for (name, tenant, _) in &listing {
-            let runners = (policy.runners.iter())
-                .filter(|r| r.tenant == **name && r.gitlab == gitlab)
-                .map(|r| format!("{} ({})", r.runner_id, r.class))
-                .collect::<Vec<_>>();
-            h.raw("<tr><td><a href=\"")
-                .text(tenant_path(name))
-                .raw("\">")
-                .text(name)
-                .raw("</a></td><td class=\"num\">")
-                .text(tenant.weight)
-                .raw("</td><td>")
-                .text(cap(tenant))
-                .raw("</td><td>")
-                .text(if runners.is_empty() {
-                    "none".to_owned()
-                } else {
-                    runners.join(", ")
-                })
-                .raw("</td>");
-            if steer {
-                h.raw("<td class=\"actions\">");
-                button_form(
-                    h,
-                    auth,
-                    REMOVE_PROJECT,
-                    &digest,
-                    &project_fields(name),
-                    "Remove",
-                );
-                h.raw("</td>");
-            }
-            h.raw("</tr>");
-        }
-        h.raw("</tbody></table>");
+    if lanes.is_empty() {
+        h.raw("<p class=\"empty\">No lane may run this project's jobs.</p></section>");
+        return;
     }
-    if steer {
-        let others: Vec<_> = (policy.tenants.keys())
-            .filter(|name| policy.project(name, gitlab, id).is_none())
-            .collect();
-        if !others.is_empty() {
-            edit_form(h, auth, ADD_PROJECT, &digest);
-            hidden(h, "gitlab", gitlab);
-            hidden(h, "project", id);
-            hidden(h, "from", FROM_PROJECT);
-            h.raw("<label>Tenant <select name=\"tenant\">");
-            for name in others {
-                h.raw("<option>").text(name).raw("</option>");
-            }
-            h.raw("</select></label><button>List it for this tenant</button></form>");
-        }
+    h.raw("<table class=\"grid\"><thead><tr><th>lane</th><th>class</th><th>branches</th>")
+        .raw("<th>nodes</th></tr></thead><tbody>");
+    for (lane, listed) in lanes {
+        let branches = match listed {
+            None => "all (any project)".to_owned(),
+            Some(None) => "all".to_owned(),
+            Some(Some(b)) => b.join(", "),
+        };
+        h.raw("<tr><td>")
+            .text(lane_name(lane))
+            .raw("</td><td>")
+            .text(lane.class)
+            .raw("</td><td>")
+            .text(branches)
+            .raw("</td><td>")
+            .text(may_use_text(lane, nodes))
+            .raw("</td></tr>");
     }
-    let Some((first, _, project)) = listing.first() else {
-        h.raw("</section>");
-        return Ok(());
-    };
-    if listing.len() > 1 {
-        h.raw("<p class=\"sub\">This project's production branches and placement rules apply ")
-            .raw("in every tenant listed above.</p>");
-    }
-    h.raw("<h3>Production branches</h3><p class=\"sub\">Globs, one per line. <code>*</code> ")
-        .raw("matches within one <code>/</code>-separated part, and <code>**</code> matches ")
-        .raw("across parts. A production runner takes only branch pipelines. The branch, as the ")
-        .raw("job's sources show it, must match a glob. Tag and merge request pipelines never ")
-        .raw("qualify.</p>");
-    if steer {
-        edit_form(h, auth, SET_BRANCHES, &digest);
-        hidden(h, "tenant", first);
-        hidden(h, "gitlab", gitlab);
-        hidden(h, "project", id);
-        h.raw("<textarea name=\"branches\" rows=\"4\" spellcheck=\"false\" ")
-            .raw("aria-label=\"Production branches\" placeholder=\"main&#10;release/**\">")
-            .text(project.production_branches.join("\n"))
-            .raw("</textarea><button>Save branches</button></form>");
-    } else if project.production_branches.is_empty() {
-        h.raw("<p class=\"empty\">None. Its production runners take none of its jobs.</p>");
-    } else {
-        h.raw("<pre>")
-            .text(project.production_branches.join("\n"))
-            .raw("</pre>");
-    }
-    h.raw("<h3>Placement rules</h3>");
-    placement_help(h);
-    if project.placement_rules.is_empty() {
-        h.raw("<p class=\"empty\">None. Its jobs may go to any node.</p>");
-    } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>jobs</th><th>nodes</th><th>pools</th>");
-        if steer {
-            h.raw("<th></th>");
-        }
-        h.raw("</tr></thead><tbody>");
-        for (i, rule) in project.placement_rules.iter().enumerate() {
-            h.raw("<tr><td>");
-            if rule.branches.is_empty() {
-                h.raw("every job");
-            } else {
-                h.raw("refs matching <code>")
-                    .text(rule.branches.join(", "))
-                    .raw("</code>");
-            }
-            let named: Vec<_> = (rule.nodes.iter())
-                .map(|id| node_label(nodes, id).to_owned())
-                .collect();
-            for list in [&named, &rule.pools] {
-                h.raw("</td><td>");
-                if list.is_empty() {
-                    h.raw("<span class=\"sub\">any</span>");
-                } else {
-                    h.raw("<code>").text(list.join(", ")).raw("</code>");
-                }
-            }
-            h.raw("</td>");
-            if steer {
-                let fields = [
-                    ("tenant", first.to_string()),
-                    ("gitlab", gitlab.to_owned()),
-                    ("project", id.to_string()),
-                    ("index", i.to_string()),
-                ];
-                h.raw("<td class=\"actions\">");
-                button_form(h, auth, REMOVE_RULE, &digest, &fields, "Remove");
-                h.raw("</td>");
-            }
-            h.raw("</tr>");
-        }
-        h.raw("</tbody></table>");
-    }
-    if steer {
-        h.raw("<h4>Add a rule</h4>");
-        edit_form(h, auth, ADD_RULE, &digest);
-        hidden(h, "tenant", first);
-        hidden(h, "gitlab", gitlab);
-        hidden(h, "project", id);
-        h.raw("<label>Refs, one glob per line (none for every job)<textarea name=\"branches\" ")
-            .raw("rows=\"3\" spellcheck=\"false\"></textarea></label>");
-        targets_picker(h, nodes, &[], &[]);
-        h.raw("<p class=\"sub\">Leave nodes or pools unticked to allow any, but not both. You ")
-            .raw("can tick at most 256 nodes and 256 pools.</p>")
-            .raw("<button>Add rule</button></form>");
-    }
-    h.raw("</section>");
-    Ok(())
+    h.raw("</tbody></table></section>");
 }
 
-/// What placement rules do, beside their editor.
-fn placement_help(h: &mut Html) {
-    h.raw("<p class=\"sub\">A node can run a job only if every placement rule that applies ")
-        .raw("to the job allows that node. A rule allows a node that is one of its nodes and in ")
-        .raw("one of its pools. An empty list allows any, but a rule cannot leave both lists ")
-        .raw("empty. A rule without refs applies to every job of the project. A rule with refs ")
-        .raw("(globs) applies to jobs whose ref matches one of them. The ref can be a branch, a ")
-        .raw("tag or a merge request, as the relay reports it. If a job's ref is unknown, every ")
-        .raw("rule applies. The ")
-        .raw("ref is not a trust boundary: a fork's merge request from a branch named ")
-        .raw("<code>main</code> gets <code>main</code>'s rules. To confine every job of the ")
-        .raw("project, use a rule without refs. If no allowed node takes a job, the job waits, ")
-        .raw("and ends at its placement deadline.</p>");
-}
-
-/// `POST /capacity`: an edit of the policy, as the operator session's principal.
+/// `POST /capacity`: set the whole policy.
 pub(super) async fn action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -1345,80 +365,66 @@ pub(super) async fn action(
         .into_iter()
         .map(|(k, v)| (k, v.replace("\r\n", "\n")))
         .collect();
-    let form = joined(form, &["nodes", "pools"]);
-    let (op, fields, back) = match edit(&form) {
-        Ok(edit) => edit,
-        Err(why) => return Ok(refused_page(&auth, PATH, StatusCode::BAD_REQUEST, why)),
-    };
-    // A field a form leaves out is empty, as the question's form posts it.
-    let mut form = form;
-    for &name in fields {
-        if field(&form, name).is_none() {
-            form.push((name.to_owned(), String::new()));
-        }
-    }
-    if op == ADD_TENANT {
-        let name = field(&form, "tenant").unwrap_or("").to_owned();
-        let (hub, actor, added) = (ui.hub.clone(), auth.session.principal(), name.clone());
-        let result =
-            blocking(move || add_tenant(&hub.db, || hub.db.capacity_policy(), &added, &actor))
-                .await?;
-        return Ok(match result {
-            Ok(changed) => {
-                if changed {
-                    ui.hub.touch();
-                    ui.hub.clients_changed();
-                }
-                super::clients::see_other(&tenant_path(&name))
-            }
-            Err((status, why)) => refused_page(&auth, &back, status, &why),
-        });
+    if field(&form, "op") != Some(SET_POLICY) {
+        return Ok(refused_page(
+            &auth,
+            PATH,
+            StatusCode::BAD_REQUEST,
+            "no such edit",
+        ));
     }
     let hub = ui.hub.clone();
-    // The enrolled nodes, to name those the question lists.
     let read = blocking(move || {
         Ok(hub
             .db
             .capacity_policy()
-            .and_then(|policy| Ok((policy, known_nodes(&hub)?))))
+            .and_then(|policy| Ok((policy, hub.db.capacity_conversion()?))))
     });
-    let (current, nodes) = match read.await? {
+    let (current, note) = match read.await? {
         Ok(read) => read,
         Err(e) => {
             let why = format!("{e:#}");
-            return Ok(refused_page(&auth, &back, StatusCode::CONFLICT, &why));
+            return Ok(refused_page(&auth, PATH, StatusCode::CONFLICT, &why));
         }
     };
     let expected = field(&form, "expected").unwrap_or("").to_owned();
     if expected != current.digest()? {
-        return Ok(refused_page(&auth, &back, StatusCode::CONFLICT, STALE));
+        return Ok(refused_page(&auth, PATH, StatusCode::CONFLICT, STALE));
     }
-    let proposed = match propose(&current, &form, op).and_then(|p| p.validate().map(|()| p)) {
+    let proposed = serde_json::from_str::<Policy>(field(&form, "policy").unwrap_or(""))
+        .context("not a capacity policy")
+        .and_then(|p| p.validate().map(|()| p));
+    let proposed = match proposed {
         Ok(proposed) => proposed,
         Err(e) => {
             let why = format!("{e:#}");
-            return Ok(refused_page(&auth, &back, StatusCode::BAD_REQUEST, &why));
+            return Ok(refused_page(&auth, PATH, StatusCode::BAD_REQUEST, &why));
         }
     };
-    // Unlike the store, ignore reordered runner mappings: such an edit is not saved.
-    if policy_changes(&current, &proposed).is_empty() {
-        return Ok(super::clients::see_other(&back));
+    let changes = policy_changes(&current, &proposed);
+    let held = note.as_ref().is_some_and(ConversionNote::held);
+    if changes.is_empty() && !held {
+        return Ok(super::clients::see_other(PATH));
     }
     let mut detail = Html::new();
     detail.raw("<ul>");
-    for change in describe(&current, &proposed, &nodes) {
+    if held {
+        detail.raw("<li>Activate the policy</li>");
+    }
+    for change in changes {
         detail.raw("<li>").text(change).raw("</li>");
     }
     detail.raw("</ul>");
     let ask = actions::Ask {
         path: PATH.to_owned(),
-        back: back.clone(),
-        op: op.to_owned(),
+        back: PATH.to_owned(),
+        op: SET_POLICY.to_owned(),
         what: "Change the capacity policy? Jobs the new policy no longer allows will wait or be \
                refused.",
         detail,
-        asked: (fields.iter())
-            .map(|&name| (name, field(&form, name).unwrap_or("").to_owned()))
+        asked: ["expected", "policy"]
+            .into_iter()
+            .map(|name| (name, field(&form, name).unwrap_or("").to_owned()))
             .collect(),
     };
     if let Some(response) =
@@ -1426,10 +432,6 @@ pub(super) async fn action(
     {
         return Ok(response);
     }
-    let unlisted = (op == REMOVE_PROJECT && field(&form, "from") == Some(FROM_PROJECT))
-        .then(|| target(&form, "project"))
-        .flatten()
-        .filter(|(gitlab, id)| proposed.project_any(gitlab, *id).is_none());
     let (hub, actor) = (ui.hub.clone(), auth.session.principal());
     let result = blocking(move || {
         Ok(hub
@@ -1451,693 +453,12 @@ pub(super) async fn action(
                 PolicyRefused::Conflict => (StatusCode::CONFLICT, STALE.to_owned()),
                 PolicyRefused::Invalid(_) => (StatusCode::BAD_REQUEST, refusal.to_string()),
             };
-            return Ok(refused_page(&auth, &back, status, &why));
+            return Ok(refused_page(&auth, PATH, status, &why));
         }
     }
-    // A project the hub has not seen has a page only while the policy lists it: once no
-    // tenant does, lead back to the tenant's page instead.
-    if let Some((gitlab, id)) = unlisted {
-        let hub = ui.hub.clone();
-        if blocking(move || hub.db.gitlab_project(&gitlab, id))
-            .await?
-            .is_none()
-        {
-            let tenant = field(&form, "tenant").unwrap_or("");
-            return Ok(super::clients::see_other(&tenant_path(tenant)));
-        }
-    }
-    Ok(super::clients::see_other(&back))
+    Ok(super::clients::see_other(PATH))
 }
 
-/// Add tenant `name`, with weight 1 and no projects or runners, to the policy `read` returns,
-/// as `actor`. Preserve concurrent edits by rereading once if another edit stores first.
-/// Return whether the policy changed, or the refusal's status and reason.
-fn add_tenant(
-    db: &crate::store::Db,
-    read: impl Fn() -> Result<Policy>,
-    name: &str,
-    actor: &str,
-) -> Result<Result<bool, (StatusCode, String)>> {
-    if !crate::store::valid_name(name) {
-        return Ok(Err((
-            StatusCode::BAD_REQUEST,
-            "not a valid tenant name".into(),
-        )));
-    }
-    for _ in 0..2 {
-        let current = match read() {
-            Ok(current) => current,
-            Err(e) => return Ok(Err((StatusCode::CONFLICT, format!("{e:#}")))),
-        };
-        if current.tenant(name).is_some() {
-            let why = format!("tenant {name:?} exists already");
-            return Ok(Err((StatusCode::BAD_REQUEST, why)));
-        }
-        let tenant = Tenant {
-            weight: 1,
-            cap: None,
-            projects: Vec::new(),
-        };
-        let mut proposed = current.clone();
-        proposed.tenants.insert(name.to_owned(), tenant);
-        match db.replace_capacity_policy_if(&proposed, &current.digest()?, actor, crate::now_secs())
-        {
-            Ok(changed) => return Ok(Ok(changed)),
-            Err(e) => match e.downcast_ref::<PolicyRefused>() {
-                Some(PolicyRefused::Conflict) => {}
-                Some(refusal) => return Ok(Err((StatusCode::BAD_REQUEST, refusal.to_string()))),
-                None => return Err(e),
-            },
-        }
-    }
-    let why = "the capacity policy kept changing. Try again";
-    Ok(Err((StatusCode::CONFLICT, why.into())))
-}
-
-/// The instance and ID `form` names in `name`: `<instance>/<ID>`, as a picker posts it, or an
-/// ID beside an instance in `gitlab`. Only names and positive IDs.
-fn target(form: &[(String, String)], name: &str) -> Option<(String, u64)> {
-    let value = field(form, name)?;
-    let (gitlab, id) = match value.split_once('/') {
-        Some((gitlab, id)) => (gitlab, id),
-        None => (field(form, "gitlab")?, value),
-    };
-    let id = id.trim().parse::<u64>().ok().filter(|&id| id > 0)?;
-    crate::store::valid_gitlab_name(gitlab).then(|| (gitlab.to_owned(), id))
-}
-
-/// The requested op, fields confirmation must preserve, and source page built from checked
-/// names; otherwise, the refusal reason.
-fn edit(
-    form: &[(String, String)],
-) -> Result<(&'static str, &'static [&'static str], String), &'static str> {
-    const INVALID: &str = "invalid project or tenant";
-    let tenant = || {
-        field(form, "tenant")
-            .filter(|t| crate::store::valid_name(t))
-            .ok_or(INVALID)
-    };
-    let project = || -> Result<String, &'static str> {
-        tenant()?;
-        let (gitlab, id) = target(form, "project").ok_or(INVALID)?;
-        Ok(super::projects::path(&gitlab, id))
-    };
-    let op = field(form, "op").unwrap_or("");
-    let (op, fields, back): (_, &'static [&'static str], _) = match op {
-        SET_POLICY => (SET_POLICY, &["expected", "policy"], PATH.to_owned()),
-        ADD_TENANT => (ADD_TENANT, &["tenant"], PATH.to_owned()),
-        REMOVE_TENANT => {
-            tenant()?;
-            (REMOVE_TENANT, &["expected", "tenant"], PATH.to_owned())
-        }
-        SET_SHARE => (
-            SET_SHARE,
-            &["expected", "tenant", "weight", "cap"],
-            tenant_path(tenant()?),
-        ),
-        ADD_PROJECT | REMOVE_PROJECT => {
-            let back = if field(form, "from") == Some(FROM_PROJECT) {
-                project()?
-            } else {
-                project()?;
-                tenant_path(tenant()?)
-            };
-            let op = if op == ADD_PROJECT {
-                ADD_PROJECT
-            } else {
-                REMOVE_PROJECT
-            };
-            (
-                op,
-                &["expected", "tenant", "gitlab", "project", "from"],
-                back,
-            )
-        }
-        MAP_RUNNER | UNMAP_RUNNER | SET_RUNNER_NODES => {
-            target(form, "runner").ok_or("invalid runner")?;
-            let back = tenant_path(tenant()?);
-            if op == MAP_RUNNER {
-                let fields = &["expected", "tenant", "gitlab", "runner", "class"];
-                (MAP_RUNNER, fields, back)
-            } else if op == SET_RUNNER_NODES {
-                let fields = &["expected", "tenant", "gitlab", "runner", "nodes", "pools"];
-                (SET_RUNNER_NODES, fields, back)
-            } else {
-                (
-                    UNMAP_RUNNER,
-                    &["expected", "tenant", "gitlab", "runner"],
-                    back,
-                )
-            }
-        }
-        SET_FALLBACK => (SET_FALLBACK, &["expected", "tenant"], PATH.to_owned()),
-        SET_CLIENT => (
-            SET_CLIENT,
-            &["expected", "principal", "tenant"],
-            PATH.to_owned(),
-        ),
-        SET_SCHEDULING => (
-            SET_SCHEDULING,
-            &[
-                "expected",
-                "probe_limit",
-                "production_probe_burst",
-                "backoff_initial_secs",
-                "backoff_max_secs",
-                "busy_secs",
-            ],
-            PATH.to_owned(),
-        ),
-        ADD_HEADROOM => (
-            ADD_HEADROOM,
-            &[
-                "expected", "pool", "labels", "slots", "mem_mib", "cpus", "disk_gib",
-            ],
-            PATH.to_owned(),
-        ),
-        REMOVE_HEADROOM => (REMOVE_HEADROOM, &["expected", "index"], PATH.to_owned()),
-        SET_BRANCHES => (
-            SET_BRANCHES,
-            &["expected", "tenant", "gitlab", "project", "branches"],
-            project()?,
-        ),
-        ADD_RULE => (
-            ADD_RULE,
-            &[
-                "expected", "tenant", "gitlab", "project", "branches", "nodes", "pools",
-            ],
-            project()?,
-        ),
-        REMOVE_RULE => (
-            REMOVE_RULE,
-            &["expected", "tenant", "gitlab", "project", "index"],
-            project()?,
-        ),
-        _ => return Err("no such edit"),
-    };
-    Ok((op, fields, back))
-}
-
-/// Join repeated fields in `names` into their first occurrence, one value per line.
-/// Pickers post one field per ticked box; confirmation questions carry one per name.
-fn joined(form: Vec<(String, String)>, names: &[&str]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    // First position in `out` for each of `names`.
-    let mut at: Vec<Option<usize>> = vec![None; names.len()];
-    for (k, v) in form {
-        if let Some(i) = names.iter().position(|n| *n == k) {
-            if let Some((_, first)) = at.get(i).copied().flatten().and_then(|j| out.get_mut(j)) {
-                first.push('\n');
-                first.push_str(&v);
-                continue;
-            }
-            if let Some(slot) = at.get_mut(i) {
-                *slot = Some(out.len());
-            }
-        }
-        out.push((k, v));
-    }
-    out
-}
-
-/// Trim `value`'s lines and omit empty ones.
-fn lines(value: &str) -> Vec<String> {
-    (value.lines())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Parse `value` as a number; name `what` in the error.
-fn number<T: std::str::FromStr>(value: &str, what: &str) -> Result<T> {
-    (value.trim().parse().ok()).with_context(|| format!("{what} must be a whole number"))
-}
-
-/// The policy `op` makes of `current` with `form`'s fields, not yet validated.
-fn propose(current: &Policy, form: &[(String, String)], op: &str) -> Result<Policy> {
-    let value = |name| field(form, name).unwrap_or("");
-    let tenant = value("tenant");
-    let no_tenant = || anyhow::anyhow!("no tenant {tenant:?}");
-    let project = || target(form, "project").context("invalid project");
-    let runner = || target(form, "runner").context("invalid runner");
-    let mut policy = current.clone();
-    match op {
-        SET_POLICY => {
-            return serde_json::from_str(value("policy")).context("not a capacity policy");
-        }
-        REMOVE_TENANT => {
-            if current.fallback == tenant {
-                bail!("tenant {tenant:?} is the fallback. Make another tenant the fallback first");
-            }
-            policy.tenants.remove(tenant).ok_or_else(no_tenant)?;
-            policy.runners.retain(|r| r.tenant != tenant);
-            policy.clients.retain(|_, t| t != tenant);
-        }
-        SET_SHARE => {
-            let t = policy.tenants.get_mut(tenant).ok_or_else(no_tenant)?;
-            t.weight = number(value("weight"), "the weight")?;
-            t.cap = match value("cap").trim() {
-                "" => None,
-                cap => Some(number(cap, "the cap")?),
-            };
-        }
-        ADD_PROJECT => {
-            let (gitlab, id) = project()?;
-            // A project other tenants list keeps its branches and rules.
-            let listed = current.project_any(&gitlab, id).cloned();
-            let t = policy.tenants.get_mut(tenant).ok_or_else(no_tenant)?;
-            if t.projects.iter().any(|p| p.gitlab == gitlab && p.id == id) {
-                bail!("tenant {tenant:?} lists project {gitlab}/{id} already");
-            }
-            t.projects.push(listed.unwrap_or(Project {
-                gitlab,
-                id,
-                production_branches: Vec::new(),
-                placement_rules: Vec::new(),
-            }));
-        }
-        REMOVE_PROJECT => {
-            let (gitlab, id) = project()?;
-            let t = policy.tenants.get_mut(tenant).ok_or_else(no_tenant)?;
-            let before = t.projects.len();
-            t.projects.retain(|p| !(p.gitlab == gitlab && p.id == id));
-            if t.projects.len() == before {
-                bail!("tenant {tenant:?} does not list project {gitlab}/{id}");
-            }
-        }
-        MAP_RUNNER => {
-            let (gitlab, runner_id) = runner()?;
-            let class = match value("class") {
-                "normal" => Class::Normal,
-                "production" => Class::Production,
-                _ => bail!("a runner's class must be normal or production"),
-            };
-            current.tenant(tenant).ok_or_else(no_tenant)?;
-            // A runner moved or made another class keeps the nodes it may use.
-            match (policy.runners.iter_mut())
-                .find(|r| r.gitlab == gitlab && r.runner_id == runner_id)
-            {
-                Some(r) => {
-                    r.tenant = tenant.to_owned();
-                    r.class = class;
-                }
-                None => policy.runners.push(RunnerMapping {
-                    gitlab,
-                    runner_id,
-                    tenant: tenant.to_owned(),
-                    class,
-                    nodes: Vec::new(),
-                    pools: Vec::new(),
-                }),
-            }
-        }
-        SET_RUNNER_NODES => {
-            let (gitlab, runner_id) = runner()?;
-            let r = (policy.runners.iter_mut())
-                .find(|r| r.gitlab == gitlab && r.runner_id == runner_id && r.tenant == tenant)
-                .with_context(|| {
-                    format!("runner {gitlab}/{runner_id} is not mapped to tenant {tenant:?}")
-                })?;
-            // Sorted and deduplicated, so an edit naming the same ones changes nothing.
-            for (list, field) in [(&mut r.nodes, "nodes"), (&mut r.pools, "pools")] {
-                *list = lines(value(field));
-                list.sort_unstable();
-                list.dedup();
-            }
-        }
-        UNMAP_RUNNER => {
-            let (gitlab, runner_id) = runner()?;
-            let before = policy.runners.len();
-            (policy.runners).retain(|r| {
-                !(r.gitlab == gitlab && r.runner_id == runner_id && r.tenant == tenant)
-            });
-            if policy.runners.len() == before {
-                bail!("runner {gitlab}/{runner_id} is not mapped to tenant {tenant:?}");
-            }
-        }
-        SET_FALLBACK => {
-            current.tenant(tenant).ok_or_else(no_tenant)?;
-            policy.fallback = tenant.to_owned();
-        }
-        SET_CLIENT => {
-            let principal = value("principal").trim();
-            if principal.is_empty() {
-                bail!("no API client principal ID");
-            }
-            if tenant.is_empty() {
-                policy.clients.remove(principal);
-            } else {
-                current.tenant(tenant).ok_or_else(no_tenant)?;
-                (policy.clients).insert(principal.to_owned(), tenant.to_owned());
-            }
-        }
-        SET_SCHEDULING => {
-            policy.probe_limit = number(value("probe_limit"), "the probe limit")?;
-            policy.production_probe_burst = number(
-                value("production_probe_burst"),
-                "the production probe burst",
-            )?;
-            policy.backoff_initial_secs =
-                number(value("backoff_initial_secs"), "the initial backoff")?;
-            policy.backoff_max_secs = number(value("backoff_max_secs"), "the maximum backoff")?;
-            policy.busy_secs = number(value("busy_secs"), "the busy time")?;
-        }
-        ADD_HEADROOM => {
-            let disk_gib: u64 = number(value("disk_gib"), "the disk")?;
-            let headroom = Headroom {
-                placement: Placement {
-                    pool: value("pool").trim().to_owned(),
-                    labels: (value("labels").split([',', ' ']))
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_owned)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                    envelope: Envelope {
-                        mem_mib: number(value("mem_mib"), "the memory")?,
-                        cpus: number(value("cpus"), "the CPUs")?,
-                        disk_bytes: disk_gib.checked_mul(1 << 30).context("too much disk")?,
-                    },
-                },
-                slots: number(value("slots"), "the slots")?,
-            };
-            // Placement matches labels as a set: so does an entry kept already.
-            fn labels(h: &Headroom) -> BTreeSet<&String> {
-                h.placement.labels.iter().collect()
-            }
-            if (policy.headroom.iter()).any(|h| {
-                h.slots == headroom.slots
-                    && h.placement.pool == headroom.placement.pool
-                    && h.placement.envelope == headroom.placement.envelope
-                    && labels(h) == labels(&headroom)
-            }) {
-                bail!("the policy keeps this headroom already");
-            }
-            policy.headroom.push(headroom);
-        }
-        REMOVE_HEADROOM => {
-            let index: usize = number(value("index"), "the headroom entry")?;
-            if index >= policy.headroom.len() {
-                bail!("no such headroom entry");
-            }
-            policy.headroom.remove(index);
-        }
-        SET_BRANCHES => {
-            let (gitlab, id) = project()?;
-            let branches = lines(value("branches"));
-            return current.with_project(tenant, &gitlab, id, |p| {
-                p.production_branches.clone_from(&branches);
-            });
-        }
-        ADD_RULE => {
-            let (gitlab, id) = project()?;
-            let rule = PlacementRule {
-                branches: lines(value("branches")),
-                nodes: lines(value("nodes")),
-                pools: lines(value("pools")),
-            };
-            if rule.nodes.is_empty() && rule.pools.is_empty() {
-                bail!("a placement rule must name some nodes or pools");
-            }
-            let listed = current.project(tenant, &gitlab, id);
-            if listed.is_some_and(|p| p.placement_rules.iter().any(|r| r.same_as(&rule))) {
-                bail!("the project has this rule already");
-            }
-            return current.with_project(tenant, &gitlab, id, |p| {
-                p.placement_rules.push(rule.clone());
-            });
-        }
-        REMOVE_RULE => {
-            let (gitlab, id) = project()?;
-            let index: usize = number(value("index"), "the rule")?;
-            let rule = (current.project(tenant, &gitlab, id))
-                .and_then(|p| p.placement_rules.get(index))
-                .cloned()
-                .context("no such placement rule")?;
-            // Other tenants may list the same rules in another order.
-            return current.with_project(tenant, &gitlab, id, |p| {
-                p.placement_rules.retain(|r| !r.same_as(&rule));
-            });
-        }
-        _ => bail!("no such edit"),
-    }
-    Ok(policy)
-}
-
-/// What changes from `before` to `after`, a line each, as a question lists it: at most
-/// [`MAX_DESCRIBED`], the rest counted.
-fn describe(before: &Policy, after: &Policy, nodes: &[KnownNode]) -> Vec<String> {
-    let mut out = Vec::new();
-    let names: BTreeSet<_> = before.tenants.keys().chain(after.tenants.keys()).collect();
-    for name in names {
-        match (before.tenants.get(name), after.tenants.get(name)) {
-            (None, Some(t)) => {
-                out.push(format!(
-                    "Add tenant {name}, of weight {} and cap {}",
-                    t.weight,
-                    cap(t)
-                ));
-                for p in &t.projects {
-                    out.push(format!("Tenant {name}: list project {}/{}", p.gitlab, p.id));
-                }
-            }
-            (Some(_), None) => out.push(format!("Remove tenant {name}")),
-            (Some(b), Some(a)) => {
-                if b.weight != a.weight {
-                    out.push(format!("Tenant {name}: weight {} → {}", b.weight, a.weight));
-                }
-                if b.cap != a.cap {
-                    out.push(format!("Tenant {name}: cap {} → {}", cap(b), cap(a)));
-                }
-                let keys = |t: &Tenant| -> BTreeSet<(String, u64)> {
-                    t.projects
-                        .iter()
-                        .map(|p| (p.gitlab.clone(), p.id))
-                        .collect()
-                };
-                let (kb, ka) = (keys(b), keys(a));
-                for (gitlab, id) in ka.difference(&kb) {
-                    out.push(format!("Tenant {name}: list project {gitlab}/{id}"));
-                }
-                for (gitlab, id) in kb.difference(&ka) {
-                    out.push(format!("Tenant {name}: stop listing project {gitlab}/{id}"));
-                }
-            }
-            (None, None) => {}
-        }
-    }
-    let projects: BTreeSet<_> = (before.tenants.values().chain(after.tenants.values()))
-        .flat_map(|t| &t.projects)
-        .map(|p| (p.gitlab.as_str(), p.id))
-        .collect();
-    for (gitlab, id) in projects {
-        // A project newly listed is described against no branches and no rules.
-        let empty = Project {
-            gitlab: gitlab.to_owned(),
-            id,
-            production_branches: Vec::new(),
-            placement_rules: Vec::new(),
-        };
-        let Some(a) = after.project_any(gitlab, id) else {
-            continue;
-        };
-        let b = before.project_any(gitlab, id).unwrap_or(&empty);
-        if b.production_branches != a.production_branches {
-            out.push(format!(
-                "Project {gitlab}/{id}: production branches {} → {}",
-                list_text(&b.production_branches),
-                list_text(&a.production_branches)
-            ));
-        }
-        if !crate::policy::same_rules(&b.placement_rules, &a.placement_rules) {
-            let has =
-                |rules: &[PlacementRule], r: &PlacementRule| rules.iter().any(|o| o.same_as(r));
-            for r in a
-                .placement_rules
-                .iter()
-                .filter(|r| !has(&b.placement_rules, r))
-            {
-                out.push(format!(
-                    "Project {gitlab}/{id}: add placement rule {}",
-                    rule_text(r, nodes)
-                ));
-            }
-            for r in b
-                .placement_rules
-                .iter()
-                .filter(|r| !has(&a.placement_rules, r))
-            {
-                out.push(format!(
-                    "Project {gitlab}/{id}: remove placement rule {}",
-                    rule_text(r, nodes)
-                ));
-            }
-        }
-    }
-    let by_key = |p: &Policy| -> BTreeMap<(String, u64), RunnerMapping> {
-        (p.runners.iter())
-            .map(|r| ((r.gitlab.clone(), r.runner_id), r.clone()))
-            .collect()
-    };
-    let (rb, ra) = (by_key(before), by_key(after));
-    let keys: BTreeSet<_> = rb.keys().chain(ra.keys()).collect();
-    for key @ (gitlab, id) in keys {
-        match (rb.get(key), ra.get(key)) {
-            (None, Some(a)) => {
-                let using = if a.confined() {
-                    format!(", using {}", may_use_text(a, nodes))
-                } else {
-                    String::new()
-                };
-                out.push(format!(
-                    "Runner {gitlab}/{id}: map to tenant {} as {}{using}",
-                    a.tenant, a.class
-                ));
-            }
-            (Some(b), None) => out.push(format!(
-                "Runner {gitlab}/{id}: unmap from tenant {}, so it gets no work",
-                b.tenant
-            )),
-            (Some(b), Some(a)) => {
-                let same_nodes = may_use_sets(b) == may_use_sets(a);
-                if (&b.tenant, b.class) != (&a.tenant, a.class) {
-                    let still = if same_nodes && a.confined() {
-                        format!(", still using {}", may_use_text(a, nodes))
-                    } else {
-                        String::new()
-                    };
-                    out.push(format!(
-                        "Runner {gitlab}/{id}: tenant {} as {} → tenant {} as {}{still}",
-                        b.tenant, b.class, a.tenant, a.class
-                    ));
-                }
-                if !same_nodes {
-                    out.push(format!(
-                        "Runner {gitlab}/{id}: may use {} → {}",
-                        may_use_text(b, nodes),
-                        may_use_text(a, nodes)
-                    ));
-                }
-            }
-            (None, None) => {}
-        }
-    }
-    let principals: BTreeSet<_> = before.clients.keys().chain(after.clients.keys()).collect();
-    for principal in principals {
-        let tenant = |p: &Policy| match p.clients.get(principal) {
-            Some(t) => t.clone(),
-            None => format!("the fallback ({})", p.fallback),
-        };
-        if before.clients.get(principal) != after.clients.get(principal) {
-            out.push(format!(
-                "API client {principal}: {} → {}",
-                tenant(before),
-                tenant(after)
-            ));
-        }
-    }
-    if before.fallback != after.fallback {
-        out.push(format!(
-            "Fallback tenant: {} → {}",
-            before.fallback, after.fallback
-        ));
-    }
-    for (what, b, a) in [
-        ("Busy time", before.busy_secs, after.busy_secs),
-        (
-            "Probe limit",
-            before.probe_limit.into(),
-            after.probe_limit.into(),
-        ),
-        (
-            "Production probe burst",
-            before.production_probe_burst.into(),
-            after.production_probe_burst.into(),
-        ),
-        (
-            "Initial backoff",
-            before.backoff_initial_secs,
-            after.backoff_initial_secs,
-        ),
-        (
-            "Maximum backoff",
-            before.backoff_max_secs,
-            after.backoff_max_secs,
-        ),
-    ] {
-        if b != a {
-            out.push(format!("{what}: {b} → {a}"));
-        }
-    }
-    let has = |list: &[Headroom], h: &Headroom| list.contains(h);
-    for h in after.headroom.iter().filter(|h| !has(&before.headroom, h)) {
-        out.push(format!("Keep headroom: {}", headroom_text(h)));
-    }
-    for h in before.headroom.iter().filter(|h| !has(&after.headroom, h)) {
-        out.push(format!("Stop keeping headroom: {}", headroom_text(h)));
-    }
-    if out.len() > MAX_DESCRIBED {
-        let more = out.len() - MAX_DESCRIBED;
-        out.truncate(MAX_DESCRIBED);
-        out.push(format!("and {more} more changes"));
-    }
-    if out.is_empty() {
-        // Only an order changed, or a duplicate rule or headroom entry (JSON editor) came or
-        // went.
-        out = policy_changes(before, after);
-    }
-    out
-}
-
-fn list_text(list: &[String]) -> String {
-    if list.is_empty() {
-        "none".to_owned()
-    } else {
-        list.join(", ")
-    }
-}
-
-fn rule_text(r: &PlacementRule, nodes: &[KnownNode]) -> String {
-    let jobs = if r.branches.is_empty() {
-        "every job".to_owned()
-    } else {
-        format!("refs {}", r.branches.join(", "))
-    };
-    let any = |list: &[String]| {
-        if list.is_empty() {
-            "any".to_owned()
-        } else {
-            list.join(", ")
-        }
-    };
-    let named: Vec<_> = (r.nodes.iter())
-        .map(|id| node_label(nodes, id).to_owned())
-        .collect();
-    format!("({jobs}: nodes {}, pools {})", any(&named), any(&r.pools))
-}
-
-fn headroom_text(h: &Headroom) -> String {
-    let p = &h.placement;
-    let labels = if p.labels.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", p.labels.join(", "))
-    };
-    let e = p.envelope;
-    // Exact, where `envelope_text` rounds the disk down to GiB.
-    let disk = if e.disk_bytes.is_multiple_of(1 << 30) {
-        format!("{} GiB", e.disk_bytes >> 30)
-    } else {
-        format!("{} bytes", e.disk_bytes)
-    };
-    format!(
-        "{} × {} MiB, {} CPUs, {disk} disk in pool {}{labels}",
-        h.slots, e.mem_mib, e.cpus, p.pool
-    )
-}
-
-/// An edit refused for `why`, as a page leading back to `back`, a hub path.
 fn refused_page(auth: &Auth, back: &str, status: StatusCode, why: &str) -> Response<Body> {
     let mut main = Html::new();
     main.raw("<p class=\"message\">")
@@ -2152,155 +473,47 @@ fn refused_page(auth: &Auth, back: &str, status: StatusCode, why: &str) -> Respo
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
+    use crate::policy::{LaneId, LaneProject};
 
-    /// A question names a new tenant's projects with their settings, and headroom exactly.
     #[test]
-    fn new_tenants_projects_and_headroom_are_described_in_full() {
-        let before = Policy::default();
-        let mut after = before.clone();
-        let project = Project {
+    fn old_pages_lead_to_the_policy() {
+        for old in [OLD_PATH, "/capacity/tenants/web", "/clients/tenants/web"] {
+            assert_eq!(moved(old).as_deref(), Some(PATH), "{old}");
+        }
+        assert_eq!(moved("/capacity/other"), None);
+    }
+
+    #[test]
+    fn a_lane_s_nodes_and_projects_are_named() {
+        let node = "0123456789abcdef0123456789abcdef";
+        let nodes = [KnownNode {
+            id: node.into(),
+            label: "n1".into(),
+        }];
+        let mut lane = Lane::new(&LaneId::Runner {
             gitlab: "gl".into(),
             id: 42,
-            production_branches: vec!["main".into()],
-            placement_rules: vec![PlacementRule {
-                branches: vec![],
-                nodes: vec![],
-                pools: vec!["trusted".into()],
-            }],
-        };
-        let tenant = Tenant {
-            weight: 2,
-            cap: None,
-            projects: vec![project],
-        };
-        after.tenants.insert("ci".into(), tenant);
-        after.headroom.push(Headroom {
-            placement: Placement {
-                pool: "ci".into(),
-                labels: vec![],
-                envelope: Envelope {
-                    mem_mib: 512,
-                    cpus: 1,
-                    disk_bytes: 3 << 29,
-                },
+        });
+        assert_eq!(may_use_text(&lane, &nodes), "any node");
+        assert_eq!(projects_text(&lane), "any");
+        lane.nodes = Some(vec![node.into(), "trusted".into()]);
+        assert_eq!(may_use_text(&lane, &nodes), "n1, trusted");
+        lane.projects = Some(vec![
+            LaneProject {
+                gitlab: "gl".into(),
+                id: 7,
+                branches: None,
             },
-            slots: 1,
-        });
-        assert_eq!(
-            describe(&before, &after, &[]),
-            [
-                "Add tenant ci, of weight 2 and cap unbounded",
-                "Tenant ci: list project gl/42",
-                "Project gl/42: production branches none → main",
-                "Project gl/42: add placement rule (every job: nodes any, pools trusted)",
-                "Keep headroom: 1 × 512 MiB, 1 CPUs, 1610612736 bytes disk in pool ci",
-            ]
-        );
-    }
-
-    /// Repeated picker fields reach the edit as one value per line.
-    #[test]
-    fn repeated_picker_fields_are_joined_into_their_first() {
-        let form = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-            (pairs.iter())
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect()
-        };
-        let posted = form(&[
-            ("op", "x"),
-            ("nodes", ""),
-            ("scope", "a"),
-            ("nodes", "n1"),
-            ("pools", "p"),
-            ("scope", "b"),
-            ("nodes", "n2"),
+            LaneProject {
+                gitlab: "gl".into(),
+                id: 8,
+                branches: Some(vec!["main".into(), "release/*".into()]),
+            },
         ]);
-        // Preserve order, first position, empty values and unrelated repeated fields.
-        assert_eq!(
-            joined(posted, &["nodes", "pools"]),
-            form(&[
-                ("op", "x"),
-                ("nodes", "\nn1\nn2"),
-                ("scope", "a"),
-                ("pools", "p"),
-                ("scope", "b"),
-            ])
-        );
-        assert_eq!(lines("\nn1\nn2"), ["n1", "n2"]);
-    }
-
-    /// Reordering nodes or pools preserves allowed nodes; long lists count omitted entries.
-    /// Moving a runner preserves its restrictions and names them in the confirmation.
-    #[test]
-    fn a_runner_s_nodes_are_described_as_sets_and_cut_short() {
-        let mut before = Policy::default();
-        let web = Tenant {
-            weight: 1,
-            cap: None,
-            projects: Vec::new(),
-        };
-        before.tenants.insert("web".into(), web);
-        before.runners.push(RunnerMapping {
-            gitlab: "gl".into(),
-            runner_id: 7,
-            tenant: "fallback".into(),
-            class: Class::Normal,
-            nodes: (0..10).map(|n| format!("n{n}")).collect(),
-            pools: vec!["a".into(), "b".into()],
-        });
-        let mut after = before.clone();
-        after.runners[0].nodes.reverse();
-        after.runners[0].pools.reverse();
-        // Saved, as any reorder is, but naming no change of what it may use.
-        assert_eq!(describe(&before, &after, &[]), ["runners: gl/7"]);
-        after.runners[0].tenant = "web".into();
-        assert_eq!(
-            describe(&before, &after, &[]),
-            [
-                "Runner gl/7: tenant fallback as normal → tenant web as normal, still using \
-                 nodes n9, n8, n7, n6, n5, n4, n3, n2 and 2 more or pools b, a"
-            ]
-        );
-    }
-
-    /// Adding a tenant retries once after a concurrent edit; a second conflict is refused.
-    #[test]
-    fn adding_a_tenant_reads_the_policy_again_once() {
-        let db = crate::store::Db::open_memory().unwrap();
-        let edits = Cell::new(0);
-        // Read the policy, then store another edit.
-        let racing = || {
-            let read = db.capacity_policy();
-            let mut other = db.capacity_policy().unwrap();
-            edits.set(edits.get() + 1);
-            other.probe_limit = 1 + edits.get();
-            db.set_capacity_policy(&other, "u", 0).unwrap();
-            read
-        };
-        let reads = Cell::new(0);
-        let once = || {
-            reads.set(reads.get() + 1);
-            if reads.get() == 1 {
-                racing()
-            } else {
-                db.capacity_policy()
-            }
-        };
-        assert_eq!(add_tenant(&db, once, "web", "u").unwrap(), Ok(true));
-        assert_eq!(reads.get(), 2);
-        let saved = db.capacity_policy().unwrap();
-        assert!(saved.tenant("web").is_some());
-        assert_eq!(saved.probe_limit, 2);
-        assert_eq!(
-            add_tenant(&db, racing, "api", "u").unwrap(),
-            Err((
-                StatusCode::CONFLICT,
-                "the capacity policy kept changing. Try again".into()
-            ))
-        );
-        assert!(db.capacity_policy().unwrap().tenant("api").is_none());
+        assert_eq!(projects_text(&lane), "7 · all; 8 · main, release/*");
+        lane.projects = Some(vec![]);
+        assert_eq!(projects_text(&lane), "none");
+        assert_eq!(projects_text(&Lane::new(&LaneId::Default)), "-");
     }
 }
