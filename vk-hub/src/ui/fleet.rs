@@ -269,6 +269,14 @@ pub(super) async fn get(
         .await?;
         return Ok(Some(page(operations(auth, &ops, &nodes, now))));
     }
+    if path == ALL_RELEASES_PATH {
+        let releases = blocking(move || hub.db.releases()).await?;
+        let mut main = Html::new();
+        main.raw("<h1>Releases</h1><p><a href=\"/operations\">Back to updates</a></p><section>");
+        releases_table(&mut main, &releases);
+        main.raw("</section>");
+        return Ok(Some(page(layout("Releases", "/operations", auth, &main))));
+    }
     if path == "/audit" {
         let (filter, before) = pages::audit_query(query);
         let (audit, subjects) = blocking(move || {
@@ -2180,6 +2188,42 @@ fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Ht
     layout("Updates", "/operations", auth, &main)
 }
 
+/// How many releases, newest first, `/operations` lists; [`ALL_RELEASES_PATH`] lists them all.
+const RELEASES_SHOWN: usize = 10;
+
+/// The page listing every release the hub holds.
+const ALL_RELEASES_PATH: &str = "/operations/releases";
+
+/// A table of `releases`, in the order given.
+fn releases_table(h: &mut Html, releases: &[Release]) {
+    h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>program</th>")
+        .raw("<th>version</th><th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
+    for r in releases {
+        h.raw("<tr><td><code title=\"")
+            .text(&r.sha256)
+            .raw("\">")
+            .text(crate::store::short(&r.sha256))
+            .raw("</code></td><td>")
+            .text(r.row.program())
+            .raw("</td><td>")
+            .text(&r.row.version)
+            .raw("</td><td>")
+            .text(bytes(r.row.size))
+            .raw("</td><td>")
+            .raw(if r.row.signature.is_some() {
+                "yes"
+            } else {
+                "no"
+            })
+            .raw("</td><td>")
+            .html(&pages::at_html(r.row.added_at))
+            .raw("</td><td>")
+            .text(&r.row.added_by)
+            .raw("</td></tr>");
+    }
+    h.raw("</tbody></table>");
+}
+
 /// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
 /// that steer it, and each ended one that updated no node the one that deletes it.
 fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
@@ -2190,32 +2234,15 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         h.raw("<p class=\"empty\">none. <code>vk-hub release add</code> copies a vk or ")
             .raw("vk-registry binary into the hub.</p>");
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>program</th>")
-            .raw("<th>version</th><th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
-        for r in &ops.releases {
-            h.raw("<tr><td><code title=\"")
-                .text(&r.sha256)
-                .raw("\">")
-                .text(crate::store::short(&r.sha256))
-                .raw("</code></td><td>")
-                .text(r.row.program())
-                .raw("</td><td>")
-                .text(&r.row.version)
-                .raw("</td><td>")
-                .text(bytes(r.row.size))
-                .raw("</td><td>")
-                .raw(if r.row.signature.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                })
-                .raw("</td><td>")
-                .html(&pages::at_html(r.row.added_at))
-                .raw("</td><td>")
-                .text(&r.row.added_by)
-                .raw("</td></tr>");
+        let shown = ops.releases.len().min(RELEASES_SHOWN);
+        releases_table(&mut h, ops.releases.get(..shown).unwrap_or_default());
+        if ops.releases.len() > shown {
+            h.raw("<p><a class=\"button\" href=\"")
+                .raw(ALL_RELEASES_PATH)
+                .raw("\">Show all ")
+                .text(ops.releases.len())
+                .raw(" releases</a></p>");
         }
-        h.raw("</tbody></table>");
     }
     h.raw("</section><section><h2>CI tools</h2>");
     if ops.tools.is_empty() {

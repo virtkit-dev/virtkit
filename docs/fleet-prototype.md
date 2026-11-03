@@ -1853,9 +1853,9 @@ the token set through `hx-headers` and need htmx; `vk-hub keys revoke` works wit
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
 node's page shows the update's release, phase and what the node said of it, and the sha256 of
-the `vk` it runs. `/operations` lists the releases the hub holds, signed or not, its ten
-latest rollouts with their state, counts, current wave, and each node's status and profile
-by wave, and, once one has enrolled, the registries: each one's version, whether
+the `vk` it runs. `/operations` lists the ten newest releases the hub holds, signed or not,
+with a link to `/operations/releases` listing them all, its ten latest rollouts with their
+state, counts, current wave, and each node's status and profile by wave, and, once one has enrolled, the registries: each one's version, whether
 its `[hub] allow` lets the hub update it and whether it takes only signed releases, and its
 update — as it reports it, or the last command while it has not taken it or once it refused or
 failed it. Operators can pause, resume and abort active rollouts, and delete, once confirmed,

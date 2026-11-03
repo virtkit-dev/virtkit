@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **Fetch all programs at once.** The Updates page fetches every program's release from
   GitHub in one go.
+- **Shorter release list.** The Updates page shows the ten newest releases, with a link to
+  the rest.
 
 ### Fixed
 

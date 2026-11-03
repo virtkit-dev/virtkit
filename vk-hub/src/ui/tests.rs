@@ -8001,6 +8001,31 @@ async fn an_operator_fetches_a_release_from_github() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `/operations` lists the newest releases, with a link to the page listing them all.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_updates_page_lists_the_newest_releases_and_links_to_all() {
+    use crate::store::Program;
+    let (addr, hub, _origin, dir) = start_fleet_releases(None).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("vk");
+    for minor in 0..12 {
+        let version = format!("0.1.{minor}");
+        std::fs::write(&file, crate::fetch::tests::fake_vk(&version)).unwrap();
+        crate::releases::add(&hub, "uid 0", &file, Program::Vk, &version, None).unwrap();
+    }
+    let page = get(addr, "/operations", Some(&viewer)).await.body;
+    assert_eq!(page.matches("<td>vk</td>").count(), 10, "{page}");
+    assert!(
+        page.contains("<a class=\"button\" href=\"/operations/releases\">Show all 12 releases</a>"),
+        "{page}"
+    );
+    let all = get(addr, "/operations/releases", Some(&viewer)).await;
+    assert_eq!(all.status, 200, "{}", all.body);
+    assert_eq!(all.body.matches("<td>vk</td>").count(), 12, "{}", all.body);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The fleet of [`start_fleet_releases`], updating itself as `[update] allow` says.
 async fn start_fleet_updating(allow: bool) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf) {
     start_fleet_updating_with(crate::config::UpdateConfig {
