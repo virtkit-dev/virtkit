@@ -19,6 +19,8 @@ use vk_gitlab::{logging, relay, session, system_id};
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+vk_hub_proto::version_mark!("vk-gitlab");
+
 #[derive(Parser)]
 #[command(
     name = "vk-gitlab",

@@ -89,6 +89,15 @@ if [ -n "${RELEASE_TAG:-}" ]; then
     *" $want "*) echo "matches $RELEASE_TAG" ;;
     *) echo "release-e2e: the binary is not version $want (tag $RELEASE_TAG)" >&2; exit 1 ;;
   esac
+  # The hub adds a release, uploaded or fetched, only if the binary holds its version as a
+  # string of its own: the NUL-delimited mark `vk_hub_proto::version_mark!` embeds.
+  for prog in vk vk-registry vk-gitlab vk-hub; do
+    LC_ALL=C grep -qaP "\\x00\\Q${prog} ${want}\\E\\x00" "$dir/$prog" || {
+      echo "release-e2e: $dir/$prog holds no version mark for $want; the hub would refuse it" >&2
+      exit 1
+    }
+  done
+  echo "version marks found in vk, vk-registry, vk-gitlab and vk-hub"
 elif [ -n "${CI:-}" ]; then
   echo "release-e2e: RELEASE_TAG unset; a gated release must compare the two" >&2
   exit 2

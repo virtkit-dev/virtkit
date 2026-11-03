@@ -59,6 +59,8 @@ use vk_hub_proto::{Acquisition, Operation};
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+vk_hub_proto::version_mark!("vk-hub");
+
 /// Fleet hub: node enrollment, inventory, heartbeats and steering; and a web UI for this
 /// machine's VMs (experimental)
 #[derive(Parser)]

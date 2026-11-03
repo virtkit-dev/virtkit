@@ -591,11 +591,7 @@ const TOOL: Tool = Tool {
     version: env!("CARGO_PKG_VERSION"),
 };
 
-/// The version as a string of its own in the binary, NUL on both sides: what `vk-hub release
-/// add --program vk-registry` checks a binary against the version it is told, as it finds a
-/// `vk`'s. The compiler would otherwise only store it run together with other literals.
-#[used]
-static VERSION_MARK: &str = concat!("\0vk-registry ", env!("CARGO_PKG_VERSION"), "\0");
+vk_hub_proto::version_mark!("vk-registry");
 
 /// Resolve an optional `--root` to a store directory, defaulting to the shared
 /// virtkit store location.

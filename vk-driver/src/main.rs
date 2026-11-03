@@ -15,6 +15,8 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+vk_hub_proto::version_mark!("vk");
+
 mod activity;
 mod admit;
 mod atop;

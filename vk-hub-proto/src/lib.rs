@@ -97,6 +97,18 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Embed `<program> <version>` in the calling binary, NUL on both sides, so the version
+/// stands as a string of its own: the hub refuses to add a release that lacks it
+/// (`vk-hub release add`, or a fetch from GitHub). The compiler would otherwise store the
+/// version only run together with other literals. Invoke it once in each released binary.
+#[macro_export]
+macro_rules! version_mark {
+    ($program:literal) => {
+        #[used]
+        static VERSION_MARK: &str = concat!("\0", $program, " ", env!("CARGO_PKG_VERSION"), "\0");
+    };
+}
+
 pub mod client;
 pub mod dispatch;
 pub mod egress;

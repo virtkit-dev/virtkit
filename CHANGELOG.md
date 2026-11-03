@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The hub accepts vk-hub and vk-gitlab releases.** Uploading or fetching either was
+  always refused.
+
 ## [0.102.1] - 2026-11-03
 
 ### Changed
