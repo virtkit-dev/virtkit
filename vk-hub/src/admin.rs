@@ -591,9 +591,11 @@ async fn fetch(
         Some(v) => crate::fetch::wanted(&v)?,
         None => None,
     };
-    let release = crate::fetch::start(hub, actor, program, version)?
+    let release = crate::fetch::start(hub, actor, &[program], version)?
         .await
-        .context("fetching the release")??;
+        .context("fetching the release")?
+        .pop()
+        .context("the fetch reported no outcome")??;
     Ok(serde_json::to_value(release)?)
 }
 

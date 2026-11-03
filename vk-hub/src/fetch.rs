@@ -17,6 +17,8 @@
 //! a node, registry or relay that requires one refuses it, as it refuses an unsigned `release
 //! add`.
 //!
+//! A fetch takes one program or several; several are fetched one after another at the same
+//! version, the latest pinned once up front, and one failing does not stop the others.
 //! One fetch runs at a time, in the background; its progress and outcome are kept for the
 //! pages and audited. Asking which release is the latest is one request at a time too, and
 //! answered from the last answer for [`CHECK_INTERVAL`]: the API allows an unauthenticated
@@ -124,18 +126,32 @@ impl Source {
 /// A fetch, as the pages show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchStatus {
-    /// The program whose binary is fetched.
-    pub program: Program,
     /// The version asked for; `None` for the latest.
     pub asked: Option<String>,
     pub by: String,
     pub started_at: u64,
+    /// Each program fetched, in order.
+    pub items: Vec<FetchItem>,
+}
+
+impl FetchStatus {
+    pub fn running(&self) -> bool {
+        self.items.iter().any(|i| i.phase.running())
+    }
+}
+
+/// One program's binary within a fetch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchItem {
+    pub program: Program,
     pub phase: Phase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum Phase {
+    /// Behind an earlier program of the same fetch.
+    Waiting,
     /// Asking the repository which release that is.
     Resolving,
     /// Downloading and checking its binary.
@@ -155,7 +171,10 @@ pub enum Phase {
 
 impl Phase {
     pub fn running(&self) -> bool {
-        matches!(self, Phase::Resolving | Phase::Downloading { .. })
+        matches!(
+            self,
+            Phase::Waiting | Phase::Resolving | Phase::Downloading { .. }
+        )
     }
 }
 
@@ -225,79 +244,116 @@ pub fn wanted(version: &str) -> Result<Option<String>> {
     Ok(Some(version.to_string()))
 }
 
-/// Fetch `version` of `program` (`None` means latest) as `actor` in the background.
-/// Resolve the handle with the outcome and keep it for the pages.
+/// Fetch `version` (`None` means latest) of each of `programs` as `actor` in the background,
+/// one after another. Resolve the handle with each program's outcome, in order, and keep
+/// them for the pages.
 pub fn start(
     hub: &Arc<Hub>,
     actor: &str,
-    program: Program,
+    programs: &[Program],
     version: Option<String>,
-) -> Result<tokio::task::JoinHandle<Result<Release>>> {
+) -> Result<tokio::task::JoinHandle<Vec<Result<Release>>>> {
     let Some(source) = hub.fetches.source().cloned() else {
         bail!("fetching releases is off: the hub's release_repository is \"none\"");
     };
+    if programs.is_empty() {
+        bail!("no program to fetch");
+    }
     hub.releases_dir()?;
     // Held until the fetch ends, whoever started it: an update of the hub would cut it.
     let long = hub.handover.long_call()?;
     let what = version.as_deref().unwrap_or("latest").to_string();
     {
         let mut status = lock(&hub.fetches.status);
-        if status.as_ref().is_some_and(|s| s.phase.running()) {
+        if status.as_ref().is_some_and(FetchStatus::running) {
             return Err(Busy.into());
         }
         *status = Some(FetchStatus {
-            program,
             asked: version.clone(),
             by: actor.to_string(),
             started_at: crate::now_secs(),
-            phase: Phase::Resolving,
+            items: programs
+                .iter()
+                .map(|&program| FetchItem {
+                    program,
+                    phase: Phase::Waiting,
+                })
+                .collect(),
         });
     }
+    let names = programs
+        .iter()
+        .map(|p| p.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     let started = format!(
-        "{actor} started fetching {program} {what} from {}",
+        "{actor} started fetching {names} {what} from {}",
         source.url()
     );
     eprintln!("vk-hub: {started}");
     hub.touch();
-    let (hub, actor) = (hub.clone(), actor.to_string());
+    let (hub, actor, programs) = (hub.clone(), actor.to_string(), programs.to_vec());
     Ok(tokio::spawn(async move {
         let _long = long;
-        let result = match local::audit(&hub, &actor, started).await {
-            Ok(()) => fetch(&hub, &actor, &source, program, version.as_deref()).await,
-            Err(e) => Err(e),
-        };
-        let now = crate::now_secs();
-        let phase = match &result {
-            Ok(r) => Phase::Done {
-                version: r.row.version.clone(),
-                sha256: r.sha256.clone(),
-                at: now,
-            },
-            Err(e) => {
-                let reason = vk_hub_proto::display_safe(&format!("{e:#}"));
-                let event = format!(
-                    "{actor} failed to fetch {program} {what} from {}: {reason}",
-                    source.url()
-                );
-                eprintln!("vk-hub: {event}");
-                if let Err(e) = local::audit(&hub, &actor, event).await {
-                    eprintln!("vk-hub: writing the audit log: {e:#}");
+        let mut results = Vec::with_capacity(programs.len());
+        // The version every program is fetched at; several come from one release, so the
+        // latest is pinned once.
+        let pinned: Result<Option<String>, String> = match local::audit(&hub, &actor, started).await
+        {
+            Err(e) => Err(format!("{e:#}")),
+            Ok(()) => match version {
+                Some(v) => Ok(Some(v)),
+                None if programs.len() == 1 => Ok(None),
+                None => {
+                    set_phase(&hub, 0, Phase::Resolving);
+                    latest(&hub)
+                        .await
+                        .map(Some)
+                        .map_err(|e| format!("finding the latest release: {e:#}"))
                 }
-                Phase::Failed { reason, at: now }
-            }
+            },
         };
-        if let Some(status) = lock(&hub.fetches.status).as_mut() {
-            status.phase = phase;
+        for (index, &program) in programs.iter().enumerate() {
+            let result = match &pinned {
+                Ok(version) => {
+                    fetch(&hub, index, &actor, &source, program, version.as_deref()).await
+                }
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            };
+            let now = crate::now_secs();
+            let phase = match &result {
+                Ok(r) => Phase::Done {
+                    version: r.row.version.clone(),
+                    sha256: r.sha256.clone(),
+                    at: now,
+                },
+                Err(e) => {
+                    let reason = vk_hub_proto::display_safe(&format!("{e:#}"));
+                    let event = format!(
+                        "{actor} failed to fetch {program} {what} from {}: {reason}",
+                        source.url()
+                    );
+                    eprintln!("vk-hub: {event}");
+                    if let Err(e) = local::audit(&hub, &actor, event).await {
+                        eprintln!("vk-hub: writing the audit log: {e:#}");
+                    }
+                    Phase::Failed { reason, at: now }
+                }
+            };
+            set_phase(&hub, index, phase);
+            results.push(result);
         }
-        hub.touch();
-        result
+        results
     }))
 }
 
-/// Set the running fetch's phase, for the pages.
-fn phase(hub: &Hub, phase: Phase) {
-    if let Some(status) = lock(&hub.fetches.status).as_mut() {
-        status.phase = phase;
+/// Set the phase of the running fetch's `index`th program, for the pages.
+fn set_phase(hub: &Hub, index: usize, phase: Phase) {
+    if let Some(item) = lock(&hub.fetches.status)
+        .as_mut()
+        .and_then(|s| s.items.get_mut(index))
+    {
+        item.phase = phase;
     }
     hub.touch();
 }
@@ -310,11 +366,13 @@ enum Holding {
 
 async fn fetch(
     hub: &Arc<Hub>,
+    index: usize,
     actor: &str,
     source: &Source,
     program: Program,
     version: Option<&str>,
 ) -> Result<Release> {
+    set_phase(hub, index, Phase::Resolving);
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
     let client = vk_selfupdate::client(concat!("vk-hub/", env!("CARGO_PKG_VERSION")))?;
     let asset = program.name();
@@ -339,8 +397,9 @@ async fn fetch(
         );
     }
     releases::check_version(&found)?;
-    phase(
+    set_phase(
         hub,
+        index,
         Phase::Downloading {
             version: found.clone(),
         },
@@ -469,6 +528,16 @@ pub mod tests {
 
     use super::*;
     use crate::store::Db;
+
+    /// Fetch `program`'s `version` alone as `uid 7`, and its outcome.
+    async fn one(hub: &Arc<Hub>, program: Program, version: Option<String>) -> Result<Release> {
+        start(hub, "uid 7", &[program], version)
+            .unwrap()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
 
     /// A stand-in for a `vk` release: an x86-64 ELF header, and `version` as `vk --version`
     /// prints it.
@@ -657,11 +726,7 @@ pub mod tests {
         let api = fake_github(FakeRelease::new("v0.85.0", bin.clone())).await;
         let (hub, dir) = hub_fetching_from(&api, "ok");
         assert_eq!(latest(&hub).await.unwrap(), "0.85.0");
-        let release = start(&hub, "uid 7", Program::Vk, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        let release = one(&hub, Program::Vk, None).await.unwrap();
         assert_eq!(release.row.version, "0.85.0");
         assert_eq!(release.row.signature, None);
         assert_eq!(release.sha256, vk_hub_proto::to_hex(&Sha256::digest(&bin)));
@@ -669,22 +734,14 @@ pub mod tests {
         assert_eq!(held, bin);
         assert_nothing_staged(&dir);
         assert!(matches!(
-            hub.fetches.status().unwrap().phase,
+            hub.fetches.status().unwrap().items[0].phase,
             Phase::Done { .. }
         ));
-        let again = start(&hub, "uid 7", Program::Vk, Some("0.85.0".into()))
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        let again = one(&hub, Program::Vk, Some("0.85.0".into())).await.unwrap();
         assert_eq!(again, release);
         // A held release whose file went missing is downloaded again, restoring it.
         std::fs::remove_file(releases::path(&dir.join("releases"), &release.sha256)).unwrap();
-        let restored = start(&hub, "uid 7", Program::Vk, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        let restored = one(&hub, Program::Vk, None).await.unwrap();
         assert_eq!(restored, release);
         let held = std::fs::read(releases::path(&dir.join("releases"), &release.sha256)).unwrap();
         assert_eq!(held, bin);
@@ -707,6 +764,47 @@ pub mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Several programs are fetched one after another from the latest release, pinned once;
+    /// one the release does not publish fails on its own and the others are still held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn several_programs_are_fetched_from_one_release_and_fail_alone() {
+        installed();
+        let mut release = FakeRelease::new("v0.85.0", fake_vk("0.85.0"));
+        let mut registry = fake_vk("0.85.0");
+        registry.extend_from_slice(b"vk-registry\0");
+        release.registry = Some(registry);
+        let api = fake_github(release).await;
+        let (hub, dir) = hub_fetching_from(&api, "several");
+        let programs = [Program::Vk, Program::Gitlab, Program::Registry];
+        let results = start(&hub, "uid 7", &programs, None)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].as_ref().unwrap().row.is(Program::Vk));
+        let err = results[1].as_ref().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("publishes no vk-gitlab"),
+            "{err:#}"
+        );
+        assert!(results[2].as_ref().unwrap().row.is(Program::Registry));
+        let status = hub.fetches.status().unwrap();
+        assert!(!status.running());
+        let phases: Vec<_> = status.items.iter().map(|i| (i.program, &i.phase)).collect();
+        assert!(
+            matches!(
+                phases.as_slice(),
+                [
+                    (Program::Vk, Phase::Done { version: a, .. }),
+                    (Program::Gitlab, Phase::Failed { .. }),
+                    (Program::Registry, Phase::Done { version: b, .. }),
+                ] if a == "0.85.0" && b == "0.85.0"
+            ),
+            "{phases:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A `vk-registry` is fetched from the same release as its own asset, and held as a
     /// registry's release; a release publishing none is refused, saying so.
     #[tokio::test(flavor = "multi_thread")]
@@ -718,23 +816,15 @@ pub mod tests {
         release.registry = Some(registry.clone());
         let api = fake_github(release).await;
         let (hub, dir) = hub_fetching_from(&api, "registry");
-        let held = start(&hub, "uid 7", Program::Registry, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        let held = one(&hub, Program::Registry, None).await.unwrap();
         assert!(held.row.is(Program::Registry), "{held:?}");
         assert_eq!(
             held.sha256,
             vk_hub_proto::to_hex(&Sha256::digest(&registry))
         );
         let status = hub.fetches.status().unwrap();
-        assert_eq!(status.program, Program::Registry);
-        let vk = start(&hub, "uid 7", Program::Vk, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(status.items[0].program, Program::Registry);
+        let vk = one(&hub, Program::Vk, None).await.unwrap();
         assert!(vk.row.is(Program::Vk), "{vk:?}");
         assert_eq!(hub.db.releases().unwrap().len(), 2);
         let events: Vec<String> = hub
@@ -751,11 +841,7 @@ pub mod tests {
 
         let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
         let (hub, dir) = hub_fetching_from(&api, "no-registry");
-        let err = start(&hub, "uid 7", Program::Registry, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap_err();
+        let err = one(&hub, Program::Registry, None).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("publishes no vk-registry"),
             "{err:#}"
@@ -768,17 +854,9 @@ pub mod tests {
         let api = fake_github(release).await;
         let (hub, dir) = hub_fetching_from(&api, "registry-only");
         assert_eq!(latest(&hub).await.unwrap(), "0.86.0");
-        let held = start(&hub, "uid 7", Program::Registry, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap();
+        let held = one(&hub, Program::Registry, None).await.unwrap();
         assert_eq!(held.row.version, "0.86.0");
-        let err = start(&hub, "uid 7", Program::Vk, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap_err();
+        let err = one(&hub, Program::Vk, None).await.unwrap_err();
         assert!(format!("{err:#}").contains("publishes no vk"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -804,17 +882,16 @@ pub mod tests {
         ] {
             let api = fake_github(release).await;
             let (hub, dir) = hub_fetching_from(&api, case);
-            let err = start(&hub, "uid 7", Program::Vk, asked.map(str::to_string))
-                .unwrap()
+            let err = one(&hub, Program::Vk, asked.map(str::to_string))
                 .await
-                .unwrap()
                 .unwrap_err();
             assert!(format!("{err:#}").contains(want), "{case}: {err:#}");
             assert!(hub.db.releases().unwrap().is_empty(), "{case}");
             if dir.join("releases").exists() {
                 assert_nothing_staged(&dir);
             }
-            let Phase::Failed { reason, .. } = hub.fetches.status().unwrap().phase else {
+            let Phase::Failed { reason, .. } = hub.fetches.status().unwrap().items.remove(0).phase
+            else {
                 panic!("{case}: not failed");
             };
             assert!(reason.contains(want), "{case}: {reason}");
@@ -838,16 +915,12 @@ pub mod tests {
         stalled.stall = true;
         let api = fake_github(stalled).await;
         let (hub, dir) = hub_fetching_from(&api, "stall");
-        let err = start(&hub, "uid 7", Program::Vk, None)
-            .unwrap()
-            .await
-            .unwrap()
-            .unwrap_err();
+        let err = one(&hub, Program::Vk, None).await.unwrap_err();
         assert!(format!("{err:#}").contains("took longer than"), "{err:#}");
         assert!(hub.db.releases().unwrap().is_empty());
         assert_nothing_staged(&dir);
         assert!(matches!(
-            hub.fetches.status().unwrap().phase,
+            hub.fetches.status().unwrap().items[0].phase,
             Phase::Failed { .. }
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -876,19 +949,22 @@ pub mod tests {
         installed();
         let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
         let (hub, dir) = hub_fetching_from(&api, "busy");
-        let first = start(&hub, "uid 7", Program::Vk, None).unwrap();
-        let second = start(&hub, "uid 7", Program::Vk, None);
+        let first = start(&hub, "uid 7", &[Program::Vk], None).unwrap();
+        let second = start(&hub, "uid 7", &[Program::Vk], None);
         // Unless the first was already over.
-        if !matches!(hub.fetches.status().unwrap().phase, Phase::Done { .. }) {
+        if !matches!(
+            hub.fetches.status().unwrap().items[0].phase,
+            Phase::Done { .. }
+        ) {
             assert!(second.unwrap_err().is::<Busy>());
         }
-        first.await.unwrap().unwrap();
+        first.await.unwrap().pop().unwrap().unwrap();
         let off = Arc::new(
             Hub::new(Arc::new(Db::open_memory().unwrap()), None)
                 .with_releases(dir.join("off"))
                 .with_release_source(None),
         );
-        let err = start(&off, "uid 7", Program::Vk, None).unwrap_err();
+        let err = start(&off, "uid 7", &[Program::Vk], None).unwrap_err();
         assert!(format!("{err:#}").contains("off"), "{err:#}");
         assert!(latest(&off).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);

@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Fetch all programs at once.** The Updates page fetches every program's release from
+  GitHub in one go.
+
 ### Fixed
 
 - **The hub accepts vk-hub and vk-gitlab releases.** Uploading or fetching either was

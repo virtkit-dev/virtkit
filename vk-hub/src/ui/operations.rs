@@ -29,7 +29,7 @@ use super::html::Html;
 use super::multipart::{self, Multipart, Refusal};
 use super::pages::{self, csrf_field};
 use super::{Auth, Body, Ui, actions, blocking, field};
-use crate::fetch::{self, FetchStatus, Phase};
+use crate::fetch::{self, FetchItem, FetchStatus, Phase};
 use crate::ops::{self, NodeView, RolloutPlan, Selection};
 use crate::releases;
 use crate::rollout::{NodeStatus, RolloutNode};
@@ -305,8 +305,8 @@ fn done(htmx: bool, said: &str) -> Response<Body> {
     }
 }
 
-/// `POST /releases/fetch`: `op=fetch` starts fetching `program`'s `version` (or the latest) in
-/// the background, which `/operations` follows; `op=check` asks the repository which release is
+/// `POST /releases/fetch`: `op=fetch` starts fetching `program`'s `version` (or the latest),
+/// or every program's with `program=all`, in the background, which `/operations` follows; `op=check` asks the repository which release is
 /// the latest.
 pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -347,27 +347,34 @@ pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Resp
                     ));
                 }
             };
-            let program = match releases::program(field(&form, "program")) {
-                Ok(program) => program,
-                Err(e) => {
-                    return Ok(actions::refused(
-                        htmx,
-                        StatusCode::BAD_REQUEST,
-                        &format!("Refused: {e:#}."),
-                    ));
-                }
+            let programs = match field(&form, "program") {
+                Some(ALL_PROGRAMS) => Program::ALL.to_vec(),
+                name => match releases::program(name) {
+                    Ok(program) => vec![program],
+                    Err(e) => {
+                        return Ok(actions::refused(
+                            htmx,
+                            StatusCode::BAD_REQUEST,
+                            &format!("Refused: {e:#}."),
+                        ));
+                    }
+                },
+            };
+            let fetched = match programs.as_slice() {
+                [one] => one.name().to_string(),
+                _ => "every program".to_string(),
             };
             let what = version.clone().unwrap_or_else(|| "latest".into());
             let (hub, principal) = (ui.hub.clone(), auth.session.principal());
             // Dropped, not awaited: the fetch runs on, and the page follows it.
             let started =
-                blocking(move || Ok(fetch::start(&hub, &principal, program, version).map(drop)))
+                blocking(move || Ok(fetch::start(&hub, &principal, &programs, version).map(drop)))
                     .await?;
             match started {
                 Ok(()) => Ok(done(
                     htmx,
                     &format!(
-                        "Fetching {program} {what} from {source}. Its progress shows below and \
+                        "Fetching {fetched} {what} from {source}. Its progress shows below and \
                          in the audit log."
                     ),
                 )),
@@ -633,7 +640,7 @@ pub(super) fn forms(
         .raw("\" enctype=\"multipart/form-data\">");
     // Before the file: the hub checks them before it writes a byte of it.
     csrf_field(h, auth);
-    program_select(h);
+    program_select(h, false);
     h.raw("<label>Version <input name=\"version\" required size=\"10\" ")
         .raw("placeholder=\"0.85.0\"></label>")
         .raw("<label>Signature <input name=\"signature\" size=\"24\" ")
@@ -654,7 +661,7 @@ pub(super) fn forms(
             .raw(FETCH_PATH)
             .raw("\" hx-swap=\"none\">");
         csrf_field(h, auth);
-        program_select(h);
+        program_select(h, true);
         h.raw("<label>Version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
             .raw("<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>")
             .raw("<button name=\"op\" value=\"check\">Check the latest</button></form>")
@@ -672,9 +679,17 @@ pub(super) fn forms(
     h.raw("</section>");
 }
 
-/// A form's choice of [`Program`], `vk` first.
-fn program_select(h: &mut Html) {
+/// The fetch form's choice of every [`Program`] at once.
+const ALL_PROGRAMS: &str = "all";
+
+/// A form's choice of [`Program`], `vk` first; with `all`, every program first and chosen.
+fn program_select(h: &mut Html, all: bool) {
     h.raw("<label>Program <select name=\"program\">");
+    if all {
+        h.raw("<option value=\"")
+            .raw(ALL_PROGRAMS)
+            .raw("\" selected>all programs</option>");
+    }
     for p in Program::ALL {
         h.raw("<option value=\"")
             .raw(p.name())
@@ -796,53 +811,83 @@ pub(super) fn fetch_line(
             .html(&pages::at_html(*at))
             .raw(". ");
     }
-    if let Some(s) = status {
-        let asked = s.asked.as_deref().unwrap_or("latest");
-        let program = s.program.name();
-        match &s.phase {
-            Phase::Resolving => {
-                h.raw("Fetching ")
-                    .raw(program)
-                    .raw(" ")
-                    .text(asked)
-                    .raw(": finding out which release that is");
-            }
-            Phase::Downloading { version } => {
-                h.raw("Fetching ")
-                    .raw(program)
-                    .raw(" ")
-                    .text(asked)
-                    .raw(": downloading and checking ")
-                    .node(version);
-            }
-            Phase::Done {
-                version,
-                sha256,
-                at,
-            } => {
-                h.raw("Fetched ")
-                    .raw(program)
-                    .raw(" ")
-                    .node(version)
-                    .raw(" (<code>")
-                    .text(crate::store::short(sha256))
-                    .raw("</code>) at ")
-                    .html(&pages::at_html(*at));
-            }
-            Phase::Failed { reason, at } => {
-                h.raw("<span class=\"reason\">Fetching ")
-                    .raw(program)
-                    .raw(" ")
-                    .text(asked)
-                    .raw(" failed</span> at ")
-                    .html(&pages::at_html(*at))
-                    .raw(": ")
-                    .node(reason);
-            }
+    let Some(s) = status else {
+        h.raw("</p>");
+        return;
+    };
+    let asked = s.asked.as_deref().unwrap_or("latest");
+    match s.items.as_slice() {
+        [one] => {
+            fetch_item(h, one, asked);
+            h.raw(", asked by ").text(&s.by).raw(".</p>");
         }
-        h.raw(", asked by ").text(&s.by).raw(".");
+        items => {
+            h.raw("Fetching every program ")
+                .text(asked)
+                .raw(", asked by ")
+                .text(&s.by)
+                .raw(":</p><ul class=\"sub\">");
+            for item in items {
+                h.raw("<li>");
+                fetch_item(h, item, asked);
+                h.raw(".</li>");
+            }
+            h.raw("</ul>");
+        }
     }
-    h.raw("</p>");
+}
+
+/// One program's part of a fetch, `asked` being the version asked for.
+fn fetch_item(h: &mut Html, item: &FetchItem, asked: &str) {
+    let program = item.program.name();
+    match &item.phase {
+        Phase::Waiting => {
+            h.raw("Fetching ")
+                .raw(program)
+                .raw(" ")
+                .text(asked)
+                .raw(": waiting for the programs before it");
+        }
+        Phase::Resolving => {
+            h.raw("Fetching ")
+                .raw(program)
+                .raw(" ")
+                .text(asked)
+                .raw(": finding out which release that is");
+        }
+        Phase::Downloading { version } => {
+            h.raw("Fetching ")
+                .raw(program)
+                .raw(" ")
+                .text(asked)
+                .raw(": downloading and checking ")
+                .node(version);
+        }
+        Phase::Done {
+            version,
+            sha256,
+            at,
+        } => {
+            h.raw("Fetched ")
+                .raw(program)
+                .raw(" ")
+                .node(version)
+                .raw(" (<code>")
+                .text(crate::store::short(sha256))
+                .raw("</code>) at ")
+                .html(&pages::at_html(*at));
+        }
+        Phase::Failed { reason, at } => {
+            h.raw("<span class=\"reason\">Fetching ")
+                .raw(program)
+                .raw(" ")
+                .text(asked)
+                .raw(" failed</span> at ")
+                .html(&pages::at_html(*at))
+                .raw(": ")
+                .node(reason);
+        }
+    }
 }
 
 #[cfg(test)]

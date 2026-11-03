@@ -1883,9 +1883,10 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   their checks. The session must still belong to an operator once the file arrives.
 - **Fetch from GitHub** posts a program and a version, `latest` by default, to `/releases/fetch`
   and starts `release fetch` in the background; the fragment shows its progress and how it
-  ended. "Check the latest" asks which version that is and shows it, giving the last answer, or
-  the last failure, again within 30 seconds. The form is absent with `release_repository =
-  "none"`.
+  ended. The program defaults to all programs: each is fetched in turn from the same release,
+  the latest resolved once, and one failing does not stop the others. "Check the latest" asks
+  which version that is and shows it, giving the last answer, or the last failure, again within
+  30 seconds. The form is absent with `release_repository = "none"`.
 - **Start a rollout** takes a held release, the nodes to update — all checked to start with, with
   All and None to check or uncheck them at once — and `rollout create`'s options, the timeouts,
   per-profile canaries and external runners folded under "Advanced", and posts to `/rollouts`. It

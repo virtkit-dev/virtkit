@@ -7930,6 +7930,38 @@ async fn an_operator_fetches_a_release_from_github() {
     let reply = post_action(addr, &origin, &operator, path, &form, true).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
 
+    // Every program at once, the form's default: one failing does not stop the others.
+    let form_page = get(addr, "/operations", Some(&operator)).await.body;
+    assert!(
+        form_page.contains("<option value=\"all\" selected>all programs</option>"),
+        "{form_page}"
+    );
+    let form = format!("_csrf={csrf}&op=fetch&version=latest&program=all");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Fetching every program latest from"),
+        "{}",
+        reply.body
+    );
+    // vk-hub, fetched last, is not published.
+    let page_all = page_with(
+        addr,
+        "/operations",
+        &operator,
+        "Fetching vk-hub latest failed",
+    )
+    .await;
+    for want in [
+        "Fetching every program latest, asked by",
+        "<li>Fetched vk 0.85.0",
+        "<li>Fetched vk-registry 0.85.0",
+        "<li><span class=\"reason\">Fetching vk-gitlab latest failed</span>",
+        "<li><span class=\"reason\">Fetching vk-hub latest failed</span>",
+    ] {
+        assert!(page_all.contains(want), "{want}: {page_all}");
+    }
+
     // A viewer may not; nor a version that is not one.
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
     let reply = post_action(
