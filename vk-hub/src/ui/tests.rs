@@ -12842,6 +12842,29 @@ async fn operators_edit_lanes_from_their_page() {
     }
 }
 
+/// The lanes' page shows what the scheduler works with, live: waiting work per step, the last
+/// pick, and links to the pages with per-node load and delisted jobs.
+#[tokio::test]
+async fn the_lanes_page_shows_the_scheduler_live() {
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/lanes", Some(&viewer)).await.body;
+    for want in [
+        "<h2>Live</h2><div id=\"live\" hx-ext=\"sse\" sse-connect=\"/events/lanes\" \
+         sse-swap=\"lanes\" sse-close=\"close\">",
+        "deadline <strong>0</strong></span> → <span title=",
+        "normal <strong>0</strong></span></p><p>No pick since the hub started.</p>\
+         <p class=\"empty\">Nothing waits.</p></div>",
+        "<a href=\"/\">Nodes</a>",
+        "<a href=\"/jobs\">Jobs</a>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    let mut live = Events::open(addr, "/events/lanes", &viewer).await;
+    let event = next_with(&mut live, "No pick since the hub started.").await;
+    assert!(event.contains("Nothing waits."), "{event}");
+}
+
 /// A policy held since its conversion lists the rules that did not convert. Editing a lane
 /// leaves it held; activating it ends the hold.
 #[tokio::test]

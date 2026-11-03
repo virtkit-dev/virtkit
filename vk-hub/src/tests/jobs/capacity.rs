@@ -301,6 +301,36 @@ async fn idle_lanes_share_one_fleet_wide_probe() {
     wait_reason_of(&hub, 43, "shared probe budget").await;
     let snapshot = crate::jobs::arbitration_snapshot(&hub).unwrap();
     assert_eq!(snapshot.get(&("gl".to_string(), 43)).unwrap().waiting, 1);
+    // The live view: the grant as the scheduler made it, and why the other request waits.
+    let live = crate::jobs::live_view(&hub);
+    let pick = live.last_pick.unwrap();
+    assert!(
+        matches!(&pick.lane, crate::policy::LaneId::Runner { id, .. } if *id != 43),
+        "{pick:?}"
+    );
+    assert_eq!(
+        (pick.step, pick.held, pick.weight),
+        (crate::jobs::Step::Normal, 0, 1)
+    );
+    let production_lane = crate::policy::LaneId::Runner {
+        gitlab: "gl".into(),
+        id: 43,
+    };
+    let waiting = &live.lanes[&production_lane].waiting;
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert_eq!(
+        (
+            waiting[0].step,
+            waiting[0].reason,
+            waiting[0].job.as_deref()
+        ),
+        (
+            crate::jobs::Step::ProductionProbes,
+            "shared probe budget",
+            None
+        )
+    );
+    assert_eq!(live.lanes[&pick.lane].held, 1);
     let answer = poll(addr, &key, &production, 0).await;
     assert_eq!(answer.status, 202, "{answer:?}");
     std::fs::remove_dir_all(&dir).unwrap();

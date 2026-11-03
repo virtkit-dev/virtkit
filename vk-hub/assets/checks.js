@@ -1,8 +1,9 @@
 // vk-hub web UI: a button with `data-check="all"` or `data-check="none"` checks or unchecks
 // every checkbox of its fieldset, such as the nodes a rollout updates. A `data-dismiss`
 // button, such as a question's Cancel, empties `#flash`; every message swapped into `#flash`
-// gets one, as the flash stays pinned to the window until dismissed. Listening on the
-// document, it serves what is swapped in later too. Without this script the boxes are
+// gets one, as the flash stays pinned to the window until dismissed. An opened
+// `<details data-keep>` stays open across live updates. Listening on the document, it serves
+// what is swapped in later too. Without this script the boxes are
 // checked one by one and a message stays until replaced.
 // Loaded as a file: the policy allows no inline script, and nothing here evaluates code.
 (function () {
@@ -46,4 +47,29 @@
       boxes[i].checked = on;
     }
   });
+
+  // A `<details data-keep="<key>">` a live update replaces stays as the viewer left it.
+  var kept = {};
+  document.addEventListener(
+    "toggle",
+    function (e) {
+      var key = e.target instanceof Element ? e.target.getAttribute("data-keep") : null;
+      if (key !== null) {
+        kept[key] = e.target.open;
+      }
+    },
+    true
+  );
+  function reopen() {
+    var all = document.querySelectorAll("details[data-keep]");
+    for (var i = 0; i < all.length; i++) {
+      var key = all[i].getAttribute("data-keep");
+      if (kept[key] === true && !all[i].open) {
+        all[i].open = true;
+      }
+    }
+  }
+  document.addEventListener("htmx:afterSwap", reopen);
+  document.addEventListener("htmx:afterSettle", reopen);
+  document.addEventListener("htmx:sseMessage", reopen);
 })();

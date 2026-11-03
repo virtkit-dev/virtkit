@@ -237,6 +237,10 @@ struct State {
     abandoned_probes: HashMap<String, ((String, u64), Instant)>,
     /// Whose turn it is between production probes and normal work.
     turns: scheduler::Turns,
+    /// The scheduler's latest grant, as it saw it then.
+    last_pick: Option<LastPick>,
+    /// [`State::last_pick`] as the live updates last showed it.
+    last_pick_shown: Option<LastPick>,
     /// Jobs not finished.
     jobs: HashMap<String, LiveJob>,
     /// Jobs ended here whose final row the database may not hold yet: a reader is served
@@ -413,38 +417,154 @@ fn arbitration_views(state: &State, now: Instant) -> HashMap<(String, u64), Arbi
     views
 }
 
-/// What a lane holds and has waiting, as the lanes page shows it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaneLoad {
-    /// Slots it holds: requests offered, granted or claimed, and its jobs charged.
-    pub held: u64,
-    /// Its requests waiting for room and its jobs queued.
-    pub waiting: usize,
+/// The steps of a scheduling pass, in the order it serves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Step {
+    /// A queued job at its deadline: placed now or ended.
+    Deadline,
+    /// A queued job starting on room already granted to it.
+    Reserved,
+    Production,
+    ProductionProbes,
+    Normal,
 }
 
-/// [`LaneLoad`]s by lane, for lanes holding or waiting for anything.
-pub fn lane_loads(hub: &Hub) -> HashMap<crate::policy::LaneId, LaneLoad> {
+impl Step {
+    pub const ALL: [Step; 5] = [
+        Step::Deadline,
+        Step::Reserved,
+        Step::Production,
+        Step::ProductionProbes,
+        Step::Normal,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Step::Deadline => "deadline",
+            Step::Reserved => "reserved",
+            Step::Production => "production",
+            Step::ProductionProbes => "production probes",
+            Step::Normal => "normal",
+        }
+    }
+
+    fn of(class: crate::policy::Class, probe: bool) -> Self {
+        match (class, probe) {
+            (crate::policy::Class::Production, false) => Step::Production,
+            (crate::policy::Class::Production, true) => Step::ProductionProbes,
+            (crate::policy::Class::Normal, _) => Step::Normal,
+        }
+    }
+}
+
+/// A grant the scheduler made, with the lane's held slots and weight as they were then;
+/// `at` in seconds since the epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastPick {
+    pub lane: crate::policy::LaneId,
+    pub step: Step,
+    pub held: u64,
+    pub weight: u32,
+    pub at: u64,
+}
+
+/// A request waiting for room, or a queued job, and why the scheduler passed it over.
+#[derive(Clone, Debug)]
+pub struct Waiting {
+    /// The job's ID; `None` for a request.
+    pub job: Option<String>,
+    /// The relay that asked, by ID, and the runner it asked for, by name.
+    pub relay: Option<String>,
+    pub runner: Option<String>,
+    pub envelope: vk_hub_proto::job::Envelope,
+    pub step: Step,
+    pub waited_secs: u64,
+    pub reason: &'static str,
+}
+
+/// What a lane holds and has waiting.
+#[derive(Clone, Debug, Default)]
+pub struct LiveLane {
+    /// Slots it holds: requests offered, granted or claimed, and its jobs charged.
+    pub held: u64,
+    pub waiting: Vec<Waiting>,
+}
+
+/// What the scheduler is working with: each lane's slots and waiting work, and its last grant.
+#[derive(Clone, Debug, Default)]
+pub struct LiveView {
+    pub lanes: HashMap<crate::policy::LaneId, LiveLane>,
+    pub last_pick: Option<LastPick>,
+}
+
+/// The [`LiveView`] now, for lanes holding or waiting for anything.
+pub fn live_view(hub: &Hub) -> LiveView {
     let state = hub.dispatch.lock();
-    let mut loads: HashMap<crate::policy::LaneId, LaneLoad> = HashMap::new();
+    let now = Instant::now();
+    let secs = crate::now_secs();
+    let mut lanes: HashMap<crate::policy::LaneId, LiveLane> = HashMap::new();
     for ticket in state.tickets.values() {
-        let load = loads.entry(ticket.identity.lane.clone()).or_default();
         if scheduler::holds(&ticket.phase) {
-            load.held += 1;
-        } else if matches!(ticket.phase, TicketPhase::Waiting) {
-            load.waiting += 1;
+            lanes.entry(ticket.identity.lane.clone()).or_default().held += 1;
+            continue;
         }
+        if !matches!(ticket.phase, TicketPhase::Waiting) {
+            continue;
+        }
+        // As the scheduler decides: a runner's request probes unless it was recently busy.
+        let demand = (ticket.identity.gitlab.clone())
+            .zip(ticket.identity.runner_id)
+            .map(|key| state.demand.get(&key));
+        let probe = demand.is_some_and(|d| !d.and_then(|d| d.busy_until).is_some_and(|t| now < t));
+        lanes
+            .entry(ticket.identity.lane.clone())
+            .or_default()
+            .waiting
+            .push(Waiting {
+                job: None,
+                relay: ticket.identity.runner.is_some().then(|| ticket.key.clone()),
+                runner: ticket.identity.runner.clone(),
+                envelope: ticket.placement.envelope,
+                step: Step::of(ticket.identity.class, probe),
+                waited_secs: now.duration_since(ticket.created).as_secs(),
+                reason: ticket.blocked.unwrap_or("waiting for its turn"),
+            });
     }
-    for job in state.jobs.values() {
-        let load = loads.entry(job_lane(&job.row)).or_default();
+    for (id, job) in &state.jobs {
+        let lane = lanes.entry(job_lane(&job.row)).or_default();
         if scheduler::charged(&state, &job.row) {
-            load.held += 1;
+            lane.held += 1;
         }
-        if job.row.state == JobState::Queued && job.row.cancel.is_none() {
-            load.waiting += 1;
+        if job.row.state != JobState::Queued || job.row.cancel.is_some() {
+            continue;
         }
+        let identity = job.row.scheduling.as_ref();
+        let step = if now >= job.deadline {
+            Step::Deadline
+        } else if job.reservation.is_some() {
+            Step::Reserved
+        } else {
+            Step::of(identity.map_or_else(Default::default, |i| i.class), false)
+        };
+        lane.waiting.push(Waiting {
+            job: Some(id.clone()),
+            relay: None,
+            runner: None,
+            envelope: job.row.placement.envelope,
+            step,
+            waited_secs: secs.saturating_sub(job.row.created_at),
+            reason: job.blocked.unwrap_or("waiting for a node"),
+        });
     }
-    loads.retain(|_, l| *l != LaneLoad::default());
-    loads
+    lanes.retain(|_, l| l.held > 0 || !l.waiting.is_empty());
+    for lane in lanes.values_mut() {
+        lane.waiting
+            .sort_by(|a, b| (a.step, b.waited_secs).cmp(&(b.step, a.waited_secs)));
+    }
+    LiveView {
+        lanes,
+        last_pick: state.last_pick.clone(),
+    }
 }
 
 /// The lane `row`'s job is charged to and held to: its scheduling identity's, or the default
@@ -4025,8 +4145,10 @@ async fn step(hub: &Hub) -> Result<()> {
         // What a server's page shows of arbitration, in O(tickets + jobs) as the pass itself.
         let mut shown = arbitration_views(&state, now);
         shown.values_mut().for_each(|view| *view = view.settled());
-        arbitration_changed = shown != state.arbitration_shown;
+        arbitration_changed =
+            shown != state.arbitration_shown || state.last_pick != state.last_pick_shown;
         state.arbitration_shown = shown;
+        state.last_pick_shown = state.last_pick.clone();
     }
     if arbitration_changed {
         hub.arbitration_changed();

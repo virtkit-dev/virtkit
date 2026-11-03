@@ -525,6 +525,7 @@ impl Found {
 #[derive(Clone)]
 struct Candidate {
     id: String,
+    lane: crate::policy::LaneId,
     node: String,
     class: crate::policy::Class,
     probe: bool,
@@ -1087,6 +1088,7 @@ fn arbitrate(
             blocked(state, id, "waiting for lane share");
             eligible.push(Candidate {
                 id: id.clone(),
+                lane: ticket.identity.lane.clone(),
                 node,
                 class: ticket.identity.class,
                 probe,
@@ -1253,6 +1255,7 @@ fn arbitrate(
                 .min(deadline);
             eligible.push(Candidate {
                 id,
+                lane: lane_id.clone(),
                 node,
                 class,
                 probe: false,
@@ -1300,6 +1303,19 @@ fn arbitrate(
             (None, Some(known)) => known,
             (None, None) => break,
         };
+        let pick = super::LastPick {
+            lane: chosen.lane.clone(),
+            step: match rank(chosen) {
+                _ if chosen.due => super::Step::Deadline,
+                0 => super::Step::Reserved,
+                1 => super::Step::Production,
+                3 => super::Step::ProductionProbes,
+                _ => super::Step::Normal,
+            },
+            held: chosen.load,
+            weight: chosen.weight,
+            at: crate::now_secs(),
+        };
         let Candidate {
             id,
             node,
@@ -1343,6 +1359,7 @@ fn arbitrate(
                 let on_reservation = started.reservation.is_some();
                 let burst = policy.production_probe_burst;
                 state.turns.granted(class, false, on_reservation, burst);
+                state.last_pick = Some(pick);
             }
             // Its charge as placed, or ended, in place of its charge as queued.
             let after = state.jobs.get(&id).map(|j| j.row.clone());
@@ -1380,6 +1397,7 @@ fn arbitrate(
             reservation: reservation.clone(),
             since: now,
         };
+        state.last_pick = Some(pick);
         state.reservations.insert(
             reservation.clone(),
             Resv {
@@ -1435,6 +1453,7 @@ mod tests {
     fn candidate(class: Class, probe: bool, reserved: bool) -> Candidate {
         Candidate {
             id: String::new(),
+            lane: crate::policy::LaneId::Default,
             node: String::new(),
             class,
             probe,

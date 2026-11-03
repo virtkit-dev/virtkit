@@ -17,6 +17,8 @@ All notable changes to virtkit will be documented in this file.
   slots it holds and its waiting work, and is edited on its own: map a runner, add an API key
   lane, change weight, max slots, nodes, projects and branches, or unmap it. Production headroom
   is edited there too. A converted policy that is not active yet is activated from the page.
+- **Live scheduling view.** The Lanes page shows live what waits at each scheduling step and why,
+  each waiting lane's slots against its weight, and the scheduler's last pick.
 - **Queued jobs follow lane changes.** A queued job whose runner is unmapped, or whose project or
   branch its lane no longer allows, waits until allowed again or its deadline.
 

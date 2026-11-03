@@ -5,7 +5,8 @@
 //! it or replacing the whole policy ends the hold. Each project's page lists the lanes that
 //! may run it ([`project_section`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use hyper::body::Incoming;
@@ -17,13 +18,19 @@ use super::fleet::{self, FleetSite};
 use super::html::Html;
 use super::pages::csrf_field;
 use super::{Auth, Body, Ui, actions, blocking, decode_form, field, page};
-use crate::jobs::LaneLoad;
+use crate::jobs::{LiveView, Step};
 use crate::policy::{Class, Headroom, Lane, LaneId, LaneProject, Policy};
 use crate::server::Hub;
 use crate::store::{ConversionNote, PolicyRefused, ProjectView, Role, policy_changes};
 
 /// The lanes' page, and where its edits post.
 pub(super) const PATH: &str = "/lanes";
+
+/// The event the live view is swapped in on, and its stream's name under `/events/`.
+pub(super) const EVENT: &str = "lanes";
+
+/// The most waiting requests and jobs the live view lists of a lane; the rest are counted.
+const MAX_LISTED_WAITING: usize = 50;
 
 /// The capacity page this one replaces, the pages of the tenants before lanes, and both
 /// before the navigation had sections: all lead to [`PATH`].
@@ -132,6 +139,8 @@ struct KnownRunner {
 #[derive(Default)]
 struct Known {
     gitlabs: usize,
+    /// Each relay's ID and display-safe hostname.
+    relays: Vec<(String, String)>,
     runners: Vec<KnownRunner>,
     /// Each API key's principal ID and name.
     keys: Vec<(String, String)>,
@@ -143,7 +152,11 @@ impl Known {
     /// Reads the database: call off the runtime.
     fn read(hub: &Hub) -> Result<Self> {
         let mut runners = Vec::new();
-        for relay in crate::relays::views(hub)? {
+        let views = crate::relays::views(hub)?;
+        let relays = (views.iter())
+            .map(|r| (r.id.clone(), vk_hub_proto::display_safe(&r.row.hostname)))
+            .collect();
+        for relay in views {
             let Some(gitlab) = relay.server.as_ref().and_then(|s| s.name.clone()) else {
                 continue;
             };
@@ -161,6 +174,7 @@ impl Known {
         runners.dedup_by(|a, b| (&a.gitlab, a.id) == (&b.gitlab, b.id));
         Ok(Known {
             gitlabs: hub.db.gitlabs()?.len(),
+            relays,
             runners,
             keys: (hub.db.api_keys_with_ids()?.into_iter())
                 .map(|(id, key)| (id, key.name))
@@ -271,7 +285,7 @@ struct Shown {
     policy: Result<Policy>,
     note: Option<ConversionNote>,
     known: Known,
-    loads: HashMap<LaneId, LaneLoad>,
+    live: LiveView,
 }
 
 impl Shown {
@@ -281,7 +295,7 @@ impl Shown {
             policy: hub.db.capacity_policy(),
             note: hub.db.capacity_conversion()?,
             known: Known::read(hub)?,
-            loads: crate::jobs::lane_loads(hub),
+            live: crate::jobs::live_view(hub),
         })
     }
 }
@@ -307,7 +321,7 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
         edit_page(&mut main, &title, &id, policy, &shown.known, auth, &digest);
         return Ok(page(fleet::layout(&title, PATH, auth, &main)));
     }
-    let waiting: usize = shown.loads.values().map(|l| l.waiting).sum();
+    let waiting: usize = shown.live.lanes.values().map(|l| l.waiting.len()).sum();
     main.raw("<h1>Lanes</h1><p class=\"sub\">")
         .text(policy.lanes.len())
         .raw(" lanes · ")
@@ -325,6 +339,16 @@ pub(super) async fn get(query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Res
     }
     main.raw("</section>");
     headroom_section(&mut main, policy, auth, &digest, steer);
+    main.raw("<section><h2>Live</h2><div id=\"live\" hx-ext=\"sse\" sse-connect=\"/events/")
+        .raw(EVENT)
+        .raw("\" sse-swap=\"")
+        .raw(EVENT)
+        .raw("\" sse-close=\"close\">")
+        .html(&live_fragment(&shown, policy, crate::now_secs()))
+        .raw("</div><p class=\"sub\">Load per node: <a href=\"/\">Nodes</a>. Delisted and ")
+        .raw("finished jobs: <a href=\"")
+        .raw(super::jobs::PATH)
+        .raw("\">Jobs</a>.</p></section>");
     whole_policy(&mut main, policy, auth, &digest, steer)?;
     Ok(page(fleet::layout("Lanes", PATH, auth, &main)))
 }
@@ -363,7 +387,8 @@ fn lanes_table(h: &mut Html, shown: &Shown, policy: &Policy, steer: bool) {
     h.raw("</tr></thead><tbody>");
     for lane in &policy.lanes {
         let Some(id) = lane.id() else { continue };
-        let load = shown.loads.get(&id).copied().unwrap_or_default();
+        let live = shown.live.lanes.get(&id);
+        let (held, waiting) = live.map_or((0, 0), |l| (l.held, l.waiting.len()));
         h.raw("<tr><td>").text(shown.known.label(&id));
         if let Some(tenant) = shared.get(&id) {
             h.raw("<div class=\"sub\">Took shared tenant ")
@@ -384,9 +409,9 @@ fn lanes_table(h: &mut Html, shown: &Shown, policy: &Policy, steer: bool) {
             .raw("</td><td>")
             .text(shown.known.projects_text(lane))
             .raw("</td><td class=\"num\">")
-            .text(load.held)
+            .text(held)
             .raw("</td><td class=\"num\">")
-            .text(load.waiting)
+            .text(waiting)
             .raw("</td>");
         if steer {
             h.raw("<td class=\"actions\"><a href=\"")
@@ -688,6 +713,138 @@ fn whole_policy(
     }
     h.raw("</details>");
     Ok(())
+}
+
+/// The live view's fragment: waiting work per step, the scheduler's last pick, and each lane
+/// with work waiting, with why each request or queued job waits.
+fn live_fragment(shown: &Shown, policy: &Policy, now: u64) -> Html {
+    let mut h = Html::new();
+    h.raw("<p class=\"steps\">");
+    for (i, step) in Step::ALL.into_iter().enumerate() {
+        let waiting = (shown.live.lanes.values())
+            .flat_map(|l| &l.waiting)
+            .filter(|w| w.step == step)
+            .count();
+        if i > 0 {
+            h.raw(" → ");
+        }
+        h.raw("<span");
+        if step == Step::Reserved {
+            h.raw(" title=\"Queued jobs starting on room already granted to them\"");
+        }
+        h.raw(">")
+            .text(step.name())
+            .raw(" <strong>")
+            .text(waiting)
+            .raw("</strong></span>");
+    }
+    h.raw("</p><p>");
+    match &shown.live.last_pick {
+        Some(pick) => {
+            h.raw("Last pick ");
+            super::fleet::time_ago(&mut h, now, pick.at);
+            h.raw(": ")
+                .text(shown.known.label(&pick.lane))
+                .raw(", ")
+                .text(pick.step.name())
+                .raw(" step, held ÷ weight ")
+                .text(share_text(pick.held, pick.weight))
+                .raw(".");
+        }
+        None => {
+            h.raw("No pick since the hub started.");
+        }
+    }
+    h.raw("</p>");
+    let mut lanes: Vec<_> = (shown.live.lanes.iter())
+        .filter(|(_, l)| !l.waiting.is_empty())
+        .map(|(id, l)| (id, l, policy.lane(id).map_or(1, |p| p.weight)))
+        .collect();
+    if lanes.is_empty() {
+        h.raw("<p class=\"empty\">Nothing waits.</p>");
+        return h;
+    }
+    // The least held for its weight first, as the scheduler serves lanes within a step.
+    lanes.sort_by(|(a, la, wa), (b, lb, wb)| {
+        (u128::from(la.held) * u128::from(*wb))
+            .cmp(&(u128::from(lb.held) * u128::from(*wa)))
+            .then_with(|| a.cmp(b))
+    });
+    h.raw("<table class=\"grid\"><thead><tr><th>lane</th><th>held ÷ weight</th>")
+        .raw("<th>waiting</th></tr></thead><tbody>");
+    for (id, lane, weight) in lanes {
+        h.raw("<tr><td>")
+            .text(shown.known.label(id))
+            .raw("</td><td>")
+            .text(share_text(lane.held, weight))
+            .raw("</td><td><details data-keep=\"")
+            .text(lane_param(id))
+            .raw("\"><summary>")
+            .text(lane.waiting.len())
+            .raw(" waiting</summary><ul>");
+        for w in lane.waiting.iter().take(MAX_LISTED_WAITING) {
+            h.raw("<li>");
+            match &w.job {
+                Some(job) => {
+                    h.raw("<a href=\"")
+                        .raw(super::jobs::DETAIL_PREFIX)
+                        .text(job)
+                        .raw("\">queued job</a>");
+                }
+                None => {
+                    h.raw("request");
+                }
+            }
+            if let Some(relay) = &w.relay {
+                let name = (shown.known.relays.iter())
+                    .find(|(id, _)| id == relay)
+                    .map_or(relay.as_str(), |(_, host)| host.as_str());
+                h.raw(" · relay ").text(name);
+            }
+            if let Some(runner) = &w.runner {
+                h.raw(" · ").text(runner);
+            }
+            h.raw(" · ")
+                .text(w.step.name())
+                .raw(" · ")
+                .text(crate::store::envelope_text(w.envelope))
+                .raw(" · ")
+                .text(w.waited_secs)
+                .raw(" s · ")
+                .text(w.reason)
+                .raw("</li>");
+        }
+        if let Some(more) = lane.waiting.len().checked_sub(MAX_LISTED_WAITING)
+            && more > 0
+        {
+            h.raw("<li>and ").text(more).raw(" more</li>");
+        }
+        h.raw("</ul></details></td></tr>");
+    }
+    h.raw("</tbody></table>");
+    h
+}
+
+/// `held ÷ weight = share`, as the live view shows it.
+fn share_text(held: u64, weight: u32) -> String {
+    let share = held as f64 / f64::from(weight.max(1));
+    format!("{held} ÷ {weight} = {share:.1}")
+}
+
+/// What `/events/lanes` renders: the live view, as the page shows it.
+pub(super) fn live_render(hub: &Arc<Hub>) -> super::sse::Render {
+    let hub = hub.clone();
+    Arc::new(move || {
+        let shown = Shown::read(&hub)?;
+        Ok(match &shown.policy {
+            Ok(policy) => live_fragment(&shown, policy, crate::now_secs()).into_string(),
+            Err(e) => {
+                let mut h = Html::new();
+                unreadable(&mut h, e);
+                h.into_string()
+            }
+        })
+    })
 }
 
 /// A form posting `op` to [`PATH`] against the policy of digest `expected`, left open.
@@ -1158,6 +1315,77 @@ mod tests {
         lane.projects = Some(vec![]);
         assert_eq!(known.projects_text(&lane), "none");
         assert_eq!(known.projects_text(&Lane::new(&LaneId::Default)), "-");
+    }
+
+    #[test]
+    fn the_live_view_lists_waiting_lanes_by_held_for_weight() {
+        use crate::jobs::{LastPick, LiveLane, Waiting};
+        let runner = LaneId::Runner {
+            gitlab: "gl".into(),
+            id: 42,
+        };
+        let mut policy = Policy::default();
+        policy.lanes.push(Lane {
+            weight: 3,
+            ..Lane::new(&runner)
+        });
+        let waiting = |job: Option<&str>, step, reason| Waiting {
+            job: job.map(str::to_owned),
+            relay: job.is_none().then(|| "r1".to_owned()),
+            runner: job.is_none().then(|| "app-main".to_owned()),
+            envelope: Envelope {
+                mem_mib: 1024,
+                cpus: 2,
+                disk_bytes: 0,
+            },
+            step,
+            waited_secs: 12,
+            reason,
+        };
+        let mut shown = Shown {
+            policy: Ok(policy.clone()),
+            note: None,
+            known: Known::default(),
+            live: LiveView::default(),
+        };
+        shown.live.lanes.insert(
+            runner.clone(),
+            LiveLane {
+                held: 6,
+                waiting: vec![waiting(None, Step::Normal, "backoff")],
+            },
+        );
+        shown.live.lanes.insert(
+            LaneId::Default,
+            LiveLane {
+                held: 4,
+                waiting: vec![waiting(Some("j1"), Step::Deadline, "lane at max slots")],
+            },
+        );
+        shown.live.last_pick = Some(LastPick {
+            lane: runner,
+            step: Step::Normal,
+            held: 5,
+            weight: 3,
+            at: 98,
+        });
+        let h = live_fragment(&shown, &policy, 100).into_string();
+        for want in [
+            "deadline <strong>1</strong>",
+            "normal <strong>1</strong>",
+            ": Runner 42, normal step, held ÷ weight 5 ÷ 3 = 1.7.",
+            "<tr><td>Runner 42</td><td>6 ÷ 3 = 2.0</td><td><details data-keep=\"runner/gl/42\"><summary>1 waiting</summary>\
+             <ul><li>request · relay r1 · app-main · normal · 1024 MiB",
+            "· 12 s · backoff</li>",
+            "<a href=\"/jobs/j1\">queued job</a> · deadline",
+        ] {
+            assert!(h.contains(want), "{want}: {h}");
+        }
+        // 2.0 before 4.0.
+        assert!(
+            h.find("Runner 42</td>") < h.find("Other API keys</td>"),
+            "{h}"
+        );
     }
 
     fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

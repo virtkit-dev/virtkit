@@ -60,6 +60,14 @@ with `capacity-policy set` only. A policy held since its conversion lists the pl
 that did not convert; other edits leave it held, and *Activate* (or replacing the whole policy)
 ends the hold. Each project's page lists the lanes that may run it.
 
+The page's *Live* section updates as the scheduler works. It shows the requests and queued
+jobs waiting in each step (deadline, reserved, production, production probes, normal), each
+lane with work waiting and the slots it holds for its weight, and each waiting request's or
+job's reason. *Last pick* is the scheduler's latest grant as recorded when
+it made it — lane, step, held ÷ weight then — kept in memory since the hub started; the page
+never predicts the next one. Per-node load stays on *Nodes*, delisted and finished jobs on
+*Jobs*.
+
 From the hub's host, through its admin socket:
 
 ```sh

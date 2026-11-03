@@ -122,6 +122,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         super::clients::RELAYS_EVENT => Some(super::clients::RELAYS_EVENT),
         _ if super::clients::server_event(event).is_some() => Some(super::clients::SERVER_EVENT),
         super::egress::EVENT => Some(super::egress::EVENT),
+        super::lanes::EVENT => Some(super::lanes::EVENT),
         _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
             .strip_prefix("node/")
@@ -186,6 +187,13 @@ pub(super) fn source(
                 },
                 feed: feed.subscribe(),
                 events: clients_events(hub, steer),
+            });
+        }
+        super::lanes::EVENT => {
+            return Some(Source::Own {
+                name: super::lanes::EVENT,
+                changes: hub.subscribe_server(),
+                render: counted(hub, super::lanes::live_render(hub)),
             });
         }
         "nodes" => {
