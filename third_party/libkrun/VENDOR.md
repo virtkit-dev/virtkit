@@ -51,6 +51,19 @@ driver never asked for. Covered by `write_from_at_must_not_overread_past_count`.
 
 ### virtio-fs passthrough (forward-ported from the 1.19 tree)
 
+`src/libkrun/src/vmm/linux/virtiofs_test.rs` + `src/devices/src/virtio/fs/worker.rs` —
+opt-in x86_64 Linux regression hook for `tests/virtiofs-full-ring-e2e.sh`.
+`VK_TEST_VIRTIOFS_ENQUEUE_PC` takes the hexadecimal guest address of
+`virtio_fs_enqueue_req`. Hardware execution breakpoints observe entry and return;
+an actual `-ENOSPC` return is logged and that vCPU sleeps for 200 ms, after enqueue
+has released the ring lock but before its caller handles the error. Large chains
+(at least 256 descriptors) get a 20 ms service delay to make the ring fill. Guest
+instructions and return values are untouched. With the variable absent, neither
+breakpoints nor delays are enabled. This is test-only: it takes over the guest's
+hardware debug registers, requires a non-preemptible kernel and stable text addresses,
+and fails on nested enqueue calls or unexpected debug exits. The Rust probe pins listings
+away from the effective IRQ CPUs and the runner refuses to pass without an observed refusal.
+
 `src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — share options the passthrough
 `Config` did not carry (`no_sync` on both hosts, the rest on Linux): `negative_timeout` (a
 missed lookup answers a zero-inode entry with that validity instead of ENOENT, so the guest

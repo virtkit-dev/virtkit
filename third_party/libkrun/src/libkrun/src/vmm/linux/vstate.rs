@@ -1044,7 +1044,13 @@ fn int1_workaround(windows: bool) -> bool {
 /// long-mode page tables (4 or 5 levels, 1 GiB and 2 MiB pages). `None` outside long mode, or
 /// for an address the tables do not map.
 #[cfg(target_arch = "x86_64")]
-fn guest_linear_byte(mem: &GuestMemoryMmap, cr3: u64, cr4: u64, efer: u64, va: u64) -> Option<u8> {
+pub(super) fn guest_linear_byte(
+    mem: &GuestMemoryMmap,
+    cr3: u64,
+    cr4: u64,
+    efer: u64,
+    va: u64,
+) -> Option<u8> {
     use vm_memory::Bytes;
     const PRESENT: u64 = 1;
     const PAGE_SIZE_BIT: u64 = 1 << 7;
@@ -1211,6 +1217,9 @@ pub struct Vcpu {
     #[cfg(target_arch = "x86_64")]
     int1_memory: Option<GuestMemoryMmap>,
 
+    #[cfg(target_arch = "x86_64")]
+    virtiofs_test: Option<super::virtiofs_test::EnqueueProbe>,
+
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
 
@@ -1355,6 +1364,7 @@ impl Vcpu {
             hyperv: false,
             kernel_enomem_workaround,
             int1_memory: None,
+            virtiofs_test: None,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1523,6 +1533,9 @@ impl Vcpu {
                 );
             }
         }
+
+        self.virtiofs_test = super::virtiofs_test::EnqueueProbe::configure(&self.fd, guest_mem)
+            .map_err(Error::VcpuSetGuestDebug)?;
 
         if kernel_boot {
             arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
@@ -1986,7 +1999,13 @@ impl Vcpu {
                 // A #DB of the guest's, on a host where this vCPU takes them (local patch).
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::Debug(debug) => {
-                    self.step_over_int1(debug)?;
+                    if let Some(probe) = &mut self.virtiofs_test {
+                        probe
+                            .handle(&self.fd, debug.pc, self.id)
+                            .map_err(Error::VcpuSetGuestDebug)?;
+                    } else {
+                        self.step_over_int1(debug)?;
+                    }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::Hlt => {

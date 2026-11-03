@@ -10,4 +10,5 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 flate2.workspace = true
+libc.workspace = true
 sha1.workspace = true

@@ -4344,6 +4344,7 @@ version = "0.102.3"
 dependencies = [
  "anyhow",
  "flate2",
+ "libc",
  "sha1",
 ]
 

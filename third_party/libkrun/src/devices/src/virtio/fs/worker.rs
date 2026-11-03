@@ -131,6 +131,8 @@ pub struct FsWorker {
     label: String,
     /// What the stall checks saw of each queue, by queue index.
     stall_watch: [StallWatch; NUM_QUEUES],
+    /// Test-only delay to make concurrent large requests exhaust the descriptor ring.
+    full_ring_test: bool,
 }
 
 /// What a stall check reads of one queue: where the avail ring stands, and with `EVENT_IDX`
@@ -307,6 +309,7 @@ impl FsWorker {
             map_sender,
             label,
             stall_watch: Default::default(),
+            full_ring_test: std::env::var_os("VK_TEST_VIRTIOFS_ENQUEUE_PC").is_some(),
         })
     }
 
@@ -520,6 +523,12 @@ impl FsWorker {
     fn process_queue(&mut self, queue_index: usize) {
         let queue = &mut self.queues[queue_index];
         while let Some(head) = queue.pop(&self.mem) {
+            if self.full_ring_test
+                && queue_index == REQ_INDEX
+                && head.clone().into_iter().count() >= 256
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();

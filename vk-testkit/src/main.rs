@@ -5,6 +5,11 @@
 //! commit of `<branch>` in a new bare repository `<repo>` for git's dumb HTTP transport:
 //! loose objects, `HEAD`, `info/refs` and an empty `objects/info/packs`. Served as plain
 //! files, it can be cloned. Prints the commit's id. The same files make the same commit.
+//!
+//! `vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds>` runs in a guest: see
+//! [`virtiofs_burst`].
+
+mod virtiofs_burst;
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -16,7 +21,7 @@ use sha1::{Digest, Sha1};
 
 fn main() -> std::process::ExitCode {
     match run(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(status) => std::process::ExitCode::from(status),
         Err(e) => {
             // Not `eprintln!`, which panics when the write fails.
             let _ = writeln!(std::io::stderr(), "vk-testkit: {e:#}");
@@ -25,15 +30,32 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run(args: &[std::ffi::OsString]) -> Result<()> {
+/// Runs one subcommand; returns the exit status.
+fn run(args: &[std::ffi::OsString]) -> Result<u8> {
     match args {
         [cmd, src, repo, branch] if cmd == "git-repo" => {
             let branch = branch.to_str().context("the branch name is not UTF-8")?;
             let commit = git_repo(Path::new(src), Path::new(repo), branch)?;
             writeln!(std::io::stdout(), "{commit}")?;
-            Ok(())
+            Ok(0)
         }
-        _ => bail!("usage: vk-testkit git-repo <src> <repo> <branch>"),
+        [cmd, merged, share, threads, seconds] if cmd == "virtiofs-burst" => {
+            let number = |arg: &std::ffi::OsString, what: &str| -> Result<u64> {
+                arg.to_str()
+                    .and_then(|s| s.parse().ok())
+                    .with_context(|| format!("{what} is not a number"))
+            };
+            virtiofs_burst::run(
+                Path::new(merged),
+                Path::new(share),
+                usize::try_from(number(threads, "the thread count")?)?,
+                number(seconds, "the duration")?,
+            )
+        }
+        _ => bail!(
+            "usage: vk-testkit git-repo <src> <repo> <branch>\n       \
+             vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds>"
+        ),
     }
 }
 
