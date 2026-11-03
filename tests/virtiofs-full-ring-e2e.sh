@@ -37,7 +37,10 @@ kernel=()
 if [ -n "${VIRTIOFS_KERNEL:-}" ]; then kernel=(--kernel "$VIRTIOFS_KERNEL"); fi
 image=${VIRTIOFS_IMAGE:-docker.io/library/alpine:3.21}
 if [ -z "${VK_TESTKIT:-}" ]; then
-  ./dev.sh build -p vk-testkit
+  # CI supplies VK as an artifact path; dev.sh locates vk through PATH.
+  mkdir "$work/bin"
+  ln -s "$VK" "$work/bin/vk"
+  PATH="$work/bin:$PATH" ./dev.sh build -p vk-testkit
   VK_TESTKIT=$here/target/x86_64-unknown-linux-musl/debug/vk-testkit
 fi
 cp "$VK_TESTKIT" "$work/vk-testkit"
