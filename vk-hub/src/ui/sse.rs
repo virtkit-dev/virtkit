@@ -96,6 +96,15 @@ const COMMENT: &[u8] = b": keep-alive\n\n";
 /// The event on which a page's `sse-close` closes the stream for good.
 pub const CLOSE: &str = "close";
 
+/// The event each stream opens with, carrying the hub's version: a page built by another
+/// version, open across the hub's update, reloads (`retry.js`) rather than swap the new
+/// version's fragments into its old frame.
+pub const VERSION: &str = "version";
+
+fn version() -> Bytes {
+    event(VERSION, env!("CARGO_PKG_VERSION"))
+}
+
 /// The streams open, against [`MAX_STREAMS`] and [`MAX_SESSION_STREAMS`].
 pub struct Streams {
     all: Arc<Semaphore>,
@@ -449,9 +458,11 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
         None => return Ok(()),
     }
     let mut sent = Sent::default();
-    if let Some(first) = sent.news(&first)
-        && !send(&tx, first).await?
-    {
+    let mut opening = version().to_vec();
+    if let Some(first) = sent.news(&first) {
+        opening.extend_from_slice(&first);
+    }
+    if !send(&tx, Bytes::from(opening)).await? {
         return Ok(());
     }
     loop {
@@ -531,6 +542,7 @@ async fn follow(
     let mut refresh = refresh_interval();
     let mut last_sent = Instant::now();
     let mut recheck = false;
+    let mut opening = true;
     loop {
         changes.borrow_and_update();
         let stepped = Instant::now();
@@ -544,6 +556,9 @@ async fn follow(
             None => return Ok(()),
         }
         let mut frame = Vec::new();
+        if std::mem::take(&mut opening) {
+            frame.extend_from_slice(&version());
+        }
         for &(event_name, ref data) in &step.events {
             frame.extend_from_slice(&event(event_name, data));
         }
@@ -677,7 +692,9 @@ mod tests {
         let Body::Stream(rx) = resp.body_mut() else {
             panic!("not a stream");
         };
-        assert_eq!(rx.recv().await.unwrap(), event("t", "B"));
+        let mut opening = version().to_vec();
+        opening.extend_from_slice(&event("t", "B"));
+        assert_eq!(rx.recv().await.unwrap(), opening);
         *lock(&shown) = "A".to_string();
         changes.send_modify(|n| *n += 1);
         let next = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;

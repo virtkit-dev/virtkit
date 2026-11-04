@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- vk-hub: pages left open during an update reload when they reconnect, so
+  menus and headers match the live content.
+
 ## [0.103.0] - 2026-11-04
 
 ### Changed

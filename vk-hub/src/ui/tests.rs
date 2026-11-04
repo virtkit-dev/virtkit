@@ -806,6 +806,8 @@ struct Events {
     body: String,
     /// The last chunk has been read.
     ended: bool,
+    /// The `version` events the stream opened with, which [`Events::next`] skips.
+    versions: Vec<String>,
 }
 
 impl Events {
@@ -819,6 +821,7 @@ impl Events {
             buf: Vec::new(),
             body: String::new(),
             ended: false,
+            versions: Vec::new(),
         };
         while !events.buf.windows(4).any(|w| w == b"\r\n\r\n") {
             assert!(events.fill().await, "no response head");
@@ -844,7 +847,8 @@ impl Events {
         n > 0
     }
 
-    /// The next event, comments skipped; `None` once the stream has ended.
+    /// The next event, comments and `version` events skipped; `None` once the stream has
+    /// ended.
     async fn next(&mut self) -> Option<String> {
         loop {
             // Whole chunks into `body`.
@@ -865,7 +869,9 @@ impl Events {
             }
             while let Some(end) = self.body.find("\n\n") {
                 let event: String = self.body.drain(..end + 2).collect();
-                if !event.starts_with(':') {
+                if event.starts_with("event: version\n") {
+                    self.versions.push(event);
+                } else if !event.starts_with(':') {
                     return Some(event);
                 }
             }
@@ -914,8 +920,15 @@ async fn a_page_is_kept_live_over_server_sent_events() {
         head.contains(&format!("content-security-policy: {CSP}")),
         "{head}"
     );
-    // The current table at once, as a single `vms` event.
+    // The hub's version first, then the current table as one immediate `vms` event.
     let first = events.next().await.unwrap();
+    assert_eq!(
+        events.versions,
+        [format!(
+            "event: version\ndata: {}\n\n",
+            env!("CARGO_PKG_VERSION")
+        )]
+    );
     assert!(first.starts_with("event: vms\ndata: <table"), "{first}");
     assert!(first.contains("alpine:3.20"), "{first}");
 
@@ -1115,6 +1128,8 @@ async fn pages_load_only_the_embedded_scripts() {
             .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
             .and_then(|rest| rest.get(..21));
         assert!(now.is_some_and(|now| now.ends_with("Z\"")), "{body}");
+        let version = format!("\" data-version=\"{}\"><head>", env!("CARGO_PKG_VERSION"));
+        assert!(body.contains(&version), "{body}");
         assert!(!body.contains(" style="), "{body}");
         // No event handler attribute: ` on<letters>=`.
         let handler = body.split(" on").skip(1).any(|rest| {

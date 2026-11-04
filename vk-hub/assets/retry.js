@@ -16,6 +16,10 @@
 // token's creation — are the browser's own, and are never sent again here. A post whose form a
 // live update replaced while it was under way fails unseen: its events no longer reach the
 // document.
+//
+// A page open across the hub's update reloads once its live updates reconnect to the new
+// version, which each stream names first: its fragments would not fit the old page around
+// them.
 // Loaded as a file: the policy allows no inline script, and nothing here evaluates code.
 (function () {
   "use strict";
@@ -23,6 +27,19 @@
   if (typeof htmx === "undefined") {
     return;
   }
+
+  document.addEventListener("htmx:sseOpen", function (e) {
+    var source = e.detail.source;
+    if (source === undefined || source.vkVersion) {
+      return;
+    }
+    source.vkVersion = true;
+    source.addEventListener("version", function (message) {
+      if (message.data !== document.documentElement.getAttribute("data-version")) {
+        location.reload();
+      }
+    });
+  });
 
   // Retry budget from the first failure, and maximum delay between retries.
   var PATIENCE = 60 * 1000;

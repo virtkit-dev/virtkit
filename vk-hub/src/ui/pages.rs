@@ -266,10 +266,12 @@ fn current(nav: &Nav, here: &str) -> (usize, usize) {
 const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"historyCacheSize":0,"refreshOnHistoryMiss":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":true,"error":false},{"code":"5..","swap":true,"error":false},{"code":"...","swap":false,"error":true}]}"#;
 
 /// Open the page through its head. `data-now` gives `time.js` the hub's page-generation
-/// time so ages use the hub's clock.
+/// time so ages use the hub's clock; `data-version` tells `retry.js` which version built it.
 fn head(h: &mut Html, title: &str) {
     h.raw("<!doctype html><html lang=\"en\" data-now=\"")
         .text(crate::utc(crate::now_secs()))
+        .raw("\" data-version=\"")
+        .raw(env!("CARGO_PKG_VERSION"))
         .raw("\"><head><meta charset=\"utf-8\">")
         .raw("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
         .raw("<meta name=\"htmx-config\" content='")
