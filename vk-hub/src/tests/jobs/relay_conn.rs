@@ -13,7 +13,7 @@ use super::*;
 type H2Body = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
 
 /// A relay's session on its connection's stream.
-type Session = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
+type Session = vk_peer::session::Ws;
 
 /// One HTTP/2 connection to the hub, as a relay's.
 #[derive(Clone)]
@@ -168,8 +168,19 @@ async fn open_session(
 ) -> (HubMsg, Session) {
     let (status, upgraded) = h2.connect().await;
     assert_eq!(status, 200);
-    let mut ws =
-        WebSocketStream::from_raw_socket(TokioIo::new(upgraded.unwrap()), Role::Client, None).await;
+    let io: Box<dyn vk_peer::session::Io> = Box::new(TokioIo::new(upgraded.unwrap()));
+    let ws = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+    authenticate(ws, key, ours, exported).await
+}
+
+/// The handshake of `key`'s relay on `ws`, speaking `ours`: what the hub answered the auth
+/// with, and the session.
+async fn authenticate(
+    mut ws: Session,
+    key: &str,
+    ours: VersionRange,
+    exported: Option<&[u8; TLS_EXPORTER_LEN]>,
+) -> (HubMsg, Session) {
     let (id, pair) = relay_pair(key);
     let incarnation = "1".repeat(32);
     let hello = serde_json::to_string(&super::super::hello(&id, &incarnation, ours)).unwrap();
@@ -547,4 +558,98 @@ async fn a_relay_is_told_when_its_tickets_and_jobs_change() {
     let more = tokio::time::timeout(Duration::from_millis(500), session.recv()).await;
     assert!(more.is_err(), "{more:?}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `vk-peer`'s dial of a relay's connection, over TLS and plain: the session it opens
+/// authenticates the connection its request sender is on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_opens_a_relay_s_connection() {
+    for tls in [true, false] {
+        let (dir, addr, _hub, key) = hub_and_relay("relay-conn-peer", tls).await;
+        let scheme = if tls { "https" } else { "http" };
+        let hub = format!("{scheme}://localhost:{}", addr.port());
+        let config = Arc::new(super::super::client_config(&[&rustls::version::TLS13], &[]));
+        let conn = vk_peer::session::connect_relay::<http_body_util::Full<bytes::Bytes>>(
+            &hub,
+            &config,
+            &hyper::client::conn::http2::Builder::new(TokioExecutor::new()),
+            gl::SESSION_PATH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.exported.is_some(), tls);
+        let ours = VersionRange {
+            min: 2,
+            max: gl::CONNECTION,
+        };
+        let (welcome, ws) = authenticate(conn.ws, &key, ours, conn.exported.as_ref()).await;
+        assert!(matches!(welcome, HubMsg::Welcome { .. }), "{welcome:?}");
+        let _session = keep_reading(ws);
+        let body = serde_json::to_vec(&json!({"runner": "test", "placement": placement()}));
+        let req = hyper::Request::post(format!("{scheme}://{}/v1/capacity", conn.authority))
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.unwrap())))
+            .unwrap();
+        let resp = conn.sender.clone().send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// A hub that answers a relay's dial with HTTP/1.1, or with HTTP/2 that does not take a
+/// WebSocket over CONNECT, is one to upgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_finds_a_hub_without_relay_connections_outdated() {
+    let dial = |hub: String| async move {
+        let config = Arc::new(super::super::client_config(&[&rustls::version::TLS13], &[]));
+        vk_peer::session::connect_relay::<http_body_util::Full<bytes::Bytes>>(
+            &hub,
+            &config,
+            &hyper::client::conn::http2::Builder::new(TokioExecutor::new()),
+            gl::SESSION_PATH,
+        )
+        .await
+        .err()
+        .unwrap()
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = {
+        let certs = CertificateDer::pem_slice_iter(TLS_CERT)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(TLS_KEY).unwrap();
+        config::acceptor(certs, key, config::UI_ALPN).unwrap()
+    };
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            if let Ok(stream) = acceptor.accept(tcp).await {
+                tokio::spawn(async move {
+                    let _held = stream;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        }
+    });
+    let e = dial(format!("https://localhost:{}", addr.port())).await;
+    assert!(e.is::<vk_peer::session::Outdated>(), "{e:#}");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let svc = hyper::service::service_fn(|_req| async {
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::new(),
+                )))
+            });
+            tokio::spawn(
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tcp), svc),
+            );
+        }
+    });
+    let e = dial(format!("http://localhost:{}", addr.port())).await;
+    assert!(e.is::<vk_peer::session::Outdated>(), "{e:#}");
 }

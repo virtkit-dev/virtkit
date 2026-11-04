@@ -139,7 +139,12 @@ impl HubClient {
             let transport = |what: &str, e: &dyn std::fmt::Display| {
                 DispatchError::new(ErrorKind::Transport, format!("{what}: {e}"))
             };
-            let (io, exported, authority) = vk_peer::session::dial(&self.opts.hub, &self.opts.tls)
+            let vk_peer::session::Dialed {
+                io,
+                exported,
+                authority,
+                ..
+            } = vk_peer::session::dial(&self.opts.hub, &self.opts.tls)
                 .await
                 .map_err(|e| transport("reaching the hub", &format!("{e:#}")))?;
             let channel = match &exported {

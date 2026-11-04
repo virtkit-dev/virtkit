@@ -63,6 +63,14 @@ fn connector_alpn(
     versions: &[&'static rustls::SupportedProtocolVersion],
     alpn: &[&[u8]],
 ) -> TlsConnector {
+    TlsConnector::from(Arc::new(client_config(versions, alpn)))
+}
+
+/// A TLS client config trusting the test CA, speaking only `versions` and offering `alpn`.
+fn client_config(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    alpn: &[&[u8]],
+) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(TLS_CA) {
         roots.add(cert.unwrap()).unwrap();
@@ -75,7 +83,7 @@ fn connector_alpn(
     .with_root_certificates(roots)
     .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    TlsConnector::from(Arc::new(config))
+    config
 }
 
 fn keypair() -> Ed25519KeyPair {
@@ -1103,6 +1111,27 @@ async fn a_tls_session_is_bound_to_its_connection() {
     assert_eq!(code, RefusalCode::BadSignature);
     assert!(reason.contains("pass TLS through"), "{reason}");
     assert_eq!(hub.reach(&node_id), Reach::Connected);
+}
+
+/// The hub offers HTTP/2 under a relay's private ID alone: a peer offering `h2` stays on
+/// HTTP/1.1, which session upgrades require.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_dial_settles_on_what_it_offers() {
+    let (addr, _hub) = start_tls().await;
+    let hub = format!("https://localhost:{}", addr.port());
+    let h2 = |alpn: &[&[u8]]| {
+        let hub = hub.clone();
+        let tls = Arc::new(client_config(&[&rustls::version::TLS13], alpn));
+        async move { vk_peer::session::dial(&hub, &tls).await.unwrap().h2 }
+    };
+    assert!(!h2(&[]).await);
+    assert!(!h2(&[b"http/1.1"]).await);
+    assert!(!h2(&[b"h2", b"http/1.1"]).await);
+    let tls = Arc::new(client_config(&[&rustls::version::TLS13], &[]));
+    let (_ws, exported) = vk_peer::session::connect(&hub, &tls, vk_hub_proto::NODE_PATH)
+        .await
+        .unwrap();
+    assert!(exported.is_some());
 }
 
 /// A hub keeping releases in a fresh directory under `tag`, on an ephemeral loopback port: the

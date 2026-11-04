@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
+use hyper::client::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use vk_hub_proto::gitlab;
 use vk_hub_proto::{Channel, HubMsg, NodeMsg, TLS_EXPORTER_LEN, VersionRange};
 
 use crate::identity::Identity;
@@ -61,13 +64,18 @@ pub async fn connect(
     tls: &Arc<rustls::ClientConfig>,
     path: &str,
 ) -> Result<(Ws, Option<[u8; TLS_EXPORTER_LEN]>)> {
-    let (io, exported, authority) = dial(hub, tls).await?;
+    let Dialed {
+        io,
+        exported,
+        authority,
+        h2,
+    } = dial(hub, tls).await?;
+    if h2 {
+        bail!("a session needs HTTP/1.1, and TLS negotiated HTTP/2");
+    }
     let scheme = if exported.is_some() { "wss" } else { "ws" };
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(vk_hub_proto::MAX_MESSAGE))
-        .max_frame_size(Some(vk_hub_proto::MAX_MESSAGE));
     let ws_url = format!("{scheme}://{authority}{path}");
-    let (ws, _) = tokio_tungstenite::client_async_with_config(ws_url, io, Some(config))
+    let (ws, _) = tokio_tungstenite::client_async_with_config(ws_url, io, Some(ws_config()))
         .await
         .map_err(|e| match e {
             // The hub's bound on handshakes in flight: transient by design.
@@ -82,13 +90,142 @@ pub async fn connect(
     Ok((ws, exported))
 }
 
-/// A connection to the hub's listener: TCP, and TLS for an `https` hub. Returns it
-/// with the TLS keying material a signature on it is bound to — `None` on plain TCP — and
-/// the `host:port` it reached.
-pub async fn dial(
+/// A session's WebSocket bounds: messages and frames of at most [`vk_hub_proto::MAX_MESSAGE`].
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(vk_hub_proto::MAX_MESSAGE))
+        .max_frame_size(Some(vk_hub_proto::MAX_MESSAGE))
+}
+
+/// A hub that cannot carry a relay's connection: it negotiated HTTP/1.1, or its HTTP/2 does
+/// not take a WebSocket over CONNECT. Only an upgrade of the hub fixes it.
+#[derive(Debug)]
+pub struct Outdated(pub String);
+
+impl std::fmt::Display for Outdated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Outdated {}
+
+/// A relay's one connection to the hub: its session's WebSocket and the sender of its requests,
+/// both on the same HTTP/2 connection, which a task of its own drives until it closes.
+pub struct RelayConnection<B> {
+    pub ws: Ws,
+    /// Requests on the connection, served as the relay's once its session's handshake passed.
+    pub sender: http2::SendRequest<B>,
+    /// The TLS keying material the session's auth is bound to; `None` on plain TCP.
+    pub exported: Option<[u8; TLS_EXPORTER_LEN]>,
+    /// The `host:port` it reached, which a request's URI names.
+    pub authority: String,
+}
+
+/// Dial the hub as a relay: TLS offering [`vk_hub_proto::gitlab::ALPN`] (or HTTP/2 with prior
+/// knowledge on plain TCP), HTTP/2 through `h2`, and the session at `path` opened as a WebSocket
+/// over the extended CONNECT (RFC 8441). A hub that answers HTTP/1.1, or whose HTTP/2 does
+/// not enable the extended CONNECT, is [`Outdated`]. Nothing here is bounded in time: the
+/// caller bounds the whole.
+pub async fn connect_relay<B>(
     hub: &str,
     tls: &Arc<rustls::ClientConfig>,
-) -> Result<(Box<dyn Io>, Option<[u8; TLS_EXPORTER_LEN]>, String)> {
+    h2: &http2::Builder<TokioExecutor>,
+    path: &str,
+) -> Result<RelayConnection<B>>
+where
+    B: hyper::body::Body + Default + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let mut offer = (**tls).clone();
+    offer.alpn_protocols = vec![gitlab::ALPN.to_vec(), b"http/1.1".to_vec()];
+    let Dialed {
+        io,
+        exported,
+        authority,
+        h2: negotiated,
+    } = dial(hub, &Arc::new(offer)).await?;
+    if exported.is_some() && !negotiated {
+        return Err(anyhow::Error::new(Outdated(format!(
+            "{hub} speaks only HTTP/1.1 to relays: it needs an upgrade"
+        ))));
+    }
+    // A plain WebSocket's CONNECT names `http` (RFC 8441, section 5).
+    let scheme = if exported.is_some() { "https" } else { "http" };
+    let (mut sender, mut conn) = h2
+        .handshake::<_, B>(TokioIo::new(io))
+        .await
+        .map_err(|e| anyhow!("opening HTTP/2 to {hub}: {e}"))?;
+    let mut req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .uri(format!("{scheme}://{authority}{path}"))
+        .header(hyper::header::SEC_WEBSOCKET_VERSION, "13")
+        .body(B::default())
+        .context("building the session's CONNECT")?;
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    // Drive the connection until the CONNECT is answered: the hub's SETTINGS, sent before any
+    // answer, are read off it.
+    let answered = tokio::select! {
+        ended = &mut conn => {
+            bail!("{hub} closed the connection before answering the session: {}", match ended {
+                Ok(()) => "no error".to_string(),
+                Err(e) => e.to_string(),
+            })
+        }
+        answered = sender.send_request(req) => answered,
+    };
+    // A refused stream on a live connection whose SETTINGS lack the extended CONNECT is the
+    // hub's answer; a connection that failed is not.
+    let alive = futures::poll!(&mut conn).is_pending();
+    if !conn.is_extended_connect_protocol_enabled() && (answered.is_ok() || alive) {
+        return Err(anyhow::Error::new(Outdated(format!(
+            "{hub} does not take a relay's session over HTTP/2: it needs an upgrade"
+        ))));
+    }
+    let resp = answered.map_err(|e| anyhow!("opening the session with {hub}: {e}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            log::debug!("The connection to the hub ended: {e}");
+        }
+    });
+    match resp.status() {
+        hyper::StatusCode::OK => {}
+        // The hub's bound on handshakes in flight: transient by design.
+        hyper::StatusCode::SERVICE_UNAVAILABLE => {
+            bail!("{hub} is busy with other peers' handshakes (HTTP 503)")
+        }
+        status => bail!("{hub} refused the session's CONNECT with {status}"),
+    }
+    let upgraded = hyper::upgrade::on(resp)
+        .await
+        .map_err(|e| anyhow!("opening the session with {hub}: {e}"))?;
+    let io: Box<dyn Io> = Box::new(TokioIo::new(upgraded));
+    let ws = WebSocketStream::from_raw_socket(io, Role::Client, Some(ws_config())).await;
+    Ok(RelayConnection {
+        ws,
+        sender,
+        exported,
+        authority,
+    })
+}
+
+/// A connection [`dial`] made.
+pub struct Dialed {
+    /// TCP, wrapped in TLS for an `https` hub.
+    pub io: Box<dyn Io>,
+    /// TLS keying material binding the signature to this connection; `None` on plain TCP.
+    pub exported: Option<[u8; TLS_EXPORTER_LEN]>,
+    /// The `host:port` it reached.
+    pub authority: String,
+    /// Whether TLS negotiated HTTP/2: `h2`, or a relay's [`gitlab::ALPN`], when `tls` offers
+    /// it.
+    pub h2: bool,
+}
+
+/// A connection to the hub's listener: TCP, and TLS for an `https` hub.
+pub async fn dial(hub: &str, tls: &Arc<rustls::ClientConfig>) -> Result<Dialed> {
     let url = reqwest::Url::parse(hub).with_context(|| format!("parsing the hub URL {hub:?}"))?;
     // Bracketed for an IPv6 literal, which is the form both the socket address and the
     // WebSocket URL want.
@@ -111,7 +248,7 @@ pub async fn dial(
     // Heartbeats are small and latency is what a session is judged on.
     tcp.set_nodelay(true).context("setting TCP_NODELAY")?;
     keepalive(&tcp).context("setting TCP keepalives")?;
-    let (io, exported): (Box<dyn Io>, _) = match url.scheme() {
+    let (io, exported, h2): (Box<dyn Io>, _, _) = match url.scheme() {
         "https" => {
             // An IP literal is verified against the certificate's IP addresses, a name
             // against its DNS names.
@@ -131,12 +268,21 @@ pub async fn dial(
                 .1
                 .export_keying_material(&mut exported, vk_hub_proto::TLS_EXPORTER_LABEL, None)
                 .context("exporting TLS keying material")?;
-            (Box::new(stream), Some(exported))
+            let h2 = matches!(
+                stream.get_ref().1.alpn_protocol(),
+                Some(b"h2" | gitlab::ALPN)
+            );
+            (Box::new(stream), Some(exported), h2)
         }
-        "http" => (Box::new(tcp), None),
+        "http" => (Box::new(tcp), None, false),
         other => bail!("the hub URL has scheme {other:?}; expected https (or http on loopback)"),
     };
-    Ok((io, exported, authority))
+    Ok(Dialed {
+        io,
+        exported,
+        authority,
+        h2,
+    })
 }
 
 /// How long a hub's resolved addresses are used before it is looked up again.

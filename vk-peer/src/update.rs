@@ -459,12 +459,12 @@ async fn attempt(
 ) -> Result<(), Failed> {
     use http_body_util::BodyExt;
     use std::io::Write;
-    let (io, exported, authority) = match tokio::time::timeout(
-        READ_TIMEOUT,
-        crate::session::dial(fetch.hub, fetch.tls),
-    )
-    .await
-    {
+    let crate::session::Dialed {
+        io,
+        exported,
+        authority,
+        ..
+    } = match tokio::time::timeout(READ_TIMEOUT, crate::session::dial(fetch.hub, fetch.tls)).await {
         Err(_) => {
             return Err(Failed::Retry(anyhow!(
                 "the hub was not reached within {READ_TIMEOUT:?}"

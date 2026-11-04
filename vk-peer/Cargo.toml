@@ -13,7 +13,7 @@ anyhow.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
-hyper = { workspace = true, features = ["client"] }
+hyper = { workspace = true, features = ["client", "http2"] }
 hyper-util.workspace = true
 libc.workspace = true
 log.workspace = true
