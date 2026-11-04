@@ -164,7 +164,8 @@ the outcome when the relay reconnects. A relay restarted mid-command ends it fro
 files: an add done if one names its command, else `gitlab_unreachable`; a removal done if the
 file is marked removed or gone, else `other`. Only a command the relay never accepted is lost with the
 hub's memory: if the relay's first report after the restart does not show it, it ends failed
-`token_lost`, for the operator to add again.
+`token_lost`, for the operator to add again. Unrecorded relay acks follow that report;
+an ack for the command replaces `token_lost`.
 
 **Capacity.** A new runner has no [lane](capacity-arbitration.md), so its jobs are refused until
 one maps its GitLab ID. Once the add is done, the page says so and links to adding the lane.

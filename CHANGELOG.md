@@ -11,6 +11,10 @@ All notable changes to virtkit will be documented in this file.
   checks each token with GitLab before starting the runner and keeps it in a private file
   under its state directory. Removed runners stop requesting jobs and leave after their
   running jobs finish.
+- **`vk-hub relays runners add|remove`.** Add a runner created in GitLab to a relay, from a
+  token file or stdin, with its pool, labels, envelope and limits; or remove one added this way.
+  The hub passes the token on to the relay without keeping it. `vk-hub relays show` tells each
+  runner's source and how each runner command ended.
 
 ### Fixed
 

@@ -9,8 +9,13 @@
 //! them; it downloads the release from
 //! [`vk_hub_proto::gitlab::RELEASE_PATH`] while the update is live. One from before updates is
 //! sent none.
+//!
+//! Likewise it adds a runner to, or removes one from, only a relay whose `[hub] allow` lists
+//! `runners`, at version [`RUNNERS`](vk_hub_proto::gitlab::RUNNERS) or later. An added runner's
+//! token stays in memory, never stored, until the relay answers: a hub restarted before then
+//! has lost it, and fails the add `token_lost` at the relay's next first report.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -21,14 +26,19 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::Message;
+use vk_hub_proto::client::Placement;
 use vk_hub_proto::gitlab::{
-    ALLOW_UPDATE, Command, HubRelayMsg, Operation, RelayMsg, Report, ServerState, ServerStatus,
+    ALLOW_RUNNERS, ALLOW_UPDATE, Command, HubRelayMsg, MAX_ADMISSIONS, MAX_LABELS, MAX_RUNNERS,
+    Operation, RUNNERS, RelayMsg, Report, Runner, RunnerSource, RunnerToken, ServerState,
+    ServerStatus,
 };
-use vk_hub_proto::{CommandAck, HubMsg, RefusalCode};
+use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
-use crate::store::{NotEnrolled, Program, RelayRow, RelayWrite, Release, normalize_gitlab_url};
+use crate::store::{
+    NotEnrolled, Program, RelayCommandRow, RelayRow, RelayWrite, Release, normalize_gitlab_url,
+};
 
 /// How long a command waits for its relay to take it.
 pub(crate) const COMMAND_TTL: Duration = Duration::from_secs(86_400);
@@ -121,8 +131,7 @@ async fn serve(
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut told: Option<ServerStatus> = None;
     let mut steer = Steer {
-        // A relay from before updates could not read a command.
-        speaks_updates: relay.version >= vk_hub_proto::gitlab::UPDATES,
+        version: relay.version,
         ..Steer::default()
     };
     loop {
@@ -216,11 +225,12 @@ async fn serve(
                     return Ok(why);
                 }
                 if inventory {
+                    record_added_runners(hub, relay).await?;
                     tell_status(ws, hub, relay, &mut told).await?;
                     steer.sync(ws, hub, relay).await?;
                 }
                 if let Some(report) = first_report {
-                    settle_unreported_updates(hub, relay, session, report).await?;
+                    settle_lost_commands(hub, relay, session, report).await?;
                     steer.sync(ws, hub, relay).await?;
                 }
             }
@@ -252,49 +262,116 @@ async fn tell_status(
 /// What a session has sent its relay of the hub's commands.
 #[derive(Default)]
 struct Steer {
-    /// Whether the session's version has commands.
-    speaks_updates: bool,
-    /// Whether its first report came, which settles the updates it lost track of.
+    /// The session's protocol version.
+    version: u32,
+    /// Whether its first report came, which settles the commands the hub lost track of.
     reported: bool,
     sent_commands: HashSet<String>,
 }
 
 impl Steer {
-    /// Send the relay each pending command once a session, after its first report, if its
-    /// session's version takes them. A relay whose `[hub] allow` no longer lists what one
-    /// needs is sent it all the same, and refuses it, rather than leave it to expire.
+    /// Send each pending command once per session, after its first report, if the protocol
+    /// version supports it. Include the token for an added runner. Send commands even if
+    /// `[hub] allow` no longer permits them, so the relay refuses them rather than leave
+    /// them to expire.
     async fn sync(&mut self, ws: &mut Ws, hub: &Hub, relay: &Peer) -> Result<()> {
-        if !(self.speaks_updates && self.reported) {
+        // A relay from before updates could not read a command.
+        if !(self.version >= vk_hub_proto::gitlab::UPDATES && self.reported) {
             return Ok(());
         }
         let db = hub.db.clone();
         let id = relay.id.clone();
+        let now = crate::now_secs();
         let pending =
-            tokio::task::spawn_blocking(move || db.pending_relay_commands(&id, crate::now_secs()))
-                .await??;
-        for command in pending {
-            if self.sent_commands.insert(command.id.clone()) {
-                send(ws, &HubRelayMsg::Command(command)).await?;
+            tokio::task::spawn_blocking(move || db.pending_relay_commands(&id, now)).await??;
+        for mut command in pending {
+            if command.op.min_version() > self.version || self.sent_commands.contains(&command.id) {
+                continue;
             }
+            if let Operation::AddRunner { token, .. } = &mut command.op {
+                // Lost with a restart: settled at the first report.
+                let Some(held) = hub.runner_tokens.get(&command.id, now) else {
+                    continue;
+                };
+                *token = held;
+            }
+            self.sent_commands.insert(command.id.clone());
+            send(ws, &HubRelayMsg::Command(command)).await?;
         }
         Ok(())
     }
 }
 
-/// Settle the accepted updates `report`, the first of session `session`, does not name, while
+/// The tokens of runners added on the hub, by the command adding each, until the relay
+/// answers it or it expires. Never stored, logged or shown.
+#[derive(Default)]
+pub(crate) struct RunnerTokens(Arc<std::sync::Mutex<TokenMap>>);
+
+type TokenMap = HashMap<String, (RunnerToken, u64)>;
+
+fn lock_tokens(tokens: &std::sync::Mutex<TokenMap>) -> std::sync::MutexGuard<'_, TokenMap> {
+    tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl RunnerTokens {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TokenMap> {
+        lock_tokens(&self.0)
+    }
+
+    /// Hold `token` for command `command` until `expires_at`, when it is dropped unanswered.
+    fn hold(&self, command: &str, token: RunnerToken, expires_at: u64, now: u64) {
+        let mut tokens = self.lock();
+        tokens.retain(|_, (_, at)| *at > now);
+        tokens.insert(command.to_string(), (token, expires_at));
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (tokens, command) = (self.0.clone(), command.to_string());
+            let wait = Duration::from_secs(expires_at.saturating_sub(now));
+            runtime.spawn(async move {
+                tokio::time::sleep(wait).await;
+                lock_tokens(&tokens).remove(&command);
+            });
+        }
+    }
+
+    /// Command `command`'s token, unless lost or expired by `now`.
+    fn get(&self, command: &str, now: u64) -> Option<RunnerToken> {
+        self.lock()
+            .get(command)
+            .filter(|(_, at)| *at > now)
+            .map(|(t, _)| t.clone())
+    }
+
+    /// Whether the hub has command `command`'s token.
+    pub(crate) fn holds(&self, command: &str) -> bool {
+        self.lock().contains_key(command)
+    }
+
+    /// Drop command `command`'s token: the relay answered it.
+    pub(crate) fn forget(&self, command: &str) {
+        self.lock().remove(command);
+    }
+}
+
+/// Settle what `report`, the first of session `session`, shows the hub lost track of, while
 /// that session is the relay's current one.
-async fn settle_unreported_updates(
+async fn settle_lost_commands(
     hub: &Arc<Hub>,
     relay: &Peer,
     session: u64,
     report: Report,
 ) -> Result<()> {
-    let (db, live) = (hub.db.clone(), hub.clone());
+    let (db, live, tokens) = (hub.db.clone(), hub.clone(), hub.clone());
     let id = relay.id.clone();
     let settled = tokio::task::spawn_blocking(move || {
-        db.settle_unreported_relay_updates(&id, &report, crate::now_secs(), || {
-            live.is_current(&id, session)
-        })
+        db.settle_lost_relay_commands(
+            &id,
+            &report,
+            crate::now_secs(),
+            |command| tokens.runner_tokens.holds(command),
+            || live.is_current(&id, session),
+        )
     })
     .await??;
     if settled {
@@ -304,8 +381,24 @@ async fn settle_unreported_updates(
     Ok(())
 }
 
-/// Record the relay's command outcome and reply with [`HubRelayMsg::Recorded`].
+/// Take the GitLab IDs of the runners the relay added from its new inventory, for the adds it
+/// acked done before.
+async fn record_added_runners(hub: &Hub, relay: &Peer) -> Result<()> {
+    let db = hub.db.clone();
+    let id = relay.id.clone();
+    let taken =
+        tokio::task::spawn_blocking(move || db.record_added_runners(&id, crate::now_secs()))
+            .await??;
+    if taken {
+        hub.changed(&relay.id);
+    }
+    Ok(())
+}
+
+/// Record the relay's command outcome and reply with [`HubRelayMsg::Recorded`]. An answered
+/// add's token is dropped: the relay journaled the command, and answers it again from there.
 async fn acknowledge(ws: &mut Ws, hub: &Hub, relay: &Peer, ack: CommandAck) -> Result<()> {
+    hub.runner_tokens.forget(&ack.id);
     let db = hub.db.clone();
     let id = relay.id.clone();
     let recorded = ack.clone();
@@ -553,9 +646,15 @@ fn issue_update(
         size: release.row.size,
         signature: release.row.signature.clone(),
     };
-    let command = hub
-        .db
-        .issue_relay_command(id, op, COMMAND_TTL, actor, crate::now_secs())?;
+    let command =
+        hub.db
+            .issue_relay_command(id, op, COMMAND_TTL, actor, crate::now_secs(), |_| {})?;
+    issued(hub, actor, id, &command);
+    Ok(command)
+}
+
+/// Log `command`, just issued, and have relay `id`'s session send it.
+fn issued(hub: &Hub, actor: &str, id: &str, command: &Command) {
     eprintln!(
         "vk-hub: relay {id}: {actor} issued {} (command {})",
         crate::store::relay_operation_name(&command.op),
@@ -564,7 +663,184 @@ fn issue_update(
     hub.kick(id);
     hub.changed(id);
     hub.touch();
+}
+
+/// How a runner added on the hub is set up: a `[[runners]]` table's settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerSettings {
+    pub placement: Placement,
+    /// Its `limit`, when limited.
+    pub limit: Option<u32>,
+    /// Its `request_concurrency`, at least 1.
+    pub request_concurrency: u32,
+}
+
+/// The longest runner name the hub takes: it names files on the relay.
+pub const MAX_RUNNER_NAME: usize = 64;
+
+/// Refuse what the relay would: a runner name that is not letters, digits, `-`, `_` and `.`
+/// (not first), and settings a `[[runners]]` table may not have, as `vk-gitlab` checks them.
+pub fn check_runner(name: &str, token: &RunnerToken, settings: &RunnerSettings) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_RUNNER_NAME
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!(
+            "a runner name is 1 to {MAX_RUNNER_NAME} letters, digits, `-`, `_` and `.`, not \
+             starting with `.`"
+        );
+    }
+    let t = token.expose();
+    if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("the runner token is empty or has spaces in it");
+    }
+    let p = &settings.placement;
+    let printable = |s: &str| vk_hub_proto::display_safe(s) == s;
+    if p.pool.trim().is_empty() || !printable(&p.pool) {
+        bail!("the pool must be printable and not empty");
+    }
+    if p.labels.len() > MAX_LABELS {
+        bail!("a runner has at most {MAX_LABELS} labels");
+    }
+    let mut labels = HashSet::new();
+    for l in &p.labels {
+        if l.trim().is_empty() || !printable(l) {
+            bail!("labels must be printable and not empty");
+        }
+        if !labels.insert(l.as_str()) {
+            bail!("label {l:?} is listed twice");
+        }
+    }
+    let e = p.envelope;
+    if e.mem_mib == 0 || e.cpus == 0 || e.disk_bytes == 0 {
+        bail!("the envelope's mem (at least 1M), cpus and disk must be set");
+    }
+    if settings.limit == Some(0) {
+        bail!("limit must be at least 1");
+    }
+    let most = u32::try_from(MAX_ADMISSIONS).unwrap_or(u32::MAX);
+    if !(1..=most).contains(&settings.request_concurrency) {
+        bail!("request_concurrency must be 1 to {most}");
+    }
+    Ok(())
+}
+
+/// Relay `id`, if it lets the hub add and remove its runners as it last reported.
+fn taking_runners(hub: &Hub, id: &str) -> Result<RelayRow> {
+    let row = hub
+        .db
+        .relay(id)?
+        .ok_or_else(|| NotEnrolled(id.to_string()))?;
+    let name = &row.hostname;
+    let Some(inventory) = &row.inventory else {
+        bail!("relay {name} has not reported its runners yet");
+    };
+    if !inventory.allow.iter().any(|a| a == ALLOW_RUNNERS) {
+        bail!(
+            "relay {name} does not let the hub add or remove its runners: its [hub] allow \
+             lacks {ALLOW_RUNNERS}"
+        );
+    }
+    if row.protocol.unwrap_or(0) < RUNNERS {
+        bail!("relay {name} runs a vk-gitlab that cannot take runners from the hub: update it");
+    }
+    Ok(row)
+}
+
+/// Add runner `name` to relay `id` with the runner authentication token `token`, GitLab
+/// created, and `settings`. The token goes to the relay and nowhere else.
+pub fn add_runner(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    name: &str,
+    token: RunnerToken,
+    settings: RunnerSettings,
+) -> Result<Command> {
+    check_runner(name, &token, &settings)?;
+    let row = taking_runners(hub, id)?;
+    let runners = row.inventory.as_ref().map_or(&[][..], |i| &i.runners[..]);
+    if runners.iter().any(|r| r.name == name) {
+        bail!("relay {} has a runner named {name} already", row.hostname);
+    }
+    if runners.len() >= MAX_RUNNERS {
+        bail!("relay {} runs {MAX_RUNNERS} runners already", row.hostname);
+    }
+    let op = Operation::AddRunner {
+        name: name.to_string(),
+        token: RunnerToken::default(),
+        placement: settings.placement,
+        limit: settings.limit,
+        request_concurrency: settings.request_concurrency,
+    };
+    let now = crate::now_secs();
+    let command = hub
+        .db
+        .issue_relay_command(id, op, COMMAND_TTL, actor, now, |c| {
+            hub.runner_tokens.hold(&c.id, token, c.expires_at, now);
+        })?;
+    issued(hub, actor, id, &command);
     Ok(command)
+}
+
+/// Remove runner `name`, added on the hub, from relay `id`: it takes no new job, and goes once
+/// its jobs end.
+pub fn remove_runner(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<Command> {
+    let row = taking_runners(hub, id)?;
+    let Some(runner) = row
+        .inventory
+        .as_ref()
+        .and_then(|i| i.runners.iter().find(|r| r.name == name))
+    else {
+        bail!("relay {} reports no runner {name}", row.hostname);
+    };
+    let (RunnerSource::Hub, Some(runner_id), Some(command)) =
+        (runner.source, runner.runner_id, runner.command.clone())
+    else {
+        bail!(
+            "runner {name} was not added on the hub: remove it from relay {}'s config",
+            row.hostname
+        );
+    };
+    let op = Operation::RemoveRunner {
+        name: name.to_string(),
+        runner_id,
+        command,
+    };
+    let command =
+        hub.db
+            .issue_relay_command(id, op, COMMAND_TTL, actor, crate::now_secs(), |_| {})?;
+    issued(hub, actor, id, &command);
+    Ok(command)
+}
+
+/// Where runner `r` comes from, as `vk-hub relays show` says it: `config`, or `hub` and the
+/// command that added it, `being removed` once `commands` hold its removal not failed by
+/// `now`.
+pub fn runner_source(r: &Runner, commands: &[RelayCommandRow], now: u64) -> String {
+    match (r.source, &r.command) {
+        (RunnerSource::Config, _) => "config".to_string(),
+        (RunnerSource::Hub, Some(added_by)) => {
+            let removing = commands.iter().any(|c| {
+                matches!(&c.command.op, Operation::RemoveRunner { command, .. } if command == added_by)
+                    && match c.outcome {
+                        None => c.command.expires_at > now,
+                        Some(Outcome::Accepted | Outcome::Done) => true,
+                        Some(_) => false,
+                    }
+            });
+            if removing {
+                format!("hub ({added_by}), being removed")
+            } else {
+                format!("hub ({added_by})")
+            }
+        }
+        (RunnerSource::Hub, None) => "hub".to_string(),
+        (RunnerSource::Other, _) => "other".to_string(),
+    }
 }
 
 /// Have the sessions of the relays bound to the server at `url` tell them its status anew,

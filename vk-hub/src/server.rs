@@ -167,6 +167,9 @@ pub struct Hub {
     pub(crate) handover: crate::update::Handover,
     /// The hub's own update, when it serves as `vk-hub serve`.
     pub(crate) self_update: std::sync::OnceLock<Arc<crate::update::SelfUpdate>>,
+    /// The tokens of the runners added on the hub that their relay has not answered yet, by
+    /// command ID: held in memory only, until the relay answers or the command expires.
+    pub(crate) runner_tokens: crate::relays::RunnerTokens,
 }
 
 /// One node's open session.
@@ -248,6 +251,7 @@ impl Hub {
             quiet: HEARTBEAT * MISSED_HEARTBEATS,
             handover: crate::update::Handover::default(),
             self_update: std::sync::OnceLock::new(),
+            runner_tokens: crate::relays::RunnerTokens::default(),
         }
     }
 

@@ -240,6 +240,17 @@ enum Call {
         id: String,
         release: String,
     },
+    /// Add a runner to a relay. `token`'s `Debug` never prints it.
+    AddRelayRunner {
+        id: String,
+        name: String,
+        token: vk_hub_proto::gitlab::RunnerToken,
+        settings: crate::relays::RunnerSettings,
+    },
+    RemoveRelayRunner {
+        id: String,
+        name: String,
+    },
     /// Update the hub itself to the `vk-hub` release `release` names.
     UpdateHub {
         release: String,
@@ -904,6 +915,17 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::UpdateRelay { id, release } => {
             serde_json::to_value(crate::relays::update(hub, &actor, &id, &release)?)?
         }
+        Call::AddRelayRunner {
+            id,
+            name,
+            token,
+            settings,
+        } => serde_json::to_value(crate::relays::add_runner(
+            hub, &actor, &id, &name, token, settings,
+        )?)?,
+        Call::RemoveRelayRunner { id, name } => {
+            serde_json::to_value(crate::relays::remove_runner(hub, &actor, &id, &name)?)?
+        }
         Call::HubUpdate => serde_json::to_value(crate::update::status(hub))?,
         Call::UpdateHub { .. } => bail!("an update of the hub is started on the runtime"),
         Call::RemoveRelay { id } => {
@@ -1321,6 +1343,33 @@ impl Client {
 
     pub fn hub_update(&self) -> Result<crate::update::Status> {
         self.call(Call::HubUpdate)
+    }
+
+    /// Add runner `name` to relay `id`. Return the issued command without its token.
+    pub fn add_relay_runner(
+        &self,
+        id: &str,
+        name: &str,
+        token: vk_hub_proto::gitlab::RunnerToken,
+        settings: crate::relays::RunnerSettings,
+    ) -> Result<vk_hub_proto::gitlab::Command> {
+        self.call(Call::AddRelayRunner {
+            id: id.to_string(),
+            name: name.to_string(),
+            token,
+            settings,
+        })
+    }
+
+    pub fn remove_relay_runner(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<vk_hub_proto::gitlab::Command> {
+        self.call(Call::RemoveRelayRunner {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
     }
 
     pub fn update_relay(&self, id: &str, release: &str) -> Result<vk_hub_proto::gitlab::Command> {

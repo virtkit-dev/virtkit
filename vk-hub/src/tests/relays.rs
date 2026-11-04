@@ -590,3 +590,272 @@ async fn a_relay_is_sent_its_update_and_downloads_only_its_release() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Runners added and removed on the hub: refused before anything is sent to a relay too old or
+/// not allowing it, or for a name it has; the token sent to the relay alone, never stored or
+/// audited; the added runner's GitLab ID taken from the inventory; a removal issued once; a
+/// relay at version 3 sent none; and an add whose token a restart lost failed at the next first
+/// report, unless the relay answers it after all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
+    use vk_hub_proto::Outcome;
+    use vk_hub_proto::gitlab::{Operation, RunnerFailure, RunnerSource, RunnerToken};
+
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let id = enrolled_relay(addr, &hub, &key).await;
+    let url = "https://gitlab.example.com";
+    let settings = relays::RunnerSettings {
+        placement: vk_hub_proto::client::Placement {
+            pool: "default".into(),
+            labels: vec!["big".into()],
+            envelope: vk_hub_proto::job::Envelope {
+                mem_mib: 4096,
+                cpus: 2,
+                disk_bytes: 16 << 30,
+            },
+        },
+        limit: Some(2),
+        request_concurrency: 1,
+    };
+    let add = |name: &str| {
+        relays::add_runner(
+            &hub,
+            "uid 0",
+            &id,
+            name,
+            RunnerToken::new("glrt-secret"),
+            settings.clone(),
+        )
+    };
+    let err_of = |r: anyhow::Result<gl::Command>| format!("{:#}", r.unwrap_err());
+    let allowing = |runners: Vec<gl::Runner>| Inventory {
+        allow: vec![gl::ALLOW_RUNNERS.into()],
+        runners,
+        ..inventory(url)
+    };
+    let reported = |hub: &Hub| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.report.is_some())
+    };
+
+    // A relay at version 3, allowing runners, takes none.
+    let mut old = dial_relay(addr).await;
+    let three = vk_hub_proto::VersionRange { min: 2, max: 3 };
+    assert!(matches!(
+        open_relay_at(&mut old, &id, &key, three).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut old, &RelayMsg::Inventory(allowing(vec![]))).await;
+    assert_eq!(hear(&mut old).await, status(ServerState::Pending, None));
+    tell(&mut old, &RelayMsg::Report(Report::default())).await;
+    eventually(|| reported(&hub)).await;
+    assert!(err_of(add("big")).contains("cannot take runners"));
+
+    // One whose [hub] allow lacks runners neither; nor a name the relay could not use.
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut ws, &RelayMsg::Inventory(inventory(url))).await;
+    assert_eq!(hear(&mut ws).await, status(ServerState::Pending, None));
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.protocol == Some(gl::RUNNERS))
+    })
+    .await;
+    assert!(err_of(add("big")).contains("lacks runners"));
+    assert!(err_of(add("../big")).contains("a runner name is"));
+    let config = gl::Runner {
+        name: "cfg".into(),
+        runner_id: Some(7),
+        placement: settings.placement.clone(),
+        verified: true,
+        ..gl::Runner::default()
+    };
+    tell(
+        &mut ws,
+        &RelayMsg::Inventory(allowing(vec![config.clone()])),
+    )
+    .await;
+    tell(&mut ws, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.report.is_some() && r.inventory.is_some_and(|i| !i.allow.is_empty()))
+    })
+    .await;
+    assert!(err_of(add("cfg")).contains("has a runner named cfg already"));
+
+    // The command goes out with the token; the hub keeps it without, until the relay answers.
+    let command = add("big").unwrap();
+    let HubRelayMsg::Command(sent) = hear(&mut ws).await else {
+        panic!("not a command");
+    };
+    let Operation::AddRunner { token, .. } = &sent.op else {
+        panic!("not an add");
+    };
+    assert_eq!(token.expose(), "glrt-secret");
+    assert_eq!(sent.op.without_token(), command.op);
+    assert!(hub.runner_tokens.holds(&command.id));
+    assert!(err_of(add("big")).contains("in progress"));
+    let ack = |id: &str, outcome| vk_hub_proto::CommandAck {
+        id: id.to_string(),
+        outcome,
+    };
+    let accepted = ack(&command.id, Outcome::Accepted);
+    tell(&mut ws, &RelayMsg::Ack(accepted.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(accepted));
+    assert!(!hub.runner_tokens.holds(&command.id));
+    // Added, and acked done before an inventory names it: the hub takes its GitLab ID from
+    // the next.
+    let added = gl::Runner {
+        name: "big".into(),
+        runner_id: Some(42),
+        source: RunnerSource::Hub,
+        command: Some(command.id.clone()),
+        ..config.clone()
+    };
+    let done = ack(&command.id, Outcome::Done);
+    tell(&mut ws, &RelayMsg::Ack(done.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(done));
+    let row = |cid: &str| {
+        hub.db
+            .relay_commands(&id)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.command.id == cid)
+            .unwrap()
+    };
+    assert_eq!(row(&command.id).runner_id, None);
+    tell(
+        &mut ws,
+        &RelayMsg::Inventory(allowing(vec![config.clone(), added.clone()])),
+    )
+    .await;
+    eventually(|| row(&command.id).runner_id == Some(42)).await;
+
+    // A config runner is not removed from the hub; one added there is, once.
+    let remove = |name: &str| relays::remove_runner(&hub, "uid 0", &id, name);
+    assert!(err_of(remove("cfg")).contains("not added on the hub"));
+    assert!(err_of(remove("nope")).contains("reports no runner nope"));
+    let removal = remove("big").unwrap();
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Command(removal.clone()));
+    assert_eq!(
+        removal.op,
+        Operation::RemoveRunner {
+            name: "big".into(),
+            runner_id: 42,
+            command: command.id.clone(),
+        }
+    );
+    let done = ack(&removal.id, Outcome::Done);
+    tell(&mut ws, &RelayMsg::Ack(done.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(done));
+    assert!(err_of(remove("big")).contains("being removed"));
+    let shown = crate::render_relay(
+        &relays::detail(&hub, &id).unwrap().unwrap(),
+        &hub.db.relay_commands(&id).unwrap(),
+        now_secs(),
+    );
+    for want in [
+        "runners from the hub allowed\n",
+        &format!("hub ({}), being removed", command.id),
+        &format!("command {} add runner big at ", command.id),
+        "done, GitLab runner 42\n",
+        "config",
+    ] {
+        assert!(shown.contains(want), "{want}: {shown}");
+    }
+
+    // A session at version 3 is not sent a runner command.
+    let pending = add("later").unwrap();
+    assert!(matches!(hear(&mut ws).await, HubRelayMsg::Command(c) if c.id == pending.id));
+    let mut old = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay_at(&mut old, &id, &key, three).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut old, &RelayMsg::Inventory(allowing(vec![]))).await;
+    assert_eq!(hear(&mut old).await, status(ServerState::Pending, None));
+    tell(&mut old, &RelayMsg::Report(Report::default())).await;
+    hub.db.add_gitlab("gl", url, "uid 0", now_secs()).unwrap();
+    relays::server_changed(&hub, url).unwrap();
+    assert_eq!(
+        hear(&mut old).await,
+        status(ServerState::Approved, Some("gl"))
+    );
+
+    // A restart loses the token of an add the relay never answered: the next session's first
+    // report fails it, and does not send it; the relay answering it after all is believed.
+    hub.runner_tokens.forget(&pending.id);
+    let mut ws = dial_relay(addr).await;
+    assert!(matches!(
+        open_relay(&mut ws, &id, &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    tell(&mut ws, &RelayMsg::Inventory(allowing(vec![]))).await;
+    assert_eq!(
+        hear(&mut ws).await,
+        status(ServerState::Approved, Some("gl"))
+    );
+    tell(&mut ws, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        row(&pending.id)
+            .outcome
+            .as_ref()
+            .and_then(RunnerFailure::of)
+            == Some(RunnerFailure::TokenLost)
+    })
+    .await;
+    let failed = ack(&pending.id, RunnerFailure::TokenRefused.outcome());
+    tell(&mut ws, &RelayMsg::Ack(failed.clone())).await;
+    assert_eq!(hear(&mut ws).await, HubRelayMsg::Recorded(failed.clone()));
+    assert_eq!(row(&pending.id).outcome, Some(failed.outcome));
+
+    // The token is in no command kept, nor in the audit.
+    let kept = serde_json::to_string(&hub.db.relay_commands(&id).unwrap()).unwrap();
+    assert!(!kept.contains("glrt"), "{kept}");
+    let audit = hub.db.audits(Some(&id), 100).unwrap();
+    assert!(audit.iter().all(|a| !a.event.contains("glrt")), "{audit:?}");
+    for event in [
+        "uid 0 issued add runner big",
+        "add runner big): GitLab runner 42",
+        "uid 0 issued remove runner big (GitLab runner 42)",
+        "failed: token_lost",
+        "failed: token_refused",
+    ] {
+        assert!(
+            audit.iter().any(|a| a.event.contains(event)),
+            "{event}: {audit:?}"
+        );
+    }
+}
+
+/// `vk-hub relays runners add`'s envelope takes any of its parts, the rest defaulting as a
+/// `[[runners]]` table's; its token is a file's first line.
+#[test]
+fn a_runner_s_envelope_and_token_are_read_from_the_command_line() {
+    let e = crate::parse_envelope("cpus=8, mem=16G").unwrap();
+    assert_eq!((e.mem_mib, e.cpus, e.disk_bytes), (16 << 10, 8, 16 << 30));
+    for bad in ["mem=1K", "cpus=0", "gpus=1", "disk=0G"] {
+        assert!(crate::parse_envelope(bad).is_err(), "{bad}");
+    }
+    let dir = std::env::temp_dir().join(format!("vk-hub-runner-token-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("token");
+    std::fs::write(&file, "  glrt-abc \nrest\n").unwrap();
+    assert_eq!(
+        crate::read_runner_token(&file).unwrap().expose(),
+        "glrt-abc"
+    );
+    std::fs::write(&file, "\n").unwrap();
+    assert!(crate::read_runner_token(&file).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

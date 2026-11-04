@@ -65,7 +65,12 @@ pub(super) static KIND: updates::Kind = updates::Kind {
 
 /// The last update the hub issued relay `id`.
 fn last_update(hub: &Hub, id: &str) -> Result<Option<RelayCommandRow>> {
-    Ok(hub.db.relay_commands(id)?.into_iter().max_by_key(|c| c.seq))
+    Ok(hub
+        .db
+        .relay_commands(id)?
+        .into_iter()
+        .filter(|c| matches!(c.command.op, Operation::Update { .. }))
+        .max_by_key(|c| c.seq))
 }
 
 /// Relay `v` as its update shows it, `last` the last update the hub issued it.

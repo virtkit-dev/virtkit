@@ -648,6 +648,95 @@ enum RelaysCmd {
         #[arg(long)]
         release: String,
     },
+    /// Add a runner created in GitLab to a relay, or remove one added here
+    #[command(subcommand)]
+    Runners(RelayRunnersCmd),
+}
+
+#[derive(Subcommand)]
+enum RelayRunnersCmd {
+    /// Add a runner created in GitLab to the relay
+    ///
+    /// Needs `runners` in the relay's `[hub] allow`. The relay checks the token with GitLab
+    /// and keeps it; the hub does not. Its jobs are placed once a lane maps the runner's
+    /// GitLab ID.
+    Add {
+        /// The relay's ID, as `vk-hub relays` lists it
+        relay: String,
+        /// The runner's name on the relay: letters, digits, `-`, `_` and `.`
+        name: String,
+        /// A file holding the runner authentication token (`glrt-…`), or - for stdin
+        #[arg(long, value_name = "FILE")]
+        token_file: std::path::PathBuf,
+        /// The pool its jobs are placed in
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// A label its jobs' nodes must have; repeat for several
+        #[arg(long = "label", value_name = "LABEL")]
+        labels: Vec<String>,
+        /// Each job's VM: mem=<size>,cpus=<n>,disk=<size>, any of them (default
+        /// mem=4G,cpus=2,disk=16G)
+        #[arg(long, value_name = "SPEC", default_value = "mem=4G,cpus=2,disk=16G", value_parser = parse_envelope)]
+        envelope: vk_hub_proto::job::Envelope,
+        /// How many of its jobs run at once (default: no limit)
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        /// How many job requests it keeps open with GitLab at once
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        request_concurrency: u32,
+    },
+    /// Remove a runner added on the hub from the relay
+    ///
+    /// It takes no new job, and goes once its running jobs end. It stays in GitLab, to delete
+    /// there.
+    Remove {
+        /// The relay's ID, as `vk-hub relays` lists it
+        relay: String,
+        name: String,
+    },
+}
+
+/// A job envelope, `mem=16G,cpus=8,disk=16G`, any part left out taking a `[[runners]]`
+/// table's default.
+fn parse_envelope(s: &str) -> Result<vk_hub_proto::job::Envelope, String> {
+    let mut e = vk_hub_proto::job::Envelope {
+        mem_mib: 4 << 10,
+        cpus: 2,
+        disk_bytes: 16 << 30,
+    };
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('=') {
+            Some(("mem", v)) => e.mem_mib = parse_mem_size(v)? >> 20,
+            Some(("cpus", v)) => {
+                e.cpus = v
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| format!("{v:?}: expected a number of CPUs"))?;
+            }
+            Some(("disk", v)) => e.disk_bytes = parse_size(v)?,
+            _ => {
+                return Err(format!(
+                    "{part:?}: expected mem=<size>, cpus=<n> or disk=<size>"
+                ));
+            }
+        }
+    }
+    Ok(e)
+}
+
+/// The runner token in `path`, or on stdin for `-`: its first line, trimmed.
+fn read_runner_token(path: &std::path::Path) -> Result<vk_hub_proto::gitlab::RunnerToken> {
+    let text = if path.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin().lock()).context("reading the token on stdin")?
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    };
+    let token = text.lines().next().unwrap_or("").trim();
+    if token.is_empty() {
+        bail!("no runner token in {}", path.display());
+    }
+    Ok(vk_hub_proto::gitlab::RunnerToken::new(token))
 }
 
 #[derive(Subcommand)]
@@ -2389,6 +2478,42 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
             let command = client.update_relay(&id, &release)?;
             eprintln!("vk-hub: relay {id}: issued command {}", command.id);
         }
+        RelaysCmd::Runners(RelayRunnersCmd::Add {
+            relay,
+            name,
+            token_file,
+            pool,
+            labels,
+            envelope,
+            limit,
+            request_concurrency,
+        }) => {
+            let token = read_runner_token(&token_file)?;
+            let settings = relays::RunnerSettings {
+                placement: vk_hub_proto::client::Placement {
+                    pool,
+                    labels,
+                    envelope,
+                },
+                limit,
+                request_concurrency,
+            };
+            // Checked here too, so a mistake is caught before the token leaves.
+            relays::check_runner(&name, &token, &settings)?;
+            let command = client.add_relay_runner(&relay, &name, token, settings)?;
+            eprintln!(
+                "vk-hub: relay {relay}: issued command {}; `vk-hub relays show {relay}` says \
+                 how it ends",
+                command.id
+            );
+        }
+        RelaysCmd::Runners(RelayRunnersCmd::Remove { relay, name }) => {
+            let command = client.remove_relay_runner(&relay, &name)?;
+            eprintln!(
+                "vk-hub: relay {relay}: issued command {}; runner {name} goes once its jobs end",
+                command.id
+            );
+        }
     }
     Ok(())
 }
@@ -2447,25 +2572,32 @@ fn render_relays(views: &[relays::RelayView], now: u64) -> String {
 
 /// `vk-hub relays show`: the relay, then the commands the hub issued it and how each ended.
 fn render_relay(r: &relays::RelayView, commands: &[store::RelayCommandRow], now: u64) -> String {
-    let mut out = render_relay_state(r, now);
+    let mut out = render_relay_state(r, commands, now);
     for c in commands {
+        let mut outcome = match &c.outcome {
+            Some(o) => store::outcome_text(o),
+            None if c.command.expires_at <= now => "expired, never taken".to_string(),
+            None => "not taken yet".to_string(),
+        };
+        if let Some(id) = c.runner_id {
+            outcome.push_str(&format!(", GitLab runner {id}"));
+        }
         out.push_str(&format!(
-            "command {} {} at {}: {}\n",
+            "command {} {} at {}: {outcome}\n",
             c.command.id,
             store::relay_operation_name(&c.command.op),
             utc(c.issued_at),
-            match &c.outcome {
-                Some(o) => store::outcome_text(o),
-                None if c.command.expires_at <= now => "expired, never taken".to_string(),
-                None => "not taken yet".to_string(),
-            }
         ));
     }
     out
 }
 
 /// The relay as it last reported itself, for [`render_relay`].
-fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
+fn render_relay_state(
+    r: &relays::RelayView,
+    commands: &[store::RelayCommandRow],
+    now: u64,
+) -> String {
     let mut out = render_relays(std::slice::from_ref(r), now);
     let Some(i) = &r.row.inventory else {
         out.push_str("\nno inventory yet\n");
@@ -2486,6 +2618,17 @@ fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
     if let Some(s) = &r.server {
         out.push_str(&format!("server {}\n", relays::server_text(s)));
     }
+    out.push_str(&format!(
+        "runners from the hub {}\n",
+        if i.allow
+            .iter()
+            .any(|a| a == vk_hub_proto::gitlab::ALLOW_RUNNERS)
+        {
+            "allowed"
+        } else {
+            "not allowed by its [hub] allow"
+        }
+    ));
     out.push_str(&format!(
         "updates {}\n",
         match (
@@ -2535,7 +2678,7 @@ fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
                 format!("{} held, {} asking", x.jobs, x.requests)
             })
     };
-    let rows: Vec<[String; 7]> = i
+    let rows: Vec<[String; 8]> = i
         .runners
         .iter()
         .map(|x| {
@@ -2555,6 +2698,7 @@ fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
                     format!("not verified; {}", state(&x.name))
                 },
                 load(&x.name),
+                relays::runner_source(x, commands, now),
             ]
         })
         .collect();
@@ -2568,6 +2712,7 @@ fn render_relay_state(r: &relays::RelayView, now: u64) -> String {
             "LIMIT",
             "STATE",
             "LOAD",
+            "SOURCE",
         ],
         &rows,
     ));
