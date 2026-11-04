@@ -22,6 +22,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A slow DNS resolver no longer cuts peers off the hub.** `vk node`, `vk-registry` and
+  `vk-gitlab` look the hub's name up at most once a minute, and keep reaching it at its last
+  known addresses while the resolver fails.
 - vk-hub: pages left open during an update reload when they reconnect, so
   menus and headers match the live content.
 

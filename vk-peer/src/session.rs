@@ -1,9 +1,10 @@
 //! Session transport: dial, upgrade, and hello → challenge → auth → welcome before each
 //! peer exchanges its own messages.
 
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
@@ -96,7 +97,15 @@ pub async fn dial(
         .port_or_known_default()
         .context("the hub URL has no port")?;
     let authority = format!("{host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&authority)
+    let addrs = ADDRS
+        .resolve(&authority, Instant::now(), |a| async move {
+            tokio::net::lookup_host(a)
+                .await
+                .map(|addrs| addrs.collect())
+        })
+        .await
+        .with_context(|| format!("resolving {authority}"))?;
+    let tcp = connect_any(&addrs)
         .await
         .with_context(|| format!("connecting to {authority}"))?;
     // Heartbeats are small and latency is what a session is judged on.
@@ -128,6 +137,103 @@ pub async fn dial(
         other => bail!("the hub URL has scheme {other:?}; expected https (or http on loopback)"),
     };
     Ok((io, exported, authority))
+}
+
+/// How long a hub's resolved addresses are used before it is looked up again.
+const RESOLVE_TTL: Duration = Duration::from_secs(60);
+
+/// The addresses each hub authority resolved to, shared by every dial in the process.
+static ADDRS: AddrCache = AddrCache::new(RESOLVE_TTL);
+
+/// Resolved addresses per `host:port`, used for a TTL and kept past it for when the resolver
+/// fails: a peer dialing the hub several times a second stays off DNS, and one whose resolver
+/// stalls keeps reaching the hub at its last known addresses.
+struct AddrCache {
+    ttl: Duration,
+    entries: std::sync::Mutex<std::collections::BTreeMap<String, Resolved>>,
+}
+
+struct Resolved {
+    addrs: Vec<SocketAddr>,
+    at: Instant,
+    /// Whether the fallback to these addresses was logged since the last good lookup.
+    warned: bool,
+}
+
+impl AddrCache {
+    const fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, Resolved>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `authority`'s addresses: cached ones younger than the TTL, else what `lookup` finds,
+    /// else, when it fails or finds none, the last ones it found.
+    async fn resolve<F, Fut>(
+        &self,
+        authority: &str,
+        now: Instant,
+        lookup: F,
+    ) -> std::io::Result<Vec<SocketAddr>>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
+        if let Some(r) = self.entries().get(authority)
+            && now.saturating_duration_since(r.at) < self.ttl
+        {
+            return Ok(r.addrs.clone());
+        }
+        let found = match lookup(authority.to_string()).await {
+            Ok(addrs) if addrs.is_empty() => Err(std::io::Error::other("no addresses")),
+            found => found,
+        };
+        let mut entries = self.entries();
+        match found {
+            Ok(addrs) => {
+                entries.insert(
+                    authority.to_string(),
+                    Resolved {
+                        addrs: addrs.clone(),
+                        at: now,
+                        warned: false,
+                    },
+                );
+                Ok(addrs)
+            }
+            Err(e) => match entries.get_mut(authority) {
+                Some(last) => {
+                    if !last.warned {
+                        last.warned = true;
+                        log::warn!(
+                            "Resolving {authority} failed ({e}); using its last known addresses"
+                        );
+                    }
+                    Ok(last.addrs.clone())
+                }
+                None => Err(e),
+            },
+        }
+    }
+}
+
+/// A TCP connection to the first of `addrs` that takes one, in order.
+async fn connect_any(addrs: &[SocketAddr]) -> std::io::Result<tokio::net::TcpStream> {
+    let mut last = None;
+    for addr in addrs {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no addresses")))
 }
 
 /// Keepalives on an idle socket and a bound on unacknowledged data on a busy one, so a hub
@@ -295,5 +401,95 @@ pub fn kind(msg: &HubMsg) -> &'static str {
         HubMsg::Command(_) => "a command",
         HubMsg::Recorded(_) => "a record of an ack",
         HubMsg::Job(_) => "a job message",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, last], 443))
+    }
+
+    /// A lookup that counts its calls and answers `answer`.
+    fn lookup(
+        calls: &AtomicUsize,
+        answer: std::io::Result<Vec<SocketAddr>>,
+    ) -> impl FnOnce(String) -> std::future::Ready<std::io::Result<Vec<SocketAddr>>> + '_ {
+        move |authority| {
+            assert_eq!(authority, "hub:443");
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(answer)
+        }
+    }
+
+    #[tokio::test]
+    async fn addresses_are_reused_within_the_ttl_and_looked_up_again_after() {
+        let cache = AddrCache::new(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let first = cache
+            .resolve("hub:443", t0, lookup(&calls, Ok(vec![addr(1)])))
+            .await
+            .unwrap();
+        assert_eq!(first, vec![addr(1)]);
+        let cached = cache
+            .resolve(
+                "hub:443",
+                t0 + Duration::from_secs(59),
+                lookup(&calls, Ok(vec![addr(2)])),
+            )
+            .await
+            .unwrap();
+        assert_eq!((cached, calls.load(Ordering::Relaxed)), (vec![addr(1)], 1));
+        let renewed = cache
+            .resolve(
+                "hub:443",
+                t0 + Duration::from_secs(60),
+                lookup(&calls, Ok(vec![addr(2)])),
+            )
+            .await
+            .unwrap();
+        assert_eq!((renewed, calls.load(Ordering::Relaxed)), (vec![addr(2)], 2));
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_falls_back_to_the_last_good_addresses() {
+        let cache = AddrCache::new(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let stall = || {
+            Err(std::io::Error::other(
+                "Temporary failure in name resolution",
+            ))
+        };
+        // Nothing to fall back to yet.
+        assert!(
+            cache
+                .resolve("hub:443", t0, lookup(&calls, stall()))
+                .await
+                .is_err()
+        );
+        cache
+            .resolve("hub:443", t0, lookup(&calls, Ok(vec![addr(1)])))
+            .await
+            .unwrap();
+        let later = t0 + Duration::from_secs(120);
+        for answer in [stall(), Ok(vec![])] {
+            let fallback = cache
+                .resolve("hub:443", later, lookup(&calls, answer))
+                .await
+                .unwrap();
+            assert_eq!(fallback, vec![addr(1)]);
+        }
+        // Looked up on each try past the TTL, and taken as soon as it answers.
+        let back = cache
+            .resolve("hub:443", later, lookup(&calls, Ok(vec![addr(3)])))
+            .await
+            .unwrap();
+        assert_eq!((back, calls.load(Ordering::Relaxed)), (vec![addr(3)], 5));
+        assert!(!cache.entries()["hub:443"].warned);
     }
 }

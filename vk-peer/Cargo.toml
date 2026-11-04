@@ -16,6 +16,7 @@ http-body-util.workspace = true
 hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 libc.workspace = true
+log.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustls.workspace = true
