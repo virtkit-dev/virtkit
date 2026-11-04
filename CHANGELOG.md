@@ -27,6 +27,8 @@ All notable changes to virtkit will be documented in this file.
   from its row.
 - **Action confirmations point to the right place.** They say where the result appears
   instead of "below", which pointed away from them at the bottom of the window.
+- **Update phase on the Updates page.** While a rollout updates a node, its row and the
+  rollout's table say whether it is draining (with the VMs left), downloading or validating.
 
 ## [0.102.4] - 2026-11-04
 

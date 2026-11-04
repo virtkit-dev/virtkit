@@ -3783,6 +3783,62 @@ async fn the_updates_page_lists_nodes_and_folds_the_upload() {
     assert!(body.contains(&row), "{row}: {body}");
 }
 
+/// While a rollout updates a node, `/updates` and the rollout history say which phase the node
+/// reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_updates_page_shows_a_node_s_update_phase() {
+    use vk_hub_proto::{NodeState, Report, UpdatePhase, UpdateProgress};
+    let (addr, hub, _) = start_fleet().await;
+    let first = rollout_of(&hub, "ci-1");
+    let (_, mut row) = hub.db.resolve_rollout(&first).unwrap();
+    let node = row.nodes[0].id.clone();
+    row.created_at = 2;
+    row.nodes[0].status = crate::rollout::NodeStatus::Updating {
+        command: "c".into(),
+        since: 1,
+        resume: NodeState::Ready,
+        drained_at: None,
+    };
+    // Only one rollout runs at a time: this one follows the first.
+    hub.db
+        .steer_rollout(&first, crate::rollout::RolloutAction::Abort, "uid 0", 2)
+        .unwrap();
+    hub.db
+        .create_rollout(&"aa".repeat(16), &row, "uid 0")
+        .unwrap();
+    let report = |phase| Report {
+        state: Some(NodeState::Draining),
+        update: Some(UpdateProgress {
+            command: "c1".repeat(16),
+            version: "0.85.0".into(),
+            sha256: "ab".repeat(32),
+            phase,
+            message: None,
+        }),
+        ..Report::default()
+    };
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    hub.db
+        .record_report(&node, report(UpdatePhase::Draining), crate::now_secs())
+        .unwrap();
+    let body = get(addr, "/updates", Some(&viewer)).await.body;
+    assert!(body.contains("<td>to 0.85.0: draining, issued "), "{body}");
+    assert!(body.contains("<td>updating: draining, issued "), "{body}");
+    hub.db
+        .record_report(&node, report(UpdatePhase::Downloading), crate::now_secs())
+        .unwrap();
+    let body = get(addr, "/updates", Some(&viewer)).await.body;
+    assert!(
+        body.contains("<td>to 0.85.0: downloading, issued "),
+        "{body}"
+    );
+    let history = get(addr, "/updates/rollouts", Some(&viewer)).await.body;
+    assert!(
+        history.contains("<td>updating: downloading, issued "),
+        "{history}"
+    );
+}
+
 /// Placed jobs have a tab of their own, right after the nodes, and `/updates` no longer
 /// lists them.
 #[tokio::test(flavor = "multi_thread")]

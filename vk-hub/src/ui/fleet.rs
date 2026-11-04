@@ -2441,7 +2441,7 @@ fn nodes_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
     let mut h = Html::new();
     node_versions(&mut h, &held.views, &rollouts);
     for r in rollouts.iter().filter(|r| r.row.state.active()) {
-        rollout(&mut h, r, steer, now);
+        rollout(&mut h, r, &held.views, steer, now);
     }
     Ok(h)
 }
@@ -2449,12 +2449,13 @@ fn nodes_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
 /// Every rollout, newest first; with `steer`, the buttons that steer them.
 fn rollouts_part(hub: &Hub, steer: bool, now: u64) -> Result<Html> {
     let rollouts = ops::rollouts(hub)?;
+    let views = ops::node_views(hub)?;
     let mut h = Html::new();
     if rollouts.is_empty() {
         h.raw("<p class=\"empty\">none yet. <code>vk-hub rollout create</code> starts one.</p>");
     }
     for r in &rollouts {
-        rollout(&mut h, r, steer, now);
+        rollout(&mut h, r, &views, steer, now);
     }
     Ok(h)
 }
@@ -2498,7 +2499,7 @@ fn node_versions(h: &mut Html, nodes: &[NodeView], rollouts: &[Rollout]) {
             _ => "by rollout",
         });
         h.raw("</td><td>");
-        last_rollout(h, &n.id, rollouts);
+        last_rollout(h, n, rollouts);
         h.raw("</td></tr>");
     }
     h.raw(
@@ -2507,9 +2508,10 @@ fn node_versions(h: &mut Html, nodes: &[NodeView], rollouts: &[Rollout]) {
     );
 }
 
-/// What the newest rollout to reach node `id` did to it: one that skipped it does not count,
-/// nor one that ended with it still pending.
-fn last_rollout(h: &mut Html, id: &str, rollouts: &[Rollout]) {
+/// What the newest rollout to reach `node` did to it: one that skipped it does not count, nor
+/// one that ended with it still pending. While it updates, the phase the node reports.
+fn last_rollout(h: &mut Html, node: &NodeView, rollouts: &[Rollout]) {
+    let id = node.id.as_str();
     let found = rollouts.iter().find_map(|r| {
         r.row
             .nodes
@@ -2526,7 +2528,11 @@ fn last_rollout(h: &mut Html, id: &str, rollouts: &[Rollout]) {
     match &n.status {
         NodeStatus::Pending | NodeStatus::Skipped { .. } => h.raw("pending"),
         NodeStatus::Updating { since, .. } => {
-            h.raw("under way, issued ").html(&pages::at_html(*since))
+            match update_phase(node, &r.row.version) {
+                Some(phase) => h.text(phase),
+                None => h.raw("under way"),
+            };
+            h.raw(", issued ").html(&pages::at_html(*since))
         }
         NodeStatus::Succeeded { at } => h.raw("done ").html(&pages::at_html(*at)),
         NodeStatus::Failed { reason, .. } => {
@@ -2536,6 +2542,30 @@ fn last_rollout(h: &mut Html, id: &str, rollouts: &[Rollout]) {
     h.raw(" (rollout <code>")
         .text(crate::rollout::short_id(&r.id))
         .raw("</code>)");
+}
+
+/// The phase `node` reports of its update to `version`, with the VMs left while it drains;
+/// `None` unless that update is draining, downloading or validating.
+fn update_phase(node: &NodeView, version: &str) -> Option<String> {
+    use vk_hub_proto::UpdatePhase;
+    let phase = node
+        .report
+        .as_ref()
+        .and_then(|r| r.update.as_ref())
+        .filter(|u| u.version == version)
+        .map(|u| u.phase)
+        .filter(|p| {
+            matches!(
+                p,
+                UpdatePhase::Draining | UpdatePhase::Downloading | UpdatePhase::Validating
+            )
+        })?;
+    let name = crate::store::update_phase_name(phase);
+    Some(match node.workloads.filter(|w| *w > 0) {
+        Some(1) if phase == UpdatePhase::Draining => format!("{name}, 1 VM left"),
+        Some(w) if phase == UpdatePhase::Draining => format!("{name}, {w} VMs left"),
+        _ => name.to_string(),
+    })
 }
 
 /// The CI tools definitions held, newest first.
@@ -2573,7 +2603,7 @@ fn tools_part(hub: &Hub) -> Result<Html> {
 }
 
 /// One rollout: what it updates to and how, its state, and each node by wave.
-fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
+fn rollout(h: &mut Html, r: &Rollout, views: &[NodeView], steer: bool, now: u64) {
     let row = &r.row;
     h.raw("<div class=\"rollout\"><h3><code>")
         .text(crate::rollout::short_id(&r.id))
@@ -2666,7 +2696,15 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
                 h.raw("skipped: ").node(reason);
             }
             NodeStatus::Updating { command, since, .. } => {
-                h.raw("updating, issued ")
+                h.raw("updating");
+                if let Some(phase) = views
+                    .iter()
+                    .find(|v| v.id == n.id)
+                    .and_then(|v| update_phase(v, &row.version))
+                {
+                    h.raw(": ").text(phase);
+                }
+                h.raw(", issued ")
                     .html(&time_ago_html(now, *since))
                     .raw(" (command <code>")
                     .text(command)
