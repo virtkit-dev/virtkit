@@ -11,6 +11,7 @@ use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
 use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
 use vk_gitlab::relay::{self, Enrollment};
+use vk_gitlab::runners::{self, Runners};
 use vk_gitlab::session::Status;
 use vk_gitlab::trace::TraceSettings;
 use vk_hub_proto::gitlab::{ServerState, ServerStatus};
@@ -207,6 +208,8 @@ pub enum Via {
 pub struct Daemon {
     /// What its session with the hub would set: the server's status.
     pub status: Option<Arc<Status>>,
+    /// Its runners, as the hub adds and removes them.
+    pub runners: Option<Arc<Runners>>,
     rt: Option<tokio::runtime::Runtime>,
     handle: Option<ShutdownHandle>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -333,6 +336,7 @@ impl Harness {
             server: ServerState::Approved,
             daemon: Daemon {
                 status: None,
+                runners: None,
                 rt: None,
                 handle: None,
                 task: None,
@@ -357,10 +361,13 @@ impl Harness {
 
     /// Starts the daemon (again, after a kill: it resumes from the state file).
     pub fn spawn_daemon(&self) -> Daemon {
-        let cfg = self.config();
+        let mut cfg = self.config();
+        cfg.runners.extend(runners::load(&cfg).unwrap());
         let status = Status::new(&cfg, TEST_SYSTEM_ID, "test-host");
         status.set_server(Some(server_status(self.server)));
         let status2 = Arc::clone(&status);
+        let (registry, changes) = Runners::new(&cfg, TEST_SYSTEM_ID, Arc::clone(&status));
+        let registry2 = Arc::clone(&registry);
         let relay = Enrollment {
             hub: TEST_HUB.to_owned(),
             relay_id: TEST_RELAY_ID.to_owned(),
@@ -377,7 +384,8 @@ impl Harness {
             Via::Direct => {
                 let d = Arc::new(self.hub.clone());
                 rt.spawn(async move {
-                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?;
+                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?
+                        .with_runners(registry2, changes);
                     poll::run(&cfg, TEST_SYSTEM_ID, &relay, prepared, d, options, shutdown).await
                 })
             }
@@ -395,13 +403,15 @@ impl Harness {
                     },
                 }));
                 rt.spawn(async move {
-                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?;
+                    let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?
+                        .with_runners(registry2, changes);
                     poll::run(&cfg, TEST_SYSTEM_ID, &relay, prepared, d, options, shutdown).await
                 })
             }
         };
         Daemon {
             status: Some(status),
+            runners: Some(registry),
             rt: Some(rt),
             handle: Some(handle),
             task: Some(task),

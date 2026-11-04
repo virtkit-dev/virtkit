@@ -12,6 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vk_gitlab::config::Config;
 use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
+use vk_gitlab::runners::{self, Runners};
 use vk_gitlab::update::{self, Updater};
 use vk_gitlab::{logging, relay, session, system_id};
 
@@ -147,12 +148,8 @@ async fn verify(config: PathBuf) -> Result<bool> {
 }
 
 async fn run(config: PathBuf) -> Result<()> {
-    let cfg = Config::load(&config)?;
-    if cfg.runners.is_empty() {
-        anyhow::bail!("{}: no [[runners]] configured", config.display());
-    }
+    let mut cfg = Config::load(&config)?;
     let system_id = system_id_for(&cfg)?;
-    log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
     // Held until the daemon exits, or executes a release, which takes it again: no join or
     // leave meanwhile.
     let _lock = relay::lock(&state_dir(&cfg))?;
@@ -163,11 +160,23 @@ async fn run(config: PathBuf) -> Result<()> {
     {
         return Err(vk_peer::update::exec(&binary, deadline));
     }
+    // The config's runners, then those added on the hub.
+    let added = runners::load(&cfg)?;
+    cfg.runners.extend(added);
+    if cfg.runners.is_empty() && !cfg.takes_runners() {
+        anyhow::bail!(
+            "{}: no [[runners]] configured or added on the hub, and [hub] allow lacks \"runners\"",
+            config.display()
+        );
+    }
+    log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
     let relay = Arc::new(relay::open(&state_dir(&cfg))?);
     log::info!(hub = relay.enrollment.hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "Relaying jobs to the hub");
     let status = session::Status::new(&cfg, &system_id, &relay::hostname());
     // Report held work in the first heartbeat, before a session can grant new work.
-    let prepared = poll::prepare_state(&cfg, &relay.enrollment.relay_id, Arc::clone(&status))?;
+    let (registry, changes) = Runners::new(&cfg, &system_id, Arc::clone(&status));
+    let prepared = poll::prepare_state(&cfg, &relay.enrollment.relay_id, Arc::clone(&status))?
+        .with_runners(Arc::clone(&registry), changes);
     let (handle, shutdown) = ShutdownHandle::new();
     let handle = Arc::new(handle);
     let updater = Updater::open(
@@ -176,6 +185,7 @@ async fn run(config: PathBuf) -> Result<()> {
         cfg.hub.clone(),
         Arc::clone(&status),
         Arc::clone(&handle),
+        registry,
     )?;
     let session = tokio::spawn(session::hold(
         Arc::clone(&relay),

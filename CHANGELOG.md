@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Add and remove vk-gitlab runners from the hub.** A relay with `runners` in `[hub] allow`
+  accepts hub runners alongside configured runners and may start with none of its own. It
+  checks each token with GitLab before starting the runner and keeps it in a private file
+  under its state directory. Removed runners stop requesting jobs and leave after their
+  running jobs finish.
+
 ### Fixed
 
 - vk-hub: pages left open during an update reload when they reconnect, so

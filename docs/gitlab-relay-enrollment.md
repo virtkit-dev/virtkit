@@ -152,13 +152,17 @@ relay that does not allow `runners` or speaks a protocol below 4, and a name it 
 
 A relay failing a command answers with a code, never GitLab's text: `token_refused` (GitLab
 answered 401 or 403), `gitlab_unreachable` (a transport error or a 5xx; adding again retries),
-`name_taken`, `runner_taken`, `too_many_runners`, `not_allowed`, `expired`, and for a removal `runner_gone`. A verify answer
-without a positive runner ID is `gitlab_unreachable`.
+`name_taken` (also for a name that is not safe as a file name), `runner_taken`,
+`too_many_runners`, `not_allowed`, `expired`, and for a removal `runner_gone`. A verify answer
+without a positive runner ID is `gitlab_unreachable`. Settings the relay's config would refuse
+(the hub checks them first), or a runner file it cannot write, fail `other`.
 
 The relay journals runner commands as it journals updates, without the token: it acks a command
 accepted before acting on it, repeats its last ack until the hub records it, and answers a
 command sent again from the journal, without verifying again. So a hub restarted mid-add learns
-the outcome when the relay reconnects. Only a command the relay never accepted is lost with the
+the outcome when the relay reconnects. A relay restarted mid-command ends it from its runner
+files: an add done if one names its command, else `gitlab_unreachable`; a removal done if the
+file is marked removed or gone, else `other`. Only a command the relay never accepted is lost with the
 hub's memory: if the relay's first report after the restart does not show it, it ends failed
 `token_lost`, for the operator to add again.
 

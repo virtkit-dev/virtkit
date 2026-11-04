@@ -58,6 +58,7 @@ both!(
     a_running_jobs_view_poll_outlives_the_tick,
     gitlab_is_asked_only_while_the_hub_approves_its_server,
     a_job_of_a_project_not_approved_fails_pointing_at_the_hub,
+    a_runner_added_on_the_hub_runs_and_goes_once_removed_and_drained,
 );
 
 async fn job_runs_and_reports(via: Via) {
@@ -799,5 +800,78 @@ async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
     }
     // Refused once each, not resubmitted.
     assert_eq!(h.count_calls(|c| matches!(c, FakeCall::Submit { .. })), 4);
+    h.stop().await;
+}
+
+/// A runner added on the hub takes jobs at once. Removed, it asks for no more, while its job
+/// runs to the end, across a restart; then its files go, and its name.
+async fn a_runner_added_on_the_hub_runs_and_goes_once_removed_and_drained(via: Via) {
+    use vk_hub_proto::gitlab::RunnerToken;
+    let mut h = Harness::unstarted(2, via).await;
+    h.runners = "[hub]\nallow = [\"runners\"]\n".to_owned();
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    let added_by = "c".repeat(32);
+    let placement = vk_gitlab::dispatch::Placement {
+        pool: "p1".into(),
+        labels: vec!["big".into()],
+        envelope: vk_gitlab::dispatch::Envelope {
+            mem_mib: 8192,
+            cpus: 4,
+            disk_bytes: 10 << 30,
+        },
+    };
+    let runners = h.daemon.runners.clone().unwrap();
+    let id = runners
+        .add(
+            &added_by,
+            "r1",
+            &RunnerToken::new(TOKEN),
+            &placement,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, RUNNER_ID as u64);
+    h.gl.push_job(job_json(40));
+    let (hub_id, sub) = h.accepted_job(1).await;
+    assert_eq!(sub.runner.as_deref(), Some("r1"));
+
+    runners.remove("r1", id, &added_by).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let requests = h.job_requests();
+    h.gl.push_job(job_json(41));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        h.job_requests(),
+        requests,
+        "a removed runner asked for a job"
+    );
+    let file = h.state_dir.join("runners/r1.toml");
+    assert!(file.exists(), "gone with a job running");
+
+    // A restart resumes the job, and asks for none.
+    h.daemon.kill();
+    h.daemon = h.spawn_daemon();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        h.job_requests(),
+        requests,
+        "a removed runner asked for a job"
+    );
+    let status = h.daemon.status.clone().unwrap();
+    assert!(status.inventory().runners.iter().any(|r| r.name == "r1"));
+    h.hub.push_output(&hub_id, b"done\n");
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(40).await["state"], "success");
+    eventually("the removed runner's files to go", || {
+        !file.exists() && !h.state_dir.join("r1.json").exists()
+    })
+    .await;
+    eventually("the removed runner to go from the inventory", || {
+        status.inventory().runners.is_empty()
+    })
+    .await;
     h.stop().await;
 }

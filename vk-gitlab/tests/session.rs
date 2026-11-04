@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::Message;
 use vk_gitlab::config::{Config, HubConfig};
 use vk_gitlab::poll::ShutdownHandle;
 use vk_gitlab::relay;
+use vk_gitlab::runners::{Change, Runners};
 use vk_gitlab::session::{self, Status};
 use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{
@@ -79,9 +81,29 @@ fn hold(
         hub,
         Arc::clone(status),
         Arc::new(handle),
+        registry(state, status, "https://gitlab.example.com").0,
     )
     .unwrap();
     tokio::spawn(session::hold(relay, Arc::clone(status), updater))
+}
+
+/// The runners of the relay in `state` whose GitLab is `gitlab`: its config's `ci`, and those
+/// the hub adds, which the receiver is told to start and stop.
+fn registry(
+    state: &Path,
+    status: &Arc<Status>,
+    gitlab: &str,
+) -> (Arc<Runners>, UnboundedReceiver<Change>) {
+    let cfg = Config::parse(
+        &format!(
+            "state_dir = \"{}\"\n[gitlab]\nurl = \"{gitlab}\"\n\
+             [[runners]]\nname = \"ci\"\ntoken = \"glrt-x\"\n",
+            state.display()
+        ),
+        Path::new("/"),
+    )
+    .unwrap();
+    Runners::new(&cfg, "s_0123456789ab", Arc::clone(status))
 }
 
 fn enroll(state: &Path, hub: &str) -> Vec<u8> {
@@ -407,7 +429,7 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
         reason.contains("[hub] allow does not list update"),
         "{reason}"
     );
-    // A runner command is refused, not taken.
+    // A runner command is refused: runners are not allowed either.
     send(
         &mut ws,
         &HubRelayMsg::Command(Command {
@@ -423,10 +445,12 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
         }),
     )
     .await;
-    assert!(matches!(
+    assert_eq!(
         ack_of(&mut ws, "e").await.outcome,
-        Outcome::Refused { .. }
-    ));
+        Outcome::Refused {
+            reason: "not_allowed".into()
+        }
+    );
     held.abort();
     std::fs::remove_dir_all(&state).unwrap();
 
@@ -521,7 +545,8 @@ async fn a_stopping_relay_takes_no_update() {
         relay_with(&listener, "session-stopping", "allow = [\"update\"]\n");
     let (handle, _shutdown) = ShutdownHandle::new();
     let handle = Arc::new(handle);
-    let updater = Updater::open(&state, relay, hub, status, Arc::clone(&handle)).unwrap();
+    let runners = registry(&state, &status, "https://gitlab.example.com").0;
+    let updater = Updater::open(&state, relay, hub, status, Arc::clone(&handle), runners).unwrap();
     handle.stop();
     let HubRelayMsg::Command(command) = update_command("d", "99.0.0", vk_peer::now_secs() + 3600)
     else {
@@ -552,6 +577,7 @@ async fn a_hub_from_before_updates_hears_no_ack() {
         hub.clone(),
         Arc::clone(&status),
         Arc::new(handle),
+        registry(&state, &status, "https://gitlab.example.com").0,
     )
     .unwrap();
     let HubRelayMsg::Command(command) = update_command("e", "99.0.0", 1) else {
@@ -628,7 +654,8 @@ async fn an_unreadable_update_state_refuses_updates_only() {
     let file = relay::dir(&state).join("update.json");
     std::fs::write(&file, b"{ not json").unwrap();
     let (handle, _shutdown) = ShutdownHandle::new();
-    let updater = Updater::open(&state, relay, hub, status, Arc::new(handle)).unwrap();
+    let runners = registry(&state, &status, "https://gitlab.example.com").0;
+    let updater = Updater::open(&state, relay, hub, status, Arc::new(handle), runners).unwrap();
     let HubRelayMsg::Command(command) = update_command("f", "99.0.0", vk_peer::now_secs() + 3600)
     else {
         unreachable!();
@@ -642,4 +669,224 @@ async fn an_unreadable_update_state_refuses_updates_only() {
     updater.recorded(&ack).unwrap();
     assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
     std::fs::remove_dir_all(&state).unwrap();
+}
+
+/// The relay's last ack of command `id`, past its acceptance.
+async fn outcome_of(ws: &mut Ws, id: &str) -> Outcome {
+    loop {
+        let ack = ack_of(ws, id).await;
+        if ack.outcome != Outcome::Accepted {
+            return ack.outcome;
+        }
+    }
+}
+
+fn add_runner(id: &str, name: &str, token: &str, expires_at: u64) -> HubRelayMsg {
+    HubRelayMsg::Command(Command {
+        id: id.repeat(32),
+        expires_at,
+        op: Operation::AddRunner {
+            name: name.into(),
+            token: vk_hub_proto::gitlab::RunnerToken::new(token),
+            placement: vk_hub_proto::client::Placement {
+                pool: "big".into(),
+                labels: vec!["large-memory".into()],
+                envelope: vk_hub_proto::job::Envelope {
+                    mem_mib: 16384,
+                    cpus: 8,
+                    disk_bytes: 16 << 30,
+                },
+            },
+            limit: Some(2),
+            request_concurrency: 1,
+        },
+    })
+}
+
+fn remove_runner(id: &str, name: &str, runner_id: u64, added_by: &str) -> HubRelayMsg {
+    HubRelayMsg::Command(Command {
+        id: id.repeat(32),
+        expires_at: vk_peer::now_secs() + 3600,
+        op: Operation::RemoveRunner {
+            name: name.into(),
+            runner_id,
+            command: added_by.repeat(32),
+        },
+    })
+}
+
+/// A relay whose `[hub]` allows `runners` adds the runner a command hands it once GitLab
+/// verified the token: it keeps the token in the runner's file alone, lists the runner before
+/// it acks the command done, answers each failure with its code, and removes the runner the
+/// command that added it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runners_are_added_and_removed_on_the_hub_s_command() {
+    use std::os::unix::fs::PermissionsExt;
+    use vk_hub_proto::gitlab::{RunnerFailure, RunnerSource};
+
+    let gl = Arc::new(support::gl::Gl::default());
+    let gitlab = support::FakeGitLab::start(gl.handler()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay, hub) =
+        relay_with(&listener, "session-runners", "allow = [\"runners\"]\n");
+    let (runners, mut changes) = registry(&state, &status, &gitlab.url);
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let updater = Updater::open(
+        &state,
+        Arc::clone(&relay),
+        hub,
+        Arc::clone(&status),
+        Arc::new(handle),
+        Arc::clone(&runners),
+    )
+    .unwrap();
+    let held = tokio::spawn(session::hold(relay, Arc::clone(&status), updater));
+    let mut ws = welcome(&listener).await;
+    let far = vk_peer::now_secs() + 3600;
+    let failed = |f: RunnerFailure| f.outcome();
+
+    send(&mut ws, &add_runner("a", "big", "glrt-SECRET-NEW", far)).await;
+    assert_eq!(ack_of(&mut ws, "a").await.outcome, Outcome::Accepted);
+    // Listed before the ack says done.
+    let mut listed = None;
+    loop {
+        match next_msg(&mut ws).await {
+            RelayMsg::Inventory(i) => listed = i.runners.into_iter().find(|r| r.name == "big"),
+            RelayMsg::Ack(ack) if ack.id == "a".repeat(32) && ack.outcome != Outcome::Accepted => {
+                assert_eq!(ack.outcome, Outcome::Done);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let big = listed.expect("the runner listed before its ack");
+    assert_eq!(big.source, RunnerSource::Hub);
+    assert_eq!(big.command, Some("a".repeat(32)));
+    assert_eq!(big.runner_id, Some(support::gl::RUNNER_ID as u64));
+    assert!(big.verified);
+    assert_eq!(big.placement.pool, "big");
+    assert_eq!(big.limit, Some(2));
+    assert!(
+        matches!(changes.try_recv(), Ok(Change::Start(cfg)) if cfg.name == "big"),
+        "the runner was not started"
+    );
+    // The token is in the runner's file, private, and nowhere else the relay keeps.
+    let file = state.join("runners/big.toml");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("glrt-SECRET-NEW")
+    );
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let journal = std::fs::read_to_string(relay::dir(&state).join("update.json")).unwrap();
+    assert!(
+        journal.contains("add_runner") && !journal.contains("SECRET"),
+        "{journal}"
+    );
+
+    // Sent again, it is answered from the journal, not verified again.
+    let verified = gitlab.requests_to("/api/v4/runners/verify").len();
+    send(&mut ws, &add_runner("a", "big", "glrt-SECRET-NEW", far)).await;
+    assert_eq!(ack_of(&mut ws, "a").await.outcome, Outcome::Done);
+    assert_eq!(gitlab.requests_to("/api/v4/runners/verify").len(), verified);
+
+    // What fails, and its code.
+    send(&mut ws, &add_runner("b", "big", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "b").await,
+        failed(RunnerFailure::NameTaken)
+    );
+    send(&mut ws, &add_runner("c", "ci", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "c").await,
+        failed(RunnerFailure::NameTaken)
+    );
+    send(&mut ws, &add_runner("d", "../x", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "d").await,
+        failed(RunnerFailure::NameTaken)
+    );
+    // GitLab's runner 77 under another name.
+    send(&mut ws, &add_runner("e", "twin", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "e").await,
+        failed(RunnerFailure::RunnerTaken)
+    );
+    *gl.verify_refused.lock().unwrap() = true;
+    send(&mut ws, &add_runner("f", "refused", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "f").await,
+        failed(RunnerFailure::TokenRefused)
+    );
+    *gl.verify_refused.lock().unwrap() = false;
+    *gl.verify_failures.lock().unwrap() = 1;
+    send(&mut ws, &add_runner("1", "flaky", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "1").await,
+        failed(RunnerFailure::GitlabUnreachable)
+    );
+    send(&mut ws, &add_runner("2", "late", "glrt-other", 1)).await;
+    assert_eq!(ack_of(&mut ws, "2").await.outcome, Outcome::Expired);
+    assert!(!state.join("runners/twin.toml").exists());
+    assert!(!state.join("runners/flaky.toml").exists());
+
+    // A removal names the runner by name, GitLab ID and the command that added it.
+    send(&mut ws, &remove_runner("3", "big", 1, "a")).await;
+    assert_eq!(
+        ack_of(&mut ws, "3").await.outcome,
+        failed(RunnerFailure::RunnerGone)
+    );
+    send(&mut ws, &remove_runner("4", "big", 77, "b")).await;
+    assert_eq!(
+        ack_of(&mut ws, "4").await.outcome,
+        failed(RunnerFailure::RunnerGone)
+    );
+    send(&mut ws, &remove_runner("5", "ci", 77, "a")).await;
+    assert_eq!(
+        ack_of(&mut ws, "5").await.outcome,
+        failed(RunnerFailure::RunnerGone)
+    );
+    send(&mut ws, &remove_runner("6", "big", 77, "a")).await;
+    assert_eq!(ack_of(&mut ws, "6").await.outcome, Outcome::Done);
+    assert!(matches!(changes.try_recv(), Ok(Change::Remove(n)) if n == "big"));
+    // Kept until its jobs have ended, its name with it.
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("removed = true")
+    );
+    send(&mut ws, &add_runner("7", "big", "glrt-other", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "7").await,
+        failed(RunnerFailure::NameTaken)
+    );
+    assert!(runners.drained("big"));
+    assert!(!file.exists());
+    assert!(
+        status.inventory().runners.iter().all(|r| r.name != "big"),
+        "still listed once gone"
+    );
+    // The config's runner's token, under another name, though its ID is not known yet.
+    send(&mut ws, &add_runner("9", "dup", "glrt-x", far)).await;
+    assert_eq!(
+        outcome_of(&mut ws, "9").await,
+        failed(RunnerFailure::RunnerTaken)
+    );
+    held.abort();
+
+    // A relay whose `[hub]` does not allow runners refuses them.
+    let (state2, status2, relay2) = relay_for(&listener, "session-runners-refused");
+    let held = hold(&state2, relay2, &status2, HubConfig::default());
+    let mut ws = welcome(&listener).await;
+    send(&mut ws, &add_runner("8", "big", "glrt-other", far)).await;
+    assert_eq!(
+        ack_of(&mut ws, "8").await.outcome,
+        failed(RunnerFailure::NotAllowed)
+    );
+    held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+    std::fs::remove_dir_all(&state2).unwrap();
 }

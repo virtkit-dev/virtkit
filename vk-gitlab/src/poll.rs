@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::Instant;
 use vk_hub_proto::client::AdmissionOutcome;
 use vk_hub_proto::stamp;
@@ -47,6 +47,7 @@ use crate::dispatch::{
 use crate::failure::{FailureReason, FailureReasonMapper, JobState};
 use crate::job::Job;
 use crate::relay::Enrollment;
+use crate::runners::{Change, Runners};
 use crate::secret::Secret;
 use crate::session::Status;
 use crate::spec::{self, SpecContext};
@@ -161,6 +162,32 @@ impl ShutdownHandle {
 async fn wait_true(rx: &mut watch::Receiver<bool>) {
     // A dropped sender means the handle is gone: treat it as set.
     let _ = rx.wait_for(|v| *v).await;
+}
+
+/// What ends a runner's job requests: the relay's stop, or the runner's removal.
+struct Stop {
+    relay: watch::Receiver<bool>,
+    runner: watch::Receiver<bool>,
+}
+
+impl Stop {
+    fn new<D>(shared: &Shared<D>, runner: &Runner) -> Self {
+        Self {
+            relay: shared.shutdown.stop.clone(),
+            runner: runner.stop.subscribe(),
+        }
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            () = wait_true(&mut self.relay) => {}
+            () = wait_true(&mut self.runner) => {}
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        *self.relay.borrow() || *self.runner.borrow()
+    }
 }
 
 impl Shutdown {
@@ -500,6 +527,10 @@ struct Runner {
     server_ca_pem: Option<String>,
     /// What came of its admissions, on the way to the hub.
     outcomes: Outcomes,
+    /// Set when the runner is removed: its job requests end.
+    stop: watch::Sender<bool>,
+    /// Set once its job requests have ended, or when it makes none.
+    requests_ended: watch::Sender<bool>,
 }
 
 impl Runner {
@@ -599,11 +630,11 @@ const REVERIFY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Verifies the runner's token every [`REVERIFY_INTERVAL`] until the loop stops.
 async fn reverify<D>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
-    let mut stop = shared.shutdown.stop.clone();
+    let mut stop = Stop::new(&shared, &runner);
     loop {
         tokio::select! {
             () = tokio::time::sleep(REVERIFY_INTERVAL) => {}
-            () = wait_true(&mut stop) => return,
+            () = stop.wait() => return,
         }
         if runner.verify().await == Verified::Refused {
             log::error!(runner = runner.cfg.name.as_str(); "GitLab refuses the runner's token");
@@ -686,6 +717,19 @@ pub struct PreparedState {
     status: Arc<Status>,
     relay_id: String,
     files: Vec<(String, StateFile)>,
+    runners: Option<(Arc<Runners>, mpsc::UnboundedReceiver<Change>)>,
+}
+
+impl PreparedState {
+    /// Take runners added and removed at run time from `changes`, as `runners` makes them.
+    pub fn with_runners(
+        mut self,
+        runners: Arc<Runners>,
+        changes: mpsc::UnboundedReceiver<Change>,
+    ) -> Self {
+        self.runners = Some((runners, changes));
+        self
+    }
 }
 
 pub fn prepare_state(
@@ -699,8 +743,7 @@ pub fn prepare_state(
         .unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_STATE_DIR));
     let mut files = Vec::with_capacity(config.runners.len());
     for runner in &config.runners {
-        let file = StateFile::open(&state_dir.join(format!("{}.json", runner.name)))?;
-        check_relay(&file, relay_id)?;
+        let file = open_state(&state_dir, &runner.name, relay_id)?;
         let records = file.records();
         status.runner(&runner.name, |r| {
             r.jobs = u32::try_from(records.len()).unwrap_or(u32::MAX);
@@ -713,12 +756,21 @@ pub fn prepare_state(
         status,
         relay_id: relay_id.to_owned(),
         files,
+        runners: None,
     })
+}
+
+/// Runner `name`'s state file in `state_dir`, checked to be the relay's.
+fn open_state(state_dir: &std::path::Path, name: &str, relay_id: &str) -> Result<StateFile> {
+    let file = StateFile::open(&state_dir.join(format!("{name}.json")))?;
+    check_relay(&file, relay_id)?;
+    Ok(file)
 }
 
 /// Polls every configured runner until `shutdown` stops it and the running jobs end, its jobs
 /// submitted as the relay `relay` enrolled. A runner asks GitLab for jobs only while `status`
-/// says the hub approved the server; the jobs it already holds run either way.
+/// says the hub approved the server; the jobs it already holds run either way. Runners the hub
+/// adds start as they come; one it removes stops asking for jobs, and goes once its jobs end.
 pub async fn run<D: Dispatcher>(
     config: &Config,
     system_id: &str,
@@ -732,6 +784,7 @@ pub async fn run<D: Dispatcher>(
         status,
         relay_id,
         files,
+        runners: control,
     } = prepared;
     if relay_id != relay.relay_id
         || files.len() != config.runners.len()
@@ -752,47 +805,37 @@ pub async fn run<D: Dispatcher>(
         shutdown,
         options,
     });
+    let state_dir = config
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_STATE_DIR));
     // Every runner is built before any loop starts: a bad one fails the whole run.
     let mut runners = Vec::with_capacity(config.runners.len());
     for (cfg, (_, state)) in config.runners.iter().zip(files) {
-        let client = client_for(
-            config.gitlab_url(),
-            cfg,
-            system_id,
-            runner_info(),
-            shared.options.retry.clone(),
-        )?;
-        let server_ca_pem = match &cfg.tls_ca_file {
-            Some(f) => Some(
-                std::fs::read_to_string(f)
-                    .with_context(|| format!("runner {:?}: reading {}", cfg.name, f.display()))?,
-            ),
-            None => None,
-        };
-        runners.push(Arc::new(Runner {
-            cfg: cfg.clone(),
-            client: Arc::new(client),
-            check_interval: config.runner_check_interval(cfg),
-            limit: (cfg.limit > 0).then(|| Arc::new(Semaphore::new(cfg.limit))),
-            health: Mutex::new(Health::new(cfg)),
-            next_poll: Mutex::new(Instant::now()),
-            state: Arc::new(state),
-            runner_id: AtomicU64::new(0),
-            status: Arc::clone(&status),
-            server_url: config.gitlab_url().to_owned(),
-            server_ca_pem,
-            outcomes: Outcomes::default(),
-        }));
+        runners.push(build_runner(config, system_id, &shared, cfg, state)?);
     }
+    let (registry, mut changes) = match control {
+        Some((registry, changes)) => (Some(registry), Some(changes)),
+        None => (None, None),
+    };
     // Every runner's outcomes, its resumed jobs' included, reach the hub until the loop ends.
     let mut delivering = tokio::task::JoinSet::new();
+    let mut delivery = std::collections::HashMap::new();
     for runner in &runners {
-        delivering.spawn(deliver_outcomes(Arc::clone(&shared), Arc::clone(runner)));
+        let task = delivering.spawn(deliver_outcomes(Arc::clone(&shared), Arc::clone(runner)));
+        delivery.insert(runner.cfg.name.clone(), task);
     }
-    let delivered = runners.clone();
+    let mut delivered = runners.clone();
+    // Every runner but those removed already, which a removal can find.
+    let mut by_name: std::collections::HashMap<String, Arc<Runner>> = runners
+        .iter()
+        .filter(|r| !r.cfg.hub.as_ref().is_some_and(|h| h.removed))
+        .map(|r| (r.cfg.name.clone(), Arc::clone(r)))
+        .collect();
     // Jobs from before a restart come first, every runner's: they are taken already, and
     // hold their slots ahead of any new request.
     let mut requesting = Vec::with_capacity(runners.len());
+    let mut draining = tokio::task::JoinSet::new();
     for runner in runners {
         let name = runner.cfg.name.as_str();
         // A refused token stops the runner's requests; any other failure is retried with its
@@ -810,27 +853,73 @@ pub async fn run<D: Dispatcher>(
                 running.hold_slots_while(&runner2, resumed).await;
             });
         }
-        if !refused {
+        if runner.cfg.hub.as_ref().is_some_and(|h| h.removed) {
+            // Removed: it resumes its jobs, and goes once they end.
+            runner.requests_ended.send_replace(true);
+            if let Some(registry) = &registry {
+                draining.spawn(drain(Arc::clone(&shared), runner, Arc::clone(registry)));
+            }
+        } else if refused {
+            runner.requests_ended.send_replace(true);
+        } else {
             requesting.push(runner);
         }
     }
     let mut workers = tokio::task::JoinSet::new();
     for runner in requesting {
-        let cfg = &runner.cfg;
-        log::info!(
-            runner = cfg.name.as_str(),
-            token = cfg.token().short().as_str(),
-            pool = cfg.pool.as_str(),
-            url = runner.server_url.as_str(),
-            request_concurrency = cfg.request_concurrency();
-            "Starting runner"
-        );
-        for _ in 0..cfg.request_concurrency() {
-            workers.spawn(request_loop(Arc::clone(&shared), Arc::clone(&runner)));
-        }
-        workers.spawn(reverify(Arc::clone(&shared), runner));
+        workers.spawn(request(Arc::clone(&shared), runner));
     }
-    while workers.join_next().await.is_some() {}
+    let mut stop = shared.shutdown.stop.clone();
+    loop {
+        if shared.shutdown.requests_stopped() && workers.is_empty() {
+            break;
+        }
+        tokio::select! {
+            Some(_) = workers.join_next(), if !workers.is_empty() => {}
+            Some(drained) = draining.join_next(), if !draining.is_empty() => {
+                // Gone: its outcomes delivered, nothing of it is kept.
+                if let Ok(Some(name)) = drained {
+                    if let Some(task) = delivery.remove(&name) {
+                        task.abort();
+                    }
+                    delivered.retain(|r| r.cfg.name != name);
+                }
+            }
+            () = wait_true(&mut stop), if !*stop.borrow() => {}
+            change = next_change(&mut changes) => match change {
+                Some(Change::Start(cfg)) => {
+                    if shared.shutdown.requests_stopped() {
+                        // Its file is kept: the next start runs it.
+                        continue;
+                    }
+                    let built = open_state(&state_dir, &cfg.name, &relay_id)
+                        .and_then(|state| build_runner(config, system_id, &shared, &cfg, state));
+                    let runner = match built {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::error!(runner = cfg.name.as_str(), error = format!("{e:#}").as_str(); "Starting the runner added on the hub failed; it starts with the relay's next start");
+                            continue;
+                        }
+                    };
+                    let task = delivering.spawn(deliver_outcomes(Arc::clone(&shared), Arc::clone(&runner)));
+                    delivery.insert(cfg.name.clone(), task);
+                    delivered.push(Arc::clone(&runner));
+                    by_name.insert(cfg.name.clone(), Arc::clone(&runner));
+                    workers.spawn(request(Arc::clone(&shared), runner));
+                }
+                Some(Change::Remove(name)) => {
+                    let Some(runner) = by_name.remove(&name) else {
+                        continue;
+                    };
+                    runner.stop.send_replace(true);
+                    if let Some(registry) = &registry {
+                        draining.spawn(drain(Arc::clone(&shared), runner, Arc::clone(registry)));
+                    }
+                }
+                None => changes = None,
+            },
+        }
+    }
     shared.shutdown.requests_ended.send_replace(true);
     log::info!(jobs = shared.running_jobs.load(Ordering::SeqCst); "Stopped requesting jobs; waiting for running jobs");
     loop {
@@ -840,6 +929,12 @@ pub async fn run<D: Dispatcher>(
         }
         done.await;
     }
+    // A removed runner whose last job just ended goes now; any other, on the next start.
+    let _ = tokio::time::timeout(shared.options.hub.retry_pause, async {
+        while draining.join_next().await.is_some() {}
+    })
+    .await;
+    draining.abort_all();
     // The outcomes still on their way get the shutdown's grace; any left, the hub reclaims
     // from the next session's heartbeats.
     let flushed = tokio::time::timeout(shared.options.hub.settle_wait, async {
@@ -854,6 +949,112 @@ pub async fn run<D: Dispatcher>(
     delivering.abort_all();
     Ok(())
 }
+
+/// The next change to the runners, or never once there are none to come.
+async fn next_change(changes: &mut Option<mpsc::UnboundedReceiver<Change>>) -> Option<Change> {
+    match changes {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Runner `cfg`, its jobs in `state`, ready to start.
+fn build_runner<D>(
+    config: &Config,
+    system_id: &str,
+    shared: &Shared<D>,
+    cfg: &RunnerConfig,
+    state: StateFile,
+) -> Result<Arc<Runner>> {
+    let client = client_for(
+        config.gitlab_url(),
+        cfg,
+        system_id,
+        runner_info(),
+        shared.options.retry.clone(),
+    )?;
+    let server_ca_pem = match &cfg.tls_ca_file {
+        Some(f) => Some(
+            std::fs::read_to_string(f)
+                .with_context(|| format!("runner {:?}: reading {}", cfg.name, f.display()))?,
+        ),
+        None => None,
+    };
+    Ok(Arc::new(Runner {
+        cfg: cfg.clone(),
+        client: Arc::new(client),
+        check_interval: config.runner_check_interval(cfg),
+        limit: (cfg.limit > 0).then(|| Arc::new(Semaphore::new(cfg.limit))),
+        health: Mutex::new(Health::new(cfg)),
+        next_poll: Mutex::new(Instant::now()),
+        state: Arc::new(state),
+        // A runner added on the hub has its ID from its file, until a verify gives one.
+        runner_id: AtomicU64::new(cfg.hub.as_ref().map_or(0, |h| h.runner_id)),
+        status: Arc::clone(&shared.status),
+        server_url: config.gitlab_url().to_owned(),
+        server_ca_pem,
+        outcomes: Outcomes::default(),
+        stop: watch::channel(false).0,
+        requests_ended: watch::channel(false).0,
+    }))
+}
+
+/// Run `runner`'s request loops, and its token's daily verify, until it is stopped or
+/// removed.
+async fn request<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
+    let cfg = &runner.cfg;
+    log::info!(
+        runner = cfg.name.as_str(),
+        token = cfg.token().short().as_str(),
+        pool = cfg.pool.as_str(),
+        url = runner.server_url.as_str(),
+        request_concurrency = cfg.request_concurrency();
+        "Starting runner"
+    );
+    let mut loops = tokio::task::JoinSet::new();
+    for _ in 0..cfg.request_concurrency() {
+        loops.spawn(request_loop(Arc::clone(&shared), Arc::clone(&runner)));
+    }
+    loops.spawn(reverify(Arc::clone(&shared), Arc::clone(&runner)));
+    while loops.join_next().await.is_some() {}
+    runner.requests_ended.send_replace(true);
+}
+
+/// Once removed `runner`'s job requests have ended, its state file holds no job and its
+/// admission outcomes reached the hub (or the shutdown's grace ran out), have `registry`
+/// delete its files. Its name once gone.
+async fn drain<D>(
+    shared: Arc<Shared<D>>,
+    runner: Arc<Runner>,
+    registry: Arc<Runners>,
+) -> Option<String> {
+    let _ = runner.requests_ended.subscribe().wait_for(|e| *e).await;
+    let mut unrecorded = shared.shutdown.unrecorded.subscribe();
+    loop {
+        let done = shared.job_done.notified();
+        if runner.state.is_empty() && *unrecorded.borrow_and_update() == 0 {
+            break;
+        }
+        tokio::select! {
+            () = done => {}
+            _ = unrecorded.changed() => {}
+            () = tokio::time::sleep(DRAIN_CHECK) => {}
+        }
+    }
+    let _ = tokio::time::timeout(shared.options.hub.settle_wait, async {
+        while !runner.outcomes.is_empty() {
+            tokio::time::sleep(shared.options.hub.retry_pause).await;
+        }
+    })
+    .await;
+    registry
+        .drained(&runner.cfg.name)
+        .then(|| runner.cfg.name.clone())
+}
+
+/// How often a removed runner's state file is checked for its last job, besides each job's
+/// end.
+const DRAIN_CHECK: Duration = Duration::from_secs(5);
 
 /// Refuses a state file whose jobs were submitted as another relay, or by a vk-gitlab from
 /// before relays: the hub scopes jobs to the relay that submitted them, so this one could
@@ -1064,12 +1265,12 @@ fn pause_for(e: &DispatchError, fallback: Duration) -> Duration {
 }
 
 async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
-    let mut stop = shared.shutdown.stop.clone();
+    let mut stop = Stop::new(&shared, &runner);
     let name = runner.cfg.name.clone();
     let placement = runner.cfg.placement();
     let hub = shared.options.hub.clone();
     loop {
-        if shared.shutdown.requests_stopped() {
+        if stop.stopped() {
             return;
         }
         // Only a server the hub approved is asked for jobs: the hub refuses the others'.
@@ -1077,7 +1278,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             runner.report(RunnerState::ServerPending, None);
             tokio::select! {
                 () = shared.status.wait_approved() => {}
-                () = wait_true(&mut stop) => return,
+                () = stop.wait() => return,
             }
             continue;
         }
@@ -1089,7 +1290,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             );
             tokio::select! {
                 () = tokio::time::sleep(wait) => {}
-                () = wait_true(&mut stop) => return,
+                () = stop.wait() => return,
             }
             continue;
         }
@@ -1097,7 +1298,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         if !pace.is_zero() {
             tokio::select! {
                 () = tokio::time::sleep(pace) => {}
-                () = wait_true(&mut stop) => return,
+                () = stop.wait() => return,
             }
         }
         runner.report(RunnerState::WaitingCapacity, None);
@@ -1105,7 +1306,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         let mut sent = Instant::now();
         let queued = tokio::select! {
             r = shared.dispatcher.queue(&name, &request_id, &placement, hub.lease, hub.wait) => r,
-            () = wait_true(&mut stop) => {
+            () = stop.wait() => {
                 // The hub may have queued the request before its answer reached us. Reuse
                 // the ID to find that ticket and cancel it, bounded during shutdown.
                 let cleanup = async {
@@ -1157,7 +1358,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
                         log::warn!(runner = name.as_str(), ticket = id.as_str(), error = e.to_string().as_str(); "Polling the ticket failed; polling it again");
                         tokio::select! {
                             () = tokio::time::sleep(pause) => {}
-                            () = wait_true(&mut stop) => {
+                            () = stop.wait() => {
                                 cancel_ticket(&shared, &id).await;
                                 return;
                             }
@@ -1177,7 +1378,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             sent = Instant::now();
             answer = tokio::select! {
                 r = shared.dispatcher.poll_ticket(&id, hub.wait) => r,
-                () = wait_true(&mut stop) => {
+                () = stop.wait() => {
                     cancel_ticket(&shared, &id).await;
                     return;
                 },
@@ -1210,7 +1411,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
                 }
                 tokio::select! {
                     () = tokio::time::sleep(pause_for(&e, runner.check_interval)) => {}
-                    () = wait_true(&mut stop) => return,
+                    () = stop.wait() => return,
                 }
                 continue;
             }
@@ -1221,7 +1422,7 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             give_back(&shared, &runner, held).await;
             tokio::select! {
                 () = tokio::time::sleep(runner.check_interval) => {}
-                () = wait_true(&mut stop) => return,
+                () = stop.wait() => return,
             }
             continue;
         }
@@ -1231,11 +1432,11 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             give_back(&shared, &runner, held).await;
             tokio::select! {
                 () = tokio::time::sleep(runner.check_interval) => {}
-                () = wait_true(&mut stop) => return,
+                () = stop.wait() => return,
             }
             continue;
         };
-        if shared.shutdown.requests_stopped() {
+        if stop.stopped() {
             give_back(&shared, &runner, held).await;
             return;
         }

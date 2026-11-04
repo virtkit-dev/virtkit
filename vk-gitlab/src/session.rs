@@ -25,11 +25,11 @@ use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::RefusalCode;
 use vk_hub_proto::gitlab::{
     Heartbeat, HubRelayMsg, Inventory, RelayMsg, Report, Runner, RunnerLoad, RunnerReport,
-    RunnerState, Server, ServerState, ServerStatus,
+    RunnerSource, RunnerState, Server, ServerState, ServerStatus,
 };
 use vk_peer::session::{Permanent, Superseded, Ws};
 
-use crate::config::Config;
+use crate::config::{Config, RunnerConfig};
 use crate::relay::Relay;
 use crate::update::Updater;
 
@@ -75,6 +75,36 @@ pub struct RunnerStatus {
     pub last_answer: Option<(u64, u16)>,
 }
 
+impl RunnerStatus {
+    /// Runner `r` as it starts, its server's status not known yet.
+    pub fn new(r: &RunnerConfig) -> Self {
+        RunnerStatus {
+            runner: Runner {
+                name: r.name.clone(),
+                runner_id: r.hub.as_ref().map(|h| h.runner_id),
+                placement: r.placement(),
+                limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
+                request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
+                verified: false,
+                source: if r.hub.is_some() {
+                    RunnerSource::Hub
+                } else {
+                    RunnerSource::Config
+                },
+                command: r.hub.as_ref().map(|h| h.command.clone()),
+            },
+            state: RunnerState::ServerPending,
+            message: None,
+            requests: 0,
+            jobs: 0,
+            request_admissions: vec![],
+            job_admissions: vec![],
+            pending_job_admissions: vec![],
+            last_answer: None,
+        }
+    }
+}
+
 /// What the poll loop and the session share.
 pub struct Status {
     /// What `vk-gitlab` is, but its runners.
@@ -98,29 +128,7 @@ impl std::fmt::Debug for Status {
 impl Status {
     /// The status of the relay `cfg` configures, its server's not known yet.
     pub fn new(cfg: &Config, system_id: &str, hostname: &str) -> Arc<Self> {
-        let runners = cfg
-            .runners
-            .iter()
-            .map(|r| RunnerStatus {
-                runner: Runner {
-                    name: r.name.clone(),
-                    runner_id: None,
-                    placement: r.placement(),
-                    limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
-                    request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
-                    verified: false,
-                    ..Runner::default()
-                },
-                state: RunnerState::ServerPending,
-                message: None,
-                requests: 0,
-                jobs: 0,
-                request_admissions: vec![],
-                job_admissions: vec![],
-                pending_job_admissions: vec![],
-                last_answer: None,
-            })
-            .collect();
+        let runners = cfg.runners.iter().map(RunnerStatus::new).collect();
         Arc::new(Self {
             inventory: Inventory {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -198,6 +206,26 @@ impl Status {
                 self.changed.notify_one();
             }
         }
+    }
+
+    /// List a runner added at run time, and send the inventory.
+    pub fn add_runner(&self, runner: RunnerStatus) {
+        self.lock().push(runner);
+        self.changed.notify_one();
+    }
+
+    /// Stop listing runner `name`, and send the inventory.
+    pub fn remove_runner(&self, name: &str) {
+        self.lock().retain(|r| r.runner.name != name);
+        self.changed.notify_one();
+    }
+
+    /// The GitLab runner IDs of the runners listed.
+    pub fn runner_ids(&self) -> Vec<u64> {
+        self.lock()
+            .iter()
+            .filter_map(|r| r.runner.runner_id)
+            .collect()
     }
 
     /// Runner `name`'s status.

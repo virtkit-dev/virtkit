@@ -21,7 +21,8 @@
 //! request_concurrency = 1   # job requests queued or in flight at once (at most 128)
 //!
 //! [hub]                     # optional: what the hub this relay is enrolled with may do
-//! allow = ["update"]        # update vk-gitlab to a release the hub holds
+//! allow = ["update"]        # update vk-gitlab to a release the hub holds; "runners" lets
+//!                           # it add runners and remove them
 //! release_keys = ["…"]      # an update must be signed by one of these
 //! # require_signed = true   # the default once release_keys names a key
 //! # allow_downgrade = false # whether an update may install an older version
@@ -82,7 +83,8 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HubConfig {
-    /// What the hub may ask: `update`, to install a `vk-gitlab` release it holds.
+    /// What the hub may ask: `update`, to install a `vk-gitlab` release it holds; `runners`,
+    /// to add runners and remove them.
     #[serde(default)]
     pub allow: Vec<String>,
     /// Ed25519 public keys, base64, an update must be signed by one of.
@@ -187,6 +189,29 @@ pub struct RunnerConfig {
 
     #[serde(skip)]
     resolved_token: Secret,
+    /// For a runner added on the hub, where it came from; `None` for the config's.
+    #[serde(skip)]
+    pub hub: Option<HubOrigin>,
+}
+
+/// What a runner added on the hub keeps beside its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubOrigin {
+    /// The command that added it.
+    pub command: String,
+    /// Its GitLab runner ID, as `verify` returned it.
+    pub runner_id: u64,
+    /// Being removed: it asks for no job, and goes once its jobs have ended.
+    pub removed: bool,
+}
+
+/// Whether `name` may name a runner: it names the runner's files.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !name.starts_with('.')
 }
 
 fn default_pool() -> String {
@@ -253,6 +278,76 @@ impl std::fmt::Debug for RunnerConfig {
 }
 
 impl RunnerConfig {
+    /// A runner added on the hub: `name`, `token` and the settings of an `add_runner`
+    /// command, checked as a `[[runners]]` table is.
+    pub fn from_hub(
+        name: &str,
+        token: &str,
+        placement: &crate::dispatch::Placement,
+        limit: Option<u32>,
+        request_concurrency: u32,
+        hub: HubOrigin,
+    ) -> Result<Self> {
+        let mut r = RunnerConfig {
+            name: name.to_owned(),
+            token: None,
+            token_file: None,
+            tls_ca_file: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            pool: placement.pool.clone(),
+            labels: placement.labels.clone(),
+            envelope: EnvelopeConfig {
+                mem: format!("{}M", placement.envelope.mem_mib),
+                cpus: placement.envelope.cpus,
+                disk: placement.envelope.disk_bytes.to_string(),
+            },
+            limit: limit.map_or(0, |l| usize::try_from(l).unwrap_or(usize::MAX)),
+            request_concurrency: usize::try_from(request_concurrency).unwrap_or(usize::MAX),
+            check_interval: None,
+            strict_check_interval: false,
+            output_limit: 0,
+            unhealthy_requests_limit: None,
+            unhealthy_interval: None,
+            job_status_final_update_retry_limit: None,
+            resolved_token: Secret::new(token.trim()),
+            hub: Some(hub),
+        };
+        let which = format!("runner {name:?}");
+        if r.resolved_token.is_empty() {
+            bail!("{which}: the token is empty");
+        }
+        if r.name.is_empty() {
+            bail!("{which}: a runner added on the hub requires a name");
+        }
+        r.check(&which)?;
+        Ok(r)
+    }
+
+    /// The checks every runner's settings pass, wherever they come from.
+    fn check(&mut self, which: &str) -> Result<()> {
+        if self.request_concurrency() > vk_hub_proto::gitlab::MAX_ADMISSIONS {
+            bail!("{which}: request_concurrency exceeds the hub's admission limit");
+        }
+        self.envelope.envelope().with_context(|| which.to_owned())?;
+        if self.pool.is_empty() {
+            bail!("{which}: pool must not be empty");
+        }
+        let mut labels = HashSet::new();
+        for l in &self.labels {
+            if l.trim().is_empty() {
+                bail!("{which}: labels must not be empty");
+            }
+            if !labels.insert(l.as_str()) {
+                bail!("{which}: label {l:?} is listed twice");
+            }
+        }
+        if !valid_name(&self.name) {
+            bail!("{which}: a runner name is letters, digits, `-`, `_` and `.`");
+        }
+        Ok(())
+    }
+
     /// The runner token, resolved from `token` or `token_file` at load.
     pub fn token(&self) -> &Secret {
         &self.resolved_token
@@ -353,12 +448,19 @@ impl Config {
             None => {}
         }
         for a in &cfg.hub.allow {
-            if a != vk_hub_proto::gitlab::ALLOW_UPDATE {
+            if a != vk_hub_proto::gitlab::ALLOW_UPDATE && a != vk_hub_proto::gitlab::ALLOW_RUNNERS {
                 bail!(
-                    "[hub] allow: {a:?} is not something the hub may do; only {:?}",
-                    vk_hub_proto::gitlab::ALLOW_UPDATE
+                    "[hub] allow: {a:?} is not something the hub may do; only {:?} and {:?}",
+                    vk_hub_proto::gitlab::ALLOW_UPDATE,
+                    vk_hub_proto::gitlab::ALLOW_RUNNERS
                 );
             }
+        }
+        if cfg.gitlab.is_none() && cfg.hub.allows(vk_hub_proto::gitlab::ALLOW_RUNNERS) {
+            bail!(
+                "[gitlab] url is required: the GitLab server the runners the hub adds take jobs \
+                 from"
+            );
         }
         cfg.hub.release_policy()?;
         let mut names = HashSet::new();
@@ -368,9 +470,6 @@ impl Config {
             } else {
                 format!("runner {:?}", r.name)
             };
-            if r.request_concurrency() > vk_hub_proto::gitlab::MAX_ADMISSIONS {
-                bail!("{which}: request_concurrency exceeds the hub's admission limit");
-            }
             r.resolved_token = match (&r.token, &r.token_file) {
                 (Some(t), None) => Secret::new(t.trim()),
                 (None, Some(file)) => {
@@ -402,33 +501,17 @@ impl Config {
             if r.name.is_empty() {
                 r.name = r.resolved_token.short();
             }
-            r.envelope.envelope().with_context(|| which.clone())?;
-            if r.pool.is_empty() {
-                bail!("{which}: pool must not be empty");
-            }
-            let mut labels = HashSet::new();
-            for l in &r.labels {
-                if l.trim().is_empty() {
-                    bail!("{which}: labels must not be empty");
-                }
-                if !labels.insert(l.as_str()) {
-                    bail!("{which}: label {l:?} is listed twice");
-                }
-            }
-            // The runner name is used as a filename.
-            if !r
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-                || r.name.starts_with('.')
-            {
-                bail!("{which}: a runner name is letters, digits, `-`, `_` and `.`");
-            }
+            r.check(&which)?;
             if !names.insert(r.name.clone()) {
                 bail!("{which}: runner names must be unique");
             }
         }
         Ok(cfg)
+    }
+
+    /// Whether the hub may add runners to this relay and remove them.
+    pub fn takes_runners(&self) -> bool {
+        self.hub.allows(vk_hub_proto::gitlab::ALLOW_RUNNERS)
     }
 
     /// The GitLab server's URL; empty without `[gitlab]`, which only a config without
@@ -641,6 +724,18 @@ mod tests {
             let err = format!("{:#}", parse(text).unwrap_err());
             assert!(err.contains(needle), "{text}: {err}");
         }
+    }
+
+    /// A relay the hub adds runners to may have none of its own, but needs its GitLab.
+    #[test]
+    fn a_relay_taking_runners_from_the_hub_needs_its_gitlab_only() {
+        let cfg =
+            parse("[gitlab]\nurl = \"https://g\"\n[hub]\nallow = [\"update\", \"runners\"]\n")
+                .unwrap();
+        assert!(cfg.takes_runners() && cfg.runners.is_empty());
+        let e = format!("{:#}", parse("[hub]\nallow = [\"runners\"]\n").unwrap_err());
+        assert!(e.contains("[gitlab] url is required"), "{e}");
+        assert!(!parse("").unwrap().takes_runners());
     }
 
     #[test]

@@ -115,7 +115,14 @@ impl std::error::Error for HttpError {}
 
 /// `POST /api/v4/runners/verify` failed for another reason than the token being refused.
 #[derive(Debug)]
-pub struct VerifyError(pub String);
+pub struct VerifyError(pub String, pub Option<u16>);
+
+impl VerifyError {
+    /// Whether GitLab answered 401 or 403: it refuses the token.
+    pub fn refused(&self) -> bool {
+        matches!(self.1, Some(401 | 403))
+    }
+}
 
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -619,7 +626,7 @@ impl GitLabClient {
             Ok(r) => r,
             Err(e) => {
                 log::error!(runner = runner.as_str(), correlation_id = cid.as_str(), status = e.to_string().as_str(); "Verifying runner... client error");
-                return Err(VerifyError(format!("client error: {e}")));
+                return Err(VerifyError(format!("client error: {e}"), None));
             }
         };
         self.record_last_update(&resp);
@@ -652,10 +659,10 @@ impl GitLabClient {
                 }
                 Ok(None)
             }
-            _ => {
+            code => {
                 let status = status_message(resp, &Method::POST).await;
                 log::error!(runner = runner.as_str(), correlation_id = cid.as_str(), status = status.as_str(); "Verifying runner... failed");
-                Err(VerifyError(status))
+                Err(VerifyError(status, Some(code)))
             }
         }
     }

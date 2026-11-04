@@ -15,6 +15,7 @@ pub mod job;
 pub mod logging;
 pub mod poll;
 pub mod relay;
+pub mod runners;
 pub mod secret;
 pub mod session;
 pub mod spec;

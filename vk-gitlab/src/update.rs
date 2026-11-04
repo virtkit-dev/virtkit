@@ -24,6 +24,9 @@
 //! A relay stopping on SIGTERM or SIGINT takes no update, and one that starts stopping during
 //! an update stops rather than executing the release.
 //!
+//! The hub's runner commands go through here too ([`crate::runners`]), journaled the same way,
+//! without the token.
+//!
 //! The commands, their outcomes and the trial are kept in `<state_dir>/hub/update.json`,
 //! written whole, so a command redelivered after a reconnect is answered with its outcome
 //! rather than run twice. The installed binary is the one `run` last started from outside
@@ -37,7 +40,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use vk_hub_proto::gitlab::{Command, Operation};
+use vk_hub_proto::gitlab::{Command, Operation, RunnerFailure};
 use vk_hub_proto::{CommandAck, Outcome, UpdatePhase, UpdateProgress};
 use vk_peer::trial::{self, Asked, Event, Keeper, Ledger, TRIAL_WINDOW, Trial};
 use vk_peer::update::{Binary, exec};
@@ -47,6 +50,7 @@ pub use vk_peer::trial::{Start, note_signals};
 use crate::config::HubConfig;
 use crate::poll::ShutdownHandle;
 use crate::relay::Relay;
+use crate::runners::Runners;
 use crate::session::Status;
 
 /// How long the job requests out to GitLab may take to end. Past it the release is executed
@@ -216,19 +220,25 @@ impl Persisted {
 
     /// Whether an update is under way: accepted and not ended.
     fn update_under_way(&self) -> bool {
-        self.journal.iter().any(|e| e.outcome == Outcome::Accepted)
+        self.journal
+            .iter()
+            .any(|e| e.outcome == Outcome::Accepted && matches!(e.op, Operation::Update { .. }))
     }
 
-    /// Fail what a restart cut short: an accepted update but the one on trial, and the
-    /// progress of an update that never reached its trial. Whether anything changed.
-    fn fail_interrupted(&mut self) -> bool {
+    /// Fail interrupted updates and their progress, except the update on trial.
+    /// Resolve accepted runner commands through `runner` using the relay's runners.
+    /// Return whether anything changed.
+    fn fail_interrupted(&mut self, runner: impl Fn(&str, &Operation) -> Outcome) -> bool {
         const WHY: &str = "interrupted by a restart";
         let on_trial = self.trial.as_ref().map(|t| t.command.clone());
         let mut changed = false;
         for e in &mut self.journal {
             if e.outcome == Outcome::Accepted && on_trial.as_ref() != Some(&e.id) {
-                e.outcome = Outcome::Failed {
-                    message: WHY.to_string(),
+                e.outcome = match e.op {
+                    Operation::Update { .. } => Outcome::Failed {
+                        message: WHY.to_string(),
+                    },
+                    _ => runner(&e.id, &e.op),
                 };
                 changed = true;
             }
@@ -255,6 +265,26 @@ impl Persisted {
     }
 }
 
+/// How runner command `id`, `op`, accepted before a restart, ended, from the runners the
+/// relay has: an add done if a runner file names it, else failed as GitLab unreachable, to be
+/// added again; a removal done if carried out, else failed.
+fn interrupted(runners: &Runners, id: &str, op: &Operation) -> Outcome {
+    let done = match op {
+        Operation::AddRunner { .. } => runners.added_by(id),
+        Operation::RemoveRunner {
+            name,
+            runner_id,
+            command,
+        } => runners.removed(name, *runner_id, command),
+        Operation::Update { .. } => false,
+    };
+    match (done, op) {
+        (true, _) => Outcome::Done,
+        (false, Operation::AddRunner { .. }) => RunnerFailure::GitlabUnreachable.outcome(),
+        (false, _) => RunnerFailure::Other.outcome(),
+    }
+}
+
 /// The previous binary's part in a trial, run by `run` before anything else, under the
 /// relay's lock ([`trial::on_start`]).
 pub fn on_start(state_dir: &Path, now: u64) -> Start {
@@ -272,6 +302,8 @@ pub struct Updater {
     status: Arc<Status>,
     /// Stops the runners' job requests before the release is executed.
     shutdown: Arc<ShutdownHandle>,
+    /// The runners the hub adds and removes.
+    runners: Arc<Runners>,
     persisted: Mutex<Persisted>,
     /// Why the persisted state could not be read: no update is taken, and the file is left
     /// as it is.
@@ -310,9 +342,10 @@ impl Updater {
         hub: HubConfig,
         status: Arc<Status>,
         shutdown: Arc<ShutdownHandle>,
+        runners: Arc<Runners>,
     ) -> Result<Arc<Self>> {
         let dir = crate::relay::dir(state_dir);
-        let (persisted, broken) = match Self::load(&dir, &relay) {
+        let (persisted, broken) = match Self::load(&dir, &relay, &runners) {
             Ok(p) => (p, None),
             Err(e) => {
                 log::error!(error = format!("{e:#}").as_str(); "The update state cannot be used; taking no update");
@@ -327,6 +360,7 @@ impl Updater {
             policy,
             status,
             shutdown,
+            runners,
             persisted: Mutex::new(persisted),
             broken,
             handover: watch::channel(Handover::None).0,
@@ -335,10 +369,10 @@ impl Updater {
 
     /// The state in `dir`, made current for `relay`'s enrollment and this start, and saved if
     /// that changed it.
-    fn load(dir: &Path, relay: &Relay) -> Result<Persisted> {
+    fn load(dir: &Path, relay: &Relay, runners: &Runners) -> Result<Persisted> {
         let mut persisted = Persisted::load(dir)?;
         let mut changed = persisted.adopt_issuer(&relay.enrollment.hub, &relay.enrollment.relay_id);
-        changed |= persisted.fail_interrupted();
+        changed |= persisted.fail_interrupted(|id, op| interrupted(runners, id, op));
         if let Ok(exe) = std::env::current_exe()
             && let Some(installed) =
                 trial::installed_after(persisted.installed.as_deref(), exe, dir)
@@ -419,16 +453,6 @@ impl Updater {
                 outcome: entry.outcome.clone(),
             });
         }
-        if !matches!(command.op, Operation::Update { .. }) {
-            // Not journaled: a runner command carries a token, kept nowhere but in a runner
-            // file.
-            return Ok(CommandAck {
-                id: command.id,
-                outcome: Outcome::Refused {
-                    reason: "this relay does not take runners from the hub yet".to_string(),
-                },
-            });
-        }
         if let Some(why) = &self.broken {
             // Not journaled: there is no journal to keep it in.
             return Ok(CommandAck {
@@ -439,6 +463,9 @@ impl Updater {
             });
         }
         let now = vk_peer::now_secs();
+        if !matches!(command.op, Operation::Update { .. }) {
+            return self.runner_command(command, now);
+        }
         let outcome = if command.expires_at <= now {
             Outcome::Expired
         } else if !self.hub.allows(command.op.allowed_by()) {
@@ -485,6 +512,80 @@ impl Updater {
             });
         }
         Ok(CommandAck { id, outcome })
+    }
+
+    /// Handle an unjournaled runner `command`: refuse it if expired or not allowed,
+    /// remove the named runner, or accept an addition and run it in the background.
+    /// Journal each command without its token and return the ack to send now.
+    fn runner_command(self: &Arc<Self>, command: Command, now: u64) -> Result<CommandAck> {
+        let outcome = if command.expires_at <= now {
+            RunnerFailure::Expired.outcome()
+        } else if !self.hub.allows(command.op.allowed_by()) {
+            RunnerFailure::NotAllowed.outcome()
+        } else {
+            Outcome::Accepted
+        };
+        let id = command.id.clone();
+        let kept = command.op.without_token();
+        // Journaled before it is acted on: a restart ends it from the runners the relay has.
+        self.change(|p| p.journal(&id, kept, command.expires_at, outcome.clone(), now))?;
+        if outcome != Outcome::Accepted {
+            return Ok(CommandAck { id, outcome });
+        }
+        match command.op {
+            Operation::RemoveRunner {
+                name,
+                runner_id,
+                command: added_by,
+            } => {
+                let outcome = match self.runners.remove(&name, runner_id, &added_by) {
+                    Ok(()) => Outcome::Done,
+                    Err(f) => f.outcome(),
+                };
+                self.change(|p| p.set_outcome(&id, outcome.clone()))?;
+                Ok(CommandAck { id, outcome })
+            }
+            Operation::AddRunner {
+                name,
+                token,
+                placement,
+                limit,
+                request_concurrency,
+            } => {
+                let updater = self.clone();
+                let ack = CommandAck {
+                    id: id.clone(),
+                    outcome,
+                };
+                tokio::spawn(async move {
+                    let outcome = match updater
+                        .runners
+                        .add(&id, &name, &token, &placement, limit, request_concurrency)
+                        .await
+                    {
+                        Ok(_) => Outcome::Done,
+                        Err(f) => {
+                            log::warn!(runner = name.as_str(), failure = f.as_str(); "Adding the runner the hub asked for failed");
+                            f.outcome()
+                        }
+                    };
+                    updater.settle(&id, outcome).await;
+                });
+                Ok(ack)
+            }
+            Operation::Update { .. } => Err(anyhow!("not a runner command")),
+        }
+    }
+
+    /// Record that command `id` ended with `outcome`, trying again until the journal takes
+    /// it: until then the hub hears it accepted.
+    async fn settle(&self, id: &str, outcome: Outcome) {
+        let mut pause = Duration::from_secs(1);
+        while let Err(e) = self.change(|p| p.set_outcome(id, outcome.clone())) {
+            log::error!(error = format!("{e:#}").as_str(); "Recording how a runner command ended failed; trying again");
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_secs(60));
+        }
     }
 
     /// Whether the relay takes `command`, an update: `Ok` with its first outcome, `Err` with
@@ -774,22 +875,83 @@ mod tests {
         p.journal("u", update(), 10, Outcome::Accepted, 0);
         p.update = Some(progress("u", UpdatePhase::Draining));
         assert!(p.update_under_way());
-        assert!(p.fail_interrupted());
+        assert!(p.fail_interrupted(|_, _| Outcome::Done));
         assert!(matches!(
             p.entry("u").unwrap().outcome,
             Outcome::Failed { .. }
         ));
         assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Failed);
         assert!(!p.update_under_way());
-        assert!(!p.fail_interrupted());
+        assert!(!p.fail_interrupted(|_, _| Outcome::Done));
 
         // The update on trial goes on: the release confirms or the previous binary ends it.
         p.journal("t", update(), 10, Outcome::Accepted, 0);
         p.update = Some(progress("t", UpdatePhase::Validating));
         p.trial = Some(trial_of("t", Path::new("/"), 1, 1));
-        assert!(!p.fail_interrupted());
+        assert!(!p.fail_interrupted(|_, _| Outcome::Done));
         assert_eq!(p.entry("t").unwrap().outcome, Outcome::Accepted);
         assert!(p.update_under_way());
+    }
+
+    /// A restart ends an accepted runner command from the runners the relay has: an add done
+    /// when a runner names its command, failed to be added again when none does; a removal
+    /// done once carried out. Neither is an update under way.
+    #[test]
+    fn a_restart_ends_runner_commands_from_the_relay_s_runners() {
+        let placement = crate::dispatch::Placement {
+            pool: "ci".into(),
+            labels: vec![],
+            envelope: crate::dispatch::Envelope {
+                mem_mib: 1024,
+                cpus: 1,
+                disk_bytes: 1 << 30,
+            },
+        };
+        let origin = |command: &str, removed| crate::config::HubOrigin {
+            command: command.repeat(32),
+            runner_id: 7,
+            removed,
+        };
+        let mut cfg = crate::config::Config::parse(
+            "[gitlab]\nurl = \"https://g\"\n[hub]\nallow = [\"runners\"]\n",
+            Path::new("/"),
+        )
+        .unwrap();
+        for (name, o) in [("kept", origin("a", false)), ("gone", origin("b", true))] {
+            let r = crate::config::RunnerConfig::from_hub(name, "glrt-x", &placement, None, 1, o)
+                .unwrap();
+            cfg.runners.push(r);
+        }
+        let status = Status::new(&cfg, "s_test", "host");
+        let (runners, _changes) = Runners::new(&cfg, "s_test", status);
+        let add = |name: &str| Operation::AddRunner {
+            name: name.into(),
+            token: Default::default(),
+            placement: placement.clone(),
+            limit: None,
+            request_concurrency: 1,
+        };
+        let remove = |name: &str, command: &str| Operation::RemoveRunner {
+            name: name.into(),
+            runner_id: 7,
+            command: command.repeat(32),
+        };
+        let mut p = Persisted::default();
+        for (id, op) in [
+            ("a", add("kept")),
+            ("c", add("lost")),
+            ("d", remove("gone", "b")),
+            ("e", remove("kept", "a")),
+        ] {
+            p.journal(&id.repeat(32), op, 10, Outcome::Accepted, 0);
+        }
+        assert!(!p.update_under_way());
+        assert!(p.fail_interrupted(|id, op| interrupted(&runners, id, op)));
+        let outcome = |id: &str| p.entry(&id.repeat(32)).unwrap().outcome.clone();
+        assert_eq!(outcome("a"), Outcome::Done);
+        assert_eq!(outcome("c"), RunnerFailure::GitlabUnreachable.outcome());
+        assert_eq!(outcome("d"), Outcome::Done);
+        assert_eq!(outcome("e"), RunnerFailure::Other.outcome());
     }
 
     #[test]
