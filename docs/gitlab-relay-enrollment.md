@@ -78,10 +78,11 @@ what the hub may do to the relay ([Updates](#updates)).
   else; `verify` gives each runner's ID. A token that lists a runner's projects or creates
   runners (`manage_runner`, `create_runner`) can also edit runners or take other runners' jobs,
   which a host reading untrusted traces should not hold.
-- **Placement stays in the relay's config, and is reported.** A runner's pool, labels and
-  envelope go with the tags it was registered with in GitLab, which the relay's operator chose;
-  keeping them beside the token keeps one place to change a runner, and the hub needs no
-  placement store, import or sync. The hub shows them.
+- **Placement stays with the runner's token, and is reported.** A runner's pool, labels and
+  envelope go with the tags it was registered with in GitLab; keeping them beside the token
+  keeps one place to change a runner, and the hub needs no placement store, import or sync. The
+  hub shows them. That place is the relay's config, or the relay's runner files for a runner
+  [added on the hub](#runners-added-on-the-hub).
 
 ## What the relay reports
 
@@ -109,6 +110,101 @@ another URL is told `rebound` and refused jobs until re-enrolled (`join --replac
 the relay knows a project only once GitLab gives it one of its jobs, and the hub learns it from
 that job's submission. **The first job of a project not yet approved fails** (below). An
 operator can approve a project beforehand, by ID and path.
+
+## Runners added on the hub
+
+Status: **design**.
+
+An operator who created a runner in GitLab hands its token to a relay from the hub, rather than
+editing the relay's config over SSH. GitLab still creates the runner: the hub keeps no GitLab
+credential and calls no GitLab API. The token passes through the hub in memory only; the relay's
+runner file is its one stored copy.
+
+**Opt-in.** A relay takes runners from the hub only if its config allows it, as for updates:
+
+```toml
+[hub]
+allow = ["update", "runners"]
+```
+
+Such a relay needs `[gitlab] url` and runs with no runner at all, waiting for one.
+
+**Add.** *Add runner* on a relay's row (GitLab › Overview), or `vk-hub relays runners add <relay>
+<name> --token-file FILE [--pool P] [--label L]… [--envelope mem=16G,cpus=8,disk=16G] [--limit
+N] [--request-concurrency N]`. The form takes the `glrt-` token, a name, and the settings a
+`[[runners]]` table has, with the same defaults. The hub refuses, before sending anything, a
+relay that does not allow `runners` or speaks a protocol below 4, and a name it reports.
+
+1. The hub issues an `add_runner` command, as it issues an update. Its record holds the name and
+   settings; the token is not part of what is stored, logged or shown, and stays in memory, with
+   the command, until the relay answers.
+2. The relay checks, under one lock for all runner changes, what the hub's view cannot: `allow`,
+   the command's expiry, a name that is safe as a file name and not taken (by the config, a
+   runner file, or a runner being removed), and `MAX_RUNNERS`. Then it verifies the token with
+   GitLab (`POST /runners/verify`, with its own system ID, as at startup). Verification records
+   the relay as a manager of that runner in GitLab, as its first job request would. A runner ID
+   this relay already runs is refused: one GitLab runner under two names would share one lane.
+3. Verified, it writes `<state_dir>/runners/<name>.toml` (`0600`, written whole and renamed into
+   place): the settings, the token, the GitLab runner ID and the command's ID. It starts the
+   runner's worker, sends a new inventory, then acks the command done.
+4. The hub records the ack, takes the runner's GitLab ID from the inventory entry naming the
+   command, audits both, and drops the token.
+
+A relay failing a command answers with a code, never GitLab's text: `token_refused` (GitLab
+answered 401 or 403), `gitlab_unreachable` (a transport error or a 5xx; adding again retries),
+`name_taken`, `runner_taken`, `too_many_runners`, `not_allowed`, `expired`, and for a removal `runner_gone`. A verify answer
+without a positive runner ID is `gitlab_unreachable`.
+
+The relay journals runner commands as it journals updates, without the token: it acks a command
+accepted before acting on it, repeats its last ack until the hub records it, and answers a
+command sent again from the journal, without verifying again. So a hub restarted mid-add learns
+the outcome when the relay reconnects. Only a command the relay never accepted is lost with the
+hub's memory: if the relay's first report after the restart does not show it, it ends failed
+`token_lost`, for the operator to add again.
+
+**Capacity.** A new runner has no [lane](capacity-arbitration.md), so its jobs are refused until
+one maps its GitLab ID. Once the add is done, the page says so and links to adding the lane.
+
+**Remove.** *Remove* on a runner added on the hub, or `vk-hub relays runners remove <relay>
+<name>`; a `[[runners]]` table stays the config's. `remove_runner` must match the runner file's
+name, GitLab ID and adding command; otherwise it is refused `runner_gone`. This prevents late
+or replayed removals from reaching a runner added again under the same name.
+
+Removal marks the runner file removed and stops new job requests. Outstanding requests finish
+through submission, as before an update; jobs finish on their job tokens. Once the state file
+holds no jobs, the relay deletes both files. Until then the name stays taken, and a restarted
+relay loads the file to resume jobs without polling. The runner stays in GitLab, to delete there.
+
+**On the relay.** `vk-gitlab run` loads the config's runners, then `<state_dir>/runners/`. A
+runner file that does not parse stops the relay at start, as a config that does not parse does:
+its jobs are resumed only with its settings. The inventory gives each runner a `source`,
+`config` or `hub` (absent from an older relay: `config`), and for `hub` the command that added
+it; the hub offers *Remove* for `hub` runners only. A relay whose config drops `runners` from
+`allow` keeps running the runners it has and refuses further commands.
+
+**Hub commands.** Runner commands share updates' table, delivery and `Recorded`.
+They do not use updates' recovery for commands absent from the relay's first report.
+Release retention and the Updates page's latest command consider `update` commands only.
+A session at protocol 3 receives update commands only.
+
+**Audit.** Each add and removal, with the actor, the relay, the runner's name and GitLab ID, and
+the outcome; never the token.
+
+**Protocol.** Version 4 raises both ranges' maximum: the `Operation` variants `add_runner` and
+`remove_runner`, and the inventory runner's optional `source` and `command`. `Operation` has no
+fallback variant, so neither is sent below 4.
+
+**Later.** Editing a runner's settings: requests already taken keep the placement of their
+admission, so an edit waits for them to drain as a removal does. Replacing a token after a reset
+in GitLab, refused if its runner ID differs. Renewing an expiring token with `POST
+/runners/reset_authentication_token`, rewriting the runner file. Until then, a runner is changed
+by removing it and adding it again.
+
+**Implementation order.** (1) Proto: the two operations, `source` and `command`, version 4.
+(2) vk-gitlab: runner files, loading them beside the config's, a relay with no runner, the
+workers started and stopped at run time, the two commands. (3) Hub: the commands with the token
+in memory only, reconciliation from the inventory, the CLI, the audit. (4) UI: *Add runner*,
+*Remove*, the outcome on the relay's row, the missing lane.
 
 ## Updates
 
