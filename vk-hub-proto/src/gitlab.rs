@@ -69,8 +69,12 @@ pub const ALPN: &[u8] = b"vk-relay/1";
 /// The protocol versions of a relay's session.
 pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 5 };
 
-/// The relay requires admission-aware scheduling, introduced in version 2.
-pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 4 };
+/// The relay speaks version [`CONNECTION`] alone: it refuses an older hub rather than fall
+/// back to signed requests on connections of their own.
+pub const RELAY_PROTOCOL: VersionRange = VersionRange {
+    min: CONNECTION,
+    max: CONNECTION,
+};
 
 /// The version the hub takes new work from: admission-aware scheduling. A relay below it
 /// is served only to settle the jobs it holds.
@@ -1251,29 +1255,26 @@ mod tests {
             runners: vec![load; MAX_RUNNERS],
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
-        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(RUNNERS));
-        assert_eq!(
-            PROTOCOL.negotiate(VersionRange {
-                min: CONNECTION,
-                max: CONNECTION
-            }),
-            Some(CONNECTION)
-        );
+        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(CONNECTION));
         const { assert!(RELAY_PROTOCOL.min >= RELAY_WORK) };
+        // The relay refuses every hub from before the connection.
         assert_eq!(
-            VersionRange { min: 1, max: 1 }.negotiate(RELAY_PROTOCOL),
+            VersionRange {
+                min: 1,
+                max: RUNNERS
+            }
+            .negotiate(RELAY_PROTOCOL),
             None
         );
-        // Either peer can still negotiate version 3 with a version-3 peer.
-        let before = VersionRange { min: 1, max: 3 };
-        assert_eq!(before.negotiate(RELAY_PROTOCOL), Some(UPDATES));
+        // The hub still meets a released relay at its highest version.
+        assert_eq!(
+            PROTOCOL.negotiate(VersionRange { min: 2, max: 4 }),
+            Some(RUNNERS)
+        );
         assert_eq!(
             PROTOCOL.negotiate(VersionRange { min: 2, max: 3 }),
             Some(UPDATES)
         );
-        // A hub or a relay from before updates still meets the other at version 2.
-        let before = VersionRange { min: 1, max: 2 };
-        assert_eq!(before.negotiate(RELAY_PROTOCOL), Some(2));
         assert_eq!(PROTOCOL.negotiate(VersionRange { min: 2, max: 2 }), Some(2));
     }
 

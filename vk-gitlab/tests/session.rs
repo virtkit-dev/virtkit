@@ -19,8 +19,8 @@ use vk_gitlab::runners::{Change, Runners};
 use vk_gitlab::session::{self, Status};
 use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{
-    Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RUNNERS, RelayMsg, RunnerState,
-    ServerState, ServerStatus, UPDATES,
+    CONNECTION, Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState,
+    ServerState, ServerStatus,
 };
 use vk_hub_proto::{Channel, CommandAck, HubMsg, NodeMsg, Outcome, RefusalCode};
 use vk_peer::identity::Identity;
@@ -29,7 +29,7 @@ use support::gl::{eventually, temp_dir, within};
 
 const RELAY_ID: &str = "fedcba9876543210fedcba9876543210";
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+use support::relayconn::Ws;
 
 /// Read the relay's next text frame and ping while waiting, as a hub does. The relay
 /// disconnects after three silent 1s heartbeat intervals, which a loaded host can
@@ -84,7 +84,12 @@ fn hold(
         registry(state, status, "https://gitlab.example.com").0,
     )
     .unwrap();
-    tokio::spawn(session::hold(relay, Arc::clone(status), updater))
+    tokio::spawn(session::hold(
+        relay,
+        Arc::clone(status),
+        updater,
+        vk_gitlab::hub::Link::new(),
+    ))
 }
 
 /// The runners of the relay in `state` whose GitLab is `gitlab`: its config's `ci`, and those
@@ -134,10 +139,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     let relay = Arc::new(relay::open(&state).unwrap());
     let held = hold(&state, relay, &status, HubConfig::default());
 
-    let (tcp, _) = within("the relay to dial", listener.accept())
-        .await
-        .unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = within("the relay to dial", support::relayconn::accept(&listener)).await;
     let NodeMsg::Hello {
         versions,
         node_id,
@@ -153,7 +155,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: RUNNERS,
+            version: CONNECTION,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&nonce),
         },
@@ -168,7 +170,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         &incarnation,
         RELAY_PROTOCOL,
         PROTOCOL,
-        RUNNERS,
+        CONNECTION,
         Channel::Plaintext,
     );
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
@@ -223,6 +225,26 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         }
     }
 
+    // The hub's notices are taken, and the session goes on.
+    send(
+        &mut ws,
+        &HubRelayMsg::Ticket {
+            ticket: "a".repeat(32),
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &HubRelayMsg::Job {
+            job: "b".repeat(32),
+            revision: 2,
+            output_len: 10,
+        },
+    )
+    .await;
+    next(&mut ws).await;
+    next(&mut ws).await;
+
     // A relay the hub removed stops for good, and polls nothing.
     send(
         &mut ws,
@@ -276,10 +298,7 @@ fn relay_with(
 
 /// Takes the relay's dial and hello; the hub's answer is the caller's.
 async fn hello(listener: &TcpListener) -> (Ws, String) {
-    let (tcp, _) = within("the relay to dial", listener.accept())
-        .await
-        .unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = within("the relay to dial", support::relayconn::accept(listener)).await;
     let NodeMsg::Hello { incarnation, .. } = serde_json::from_str(&next(&mut ws).await).unwrap()
     else {
         panic!("not a hello");
@@ -293,7 +312,7 @@ async fn welcome(listener: &TcpListener) -> Ws {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: RUNNERS,
+            version: CONNECTION,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
@@ -482,15 +501,11 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
     );
     let held = hold(&state, relay, &status, hub);
     let (mut ws, _) = hello(&listener).await;
-    // Updates still work with a version-3 hub.
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: UPDATES,
-            versions: vk_hub_proto::VersionRange {
-                min: 1,
-                max: UPDATES,
-            },
+            version: CONNECTION,
+            versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
     )
@@ -583,10 +598,9 @@ async fn a_stopping_relay_takes_no_update() {
     std::fs::remove_dir_all(&state).unwrap();
 }
 
-/// A hub from before updates, which meets the relay at version 2, is sent no ack: it could not
-/// read one. The relay keeps it for a hub that can.
+/// An answer the hub has not stored, journaled before the session, is sent in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hub_from_before_updates_hears_no_ack() {
+async fn an_answer_the_hub_has_not_stored_is_sent_in_the_next_session() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (state, status, relay, hub) =
         relay_with(&listener, "session-old-hub", "allow = [\"update\"]\n");
@@ -608,57 +622,6 @@ async fn a_hub_from_before_updates_hears_no_ack() {
     drop(journal);
 
     let held = hold(&state, relay, &status, hub);
-    let (mut ws, _) = hello(&listener).await;
-    send(
-        &mut ws,
-        &HubMsg::Challenge {
-            version: 2,
-            versions: vk_hub_proto::VersionRange { min: 1, max: 2 },
-            nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
-        },
-    )
-    .await;
-    let NodeMsg::Auth { .. } = serde_json::from_str(&next(&mut ws).await).unwrap() else {
-        panic!("not an auth");
-    };
-    send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
-    status.runner("ci", |r| r.state = RunnerState::Unhealthy);
-    loop {
-        match next_msg(&mut ws).await {
-            RelayMsg::Report(r) if r.runners[0].state == RunnerState::Unhealthy => break,
-            RelayMsg::Ack(ack) => panic!("an ack to a version-2 hub: {ack:?}"),
-            _ => {}
-        }
-    }
-    // Nor does it take a command there: the session ends.
-    send(&mut ws, &update_command("v2", "99.0.0", u64::MAX)).await;
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Text(t))) => {
-                    assert!(!t.as_str().contains("\"ack\""), "an ack: {t}")
-                }
-                Some(Ok(_)) => {}
-            }
-        }
-    });
-    ended.await.expect("the session did not end");
-    held.abort();
-
-    // A hub that speaks updates hears it.
-    let held = {
-        let (_, status, relay, hub) = (
-            (),
-            Arc::clone(&status),
-            Arc::new(relay::open(&state).unwrap()),
-            HubConfig {
-                allow: vec!["update".into()],
-                ..HubConfig::default()
-            },
-        );
-        hold(&state, relay, &status, hub)
-    };
     let mut ws = welcome(&listener).await;
     assert_eq!(ack_of(&mut ws, "e").await.outcome, Outcome::Expired);
     held.abort();
@@ -761,7 +724,12 @@ async fn runners_are_added_and_removed_on_the_hub_s_command() {
         Arc::clone(&runners),
     )
     .unwrap();
-    let held = tokio::spawn(session::hold(relay, Arc::clone(&status), updater));
+    let held = tokio::spawn(session::hold(
+        relay,
+        Arc::clone(&status),
+        updater,
+        vk_gitlab::hub::Link::new(),
+    ));
     let mut ws = welcome(&listener).await;
     let far = vk_peer::now_secs() + 3600;
     let failed = |f: RunnerFailure| f.outcome();

@@ -1,12 +1,16 @@
-//! The hub client: [`Dispatcher`] over vk-hub's client API (HTTP/1.1 and JSON, TLS 1.3),
-//! as `docs/gitlab-dispatch.md`, "Daemon ↔ hub", and vk-hub's `src/client.rs` define it.
+//! [`Dispatcher`] over vk-hub's client API, on the relay's one HTTP/2 connection to the hub.
+//! Defined in `docs/gitlab-dispatch.md`, "Daemon ↔ hub", and vk-hub's `src/client.rs`.
 //!
-//! Each request is signed by the relay's key, as a node signs a release download: the
-//! [`RELAY_HEADER`], [`TIME_HEADER`] and [`SIGNATURE_HEADER`] headers carry the relay's ID,
-//! the time, and its signature over [`client_request_message`] — the method, path and query,
-//! the body's SHA-256, the time and the TLS connection's exporter. A signature is good on its
-//! own connection only, so each request opens a connection of its own, and a retry signs
-//! again; a long poll then never holds a renewal up behind it.
+//! The session ([`crate::session`]) dials that connection and authenticates it; requests ride
+//! it, unsigned, while the session is up, and wait for the next session while there is none.
+//! The hub tells the session when a ticket or a job of the relay changes, and the [`Link`]
+//! keeps its latest notice per ticket and job. Nothing long-polls: a wait for a ticket's
+//! grant, a job's next revision or more of its output fetches at once the first time and in
+//! each new session, which may have missed a notice; else it ends on a notice about its object,
+//! or after [`MAX_WAIT_SECS`], and then fetches. At most
+//! [`MAX_OUTPUTS`] output reads and [`MAX_SUBMISSIONS`] submissions, the only large bodies,
+//! are in flight, so that the session's stream never waits behind more than the connection's
+//! windows hold.
 //!
 //! Transport errors and the retryable codes (`unavailable`, `internal`, and `no_capacity`
 //! outside a reservation) are retried with backoff from 1 to 30 seconds and jitter, honouring
@@ -16,28 +20,30 @@
 //! body is cut short is retried as a request without one is. A renewal is tried once, and
 //! its caller retries it within the lease.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::{Semaphore, watch};
 use tokio::time::Instant;
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http2;
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vk_hub_proto::client::{
     CAPACITY_PATH, CancelMode, CancelRequest, Capacity, CapacityRequest, ClientError, ErrorCode,
     JOBS_PATH, JobSubmission, JobView, MAX_OUTPUT_READ, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER,
-    OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RELAY_HEADER, RESERVATIONS_PATH,
-    RenewRequest, ReservationGrant, ReservationRequest, ReservationTicket, TICKETS_PATH,
-    client_request_message,
+    OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, Placement, RESERVATIONS_PATH, RenewRequest,
+    ReservationGrant, ReservationRequest, ReservationTicket, TICKETS_PATH,
 };
 use vk_hub_proto::dispatch::MAX_LEASE_SECS;
 use vk_hub_proto::job::MAX_JOB_SPEC;
-use vk_hub_proto::{SIGNATURE_HEADER, TIME_HEADER, valid_id};
-use vk_peer::identity::Identity;
+use vk_hub_proto::valid_id;
 
 use crate::backoff::Backoff;
 use crate::dispatch::{
@@ -45,12 +51,308 @@ use crate::dispatch::{
     Submission,
 };
 
-/// How long a request may take beyond the long poll it asks for.
-const REQUEST_SLACK: Duration = Duration::from_secs(30);
+/// How long a request may take, its wait for a session included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest `retry_after_secs` (or `Retry-After`) honoured.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// The most an answer's body is read to: an output read, and room for its headers' worth.
 const MAX_ANSWER: usize = MAX_OUTPUT_READ + (64 << 10);
+/// How often the connection is pinged.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Ping response deadline. A timeout closes the connection, and with it the session.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// What the hub may send on the connection before the relay reads it: [`MAX_OUTPUTS`] output
+/// reads, with room left for the session's stream.
+const CONNECTION_WINDOW: u32 = 5 << 20;
+/// What the hub may send on one stream before the relay reads it: an output read whole.
+const STREAM_WINDOW: u32 = 2 << 20;
+/// Output reads in flight at most: up to 4 MiB from the hub.
+pub const MAX_OUTPUTS: usize = 4;
+/// Submissions in flight at most: specs of up to 512 KiB each to the hub, whose connection
+/// window is 4 MiB.
+pub const MAX_SUBMISSIONS: usize = 4;
+/// How long the latest notice about a ticket or a job is kept for an ID nothing waits on.
+const UNCLAIMED: Duration = Duration::from_secs(120);
+
+const _: () = assert!(MAX_OUTPUTS * MAX_ANSWER < CONNECTION_WINDOW as usize);
+const _: () = assert!(MAX_ANSWER <= STREAM_WINDOW as usize);
+
+/// The relay's HTTP/2 to the hub: pings that find a dead connection, and windows that let
+/// [`MAX_OUTPUTS`] output reads arrive whole.
+pub fn http2_builder() -> http2::Builder<TokioExecutor> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new())
+        .keep_alive_interval(PING_INTERVAL)
+        .keep_alive_timeout(PING_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .initial_stream_window_size(STREAM_WINDOW);
+    builder
+}
+
+/// The relay's connection to the hub, as its session and its client share it: the request
+/// sender of the session's connection while the session is up, and the hub's latest notice
+/// about each ticket and job.
+pub struct Link {
+    state: Mutex<LinkState>,
+    /// Moved on at every change of `state`, for the waiters.
+    changed: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct LinkState {
+    conn: Option<Conn>,
+    /// Sessions up so far.
+    sessions: u64,
+    tickets: HashMap<String, Told>,
+    jobs: HashMap<String, Told>,
+}
+
+/// A session's connection.
+#[derive(Clone)]
+struct Conn {
+    sender: http2::SendRequest<Full<Bytes>>,
+    /// `scheme://host:port`, which a request's URI starts with.
+    base: String,
+}
+
+/// What the relay knows of a ticket or a job: the hub's notices, and its own fetches.
+struct Told {
+    /// Notices about it so far.
+    count: u64,
+    /// The highest revision and output length told or fetched in the current session: the
+    /// hub has at least these. A restarted hub may have recovered less.
+    revision: u64,
+    output_len: u64,
+    /// `count` and the session at the last fetch of a ticket, or of a job's output.
+    fetched: Option<(u64, u64)>,
+    /// The session at the last fetch of a job's view.
+    viewed: Option<u64>,
+    /// Waited on: kept until its ticket ends or its job is settled.
+    claimed: bool,
+    /// When it was first told.
+    told_at: Instant,
+}
+
+impl Told {
+    fn new() -> Self {
+        Told {
+            count: 0,
+            revision: 0,
+            output_len: 0,
+            fetched: None,
+            viewed: None,
+            claimed: false,
+            told_at: Instant::now(),
+        }
+    }
+}
+
+/// Shares a session's connection while it lives: dropped when the session ends.
+pub struct Up<'a> {
+    link: &'a Link,
+    session: u64,
+}
+
+impl Drop for Up<'_> {
+    fn drop(&mut self) {
+        self.link.modify(|s| {
+            if s.conn.is_some() && s.sessions == self.session {
+                s.conn = None;
+            }
+        });
+    }
+}
+
+impl Link {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Link {
+            state: Mutex::new(LinkState::default()),
+            changed: watch::Sender::new(0),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn modify<T>(&self, f: impl FnOnce(&mut LinkState) -> T) -> T {
+        let out = f(&mut self.lock());
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        out
+    }
+
+    /// A session is up on the connection `sender` sends on, reached at `base`
+    /// (`scheme://host:port`): requests go on it until the [`Up`] is dropped. A new session
+    /// tells every waiter to fetch, as a notice about everything would.
+    pub fn up(&self, sender: http2::SendRequest<Full<Bytes>>, base: String) -> Up<'_> {
+        let session = self.modify(|s| {
+            s.sessions = s.sessions.wrapping_add(1);
+            s.conn = Some(Conn { sender, base });
+            for t in s.tickets.values_mut().chain(s.jobs.values_mut()) {
+                t.revision = 0;
+                t.output_len = 0;
+            }
+            s.sessions
+        });
+        Up {
+            link: self,
+            session,
+        }
+    }
+
+    /// The hub's notice that ticket `id` was granted or ended.
+    pub fn told_ticket(&self, id: &str) {
+        self.modify(|s| {
+            forget_unclaimed(&mut s.tickets);
+            let t = s.tickets.entry(id.to_owned()).or_insert_with(Told::new);
+            t.count = t.count.wrapping_add(1);
+        });
+    }
+
+    /// The hub's notice that job `id` is at `revision`, with `output_len` bytes of output.
+    pub fn told_job(&self, id: &str, revision: u64, output_len: u64) {
+        self.modify(|s| {
+            forget_unclaimed(&mut s.jobs);
+            let j = s.jobs.entry(id.to_owned()).or_insert_with(Told::new);
+            j.count = j.count.wrapping_add(1);
+            j.revision = j.revision.max(revision);
+            j.output_len = j.output_len.max(output_len);
+        });
+    }
+
+    /// The current session's connection, once there is one.
+    async fn connection(&self) -> Conn {
+        let mut rx = self.changed.subscribe();
+        loop {
+            if let Some(conn) = self.lock().conn.as_ref().filter(|c| !c.sender.is_closed()) {
+                return conn.clone();
+            }
+            if rx.changed().await.is_err() {
+                // Never: `self` holds the sender.
+                return std::future::pending().await;
+            }
+        }
+    }
+
+    /// Wait until `ready` holds or `wait`, capped at [`MAX_WAIT_SECS`], passes; then run `fetching`.
+    async fn wait(
+        &self,
+        wait: Duration,
+        mut ready: impl FnMut(&mut LinkState) -> bool,
+        fetching: impl FnOnce(&mut LinkState),
+    ) {
+        let deadline = Instant::now() + wait.min(Duration::from_secs(u64::from(MAX_WAIT_SECS)));
+        let mut rx = self.changed.subscribe();
+        loop {
+            if ready(&mut self.lock()) {
+                break;
+            }
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { break },
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        fetching(&mut self.lock());
+    }
+
+    /// Wait to fetch ticket `id`: at once the first time and in each new session, which may
+    /// have missed a notice; else until the hub tells of it, or `wait`.
+    async fn ticket(&self, id: &str, wait: Duration) {
+        self.wait(
+            wait,
+            |s| {
+                let session = s.sessions;
+                let t = claim(&mut s.tickets, id);
+                t.fetched != Some((t.count, session))
+            },
+            |s| {
+                let session = s.sessions;
+                let t = claim(&mut s.tickets, id);
+                t.fetched = Some((t.count, session));
+            },
+        )
+        .await;
+    }
+
+    /// Wait to fetch job `id`'s view: at once the first time and in each new session; else
+    /// until the hub tells of a revision past `after`, or `wait`.
+    async fn job(&self, id: &str, after: u64, wait: Duration) {
+        self.wait(
+            wait,
+            |s| {
+                let session = s.sessions;
+                let j = claim(&mut s.jobs, id);
+                j.revision > after || j.viewed != Some(session)
+            },
+            |s| {
+                let session = s.sessions;
+                claim(&mut s.jobs, id).viewed = Some(session);
+            },
+        )
+        .await;
+    }
+
+    /// Wait to fetch job `id`'s output from `offset`: at once the first time and in each new
+    /// session; else until the hub has output past it, or tells of anything since the last
+    /// fetch (such as the job's end), or `wait`.
+    async fn output(&self, id: &str, offset: u64, wait: Duration) {
+        self.wait(
+            wait,
+            |s| {
+                let session = s.sessions;
+                let j = claim(&mut s.jobs, id);
+                j.output_len > offset || j.fetched != Some((j.count, session))
+            },
+            |s| {
+                let session = s.sessions;
+                let j = claim(&mut s.jobs, id);
+                j.fetched = Some((j.count, session));
+            },
+        )
+        .await;
+    }
+
+    /// The current session's number, for [`Self::fetched_job`].
+    fn session(&self) -> u64 {
+        self.lock().sessions
+    }
+
+    /// A fetch of job `id` sent in `session` answered: the hub has at least `revision` and
+    /// `output_len`. An answer from an earlier session's connection is ignored.
+    fn fetched_job(&self, session: u64, id: &str, revision: u64, output_len: u64) {
+        let mut s = self.lock();
+        if s.sessions != session {
+            return;
+        }
+        if let Some(j) = s.jobs.get_mut(id) {
+            j.revision = j.revision.max(revision);
+            j.output_len = j.output_len.max(output_len);
+        }
+    }
+
+    fn forget_ticket(&self, id: &str) {
+        self.lock().tickets.remove(id);
+    }
+
+    fn forget_job(&self, id: &str) {
+        self.lock().jobs.remove(id);
+    }
+}
+
+/// Drop the notices about IDs nothing has waited on within [`UNCLAIMED`].
+fn forget_unclaimed(told: &mut HashMap<String, Told>) {
+    let now = Instant::now();
+    told.retain(|_, t| t.claimed || now.duration_since(t.told_at) < UNCLAIMED);
+}
+
+/// The entry of `id`, waited on.
+fn claim<'a>(told: &'a mut HashMap<String, Told>, id: &str) -> &'a mut Told {
+    let t = told.entry(id.to_owned()).or_insert_with(Told::new);
+    t.claimed = true;
+    t
+}
 
 /// How often a call is tried.
 #[derive(Debug, Clone, Copy)]
@@ -81,29 +383,16 @@ impl Default for HubRetry {
     }
 }
 
-/// The enrolled relay a client speaks as.
-#[derive(Clone)]
-pub struct HubOptions {
-    /// The hub's base URL, as `join` checked it: `https://…`, or `http://` to a loopback hub.
-    pub hub: String,
-    /// The TLS the hub is reached with.
-    pub tls: Arc<rustls::ClientConfig>,
-    /// The relay's ID and key.
-    pub relay_id: String,
-    pub identity: Arc<Identity>,
-    pub retry: HubRetry,
-}
-
 pub struct HubClient {
-    opts: HubOptions,
+    link: Arc<Link>,
+    retry: HubRetry,
+    outputs: Semaphore,
+    submissions: Semaphore,
 }
 
 impl std::fmt::Debug for HubClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HubClient")
-            .field("hub", &self.opts.hub)
-            .field("relay_id", &self.opts.relay_id)
-            .finish_non_exhaustive()
+        f.debug_struct("HubClient").finish_non_exhaustive()
     }
 }
 
@@ -112,6 +401,8 @@ struct Answer {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+    /// When its request was sent.
+    sent: Instant,
 }
 
 impl Answer {
@@ -121,107 +412,56 @@ impl Answer {
 }
 
 impl HubClient {
-    pub fn new(opts: HubOptions) -> Self {
-        Self { opts }
+    /// A client sending on `link`'s connection, which a session keeps.
+    pub fn new(link: Arc<Link>, retry: HubRetry) -> Self {
+        Self {
+            link,
+            retry,
+            outputs: Semaphore::new(MAX_OUTPUTS),
+            submissions: Semaphore::new(MAX_SUBMISSIONS),
+        }
     }
 
-    /// One request on a connection of its own, signed for it, and its answer read whole,
-    /// all within `timeout`. `Err` is a failed answer, or [`ErrorKind::Transport`] when none
-    /// came whole.
+    /// Send a request once `gate`, if any, lets it, and read its complete answer within
+    /// [`REQUEST_TIMEOUT`]. Return a failed answer as `Err`, or [`ErrorKind::Transport`] for an
+    /// incomplete answer.
     async fn send(
         &self,
         method: &Method,
         path_and_query: &str,
         body: &Bytes,
-        timeout: Duration,
+        gate: Option<&Semaphore>,
     ) -> DispatchResult<Answer> {
-        let exchange = async {
-            let transport = |what: &str, e: &dyn std::fmt::Display| {
-                DispatchError::new(ErrorKind::Transport, format!("{what}: {e}"))
-            };
-            let vk_peer::session::Dialed {
-                io,
-                exported,
-                authority,
-                ..
-            } = vk_peer::session::dial(&self.opts.hub, &self.opts.tls)
-                .await
-                .map_err(|e| transport("reaching the hub", &format!("{e:#}")))?;
-            let channel = match &exported {
-                Some(e) => vk_hub_proto::Channel::Tls(e),
-                None => vk_hub_proto::Channel::Plaintext,
-            };
-            let at = vk_peer::now_secs();
-            let digest: [u8; vk_hub_proto::SHA256_LEN] =
-                ring::digest::digest(&ring::digest::SHA256, body)
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| DispatchError::new(ErrorKind::Other, "a SHA-256 of 32 bytes"))?;
-            let signature = self.opts.identity.sign(&client_request_message(
-                &self.opts.relay_id,
-                method.as_str(),
-                path_and_query,
-                &digest,
-                at,
-                channel,
-            ));
-            let (mut sender, conn) =
-                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        // Queued behind the relay's own requests, not the hub: outside the timeout.
+        let _permit = match gate {
+            Some(gate) => Some(
+                gate.acquire()
                     .await
-                    .map_err(|e| transport("opening the request", &e))?;
-            let driver = tokio::spawn(conn);
-            let mut request = hyper::Request::builder()
-                .method(method.clone())
-                .uri(path_and_query)
-                .header(hyper::header::HOST, authority)
-                .header(
-                    hyper::header::USER_AGENT,
-                    concat!("vk-gitlab ", env!("CARGO_PKG_VERSION")),
-                )
-                .header(RELAY_HEADER, &self.opts.relay_id)
-                .header(TIME_HEADER, at.to_string())
-                .header(SIGNATURE_HEADER, signature);
-            if !body.is_empty() {
-                request = request.header(
-                    hyper::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-            }
-            let request = request
-                .body(http_body_util::Full::new(body.clone()))
-                .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?;
-            let answer = async {
-                let resp = sender
-                    .send_request(request)
-                    .await
-                    .map_err(|e| transport("sending the request", &e))?;
-                let (parts, incoming) = resp.into_parts();
-                let body = http_body_util::Limited::new(incoming, MAX_ANSWER)
-                    .collect()
-                    .await
-                    .map_err(|e| transport("reading the answer", &e))?
-                    .to_bytes();
-                Ok((parts.status, parts.headers, body))
-            }
-            .await;
-            driver.abort();
-            let (status, headers, body) = answer?;
-            if status.is_success() {
-                Ok(Answer {
-                    status,
-                    headers,
-                    body,
-                })
-            } else {
-                Err(error_of(status, &headers, &body))
-            }
+                    .map_err(|e| transport("queueing", &e))?,
+            ),
+            None => None,
         };
-        tokio::time::timeout(timeout, exchange)
+        let exchange = async {
+            let conn = self.link.connection().await;
+            let request = request(method, &conn.base, path_and_query, body)?;
+            let sent = Instant::now();
+            let resp = conn
+                .sender
+                .clone()
+                .send_request(request)
+                .await
+                .map_err(|e| transport("sending the request", &e))?;
+            read_answer(resp, sent).await
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, exchange)
             .await
             .unwrap_or_else(|_| {
                 Err(DispatchError::new(
                     ErrorKind::Transport,
-                    format!("the hub did not answer within {}s", timeout.as_secs()),
+                    format!(
+                        "the hub did not answer within {}s",
+                        REQUEST_TIMEOUT.as_secs()
+                    ),
                 ))
             })
     }
@@ -235,7 +475,7 @@ impl HubClient {
         path: &str,
         query: &str,
         body: Option<Bytes>,
-        timeout: Duration,
+        gate: Option<&Semaphore>,
         retry_no_capacity: bool,
         tries: Tries,
         read: impl Fn(Answer) -> DispatchResult<T>,
@@ -246,16 +486,11 @@ impl HubClient {
             format!("{path}?{query}")
         };
         let body = body.unwrap_or_default();
-        let mut backoff = Backoff::new(
-            self.opts.retry.backoff_min,
-            self.opts.retry.backoff_max,
-            2.0,
-            true,
-        );
+        let mut backoff = Backoff::new(self.retry.backoff_min, self.retry.backoff_max, 2.0, true);
         let mut attempt = 0u32;
         loop {
             attempt = attempt.saturating_add(1);
-            let err = match self.send(&method, &path_and_query, &body, timeout).await {
+            let err = match self.send(&method, &path_and_query, &body, gate).await {
                 Ok(answer) => return read(answer),
                 Err(e) => e,
             };
@@ -268,7 +503,7 @@ impl HubClient {
                 .retry_after
                 .map_or_else(|| backoff.next_delay(), |d| d.min(MAX_RETRY_AFTER));
             let again = match tries {
-                Tries::Attempts => attempt < self.opts.retry.max_attempts,
+                Tries::Attempts => attempt < self.retry.max_attempts,
                 Tries::Once => false,
                 Tries::Until(deadline) => Instant::now() + wait < deadline,
             };
@@ -294,17 +529,8 @@ impl HubClient {
         body: Option<Bytes>,
         tries: Tries,
     ) -> DispatchResult<()> {
-        self.call(
-            method,
-            path,
-            "",
-            body,
-            timeout_for(Duration::ZERO),
-            true,
-            tries,
-            |_| Ok(()),
-        )
-        .await
+        self.call(method, path, "", body, None, true, tries, |_| Ok(()))
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,7 +540,7 @@ impl HubClient {
         path: &str,
         query: &str,
         body: Option<&impl Serialize>,
-        timeout: Duration,
+        gate: Option<&Semaphore>,
         retry_no_capacity: bool,
         tries: Tries,
     ) -> DispatchResult<T> {
@@ -331,7 +557,7 @@ impl HubClient {
             path,
             query,
             body,
-            timeout,
+            gate,
             retry_no_capacity,
             tries,
             |answer| {
@@ -344,6 +570,59 @@ impl HubClient {
             },
         )
         .await
+    }
+}
+
+fn transport(what: &str, e: &dyn std::fmt::Display) -> DispatchError {
+    DispatchError::new(ErrorKind::Transport, format!("{what}: {e}"))
+}
+
+/// A request for `path_and_query` at `base` (`scheme://host:port`).
+fn request(
+    method: &Method,
+    base: &str,
+    path_and_query: &str,
+    body: &Bytes,
+) -> DispatchResult<hyper::Request<Full<Bytes>>> {
+    let mut request = hyper::Request::builder()
+        .method(method.clone())
+        .uri(format!("{base}{path_and_query}"))
+        .header(
+            hyper::header::USER_AGENT,
+            concat!("vk-gitlab ", env!("CARGO_PKG_VERSION")),
+        );
+    if !body.is_empty() {
+        request = request.header(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    request
+        .body(Full::new(body.clone()))
+        .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))
+}
+
+/// `resp`, to a request sent at `sent`, read whole: an [`Answer`] when it succeeded, else its
+/// error.
+async fn read_answer(
+    resp: hyper::Response<hyper::body::Incoming>,
+    sent: Instant,
+) -> DispatchResult<Answer> {
+    let (parts, incoming) = resp.into_parts();
+    let body = http_body_util::Limited::new(incoming, MAX_ANSWER)
+        .collect()
+        .await
+        .map_err(|e| transport("reading the answer", &e))?
+        .to_bytes();
+    if parts.status.is_success() {
+        Ok(Answer {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+            sent,
+        })
+    } else {
+        Err(error_of(parts.status, &parts.headers, &body))
     }
 }
 
@@ -412,12 +691,6 @@ fn error_of(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> DispatchErr
     }
 }
 
-fn wait_secs(wait: Duration) -> u32 {
-    u32::try_from(wait.as_secs())
-        .unwrap_or(u32::MAX)
-        .min(MAX_WAIT_SECS)
-}
-
 fn checked_id(id: &str) -> DispatchResult<&str> {
     if valid_id(id) {
         Ok(id)
@@ -427,11 +700,6 @@ fn checked_id(id: &str) -> DispatchResult<&str> {
             format!("{id:?} is not a hub ID"),
         ))
     }
-}
-
-/// A plain request's bound: the long poll it asks for, plus slack.
-fn timeout_for(wait: Duration) -> Duration {
-    wait.min(Duration::from_secs(u64::from(MAX_WAIT_SECS))) + REQUEST_SLACK
 }
 
 /// A queued reservation request's answer, told apart by its status as
@@ -452,6 +720,7 @@ fn queue_answer(answer: Answer) -> DispatchResult<QueueAnswer> {
                 node: g.node,
                 envelope: g.envelope,
                 lease: Duration::from_secs(u64::from(g.lease_secs)),
+                sent: answer.sent,
             }))
         }
         StatusCode::ACCEPTED => {
@@ -474,20 +743,21 @@ impl Dispatcher for HubClient {
         runner: &str,
         placement: &Placement,
         after: Option<u64>,
-        wait: Duration,
+        _wait: Duration,
     ) -> DispatchResult<Capacity> {
+        // Not long-polled: no notice tells of capacity.
         let body = CapacityRequest {
             runner: Some(runner.to_owned()),
             placement: placement.clone(),
             after,
-            wait_secs: wait_secs(wait),
+            wait_secs: 0,
         };
         self.call_json(
             Method::POST,
             CAPACITY_PATH,
             "",
             Some(&body),
-            timeout_for(wait),
+            None,
             true,
             Tries::Attempts,
         )
@@ -500,7 +770,7 @@ impl Dispatcher for HubClient {
         request_id: &str,
         placement: &Placement,
         lease: Duration,
-        wait: Duration,
+        _wait: Duration,
     ) -> DispatchResult<Reservation> {
         let body = ReservationRequest {
             runner: Some(runner.to_owned()),
@@ -508,43 +778,7 @@ impl Dispatcher for HubClient {
             request_id: request_id.to_owned(),
             placement: placement.clone(),
             lease_secs: lease_secs(lease),
-            wait_secs: wait_secs(wait),
-        };
-        let grant: ReservationGrant = self
-            .call_json(
-                Method::POST,
-                RESERVATIONS_PATH,
-                "",
-                Some(&body),
-                timeout_for(wait),
-                false,
-                Tries::Attempts,
-            )
-            .await?;
-        Ok(Reservation {
-            admission: grant.admission,
-            id: grant.reservation,
-            node: grant.node,
-            envelope: grant.envelope,
-            lease: Duration::from_secs(u64::from(grant.lease_secs)),
-        })
-    }
-
-    async fn queue(
-        &self,
-        runner: &str,
-        request_id: &str,
-        placement: &Placement,
-        lease: Duration,
-        wait: Duration,
-    ) -> DispatchResult<QueueAnswer> {
-        let body = ReservationRequest {
-            runner: Some(runner.to_owned()),
-            queue: true,
-            request_id: request_id.to_owned(),
-            placement: placement.clone(),
-            lease_secs: lease_secs(lease),
-            wait_secs: wait_secs(wait),
+            wait_secs: 0,
         };
         let body = Bytes::from(
             serde_json::to_vec(&body)
@@ -555,7 +789,56 @@ impl Dispatcher for HubClient {
             RESERVATIONS_PATH,
             "",
             Some(body),
-            timeout_for(wait),
+            None,
+            false,
+            Tries::Attempts,
+            |answer| {
+                let grant: ReservationGrant =
+                    serde_json::from_slice(&answer.body).map_err(|e| {
+                        DispatchError::new(
+                            ErrorKind::Other,
+                            format!("the hub's answer does not parse: {e}"),
+                        )
+                    })?;
+                Ok(Reservation {
+                    admission: grant.admission,
+                    id: grant.reservation,
+                    node: grant.node,
+                    envelope: grant.envelope,
+                    lease: Duration::from_secs(u64::from(grant.lease_secs)),
+                    sent: answer.sent,
+                })
+            },
+        )
+        .await
+    }
+
+    async fn queue(
+        &self,
+        runner: &str,
+        request_id: &str,
+        placement: &Placement,
+        lease: Duration,
+        _wait: Duration,
+    ) -> DispatchResult<QueueAnswer> {
+        let body = ReservationRequest {
+            runner: Some(runner.to_owned()),
+            queue: true,
+            request_id: request_id.to_owned(),
+            placement: placement.clone(),
+            lease_secs: lease_secs(lease),
+            wait_secs: 0,
+        };
+        let body = Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|e| DispatchError::new(ErrorKind::Invalid, e.to_string()))?,
+        );
+        self.call(
+            Method::POST,
+            RESERVATIONS_PATH,
+            "",
+            Some(body),
+            None,
             false,
             Tries::Attempts,
             queue_answer,
@@ -565,22 +848,36 @@ impl Dispatcher for HubClient {
 
     async fn poll_ticket(&self, ticket: &str, wait: Duration) -> DispatchResult<QueueAnswer> {
         let path = format!("{TICKETS_PATH}/{}", checked_id(ticket)?);
-        let query = format!("wait={}", wait_secs(wait));
-        self.call(
-            Method::GET,
-            &path,
-            &query,
-            None,
-            timeout_for(wait),
-            false,
-            Tries::Attempts,
-            queue_answer,
-        )
-        .await
+        self.link.ticket(ticket, wait).await;
+        let answer = self
+            .call(
+                Method::GET,
+                &path,
+                "",
+                None,
+                None,
+                false,
+                Tries::Attempts,
+                queue_answer,
+            )
+            .await;
+        // A ticket granted or gone is not told of again.
+        if matches!(
+            &answer,
+            Ok(QueueAnswer::Grant(_))
+                | Err(DispatchError {
+                    kind: ErrorKind::ReservationGone | ErrorKind::NotFound,
+                    ..
+                })
+        ) {
+            self.link.forget_ticket(ticket);
+        }
+        answer
     }
 
     async fn cancel_ticket(&self, ticket: &str) -> DispatchResult<()> {
         let path = format!("{TICKETS_PATH}/{}", checked_id(ticket)?);
+        self.link.forget_ticket(ticket);
         self.call_empty(Method::DELETE, &path, None, Tries::Attempts)
             .await
     }
@@ -619,7 +916,7 @@ impl Dispatcher for HubClient {
                 Some(&RenewRequest {
                     lease_secs: lease_secs(lease),
                 }),
-                timeout_for(Duration::ZERO),
+                None,
                 true,
                 Tries::Once,
             )
@@ -657,7 +954,7 @@ impl Dispatcher for HubClient {
             JOBS_PATH,
             "",
             Some(&body),
-            timeout_for(Duration::ZERO),
+            Some(&self.submissions),
             true,
             Tries::Until(Instant::now() + submission.place_within),
         )
@@ -666,52 +963,69 @@ impl Dispatcher for HubClient {
 
     async fn job(&self, id: &str, after: Option<u64>, wait: Duration) -> DispatchResult<JobView> {
         let path = format!("{JOBS_PATH}/{}", checked_id(id)?);
-        let mut query = format!("wait={}", wait_secs(wait));
-        if let Some(a) = after {
-            query.push_str(&format!("&after={a}"));
+        if let Some(after) = after {
+            self.link.job(id, after, wait).await;
         }
-        self.call_json(
-            Method::GET,
-            &path,
-            &query,
-            None::<&()>,
-            timeout_for(wait),
-            true,
-            Tries::Attempts,
-        )
-        .await
+        let session = self.link.session();
+        let view: DispatchResult<JobView> = self
+            .call_json(
+                Method::GET,
+                &path,
+                "",
+                None::<&()>,
+                None,
+                true,
+                Tries::Attempts,
+            )
+            .await;
+        match &view {
+            Ok(v) => self.link.fetched_job(session, id, v.revision, v.output_len),
+            Err(e) if e.kind == ErrorKind::NotFound => self.link.forget_job(id),
+            Err(_) => {}
+        }
+        view
     }
 
     async fn output(&self, id: &str, offset: u64, wait: Duration) -> DispatchResult<OutputChunk> {
         let path = format!("{JOBS_PATH}/{}/output", checked_id(id)?);
-        let query = format!("offset={offset}&wait={}", wait_secs(wait));
-        self.call(
-            Method::GET,
-            &path,
-            &query,
-            None,
-            timeout_for(wait),
-            true,
-            Tries::Attempts,
-            |answer| {
-                let chunk_offset = answer
-                    .header(OUTPUT_OFFSET_HEADER)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(offset);
-                let length = answer
-                    .header(OUTPUT_LENGTH_HEADER)
-                    .and_then(|v| v.parse().ok());
-                let complete = answer.header(OUTPUT_COMPLETE_HEADER) == Some("true");
-                let data = answer.body;
-                Ok(OutputChunk {
-                    offset: chunk_offset,
-                    length: length.unwrap_or(chunk_offset.saturating_add(data.len() as u64)),
-                    complete,
-                    data,
-                })
-            },
-        )
-        .await
+        let query = format!("offset={offset}");
+        self.link.output(id, offset, wait).await;
+        let session = self.link.session();
+        let chunk = self
+            .call(
+                Method::GET,
+                &path,
+                &query,
+                None,
+                Some(&self.outputs),
+                true,
+                Tries::Attempts,
+                |answer| {
+                    let chunk_offset = answer
+                        .header(OUTPUT_OFFSET_HEADER)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(offset);
+                    let length = answer
+                        .header(OUTPUT_LENGTH_HEADER)
+                        .and_then(|v| v.parse().ok());
+                    let complete = answer.header(OUTPUT_COMPLETE_HEADER) == Some("true");
+                    let data = answer.body;
+                    Ok(OutputChunk {
+                        offset: chunk_offset,
+                        length: length.unwrap_or(chunk_offset.saturating_add(data.len() as u64)),
+                        complete,
+                        data,
+                    })
+                },
+            )
+            .await;
+        match &chunk {
+            // Output past this read is fetched again at once.
+            Ok(c) => self.link.fetched_job(session, id, 0, c.length),
+            Err(e) if e.kind == ErrorKind::NotFound => self.link.forget_job(id),
+            Err(_) => {}
+        }
+        chunk
     }
 
     async fn cancel(&self, id: &str, mode: CancelMode) -> DispatchResult<JobView> {
@@ -721,7 +1035,7 @@ impl Dispatcher for HubClient {
             &path,
             "",
             Some(&CancelRequest { mode }),
-            timeout_for(Duration::ZERO),
+            None,
             true,
             Tries::Attempts,
         )
@@ -731,7 +1045,10 @@ impl Dispatcher for HubClient {
     async fn settle(&self, id: &str) -> DispatchResult<()> {
         let path = format!("{JOBS_PATH}/{}/settle", checked_id(id)?);
         self.call_empty(Method::POST, &path, None, Tries::Attempts)
-            .await
+            .await?;
+        // A settled job is not told of again.
+        self.link.forget_job(id);
+        Ok(())
     }
 }
 
@@ -751,6 +1068,7 @@ mod queue_tests {
             status,
             headers: HeaderMap::new(),
             body: Bytes::from(body.to_string()),
+            sent: Instant::now(),
         }
     }
 

@@ -1,7 +1,9 @@
-//! The relay's session with its hub: dial `/v1/gitlab/session`, the handshake every peer
-//! shares, then its inventory, heartbeats and reports one way and its GitLab server's status
-//! the other, until the connection is lost — and dial again, backing off, unless the hub
-//! refused the relay for good.
+//! The relay's session with its hub: dial the relay's HTTP/2 connection, open
+//! `/v1/gitlab/session` on it, the handshake every peer shares, then its inventory, heartbeats
+//! and reports one way and its GitLab server's status and notices the other, until the
+//! connection is lost — and dial again, backing off, unless the hub refused the relay for good.
+//! While the session is up, the hub client sends its requests on the same connection
+//! ([`Link`]). A hub that cannot carry that connection is handled as one to upgrade.
 //!
 //! A relay whose `[hub] allow` lists `update` takes the hub's commands to update it
 //! ([`crate::update`]): in a session at version
@@ -28,9 +30,10 @@ use vk_hub_proto::gitlab::{
     Heartbeat, HubRelayMsg, Inventory, RelayMsg, Report, Runner, RunnerLoad, RunnerReport,
     RunnerSource, RunnerState, Server, ServerState, ServerStatus,
 };
-use vk_peer::session::{Permanent, Superseded, Ws};
+use vk_peer::session::{Outdated, Permanent, RelayConnection, Superseded, Ws};
 
 use crate::config::{Config, RunnerConfig};
+use crate::hub::Link;
 use crate::relay::Relay;
 use crate::update::Updater;
 
@@ -342,8 +345,8 @@ impl Status {
     }
 }
 
-/// Keep a session with the hub for as long as `run` runs.
-pub async fn hold(relay: Arc<Relay>, status: Arc<Status>, updater: Arc<Updater>) {
+/// Keep a session with the hub for as long as `run` runs, sharing its connection on `link`.
+pub async fn hold(relay: Arc<Relay>, status: Arc<Status>, updater: Arc<Updater>, link: Arc<Link>) {
     let mut incarnation = [0u8; vk_hub_proto::ID_BYTES];
     if let Err(e) = vk_peer::fill_random(&mut incarnation) {
         log::error!(error = format!("{e:#}").as_str(); "No session with the hub");
@@ -353,7 +356,7 @@ pub async fn hold(relay: Arc<Relay>, status: Arc<Status>, updater: Arc<Updater>)
     let mut backoff = BACKOFF.0;
     loop {
         let started = tokio::time::Instant::now();
-        match run(&relay, &status, &updater, &incarnation).await {
+        match run(&relay, &status, &updater, &link, &incarnation).await {
             Ok(()) => {}
             Err(e) if e.is::<Permanent>() => {
                 // The hub no longer knows this relay: its jobs would be refused.
@@ -361,10 +364,10 @@ pub async fn hold(relay: Arc<Relay>, status: Arc<Status>, updater: Arc<Updater>)
                 log::error!(error = format!("{e:#}").as_str(); "The hub refused this relay; no longer taking jobs from GitLab");
                 return;
             }
-            Err(e) if e.is::<VersionRefused>() => {
+            Err(e) if e.is::<VersionRefused>() || e.is::<Outdated>() => {
                 // An older hub, whose jobs would be refused: none taken until it is upgraded.
                 status.set_server(None);
-                log::error!(error = format!("{e:#}").as_str(); "The hub refused this relay's protocol; dialing again later");
+                log::error!(error = format!("{e:#}").as_str(); "The hub must be upgraded to serve this relay; dialing again later");
                 tokio::time::sleep(vk_peer::jittered(BACKOFF.1)).await;
                 continue;
             }
@@ -423,12 +426,23 @@ async fn run(
     relay: &Relay,
     status: &Status,
     updater: &Arc<Updater>,
+    link: &Link,
     incarnation: &str,
 ) -> Result<()> {
     let hub = &relay.enrollment.hub;
-    let (mut ws, exported) = tokio::time::timeout(
+    let RelayConnection {
+        mut ws,
+        sender,
+        exported,
+        authority,
+    } = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        vk_peer::session::connect(hub, &relay.tls, vk_hub_proto::gitlab::SESSION_PATH),
+        vk_peer::session::connect_relay(
+            hub,
+            &relay.tls,
+            &crate::hub::http2_builder(),
+            vk_hub_proto::gitlab::SESSION_PATH,
+        ),
     )
     .await
     .map_err(|_| anyhow!("connecting to {hub} timed out"))??;
@@ -444,6 +458,10 @@ async fn run(
             .await?;
     // A hub from before updates could not read an ack.
     let updates = version >= vk_hub_proto::gitlab::UPDATES;
+    // The connection is the relay's from the welcome on: its requests go on it until the
+    // session ends.
+    let scheme = if exported.is_some() { "https" } else { "http" };
+    let _up = link.up(sender, format!("{scheme}://{authority}"));
     log::info!(hub = hub.as_str(), relay = relay.enrollment.relay_id.as_str(); "In session with the hub");
     // In session with the hub: an update on trial has passed.
     let confirming = updater.clone();
@@ -531,8 +549,17 @@ async fn run(
                         send(&mut ws, &RelayMsg::Ack(ack), beat).await?;
                     }
                     HubRelayMsg::Recorded(ack) => updater.recorded(&ack)?,
-                    HubRelayMsg::Ticket { .. } | HubRelayMsg::Job { .. } => {
-                        bail!("the hub sent a notice in a session before version 5")
+                    HubRelayMsg::Ticket { ticket } => {
+                        if !vk_hub_proto::valid_id(&ticket) {
+                            bail!("the hub sent a ticket notice with a malformed ID");
+                        }
+                        link.told_ticket(&ticket);
+                    }
+                    HubRelayMsg::Job { job, revision, output_len } => {
+                        if !vk_hub_proto::valid_id(&job) {
+                            bail!("the hub sent a job notice with a malformed ID");
+                        }
+                        link.told_job(&job, revision, output_len);
                     }
                     HubRelayMsg::Refused { code, reason } => return Err(refusal(code, &reason)),
                 }
@@ -592,7 +619,7 @@ mod tests {
         assert!(e.is::<VersionRefused>() && !e.is::<Permanent>(), "{e:#}");
         let message = e.to_string();
         assert!(
-            message.contains("relay protocol 2") && message.contains("upgrade vk-hub"),
+            message.contains("relay protocol 5") && message.contains("upgrade vk-hub"),
             "{message}"
         );
     }

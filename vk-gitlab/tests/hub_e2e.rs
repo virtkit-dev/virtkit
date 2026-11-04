@@ -1,6 +1,6 @@
 //! The daemon against the fake hub's HTTP API, for what only the wire shows: retries on the
 //! hub's 503s, a restarted daemon resuming its jobs from the state file, and every request
-//! signed by the enrolled relay.
+//! sent on the connection of the enrolled relay's session.
 //!
 //! vk-hub has no library target, so its handlers cannot run in process here; the fake hub
 //! follows `vk-hub/src/client.rs`, idempotent submissions included.
@@ -14,10 +14,8 @@ use std::sync::Arc;
 
 use support::fakehub::TEST_RELAY_ID;
 use support::gl::{Harness, TOKEN, Via, eventually, job_json, runner_toml, within};
-use vk_gitlab::dispatch::{
-    CancelMode, Dispatcher, ErrorKind, FakeCall, Placement, QueueAnswer, Submission,
-};
-use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
+use vk_gitlab::dispatch::{CancelMode, Dispatcher, FakeCall, Placement, QueueAnswer, Submission};
+use vk_gitlab::hub::HubRetry;
 use vk_gitlab::relay;
 use vk_gitlab::spec::{self, SpecContext};
 use vk_gitlab::state::{JobRecord, Phase, StateFile};
@@ -105,14 +103,7 @@ fn records(path: &Path) -> Vec<JobRecord> {
 async fn cancel_ticket_releases_a_grant_whose_response_was_lost() {
     let h = Harness::unstarted(2, Via::Http).await;
     h.hub.set_slots("p1", 1);
-    let relay = relay::open(&h.state_dir).unwrap();
-    let client = HubClient::new(HubOptions {
-        hub: relay.enrollment.hub.clone(),
-        tls: relay.tls,
-        relay_id: relay.enrollment.relay_id.clone(),
-        identity: relay.identity,
-        retry: HubRetry::default(),
-    });
+    let (client, session) = support::gl::client(&h, HubRetry::default());
     let QueueAnswer::Ticket(ticket) = client
         .queue(
             "r1",
@@ -126,10 +117,17 @@ async fn cancel_ticket_releases_a_grant_whose_response_was_lost() {
     else {
         panic!("expected a ticket");
     };
-    let QueueAnswer::Grant(grant) = client.poll_ticket(&ticket, Duration::ZERO).await.unwrap()
-    else {
-        panic!("expected a grant");
-    };
+    // Fetched at once, then once the hub tells of the grant.
+    let grant = within("the grant", async {
+        loop {
+            match client.poll_ticket(&ticket, Duration::from_secs(50)).await {
+                Ok(QueueAnswer::Grant(grant)) => return grant,
+                Ok(QueueAnswer::Ticket(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await;
     let QueueAnswer::Grant(repeated) = client.poll_ticket(&ticket, Duration::ZERO).await.unwrap()
     else {
         panic!("expected the same grant");
@@ -138,6 +136,7 @@ async fn cancel_ticket_releases_a_grant_whose_response_was_lost() {
     assert_eq!(h.hub.reservations().len(), 1);
     client.cancel_ticket(&ticket).await.unwrap();
     assert!(h.hub.reservations().is_empty());
+    session.abort();
     h.stop().await;
 }
 
@@ -281,6 +280,39 @@ async fn hub_503s_are_retried_after_retry_after() {
     h.hub.finish(&hub_id, None, None);
     assert_eq!(h.final_update(30).await["state"], "success");
     h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_request_with_no_answer_is_sent_again_under_its_id() {
+    let mut h = Harness::unstarted(1, Via::Http).await;
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    // A refusal, then a request whose every attempt (quick_retry's 5) loses its stream.
+    let queue = "/v1/reservations";
+    fake_hub.fail_next_ending(1, queue, queue, 403, ErrorCode::Forbidden, None);
+    fake_hub.fail_next_ending(5, queue, queue, 0, ErrorCode::Unavailable, None);
+    h.daemon = h.spawn_daemon();
+    let posts = || -> Vec<String> {
+        let requests = fake_hub.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path == queue)
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .map(|v| v["request_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    eventually("the request queued", || {
+        posts()
+            .get(6)
+            .is_some_and(|id| fake_hub.ticket_for(id).is_some())
+    })
+    .await;
+    let ids = posts();
+    assert_ne!(ids[0], ids[1], "a refused request is not sent again");
+    assert!(
+        ids[1..7].iter().all(|id| *id == ids[1]),
+        "an unanswered request keeps its ID: {ids:?}"
+    );
+    h.daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -702,9 +734,9 @@ async fn resumed_jobs_hold_their_slots() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_hub_request_is_signed_by_the_relay() {
+async fn hub_requests_ride_the_sessions_connection_unsigned() {
     let mut h = Harness::unstarted(2, Via::Http).await;
-    // A retried request is signed too.
+    // A retried request too.
     let fake_hub = h.http_hub.as_ref().unwrap();
     fake_hub.fail_next(1, "/v1/jobs", 503, ErrorCode::Unavailable, None);
     h.daemon = h.spawn_daemon();
@@ -720,17 +752,24 @@ async fn every_hub_request_is_signed_by_the_relay() {
         .filter(|r| r.method == "POST" && r.path == "/v1/jobs")
         .count();
     assert!(submissions >= 2, "the 503'd submission retried");
+    // One connection, its session never lost: the fake refuses a request off it.
+    assert_eq!((fake_hub.connections(), fake_hub.sessions()), (2, 1));
     for r in requests.iter().filter(|r| r.path != "/v1/gitlab/enroll") {
-        let header = |name: &str| r.headers.get(name).and_then(|v| v.to_str().ok());
-        assert_eq!(
-            header("vk-relay"),
-            Some(TEST_RELAY_ID),
-            "{} {}",
+        for header in ["vk-relay", "vk-signature", "vk-time", "authorization"] {
+            assert!(
+                !r.headers.contains_key(header),
+                "{} {} {header}",
+                r.method,
+                r.path
+            );
+        }
+        assert!(
+            !r.query.contains("wait"),
+            "{} {}?{}",
             r.method,
-            r.path
+            r.path,
+            r.query
         );
-        assert!(header("vk-signature").is_some() && header("vk-time").is_some());
-        assert!(header("authorization").is_none() && header("vk-client-instance").is_none());
     }
     h.stop().await;
 }
@@ -738,21 +777,18 @@ async fn every_hub_request_is_signed_by_the_relay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_the_hub_did_not_enroll_is_refused() {
     let h = Harness::unstarted(2, Via::Http).await;
-    let relay = relay::open(&h.state_dir).unwrap();
-    let other = support::gl::temp_dir("other-key");
-    let client = HubClient::new(HubOptions {
-        hub: relay.enrollment.hub.clone(),
-        tls: relay.tls,
-        relay_id: relay.enrollment.relay_id.clone(),
-        identity: Arc::new(Identity::load_or_create(&other).unwrap()),
-        retry: HubRetry::default(),
-    });
-    let err = client
-        .capacity("test", &p1(), None, Duration::ZERO)
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
-    std::fs::remove_dir_all(&other).unwrap();
+    // The relay's key, replaced by one the hub never saw.
+    let dir = relay::dir(&h.state_dir);
+    std::fs::remove_file(dir.join("key.pk8")).unwrap();
+    Identity::load_or_create(&dir).unwrap();
+    let (_client, session) = support::gl::client(&h, HubRetry::default());
+    within("the session to give up", session).await.unwrap();
+    let fake_hub = h.http_hub.as_ref().unwrap();
+    assert_eq!(fake_hub.sessions(), 0);
+    assert_eq!(
+        fake_hub.requests_to("/v1/jobs") + fake_hub.requests_to("/v1/reservations"),
+        0
+    );
     h.stop().await;
 }
 

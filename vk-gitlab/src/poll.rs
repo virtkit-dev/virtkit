@@ -203,7 +203,8 @@ impl Shutdown {
 pub struct HubTimings {
     /// A reservation's lease, renewed every third of it while a job request is out.
     pub lease: Duration,
-    /// The longest a capacity, reservation, job-view or output long poll is held.
+    /// The longest a wait for a ticket's grant, a job's next view or more of its output
+    /// lasts without a notice from the hub, before it fetches anyway.
     pub wait: Duration,
     /// How long the hub may take to place a job whose reservation was lost.
     pub place_within: Duration,
@@ -1284,6 +1285,62 @@ fn pause_for(e: &DispatchError, fallback: Duration) -> Duration {
 }
 
 async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
+    // A request whose queueing got no answer: the hub may hold its ticket, which only its ID
+    // finds again.
+    let mut unanswered: Option<String> = None;
+    request_until_stopped(&shared, &runner, &mut unanswered).await;
+    if let Some(request_id) = unanswered {
+        forsake_request(&shared, &runner, &request_id).await;
+    }
+}
+
+/// Finds the ticket or grant the hub may hold for queue request `request_id`, whose answer
+/// never came, and gives it up, bounded during shutdown.
+async fn forsake_request<D: Dispatcher>(shared: &Shared<D>, runner: &Runner, request_id: &str) {
+    let name = runner.cfg.name.as_str();
+    let hub = &shared.options.hub;
+    let placement = runner.cfg.placement();
+    let cleanup = async {
+        match shared
+            .dispatcher
+            .queue(name, request_id, &placement, hub.lease, hub.wait)
+            .await
+        {
+            Ok(QueueAnswer::Ticket(id)) => {
+                if let Err(e) = shared.dispatcher.cancel_ticket(&id).await {
+                    log::warn!(ticket = id.as_str(), error = e.to_string().as_str(); "Cancelling the ticket failed");
+                }
+            }
+            Ok(QueueAnswer::Grant(grant)) => {
+                if let Some(id) = &grant.admission {
+                    runner.report_outcome(id, AdmissionOutcome::Released);
+                }
+                if let Err(e) = shared.dispatcher.release(&grant.id).await {
+                    log::warn!(reservation = grant.id.as_str(), error = e.to_string().as_str(); "Releasing the reservation failed");
+                }
+            }
+            Err(e) => {
+                log::warn!(runner = name, error = e.to_string().as_str(); "Could not recover the ticket during shutdown")
+            }
+        }
+    };
+    if tokio::time::timeout(hub.settle_wait, cleanup)
+        .await
+        .is_err()
+    {
+        log::warn!(runner = name; "Timed out cancelling the ticket during shutdown");
+    }
+}
+
+/// Requests jobs for `runner` until it is stopped, leaving in `unanswered` a queue request
+/// the hub may hold a ticket for.
+async fn request_until_stopped<D: Dispatcher>(
+    shared: &Arc<Shared<D>>,
+    runner: &Arc<Runner>,
+    unanswered: &mut Option<String>,
+) {
+    let shared = Arc::clone(shared);
+    let runner = Arc::clone(runner);
     let mut stop = Stop::new(&shared, &runner);
     let name = runner.cfg.name.clone();
     let placement = runner.cfg.placement();
@@ -1339,34 +1396,12 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             }
         }
         runner.report(RunnerState::WaitingCapacity, None);
-        let request_id = new_request_id();
-        let mut sent = Instant::now();
+        let request_id = unanswered.take().unwrap_or_else(new_request_id);
         let queued = tokio::select! {
             r = shared.dispatcher.queue(&name, &request_id, &placement, hub.lease, hub.wait) => r,
             () = stop.wait() => {
-                // The hub may have queued the request before its answer reached us. Reuse
-                // the ID to find that ticket and cancel it, bounded during shutdown.
-                let cleanup = async {
-                    match shared.dispatcher.queue(&name, &request_id, &placement, hub.lease, hub.wait).await {
-                        Ok(QueueAnswer::Ticket(id)) => {
-                            if let Err(e) = shared.dispatcher.cancel_ticket(&id).await {
-                                log::warn!(ticket = id.as_str(), error = e.to_string().as_str(); "Cancelling the ticket failed");
-                            }
-                        }
-                        Ok(QueueAnswer::Grant(grant)) => {
-                            if let Some(id) = &grant.admission {
-                                runner.report_outcome(id, AdmissionOutcome::Released);
-                            }
-                            if let Err(e) = shared.dispatcher.release(&grant.id).await {
-                                log::warn!(reservation = grant.id.as_str(), error = e.to_string().as_str(); "Releasing the reservation failed");
-                            }
-                        }
-                        Err(e) => log::warn!(runner = name.as_str(), error = e.to_string().as_str(); "Could not recover the ticket during shutdown"),
-                    }
-                };
-                if tokio::time::timeout(hub.settle_wait, cleanup).await.is_err() {
-                    log::warn!(runner = name.as_str(); "Timed out cancelling the ticket during shutdown");
-                }
+                // The hub may have queued the request before its answer reached us.
+                *unanswered = Some(request_id);
                 return;
             },
         };
@@ -1409,10 +1444,17 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
                         }
                         break Err(e);
                     }
-                    None => break Err(e),
+                    None => {
+                        if matches!(
+                            e.kind,
+                            ErrorKind::Transport | ErrorKind::Unavailable | ErrorKind::Internal
+                        ) {
+                            *unanswered = Some(request_id.clone());
+                        }
+                        break Err(e);
+                    }
                 },
             };
-            sent = Instant::now();
             answer = tokio::select! {
                 r = shared.dispatcher.poll_ticket(&id, hub.wait) => r,
                 () = stop.wait() => {
@@ -1427,8 +1469,8 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
         };
         let mut held = match granted {
             Ok(reservation) => Some(Held {
+                since: reservation.sent,
                 reservation,
-                since: sent,
                 retry_at: None,
             }),
             Err(e) => {

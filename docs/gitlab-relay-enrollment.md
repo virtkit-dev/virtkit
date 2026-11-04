@@ -397,7 +397,10 @@ state or a later one, so it sees at least the revision and output length the not
 notice can come before the answer that tells the relay about its object: a grant before
 `POST /v1/reservations` has answered with the ticket, or a revision before `POST /v1/jobs`
 has answered. So the relay keeps the latest notice per ID in a table, as a `watch` keeps its
-value, and a waiter compares against the table rather than waiting for the next notice. An
+value, and a waiter compares against the table rather than waiting for the next notice. A
+waiter fetches once when it starts following an object, which a notice may not cover (a job
+finished before the hub started), and keeps the output length each answer reports, so it
+reads on at once while more is there. An
 entry goes when its ticket ends or its job is settled. An entry for an ID nothing claims
 within two minutes goes too. A duplicate notice costs at most one fetch: the relay fetches
 only past the revision and offset it holds. Notices are lost only with the session. The

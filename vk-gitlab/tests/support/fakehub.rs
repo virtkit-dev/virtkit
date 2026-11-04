@@ -1,14 +1,21 @@
 //! vk-hub's client API over HTTP (`vk-hub/src/client.rs`: paths,
 //! statuses, error bodies, output headers), served from the in-memory `FakeDispatcher`, so
-//! the real hub client is tested on the wire. A relay enrolls at `/v1/gitlab/enroll`, and
-//! every request after must carry its signature, checked as the hub checks it; a request
-//! without one is answered 401.
+//! the real hub client is tested on the wire. A relay enrolls at `/v1/gitlab/enroll` over
+//! HTTP/1.1, then dials its connection as the hub's listener serves it: HTTP/2 under the relay's
+//! ALPN ID over TLS, told by its preface on plain TCP. Its session is checked against the
+//! enrolled key, and the connection serves the relay's requests while the session is up, a
+//! long poll refused; the session tells the relay of its tickets and jobs as the hub does.
 //!
-//! Queued requests get tickets of the fake's own, which name the admission of their grant;
-//! the fake checks what the hub checks of an admission: claimed before a job is submitted
-//! under it, its outcome reported under its own ID, and once (but for a job found empty).
+//! Queued requests get tickets of the fake's own, which name the admission of their grant,
+//! granted once a reservation fits; the fake checks what the hub checks of an admission:
+//! claimed before a job is submitted under it, its outcome reported under its own ID, and
+//! once (but for a job found empty).
+//!
+//! It counts the connections it accepts and the sessions it welcomes, and can cut every
+//! connection.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +27,8 @@ use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+use super::relayconn::{self, Io, Ws};
 
 use vk_gitlab::dispatch::{DispatchError, Dispatcher, ErrorKind, FakeDispatcher, Submission};
 use vk_hub_proto::client::{
@@ -36,7 +45,7 @@ pub struct Fault {
     pub path_prefix: String,
     /// What the path ends with, `""` for any.
     pub path_suffix: String,
-    /// The answer's status; 0 cuts the connection without one.
+    /// The answer's status; 0 resets the request's stream without one.
     pub status: u16,
     pub code: ErrorCode,
     pub retry_after_secs: Option<u32>,
@@ -47,6 +56,7 @@ pub struct Fault {
 pub struct HubRequest {
     pub method: String,
     pub path: String,
+    pub query: String,
     pub headers: HeaderMap,
     pub body: Bytes,
 }
@@ -59,6 +69,15 @@ pub struct FakeHub {
     faults: Arc<Mutex<VecDeque<Fault>>>,
     queue_response_delay: Arc<Mutex<Option<Duration>>>,
     tickets: Arc<Mutex<Tickets>>,
+    /// Connections accepted, and those closed since.
+    connections: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
+    /// Sessions welcomed.
+    sessions: Arc<AtomicUsize>,
+    /// Bumped to cut every open connection.
+    cut: tokio::sync::watch::Sender<u64>,
+    /// The TLS config a connection is accepted with, its ALPN changeable.
+    tls_config: Option<Arc<Mutex<Arc<rustls::ServerConfig>>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -69,6 +88,15 @@ impl Drop for FakeHub {
 }
 
 type Resp = Response<Full<Bytes>>;
+
+/// Counts a connection closed once dropped.
+struct Closing(Arc<AtomicUsize>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone)]
 enum Ticket {
@@ -173,42 +201,290 @@ fn query(q: &str, name: &str) -> Option<u64> {
         .and_then(|(_, v)| v.parse().ok())
 }
 
-/// Whether the request is signed by the relay whose key is `key`, as `vk-hub/src/client.rs`
-/// checks it (over plain TCP: no TLS exporter).
-fn signed(
-    key: &[u8],
-    headers: &HeaderMap,
-    method: &str,
-    path_and_query: &str,
-    body: &[u8],
-) -> bool {
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let (Some(relay), Some(at), Some(signature)) = (
-        header("vk-relay"),
-        header("vk-time").and_then(|t| t.parse::<u64>().ok()),
-        header("vk-signature")
-            .and_then(vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SIGNATURE_LEN }>),
-    ) else {
-        return false;
-    };
-    if relay != TEST_RELAY_ID || headers.contains_key("authorization") {
-        return false;
+/// Aborts its task once dropped.
+struct Aborting(tokio::task::JoinHandle<()>);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    let digest: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, body)
-        .as_ref()
-        .try_into()
-        .unwrap();
-    let message = vk_hub_proto::client::client_request_message(
-        relay,
-        method,
-        path_and_query,
-        &digest,
-        at,
-        vk_hub_proto::Channel::Plaintext,
+}
+
+/// A request on a relay's connection, served as the hub serves it: refused before the session
+/// and after it, and refused for a long poll.
+async fn request(
+    req: Request<Incoming>,
+    up: Arc<AtomicBool>,
+    hub: FakeDispatcher,
+    recs: Arc<Mutex<Vec<HubRequest>>>,
+    flts: Arc<Mutex<VecDeque<Fault>>>,
+    tickets: Arc<Mutex<Tickets>>,
+    delay: Arc<Mutex<Option<Duration>>>,
+) -> Result<Resp, std::io::Error> {
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path().to_owned();
+    let q = parts.uri.query().unwrap_or("").to_owned();
+    let body = body
+        .collect()
+        .await
+        .map_err(std::io::Error::other)?
+        .to_bytes();
+    recs.lock().unwrap().push(HubRequest {
+        method: parts.method.to_string(),
+        path: path.clone(),
+        query: q.clone(),
+        headers: parts.headers.clone(),
+        body: body.clone(),
+    });
+    if !up.load(Ordering::SeqCst) {
+        return Ok(error(
+            503,
+            ErrorCode::Unavailable,
+            "the connection's session is not up",
+            None,
+        ));
+    }
+    if query(&q, "wait").is_some() {
+        return Ok(error(
+            400,
+            ErrorCode::Invalid,
+            "a relay's connection does not long-poll: wait is refused",
+            None,
+        ));
+    }
+    let fault = {
+        let mut f = flts.lock().unwrap();
+        match f.front() {
+            Some(fault)
+                if path.starts_with(&fault.path_prefix) && path.ends_with(&fault.path_suffix) =>
+            {
+                f.pop_front()
+            }
+            _ => None,
+        }
+    };
+    if let Some(f) = fault {
+        if f.status == 0 {
+            // The request's stream reset, without an answer.
+            return Err(std::io::Error::other("stream reset"));
+        }
+        let mut r = error(f.status, f.code, "injected", f.retry_after_secs);
+        if let Some(s) = f.retry_after_secs {
+            r.headers_mut()
+                .insert("retry-after", s.to_string().parse().unwrap());
+        }
+        return Ok(r);
+    }
+    let delay = if parts.method == "POST" && path == "/v1/reservations" {
+        delay.lock().unwrap().take()
+    } else {
+        None
+    };
+    let response = serve(hub, parts.method, path, q, body, tickets).await;
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    Ok(response)
+}
+
+/// Grant each queued ticket once a reservation fits, as the hub's scheduler does.
+async fn grant_tickets(hub: FakeDispatcher, tickets: Arc<Mutex<Tickets>>) {
+    loop {
+        let waiting: Vec<(String, ReservationRequest)> = tickets
+            .lock()
+            .unwrap()
+            .tickets
+            .iter()
+            .filter_map(|(id, t)| match t {
+                Ticket::Waiting(ask) => Some((id.clone(), ask.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, ask) in waiting {
+            let lease = Duration::from_secs(u64::from(ask.lease_secs));
+            let Ok(r) = hub
+                .reserve(
+                    ask.runner.as_deref().unwrap_or(""),
+                    &ask.request_id,
+                    &ask.placement,
+                    lease,
+                    Duration::ZERO,
+                )
+                .await
+            else {
+                continue;
+            };
+            let grant = ReservationGrant {
+                // The ticket names its grant's admission, as the hub's does.
+                admission: Some(id.clone()),
+                reservation: r.id,
+                node: r.node,
+                envelope: r.envelope,
+                lease_secs: u32::try_from(r.lease.as_secs()).unwrap(),
+            };
+            let taken = {
+                let mut t = tickets.lock().unwrap();
+                match t.tickets.get_mut(&id) {
+                    Some(ticket @ Ticket::Waiting(_)) => {
+                        *ticket = Ticket::Granted(grant.clone());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !taken {
+                hub.release(&grant.reservation).await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The heartbeat the fake hub welcomes a relay with.
+pub const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// A relay's session at version 5, as `vk-hub/src/relays.rs` holds it: the handshake, checked
+/// against the enrolled `key`, then pings, and a notice per ticket and job that changed,
+/// diffed every 20 ms; the session ends once the relay is silent for three heartbeats.
+async fn session(
+    mut ws: Ws,
+    key: Option<Vec<u8>>,
+    exported: Option<[u8; vk_hub_proto::TLS_EXPORTER_LEN]>,
+    up: &AtomicBool,
+    sessions: &AtomicUsize,
+    hub: FakeDispatcher,
+    tickets: Arc<Mutex<Tickets>>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use vk_hub_proto::gitlab::{CONNECTION, HubRelayMsg};
+    use vk_hub_proto::{HubMsg, NodeMsg, RefusalCode, VersionRange};
+
+    async fn text(ws: &mut Ws) -> Option<String> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => return Some(t.as_str().to_owned()),
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+                _ => return None,
+            }
+        }
+    }
+    // A send is bounded by the heartbeat, as the hub's is.
+    async fn send(ws: &mut Ws, msg: &impl serde::Serialize) -> bool {
+        let frame = Message::text(serde_json::to_string(msg).unwrap());
+        matches!(
+            tokio::time::timeout(HEARTBEAT, ws.send(frame)).await,
+            Ok(Ok(()))
+        )
+    }
+    let Some(Ok(NodeMsg::Hello {
+        versions,
+        node_id,
+        incarnation,
+        ..
+    })) = text(&mut ws).await.map(|t| serde_json::from_str(&t))
+    else {
+        return;
+    };
+    let offered = VersionRange {
+        min: CONNECTION,
+        max: CONNECTION,
+    };
+    let nonce = [9u8; vk_hub_proto::CHALLENGE_LEN];
+    let challenge = HubMsg::Challenge {
+        version: CONNECTION,
+        versions: offered,
+        nonce: vk_hub_proto::to_hex(&nonce),
+    };
+    if !send(&mut ws, &challenge).await {
+        return;
+    }
+    let Some(Ok(NodeMsg::Auth { signature })) =
+        text(&mut ws).await.map(|t| serde_json::from_str(&t))
+    else {
+        return;
+    };
+    let message = vk_hub_proto::auth_message(
+        &nonce,
+        &node_id,
+        &incarnation,
+        versions,
+        offered,
+        CONNECTION,
+        match &exported {
+            Some(e) => vk_hub_proto::Channel::Tls(e),
+            None => vk_hub_proto::Channel::Plaintext,
+        },
     );
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-        .verify(&message, &signature)
-        .is_ok()
+    let signed = key.is_some_and(|k| {
+        vk_hub_proto::from_hex(&signature).is_some_and(|s: Vec<u8>| {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &k)
+                .verify(&message, &s)
+                .is_ok()
+        })
+    });
+    if node_id != TEST_RELAY_ID || !signed {
+        let refused = HubMsg::Refused {
+            code: RefusalCode::NotEnrolled,
+            reason: "not an enrolled relay".to_owned(),
+        };
+        send(&mut ws, &refused).await;
+        return;
+    }
+    up.store(true, Ordering::SeqCst);
+    let welcome = HubMsg::Welcome {
+        heartbeat_secs: u32::try_from(HEARTBEAT.as_secs()).unwrap(),
+    };
+    if !send(&mut ws, &welcome).await {
+        return;
+    }
+    sessions.fetch_add(1, Ordering::SeqCst);
+    let mut ping = tokio::time::interval(HEARTBEAT);
+    let mut diff = tokio::time::interval(Duration::from_millis(20));
+    let mut heard = tokio::time::Instant::now();
+    // What this session last told of each ticket (granted or ended) and job.
+    let mut told_tickets: HashMap<String, bool> = HashMap::new();
+    let mut told_jobs: HashMap<String, (u64, u64)> = HashMap::new();
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                let ping = ws.send(Message::Ping(Vec::new().into()));
+                if !matches!(tokio::time::timeout(HEARTBEAT, ping).await, Ok(Ok(()))) {
+                    return;
+                }
+            }
+            _ = diff.tick() => {
+                let mut notices = Vec::new();
+                for (id, ticket) in tickets.lock().unwrap().tickets.iter() {
+                    let granted = match ticket {
+                        Ticket::Waiting(_) => continue,
+                        Ticket::Granted(_) => true,
+                        Ticket::Cancelled => false,
+                    };
+                    if told_tickets.insert(id.clone(), granted) != Some(granted) {
+                        notices.push(HubRelayMsg::Ticket { ticket: id.clone() });
+                    }
+                }
+                for (job, revision, output_len) in hub.unsettled() {
+                    if told_jobs.insert(job.clone(), (revision, output_len))
+                        != Some((revision, output_len))
+                    {
+                        notices.push(HubRelayMsg::Job { job, revision, output_len });
+                    }
+                }
+                for notice in notices {
+                    if !send(&mut ws, &notice).await {
+                        return;
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(heard + HEARTBEAT * 3) => return,
+            frame = ws.next() => match frame {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => heard = tokio::time::Instant::now(),
+            },
+        }
+    }
 }
 
 async fn serve(
@@ -292,71 +568,16 @@ async fn serve(
             }
         }
         ("GET", ["v1", "reservations", "tickets", id]) => {
-            // Long-polled as the hub's is: granted once a reservation fits, within `wait`.
-            let deadline = tokio::time::Instant::now() + wait;
-            loop {
-                let ticket = tickets.lock().unwrap().tickets.get(*id).cloned();
-                let ask = match ticket {
-                    Some(Ticket::Waiting(ask)) => ask,
-                    Some(Ticket::Granted(grant)) => return json(201, &grant),
-                    Some(Ticket::Cancelled) | None => {
-                        return error(410, ErrorCode::ReservationGone, "ticket cancelled", None);
-                    }
-                };
-                let lease = Duration::from_secs(u64::from(ask.lease_secs));
-                match hub
-                    .reserve(
-                        ask.runner.as_deref().unwrap_or(""),
-                        &ask.request_id,
-                        &ask.placement,
-                        lease,
-                        Duration::ZERO,
-                    )
-                    .await
-                {
-                    Ok(r) => {
-                        let grant = ReservationGrant {
-                            // The ticket names its grant's admission, as the hub's does.
-                            admission: Some((*id).to_owned()),
-                            reservation: r.id,
-                            node: r.node,
-                            envelope: r.envelope,
-                            lease_secs: u32::try_from(r.lease.as_secs()).unwrap(),
-                        };
-                        let previous = {
-                            let mut t = tickets.lock().unwrap();
-                            match t.tickets.get_mut(*id) {
-                                Some(ticket @ Ticket::Waiting(_)) => {
-                                    *ticket = Ticket::Granted(grant.clone());
-                                    None
-                                }
-                                Some(Ticket::Granted(existing)) => Some(Some(existing.clone())),
-                                Some(Ticket::Cancelled) | None => Some(None),
-                            }
-                        };
-                        if let Some(previous) = previous {
-                            hub.release(&grant.reservation).await.unwrap();
-                            return match previous {
-                                Some(existing) => json(201, &existing),
-                                None => {
-                                    error(410, ErrorCode::ReservationGone, "ticket cancelled", None)
-                                }
-                            };
-                        }
-                        return json(201, &grant);
-                    }
-                    Err(e) if e.kind == ErrorKind::NoCapacity => {
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                        if tokio::time::Instant::now() >= deadline {
-                            return json(
-                                202,
-                                &ReservationTicket {
-                                    ticket: (*id).to_owned(),
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => return dispatch_error(e),
+            match tickets.lock().unwrap().tickets.get(*id) {
+                Some(Ticket::Waiting(_)) => json(
+                    202,
+                    &ReservationTicket {
+                        ticket: (*id).to_owned(),
+                    },
+                ),
+                Some(Ticket::Granted(grant)) => json(201, grant),
+                Some(Ticket::Cancelled) | None => {
+                    error(410, ErrorCode::ReservationGone, "ticket cancelled", None)
                 }
             }
         }
@@ -507,8 +728,53 @@ async fn serve(
 
 impl FakeHub {
     pub async fn start(hub: FakeDispatcher) -> FakeHub {
+        Self::start_on(hub, None).await
+    }
+
+    /// A fake hub over TLS with `tls/hub-cert.pem` for `localhost`, offering `alpn`. The
+    /// fixtures are copies of vk-hub's `src/testdata/tls-*.pem`: regenerate both together.
+    pub async fn start_tls(hub: FakeDispatcher, alpn: &[&[u8]]) -> FakeHub {
+        use rustls::pki_types::pem::PemObject;
+        let fixture = |name: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/tls")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&fixture("hub-cert.pem"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key =
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(&fixture("hub-key.pem")).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Self::start_on(hub, Some(Arc::new(Mutex::new(Arc::new(config))))).await
+    }
+
+    async fn start_on(
+        hub: FakeDispatcher,
+        tls: Option<Arc<Mutex<Arc<rustls::ServerConfig>>>>,
+    ) -> FakeHub {
+        let tls_config = tls.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let url = match tls {
+            Some(_) => format!("https://localhost:{}", addr.port()),
+            None => format!("http://{addr}"),
+        };
+        let connections = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let cut = tokio::sync::watch::Sender::new(0u64);
+        let sessions = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let relay_key = Arc::new(Mutex::new(None));
         let faults: Arc<Mutex<VecDeque<Fault>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -521,100 +787,134 @@ impl FakeHub {
             Arc::clone(&tickets),
             Arc::clone(&queue_response_delay),
         );
+        let accepted = Arc::clone(&connections);
+        let closing = Arc::clone(&closed);
+        let cutting = cut.subscribe();
+        let in_session = Arc::clone(&sessions);
+        // As the hub's scheduler: a queued request is granted once a reservation fits.
+        let granter = tokio::spawn(grant_tickets(hub.clone(), Arc::clone(&tickets)));
         let task = tokio::spawn(async move {
+            let _granter = Aborting(granter);
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (hub, state) = (hub.clone(), state.clone());
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let open = Closing(Arc::clone(&closing));
+                let (hub, state, tls) = (hub.clone(), state.clone(), tls.clone());
+                let sessions = Arc::clone(&in_session);
+                // Only future cut notifications affect this connection.
+                let mut cutting = cutting.clone();
+                cutting.borrow_and_update();
                 tokio::spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let (hub, (recs, key, flts, tickets, delay)) = (hub.clone(), state.clone());
-                        async move {
-                            let (parts, body) = req.into_parts();
-                            let path = parts.uri.path().to_owned();
-                            let q = parts.uri.query().unwrap_or("").to_owned();
-                            let body = body.collect().await.unwrap().to_bytes();
-                            recs.lock().unwrap().push(HubRequest {
-                                method: parts.method.to_string(),
-                                path: path.clone(),
-                                headers: parts.headers.clone(),
-                                body: body.clone(),
-                            });
-                            if parts.method == "POST" && path == "/v1/gitlab/enroll" {
-                                let ask: vk_hub_proto::EnrollRequest =
-                                    serde_json::from_slice(&body).unwrap();
-                                *key.lock().unwrap() =
-                                    Some(vk_hub_proto::from_hex(&ask.public_key).unwrap());
-                                return Ok::<_, std::io::Error>(json(
-                                    200,
-                                    &vk_hub_proto::gitlab::EnrollResponse {
-                                        relay_id: TEST_RELAY_ID.to_owned(),
-                                    },
-                                ));
-                            }
-                            let path_and_query =
-                                parts.uri.path_and_query().map_or("", |p| p.as_str());
-                            let known = key.lock().unwrap().clone();
-                            if !known.is_some_and(|k| {
-                                signed(
-                                    &k,
-                                    &parts.headers,
-                                    parts.method.as_str(),
-                                    path_and_query,
-                                    &body,
+                    let _open = open;
+                    let (io, exported, h2): (Box<dyn Io>, _, _) = match tls {
+                        Some(config) => {
+                            let config = config.lock().unwrap().clone();
+                            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                            let Ok(stream) = acceptor.accept(stream).await else {
+                                return;
+                            };
+                            let mut exported = [0u8; vk_hub_proto::TLS_EXPORTER_LEN];
+                            stream
+                                .get_ref()
+                                .1
+                                .export_keying_material(
+                                    &mut exported,
+                                    vk_hub_proto::TLS_EXPORTER_LABEL,
+                                    None,
                                 )
-                            }) {
-                                return Ok(error(
+                                .unwrap();
+                            let h2 = stream.get_ref().1.alpn_protocol()
+                                == Some(vk_hub_proto::gitlab::ALPN);
+                            (Box::new(stream), Some(exported), h2)
+                        }
+                        None => {
+                            let h2 = relayconn::is_h2(&stream).await;
+                            (Box::new(stream), None, h2)
+                        }
+                    };
+                    if !h2 {
+                        // HTTP/1.1 serves the enrollment alone.
+                        let key = state.1.clone();
+                        let recs = state.0.clone();
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let (key, recs) = (key.clone(), recs.clone());
+                            async move {
+                                let (parts, body) = req.into_parts();
+                                let body = body.collect().await.unwrap().to_bytes();
+                                let path = parts.uri.path().to_owned();
+                                recs.lock().unwrap().push(HubRequest {
+                                    method: parts.method.to_string(),
+                                    path: path.clone(),
+                                    query: parts.uri.query().unwrap_or("").to_owned(),
+                                    headers: parts.headers.clone(),
+                                    body: body.clone(),
+                                });
+                                if parts.method == "POST" && path == "/v1/gitlab/enroll" {
+                                    let ask: vk_hub_proto::EnrollRequest =
+                                        serde_json::from_slice(&body).unwrap();
+                                    *key.lock().unwrap() =
+                                        Some(vk_hub_proto::from_hex(&ask.public_key).unwrap());
+                                    return Ok::<_, std::io::Error>(json(
+                                        200,
+                                        &vk_hub_proto::gitlab::EnrollResponse {
+                                            relay_id: TEST_RELAY_ID.to_owned(),
+                                        },
+                                    ));
+                                }
+                                Ok(error(
                                     401,
                                     ErrorCode::Unauthorized,
-                                    "a request signed by an enrolled relay is required",
+                                    "a relay's requests ride its session's connection",
                                     None,
-                                ));
+                                ))
                             }
-                            let fault = {
-                                let mut f = flts.lock().unwrap();
-                                match f.front() {
-                                    Some(fault)
-                                        if path.starts_with(&fault.path_prefix)
-                                            && path.ends_with(&fault.path_suffix) =>
-                                    {
-                                        f.pop_front()
-                                    }
-                                    _ => None,
-                                }
-                            };
-                            if let Some(f) = fault {
-                                if f.status == 0 {
-                                    return Err(std::io::Error::other("connection cut"));
-                                }
-                                let mut r = error(f.status, f.code, "injected", f.retry_after_secs);
-                                if let Some(s) = f.retry_after_secs {
-                                    r.headers_mut()
-                                        .insert("retry-after", s.to_string().parse().unwrap());
-                                }
-                                return Ok(r);
-                            }
-                            let delay = if parts.method == "POST" && path == "/v1/reservations" {
-                                delay.lock().unwrap().take()
-                            } else {
-                                None
-                            };
-                            let response = serve(hub, parts.method, path, q, body, tickets).await;
-                            if let Some(delay) = delay {
-                                tokio::time::sleep(delay).await;
-                            }
-                            Ok(response)
+                        });
+                        tokio::select! {
+                            _ = http1::Builder::new().serve_connection(TokioIo::new(io), service) => {}
+                            _ = cutting.changed() => {}
                         }
+                        return;
+                    }
+                    // As the hub: the connection serves its relay's requests while its session
+                    // is up, and closes with it.
+                    let up = Arc::new(AtomicBool::new(false));
+                    let ended = Arc::new(tokio::sync::Notify::new());
+                    let serving = Arc::clone(&up);
+                    let key = state.1.clone();
+                    let (session_hub, tickets) = (hub.clone(), Arc::clone(&state.3));
+                    let other = move |req: Request<Incoming>| {
+                        let (hub, (recs, _, flts, tickets, delay)) = (hub.clone(), state.clone());
+                        let up = Arc::clone(&serving);
+                        async move { request(req, up, hub, recs, flts, tickets, delay).await }
+                    };
+                    let closed = Arc::clone(&ended);
+                    let (conn, ws) =
+                        relayconn::serve(io, other, async move { closed.notified().await });
+                    let session = tokio::spawn(async move {
+                        if let Ok(ws) = ws.await {
+                            let key = key.lock().unwrap().clone();
+                            session(ws, key, exported, &up, &sessions, session_hub, tickets).await;
+                        }
+                        up.store(false, Ordering::SeqCst);
+                        ended.notify_one();
                     });
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
+                    let _session = Aborting(session);
+                    tokio::select! {
+                        () = conn => {}
+                        _ = cutting.changed() => {}
+                    }
                 });
             }
         });
         FakeHub {
-            url: format!("http://{addr}"),
+            url,
+            connections,
+            closed,
+            sessions,
+            cut,
+            tls_config,
             requests,
             relay_key,
             faults,
@@ -622,6 +922,44 @@ impl FakeHub {
             tickets,
             task,
         }
+    }
+
+    /// Connections accepted so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Cut every open connection, without an answer to the requests on it, and wait until
+    /// they are closed.
+    pub async fn cut_connections(&self) {
+        let open = self.connections();
+        self.cut.send_modify(|n| *n += 1);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while self.closed.load(Ordering::SeqCst) < open {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connections cut close");
+    }
+
+    /// Sessions welcomed so far.
+    pub fn sessions(&self) -> usize {
+        self.sessions.load(Ordering::SeqCst)
+    }
+
+    /// Offer `alpn` on the connections accepted from now on.
+    pub fn set_alpn(&self, alpn: &[&[u8]]) {
+        let tls = self.tls_config.as_ref().expect("a fake hub over TLS");
+        let mut config = tls.lock().unwrap();
+        let mut next = (**config).clone();
+        next.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        *config = Arc::new(next);
+    }
+
+    /// Take `public_key` for the enrolled relay's, as an enrollment would.
+    pub fn enroll(&self, public_key: &[u8]) {
+        *self.relay_key.lock().unwrap() = Some(public_key.to_vec());
     }
 
     /// The ticket a queued request with `request_id` got, once the fake has it.

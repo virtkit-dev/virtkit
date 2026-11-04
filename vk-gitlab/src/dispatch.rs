@@ -24,8 +24,10 @@ pub struct Reservation {
     pub admission: Option<String>,
     pub node: String,
     pub envelope: Envelope,
-    /// The lease the node granted, counted from when the request was sent.
+    /// The lease the node granted, counted from `sent`.
     pub lease: Duration,
+    /// When the request that brought the grant was sent.
+    pub sent: tokio::time::Instant,
 }
 
 #[derive(Debug)]
@@ -433,9 +435,29 @@ mod fake {
             });
         }
 
+        /// Sets a job's revision; a lower one stands for a restarted hub that recovered less.
+        pub fn set_revision(&self, id: &str, revision: u64) {
+            self.change(|i| {
+                if let Some(j) = i.job_mut(id) {
+                    j.view.revision = revision;
+                }
+            });
+        }
+
         /// Ends a reservation, as a lapsed lease or a lost node does.
         pub fn drop_reservation(&self, id: &str) {
             self.change(|i| i.reservations.remove(id));
+        }
+
+        /// Each job not settled: its ID, revision and output length, as the hub's notices tell
+        /// them.
+        pub fn unsettled(&self) -> Vec<(String, u64, u64)> {
+            self.lock()
+                .jobs
+                .iter()
+                .filter(|j| !j.settled)
+                .map(|j| (j.view.id.clone(), j.view.revision, j.view.output_len))
+                .collect()
         }
 
         /// Number of view reads started for job `id`.
@@ -613,6 +635,7 @@ mod fake {
                     node: "node-1".to_owned(),
                     envelope: placement.envelope,
                     lease,
+                    sent: tokio::time::Instant::now(),
                 }),
                 None => Err(DispatchError {
                     retry_after: Some(Duration::from_secs(1)),

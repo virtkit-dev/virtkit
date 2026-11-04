@@ -300,3 +300,4 @@ pub fn options(url: &str, token: &str, retry: RetryPolicy) -> ClientOptions {
 
 pub mod fakehub;
 pub mod gl;
+pub mod relayconn;

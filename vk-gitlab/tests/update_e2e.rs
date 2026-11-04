@@ -13,9 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use vk_hub_proto::gitlab::{
-    Command, HubRelayMsg, Operation, PROTOCOL, RELEASE_PATH, RUNNERS, RelayMsg,
-};
+use vk_hub_proto::gitlab::{CONNECTION, Command, HubRelayMsg, Operation, PROTOCOL, RelayMsg};
 use vk_hub_proto::{CommandAck, HubMsg, NodeMsg, Outcome, UpdatePhase};
 use vk_peer::identity::Identity;
 
@@ -50,12 +48,23 @@ async fn hub(
             Arc::clone(&sent),
         );
         tokio::spawn(async move {
-            let mut head = [0u8; 256];
-            let n = stream.peek(&mut head).await.unwrap_or(0);
-            if head[..n].starts_with(format!("GET {RELEASE_PATH}").as_bytes()) {
+            if !support::relayconn::is_h2(&stream).await {
                 serve_release(stream, &release).await;
-            } else {
-                session(stream, command, seen, sent).await;
+                return;
+            }
+            let (conn, ws) = support::relayconn::serve(
+                Box::new(stream),
+                |_| async {
+                    Ok(hyper::Response::builder()
+                        .status(404)
+                        .body(http_body_util::Full::new(bytes::Bytes::new()))
+                        .unwrap())
+                },
+                std::future::pending(),
+            );
+            tokio::spawn(conn);
+            if let Ok(ws) = ws.await {
+                session(ws, command, seen, sent).await;
             }
         });
     }
@@ -81,14 +90,11 @@ async fn serve_release(mut stream: TcpStream, release: &[u8]) {
 }
 
 async fn session(
-    stream: TcpStream,
+    mut ws: support::relayconn::Ws,
     command: Command,
     seen: mpsc::UnboundedSender<Seen>,
     sent: Arc<Mutex<bool>>,
 ) {
-    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-        return;
-    };
     let text = |m: Option<Result<Message, _>>| match m {
         Some(Ok(Message::Text(t))) => Some(t.as_str().to_owned()),
         _ => None,
@@ -99,7 +105,7 @@ async fn session(
         return;
     };
     let challenge = HubMsg::Challenge {
-        version: RUNNERS,
+        version: CONNECTION,
         versions: PROTOCOL,
         nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
     };

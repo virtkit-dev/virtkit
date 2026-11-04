@@ -4202,6 +4202,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml",
  "vk-fs",

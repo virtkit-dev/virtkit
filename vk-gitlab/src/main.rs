@@ -10,7 +10,7 @@ use log::LevelFilter;
 use tokio::signal::unix::{SignalKind, signal};
 
 use vk_gitlab::config::Config;
-use vk_gitlab::hub::{HubClient, HubOptions};
+use vk_gitlab::hub::{HubClient, Link};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
 use vk_gitlab::runners::{self, Runners};
 use vk_gitlab::update::{self, Updater};
@@ -187,18 +187,15 @@ async fn run(config: PathBuf) -> Result<()> {
         Arc::clone(&handle),
         registry,
     )?;
+    // The session's connection carries the hub client's requests.
+    let link = Link::new();
     let session = tokio::spawn(session::hold(
         Arc::clone(&relay),
         Arc::clone(&status),
         Arc::clone(&updater),
+        Arc::clone(&link),
     ));
-    let dispatcher = Arc::new(HubClient::new(HubOptions {
-        hub: relay.enrollment.hub.clone(),
-        tls: Arc::clone(&relay.tls),
-        relay_id: relay.enrollment.relay_id.clone(),
-        identity: Arc::clone(&relay.identity),
-        retry: Default::default(),
-    }));
+    let dispatcher = Arc::new(HubClient::new(link, Default::default()));
     let shutdown_timeout = cfg.shutdown_timeout();
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;

@@ -39,6 +39,9 @@
 //! | `POST` [`JOBS_PATH`]`/<id>/settle` | — | 204 |
 //! | `POST` [`CLIENTS_PATH`] | [`ClientHello`] | 204 |
 //!
+//! A relay at version [`CONNECTION`](crate::gitlab::CONNECTION) sends its requests unsigned
+//! on the HTTP/2 connection its session authenticates, and never long-polls there.
+//!
 //! `wait` on the `GET`s, and `wait_secs` in a [`CapacityRequest`], make a request
 //! long-poll for at most that many seconds, capped at [`MAX_WAIT_SECS`]: a ticket returns
 //! once it is granted, a job view once its revision passes `after`, output once there are

@@ -40,8 +40,8 @@ vk-hub-proto = { path = "../vk-hub-proto" }
 # The relay's identity, enrollment and session with the hub, and its files written whole.
 vk-fs = { path = "../vk-fs" }
 vk-peer = { path = "../vk-peer" }
-# The hub client: one signed HTTP/1.1 request per connection vk-peer dials.
-hyper = { workspace = true, features = ["client"] }
+# The hub client: requests on the session's HTTP/2 connection, dialed by vk-peer.
+hyper = { workspace = true, features = ["client", "http2"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
 # The relay's session with the hub, dialed through vk-peer.
@@ -58,4 +58,6 @@ libc.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+# The fake hub's TLS listener.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "test-util"] }

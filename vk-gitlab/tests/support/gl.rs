@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use vk_gitlab::config::Config;
 use vk_gitlab::dispatch::{FakeCall, FakeDispatcher, Submission};
-use vk_gitlab::hub::{HubClient, HubOptions, HubRetry};
+use vk_gitlab::hub::{HubClient, HubRetry, Link};
 use vk_gitlab::poll::{self, HubTimings, RunOptions, ShutdownHandle};
 use vk_gitlab::relay::{self, Enrollment};
 use vk_gitlab::runners::{self, Runners};
-use vk_gitlab::session::Status;
+use vk_gitlab::session::{self, Status};
 use vk_gitlab::trace::TraceSettings;
+use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{ServerState, ServerStatus};
 
 use super::fakehub::{FakeHub, TEST_RELAY_ID};
@@ -398,19 +399,11 @@ impl Harness {
                 })
             }
             Via::Http => {
-                let enrolled = relay::open(&self.state_dir).unwrap();
-                let d = Arc::new(HubClient::new(HubOptions {
-                    hub: enrolled.enrollment.hub.clone(),
-                    tls: enrolled.tls,
-                    relay_id: enrolled.enrollment.relay_id.clone(),
-                    identity: enrolled.identity,
-                    retry: HubRetry {
-                        max_attempts: 5,
-                        backoff_min: Duration::from_millis(50),
-                        backoff_max: Duration::from_millis(200),
-                    },
-                }));
+                let state_dir = self.state_dir.clone();
                 rt.spawn(async move {
+                    let (link, _session) =
+                        hold_session(&state_dir, &cfg, &status2, Arc::clone(&registry2));
+                    let d = Arc::new(HubClient::new(link, quick_retry()));
                     let prepared = poll::prepare_state(&cfg, &relay.relay_id, status2)?
                         .with_runners(registry2, changes);
                     poll::run(&cfg, TEST_SYSTEM_ID, &relay, prepared, d, options, shutdown).await
@@ -473,6 +466,53 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&self.state_dir);
         self.hub.clone()
     }
+}
+
+/// Retries quick enough for a test.
+pub fn quick_retry() -> HubRetry {
+    HubRetry {
+        max_attempts: 5,
+        backoff_min: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+    }
+}
+
+/// Holds the session of the relay enrolled in `state_dir`, as `cfg` configures it, on the
+/// current runtime; returns the link its client sends on, and the session's task.
+pub fn hold_session(
+    state_dir: &Path,
+    cfg: &Config,
+    status: &Arc<Status>,
+    registry: Arc<Runners>,
+) -> (Arc<Link>, tokio::task::JoinHandle<()>) {
+    let relay = Arc::new(relay::open(state_dir).unwrap());
+    let (handle, _shutdown) = ShutdownHandle::new();
+    let updater = Updater::open(
+        state_dir,
+        Arc::clone(&relay),
+        cfg.hub.clone(),
+        Arc::clone(status),
+        Arc::new(handle),
+        registry,
+    )
+    .unwrap();
+    let link = Link::new();
+    let session = tokio::spawn(session::hold(
+        relay,
+        Arc::clone(status),
+        updater,
+        Arc::clone(&link),
+    ));
+    (link, session)
+}
+
+/// A client of the hub for the relay of `h`, its session held meanwhile.
+pub fn client(h: &Harness, retry: HubRetry) -> (HubClient, tokio::task::JoinHandle<()>) {
+    let cfg = h.config();
+    let status = Status::new(&cfg, TEST_SYSTEM_ID, "test-host");
+    let (registry, _changes) = Runners::new(&cfg, TEST_SYSTEM_ID, Arc::clone(&status));
+    let (link, session) = hold_session(&h.state_dir, &cfg, &status, registry);
+    (HubClient::new(link, retry), session)
 }
 
 /// The server's status as the hub would send it.

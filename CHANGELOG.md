@@ -4,11 +4,20 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A GitLab relay holds one HTTP/2 connection to vk-hub.** The relay's session and its requests
+  share it, and the session authenticates them. The hub tells the relay when its reservations
+  and jobs change and the relay fetches them, so no request is held open waiting. API-key
+  clients, nodes, registries and relays of earlier releases stay on HTTP/1.1, as before.
+
 ### Changed
 
 - **vk-hub's GitLab server pages show each relay with its runners.** Runner tables fit the
   page, with scheduling details folded under each runner. A runner without a lane says its
   jobs are refused. Operators add and remove runners there; the Overview's relays link there.
+- **vk-gitlab needs a hub of this release: upgrade the hub first.** Against an older hub it
+  logs that the hub must be upgraded and takes no jobs from GitLab until it is.
 
 ### Fixed
 
