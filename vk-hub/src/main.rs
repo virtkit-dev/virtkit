@@ -676,7 +676,7 @@ enum RelayRunnersCmd {
         labels: Vec<String>,
         /// Each job's VM: mem=<size>,cpus=<n>,disk=<size>, any of them (default
         /// mem=4G,cpus=2,disk=16G)
-        #[arg(long, value_name = "SPEC", default_value = "mem=4G,cpus=2,disk=16G", value_parser = parse_envelope)]
+        #[arg(long, value_name = "SPEC", default_value = DEFAULT_ENVELOPE, value_parser = parse_envelope)]
         envelope: vk_hub_proto::job::Envelope,
         /// How many of its jobs run at once (default: no limit)
         #[arg(long, value_name = "N")]
@@ -696,9 +696,12 @@ enum RelayRunnersCmd {
     },
 }
 
+/// A `[[runners]]` table's default envelope, as [`parse_envelope`] reads it.
+pub(crate) const DEFAULT_ENVELOPE: &str = "mem=4G,cpus=2,disk=16G";
+
 /// A job envelope, `mem=16G,cpus=8,disk=16G`, any part left out taking a `[[runners]]`
 /// table's default.
-fn parse_envelope(s: &str) -> Result<vk_hub_proto::job::Envelope, String> {
+pub(crate) fn parse_envelope(s: &str) -> Result<vk_hub_proto::job::Envelope, String> {
     let mut e = vk_hub_proto::job::Envelope {
         mem_mib: 4 << 10,
         cpus: 2,

@@ -742,7 +742,7 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     eventually(|| row(&command.id).runner_id == Some(42)).await;
 
     // A config runner is not removed from the hub; one added there is, once.
-    let remove = |name: &str| relays::remove_runner(&hub, "uid 0", &id, name);
+    let remove = |name: &str| relays::remove_runner(&hub, "uid 0", &id, name, None);
     assert!(err_of(remove("cfg")).contains("not added on the hub"));
     assert!(err_of(remove("nope")).contains("reports no runner nope"));
     let removal = remove("big").unwrap();

@@ -378,6 +378,9 @@ pub(super) async fn get(
     if path == super::lanes::PATH {
         return super::lanes::get(query, auth, ui).await.map(Some);
     }
+    if let Some(id) = super::relays::add_runner_target(path) {
+        return super::relays::add_runner_page(id, auth, ui).await.map(Some);
+    }
     if let Some((gitlab, id)) = super::projects::target(path) {
         return super::projects::get(gitlab, id, auth, ui).await.map(Some);
     }

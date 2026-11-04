@@ -15,6 +15,10 @@ All notable changes to virtkit will be documented in this file.
   token file or stdin, with its pool, labels, envelope and limits; or remove one added this way.
   The hub passes the token on to the relay without keeping it. `vk-hub relays show` tells each
   runner's source and how each runner command ended.
+- **Add and remove runners from GitLab's Overview.** Operators add runners from eligible
+  relays' rows and remove runners added on the hub from their rows. Relay rows show the latest
+  runner change's outcome. New runners without a lane show that their jobs are refused until
+  one is added.
 
 ### Fixed
 

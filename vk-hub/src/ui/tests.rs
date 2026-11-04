@@ -9779,7 +9779,7 @@ async fn relays_and_their_runners_follow_their_server() {
         &format!("certificate key sha256 <code>{}</code>", "ab".repeat(32)),
         "<td>0.96.0</td><td class=\"num\">2</td><td class=\"num\">6</td>",
         // Its server not approved: neither mapped nor unmapped.
-        "<td>relay-1</td><td>ci</td><td>42</td><td>-</td><td>-</td><td>pool ci · large · 4096 MiB",
+        "<td>relay-1</td><td>ci</td><td>42</td><td>config</td><td>-</td><td>-</td><td>pool ci · large · 4096 MiB",
         "<td class=\"num\">4</td><td><span class=\"badge warn\">server not approved</span>",
         "<td class=\"num\">1</td><td class=\"num\">3</td><td><time",
         " · HTTP 204</td>",
@@ -9803,7 +9803,9 @@ async fn relays_and_their_runners_follow_their_server() {
     let event = next_with(&mut live_server, "<td>42</td>").await;
     // Its server approved: no lane, and no Map link for a viewer.
     assert!(
-        event.contains("<td>42</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"),
+        event.contains(
+            "<td>42</td><td>config</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"
+        ),
         "{event}"
     );
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
@@ -9838,7 +9840,7 @@ async fn relays_and_their_runners_follow_their_server() {
     let event = next_with(&mut live_server, "production</td>").await;
     assert!(
         event.contains(
-            "<td>42</td><td><a href=\"/lanes\">weight 2</a></td>\
+            "<td>42</td><td>config</td><td><a href=\"/lanes\">weight 2</a></td>\
              <td>production</td><td>pool ci"
         ),
         "{event}"
@@ -9898,6 +9900,388 @@ async fn relays_and_their_runners_follow_their_server() {
         let reply = post_action(addr, &origin, &operator, "/clients", &form, true).await;
         assert_eq!(reply.status, 404, "{}", reply.body);
     }
+}
+
+/// An operator adds a runner to a relay that takes runners from GitLab's Overview: a form with
+/// the CLI's defaults, refused with the hub's reason and never sending the token back. The
+/// relay's row tells how its last runner command went, an added runner with no lane says its
+/// jobs are refused and links to adding one, and a runner added on the hub is removed once
+/// asked. A viewer has no link nor button and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_adds_and_removes_a_relay_s_runners() {
+    use crate::store::RelayWrite;
+    use vk_hub_proto::gitlab::{ALLOW_RUNNERS, Operation, Runner, RunnerFailure, RunnerSource};
+    use vk_hub_proto::{CommandAck, Outcome};
+    let (addr, hub, origin) = start_fleet().await;
+    let url = "https://gitlab.example.com";
+    let relay = bound_relay(&hub, "aa", url);
+    let now = crate::now_secs();
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let href = format!("/relay/{relay}/add-runner");
+    let action = format!("/relay/{relay}/action");
+    let link = format!("<a href=\"{href}\">Add runner</a>");
+
+    // A relay whose [hub] allow lacks runners: no link, and its page says why, with no form.
+    assert!(
+        !get(addr, "/gitlab", Some(&operator))
+            .await
+            .body
+            .contains(&link)
+    );
+    let page = get(addr, &href, Some(&operator)).await.body;
+    assert!(page.contains("lacks runners"), "{page}");
+    assert!(!page.contains("name=\"token\""), "{page}");
+    // Allowing runners, but at a protocol below 4: none either.
+    let mut inventory = hub.db.relay(&relay).unwrap().unwrap().inventory.unwrap();
+    inventory.allow = vec![ALLOW_RUNNERS.into()];
+    let config = Runner {
+        name: "cfg".into(),
+        runner_id: Some(7),
+        verified: true,
+        ..Runner::default()
+    };
+    inventory.runners = vec![config.clone()];
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory.clone()), now)
+        .unwrap();
+    assert!(
+        hub.db
+            .record_relay_session(&relay, "i", 3, now, || true)
+            .unwrap()
+    );
+    assert!(
+        !get(addr, "/gitlab", Some(&operator))
+            .await
+            .body
+            .contains(&link)
+    );
+    assert!(
+        hub.db
+            .record_relay_session(&relay, "i", 4, now, || true)
+            .unwrap()
+    );
+    assert!(
+        get(addr, "/gitlab", Some(&operator))
+            .await
+            .body
+            .contains(&link)
+    );
+
+    // A viewer has no link, and is refused the form and its post.
+    assert!(
+        !get(addr, "/gitlab", Some(&viewer))
+            .await
+            .body
+            .contains(&href)
+    );
+    assert_eq!(get(addr, &href, Some(&viewer)).await.status, 403);
+    let form = format!("_csrf={viewer_csrf}&op=add-runner&token=glrt-secret&name=ci-1");
+    let reply = post_action(addr, &origin, &viewer, &action, &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(hub.db.relay_commands(&relay).unwrap().is_empty());
+
+    // The form: the CLI's defaults, the token a password field.
+    let page = get(addr, &href, Some(&operator)).await.body;
+    for want in [
+        "<input id=\"runner-token\" type=\"password\" name=\"token\" autocomplete=\"off\"",
+        "name=\"pool\" autocomplete=\"off\" spellcheck=\"false\" value=\"default\"",
+        "name=\"envelope\" autocomplete=\"off\" spellcheck=\"false\" \
+         value=\"mem=4G,cpus=2,disk=16G\"",
+        "name=\"limit\" autocomplete=\"off\" spellcheck=\"false\" value=\"\"",
+        "name=\"request_concurrency\" autocomplete=\"off\" spellcheck=\"false\" value=\"1\"",
+        &format!("<form class=\"wide\" method=\"post\" action=\"{action}\">"),
+        &format!("name=\"_csrf\" value=\"{csrf}\""),
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+
+    // Refused with the hub's reason, the rest filled in again but never the token.
+    let fields = |name: &str, envelope: &str| {
+        format!(
+            "_csrf={csrf}&op=add-runner&token=glrt-secret&name={name}&pool=ci\
+             &labels=kvm%2C+big&envelope={envelope}&limit=2&request_concurrency=1"
+        )
+    };
+    for (form, status, want) in [
+        (
+            fields("..bad", "mem%3D8G"),
+            409,
+            "Refused: a runner name is",
+        ),
+        (
+            fields("cfg", "mem%3D8G"),
+            409,
+            "Refused: relay relay-1 has a runner named cfg",
+        ),
+        (fields("ci-1", "ram%3D8G"), 400, "Refused: envelope "),
+    ] {
+        let reply = post_action(addr, &origin, &operator, &action, &form, false).await;
+        assert_eq!(reply.status, status, "{want}: {}", reply.body);
+        for want in [want, "value=\"kvm, big\"", "name=\"token\""] {
+            assert!(reply.body.contains(want), "{want}: {}", reply.body);
+        }
+        assert!(!reply.body.contains("glrt-secret"), "{}", reply.body);
+    }
+    assert!(hub.db.relay_commands(&relay).unwrap().is_empty());
+
+    // How each failure the relay answers with is told on its row.
+    let add = |name: &str| {
+        crate::relays::add_runner(
+            &hub,
+            "u",
+            &relay,
+            name,
+            vk_hub_proto::gitlab::RunnerToken::new("glrt-x"),
+            crate::relays::RunnerSettings {
+                placement: vk_hub_proto::client::Placement {
+                    pool: "ci".into(),
+                    labels: vec![],
+                    envelope: vk_hub_proto::job::Envelope {
+                        mem_mib: 4096,
+                        cpus: 2,
+                        disk_bytes: 16 << 30,
+                    },
+                },
+                limit: None,
+                request_concurrency: 1,
+            },
+        )
+        .unwrap()
+    };
+    let mut live = Events::open(addr, "/events/gitlab", &viewer).await;
+    live.next().await.unwrap();
+    for (n, (outcome, want)) in [
+        (RunnerFailure::TokenRefused, "GitLab refused the token"),
+        (
+            RunnerFailure::GitlabUnreachable,
+            "The relay could not reach GitLab: add the runner again",
+        ),
+        (
+            RunnerFailure::NameTaken,
+            "The relay has a runner with this name already",
+        ),
+        (
+            RunnerFailure::RunnerTaken,
+            "The relay runs this GitLab runner already, under another name",
+        ),
+        (
+            RunnerFailure::TooManyRunners,
+            "The relay runs as many runners as it can",
+        ),
+        (
+            RunnerFailure::NotAllowed,
+            "The relay&#39;s [hub] allow no longer lists runners",
+        ),
+        (RunnerFailure::Expired, "The relay did not take it in time"),
+        (
+            RunnerFailure::TokenLost,
+            "The hub restarted before the relay got the token: add the runner again",
+        ),
+        (
+            RunnerFailure::RunnerGone,
+            "The relay no longer runs this runner",
+        ),
+        (
+            RunnerFailure::Other,
+            "The relay could not do it: see its log",
+        ),
+    ]
+    .into_iter()
+    .map(|(f, want)| (f.outcome(), want))
+    .chain([(
+        Outcome::Failed {
+            message: "a_later_code".into(),
+        },
+        "The relay could not do it: see its log",
+    )])
+    .enumerate()
+    {
+        let name = format!("f{n}");
+        let command = add(&name);
+        let pending = format!(
+            "Add runner <strong>{name}</strong>: <span class=\"badge busy\">pending</span>"
+        );
+        let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+        assert!(page.contains(&pending), "{page}");
+        let ack = CommandAck {
+            id: command.id,
+            outcome,
+        };
+        assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
+        let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+        let told = format!(
+            "Add runner <strong>{name}</strong>: <span class=\"badge bad\">failed</span> {want}"
+        );
+        assert!(page.contains(&told), "{want}: {page}");
+    }
+
+    // Each command issued shows live.
+    next_with(&mut live, "Add runner <strong>f10</strong>").await;
+
+    // Added: back to GitLab, the token held for the relay, not stored.
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &action,
+        &fields("ci-1", "mem%3D8G"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/gitlab"));
+    let added = crate::relays::last_runner_command(&hub.db.relay_commands(&relay).unwrap())
+        .cloned()
+        .unwrap();
+    let Operation::AddRunner {
+        name,
+        token,
+        placement,
+        limit,
+        request_concurrency,
+    } = &added.command.op
+    else {
+        panic!("not an add: {added:?}");
+    };
+    assert_eq!(
+        (
+            name.as_str(),
+            token.expose(),
+            placement.pool.as_str(),
+            *limit,
+            *request_concurrency
+        ),
+        ("ci-1", "", "ci", Some(2), 1)
+    );
+    assert_eq!(placement.labels, ["kvm", "big"]);
+    assert_eq!(placement.envelope.mem_mib, 8 << 10);
+    assert!(hub.runner_tokens.holds(&added.command.id));
+
+    // Done, with no lane: the row says its jobs are refused, and links an operator to a lane.
+    let ack = CommandAck {
+        id: added.command.id.clone(),
+        outcome: Outcome::Done,
+    };
+    assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
+    hub.clients_changed();
+    next_with(
+        &mut live,
+        "Add runner <strong>ci-1</strong>: <span class=\"badge ok\">done",
+    )
+    .await;
+    let hubbed = Runner {
+        name: "ci-1".into(),
+        runner_id: Some(42),
+        verified: true,
+        source: RunnerSource::Hub,
+        command: Some(added.command.id.clone()),
+        ..Runner::default()
+    };
+    inventory.runners = vec![config, hubbed];
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory.clone()), now)
+        .unwrap();
+    hub.db.record_added_runners(&relay, now).unwrap();
+    hub.db.add_gitlab("gl", url, "u", now).unwrap();
+    let lane = "/lanes?edit=runner%2Fgl%2F42";
+    let notice = "<span class=\"badge warn\">No lane: its jobs are refused</span>";
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    let want = format!(
+        "Add runner <strong>ci-1</strong>: <span class=\"badge ok\">done</span> {notice} \
+         <a href=\"{lane}\">Add a lane</a>"
+    );
+    assert!(page.contains(&want), "{page}");
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    assert!(page.contains(notice) && !page.contains(lane), "{page}");
+
+    // The server's page: where each runner comes from; Remove for the one added on the hub.
+    let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
+    for want in [
+        "<td>7</td><td>config</td><td><span class=\"badge warn\">unmapped</span>",
+        &format!(
+            "<td>42</td><td>added on the hub</td><td>{notice} <a href=\"{lane}\">Add a lane</a>"
+        ),
+        "<input type=\"hidden\" name=\"op\" value=\"remove-runner\"><input type=\"hidden\" \
+         name=\"name\" value=\"ci-1\"><button class=\"danger\">Remove</button>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("name=\"name\" value=\"cfg\""), "{page}");
+    let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
+    assert!(
+        !page.contains("remove-runner") && !page.contains(lane),
+        "{page}"
+    );
+    let form = format!("_csrf={viewer_csrf}&op=remove-runner&name=ci-1");
+    let reply = post_action(addr, &origin, &viewer, &action, &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    // A config runner is refused; the hub's is removed once asked.
+    let form = format!("_csrf={csrf}&op=remove-runner&name=cfg");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    assert!(reply.body.contains("Remove this runner?"), "{}", reply.body);
+    let answer = posted_form(&reply.body, "remove-runner", 0);
+    let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("was not added on the hub"),
+        "{}",
+        reply.body
+    );
+    // A confirmation of a runner added again since is refused.
+    let form = format!("_csrf={csrf}&op=remove-runner&name=ci-1");
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    let stale = posted_form(&reply.body, "remove-runner", 0);
+    let mut again = inventory.clone();
+    again.runners[1].command = Some("ab".repeat(16));
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(again), now)
+        .unwrap();
+    let reply = post_action(addr, &origin, &operator, &action, &stale, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("it changed since you were asked"),
+        "{}",
+        reply.body
+    );
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory.clone()), now)
+        .unwrap();
+    let reply = post_action(addr, &origin, &operator, &action, &form, true).await;
+    for want in [
+        "Remove this runner? It stops taking new jobs and is removed after its running jobs end.",
+        "Runner <strong>ci-1</strong> (GitLab ID 42) on relay <strong>relay-1</strong>",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(!reply.body.contains("below"), "{}", reply.body);
+    let answer = posted_form(&reply.body, "remove-runner", 0);
+    let reply = post_action(addr, &origin, &operator, &action, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Removing runner ci-1 from relay-1."),
+        "{}",
+        reply.body
+    );
+    let removal = crate::relays::last_runner_command(&hub.db.relay_commands(&relay).unwrap())
+        .cloned()
+        .unwrap();
+    assert!(
+        matches!(&removal.command.op, Operation::RemoveRunner { name, runner_id: 42, command } if name == "ci-1" && *command == added.command.id),
+        "{removal:?}"
+    );
+    audited(&hub, "remove runner ci-1").await;
+    let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
+    assert!(page.contains("<td>42</td><td>being removed</td>"), "{page}");
+    assert!(!page.contains("remove-runner"), "{page}");
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(
+        page.contains(
+            "Remove runner <strong>ci-1</strong>: <span class=\"badge busy\">pending</span>"
+        ),
+        "{page}"
+    );
 }
 
 /// What waits for approval is on top of the GitLab pages, counted on the GitLab link and its

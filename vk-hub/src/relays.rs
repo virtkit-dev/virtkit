@@ -376,6 +376,8 @@ async fn settle_lost_commands(
     .await??;
     if settled {
         hub.changed(&relay.id);
+        // GitLab's Overview shows a runner command's outcome; `/updates` an update's.
+        hub.clients_changed();
         hub.touch();
     }
     Ok(())
@@ -391,6 +393,7 @@ async fn record_added_runners(hub: &Hub, relay: &Peer) -> Result<()> {
             .await??;
     if taken {
         hub.changed(&relay.id);
+        hub.clients_changed();
     }
     Ok(())
 }
@@ -407,7 +410,9 @@ async fn acknowledge(ws: &mut Ws, hub: &Hub, relay: &Peer, ack: CommandAck) -> R
             .await??;
     if news {
         hub.changed(&relay.id);
-        // A command's outcome: `/updates` shows an update's.
+        // A command's outcome: GitLab's Overview shows a runner command's, `/updates` an
+        // update's.
+        hub.clients_changed();
         hub.touch();
     }
     send(ws, &HubRelayMsg::Recorded(recorded)).await
@@ -662,6 +667,7 @@ fn issued(hub: &Hub, actor: &str, id: &str, command: &Command) {
     );
     hub.kick(id);
     hub.changed(id);
+    hub.clients_changed();
     hub.touch();
 }
 
@@ -728,24 +734,35 @@ pub fn check_runner(name: &str, token: &RunnerToken, settings: &RunnerSettings) 
     Ok(())
 }
 
+/// Why relay `row` would refuse runner commands, going by what it last reported: no
+/// inventory yet, a `[hub] allow` lacking `runners`, or a protocol below [`RUNNERS`].
+pub fn runners_refusal(row: &RelayRow) -> Option<String> {
+    let name = &row.hostname;
+    let Some(inventory) = &row.inventory else {
+        return Some(format!("relay {name} has not reported its runners yet"));
+    };
+    if !inventory.allow.iter().any(|a| a == ALLOW_RUNNERS) {
+        return Some(format!(
+            "relay {name} does not let the hub add or remove its runners: its [hub] allow \
+             lacks {ALLOW_RUNNERS}"
+        ));
+    }
+    if row.protocol.unwrap_or(0) < RUNNERS {
+        return Some(format!(
+            "relay {name} runs a vk-gitlab that cannot take runners from the hub: update it"
+        ));
+    }
+    None
+}
+
 /// Relay `id`, if it lets the hub add and remove its runners as it last reported.
 fn taking_runners(hub: &Hub, id: &str) -> Result<RelayRow> {
     let row = hub
         .db
         .relay(id)?
         .ok_or_else(|| NotEnrolled(id.to_string()))?;
-    let name = &row.hostname;
-    let Some(inventory) = &row.inventory else {
-        bail!("relay {name} has not reported its runners yet");
-    };
-    if !inventory.allow.iter().any(|a| a == ALLOW_RUNNERS) {
-        bail!(
-            "relay {name} does not let the hub add or remove its runners: its [hub] allow \
-             lacks {ALLOW_RUNNERS}"
-        );
-    }
-    if row.protocol.unwrap_or(0) < RUNNERS {
-        bail!("relay {name} runs a vk-gitlab that cannot take runners from the hub: update it");
+    if let Some(why) = runners_refusal(&row) {
+        bail!(why);
     }
     Ok(row)
 }
@@ -787,8 +804,14 @@ pub fn add_runner(
 }
 
 /// Remove runner `name`, added on the hub, from relay `id`: it takes no new job, and goes once
-/// its jobs end.
-pub fn remove_runner(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<Command> {
+/// its jobs end. With `added_by`, only the runner that command added.
+pub fn remove_runner(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    name: &str,
+    added_by: Option<&str>,
+) -> Result<Command> {
     let row = taking_runners(hub, id)?;
     let Some(runner) = row
         .inventory
@@ -805,6 +828,9 @@ pub fn remove_runner(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<Com
             row.hostname
         );
     };
+    if added_by.is_some_and(|added_by| added_by != command) {
+        bail!("runner {name} was added again since: look at it again");
+    }
     let op = Operation::RemoveRunner {
         name: name.to_string(),
         runner_id,
@@ -817,30 +843,78 @@ pub fn remove_runner(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<Com
     Ok(command)
 }
 
+/// Where a relay's runner comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerOrigin<'a> {
+    Config,
+    /// Added on the hub by command `added_by`, when the relay names it; `removing` once a
+    /// removal of it is under way or done.
+    Hub {
+        added_by: Option<&'a str>,
+        removing: bool,
+    },
+    /// A source from a later relay.
+    Other,
+}
+
+/// Where runner `r` comes from, its removal looked up in `commands` as of `now`.
+pub fn runner_origin<'a>(
+    r: &'a Runner,
+    commands: &[RelayCommandRow],
+    now: u64,
+) -> RunnerOrigin<'a> {
+    match r.source {
+        RunnerSource::Config => RunnerOrigin::Config,
+        RunnerSource::Hub => {
+            let added_by = r.command.as_deref();
+            let removing = added_by.is_some_and(|added_by| {
+                commands.iter().any(|c| {
+                    matches!(&c.command.op, Operation::RemoveRunner { command, .. } if command == added_by)
+                        && match c.outcome {
+                            None => c.command.expires_at > now,
+                            Some(Outcome::Accepted | Outcome::Done) => true,
+                            Some(_) => false,
+                        }
+                })
+            });
+            RunnerOrigin::Hub { added_by, removing }
+        }
+        RunnerSource::Other => RunnerOrigin::Other,
+    }
+}
+
 /// Where runner `r` comes from, as `vk-hub relays show` says it: `config`, or `hub` and the
 /// command that added it, `being removed` once `commands` hold its removal not failed by
 /// `now`.
 pub fn runner_source(r: &Runner, commands: &[RelayCommandRow], now: u64) -> String {
-    match (r.source, &r.command) {
-        (RunnerSource::Config, _) => "config".to_string(),
-        (RunnerSource::Hub, Some(added_by)) => {
-            let removing = commands.iter().any(|c| {
-                matches!(&c.command.op, Operation::RemoveRunner { command, .. } if command == added_by)
-                    && match c.outcome {
-                        None => c.command.expires_at > now,
-                        Some(Outcome::Accepted | Outcome::Done) => true,
-                        Some(_) => false,
-                    }
-            });
+    match runner_origin(r, commands, now) {
+        RunnerOrigin::Config => "config".to_string(),
+        RunnerOrigin::Hub {
+            added_by: Some(added_by),
+            removing,
+        } => {
             if removing {
                 format!("hub ({added_by}), being removed")
             } else {
                 format!("hub ({added_by})")
             }
         }
-        (RunnerSource::Hub, None) => "hub".to_string(),
-        (RunnerSource::Other, _) => "other".to_string(),
+        RunnerOrigin::Hub { added_by: None, .. } => "hub".to_string(),
+        RunnerOrigin::Other => "other".to_string(),
     }
+}
+
+/// The latest runner command in a relay's `commands`.
+pub fn last_runner_command(commands: &[RelayCommandRow]) -> Option<&RelayCommandRow> {
+    commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.command.op,
+                Operation::AddRunner { .. } | Operation::RemoveRunner { .. }
+            )
+        })
+        .max_by_key(|c| c.seq)
 }
 
 /// Have the sessions of the relays bound to the server at `url` tell them its status anew,

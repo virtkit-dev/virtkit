@@ -924,7 +924,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             hub, &actor, &id, &name, token, settings,
         )?)?,
         Call::RemoveRelayRunner { id, name } => {
-            serde_json::to_value(crate::relays::remove_runner(hub, &actor, &id, &name)?)?
+            serde_json::to_value(crate::relays::remove_runner(hub, &actor, &id, &name, None)?)?
         }
         Call::HubUpdate => serde_json::to_value(crate::update::status(hub))?,
         Call::UpdateHub { .. } => bail!("an update of the hub is started on the runtime"),
