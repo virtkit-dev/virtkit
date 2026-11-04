@@ -376,7 +376,7 @@ An error body is `{error, code, retry_after_secs?, approval_url?}`. Unknown code
 unknown fields are ignored. When the hub serves a web UI, `approval_pending` and
 `project_rejected` include `approval_url`: the page where an operator decides on the project's
 approval, `<ui_url>/gitlab/<instance>/projects/<project ID>`, or, for its server, *GitLab* ›
-*Servers*, `<ui_url>/gitlab`, which lists the servers pending.
+*Overview*, `<ui_url>/gitlab`, which lists the servers pending.
 
 A job refused `approval_pending` or `project_rejected` is not held: approval is a human step.
 `vk-gitlab` releases its reservation and fails it in GitLab, uncommitted, as

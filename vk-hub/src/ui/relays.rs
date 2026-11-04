@@ -1,5 +1,5 @@
 //! GitLab relay updates: the `/updates` section ([`updates`]) and `/relay/<id>/action`
-//! handler, using the same operation as `vk-hub relays update`. The relay list is on `/relays`
+//! handler, using the same operation as `vk-hub relays update`. The relay list is on `/gitlab`
 //! ([`super::clients`]).
 
 use anyhow::Result;

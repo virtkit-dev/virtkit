@@ -1426,13 +1426,14 @@ or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in th
 provider (see [Signing in](#signing-in)).
 
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
-row below: *Nodes* (*Compute*, the nodes table; *Storage*, the registries; *GitLab adapters*, the
-relays; *Updates*, releases and the versions running; *Rollouts*, every rollout), *GitLab* (*Servers*, then a tab per server),
-*Lanes*, *Jobs*, *Egress*, and *Administration* (*API keys*, *Users* for operators, *Audit*).
+row below: *Fleet* (*Compute*, the nodes table; *Storage*, the registries; *Updates*, releases
+and the versions running; *Rollouts*, every rollout), *GitLab* (*Overview*, the servers and
+relays, then a tab per server), *Lanes*, *Jobs*, *Egress*, and *Administration* (*API keys*,
+*Users* for operators, *Audit*).
 A section's link counts what waits in its tabs, each tab its own. Connections' former
 addresses, `/clients[?tab=other]`, `/clients/capacity`, `/clients/tenants/<name>` and
 `/clients/projects/<instance>/<ID>`, redirect to their pages, as do `/capacity` and
-`/capacity/tenants/<name>` to *Lanes*.
+`/capacity/tenants/<name>` to *Lanes* and `/relays` to `/gitlab#adapters`.
 
 A button or form the pages post through htmx that the hub does not answer — the connection
 refused or cut while the hub restarts or hands over to a release, or a 502, 503 or 504 from a
@@ -1769,10 +1770,11 @@ first to refuse it, or that the job's restriction is not known; an address its r
 allowed only if a listed name's lookup resolved to it. As the node enforces it, a narrowing that
 declares one dimension allows none of the other, whatever the cap allows of it.
 
-`/gitlab`, *GitLab* › *Servers* in the navigation, shows each GitLab server the hub takes jobs
+`/gitlab`, *GitLab* › *Overview* in the navigation, shows each GitLab server the hub takes jobs
 from (`vk-hub gitlabs`), its name, linked to its page `/gitlab/<name>`, URL and counts of relays
-and projects. A server's page shows its projects and the runners of the relays bound to it.
-`/relays`, *Nodes* › *GitLab adapters*, shows each relay (`vk-hub relays`) —
+and projects. A server's page shows its projects and the runners of the relays bound to it; for
+operators, each runner links to its lane's form on *Lanes*: *Edit lane*, or *Map* when it has
+none. Below the servers, the overview shows each relay (`vk-hub relays`) —
 its hostname and ID, whether it is connected, when it was last heard from, the server it is
 bound to and what the hub makes of it (the instance's name once approved, else *pending*,
 *rejected* or *reports another server*), the URL, certificate key digest and version it reports
@@ -1790,7 +1792,7 @@ submitted it, since when and how many jobs were refused. *Rejected* lists the se
 and by whom, and on a server's page its projects rejected, then *Approved projects*. The
 navigation's *GitLab* link counts the servers and projects pending, as *Egress* counts *New* rows.
 *Administration*'s *API keys* (`/keys`) shows the API keys (see [Placed jobs](#placed-jobs)) and
-the client instances using each. The servers' page, a server's, *GitLab adapters* and *API keys*
+the client instances using each. The overview, a server's page and *API keys*
 show viewers and operators alike the same things. Each key shows its name, first 8
 characters, scopes, pools, largest envelope, when and by whom it was created, whether it is
 revoked, expired or when it expires, when any of its instances was last heard from, how many
@@ -1812,11 +1814,11 @@ The form uses a plain POST outside the live fragment and returns a page showing 
 with the hub's node address its client sends it to, as `Authorization: Bearer`; `vk-gitlab`
 needs none, as a relay. The key never appears in live updates, logs or audit entries.
 
-Operators add a GitLab server on *GitLab* › *Servers* with the same validation as `vk-hub gitlabs
+Operators add a GitLab server on *GitLab* › *Overview* with the same validation as `vk-hub gitlabs
 add`: a name and a URL, by a plain POST back to the page. A server no relay is bound to has a
 *Remove* button that removes it, once confirmed, as `vk-hub gitlabs remove` does; the removal
-applies only to the server confirmed, not to a namesake added since. On *Nodes* › *GitLab adapters*,
-each relay has a *Remove* button that removes it, once confirmed, as `vk-hub relays remove` does:
+applies only to the server confirmed, not to a namesake added since. Below the servers, each
+relay has a *Remove* button that removes it, once confirmed, as `vk-hub relays remove` does:
 its key is no longer pinned and its session ends. All are audited. *Add a relay* issues a single-use
 token of kind `gitlab`, valid an hour, as `vk-hub token create --kind gitlab` does, by a plain POST
 to `/tokens` answered by a page of its own showing it once with the `vk-gitlab join <hub-url>
@@ -1924,8 +1926,8 @@ The **GitLab adapters** section in the same fragment shows each relay's version,
 a held `vk-gitlab` release, posted by htmx to `/relay/<id>/action` with `op=update`. It uses
 `vk-hub relays update`'s operation, with the same checks and confirmation as a registry update.
 The relay stops asking GitLab for jobs, then restarts on the release while its running jobs
-continue (`docs/gitlab-relay-enrollment.md`, "Updates"). `/relays` lists each relay's version
-and links here.
+continue (`docs/gitlab-relay-enrollment.md`, "Updates"). *GitLab* › *Overview* lists each
+relay's version and links here.
 
 With `vk-hub serve`, the **Hub** section shows its version, `[update] allow` policy and last
 update. Operators get an **Update** form to choose a held `vk-hub` release, posted to

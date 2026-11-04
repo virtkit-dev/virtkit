@@ -21,6 +21,10 @@ All notable changes to virtkit will be documented in this file.
   each waiting lane's slots against its weight, and the scheduler's last pick.
 - **Queued jobs follow lane changes.** A queued job whose runner is unmapped, or whose project or
   branch its lane no longer allows, waits until allowed again or its deadline.
+- **Navigation regrouped.** *Nodes* is now *Fleet*. GitLab's first tab, *Overview*, shows the
+  servers, then the relays (formerly *GitLab adapters*; `/relays` redirects there) and the
+  runners waiting for their server. On a server's page, operators edit or map each runner's lane
+  from its row.
 
 ## [0.102.4] - 2026-11-04
 

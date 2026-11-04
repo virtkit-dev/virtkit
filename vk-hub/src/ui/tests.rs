@@ -3627,8 +3627,8 @@ async fn releases_and_rollouts_are_shown_live() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert_secure(&page);
     for want in [
-        "<nav class=\"subnav\" aria-label=\"Nodes\"><a href=\"/\">Compute</a>\
-         <a href=\"/registries\">Storage</a><a href=\"/relays\">GitLab adapters</a>\
+        "<nav class=\"subnav\" aria-label=\"Fleet\"><a href=\"/\">Compute</a>\
+         <a href=\"/registries\">Storage</a>\
          <a href=\"/updates\" aria-current=\"page\">Updates</a>\
          <a href=\"/updates/rollouts\">Rollouts</a></nav>",
         "sse-connect=\"/events/updates\"",
@@ -3793,7 +3793,7 @@ async fn placed_jobs_are_a_tab_of_their_own() {
         let page = get(addr, "/updates", Some(&cookie)).await.body;
         assert!(
             page.contains(
-                "<nav aria-label=\"Sections\"><a href=\"/\" aria-current=\"true\">Nodes</a>\
+                "<nav aria-label=\"Sections\"><a href=\"/\" aria-current=\"true\">Fleet</a>\
                  <a href=\"/gitlab\">GitLab<span id=\"nav-count-gitlab\"></span></a>\
                  <a href=\"/lanes\">Lanes</a><a href=\"/jobs\">Jobs</a>\
                  <a href=\"/egress\">Egress<span id=\"nav-count-egress\"></span></a>\
@@ -8822,8 +8822,8 @@ async fn an_operator_updates_a_relay_from_the_updates_page() {
     let reply = post_action(addr, &origin, &operator, &path, &form, true).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
 
-    // The relays' page points at the updates.
-    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    // GitLab's relays point at the updates.
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
         page.contains("<a href=\"/updates\">Updates</a> lists"),
         "{page}"
@@ -9203,17 +9203,21 @@ async fn the_gitlab_page_lists_its_servers() {
         .unwrap();
     let body = get(addr, "/gitlab", Some(&viewer)).await.body;
     for want in [
-        "<h1>GitLab servers</h1>",
+        "<h1>GitLab</h1>",
         "<a href=\"/gitlab\" aria-current=\"true\">GitLab\
          <span id=\"nav-count-gitlab\"></span></a>",
         "<nav class=\"subnav\" aria-label=\"GitLab\">\
-         <a href=\"/gitlab\" aria-current=\"page\">Servers\
+         <a href=\"/gitlab\" aria-current=\"page\">Overview\
          <span id=\"nav-count-tab-gitlab\"></span></a>\
          <a href=\"/gitlab/gl\">gl<span id=\"nav-count-tab-gitlab-gl\"></span></a>\
          <a href=\"/gitlab/partner\">partner\
          <span id=\"nav-count-tab-gitlab-partner\"></span></a></nav>",
-        "id=\"gitlab-servers\" hx-ext=\"sse\" sse-connect=\"/events/gitlab\" \
-         sse-swap=\"gitlab\"",
+        // The servers, then the relays, then the runners waiting for their server, on one
+        // stream.
+        "<div hx-ext=\"sse\" sse-connect=\"/events/gitlab\" sse-close=\"close\">\
+         <div id=\"gitlab-servers\" sse-swap=\"gitlab\"><section><h2>Pending</h2>",
+        "</section></div><div id=\"adapters\" sse-swap=\"relays\"><section><h2>Relays</h2>",
+        "</section></div><div id=\"gitlab-waiting\" sse-swap=\"gitlab-waiting\"></div></div>",
         "<tr><td><a href=\"/gitlab/gl\"><strong>gl</strong></a></td>\
          <td>https://gitlab.example.com</td><td class=\"num\">0</td>\
          <td class=\"num\">0</td><td class=\"num\">0</td></tr>",
@@ -9223,8 +9227,8 @@ async fn the_gitlab_page_lists_its_servers() {
     }
     assert!(!body.contains("<h2>API keys</h2>"), "{body}");
     assert!(!body.contains("deploy"), "{body}");
-    // Old Connections, capacity, project and Updates URLs redirect to their pages, an unknown
-    // Connections tab to the GitLab page's; anything else there is not a page.
+    // Old Connections, relays, capacity, project and Updates URLs redirect to their pages, an
+    // unknown Connections tab to the GitLab page's; anything else there is not a page.
     for (from, to) in [
         ("/operations", Some("/updates")),
         ("/operations/releases", Some("/updates/releases")),
@@ -9233,6 +9237,7 @@ async fn the_gitlab_page_lists_its_servers() {
         ("/clients?tab=bogus", Some("/gitlab")),
         ("/clients?tab=%3Cscript%3E", Some("/gitlab")),
         ("/clients?tab=other", Some("/keys")),
+        ("/relays", Some("/gitlab#adapters")),
         ("/clients/capacity", Some("/lanes")),
         ("/clients/tenants/web", Some("/lanes")),
         ("/capacity", Some("/lanes")),
@@ -9529,7 +9534,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
     assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
-/// An operator adds a relay from the GitLab adapters' page: a single-use relay token, shown once
+/// An operator adds a relay from GitLab's Overview: a single-use relay token, shown once
 /// with the `vk-gitlab join` redeeming it, that enrolls a relay and nothing else. A viewer has
 /// no form.
 #[tokio::test(flavor = "multi_thread")]
@@ -9537,11 +9542,11 @@ async fn an_operator_issues_a_relay_token_from_the_adapters_page() {
     use crate::store::RelayEnrollment;
     let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(!page.contains("Add a relay"), "{page}");
 
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/relays", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
         page.contains("<h2>Add a relay</h2><form method=\"post\" action=\"/tokens\">")
             && page.contains("<input type=\"hidden\" name=\"kind\" value=\"gitlab\">"),
@@ -9554,8 +9559,8 @@ async fn an_operator_issues_a_relay_token_from_the_adapters_page() {
     for want in [
         "<h1>Relay enrollment token</h1>",
         "<pre>vk-gitlab join https://hub.example.com:8443 --token -</pre>",
-        "<a href=\"/relays\">Back to the GitLab adapters</a>",
-        "<a href=\"/relays\" aria-current=\"page\">GitLab adapters</a>",
+        "<a href=\"/gitlab\">Back to GitLab</a>",
+        "<a href=\"/gitlab\" aria-current=\"page\">GitLab",
     ] {
         assert!(reply.body.contains(want), "{want}: {}", reply.body);
     }
@@ -9580,7 +9585,7 @@ async fn an_operator_issues_a_relay_token_from_the_adapters_page() {
     assert_eq!(reply.status, 400, "{}", reply.body);
 }
 
-/// The GitLab adapters' page shows each relay, what the hub makes of its server and what it
+/// GitLab's Overview shows each relay, what the hub makes of its server and what it
 /// reports of it, and the runners of a relay whose server is not approved; its server's page
 /// then shows them. Each runner's placement, state and load are all text, followed live. An
 /// operator removes a relay once asked, audited; a viewer has no button and is refused.
@@ -9593,12 +9598,12 @@ async fn relays_and_their_runners_follow_their_server() {
     };
     let (addr, hub, origin) = start_fleet().await;
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(
         page.contains("<h2>Relays</h2><p class=\"empty\">None yet"),
         "{page}"
     );
-    let mut live = Events::open(addr, "/events/relays", &viewer).await;
+    let mut live = Events::open(addr, "/events/gitlab", &viewer).await;
     live.next().await.unwrap();
 
     let hostile = "<script>x</script>";
@@ -9685,7 +9690,7 @@ async fn relays_and_their_runners_follow_their_server() {
     hub.clients_changed();
     // The stream's periodic heartbeat can render between writes. Wait for the relay's
     // heartbeat, written last, so the event includes its inventory and report too.
-    let event = next_with(&mut live, " · HTTP 204</td>").await;
+    let event = events_until(&mut live, " · HTTP 204</td>").await.concat();
     for want in [
         "<strong>relay-1</strong> <code class=\"sub\">",
         "<span class=\"badge bad\">unreachable</span>",
@@ -9709,14 +9714,32 @@ async fn relays_and_their_runners_follow_their_server() {
         .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
         .unwrap();
     hub.clients_changed();
-    let event = next_with(&mut live, "<td><strong>gl</strong></td>").await;
-    assert!(!event.contains("Runners waiting"), "{event}");
+    next_with(&mut live, "<td><strong>gl</strong></td>").await;
+    // Its runners no longer wait for their server.
+    let waiting = next_with(&mut live, "event: gitlab-waiting\n").await;
+    assert!(!waiting.contains("Runners waiting"), "{waiting}");
     let mut live_server = Events::open(addr, "/events/gitlab/gl", &viewer).await;
     let event = next_with(&mut live_server, "<td>42</td>").await;
-    // Its server approved: no lane.
+    // Its server approved: no lane, and no Map link for a viewer.
     assert!(
         event.contains("<td>42</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"),
         "{event}"
+    );
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let lane = "/lanes?edit=runner%2Fgl%2F42";
+    let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
+    assert!(
+        page.contains(&format!(
+            "<span class=\"badge warn\">unmapped</span> <a href=\"{lane}\">Map</a></td>"
+        )),
+        "{page}"
+    );
+    assert!(
+        get(addr, lane, Some(&operator))
+            .await
+            .body
+            .contains("<form"),
+        "the runner's lane form"
     );
     // Given a lane, by its approved instance's name and GitLab ID: its weight and class.
     let mut policy = hub.db.capacity_policy().unwrap();
@@ -9738,6 +9761,13 @@ async fn relays_and_their_runners_follow_their_server() {
              <td>production</td><td>pool ci"
         ),
         "{event}"
+    );
+    let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/lanes\">weight 2</a> <a href=\"{lane}\">Edit lane</a></td>"
+        )),
+        "{page}"
     );
     // No request of it is queued: nothing waits.
     assert!(
@@ -9762,8 +9792,7 @@ async fn relays_and_their_runners_follow_their_server() {
     let reply = post_action(addr, &origin, &viewer, "/clients", &form, false).await;
     assert_eq!(reply.status, 403, "{}", reply.body);
 
-    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
-    let page = get(addr, "/relays", Some(&operator)).await.body;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
         page.contains(&format!(
             "<input type=\"hidden\" name=\"op\" value=\"remove-relay\"><input \
@@ -9779,7 +9808,7 @@ async fn relays_and_their_runners_follow_their_server() {
     let answer = format!("{form}&nonce={}&confirm=yes", hidden(&reply.body, "nonce"));
     let reply = post_action(addr, &origin, &operator, "/clients", &answer, false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert_eq!(reply.header("location"), Some("/relays"));
+    assert_eq!(reply.header("location"), Some("/gitlab"));
     assert!(hub.db.relay(&relay).unwrap().is_none());
     audited(&hub, &format!("removed relay {relay}")).await;
     next_with(&mut live, "<h2>Relays</h2><p class=\"empty\">None yet").await;
@@ -9908,7 +9937,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         assert!(event.contains(want), "{want}: {event}");
     }
     // A page outside GitLab has hidden targets for its tabs' counts, and keeps them current.
-    let page = get(addr, "/relays", Some(&viewer)).await.body;
+    let page = get(addr, "/keys", Some(&viewer)).await.body;
     assert!(
         page.contains(
             "<div hidden><span id=\"nav-count-tab-gitlab\"></span>\
@@ -9916,7 +9945,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
         ),
         "{page}"
     );
-    let mut live_relays = Events::open(addr, "/events/relays", &viewer).await;
+    let mut live_relays = Events::open(addr, "/events/clients", &viewer).await;
     next_with(
         &mut live_relays,
         "<span id=\"nav-count-tab-gitlab-gl\" hx-swap-oob=\"true\"> \

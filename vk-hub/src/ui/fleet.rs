@@ -119,7 +119,6 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         super::jobs::EVENT => Some(super::jobs::EVENT),
         super::clients::EVENT => Some(super::clients::EVENT),
         super::clients::GITLAB_EVENT => Some(super::clients::GITLAB_EVENT),
-        super::clients::RELAYS_EVENT => Some(super::clients::RELAYS_EVENT),
         _ if super::clients::server_event(event).is_some() => Some(super::clients::SERVER_EVENT),
         super::egress::EVENT => Some(super::egress::EVENT),
         super::lanes::EVENT => Some(super::lanes::EVENT),
@@ -171,9 +170,9 @@ pub(super) fn source(
                 super::egress::source(hub, &site.egress, query, steer),
             ));
         }
-        // The keys', servers' or relays' page's: one rendering of the three, each page told of
-        // its session's end in its own.
-        super::clients::EVENT | super::clients::GITLAB_EVENT | super::clients::RELAYS_EVENT => {
+        // The keys' or GitLab's page's: one rendering of both, each page told of its session's
+        // end in its own.
+        super::clients::EVENT | super::clients::GITLAB_EVENT => {
             let feed = if steer {
                 &site.steered_clients_feed
             } else {
@@ -182,8 +181,7 @@ pub(super) fn source(
             return Some(Source::Shared {
                 name: match event {
                     super::clients::EVENT => super::clients::EVENT,
-                    super::clients::GITLAB_EVENT => super::clients::GITLAB_EVENT,
-                    _ => super::clients::RELAYS_EVENT,
+                    _ => super::clients::GITLAB_EVENT,
                 },
                 feed: feed.subscribe(),
                 events: clients_events(hub, steer),
@@ -372,7 +370,6 @@ pub(super) async fn get(
     let clients = match path {
         super::clients::KEYS_PATH => Some(super::clients::Page::Keys),
         super::clients::GITLAB_PATH => Some(super::clients::Page::Servers),
-        super::clients::RELAYS_PATH => Some(super::clients::Page::Relays),
         _ => super::clients::server_target(path).map(super::clients::Page::Server),
     };
     if let Some(at) = clients {
@@ -419,6 +416,13 @@ pub(super) async fn get(
 pub(super) fn moved(path: &str, query: Option<&str>) -> Option<String> {
     if path == super::clients::PATH {
         return Some(super::clients::moved(query).to_string());
+    }
+    if path == super::clients::RELAYS_PATH {
+        return Some(format!(
+            "{}#{}",
+            super::clients::GITLAB_PATH,
+            super::clients::ADAPTERS_ID
+        ));
     }
     // Old links to the Updates page and its full release list.
     if let Some(rest) = path.strip_prefix("/operations")
@@ -943,7 +947,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
     admin.push(tab("/audit", "Audit"));
     vec![
         Section {
-            label: "Nodes",
+            label: "Fleet",
             tabs: vec![
                 tab("/", "Compute"),
                 Tab {
@@ -951,14 +955,13 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                     also: &["/registry"],
                     ..tab(super::registries::PATH, "Storage")
                 },
-                tab(super::clients::RELAYS_PATH, "GitLab adapters"),
                 tab(UPDATES_PATH, "Updates"),
                 tab(ROLLOUTS_PATH, "Rollouts"),
             ],
         },
         Section {
             label: "GitLab",
-            tabs: std::iter::once(tab(super::clients::GITLAB_PATH, "Servers"))
+            tabs: std::iter::once(tab(super::clients::GITLAB_PATH, "Overview"))
                 .chain(
                     gitlabs
                         .iter()
@@ -1023,7 +1026,7 @@ fn counts_oob(hub: &Arc<Hub>) -> sse::Render {
     })
 }
 
-/// `/keys`', `/gitlab`' and `/relays`' events, each page's fragment followed by the navigation's counts
+/// `/keys`' and `/gitlab`'s events, each fragment followed by the navigation's counts
 /// ([`counted`]): a page swaps in its own alone.
 fn clients_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     super::clients::events(hub, steer)
@@ -1204,15 +1207,15 @@ fn relay_token(ui: &Ui, auth: &Auth, token: &str, expires_at: u64) -> Html {
         .raw("certificate.</li>")
         .raw("<li><code>--replace</code>, to enroll an already enrolled relay as a new one.</li>")
         .raw("</ul><p class=\"sub\">The relay's config names its GitLab server in ")
-        .raw("<code>[gitlab] url</code>. That server waits for approval on GitLab's Servers ")
+        .raw("<code>[gitlab] url</code>. That server waits for approval on GitLab's Overview ")
         .raw("until an operator gives it a name. Because the token is read on stdin, it stays ")
         .raw("out of the shell's history and the process list.</p>")
         .raw("<p><a href=\"")
-        .raw(super::clients::RELAYS_PATH)
-        .raw("\">Back to the GitLab adapters</a></p>");
+        .raw(super::clients::GITLAB_PATH)
+        .raw("\">Back to GitLab</a></p>");
     layout(
         "Relay enrollment token",
-        super::clients::RELAYS_PATH,
+        super::clients::GITLAB_PATH,
         auth,
         &main,
     )

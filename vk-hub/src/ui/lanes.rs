@@ -271,8 +271,8 @@ fn parse_lane(param: &str) -> Option<LaneId> {
         .then(|| LaneId::Key(principal.to_owned()))
 }
 
-/// The address of lane `id`'s edit form.
-fn edit_href(id: &LaneId) -> String {
+/// The address of lane `id`'s edit form, or of mapping it, for a runner without one.
+pub(super) fn edit_href(id: &LaneId) -> String {
     format!(
         "{PATH}?edit={}",
         super::jobs::percent_encode(&lane_param(id))

@@ -65,8 +65,8 @@ jobs waiting in each step (deadline, reserved, production, production probes, no
 lane with work waiting and the slots it holds for its weight, and each waiting request's or
 job's reason. *Last pick* is the scheduler's latest grant as recorded when
 it made it — lane, step, held ÷ weight then — kept in memory since the hub started; the page
-never predicts the next one. Per-node load stays on *Nodes*, delisted and finished jobs on
-*Jobs*.
+never predicts the next one. Per-node load stays on *Fleet* › *Compute*, delisted and finished
+jobs on *Jobs*.
 
 From the hub's host, through its admin socket:
 
@@ -123,9 +123,9 @@ it finishes.
 Capacity arbitration needs relay session protocol 2, which a `vk-gitlab` of this release speaks:
 
 1. **Upgrade the hub.** It keeps taking a protocol 1 relay's session, which follows, cancels and
-   settles the jobs it holds, but gets no capacity, reservation or new job: *GitLab adapters* marks
-   the relay *upgrade vk-gitlab: no new jobs*. A job such a relay took from GitLab and had not
-   yet submitted fails.
+   settles the jobs it holds, but gets no capacity, reservation or new job: *GitLab* ›
+   *Overview* marks the relay *upgrade vk-gitlab: no new jobs*. A job such a relay took from
+   GitLab and had not yet submitted fails.
 2. **Map the runners.** Approve the relays' GitLab server and give each runner a lane by its
    GitLab ID. The hub refuses a runner's requests unless it is verified with GitLab, listed once
    in its relay's inventory with its GitLab ID, of the placement it requests, and has a lane.

@@ -1,9 +1,9 @@
-//! `/keys`, `/gitlab`, `/gitlab/<name>` and `/relays`, for viewers and operators alike: the
-//! API keys the client API takes and the client instances using each — the host, program and
-//! runners an instance's hello named, when it was last heard from and what it holds; the GitLab
-//! servers; a server's projects and runners; and the relays. All four post to `/clients`. The
-//! keys', servers' and relays' fragments are rendered once for all open viewers' pages and once
-//! for all operators' ([`sse::feed`]), on what [`Hub::clients_changed`] notes; a server's page
+//! `/keys`, `/gitlab` and `/gitlab/<name>`, for viewers and operators alike: the API keys the
+//! client API takes and the client instances using each — the host, program and runners an
+//! instance's hello named, when it was last heard from and what it holds; the GitLab servers and
+//! relays; a server's projects and runners. All three post to `/clients`. The keys', servers',
+//! relays' and waiting runners' fragments are rendered once for all open viewers' pages and
+//! once for all operators' ([`sse::feed`]), on what [`Hub::clients_changed`] notes; a server's page
 //! renders its own on a stream per connection, on that and on what
 //! [`Hub::arbitration_changed`] notes. Each also renders once a heartbeat interval while open,
 //! which moves the ages, what the instances hold and the relays' load.
@@ -33,10 +33,11 @@
 //! jobs are refused. Each server's form and each project's box is `hx-preserve`d under an ID of
 //! what it decides on, so the fragment's updates leave one being filled in alone.
 //!
-//! `/relays` lists the relays enrolled — their reach, server, what they report of it — then the
-//! runners of those bound to no server the hub has, which no server's page shows. Operators add
-//! a relay by a plain form outside the fragment, and remove one, as `vk-hub relays remove` does,
-//! by a button that asks first.
+//! Below its servers, `/gitlab` lists the relays enrolled — their reach, server, what they
+//! report of it — then the runners of those bound to no server the hub has, which no server's
+//! page shows; each part is a fragment of its own on the page's one stream. Operators add a
+//! relay by a plain form between the two, and remove one, as `vk-hub relays remove` does, by a
+//! button that asks first. `/relays` redirects there.
 //!
 //! Each runner shows its lane's weight and class, and how the hub schedules it: its
 //! requests waiting, offered and held, its jobs, its demand and backoff, and why it waits.
@@ -74,8 +75,11 @@ pub(super) const PATH: &str = "/clients";
 /// and runners.
 pub(super) const GITLAB_PATH: &str = "/gitlab";
 
-/// The relays' page, under Nodes.
+/// The former relays' page; redirects to [`GITLAB_PATH`]'s [`ADAPTERS_ID`] part.
 pub(super) const RELAYS_PATH: &str = "/relays";
+
+/// The ID of `/gitlab`'s relays part.
+pub(super) const ADAPTERS_ID: &str = "adapters";
 
 /// The API keys page: the keys and their instances.
 pub(super) const KEYS_PATH: &str = "/keys";
@@ -88,12 +92,15 @@ pub(super) const EVENT: &str = "clients";
 const KEY_TTLS: [u64; 4] = [90, 7, 30, 365];
 
 /// The event the GitLab servers' fragment is swapped in on, and its stream's name under
-/// `/events/`. The keys', servers' and relays' streams carry the three pages' fragments,
-/// rendered once for all of them.
+/// `/events/`. The keys' and GitLab's streams carry both pages' fragments, rendered once for
+/// all of them.
 pub(super) const GITLAB_EVENT: &str = "gitlab";
 
-/// The event the relays' fragment is swapped in on, and its stream's name under `/events/`.
-pub(super) const RELAYS_EVENT: &str = "relays";
+/// The event `/gitlab`'s relays fragment is swapped in on.
+const RELAYS_EVENT: &str = "relays";
+
+/// The event `/gitlab`'s fragment of runners waiting for their server is swapped in on.
+const WAITING_EVENT: &str = "gitlab-waiting";
 
 /// The event a server's fragment is swapped in on; its stream is `/events/gitlab/<name>`, of
 /// its page alone.
@@ -118,13 +125,12 @@ pub(super) fn server_event(event: &str) -> Option<&str> {
         .filter(|name| crate::store::valid_gitlab_name(name))
 }
 
-/// A page of these: the API keys, the GitLab servers, one server, or the relays.
+/// A page of these: the API keys, the GitLab servers and relays, or one server.
 #[derive(Clone, Copy)]
 pub(super) enum Page<'a> {
     Keys,
     Servers,
     Server(&'a str),
-    Relays,
 }
 
 /// What a GitLab page shows: the GitLab servers, and what [`Shown::read`] reads for the page.
@@ -146,7 +152,8 @@ struct Shown {
     nodes: Vec<super::lanes::KnownNode>,
 }
 
-/// The GitLab page [`Shown::read`] reads for.
+/// The GitLab part [`Shown::read`] reads for: `/gitlab`'s servers, a server's page, or
+/// `/gitlab`'s relays and the runners waiting for their server.
 #[derive(Clone, Copy)]
 enum For<'a> {
     Servers,
@@ -219,9 +226,9 @@ pub(super) fn moved(query: Option<&str>) -> &'static str {
 }
 
 /// `GET /keys`: the API keys and their instances; `GET /gitlab`: the GitLab servers the hub
-/// takes jobs from, and those waiting for approval or rejected; `GET /gitlab/<name>`: a
-/// server's projects and runners; `GET /relays`: the relays. Each page's fragment is live, on a
-/// stream of its own. A server the hub has not is answered 404.
+/// takes jobs from, those waiting for approval or rejected, then the relays; `GET
+/// /gitlab/<name>`: a server's projects and runners. Each page is live, on a stream of its own.
+/// A server the hub has not is answered 404.
 pub(super) async fn get(at: Page<'_>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     let read = |page: For<'_>| {
         let hub = ui.hub.clone();
@@ -242,25 +249,51 @@ pub(super) async fn get(at: Page<'_>, auth: &Auth, ui: &Ui) -> Result<Response<B
     let now = crate::now_secs();
     let steer = auth.session.role >= Role::Operator;
     let mut sub = None;
-    let (title, here, id, event, fragment) = match at {
+    // The page's title and tab, its stream, and its parts.
+    let (title, here, event, parts): (String, String, String, Vec<Part>) = match at {
         Page::Keys => {
             let hub = ui.hub.clone();
             let views = blocking(move || crate::clients::views(&hub)).await?;
             (
                 "API keys".to_string(),
                 KEYS_PATH.to_string(),
-                "clients",
                 EVENT.to_string(),
-                fragment(&views, now, steer),
+                vec![(
+                    "clients",
+                    EVENT,
+                    fragment(&views, now, steer),
+                    Some(create_form as fn(&mut Html, &Auth)),
+                )],
             )
         }
-        Page::Servers => (
-            "GitLab servers".to_string(),
-            GITLAB_PATH.to_string(),
-            "gitlab-servers",
-            GITLAB_EVENT.to_string(),
-            servers_fragment(&read(For::Servers).await?, steer),
-        ),
+        Page::Servers => {
+            let relays = read(For::Relays).await?;
+            (
+                "GitLab".to_string(),
+                GITLAB_PATH.to_string(),
+                GITLAB_EVENT.to_string(),
+                vec![
+                    (
+                        "gitlab-servers",
+                        GITLAB_EVENT,
+                        servers_fragment(&read(For::Servers).await?, steer),
+                        Some(add_server_form as fn(&mut Html, &Auth)),
+                    ),
+                    (
+                        ADAPTERS_ID,
+                        RELAYS_EVENT,
+                        relays_fragment(&relays, now, steer),
+                        Some(add_relay_form as fn(&mut Html, &Auth)),
+                    ),
+                    (
+                        "gitlab-waiting",
+                        WAITING_EVENT,
+                        waiting_fragment(&relays, now),
+                        None,
+                    ),
+                ],
+            )
+        }
         Page::Server(name) => {
             let shown = read(For::Server(name)).await?;
             let Some(fragment) = server_fragment(&shown, name, now, steer) else {
@@ -273,22 +306,10 @@ pub(super) async fn get(at: Page<'_>, auth: &Auth, ui: &Ui) -> Result<Response<B
             (
                 name.to_string(),
                 server_path(name),
-                "gitlab-server",
                 format!("gitlab/{name}"),
-                fragment,
+                vec![("gitlab-server", SERVER_EVENT, fragment, None)],
             )
         }
-        Page::Relays => (
-            "GitLab adapters".to_string(),
-            RELAYS_PATH.to_string(),
-            "relays",
-            RELAYS_EVENT.to_string(),
-            relays_fragment(&read(For::Relays).await?, now, steer),
-        ),
-    };
-    let swap = match at {
-        Page::Server(_) => SERVER_EVENT.to_string(),
-        _ => event.clone(),
     };
     let mut main = Html::new();
     main.raw("<h1>").text(&title).raw("</h1>");
@@ -301,26 +322,46 @@ pub(super) async fn get(at: Page<'_>, auth: &Auth, ui: &Ui) -> Result<Response<B
             .text(&auth.csrf)
             .raw("&quot;}\"><div id=\"flash\"></div>");
     }
-    main.raw("<div id=\"")
-        .raw(id)
-        .raw("\" hx-ext=\"sse\" sse-connect=\"/events/")
-        .text(&event)
-        .raw("\" sse-swap=\"")
-        .text(&swap)
-        .raw("\" sse-close=\"close\">")
-        .html(&fragment)
-        .raw("</div>");
+    // One stream for the page, each part swapped in on its own event.
+    let one = parts.len() == 1;
+    if !one {
+        main.raw("<div hx-ext=\"sse\" sse-connect=\"/events/")
+            .text(&event)
+            .raw("\" sse-close=\"close\">");
+    }
+    for (id, swap, fragment, form) in &parts {
+        main.raw("<div id=\"").raw(id).raw("\"");
+        if one {
+            main.raw(" hx-ext=\"sse\" sse-connect=\"/events/")
+                .text(&event)
+                .raw("\"");
+        }
+        main.raw(" sse-swap=\"").text(swap).raw("\"");
+        if one {
+            main.raw(" sse-close=\"close\"");
+        }
+        main.raw(">").html(fragment).raw("</div>");
+        if steer && let Some(form) = form {
+            form(&mut main, auth);
+        }
+    }
+    if !one {
+        main.raw("</div>");
+    }
     if steer {
         main.raw("</div>");
-        match at {
-            Page::Keys => create_form(&mut main, auth),
-            Page::Servers => add_server_form(&mut main, auth),
-            Page::Relays => add_relay_form(&mut main, auth),
-            Page::Server(_) => {}
-        }
     }
     Ok(page(fleet::layout(&title, &here, auth, &main)))
 }
+
+/// A part of a page: its ID, the event it is swapped in on, its fragment, and the form an
+/// operator gets after it.
+type Part = (
+    &'static str,
+    &'static str,
+    Html,
+    Option<fn(&mut Html, &Auth)>,
+);
 
 /// The GitLab servers' page: those waiting for approval and rejected, then those the hub takes
 /// jobs from, each linking to its page. With `steer`, a server no relay is bound to carries the
@@ -396,13 +437,12 @@ fn server_fragment(shown: &Shown, name: &str, now: u64, steer: bool) -> Option<H
     let relays: Vec<&RelayView> = (shown.relays.iter())
         .filter(|r| r.row.server_url.as_deref() == Some(url))
         .collect();
-    runners_table(&mut h, shown, &relays, now);
+    runners_table(&mut h, shown, &relays, now, steer);
     h.raw("</section>");
     Some(h)
 }
 
-/// The relays' page: each relay, with, for an operator, the button that removes it; then the
-/// runners of those bound to no server the hub has, which no server's page shows.
+/// `/gitlab`'s relays: each relay, with, for an operator, the button that removes it.
 fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
     let mut h = Html::new();
     h.raw("<section><h2>Relays</h2>");
@@ -421,6 +461,13 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
             .raw("can update the relay there.</p>");
     }
     h.raw("</section>");
+    h
+}
+
+/// `/gitlab`'s runners of the relays bound to no server the hub has, which no server's page
+/// shows: nothing when there are none.
+fn waiting_fragment(shown: &Shown, now: u64) -> Html {
+    let mut h = Html::new();
     let unbound: Vec<&RelayView> = (shown.relays.iter())
         .filter(|r| {
             !(shown.gitlabs.iter()).any(|(_, g)| r.row.server_url.as_deref() == Some(&g.url))
@@ -436,7 +483,7 @@ fn relays_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         h.raw("<section><h2>Runners waiting for their server</h2><p class=\"sub\">Their ")
             .raw("relays are bound to a server the hub does not have. Once the hub has that ")
             .raw("server, these runners show on its page.</p>");
-        runners_table(&mut h, shown, &unbound, now);
+        runners_table(&mut h, shown, &unbound, now, false);
         h.raw("</section>");
     }
     h
@@ -887,8 +934,9 @@ fn server_status(h: &mut Html, s: &ServerStatus) {
 }
 
 /// The runners of `relays`: GitLab's ID for each, where its jobs go, how many at once, whether
-/// GitLab took its token, what it is doing and its load, as the relay last said.
-fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
+/// GitLab took its token, what it is doing and its load, as the relay last said. With `steer`,
+/// each runner the hub schedules links to its lane's form, or to mapping it.
+fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, steer: bool) {
     let runners = || {
         relays.iter().flat_map(|r| {
             (r.row.inventory.iter())
@@ -930,6 +978,12 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
             .zip(runner.runner_id);
         let mapping = (key.as_ref().zip(shown.policy.as_ref().ok()))
             .and_then(|((gitlab, id), policy)| policy.runner(gitlab, *id));
+        let lane = (key.as_ref().filter(|_| steer)).map(|(gitlab, id)| {
+            super::lanes::edit_href(&crate::policy::LaneId::Runner {
+                gitlab: gitlab.clone(),
+                id: *id,
+            })
+        });
         h.raw("</td><td>");
         match mapping {
             Some(m) => {
@@ -940,11 +994,19 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64) {
                 if let Some(max) = m.max_slots {
                     h.raw(", max ").text(max);
                 }
-                h.raw("</a></td><td>").text(m.class);
+                h.raw("</a>");
+                if let Some(href) = &lane {
+                    h.raw(" <a href=\"").text(href).raw("\">Edit lane</a>");
+                }
+                h.raw("</td><td>").text(m.class);
             }
             // Its server approved, its GitLab ID known and the policy read: it maps to none.
             None if key.is_some() && shown.policy.is_ok() => {
-                h.raw("<span class=\"badge warn\">unmapped</span></td><td>-");
+                h.raw("<span class=\"badge warn\">unmapped</span>");
+                if let Some(href) = &lane {
+                    h.raw(" <a href=\"").text(href).raw("\">Map</a>");
+                }
+                h.raw("</td><td>-");
             }
             None => {
                 h.raw("-</td><td>-");
@@ -1104,8 +1166,8 @@ fn add_server_form(h: &mut Html, auth: &Auth) {
         .raw("</section>");
 }
 
-/// The keys', servers' and relays' fragments, as one rendering for every page showing them:
-/// with the buttons for an operator's, without for a viewer's. The keys' first.
+/// The keys', servers', relays' and waiting runners' fragments, as one rendering for every page
+/// showing them: with the buttons for an operator's, without for a viewer's. The keys' first.
 pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
     let keys: sse::Render = {
         let hub = hub.clone();
@@ -1128,10 +1190,18 @@ pub(super) fn events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
             Ok(relays_fragment(&shown, crate::now_secs(), steer).into_string())
         })
     };
+    let waiting: sse::Render = {
+        let hub = hub.clone();
+        Arc::new(move || {
+            let shown = Shown::read(&hub, For::Relays)?;
+            Ok(waiting_fragment(&shown, crate::now_secs()).into_string())
+        })
+    };
     sse::Events::from([
         (EVENT, keys),
         (GITLAB_EVENT, servers),
         (RELAYS_EVENT, relays),
+        (WAITING_EVENT, waiting),
     ])
 }
 
@@ -1490,7 +1560,7 @@ async fn create(ui: &Ui, auth: &Auth, form: &[(String, String)]) -> Result<Respo
     };
     main.raw("</code>, as <code>Authorization: Bearer &lt;key&gt;</code>. A GitLab runner ")
         .raw("does not need a key. Instead, <code>vk-gitlab</code> enrolls as a relay, from ")
-        .raw("the GitLab adapters page.</p><p><a href=\"")
+        .raw("GitLab's Overview.</p><p><a href=\"")
         .raw(KEYS_PATH)
         .raw("\">Back to the API keys</a></p>");
     Ok(page(fleet::layout("API key", KEYS_PATH, auth, &main)))
@@ -1676,7 +1746,7 @@ async fn remove_relay(
     detail.raw("</p>");
     let ask = actions::Ask {
         path: PATH.to_string(),
-        back: RELAYS_PATH.to_string(),
+        back: GITLAB_PATH.to_string(),
         op: REMOVE_RELAY.to_string(),
         what: "Remove this relay? The hub stops trusting the relay's key and ends its \
                session. The relay takes no more jobs, and can no longer follow or settle jobs \
@@ -1703,7 +1773,7 @@ async fn remove_relay(
         auth.session.principal()
     );
     if !htmx {
-        return Ok(see_other(RELAYS_PATH));
+        return Ok(see_other(GITLAB_PATH));
     }
     let mut h = Html::new();
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">Removed relay ")

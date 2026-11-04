@@ -36,7 +36,7 @@ Nodes and registries have none of this: one token, one pinned identity, one sess
 ## Model
 
 - **The enrollment token is the operator's approval of the relay.** `vk-hub token create --kind
-  gitlab` issues it (CLI or Nodes › GitLab adapters); spending it pins the relay's ed25519 key. From
+  gitlab` issues it (CLI or GitLab › Overview); spending it pins the relay's ed25519 key. From
   then on the relay is trusted like a node: it already holds the runner tokens and sees every
   job's secrets, so a hub-side ceiling on what it claims would protect little. Removing it from
   the page or with `vk-hub relays remove` revokes it; there is no pausing one short of that.
