@@ -225,7 +225,7 @@ fn command_line(h: &mut Html, c: &Issued, now: u64) {
 pub(super) fn sent(peer: &str, program: Program, version: &str, command: &str) -> String {
     format!(
         "Sent {peer} the update to {program} {version} (command {command}). Its progress shows \
-         below."
+         on this page."
     )
 }
 

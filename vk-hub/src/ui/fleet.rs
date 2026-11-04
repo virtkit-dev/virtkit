@@ -703,7 +703,7 @@ pub(super) async fn node_action(
             }),
             Steer::Command(op) => ops::command(&hub, &principal, &node, op).map(|c| {
                 format!(
-                    "Issued {} (command {}). The node's response shows below.",
+                    "Issued {} (command {}). The node's response shows on this page.",
                     crate::store::operation_name(&c.op),
                     c.id
                 )

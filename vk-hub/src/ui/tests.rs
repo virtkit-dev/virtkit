@@ -1772,7 +1772,7 @@ esac"#,
     let confirmed = ask(addr, &origin, &cookie, &csrf, &path, "stop").await;
     let reply = post_action(addr, &origin, &cookie, &path, &confirmed, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
-    assert!(reply.body.contains("shows below"), "{}", reply.body);
+    assert!(reply.body.contains("shows on this page"), "{}", reply.body);
     audited(&hub, "ran `vk stop -- '/s/a b'` on VM").await;
 
     // A CI job is its runner's; an unknown action or VM is no action.
@@ -8022,7 +8022,7 @@ async fn an_operator_fetches_a_release_from_github() {
     let reply = post_action(addr, &origin, &operator, path, &form, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
-        reply.body.contains("Fetching vk latest from"),
+        reply.body.contains("Fetching the latest vk from"),
         "{}",
         reply.body
     );
@@ -8039,7 +8039,7 @@ async fn an_operator_fetches_a_release_from_github() {
     let reply = post_action(addr, &origin, &operator, path, &form, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
-        reply.body.contains("Fetching vk-registry latest from"),
+        reply.body.contains("Fetching the latest vk-registry from"),
         "{}",
         reply.body
     );
@@ -8065,18 +8065,26 @@ async fn an_operator_fetches_a_release_from_github() {
     let reply = post_action(addr, &origin, &operator, path, &form, true).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
-        reply.body.contains("Fetching every program latest from"),
+        reply
+            .body
+            .contains("Fetching the latest release of every program from"),
         "{}",
         reply.body
     );
     // vk-hub, fetched last, is not published.
-    let page_all = page_with(addr, "/updates", &operator, "Fetching vk-hub latest failed").await;
+    let page_all = page_with(
+        addr,
+        "/updates",
+        &operator,
+        "Fetching the latest vk-hub failed",
+    )
+    .await;
     for want in [
-        "Fetching every program latest, asked by",
+        "Fetching the latest release of every program, asked by",
         "<li>Fetched vk 0.85.0",
         "<li>Fetched vk-registry 0.85.0",
-        "<li><span class=\"reason\">Fetching vk-gitlab latest failed</span>",
-        "<li><span class=\"reason\">Fetching vk-hub latest failed</span>",
+        "<li><span class=\"reason\">Fetching the latest vk-gitlab failed</span>",
+        "<li><span class=\"reason\">Fetching the latest vk-hub failed</span>",
     ] {
         assert!(page_all.contains(want), "{want}: {page_all}");
     }

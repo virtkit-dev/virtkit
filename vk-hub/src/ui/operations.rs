@@ -362,11 +362,13 @@ pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Resp
                     }
                 },
             };
-            let fetched = match programs.as_slice() {
-                [one] => one.name().to_string(),
-                _ => "every program".to_string(),
-            };
-            let what = version.clone().unwrap_or_else(|| "latest".into());
+            let fetched = fetched(
+                match programs.as_slice() {
+                    [one] => Some(one.name()),
+                    _ => None,
+                },
+                version.as_deref(),
+            );
             let (hub, principal) = (ui.hub.clone(), auth.session.principal());
             // Dropped, not awaited: the fetch runs on, and the page follows it.
             let started =
@@ -376,8 +378,8 @@ pub(super) async fn fetch_action(req: Request<Incoming>, ui: &Ui) -> Result<Resp
                 Ok(()) => Ok(done(
                     htmx,
                     &format!(
-                        "Fetching {fetched} {what} from {source}. Its progress shows below and \
-                         in the audit log."
+                        "Fetching {fetched} from {source}. Progress shows in the Releases section \
+                         and in the audit log."
                     ),
                 )),
                 Err(e) => Ok(actions::refused(
@@ -450,7 +452,7 @@ pub(super) async fn create_rollout(
         Ok(r) => Ok(done(
             htmx,
             &format!(
-                "Started rollout {} of vk {}. The rollout shows below.",
+                "Started rollout {} of vk {}. It shows in the Nodes section.",
                 crate::rollout::short_id(&r.id),
                 r.row.version
             ),
@@ -786,6 +788,16 @@ pub(super) fn start_rollout(
     h.html(&form).raw("</form>");
 }
 
+/// What a fetch gets, for `program` or every program, at `version` or the latest.
+fn fetched(program: Option<&str>, version: Option<&str>) -> String {
+    match (program, version) {
+        (Some(p), Some(v)) => format!("{p} {v}"),
+        (Some(p), None) => format!("the latest {p}"),
+        (None, Some(v)) => format!("every program at {v}"),
+        (None, None) => "the latest release of every program".to_string(),
+    }
+}
+
 /// The fetch under way or last ended, and the latest release last asked about: a line of
 /// `/updates`' releases part.
 pub(super) fn fetch_line(
@@ -808,15 +820,15 @@ pub(super) fn fetch_line(
         h.raw("</p>");
         return;
     };
-    let asked = s.asked.as_deref().unwrap_or("latest");
+    let asked = s.asked.as_deref();
     match s.items.as_slice() {
         [one] => {
             fetch_item(h, one, asked);
             h.raw(", asked by ").text(&s.by).raw(".</p>");
         }
         items => {
-            h.raw("Fetching every program ")
-                .text(asked)
+            h.raw("Fetching ")
+                .text(fetched(None, asked))
                 .raw(", asked by ")
                 .text(&s.by)
                 .raw(":</p><ul class=\"sub\">");
@@ -831,28 +843,23 @@ pub(super) fn fetch_line(
 }
 
 /// One program's part of a fetch, `asked` being the version asked for.
-fn fetch_item(h: &mut Html, item: &FetchItem, asked: &str) {
+fn fetch_item(h: &mut Html, item: &FetchItem, asked: Option<&str>) {
     let program = item.program.name();
+    let what = fetched(Some(program), asked);
     match &item.phase {
         Phase::Waiting => {
             h.raw("Fetching ")
-                .raw(program)
-                .raw(" ")
-                .text(asked)
+                .text(&what)
                 .raw(": waiting for the programs before it");
         }
         Phase::Resolving => {
             h.raw("Fetching ")
-                .raw(program)
-                .raw(" ")
-                .text(asked)
+                .text(&what)
                 .raw(": finding out which release that is");
         }
         Phase::Downloading { version } => {
             h.raw("Fetching ")
-                .raw(program)
-                .raw(" ")
-                .text(asked)
+                .text(&what)
                 .raw(": downloading and checking ")
                 .node(version);
         }
@@ -872,9 +879,7 @@ fn fetch_item(h: &mut Html, item: &FetchItem, asked: &str) {
         }
         Phase::Failed { reason, at } => {
             h.raw("<span class=\"reason\">Fetching ")
-                .raw(program)
-                .raw(" ")
-                .text(asked)
+                .text(&what)
                 .raw(" failed</span> at ")
                 .html(&pages::at_html(*at))
                 .raw(": ")

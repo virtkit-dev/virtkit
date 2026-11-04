@@ -346,7 +346,7 @@ async fn run(
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">Started <code>")
         .node(&command)
         .raw(if live {
-            "</code>. Its result shows below and in the audit log.</div>"
+            "</code>. Its result shows on this page and in the audit log.</div>"
         } else {
             "</code>. Reload the page to see its result. The audit log records it too.</div>"
         });

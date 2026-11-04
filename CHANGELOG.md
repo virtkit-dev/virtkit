@@ -25,6 +25,8 @@ All notable changes to virtkit will be documented in this file.
   servers, then the relays (formerly *GitLab adapters*; `/relays` redirects there) and the
   runners waiting for their server. On a server's page, operators edit or map each runner's lane
   from its row.
+- **Action confirmations point to the right place.** They say where the result appears
+  instead of "below", which pointed away from them at the bottom of the window.
 
 ## [0.102.4] - 2026-11-04
 
