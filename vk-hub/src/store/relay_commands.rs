@@ -45,8 +45,8 @@ impl RelayCommandRow {
 
     /// [`RelayCommandRow::live`], and an update to release `sha256`.
     pub(super) fn updates_to(&self, sha256: &str, now: u64) -> bool {
-        let Operation::Update { sha256: s, .. } = &self.command.op;
-        self.live(now) && s == sha256
+        self.live(now)
+            && matches!(&self.command.op, Operation::Update { sha256: s, .. } if s == sha256)
     }
 
     /// An update is under way if unaccepted and unexpired, or accepted and running in the
@@ -87,6 +87,8 @@ pub(super) fn command_range(id: &str) -> (String, String) {
 pub fn relay_operation_name(op: &Operation) -> String {
     match op {
         Operation::Update { version, .. } => format!("update to vk-gitlab {version}"),
+        Operation::AddRunner { name, .. } => format!("add runner {name}"),
+        Operation::RemoveRunner { name, .. } => format!("remove runner {name}"),
     }
 }
 

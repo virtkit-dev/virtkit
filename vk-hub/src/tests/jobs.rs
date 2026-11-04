@@ -200,6 +200,7 @@ fn enrolled_key(hub: &Hub) -> String {
             limit: None,
             request_concurrency: 1,
             verified: true,
+            ..Default::default()
         }],
         server: vk_hub_proto::gitlab::Server {
             url: GITLAB_URL.into(),

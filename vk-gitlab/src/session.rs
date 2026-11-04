@@ -109,6 +109,7 @@ impl Status {
                     limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
                     request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
                     verified: false,
+                    ..Runner::default()
                 },
                 state: RunnerState::ServerPending,
                 message: None,

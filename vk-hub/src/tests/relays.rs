@@ -313,6 +313,7 @@ async fn a_relay_past_the_hub_s_runner_or_request_limits_is_refused() {
         limit: None,
         request_concurrency,
         verified: true,
+        ..Default::default()
     };
     let at_limits = |inventory: &mut Inventory| {
         inventory.runners = (0..gl::MAX_RUNNERS).map(|n| runner(n, 1)).collect();

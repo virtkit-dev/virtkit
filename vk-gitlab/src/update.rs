@@ -419,6 +419,16 @@ impl Updater {
                 outcome: entry.outcome.clone(),
             });
         }
+        if !matches!(command.op, Operation::Update { .. }) {
+            // Not journaled: a runner command carries a token, kept nowhere but in a runner
+            // file.
+            return Ok(CommandAck {
+                id: command.id,
+                outcome: Outcome::Refused {
+                    reason: "this relay does not take runners from the hub yet".to_string(),
+                },
+            });
+        }
         if let Some(why) = &self.broken {
             // Not journaled: there is no journal to keep it in.
             return Ok(CommandAck {
@@ -448,10 +458,11 @@ impl Updater {
         self.change(|p| {
             // Under way from its acceptance on, so a report sent before the download starts
             // names it.
-            if outcome == Outcome::Accepted {
-                let Operation::Update {
+            if outcome == Outcome::Accepted
+                && let Operation::Update {
                     version, sha256, ..
-                } = &op;
+                } = &op
+            {
                 p.update = Some(UpdateProgress {
                     command: id.clone(),
                     version: version.clone(),
@@ -484,7 +495,10 @@ impl Updater {
             sha256,
             size,
             signature,
-        } = &command.op;
+        } = &command.op
+        else {
+            return Err("not an update".to_string());
+        };
         if self.stopping() {
             return Err("the relay is stopping".to_string());
         }
@@ -512,7 +526,10 @@ impl Updater {
     fn failed(&self, command: &Command, why: &str) -> Result<()> {
         let Operation::Update {
             version, sha256, ..
-        } = &command.op;
+        } = &command.op
+        else {
+            return Ok(());
+        };
         trial::failed(self, &command.id, version, sha256, why)
     }
 
@@ -527,7 +544,10 @@ impl Updater {
             sha256,
             size,
             ..
-        } = &command.op;
+        } = &command.op
+        else {
+            return Err(anyhow!("not an update"));
+        };
         let progress = |phase| UpdateProgress {
             command: command.id.clone(),
             version: version.clone(),
@@ -582,7 +602,9 @@ impl Updater {
     /// place of this one; returns only why it did not. A relay that starts stopping meanwhile
     /// does not execute the release, and its trial is undone.
     async fn hand_over(&self, command: &Command, trial: Trial, binary: &Binary) -> anyhow::Error {
-        let Operation::Update { version, .. } = &command.op;
+        let Operation::Update { version, .. } = &command.op else {
+            return anyhow!("not an update");
+        };
         if tokio::time::timeout(REQUESTS_WAIT, self.shutdown.requests_ended())
             .await
             .is_err()

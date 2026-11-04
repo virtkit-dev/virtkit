@@ -192,7 +192,9 @@ the outcome; never the token.
 
 **Protocol.** Version 4 raises both ranges' maximum: the `Operation` variants `add_runner` and
 `remove_runner`, and the inventory runner's optional `source` and `command`. `Operation` has no
-fallback variant, so neither is sent below 4.
+fallback variant, so neither is sent below 4. A failure code rides in the ack's outcome:
+`expired` as `expired`, `not_allowed` as `refused`, the others as `failed`, the code its reason
+or message. `add_runner`'s token is absent from the JSON of the command as the hub stores it.
 
 **Later.** Editing a runner's settings: requests already taken keep the placement of their
 admission, so an edit waits for them to drain as a removal does. Replacing a token after a reset
@@ -364,8 +366,8 @@ file is refused the same way. Upgrading is **drain, upgrade, enroll, start**:
 
 `vk_hub_proto::gitlab`: enrollment at `/v1/gitlab/enroll` (its own table of pinned keys and a
 token of kind `gitlab`, so no other peer's token enrolls a relay), the session at
-`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`. The hub speaks `PROTOCOL` 1 to 3, a relay
-`RELAY_PROTOCOL` 2 to 3. Version 2 adds each runner's `request_concurrency` to the inventory and
+`/v1/gitlab/session`, `RelayMsg` and `HubRelayMsg`. The hub speaks `PROTOCOL` 1 to 4, a relay
+`RELAY_PROTOCOL` 2 to 4. Version 2 adds each runner's `request_concurrency` to the inventory and
 `request_admissions` and `job_admissions` to its heartbeat load; the hub takes new work only
 from a relay at version 2 or later, and serves a version-1 relay only to settle the jobs it
 holds: replayed submissions, output, cancel and settle. A hub at version 1 refuses a version-2
@@ -377,7 +379,7 @@ headers and the `approval_pending` and `project_rejected` codes, which an older 
 `other`. Version 3 adds updates: `command`, `ack` and `recorded`, sent only in a session at
 version 3, and the inventory's `allow` and `requires_signed` and the report's `update`, optional
 fields a version-2 peer ignores, so either side meets an older other at version 2, without
-updates.
+updates. Version 4 adds [runners added on the hub](#runners-added-on-the-hub).
 
 ## Implementation order
 

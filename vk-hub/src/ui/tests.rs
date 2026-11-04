@@ -9714,6 +9714,7 @@ async fn relays_and_their_runners_follow_their_server() {
                 limit: Some(4),
                 request_concurrency: 1,
                 verified: true,
+                ..Runner::default()
             },
             Runner {
                 name: hostile.into(),
@@ -9730,6 +9731,7 @@ async fn relays_and_their_runners_follow_their_server() {
                 limit: None,
                 request_concurrency: 1,
                 verified: false,
+                ..Runner::default()
             },
         ],
         ..Inventory::default()

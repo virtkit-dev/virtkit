@@ -17,8 +17,8 @@ use vk_gitlab::relay;
 use vk_gitlab::session::{self, Status};
 use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{
-    Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState, ServerState,
-    ServerStatus, UPDATES,
+    Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RUNNERS, RelayMsg, RunnerState,
+    ServerState, ServerStatus, UPDATES,
 };
 use vk_hub_proto::{Channel, CommandAck, HubMsg, NodeMsg, Outcome, RefusalCode};
 use vk_peer::identity::Identity;
@@ -131,7 +131,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: UPDATES,
+            version: RUNNERS,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&nonce),
         },
@@ -146,7 +146,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         &incarnation,
         RELAY_PROTOCOL,
         PROTOCOL,
-        UPDATES,
+        RUNNERS,
         Channel::Plaintext,
     );
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
@@ -271,7 +271,7 @@ async fn welcome(listener: &TcpListener) -> Ws {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: UPDATES,
+            version: RUNNERS,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
@@ -407,6 +407,26 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
         reason.contains("[hub] allow does not list update"),
         "{reason}"
     );
+    // A runner command is refused, not taken.
+    send(
+        &mut ws,
+        &HubRelayMsg::Command(Command {
+            id: "e".repeat(32),
+            expires_at: far,
+            op: Operation::AddRunner {
+                name: "big".into(),
+                token: vk_hub_proto::gitlab::RunnerToken::new("glrt-x"),
+                placement: Default::default(),
+                limit: None,
+                request_concurrency: 1,
+            },
+        }),
+    )
+    .await;
+    assert!(matches!(
+        ack_of(&mut ws, "e").await.outcome,
+        Outcome::Refused { .. }
+    ));
     held.abort();
     std::fs::remove_dir_all(&state).unwrap();
 
@@ -417,11 +437,15 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
     );
     let held = hold(&state, relay, &status, hub);
     let (mut ws, _) = hello(&listener).await;
+    // Updates still work with a version-3 hub.
     send(
         &mut ws,
         &HubMsg::Challenge {
             version: UPDATES,
-            versions: PROTOCOL,
+            versions: vk_hub_proto::VersionRange {
+                min: 1,
+                max: UPDATES,
+            },
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
     )

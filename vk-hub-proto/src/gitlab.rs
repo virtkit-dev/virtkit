@@ -40,12 +40,17 @@
 //! negotiated version 2. Version 3 adds updates: the commands, acks and records, which
 //! neither side sends in a session below it, and the inventory's `allow` and
 //! `requires_signed` and the report's `update`, optional fields a version-2 peer ignores.
+//! Version 4 adds runners added on the hub: [`Operation::AddRunner`] and
+//! [`Operation::RemoveRunner`], sent only in a session at it or later, for a relay whose
+//! `allow` lists [`ALLOW_RUNNERS`], and the inventory runner's `source` and `command`, optional
+//! fields an older hub ignores. A runner command that fails is answered with a
+//! [`RunnerFailure`]'s code, never GitLab's text.
 
 use serde::{Deserialize, Serialize};
 
 use crate::client::Placement;
 use crate::{
-    CommandAck, RefusalCode, SHA256_LEN, UpdateProgress, VersionRange, display_safe, part,
+    CommandAck, Outcome, RefusalCode, SHA256_LEN, UpdateProgress, VersionRange, display_safe, part,
     valid_id, valid_sha256,
 };
 
@@ -56,14 +61,18 @@ pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
 pub const SESSION_PATH: &str = "/v1/gitlab/session";
 
 /// The protocol versions of a relay's session.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 3 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 4 };
 
 /// The relay requires admission-aware scheduling, introduced in version 2.
-pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 3 };
+pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 4 };
 
 /// The version that adds updates: [`HubRelayMsg::Command`], [`RelayMsg::Ack`] and
 /// [`HubRelayMsg::Recorded`] are sent only in a session at it or later.
 pub const UPDATES: u32 = 3;
+
+/// The version that adds runners added on the hub: [`Operation::AddRunner`] and
+/// [`Operation::RemoveRunner`] are sent only in a session at it or later.
+pub const RUNNERS: u32 = 4;
 
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
@@ -81,6 +90,9 @@ pub const RELEASE_PATH: &str = "/v1/gitlab/releases/";
 
 /// `[hub] allow`'s value letting the hub update the relay.
 pub const ALLOW_UPDATE: &str = "update";
+
+/// `[hub] allow`'s value letting the hub add runners to the relay and remove them.
+pub const ALLOW_RUNNERS: &str = "runners";
 
 /// The most entries an inventory's `allow` keeps once made display-safe.
 pub const MAX_ALLOW: usize = 16;
@@ -141,7 +153,7 @@ pub struct Inventory {
     /// At most [`MAX_RUNNERS`].
     #[serde(default)]
     pub runners: Vec<Runner>,
-    /// What its config lets the hub do (`[hub] allow`): [`ALLOW_UPDATE`]. At most
+    /// What its config lets the hub do (`[hub] allow`): [`ALLOW_UPDATE`], [`ALLOW_RUNNERS`]. At most
     /// [`MAX_ALLOW`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
@@ -184,16 +196,45 @@ pub struct Runner {
     pub request_concurrency: u32,
     /// Whether GitLab took its token at the relay's last `verify`.
     pub verified: bool,
+    /// Where it was defined. Version 4; absent from an older relay, and for
+    /// [`RunnerSource::Config`].
+    #[serde(default, skip_serializing_if = "RunnerSource::is_config")]
+    pub source: RunnerSource,
+    /// For [`RunnerSource::Hub`], the [`Operation::AddRunner`] command that added it
+    /// ([`valid_id`]). Version 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 fn one() -> u32 {
     1
 }
 
+/// Where a relay's runner was defined.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerSource {
+    /// A `[[runners]]` table of the relay's config.
+    #[default]
+    Config,
+    /// Added on the hub, by an [`Operation::AddRunner`].
+    Hub,
+    /// A source from a later relay: as one the hub cannot remove.
+    #[serde(other)]
+    Other,
+}
+
+impl RunnerSource {
+    fn is_config(&self) -> bool {
+        *self == RunnerSource::Config
+    }
+}
+
 impl Inventory {
     /// Apply [`display_safe`] to strings, drop the server's SPKI digest unless
     /// [`valid_sha256`], truncate runners to [`MAX_RUNNERS`] and their labels to
-    /// [`MAX_LABELS`], `allow` to [`MAX_ALLOW`], and raise a `request_concurrency` of 0 to 1.
+    /// [`MAX_LABELS`], `allow` to [`MAX_ALLOW`], drop a runner's `command` unless [`valid_id`],
+    /// and raise a `request_concurrency` of 0 to 1.
     pub fn make_display_safe(&mut self) {
         for s in [&mut self.version, &mut self.hostname, &mut self.system_id] {
             *s = display_safe(s);
@@ -208,6 +249,7 @@ impl Inventory {
         self.runners.truncate(MAX_RUNNERS);
         for r in &mut self.runners {
             r.name = display_safe(&r.name);
+            r.command = r.command.take().filter(|c| valid_id(c));
             r.request_concurrency = r.request_concurrency.max(1);
             r.placement.pool = display_safe(&r.placement.pool);
             r.placement.labels.truncate(MAX_LABELS);
@@ -346,6 +388,31 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// Add a runner GitLab created, under `name`, with the settings a `[[runners]]` table
+    /// has. Version [`RUNNERS`].
+    AddRunner {
+        name: String,
+        /// Its runner authentication token (`glrt-…`). Empty, and then absent from the JSON,
+        /// only where the hub keeps the command once sent: it never stores the token.
+        #[serde(default, skip_serializing_if = "RunnerToken::is_empty")]
+        token: RunnerToken,
+        placement: Placement,
+        /// The runner's `limit`, when limited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        /// The runner's `request_concurrency`, at least 1.
+        #[serde(default = "one")]
+        request_concurrency: u32,
+    },
+    /// Remove a runner added on the hub. Refused [`RunnerFailure::RunnerGone`] unless the
+    /// relay runs a runner added on the hub with this name, this GitLab ID, added by this
+    /// command. Version [`RUNNERS`].
+    RemoveRunner {
+        name: String,
+        runner_id: u64,
+        /// The [`Operation::AddRunner`] command that added it.
+        command: String,
+    },
 }
 
 impl Operation {
@@ -353,7 +420,148 @@ impl Operation {
     pub fn allowed_by(&self) -> &'static str {
         match self {
             Operation::Update { .. } => ALLOW_UPDATE,
+            Operation::AddRunner { .. } | Operation::RemoveRunner { .. } => ALLOW_RUNNERS,
         }
+    }
+
+    /// The protocol version a session needs before the hub sends this command.
+    pub fn min_version(&self) -> u32 {
+        match self {
+            Operation::Update { .. } => UPDATES,
+            Operation::AddRunner { .. } | Operation::RemoveRunner { .. } => RUNNERS,
+        }
+    }
+
+    /// This operation as the hub keeps it: an [`Operation::AddRunner`]'s token emptied.
+    pub fn without_token(&self) -> Operation {
+        let mut op = self.clone();
+        if let Operation::AddRunner { token, .. } = &mut op {
+            *token = RunnerToken::default();
+        }
+        op
+    }
+}
+
+/// A runner authentication token. `Debug` and `Display` never print it; [`RunnerToken::expose`]
+/// is the one way to the value.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunnerToken(String);
+
+impl RunnerToken {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RunnerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunnerToken([redacted])")
+    }
+}
+
+impl std::fmt::Display for RunnerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// Why a runner command failed: the code a relay answers with, never GitLab's text. A relay
+/// sends it as [`RunnerFailure::outcome`] makes it, and the hub reads it back with
+/// [`RunnerFailure::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerFailure {
+    /// GitLab answered `verify` with 401 or 403.
+    TokenRefused,
+    /// GitLab could not be reached, answered with a 5xx, or gave no positive runner ID:
+    /// adding again retries.
+    GitlabUnreachable,
+    /// The name is the config's, another runner file's, or a runner's being removed.
+    NameTaken,
+    /// The relay already runs the token's GitLab runner, under another name.
+    RunnerTaken,
+    /// The relay runs [`MAX_RUNNERS`] already.
+    TooManyRunners,
+    /// The relay's `[hub] allow` lacks [`ALLOW_RUNNERS`].
+    NotAllowed,
+    /// The command arrived past its `expires_at`.
+    Expired,
+    /// A removal names no runner the relay runs with that name, GitLab ID and command.
+    RunnerGone,
+    /// Set by the hub, never sent: it lost the token of an add the relay never accepted.
+    TokenLost,
+    /// A code from a later peer.
+    #[serde(other)]
+    Other,
+}
+
+impl RunnerFailure {
+    const ALL: [RunnerFailure; 9] = [
+        RunnerFailure::TokenRefused,
+        RunnerFailure::GitlabUnreachable,
+        RunnerFailure::NameTaken,
+        RunnerFailure::RunnerTaken,
+        RunnerFailure::TooManyRunners,
+        RunnerFailure::NotAllowed,
+        RunnerFailure::Expired,
+        RunnerFailure::RunnerGone,
+        RunnerFailure::TokenLost,
+    ];
+
+    /// The code, as the JSON spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunnerFailure::TokenRefused => "token_refused",
+            RunnerFailure::GitlabUnreachable => "gitlab_unreachable",
+            RunnerFailure::NameTaken => "name_taken",
+            RunnerFailure::RunnerTaken => "runner_taken",
+            RunnerFailure::TooManyRunners => "too_many_runners",
+            RunnerFailure::NotAllowed => "not_allowed",
+            RunnerFailure::Expired => "expired",
+            RunnerFailure::RunnerGone => "runner_gone",
+            RunnerFailure::TokenLost => "token_lost",
+            RunnerFailure::Other => "other",
+        }
+    }
+
+    /// The outcome a relay acks with: [`Outcome::Expired`] for [`RunnerFailure::Expired`],
+    /// [`Outcome::Refused`] for [`RunnerFailure::NotAllowed`], [`Outcome::Failed`] otherwise,
+    /// the code its reason or message.
+    pub fn outcome(self) -> Outcome {
+        match self {
+            RunnerFailure::Expired => Outcome::Expired,
+            RunnerFailure::NotAllowed => Outcome::Refused {
+                reason: self.as_str().into(),
+            },
+            _ => Outcome::Failed {
+                message: self.as_str().into(),
+            },
+        }
+    }
+
+    /// The failure an outcome stands for: `None` for one that did not fail, and
+    /// [`RunnerFailure::Other`] for a code this side does not know.
+    pub fn of(outcome: &Outcome) -> Option<RunnerFailure> {
+        let code = match outcome {
+            Outcome::Accepted | Outcome::Done => return None,
+            Outcome::Expired => return Some(RunnerFailure::Expired),
+            Outcome::Failed { message: code } | Outcome::Refused { reason: code } => code,
+        };
+        Some(
+            Self::ALL
+                .into_iter()
+                .find(|f| f.as_str() == code)
+                .unwrap_or(RunnerFailure::Other),
+        )
     }
 }
 
@@ -432,6 +640,7 @@ mod tests {
             limit: Some(8),
             request_concurrency: 2,
             verified: true,
+            ..Runner::default()
         }
     }
 
@@ -601,6 +810,185 @@ mod tests {
         assert!(wire.get("allow").is_none() && wire.get("requires_signed").is_none());
     }
 
+    fn add_runner(token: &str) -> Operation {
+        Operation::AddRunner {
+            name: "big".into(),
+            token: RunnerToken::new(token),
+            placement: runner().placement,
+            limit: Some(4),
+            request_concurrency: 2,
+        }
+    }
+
+    /// The runner commands, and the inventory fields they add, keep their JSON.
+    #[test]
+    fn runner_messages_keep_their_json() {
+        let placement = r#"{"pool":"ci","labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}"#;
+        pinned(
+            &HubRelayMsg::Command(Command {
+                id: "c".into(),
+                expires_at: 9,
+                op: add_runner("glrt-secret"),
+            }),
+            &format!(
+                r#"{{"type":"command","id":"c","expires_at":9,"op":{{"kind":"add_runner","name":"big","token":"glrt-secret","placement":{placement},"limit":4,"request_concurrency":2}}}}"#
+            ),
+        );
+        pinned(
+            &HubRelayMsg::Command(Command {
+                id: "d".into(),
+                expires_at: 9,
+                op: Operation::RemoveRunner {
+                    name: "big".into(),
+                    runner_id: 42,
+                    command: "c".into(),
+                },
+            }),
+            r#"{"type":"command","id":"d","expires_at":9,"op":{"kind":"remove_runner","name":"big","runner_id":42,"command":"c"}}"#,
+        );
+        // The settings take a `[[runners]]` table's defaults.
+        let op: Operation = serde_json::from_str(&format!(
+            r#"{{"kind":"add_runner","name":"big","token":"t","placement":{placement}}}"#
+        ))
+        .unwrap();
+        assert!(matches!(
+            op,
+            Operation::AddRunner {
+                limit: None,
+                request_concurrency: 1,
+                ..
+            }
+        ));
+        let hub = Runner {
+            source: RunnerSource::Hub,
+            command: Some("c".into()),
+            ..runner()
+        };
+        let wire = serde_json::to_value(&hub).unwrap();
+        assert_eq!(
+            (&wire["source"], &wire["command"]),
+            (&serde_json::json!("hub"), &serde_json::json!("c"))
+        );
+        assert_eq!(serde_json::from_value::<Runner>(wire).unwrap(), hub);
+        // Config runners omit both fields, matching older relays; unknown sources read as Other.
+        let wire = serde_json::to_value(runner()).unwrap();
+        assert!(wire.get("source").is_none() && wire.get("command").is_none());
+        let mut wire = wire;
+        wire["source"] = serde_json::json!("cloud");
+        let r: Runner = serde_json::from_value(wire).unwrap();
+        assert_eq!(r.source, RunnerSource::Other);
+        assert_eq!(ALLOW_RUNNERS, "runners");
+    }
+
+    /// A runner token is never printed, and the hub's kept command has none.
+    #[test]
+    fn a_runner_token_stays_secret() {
+        let command = Command {
+            id: "c".into(),
+            expires_at: 9,
+            op: add_runner("glrt-secret"),
+        };
+        let Operation::AddRunner { token, .. } = &command.op else {
+            unreachable!()
+        };
+        assert_eq!(token.expose(), "glrt-secret");
+        for shown in [
+            format!("{command:?}"),
+            format!("{command:#?}"),
+            format!("{token}"),
+        ] {
+            assert!(!shown.contains("secret"), "{shown}");
+        }
+        let kept = command.op.without_token();
+        let wire = serde_json::to_value(&kept).unwrap();
+        assert!(wire.get("token").is_none(), "{wire}");
+        assert_eq!(serde_json::from_value::<Operation>(wire).unwrap(), kept);
+        assert_eq!(kept, add_runner(""));
+        let update = Operation::Update {
+            version: "1".into(),
+            sha256: "ab".repeat(SHA256_LEN),
+            size: 1,
+            signature: None,
+        };
+        assert_eq!(update.without_token(), update);
+    }
+
+    /// Runner commands need `runners` allowed and version 4; updates `update` and version 3.
+    #[test]
+    fn runner_commands_need_runners_allowed_and_version_4() {
+        let remove = Operation::RemoveRunner {
+            name: "n".into(),
+            runner_id: 1,
+            command: "c".into(),
+        };
+        for op in [add_runner("t"), remove] {
+            assert_eq!(
+                (op.allowed_by(), op.min_version()),
+                (ALLOW_RUNNERS, RUNNERS)
+            );
+        }
+        let update = Operation::Update {
+            version: "1".into(),
+            sha256: String::new(),
+            size: 1,
+            signature: None,
+        };
+        assert_eq!(
+            (update.allowed_by(), update.min_version()),
+            (ALLOW_UPDATE, UPDATES)
+        );
+    }
+
+    /// Each failure code is its JSON spelling, rides in an ack's outcome and reads back.
+    #[test]
+    fn runner_failures_ride_in_outcomes() {
+        let failed = |code: &str| format!(r#"{{"state":"failed","message":"{code}"}}"#);
+        for (f, wire) in [
+            (RunnerFailure::TokenRefused, failed("token_refused")),
+            (
+                RunnerFailure::GitlabUnreachable,
+                failed("gitlab_unreachable"),
+            ),
+            (RunnerFailure::NameTaken, failed("name_taken")),
+            (RunnerFailure::RunnerTaken, failed("runner_taken")),
+            (RunnerFailure::TooManyRunners, failed("too_many_runners")),
+            (
+                RunnerFailure::NotAllowed,
+                r#"{"state":"refused","reason":"not_allowed"}"#.into(),
+            ),
+            (RunnerFailure::Expired, r#"{"state":"expired"}"#.into()),
+            (RunnerFailure::RunnerGone, failed("runner_gone")),
+            (RunnerFailure::TokenLost, failed("token_lost")),
+        ] {
+            pinned(&f.outcome(), &wire);
+        }
+        for f in RunnerFailure::ALL {
+            assert_eq!(serde_json::to_value(f).unwrap(), f.as_str());
+            assert_eq!(RunnerFailure::of(&f.outcome()), Some(f));
+        }
+        assert_eq!(RunnerFailure::Expired.outcome(), Outcome::Expired);
+        assert!(matches!(
+            RunnerFailure::NotAllowed.outcome(),
+            Outcome::Refused { reason } if reason == "not_allowed"
+        ));
+        assert_eq!(
+            RunnerFailure::TokenRefused.outcome(),
+            Outcome::Failed {
+                message: "token_refused".into()
+            }
+        );
+        assert_eq!(RunnerFailure::of(&Outcome::Done), None);
+        assert_eq!(RunnerFailure::of(&Outcome::Accepted), None);
+        assert_eq!(
+            RunnerFailure::of(&Outcome::Failed {
+                message: "quota".into()
+            }),
+            Some(RunnerFailure::Other)
+        );
+        let f: RunnerFailure = serde_json::from_str(r#""quota""#).unwrap();
+        assert_eq!(f, RunnerFailure::Other);
+    }
+
     /// A relay's release is signed under a label of its own.
     #[test]
     fn a_relay_release_is_signed_apart() {
@@ -749,6 +1137,25 @@ mod tests {
         assert_eq!(r.placement.labels, vec!["l".to_string(); MAX_LABELS]);
 
         let mut i = Inventory {
+            runners: vec![
+                Runner {
+                    source: RunnerSource::Hub,
+                    command: Some("c\n".into()),
+                    ..runner()
+                },
+                Runner {
+                    source: RunnerSource::Hub,
+                    command: Some("0".repeat(32)),
+                    ..runner()
+                },
+            ],
+            ..Inventory::default()
+        };
+        i.make_display_safe();
+        assert_eq!(i.runners[0].command, None);
+        assert_eq!(i.runners[1].command, Some("0".repeat(32)));
+
+        let mut i = Inventory {
             server: Server {
                 spki_sha256: Some("ab".repeat(32)),
                 ..Server::default()
@@ -805,10 +1212,17 @@ mod tests {
             runners: vec![load; MAX_RUNNERS],
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
-        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(UPDATES));
+        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(RUNNERS));
         assert_eq!(
             VersionRange { min: 1, max: 1 }.negotiate(RELAY_PROTOCOL),
             None
+        );
+        // Either peer can still negotiate version 3 with a version-3 peer.
+        let before = VersionRange { min: 1, max: 3 };
+        assert_eq!(before.negotiate(RELAY_PROTOCOL), Some(UPDATES));
+        assert_eq!(
+            PROTOCOL.negotiate(VersionRange { min: 2, max: 3 }),
+            Some(UPDATES)
         );
         // A hub or a relay from before updates still meets the other at version 2.
         let before = VersionRange { min: 1, max: 2 };

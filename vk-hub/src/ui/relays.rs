@@ -81,15 +81,17 @@ fn peer(v: RelayView, last: Option<RelayCommandRow>) -> updates::Peer {
         allows_downgrade: None,
         requires_signed: inventory.is_some_and(|i| i.requires_signed),
         reported: v.row.report.as_ref().and_then(|r| r.update.clone()),
-        last: last.map(|c| {
-            let Operation::Update { version, .. } = c.command.op;
-            updates::Issued {
+        last: last.and_then(|c| {
+            let Operation::Update { version, .. } = c.command.op else {
+                return None;
+            };
+            Some(updates::Issued {
                 id: c.command.id,
                 version,
                 issued_at: c.issued_at,
                 expires_at: c.command.expires_at,
                 outcome: c.outcome,
-            }
+            })
         }),
         id: v.id,
     }
