@@ -42,11 +42,18 @@ pub async fn run(
     exported: Exported,
     permit: OwnedSemaphorePermit,
 ) {
-    let registry =
-        match crate::session::handshake(&mut ws, &hub, exported, PeerKind::Registry).await {
-            Ok(r) => r,
-            Err(r) => return turn_away(&mut ws, peer, r).await,
-        };
+    let registry = match crate::session::handshake(
+        &mut ws,
+        &hub,
+        exported,
+        PeerKind::Registry,
+        vk_hub_proto::registry::PROTOCOL,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(r) => return turn_away(&mut ws, peer, r).await,
+    };
     let (session, ending) = hub.open_session(&registry.id);
     let welcomed = welcome(&mut ws, &hub, &registry, session).await;
     drop(permit);

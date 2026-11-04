@@ -42,7 +42,7 @@ fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = PrivateKeyDer::from_pem_slice(TLS_KEY).unwrap();
-    config::acceptor(certs, key).unwrap()
+    config::acceptor(certs, key, config::API_ALPN).unwrap()
 }
 
 async fn serve_on(tls: Option<tokio_rustls::TlsAcceptor>) -> (SocketAddr, Arc<Hub>) {
@@ -55,17 +55,26 @@ async fn serve_on(tls: Option<tokio_rustls::TlsAcceptor>) -> (SocketAddr, Arc<Hu
 
 /// A TLS client trusting the test CA, speaking only `versions`.
 fn connector(versions: &[&'static rustls::SupportedProtocolVersion]) -> TlsConnector {
+    connector_alpn(versions, &[])
+}
+
+/// [`connector`], offering `alpn`.
+fn connector_alpn(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    alpn: &[&[u8]],
+) -> TlsConnector {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(TLS_CA) {
         roots.add(cert.unwrap()).unwrap();
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(versions)
     .unwrap()
     .with_root_certificates(roots)
     .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     TlsConnector::from(Arc::new(config))
 }
 

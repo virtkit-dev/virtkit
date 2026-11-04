@@ -480,6 +480,7 @@ impl HubConfig {
             self.tls_cert.as_deref(),
             self.tls_key.as_deref(),
             "tls_cert and tls_key",
+            API_ALPN,
         )
     }
 }
@@ -491,6 +492,7 @@ impl UiConfig {
             self.tls_cert.as_deref(),
             self.tls_key.as_deref(),
             "ui_tls_cert and ui_tls_key",
+            UI_ALPN,
         )
     }
 }
@@ -636,21 +638,35 @@ fn parse_origin(url: &str) -> Result<String> {
     })
 }
 
-fn build_tls(cert: Option<&Path>, key: Option<&Path>, what: &str) -> Result<Option<TlsAcceptor>> {
+/// What the node listener speaks: HTTP/2 under a relay's private ID alone, for its session
+/// and client API requests on one connection, never `h2`, so every other client stays on
+/// HTTP/1.1.
+pub(crate) const API_ALPN: &[&[u8]] = &[vk_hub_proto::gitlab::ALPN, b"http/1.1"];
+
+/// What the web UI's listener speaks.
+pub(crate) const UI_ALPN: &[&[u8]] = &[b"http/1.1"];
+
+fn build_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    what: &str,
+    alpn: &[&[u8]],
+) -> Result<Option<TlsAcceptor>> {
     let (cert, key) = match (cert, key) {
         (Some(c), Some(k)) => (c, k),
         (None, None) => return Ok(None),
         _ => bail!("{what} must be set together"),
     };
-    acceptor(load_certs(cert)?, load_key(key)?).map(Some)
+    acceptor(load_certs(cert)?, load_key(key)?, alpn).map(Some)
 }
 
 /// The acceptor for `certs` and `key`. TLS 1.3 only: a session signs the connection's
 /// exporter, which TLS 1.2 ties to the handshake only with the extended master secret
-/// (RFC 7627).
+/// (RFC 7627). `alpn` is what it offers, in its order of preference.
 pub(crate) fn acceptor(
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    alpn: &[&[u8]],
 ) -> Result<TlsAcceptor> {
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -660,7 +676,7 @@ pub(crate) fn acceptor(
     .with_no_client_auth()
     .with_single_cert(certs, key)
     .context("building the TLS server config")?;
-    sc.alpn_protocols = vec![b"http/1.1".to_vec()];
+    sc.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(TlsAcceptor::from(Arc::new(sc)))
 }
 

@@ -599,6 +599,9 @@ struct Ticket {
     /// When it was claimed in [`Ticket::session`]: a heartbeat of that session received well
     /// after that must list it.
     claimed_at: Option<Instant>,
+    /// Queued on a relay's HTTP/2 connection, under that connection's session: it ends with
+    /// that session, and is not polled, so it never goes idle while live.
+    bound: bool,
     tried: HashSet<String>,
     round_ended: Option<Instant>,
     blocked: Option<&'static str>,
@@ -2425,14 +2428,22 @@ pub fn queue_reservation(
         queued,
     } = ask;
     hub.dispatch.output_dir()?;
+    // The session of the connection that queued it, or for a signed request the relay's
+    // current one: the ticket ends with it.
+    let session_bound = principal.session().is_some();
     let session = if principal.is_relay() {
-        Some(hub.current_session(&principal.id).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::Unavailable,
-                "relay session is not connected",
-            )
-        })?)
+        Some(
+            principal
+                .session()
+                .or_else(|| hub.current_session(&principal.id))
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorCode::Unavailable,
+                        "relay session is not connected",
+                    )
+                })?,
+        )
     } else {
         None
     };
@@ -2513,6 +2524,7 @@ pub fn queue_reservation(
             reservation: None,
             session,
             claimed_at: None,
+            bound: session_bound,
             tried: HashSet::new(),
             round_ended: None,
             blocked: None,
@@ -2700,7 +2712,28 @@ pub async fn claim(
 }
 
 fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Result<(), ApiError> {
+    // On a relay's connection, only while that connection's session is current, checked under
+    // the dispatch lock as the session's end is handled: the claim either comes before
+    // `relay_disconnected` or is refused.
+    let current = || {
+        principal
+            .session()
+            .is_none_or(|session| hub.is_current(&principal.id, session))
+    };
+    let ended = || {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "relay session changed",
+        )
+    };
+    // A grant queued on a relay's connection is claimed on that connection's session alone:
+    // one of a session superseded ends with it.
+    let ours = |t: &Ticket| !t.bound || t.session == principal.session();
     let mut state = hub.dispatch.lock();
+    if !current() {
+        return Err(ended());
+    }
     if state.tickets.values().any(|t| {
         t.key == principal.id
             && matches!(&t.phase, TicketPhase::Claimed { reservation: r } if r == reservation)
@@ -2712,7 +2745,7 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
         .get(reservation)
         .is_some_and(|r| r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. }));
     let lease_deadline = state.tickets.values().find_map(|t| {
-        if t.key != principal.id {
+        if t.key != principal.id || !ours(t) {
             return None;
         }
         let TicketPhase::Granted {
@@ -2776,14 +2809,17 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
         state.pending_admissions.remove(&id);
         return Err(error.into());
     }
-    let valid = lease_deadline.is_some_and(|deadline| Instant::now() < deadline)
+    let current = current();
+    let valid = current
+        && lease_deadline.is_some_and(|deadline| Instant::now() < deadline)
         && state
             .reservations
             .get(reservation)
             .is_some_and(|r| r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. }))
-        && state.tickets.get(&id).is_some_and(
-            |t| matches!(&t.phase, TicketPhase::Granted { reservation: r, .. } if r == reservation),
-        );
+        && state.tickets.get(&id).is_some_and(|t| {
+            ours(t)
+                && matches!(&t.phase, TicketPhase::Granted { reservation: r, .. } if r == reservation)
+        });
     if !valid {
         let probe = state.tickets.get_mut(&id).and_then(|ticket| {
             let probe = ticket
@@ -2811,7 +2847,7 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
         }
         drop(state);
         hub.dispatch.bump();
-        return Err(gone(reservation));
+        return Err(if current { gone(reservation) } else { ended() });
     }
     state.pending_admissions.remove(&id);
     // Validated under this lock just above.
@@ -2823,7 +2859,10 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
     };
     // Claimed in the relay's current session, whose heartbeats must list it from now on.
     if principal.is_relay() {
-        ticket.session = hub.current_session(&principal.id).or(ticket.session);
+        ticket.session = principal
+            .session()
+            .or_else(|| hub.current_session(&principal.id))
+            .or(ticket.session);
     }
     ticket.claimed_at = Some(Instant::now());
     Ok(())
@@ -3616,6 +3655,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     reservation: Some(admission.reservation),
                     session: None,
                     claimed_at: None,
+                    bound: false,
                     tried: HashSet::new(),
                     round_ended: None,
                     blocked: None,
@@ -4943,6 +4983,7 @@ mod tests {
             reservation: None,
             session: None,
             claimed_at: None,
+            bound: false,
             tried: HashSet::new(),
             round_ended: None,
             blocked: None,
@@ -5060,7 +5101,7 @@ mod tests {
             id: "key".into(),
             name: "key".into(),
             instance: None,
-            kind: crate::store::PrincipalKind::Relay,
+            kind: crate::store::PrincipalKind::Relay { session: None },
         };
         let old = Instant::now() - Duration::from_secs(10);
         {
@@ -5181,7 +5222,7 @@ mod tests {
             id: "relay".into(),
             name: "relay".into(),
             instance: None,
-            kind: crate::store::PrincipalKind::Relay,
+            kind: crate::store::PrincipalKind::Relay { session: None },
         };
         let now = Instant::now();
         let identity = ResolvedIdentity {
@@ -5217,6 +5258,7 @@ mod tests {
                     reservation: Some("reservation".into()),
                     session: Some(1),
                     claimed_at: None,
+                    bound: false,
                     tried: HashSet::new(),
                     round_ended: None,
                     blocked: None,
@@ -5997,6 +6039,14 @@ pub(crate) mod testing {
                 .values_mut()
                 .find(|t| t.reservation.as_deref() == Some(reservation))
                 .unwrap();
+            ticket.polled = Instant::now() - TICKET_IDLE - Duration::from_secs(1);
+        }
+        super::step(hub).await.unwrap();
+    }
+
+    /// Have every ticket go unpolled past [`TICKET_IDLE`], then run a pass.
+    pub async fn age_tickets_and_step(hub: &Hub) {
+        for ticket in hub.dispatch.lock().tickets.values_mut() {
             ticket.polled = Instant::now() - TICKET_IDLE - Duration::from_secs(1);
         }
         super::step(hub).await.unwrap();

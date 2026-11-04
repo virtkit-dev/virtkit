@@ -191,8 +191,12 @@ pub struct ApiPrincipal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrincipalKind {
     Key(Box<KeyRow>),
-    /// An enrolled relay: trusted as a node is, with no policy of its own.
-    Relay,
+    /// An enrolled relay: trusted as a node is, with no policy of its own. `session` is the
+    /// session whose HTTP/2 connection carried the request, which that session authenticated;
+    /// `None` for a request signed on its own, over HTTP/1.1.
+    Relay {
+        session: Option<u64>,
+    },
 }
 
 impl ApiPrincipal {
@@ -200,19 +204,28 @@ impl ApiPrincipal {
     pub fn actor(&self) -> String {
         match self.kind {
             PrincipalKind::Key(_) => format!("key {}", self.name),
-            PrincipalKind::Relay => format!("relay {}", self.id),
+            PrincipalKind::Relay { .. } => format!("relay {}", self.id),
         }
     }
 
     /// Whether it is a relay.
     pub fn is_relay(&self) -> bool {
-        self.kind == PrincipalKind::Relay
+        matches!(self.kind, PrincipalKind::Relay { .. })
+    }
+
+    /// The relay session whose connection carried the request, for a relay's request on its
+    /// HTTP/2 connection.
+    pub fn session(&self) -> Option<u64> {
+        match self.kind {
+            PrincipalKind::Relay { session } => session,
+            PrincipalKind::Key(_) => None,
+        }
     }
 
     pub fn has(&self, scope: Scope) -> bool {
         match &self.kind {
             PrincipalKind::Key(row) => row.scopes.contains(&scope),
-            PrincipalKind::Relay => true,
+            PrincipalKind::Relay { .. } => true,
         }
     }
 

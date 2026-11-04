@@ -1,6 +1,7 @@
 //! The client API on the node listener (`vk_hub_proto::client`): an enrolled GitLab relay
-//! (`vk-gitlab`) signing each request with its key, or a client holding an API key in
-//! `authorization: Bearer`, requests and reserves capacity, submits jobs and follows them. Only
+//! (`vk-gitlab`) on the HTTP/2 connection its session authenticated, or signing each request
+//! with its key over HTTP/1.1, or a client holding an API key in `authorization: Bearer`,
+//! requests and reserves capacity, submits jobs and follows them. Only
 //! a relay submits GitLab jobs, each through the approval gate ([`Db::gate_job`]). This module
 //! handles HTTP paths, bodies, long polls, idempotent creates and error codes; [`crate::jobs`]
 //! handles the work.
@@ -142,6 +143,8 @@ fn instance(headers: &HeaderMap) -> Option<String> {
 /// Who a request says it comes from, checked as far as its headers go.
 pub enum Claimed {
     Key(ApiPrincipal),
+    /// A relay on the HTTP/2 connection its session authenticated.
+    Session(ApiPrincipal),
     /// A relay, its signature still to check against the body.
     Relay {
         principal: ApiPrincipal,
@@ -196,7 +199,7 @@ pub async fn authenticate(headers: &HeaderMap, hub: &Hub) -> Result<Claimed, Api
                 id: relay.to_string(),
                 name: row.hostname,
                 instance: None,
-                kind: PrincipalKind::Relay,
+                kind: PrincipalKind::Relay { session: None },
             },
             public_key,
             at,
@@ -248,7 +251,7 @@ pub async fn admit(
     };
     let body = read_body(&parts.headers, body, limit).await?;
     let principal = match claimed {
-        Claimed::Key(p) => p,
+        Claimed::Key(p) | Claimed::Session(p) => p,
         Claimed::Relay {
             principal,
             public_key,
@@ -288,6 +291,38 @@ pub async fn admit(
     })
 }
 
+/// Serve a request of `principal`, a relay, on the HTTP/2 connection its session
+/// authenticated: refused `forbidden` if it carries a key or a signature, as that
+/// connection serves its relay alone.
+pub async fn serve_relay(
+    req: Request<Incoming>,
+    hub: &Arc<Hub>,
+    principal: ApiPrincipal,
+) -> Response<Body> {
+    let headers = req.headers();
+    if [
+        AUTHORIZATION,
+        RELAY_HEADER,
+        vk_hub_proto::TIME_HEADER,
+        vk_hub_proto::SIGNATURE_HEADER,
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
+    {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "a relay's connection is authenticated by its session: a request on it carries no \
+             key or signature",
+        )
+        .response();
+    }
+    match admit(req, Claimed::Session(principal), None).await {
+        Ok(admitted) => serve(admitted, hub).await,
+        Err(e) => e.response(),
+    }
+}
+
 /// Serve an [`admit`]ted request.
 pub async fn serve(admitted: Admitted, hub: &Arc<Hub>) -> Response<Body> {
     let Admitted {
@@ -319,6 +354,12 @@ async fn route(
             StatusCode::FORBIDDEN,
             ErrorCode::Forbidden,
             "this key's scopes do not allow this request",
+        ));
+    }
+    // Version 5 tells a relay of changes instead of long polls: a stream held there is a bug.
+    if principal.session().is_some() && query_number(query, "wait")?.is_some() {
+        return Err(ApiError::invalid(
+            "a relay's connection does not long-poll: wait is refused",
         ));
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -528,6 +569,11 @@ async fn capacity(
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
     let (ask, _) = parse_json::<CapacityRequest>(body)?;
+    if principal.session().is_some() && ask.wait_secs > 0 {
+        return Err(ApiError::invalid(
+            "a relay's connection does not long-poll: wait_secs is refused",
+        ));
+    }
     check_placement(&ask.placement, principal)?;
     resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement, None).await?;
     let deadline = Instant::now() + wait_for(ask.wait_secs);

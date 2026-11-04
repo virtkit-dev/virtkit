@@ -232,9 +232,14 @@ const SECURE_COOKIE: &str = "__Host-vk-hub";
 pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
     let gate = ui.hub.handover.gate.clone();
-    crate::server::accept(listener, tls, permits, gate, move |io, peer, _, _| {
-        serve_conn(io, ui.clone(), peer)
-    })
+    crate::server::accept(
+        listener,
+        tls,
+        permits,
+        gate,
+        false,
+        move |io, peer, _, _, _| serve_conn(io, ui.clone(), peer),
+    )
     .await
 }
 

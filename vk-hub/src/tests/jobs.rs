@@ -34,6 +34,7 @@ mod capacity;
 mod capacity_placement;
 mod capacity_recovery;
 mod handover;
+mod relay_conn;
 
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };
@@ -91,6 +92,17 @@ async fn serve_undriven_with(
     lost_after: Duration,
     configure: impl FnOnce(Hub) -> Hub,
 ) -> (SocketAddr, Arc<Hub>) {
+    serve_undriven_on(db, dir, lost_after, configure, None).await
+}
+
+/// [`serve_undriven_with`]'s hub, over TLS with `tls`, else plain HTTP.
+async fn serve_undriven_on(
+    db: Arc<Db>,
+    dir: &std::path::Path,
+    lost_after: Duration,
+    configure: impl FnOnce(Hub) -> Hub,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     // Fake nodes share the test process: a stall under load does not mean a node went silent
@@ -104,7 +116,7 @@ async fn serve_undriven_with(
             .answering_offers_within(SLOW_OFFER),
     ));
     crate::jobs::recover(&hub).await.unwrap();
-    tokio::spawn(server::serve(listener, None, hub.clone()));
+    tokio::spawn(server::serve(listener, tls, hub.clone()));
     (addr, hub)
 }
 
@@ -336,28 +348,41 @@ fn relay_id(key: &str) -> &str {
 
 /// The headers authenticating a request as [`jobs_key`]'s relay or with an API key.
 fn auth_headers(key: &str, method: &str, path: &str, body: &[u8]) -> String {
-    let Some((id, seed)) = key.strip_prefix("relay:").and_then(|k| k.split_once(':')) else {
+    if !key.starts_with("relay:") {
         return format!("Authorization: Bearer {key}\r\n");
-    };
+    }
+    relay_headers(key, method, path, body, vk_hub_proto::Channel::Plaintext)
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect()
+}
+
+/// The headers [`jobs_key`]'s relay signs a request with, bound to `channel`.
+fn relay_headers(
+    key: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    channel: vk_hub_proto::Channel<'_>,
+) -> Vec<(&'static str, String)> {
+    let (id, seed) = key
+        .strip_prefix("relay:")
+        .and_then(|k| k.split_once(':'))
+        .unwrap();
     let seed: [u8; 32] = vk_hub_proto::from_hex_lower(seed).unwrap();
     let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
     let at = now_secs();
     let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(body).into();
-    let message = vk_hub_proto::client::client_request_message(
-        id,
-        method,
-        path,
-        &digest,
-        at,
-        vk_hub_proto::Channel::Plaintext,
-    );
-    let signature = vk_hub_proto::to_hex(pair.sign(&message).as_ref());
-    format!(
-        "{}: {id}\r\n{}: {at}\r\n{}: {signature}\r\n",
-        vk_hub_proto::client::RELAY_HEADER,
-        vk_hub_proto::TIME_HEADER,
-        vk_hub_proto::SIGNATURE_HEADER
-    )
+    let message =
+        vk_hub_proto::client::client_request_message(id, method, path, &digest, at, channel);
+    vec![
+        (vk_hub_proto::client::RELAY_HEADER, id.to_string()),
+        (vk_hub_proto::TIME_HEADER, at.to_string()),
+        (
+            vk_hub_proto::SIGNATURE_HEADER,
+            vk_hub_proto::to_hex(pair.sign(&message).as_ref()),
+        ),
+    ]
 }
 
 /// An answer to a client API request.
@@ -4038,6 +4063,33 @@ async fn client_connections_past_the_cap_are_told_to_retry() {
     let rows = hub.db.clients().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1.instance, "");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Client requests in flight past the hub's cap are told to retry, whatever connection carries
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_requests_past_the_cap_are_told_to_retry() {
+    let dir = scratch("client-request-cap");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = plain_key(&hub);
+    let ask = || Some(json!({"placement": placement()}));
+    let all = u32::try_from(server::MAX_CLIENT_REQUESTS).unwrap();
+    let held = hub
+        .client_requests
+        .clone()
+        .try_acquire_many_owned(all)
+        .unwrap();
+    let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
+    assert_eq!((resp.status, resp.code()), (503, ErrorCode::Unavailable));
+    assert_eq!(
+        resp.json::<vk_hub_proto::client::ClientError>()
+            .retry_after_secs,
+        Some(1)
+    );
+    drop(held);
+    let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

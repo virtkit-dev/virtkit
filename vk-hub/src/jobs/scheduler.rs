@@ -785,7 +785,15 @@ fn expire(state: &mut State, now: Instant, offer_timeout: Duration) -> bool {
         let Some(ticket) = state.tickets.get(&id) else {
             continue;
         };
-        let idle = now.duration_since(ticket.polled) >= TICKET_IDLE;
+        // One bound to its session is not polled while live: it ends with the session.
+        let idle = now.duration_since(ticket.polled) >= TICKET_IDLE
+            && !(ticket.bound
+                && matches!(
+                    ticket.phase,
+                    TicketPhase::Waiting
+                        | TicketPhase::Offering { .. }
+                        | TicketPhase::Granted { .. }
+                ));
         let offering = match &ticket.phase {
             TicketPhase::Offering { reservation, since } => Some((reservation.clone(), *since)),
             _ => None,

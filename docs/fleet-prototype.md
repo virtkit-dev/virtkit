@@ -1969,7 +1969,7 @@ which htmx's SSE extension (`sse-close`) stops reconnecting; a page asking for a
 cookie of a session that has ended is answered the same, rather than refused into retrying. A
 stream whose browser stops reading is given up on, and its connection dropped.
 
-Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
+Streams hold connections — the UI's listener speaks HTTP/1.1 only, one stream per connection —
 so at most 96 of its 128 are streams and at most 4 belong to one session — below the six a
 browser opens to one host, which every tab shares; past either a stream is refused with 429 or
 503, which the SSE extension retries with its backoff, doubling from half a second to 64

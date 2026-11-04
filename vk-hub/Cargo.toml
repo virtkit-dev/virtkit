@@ -19,7 +19,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 bytes.workspace = true
-hyper.workspace = true
+# `http2`: a relay's session and client API requests share one connection.
+hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
 # `process`: the `vk` commands local mode runs; `fs`: the release binaries streamed to nodes
@@ -50,6 +51,8 @@ vk-selfupdate = { path = "../vk-selfupdate" }
 
 [dev-dependencies]
 vk-oidc = { path = "../vk-oidc", features = ["fake-idp"] }
+# The tests' relay, on its one HTTP/2 connection.
+hyper = { workspace = true, features = ["client", "http2"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

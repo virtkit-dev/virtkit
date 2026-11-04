@@ -53,6 +53,14 @@ pub(crate) const RELAY_HTTP1: VersionRange = VersionRange {
     max: vk_hub_proto::gitlab::RUNNERS,
 };
 
+/// The version of a relay's session over its HTTP/2 connection: that one alone, so a relay there
+/// speaks version 5's notices instead of long polls, and one served unsigned has authenticated
+/// its connection.
+pub(crate) const RELAY_HTTP2: VersionRange = VersionRange {
+    min: vk_hub_proto::gitlab::CONNECTION,
+    max: vk_hub_proto::gitlab::CONNECTION,
+};
+
 /// What a node removed from the hub is told.
 const REMOVED: &str = "this node was removed from the hub";
 
@@ -65,7 +73,7 @@ pub async fn run(
     exported: Exported,
     permit: OwnedSemaphorePermit,
 ) {
-    let node = match handshake(&mut ws, &hub, exported, PeerKind::Node).await {
+    let node = match handshake(&mut ws, &hub, exported, PeerKind::Node, PROTOCOL).await {
         Ok(node) => node,
         Err(r) => return turn_away(&mut ws, peer, r).await,
     };
@@ -150,14 +158,6 @@ pub(crate) enum PeerKind {
 }
 
 impl PeerKind {
-    fn protocol(self) -> VersionRange {
-        match self {
-            PeerKind::Node => PROTOCOL,
-            PeerKind::Registry => vk_hub_proto::registry::PROTOCOL,
-            PeerKind::Relay => RELAY_HTTP1,
-        }
-    }
-
     fn noun(self) -> &'static str {
         match self {
             PeerKind::Node => "node",
@@ -211,13 +211,14 @@ impl<E: std::fmt::Display> From<E> for Refusal {
     }
 }
 
+/// Authenticate the `kind` of peer opening a session on `ws`, speaking `protocol_range`.
 pub(crate) async fn handshake(
     ws: &mut Ws,
     hub: &Hub,
     exported: Exported,
     kind: PeerKind,
+    protocol_range: VersionRange,
 ) -> Result<Peer, Refusal> {
-    let protocol_range = kind.protocol();
     let noun = kind.noun();
     let protocol = |e: anyhow::Error| Refusal {
         code: RefusalCode::Protocol,

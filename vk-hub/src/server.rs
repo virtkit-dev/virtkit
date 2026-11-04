@@ -15,10 +15,10 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, header};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
@@ -85,18 +85,44 @@ pub(crate) const MAX_PRE_AUTH: usize = 256;
 /// answered 503, to be retried.
 pub(crate) const MAX_DOWNLOADS: usize = 64;
 
-/// Client API connections at once, past their key's check. A `vk-gitlab` holds one per request
-/// in flight, most of them long polls: each running job keeps two open (its view's and its
-/// output's), so a daemon with a few hundred jobs needs about twice that many. An idle one costs a
-/// descriptor, a task, and a TLS session with its buffers. The cap is shared by every key, not
-/// counted per key. One past it is answered `unavailable`.
+/// Client API connections over HTTP/1.1 at once, past their key's check. A client holds one
+/// per request in flight, most of them long polls: a relay at 2 to 4 two per running job, its
+/// view's and its output's. An idle one costs a descriptor, a task, and a TLS session with its
+/// buffers. The cap is shared by every key, not counted per key. One
+/// past it is answered `unavailable`. A relay's HTTP/2 connection is not counted: it lives as
+/// long as the relay's session, one per relay.
 pub(crate) const MAX_CLIENT_CONNS: usize = 1024;
 
-/// How long a client API connection may stay open. It then finishes the request it is serving
-/// — a long poll at most, within [`CLIENT_DRAIN`] — and closes, and the client dials again.
+/// Client API requests in flight at once, over every connection: a relay's HTTP/2 connection
+/// carries up to [`MAX_CLIENT_STREAMS`], which the connections' cap alone would not bound.
+/// Shared by every key and relay; one past it is answered `unavailable`.
+pub(crate) const MAX_CLIENT_REQUESTS: usize = 4096;
+
+/// Requests at once on a relay's HTTP/2 connection, its session's stream included. A relay
+/// long-polls nothing there, so it keeps far fewer in flight. Past it, its next request waits
+/// for one to end.
+const MAX_CLIENT_STREAMS: u32 = 512;
+
+/// The headers an HTTP/2 request may carry: a client API request's are well within it.
+const MAX_H2_HEADER_LIST: u32 = 8 * 1024;
+
+/// A relay's HTTP/2 connection window, raised from hyper's 1 MiB: room for several
+/// submissions' bodies (576 KiB at most each), so its session's stream is never starved of
+/// window by them.
+const H2_CONNECTION_WINDOW: u32 = 4 << 20;
+
+/// How often an idle HTTP/2 connection is pinged.
+const H2_PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long a relay has to answer a ping before its HTTP/2 connection is closed as dead.
+const H2_PING_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a client API connection over HTTP/1.1 may stay open past its first three
+/// [`PRE_AUTH_TIMEOUT`]s. It then finishes the request it is serving — a long poll at most,
+/// within [`CLIENT_DRAIN`] — and closes, and the client dials again.
 const CLIENT_LIFETIME: Duration = Duration::from_secs(600);
 
-/// How long a client connection asked to close has to finish its request.
+/// How long a client connection asked to close has to finish its requests.
 const CLIENT_DRAIN: Duration = Duration::from_secs(120);
 
 /// What every connection shares: the database, the sessions currently open, and the bounds
@@ -148,6 +174,8 @@ pub struct Hub {
     sessions: watch::Sender<u64>,
     /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
     pub(crate) client_conns: Arc<Semaphore>,
+    /// Permits for client API requests in flight ([`MAX_CLIENT_REQUESTS`]).
+    pub(crate) client_requests: Arc<Semaphore>,
     /// The client instances heard from.
     pub(crate) instances: crate::clients::Instances,
     /// Bumped by [`Hub::clients_changed`] alone, for the keys', servers' and relays' pages (not
@@ -240,6 +268,7 @@ impl Hub {
             egress: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
             client_conns: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
+            client_requests: Arc::new(Semaphore::new(MAX_CLIENT_REQUESTS)),
             instances: crate::clients::Instances::default(),
             client_changes: watch::Sender::new(0),
             server_changes: watch::Sender::new(0),
@@ -709,24 +738,67 @@ pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, hub: Arc<Hub
         tls,
         permits,
         gate,
-        move |io, peer, exported, permit| serve_conn(io, hub.clone(), peer, exported, permit),
+        true,
+        move |io, peer, exported, permit, http| {
+            serve_conn(io, hub.clone(), peer, exported, permit, http)
+        },
     )
     .await
+}
+
+/// The HTTP a connection speaks: HTTP/1.1, or HTTP/2 for a relay's connection, negotiated as
+/// [`gitlab::ALPN`] over TLS or told by its preface over plain TCP.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Http {
+    V1,
+    V2,
+}
+
+/// HTTP/2's connection preface (RFC 9113 §3.4), which no HTTP/1.1 request starts with.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Whether a plain connection opens with HTTP/2's preface (h2c with prior knowledge), told from
+/// its first bytes without consuming them. `None` for one closed, failed or too slow to say.
+async fn h2c_preface(stream: &tokio::net::TcpStream) -> Option<bool> {
+    let peek = async {
+        let mut buf = [0u8; H2_PREFACE.len()];
+        loop {
+            let n = stream.peek(&mut buf).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            if !H2_PREFACE.starts_with(buf.get(..n)?) {
+                return Some(false);
+            }
+            if n == H2_PREFACE.len() {
+                return Some(true);
+            }
+            // Part of the preface came: wait for the rest, which a peek does not.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(PRE_AUTH_TIMEOUT, peek)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Accept on `listener` until the process ends, while `gate` is open: closed, connections wait
 /// in the listener's backlog. Complete any TLS handshake within [`PRE_AUTH_TIMEOUT`] before
 /// calling `conn`, holding a permit for the connection's lifetime unless `conn` gives it up
-/// ([`PreAuth`]). Close excess connections immediately.
+/// ([`PreAuth`]), and telling it whether it speaks HTTP/2: over TLS when it negotiated
+/// [`gitlab::ALPN`], and over plain TCP, with `h2c`, when it opens with HTTP/2's preface.
+/// Close excess connections immediately.
 pub(crate) async fn accept<F, Fut>(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     permits: Arc<Semaphore>,
     gate: vk_peer::handoff::Gate,
+    h2c: bool,
     conn: F,
 ) -> Result<()>
 where
-    F: Fn(Io, SocketAddr, Exported, PreAuth) -> Fut + Send + Sync + 'static,
+    F: Fn(Io, SocketAddr, Exported, PreAuth, Http) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let conn = Arc::new(conn);
@@ -765,16 +837,31 @@ where
                                 eprintln!("vk-hub: {peer}: exporting TLS keying material: {e}");
                                 return;
                             }
+                            let http = if stream.get_ref().1.alpn_protocol() == Some(gitlab::ALPN) {
+                                Http::V2
+                            } else {
+                                Http::V1
+                            };
                             let io: Box<dyn Stream> = Box::new(stream);
-                            conn(TokioIo::new(io), peer, Some(exported), permit.clone()).await;
+                            conn(TokioIo::new(io), peer, Some(exported), permit.clone(), http)
+                                .await;
                         }
                         Ok(Err(e)) => eprintln!("vk-hub: {peer}: TLS handshake error: {e}"),
                         Err(_) => eprintln!("vk-hub: {peer}: TLS handshake timed out"),
                     }
                 }
                 None => {
+                    let http = if !h2c {
+                        Http::V1
+                    } else {
+                        match h2c_preface(&stream).await {
+                            Some(true) => Http::V2,
+                            Some(false) => Http::V1,
+                            None => return,
+                        }
+                    };
                     let io: Box<dyn Stream> = Box::new(stream);
-                    conn(TokioIo::new(io), peer, None, permit.clone()).await;
+                    conn(TokioIo::new(io), peer, None, permit.clone(), http).await;
                 }
             }
             drop(permit);
@@ -782,13 +869,117 @@ where
     }
 }
 
-/// What a connection's requests share: whether it serves a download, its [`PreAuth`], and
-/// once a client API key was checked on it, its place among the clients'.
+/// What a connection's requests share: whether it serves a download, its [`PreAuth`], its place
+/// among the clients' once a client API key was checked on it, and, for a relay's HTTP/2
+/// connection, what it is to that relay.
 #[derive(Clone)]
 struct ConnState {
     downloading: Arc<AtomicBool>,
     permit: PreAuth,
     client: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    relay: Option<RelayConn>,
+}
+
+/// What a relay's HTTP/2 connection is to its relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Binding {
+    /// Nothing yet: it serves its relay's session alone.
+    Fresh,
+    /// Its session is in its handshake.
+    Opening,
+    /// Its session's, marked before the welcome: it serves that relay's requests while the
+    /// session is current.
+    Bound {
+        relay: String,
+        hostname: String,
+        session: u64,
+    },
+    /// Its session ended: it serves nothing new and closes.
+    Ended,
+}
+
+/// A relay's HTTP/2 connection, shared by its requests and its session: the session
+/// authenticates the connection, which then lives as long as the session.
+#[derive(Clone)]
+pub(crate) struct RelayConn(Arc<RelayConnInner>);
+
+struct RelayConnInner {
+    binding: watch::Sender<Binding>,
+    /// The connection's place among the unauthenticated ones, given up once it is bound.
+    permit: PreAuth,
+}
+
+impl RelayConn {
+    fn new(permit: PreAuth) -> Self {
+        RelayConn(Arc::new(RelayConnInner {
+            binding: watch::Sender::new(Binding::Fresh),
+            permit,
+        }))
+    }
+
+    fn binding(&self) -> Binding {
+        self.0.binding.borrow().clone()
+    }
+
+    /// Take the connection for its session: whether it had none.
+    fn open(&self) -> bool {
+        self.0.binding.send_if_modified(|b| {
+            let fresh = *b == Binding::Fresh;
+            if fresh {
+                *b = Binding::Opening;
+            }
+            fresh
+        })
+    }
+
+    /// Mark the connection as relay `relay`'s, of session `session`: its requests are served as
+    /// that relay's from now on, and it no longer counts among the unauthenticated.
+    pub(crate) fn bind(&self, relay: &str, hostname: &str, session: u64) {
+        let bound = self.0.binding.send_if_modified(|b| {
+            let opening = *b == Binding::Opening;
+            if opening {
+                *b = Binding::Bound {
+                    relay: relay.to_string(),
+                    hostname: hostname.to_string(),
+                    session,
+                };
+            }
+            opening
+        });
+        if bound {
+            drop(
+                self.0
+                    .permit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+        }
+    }
+
+    /// End the connection with its session: it takes no new request, and closes once those
+    /// accepted are answered.
+    pub(crate) fn end(&self) {
+        self.0.binding.send_replace(Binding::Ended);
+    }
+
+    /// Once the session has ended.
+    async fn ended(&self) {
+        let mut rx = self.0.binding.subscribe();
+        // The sender lives as long as `self`, so this cannot fail.
+        let _ = rx.wait_for(|b| *b == Binding::Ended).await;
+    }
+}
+
+/// Ends a relay's connection when dropped, however its session task ends.
+struct EndsConn(Option<RelayConn>);
+
+impl Drop for EndsConn {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.end();
+        }
+    }
 }
 
 impl ConnState {
@@ -822,11 +1013,20 @@ impl ConnState {
     }
 }
 
-async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported, permit: PreAuth) {
+async fn serve_conn(
+    io: Io,
+    hub: Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    permit: PreAuth,
+    http: Http,
+) {
+    let relay = (http == Http::V2).then(|| RelayConn::new(permit.clone()));
     let state = ConnState {
         downloading: Arc::new(AtomicBool::new(false)),
         permit,
         client: Arc::new(Mutex::new(None)),
+        relay: relay.clone(),
     };
     let downloading = state.downloading.clone();
     let conn_state = state.clone();
@@ -839,30 +1039,60 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
             handle(req, hub.clone(), peer, exported, state.clone())
         })
     };
-    // `with_upgrades`: a WebSocket is an HTTP/1.1 upgrade, handed over once the 101 is out,
-    // which is also when this future ends. The header timeout needs the timer — without one
-    // hyper quietly applies none. The connection as a whole is bounded too: a node makes one
-    // request on it, an enrollment, an upgrade or a download, so one kept idle is only one
-    // held open. An authenticated download gets [`DOWNLOAD_TIMEOUT`] more, and a client
-    // whose key was checked [`CLIENT_LIFETIME`]; between its requests, the header timeout
-    // closes one left idle.
-    // Asked to end, after the request it serves or the first it makes, when the hub hands over
-    // to a release.
-    let mut conn = hub_gate.serve(
-        http1::Builder::new()
+    // Asked to end, after the requests it serves or the first it makes, when the hub hands
+    // over to a release.
+    if let Some(relay) = relay {
+        // A relay's session, as a WebSocket over the extended CONNECT (RFC 8441), and its
+        // client API requests beside it. Pings find a relay gone; graceful shutdown lets the
+        // requests in flight end.
+        let mut builder = http2::Builder::new(TokioExecutor::new());
+        builder
             .timer(TokioTimer::new())
-            .header_read_timeout(PRE_AUTH_TIMEOUT)
-            .serve_connection(io, svc)
-            .with_upgrades(),
-        started,
-        |c| c.graceful_shutdown(),
-    );
+            .enable_connect_protocol()
+            .max_concurrent_streams(MAX_CLIENT_STREAMS)
+            .max_header_list_size(MAX_H2_HEADER_LIST)
+            .initial_connection_window_size(H2_CONNECTION_WINDOW)
+            .keep_alive_interval(Some(H2_PING_INTERVAL))
+            .keep_alive_timeout(H2_PING_TIMEOUT);
+        let conn = hub_gate.serve(builder.serve_connection(io, svc), started, |c| {
+            c.graceful_shutdown()
+        });
+        drive_relay(conn, peer, &relay).await;
+    } else {
+        // `with_upgrades`: a WebSocket is an HTTP/1.1 upgrade, handed over once the 101 is
+        // out, which is also when this future ends. The header timeout needs the timer: hyper
+        // panics on one set without it. Between a client's requests, it closes one left idle.
+        let conn = hub_gate.serve(
+            http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(PRE_AUTH_TIMEOUT)
+                .serve_connection(io, svc)
+                .with_upgrades(),
+            started,
+            |c| c.graceful_shutdown(),
+        );
+        drive(conn, peer, &downloading, &conn_state).await;
+    }
+}
+
+/// Serve an HTTP/1.1 connection to its end, bounded: a node makes one request on it, an
+/// enrollment, an upgrade or a download, so one kept idle is only one held open. An
+/// authenticated download gets [`DOWNLOAD_TIMEOUT`] more, and a client whose key was checked
+/// [`CLIENT_LIFETIME`].
+async fn drive<C>(
+    mut conn: vk_peer::handoff::Graceful<C>,
+    peer: SocketAddr,
+    downloading: &AtomicBool,
+    state: &ConnState,
+) where
+    C: std::future::Future<Output = hyper::Result<()>>,
+{
     let ended = match tokio::time::timeout(PRE_AUTH_TIMEOUT * 3, &mut conn).await {
         Ok(ended) => Some(ended),
         Err(_) if downloading.load(Ordering::Relaxed) => {
             tokio::time::timeout(DOWNLOAD_TIMEOUT, conn).await.ok()
         }
-        Err(_) if conn_state.is_client() => {
+        Err(_) if state.is_client() => {
             match tokio::time::timeout(CLIENT_LIFETIME, &mut conn).await {
                 Ok(ended) => Some(ended),
                 Err(_) => {
@@ -875,9 +1105,44 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
     };
     match ended {
         // A client's connection left idle between its requests, closed as intended.
-        Some(Err(e)) if e.is_timeout() && conn_state.is_client() => {}
+        Some(Err(e)) if e.is_timeout() && state.is_client() => {}
         Some(Err(e)) => eprintln!("vk-hub: {peer}: connection error: {e}"),
         _ => {}
+    }
+}
+
+/// Serve a relay's HTTP/2 connection to its end: dropped unless its session is up within three
+/// [`PRE_AUTH_TIMEOUT`]s, as an HTTP/1.1 connection is, then served as long as the session
+/// lasts. Once it ends, the connection takes no new request (GOAWAY) and closes when those
+/// accepted are answered, within [`CLIENT_DRAIN`]. A relay that stopped answering pings is
+/// logged: it vanished.
+async fn drive_relay<C>(
+    mut conn: vk_peer::handoff::Graceful<C>,
+    peer: SocketAddr,
+    relay: &RelayConn,
+) where
+    C: std::future::Future<Output = hyper::Result<()>>,
+{
+    let unbound = tokio::time::sleep(PRE_AUTH_TIMEOUT * 3);
+    tokio::pin!(unbound);
+    let mut waiting = true;
+    let ended = loop {
+        tokio::select! {
+            ended = &mut conn => break Some(ended),
+            () = &mut unbound, if waiting => {
+                if matches!(relay.binding(), Binding::Fresh | Binding::Opening) {
+                    break None;
+                }
+                waiting = false;
+            }
+            () = relay.ended() => {
+                conn.shut_down();
+                break tokio::time::timeout(CLIENT_DRAIN, conn).await.ok();
+            }
+        }
+    };
+    if let Some(Err(e)) = ended {
+        eprintln!("vk-hub: {peer}: relay connection error: {e}");
     }
 }
 
@@ -888,6 +1153,9 @@ async fn handle(
     exported: Exported,
     state: ConnState,
 ) -> Result<Response<Body>, Infallible> {
+    if let Some(relay) = &state.relay {
+        return Ok(relay_request(req, &hub, peer, exported, relay).await);
+    }
     let resp = match (req.method(), req.uri().path()) {
         (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Node).await,
         (&Method::POST, registry::ENROLL_PATH) => enroll(req, &hub, peer, PeerKind::Registry).await,
@@ -939,11 +1207,14 @@ async fn client(
     exported: Exported,
     state: &ConnState,
 ) -> Response<Body> {
+    let Ok(_in_flight) = hub.client_requests.try_acquire() else {
+        return unavailable("too many client requests");
+    };
     let claimed = match crate::client::authenticate(req.headers(), hub).await {
         Ok(c) => c,
         Err(e) => return e.response(),
     };
-    let hello =
+    let describes =
         req.method() == Method::POST && req.uri().path() == vk_hub_proto::client::CLIENTS_PATH;
     // Under the connection's unauthenticated permit until a relay's signature checks.
     let admitted = match crate::client::admit(req, claimed, exported).await {
@@ -951,21 +1222,83 @@ async fn client(
         Err(e) => return e.response(),
     };
     if !state.claim_client(hub) {
-        return crate::client::ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            vk_hub_proto::client::ErrorCode::Unavailable,
-            "too many client connections",
-        )
-        .retry_after(1)
-        .response();
+        return unavailable("too many client connections");
     }
-    // A hello naming no instance in its header is recorded under the one its body names. A
-    // relay's contacts are its session's.
+    // An instance's description naming no instance in its header is recorded under the one
+    // its body names. A relay's contacts are its session's.
     let principal = &admitted.principal;
-    if !principal.is_relay() && (principal.instance.is_some() || !hello) {
+    if !principal.is_relay() && (principal.instance.is_some() || !describes) {
         crate::clients::seen(hub, principal, crate::now_secs());
     }
     crate::client::serve(admitted, hub).await
+}
+
+/// A client API answer `unavailable`, to be retried in a second.
+fn unavailable(what: &str) -> Response<Body> {
+    crate::client::ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        vk_hub_proto::client::ErrorCode::Unavailable,
+        what,
+    )
+    .retry_after(1)
+    .response()
+}
+
+/// A client API answer `forbidden`.
+fn forbidden(what: &str) -> Response<Body> {
+    crate::client::ApiError::new(
+        StatusCode::FORBIDDEN,
+        vk_hub_proto::client::ErrorCode::Forbidden,
+        what,
+    )
+    .response()
+}
+
+/// A request on a relay's HTTP/2 connection: before its session, that session's `CONNECT`
+/// alone; once the session marked it, that relay's client API requests, unsigned, while the
+/// session is current; once the session ended, nothing.
+async fn relay_request(
+    req: Request<Incoming>,
+    hub: &Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    relay: &RelayConn,
+) -> Response<Body> {
+    let connect = req.method() == Method::CONNECT;
+    match relay.binding() {
+        Binding::Fresh if connect && req.uri().path() == gitlab::SESSION_PATH => {
+            connect_session(req, hub, peer, exported, relay)
+        }
+        Binding::Fresh | Binding::Opening => {
+            forbidden("this connection serves its relay's session before anything else")
+        }
+        _ if connect => forbidden("a connection carries one session"),
+        Binding::Ended => unavailable("this connection's session has ended: dial again"),
+        Binding::Bound {
+            relay: id,
+            hostname,
+            session,
+        } => {
+            if !hub.is_current(&id, session) {
+                return unavailable("this connection's session has ended: dial again");
+            }
+            if !crate::client::is_client_path(req.uri().path()) {
+                return forbidden("this connection serves its relay's client API requests alone");
+            }
+            let Ok(_in_flight) = hub.client_requests.try_acquire() else {
+                return unavailable("too many client requests");
+            };
+            let principal = crate::store::ApiPrincipal {
+                id,
+                name: hostname,
+                instance: None,
+                kind: crate::store::PrincipalKind::Relay {
+                    session: Some(session),
+                },
+            };
+            crate::client::serve_relay(req, hub, principal).await
+        }
+    }
 }
 
 /// `POST /v1/enroll`: check the node's proof of its key, then spend the token on it.
@@ -1517,27 +1850,7 @@ fn upgrade(
             "too many handshakes in progress",
         );
     };
-    let on_upgrade = hyper::upgrade::on(&mut req);
-    tokio::spawn(async move {
-        let upgraded = match on_upgrade.await {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("vk-hub: {peer}: WebSocket upgrade failed: {e}");
-                return;
-            }
-        };
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(vk_hub_proto::MAX_MESSAGE))
-            .max_frame_size(Some(vk_hub_proto::MAX_MESSAGE));
-        let ws =
-            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config))
-                .await;
-        match kind {
-            PeerKind::Node => crate::session::run(ws, hub, peer, exported, permit).await,
-            PeerKind::Registry => crate::registries::run(ws, hub, peer, exported, permit).await,
-            PeerKind::Relay => crate::relays::run(ws, hub, peer, exported, permit).await,
-        }
-    });
+    run_session(&mut req, hub, peer, exported, kind, permit, None);
     let mut resp = Response::new(full(Bytes::new()));
     *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     let h = resp.headers_mut();
@@ -1558,6 +1871,94 @@ fn upgrade(
         // unwrapped all the same.
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     }
+}
+
+/// A relay's `CONNECT` of its session on its HTTP/2 connection, a WebSocket over the extended
+/// CONNECT (RFC 8441): answered 200, and the session run on the stream it opened as on an
+/// HTTP/1.1 upgrade's. It takes a handshake permit as an upgrade does, and the connection,
+/// which carries one session.
+fn connect_session(
+    mut req: Request<Incoming>,
+    hub: &Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    relay: &RelayConn,
+) -> Response<Body> {
+    let websocket = req
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"));
+    if !websocket {
+        return error(StatusCode::BAD_REQUEST, "a session is a WebSocket CONNECT");
+    }
+    if req
+        .headers()
+        .get(header::SEC_WEBSOCKET_VERSION)
+        .is_none_or(|v| v != "13")
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "only WebSocket version 13 is spoken",
+        );
+    }
+    let Ok(permit) = hub.handshakes.clone().try_acquire_owned() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many handshakes in progress",
+        );
+    };
+    if !relay.open() {
+        return forbidden("a connection carries one session");
+    }
+    run_session(
+        &mut req,
+        hub.clone(),
+        peer,
+        exported,
+        PeerKind::Relay,
+        permit,
+        Some(relay.clone()),
+    );
+    let mut resp = Response::new(full(Bytes::new()));
+    *resp.status_mut() = StatusCode::OK;
+    resp
+}
+
+/// Once `req`'s upgrade is under way, run the `kind` of session on it. `relay` is the HTTP/2
+/// connection the session's stream belongs to, ended with the session.
+fn run_session(
+    req: &mut Request<Incoming>,
+    hub: Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    kind: PeerKind,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    relay: Option<RelayConn>,
+) {
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let ends = EndsConn(relay);
+        let upgraded = match on_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("vk-hub: {peer}: WebSocket upgrade failed: {e}");
+                return;
+            }
+        };
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(vk_hub_proto::MAX_MESSAGE))
+            .max_frame_size(Some(vk_hub_proto::MAX_MESSAGE));
+        let ws =
+            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config))
+                .await;
+        match kind {
+            PeerKind::Node => crate::session::run(ws, hub, peer, exported, permit).await,
+            PeerKind::Registry => crate::registries::run(ws, hub, peer, exported, permit).await,
+            PeerKind::Relay => {
+                crate::relays::run(ws, hub, peer, exported, permit, ends.0.clone()).await
+            }
+        }
+    });
 }
 
 fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response<Body> {

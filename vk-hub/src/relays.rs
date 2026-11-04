@@ -14,6 +14,11 @@
 //! `runners`, at version [`RUNNERS`](vk_hub_proto::gitlab::RUNNERS) or later. An added runner's
 //! token stays in memory, never stored, until the relay answers: a hub restarted before then
 //! has lost it, and fails the add `token_lost` at the relay's next first report.
+//!
+//! A relay at version [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION) holds its session on
+//! its HTTP/2 connection, which the session authenticates for the relay's client API requests
+//! and which ends with it. Every relay session is closed when the hub hands over to a release,
+//! so that such a connection drains rather than holds the hand-over.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -34,8 +39,12 @@ use vk_hub_proto::gitlab::{
 };
 use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
-use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
-use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
+use crate::server::{
+    Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach, RelayConn,
+};
+use crate::session::{
+    HANDSHAKE_STEP, Peer, PeerKind, RELAY_HTTP1, RELAY_HTTP2, Refusal, Ws, turn_away,
+};
 use crate::store::{
     NotEnrolled, Program, RelayCommandRow, RelayRow, RelayWrite, Release, normalize_gitlab_url,
 };
@@ -49,20 +58,30 @@ const REMOVED: &str = "this relay was removed from the hub";
 /// What a relay superseded by a newer session of its own is told.
 const SUPERSEDED: &str = "superseded by a newer session of this relay";
 
-/// Run a relay's session on `ws` to its end, logging why it ended.
-pub async fn run(
+/// Run a relay's session on `ws` to its end, logging why it ended. `conn` is the relay's
+/// HTTP/2 connection the session's stream belongs to, which the session marks as the relay's
+/// before its welcome; `None` for a session over HTTP/1.1.
+pub(crate) async fn run(
     mut ws: Ws,
     hub: Arc<Hub>,
     peer: SocketAddr,
     exported: Exported,
     permit: OwnedSemaphorePermit,
+    conn: Option<RelayConn>,
 ) {
-    let relay = match crate::session::handshake(&mut ws, &hub, exported, PeerKind::Relay).await {
+    let versions = if conn.is_some() {
+        RELAY_HTTP2
+    } else {
+        RELAY_HTTP1
+    };
+    let handshake =
+        crate::session::handshake(&mut ws, &hub, exported, PeerKind::Relay, versions).await;
+    let relay = match handshake {
         Ok(r) => r,
         Err(r) => return turn_away(&mut ws, peer, r).await,
     };
     let (session, ending) = hub.open_session(&relay.id);
-    let welcomed = welcome(&mut ws, &hub, &relay, session).await;
+    let welcomed = welcome(&mut ws, &hub, &relay, session, conn.as_ref()).await;
     drop(permit);
     if let Err(r) = welcomed {
         hub.close_session(&relay.id, session);
@@ -70,8 +89,8 @@ pub async fn run(
         return turn_away(&mut ws, peer, r).await;
     }
     eprintln!(
-        "vk-hub: {peer}: relay {} ({}) connected",
-        relay.id, relay.hostname
+        "vk-hub: {peer}: relay {} ({}) connected at protocol version {}",
+        relay.id, relay.hostname, relay.version
     );
     hub.changed(&relay.id);
     hub.clients_changed();
@@ -92,8 +111,16 @@ pub async fn run(
     }
 }
 
-/// Record the session and welcome the relay, unless it was removed or superseded.
-async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, relay: &Peer, session: u64) -> Result<(), Refusal> {
+/// Record the session and welcome the relay, unless it was removed or superseded. Once
+/// recorded, and before the welcome, mark `conn`, the relay's HTTP/2 connection, as the
+/// session's.
+async fn welcome(
+    ws: &mut Ws,
+    hub: &Arc<Hub>,
+    relay: &Peer,
+    session: u64,
+    conn: Option<&RelayConn>,
+) -> Result<(), Refusal> {
     let (db, live) = (hub.db.clone(), hub.clone());
     let (id, incarnation, version) = (relay.id.clone(), relay.incarnation.clone(), relay.version);
     let recorded = tokio::task::spawn_blocking(move || {
@@ -107,6 +134,9 @@ async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, relay: &Peer, session: u64) -> Res
         Ok(false) => return Err(Refusal::new(RefusalCode::Superseded, SUPERSEDED)),
         Err(e) if e.is::<NotEnrolled>() => return Err(Refusal::new(RefusalCode::Revoked, REMOVED)),
         Err(e) => return Err(e.into()),
+    }
+    if let Some(conn) = conn {
+        conn.bind(&relay.id, &relay.hostname, session);
     }
     let text = serde_json::to_string(&HubMsg::Welcome {
         heartbeat_secs: HEARTBEAT_SECS,
@@ -134,8 +164,17 @@ async fn serve(
         version: relay.version,
         ..Steer::default()
     };
+    let handover = hub.handover.gate.closing();
+    tokio::pin!(handover);
     loop {
         tokio::select! {
+            () = &mut handover => {
+                // The relay redials into the listener's backlog, which the release accepts.
+                // Best effort, bounded: a relay that does not read the close is cut with the
+                // rest.
+                let _ = tokio::time::timeout(HANDSHAKE_STEP, ws.close(None)).await;
+                return Ok("closed for the hub's hand-over");
+            }
             () = ending.notify.notified() => {
                 let (code, reason, why) = if ending.revoked.load(Ordering::Relaxed) {
                     (RefusalCode::Revoked, REMOVED, "removed")
