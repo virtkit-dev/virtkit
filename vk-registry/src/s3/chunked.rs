@@ -40,15 +40,6 @@ const TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
 /// The SHA-256 of nothing, which a chunk's string to sign carries where a header hash would be.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// The checksums a trailer may carry, as `x-amz-trailer` names them.
-pub(crate) const CHECKSUMS: [&str; 5] = [
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-crc64nvme",
-];
-
 /// How a chunked body is framed and signed, from its `x-amz-content-sha256`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -90,7 +81,8 @@ pub(crate) struct Framing {
     pub(crate) mode: Mode,
     /// `x-amz-decoded-content-length`: exactly how many bytes the chunks hold
     pub(crate) declared: u64,
-    /// the checksum `x-amz-trailer` announced, one of [`CHECKSUMS`]
+    /// the checksum `x-amz-trailer` announced, the header of one of
+    /// [`super::checksum::ALGORITHMS`]
     pub(crate) trailer: Option<&'static str>,
 }
 

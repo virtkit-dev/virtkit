@@ -18,11 +18,11 @@ use hyper::header::{
     CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED,
 };
 use hyper::{Request, Response, StatusCode};
-use sha1::Digest as _;
+use sha2::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::range::{self, Range};
-use super::{Ctx, UNCOMPRESSED_FROM, chunked, drain, meta, refuse, xml};
+use super::{Ctx, UNCOMPRESSED_FROM, checksum, chunked, drain, meta, refuse, xml};
 use crate::dav::http_date;
 use crate::files::{
     self, Commit, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed, object_of,
@@ -33,7 +33,8 @@ use crate::{Authz, Body, ServerState, Store, accounts, body_of};
 /// The header asking a read for the object's checksum.
 const CHECKSUM_MODE: &str = "x-amz-checksum-mode";
 
-/// The checksum a read answers with, when asked: the SHA-256 the store names the bytes by.
+/// The checksum a read answers with, when asked, for an object whose write kept none: the
+/// SHA-256 the store names the bytes by.
 const CHECKSUM_SHA256: &str = "x-amz-checksum-sha256";
 
 /// Whether this caller may `action` on the key at `segs` or on its parent: what admits a
@@ -207,11 +208,14 @@ pub(super) async fn get(
         // The whole object's checksum, on the whole object only: S3 sends none with a part,
         // and the AWS CLI checks what it is sent against the bytes of each part it fetches.
         if checksum && !partial {
-            insert(
-                headers,
-                hyper::header::HeaderName::from_static(CHECKSUM_SHA256),
-                &sha256_base64(&obj.layer),
-            );
+            match checksum::stored(&obj.annotations) {
+                Some(kept) => headers.extend(kept.headers()),
+                None => insert(
+                    headers,
+                    hyper::header::HeaderName::from_static(CHECKSUM_SHA256),
+                    &sha256_base64(&obj.layer),
+                ),
+            }
         }
         for (name, value) in meta::headers(&obj.annotations) {
             headers.append(name, value);
@@ -273,10 +277,11 @@ pub(super) async fn attributes(
             ));
         }
         if has("Checksum") {
-            inner.push_str(&format!(
-                "<Checksum>{}</Checksum>",
-                xml::element("ChecksumSHA256", &sha256_base64(&obj.layer))
-            ));
+            let kept = match checksum::stored(&obj.annotations) {
+                Some(kept) => kept.elements(),
+                None => xml::element("ChecksumSHA256", &sha256_base64(&obj.layer)),
+            };
+            inner.push_str(&format!("<Checksum>{kept}</Checksum>"));
         }
         if has("StorageClass") {
             inner.push_str(&xml::element("StorageClass", "STANDARD"));
@@ -331,12 +336,24 @@ const DECODED_LENGTH: &str = "x-amz-decoded-content-length";
 #[derive(Default)]
 struct Expected {
     md5: Option<Vec<u8>>,
-    sha256: Option<Vec<u8>>,
-    sha1: Option<Vec<u8>>,
-    crc32: Option<Vec<u8>>,
-    /// the `x-amz-checksum-*` headers to echo once they held
-    echo: Vec<(&'static str, String)>,
+    /// the one `x-amz-checksum-*` it carries, as a header or in the trailer
+    checksum: Option<Claim>,
 }
+
+/// An `x-amz-checksum-*` a request carries: its header, its text (to echo and keep once it
+/// held) and the bytes the text decodes to.
+struct Claim {
+    header: &'static str,
+    text: String,
+    bytes: Vec<u8>,
+}
+
+/// The refusal of a second `x-amz-checksum-*`, as S3 words it.
+const ONE_CHECKSUM: Refused = (
+    StatusCode::BAD_REQUEST,
+    "InvalidRequest",
+    "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+);
 
 /// What a PutObject's headers ask that cannot be served, or are malformed: a status, a code
 /// and a message.
@@ -422,10 +439,21 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
         }
         Some(v) => {
             let name = v.to_str().unwrap_or_default().trim();
-            let known = chunked::CHECKSUMS
+            let known = checksum::ALGORITHMS
                 .into_iter()
+                .map(|(header, _, _)| header)
                 .find(|c| c.eq_ignore_ascii_case(name));
-            Some(known.ok_or(invalid("x-amz-trailer names one x-amz-checksum header"))?)
+            match known {
+                Some(header) => Some(header),
+                None if !name.contains(',')
+                    && name
+                        .to_ascii_lowercase()
+                        .starts_with(checksum::HEADER_PREFIX) =>
+                {
+                    return Err(checksum::NOT_COMPUTED);
+                }
+                None => return Err(invalid("x-amz-trailer names one x-amz-checksum header")),
+            }
         }
     };
     Ok(Payload {
@@ -436,16 +464,6 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
             trailer,
         }),
     })
-}
-
-/// How many bytes the checksum a header or trailer `name`s is.
-fn checksum_len(name: &str) -> usize {
-    match name {
-        "x-amz-checksum-sha256" => 32,
-        "x-amz-checksum-sha1" => 20,
-        "x-amz-checksum-crc64nvme" => 8,
-        _ => 4,
-    }
 }
 
 /// Header `name`'s text and the bytes it decodes to from base64, `len` of them: `Ok(None)`
@@ -477,16 +495,18 @@ fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refu
     Ok(md5.map(|(_, b)| b))
 }
 
+/// What a request's headers ask to be checked: its `Content-MD5` and the one
+/// `x-amz-checksum-*` it carries, in an algorithm computed here; a second one is refused as
+/// S3 refuses it, and one in another algorithm as not implemented.
 fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
+    if checksum::not_computed(headers) {
+        return Err(checksum::NOT_COMPUTED);
+    }
     let mut out = Expected {
         md5: content_md5(headers)?,
         ..Expected::default()
     };
-    for (name, len) in [
-        ("x-amz-checksum-sha256", 32),
-        ("x-amz-checksum-sha1", 20),
-        ("x-amz-checksum-crc32", 4),
-    ] {
+    for (name, _, len) in checksum::ALGORITHMS {
         let value = base64_header(headers, name, len).map_err(|()| {
             (
                 StatusCode::BAD_REQUEST,
@@ -494,80 +514,80 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
                 "an x-amz-checksum header is the checksum of the body in base64",
             )
         })?;
-        if let Some((text, value)) = value {
-            out.expect(name, text, value);
+        if let Some((text, bytes)) = value {
+            if out.checksum.is_some() {
+                return Err(ONE_CHECKSUM);
+            }
+            out.checksum = Some(Claim {
+                header: name,
+                text,
+                bytes,
+            });
         }
+    }
+    // An SDK names the algorithm of the checksum it sends: one naming another is refused as
+    // S3 refuses it, so the checksum is checked in the algorithm the client meant.
+    if let (Some(named), Some(claim)) = (headers.get(checksum::SDK_ALGORITHM), &out.checksum)
+        && !checksum::algorithm(claim.header)
+            .is_some_and(|a| named.as_bytes().eq_ignore_ascii_case(a.as_bytes()))
+    {
+        return Err(checksum::ALGORITHM_MISMATCH);
     }
     Ok(out)
 }
 
 impl Expected {
-    /// Check the body against `value`, the checksum `name`s, and echo its `text` once it
-    /// held: for the checksums this registry computes; any other is taken unchecked.
-    fn expect(&mut self, name: &'static str, text: String, value: Vec<u8>) {
-        let slot = match name {
-            "x-amz-checksum-sha256" => &mut self.sha256,
-            "x-amz-checksum-sha1" => &mut self.sha1,
-            "x-amz-checksum-crc32" => &mut self.crc32,
-            _ => return,
-        };
-        *slot = Some(value);
-        self.echo.push((name, text));
-    }
-
     /// The trailer's checksum `name`d, as sent: base64 of the checksum's length.
     fn trailer(&mut self, name: &'static str, text: &str) -> std::result::Result<(), Refused> {
-        let value = crate::auth::base64_decode(text)
-            .filter(|b| b.len() == checksum_len(name))
+        let bytes = crate::auth::base64_decode(text)
+            .filter(|b| Some(b.len()) == checksum::len(name))
             .ok_or((
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
                 "the trailer's x-amz-checksum is the checksum of the body in base64",
             ))?;
-        self.expect(name, text.to_string(), value);
+        self.checksum = Some(Claim {
+            header: name,
+            text: text.to_string(),
+            bytes,
+        });
         Ok(())
     }
 }
 
-/// The digests computed while a body streams: MD5 always (the ETag), SHA-1 and CRC32 only
-/// when the request asks to be checked against them.
+/// The digests computed while a body streams: MD5 always (the ETag), and the checksum the
+/// request asks to be checked against, in its algorithm, when that is not the SHA-256 the
+/// store computes anyway.
 struct Digests {
     md5: md5::Context,
-    sha1: Option<sha1::Sha1>,
-    crc32: Option<crc32fast::Hasher>,
+    checksum: Option<checksum::Hasher>,
 }
 
 impl Digests {
-    /// The digests `expected` asks for, and the one a trailer announced as `trailer`.
+    /// The digests `expected` asks for, or the one a trailer announced as `trailer`.
     fn for_(expected: &Expected, trailer: Option<&str>) -> Self {
-        let wanted = |set: bool, name| set || trailer == Some(name);
+        let header = expected.checksum.as_ref().map(|c| c.header).or(trailer);
         Digests {
             md5: md5::Context::new(),
-            sha1: wanted(expected.sha1.is_some(), "x-amz-checksum-sha1").then(sha1::Sha1::new),
-            crc32: wanted(expected.crc32.is_some(), "x-amz-checksum-crc32")
-                .then(crc32fast::Hasher::new),
+            checksum: header.and_then(checksum::Hasher::for_),
         }
     }
 
     fn update(&mut self, data: &[u8]) {
         self.md5.consume(data);
-        if let Some(h) = &mut self.sha1 {
-            h.update(data);
-        }
-        if let Some(h) = &mut self.crc32 {
+        if let Some(h) = &mut self.checksum {
             h.update(data);
         }
     }
 }
 
-/// Check what arrived against what the request said of it: its `md5`, and its `sha256`,
-/// `sha1` and `crc32` where they were computed.
+/// Check what arrived against what the request said of it: its `md5`, and its checksum,
+/// which is `sha256` for that algorithm and `computed` for any other.
 fn verify(
     expected: &Expected,
     md5: &[u8],
-    sha256: &Option<Vec<u8>>,
-    sha1: &Option<Vec<u8>>,
-    crc32: &Option<Vec<u8>>,
+    sha256: Option<&[u8]>,
+    computed: Option<Vec<u8>>,
 ) -> std::result::Result<(), Refused> {
     if expected.md5.as_deref().is_some_and(|m| m != md5) {
         return Err((
@@ -576,37 +596,34 @@ fn verify(
             "the Content-MD5 you specified did not match what was received",
         ));
     }
-    let mismatch = |expected: &Option<Vec<u8>>, got: &Option<Vec<u8>>| {
-        expected.as_ref().is_some_and(|e| Some(e) != got.as_ref())
-    };
-    if mismatch(&expected.sha256, sha256)
-        || mismatch(&expected.sha1, sha1)
-        || mismatch(&expected.crc32, crc32)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the x-amz-checksum you specified did not match the checksum of what was received",
-        ));
+    if let Some(claim) = &expected.checksum {
+        let got = if claim.header == CHECKSUM_SHA256 {
+            sha256
+        } else {
+            computed.as_deref()
+        };
+        if got != Some(claim.bytes.as_slice()) {
+            return Err(checksum::mismatch(claim.header));
+        }
     }
     Ok(())
 }
 
 /// Check a request document read whole (a `Delete`) against what its headers say of it, as a
 /// PutObject's body is checked: the signed `x-amz-content-sha256`, `Content-MD5` and the
-/// `x-amz-checksum-*` headers. A document is sent whole, not `aws-chunked`.
+/// `x-amz-checksum-*` header. A document is sent whole, not `aws-chunked`.
 pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
     check_document(headers, body)?;
     let expected = expected(headers)?;
-    let sha256 = sha2::Sha256::digest(body).to_vec();
-    let sha1 = sha1::Sha1::digest(body).to_vec();
-    let crc32 = crc32fast::hash(body).to_be_bytes().to_vec();
+    let computed = expected
+        .checksum
+        .as_ref()
+        .and_then(|c| checksum::of(c.header, body));
     verify(
         &expected,
         &md5::compute(body).0,
-        &Some(sha256),
-        &Some(sha1),
-        &Some(crc32),
+        Some(&sha2::Sha256::digest(body)),
+        computed,
     )
 }
 
@@ -636,7 +653,7 @@ pub(super) fn check_document(headers: &HeaderMap, body: &[u8]) -> std::result::R
         md5: content_md5(headers)?,
         ..Expected::default()
     };
-    verify(&expected, &md5::compute(body).0, &None, &None, &None)
+    verify(&expected, &md5::compute(body).0, None, None)
 }
 
 /// Why a write at a path that takes no object is refused: what is in the way.
@@ -681,18 +698,24 @@ pub(super) struct Plan {
 /// The [`Plan`] of a write's body, or why its headers are refused.
 pub(super) fn plan(headers: &HeaderMap) -> std::result::Result<Plan, Refused> {
     let payload = payload(headers)?;
-    let trailer = payload.framing.and_then(|f| f.trailer);
-    if trailer.is_some_and(|name| headers.contains_key(name)) {
+    let expected = expected(headers)?;
+    if payload.framing.is_some_and(|f| f.trailer.is_some()) && expected.checksum.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
             "a checksum is sent as a header or in the trailer, not both",
         ));
     }
-    Ok(Plan {
-        payload,
-        expected: expected(headers)?,
-    })
+    // As beside a checksum header: the trailer's checksum is in the algorithm the SDK names.
+    if let (Some(named), Some(trailer)) = (
+        headers.get(checksum::SDK_ALGORITHM),
+        payload.framing.and_then(|f| f.trailer),
+    ) && !checksum::algorithm(trailer)
+        .is_some_and(|a| named.as_bytes().eq_ignore_ascii_case(a.as_bytes()))
+    {
+        return Err(checksum::ALGORITHM_MISMATCH);
+    }
+    Ok(Plan { payload, expected })
 }
 
 /// A write's body, received whole and checked against what its request said of it.
@@ -700,8 +723,8 @@ pub(super) struct Received {
     /// the bytes, staged
     pub(super) staged: files::Staged,
     pub(super) md5: [u8; 16],
-    /// the `x-amz-checksum-*` that held, to echo
-    pub(super) echo: Vec<(&'static str, String)>,
+    /// the `x-amz-checksum-*` that held, its header and text: to echo, and to keep
+    pub(super) echo: Option<(&'static str, String)>,
 }
 
 /// Stream `body` into `staging` (a private file just created, and its path) while hashing it,
@@ -760,28 +783,27 @@ pub(super) async fn receive(
         )));
     }
     let md5 = digests.md5.finalize().0;
-    let sha1 = digests.sha1.map(|h| h.finalize().to_vec());
-    let crc32 = digests.crc32.map(|h| h.finalize().to_be_bytes().to_vec());
+    let computed = digests.checksum.map(checksum::Hasher::finalize);
     let sha256 = hex_bytes(&staged.hex);
-    if let Err((status, code, message)) = verify(&expected, &md5, &sha256, &sha1, &crc32) {
+    if let Err((status, code, message)) = verify(&expected, &md5, sha256.as_deref(), computed) {
         return Ok(Err(ctx.error(status, code, message)));
     }
     Ok(Ok(Received {
         staged,
         md5,
-        echo: expected.echo,
+        echo: expected.checksum.map(|c| (c.header, c.text)),
     }))
 }
 
-/// The 200 a write answers: its `etag` (quoted) and the checksums that held.
-pub(super) fn written(etag: &str, echo: Vec<(&'static str, String)>) -> Result<Response<Body>> {
+/// The 200 a write answers: its `etag` (quoted) and the checksum that held.
+pub(super) fn written(etag: &str, echo: Option<(&'static str, String)>) -> Result<Response<Body>> {
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, "0")
         .body(body_of(bytes::Bytes::new()))?;
     let headers = resp.headers_mut();
     insert(headers, ETAG, etag);
-    for (name, value) in echo {
+    if let Some((name, value)) = echo {
         insert(
             headers,
             hyper::header::HeaderName::from_static(name),
@@ -793,8 +815,9 @@ pub(super) fn written(etag: &str, echo: Vec<(&'static str, String)>) -> Result<R
 
 /// `PUT /s3/<bucket>/<key>`: stream the body into staging while hashing it, check it against
 /// what the request said of it ([`receive`]), then tag it under the namespace lock, with its
-/// MD5 and user metadata on the manifest and the request's `If-None-Match: *`/`If-Match`
-/// checked there. Its `Content-Type` is not kept: every object is served as bytes.
+/// MD5, the checksum that held and its user metadata on the manifest and the request's
+/// `If-None-Match: *`/`If-Match` checked there. Its `Content-Type` is not kept: every object
+/// is served as bytes.
 pub(super) async fn put(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -851,6 +874,13 @@ pub(super) async fn put(
     };
     let md5_hex = crate::hex_of(&received.md5);
     annotations.insert(MD5_ANNOTATION.to_string(), md5_hex.clone());
+    let kept = received
+        .echo
+        .as_ref()
+        .and_then(|(header, text)| checksum::annotation(header, text));
+    if let Some((name, value)) = kept.clone() {
+        annotations.insert(name, value);
+    }
     let how = Commit {
         annotations,
         precondition: conditions.precondition(),
@@ -868,7 +898,14 @@ pub(super) async fn put(
             ));
         }
     }
-    self::written(&format!("\"{md5_hex}\""), received.echo)
+    let mut resp = self::written(&format!("\"{md5_hex}\""), received.echo)?;
+    if kept.is_some() {
+        resp.headers_mut().insert(
+            checksum::TYPE_HEADER,
+            HeaderValue::from_static(checksum::FULL_OBJECT),
+        );
+    }
+    Ok(resp)
 }
 
 /// `DELETE /s3/<bucket>/<key>`: 204 whether or not the key held an object, as S3 answers;
@@ -1046,17 +1083,17 @@ mod tests {
         let trailer = ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
         let (_, f) = framing(&[trailer, length, ("x-amz-trailer", "X-Amz-Checksum-CRC32")]);
         assert_eq!(f.trailer, Some("x-amz-checksum-crc32"));
-        for bad in [
-            "x-amz-checksum-md5",
-            "x-amz-checksum-crc32,x-amz-checksum-sha1",
-            "",
-        ] {
+        for bad in ["x-amz-checksum-crc32,x-amz-checksum-sha1", ""] {
             assert_eq!(
                 code(&[trailer, length, ("x-amz-trailer", bad)]),
                 Some("InvalidRequest"),
                 "{bad}"
             );
         }
+        assert_eq!(
+            code(&[trailer, length, ("x-amz-trailer", "x-amz-checksum-xxhash3")]),
+            Some("NotImplemented")
+        );
         let signed = ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
         let crc = ("x-amz-trailer", "x-amz-checksum-crc32");
         assert_eq!(code(&[signed, length, crc]), Some("InvalidRequest"));
@@ -1068,34 +1105,51 @@ mod tests {
         let mut e = Expected::default();
         let crc = vk_hub_proto::to_base64(&[1, 2, 3, 4]);
         e.trailer("x-amz-checksum-crc32", &crc).ok().unwrap();
-        assert_eq!(e.crc32, Some(vec![1, 2, 3, 4]));
-        assert_eq!(e.echo, [("x-amz-checksum-crc32", crc.clone())]);
-        // Taken unchecked, and not echoed.
-        e.trailer(
-            "x-amz-checksum-crc64nvme",
-            &vk_hub_proto::to_base64(&[0; 8]),
-        )
-        .ok()
-        .unwrap();
-        assert_eq!(e.echo.len(), 1);
+        let claim = e.checksum.as_ref().unwrap();
+        assert_eq!(claim.bytes, [1, 2, 3, 4]);
+        assert_eq!(
+            (claim.header, claim.text.as_str()),
+            ("x-amz-checksum-crc32", crc.as_str())
+        );
+        let nvme = vk_hub_proto::to_base64(&[0; 8]);
+        e.trailer("x-amz-checksum-crc64nvme", &nvme).ok().unwrap();
+        let claim = e.checksum.as_ref().unwrap();
+        assert_eq!(
+            (claim.header, claim.bytes.len()),
+            ("x-amz-checksum-crc64nvme", 8)
+        );
         assert!(e.trailer("x-amz-checksum-sha256", &crc).is_err());
         assert!(e.trailer("x-amz-checksum-crc32c", "!!").is_err());
+        assert!(e.trailer("x-amz-checksum-md5", &crc).is_err());
     }
 
     #[test]
-    fn checksums_are_base64_of_their_length() {
+    fn checksums_are_base64_of_their_length_and_one_at_most() {
         let md5 = vk_hub_proto::to_base64(&[0u8; 16]);
         let sha = vk_hub_proto::to_base64(&[1u8; 32]);
         let e = expected(&headers(&[
             ("content-md5", &md5),
             ("x-amz-checksum-sha256", &sha),
-            ("x-amz-checksum-crc32c", "AAAAAA=="),
         ]))
         .ok()
         .unwrap();
         assert_eq!(e.md5, Some(vec![0u8; 16]));
-        assert_eq!(e.sha256, Some(vec![1u8; 32]));
-        assert_eq!(e.echo, [("x-amz-checksum-sha256", sha.clone())]);
+        let claim = e.checksum.unwrap();
+        assert_eq!(
+            (claim.header, claim.text.as_str()),
+            ("x-amz-checksum-sha256", sha.as_str())
+        );
+        assert_eq!(claim.bytes, vec![1u8; 32]);
+        for (name, len) in [
+            ("x-amz-checksum-crc32", 4),
+            ("x-amz-checksum-crc32c", 4),
+            ("x-amz-checksum-sha1", 20),
+            ("x-amz-checksum-crc64nvme", 8),
+        ] {
+            let value = vk_hub_proto::to_base64(&vec![2u8; len]);
+            let e = expected(&headers(&[(name, &value)])).ok().unwrap();
+            assert_eq!(e.checksum.unwrap().header, name);
+        }
         let code = |pairs: &[(&str, &str)]| expected(&headers(pairs)).err().map(|e| e.1);
         assert_eq!(code(&[("content-md5", "AAAA")]), Some("InvalidDigest"));
         assert_eq!(code(&[("content-md5", "!!")]), Some("InvalidDigest"));
@@ -1106,6 +1160,62 @@ mod tests {
         assert_eq!(
             code(&[("x-amz-checksum-crc32", &md5)]),
             Some("InvalidRequest")
+        );
+        assert_eq!(
+            code(&[("x-amz-checksum-crc64nvme", "AAAAAA==")]),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            code(&[("x-amz-checksum-xxhash64", "AAAAAAAAAAA=")]),
+            Some("NotImplemented")
+        );
+        assert_eq!(
+            code(&[("x-amz-sdk-checksum-algorithm", "XXHASH128")]),
+            Some("NotImplemented")
+        );
+        assert_eq!(
+            code(&[
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-sha256", &sha)
+            ]),
+            Some("InvalidRequest")
+        );
+        assert!(
+            expected(&headers(&[
+                ("x-amz-sdk-checksum-algorithm", "sha256"),
+                ("x-amz-checksum-sha256", &sha)
+            ]))
+            .is_ok()
+        );
+        assert_eq!(
+            code(&[
+                ("x-amz-checksum-sha256", &sha),
+                ("x-amz-checksum-crc32", "AAAAAA==")
+            ]),
+            Some("InvalidRequest")
+        );
+        // A header beside a trailer, of any algorithm.
+        let crc = ("x-amz-trailer", "x-amz-checksum-crc32");
+        let streaming = ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        let length = ("x-amz-decoded-content-length", "13");
+        assert_eq!(
+            plan(&headers(&[
+                streaming,
+                length,
+                crc,
+                ("x-amz-checksum-sha256", &sha)
+            ]))
+            .err()
+            .map(|e| e.1),
+            Some("InvalidRequest")
+        );
+        assert!(plan(&headers(&[streaming, length, crc])).is_ok());
+        // The trailer is in the algorithm the SDK names, in any case.
+        let sdk = |name| ("x-amz-sdk-checksum-algorithm", name);
+        assert!(plan(&headers(&[streaming, length, crc, sdk("crc32")])).is_ok());
+        assert_eq!(
+            plan(&headers(&[streaming, length, crc, sdk("SHA1")])).err(),
+            Some(checksum::ALGORITHM_MISMATCH)
         );
     }
 

@@ -12,7 +12,8 @@
 //! answers the service and its buckets, [`list`] a bucket's listings, [`object`] the
 //! objects, with [`chunked`] decoding the `aws-chunked` bodies SDKs upload them in, [`copy`]
 //! their copies, [`multipart`] their uploads in parts and [`batch`] their deletion in
-//! batches; [`canned`] answers the configurations a bucket or an object has none of.
+//! batches, with [`checksum`] checking and keeping the checksum a write carries; [`canned`]
+//! answers the configurations a bucket or an object has none of.
 //! Operations not served answer `NotImplemented`.
 //!
 //! With `s3_host` set, a request sent to `<bucket>.<s3_host>` names its bucket by its host,
@@ -23,6 +24,7 @@
 mod batch;
 mod bucket;
 mod canned;
+mod checksum;
 mod chunked;
 mod conditional;
 mod copy;

@@ -4304,6 +4304,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "crc",
  "crc32fast",
  "futures",
  "hmac",

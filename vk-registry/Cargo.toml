@@ -36,10 +36,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 oci-client.workspace = true
 sha2.workspace = true
 # The digests S3 clients send or expect beside SHA-256: an object's MD5 (its ETag), and the
-# SHA-1 and CRC32 an upload may be checked against.
+# SHA-1, CRC32, CRC32C and CRC64NVME an upload may be checked against.
 md5.workspace = true
 sha1.workspace = true
 crc32fast.workspace = true
+crc.workspace = true
 # SigV4's HMAC chain for /s3/; zeroize wipes the keys it derives.
 hmac.workspace = true
 zeroize.workspace = true
