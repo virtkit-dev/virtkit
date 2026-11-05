@@ -2518,15 +2518,20 @@ async fn ranges_of_plain_and_zstd_stored_objects() {
         }
         assert!(joined == *data, "{key}: the parts are the whole");
 
-        // The checksum is the whole object's, and only when asked.
-        let resp = send(&host, ranged("bytes=0-9")).await;
+        // The checksum is the whole object's, so a part carries none even when asked: the
+        // AWS CLI checks one against each part it fetches.
+        let asked = |value: &str| ranged(value).header("x-amz-checksum-mode", "ENABLED");
+        let resp = send(&host, asked("bytes=0-9")).await;
+        is_part(&resp, data, 0, 10, &etag);
+        assert_eq!(resp.header("x-amz-checksum-sha256"), None);
+        let resp = send(&host, asked(&format!("bytes=0-{}", n - 1))).await;
+        is_part(&resp, data, 0, n, &etag);
         assert_eq!(resp.header("x-amz-checksum-sha256"), None);
         let resp = send(
             &host,
-            ranged("bytes=0-9").header("x-amz-checksum-mode", "ENABLED"),
+            Req::new("GET", &path).header("x-amz-checksum-mode", "ENABLED"),
         )
         .await;
-        is_part(&resp, data, 0, 10, &etag);
         let sha = b64(&sha2::Sha256::digest(data));
         assert_eq!(resp.header("x-amz-checksum-sha256"), Some(&*sha));
 
