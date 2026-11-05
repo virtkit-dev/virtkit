@@ -1768,6 +1768,89 @@ async fn user_metadata_round_trips_and_no_content_type_is_kept() {
         .is(404, "NoSuchKey");
 }
 
+/// A header asking for a configuration this registry keeps nothing of — encryption, tags,
+/// an ACL, a storage class, a redirect, a lock — refuses the request rather than being
+/// dropped: nothing is written under it, and a read asking for a key gets no bytes.
+#[tokio::test]
+async fn headers_asking_for_what_is_not_kept_refuse_the_request() {
+    let dir = tmp("asked");
+    let host = spawn(open_state(&dir, true));
+    let put = |name: &str, value: &str| {
+        Req::new("PUT", "/s3/b/asked")
+            .header(name, value)
+            .body(HELLO.to_vec())
+    };
+    for (name, value) in [
+        ("x-amz-server-side-encryption", "AES256"),
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", "a2V5"),
+        ("x-amz-tagging", "a=b"),
+        ("x-amz-acl", "public-read"),
+        (
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        ),
+        ("x-amz-storage-class", "GLACIER"),
+        ("x-amz-website-redirect-location", "/elsewhere"),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ] {
+        send(&host, put(name, value))
+            .await
+            .is(501, "NotImplemented");
+    }
+    send(&host, put("x-amz-storage-class", "INVALID_CLASS"))
+        .await
+        .is(400, "InvalidStorageClass");
+    send(&host, Req::new("GET", "/s3/b/asked"))
+        .await
+        .is(404, "NoSuchKey");
+    // The one ACL and the one storage class there are ask for nothing.
+    send(
+        &host,
+        put("x-amz-acl", "private").header("x-amz-storage-class", "STANDARD"),
+    )
+    .await
+    .ok(200);
+    is_object(&send(&host, Req::new("GET", "/s3/b/asked")).await, HELLO);
+    // A read asking to decrypt with a key it brings is refused, as is a copy from such a
+    // source, and a bucket asking for an ACL.
+    for req in [
+        Req::new("GET", "/s3/b/asked")
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", "a2V5"),
+        Req::new("PUT", "/s3/b/copy")
+            .header("x-amz-copy-source", "/b/asked")
+            .header(
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                "a2V5",
+            ),
+        Req::new("POST", "/s3/b/up")
+            .query("uploads=")
+            .header("x-amz-tagging", "a=b"),
+        Req::new("PUT", "/s3/c").header("x-amz-acl", "public-read-write"),
+    ] {
+        send(&host, req).await.is(501, "NotImplemented");
+    }
+    let head =
+        Req::new("HEAD", "/s3/b/asked").header("x-amz-server-side-encryption-customer-key", "a2V5");
+    send(&host, head).await.ok(501);
+    send(&host, Req::new("GET", "/s3/b/copy"))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, Req::new("HEAD", "/s3/c")).await.ok(404);
+    send(
+        &host,
+        Req::new("PUT", "/s3/c").header("x-amz-acl", "private"),
+    )
+    .await
+    .ok(200);
+    let copy = Req::new("PUT", "/s3/b/copy")
+        .header("x-amz-copy-source", "/b/asked")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .header("x-amz-tagging", "");
+    send(&host, copy).await.ok(200);
+}
+
 #[tokio::test]
 async fn conditional_headers_decide_reads_and_writes() {
     let dir = tmp("conditional");
