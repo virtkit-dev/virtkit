@@ -2837,7 +2837,12 @@ async fn build_and_boot(
             service_exec,
         ))
     } else if service_exec {
-        Some(crate::vm::spawn_service_exec_serve_at(&vsock, work, agent))
+        Some(crate::vm::spawn_service_exec_serve_at(
+            &vsock,
+            work,
+            agent,
+            crate::vm::HostForms::EXEC,
+        ))
     } else {
         None
     };
@@ -4138,7 +4143,7 @@ fn spawn_host_exec_serve(
 ) -> Result<Child> {
     let listen = crate::vmm::hybrid_socket(vsock, HOST_EXEC_PORT);
     let services = service_exec
-        .then(|| crate::vm::service_exec_command(work))
+        .then(|| crate::vm::service_exec_command(work, crate::vm::HostForms::EXEC))
         .transpose()?;
     let log = std::fs::File::create(work.join("host-exec-serve.log"))
         .context("creating the host-exec serve log")?;

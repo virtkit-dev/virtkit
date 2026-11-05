@@ -1323,12 +1323,15 @@ enum Cmd {
     /// plumbing: a guest's `vk-agent exec --service`, over the VM's host command channel
     ///
     /// A CI job VM's or a `vk run --compose` primary's channel runs every request through
-    /// this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
-    /// anything else is refused with exit 2.
+    /// this: a form `--allow` names runs — `vk exec --service NAME … -- CMD` into one of
+    /// that VM's own services for `exec` — and anything else is refused with exit 2.
     #[command(name = "service-exec", hide = true)]
     ServiceExec {
         /// the job's or run's directory, whose `svc-<name>` dirs are its services
         dir: PathBuf,
+        /// the forms the VM may ask for, comma-separated: exec, build [default: exec]
+        #[arg(long, value_name = "FORMS")]
+        allow: Option<vm::HostForms>,
         /// the guest's request, `vk` first, after `--`
         #[arg(last = true)]
         argv: Vec<String>,
@@ -3296,8 +3299,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     // Decide a guest's `vk-agent exec --service` request from its argv and the services
     // under its dir alone, before Config::load: guest input must not reach config loading.
-    if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
-        return vm::service_exec(dir, argv).await;
+    if let Cmd::ServiceExec { dir, allow, argv } = &cli.cmd {
+        return vm::service_exec(dir, allow.unwrap_or(vm::HostForms::EXEC), argv).await;
     }
     // `update` replaces the binary and reads nothing from the config — handle it before
     // Config::load, so a config file that no longer parses cannot block the upgrade that
@@ -6792,18 +6795,67 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.config, None);
-        let Cmd::ServiceExec { dir, argv } = cli.cmd else {
+        let Cmd::ServiceExec { dir, allow, argv } = cli.cmd else {
             panic!("expected service-exec")
         };
+        assert_eq!(allow, None);
         assert_eq!(argv[0], "--config=/x");
         assert_eq!(argv[1..3], ["vk", "exec"]);
         assert_eq!(
-            vm::service_exec(&dir, &argv).await,
+            vm::service_exec(&dir, vm::HostForms::EXEC, &argv).await,
             ExitCode::from(2),
             "{argv:?}"
         );
         // Without the `--` nothing runs at all.
         assert!(Cli::try_parse_from(["vk", "service-exec", "/job", "vk", "exec"]).is_err());
+    }
+
+    /// Before `--`, `--allow` selects the wrapper's forms; after it, `--allow` belongs to
+    /// the guest. Omitting it keeps exec-only access for serves started by an earlier vk.
+    #[test]
+    fn service_exec_takes_its_allowed_forms_before_the_guests_argv() {
+        let allowed = |argv: &[&str]| {
+            let Cmd::ServiceExec { allow, argv, .. } = Cli::try_parse_from(argv).unwrap().cmd
+            else {
+                panic!("expected service-exec")
+            };
+            (allow, argv)
+        };
+        let both = vm::HostForms {
+            exec: true,
+            build: true,
+        };
+        assert_eq!(
+            allowed(&[
+                "vk",
+                "service-exec",
+                "/job",
+                "--allow",
+                "exec,build",
+                "--",
+                "vk"
+            ]),
+            (Some(both), vec!["vk".to_string()])
+        );
+        assert_eq!(
+            allowed(&["vk", "service-exec", "/job", "--", "--allow", "build"]),
+            (None, vec!["--allow".to_string(), "build".to_string()])
+        );
+        for bad in ["", "shell"] {
+            let argv = ["vk", "service-exec", "/job", "--allow", bad, "--", "vk"];
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+        // What the node passes parses back to the forms it gave.
+        let (_, args) =
+            vm::service_exec_command(Path::new("/job"), "exec,build".parse().unwrap()).unwrap();
+        let mut argv = vec!["vk".to_string()];
+        argv.extend(args);
+        argv.extend(["vk".to_string(), "exec".to_string()]);
+        let Cmd::ServiceExec { allow, argv, .. } = Cli::try_parse_from(&argv).unwrap().cmd else {
+            panic!("expected service-exec")
+        };
+        assert_eq!(allow, Some(both));
+        assert_eq!(argv, ["vk", "exec"]);
     }
 
     // `vk publish` CLI shape. The foreground form takes a positional target and requires

@@ -2142,7 +2142,51 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
 /// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk-agent exec
 /// --service` dials — for its services ([`spawn_service_exec_serve_at`]).
 fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
-    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent)
+    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent, HostForms::EXEC)
+}
+
+/// The requests a VM's host command channel allows, passed to its wrapper as trusted
+/// arguments (`vk service-exec <dir> --allow exec,build -- …`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostForms {
+    /// `vk-agent exec --service`: an exec into one of the VM's services.
+    pub exec: bool,
+    /// `vk-agent build`: an image built from a context the guest sends.
+    pub build: bool,
+}
+
+impl HostForms {
+    /// Exec-only default for wrappers invoked without `--allow` by serves started before
+    /// the vk binary was updated.
+    pub const EXEC: Self = Self {
+        exec: true,
+        build: false,
+    };
+}
+
+impl std::fmt::Display for HostForms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let forms = [(self.exec, "exec"), (self.build, "build")];
+        let names: Vec<&str> = forms.iter().filter(|f| f.0).map(|f| f.1).collect();
+        f.write_str(&names.join(","))
+    }
+}
+
+impl std::str::FromStr for HostForms {
+    type Err = String;
+
+    /// A comma-separated list of `exec` and `build`, at least one.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut forms = Self::default();
+        for form in s.split(',') {
+            match form {
+                "exec" => forms.exec = true,
+                "build" => forms.build = true,
+                _ => return Err(format!("unknown form {form:?}: expected exec or build")),
+            }
+        }
+        Ok(forms)
+    }
 }
 
 /// How many of a VM's `vk exec --service` its host runs at once: each is a host `vk` (and a
@@ -2153,17 +2197,25 @@ pub(crate) const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
 /// The guest controls request volume and therefore log volume.
 pub(crate) const SERVE_LOG_MAX: u64 = 1 << 20;
 
-/// Build `vk service-exec <dir> --` to restrict host requests to `vk exec --service`
-/// into `svc-<name>` services under `dir`. Guest arguments follow `--`; `dir` is absolute
-/// because the serve may run elsewhere. Resolve this vk's path now: a `vk update` during
-/// the VM's lifetime replaces that binary, so later requests run the updated version.
-pub(crate) fn service_exec_command(dir: &Path) -> Result<(PathBuf, [String; 3])> {
+/// Build `vk service-exec <dir> --allow <forms> --` to restrict host requests to `forms`:
+/// `vk exec --service` into `svc-<name>` services under `dir`. Guest arguments follow `--`;
+/// `dir` is absolute because the serve may run elsewhere. Resolve this vk's path now: a `vk
+/// update` during the VM's lifetime replaces that binary, so later requests run the updated
+/// version with these arguments.
+pub(crate) fn service_exec_command(dir: &Path, forms: HostForms) -> Result<(PathBuf, Vec<String>)> {
     let exe = std::env::current_exe().context("finding the vk binary")?;
     let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
     let dir = dir
         .to_str()
         .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
-    Ok((exe, ["service-exec".into(), dir.into(), "--".into()]))
+    let args = vec![
+        "service-exec".to_string(),
+        dir.into(),
+        "--allow".into(),
+        forms.to_string(),
+        "--".into(),
+    ];
+    Ok((exe, args))
 }
 
 /// Pipe serve output to a thread that keeps at most `max` bytes in `log`; the guest controls
@@ -2179,18 +2231,19 @@ pub(crate) fn capped_log_pipe(log: std::fs::File, max: u64) -> Result<std::io::P
 }
 
 /// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
-/// serve`, every command forced through `vk service-exec <dir> -- …` (the guest's argv only
-/// after the `--`), which allows `vk exec --service` into the `svc-<name>` services under
-/// `dir` — a CI job's dir, or a `vk run --compose`'s — and nothing else. It runs in `dir` as
-/// the serve's user, whatever directory or user the guest asks for, in the foreground of its
-/// session, at most [`SERVICE_EXEC_MAX_CONCURRENT`] at once. Its log is
-/// `dir/service-exec.log`, at most [`SERVE_LOG_MAX`] bytes of it.
+/// serve`, every command forced through `vk service-exec <dir> --allow <forms> -- …` (the
+/// guest's argv only after the `--`), which allows `forms` and nothing else: `exec` is
+/// `vk exec --service` into the `svc-<name>` services under `dir` — a CI job's dir, or a
+/// `vk run --compose`'s. It runs in `dir` as the serve's user, whatever directory or user the
+/// guest asks for, in the foreground of its session, at most [`SERVICE_EXEC_MAX_CONCURRENT`]
+/// at once. Its log is `dir/service-exec.log`, at most [`SERVE_LOG_MAX`] bytes of it.
 pub(crate) fn spawn_service_exec_serve_at(
     vsock: &Path,
     dir: &Path,
     agent: &Path,
+    forms: HostForms,
 ) -> Result<std::process::Child> {
-    let (exe, wrapper_args) = service_exec_command(dir)?;
+    let (exe, wrapper_args) = service_exec_command(dir, forms)?;
     let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
     let mut cmd = Command::new(agent);
     cmd.arg("-s")
@@ -2302,11 +2355,11 @@ struct ServiceRequest {
     args: Vec<String>,
 }
 
-/// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's agent asked, run
-/// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir, a
-/// compose run's) and refused with exit 2 otherwise.
-pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode {
-    let req = match service_request(dir, argv) {
+/// `vk service-exec <dir> --allow <forms> -- vk exec --service NAME … -- CMD…`: what a VM's
+/// agent asked, run when `forms` allow exec and it is an exec into one of the `svc-<name>`
+/// services under `dir` (a CI job's dir, a compose run's), refused with exit 2 otherwise.
+pub async fn service_exec(dir: &Path, forms: HostForms, argv: &[String]) -> std::process::ExitCode {
+    let req = match service_request(dir, forms, argv) {
         Ok(req) => req,
         Err(code) => return code,
     };
@@ -2333,14 +2386,24 @@ pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode
     }
 }
 
-/// [`service_exec`]'s decision: the request when `argv` is the guest agent's `vk exec --service`
-/// into a service under `dir`, else the exit status, the reason already on stderr.
-fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::process::ExitCode> {
+/// [`service_exec`]'s decision: the request when `forms` allow exec and `argv` is the guest
+/// agent's `vk exec --service` into a service under `dir`, else the exit status, the reason
+/// already on stderr.
+fn service_request(
+    dir: &Path,
+    forms: HostForms,
+    argv: &[String],
+) -> Result<ServiceRequest, std::process::ExitCode> {
     use clap::Parser;
     let refuse = |why: String| {
         eprintln!("vk: {why}");
         std::process::ExitCode::from(2)
     };
+    if !forms.exec {
+        return Err(refuse(
+            "this VM's host does not allow `vk-agent exec --service`".to_string(),
+        ));
+    }
     // A service exec request names `vk` first; anything else is not one.
     if argv.first().map(String::as_str) != Some("vk") {
         return Err(refuse(
@@ -4777,12 +4840,13 @@ mod tests {
             argv(&["vk", "exec", "--service", "relinked", "--", "true"]),
             argv(&["vk", "exec", "--service", "down", "--", "true"]),
         ] {
-            let refused = service_request(&job.0, &asked).map(|_| ());
+            let refused = service_request(&job.0, HostForms::EXEC, &asked).map(|_| ());
             assert_eq!(refused, Err(std::process::ExitCode::from(2)), "{asked:?}");
         }
 
         let req = service_request(
             &job.0,
+            HostForms::EXEC,
             &argv(&[
                 "vk",
                 "exec",
@@ -4817,10 +4881,46 @@ mod tests {
         );
         let req = service_request(
             &job.0,
+            HostForms::EXEC,
             &argv(&["vk", "exec", "--service", "db", "-b", "--", "x"]),
         )
         .unwrap();
         assert!(req.background);
+    }
+
+    /// A VM's host command channel runs only the forms its wrapper was given: an exec request
+    /// with `exec`, never with `build` alone.
+    #[test]
+    fn a_vms_host_command_channel_runs_only_the_forms_it_allows() {
+        let job = crate::qga::tests::TempDir::new("host-forms");
+        std::fs::create_dir_all(job.0.join("svc-db")).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(
+            job.0
+                .join("svc-db")
+                .join(format!("vsock.sock_{}", crate::units::VSOCK_PORT)),
+        )
+        .unwrap();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let exec = argv(&["vk", "exec", "--service", "db", "--", "true"]);
+        let refused = Err(std::process::ExitCode::from(2));
+        let exec_only: HostForms = "exec".parse().unwrap();
+        let build_only: HostForms = "build".parse().unwrap();
+        let both: HostForms = "exec,build".parse().unwrap();
+        assert_eq!(exec_only, HostForms::EXEC);
+        assert!(service_request(&job.0, exec_only, &exec).is_ok());
+        assert!(service_request(&job.0, both, &exec).is_ok());
+        assert_eq!(
+            service_request(&job.0, build_only, &exec).map(|_| ()),
+            refused
+        );
+        // What `service_exec_command` passes is what the wrapper reads back.
+        for forms in [exec_only, build_only, both] {
+            assert_eq!(forms.to_string().parse::<HostForms>(), Ok(forms));
+        }
+        assert_eq!(both.to_string(), "exec,build");
+        for bad in ["", "exec,", "shell", "exec,shell", "EXEC"] {
+            assert!(bad.parse::<HostForms>().is_err(), "{bad:?}");
+        }
     }
 
     /// The service exec log keeps its first bytes and says it dropped the rest, reading
