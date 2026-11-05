@@ -1783,6 +1783,14 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
              enforce them",
         );
     }
+    if v.without_job_build_cache {
+        kv(
+            &mut h,
+            "Takes no placed jobs",
+            "the hub requires job build caches ([jobs] require_job_build_cache), and this \
+             node does not cache builds by the job's scope",
+        );
+    }
     if let Some(why) = &v.last_refusal {
         kv_node(&mut h, "Refuses reservations", why);
     }

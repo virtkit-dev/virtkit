@@ -70,6 +70,10 @@ pub struct NodeView {
     /// the hub's egress rules.
     #[serde(default)]
     pub without_egress_rules: bool,
+    /// It takes none of the hub's jobs: `[jobs] require_job_build_cache` is on and it does not
+    /// announce `job_build_cache`.
+    #[serde(default)]
+    pub without_job_build_cache: bool,
 }
 
 impl NodeView {
@@ -122,6 +126,8 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
             .then(|| crate::jobs::placed_on(hub, &id)),
         without_egress_rules: crate::jobs::accepting(hub).is_ok()
             && !crate::jobs::enforces_rules(hub, row),
+        without_job_build_cache: crate::jobs::accepting(hub).is_ok()
+            && !crate::jobs::caches_builds_as_required(hub, row),
         id,
     }
 }

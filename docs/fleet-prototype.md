@@ -1417,6 +1417,13 @@ record keeps the rules it was resolved under, with the rules' generation: its pa
 jobs show` name them. `vk-hub egress list` and the hub's start warn of rules that restrict
 nothing, and of rules on with no enforced Fallback.
 
+**`[jobs] require_job_build_cache = true`** restricts placement to nodes announcing
+`job_build_cache`: they build with the cache under the job's `ci-build` prefix and token,
+or with caching off, and never lend guests their own registry credential ([build
+caches](build-cache-design.md)). The default is off: older nodes still take jobs and use
+their shared build cache. `vk-hub nodes` and the node's page explain why a node takes no
+jobs. Enabling it before upgrading the nodes stops all placement.
+
 **The Fallback for gitlab-runner jobs.** With rules on, the hub sets a node's desired state's
 `egress` to the layer of a job with no claims — the Fallback's alone — if the node announces
 `egress_fallback`, and to none otherwise: when the node reports what it enforces, when the

@@ -2489,6 +2489,15 @@ fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
              which [jobs] egress_rules turns on"
         ]
     );
+    n.without_egress_rules = false;
+    n.without_job_build_cache = true;
+    assert_eq!(
+        node_notes(&n),
+        [
+            "ci-1: takes none of the hub's jobs: it does not cache their builds by their scope, \
+             as [jobs] require_job_build_cache asks"
+        ]
+    );
 }
 
 #[test]

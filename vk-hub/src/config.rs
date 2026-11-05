@@ -41,6 +41,10 @@
 //! # node that enforces them, and give gitlab-runner's jobs the Fallback rule; off, the rules
 //! # restrict nothing.
 //! egress_rules = true
+//! # Place jobs only on nodes that cache their builds by the job's project, protection and
+//! # scope (`ci-build`) and never lend a job's guest their registry credential; off, a node
+//! # of an older release still takes jobs and caches their builds in its shared cache.
+//! require_job_build_cache = true
 //!
 //! # Whether operators may update the hub to a vk-hub release it holds, from the web UI or
 //! # with `vk-hub update`; off unless set. The hub executes the release in its place, handing
@@ -131,6 +135,9 @@ pub struct HubConfig {
     pub max_job_token: std::time::Duration,
     /// `[jobs] egress_rules`: whether the hub's egress rules restrict jobs.
     pub egress_rules: bool,
+    /// `[jobs] require_job_build_cache`: whether placed jobs go only to nodes announcing
+    /// `job_build_cache`.
+    pub require_job_build_cache: bool,
     /// `[update]`: whether, and to which releases, the hub may update itself.
     pub update: UpdateConfig,
 }
@@ -214,6 +221,7 @@ struct FileUpdate {
 #[serde(deny_unknown_fields)]
 struct FileJobs {
     egress_rules: Option<bool>,
+    require_job_build_cache: Option<bool>,
 }
 
 /// `[oidc]` as written; `deny_unknown_fields` for the same reason.
@@ -433,7 +441,16 @@ impl HubConfig {
             kept_output_total,
             image_affinity,
             max_job_token,
-            egress_rules: f.jobs.and_then(|j| j.egress_rules).unwrap_or(false),
+            egress_rules: f
+                .jobs
+                .as_ref()
+                .and_then(|j| j.egress_rules)
+                .unwrap_or(false),
+            require_job_build_cache: f
+                .jobs
+                .as_ref()
+                .and_then(|j| j.require_job_build_cache)
+                .unwrap_or(false),
             update,
         })
     }
@@ -946,6 +963,16 @@ mod tests {
         assert!(!on("[jobs]\n").unwrap());
         assert!(on("[jobs]\negress_rules = true\n").unwrap());
         assert!(on("[jobs]\negress_rule = true\n").is_err());
+    }
+
+    #[test]
+    fn the_job_build_cache_is_required_only_when_jobs_says_so() {
+        let on = |extra: &str| {
+            parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.require_job_build_cache)
+        };
+        assert!(!on("").unwrap());
+        assert!(!on("[jobs]\negress_rules = true\n").unwrap());
+        assert!(on("[jobs]\nrequire_job_build_cache = true\n").unwrap());
     }
 
     #[test]

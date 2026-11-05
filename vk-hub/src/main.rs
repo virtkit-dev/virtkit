@@ -77,7 +77,8 @@ struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
     /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
     /// kept_output, kept_output_total, image_affinity_max_load, image_affinity_max_extra_load,
-    /// max_job_token_secs, [jobs] egress_rules, [oidc] [default: built-in defaults]
+    /// max_job_token_secs, [jobs] egress_rules, [jobs] require_job_build_cache, [oidc]
+    /// [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -1966,7 +1967,9 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
     if let Some(role) = default_role {
         db = db.with_oidc_default_role(role);
     }
-    db = db.with_egress_rules(cfg.egress_rules);
+    db = db
+        .with_egress_rules(cfg.egress_rules)
+        .with_require_job_build_cache(cfg.require_job_build_cache);
     // [jobs] egress_rules turned on or off while the hub was stopped holds from its start.
     if cfg.egress_rules {
         let rules = egress::rules::Rules {
@@ -1989,6 +1992,12 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
         eprintln!(
             "vk-hub: placed jobs are held to the hub's egress rules ([jobs] egress_rules), on \
              nodes that enforce them only"
+        );
+    }
+    if cfg.require_job_build_cache {
+        eprintln!(
+            "vk-hub: placed jobs go only to nodes caching their builds by the job's scope \
+             ([jobs] require_job_build_cache)"
         );
     }
     // A default role lowered or removed while the hub was stopped takes effect at once, as a
@@ -3401,6 +3410,13 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
         placement.push(format!(
             "{}: takes none of the hub's jobs: it does not enforce the hub's egress rules, \
              which [jobs] egress_rules turns on",
+            n.hostname
+        ));
+    }
+    if n.without_job_build_cache {
+        placement.push(format!(
+            "{}: takes none of the hub's jobs: it does not cache their builds by their scope, \
+             as [jobs] require_job_build_cache asks",
             n.hostname
         ));
     }

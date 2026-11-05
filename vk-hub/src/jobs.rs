@@ -1906,6 +1906,9 @@ fn room(
     if !enforces_rules(hub, row) {
         return None;
     }
+    if !caches_builds_as_required(hub, row) {
+        return None;
+    }
     if !placement
         .labels
         .iter()
@@ -4330,6 +4333,12 @@ fn egress_for(
     Ok((layer, applied))
 }
 
+/// Whether `row` may take the hub's jobs under `[jobs] require_job_build_cache`: it is off, or
+/// the node announces `job_build_cache`.
+pub fn caches_builds_as_required(hub: &Hub, row: &NodeRow) -> bool {
+    !hub.db.job_build_cache_required() || row.inventory.as_ref().is_some_and(|i| i.job_build_cache)
+}
+
 /// Whether `row`'s node may run a placed job of this hub: one enforcing the hub's egress rules
 /// when `[jobs] egress_rules` is on, since an older node would ignore its layer and run the job
 /// under its own cap alone.
@@ -4375,7 +4384,9 @@ fn usable_reservation<'s>(
     let ok = matches!(x.phase, ResvPhase::Held { .. })
         && state.links.get(&x.node).is_some_and(|l| l.held)
         && !excluded.contains(&x.node)
-        && (nodes.iter()).any(|(n, row)| *n == x.node && enforces_rules(hub, row));
+        && (nodes.iter()).any(|(n, row)| {
+            *n == x.node && enforces_rules(hub, row) && caches_builds_as_required(hub, row)
+        });
     ok.then_some(x)
 }
 

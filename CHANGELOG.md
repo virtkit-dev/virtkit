@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
 - **vk-hub adds a `ci-build` namespace for build caches,** one per project, protection and
   isolated ref, kept 14 days, to every registry taking tokens, existing ones included unless a
   namespace already uses that name or root. Nodes do not use it yet.
+- **`[jobs] require_job_build_cache` in hub.toml** places jobs only on nodes that cache their
+  builds by project, protection and scope; `vk-hub nodes` says why another takes none. No node
+  announces it yet: turning it on now stops all placement.
 
 ### Changed
 

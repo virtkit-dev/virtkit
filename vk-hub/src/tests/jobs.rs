@@ -5921,6 +5921,103 @@ async fn a_refused_start_forgets_the_registry_access_it_was_given() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Under `[jobs] require_job_build_cache`, a node not announcing `job_build_cache` has no room
+/// and is sent nothing; once it announces it, the queued job starts there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_build_cache_keeps_jobs_off_nodes_without_it() {
+    let dir = scratch("build-cache-required");
+    let db = Arc::new(
+        Db::open_memory()
+            .unwrap()
+            .with_require_job_build_cache(true),
+    );
+    let (addr, hub) = serve_hub(db, &dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    approve(&hub, "42:wab/core");
+    let mut node = ready_node(addr, &hub, 16384 * 8).await;
+    let fits = |key: String| async move {
+        api(
+            addr,
+            "POST",
+            "/v1/capacity",
+            Some(&key),
+            Some(json!({"runner": "test", "placement": placement()})),
+        )
+        .await
+        .json::<Capacity>()
+        .fits
+    };
+    assert_eq!(fits(key.clone()).await, 0);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(bound_body(1, 42, "wab/core", 600)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    node.quiet(Duration::from_millis(1500)).await;
+    let node_id = node.id.clone();
+    let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
+    inventory.job_build_cache = true;
+    hub.db
+        .record_inventory(&node_id, inventory, true, now_secs())
+        .unwrap();
+    hub.touch();
+    assert!(fits(key.clone()).await > 0);
+    let HubJobMsg::Start(_) = node.job().await else {
+        panic!("expected a start");
+    };
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A reservation held on a node that stops announcing `job_build_cache` starts no job there
+/// under `[jobs] require_job_build_cache`, until it announces it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_build_cache_holds_back_a_job_on_its_reservation() {
+    let dir = scratch("build-cache-resv");
+    let db = Arc::new(
+        Db::open_memory()
+            .unwrap()
+            .with_require_job_build_cache(true),
+    );
+    let (addr, hub) = serve_hub(db, &dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384 * 8).await;
+    let node_id = node.id.clone();
+    let announce = |caches: bool| {
+        let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
+        inventory.job_build_cache = caches;
+        hub.db
+            .record_inventory(&node_id, inventory, true, now_secs())
+            .unwrap();
+        hub.touch();
+    };
+    announce(true);
+    let grant = reserve_on(addr, &key, &mut node, 1, Some("test")).await;
+    announce(false);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(2, Some(&grant.reservation), 60)),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    node.quiet(Duration::from_millis(1500)).await;
+    announce(true);
+    let HubJobMsg::Start(start) = node.job().await else {
+        panic!("expected a start");
+    };
+    assert_eq!(
+        start.reservation.as_deref(),
+        Some(grant.reservation.as_str())
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// With `[jobs] egress_rules`, a job is placed only on a node that enforces the rules, with
 /// the layer they resolve to from its claims, bounded by its key; one whose layer cannot be
 /// sent fails, saying why.

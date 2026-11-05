@@ -829,6 +829,9 @@ pub struct Db {
     /// `[jobs] egress_rules`: placed jobs, and gitlab-runner's under the Fallback, get the
     /// hub's egress layer.
     egress_rules: bool,
+    /// `[jobs] require_job_build_cache`: placed jobs go only to nodes announcing
+    /// `job_build_cache`.
+    require_job_build_cache: bool,
     /// When a heartbeat's write was last made durable ([`HEARTBEAT_SYNC_SECS`]).
     heartbeat_synced_at: AtomicU64,
     /// When requests past their keep were last swept.
@@ -910,6 +913,18 @@ impl Db {
     pub fn with_egress_rules(mut self, on: bool) -> Self {
         self.egress_rules = on;
         self
+    }
+
+    /// The hub with `[jobs] require_job_build_cache = true` when `on`.
+    pub fn with_require_job_build_cache(mut self, on: bool) -> Self {
+        self.require_job_build_cache = on;
+        self
+    }
+
+    /// Whether `[jobs] require_job_build_cache` is set: placed jobs go only to nodes caching
+    /// their builds by the job's scope ([`vk_hub_proto::Inventory::job_build_cache`]).
+    pub fn job_build_cache_required(&self) -> bool {
+        self.require_job_build_cache
     }
 
     /// Whether `[jobs] egress_rules` is set: placed jobs get the hub's egress layer, and are
@@ -1060,6 +1075,7 @@ impl Db {
             job_briefs: std::sync::RwLock::default(),
             db: Store::new(db),
             egress_rules: false,
+            require_job_build_cache: false,
             heartbeat_synced_at: AtomicU64::new(0),
             requests_swept_at: AtomicU64::new(0),
             oidc_default_role: None,
