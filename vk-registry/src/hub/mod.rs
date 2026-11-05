@@ -923,6 +923,7 @@ mod tests {
             auth: crate::Authenticator::Shared(crate::auth::Auth::None),
             tls: None,
             webdav: false,
+            s3: false,
             tokens: Default::default(),
             handover: Default::default(),
         })

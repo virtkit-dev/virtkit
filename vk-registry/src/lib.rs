@@ -109,6 +109,8 @@ pub struct ServerState {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// Enable WebDAV routes.
     pub webdav: bool,
+    /// Enable the S3 routes under `/s3/`.
+    pub s3: bool,
     /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
     pub tokens: hubtoken::TokenGate,
     /// The listeners served through, to hand to a release.
@@ -4183,6 +4185,9 @@ async fn serve_refusing(
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
     }
+    if !state.s3 {
+        eprintln!("vk-registry: S3 off (s3 = false): /s3/ answers 404");
+    }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
     let mut refused = RefusalLog::default();
@@ -6699,6 +6704,7 @@ mod tests {
             auth: Authenticator::Shared(auth),
             tls,
             webdav: false,
+            s3: false,
             tokens: Default::default(),
             handover: Default::default(),
         });
@@ -7140,6 +7146,7 @@ mod tests {
                 auth: Authenticator::Shared(auth::Auth::None),
                 tls: acceptor,
                 webdav: false,
+                s3: false,
                 tokens: Default::default(),
                 handover: Default::default(),
             });
@@ -10638,6 +10645,7 @@ mod tests {
             auth: Authenticator::Shared(auth::Auth::None),
             tls: None,
             webdav: false,
+            s3: false,
             tokens: Default::default(),
             handover: Default::default(),
         });

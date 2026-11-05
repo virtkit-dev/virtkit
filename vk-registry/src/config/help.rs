@@ -98,6 +98,11 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "s3",
+        help: "enable /s3/; false returns 404 [default: true]",
+    },
+    Key {
+        table: Table::Top,
         name: "max_connections",
         help: "connections served at once, each holding a file\n\
                descriptor; past it, new ones wait [default: 4096]",
