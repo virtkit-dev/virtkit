@@ -51,6 +51,7 @@ pub(crate) mod captions;
 pub mod client;
 pub mod config;
 pub(crate) mod dav;
+pub(crate) mod files;
 pub(crate) mod forms;
 pub mod handover;
 pub(crate) mod html;

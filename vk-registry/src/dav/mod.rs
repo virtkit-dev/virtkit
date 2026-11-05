@@ -90,7 +90,7 @@ async fn root(
                     entries.push(Entry::collection(href(&["repos"], true), repos));
                     entries.push(Entry::collection(
                         href(&["files"], true),
-                        store.repos_path_modified(files::FILES_REPO),
+                        store.repos_path_modified(crate::files::FILES_REPO),
                     ));
                 }
                 Ok(multistatus(&entries))
