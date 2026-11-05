@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **vk-hub rejects unusable registry paths.** Namespace paths and operator token grants
+  are rejected when stored or minted if they exceed 16 components or contain `tags`,
+  `manifests` or `blobs` as a component. GitLab instances cannot use those names either.
+  These paths were already refused by the registry.
+
 ## [0.106.1] - 2026-11-06
 
 ### Fixed

@@ -474,8 +474,13 @@ pub fn parse_grant(s: &str) -> Result<Grant, String> {
     let (prefix, rights) = s
         .split_once('=')
         .ok_or_else(|| format!("{s:?}: expected <prefix>=<rights>, as images=r"))?;
-    if !vk_hub_proto::token::valid_prefix(prefix) {
-        return Err(format!("{prefix:?} is not a repository name"));
+    if !vk_hub_proto::token::servable_prefix(prefix) {
+        return Err(format!(
+            "{prefix:?} is not a repository name the registry serves: lowercase components, at \
+             most {}, none of them {}",
+            vk_hub_proto::token::MAX_PREFIX_COMPONENTS,
+            vk_hub_proto::token::RESERVED_COMPONENTS.join(", ")
+        ));
     }
     if rights.is_empty() || !rights.chars().all(|c| matches!(c, 'r' | 'w' | 'l')) {
         return Err(format!("{rights:?}: rights are some of r, w and l"));
@@ -605,6 +610,18 @@ mod tests {
             reason(none(&ctx, Some("k"))),
             NoAccess::NodeWithoutJobTokens
         );
+    }
+
+    #[test]
+    fn an_operator_grant_names_a_prefix_the_registry_serves() {
+        assert!(parse_grant("images=r").is_ok());
+        for bad in [
+            "a/tags=r",
+            "Images=r",
+            &format!("{}=r", vec!["a"; 17].join("/")),
+        ] {
+            assert!(parse_grant(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

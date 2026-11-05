@@ -12,7 +12,9 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::dispatch::Area;
 use vk_hub_proto::registry::PrefixRetention;
-use vk_hub_proto::token::{ALIAS_ROOT, Grant, valid_component, valid_prefix};
+use vk_hub_proto::token::{
+    ALIAS_ROOT, Grant, MAX_PREFIX_COMPONENTS, RESERVED_COMPONENTS, servable_prefix, valid_component,
+};
 
 use super::registries::REGISTRIES;
 use super::{Db, NotEnrolled, append_audit, decode, encode};
@@ -113,8 +115,13 @@ impl NamespaceRow {
                 PLACEHOLDERS.join(", ")
             )
         })?;
-        if !valid_prefix(&sample) {
-            return Err(format!("{:?} is not a repository name", self.path));
+        if !servable_prefix(&sample) {
+            return Err(format!(
+                "{:?} is not a repository name the registry serves: lowercase components, at \
+                 most {MAX_PREFIX_COMPONENTS}, none of them {}",
+                self.path,
+                RESERVED_COMPONENTS.join(", ")
+            ));
         }
         if self.path.starts_with('{') {
             return Err(format!(
@@ -272,7 +279,7 @@ pub fn render(path: &str, c: &JobClaims) -> Option<String> {
         out.push(value);
     }
     let path = out.join("/");
-    valid_prefix(&path).then_some(path)
+    servable_prefix(&path).then_some(path)
 }
 
 /// What a job's token carries, from the namespaces of its registry.
@@ -666,6 +673,8 @@ mod tests {
             ns("x", "P/{project_id}", &["r:*"], None),
             ns("x", "p/{nope}", &["r:*"], None),
             ns("x", "files/a", &["r:*"], None),
+            ns("x", "p/blobs", &["r:*"], None),
+            ns("x", &vec!["p"; 17].join("/"), &["r:*"], None),
             ns("x", "p", &["w:ref release/*"], None),
             ns("x", "p", &["r:*"], Some(0)),
             ns("x", "p", &[], None),

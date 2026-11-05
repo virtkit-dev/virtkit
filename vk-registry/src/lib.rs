@@ -6579,6 +6579,16 @@ pub fn install_service(facts: &UnitFacts) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Hub prefixes must meet the store's repository-name limits.
+    #[test]
+    fn grant_prefixes_follow_the_names_the_store_takes() {
+        assert_eq!(REPO_SUBDIRS, vk_hub_proto::token::RESERVED_COMPONENTS);
+        assert_eq!(
+            MAX_NAME_SEGMENTS,
+            vk_hub_proto::token::MAX_PREFIX_COMPONENTS
+        );
+    }
+
     /// Start a server with `limits` on an ephemeral port over a fresh store named `tag`.
     async fn serve_test_limited(tag: &str, limits: ConnLimits) -> (SocketAddr, PathBuf) {
         let (addr, dir, _) = serve_test_with(tag, limits, auth::Auth::None, None).await;

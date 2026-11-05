@@ -33,6 +33,12 @@ pub const MAX_GRANTS: usize = 64;
 /// The longest a grant's prefix may be, as a repository name may.
 pub const MAX_PREFIX_LEN: usize = 255;
 
+/// Maximum components in a grant prefix, matching the registry's repository-name limit.
+pub const MAX_PREFIX_COMPONENTS: usize = 16;
+
+/// Registry layout directories, forbidden as repository-name components.
+pub const RESERVED_COMPONENTS: [&str; 3] = ["tags", "manifests", "blobs"];
+
 /// How far a registry's clock may be ahead of the hub's when it checks `exp`.
 pub const SKEW_SECS: u64 = 60;
 
@@ -154,6 +160,16 @@ pub fn under(prefix: &str, path: &str) -> bool {
 /// [`FILES_REPO`], which grants reach through their own prefix.
 pub fn valid_prefix(prefix: &str) -> bool {
     prefix.len() <= MAX_PREFIX_LEN && valid_path(prefix) && !under(FILES_REPO, prefix)
+}
+
+/// A [`valid_prefix`] with at most [`MAX_PREFIX_COMPONENTS`] components and none of
+/// [`RESERVED_COMPONENTS`], suitable for repositories on the registry.
+/// The hub enforces this when minting and storing prefixes. Registry and node readers
+/// retain the broader grammar, including lock paths, for older tokens and configs.
+pub fn servable_prefix(prefix: &str) -> bool {
+    valid_prefix(prefix)
+        && prefix.split('/').count() <= MAX_PREFIX_COMPONENTS
+        && !prefix.split('/').any(|c| RESERVED_COMPONENTS.contains(&c))
 }
 
 /// Whether `path` is in the repository grammar: `/`-separated [`valid_component`]s.
@@ -389,6 +405,28 @@ mod tests {
         ] {
             assert!(!valid_prefix(bad), "{bad}");
         }
+    }
+
+    /// The hub mints servable prefixes; the registry still accepts valid prefixes,
+    /// including lock paths.
+    #[test]
+    fn a_servable_prefix_is_one_the_store_takes_as_a_name() {
+        let deep = vec!["a"; MAX_PREFIX_COMPONENTS].join("/");
+        let deeper = format!("{deep}/a");
+        for ok in ["a/tags2/blob", deep.as_str(), "ci-cache/gl/42/protected"] {
+            assert!(servable_prefix(ok), "{ok}");
+        }
+        for bad in [
+            "a/tags",
+            "blobs",
+            "a/manifests/b",
+            deeper.as_str(),
+            "A",
+            "files/x",
+        ] {
+            assert!(!servable_prefix(bad), "{bad}");
+        }
+        assert!(valid_prefix("a/tags") && valid_prefix(&deeper));
     }
 
     #[test]

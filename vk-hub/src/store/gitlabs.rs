@@ -135,6 +135,12 @@ impl Db {
                  digits and '-', starting and ending with a letter or digit"
             )));
         }
+        if vk_hub_proto::token::RESERVED_COMPONENTS.contains(&name) {
+            return Err(refused(format!(
+                "{name:?} is reserved: the registry takes no repository path component named \
+                 so, and namespace paths hold the instance's name"
+            )));
+        }
         let Some(url) = normalize_gitlab_url(url) else {
             return Err(refused(format!("{url:?} is not an http(s) URL")));
         };
@@ -293,6 +299,18 @@ mod tests {
         db.egress_mute(&subject, "p", "noisy", Some(6), "u", 5)
             .unwrap();
         db.add_gitlab("gl", "https://b.example", "u", 6).unwrap();
+    }
+
+    #[test]
+    fn no_instance_is_named_like_a_registry_directory() {
+        let db = Db::open_memory().unwrap();
+        for name in ["tags", "manifests", "blobs"] {
+            let err = db
+                .add_gitlab(name, "https://a.example", "u", 1)
+                .unwrap_err();
+            assert!(err.to_string().contains("is reserved"), "{err:#}");
+        }
+        db.add_gitlab("tags2", "https://a.example", "u", 1).unwrap();
     }
 
     #[test]
