@@ -22,13 +22,17 @@ tests/gitlab-e2e.sh --stop-gitlab                 # stop a GitLab left up by --k
 
 - **Binaries.** The node runs `--vk` (default `$VK`, else `dist/vk`); `vk-hub`, `vk-registry`
   and `vk-gitlab` default to the ones beside it, and `--vk-hub`, `--vk-registry` and
-  `--vk-gitlab` override each. Without a `vk-registry` the `cache` and `registry` scenarios are
-  skipped, and with `E2E_TOKENS=0` the `registry` one. GitLab boots with the `vk` on `PATH`,
-  else `--vk` (`--vk-boot`).
+  `--vk-gitlab` override each. Without a `vk-registry` the `cache`, `registry` and
+  `pipeline_build` scenarios are skipped, and with `E2E_TOKENS=0` the last two. GitLab boots
+  with the `vk` on `PATH`, else `--vk` (`--vk-boot`).
 - **Scenarios.** `basic`, `scripts` (before/after_script), `variables` (masked, file),
   `exit_codes` (`allow_failure: exit_codes`), `artifacts` (upload, exclude, dependency
   download), `cache` (miss then hit across two pipelines), `registry` (a job's token through
   `registry.vk`: its pipeline's namespace takes a push and a lock, `images` refuses both),
+  `pipeline_build` (`vk-agent build` in one job, the image booted by later jobs of its
+  pipeline by full reference and as `pipeline/build/runner`; a second build of the name, a
+  symlink in the context or as the Dockerfile, a direct reference into the pipeline
+  namespace and the image from another pipeline refused),
   `services`, `timeout`, `cancel`, `restart` (vk-gitlab killed with SIGKILL mid-job, then
   resumed). All but `restart` run concurrently; `restart` runs alone after them.
 - **GitLab.** `gitlab/gitlab-ce`, pinned by digest in `tests/gitlab/images.env` (which says

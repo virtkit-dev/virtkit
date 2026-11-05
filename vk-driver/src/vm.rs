@@ -1951,14 +1951,23 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
 
-    // The guest's `vk-agent exec --service`: its host command channel, served below.
-    let service_exec = cfg.executor.guest_service_exec && !service_names.is_empty();
-    if service_exec {
+    // What the guest may ask of its host over its host command channel, served below.
+    let host_forms = HostForms {
+        exec: cfg.executor.guest_service_exec && !service_names.is_empty(),
+        build: guest_build_offered(ctx),
+    };
+    let host_channel = host_forms.any();
+    if host_channel {
         cmdline.push_str(&format!(
-            " VIRTKIT_HOST_EXEC_PORT={} {}=1",
-            crate::run::HOST_EXEC_PORT,
-            vk_core::service_exec::CMDLINE_KEY
+            " VIRTKIT_HOST_EXEC_PORT={}",
+            crate::run::HOST_EXEC_PORT
         ));
+    }
+    if host_forms.exec {
+        cmdline.push_str(&format!(" {}=1", vk_core::service_exec::CMDLINE_KEY));
+    }
+    if host_forms.build {
+        cmdline.push_str(&format!(" {}=1", vk_core::guest_build::CMDLINE_KEY));
     }
 
     if !cfg.executor.vm.cmdline_extra.is_empty() {
@@ -1986,7 +1995,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             crate::run::SSH_AGENT_VSOCK_PORT,
         ));
     }
-    if service_exec {
+    if host_channel {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),
             crate::run::HOST_EXEC_PORT,
@@ -2044,11 +2053,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
     // Without it the job still runs: its `vk-agent exec --service` then finds no one serving
     // the channel.
-    if service_exec {
-        match spawn_service_exec_serve(ctx, &agent.path) {
+    if host_channel {
+        match spawn_service_exec_serve(ctx, &agent.path, host_forms) {
             Ok(child) => children.push(child),
             Err(e) => {
-                eprintln!("virtkit: warning: the job's `vk-agent exec --service` is off: {e:#}")
+                eprintln!("virtkit: warning: the job's host command channel is off: {e:#}")
             }
         }
     }
@@ -2140,13 +2149,37 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
 }
 
 /// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk-agent exec
-/// --service` dials — for its services ([`spawn_service_exec_serve_at`]).
-fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
-    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent, HostForms::EXEC)
+/// --service` dials — for the forms it allows ([`spawn_service_exec_serve_at`]).
+fn spawn_service_exec_serve(
+    ctx: &JobCtx,
+    agent: &Path,
+    forms: HostForms,
+) -> Result<std::process::Child> {
+    // The build form loads the config the job runs with; exec needs none.
+    let config = ctx.cfg.source.as_deref().filter(|_| forms.build);
+    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent, forms, config)
+}
+
+/// Whether the job's guest may ask for `vk-agent build`: the node offers it
+/// ([`crate::config::Config::guest_build`]) with a remote `[registry]` to publish to, and the
+/// job's start names a pipeline namespace, with a registry token to publish there.
+fn guest_build_offered(ctx: &JobCtx) -> bool {
+    ctx.cfg.guest_build()
+        && ctx
+            .cfg
+            .registry
+            .as_ref()
+            .and_then(|rg| rg.base_url())
+            .is_some()
+        && ctx
+            .job_registry
+            .as_ref()
+            .is_some_and(|j| j.pipeline_prefix.is_some() && !j.token.is_empty())
 }
 
 /// The requests a VM's host command channel allows, passed to its wrapper as trusted
-/// arguments (`vk service-exec <dir> --allow exec,build -- …`).
+/// arguments (`vk service-exec <dir> --allow exec,build -- …`). The channel is served when
+/// at least one is allowed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostForms {
     /// `vk-agent exec --service`: an exec into one of the VM's services.
@@ -2162,6 +2195,10 @@ impl HostForms {
         exec: true,
         build: false,
     };
+
+    pub fn any(self) -> bool {
+        self.exec || self.build
+    }
 }
 
 impl std::fmt::Display for HostForms {
@@ -2197,24 +2234,37 @@ pub(crate) const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
 /// The guest controls request volume and therefore log volume.
 pub(crate) const SERVE_LOG_MAX: u64 = 1 << 20;
 
-/// Build `vk service-exec <dir> --allow <forms> --` to restrict host requests to `forms`:
-/// `vk exec --service` into `svc-<name>` services under `dir`. Guest arguments follow `--`;
-/// `dir` is absolute because the serve may run elsewhere. Resolve this vk's path now: a `vk
-/// update` during the VM's lifetime replaces that binary, so later requests run the updated
-/// version with these arguments.
-pub(crate) fn service_exec_command(dir: &Path, forms: HostForms) -> Result<(PathBuf, Vec<String>)> {
+/// Build `vk service-exec <dir> --allow <forms> [--config <file>] --` to restrict host
+/// requests to `forms`: `vk exec --service` into `svc-<name>` services under `dir`, `vk
+/// build` with the config at `config`. Guest arguments follow `--`; `dir` is absolute because
+/// the serve may run elsewhere. Resolve this vk's path now: a `vk update` during the VM's
+/// lifetime replaces that binary, so later requests run the updated version with these
+/// arguments.
+pub(crate) fn service_exec_command(
+    dir: &Path,
+    forms: HostForms,
+    config: Option<&Path>,
+) -> Result<(PathBuf, Vec<String>)> {
     let exe = std::env::current_exe().context("finding the vk binary")?;
     let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
     let dir = dir
         .to_str()
         .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
-    let args = vec![
+    let mut args = vec![
         "service-exec".to_string(),
         dir.into(),
         "--allow".into(),
         forms.to_string(),
-        "--".into(),
     ];
+    if let Some(config) = config {
+        let config = std::path::absolute(config)
+            .with_context(|| format!("resolving {}", config.display()))?;
+        let config = config
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", config.display()))?;
+        args.extend(["--config".to_string(), config.to_string()]);
+    }
+    args.push("--".into());
     Ok((exe, args))
 }
 
@@ -2242,8 +2292,9 @@ pub(crate) fn spawn_service_exec_serve_at(
     dir: &Path,
     agent: &Path,
     forms: HostForms,
+    config: Option<&Path>,
 ) -> Result<std::process::Child> {
-    let (exe, wrapper_args) = service_exec_command(dir, forms)?;
+    let (exe, wrapper_args) = service_exec_command(dir, forms, config)?;
     let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
     let mut cmd = Command::new(agent);
     cmd.arg("-s")
@@ -2355,12 +2406,26 @@ struct ServiceRequest {
     args: Vec<String>,
 }
 
-/// `vk service-exec <dir> --allow <forms> -- vk exec --service NAME … -- CMD…`: what a VM's
-/// agent asked, run when `forms` allow exec and it is an exec into one of the `svc-<name>`
-/// services under `dir` (a CI job's dir, a compose run's), refused with exit 2 otherwise.
-pub async fn service_exec(dir: &Path, forms: HostForms, argv: &[String]) -> std::process::ExitCode {
-    let req = match service_request(dir, forms, argv) {
-        Ok(req) => req,
+/// `vk service-exec <dir> --allow <forms> [--config <file>] -- vk …`: what a VM's agent asked,
+/// run when `forms` allow it and it is an exec into one of the `svc-<name>` services under
+/// `dir` (a CI job's dir, a compose run's) or a `vk-agent build` of the CI job in `dir` with
+/// the config at `config`, refused with exit 2 otherwise.
+pub async fn service_exec(
+    dir: &Path,
+    forms: HostForms,
+    config: Option<&Path>,
+    argv: &[String],
+) -> std::process::ExitCode {
+    let req = match host_request(dir, forms, argv) {
+        Ok(HostRequest::Exec(req)) => req,
+        Ok(HostRequest::Build(req)) => {
+            let (dir, config) = (dir.to_path_buf(), config.map(Path::to_path_buf));
+            return tokio::task::spawn_blocking(move || {
+                crate::guestbuild::serve(&dir, config.as_deref(), req)
+            })
+            .await
+            .unwrap_or(std::process::ExitCode::FAILURE);
+        }
         Err(code) => return code,
     };
     match crate::exec::run(
@@ -2386,9 +2451,36 @@ pub async fn service_exec(dir: &Path, forms: HostForms, argv: &[String]) -> std:
     }
 }
 
-/// [`service_exec`]'s decision: the request when `forms` allow exec and `argv` is the guest
-/// agent's `vk exec --service` into a service under `dir`, else the exit status, the reason
-/// already on stderr.
+/// What a VM's agent asked of its host ([`host_request`]).
+#[derive(Debug)]
+enum HostRequest {
+    Exec(ServiceRequest),
+    Build(crate::guestbuild::BuildRequest),
+}
+
+/// [`service_exec`]'s decision: the request when `forms` allow it and `argv` is the guest
+/// agent's `vk exec --service` into a service under `dir` or its `vk build`, else the exit
+/// status, the reason already on stderr.
+fn host_request(
+    dir: &Path,
+    forms: HostForms,
+    argv: &[String],
+) -> Result<HostRequest, std::process::ExitCode> {
+    // `vk build …` is a `vk-agent build`; anything else is taken for an exec request.
+    let words = (argv.first(), argv.get(1));
+    if words.0.map(String::as_str) == Some("vk") && words.1.map(String::as_str) == Some("build") {
+        if !forms.build {
+            eprintln!("vk: this VM's host does not allow `vk-agent build`");
+            return Err(std::process::ExitCode::from(2));
+        }
+        return crate::guestbuild::request(argv).map(HostRequest::Build);
+    }
+    service_request(dir, forms, argv).map(HostRequest::Exec)
+}
+
+/// [`host_request`]'s decision on an exec: the request when `forms` allow exec and `argv` is
+/// the guest agent's `vk exec --service` into a service under `dir`, else the exit status, the
+/// reason already on stderr.
 fn service_request(
     dir: &Path,
     forms: HostForms,
@@ -4889,7 +4981,7 @@ mod tests {
     }
 
     /// A VM's host command channel runs only the forms its wrapper was given: an exec request
-    /// with `exec`, never with `build` alone.
+    /// with `exec`, never with `build` alone; a `vk-agent build` request with `build` only.
     #[test]
     fn a_vms_host_command_channel_runs_only_the_forms_it_allows() {
         let job = crate::qga::tests::TempDir::new("host-forms");
@@ -4902,17 +4994,23 @@ mod tests {
         .unwrap();
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let exec = argv(&["vk", "exec", "--service", "db", "--", "true"]);
+        let build = argv(&["vk", "build", "--as", "runner"]);
         let refused = Err(std::process::ExitCode::from(2));
         let exec_only: HostForms = "exec".parse().unwrap();
         let build_only: HostForms = "build".parse().unwrap();
         let both: HostForms = "exec,build".parse().unwrap();
         assert_eq!(exec_only, HostForms::EXEC);
-        assert!(service_request(&job.0, exec_only, &exec).is_ok());
-        assert!(service_request(&job.0, both, &exec).is_ok());
-        assert_eq!(
-            service_request(&job.0, build_only, &exec).map(|_| ()),
-            refused
-        );
+        let is_exec = |r: Result<HostRequest, _>| matches!(r, Ok(HostRequest::Exec(_)));
+        let is_build = |r: Result<HostRequest, _>| matches!(r, Ok(HostRequest::Build(_)));
+        assert!(is_exec(host_request(&job.0, exec_only, &exec)));
+        assert!(is_exec(host_request(&job.0, both, &exec)));
+        assert_eq!(host_request(&job.0, build_only, &exec).map(|_| ()), refused);
+        assert_eq!(host_request(&job.0, exec_only, &build).map(|_| ()), refused);
+        assert!(is_build(host_request(&job.0, build_only, &build)));
+        assert!(is_build(host_request(&job.0, both, &build)));
+        // A build request that does not parse is refused, never taken for an exec.
+        let bad = argv(&["vk", "build", "--as", "Runner"]);
+        assert_eq!(host_request(&job.0, both, &bad).map(|_| ()), refused);
         // What `service_exec_command` passes is what the wrapper reads back.
         for forms in [exec_only, build_only, both] {
             assert_eq!(forms.to_string().parse::<HostForms>(), Ok(forms));
@@ -4921,6 +5019,47 @@ mod tests {
         for bad in ["", "exec,", "shell", "exec,shell", "EXEC"] {
             assert!(bad.parse::<HostForms>().is_err(), "{bad:?}");
         }
+    }
+
+    /// A job's guest is offered `vk-agent build` when the node offers it and the job's start
+    /// names a pipeline namespace with a token to publish there.
+    #[test]
+    fn guest_build_is_offered_to_a_job_with_a_pipeline_namespace() {
+        let env = [("CUSTOM_ENV_CI_JOB_ID".to_string(), "7".to_string())];
+        let ctx = |cfg: Config, prefix: Option<&str>, token: &str| {
+            let mut ctx = JobCtx::for_env(cfg, &env).unwrap();
+            ctx.job_registry = Some(vk_hub_proto::dispatch::JobRegistry {
+                registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+                token: token.into(),
+                expires_at: u64::MAX,
+                grants: Vec::new(),
+                cache_repo: None,
+                pipeline_prefix: prefix.map(str::to_string),
+                areas: vec![],
+            });
+            ctx
+        };
+        let cfg = |toml: &str| toml::from_str::<Config>(toml).unwrap();
+        const PIPELINE: Option<&str> = Some("ci-pipeline/gl/42/7");
+        const REMOTE: &str = "[registry]\nrepo = \"reg.example/x\"\n";
+        assert!(guest_build_offered(&ctx(cfg(REMOTE), PIPELINE, "vkt_x.y")));
+        assert!(!guest_build_offered(&ctx(cfg(REMOTE), None, "vkt_x.y")));
+        assert!(!guest_build_offered(&ctx(cfg(REMOTE), PIPELINE, "")));
+        let mut unplaced = ctx(cfg(REMOTE), PIPELINE, "vkt_x.y");
+        unplaced.job_registry = None;
+        assert!(!guest_build_offered(&unplaced));
+        // No registry to publish to, or a local store.
+        assert!(!guest_build_offered(&ctx(cfg(""), PIPELINE, "vkt_x.y")));
+        let local = cfg("[registry]\nrepo = \"/srv/registry\"\n");
+        assert!(!guest_build_offered(&ctx(local, PIPELINE, "vkt_x.y")));
+        let off = cfg(&format!("[executor]\nguest_build = false\n{REMOTE}"));
+        assert!(!guest_build_offered(&ctx(off, PIPELINE, "vkt_x.y")));
+        let node = cfg("[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\n");
+        assert!(!guest_build_offered(&ctx(node, PIPELINE, "vkt_x.y")));
+        let job = cfg(
+            "[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\nguest_credential = \"job\"\n",
+        );
+        assert!(guest_build_offered(&ctx(job, PIPELINE, "vkt_x.y")));
     }
 
     /// The service exec log keeps its first bytes and says it dropped the rest, reading

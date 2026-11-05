@@ -212,6 +212,68 @@ test-in-repo-image:
     MICROVM_IMAGE: dockerfile:ci/Dockerfile#test   # built from this checkout, then booted
 ```
 
+### Pipeline images built in a job
+
+A fleet job with a pipeline namespace can build an image from its own output for later jobs
+in the same pipeline to boot:
+
+```sh
+ref=$(vk-agent build -f docker/runner.Dockerfile --target runner \
+        --build-arg VERSION="$VERSION" --as runner ./out)
+echo "RUNNER_IMAGE=$ref" >> build.env
+```
+
+```yaml
+build-debs:
+  script: [./debbuild.sh]
+  artifacts:
+    reports: { dotenv: build.env }
+
+test:
+  needs: [build-debs]
+  variables:
+    MICROVM_IMAGE: $RUNNER_IMAGE    # pipeline/build/runner:job-1234@sha256:…
+```
+
+`vk-agent build [-f FILE] [--target STAGE] [--build-arg NAME=VALUE]… --as NAME CONTEXT` sends
+`CONTEXT`, less what its `.dockerignore` excludes, and the Dockerfile (`-f`, by default
+`CONTEXT/Dockerfile`, which may lie outside the context) to the host over the VM's host
+command channel. The host builds them as it builds a `dockerfile:` image — the build tier,
+`[build] cache_registry`, the build phase's egress — pushes the bundle to
+`<prefix>/builds/NAME` in the pipeline namespace with the job's registry token, tagged
+`job-<job id>`, then moves `current` onto it. The build's output goes to stderr; stdout is one
+line, `pipeline/build/NAME:job-<job id>@sha256:…`. Pass that full reference on: a retried
+producer publishes under its own job ID, and `pipeline/build/NAME` alone names whichever
+image was published last, which may change between a consumer's preparation and its boot.
+
+- The context holds regular files and directories only: a symlink or a special file left in
+  is refused by its path (`.dockerignore` can leave it out), and so is a symlinked
+  Dockerfile. The context travels as plain ustar: `context/` and a path below it must split
+  at a `/` into at most 155 bytes before it and 100 after, which caps the path at 248 bytes.
+- A file keeps its permission bits, its owner's read bit added; a directory keeps its own,
+  its owner's three added. Neither keeps an owner, nor a setuid, setgid or sticky bit.
+- The build arguments land in the job's host-side logs, as in the image's history: pass no
+  secret in one.
+- `[executor] guest_build_max_context` (default `"8G"`, counted on the wire) and
+  `guest_build_max_entries` (default `1000000`) cap a context; crossing either stops the
+  transfer and the build.
+- A job runs one build at a time, a second waiting up to 10 s for the first, and its
+  context's removal, before it is refused; and it publishes a name once.
+- The build is part of the job: cancelling or timing out the job stops it. The context is
+  unpacked under the job's directory on the host and removed when the build ends.
+- Exit status 2: refused before the context was read — no pipeline namespace, a name the job
+  already published, another build running, an argument the host does not take. 1: the
+  host failed before reading it (its config, its registry), the context could not be read or
+  sent, or the build or the push failed.
+
+`[executor] guest_build` decides whether jobs are offered it. Unset, it is on unless the
+guests' registry proxy lends the node's own credential (`[registry] proxy_guests` without
+`guest_credential = "job"`): such a proxy gives every guest the registry as the node sees it,
+every pipeline's images included. `true` beside one is refused when the config loads;
+`false` turns it off. Isolation between pipelines holds only on a registry whose nodes all
+lend job tokens or run no proxy; see the
+[pipeline images design](pipeline-images-design.md#host-side).
+
 ## Resource usage
 
 Each phase reports what it cost the runner. A job that builds its own image

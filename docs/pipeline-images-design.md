@@ -1,6 +1,10 @@
 # Pipeline images: built from a job, booted by its pipeline
 
-Status: step 1 implemented.
+Status: steps 1–4 implemented, step 5 in part. The GitLab end-to-end scenario
+`pipeline_build` covers a build, its consumers, a second build of one name, symlinks in a
+context, a direct reference and another pipeline. Not covered end to end: another project,
+the context caps, a tar escaping its root (unit-tested), and tag refresh by a digest-pinned
+consumer (unit-tested).
 
 A job builds an image from a Dockerfile and a context it produced itself, and later jobs of
 the same pipeline boot it. The case: a packaging job ends with its `.deb`s in a directory,

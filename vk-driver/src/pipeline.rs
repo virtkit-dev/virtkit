@@ -273,7 +273,6 @@ fn host_and_path(repo: &str, insecure: bool) -> Option<(String, &str)> {
 /// `<prefix>/builds/<name>` with the job's token, tagged `job-<job id>`, then `current` moved
 /// onto it. Refused when the job already published `name`. Returns the reference to it,
 /// `pipeline/build/<name>:job-<job id>@<digest>`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn publish_build(
     cfg: &Config,
     job: Option<&JobRegistry>,
@@ -294,7 +293,6 @@ pub fn publish_build(
 /// Refuse, before anything is built, what [`publish_build`] would: a job without a pipeline
 /// namespace or a live token, and a name the job already published. `Ok(Err(why))` when
 /// refused, `Err` when the registry could not say.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn check_publishable(
     cfg: &Config,
     job: Option<&JobRegistry>,

@@ -314,6 +314,15 @@
 #                        # own VM: `vk-agent exec --service NAME -- CMD`, which the host runs
 #                        # into that job's services and nothing else. Costs a host `vk`
 #                        # process per request; false gives the job VM no host channel
+# guest_build = true     # a job the hub placed with a pipeline namespace builds an image from
+#                        # a context of its own: `vk-agent build --as NAME CONTEXT`, built on
+#                        # the host and published as pipeline/build/NAME. Unset: on, unless
+#                        # [registry] proxy_guests lends this node's credential (refused
+#                        # beside one when set to true)
+# guest_build_max_context = "8G"  # the most a context may take on the wire, per job: concurrent
+#                        # jobs' contexts, and the image each exports, share state_dir with
+#                        # no node-wide cap
+# guest_build_max_entries = 1000000  # the most files and directories a context may hold
 
 [executor.vm]            # the job-VM template (only the CI job path reads it; `vk run` takes
                          # its sizing from flags and service VMs from the service name)

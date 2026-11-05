@@ -426,6 +426,30 @@ impl From<Limit> for String {
     }
 }
 
+/// A size with a binary suffix (`"8G"`, `"512M"`, `"2T"`, `"64K"`), as [`Limit`] reads one:
+/// neither a share nor `"none"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ByteSize(pub u64);
+
+impl TryFrom<String> for ByteSize {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<ByteSize, String> {
+        let shown = format!("{s:?}");
+        match Limit::try_from(s) {
+            Ok(Limit::Bytes(b)) => Ok(ByteSize(b)),
+            _ => Err(format!("{shown} is not a size: write \"8G\" or \"512M\"")),
+        }
+    }
+}
+
+impl From<ByteSize> for String {
+    fn from(b: ByteSize) -> String {
+        Limit::Bytes(b.0).into()
+    }
+}
+
 /// `[numa]` — NUMA placement for every VM this host boots. On a multi-socket host a VM whose
 /// memory is scattered across the sockets and whose vCPUs run on the far side of it loses
 /// throughput to the interconnect for as long as it runs; placed on one node — vCPUs pinned
@@ -656,6 +680,21 @@ pub struct Executor {
     /// whatever user it names in the service, root included; a service with wider egress than
     /// the job lends it that egress. Default true.
     pub guest_service_exec: bool,
+    /// Let a job a fleet hub placed build an image from a context of its own: `vk-agent build
+    /// [-f FILE] [--target STAGE] [--build-arg NAME=VALUE]… --as NAME CONTEXT`, sent over the
+    /// guest's host command channel, built on the host as a `dockerfile:` image is, and
+    /// published to the job's pipeline namespace as `pipeline/build/<NAME>`. Offered only to a
+    /// job whose start names a pipeline namespace and carries a registry token. Unset: on,
+    /// unless a guest registry proxy lends this node's credential (`[registry] proxy_guests`
+    /// without `guest_credential = "job"`), which reaches every pipeline's images; `true`
+    /// beside such a proxy is refused when the config loads. `false` turns it off.
+    pub guest_build: Option<bool>,
+    /// The most a `vk-agent build` context may take on the wire, tar headers included: a size
+    /// with a binary suffix (`"8G"`, the default; `"512M"`). Crossing it stops the transfer.
+    pub guest_build_max_context: ByteSize,
+    /// The most entries, files and directories, a `vk-agent build` context may hold. Default
+    /// 1000000. Crossing it stops the transfer.
+    pub guest_build_max_entries: std::num::NonZeroU64,
     /// `[executor.vm]` — the job VM template: cpus/mem/hostname and the per-job
     /// MICROVM_CPUS/MICROVM_MEM ceilings. Only the CI job path reads it; `vk run` takes
     /// its sizing from flags and service VMs from the service name.
@@ -705,6 +744,9 @@ impl Default for Executor {
             atop_interval_secs: 10,
             atop_retention_days: 14,
             guest_service_exec: true,
+            guest_build: None,
+            guest_build_max_context: ByteSize(8 << 30),
+            guest_build_max_entries: std::num::NonZeroU64::MIN.saturating_add(999_999),
             vm: Vm::default(),
             guest: Guest::default(),
             share: None,
@@ -1062,6 +1104,12 @@ impl Registry {
         self.pipeline_root.as_deref().unwrap_or("ci-pipeline")
     }
 
+    /// Whether the guest's proxy lends this section's own credential: `proxy_guests` without
+    /// `guest_credential = "job"`.
+    pub fn lends_node_credential(&self) -> bool {
+        self.proxy_guests && self.guest_credential != GuestCredential::Job
+    }
+
     /// Whether the guest's proxy lends a job's token rather than this section's credential:
     /// `guest_credential = "job"` on a remote registry.
     pub fn lends_job_token(&self) -> bool {
@@ -1268,6 +1316,18 @@ fn refuse_conflicts(cfg: &Config) -> Result<()> {
              components separated by `/`"
         );
     }
+    if cfg.executor.guest_build == Some(true)
+        && cfg
+            .registry
+            .as_ref()
+            .is_some_and(Registry::lends_node_credential)
+    {
+        anyhow::bail!(
+            "`[executor] guest_build = true` beside `[registry] proxy_guests`, which lends every \
+             job this node's credential and so every pipeline's images: set \
+             `guest_credential = \"job\"` or drop `guest_build`"
+        );
+    }
     Ok(())
 }
 
@@ -1305,6 +1365,16 @@ impl Config {
             .chain([PathBuf::from(DEFAULT_PATH)])
             .collect();
         load_resolved(explicit, &fallbacks)
+    }
+
+    /// Whether a job may ask for `vk-agent build` (`[executor] guest_build`): unset, unless
+    /// the guests' registry proxy lends this node's credential.
+    pub fn guest_build(&self) -> bool {
+        self.executor.guest_build.unwrap_or(true)
+            && !self
+                .registry
+                .as_ref()
+                .is_some_and(Registry::lends_node_credential)
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -1498,6 +1568,46 @@ mod tests {
         let stale = dir.file("stale.toml", "[vm]\ncpus = 1\n");
         let err = format!("{:#}", load_resolved(Some(stale), &[]).unwrap_err());
         assert!(err.contains("[executor.vm]"), "{err}");
+    }
+
+    /// `guest_build` is on by default unless the guests' proxy lends the node's credential, a
+    /// config that does so still loads, and only an explicit `true` beside it is refused.
+    #[test]
+    fn guest_build_defaults_off_beside_a_node_credential_proxy() {
+        let dir = Dir::new("guest-build");
+        let load = |name: &str, text: &str| load_resolved(Some(dir.file(name, text)), &[]);
+        const NODE: &str = "[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\n";
+        const JOB: &str = "[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\nguest_credential = \"job\"\n";
+        let cfg = load("none.toml", "").unwrap();
+        assert!(cfg.guest_build());
+        assert_eq!(cfg.executor.guest_build_max_context, ByteSize(8 << 30));
+        assert_eq!(cfg.executor.guest_build_max_entries.get(), 1_000_000);
+        assert!(!load("node.toml", NODE).unwrap().guest_build());
+        assert!(load("job.toml", JOB).unwrap().guest_build());
+        let explicit = format!("[executor]\nguest_build = true\n{JOB}");
+        assert!(load("job-on.toml", &explicit).unwrap().guest_build());
+        let off = "[executor]\nguest_build = false\n";
+        assert!(!load("off.toml", off).unwrap().guest_build());
+        let explicit = format!("[executor]\nguest_build = true\n{NODE}");
+        let err = format!("{:#}", load("node-on.toml", &explicit).unwrap_err());
+        assert!(err.contains("guest_credential"), "{err}");
+
+        let sized = "[executor]\nguest_build_max_context = \"512M\"\nguest_build_max_entries = 5\n";
+        let cfg = load("sized.toml", sized).unwrap();
+        assert_eq!(cfg.executor.guest_build_max_context, ByteSize(512 << 20));
+        assert_eq!(cfg.executor.guest_build_max_entries.get(), 5);
+        for bad in [
+            "guest_build_max_context = \"10%\"",
+            "guest_build_max_context = \"none\"",
+            "guest_build_max_context = \"8\"",
+            "guest_build_max_context = \"0G\"",
+            "guest_build_max_entries = 0",
+        ] {
+            assert!(
+                load("bad.toml", &format!("[executor]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     /// `pipeline_root` defaults to the namespace's default path root and must be a path.

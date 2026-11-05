@@ -11,6 +11,12 @@ All notable changes to virtkit will be documented in this file.
   the job's pipeline: `job-<id>`'s, or the latest. A missing image fails naming the producer
   job to rerun. Naming the pipeline namespace's images directly is refused for every job;
   `[registry] pipeline_root` (default `ci-pipeline`) says where that namespace lives.
+- **Build a pipeline image from a job.** On a fleet, `vk-agent build [-f FILE] [--target
+  STAGE] [--build-arg NAME=VALUE]… --as NAME CONTEXT` builds an image on the host
+  from a context produced by the job and publishes it in the job's pipeline, printing the
+  `pipeline/build/NAME:job-<id>@sha256:…` reference a later job boots. `[executor]
+  guest_build` turns it off; it is off by default on a node whose registry proxy lends guests
+  its own credential. `guest_build_max_context` and `guest_build_max_entries` cap a context.
 
 ## [0.104.0] - 2026-11-04
 
