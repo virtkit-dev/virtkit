@@ -111,6 +111,8 @@ pub struct ServerState {
     pub webdav: bool,
     /// Enable the S3 routes under `/s3/`.
     pub s3: bool,
+    /// The domain whose subdomains name S3 buckets, virtual-hosted style, when S3 is on.
+    pub s3_host: Option<String>,
     /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
     pub tokens: hubtoken::TokenGate,
     /// The listeners served through, to hand to a release.
@@ -4318,6 +4320,8 @@ async fn serve_refusing(
     }
     if !state.s3 {
         eprintln!("vk-registry: S3 off (s3 = false): /s3/ answers 404");
+    } else if let Some(host) = &state.s3_host {
+        eprintln!("vk-registry: S3 buckets also served as <bucket>.{host}");
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
@@ -4686,6 +4690,15 @@ fn token_challenge(auth: &Authenticator) -> Response<Body> {
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
+    // A host naming a bucket under `s3_host` makes the whole path an S3 key, so this comes
+    // before any route a path selects: an object may be called `login`.
+    if state.s3
+        && let Some(s3_host) = &state.s3_host
+        && let Some(bucket) = s3::host_of(&req).and_then(|h| s3::virtual_bucket(s3_host, h))
+    {
+        let bucket = bucket.to_string();
+        return s3::route(&state, Some(&bucket), req).await;
+    }
     let path = req.uri().path().to_string();
 
     // OIDC login/callback/logout must be reachable without a principal — gating the
@@ -4700,7 +4713,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // `/s3/` passes through a gate of its own, built on the same resolvers. Disabled, it is
     // the 404 below after this gate, as a disabled `/dav/` is.
     if state.s3 && s3::is_path(&path) {
-        return s3::route(&state, req).await;
+        return s3::route(&state, None, req).await;
     }
 
     // Client auth on every other path, including the `/v2/` version probe. Returning
@@ -6730,6 +6743,7 @@ mod tests {
             tls,
             webdav: false,
             s3: false,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         });
@@ -7172,6 +7186,7 @@ mod tests {
                 tls: acceptor,
                 webdav: false,
                 s3: false,
+                s3_host: None,
                 tokens: Default::default(),
                 handover: Default::default(),
             });

@@ -922,6 +922,7 @@ mod tests {
             tls: None,
             webdav: false,
             s3: false,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         })

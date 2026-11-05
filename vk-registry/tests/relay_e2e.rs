@@ -97,6 +97,7 @@ async fn relay_caches_digest_not_tag() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -119,6 +120,7 @@ async fn relay_caches_digest_not_tag() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -194,6 +196,7 @@ async fn multi_lock_is_atomic_all_or_nothing() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -271,6 +274,7 @@ async fn lock_client_authenticates_with_basic() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -316,6 +320,7 @@ async fn lock_client_authenticates_with_bearer() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -357,6 +362,7 @@ async fn lock_client_round_trips_against_the_server() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -427,6 +433,7 @@ async fn bearer_auth_gates_everything_including_the_probe() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -513,6 +520,7 @@ async fn basic_auth_gates_and_challenges() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -731,6 +739,7 @@ async fn relay_does_not_leak_upstream_credentials_to_the_client() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -776,6 +785,7 @@ async fn lock_api_build_once_over_http() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -1086,6 +1096,7 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -1279,6 +1290,7 @@ fn mirror_of(up_addr: std::net::SocketAddr, dir: &std::path::Path) -> Arc<Server
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     })
@@ -1557,6 +1569,7 @@ async fn a_blob_head_is_never_relayed() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1577,6 +1590,7 @@ async fn a_blob_head_is_never_relayed() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1645,6 +1659,7 @@ async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1751,6 +1766,7 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));

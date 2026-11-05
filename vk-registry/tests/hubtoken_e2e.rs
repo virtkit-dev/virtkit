@@ -91,6 +91,7 @@ fn shared_with(
         tls: None,
         webdav: true,
         s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });

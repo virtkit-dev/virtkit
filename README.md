@@ -868,7 +868,8 @@ SCCACHE_S3_KEY_PREFIX=<dir> AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$KEY sc
 
 Object keys follow the store's names (`A-Z a-z 0-9 . _ -` between slashes, at most 1024
 bytes); objects are at most 4 GiB; presigned URLs are refused. Set `s3 = false` to disable
-it.
+it. With wildcard DNS, `s3_host = "s3.example.com"` also serves each bucket virtual-hosted
+style, as `https://<bucket>.s3.example.com/<key>`.
 
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
 digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and

@@ -77,7 +77,7 @@ pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
         None => (rest, None),
     };
     let bucket = decode_segment(raw_bucket)
-        .filter(|b| crate::valid_name(b) && !b.contains('/') && b.len() <= MAX_COMPONENT)
+        .filter(|b| is_bucket(b))
         .ok_or(BAD_BUCKET)?;
     let raw_key = match raw_key {
         None | Some("") => return Ok(Target::Bucket(bucket)),
@@ -95,6 +95,11 @@ pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
         return Err(KEY_TOO_LONG);
     }
     Ok(Target::Object { key, segs })
+}
+
+/// Whether `name`, decoded, can name a bucket: one top-level component of `files/`.
+pub(crate) fn is_bucket(name: &str) -> bool {
+    crate::valid_name(name) && !name.contains('/') && name.len() <= MAX_COMPONENT
 }
 
 /// One key component, decoded and held to a repository name's component rule (which the

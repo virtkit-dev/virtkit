@@ -580,8 +580,19 @@ the server logs this setting at startup.
 
 Clients take `endpoint = https://<registry>/s3` and any region: `sccache` with
 `SCCACHE_BUCKET=<bucket> SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto`
-(`SCCACHE_S3_KEY_PREFIX` names a directory inside the bucket). Virtual-hosted style, which
-needs wildcard DNS, is not served.
+(`SCCACHE_S3_KEY_PREFIX` names a directory inside the bucket).
+
+**Virtual-hosted style** is opt-in, for clients that cannot be made to use paths: with
+`s3_host = "s3.example.com"`, a request sent to `<bucket>.s3.example.com` names its bucket by
+its host and its key by its whole path, and is served as `/s3/<bucket>/<path>`, so `/` there
+is the bucket and `/a/b` its object `a/b`, even where the path is one another route would
+take. The `Host` port is ignored. The signature is checked over the request as sent, host and
+path included, so nothing about credentials changes. It needs a wildcard DNS record
+`*.s3.example.com` pointing at the registry and, with TLS, a certificate covering that
+wildcard (one label deep: a bucket name with a dot is not covered). A host whose label cannot
+be a bucket, `s3_host` itself, and every other host are served as before, and path-style
+`/s3/` keeps working on any of them. The setting is a lowercase host name with no port; the
+server refuses anything else at startup.
 
 **Credentials.** SigV4 needs the server to hold the signing secret, and this registry stores
 API keys only as hashes and never mints hub tokens, so no new secret is introduced: the

@@ -103,6 +103,13 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "s3_host",
+        help: "host name whose subdomains are S3 buckets: <bucket>.<s3_host>\n\
+               is served as /s3/<bucket>/, for virtual-hosted clients;\n\
+               needs wildcard DNS and certificate [default: unset]",
+    },
+    Key {
+        table: Table::Top,
         name: "max_connections",
         help: "connections served at once, each holding a file\n\
                descriptor; past it, new ones wait [default: 4096]",
