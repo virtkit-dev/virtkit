@@ -19,6 +19,7 @@ mod list;
 mod meta;
 mod object;
 mod path;
+mod range;
 mod sigv4;
 mod xml;
 

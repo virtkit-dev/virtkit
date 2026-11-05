@@ -280,6 +280,10 @@ pub(crate) struct Commit {
     /// checked under the locks the tag is written under, so no other write of this server
     /// comes between the check and the write
     pub(crate) precondition: Option<Precondition>,
+    /// promoted as the bytes came, with no compression pass, so that ranges of it are read
+    /// by seeking (see [`crate::StagedBlob::uncompressed`]); otherwise compressed when that
+    /// pays
+    pub(crate) uncompressed: bool,
 }
 
 /// Promote a [`stage`]d body into the pool and tag it at `segs` as a raw file, re-checking
@@ -299,7 +303,11 @@ pub(crate) async fn commit(
             hex,
             mut staging,
         } = staged;
-        let promotion = store.stage_promotion(&hex, &staging.path)?;
+        let promotion = if how.uncompressed {
+            crate::StagedBlob::uncompressed(&staging.path)
+        } else {
+            store.stage_promotion(&hex, &staging.path)?
+        };
         let _namespace = namespace(&store)?;
         // shared store lock (vs. an exclusive gc) across the promote and the manifest that
         // references it; see Store::lock_shared. Another write may have changed the path
@@ -502,6 +510,7 @@ mod tests {
         let how = Commit {
             annotations: annotations.clone(),
             precondition: absent(),
+            ..Commit::default()
         };
         assert!(matches!(write(b"one", how).await, Written::Created));
         let (hex, _) = store.tag_target("files/b", "k").unwrap();
@@ -533,6 +542,41 @@ mod tests {
             ..Commit::default()
         };
         assert!(matches!(write(b"three", how).await, Written::Replaced));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit asked to keep its bytes uncompressed promotes them plain, however well they
+    /// would compress; otherwise compressible bytes are stored as a zstd frame.
+    #[tokio::test]
+    async fn an_uncompressed_commit_is_promoted_plain() {
+        let dir = std::env::temp_dir().join(format!("vk-reg-files-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.clone()).unwrap());
+        let write = async |name: &str, data: Vec<u8>, uncompressed: bool| {
+            let frame: std::result::Result<_, std::io::Error> =
+                Ok(hyper::body::Frame::data(Bytes::from(data)));
+            let body = http_body_util::StreamBody::new(futures::stream::iter([frame]));
+            let staged = stage(&store, body, &mut |_| {}).await.ok().unwrap();
+            let hex = staged.hex.clone();
+            let segs = vec!["b".to_string(), name.to_string()];
+            let how = Commit {
+                uncompressed,
+                ..Commit::default()
+            };
+            let written = commit(Arc::clone(&store), segs, staged, how).await;
+            assert!(matches!(written.unwrap(), Written::Created));
+            hex
+        };
+        let data = b"compressible ".repeat(4096);
+        let plain = write("plain", data.clone(), true).await;
+        assert!(store.blob_path(&plain).is_file());
+        assert!(!store.zstd_blob_path(&plain).is_file());
+        let mut other = data.clone();
+        other.push(b'!');
+        let packed = write("packed", other, false).await;
+        assert!(store.zstd_blob_path(&packed).is_file());
+        assert!(!store.blob_path(&packed).is_file());
+        assert_eq!(store.get_blob(&plain).unwrap().unwrap(), data);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

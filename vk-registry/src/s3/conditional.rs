@@ -109,7 +109,7 @@ impl Conditions {
     }
 }
 
-fn whole_seconds(t: SystemTime) -> u64 {
+pub(crate) fn whole_seconds(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()

@@ -268,6 +268,42 @@ fn stream_body(reader: impl std::io::Read + Send + Sync + 'static, what: &str) -
     StreamBody::new(stream).boxed()
 }
 
+/// What [`Store::serve_blob_range`] serves: the blob's canonical length, and the part.
+pub(crate) struct BlobPart {
+    pub(crate) total: u64,
+    pub(crate) body: Body,
+}
+
+/// A reader that discards the first `skip` bytes of `inner` on its first read, through the
+/// caller's buffer: a ranged read of a zstd-stored blob decodes what precedes the range on
+/// the blocking pool the stream reads on, not before the answer's headers are sent.
+struct Skip<R> {
+    inner: R,
+    skip: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Skip<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Counted down as it goes, so a read retried after `Interrupted` resumes where the
+        // one before stopped.
+        while self.skip > 0 {
+            let want = usize::try_from(self.skip).map_or(buf.len(), |s| s.min(buf.len()));
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the blob ends before the range starts",
+                ));
+            }
+            self.skip = self.skip.saturating_sub(n as u64);
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// Capability header a cooperating server sets on its `GET /v2/` response, so an
 /// auto-mode client knows it may push transparent-zstd (uncompressed-digest) chunks.
 /// Absent on any dumb OCI registry.
@@ -448,6 +484,17 @@ pub(crate) struct StagedBlob {
 }
 
 impl StagedBlob {
+    /// `tmp` installed as it is, the canonical bytes, with no compression pass: for a writer
+    /// whose objects will be read back in ranges, which a plain blob serves by seeking (see
+    /// [`Store::serve_blob_range`]). A blob already held keeps the form it has.
+    pub(crate) fn uncompressed(tmp: &Path) -> Self {
+        StagedBlob {
+            install: tmp.to_path_buf(),
+            discard: None,
+            zstd: false,
+        }
+    }
+
     /// Drop the staged files without installing anything — for a caller that gives up
     /// between staging and promoting. `gc` would sweep `uploads/` eventually anyway, so an
     /// unlink that fails is not worth reporting over whatever made the caller give up.
@@ -1115,6 +1162,64 @@ impl Store {
         std::fs::rename(&install, &dest).with_context(|| format!("promoting the blob {hex}"))?;
         drop_discard();
         Ok(())
+    }
+
+    /// `len` of blob `hex`'s canonical bytes from `start`, streamed through the body a whole
+    /// blob is, with the blob's canonical length; `None` when the blob is absent, and an error
+    /// when the part does not lie within it. Opened once and served from that descriptor, as
+    /// [`serve_blob`] is, and measured without reading it. Nothing is read for `head`.
+    ///
+    /// A plain blob is read from `start` after a seek. A zstd-stored one is decoded from the
+    /// frame's start and its first `start` bytes discarded, on the blocking pool as the
+    /// stream's first read: O(`start`) of decoding, with the decoder's window as memory, before
+    /// the part's first byte goes out. A client reading a large zstd blob in consecutive
+    /// ranges so pays quadratically, which is why the S3 view stores its large writes plain
+    /// ([`StagedBlob::uncompressed`]).
+    pub(crate) fn serve_blob_range(
+        &self,
+        hex: &str,
+        start: u64,
+        len: u64,
+        head: bool,
+    ) -> Result<Option<BlobPart>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some((path, is_zstd)) = self.find_blob(hex) else {
+            return Ok(None);
+        };
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let total = if is_zstd {
+            zstd_canonical_len(&mut file)
+                .with_context(|| format!("measuring the stored blob {hex}"))?
+        } else {
+            file.metadata()
+                .with_context(|| format!("stat {}", path.display()))?
+                .len()
+        };
+        if start.checked_add(len).is_none_or(|end| end > total) {
+            bail!("bytes {start}+{len} of the blob {hex}, which holds {total}");
+        }
+        if head || len == 0 {
+            return Ok(Some(BlobPart {
+                total,
+                body: body_of(Bytes::new()),
+            }));
+        }
+        let what = format!("sha256:{hex}");
+        let body = if is_zstd {
+            let decoder =
+                zstd::stream::read::Decoder::new(file).context("opening a stored blob")?;
+            let skipped = Skip {
+                inner: decoder,
+                skip: start,
+            };
+            stream_body(skipped.take(len), &what)
+        } else {
+            file.seek(SeekFrom::Start(start))
+                .with_context(|| format!("seeking in {}", path.display()))?;
+            stream_body(file.take(len), &what)
+        };
+        Ok(Some(BlobPart { total, body }))
     }
 
     /// Return a blob's decompressed bytes, or `None` if absent or larger than `cap`.
@@ -10303,6 +10408,66 @@ mod tests {
             shown.contains("sha256:beef") && shown.contains("the disk went away"),
             "the error must name the blob and the cause, got {shown}"
         );
+    }
+
+    /// A range of a blob is the same bytes stored plain (a seek) or as a zstd frame (decoded
+    /// and skipped), across chunk boundaries, at either end and whole; a HEAD reads nothing,
+    /// and a part not within the blob is an error, not a short body.
+    #[tokio::test]
+    async fn a_blob_range_is_the_same_bytes_plain_or_zstd() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        // Compressible, so `put_blob` keeps a frame; long enough for several chunks.
+        let raw: Vec<u8> = (0..3 * STREAM_CHUNK + 17)
+            .map(|i| (i / 1000 % 251) as u8)
+            .collect();
+        let zstd = store.put_blob(&raw).unwrap();
+        let zstd = zstd.trim_start_matches("sha256:");
+        assert!(store.zstd_blob_path(zstd).is_file());
+        let mut other = raw.clone();
+        other[0] ^= 1;
+        let plain = sha256_hex_raw(&other);
+        atomic_write(&store.blob_path(&plain), &other).unwrap();
+        let total = raw.len() as u64;
+
+        for (hex, raw) in [(zstd, &raw), (plain.as_str(), &other)] {
+            let read = async |start: u64, len: u64| {
+                let part = store
+                    .serve_blob_range(hex, start, len, false)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(part.total, total);
+                part.body.collect().await.unwrap().to_bytes().to_vec()
+            };
+            let at = |start: usize, len: usize| raw[start..start + len].to_vec();
+            assert_eq!(read(0, 1).await, at(0, 1));
+            assert_eq!(read(0, 100).await, at(0, 100));
+            let middle = STREAM_CHUNK as u64 - 5;
+            assert_eq!(
+                read(middle, STREAM_CHUNK as u64 + 10).await,
+                at(middle as usize, STREAM_CHUNK + 10),
+                "across a chunk"
+            );
+            assert_eq!(read(total - 1, 1).await, at(raw.len() - 1, 1));
+            assert_eq!(read(0, total).await, *raw);
+            assert!(read(total, 0).await.is_empty(), "a zero-length tail");
+
+            let head = store.serve_blob_range(hex, 5, 10, true).unwrap().unwrap();
+            assert_eq!(head.total, total);
+            assert!(head.body.collect().await.unwrap().to_bytes().is_empty());
+            assert!(store.serve_blob_range(hex, total, 1, false).is_err());
+            assert!(store.serve_blob_range(hex, 1, total, false).is_err());
+            assert!(store.serve_blob_range(hex, u64::MAX, 2, false).is_err());
+        }
+        let absent = sha256_hex_raw(b"absent");
+        assert!(
+            store
+                .serve_blob_range(&absent, 0, 1, false)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A reader whose length is an exact multiple of the chunk ends on the empty read,

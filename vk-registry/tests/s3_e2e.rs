@@ -1023,7 +1023,7 @@ fn is_object(resp: &Resp, body: &[u8]) {
     );
     assert_eq!(resp.header("content-disposition"), Some("attachment"));
     assert!(resp.header("last-modified").is_some(), "{resp:?}");
-    assert_eq!(resp.header("accept-ranges"), None);
+    assert_eq!(resp.header("accept-ranges"), Some("bytes"));
     assert_eq!(resp.header("docker-content-digest"), None);
 }
 
@@ -2328,4 +2328,208 @@ async fn s3_dav_and_v2_see_the_same_objects() {
     send(&host, Req::new("GET", "/s3/b/dav"))
         .await
         .is(404, "NoSuchKey");
+}
+
+/// What a ranged answer carries: 206, `Content-Range` and the part's length, and the whole
+/// object's headers.
+#[track_caller]
+fn is_part(resp: &Resp, data: &[u8], start: usize, len: usize, etag: &str) {
+    resp.ok(206);
+    let last = start + len - 1;
+    assert_eq!(
+        resp.header("content-range"),
+        Some(&*format!("bytes {start}-{last}/{}", data.len()))
+    );
+    assert_eq!(resp.header("content-length"), Some(&*len.to_string()));
+    assert_eq!(resp.header("etag"), Some(etag));
+    assert_eq!(resp.header("accept-ranges"), Some("bytes"));
+    assert_eq!(resp.header("content-disposition"), Some("attachment"));
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/octet-stream")
+    );
+    assert!(resp.header("last-modified").is_some(), "{resp:?}");
+    assert_eq!(resp.header("docker-content-digest"), None);
+}
+
+/// Bytes zstd shrinks well, varying enough that a misplaced range shows.
+fn compressible(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i / 300 % 251) as u8).collect()
+}
+
+/// Ranges of an object stored compressed (a small S3 write) and of one stored plain (an S3
+/// write of 8 MiB or more, so the AWS CLI's parallel 8 MiB ranges each cost a seek): every
+/// form, cut to the end, a HEAD, 416, and what is ignored.
+#[tokio::test]
+async fn ranges_of_plain_and_zstd_stored_objects() {
+    let dir = tmp("ranges");
+    let host = spawn(open_state(&dir, true));
+    let blobs = dir.join("store/blobs");
+    let small = compressible(300_000);
+    let big = compressible(8 << 20);
+    for (key, data) in [("small", &small), ("big", &big)] {
+        let path = format!("/s3/b/{key}");
+        send(&host, Req::new("PUT", &path).body(data.clone()))
+            .await
+            .ok(200);
+        let hex = sha256_hex(data);
+        let zstd = blobs.join("zstd").join(&hex).is_file();
+        let plain = blobs.join("sha256").join(&hex).is_file();
+        assert_eq!((zstd, plain), (key == "small", key == "big"), "{key}");
+
+        let whole = send(&host, Req::new("GET", &path)).await;
+        is_object(&whole, data);
+        let etag = whole.header("etag").unwrap().to_string();
+        let n = data.len();
+        let ranged = |value: &str| Req::new("GET", &path).header("Range", value);
+        for (value, start, len) in [
+            ("bytes=0-0".to_string(), 0, 1),
+            ("bytes=0-99".to_string(), 0, 100),
+            (format!("bytes={}-{}", n / 2, n / 2 + 70_000), n / 2, 70_001),
+            ("bytes=1000-".to_string(), 1000, n - 1000),
+            ("bytes=-500".to_string(), n - 500, 500),
+            (format!("bytes={}-", n - 1), n - 1, 1),
+            (format!("bytes=-{}", n + 10), 0, n),
+            (format!("bytes=10-{}", n * 2), 10, n - 10),
+            ("bytes=7-9,".to_string(), 7, 3),
+        ] {
+            let resp = send(&host, ranged(&value)).await;
+            is_part(&resp, data, start, len, &etag);
+            assert!(resp.bytes == data[start..start + len], "{key} {value}");
+        }
+        // The whole object again, from consecutive ranges as a transfer manager reads it.
+        let step = 3 << 20;
+        let mut joined = Vec::new();
+        for start in (0..n).step_by(step) {
+            let value = format!("bytes={start}-{}", start + step - 1);
+            joined.extend(send(&host, ranged(&value)).await.bytes);
+        }
+        assert!(joined == *data, "{key}: the parts are the whole");
+
+        // The checksum is the whole object's, and only when asked.
+        let resp = send(&host, ranged("bytes=0-9")).await;
+        assert_eq!(resp.header("x-amz-checksum-sha256"), None);
+        let resp = send(
+            &host,
+            ranged("bytes=0-9").header("x-amz-checksum-mode", "ENABLED"),
+        )
+        .await;
+        is_part(&resp, data, 0, 10, &etag);
+        let sha = b64(&sha2::Sha256::digest(data));
+        assert_eq!(resp.header("x-amz-checksum-sha256"), Some(&*sha));
+
+        // A HEAD answers what the GET would.
+        let resp = send(
+            &host,
+            Req::new("HEAD", &path).header("Range", "bytes=100-199"),
+        )
+        .await;
+        is_part(&resp, data, 100, 100, &etag);
+        assert!(resp.bytes.is_empty());
+        let resp = send(&host, Req::new("HEAD", &path)).await;
+        resp.ok(200);
+        assert_eq!(resp.header("accept-ranges"), Some("bytes"));
+        assert_eq!(resp.header("content-length"), Some(&*n.to_string()));
+
+        // No byte of the object.
+        for value in [format!("bytes={n}-"), "bytes=-0".into()] {
+            let resp = send(&host, ranged(&value)).await;
+            resp.is(416, "InvalidRange");
+            assert_eq!(resp.header("content-range"), Some(&*format!("bytes */{n}")));
+            assert!(
+                resp.body
+                    .contains(&format!("<ActualObjectSize>{n}</ActualObjectSize>")),
+                "{}",
+                resp.body
+            );
+        }
+        let head = Req::new("HEAD", &path).header("Range", &format!("bytes={n}-"));
+        assert_eq!(send(&host, head).await.status, 416);
+        // Several ranges, or one that does not parse: the whole object.
+        for value in [
+            "bytes=0-1,5-6",
+            "bytes=x-y",
+            "lines=0-1",
+            "bytes=5-2",
+            "bytes= -1",
+        ] {
+            is_object(&send(&host, ranged(value)).await, data);
+        }
+
+        // If-Range: the part while the object is the one it names, else the whole.
+        let modified = whole.header("last-modified").unwrap().to_string();
+        let resp = send(&host, ranged("bytes=0-9").header("If-Range", &etag)).await;
+        is_part(&resp, data, 0, 10, &etag);
+        let resp = send(&host, ranged("bytes=0-9").header("If-Range", &modified)).await;
+        is_part(&resp, data, 0, 10, &etag);
+        for stale in ["\"0000\"", "Mon, 01 Jan 2001 00:00:00 GMT"] {
+            let resp = send(&host, ranged("bytes=0-9").header("If-Range", stale)).await;
+            is_object(&resp, data);
+        }
+        // The preconditions come first.
+        let resp = send(&host, ranged("bytes=0-9").header("If-None-Match", &etag)).await;
+        resp.ok(304);
+    }
+
+    // An empty object has no first byte, but a suffix of it is the whole of it.
+    send(&host, Req::new("PUT", "/s3/b/empty")).await.ok(200);
+    for method in ["GET", "HEAD"] {
+        let ranged = |value: &str| Req::new(method, "/s3/b/empty").header("Range", value);
+        let resp = send(&host, ranged("bytes=-1")).await;
+        resp.ok(200);
+        assert_eq!(resp.header("content-length"), Some("0"));
+        assert_eq!(resp.header("content-range"), None);
+        for value in ["bytes=0-", "bytes=0-0", "bytes=-0"] {
+            assert_eq!(
+                send(&host, ranged(value)).await.status,
+                416,
+                "{method} {value}"
+            );
+        }
+    }
+}
+
+/// An object written over WebDAV is stored compressed when that pays, whatever its size, and
+/// is served in ranges all the same. A ranged GET is a read, so it refreshes an idle tag as a
+/// whole one does; a ranged HEAD does not.
+#[tokio::test]
+async fn a_dav_written_object_is_served_in_ranges_and_a_ranged_get_refreshes_it() {
+    let dir = tmp("dav-ranges");
+    let host = spawn(open_state(&dir, true));
+    let data = compressible(100_000);
+    for name in ["got", "headed"] {
+        let path = format!("/dav/files/b/{name}");
+        let resp = send(&host, Req::new("PUT", &path).body(data.clone())).await;
+        assert_eq!(resp.status, 201);
+    }
+    let hex = sha256_hex(&data);
+    assert!(dir.join("store/blobs/zstd").join(&hex).is_file());
+    let etag = format!("\"{hex}\"");
+
+    let tag = |name: &str| dir.join(format!("store/repos/files/b/tags/{name}"));
+    let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(784_887_151);
+    for name in ["got", "headed"] {
+        std::fs::File::open(tag(name))
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+    let mtime = |name: &str| std::fs::metadata(tag(name)).unwrap().modified().unwrap();
+
+    let ranged = |method, name: &str| {
+        Req::new(method, &format!("/s3/b/{name}")).header("Range", "bytes=-1000")
+    };
+    let resp = send(&host, ranged("GET", "got")).await;
+    is_part(&resp, &data, data.len() - 1000, 1000, &etag);
+    assert!(resp.bytes == data[data.len() - 1000..]);
+    // The header is the pre-touch time.
+    assert_eq!(
+        resp.header("last-modified"),
+        Some("Tue, 15 Nov 1994 08:12:31 GMT")
+    );
+    assert!(mtime("got") > SystemTime::now() - Duration::from_secs(60));
+
+    let resp = send(&host, ranged("HEAD", "headed")).await;
+    is_part(&resp, &data, data.len() - 1000, 1000, &etag);
+    assert_eq!(mtime("headed"), long_ago);
 }
