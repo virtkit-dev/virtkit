@@ -54,7 +54,7 @@ both!(
     strict_check_interval_paces_requests_after_a_job,
     output_the_hub_lost_fails_the_job,
     abort_reports_a_job_the_hub_never_ends,
-    a_failed_verify_is_retried_for_the_runner_id,
+    a_failed_verify_is_retried_without_a_job,
     a_running_jobs_view_poll_outlives_the_tick,
     gitlab_is_asked_only_while_the_hub_approves_its_server,
     a_job_of_a_project_not_approved_fails_pointing_at_the_hub,
@@ -660,18 +660,22 @@ async fn abort_reports_a_job_the_hub_never_ends(via: Via) {
     h.daemon.join().await;
 }
 
-async fn a_failed_verify_is_retried_for_the_runner_id(via: Via) {
+async fn a_failed_verify_is_retried_without_a_job(via: Via) {
     let mut h = Harness::unstarted(2, via).await;
     *h.gl.verify_failures.lock().unwrap() = 1;
     h.daemon = h.spawn_daemon();
+    let status = h.daemon.status.clone().unwrap();
+    eventually("verified again", || {
+        status
+            .runner_status("r1")
+            .is_some_and(|r| r.runner.verified && r.runner.runner_id == Some(RUNNER_ID as u64))
+    })
+    .await;
     h.hub.set_slots("p1", 1);
     h.gl.push_job(job_json(29));
     let (hub_id, sub) = h.accepted_job(1).await;
     let JobSpec::GitlabCi(spec) = &sub.spec;
-    assert_eq!(
-        spec.job.runner_id, RUNNER_ID as u64,
-        "verified with the job"
-    );
+    assert_eq!(spec.job.runner_id, RUNNER_ID as u64);
     assert_eq!(h.fake.requests_to("/api/v4/runners/verify").len(), 2);
     h.hub.finish(&hub_id, None, None);
     h.final_update(29).await;

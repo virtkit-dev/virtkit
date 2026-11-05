@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A runner GitLab did not answer at start is verified again.** A verify that got no answer
+  was retried only on the runner's next job, which the hub refused it, and otherwise a day
+  later. It is now retried, backing off up to five minutes.
+
 ## [0.105.0] - 2026-11-05
 
 ### Added

@@ -567,7 +567,7 @@ impl Runner {
             }
             Ok(None) => Verified::Refused,
             Err(e) => {
-                log::warn!(runner = name, error = e.to_string().as_str(); "Verifying the runner failed; trying again with its next job");
+                log::warn!(runner = name, error = e.to_string().as_str(); "Verifying the runner failed; trying again later");
                 Verified::Unknown
             }
         };
@@ -627,16 +627,33 @@ enum Verified {
 const TOKEN_EXPIRY_WARNING: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often a running runner's token is verified again, for the expiry warning.
 const REVERIFY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest wait between verifies GitLab gave no answer to.
+const UNVERIFIED_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
-/// Verifies the runner's token every [`REVERIFY_INTERVAL`] until the loop stops.
-async fn reverify<D>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
+/// Verifies the runner's token every [`REVERIFY_INTERVAL`] until the loop stops, and sooner,
+/// backing off up to [`UNVERIFIED_RETRY_MAX`], while GitLab gave no answer: the hub refuses an
+/// unverified runner's requests. `last` is how the latest verify went.
+async fn reverify<D>(shared: Arc<Shared<D>>, runner: Arc<Runner>, mut last: Verified) {
     let mut stop = Stop::new(&shared, &runner);
+    let mut retry = Backoff::new(
+        runner.check_interval.min(UNVERIFIED_RETRY_MAX),
+        UNVERIFIED_RETRY_MAX,
+        2.0,
+        true,
+    );
     loop {
+        let wait = if last == Verified::Unknown {
+            retry.next_delay()
+        } else {
+            retry.reset();
+            REVERIFY_INTERVAL
+        };
         tokio::select! {
-            () = tokio::time::sleep(REVERIFY_INTERVAL) => {}
+            () = tokio::time::sleep(wait) => {}
             () = stop.wait() => return,
         }
-        if runner.verify().await == Verified::Refused {
+        last = runner.verify().await;
+        if last == Verified::Refused {
             log::error!(runner = runner.cfg.name.as_str(); "GitLab refuses the runner's token");
         }
     }
@@ -838,9 +855,10 @@ pub async fn run<D: Dispatcher>(
     let mut draining = tokio::task::JoinSet::new();
     for runner in runners {
         let name = runner.cfg.name.as_str();
-        // A refused token stops the runner's requests; any other failure is retried with its
-        // first job. Its recorded jobs resume either way: their job tokens are their own.
-        let refused = runner.verify().await == Verified::Refused;
+        // A refused token stops the runner's requests; any other failure is retried until
+        // GitLab answers. Its recorded jobs resume either way: their job tokens are their own.
+        let verified = runner.verify().await;
+        let refused = verified == Verified::Refused;
         if refused {
             log::error!(runner = name; "GitLab refuses the runner's token; the runner requests no jobs");
         }
@@ -862,12 +880,12 @@ pub async fn run<D: Dispatcher>(
         } else if refused {
             runner.requests_ended.send_replace(true);
         } else {
-            requesting.push(runner);
+            requesting.push((runner, verified));
         }
     }
     let mut workers = tokio::task::JoinSet::new();
-    for runner in requesting {
-        workers.spawn(request(Arc::clone(&shared), runner));
+    for (runner, verified) in requesting {
+        workers.spawn(request(Arc::clone(&shared), runner, verified));
     }
     let mut stop = shared.shutdown.stop.clone();
     loop {
@@ -905,7 +923,8 @@ pub async fn run<D: Dispatcher>(
                     delivery.insert(cfg.name.clone(), task);
                     delivered.push(Arc::clone(&runner));
                     by_name.insert(cfg.name.clone(), Arc::clone(&runner));
-                    workers.spawn(request(Arc::clone(&shared), runner));
+                    // Verified as it was added.
+                    workers.spawn(request(Arc::clone(&shared), runner, Verified::Valid));
                 }
                 Some(Change::Remove(name)) => {
                     let Some(runner) = by_name.remove(&name) else {
@@ -1000,8 +1019,8 @@ fn build_runner<D>(
 }
 
 /// Run `runner`'s request loops, and its token's daily verify, until it is stopped or
-/// removed.
-async fn request<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
+/// removed. `verified` is how its latest verify went.
+async fn request<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>, verified: Verified) {
     let cfg = &runner.cfg;
     log::info!(
         runner = cfg.name.as_str(),
@@ -1015,7 +1034,7 @@ async fn request<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>) {
     for _ in 0..cfg.request_concurrency() {
         loops.spawn(request_loop(Arc::clone(&shared), Arc::clone(&runner)));
     }
-    loops.spawn(reverify(Arc::clone(&shared), Arc::clone(&runner)));
+    loops.spawn(reverify(Arc::clone(&shared), Arc::clone(&runner), verified));
     while loops.join_next().await.is_some() {}
     runner.requests_ended.send_replace(true);
 }

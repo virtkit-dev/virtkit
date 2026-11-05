@@ -545,7 +545,8 @@ refused while a job is still recorded, until it ends or the file is removed, whi
 job up to GitLab's timeout.
 
 The daemon does not rotate runner tokens. It verifies the token at start and daily, warns
-from a week before GitLab's `token_expires_at`, and logs an error once it has expired.
+from a week before GitLab's `token_expires_at`, and logs an error once it has expired. A
+verify GitLab gives no answer to is retried, backing off up to five minutes.
 
 ## Failures
 
