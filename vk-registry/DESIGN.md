@@ -798,6 +798,13 @@ print the issuer and subject of the user they act on. If more than one issuer ha
 the same email, the command requires `--issuer`. API keys are selected by the full hash
 identifier printed by `list-keys`.
 
+`create-key` prints the new token alone on stdout, so a redirect captures it and nothing else;
+what to do with it goes to stderr, including the token as S3 clients take it
+(`AWS_ACCESS_KEY_ID=vkr_… AWS_SECRET_ACCESS_KEY=vkr_…`, the same value twice). That pair
+spells the token out only when stdout is a terminal, so a redirected run leaves it out of a
+log stderr may be going to. `/settings/keys` shows a key it mints both ways, on the one page
+that ever shows its token.
+
 The administration channel is not HTTP and is never part of the public route table. By
 default, the socket is `admin.sock` beside the accounts database. It is published with mode
 `0600` by binding it inside a private staging directory and atomically renaming it into

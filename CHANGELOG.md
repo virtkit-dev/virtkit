@@ -21,7 +21,8 @@ All notable changes to virtkit will be documented in this file.
   (versioning, ACLs, tagging and the like) are answered as for a bucket with none set. Large
   files can be uploaded in parts, as the AWS CLI uploads them, parts copied from other objects,
   and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts
-  them. Set `s3 = false` in the server config to turn it off.
+  them. Set `s3 = false` in the server config to turn it off. A newly created API key is also
+  shown as the S3 key pair, ready to paste.
 
 ## [0.106.0] - 2026-11-05
 

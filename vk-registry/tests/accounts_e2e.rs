@@ -665,9 +665,24 @@ async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let minted = resp.text().await.unwrap();
     let keys = db.list_api_keys(&user.id).unwrap();
     assert_eq!(keys.len(), 1);
     assert!(keys[0].revoked_at.is_none());
+    // shown once, as the bearer and as the S3 pair, the same token both times
+    let shown = minted
+        .split("<pre>")
+        .nth(1)
+        .and_then(|s| s.split("</pre>").next())
+        .unwrap();
+    let after_prefix = shown.strip_prefix("vkr_").unwrap_or_default();
+    assert!(after_prefix.starts_with(&keys[0].token_prefix), "{minted}");
+    assert!(
+        minted.contains(&format!(
+            "AWS_ACCESS_KEY_ID={shown} AWS_SECRET_ACCESS_KEY={shown}"
+        )),
+        "{minted}"
+    );
 
     // An API key cannot manage keys, even authenticated.
     let (_, token) = db
