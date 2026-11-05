@@ -1,5 +1,5 @@
-//! Objects: PutObject, GetObject and HeadObject, GetObjectAttributes and DeleteObject, over
-//! the object layer the WebDAV view shares. Authorized as that view authorizes: a write needs
+//! Objects: PutObject, GetObject and HeadObject, GetObjectAttributes, an object's canned
+//! configurations and DeleteObject, over the object layer the WebDAV view shares. Authorized as that view authorizes: a write needs
 //! `Write` on the key's parent repository, a read `Read` on the repository the key resolves
 //! to; a caller holding the action on neither the key's path nor its parent is refused before
 //! any lookup, and what it may not read is absent (`NoSuchKey`).
@@ -38,12 +38,12 @@ const CHECKSUM_SHA256: &str = "x-amz-checksum-sha256";
 
 /// Whether this caller may `action` on the key at `segs` or on its parent: what admits a
 /// request to the lookup that then decides on the repository the key resolves to.
-fn admitted(authz: &Authz<'_>, action: accounts::Action, segs: &[String]) -> bool {
+pub(super) fn admitted(authz: &Authz<'_>, action: accounts::Action, segs: &[String]) -> bool {
     allowed(authz, action, &repo_name(segs))
         || object_of(segs).is_some_and(|(parent, _)| allowed(authz, action, &parent))
 }
 
-fn no_such_key(ctx: &Ctx) -> Response<Body> {
+pub(super) fn no_such_key(ctx: &Ctx) -> Response<Body> {
     ctx.error(
         StatusCode::NOT_FOUND,
         "NoSuchKey",
@@ -54,7 +54,11 @@ fn no_such_key(ctx: &Ctx) -> Response<Body> {
 /// The object at `segs` as this caller may read it: `None` when nothing is there, when a
 /// directory or a foreign tag is, or when the caller may not read the repository it is in or
 /// its bytes through it.
-fn readable(store: &Store, authz: &Authz<'_>, segs: &[String]) -> Result<Option<Object>> {
+pub(super) fn readable(
+    store: &Store,
+    authz: &Authz<'_>,
+    segs: &[String],
+) -> Result<Option<Object>> {
     Ok(match files::resolve(store, segs)? {
         Some(Node::Object(obj))
             if allowed(authz, accounts::Action::Read, &obj.repo)
@@ -284,6 +288,29 @@ pub(super) async fn attributes(
     .await
 }
 
+/// `GET /s3/<bucket>/<key>?tagging|acl`: the configuration `canned` says an object has, once
+/// the object is one the caller may read.
+pub(super) async fn configuration(
+    state: &ServerState,
+    authz: &Authz<'_>,
+    segs: Vec<String>,
+    canned: super::canned::Canned,
+    req: Request<Incoming>,
+    ctx: &Ctx,
+) -> Result<Response<Body>> {
+    if !admitted(authz, accounts::Action::Read, &segs) {
+        return refuse(req, ctx.access_denied(), ctx).await;
+    }
+    let ctx = ctx.clone();
+    crate::dav::blocking(state, authz, move |store, authz| {
+        Ok(match readable(store, authz, &segs)? {
+            Some(_) => canned.answer(&ctx),
+            None => no_such_key(&ctx),
+        })
+    })
+    .await
+}
+
 /// How a PutObject's body is bound to its signature, by `x-amz-content-sha256`, and how it is
 /// framed.
 struct Payload {
@@ -317,7 +344,7 @@ struct Expected {
 
 /// What a PutObject's headers ask that cannot be served, or are malformed: a status, a code
 /// and a message.
-type Refused = (StatusCode, &'static str, &'static str);
+pub(super) type Refused = (StatusCode, &'static str, &'static str);
 
 /// What `x-amz-content-sha256`, `Content-Encoding`, `x-amz-decoded-content-length` and
 /// `x-amz-trailer` say of a PutObject's body. A streaming mode, or `aws-chunked` named among
@@ -526,15 +553,90 @@ impl Digests {
     }
 }
 
-/// The answer to a write at a path that takes no object, with what is in the way.
-fn unwritable(why: Unwritable, ctx: &Ctx) -> Response<Body> {
-    let message = match why {
+/// Check what arrived against what the request said of it: its `md5`, and its `sha256`,
+/// `sha1` and `crc32` where they were computed.
+fn verify(
+    expected: &Expected,
+    md5: &[u8],
+    sha256: &Option<Vec<u8>>,
+    sha1: &Option<Vec<u8>>,
+    crc32: &Option<Vec<u8>>,
+) -> std::result::Result<(), Refused> {
+    if expected.md5.as_deref().is_some_and(|m| m != md5) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "the Content-MD5 you specified did not match what was received",
+        ));
+    }
+    let mismatch = |expected: &Option<Vec<u8>>, got: &Option<Vec<u8>>| {
+        expected.as_ref().is_some_and(|e| Some(e) != got.as_ref())
+    };
+    if mismatch(&expected.sha256, sha256)
+        || mismatch(&expected.sha1, sha1)
+        || mismatch(&expected.crc32, crc32)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "the x-amz-checksum you specified did not match the checksum of what was received",
+        ));
+    }
+    Ok(())
+}
+
+/// Check a request document read whole (a `Delete`) against what its headers say of it, as a
+/// PutObject's body is checked: the signed `x-amz-content-sha256`, `Content-MD5` and the
+/// `x-amz-checksum-*` headers. A document is sent whole, not `aws-chunked`.
+pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
+    let payload = payload(headers)?;
+    if payload.framing.is_some() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "a request document is sent whole, not aws-chunked",
+        ));
+    }
+    let expected = expected(headers)?;
+    let sha256 = sha2::Sha256::digest(body).to_vec();
+    if payload
+        .sha256
+        .is_some_and(|signed| signed != crate::hex_of(&sha256))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
+        ));
+    }
+    let sha1 = sha1::Sha1::digest(body).to_vec();
+    let crc32 = crc32fast::hash(body).to_be_bytes().to_vec();
+    verify(
+        &expected,
+        &md5::compute(body).0,
+        &Some(sha256),
+        &Some(sha1),
+        &Some(crc32),
+    )
+}
+
+/// Why a write at a path that takes no object is refused: what is in the way.
+pub(super) fn unwritable_message(why: Unwritable) -> &'static str {
+    match why {
         Unwritable::TopLevel => "a bucket takes no object of its own name",
         Unwritable::Directory => "this key is a prefix of other keys, and cannot be an object",
         Unwritable::Foreign => "this key holds content that is not a file, pushed over /v2/",
         Unwritable::UnderObject => "a prefix of this key is an object, which cannot hold keys",
-    };
-    ctx.error(StatusCode::CONFLICT, "OperationAborted", message)
+    }
+}
+
+/// The answer to a write at a path that takes no object, with what is in the way.
+pub(super) fn unwritable(why: Unwritable, ctx: &Ctx) -> Response<Body> {
+    ctx.error(
+        StatusCode::CONFLICT,
+        "OperationAborted",
+        unwritable_message(why),
+    )
 }
 
 /// `PUT /s3/<bucket>/<key>`: stream the body into staging while hashing it, check it against
@@ -566,9 +668,6 @@ pub(super) async fn put(
     };
     if over(CONTENT_LENGTH.as_str()) || over(DECODED_LENGTH) {
         return Ok(ctx.too_large());
-    }
-    if headers.contains_key("x-amz-copy-source") {
-        return refuse(req, ctx.not_implemented(), ctx).await;
     }
     let checked = payload(headers).and_then(|p| {
         let trailer = p.framing.and_then(|f| f.trailer);
@@ -660,26 +759,9 @@ pub(super) async fn put(
     let md5 = digests.md5.finalize().0;
     let sha1 = digests.sha1.map(|h| h.finalize().to_vec());
     let crc32 = digests.crc32.map(|h| h.finalize().to_be_bytes().to_vec());
-    if expected.md5.as_deref().is_some_and(|m| m != md5) {
-        return Ok(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the Content-MD5 you specified did not match what was received",
-        ));
-    }
     let sha256 = hex_bytes(&staged.hex);
-    let mismatch = |expected: &Option<Vec<u8>>, got: &Option<Vec<u8>>| {
-        expected.as_ref().is_some_and(|e| Some(e) != got.as_ref())
-    };
-    if mismatch(&expected.sha256, &sha256)
-        || mismatch(&expected.sha1, &sha1)
-        || mismatch(&expected.crc32, &crc32)
-    {
-        return Ok(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the x-amz-checksum you specified did not match the checksum of what was received",
-        ));
+    if let Err((status, code, message)) = verify(&expected, &md5, &sha256, &sha1, &crc32) {
+        return Ok(ctx.error(status, code, message));
     }
     let md5_hex = crate::hex_of(&md5);
     annotations.insert(MD5_ANNOTATION.to_string(), md5_hex.clone());
@@ -735,27 +817,49 @@ pub(super) async fn delete(
     }
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
-        let _namespace = files::namespace(store)?;
-        let node = match files::resolve(store, &segs)? {
-            Some(node) if allowed(authz, accounts::Action::Read, node.repo()) => node,
-            // Nothing there, as far as this caller can tell.
-            _ => return Ok(no_content()),
-        };
-        if !allowed(authz, accounts::Action::Write, node.repo()) {
-            return Ok(ctx.access_denied());
-        }
-        match node {
-            Node::Object(obj) => {
-                store.delete_tag(&obj.repo, &obj.tag)?;
-            }
-            Node::Foreign(_) => {
-                return Ok(unwritable(Unwritable::Foreign, &ctx));
-            }
-            Node::Dir(_) => {}
-        }
-        Ok(no_content())
+        let namespace = files::namespace(store)?;
+        Ok(match delete_one(store, &namespace, authz, &segs)? {
+            Deleted::Gone => no_content(),
+            Deleted::Denied => ctx.access_denied(),
+            Deleted::Foreign => unwritable(Unwritable::Foreign, &ctx),
+        })
     })
     .await
+}
+
+/// What [`delete_one`] did.
+pub(super) enum Deleted {
+    /// no object is at the key now, whether or not one was, as far as the caller can tell
+    Gone,
+    /// the caller may read the object but not write it
+    Denied,
+    /// a foreign tag is there, which is not this view's to delete
+    Foreign,
+}
+
+/// Delete the object at `segs` for this caller, the namespace held (`_namespace`): a key
+/// that is a directory holds no object to delete, and one the caller may not read is absent.
+pub(super) fn delete_one(
+    store: &Store,
+    _namespace: &files::Namespace,
+    authz: &Authz<'_>,
+    segs: &[String],
+) -> Result<Deleted> {
+    let node = match files::resolve(store, segs)? {
+        Some(node) if allowed(authz, accounts::Action::Read, node.repo()) => node,
+        _ => return Ok(Deleted::Gone),
+    };
+    if !allowed(authz, accounts::Action::Write, node.repo()) {
+        return Ok(Deleted::Denied);
+    }
+    match node {
+        Node::Object(obj) => {
+            store.delete_tag(&obj.repo, &obj.tag)?;
+        }
+        Node::Foreign(_) => return Ok(Deleted::Foreign),
+        Node::Dir(_) => {}
+    }
+    Ok(Deleted::Gone)
 }
 
 fn no_content() -> Response<Body> {

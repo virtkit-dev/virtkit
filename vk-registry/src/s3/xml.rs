@@ -1,5 +1,7 @@
 //! The XML S3 answers in: the `Error` document every refusal carries, and the documents of
-//! the operations that answer with one.
+//! the operations that answer with one. The XML requests carry is read by [`scan`].
+
+pub(crate) mod scan;
 
 use bytes::Bytes;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};

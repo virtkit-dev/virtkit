@@ -67,6 +67,16 @@ pub(crate) fn annotations(headers: &HeaderMap) -> Result<BTreeMap<String, String
     Ok(out)
 }
 
+/// The user metadata among an object's annotations, as [`annotations`] made them: what a
+/// copy carries over.
+pub(crate) fn carried(annotations: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    annotations
+        .iter()
+        .filter(|(k, _)| k.starts_with(ANNOTATION_PREFIX))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// The `x-amz-meta-*` headers an object's annotations hold; one that cannot be a header any
 /// more is left out.
 pub(crate) fn headers(
@@ -116,6 +126,8 @@ mod tests {
         );
         let mut all = a.clone();
         all.insert("org.virtkit.md5".into(), "00".into());
+        all.insert("org.virtkit.retention".into(), "keep".into());
+        assert_eq!(carried(&all), a);
         let back: Vec<(String, String)> = headers(&all)
             .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_string()))
             .collect();

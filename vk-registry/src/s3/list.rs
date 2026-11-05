@@ -344,7 +344,7 @@ fn url_encode(key: &str) -> String {
 }
 
 /// An object's `LastModified` as S3's listings write it.
-fn iso8601(t: std::time::SystemTime) -> String {
+pub(super) fn iso8601(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

@@ -9,12 +9,17 @@
 //! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
 //! one, served over the object layer the WebDAV view shares ([`crate::files`]): [`bucket`]
 //! answers the service and its buckets, [`list`] a bucket's listings, [`object`] the
-//! objects, with [`chunked`] decoding the `aws-chunked` bodies SDKs upload them in.
-//! Operations not served yet answer `NotImplemented`.
+//! objects, with [`chunked`] decoding the `aws-chunked` bodies SDKs upload them in, [`copy`]
+//! their copies and [`batch`] their deletion in batches; [`canned`] answers the
+//! configurations a bucket or an object has none of. Operations not served yet answer
+//! `NotImplemented`.
 
+mod batch;
 mod bucket;
+mod canned;
 mod chunked;
 mod conditional;
+mod copy;
 mod list;
 mod meta;
 mod object;
@@ -237,11 +242,34 @@ async fn operate(
         (path::Target::Bucket(b), &Method::GET, _) if list::is_listing(&query) => {
             list::list(state, authz, b, &query, req, ctx).await
         }
+        (path::Target::Bucket(b), &Method::GET, Some(sub)) => match canned::bucket(sub) {
+            Some(canned) => bucket::configuration(state, authz, b, canned, req, ctx).await,
+            None => refuse(req, ctx.not_implemented(), ctx).await,
+        },
+        (path::Target::Bucket(b), &Method::PUT, None) => {
+            bucket::create(state, authz, b, req, ctx).await
+        }
+        (path::Target::Bucket(b), &Method::DELETE, None) => {
+            bucket::delete(state, authz, b, req, ctx).await
+        }
+        (path::Target::Bucket(b), &Method::POST, Some("delete")) => {
+            batch::delete(state, authz, b, req, ctx).await
+        }
         (path::Target::Object { segs, .. }, &Method::GET | &Method::HEAD, None) => {
             object::get(state, authz, segs, method == Method::HEAD, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::GET, Some("attributes")) => {
             object::attributes(state, authz, segs, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::GET, Some(sub)) => match canned::object(sub) {
+            Some(canned) => object::configuration(state, authz, segs, canned, req, ctx).await,
+            None => refuse(req, ctx.not_implemented(), ctx).await,
+        },
+        // A copy names its source in a header, and its body is not the object.
+        (path::Target::Object { segs, .. }, &Method::PUT, None)
+            if req.headers().contains_key(copy::COPY_SOURCE) =>
+        {
+            copy::copy(state, authz, segs, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::PUT, None) => {
             object::put(state, authz, segs, seed, req, ctx).await
@@ -269,6 +297,34 @@ async fn drain(req: Request<Incoming>, ctx: &Ctx) -> Result<Option<Response<Body
         Err(PutError::TooLarge) => Ok(Some(ctx.too_large())),
         Err(PutError::Failed(e)) => Err(e),
     }
+}
+
+/// A request document read whole, up to `cap` bytes: `Err(too_long)` when it is longer,
+/// once the rest has been read through as a refusal's is (or 413 past the object cap).
+async fn read_small(
+    mut body: Incoming,
+    cap: usize,
+    too_long: Response<Body>,
+    ctx: &Ctx,
+) -> Result<std::result::Result<Vec<u8>, Response<Body>>> {
+    use http_body_util::BodyExt as _;
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = anyhow::Context::context(frame, "reading a request document")?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if out.len().saturating_add(data.len()) > cap {
+            let sink = &mut tokio::io::sink();
+            return match crate::files::drain_into(sink, &mut body, MAX_OBJECT, &mut |_| {}).await {
+                Ok(_) => Ok(Err(too_long)),
+                Err(PutError::TooLarge) => Ok(Err(ctx.too_large())),
+                Err(PutError::Failed(e)) => Err(e),
+            };
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(Ok(out))
 }
 
 /// Answer `resp` to a request refused before it was authenticated, having read at most

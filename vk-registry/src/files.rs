@@ -30,6 +30,10 @@ pub(crate) const MAX_OBJECT: u64 = 4 << 30;
 /// gc's retention keys on — so a cache read is a metadata write at most once an hour.
 const TOUCH_AFTER: Duration = Duration::from_secs(3600);
 
+/// Longest a directory's removal waits for the exclusive store lock, released between
+/// attempts, before answering 503.
+pub(crate) const DELETE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
 /// Serialize `files/` checks and namespace changes (object tags, new directories, deletions)
 /// in this server so a write of an object and of a directory at the same path cannot both
 /// succeed. Acquire before the store lock, never while holding it. `/v2/` writes into
@@ -312,31 +316,20 @@ pub(crate) async fn commit(
         // shared store lock (vs. an exclusive gc) across the promote and the manifest that
         // references it; see Store::lock_shared. Another write may have changed the path
         // while the body streamed, so it is checked again.
-        let checked = store.lock_shared().and_then(|lock| {
-            let existing = match resolve(&store, &segs)? {
-                Some(Node::Object(obj)) => Some(obj),
-                _ => None,
-            };
-            Ok((lock, unwritable(&store, &segs)?, existing))
-        });
-        let (_lock, existing) = match checked {
-            Ok((lock, None, existing)) => (lock, existing),
-            Ok((_, Some(why), _)) => {
+        let checked = store
+            .lock_shared()
+            .and_then(|lock| Ok((lock, admit(&store, &segs, how.precondition)?)));
+        let (_lock, existed) = match checked {
+            Ok((lock, Ok(existed))) => (lock, existed),
+            Ok((_, Err(refused))) => {
                 promotion.discard();
-                return Ok(Written::Refused(why));
+                return Ok(refused);
             }
             Err(e) => {
                 promotion.discard();
                 return Err(e);
             }
         };
-        if let Some(precondition) = how.precondition
-            && !precondition(existing.as_ref())
-        {
-            promotion.discard();
-            return Ok(Written::PreconditionFailed);
-        }
-        let existed = existing.is_some();
         store.promote_staged(&hex, promotion)?;
         staging.armed = false;
         let (repo, tag) = object_of(&segs).context("a write past its checks names an object")?;
@@ -349,6 +342,73 @@ pub(crate) async fn commit(
     })
     .await
     .context("the object's promotion panicked")?
+}
+
+/// Whether a write at `segs` goes ahead, checked under the locks it is written under:
+/// `Ok(existed)`, or the [`Written`] refusal — [`unwritable`] first, then `precondition` on
+/// the object found there.
+fn admit(
+    store: &Store,
+    segs: &[String],
+    precondition: Option<Precondition>,
+) -> Result<std::result::Result<bool, Written>> {
+    let existing = match resolve(store, segs)? {
+        Some(Node::Object(obj)) => Some(obj),
+        _ => None,
+    };
+    if let Some(why) = unwritable(store, segs)? {
+        return Ok(Err(Written::Refused(why)));
+    }
+    if let Some(precondition) = precondition
+        && !precondition(existing.as_ref())
+    {
+        return Ok(Err(Written::PreconditionFailed));
+    }
+    Ok(Ok(existing.is_some()))
+}
+
+/// The [`namespace`] and the shared store lock, held together in that order as a write of
+/// `files/` holds them: what [`link`] is called under, across whatever its caller read the
+/// layer it tags from.
+pub(crate) struct Held {
+    _namespace: Namespace,
+    _store: crate::LockGuard,
+}
+
+/// Take [`Held`]'s locks.
+pub(crate) fn hold(store: &Store) -> Result<Held> {
+    let namespace = namespace(store)?;
+    Ok(Held {
+        _namespace: namespace,
+        _store: store.lock_shared()?,
+    })
+}
+
+/// Tag `layer`, a blob of `size` bytes already in the pool, at `segs` as a raw file: what
+/// [`commit`] does for bytes that need no staging, such as a copy of another object. The
+/// caller holds the locks (`_held`) and has checked that the blob is there; [`unwritable`]
+/// and `how`'s precondition are checked here, and the layer's membership in the destination
+/// repository is recorded with the tag, as a commit records it. `how.uncompressed` says
+/// nothing here: the blob keeps the form it is stored in.
+pub(crate) fn link(
+    store: &Store,
+    _held: &Held,
+    segs: &[String],
+    layer: &str,
+    size: u64,
+    how: Commit,
+) -> Result<Written> {
+    let existed = match admit(store, segs, how.precondition)? {
+        Ok(existed) => existed,
+        Err(refused) => return Ok(refused),
+    };
+    let (repo, tag) = object_of(segs).context("a write past its checks names an object")?;
+    store.put_raw_file_annotated(&repo, tag, layer, size, None, &how.annotations)?;
+    Ok(if existed {
+        Written::Replaced
+    } else {
+        Written::Created
+    })
 }
 
 /// Stream `body` to `out`, coalescing small frames and enforcing `cap`, including for chunked
@@ -542,6 +602,54 @@ mod tests {
             ..Commit::default()
         };
         assert!(matches!(write(b"three", how).await, Written::Replaced));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link tags a layer already in the pool elsewhere, recording it a member of the
+    /// destination so it is readable there, and is refused as a commit is.
+    #[tokio::test]
+    async fn a_link_tags_a_layer_already_held_as_a_commit_would() {
+        let dir = std::env::temp_dir().join(format!("vk-reg-files-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.clone()).unwrap());
+        let frame: std::result::Result<_, std::io::Error> =
+            Ok(hyper::body::Frame::data(Bytes::from_static(b"one")));
+        let body = http_body_util::StreamBody::new(futures::stream::iter([frame]));
+        let staged = stage(&store, body, &mut |_| {}).await.ok().unwrap();
+        let layer = staged.hex.clone();
+        let src = vec!["b".to_string(), "k".to_string()];
+        let written = commit(Arc::clone(&store), src, staged, Commit::default()).await;
+        assert!(matches!(written.unwrap(), Written::Created));
+        let segs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let held = hold(&store).unwrap();
+        let annotations = BTreeMap::from([("org.example.k".to_string(), "v".to_string())]);
+        let how = Commit {
+            annotations,
+            ..Commit::default()
+        };
+        let dst = segs(&["c", "d", "copy"]);
+        let written = link(&store, &held, &dst, &layer, 3, how).unwrap();
+        assert!(matches!(written, Written::Created));
+        assert!(store.repo_has_blob("files/c/d", &layer));
+        let Some(Node::Object(obj)) = resolve(&store, &dst).unwrap() else {
+            panic!("an object at the link");
+        };
+        assert_eq!((obj.layer.as_str(), obj.size), (layer.as_str(), 3));
+        assert_eq!(obj.annotations["org.example.k"], "v");
+
+        let absent = Commit {
+            precondition: Some(Box::new(|o: Option<&Object>| o.is_none())),
+            ..Commit::default()
+        };
+        let written = link(&store, &held, &dst, &layer, 3, absent).unwrap();
+        assert!(matches!(written, Written::PreconditionFailed));
+        let below = segs(&["b", "k", "x"]);
+        let written = link(&store, &held, &below, &layer, 3, Commit::default()).unwrap();
+        assert!(matches!(written, Written::Refused(Unwritable::UnderObject)));
+        let written = link(&store, &held, &dst, &layer, 3, Commit::default()).unwrap();
+        assert!(matches!(written, Written::Replaced));
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
