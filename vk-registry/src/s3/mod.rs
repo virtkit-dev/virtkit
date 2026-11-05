@@ -3,7 +3,8 @@
 //! registry already takes (an API key, a hub token, the shared bearer, or the shared Basic
 //! user) and whose signing secret is that same string (the Basic password for the user), so
 //! nothing new is stored; or by the bearer, Basic or session credential the other routes
-//! take. Every answer carries an `x-amz-request-id`, and refusals are S3's XML `Error`.
+//! take. Every answer carries an `x-amz-request-id` (and the same id as `x-amz-id-2`), and
+//! refusals are S3's XML `Error`.
 //! Presigned URLs and temporary credentials are refused.
 //!
 //! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
@@ -80,6 +81,10 @@ const PRE_AUTH_DRAIN: u64 = 64 * 1024;
 /// The header naming each request, for a client's report to be matched to a server line.
 const REQUEST_ID: &str = "x-amz-request-id";
 
+/// S3's second id of a request, carried on every answer as the first one again: SDK test
+/// suites assert it is there, and a client's report may quote either.
+const EXTENDED_ID: &str = "x-amz-id-2";
+
 /// The size from which a written object is stored uncompressed. The AWS CLI and SDK transfer
 /// managers download an object past 8 MiB as parallel 8 MiB ranges, and a range of a
 /// zstd-stored blob is decoded from the blob's start ([`crate::Store::serve_blob_range`]):
@@ -118,6 +123,7 @@ pub(crate) async fn route(
     };
     let headers = resp.headers_mut();
     headers.insert(REQUEST_ID, HeaderValue::from_str(id)?);
+    headers.insert(EXTENDED_ID, HeaderValue::from_str(id)?);
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     Ok(resp)
 }

@@ -784,8 +784,9 @@ it; they keep the source file's own time in user metadata.
 **Errors** are S3's XML `Error` documents (`Code`, `Message`, `Resource`, `RequestId`, and
 the extra elements AWS sends, such as `ServerTime` or `Condition`), so a client shows a code
 rather than a bare status. Every `/s3/` response carries an `x-amz-request-id` of 16 hex
-digits and `nosniff`; an internal error logs its request id, so a client's report can be
-matched to the server's line. A refusal decided before the caller is authenticated reads at
+digits, the same id again as `x-amz-id-2` (S3's second id, which SDK test suites expect on
+every answer) and `nosniff`; an internal error logs its request id, so a client's report can
+be matched to the server's line. A refusal decided before the caller is authenticated reads at
 most 64 KiB of the body first, enough for `sccache`'s 13-byte probe to see its answer rather
 than a reset; every refusal after it reads the body through, up to the 4 GiB cap, as
 WebDAV's do. A refusal of a request with a body then closes the connection. A registry its
