@@ -1,0 +1,8 @@
+# What the harness fetches and produces: the server's state, the pinned tools and suites,
+# their virtualenvs and every run's results. Only the scripts, templates and baselines are
+# versioned.
+/.state/
+/*/upstream/
+/*/.venv/
+/*/results/
+/__pycache__/

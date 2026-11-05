@@ -1,0 +1,58 @@
+# s3-tests configuration, rendered by run.sh into results/<run>/s3tests.conf.
+# The server has one credential, so main, alt and tenant are the same user: the tests
+# telling two users apart (ACLs, policies, cross-account) cannot pass here and are
+# expected failures. The iam sections exist because configure() insists on them.
+[DEFAULT]
+host = @HOST@
+port = @PORT@
+is_secure = @SECURE@
+ssl_verify = False
+
+[fixtures]
+bucket prefix = s3compat-{random}-
+iam name prefix = s3compat-
+iam path prefix = /s3compat/
+
+[s3 main]
+display_name = vk-registry
+user_id = s3compat
+email = s3compat@example.com
+api_name = default
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+
+[s3 alt]
+display_name = vk-registry
+user_id = s3compat-alt
+email = s3compat-alt@example.com
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+
+[s3 tenant]
+display_name = testx$tenanteduser
+user_id = testx$s3compat-tenant
+email = s3compat-tenant@example.com
+tenant = testx
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+
+[iam]
+display_name = s3compat-iam
+user_id = s3compat-iam
+email = s3compat-iam@example.com
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+
+[iam root]
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+account_id = RGW11111111111111111
+user_id = RGW11111111111111111
+email = s3compat-root@example.com
+
+[iam alt root]
+access_key = @ACCESS_KEY@
+secret_key = @SECRET_KEY@
+account_id = RGW22222222222222222
+user_id = RGW22222222222222222
+email = s3compat-alt-root@example.com
