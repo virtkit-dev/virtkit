@@ -198,12 +198,15 @@ pub(super) async fn get(
         if !head {
             files::touch_if_idle(store, &obj);
         }
+        let partial = resp.status() == StatusCode::PARTIAL_CONTENT;
         let headers = resp.headers_mut();
         headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
         insert(headers, ETAG, &etag);
         insert(headers, LAST_MODIFIED, &modified);
-        if checksum {
+        // The whole object's checksum, on the whole object only: S3 sends none with a part,
+        // and the AWS CLI checks what it is sent against the bytes of each part it fetches.
+        if checksum && !partial {
             insert(
                 headers,
                 hyper::header::HeaderName::from_static(CHECKSUM_SHA256),
