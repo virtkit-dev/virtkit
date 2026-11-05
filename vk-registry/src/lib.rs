@@ -61,6 +61,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod s3;
 pub(crate) mod tags;
 pub(crate) mod upload;
 
@@ -135,7 +136,7 @@ impl ServerState {
 /// lock service, sign-ins, keys and captions (the accounts db, not the store) do not touch
 /// it, and the batched exists probe is a read sent as a POST; a tag deleted from the settings
 /// pages is a write.
-fn is_store_write(method: &Method, path: &str) -> bool {
+pub(crate) fn is_store_write(method: &Method, path: &str) -> bool {
     match method.as_str() {
         "GET" | "HEAD" | "OPTIONS" | "PROPFIND" => false,
         _ if path.starts_with("/lock/") || path == EXISTS_PATH => false,
@@ -4386,7 +4387,7 @@ fn closing_after_refusal(mut resp: Response<Body>, has_body: bool) -> Response<B
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
 /// that predates the header, and every non-browser client, sends none.
-fn cross_site(headers: &hyper::HeaderMap) -> bool {
+pub(crate) fn cross_site(headers: &hyper::HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -4421,6 +4422,14 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // the auth gate below, the same way `/lock/` is exempt from `/v2/` routing.
     if matches!(path.as_str(), "/login" | "/auth/callback" | "/logout") {
         return oidc::route(&state, req).await;
+    }
+
+    // S3 clients get S3's answers from the gate too — a 403 in XML where the other routes
+    // challenge with a 401, and a SigV4 signature checked where they take a bearer — so
+    // `/s3/` passes through a gate of its own, built on the same resolvers. Disabled, it is
+    // the 404 below after this gate, as a disabled `/dav/` is.
+    if state.s3 && s3::is_path(&path) {
+        return s3::route(&state, req).await;
     }
 
     // Client auth on every other path, including the `/v2/` version probe. Returning
@@ -4503,7 +4512,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             resolved
         }
         Authenticator::Shared(auth) => {
-            if auth.enabled() && !auth.allows(&req) {
+            if auth.enabled() && !auth.allows(req.headers()) {
                 return Ok(auth.challenge());
             }
             None

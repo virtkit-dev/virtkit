@@ -4305,6 +4305,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "hmac",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -4328,6 +4329,7 @@ dependencies = [
  "vk-oidc",
  "vk-peer",
  "vk-selfupdate",
+ "zeroize",
  "zstd",
 ]
 

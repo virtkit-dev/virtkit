@@ -352,6 +352,20 @@ where
     Ok((total, crate::hex_of(&hasher.finalize())))
 }
 
+/// Read and discard `body` up to `cap` bytes, and the frame that crosses it. For a refusal
+/// answered before the caller is known, which must not make the server read a whole
+/// upload: a body that ends within them is answered rather than reset, and what is left of a
+/// longer one closes the connection after the answer, as every refusal of a request with a
+/// body does.
+pub(crate) async fn drain_up_to<B>(body: B, cap: u64)
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Past `cap`, or unreadable: either way there is nothing more to read.
+    let _ = drain_into(&mut tokio::io::sink(), body, cap).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
