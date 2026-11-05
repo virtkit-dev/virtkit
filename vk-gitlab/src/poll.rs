@@ -1301,6 +1301,24 @@ async fn request_loop<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>
             }
             continue;
         }
+        // Nor is a runner until the hub has its inventory listing it verified.
+        if !shared.status.told_verified(&name) {
+            let verified = shared
+                .status
+                .runner_status(&name)
+                .is_some_and(|r| r.runner.verified);
+            if !verified {
+                runner.report(
+                    RunnerState::Unhealthy,
+                    Some("GitLab has not verified the runner's token yet".to_owned()),
+                );
+            }
+            tokio::select! {
+                () = shared.status.wait_told_verified(&name) => {}
+                () = stop.wait() => return,
+            }
+            continue;
+        }
         let health_wait = runner.health.lock().ok().and_then(|mut h| h.check(&name));
         if let Some(wait) = health_wait {
             runner.report(

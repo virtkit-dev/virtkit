@@ -546,7 +546,9 @@ job up to GitLab's timeout.
 
 The daemon does not rotate runner tokens. It verifies the token at start and daily, warns
 from a week before GitLab's `token_expires_at`, and logs an error once it has expired. A
-verify GitLab gives no answer to is retried, backing off up to five minutes.
+verify GitLab gives no answer to is retried, backing off up to five minutes. On a fleet, a
+runner asks for jobs only once its session has sent the hub an inventory listing it verified,
+which it sends without coalescing: the hub refuses an unverified runner's requests.
 
 ## Failures
 

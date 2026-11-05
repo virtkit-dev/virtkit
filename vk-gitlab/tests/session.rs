@@ -386,6 +386,27 @@ async fn a_burst_of_changes_goes_out_coalesced_while_the_hub_pings() {
     std::fs::remove_dir_all(&state).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_newly_verified_is_told_the_hub_at_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, status, relay) = relay_for(&listener, "session-verified");
+    let held = hold(&state, relay, &status, HubConfig::default());
+    let mut ws = welcome(&listener).await;
+    assert!(!status.told_verified("ci"), "listed unverified");
+    let started = std::time::Instant::now();
+    status.runner("ci", |r| r.runner.verified = true);
+    // Its job requests wait for the hub to know: not a coalescing window more.
+    let RelayMsg::Inventory(inventory) = next_msg(&mut ws).await else {
+        panic!("not the inventory");
+    };
+    assert!(inventory.runners[0].verified);
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(200), "sent after {took:?}");
+    eventually("told verified", || status.told_verified("ci")).await;
+    held.abort();
+    std::fs::remove_dir_all(&state).unwrap();
+}
+
 /// The relay's next ack of command `id`, past other messages.
 async fn ack_of(ws: &mut Ws, id: &str) -> CommandAck {
     loop {

@@ -13,7 +13,8 @@
 //! sent, which the loop waits on before it asks GitLab for a job, and what each runner is
 //! doing, which the session reports. The status outlives a lost session: a relay whose server
 //! is approved goes on polling while it redials, and one the hub never approved, or no longer
-//! knows, does not poll at all.
+//! knows, does not poll at all. A runner asks the hub for jobs only once an inventory the
+//! session sent lists it verified: the hub refuses the others'.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +45,16 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 
 /// How long a change to the report waits for more to send them in one heartbeat.
 const COALESCE: Duration = Duration::from_millis(250);
+
+/// The names of the runners `inventory` lists verified.
+fn verified(inventory: &Inventory) -> Vec<String> {
+    inventory
+        .runners
+        .iter()
+        .filter(|r| r.verified)
+        .map(|r| r.name.clone())
+        .collect()
+}
 
 /// The hub refused the session for its protocol version: the relay redials at the longest
 /// backoff, for a hub that may be upgraded meanwhile.
@@ -115,6 +126,8 @@ pub struct Status {
     spki: Mutex<Option<String>>,
     /// Woken when the inventory or the report may have changed.
     changed: Notify,
+    /// The runners verified in the inventory a session last sent the hub.
+    told_verified: watch::Sender<Vec<String>>,
 }
 
 impl std::fmt::Debug for Status {
@@ -150,6 +163,7 @@ impl Status {
             runners: Mutex::new(runners),
             spki: Mutex::new(None),
             changed: Notify::new(),
+            told_verified: watch::channel(Vec::new()).0,
         })
     }
 
@@ -187,6 +201,29 @@ impl Status {
         let _ = rx
             .wait_for(|s| s.as_ref().is_some_and(|s| s.state.approved()))
             .await;
+    }
+
+    /// Record that a session sent the hub `inventory`; public for a test standing in for the
+    /// session.
+    pub fn sent(&self, inventory: &Inventory) {
+        let verified = verified(inventory);
+        self.told_verified.send_if_modified(|v| {
+            let changed = *v != verified;
+            *v = verified;
+            changed
+        });
+    }
+
+    /// Wait until an inventory a session sent the hub lists runner `name` verified.
+    pub async fn wait_told_verified(&self, name: &str) {
+        let mut rx = self.told_verified.subscribe();
+        // Only an error once the sender, which `self` holds, is gone.
+        let _ = rx.wait_for(|v| v.iter().any(|n| n == name)).await;
+    }
+
+    /// Whether an inventory a session sent the hub lists runner `name` verified.
+    pub fn told_verified(&self, name: &str) -> bool {
+        self.told_verified.borrow().iter().any(|n| n == name)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RunnerStatus>> {
@@ -417,6 +454,7 @@ async fn run(
     let quiet = beat * 3;
     let mut sent_inventory = status.inventory();
     send(&mut ws, &RelayMsg::Inventory(sent_inventory.clone()), beat).await?;
+    status.sent(&sent_inventory);
     let mut sent_report = report(status, updater);
     send(&mut ws, &RelayMsg::Report(sent_report.clone()), beat).await?;
     if updates {
@@ -434,8 +472,16 @@ async fn run(
                 send(&mut ws, &RelayMsg::Heartbeat(status.heartbeat()), beat).await?;
             }
             () = status.changed.notified() => {
-                // Coalesce bursts of job and runner updates into one heartbeat.
-                flush.get_or_insert_with(|| tokio::time::Instant::now() + COALESCE);
+                // Coalesce bursts of job and runner updates into one heartbeat; a runner
+                // newly verified waits for none, its job requests waiting on it.
+                let now = tokio::time::Instant::now();
+                let verified = verified(&status.inventory());
+                let at = if verified.iter().any(|n| !status.told_verified(n)) {
+                    now
+                } else {
+                    now + COALESCE
+                };
+                flush = Some(flush.map_or(at, |f| f.min(at)));
             }
             () = tokio::time::sleep_until(flush.unwrap_or(deadline)), if flush.is_some() => {
                 flush = None;
@@ -443,6 +489,7 @@ async fn run(
                 let inventory = status.inventory();
                 if inventory != sent_inventory {
                     send(&mut ws, &RelayMsg::Inventory(inventory.clone()), beat).await?;
+                    status.sent(&inventory);
                     sent_inventory = inventory;
                 }
                 let report = report(status, updater);

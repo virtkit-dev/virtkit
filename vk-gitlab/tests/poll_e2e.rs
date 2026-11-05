@@ -54,7 +54,7 @@ both!(
     strict_check_interval_paces_requests_after_a_job,
     output_the_hub_lost_fails_the_job,
     abort_reports_a_job_the_hub_never_ends,
-    a_failed_verify_is_retried_without_a_job,
+    a_runner_not_verified_asks_for_no_job_until_a_verify_succeeds,
     a_running_jobs_view_poll_outlives_the_tick,
     gitlab_is_asked_only_while_the_hub_approves_its_server,
     a_job_of_a_project_not_approved_fails_pointing_at_the_hub,
@@ -660,18 +660,22 @@ async fn abort_reports_a_job_the_hub_never_ends(via: Via) {
     h.daemon.join().await;
 }
 
-async fn a_failed_verify_is_retried_without_a_job(via: Via) {
+async fn a_runner_not_verified_asks_for_no_job_until_a_verify_succeeds(via: Via) {
     let mut h = Harness::unstarted(2, via).await;
     *h.gl.verify_failures.lock().unwrap() = 1;
     h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
     let status = h.daemon.status.clone().unwrap();
-    eventually("verified again", || {
+    // The hub would refuse it: neither GitLab nor the hub is asked.
+    eventually("the runner reported unverified", || {
         status
             .runner_status("r1")
-            .is_some_and(|r| r.runner.verified && r.runner.runner_id == Some(RUNNER_ID as u64))
+            .is_some_and(|r| r.state == RunnerState::Unhealthy && !r.runner.verified)
     })
     .await;
-    h.hub.set_slots("p1", 1);
+    assert_eq!(h.count_calls(|c| matches!(c, FakeCall::Reserve(..))), 0);
+    assert_eq!(h.job_requests(), 0);
+    // Verified again without waiting for a job, which it could not get.
     h.gl.push_job(job_json(29));
     let (hub_id, sub) = h.accepted_job(1).await;
     let JobSpec::GitlabCi(spec) = &sub.spec;

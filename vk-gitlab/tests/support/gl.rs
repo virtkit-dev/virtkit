@@ -378,6 +378,14 @@ impl Harness {
             .enable_all()
             .build()
             .unwrap();
+        // Standing in for the session, which sends the hub the inventory as it changes.
+        let sending = Arc::clone(&status);
+        rt.spawn(async move {
+            loop {
+                sending.sent(&sending.inventory());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
         let (handle, shutdown) = ShutdownHandle::new();
         let options = self.options.clone();
         let task = match self.via {

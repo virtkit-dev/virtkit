@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **No reservation refused at relay start.** A vk-gitlab runner asked the hub for capacity
+  before its inventory told the hub GitLab had verified it, so the hub refused it once with
+  "not verified with GitLab" and the runner showed *unhealthy* for a check interval. A runner
+  now waits until the hub has its verified inventory, which goes out without coalescing.
 - **A runner GitLab did not answer at start is verified again.** A verify that got no answer
   was retried only on the runner's next job, which the hub refused it, and otherwise a day
   later. It is now retried, backing off up to five minutes.
