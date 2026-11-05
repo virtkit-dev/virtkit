@@ -326,6 +326,7 @@ pub fn translate(job: &Job, ctx: &SpecContext) -> Translated {
             } else {
                 RefType::Branch
             },
+            ref_type_unknown: !matches!(git.ref_type.as_str(), "branch" | "tag"),
             sha: git.sha.clone(),
             before_sha: git.before_sha.clone(),
             refspecs: git.refspecs.clone(),

@@ -150,6 +150,12 @@ pub struct Sources {
     #[serde(rename = "ref")]
     pub git_ref: String,
     pub ref_type: RefType,
+    /// Whether GitLab named a ref kind other than a branch or a tag: `ref_type` then says
+    /// `Branch`, which is how the ref is checked out, but the hub does not take the ref for a
+    /// branch where its kind matters. A separate flag keeps jobs readable by older hubs and nodes
+    /// without adding a `RefType` variant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ref_type_unknown: bool,
     pub sha: String,
     pub before_sha: String,
     #[serde(default)]
@@ -678,6 +684,7 @@ pub(crate) mod tests {
                 object_format: ObjectFormat::Sha1,
                 git_ref: "main".into(),
                 ref_type: RefType::Branch,
+                ref_type_unknown: false,
                 sha: "ab".repeat(20),
                 before_sha: "cd".repeat(20),
                 refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
@@ -790,6 +797,21 @@ pub(crate) mod tests {
         assert_eq!(value["sources"]["ref"], "main");
         assert_eq!(value["sources"]["object_format"], "sha1");
         assert_eq!(value["sources"]["ref_type"], "branch");
+        // An older hub or node reads sources without the flag, and an older relay sends none.
+        assert!(value["sources"].get("ref_type_unknown").is_none());
+        let mut sources = value["sources"].clone();
+        assert!(
+            !serde_json::from_value::<Sources>(sources.clone())
+                .unwrap()
+                .ref_type_unknown
+        );
+        sources["ref_type_unknown"] = serde_json::json!(true);
+        let unknown: Sources = serde_json::from_value(sources).unwrap();
+        assert!(unknown.ref_type_unknown);
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap()["ref_type_unknown"],
+            true
+        );
         assert_eq!(
             value["services"][0]["pull_policy"],
             json!(["if-not-present"])

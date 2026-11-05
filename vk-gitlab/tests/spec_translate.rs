@@ -49,6 +49,7 @@ fn upstream_request_job_response() {
     assert_eq!(job.sources.sha, "abcdef123456");
     assert_eq!(job.sources.before_sha, "654321fedcba");
     assert_eq!(job.sources.ref_type, RefType::Branch);
+    assert!(!job.sources.ref_type_unknown);
     assert!(!job.sources.allow_fetch);
     let ci_ref = var(&job, "CI_REF_NAME");
     assert!(ci_ref.public && ci_ref.file && ci_ref.raw);
@@ -193,6 +194,7 @@ fn defaults_and_normalization() {
     let ci = t.job;
     assert_eq!(ci.timeout_secs, 7200, "gitlab-runner's default timeout");
     assert_eq!(ci.sources.ref_type, RefType::Tag);
+    assert!(!ci.sources.ref_type_unknown);
     assert_eq!(ci.sources.object_format, ObjectFormat::Sha256);
     assert_eq!(
         ci.image.ports[0].protocol, "http",
@@ -213,6 +215,28 @@ fn defaults_and_normalization() {
             "{dropped}: {:?}",
             t.warnings
         );
+    }
+}
+
+#[test]
+fn a_ref_of_another_kind_checks_out_as_a_branch_and_says_its_kind_is_unknown() {
+    for (kind, unknown) in [
+        ("branch", false),
+        ("tag", false),
+        ("", true),
+        ("merge_request", true),
+    ] {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 3,
+            "token": "t",
+            "git_info": {"ref": "x", "ref_type": kind},
+        }))
+        .unwrap();
+        let ci = translate(&job, &SpecContext::default()).job;
+        assert_eq!(ci.sources.ref_type_unknown, unknown, "{kind:?}");
+        if unknown {
+            assert_eq!(ci.sources.ref_type, RefType::Branch, "{kind:?}");
+        }
     }
 }
 

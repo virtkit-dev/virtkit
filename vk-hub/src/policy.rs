@@ -263,9 +263,9 @@ fn deserialize_placement<'de, D: serde::Deserializer<'de>>(
 
 /// The branch a job's pipeline runs for, when its sources fetch that branch and nothing
 /// else: the branch's own refspec once, and at most its pipeline's ref at the job's commit.
-/// `None` for a tag, a merge request, or any other refspec.
+/// `None` for a tag, a ref of unknown kind, a merge request, or any other refspec.
 pub fn branch_name(sources: &vk_hub_proto::job::Sources) -> Option<&str> {
-    if sources.ref_type != vk_hub_proto::job::RefType::Branch {
+    if sources.ref_type != vk_hub_proto::job::RefType::Branch || sources.ref_type_unknown {
         return None;
     }
     let branch = &sources.git_ref;
@@ -844,5 +844,10 @@ mod tests {
             let s = sources(ref_type, sha, refspecs.clone());
             assert_eq!(branch_name(&s), named.then_some("main"), "{refspecs:?}");
         }
+        let unknown = Sources {
+            ref_type_unknown: true,
+            ..sources(RefType::Branch, &sha, vec![branch.clone()])
+        };
+        assert_eq!(branch_name(&unknown), None);
     }
 }
