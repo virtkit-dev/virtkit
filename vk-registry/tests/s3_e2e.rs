@@ -1937,6 +1937,47 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     assert_eq!(staging_left(&dir), 0);
 }
 
+/// A query's names are taken decoded, as the signature takes them, wherever they dispatch;
+/// a malformed escape is refused.
+#[tokio::test]
+async fn query_names_are_decoded_before_dispatch() {
+    let dir = tmp("query-names");
+    let host = spawn(open_state(&dir, true));
+    for key in ["d/k", "e/k"] {
+        send(
+            &host,
+            Req::new("PUT", &format!("/s3/b/{key}")).body(HELLO.to_vec()),
+        )
+        .await
+        .ok(200);
+    }
+    let resp = send(
+        &host,
+        Req::new("GET", "/s3/b").query("list-%74ype=2&prefi%78=d%2F"),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(keys(&resp.body), ["d/k"]);
+    send(&host, Req::new("GET", "/s3/b").query("%6Cocation"))
+        .await
+        .ok(200);
+    send(&host, Req::new("GET", "/s3/b/d/k").query("upload%49d=nope"))
+        .await
+        .is(404, "NoSuchUpload");
+    let resp = send(&host, Req::new("GET", "/s3/b").query("upload%73")).await;
+    resp.ok(200);
+    assert!(
+        resp.body.contains("<ListMultipartUploadsResult"),
+        "{}",
+        resp.body
+    );
+    for bad in ["prefix=%2", "%zz", "list-type=2&prefix=%FF"] {
+        send(&host, Req::new("GET", "/s3/b").query(bad))
+            .await
+            .is(400, "InvalidArgument");
+    }
+}
+
 impl Req {
     /// The same request at another path.
     fn path_of(mut self, path: &str) -> Self {

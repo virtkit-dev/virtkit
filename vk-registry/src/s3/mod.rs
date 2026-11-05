@@ -248,17 +248,33 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
 /// the method and path do not.
 const OPERATION_HINT: &str = "x-id";
 
+/// A request's query parameters, name and value, in order.
+type Params = [(String, String)];
+
+/// `raw`'s parameters, each name and value percent-decoded as the signature decodes them (a
+/// `+` is itself), so that what dispatches a request and what an operation reads is what was
+/// signed. `None` for a malformed escape, or a name or value that is not UTF-8.
+fn parse_query(raw: &str) -> Option<Vec<(String, String)>> {
+    raw.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (name, value) = p.split_once('=').unwrap_or((p, ""));
+            Some((
+                crate::dav::decode_segment(name)?,
+                crate::dav::decode_segment(value)?,
+            ))
+        })
+        .collect()
+}
+
 /// The subresource a query names (`location`, `attributes`, `uploads`…): `None` for a query
 /// of [`OPERATION_HINT`] at most, `Some("")` when it names more than one parameter or names
 /// one with a value — which nothing served here takes.
-fn subresource(query: &str) -> Option<&str> {
-    let mut names = query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .filter(|p| p.split_once('=').map_or(*p, |(n, _)| n) != OPERATION_HINT);
-    let first = names.next()?;
-    Some(match (first.split_once('='), names.next()) {
-        (None | Some((_, "")), None) => first.trim_end_matches('='),
+fn subresource(params: &Params) -> Option<&str> {
+    let mut named = params.iter().filter(|(n, _)| n != OPERATION_HINT);
+    let (name, value) = named.next()?;
+    Some(match (value.is_empty(), named.next()) {
+        (true, None) => name,
         _ => "",
     })
 }
@@ -280,7 +296,14 @@ async fn operate(
             return refuse(req, resp, ctx).await;
         }
     };
-    let query = req.uri().query().unwrap_or("").to_string();
+    let Some(query) = parse_query(req.uri().query().unwrap_or("")) else {
+        let resp = ctx.error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "a query parameter has a malformed percent escape or is not UTF-8",
+        );
+        return refuse(req, resp, ctx).await;
+    };
     let sub = subresource(&query);
     let method = req.method().clone();
     match (target, &method, sub) {
@@ -690,19 +713,38 @@ mod tests {
 
     #[test]
     fn a_query_names_one_subresource_or_none() {
-        assert_eq!(subresource(""), None);
-        assert_eq!(subresource("x-id=GetObject"), None);
-        assert_eq!(subresource("location"), Some("location"));
-        assert_eq!(subresource("location="), Some("location"));
+        let sub = |q: &str| subresource(&parse_query(q).unwrap()).map(str::to_string);
+        assert_eq!(sub(""), None);
+        assert_eq!(sub("x-id=GetObject"), None);
+        assert_eq!(sub("location"), Some("location".to_string()));
+        assert_eq!(sub("location="), Some("location".to_string()));
         assert_eq!(
-            subresource("attributes&x-id=GetObjectAttributes"),
-            Some("attributes")
+            sub("attributes&x-id=GetObjectAttributes"),
+            Some("attributes".to_string())
         );
-        assert_eq!(subresource("x-id=PutObject&tagging"), Some("tagging"));
-        assert_eq!(subresource("list-type=2"), Some(""));
-        assert_eq!(subresource("partNumber=1&uploadId=a"), Some(""));
-        assert_eq!(subresource("location&acl"), Some(""));
-        assert_eq!(subresource("versionId=null"), Some(""));
+        assert_eq!(sub("x-id=PutObject&tagging"), Some("tagging".to_string()));
+        assert_eq!(sub("list-type=2"), Some("".to_string()));
+        assert_eq!(sub("partNumber=1&uploadId=a"), Some("".to_string()));
+        assert_eq!(sub("location&acl"), Some("".to_string()));
+        assert_eq!(sub("versionId=null"), Some("".to_string()));
+        // Names are decoded as the signature decodes them.
+        assert_eq!(sub("upload%73"), Some("uploads".to_string()));
+        assert_eq!(sub("x%2Did=GetObject"), None);
+    }
+
+    #[test]
+    fn a_query_is_decoded_once_or_refused() {
+        assert_eq!(
+            parse_query("upload%49d=a%2Bb+c&&prefix=&x").unwrap(),
+            [
+                ("uploadId".to_string(), "a+b+c".to_string()),
+                ("prefix".to_string(), String::new()),
+                ("x".to_string(), String::new()),
+            ]
+        );
+        for bad in ["a%2", "a=%zz", "%ff", "a=%C3"] {
+            assert!(parse_query(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
