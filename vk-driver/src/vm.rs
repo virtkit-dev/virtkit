@@ -796,34 +796,51 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 /// checkout into the shared build tier and return its rootfs, captured runtime config, and a
 /// held reference on the entry (see [`crate::ensure::ensure_build_tier`]). Shared
 /// by the job's primary (`resolve_dockerfile_form`) and its git-defined services
-/// (`plan_services`). Requires `[executor] host_checkout`: the Dockerfile + context are the
-/// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
-/// overrides it. `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
-/// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
-/// confined to the checkout, since all of them are job-authored. `service` names the service
-/// whose image it is, for the job's egress record; `None` for the job's own.
+/// (`plan_services`). `service` names the service whose image it is, for the job's egress
+/// record; `None` for the job's own.
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
     service: Option<&str>,
 ) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
-    let cfg = &ctx.cfg;
-    if !cfg.executor.host_checkout {
+    build_image_sources(ctx, git_image_sources(ctx, spec, service)?)
+}
+
+/// Image build inputs, with every path confined to its source tree.
+pub(crate) struct ImageSources {
+    pub dockerfile: PathBuf,
+    pub context: PathBuf,
+    /// Named build contexts, for `COPY --from=<NAME>`.
+    pub build_contexts: Vec<(String, PathBuf)>,
+    pub build_args: Vec<(String, String)>,
+    /// The build target, if any.
+    pub stage: Option<String>,
+    /// Names the image in the build tier's wait message and in errors.
+    pub label: String,
+    /// The service whose image it is, for the job's egress record; `None` for the job's own.
+    pub service: Option<String>,
+}
+
+/// Resolve a `dockerfile:` spec's sources against the job's checkout. Requires
+/// `[executor] host_checkout`: the Dockerfile + context are the checked-out sources. The
+/// context defaults to the Dockerfile's directory; `?context=<dir>` overrides it.
+/// `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
+/// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
+/// confined to the checkout, since all of them are job-authored.
+fn git_image_sources(ctx: &JobCtx, spec: &str, service: Option<&str>) -> Result<ImageSources> {
+    if !ctx.cfg.executor.host_checkout {
         bail!(
             "a git-defined (dockerfile:/compose:) image requires [executor] host_checkout — the \
              Dockerfile and its context are the checked-out sources"
         );
     }
     let parsed = parse_dockerfile_spec(spec)?;
-    let stage = parsed.stage;
     let checkout = ctx.host_checkout_dir();
     // The Dockerfile path is job-controlled; confine it to the checkout so a `dockerfile:` job
     // cannot read another tenant's checkout or an arbitrary host file during the host-side
     // build (this runs outside the microVM boundary).
     let dockerfile = confined_dockerfile(&checkout, parsed.path)?;
     let context = resolve_build_context(&checkout, &dockerfile, parsed.context)?;
-    let dockerfiles = vec![dockerfile];
-    let contexts = vec![context];
     let build_args: Vec<(String, String)> = parsed
         .build_args
         .iter()
@@ -841,6 +858,39 @@ fn build_git_image(
             Ok(((*name).to_string(), dir))
         })
         .collect::<Result<_>>()?;
+    Ok(ImageSources {
+        dockerfile,
+        context,
+        build_contexts,
+        build_args,
+        stage: parsed.stage.map(str::to_string),
+        label: spec.to_string(),
+        service: service.map(str::to_string),
+    })
+}
+
+/// Build `sources` into the shared build tier using the job's build-phase egress,
+/// `[build] cache_registry`, and build record. Return the rootfs, captured runtime config,
+/// and a held reference on the entry (see [`crate::ensure::ensure_build_tier`]).
+/// The caller has confined every path in `sources`: the build reads them on the host,
+/// outside the microVM boundary.
+pub(crate) fn build_image_sources(
+    ctx: &JobCtx,
+    sources: ImageSources,
+) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
+    let cfg = &ctx.cfg;
+    let ImageSources {
+        dockerfile,
+        context,
+        build_contexts,
+        build_args,
+        stage,
+        label,
+        service,
+    } = sources;
+    let stage = stage.as_deref();
+    let dockerfiles = vec![dockerfile];
+    let contexts = vec![context];
     let stage_key = crate::build::target_stage_key(
         &dockerfiles,
         &contexts,
@@ -848,7 +898,7 @@ fn build_git_image(
         &build_args,
         stage,
     )
-    .context("computing the git-defined image's stage fingerprint")?;
+    .context("computing the image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
     let cache = crate::build::CacheOpts::from_config(&cfg.build);
     let recipe = crate::ensure::BuildRecipe {
@@ -863,7 +913,7 @@ fn build_git_image(
         cache_auth: cache.auth,
         net,
         audit,
-        record: build_record(ctx, service)?,
+        record: build_record(ctx, service.as_deref())?,
     };
     let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -871,10 +921,10 @@ fn build_git_image(
         &recipe,
         stage,
         &stage_key,
-        spec,
+        &label,
         None,
     )
-    .with_context(|| format!("building the git-defined image {spec:?}"))?;
+    .with_context(|| format!("building the image {label:?}"))?;
     let rootfs = dir.join(crate::ensure::UNIT_IMAGE);
     // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
     let config = crate::build::read_config_sidecar(&rootfs)?;
