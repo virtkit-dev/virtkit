@@ -857,7 +857,8 @@ where
 }
 
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
-/// or ones we set ourselves).
+/// or ones we set ourselves). An answer's `content-length` is kept when its body is not
+/// rewritten ([`forward`]).
 fn is_skipped(name: &str) -> bool {
     matches!(
         name,
@@ -997,11 +998,16 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let xml = headers_out
         .get(hyper::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/xml"));
+    // A HEAD answer has no body to map, and its length is what a GET would send: an object's.
     let body_map: Option<Box<dyn BodyMap + Send>> = match (hrefs, &s3_names) {
+        _ if method == Method::HEAD => None,
         (Some(map), _) => Some(Box::new(map)),
         (None, Some(names)) if xml => Some(Box::new(S3Map::new(names.clone()))),
         _ => None,
     };
+    // A rewritten body's length is not the upstream's; any other is the upstream's bytes,
+    // whole or resumed, so its length holds.
+    let rewritten = body_map.is_some();
     // stream the upstream response back without buffering (blob pulls).
     let stream = resp.bytes_stream();
     let body = match (body_map, resume) {
@@ -1053,7 +1059,8 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
 
     let mut out = Response::builder().status(status);
     for (k, v) in headers_out.iter() {
-        if is_skipped(&k.as_str().to_ascii_lowercase()) {
+        let keep_length = k == hyper::header::CONTENT_LENGTH && !rewritten;
+        if is_skipped(&k.as_str().to_ascii_lowercase()) && !keep_length {
             continue;
         }
         // A bucket created through an area is located at the alias.
@@ -2171,6 +2178,56 @@ mod tests {
         assert_eq!(
             get(bytes, "/s3/job/three/k").await,
             ("/s3/job/three".to_string(), LISTING.to_string())
+        );
+    }
+
+    /// An answer whose body is passed on as it came keeps its length, a HEAD's included, which
+    /// is how a client learns an object's size; a rewritten document drops the stale one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_keeps_its_length_unless_rewritten() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, _) = fake_upstream_answering(
+            b"<ListBucketResult><Name>tri</Name></ListBucketResult>",
+            &[
+                ("content-type", "application/xml"),
+                ("accept-ranges", "bytes"),
+                ("content-range", "bytes 0-52/100"),
+            ],
+        );
+        let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
+            .unwrap()
+            .with_areas(&s3_areas());
+        let proxy = spawn_blocking(cfg).unwrap();
+        let client = reqwest::Client::new();
+        for (method, target) in [
+            (reqwest::Method::HEAD, "/s3/tri/b/c/k"),
+            (reqwest::Method::GET, "/s3/tri/b/c/k"),
+            (reqwest::Method::HEAD, "/s3/job/three/k"),
+            (reqwest::Method::HEAD, "/s3/job/three"),
+        ] {
+            let r = client
+                .request(method.clone(), format!("http://{proxy}{target}"))
+                .send()
+                .await
+                .unwrap();
+            let h = r.headers();
+            assert_eq!(h.get("content-length").unwrap(), "53", "{method} {target}");
+            assert_eq!(
+                h.get("accept-ranges").unwrap(),
+                "bytes",
+                "{method} {target}"
+            );
+            assert_eq!(h.get("content-range").unwrap(), "bytes 0-52/100");
+        }
+        let r = client
+            .get(format!("http://{proxy}/s3/job/three?list-type=2"))
+            .send()
+            .await
+            .unwrap();
+        assert!(!r.headers().contains_key("content-length"));
+        assert_eq!(
+            r.text().await.unwrap(),
+            "<ListBucketResult><Name>three</Name></ListBucketResult>"
         );
     }
 
