@@ -444,7 +444,14 @@ fn map_s3<'a>(areas: &'a [Area], method: &Method, rest: &str, query: Option<&str
                 b"registry proxy: an area below its bucket takes reads only, not bucket writes",
             );
         }
-        _ if *method == Method::GET => Some(listing_query(&names, query.unwrap_or_default())),
+        _ if *method == Method::GET => match listing_query(&names, query.unwrap_or_default()) {
+            Some(query) => Some(query),
+            None => {
+                return Mapped::Refused(
+                    b"registry proxy: a listing through an area takes only a listing's parameters",
+                );
+            }
+        },
         _ => query.map(str::to_string),
     };
     let query = query
@@ -455,7 +462,8 @@ fn map_s3<'a>(areas: &'a [Area], method: &Method, rest: &str, query: Option<&str
 }
 
 /// The parameters a bucket listing takes, of either version, and a listing of its multipart
-/// uploads; an SDK's `x-id` hint too. A query naming another is not a listing.
+/// uploads, without a `delimiter`, which the registry does not serve there; an SDK's `x-id`
+/// hint too.
 const LISTING_PARAMS: &[&str] = &[
     "list-type",
     "prefix",
@@ -471,7 +479,6 @@ const LISTING_PARAMS: &[&str] = &[
 const UPLOADS_PARAMS: &[&str] = &[
     "uploads",
     "prefix",
-    "delimiter",
     "key-marker",
     "upload-id-marker",
     "max-uploads",
@@ -482,16 +489,22 @@ const UPLOADS_PARAMS: &[&str] = &[
 /// A bucket `GET`'s query through an area below its bucket: a listing's keys are the area's,
 /// so the key prefix goes before each `prefix`, `start-after`, `marker` and `key-marker`, and
 /// into the key a `continuation-token` names; a `prefix` is added when none is given, so the
-/// listing stays in the area. Any other query, a configuration's, is kept as sent.
-fn listing_query(names: &S3Names, query: &str) -> String {
-    let name = |p: &str| p.split_once('=').map_or(p, |(n, _)| n).to_string();
+/// listing stays in the area. A query naming no listing parameter, a configuration's, is
+/// kept as sent. `None` for one naming a listing's parameters with others, which the prefix
+/// could not be trusted to confine. Names are compared decoded, as the registry takes them.
+fn listing_query(names: &S3Names, query: &str) -> Option<String> {
+    let name = |p: &str| vk_registry::percent_decode(p.split_once('=').map_or(p, |(n, _)| n));
     let pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
     let known = match pairs.iter().any(|p| name(p) == "uploads") {
         true => UPLOADS_PARAMS,
         false => LISTING_PARAMS,
     };
+    let listing = |n: &str| n != "x-id" && (LISTING_PARAMS.contains(&n) || n == "uploads");
     if !pairs.iter().all(|p| known.contains(&name(p).as_str())) {
-        return query.to_string();
+        return match pairs.iter().any(|p| listing(&name(p))) {
+            true => None,
+            false => Some(query.to_string()),
+        };
     }
     // A prefix is lowercase alphanumerics and `._-/`, so encoding escapes the `/` alone.
     let keys = vk_registry::percent_encode(&names.keys);
@@ -509,7 +522,7 @@ fn listing_query(names: &S3Names, query: &str) -> String {
     if !pairs.iter().any(|p| name(p) == "prefix") {
         out.push(format!("prefix={keys}"));
     }
-    out.join("&")
+    Some(out.join("&"))
 }
 
 /// An `x-amz-copy-source` under the job's areas: `[/]job/<alias>/<key…>`, escaped as a whole
@@ -1976,6 +1989,9 @@ mod tests {
             ("PUT", "/s3/job/three"),
             ("DELETE", "/s3/job/two/"),
             ("POST", "/s3/job/three?delete"),
+            ("GET", "/s3/job/three?list-type=2&x=1"),
+            ("GET", "/s3/job/two?uploads&delimiter=/"),
+            ("GET", "/s3/job/two?prefix=a&acl"),
         ] {
             let (status, _, path) = status_and_auth(proxy, method, target, &seen).await;
             assert_eq!(status, 403, "{method} {target}");
@@ -2023,7 +2039,9 @@ mod tests {
                 &names,
                 &format!("list-type=2&continuation-token={token}&max-keys=2")
             ),
-            format!("list-type=2&continuation-token={real}&max-keys=2&prefix=b%2Fc%2F")
+            Some(format!(
+                "list-type=2&continuation-token={real}&max-keys=2&prefix=b%2Fc%2F"
+            ))
         );
         assert_eq!(
             names.token_out(real.as_bytes()),
@@ -2036,16 +2054,31 @@ mod tests {
         assert_eq!(names.token_out(to_base64url(b"x/k").as_bytes()), None);
         assert_eq!(names.token_out(b"!!"), None);
         assert_eq!(
-            listing_query(&names, "prefix&start-after"),
-            "prefix=b%2Fc%2F&start-after=b%2Fc%2F"
+            listing_query(&names, "prefix&start-after").as_deref(),
+            Some("prefix=b%2Fc%2F&start-after=b%2Fc%2F")
         );
-        for kept in [
-            "versioning",
-            "acl",
+        // A name is taken decoded, as the registry takes it.
+        assert_eq!(
+            listing_query(&names, "list-type=2&prefi%78=d/").as_deref(),
+            Some("list-type=2&prefix=b%2Fc%2Fd/")
+        );
+        assert_eq!(
+            listing_query(&names, "upload%73").as_deref(),
+            Some("upload%73&prefix=b%2Fc%2F")
+        );
+        // A configuration's query is kept; a listing's with anything else is refused.
+        for kept in ["versioning", "acl", "acl&x-id=GetBucketAcl"] {
+            assert_eq!(listing_query(&names, kept).as_deref(), Some(kept));
+        }
+        for refused in [
             "list-type=2&tagging",
             "uploads&list-type=2",
+            "uploads&delimiter=/",
+            "prefix=a&acl",
+            "list-type=2&x",
+            "list-type=2&%78",
         ] {
-            assert_eq!(listing_query(&names, kept), kept);
+            assert_eq!(listing_query(&names, refused), None, "{refused}");
         }
         // A one-component prefix is the bucket alone.
         let one = S3Names::new(&area("one", "solo"));
