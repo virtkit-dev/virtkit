@@ -778,6 +778,17 @@ blocking pool and stream their bodies on the runtime. Objects expire under the g
 retention like every `files/` entry ("Lifecycle" above): a PutObject writes no retention
 annotation.
 
+**Tests.** Besides the in-process suite (`tests/s3_e2e.rs`), `tests/s3-e2e.sh` at the
+repository root drives real clients in a microVM (`tests/s3/Dockerfile`) against a
+`vk-registry serve` in accounts mode, with TLS on the host's LAN address: `sccache` (a miss
+then a hit, read-only with a `read:files/*` key, a wrong secret failing its startup check),
+the AWS CLI (`cp` up to 100 MiB each way through multipart uploads and ranged downloads, its
+default CRC64NVME and CRC32/SHA-1/SHA-256 checksums, paged `list-objects-v2`, `sync`,
+`head-object`, ranged `get-object`, `copy-object`, `delete-objects`, a multipart upload by
+hand, a presigned URL refused, `rb --force`) and rclone (`copy` with a multipart upload,
+`ls`, `check`, `sync` twice with modification times from metadata, `delete`, `cleanup`); then
+`vk registry get` reads an object the CLI wrote and `vk-registry gc` keeps it.
+
 ## Accounts administration
 
 `vk-registry accounts` manages users, sessions, administrators, and API keys. The command
