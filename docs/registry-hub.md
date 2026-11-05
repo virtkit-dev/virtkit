@@ -705,7 +705,9 @@ though within them it can claim protection.
   - `<prefix>/cache`, the pipeline's caches, one tag per key;
   - `<prefix>/services/<name>`, the service captures of
     [the disk images design](disk-images-design.md) (§3), each tagged `job-<job id>` by the
-    job that captured it and `current` for the last one published.
+    job that captured it and `current` for the last one published;
+  - `<prefix>/builds/<name>`, the images a job built from its own context, tagged the same
+    way ([the pipeline images design](pipeline-images-design.md)).
 - **Caches from `.gitlab-ci.yml`.** A cache whose key starts with `vk-pipeline/` goes to
   `<prefix>/cache` instead of `ci-cache`, tagged with the sha256 of the rest of the key.
   `policy`, `when` and `fallback_keys` behave as for other caches, and a job may mix both

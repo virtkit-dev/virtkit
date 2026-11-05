@@ -49,6 +49,7 @@ mod ext4_read;
 mod files;
 mod fullvm;
 mod gc;
+mod guestbuild;
 mod health;
 mod hostpolicy;
 mod image;
@@ -67,6 +68,7 @@ mod oci;
 mod oomkills;
 mod outrelay;
 mod ova;
+mod pipeline;
 mod prio;
 mod publish;
 mod qcow2;
@@ -1319,18 +1321,33 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// plumbing: a guest's `vk-agent exec --service`, over the VM's host command channel
+    /// plumbing: a guest's `vk-agent exec --service` or `build`, over its host channel
     ///
     /// A CI job VM's or a `vk run --compose` primary's channel runs every request through
-    /// this: `vk exec --service NAME … -- CMD` into one of that VM's own services runs, and
-    /// anything else is refused with exit 2.
+    /// this: a form `--allow` names runs — `vk exec --service NAME … -- CMD` into one of
+    /// that VM's own services for `exec`, `vk build … --as NAME` with a context on stdin for
+    /// `build`, under the `--config` given before the `--` — and anything else is refused
+    /// with exit 2.
     #[command(name = "service-exec", hide = true)]
     ServiceExec {
         /// the job's or run's directory, whose `svc-<name>` dirs are its services
         dir: PathBuf,
+        /// the forms the VM may ask for, comma-separated: exec, build [default: exec]
+        #[arg(long, value_name = "FORMS")]
+        allow: Option<vm::HostForms>,
         /// the guest's request, `vk` first, after `--`
         #[arg(last = true)]
         argv: Vec<String>,
+    },
+    /// plumbing: remove a `vk-agent build` context once its build's process is gone
+    ///
+    /// Started by the build, in a session of its own; waits for stdin to close.
+    #[command(name = "guest-build-reap", hide = true)]
+    GuestBuildReap {
+        /// the job's directory of build contexts
+        contexts: PathBuf,
+        /// the context's name in it
+        name: std::ffi::OsString,
     },
     /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
     ///
@@ -3295,8 +3312,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     // Decide a guest's `vk-agent exec --service` request from its argv and the services
     // under its dir alone, before Config::load: guest input must not reach config loading.
-    if let Cmd::ServiceExec { dir, argv } = &cli.cmd {
-        return vm::service_exec(dir, argv).await;
+    // A build loads the config the wrapper was given, never one the guest names.
+    if let Cmd::GuestBuildReap { contexts, name } = &cli.cmd {
+        return guestbuild::reap(contexts, name);
+    }
+    if let Cmd::ServiceExec { dir, allow, argv } = &cli.cmd {
+        let forms = allow.unwrap_or(vm::HostForms::EXEC);
+        return vm::service_exec(dir, forms, cli.config.as_deref(), argv).await;
     }
     // `update` replaces the binary and reads nothing from the config — handle it before
     // Config::load, so a config file that no longer parses cannot block the upgrade that
@@ -5317,6 +5339,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Toolchain { .. }
         | Cmd::HostPolicy { .. }
         | Cmd::ServiceExec { .. }
+        | Cmd::GuestBuildReap { .. }
         | Cmd::Service { .. } => {
             unreachable!()
         }
@@ -6791,18 +6814,90 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.config, None);
-        let Cmd::ServiceExec { dir, argv } = cli.cmd else {
+        let Cmd::ServiceExec { dir, allow, argv } = cli.cmd else {
             panic!("expected service-exec")
         };
+        assert_eq!(allow, None);
         assert_eq!(argv[0], "--config=/x");
         assert_eq!(argv[1..3], ["vk", "exec"]);
         assert_eq!(
-            vm::service_exec(&dir, &argv).await,
+            vm::service_exec(&dir, vm::HostForms::EXEC, None, &argv).await,
             ExitCode::from(2),
             "{argv:?}"
         );
         // Without the `--` nothing runs at all.
         assert!(Cli::try_parse_from(["vk", "service-exec", "/job", "vk", "exec"]).is_err());
+    }
+
+    /// `--allow` names the forms the wrapper allows, before the `--`; absent, it allows exec
+    /// alone, as a serve started by an earlier vk asks. After the `--` it is the guest's.
+    #[test]
+    fn service_exec_takes_its_allowed_forms_before_the_guests_argv() {
+        let allowed = |argv: &[&str]| {
+            let Cmd::ServiceExec { allow, argv, .. } = Cli::try_parse_from(argv).unwrap().cmd
+            else {
+                panic!("expected service-exec")
+            };
+            (allow, argv)
+        };
+        let both = vm::HostForms {
+            exec: true,
+            build: true,
+        };
+        assert_eq!(
+            allowed(&[
+                "vk",
+                "service-exec",
+                "/job",
+                "--allow",
+                "exec,build",
+                "--",
+                "vk"
+            ]),
+            (Some(both), vec!["vk".to_string()])
+        );
+        assert_eq!(
+            allowed(&["vk", "service-exec", "/job", "--", "--allow", "build"]),
+            (None, vec!["--allow".to_string(), "build".to_string()])
+        );
+        for bad in ["", "shell"] {
+            let argv = ["vk", "service-exec", "/job", "--allow", bad, "--", "vk"];
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+        // The config a build loads is the one given before the `--`, never the guest's.
+        let cli = Cli::try_parse_from([
+            "vk",
+            "service-exec",
+            "/job",
+            "--allow",
+            "build",
+            "--config",
+            "/etc/vk.toml",
+            "--",
+            "vk",
+            "build",
+            "--config",
+            "/x",
+        ])
+        .unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/vk.toml")));
+        // What the node passes parses back to the forms and config it gave.
+        let (_, args) = vm::service_exec_command(
+            Path::new("/job"),
+            "exec,build".parse().unwrap(),
+            Some(Path::new("/etc/vk.toml")),
+        )
+        .unwrap();
+        let mut argv = vec!["vk".to_string()];
+        argv.extend(args);
+        argv.extend(["vk".to_string(), "build".to_string()]);
+        let cli = Cli::try_parse_from(&argv).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/vk.toml")));
+        let Cmd::ServiceExec { allow, argv, .. } = cli.cmd else {
+            panic!("expected service-exec")
+        };
+        assert_eq!(allow, Some(both));
+        assert_eq!(argv, ["vk", "build"]);
     }
 
     // `vk publish` CLI shape. The foreground form takes a positional target and requires

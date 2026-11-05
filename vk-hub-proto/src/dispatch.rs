@@ -113,8 +113,9 @@ pub struct JobRegistry {
     /// absolute path on the registry. `None` when no such namespace selects the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_repo: Option<String>,
-    /// The prefix of the job's pipeline namespace (`ci-pipeline`), when one selects it.
-    /// Reserved for pipeline caches and captures: nodes do not read it yet.
+    /// The prefix of the job's pipeline namespace (`ci-pipeline`), when one selects it: an
+    /// absolute path on the registry. The node resolves the job's `pipeline/build/<name>`
+    /// images to `<prefix>/builds/<name>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_prefix: Option<String>,
     /// The job's areas: on its guest registry proxy, `job/<alias>` stands for the area's

@@ -197,9 +197,9 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     ensure_home_for_default_user(); // default user's passwd HOME, not the kernel's inherited /
-    if service_exec(&cmdline) {
-        // The agent, whose `exec --service` reaches this VM's services, for every command and
-        // login shell — last, so it shadows none of the image's commands.
+    if agent_on_path(&cmdline) {
+        // The agent, whose `exec --service` and `build` reach the host command channel, for
+        // every command and login shell — last, so it shadows none of the image's commands.
         set_env(
             "PATH",
             &with_agent_bin_dir(&std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.into())),
@@ -1310,7 +1310,7 @@ fn publish_env(
         }
     }
     // The PATH run_init gave every command, with the agent on it.
-    if service_exec(cmdline)
+    if agent_on_path(cmdline)
         && let Ok(path) = std::env::var("PATH")
     {
         match env.iter_mut().find(|(k, _)| k == "PATH") {
@@ -2740,8 +2740,8 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
     if let Err(e) = fork_agent(&host_exec_forward_args(port, run_user.as_deref())) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
-    if !agent_bin && service_exec(cmdline) {
-        warn!("vk-agent init: `vk-agent exec --service` is not on the PATH");
+    if !agent_bin {
+        warn!("vk-agent init: `vk-agent` is not on the PATH for the host command channel");
     }
 }
 
@@ -2754,9 +2754,15 @@ fn service_exec(cmdline: &HashMap<String, String>) -> bool {
     )
 }
 
-/// The directory of [`crate::runenv::AGENT_BIN`], on the `PATH` of a VM with
-/// [`service_exec`], so `vk-agent exec --service` reaches its services; on the `/run` tmpfs,
-/// never in the image.
+/// Whether the guest's commands find the agent on their `PATH`: when the host serves the VM
+/// a command channel (`VIRTKIT_HOST_EXEC_PORT`), which `vk-agent exec --service` and
+/// `vk-agent build` reach, or its compose services ([`service_exec`]).
+fn agent_on_path(cmdline: &HashMap<String, String>) -> bool {
+    cmdline.contains_key("VIRTKIT_HOST_EXEC_PORT") || service_exec(cmdline)
+}
+
+/// The directory of [`crate::runenv::AGENT_BIN`], on the `PATH` of a VM where
+/// [`agent_on_path`]; on the `/run` tmpfs, never in the image.
 const AGENT_BIN_DIR: &str = "/run/vk/bin";
 
 /// `path` with [`AGENT_BIN_DIR`] last, once.
@@ -3524,6 +3530,24 @@ mod tests {
             "/run/vk/bin:/usr/bin"
         );
         assert_eq!(with_agent_bin_dir(""), "/run/vk/bin");
+    }
+
+    /// The agent is on the PATH of a VM served a host command channel, whatever forms it
+    /// allows, and of one serving its services.
+    #[test]
+    fn the_agent_is_on_the_path_with_a_host_channel() {
+        let on = |pairs: &[(&str, &str)]| {
+            agent_on_path(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        assert!(on(&[("VIRTKIT_HOST_EXEC_PORT", "1100")]));
+        assert!(on(&[("VIRTKIT_SERVICE_EXEC", "1")]));
+        assert!(!on(&[("VIRTKIT_SERVICE_EXEC", "0")]));
+        assert!(!on(&[]));
     }
 
     /// Service exec is on with `VIRTKIT_SERVICE_EXEC=1` only, as `vk-agent exec --service`

@@ -22,8 +22,9 @@
 //! name to refer only to a socket already restricted to `0600`.
 //!
 //! [`open_dir`], [`open_dir_nofollow`] and [`open_dir_in`] expose the third rule to callers
-//! that anchor their own `*at()` operations, and [`reopen_dir`] and [`dir_names`] read or lock
-//! a directory so held.
+//! that anchor their own `*at()` operations, [`reopen_dir`] and [`dir_names`] read or lock
+//! a directory so held, and [`create_dir_in`] and [`create_file_in`] make a new entry in it,
+//! never one already there.
 //!
 //! [`entry_in`] exposes the fourth to callers walking a path, links included: it says whether
 //! an entry could have been put there, or swapped since, by another user.
@@ -736,6 +737,47 @@ fn fsync_dir(dir: BorrowedFd<'_>) -> std::io::Result<()> {
 pub fn open_dir_in(dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, anyhow::Error> {
     openat_dir_raw(dir, &one_name(name)?)
         .map_err(|e| anyhow!(e).context(format!("opening {name:?}")))
+}
+
+/// Make the directory `name` in the already-open `dir`, with `mode`, and open it as
+/// [`open_dir_in`] does. Refused with `EEXIST` when `name` is already there in any form, a
+/// symlink included. `name` is one name: not empty, and without a `/`.
+pub fn create_dir_in(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    mode: u32,
+) -> Result<OwnedFd, anyhow::Error> {
+    let c_name = one_name(name)?;
+    // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), mode as libc::mode_t) } != 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()).context(format!("creating {name:?}")));
+    }
+    openat_dir_raw(dir, &c_name).map_err(|e| anyhow!(e).context(format!("opening {name:?}")))
+}
+
+/// Create the regular file `name` in the already-open `dir`, with `mode`, open for writing.
+/// Refused with `EEXIST` when `name` is already there in any form, a symlink included: what
+/// is written is always the new file. `name` is one name: not empty, and without a `/`.
+pub fn create_file_in(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    mode: u32,
+) -> Result<std::fs::File, anyhow::Error> {
+    let c_name = one_name(name)?;
+    // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()).context(format!("creating {name:?}")));
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Reopen `dir` for listing or `flock`, which an `O_PATH` descriptor from [`open_dir_in`]
@@ -1526,6 +1568,41 @@ mod tests {
         let slash = open_dir(Path::new("/")).unwrap();
         let above = open_dir_in(slash.as_fd(), OsStr::new("..")).unwrap();
         assert_eq!(id(&above), path_id(Path::new("/")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new entry is made only where nothing stands, a dangling link included, with the mode
+    /// asked for, and only as one name.
+    #[test]
+    fn creating_in_a_directory_never_reuses_a_name() {
+        use std::io::Write;
+        let dir = scratch("create-in");
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("link")).unwrap();
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        let top = open_dir(&dir).unwrap();
+        let eexist = |e: anyhow::Error| {
+            e.root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+        };
+        for taken in ["link", "file"] {
+            let name = OsStr::new(taken);
+            assert!(eexist(create_dir_in(top.as_fd(), name, 0o700).unwrap_err()));
+            assert!(eexist(
+                create_file_in(top.as_fd(), name, 0o600).unwrap_err()
+            ));
+        }
+        assert!(!dir.join("nowhere").exists());
+        assert!(create_dir_in(top.as_fd(), OsStr::new("a/b"), 0o700).is_err());
+        assert!(create_file_in(top.as_fd(), OsStr::new(""), 0o600).is_err());
+
+        let sub = create_dir_in(top.as_fd(), OsStr::new("sub"), 0o700).unwrap();
+        let mut f = create_file_in(sub.as_fd(), OsStr::new("f"), 0o600).unwrap();
+        f.write_all(b"data").unwrap();
+        assert_eq!(std::fs::read(dir.join("sub/f")).unwrap(), b"data");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&dir.join("sub")), 0o700);
+        assert_eq!(mode(&dir.join("sub/f")), 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

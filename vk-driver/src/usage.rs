@@ -495,6 +495,11 @@ fn ppid_links() -> HashMap<i32, Vec<i32>> {
     links
 }
 
+/// The parent of `pid`, `None` once it is gone.
+pub(crate) fn parent_of(pid: i32) -> Option<i32> {
+    stat(pid).map(|(ppid, _)| ppid)
+}
+
 /// `(ppid, CPU ticks)` for `pid`. Fields are counted from the last `)`: before it sits the
 /// comm field, a process name that may hold spaces and parentheses — the ppid scan reads
 /// every process on the host, and vk's own VMM name comes from a `--vm-name` template — so

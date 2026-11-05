@@ -356,6 +356,38 @@ enum Route {
     Direct,
 }
 
+/// A `[docker]` section a pull is routed through, whose credential it sends: its `repo` and
+/// whether it is plain HTTP.
+pub(crate) struct Via<'a> {
+    pub repo: &'a str,
+    pub insecure: bool,
+}
+
+/// The repository a job's `image:` is pulled from as `<host>/<path>`, tag and digest dropped,
+/// and the `[docker]` repo or mirror routing it there. A ref nothing routes, or routing
+/// refuses, is returned as written with no section.
+pub(crate) fn routed_repository<'a>(cfg: &'a Config, image: &str) -> (String, Option<Via<'a>>) {
+    let (full, via) = match cfg.docker.as_ref().map(|dk| (dk, route(dk, image))) {
+        Some((dk, Ok(Route::Repo { full, .. }))) => {
+            let via = dk.repo.as_deref().map(|repo| Via {
+                repo,
+                insecure: dk.insecure,
+            });
+            (full, via)
+        }
+        Some((dk, Ok(Route::Mirror { full, .. }))) => {
+            let via = dk.mirror.as_ref().map(|m| Via {
+                repo: &m.repo,
+                insecure: m.insecure,
+            });
+            (full, via)
+        }
+        _ => (image.to_string(), None),
+    };
+    // Twice: a `:tag` before an `@digest` survives the first split.
+    (split_ref(split_ref(&full).0).0.to_string(), via)
+}
+
 /// Route a job's `image:` against a configured `[docker]`. Precedence:
 ///   1. a ref already under `repo` → through the repo proxy;
 ///   2. a Docker Hub ref (bare name or explicit docker.io host) with a `[docker.mirror]`

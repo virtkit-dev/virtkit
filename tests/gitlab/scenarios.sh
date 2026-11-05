@@ -297,6 +297,100 @@ EOF
   SC_DETAIL="pipeline $p: own namespace writable and lockable, others refused"
 }
 
+# A job builds an image from a context it made (`vk-agent build`) and later jobs of its
+# pipeline boot it, by the full reference passed on as a dotenv variable and as
+# pipeline/build/<name>. Refused: a second build of the name in the job, a symlink in a
+# context, a symlinked Dockerfile, a reference written straight into the pipeline namespace,
+# and the image from another pipeline by either form.
+sc_pipeline_build() {
+  local p1 p2 b j ref want
+  p1=$({
+    ci_header
+    cat <<EOF
+stages: [build, test]
+build:
+  stage: build
+  script:
+    - mkdir -p ctx bad
+    - echo "pipeline-marker-\$CI_PIPELINE_ID" > ctx/marker.txt
+    - printf 'FROM %s\nCOPY marker.txt /pipeline-marker.txt\n' "$JOB_IMAGE" > runner.Dockerfile
+    - ref=\$(vk-agent build -f runner.Dockerfile --as runner ctx)
+    - echo "built=\$ref"
+    - echo "RUNNER_IMAGE=\$ref" > build.env
+    - rc=0; vk-agent build -f runner.Dockerfile --as runner ctx || rc=\$?; echo "again-rc=\$rc"
+    - echo x > bad/file && ln -s file bad/link
+    - rc=0; vk-agent build -f runner.Dockerfile --as bad bad || rc=\$?; echo "symlink-rc=\$rc"
+    - ln -s runner.Dockerfile link.Dockerfile
+    - rc=0; vk-agent build -f link.Dockerfile --as linked ctx || rc=\$?; echo "link-rc=\$rc"
+  artifacts:
+    reports:
+      dotenv: build.env
+use:
+  stage: test
+  needs: [build]
+  variables:
+    MICROVM_IMAGE: \$RUNNER_IMAGE
+  script: [cat /pipeline-marker.txt]
+use-current:
+  stage: test
+  needs: [build]
+  variables:
+    MICROVM_IMAGE: pipeline/build/runner
+  script: [cat /pipeline-marker.txt]
+direct:
+  stage: build
+  variables:
+    MICROVM_IMAGE: 127.0.0.1:$REG_PORT/ci-pipeline/e2e/$GL_PROJECT_ID/1/builds/runner:current
+  script: [echo never-marker]
+  allow_failure: true
+EOF
+  } | push_scenario pipeline_build) || return 1
+  wait_pipeline "$p1" success || return 1
+  b=$(job "$p1" build)
+  ref=$(grep -oE "${LINE}built=pipeline/build/runner:job-$b@sha256:[0-9a-f]{64}\$" \
+    "$RUN/jobs/$b.log" | sed 's/.*built=//')
+  [ -n "$ref" ] || bad "job $b's trace lacks a line 'built=pipeline/build/runner:job-$b@sha256:…'"
+  for want in "again-rc=2" "symlink-rc=[1-9][0-9]*" "link-rc=[1-9][0-9]*"; do
+    grep -qE "${LINE}${want}\$" "$RUN/jobs/$b.log" || bad "job $b's trace lacks a line '$want'"
+  done
+  trace_has "$b" "a job publishes a name once" "bad/link: a symlink" \
+    "link.Dockerfile (a symlink is not sent"
+  for j in "$(job "$p1" use)" "$(job "$p1" use-current)"; do
+    job_field_is "$j" .status success
+    grep -qE "${LINE}pipeline-marker-$p1\$" "$RUN/jobs/$j.log" ||
+      bad "job $j's trace lacks a line 'pipeline-marker-$p1'"
+  done
+  j=$(job "$p1" direct)
+  job_field_is "$j" .status failed
+  trace_has "$j" "is in the pipeline namespace (ci-pipeline/)"
+  trace_lacks "$j" never-marker
+  [ -n "$ref" ] || return 1
+
+  p2=$({
+    ci_header
+    cat <<EOF
+full:
+  variables:
+    MICROVM_IMAGE: "$ref"
+  script: [echo never-marker]
+current:
+  variables:
+    MICROVM_IMAGE: pipeline/build/runner
+  script: [echo never-marker]
+EOF
+  } | push_scenario pipeline_build -second) || return 1
+  wait_pipeline "$p2" failed || return 1
+  j=$(job "$p2" full)
+  job_field_is "$j" .status failed
+  trace_has "$j" "image $ref is not in this pipeline" "rerun job $b"
+  trace_lacks "$j" never-marker
+  j=$(job "$p2" current)
+  job_field_is "$j" .status failed
+  trace_has "$j" "image pipeline/build/runner is not in this pipeline"
+  trace_lacks "$j" never-marker
+  SC_DETAIL="built in $p1 ($ref), refused in $p2"
+}
+
 sc_services() {
   local p j
   p=$({

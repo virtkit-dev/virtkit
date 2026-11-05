@@ -4,6 +4,20 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Boot a pipeline's own images.** On a fleet, a job or service image
+  `pipeline/build/<name>[:job-<id>][@sha256:…]` boots the image published under that name in
+  the job's pipeline: `job-<id>`'s, or the latest. A missing image fails naming the producer
+  job to rerun. Images of the pipeline namespace named directly are refused, under
+  `[registry] pipeline_root` (default `ci-pipeline`) for every job.
+- **Build a pipeline image from a job.** On a fleet, `vk-agent build [-f FILE] [--target
+  STAGE] [--build-arg NAME=VALUE]… --as NAME CONTEXT` in a job builds a context the job made
+  itself on its host and publishes it in the job's pipeline, printing the
+  `pipeline/build/NAME:job-<id>@sha256:…` reference a later job boots. `[executor]
+  guest_build` turns it off; it is off by default on a node whose registry proxy lends guests
+  its own credential. `guest_build_max_context` and `guest_build_max_entries` cap a context.
+
 ## [0.104.0] - 2026-11-04
 
 ### Added

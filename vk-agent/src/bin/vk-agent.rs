@@ -83,6 +83,31 @@ enum Commands {
         /// Arguments for the command
         args: Vec<String>,
     },
+    /// Build an image on the VM's host from a context here and print its reference
+    ///
+    /// For a CI job a fleet hub placed with a pipeline namespace. The context, less what its
+    /// .dockerignore excludes, and the Dockerfile go to the host over its command channel
+    /// (--socket, default /run/vk/host.sock), which builds them as a `dockerfile:` image and
+    /// publishes the image in the job's pipeline. The build's output goes to stderr; stdout is
+    /// one line, `pipeline/build/NAME:job-<id>@sha256:…`, for a later job's MICROVM_IMAGE.
+    /// The context holds regular files and directories only.
+    #[command(arg_required_else_help = true)]
+    Build {
+        /// The Dockerfile, which may lie outside the context [default: CONTEXT/Dockerfile]
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// The stage to build [default: the last]
+        #[arg(long, value_name = "STAGE")]
+        target: Option<String>,
+        /// A build argument, NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+        /// The image's name in the pipeline: pipeline/build/NAME
+        #[arg(long = "as", value_name = "NAME")]
+        name: String,
+        /// The build context directory
+        context: PathBuf,
+    },
     /// Serve the exec channel on --socket
     Serve {
         /// Log at debug level instead of info
@@ -353,6 +378,17 @@ fn main() {
             std::process::exit(service_exec(cli_args.socket, argv, tty));
         }
     }
+    if let Commands::Build {
+        file,
+        target,
+        build_arg,
+        name,
+        context,
+    } = cli_args.command
+    {
+        let req = vk_agent::guestbuild::Request::new(file, target, &build_arg, name, context);
+        std::process::exit(guest_build(cli_args.socket, req));
+    }
     let Some(socket) = cli_args.socket else {
         <Cli as clap::CommandFactory>::command()
             .error(
@@ -500,6 +536,88 @@ fn service_exec(socket: Option<SocketAddr>, argv: Vec<String>, tty: bool) -> i32
             1
         }
     }
+}
+
+/// `vk-agent build`: `req` sent to the VM's host over its host command channel at `socket`,
+/// by default [`HOST_SOCK`], with its context streamed on the request's stdin. The host's exit
+/// status, or 1 when the context cannot be read or the host reached.
+fn guest_build(socket: Option<SocketAddr>, req: vk_agent::guestbuild::Request) -> i32 {
+    // Everything the context holds is checked before the host is asked.
+    let entries = match vk_agent::guestbuild::entries(&req.context) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("vk-agent: {e:#}");
+            return 1;
+        }
+    };
+    if socket.is_none() && std::fs::symlink_metadata(HOST_SOCK).is_err() {
+        eprintln!(
+            "vk-agent: this VM has no host command channel {HOST_SOCK}: `build` is for CI jobs a \
+             fleet hub placed with a pipeline namespace, on a node with `[executor] guest_build`"
+        );
+        return 1;
+    }
+    let socket = socket.unwrap_or_else(|| SocketAddr::Unix(HOST_SOCK.into()));
+    // The tar is the request's stdin: written to a pipe that stands in for fd 0, which the
+    // exec client forwards, from a thread of its own.
+    let (read, write) = match std::io::pipe() {
+        Ok(pipe) => pipe,
+        Err(e) => {
+            eprintln!("vk-agent: creating the context pipe: {e}");
+            return 1;
+        }
+    };
+    // SAFETY: dup2(2) onto fd 0, which this process reads only through the exec client.
+    if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&read), 0) } < 0 {
+        eprintln!(
+            "vk-agent: sending the context: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    drop(read);
+    let (sent_tx, sent) = std::sync::mpsc::channel();
+    let (context, dockerfile) = (req.context.clone(), req.dockerfile.clone());
+    std::thread::spawn(move || {
+        let r = vk_agent::guestbuild::write_tar(&context, &entries, &dockerfile, write);
+        // The receiver may be gone: the host answered already.
+        let _ = sent_tx.send(r);
+    });
+    let mut argv = req.argv.into_iter();
+    let name = argv.next().unwrap_or_default();
+    let ran = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("building the tokio runtime")
+        .block_on(execute(
+            socket,
+            name,
+            argv.collect(),
+            false,
+            Vec::new(),
+            RunMode::Interactive,
+            None,
+            None,
+            None,
+        ));
+    let code = match ran {
+        Ok(result) => match (result.code, result.signal) {
+            (Some(code), _) => code,
+            (None, Some(signal)) => 128 + signal,
+            (None, None) => 0,
+        },
+        Err(e) => {
+            eprintln!("vk-agent: {e:#}");
+            1
+        }
+    };
+    // Why the context stopped short, when it did and the host failed for it.
+    if code != 0
+        && let Ok(Err(e)) = sent.recv_timeout(Duration::from_secs(1))
+    {
+        eprintln!("vk-agent: {e:#}");
+    }
+    code
 }
 
 /// `vk-agent service OP [NAME]`: the service manager's answer to `args`.
@@ -713,7 +831,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             }
         }
         // handled synchronously in main(), before the runtime is built
-        Commands::Init { .. } => unreachable!(),
+        Commands::Init { .. } | Commands::Build { .. } => unreachable!(),
     }
 }
 
@@ -844,6 +962,63 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    /// `build` takes the Dockerfile, stage, build arguments and name as flags and the context
+    /// as its one positional, and asks the host for `vk build` with all but the paths.
+    #[test]
+    fn build_asks_the_host_for_vk_build() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "vk-agent",
+            "build",
+            "-f",
+            "docker/runner.Dockerfile",
+            "--target",
+            "runner",
+            "--build-arg",
+            "VERSION=1",
+            "--as",
+            "runner",
+            "./out",
+        ])
+        .unwrap();
+        let super::Commands::Build {
+            file,
+            target,
+            build_arg,
+            name,
+            context,
+        } = cli.command
+        else {
+            panic!("expected build")
+        };
+        let req = vk_agent::guestbuild::Request::new(file, target, &build_arg, name, context);
+        assert_eq!(
+            req.argv,
+            [
+                "vk",
+                "build",
+                "--target",
+                "runner",
+                "--build-arg",
+                "VERSION=1",
+                "--as",
+                "runner"
+            ]
+        );
+        assert_eq!(
+            req.dockerfile,
+            std::path::Path::new("docker/runner.Dockerfile")
+        );
+        assert!(cli.socket.is_none());
+        for bad in [
+            &["vk-agent", "build", "./out"][..],
+            &["vk-agent", "build", "--as", "runner"],
+            &["vk-agent", "build", "--as", "runner", "a", "b"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
     }
 
     /// Without --socket, `exec --service` dials the host command channel only when the kernel

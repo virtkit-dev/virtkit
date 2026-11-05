@@ -298,6 +298,96 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
         .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
 }
 
+/// `rg` with its repository prefix replaced by `path`, an absolute path on the same registry,
+/// and `token`, when given, in place of its credential. `None` for a local store or a `repo`
+/// naming no host.
+pub(crate) fn at_path(rg: &Registry, path: &str, token: Option<&str>) -> Option<Registry> {
+    let (base, _) = rg.base_url()?;
+    let authority = base.split_once("://").map_or(base.as_str(), |(_, a)| a);
+    let mut out = rg.clone();
+    out.repo = format!("{authority}/{path}");
+    out.job_token = token.map(|t| crate::config::JobToken(t.to_string()));
+    Some(out)
+}
+
+/// The digest `<name>:<tag>` names, or `None` when the registry says it has no such tag.
+async fn tag_digest(
+    client: &oci_client::Client,
+    auth: &RegistryAuth,
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+) -> Result<Option<String>> {
+    let image = make_ref(rg, name, tag)?;
+    match resolve_digest(client, &image, auth).await {
+        Ok(digest) => Ok(Some(digest)),
+        Err(e) if is_manifest_unknown(&e) => Ok(None),
+        Err(e) => {
+            Err(anyhow::Error::new(e)
+                .context(format!("resolving {name}:{tag} against {}", rg.repo)))
+        }
+    }
+}
+
+/// The digest `<name>:<tag>` names in `rg`, or `None` when the registry says it has no such
+/// tag.
+pub(crate) fn tag_digest_of(rg: &Registry, name: &str, tag: &str) -> Result<Option<String>> {
+    block_on(async {
+        let (client, auth) = client(rg)?;
+        tag_digest(&client, &auth, rg, name, tag).await
+    })
+}
+
+/// Pull+cache the bundle `<name>:<tag>`, asking the registry for the tag even when the bundle
+/// is cached: reading a tag is what dates its last use there. `expect`, when given, must be
+/// the tag's digest. `Ok(None)` when the registry has no such tag.
+pub(crate) fn resolve_tag(
+    cfg: &Config,
+    state_dir: &Path,
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    expect: Option<&str>,
+) -> Result<Option<ResolvedImage>> {
+    block_on(async {
+        let (client, auth) = client(rg)?;
+        let Some(digest) = tag_digest(&client, &auth, rg, name, tag).await? else {
+            return Ok(None);
+        };
+        if let Some(want) = expect
+            && want != digest
+        {
+            bail!("{}/{name}:{tag} is {digest}, not {want}", rg.repo);
+        }
+        let (resolved, _) =
+            resolve_async(cfg, state_dir, rg, name, Reference::Digest(digest)).await?;
+        Ok(Some(resolved))
+    })
+}
+
+/// Push the bundle `dir` as `<name>:<first>`, then move `<name>:<then>` onto it. Refused
+/// before anything is pushed when `<name>:<first>` exists, so what `first` names never
+/// changes; a concurrent push of the same `first` is the caller's to prevent. Returns the
+/// manifest digest.
+pub(crate) fn push_once_then_tag(
+    rg: &Registry,
+    dir: &Path,
+    name: &str,
+    first: &str,
+    then: &str,
+) -> Result<String> {
+    block_on(async {
+        let (client, auth) = client(rg)?;
+        if let Some(digest) = tag_digest(&client, &auth, rg, name, first).await? {
+            bail!("{}/{name}:{first} already exists ({digest})", rg.repo);
+        }
+        let digest =
+            with_upload_retry("push", |force| push_async(rg, dir, name, first, force)).await?;
+        retag_async(rg, name, &digest, then).await?;
+        Ok(digest)
+    })
+}
+
 /// True if `<name>:<tag>` resolves in the registry — a cheap manifest HEAD, no pull.
 /// The build instruction-cache existence check; a registry error reads as "absent".
 pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
@@ -329,15 +419,11 @@ pub fn record_build_stage(rg: &Registry, snapshot_tag: &str, digest: &str) -> Re
         store.put_manifest(name, &tag, &ctype, &body)?;
         return Ok(());
     }
-    block_on(record_build_stage_async(rg, name, digest, &tag))
+    block_on(retag_async(rg, name, digest, &tag)).context("recording the completed stage")
 }
 
-async fn record_build_stage_async(
-    rg: &Registry,
-    name: &str,
-    digest: &str,
-    tag: &str,
-) -> Result<()> {
+/// Tag the manifest `<name>@<digest>` as `<name>:<tag>` too, its bytes unchanged.
+async fn retag_async(rg: &Registry, name: &str, digest: &str, tag: &str) -> Result<()> {
     let (client, auth) = client(rg)?;
     let source = make_digest_ref(rg, name, digest)?;
     let target = make_ref(rg, name, tag)?;
@@ -350,7 +436,7 @@ async fn record_build_stage_async(
         .await
     }
     .await
-    .context("reading the completed stage manifest")?;
+    .with_context(|| format!("reading the manifest {name}@{digest}"))?;
     client
         .store_auth_if_needed(target.resolve_registry(), &auth)
         .await;
@@ -363,7 +449,7 @@ async fn record_build_stage_async(
         .await
     }
     .await
-    .context("recording the completed stage")?;
+    .with_context(|| format!("tagging {name}@{digest} as {tag}"))?;
     Ok(())
 }
 
@@ -3443,6 +3529,9 @@ pub(crate) enum Cred {
 }
 
 pub(crate) fn cred(rg: &Registry) -> Result<Cred> {
+    if let Some(t) = &rg.job_token {
+        return Ok(Cred::Bearer { token: t.0.clone() });
+    }
     if let Some(tf) = &rg.token_file {
         // A bearer token carries no meaningful surrounding whitespace, so trim both ends
         // (unlike a password below, which may legitimately begin with whitespace and is
@@ -5245,7 +5334,7 @@ pub(crate) mod tests {
             Some(token),
             None,
         );
-        let got = record_build_stage_async(&rg, "build-cache", &digest, "stage-x").await;
+        let got = retag_async(&rg, "build-cache", &digest, "stage-x").await;
         let _ = std::fs::remove_dir_all(&dir);
         got.unwrap();
         let seen = server.seen();
@@ -5549,18 +5638,28 @@ pub(crate) mod tests {
     /// A [`Registry`] reaching, over plain HTTP, a `vk-registry` serving the store at `root`
     /// with no accounts.
     pub(crate) fn served_store(root: &Path) -> Registry {
+        let store = std::sync::Arc::new(vk_registry::Store::new(root.to_path_buf()).unwrap());
+        let url = serve_store(store, vk_registry::auth::Auth::None);
+        Registry::for_share(url, true, None, String::new(), None, None, None)
+    }
+
+    /// A `vk-registry` serving `store` over plain HTTP, every request checked against `auth`.
+    /// Returns its `host:port`.
+    pub(crate) fn serve_store(
+        store: std::sync::Arc<vk_registry::Store>,
+        auth: vk_registry::auth::Auth,
+    ) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
-            store: std::sync::Arc::new(vk_registry::Store::new(root.to_path_buf()).unwrap()),
+        spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store,
             upstreams: vec![],
             locks: vk_registry::lock::LockManager::new(),
-            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            auth: vk_registry::Authenticator::Shared(auth),
             tls: None,
             webdav: true,
             tokens: Default::default(),
             handover: Default::default(),
-        }));
-        Registry::for_share(url, true, None, String::new(), None, None, None)
+        }))
     }
 
     fn retry_tmpdir(tag: &str) -> std::path::PathBuf {

@@ -11,6 +11,7 @@ pub mod exec;
 pub mod fleetctl;
 pub mod forward;
 pub mod framing;
+pub mod guest_build;
 pub mod messages;
 pub mod net;
 pub mod oomkills;

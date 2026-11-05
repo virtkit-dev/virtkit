@@ -154,6 +154,13 @@ job's plain GitLab `image:` is read the same way):
 - unset → `local/default` (the baked default bundle);
 - `local/<name>` — a bundle directory under `[local] dir`;
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo;
+- `pipeline/build/<name>[:job-<id>][@sha256:…]` — a bundle in the job's pipeline namespace
+  (`<prefix>/builds/<name>`), for a job the hub placed with one: tag `job-<id>` when given,
+  else `current`, the last one published. A digest given beside it must be the tag's. A
+  reference written straight into the pipeline namespace is refused: anything under
+  `[registry] pipeline_root` (default `ci-pipeline`, set it to the root of the namespace's
+  path when the hub's config moves it) or under the first component of the job's prefix.
+  Other `pipeline/` names are reserved;
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, booted
   directly (embedded kernel + agent). A reference `[docker]` does not route — and every
   one of them when that section is absent — is offered first to the vk-registry this
@@ -204,6 +211,62 @@ test-in-repo-image:
   variables:
     MICROVM_IMAGE: dockerfile:ci/Dockerfile#test   # built from this checkout, then booted
 ```
+
+### Pipeline images built in a job
+
+A job a fleet hub placed with a pipeline namespace can build an image from files it produced
+itself, for later jobs of its pipeline to boot:
+
+```sh
+ref=$(vk-agent build -f docker/runner.Dockerfile --target runner \
+        --build-arg VERSION="$VERSION" --as runner ./out)
+echo "RUNNER_IMAGE=$ref" >> build.env
+```
+
+```yaml
+build-debs:
+  script: [./debbuild.sh]
+  artifacts:
+    reports: { dotenv: build.env }
+
+test:
+  needs: [build-debs]
+  variables:
+    MICROVM_IMAGE: $RUNNER_IMAGE    # pipeline/build/runner:job-1234@sha256:…
+```
+
+`vk-agent build [-f FILE] [--target STAGE] [--build-arg NAME=VALUE]… --as NAME CONTEXT` sends
+`CONTEXT`, less what its `.dockerignore` excludes, and the Dockerfile (`-f`, by default
+`CONTEXT/Dockerfile`, which may lie outside the context) to the host over the VM's host
+command channel. The host builds them as it builds a `dockerfile:` image — the build tier,
+`[build] cache_registry`, the build phase's egress — pushes the bundle to
+`<prefix>/builds/NAME` in the pipeline namespace with the job's registry token, tagged
+`job-<job id>`, then moves `current` onto it. The build's output goes to stderr; stdout is one
+line, `pipeline/build/NAME:job-<job id>@sha256:…`. Pass that full reference on: a retried
+producer publishes under its own job ID, and `pipeline/build/NAME` alone names whichever
+image was published last.
+
+- The context holds regular files and directories only: a symlink or a special file left in
+  is refused by its path (`.dockerignore` can leave it out), and so is a symlinked
+  Dockerfile. A path below the context holds at most 247 bytes, 100 per name: the context
+  travels as plain ustar.
+- `[executor] guest_build_max_context` (default `"8G"`, counted on the wire) and
+  `guest_build_max_entries` (default `1000000`) cap a context; crossing either stops the
+  transfer and the build.
+- A job runs one build at a time, a second refused at once, and publishes a name once.
+- The build is part of the job: cancelling or timing out the job stops it. The context is
+  unpacked under the job's directory on the host and removed when the build ends.
+- Exit status 2: refused before the context was read — no pipeline namespace, a name the job
+  already published, another build running, an argument the host does not take. 1: the
+  context could not be read or sent, or the build or the push failed.
+
+`[executor] guest_build` decides whether jobs are offered it. Unset, it is on unless the
+guests' registry proxy lends the node's own credential (`[registry] proxy_guests` without
+`guest_credential = "job"`): such a proxy gives every guest the registry as the node sees it,
+every pipeline's images included. `true` beside one is refused when the config loads;
+`false` turns it off. Isolation between pipelines holds only on a registry whose nodes all
+lend job tokens or run no proxy; see the
+[pipeline images design](pipeline-images-design.md#host-side).
 
 ## Resource usage
 

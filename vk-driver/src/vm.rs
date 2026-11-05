@@ -473,7 +473,8 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     }
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
-    // the supervisor re-resolves from the same env (a fingerprint hit for a build).
+    // the supervisor re-resolves from the same env (a fingerprint hit for a build). A ref by
+    // tag alone, such as a bare `pipeline/build/<name>` (`current`), may move in between.
     let mut plan = resolve_media(ctx)?;
     // The bases this job boots, for its next admission to keep (see `admit`); supervise notes
     // them again with the services only it resolves.
@@ -749,7 +750,8 @@ async fn wait_for_windows(
 /// `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds a **git-defined** image from the
 /// host-side checkout into the shared build tier and boots that; `compose:<file>#<primary>`
 /// takes the primary out of the fleet and resolves that unit; any other form resolves
-/// through the shared image cache (`resolve_ref`).
+/// through the shared image cache under the job's pipeline scope
+/// (`pipeline::resolve_ref`).
 fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     if let Some(spec) = image_ref.strip_prefix("dockerfile:") {
@@ -759,7 +761,8 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
         let fleet = load_compose_fleet(ctx, spec)?;
         return compose_unit_media(ctx, &fleet.units[fleet.primary]);
     }
-    match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
+    let job = ctx.job_registry.as_ref();
+    match crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image_ref)? {
         ResolvedImage::Disk { rootfs, config } => Ok(BootPlan {
             media: Media {
                 rootfs,
@@ -793,34 +796,51 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 /// checkout into the shared build tier and return its rootfs, captured runtime config, and a
 /// held reference on the entry (see [`crate::ensure::ensure_build_tier`]). Shared
 /// by the job's primary (`resolve_dockerfile_form`) and its git-defined services
-/// (`plan_services`). Requires `[executor] host_checkout`: the Dockerfile + context are the
-/// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
-/// overrides it. `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
-/// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
-/// confined to the checkout, since all of them are job-authored. `service` names the service
-/// whose image it is, for the job's egress record; `None` for the job's own.
+/// (`plan_services`). `service` names the service whose image it is, for the job's egress
+/// record; `None` for the job's own.
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
     service: Option<&str>,
 ) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
-    let cfg = &ctx.cfg;
-    if !cfg.executor.host_checkout {
+    build_image_sources(ctx, git_image_sources(ctx, spec, service)?)
+}
+
+/// What an image is built from, every path already confined to the tree it came from.
+pub(crate) struct ImageSources {
+    pub dockerfile: PathBuf,
+    pub context: PathBuf,
+    /// Named build contexts, for `COPY --from=<NAME>`.
+    pub build_contexts: Vec<(String, PathBuf)>,
+    pub build_args: Vec<(String, String)>,
+    /// The build target, if any.
+    pub stage: Option<String>,
+    /// Names the image in the build tier's wait message and in errors.
+    pub label: String,
+    /// The service whose image it is, for the job's egress record; `None` for the job's own.
+    pub service: Option<String>,
+}
+
+/// Resolve a `dockerfile:` spec's sources against the job's checkout. Requires
+/// `[executor] host_checkout`: the Dockerfile + context are the checked-out sources. The
+/// context defaults to the Dockerfile's directory; `?context=<dir>` overrides it.
+/// `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
+/// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
+/// confined to the checkout, since all of them are job-authored.
+fn git_image_sources(ctx: &JobCtx, spec: &str, service: Option<&str>) -> Result<ImageSources> {
+    if !ctx.cfg.executor.host_checkout {
         bail!(
             "a git-defined (dockerfile:/compose:) image requires [executor] host_checkout — the \
              Dockerfile and its context are the checked-out sources"
         );
     }
     let parsed = parse_dockerfile_spec(spec)?;
-    let stage = parsed.stage;
     let checkout = ctx.host_checkout_dir();
     // The Dockerfile path is job-controlled; confine it to the checkout so a `dockerfile:` job
     // cannot read another tenant's checkout or an arbitrary host file during the host-side
     // build (this runs outside the microVM boundary).
     let dockerfile = confined_dockerfile(&checkout, parsed.path)?;
     let context = resolve_build_context(&checkout, &dockerfile, parsed.context)?;
-    let dockerfiles = vec![dockerfile];
-    let contexts = vec![context];
     let build_args: Vec<(String, String)> = parsed
         .build_args
         .iter()
@@ -838,6 +858,39 @@ fn build_git_image(
             Ok(((*name).to_string(), dir))
         })
         .collect::<Result<_>>()?;
+    Ok(ImageSources {
+        dockerfile,
+        context,
+        build_contexts,
+        build_args,
+        stage: parsed.stage.map(str::to_string),
+        label: spec.to_string(),
+        service: service.map(str::to_string),
+    })
+}
+
+/// Build `sources` into the shared build tier, under the job's build-phase egress, its
+/// `[build] cache_registry` and its build record, and return the image's rootfs, captured
+/// runtime config, and a held reference on the entry (see
+/// [`crate::ensure::ensure_build_tier`]). The caller has confined every path in `sources`:
+/// the build reads them on the host, outside the microVM boundary.
+pub(crate) fn build_image_sources(
+    ctx: &JobCtx,
+    sources: ImageSources,
+) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
+    let cfg = &ctx.cfg;
+    let ImageSources {
+        dockerfile,
+        context,
+        build_contexts,
+        build_args,
+        stage,
+        label,
+        service,
+    } = sources;
+    let stage = stage.as_deref();
+    let dockerfiles = vec![dockerfile];
+    let contexts = vec![context];
     let stage_key = crate::build::target_stage_key(
         &dockerfiles,
         &contexts,
@@ -845,7 +898,7 @@ fn build_git_image(
         &build_args,
         stage,
     )
-    .context("computing the git-defined image's stage fingerprint")?;
+    .context("computing the image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
     let cache = crate::build::CacheOpts::from_config(&cfg.build);
     let recipe = crate::ensure::BuildRecipe {
@@ -860,7 +913,7 @@ fn build_git_image(
         cache_auth: cache.auth,
         net,
         audit,
-        record: build_record(ctx, service)?,
+        record: build_record(ctx, service.as_deref())?,
     };
     let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -868,10 +921,10 @@ fn build_git_image(
         &recipe,
         stage,
         &stage_key,
-        spec,
+        &label,
         None,
     )
-    .with_context(|| format!("building the git-defined image {spec:?}"))?;
+    .with_context(|| format!("building the image {label:?}"))?;
     let rootfs = dir.join(crate::ensure::UNIT_IMAGE);
     // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
     let config = crate::build::read_config_sidecar(&rootfs)?;
@@ -1364,8 +1417,9 @@ fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootP
             })
         }
         crate::compose::Source::Image(image) => {
+            let job = ctx.job_registry.as_ref();
             let crate::image::ResolvedImage::Disk { rootfs, config } =
-                crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image)?;
+                crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image)?;
             let config = Some(crate::compose::merged_config(
                 &config.unwrap_or_default(),
                 unit,
@@ -1897,14 +1951,20 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
 
-    // The guest's `vk-agent exec --service`: its host command channel, served below.
-    let service_exec = cfg.executor.guest_service_exec && !service_names.is_empty();
-    if service_exec {
+    // What the guest may ask of its host over its host command channel, served below.
+    let host_forms = HostForms {
+        exec: cfg.executor.guest_service_exec && !service_names.is_empty(),
+        build: guest_build_offered(ctx),
+    };
+    let host_channel = host_forms.any();
+    if host_channel {
         cmdline.push_str(&format!(
-            " VIRTKIT_HOST_EXEC_PORT={} {}=1",
-            crate::run::HOST_EXEC_PORT,
-            vk_core::service_exec::CMDLINE_KEY
+            " VIRTKIT_HOST_EXEC_PORT={}",
+            crate::run::HOST_EXEC_PORT
         ));
+    }
+    if host_forms.exec {
+        cmdline.push_str(&format!(" {}=1", vk_core::service_exec::CMDLINE_KEY));
     }
 
     if !cfg.executor.vm.cmdline_extra.is_empty() {
@@ -1932,7 +1992,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             crate::run::SSH_AGENT_VSOCK_PORT,
         ));
     }
-    if service_exec {
+    if host_channel {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),
             crate::run::HOST_EXEC_PORT,
@@ -1990,11 +2050,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
     // Without it the job still runs: its `vk-agent exec --service` then finds no one serving
     // the channel.
-    if service_exec {
-        match spawn_service_exec_serve(ctx, &agent.path) {
+    if host_channel {
+        match spawn_service_exec_serve(ctx, &agent.path, host_forms) {
             Ok(child) => children.push(child),
             Err(e) => {
-                eprintln!("virtkit: warning: the job's `vk-agent exec --service` is off: {e:#}")
+                eprintln!("virtkit: warning: the job's host command channel is off: {e:#}")
             }
         }
     }
@@ -2086,9 +2146,75 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
 }
 
 /// Serve the job VM's host command channel — the `/run/vk/host.sock` its `vk-agent exec
-/// --service` dials — for its services ([`spawn_service_exec_serve_at`]).
-fn spawn_service_exec_serve(ctx: &JobCtx, agent: &Path) -> Result<std::process::Child> {
-    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent)
+/// --service` dials — for the forms it allows ([`spawn_service_exec_serve_at`]).
+fn spawn_service_exec_serve(
+    ctx: &JobCtx,
+    agent: &Path,
+    forms: HostForms,
+) -> Result<std::process::Child> {
+    // The build form loads the config the job runs with; exec needs none.
+    let config = ctx.cfg.source.as_deref().filter(|_| forms.build);
+    spawn_service_exec_serve_at(&ctx.vsock_sock(), &ctx.job_dir, agent, forms, config)
+}
+
+/// Whether the job's guest may ask for `vk-agent build`: the node offers it
+/// ([`crate::config::Config::guest_build`]) and the job's start names a pipeline namespace,
+/// with a registry token to publish there.
+fn guest_build_offered(ctx: &JobCtx) -> bool {
+    ctx.cfg.guest_build()
+        && ctx
+            .job_registry
+            .as_ref()
+            .is_some_and(|j| j.pipeline_prefix.is_some() && !j.token.is_empty())
+}
+
+/// The requests a VM's host command channel allows, passed to its wrapper as trusted
+/// arguments (`vk service-exec <dir> --allow exec,build -- …`). The channel is served when
+/// at least one is allowed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostForms {
+    /// `vk-agent exec --service`: an exec into one of the VM's services.
+    pub exec: bool,
+    /// `vk-agent build`: an image built from a context the guest sends.
+    pub build: bool,
+}
+
+impl HostForms {
+    /// Exec alone: what a wrapper given no `--allow` allows, since a serve started by an
+    /// earlier vk invokes the updated one without it.
+    pub const EXEC: Self = Self {
+        exec: true,
+        build: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.exec || self.build
+    }
+}
+
+impl std::fmt::Display for HostForms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let forms = [(self.exec, "exec"), (self.build, "build")];
+        let names: Vec<&str> = forms.iter().filter(|f| f.0).map(|f| f.1).collect();
+        f.write_str(&names.join(","))
+    }
+}
+
+impl std::str::FromStr for HostForms {
+    type Err = String;
+
+    /// A comma-separated list of `exec` and `build`, at least one.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut forms = Self::default();
+        for form in s.split(',') {
+            match form {
+                "exec" => forms.exec = true,
+                "build" => forms.build = true,
+                _ => return Err(format!("unknown form {form:?}: expected exec or build")),
+            }
+        }
+        Ok(forms)
+    }
 }
 
 /// How many of a VM's `vk exec --service` its host runs at once: each is a host `vk` (and a
@@ -2099,17 +2225,38 @@ pub(crate) const SERVICE_EXEC_MAX_CONCURRENT: u32 = 4;
 /// The guest controls request volume and therefore log volume.
 pub(crate) const SERVE_LOG_MAX: u64 = 1 << 20;
 
-/// Build `vk service-exec <dir> --` to restrict host requests to `vk exec --service`
-/// into `svc-<name>` services under `dir`. Guest arguments follow `--`; `dir` is absolute
-/// because the serve may run elsewhere. Resolve this vk's path now: a `vk update` during
-/// the VM's lifetime replaces that binary, so later requests run the updated version.
-pub(crate) fn service_exec_command(dir: &Path) -> Result<(PathBuf, [String; 3])> {
+/// Build `vk service-exec <dir> --allow <forms> [--config <file>] --` to restrict host
+/// requests to `forms`: `vk exec --service` into `svc-<name>` services under `dir`, `vk
+/// build` with the config at `config`. Guest arguments follow `--`; `dir` is absolute because
+/// the serve may run elsewhere. Resolve this vk's path now: a `vk update` during the VM's
+/// lifetime replaces that binary, so later requests run the updated version with these
+/// arguments.
+pub(crate) fn service_exec_command(
+    dir: &Path,
+    forms: HostForms,
+    config: Option<&Path>,
+) -> Result<(PathBuf, Vec<String>)> {
     let exe = std::env::current_exe().context("finding the vk binary")?;
     let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
     let dir = dir
         .to_str()
         .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
-    Ok((exe, ["service-exec".into(), dir.into(), "--".into()]))
+    let mut args = vec![
+        "service-exec".to_string(),
+        dir.into(),
+        "--allow".into(),
+        forms.to_string(),
+    ];
+    if let Some(config) = config {
+        let config = std::path::absolute(config)
+            .with_context(|| format!("resolving {}", config.display()))?;
+        let config = config
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", config.display()))?;
+        args.extend(["--config".to_string(), config.to_string()]);
+    }
+    args.push("--".into());
+    Ok((exe, args))
 }
 
 /// Pipe serve output to a thread that keeps at most `max` bytes in `log`; the guest controls
@@ -2125,18 +2272,20 @@ pub(crate) fn capped_log_pipe(log: std::fs::File, max: u64) -> Result<std::io::P
 }
 
 /// Serve the host command channel of the VM whose vsock socket is `vsock` with `vk-agent
-/// serve`, every command forced through `vk service-exec <dir> -- …` (the guest's argv only
-/// after the `--`), which allows `vk exec --service` into the `svc-<name>` services under
-/// `dir` — a CI job's dir, or a `vk run --compose`'s — and nothing else. It runs in `dir` as
-/// the serve's user, whatever directory or user the guest asks for, in the foreground of its
-/// session, at most [`SERVICE_EXEC_MAX_CONCURRENT`] at once. Its log is
-/// `dir/service-exec.log`, at most [`SERVE_LOG_MAX`] bytes of it.
+/// serve`, every command forced through `vk service-exec <dir> --allow <forms> -- …` (the
+/// guest's argv only after the `--`), which allows `forms` and nothing else: `exec` is
+/// `vk exec --service` into the `svc-<name>` services under `dir` — a CI job's dir, or a
+/// `vk run --compose`'s. It runs in `dir` as the serve's user, whatever directory or user the
+/// guest asks for, in the foreground of its session, at most [`SERVICE_EXEC_MAX_CONCURRENT`]
+/// at once. Its log is `dir/service-exec.log`, at most [`SERVE_LOG_MAX`] bytes of it.
 pub(crate) fn spawn_service_exec_serve_at(
     vsock: &Path,
     dir: &Path,
     agent: &Path,
+    forms: HostForms,
+    config: Option<&Path>,
 ) -> Result<std::process::Child> {
-    let (exe, wrapper_args) = service_exec_command(dir)?;
+    let (exe, wrapper_args) = service_exec_command(dir, forms, config)?;
     let listen = crate::vmm::hybrid_socket(vsock, crate::run::HOST_EXEC_PORT);
     let mut cmd = Command::new(agent);
     cmd.arg("-s")
@@ -2248,12 +2397,26 @@ struct ServiceRequest {
     args: Vec<String>,
 }
 
-/// `vk service-exec <dir> -- vk exec --service NAME … -- CMD…`: what a VM's agent asked, run
-/// when it is an exec into one of the `svc-<name>` services under `dir` (a CI job's dir, a
-/// compose run's) and refused with exit 2 otherwise.
-pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode {
-    let req = match service_request(dir, argv) {
-        Ok(req) => req,
+/// `vk service-exec <dir> --allow <forms> [--config <file>] -- vk …`: what a VM's agent asked,
+/// run when `forms` allow it and it is an exec into one of the `svc-<name>` services under
+/// `dir` (a CI job's dir, a compose run's) or a `vk-agent build` of the CI job in `dir` with
+/// the config at `config`, refused with exit 2 otherwise.
+pub async fn service_exec(
+    dir: &Path,
+    forms: HostForms,
+    config: Option<&Path>,
+    argv: &[String],
+) -> std::process::ExitCode {
+    let req = match host_request(dir, forms, argv) {
+        Ok(HostRequest::Exec(req)) => req,
+        Ok(HostRequest::Build(req)) => {
+            let (dir, config) = (dir.to_path_buf(), config.map(Path::to_path_buf));
+            return tokio::task::spawn_blocking(move || {
+                crate::guestbuild::serve(&dir, config.as_deref(), req)
+            })
+            .await
+            .unwrap_or(std::process::ExitCode::FAILURE);
+        }
         Err(code) => return code,
     };
     match crate::exec::run(
@@ -2279,14 +2442,51 @@ pub async fn service_exec(dir: &Path, argv: &[String]) -> std::process::ExitCode
     }
 }
 
-/// [`service_exec`]'s decision: the request when `argv` is the guest agent's `vk exec --service`
-/// into a service under `dir`, else the exit status, the reason already on stderr.
-fn service_request(dir: &Path, argv: &[String]) -> Result<ServiceRequest, std::process::ExitCode> {
+/// What a VM's agent asked of its host ([`host_request`]).
+#[derive(Debug)]
+enum HostRequest {
+    Exec(ServiceRequest),
+    Build(crate::guestbuild::BuildRequest),
+}
+
+/// [`service_exec`]'s decision: the request when `forms` allow it and `argv` is the guest
+/// agent's `vk exec --service` into a service under `dir` or its `vk build`, else the exit
+/// status, the reason already on stderr.
+fn host_request(
+    dir: &Path,
+    forms: HostForms,
+    argv: &[String],
+) -> Result<HostRequest, std::process::ExitCode> {
+    // `vk build …` is a `vk-agent build`; anything else is taken for an exec request.
+    let words = (argv.first(), argv.get(1));
+    if words.0.map(String::as_str) == Some("vk") && words.1.map(String::as_str) == Some("build") {
+        if !forms.build {
+            eprintln!("vk: this VM's host does not allow `vk-agent build`");
+            return Err(std::process::ExitCode::from(2));
+        }
+        return crate::guestbuild::request(argv).map(HostRequest::Build);
+    }
+    service_request(dir, forms, argv).map(HostRequest::Exec)
+}
+
+/// [`host_request`]'s decision on an exec: the request when `forms` allow exec and `argv` is
+/// the guest agent's `vk exec --service` into a service under `dir`, else the exit status, the
+/// reason already on stderr.
+fn service_request(
+    dir: &Path,
+    forms: HostForms,
+    argv: &[String],
+) -> Result<ServiceRequest, std::process::ExitCode> {
     use clap::Parser;
     let refuse = |why: String| {
         eprintln!("vk: {why}");
         std::process::ExitCode::from(2)
     };
+    if !forms.exec {
+        return Err(refuse(
+            "this VM's host does not allow `vk-agent exec --service`".to_string(),
+        ));
+    }
     // A service exec request names `vk` first; anything else is not one.
     if argv.first().map(String::as_str) != Some("vk") {
         return Err(refuse(
@@ -2486,7 +2686,7 @@ fn tools_problem(out: &[u8]) -> Option<String> {
 enum ServiceMedia<'a> {
     Git(&'a str),
     Build,
-    Image,
+    Image(&'a str),
     /// a Windows bundle, which a CI job does not boot
     Bundle,
 }
@@ -2498,7 +2698,7 @@ fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
     match source {
         crate::compose::Source::Image(image) => match image.strip_prefix("dockerfile:") {
             Some(spec) => ServiceMedia::Git(spec),
-            None => ServiceMedia::Image,
+            None => ServiceMedia::Image(image),
         },
         crate::compose::Source::Build { .. } => ServiceMedia::Build,
         crate::compose::Source::Bundle { .. } => ServiceMedia::Bundle,
@@ -2589,14 +2789,14 @@ fn plan_services(
                 guards.push(guard);
                 crate::units::provisioned(&unit, ext4, config, siting(slot, extra_ips))?
             }
-            ServiceMedia::Image => {
-                let prov = crate::units::provision(
-                    &ctx.cfg,
-                    ctx.cfg.state_dir(),
-                    &[],
-                    &unit,
-                    siting(slot, extra_ips),
-                )?;
+            ServiceMedia::Image(image) => {
+                let job = ctx.job_registry.as_ref();
+                let crate::image::ResolvedImage::Disk { rootfs, config } =
+                    crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image)
+                        .with_context(|| format!("service {}", unit.name))?;
+                let config = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
+                let prov =
+                    crate::units::provisioned(&unit, rootfs, config, siting(slot, extra_ips))?;
                 if let Some(g) =
                     crate::image::acquire_use_lock_for(ctx.cfg.state_dir(), &prov.ext4)?
                 {
@@ -4723,12 +4923,13 @@ mod tests {
             argv(&["vk", "exec", "--service", "relinked", "--", "true"]),
             argv(&["vk", "exec", "--service", "down", "--", "true"]),
         ] {
-            let refused = service_request(&job.0, &asked).map(|_| ());
+            let refused = service_request(&job.0, HostForms::EXEC, &asked).map(|_| ());
             assert_eq!(refused, Err(std::process::ExitCode::from(2)), "{asked:?}");
         }
 
         let req = service_request(
             &job.0,
+            HostForms::EXEC,
             &argv(&[
                 "vk",
                 "exec",
@@ -4763,10 +4964,88 @@ mod tests {
         );
         let req = service_request(
             &job.0,
+            HostForms::EXEC,
             &argv(&["vk", "exec", "--service", "db", "-b", "--", "x"]),
         )
         .unwrap();
         assert!(req.background);
+    }
+
+    /// A VM's host command channel runs only the forms its wrapper was given: an exec request
+    /// with `exec`, never with `build` alone; a `vk-agent build` request with `build` only.
+    #[test]
+    fn a_vms_host_command_channel_runs_only_the_forms_it_allows() {
+        let job = crate::qga::tests::TempDir::new("host-forms");
+        std::fs::create_dir_all(job.0.join("svc-db")).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(
+            job.0
+                .join("svc-db")
+                .join(format!("vsock.sock_{}", crate::units::VSOCK_PORT)),
+        )
+        .unwrap();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let exec = argv(&["vk", "exec", "--service", "db", "--", "true"]);
+        let build = argv(&["vk", "build", "--as", "runner"]);
+        let refused = Err(std::process::ExitCode::from(2));
+        let exec_only: HostForms = "exec".parse().unwrap();
+        let build_only: HostForms = "build".parse().unwrap();
+        let both: HostForms = "exec,build".parse().unwrap();
+        assert_eq!(exec_only, HostForms::EXEC);
+        let is_exec = |r: Result<HostRequest, _>| matches!(r, Ok(HostRequest::Exec(_)));
+        let is_build = |r: Result<HostRequest, _>| matches!(r, Ok(HostRequest::Build(_)));
+        assert!(is_exec(host_request(&job.0, exec_only, &exec)));
+        assert!(is_exec(host_request(&job.0, both, &exec)));
+        assert_eq!(host_request(&job.0, build_only, &exec).map(|_| ()), refused);
+        assert_eq!(host_request(&job.0, exec_only, &build).map(|_| ()), refused);
+        assert!(is_build(host_request(&job.0, build_only, &build)));
+        assert!(is_build(host_request(&job.0, both, &build)));
+        // A build request that does not parse is refused, never taken for an exec.
+        let bad = argv(&["vk", "build", "--as", "Runner"]);
+        assert_eq!(host_request(&job.0, both, &bad).map(|_| ()), refused);
+        // What `service_exec_command` passes is what the wrapper reads back.
+        for forms in [exec_only, build_only, both] {
+            assert_eq!(forms.to_string().parse::<HostForms>(), Ok(forms));
+        }
+        assert_eq!(both.to_string(), "exec,build");
+        for bad in ["", "exec,", "shell", "exec,shell", "EXEC"] {
+            assert!(bad.parse::<HostForms>().is_err(), "{bad:?}");
+        }
+    }
+
+    /// A job's guest is offered `vk-agent build` when the node offers it and the job's start
+    /// names a pipeline namespace with a token to publish there.
+    #[test]
+    fn guest_build_is_offered_to_a_job_with_a_pipeline_namespace() {
+        let env = [("CUSTOM_ENV_CI_JOB_ID".to_string(), "7".to_string())];
+        let ctx = |cfg: Config, prefix: Option<&str>, token: &str| {
+            let mut ctx = JobCtx::for_env(cfg, &env).unwrap();
+            ctx.job_registry = Some(vk_hub_proto::dispatch::JobRegistry {
+                registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+                token: token.into(),
+                expires_at: u64::MAX,
+                grants: Vec::new(),
+                cache_repo: None,
+                pipeline_prefix: prefix.map(str::to_string),
+                areas: vec![],
+            });
+            ctx
+        };
+        let cfg = |toml: &str| toml::from_str::<Config>(toml).unwrap();
+        const PIPELINE: Option<&str> = Some("ci-pipeline/gl/42/7");
+        assert!(guest_build_offered(&ctx(cfg(""), PIPELINE, "vkt_x.y")));
+        assert!(!guest_build_offered(&ctx(cfg(""), None, "vkt_x.y")));
+        assert!(!guest_build_offered(&ctx(cfg(""), PIPELINE, "")));
+        let mut unplaced = ctx(cfg(""), PIPELINE, "vkt_x.y");
+        unplaced.job_registry = None;
+        assert!(!guest_build_offered(&unplaced));
+        let off = cfg("[executor]\nguest_build = false\n");
+        assert!(!guest_build_offered(&ctx(off, PIPELINE, "vkt_x.y")));
+        let node = cfg("[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\n");
+        assert!(!guest_build_offered(&ctx(node, PIPELINE, "vkt_x.y")));
+        let job = cfg(
+            "[registry]\nrepo = \"reg.example/x\"\nproxy_guests = true\nguest_credential = \"job\"\n",
+        );
+        assert!(guest_build_offered(&ctx(job, PIPELINE, "vkt_x.y")));
     }
 
     /// The service exec log keeps its first bytes and says it dropped the rest, reading
@@ -6860,7 +7139,7 @@ mod tests {
         );
         assert_eq!(
             service_media(&Source::Image("alpine:3.21".into())),
-            ServiceMedia::Image
+            ServiceMedia::Image("alpine:3.21")
         );
         // A Windows bundle is a media of its own, which `plan_services` refuses.
         assert_eq!(

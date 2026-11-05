@@ -5,7 +5,8 @@
 //! gitlab-runner (`tools`), the line the marks publish (`mark`), the run's environment for login
 //! shells (`runenv`), guest statistics in atop's
 //! parseable format (`atop`, with the exited tasks `taskstats` reports), networking
-//! (`netcfg`) and the embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
+//! (`netcfg`), the context a CI job's `vk-agent build` sends its host (`guestbuild`) and the
+//! embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
 //! protocol and runtime helpers live in the `vk-core` crate.
 
 pub mod archive;
@@ -15,6 +16,7 @@ pub mod ctlfs;
 pub mod diskmount;
 pub mod fsfreeze;
 pub mod fsmark;
+pub mod guestbuild;
 pub mod init;
 pub(crate) mod mark;
 pub mod memmark;
