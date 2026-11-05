@@ -1970,6 +1970,53 @@ async fn a_key_that_fails_to_delete_is_reported_and_the_batch_goes_on() {
     is_object(&send(&host, Req::new("GET", "/s3/b/d/x")).await, HELLO);
 }
 
+/// A browser's write from another site's page cannot ride the session cookie it attaches,
+/// path-style or virtual-hosted; a read can, and so can a write from the registry's own pages.
+#[tokio::test]
+async fn a_cross_site_write_is_refused() {
+    let dir = tmp("cross-site");
+    let mut cfg = accounts_config(&dir);
+    cfg.s3_host = Some("s3.example.com".to_string());
+    let state = Arc::new(cfg.into_state().unwrap());
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    db.set_admin(&user.id, true).unwrap();
+    let session = db
+        .create_session(&user.id, Duration::from_secs(3600))
+        .unwrap();
+    let addr = spawn(state.clone());
+    let cookie = format!("__Host-vk_session={session}");
+    let send_to = |host: &str, req: Req, site: Option<&str>| {
+        let (addr, host) = (addr.clone(), host.to_string());
+        let mut req = req.header("Cookie", &cookie);
+        if let Some(site) = site {
+            req = req.header("Sec-Fetch-Site", site);
+        }
+        async move { Conn::open_as(&addr, &host).await.send(&req).await }
+    };
+    let vhost = "b.s3.example.com";
+    for (host, path) in [(addr.as_str(), "/s3/b/k"), (vhost, "/v")] {
+        for site in ["cross-site", "same-site"] {
+            let put = Req::new("PUT", path).body(HELLO.to_vec());
+            send_to(host, put, Some(site)).await.is(403, "AccessDenied");
+            let del = Req::new("DELETE", path);
+            send_to(host, del, Some(site)).await.is(403, "AccessDenied");
+        }
+        send_to(host, Req::new("GET", path), Some("cross-site"))
+            .await
+            .is(404, "NoSuchKey");
+        for site in [Some("same-origin"), None] {
+            let put = Req::new("PUT", path).body(HELLO.to_vec());
+            send_to(host, put, site).await.ok(200);
+        }
+        let get = send_to(host, Req::new("GET", path), Some("cross-site")).await;
+        is_object(&get, HELLO);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What an answer echoes holds no character XML cannot write: an uploads listing's prefix and
 /// markers, and a batch delete's keys.
 #[tokio::test]
