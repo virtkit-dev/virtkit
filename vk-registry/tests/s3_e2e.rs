@@ -1919,8 +1919,20 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         .is(404, "NoSuchKey");
 
     // DeleteObject: 204 there or not; a directory has no object to delete; a foreign tag is
-    // not this view's.
-    send(&host, Req::new("DELETE", "/s3/b/k")).await.ok(204);
+    // not this view's. The null version, which ListObjectVersions names, is the object.
+    is_object(
+        &send(&host, Req::new("GET", "/s3/b/k?versionId=null")).await,
+        HELLO,
+    );
+    send(&host, Req::new("GET", "/s3/b/k?versionId=1"))
+        .await
+        .is(501, "NotImplemented");
+    send(&host, Req::new("DELETE", "/s3/b/k?versionId=1"))
+        .await
+        .is(501, "NotImplemented");
+    send(&host, Req::new("DELETE", "/s3/b/k?versionId=null"))
+        .await
+        .ok(204);
     send(&host, Req::new("GET", "/s3/b/k"))
         .await
         .is(404, "NoSuchKey");
@@ -2441,6 +2453,65 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
         assert_eq!(&marker, seen.last().unwrap());
     }
     assert_eq!(seen, written);
+
+    // The versions: each object the one, `null`, version of its key, paged by key marker
+    // as boto3's paginator pages it, sending back the version id marker it was given.
+    let mut seen = Vec::new();
+    let mut markers: Option<(String, String)> = None;
+    loop {
+        let q = match &markers {
+            Some((key, version)) => format!(
+                "key-marker={}&max-keys=3&version-id-marker={version}&versions=",
+                key.replace('/', "%2F")
+            ),
+            None => "max-keys=3&versions=".to_string(),
+        };
+        let resp = send(host, list(&q)).await;
+        resp.ok(200);
+        assert!(
+            resp.body.starts_with(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>sccache</Name><Prefix></Prefix><KeyMarker>"
+            ),
+            "{}",
+            resp.body
+        );
+        let (key, version) = markers.clone().unwrap_or_default();
+        assert_eq!(element(&resp.body, "KeyMarker"), key);
+        assert_eq!(element(&resp.body, "VersionIdMarker"), version);
+        assert!(!resp.body.contains("<Contents>") && !resp.body.contains("DeleteMarker"));
+        let page = keys(&resp.body);
+        assert_eq!(elements(&resp.body, "Version").len(), page.len());
+        assert_eq!(elements(&resp.body, "VersionId"), vec!["null"; page.len()]);
+        assert_eq!(elements(&resp.body, "IsLatest"), vec!["true"; page.len()]);
+        assert_eq!(elements(&resp.body, "Owner").len(), page.len());
+        seen.extend(page);
+        if element(&resp.body, "IsTruncated") == "false" {
+            assert!(!resp.body.contains("NextKeyMarker"));
+            break;
+        }
+        let next = (
+            element(&resp.body, "NextKeyMarker"),
+            element(&resp.body, "NextVersionIdMarker"),
+        );
+        assert_eq!(next, (seen.last().unwrap().clone(), "null".to_string()));
+        markers = Some(next);
+    }
+    assert_eq!(seen, written);
+    let resp = send(host, list("delimiter=%2F&versions=")).await;
+    assert_eq!(keys(&resp.body), [".sccache_check"]);
+    assert_eq!(prefixes(&resp.body), ["ci/"]);
+    for bad in [
+        "list-type=2&versions=",
+        "version-id-marker=null&versions=",
+        "versions=1",
+    ] {
+        send(host, list(bad)).await.is(400, "InvalidArgument");
+    }
+    send(host, sign(Req::new("GET", "/s3/none").query("versions=")))
+        .await
+        .is(404, "NoSuchBucket");
 
     // The other parameters.
     let start = &written[3];
@@ -3125,18 +3196,16 @@ async fn objects_are_copied(host: &str, sign: Sign<'_>) -> Vec<u8> {
     assert_eq!(copied(&send(host, sign(req)).await), etag);
     let req = copy("/s3/dst/fresh", "/src/d/k").header("If-None-Match", "*");
     assert_eq!(copied(&send(host, sign(req)).await), etag);
+    // The null version is the source itself.
+    let req = copy("/s3/dst/null", "/src/d/k?versionId=null");
+    assert_eq!(copied(&send(host, sign(req)).await), etag);
 
     // What names no object, or no place for one.
     for (to, from, status, code) in [
         ("/s3/dst/x", "/src/absent", 404, "NoSuchKey"),
         ("/s3/dst/x", "/src/d", 404, "NoSuchKey"),
         ("/s3/dst/x", "/nobucket/k", 404, "NoSuchBucket"),
-        (
-            "/s3/dst/x",
-            "/src/d/k?versionId=null",
-            501,
-            "NotImplemented",
-        ),
+        ("/s3/dst/x", "/src/d/k?versionId=1", 501, "NotImplemented"),
         ("/s3/dst/x", "/src", 400, "InvalidArgument"),
         ("/s3/dst/x", "/src/a%20b", 400, "InvalidArgument"),
         ("/s3/src/d", "/src/d/k", 409, "OperationAborted"),
@@ -3362,14 +3431,15 @@ async fn objects_are_deleted_in_batches(host: &str, sign: Sign<'_>, store: &Stor
             &key_of("a&amp;b"),
             &key_of("d"),
             &key_of("img/v1"),
-            "<Key>c</Key><VersionId>null</VersionId>",
+            "<Key>c</Key><VersionId>1</VersionId>",
             &key_of("d/b"),
             &key_of("x/../y"),
+            "<Key>kept</Key><VersionId>null</VersionId>",
         ],
         false,
     );
     let (deleted, errors) = delete_result(&send(host, sign(delete_objects("batch", doc))).await);
-    assert_eq!(deleted, ["a", "absent", "d", "d/b"]);
+    assert_eq!(deleted, ["a", "absent", "d", "d/b", "kept"]);
     assert_eq!(
         errors,
         [
@@ -3379,7 +3449,7 @@ async fn objects_are_deleted_in_batches(host: &str, sign: Sign<'_>, store: &Stor
             pair("x/../y", "InvalidArgument"),
         ]
     );
-    for gone in ["/s3/batch/a", "/s3/batch/d/b"] {
+    for gone in ["/s3/batch/a", "/s3/batch/d/b", "/s3/batch/kept"] {
         send(host, sign(Req::new("GET", gone)))
             .await
             .is(404, "NoSuchKey");

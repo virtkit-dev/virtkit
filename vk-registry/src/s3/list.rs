@@ -1,4 +1,6 @@
-//! A bucket's objects: ListObjectsV2 (`?list-type=2`) and ListObjects (v1, `marker`). The
+//! A bucket's objects: ListObjectsV2 (`?list-type=2`), ListObjects (v1, `marker`) and
+//! ListObjectVersions (`?versions`, `key-marker`), the last as a store that keeps no versions
+//! answers it: every object is its one version, `null`, and the latest. The
 //! listing is a depth-first walk of the bucket's directories that yields keys in byte order
 //! of the whole key: a directory's members all start with `<name>/`, so at each level the
 //! directories sort as `<name>/` among the tags, which puts tag `a-b` and `a.b` before
@@ -16,14 +18,14 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::path::MAX_KEY;
-use super::{Ctx, Params, bucket, conditional, refuse, sigv4, xml};
+use super::{Ctx, NULL_VERSION, Params, bucket, conditional, refuse, sigv4, xml};
 use crate::files::{self, FILES_REPO, Node, Object, allowed, repo_name};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
 /// Most entries a page holds, and what `max-keys` is clamped to: S3's bound.
 const MAX_KEYS: usize = 1000;
 
-/// The query parameters a listing takes, of either version; an SDK's `x-id` hint too.
+/// The query parameters a listing takes, of any of the three; an SDK's `x-id` hint too.
 const PARAMS: &[&str] = &[
     "list-type",
     "prefix",
@@ -32,6 +34,9 @@ const PARAMS: &[&str] = &[
     "continuation-token",
     "start-after",
     "marker",
+    "versions",
+    "key-marker",
+    "version-id-marker",
     "encoding-type",
     "fetch-owner",
     "x-id",
@@ -47,6 +52,11 @@ pub(super) fn is_listing(params: &Params) -> bool {
 struct Query {
     /// `list-type=2`
     v2: bool,
+    /// `?versions`
+    versions: bool,
+    /// `version-id-marker`, as sent, to echo: with one version a key, `key-marker` alone
+    /// says where to resume
+    version_marker: Option<String>,
     prefix: String,
     delimiter: Option<String>,
     max_keys: usize,
@@ -68,7 +78,7 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
         max_keys: MAX_KEYS,
         ..Query::default()
     };
-    let (mut start_after, mut marker) = (None, None);
+    let (mut start_after, mut marker, mut key_marker) = (None, None, None);
     let mut seen: Vec<&str> = Vec::new();
     for (name, value) in params {
         let (name, value) = (name.as_str(), value.clone());
@@ -91,14 +101,27 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
             "continuation-token" => q.token = Some(value),
             "start-after" => start_after = Some(text(value)?),
             "marker" => marker = Some(text(value)?),
+            "versions" if value.is_empty() => q.versions = true,
+            "versions" => return Err("versions takes no value"),
+            "key-marker" => key_marker = Some(text(value)?),
+            "version-id-marker" => q.version_marker = Some(text(value)?),
             "encoding-type" if value == "url" => q.url = true,
             "encoding-type" => return Err("encoding-type is url, or absent"),
             "fetch-owner" => q.owner = value == "true",
             _ => {}
         }
     }
-    // Each version resumes its own way; a first-version listing always names the owner.
-    if q.v2 {
+    // Each listing resumes its own way; the first version and the versions one always name
+    // the owner.
+    if q.versions {
+        if q.v2 {
+            return Err("list-type names ListObjectsV2, which a versions listing is not");
+        }
+        if q.version_marker.is_some() && key_marker.is_none() {
+            return Err("a version-id-marker needs the key-marker it is a version of");
+        }
+        (q.start, q.token, q.owner) = (key_marker, None, true);
+    } else if q.v2 {
         q.start = start_after;
     } else {
         (q.start, q.token, q.owner) = (marker, None, true);
@@ -377,7 +400,7 @@ pub(super) async fn list(
         }
         let (items, truncated) = page(store, authz, &bucket, &q)?;
         Ok(xml::document(
-            "ListBucketResult",
+            q.root(),
             &render(&bucket, &q, &items, truncated),
         ))
     })
@@ -414,18 +437,38 @@ pub(super) fn admitted(authz: &Authz<'_>, bucket: &str, prefix: &str) -> bool {
         })
 }
 
-/// The `ListBucketResult` of a page: its parameters, then the objects, then the common
-/// prefixes, every caller string escaped and, under `encoding-type=url`, encoded.
+impl Query {
+    /// The root element of the document this listing answers with.
+    fn root(&self) -> &'static str {
+        if self.versions {
+            "ListVersionsResult"
+        } else {
+            "ListBucketResult"
+        }
+    }
+}
+
+/// The `ListBucketResult` or `ListVersionsResult` of a page: its parameters, then the
+/// objects (each a `Version` of id `null` in the latter), then the common prefixes, every
+/// caller string escaped and, under `encoding-type=url`, encoded.
 fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
     let enc = |s: &str| if q.url { url_encode(s) } else { s.to_string() };
     let mut out = xml::element("Name", bucket);
     out.push_str(&xml::element("Prefix", &enc(&q.prefix)));
     let next = truncated.then(|| items.last().map(Item::key)).flatten();
-    if !q.v2 {
+    let start = enc(q.start.as_deref().unwrap_or(""));
+    if q.versions {
+        out.push_str(&xml::element("KeyMarker", &start));
         out.push_str(&xml::element(
-            "Marker",
-            &enc(q.start.as_deref().unwrap_or("")),
+            "VersionIdMarker",
+            &enc(q.version_marker.as_deref().unwrap_or("")),
         ));
+        if let Some(next) = next {
+            out.push_str(&xml::element("NextKeyMarker", &enc(next)));
+            out.push_str(&xml::element("NextVersionIdMarker", NULL_VERSION));
+        }
+    } else if !q.v2 {
+        out.push_str(&xml::element("Marker", &start));
         if let Some(next) = next {
             out.push_str(&xml::element("NextMarker", &enc(next)));
         }
@@ -456,10 +499,19 @@ fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
             out.push_str(&xml::element("StartAfter", &enc(start)));
         }
     }
+    let (entry, version) = if q.versions {
+        (
+            "Version",
+            xml::element("VersionId", NULL_VERSION) + &xml::element("IsLatest", "true"),
+        )
+    } else {
+        ("Contents", String::new())
+    };
     for item in items {
         if let Item::Object(key, obj) = item {
-            out.push_str("<Contents>");
+            out.push_str(&format!("<{entry}>"));
             out.push_str(&xml::element("Key", &enc(key)));
+            out.push_str(&version);
             out.push_str(&xml::element("LastModified", &iso8601(obj.modified)));
             out.push_str(&xml::element("ETag", &conditional::etag_of(obj)));
             out.push_str(&xml::element("Size", &obj.size.to_string()));
@@ -467,7 +519,7 @@ fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
                 out.push_str(&bucket::owner());
             }
             out.push_str(&xml::element("StorageClass", "STANDARD"));
-            out.push_str("</Contents>");
+            out.push_str(&format!("</{entry}>"));
         }
     }
     for item in items {
@@ -827,6 +879,10 @@ mod tests {
         assert!(is_listing("list-%74ype=2"));
         assert!(is_listing("list-type=2&prefix=a%2F&delimiter=%2F"));
         assert!(is_listing("marker=a&max-keys=2&x-id=ListObjects"));
+        assert!(is_listing("versions"));
+        assert!(is_listing(
+            "key-marker=a&max-keys=2&version-id-marker=null&versions="
+        ));
         assert!(!is_listing("location"));
         assert!(!is_listing("list-type=2&acl"));
         assert!(!is_listing("uploads"));
@@ -856,6 +912,21 @@ mod tests {
         assert_eq!(parse("").unwrap().max_keys, 1000);
         assert_eq!(parse("max-keys=0").unwrap().max_keys, 0);
         assert!(parse("encoding-type=url").unwrap().url);
+        assert_eq!(parse("").unwrap().root(), "ListBucketResult");
+        // The versions listing: `key-marker` resumes, `version-id-marker` is echoed only.
+        let q = parse("key-marker=a&marker=b&version-id-marker=null&versions").unwrap();
+        assert!(q.versions && q.owner && !q.v2);
+        assert_eq!(
+            (
+                q.start.as_deref(),
+                q.after.as_deref(),
+                q.version_marker.as_deref()
+            ),
+            (Some("a"), Some("a"), Some("null"))
+        );
+        assert_eq!(q.root(), "ListVersionsResult");
+        let q = parse("versions=").unwrap();
+        assert!(q.versions && q.after.is_none() && q.version_marker.is_none());
 
         let bad_token = |t: &[u8]| {
             let token = vk_hub_proto::token::to_base64url(t);
@@ -876,6 +947,10 @@ mod tests {
             "prefix=%0A",
             "prefix=%FF",
             "delimiter=%2",
+            "list-type=2&versions",
+            "version-id-marker=null&versions",
+            "versions=1",
+            "key-marker=%0A&versions",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -968,5 +1043,50 @@ mod tests {
             iso8601(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_401)),
             "1970-01-02T00:00:01.000Z"
         );
+
+        // The versions listing: each object its `null` version, the latest; the markers
+        // sent back as a paginator sends them, the key's version being `null`.
+        let q = Query {
+            versions: true,
+            version_marker: Some("<v>".to_string()),
+            ..q
+        };
+        let (items, truncated) = page(&t.store, &Authz::NoScopes, "b", &q).unwrap();
+        let xml = render("b", &q, &items, truncated);
+        assert!(
+            xml.starts_with(
+                "<Name>b</Name><Prefix>d/</Prefix><KeyMarker>d/a</KeyMarker>\
+                 <VersionIdMarker>&lt;v&gt;</VersionIdMarker><NextKeyMarker>d/k</NextKeyMarker>\
+                 <NextVersionIdMarker>null</NextVersionIdMarker><MaxKeys>1</MaxKeys>\
+                 <IsTruncated>true</IsTruncated><Version><Key>d/k</Key><VersionId>null</VersionId>\
+                 <IsLatest>true</IsLatest><LastModified>"
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&format!(
+                "</Size>{}<StorageClass>STANDARD</StorageClass></Version>",
+                bucket::owner()
+            )),
+            "{xml}"
+        );
+        assert!(!xml.contains("Marker>d/a</Marker") && !xml.contains("Contents"));
+        let q = Query {
+            versions: true,
+            prefix: "d/".to_string(),
+            max_keys: 2,
+            ..Query::default()
+        };
+        let (items, truncated) = page(&t.store, &Authz::NoScopes, "b", &q).unwrap();
+        let xml = render("b", &q, &items, truncated);
+        assert!(
+            xml.starts_with(
+                "<Name>b</Name><Prefix>d/</Prefix><KeyMarker></KeyMarker>\
+                 <VersionIdMarker></VersionIdMarker><MaxKeys>2</MaxKeys>\
+                 <IsTruncated>false</IsTruncated><Version>"
+            ),
+            "{xml}"
+        );
+        assert_eq!(xml.matches("<Version>").count(), 2);
     }
 }
