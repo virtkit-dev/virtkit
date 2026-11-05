@@ -647,7 +647,8 @@ refused over a clash answers 409 and so reveals that the name exists, as WebDAV'
 bucket authorizes as `files/<bucket>`, except that HeadBucket and GetBucketLocation also
 admit a caller that may read only a directory inside it, which clients probe before listing
 the prefix they were given. Listing the buckets needs a configured credential, as `/dav/`'s
-root listing does, and shows only those the caller may read. Listing a bucket's objects is
+root listing does, and shows only those HeadBucket admits the caller to: a bucket it may read,
+or read a directory inside. Listing a bucket's objects is
 admitted when the caller may read the bucket or the directory the prefix's whole components
 name (`prefix=proj/` for a `read:files/team/proj/*` key over bucket `team`; `prefix=proj`
 names no directory and is refused), and shows only what a read would serve: a directory the
