@@ -1831,3 +1831,34 @@ async fn a_directory_delete_waits_for_the_store_lock_without_holding_up_writes()
     assert!(!dir.join("store/repos/files/gone").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small object read back again and again on one connection comes back in about a
+/// millisecond, not after the client's delayed ACK: the server sends a response's head and
+/// body as two writes, and with Nagle's algorithm on, the second waits for that ACK (about
+/// 40 ms on Linux), which made a cache of many small entries slow to read.
+#[tokio::test]
+async fn small_objects_are_answered_without_waiting_for_a_delayed_ack() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("nodelay");
+    let url = spawn(open_state(&dir));
+    let c = client();
+    let object = format!("{url}/dav/files/cache/ab/small");
+    let put = c.put(&object).body(vec![7u8; 86]).send().await.unwrap();
+    assert_eq!(put.status(), 201);
+
+    let mut took = Vec::new();
+    for _ in 0..21 {
+        let start = std::time::Instant::now();
+        let resp = c.get(&object).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().await.unwrap().len(), 86);
+        took.push(start.elapsed());
+    }
+    took.sort();
+    let median = took[took.len() / 2];
+    assert!(
+        median < std::time::Duration::from_millis(20),
+        "median GET of a small object took {median:?} on one connection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **vk-registry no longer stalls about 40 ms on each small read.** A client reading many
+  small objects over one connection, such as a build cache fetching its entries, gets each
+  one back without waiting for its own delayed acknowledgement.
+
 ## [0.105.0] - 2026-11-05
 
 ### Added
