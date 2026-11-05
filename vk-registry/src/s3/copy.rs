@@ -21,7 +21,7 @@ pub(super) const COPY_SOURCE: &str = "x-amz-copy-source";
 
 /// What `x-amz-copy-source` names.
 #[derive(Debug, PartialEq, Eq)]
-enum Source {
+pub(super) enum Source {
     /// an object: the bucket then the key's components, as [`path::Target::Object`]'s
     Object(Vec<String>),
     /// one version of an object, which this registry does not keep
@@ -35,7 +35,7 @@ enum Source {
 /// `/` between components names the same object as one that does not. What is decoded is
 /// then held to the key rules a request path is, and an escape that decodes to a `%`, which
 /// no key holds, is refused rather than decoded twice.
-fn source(value: &str) -> Source {
+pub(super) fn source(value: &str) -> Source {
     let (raw, query) = match value.split_once('?') {
         Some((raw, query)) => (raw, Some(query)),
         None => (value, None),
@@ -76,7 +76,7 @@ fn source(value: &str) -> Source {
     }
 }
 
-fn failed(ctx: &Ctx) -> Response<Body> {
+pub(super) fn failed(ctx: &Ctx) -> Response<Body> {
     ctx.error(
         StatusCode::PRECONDITION_FAILED,
         "PreconditionFailed",
@@ -86,7 +86,12 @@ fn failed(ctx: &Ctx) -> Response<Body> {
 
 /// The answer for a source the caller cannot read: `NoSuchBucket` when its bucket is no
 /// directory and the caller may read in it, otherwise `NoSuchKey`, as a read of it answers.
-fn absent(store: &Store, authz: &Authz<'_>, src: &[String], ctx: &Ctx) -> Response<Body> {
+pub(super) fn absent(
+    store: &Store,
+    authz: &Authz<'_>,
+    src: &[String],
+    ctx: &Ctx,
+) -> Response<Body> {
     let bucket = format!("{FILES_REPO}/{}", src.first().map_or("", String::as_str));
     if authz.may_read_below(&bucket) && !store.repo_dir_exists(&bucket) {
         return ctx.error(

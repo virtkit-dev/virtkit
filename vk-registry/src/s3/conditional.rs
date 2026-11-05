@@ -10,24 +10,38 @@ use hyper::header::{HeaderMap, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UN
 
 use crate::files::{Object, Precondition};
 
-/// The manifest annotation holding an S3-written object's MD5, as lowercase hex.
+/// The manifest annotation holding an S3-written object's MD5, as lowercase hex; for an
+/// object a multipart upload made, its multipart ETag, `<md5>-<parts>`.
 pub(crate) const MD5_ANNOTATION: &str = "org.virtkit.md5";
 
-/// An object's ETag, quoted: the MD5 an S3 write recorded, or the SHA-256 of its bytes for
-/// one written otherwise (WebDAV, `vk registry put`). 64 hex digits, so a client that checks
-/// an ETag as an MD5 sees it is not one rather than a mismatch.
+/// An object's ETag, quoted: the MD5 an S3 write recorded (or the multipart ETag a completed
+/// upload did), or the SHA-256 of its bytes for one written otherwise (WebDAV, `vk registry
+/// put`). 64 hex digits, so a client that checks an ETag as an MD5 sees it is not one rather
+/// than a mismatch.
 pub(crate) fn etag(layer: &str, annotations: &BTreeMap<String, String>) -> String {
     match annotations.get(MD5_ANNOTATION) {
-        Some(md5)
-            if md5.len() == 32
-                && md5
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-        {
-            format!("\"{md5}\"")
-        }
+        Some(md5) if is_md5_etag(md5) => format!("\"{md5}\""),
         _ => format!("\"{layer}\""),
     }
+}
+
+/// Whether `s` is an ETag an S3 write records: 32 lowercase hex digits, then for a multipart
+/// upload's `-` and its count of parts, 1 to 10000.
+fn is_md5_etag(s: &str) -> bool {
+    let (md5, parts) = match s.split_once('-') {
+        Some((md5, parts)) => (md5, Some(parts)),
+        None => (s, None),
+    };
+    md5.len() == 32
+        && md5
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && parts.is_none_or(|p| {
+            !p.starts_with('0')
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| (1..=10_000).contains(&n))
+        })
 }
 
 /// [`etag`] of an object.
@@ -251,6 +265,21 @@ mod tests {
             etag_of(&object(&[(MD5_ANNOTATION, &MD5[1..])])),
             format!("\"{SHA}\"")
         );
+        // A multipart upload's: the MD5 of its parts' MD5s and their count.
+        for parts in ["1", "3", "10000"] {
+            let multipart = format!("{MD5}-{parts}");
+            assert_eq!(
+                etag_of(&object(&[(MD5_ANNOTATION, &multipart)])),
+                format!("\"{multipart}\"")
+            );
+        }
+        for bad in ["-", "-0", "-01", "-10001", "-x", "-1-2", "- 1"] {
+            assert_eq!(
+                etag_of(&object(&[(MD5_ANNOTATION, &format!("{MD5}{bad}"))])),
+                format!("\"{SHA}\""),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

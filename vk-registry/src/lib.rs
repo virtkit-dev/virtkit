@@ -21,6 +21,7 @@
 //!                                 which is what makes a blob read repo-scoped
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
+//!   uploads/s3/<id>/              an S3 multipart upload: its `meta.json` and parts
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -606,12 +607,7 @@ impl Store {
     pub(crate) fn stage_file(&self) -> Result<(PathBuf, std::fs::File)> {
         let dir = self.uploads_dir();
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = self.upload_path(&format!(
-            "{}-{}-{}",
-            std::process::id(),
-            self.next_upload.fetch_add(1, Ordering::Relaxed),
-            accounts::random_token(16),
-        ));
+        let path = self.upload_path(&self.new_upload_id());
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -623,6 +619,59 @@ impl Store {
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         Ok((path, file))
+    }
+
+    /// A fresh upload id, `<pid>-<n>-<random hex>`: the counter keeps ids unique within a
+    /// process, the pid across the servers sharing a store, and the random tail unguessable,
+    /// so one client cannot reach another's in-flight upload by enumerating ids. Always a
+    /// [`valid_upload_id`].
+    fn new_upload_id(&self) -> String {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            self.next_upload.fetch_add(1, Ordering::Relaxed),
+            accounts::random_token(16),
+        )
+    }
+
+    /// Where S3 multipart uploads are staged, a directory each. A subdirectory of `uploads/`
+    /// whose name no upload id can take, so the OCI sessions beside it never collide with it.
+    fn multipart_root(&self) -> PathBuf {
+        self.root.join("uploads").join(MULTIPART_DIR)
+    }
+
+    /// The directory of S3 multipart upload `id`, whether or not it exists; `None` for an id
+    /// this server cannot have minted, which so never names anything outside it.
+    pub(crate) fn multipart_dir(&self, id: &str) -> Option<PathBuf> {
+        valid_upload_id(id).then(|| self.multipart_root().join(id))
+    }
+
+    /// A new S3 multipart upload's directory, private to this user from its creation: its id
+    /// and path. [`Store::gc`] sweeps it once nothing in it has been written for the grace
+    /// window.
+    pub(crate) fn create_multipart(&self) -> Result<(String, PathBuf)> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = self.multipart_root();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .with_context(|| format!("creating {}", root.display()))?;
+        let id = self.new_upload_id();
+        let dir = root.join(&id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        Ok((id, dir))
+    }
+
+    /// The S3 multipart uploads in progress, by id: their directories.
+    pub(crate) fn multipart_uploads(&self) -> Vec<(String, PathBuf)> {
+        multipart_dirs(&self.multipart_root())
+            .into_iter()
+            .filter_map(|dir| Some((dir.file_name()?.to_str()?.to_string(), dir)))
+            .collect()
     }
 
     /// The repositories one level below `name` (`""` for the top level), sorted: the
@@ -1172,15 +1221,8 @@ impl Store {
 
     /// `len` of blob `hex`'s canonical bytes from `start`, streamed through the body a whole
     /// blob is, with the blob's canonical length; `None` when the blob is absent, and an error
-    /// when the part does not lie within it. Opened once and served from that descriptor, as
-    /// [`serve_blob`] is, and measured without reading it. Nothing is read for `head`.
-    ///
-    /// A plain blob is read from `start` after a seek. A zstd-stored one is decoded from the
-    /// frame's start and its first `start` bytes discarded, on the blocking pool as the
-    /// stream's first read: O(`start`) of decoding, with the decoder's window as memory, before
-    /// the part's first byte goes out. A client reading a large zstd blob in consecutive
-    /// ranges so pays quadratically, which is why the S3 view stores its large writes plain
-    /// ([`StagedBlob::uncompressed`]).
+    /// when the part does not lie within it. Read as [`Store::read_blob_range`] reads it, and
+    /// served from that descriptor, as [`serve_blob`] is. Nothing is read for `head`.
     pub(crate) fn serve_blob_range(
         &self,
         hex: &str,
@@ -1188,6 +1230,33 @@ impl Store {
         len: u64,
         head: bool,
     ) -> Result<Option<BlobPart>> {
+        let Some((total, reader)) = self.read_blob_range(hex, start, len)? else {
+            return Ok(None);
+        };
+        let body = if head || len == 0 {
+            body_of(Bytes::new())
+        } else {
+            stream_body(reader, &format!("sha256:{hex}"))
+        };
+        Ok(Some(BlobPart { total, body }))
+    }
+
+    /// A blocking reader of `len` of blob `hex`'s canonical bytes from `start`, with the
+    /// blob's canonical length; `None` when the blob is absent, and an error when the part
+    /// does not lie within it. Opened once and read from that descriptor, and measured
+    /// without reading it.
+    ///
+    /// A plain blob is read from `start` after a seek. A zstd-stored one is decoded from the
+    /// frame's start and its first `start` bytes discarded by the reader's first read: O(`start`)
+    /// of decoding, with the decoder's window as memory, before the part's first byte. A
+    /// client reading a large zstd blob in consecutive ranges so pays quadratically, which is
+    /// why the S3 view stores its large writes plain ([`StagedBlob::uncompressed`]).
+    pub(crate) fn read_blob_range(
+        &self,
+        hex: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, Box<dyn std::io::Read + Send + Sync>)>> {
         use std::io::{Read, Seek, SeekFrom};
         let Some((path, is_zstd)) = self.find_blob(hex) else {
             return Ok(None);
@@ -1205,27 +1274,20 @@ impl Store {
         if start.checked_add(len).is_none_or(|end| end > total) {
             bail!("bytes {start}+{len} of the blob {hex}, which holds {total}");
         }
-        if head || len == 0 {
-            return Ok(Some(BlobPart {
-                total,
-                body: body_of(Bytes::new()),
-            }));
-        }
-        let what = format!("sha256:{hex}");
-        let body = if is_zstd {
+        let reader: Box<dyn Read + Send + Sync> = if is_zstd {
             let decoder =
                 zstd::stream::read::Decoder::new(file).context("opening a stored blob")?;
             let skipped = Skip {
                 inner: decoder,
                 skip: start,
             };
-            stream_body(skipped.take(len), &what)
+            Box::new(skipped.take(len))
         } else {
             file.seek(SeekFrom::Start(start))
                 .with_context(|| format!("seeking in {}", path.display()))?;
-            stream_body(file.take(len), &what)
+            Box::new(file.take(len))
         };
-        Ok(Some(BlobPart { total, body }))
+        Ok(Some((total, reader)))
     }
 
     /// Return a blob's decompressed bytes, or `None` if absent or larger than `cap`.
@@ -2118,6 +2180,11 @@ impl Store {
                 .into_iter()
                 .map(Last::Owner),
         );
+        last.extend(
+            multipart_dirs(&self.multipart_root())
+                .into_iter()
+                .map(Last::Multipart),
+        );
         let last_done = spells.run(Phase::Last, &mut plan, &idle, last, |plan, _, item| {
             match item {
                 Last::Sidecar(sidecar) => {
@@ -2151,6 +2218,30 @@ impl Store {
                         remove_if_present(&self.upload_owner_path(id))?;
                     }
                     remove(&upload)?;
+                    report.uploads_dropped += 1;
+                }
+                // An S3 multipart upload is idle when nothing in it has been written for the
+                // window: its directory's own mtime does not move when a part is rewritten in
+                // place, so the newest of its entries' says when it was last used. It goes
+                // whole, parts and all.
+                Last::Multipart(dir) => {
+                    let idle = newest_mtime(&dir)
+                        .and_then(|m| now.duration_since(m).ok())
+                        .is_some_and(|age| age > policy.grace);
+                    if !idle {
+                        return Ok(());
+                    }
+                    if !dry_run {
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => {}
+                            // Gone since the listing: completed, aborted or swept meanwhile.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                            Err(e) => {
+                                return Err(e)
+                                    .with_context(|| format!("removing {}", dir.display()));
+                            }
+                        }
+                    }
                     report.uploads_dropped += 1;
                 }
                 // An owner record whose session is already gone (dropped by an earlier sweep,
@@ -2768,6 +2859,7 @@ impl Store {
             s.uploads += 1;
             s.upload_bytes += std::fs::metadata(&up).map(|m| m.len()).unwrap_or(0);
         }
+        (s.multipart_uploads, s.multipart_bytes) = multipart_usage(&self.multipart_root());
 
         // per-repo content: a repo is a dir under repos/ holding any of its own
         // subdirectories. `blobs/` counts — a pull-through cache serving tag pulls holds
@@ -3151,6 +3243,7 @@ pub struct GcReport {
     pub blobs_dropped: usize,
     /// the space the dropped blobs took on disk (allocated blocks)
     pub bytes_freed: u64,
+    /// idle upload sessions and staging files, and idle S3 multipart uploads
     pub uploads_dropped: usize,
     /// membership markers removed because the blob they named is gone
     pub blob_markers_dropped: usize,
@@ -3346,6 +3439,8 @@ enum Last {
     Marker(PathBuf, String),
     Upload(PathBuf),
     Owner(PathBuf),
+    /// an S3 multipart upload's directory under `uploads/s3/`
+    Multipart(PathBuf),
 }
 
 /// The exclusive spells of one [`Store::gc_with`] pass.
@@ -3518,6 +3613,9 @@ pub struct StoreStats {
     pub zstd_bytes: u64,
     pub uploads: usize,
     pub upload_bytes: u64,
+    /// S3 multipart uploads in progress, and the bytes of their parts so far
+    pub multipart_uploads: usize,
+    pub multipart_bytes: u64,
     pub total_tags: usize,
     pub total_manifests: usize,
     /// membership markers across every repo, summed — the inode cost of repo-scoping
@@ -3753,6 +3851,47 @@ fn dir_files(dir: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .collect()
+}
+
+/// The directory multipart uploads are staged in, under `uploads/` (see
+/// [`Store::create_multipart`]).
+const MULTIPART_DIR: &str = "s3";
+
+/// The S3 multipart upload directories directly inside `dir`, by `lstat`: real directories
+/// named like an upload id, so nothing else there is ever swept as one (a missing dir reads
+/// as empty).
+fn multipart_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| e.file_name().to_str().is_some_and(valid_upload_id))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// When anything in `dir` was last written: the newest mtime of the directory and of the
+/// entries directly in it, by `lstat`. `None` when the directory cannot be read, which a
+/// sweep takes as fresh: never delete on uncertain evidence.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = std::fs::symlink_metadata(dir).ok()?.modified().ok()?;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let modified = entry.ok()?.metadata().ok()?.modified().ok()?;
+        newest = newest.max(modified);
+    }
+    Some(newest)
+}
+
+/// What the S3 multipart uploads in `dir` hold: how many there are, and their files' bytes.
+fn multipart_usage(dir: &Path) -> (usize, u64) {
+    let uploads = multipart_dirs(dir);
+    let bytes = uploads
+        .iter()
+        .flat_map(|d| dir_files(d))
+        .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+        .sum();
+    (uploads.len(), bytes)
 }
 
 /// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
@@ -4999,15 +5138,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 
 /// POST /v2/<name>/blobs/uploads/ — open an upload session (an empty temp file).
 fn start_upload(store: &Store, name: &str) -> Result<Response<Body>> {
-    // The counter keeps ids unique within a process; the random tail keeps them
-    // unguessable, so one client cannot append to another's in-flight upload by
+    // Unguessable, so one client cannot append to another's in-flight upload by
     // enumerating session ids.
-    let id = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        store.next_upload.fetch_add(1, Ordering::Relaxed),
-        accounts::random_token(16),
-    );
+    let id = store.new_upload_id();
     // The binding first, the session second: `upload_is_for` fails closed, so a session
     // file that existed before its binding would be a session nothing could finish — and,
     // worse, the gc's orphaned-binding sweep keys on "a binding whose session is absent".
@@ -6238,6 +6371,14 @@ fn status_to(out: &mut impl std::io::Write, cmd: &str, root: PathBuf) -> Result<
             "  Uploads in progress: {} ({} files, separate from stored blobs)",
             human_bytes(s.upload_bytes),
             s.uploads,
+        )?;
+    }
+    if s.multipart_uploads > 0 {
+        writeln!(
+            out,
+            "  Multipart uploads in progress: {} ({} uploads, separate from stored blobs)",
+            human_bytes(s.multipart_bytes),
+            s.multipart_uploads,
         )?;
     }
     if !s.repos.is_empty() {
@@ -8130,6 +8271,56 @@ mod tests {
         assert_eq!(report.manifests_dropped, 1);
         assert_eq!(report.blobs_dropped, 3);
         assert_eq!(report.uploads_dropped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An S3 multipart upload is idle when nothing in it was written for the grace window:
+    /// one whose part was rewritten lately stays, however old its directory, as does one
+    /// holding only a fresh record; an idle one goes whole. `status` counts the ones left.
+    #[test]
+    fn gc_sweeps_idle_multipart_uploads_by_their_newest_entry() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let (_, idle) = store.create_multipart().unwrap();
+        let (_, busy) = store.create_multipart().unwrap();
+        let (_, fresh) = store.create_multipart().unwrap();
+        for up in [&idle, &busy] {
+            std::fs::write(up.join("meta.json"), b"{}").unwrap();
+            std::fs::write(up.join("part-1"), b"part").unwrap();
+            std::fs::write(up.join("part-1.json"), b"{}").unwrap();
+        }
+        std::fs::write(fresh.join("meta.json"), b"{}").unwrap();
+        // Not an upload's name: never taken for one.
+        std::fs::create_dir_all(dir.join("uploads/s3/not-an-upload")).unwrap();
+
+        let old = SystemTime::now() - DAY * 100;
+        backdate_all(&dir, old);
+        for up in [&idle, &busy, &fresh, &dir.join("uploads/s3/not-an-upload")] {
+            std::fs::File::open(up).unwrap().set_modified(old).unwrap();
+        }
+        touch(&busy.join("part-1"));
+        touch(&fresh.join("meta.json"));
+        let s = store.stats().unwrap();
+        assert_eq!((s.multipart_uploads, s.multipart_bytes), (3, 8 + 8 + 2));
+        let mut out = Vec::new();
+        status_to(&mut out, "vk-registry", dir.clone()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Multipart uploads in progress: 18 B (3 uploads"),
+            "{out}"
+        );
+
+        let dry = store.gc(DAY * 30, DAY, true).unwrap();
+        assert_eq!(dry.uploads_dropped, 1);
+        assert!(idle.is_dir(), "a dry run removes nothing");
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.uploads_dropped, 1);
+        assert!(!idle.exists());
+        assert!(busy.join("part-1").is_file());
+        assert!(fresh.join("meta.json").is_file());
+        assert!(dir.join("uploads/s3/not-an-upload").is_dir());
+        assert_eq!(store.stats().unwrap().multipart_uploads, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

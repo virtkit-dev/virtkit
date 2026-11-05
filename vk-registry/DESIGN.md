@@ -556,7 +556,11 @@ an object under a name a collection already holds. Idleness is the tag's mtime, 
 `PUT` sets and a `GET` refreshes once it is an hour old, so a read-only pipeline's hits keep
 an entry alive as a writer's do. There is no per-directory policy and no size cap; a
 replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
-left in `uploads/` goes with the idle uploads.
+left in `uploads/` goes with the idle uploads, and so does an S3 multipart upload nothing has
+been written into for the grace window: its directory under `uploads/s3/` is idle by the
+newest mtime among its files (the directory's own does not move when a part is replaced),
+and goes whole, parts and all. Completing an upload marks it used, so the sweep does not
+take it while its parts are read.
 
 ## S3 view (`/s3/`)
 
@@ -637,7 +641,9 @@ is not stored, for the reason manifest media types are restricted (this origin a
 which a `PutObject` computes in the same pass as the SHA-256 and records on the manifest as
 `org.virtkit.md5`; an object written otherwise (WebDAV, `vk registry put`, `/upload`) has no
 MD5 and its ETag is its SHA-256, quoted — 64 hex digits, which a client checking an ETag as
-an MD5 sees is not one. User metadata (`x-amz-meta-<name>`, names `[a-z0-9-]`, at most 2 KiB
+an MD5 sees is not one. An object a multipart upload made has S3's multipart ETag,
+`"<MD5 of its parts' MD5s>-<parts>"`, recorded in the same annotation, so GetObject, HeadObject,
+the listings and a copy's source all answer it. User metadata (`x-amz-meta-<name>`, names `[a-z0-9-]`, at most 2 KiB
 of names and values) is kept on the manifest as `org.virtkit.s3-meta.<name>` and sent back on
 reads; a replaced object keeps only what its own write sent.
 
@@ -657,17 +663,25 @@ reads; a replaced object keeps only what its own write sent.
 | `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 when the caller may read neither `files/<b>` nor anything below it |
 | `GET /s3/<b>?location` GetBucketLocation | the region the request was signed for, which is any the client chose, or an empty `LocationConstraint` for an unsigned request; after HeadBucket's checks |
 | `GET /s3/` ListBuckets | `ListAllMyBucketsResult`: the readable top-level directories, each dated by its directory's mtime, and the owner `vk-registry`; 403 `AccessDenied` on a server with no credential |
-| anything else | 501 `NotImplemented`: multipart uploads and part copies, writes of tagging, ACLs, versioning and the other configurations, and every other subresource; an SDK's `x-id` operation hint is ignored |
+| `POST /s3/<b>/<k>?uploads` CreateMultipartUpload | 200 `InitiateMultipartUploadResult` (`Bucket`, `Key`, `UploadId`): a new upload of the key, its user metadata recorded for the object; needs `Write` on the key's parent, and the key is checked as PutObject's is (409 `OperationAborted`), and again at completion. `x-amz-checksum-algorithm` is taken and echoed; `x-amz-copy-source` is 400 `InvalidArgument` |
+| `PUT /s3/<b>/<k>?partNumber=<n>&uploadId=<id>` UploadPart | 200 with the part's `ETag` (its MD5): its body received as a PutObject's is — the same payload modes, `aws-chunked` decoding, `Content-MD5` and `x-amz-checksum-*` checks and echoes, 413 `EntityTooLarge` past 4 GiB — into the upload's directory, replacing any earlier part `n` whole. Part numbers are 1 to 10000 (else 400 `InvalidArgument`); no minimum part size is enforced. An upload id that is not one of the key's own uploads, completed or aborted is 404 `NoSuchUpload`, whatever key it was made for |
+| UploadPart with `x-amz-copy-source` UploadPartCopy | 200 `CopyPartResult` (`LastModified`, `ETag`): the source object, or the bytes `x-amz-copy-source-range: bytes=<first>-<last>` names, copied into the part off the runtime (a part is the upload's own until it completes), the source read and its `x-amz-copy-source-if-*` conditions checked as CopyObject's are. A range past the source's end is 416 `InvalidRange`, a malformed one 400 `InvalidArgument` |
+| `POST /s3/<b>/<k>?uploadId=<id>` CompleteMultipartUpload | 200 `CompleteMultipartUploadResult` (`Location`, the object's absolute URL as S3 gives it, from the listener's scheme, the `Host` and the path as sent; `Bucket`, `Key`, `ETag`): the parts the `CompleteMultipartUpload` document names, concatenated in that order into one staging file in a single pass off the runtime, then tagged as a PutObject's body is (the key checked again, `If-None-Match: *`/`If-Match` where the tag is written, stored plain from 8 MiB), with the metadata recorded at creation; the upload then goes. The numbers must ascend (400 `InvalidPartOrder`), each part must be there with the ETag given (400 `InvalidPart`; each part's MD5 is checked again as it is read), at least one part (400 `MalformedXML`), and the total at most 4 GiB (413 `EntityTooLarge`). A whole-object `x-amz-checksum-{sha256,sha1,crc32}` is checked against the object (400 `BadDigest`); a composite one (`…-<parts>`) or another algorithm is taken unchecked. Every refusal is a real status, never S3's late `200` carrying an `Error`, and leaves the upload to be completed again |
+| `DELETE /s3/<b>/<k>?uploadId=<id>` AbortMultipartUpload | 204: the upload and its parts removed; 404 `NoSuchUpload` |
+| `GET /s3/<b>/<k>?uploadId=<id>` ListParts | 200 `ListPartsResult`: the parts in ascending order after `part-number-marker`, `max-parts` of them (at most and by default 1000), each with `PartNumber`, `LastModified`, `ETag` and `Size`, `IsTruncated` and `NextPartNumberMarker`; needs `Read` on the key's parent; 404 `NoSuchUpload` |
+| `GET /s3/<b>?uploads` ListMultipartUploads | 200 `ListMultipartUploadsResult`: the bucket's uploads in progress whose key starts with `prefix`, by key then upload id, after `key-marker` (and `upload-id-marker` for that key), `max-uploads` of them (at most and by default 1000), each with `Key`, `UploadId`, `Initiator`, `Owner`, `StorageClass` and `Initiated`; admitted as a listing of the bucket with that prefix is, showing only the uploads whose key the caller may read; `encoding-type=url` honoured, `delimiter` 501 `NotImplemented`; 404 `NoSuchBucket` |
+| anything else | 501 `NotImplemented`: writes of tagging, ACLs, versioning and the other configurations, `partNumber` on a read, every other subresource, and a parameter an operation does not take; an SDK's `x-id` operation hint is ignored |
 
-**XML in** (`Delete`, `CreateBucketConfiguration`) is read by an element scanner of this
-registry's own, not a parser: UTF-8 only; the XML declaration, processing instructions and
-comments are passed over and CDATA is text; `&lt; &gt; &amp; &quot; &apos;` and character
-references are decoded, and any other entity, or a document type declaration (which could
-define one), is 400 `MalformedXML`, so nothing is fetched or expanded. Elements are known by
-their local name, so namespaces and attributes say nothing, and an element a request does not
-define is passed over. Nesting is at most 16 deep and a document holds a bounded number of
-elements (6 per key and a few more for a `Delete`), so it costs at most its length in memory;
-a field given twice, a missing `Key` or anything that is not well formed is `MalformedXML`.
+**XML in** (`Delete`, `CreateBucketConfiguration`, `CompleteMultipartUpload`) is read by an
+element scanner of this registry's own, not a parser: UTF-8 only; the XML declaration,
+processing instructions and comments are passed over and CDATA is text;
+`&lt; &gt; &amp; &quot; &apos;` and character references are decoded, and any other entity, or
+a document type declaration (which could define one), is 400 `MalformedXML`, so nothing is
+fetched or expanded. Elements are known by their local name, so namespaces and attributes say
+nothing, and an element a request does not define is passed over. Nesting is at most 16 deep and a document holds a bounded number of
+elements (6 per key or part and a few more for a `Delete` or a `CompleteMultipartUpload`, of
+at most 1 MiB), so it costs at most its length in memory; a field given twice, a missing `Key`,
+`PartNumber` or `ETag`, or anything that is not well formed is `MalformedXML`.
 
 **`aws-chunked` bodies**, which AWS's SDKs and CLI send by default, are decoded as they
 stream, in one pass: a run of `<hex size>[;chunk-signature=<sig>]\r\n<data>\r\n` chunks ended
@@ -718,6 +732,20 @@ costs a manifest read and a membership `stat`, as a `PROPFIND` entry does: about
 small reads for a full page. A listing with `delimiter=/` never walks below the level it
 lists; one without a delimiter over a sharded `sccache` directory walks its thousands of
 repositories across its pages (see "Operational constraints and deferred work").
+
+**Multipart uploads** are staged in the store, each in a private directory
+`uploads/s3/<id>/` the gc sweeps once idle ("Lifecycle" above), not in the pool: `meta.json`
+(the bucket, the key, when it was created and the user metadata the object will carry), and
+for each part `part-<n>` (its bytes) and `part-<n>.json` (their size and MD5). Each file is
+written under a private temporary name and renamed over its own, so a part sent again replaces
+the earlier one whole; since a part's bytes and its record are two renames, completing an
+upload checks each part's MD5 again as it reads it. An upload id is minted as an OCI upload id
+is, `<pid>-<n>-<random hex>`, and held to hex digits and dashes, so it never names a path, and
+every call checks that the id's recorded bucket and key are the request's. A part's bytes
+stay out of the pool until the upload completes, so parts of the same content are stored once
+per upload until then; completing an upload costs a sequential read and write of the whole
+object, and listing uploads reads the record of every upload in progress in the store.
+`vk-registry status` counts the multipart uploads in progress beside the OCI ones.
 
 **`LastModified` moves on reads**, as `getlastmodified` does over WebDAV: a `GET` refreshes
 the tag's mtime once it is an hour old, which is what keeps a hot cache entry from the gc's
@@ -788,10 +816,10 @@ service; an operator can still stop the server and use direct database access.
 ## Garbage collection and reporting
 
 `status` reports stored blob bytes split by whether tags reference them, with in-progress
-uploads counted separately. A blob counts as referenced when the `gc` mark would reach it
-from a tag, image indexes included. The repository table lists tag counts. Bytes without
-tag references are not a prediction of what `gc` will reclaim: its retention and grace
-windows still apply.
+uploads, and the S3 multipart uploads in progress, counted separately. A blob counts as
+referenced when the `gc` mark would reach it from a tag, image indexes included. The
+repository table lists tag counts. Bytes without tag references are not a prediction of what
+`gc` will reclaim: its retention and grace windows still apply.
 
 `Stage data` is the uncompressed data in recorded completed build stages, including builder
 stages but excluding intermediate instruction checkpoints. It sums the chunk placement
@@ -825,7 +853,8 @@ and markers included, waits for the next complete pass.
 `gc` applies two windows:
 
 - retention controls when idle tags stop being roots; and
-- grace protects recent unreferenced blobs, digest-pinned manifests, and uploads.
+- grace protects recent unreferenced blobs, digest-pinned manifests, and uploads, S3
+  multipart uploads among them (idle by the newest file in the upload's directory).
 
 A manifest can set its own tags' retention through annotations, which the pusher chooses:
 `org.virtkit.retention=keep` keeps a tag however long it sits idle, and

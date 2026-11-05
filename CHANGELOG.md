@@ -18,8 +18,10 @@ All notable changes to virtkit will be documented in this file.
   checked, and objects can be read in byte ranges, as the AWS CLI downloads large files.
   Buckets can be created and removed, objects copied without their bytes being stored twice
   and deleted in batches, and the configuration probes tools send before using a bucket
-  (versioning, ACLs, tagging and the like) are answered as for a bucket with none set;
-  multipart uploads are not served yet. Set `s3 = false` in the server config to turn it off.
+  (versioning, ACLs, tagging and the like) are answered as for a bucket with none set. Large
+  files can be uploaded in parts, as the AWS CLI uploads them, parts copied from other objects,
+  and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts
+  them. Set `s3 = false` in the server config to turn it off.
 
 ## [0.106.0] - 2026-11-05
 

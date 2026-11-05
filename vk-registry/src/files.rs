@@ -247,6 +247,21 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let (path, file) = store.stage_file().map_err(PutError::Failed)?;
+    stage_into(path, file, body, tap).await
+}
+
+/// [`stage`] into `file`, a private file just created at `path`, which is then the
+/// [`Staged`]'s: unlinked if it is dropped.
+pub(crate) async fn stage_into<B>(
+    path: PathBuf,
+    file: std::fs::File,
+    body: B,
+    tap: &mut impl FnMut(&[u8]),
+) -> std::result::Result<Staged, PutError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let staging = Staging { path, armed: true };
     let mut file = tokio::fs::File::from_std(file);
     let written = drain_into(&mut file, body, MAX_OBJECT, tap).await;
@@ -257,6 +272,27 @@ where
     drop(file);
     let (size, hex) = written.and_then(|w| flushed.map(|()| w))?;
     Ok(Staged { size, hex, staging })
+}
+
+impl Staged {
+    /// A staging file `path` its caller wrote whole, `size` bytes whose SHA-256 is `hex`:
+    /// unlinked if it is dropped, as one [`stage`] wrote.
+    pub(crate) fn written(path: PathBuf, size: u64, hex: String) -> Self {
+        Staged {
+            size,
+            hex,
+            staging: Staging { path, armed: true },
+        }
+    }
+
+    /// Rename the bytes to `dest`, replacing what is there, rather than promote them: for a
+    /// front that keeps them outside the pool for a while, such as an S3 part.
+    pub(crate) fn rename_to(mut self, dest: &std::path::Path) -> Result<()> {
+        std::fs::rename(&self.staging.path, dest)
+            .with_context(|| format!("renaming into {}", dest.display()))?;
+        self.staging.armed = false;
+        Ok(())
+    }
 }
 
 /// What [`commit`] did.
