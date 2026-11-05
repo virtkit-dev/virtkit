@@ -137,11 +137,12 @@ async fn session(
     ws.send(send(serde_json::to_string(&welcome).unwrap()))
         .await
         .unwrap();
+    // Waiting on `go` before the test hears of the session, which then notifies it.
+    let told = go.notified();
+    tokio::pin!(told);
     let _ = seen.send(Seen::Session(incarnation));
     let first = !*sent.lock().unwrap();
     let mut ping = tokio::time::interval(Duration::from_millis(300));
-    let told = go.notified();
-    tokio::pin!(told);
     let mut told_done = !first;
     loop {
         tokio::select! {
