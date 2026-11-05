@@ -4078,6 +4078,10 @@ async fn serve_refusing(
                 continue;
             }
         };
+        // A streamed response's head is written before its body exists; with Nagle on, a
+        // small body then waits for the client's delayed ACK, about 40 ms on Linux. Best
+        // effort: without it the connection is only slower.
+        let _ = stream.set_nodelay(true);
         let Some(peer_slot) = PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) else {
             drop(slot);
             let key = peer_key(peer.ip());

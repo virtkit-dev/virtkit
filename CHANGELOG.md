@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Faster small reads from vk-registry.** Clients reading many small objects over one
+  connection, such as a build cache fetching entries, no longer wait about 40 ms extra
+  per read.
+
 ## [0.105.1] - 2026-11-05
 
 ### Fixed
