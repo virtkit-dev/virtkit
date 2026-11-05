@@ -623,7 +623,7 @@ async fn resolve_identity(
         let (row, status) = db
             .relay_with_status(&who.id)?
             .ok_or_else(|| identity_refused("the relay is no longer enrolled"))?;
-        let min = vk_hub_proto::gitlab::RELAY_PROTOCOL.min;
+        let min = vk_hub_proto::gitlab::RELAY_WORK;
         if row.protocol.is_none_or(|v| v < min) && recorded.is_none() {
             return Err(identity_refused(&format!(
                 "relay protocol version {min} is required: upgrade vk-gitlab on the relay"

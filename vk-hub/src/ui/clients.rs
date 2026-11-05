@@ -919,7 +919,7 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
             });
         if r.row
             .protocol
-            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_PROTOCOL.min)
+            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_WORK)
         {
             h.raw(" <span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span>");
         }
@@ -1079,7 +1079,7 @@ fn relay_blocks(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, st
             });
         if r.row
             .protocol
-            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_PROTOCOL.min)
+            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_WORK)
         {
             h.raw("<span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span>");
         }

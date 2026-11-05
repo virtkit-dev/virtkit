@@ -46,6 +46,13 @@ pub const PROTOCOL: VersionRange = VersionRange {
     max: LIVE_EGRESS,
 };
 
+/// The versions of a relay's session over HTTP/1.1: every one but
+/// [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION), which only HTTP/2 carries.
+pub(crate) const RELAY_HTTP1: VersionRange = VersionRange {
+    min: vk_hub_proto::gitlab::PROTOCOL.min,
+    max: vk_hub_proto::gitlab::RUNNERS,
+};
+
 /// What a node removed from the hub is told.
 const REMOVED: &str = "this node was removed from the hub";
 
@@ -147,7 +154,7 @@ impl PeerKind {
         match self {
             PeerKind::Node => PROTOCOL,
             PeerKind::Registry => vk_hub_proto::registry::PROTOCOL,
-            PeerKind::Relay => vk_hub_proto::gitlab::PROTOCOL,
+            PeerKind::Relay => RELAY_HTTP1,
         }
     }
 

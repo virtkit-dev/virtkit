@@ -531,6 +531,9 @@ async fn run(
                         send(&mut ws, &RelayMsg::Ack(ack), beat).await?;
                     }
                     HubRelayMsg::Recorded(ack) => updater.recorded(&ack)?,
+                    HubRelayMsg::Ticket { .. } | HubRelayMsg::Job { .. } => {
+                        bail!("the hub sent a notice in a session before version 5")
+                    }
                     HubRelayMsg::Refused { code, reason } => return Err(refusal(code, &reason)),
                 }
             }

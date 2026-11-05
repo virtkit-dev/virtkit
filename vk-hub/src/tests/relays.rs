@@ -9,6 +9,7 @@ use vk_hub_proto::gitlab::{
 
 use super::*;
 use crate::relays;
+use crate::session::RELAY_HTTP1;
 use crate::store::TokenKind;
 
 fn relay_token(hub: &Hub) -> String {
@@ -74,7 +75,7 @@ async fn dial_relay(addr: SocketAddr) -> Client {
 
 /// Hello, challenge and auth as a relay; what the hub answered.
 async fn open_relay(ws: &mut Client, id: &str, key: &Ed25519KeyPair) -> HubMsg {
-    open_relay_at(ws, id, key, gl::PROTOCOL).await
+    open_relay_at(ws, id, key, RELAY_HTTP1).await
 }
 
 /// [`open_relay`], speaking `ours`.
@@ -95,7 +96,7 @@ async fn open_relay_at(
     };
     assert_eq!(
         (Some(version), versions),
-        (ours.negotiate(gl::PROTOCOL), gl::PROTOCOL)
+        (ours.negotiate(RELAY_HTTP1), RELAY_HTTP1)
     );
     let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
     let signature = key.sign(&vk_hub_proto::auth_message(

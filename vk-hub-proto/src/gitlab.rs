@@ -44,7 +44,9 @@
 //! [`Operation::RemoveRunner`], sent only in a session at it or later, for a relay whose
 //! `allow` lists [`ALLOW_RUNNERS`], and the inventory runner's `source` and `command`, optional
 //! fields an older hub ignores. A runner command that fails is answered with a
-//! [`RunnerFailure`]'s code, never GitLab's text.
+//! [`RunnerFailure`]'s code, never GitLab's text. Version [`CONNECTION`] carries the relay's
+//! session and its client API requests on one HTTP/2 connection, and adds the hub's notices
+//! [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`], sent only in a session at it.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,11 +62,19 @@ pub const ENROLL_PATH: &str = "/v1/gitlab/enroll";
 /// Where a relay holds its session.
 pub const SESSION_PATH: &str = "/v1/gitlab/session";
 
+/// The TLS ALPN protocol ID of a relay's connection at version [`CONNECTION`]: HTTP/2, under
+/// a private ID so that only a relay negotiates it, never a client offering `h2`.
+pub const ALPN: &[u8] = b"vk-relay/1";
+
 /// The protocol versions of a relay's session.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 4 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 5 };
 
 /// The relay requires admission-aware scheduling, introduced in version 2.
 pub const RELAY_PROTOCOL: VersionRange = VersionRange { min: 2, max: 4 };
+
+/// The version the hub takes new work from: admission-aware scheduling. A relay below it
+/// is served only to settle the jobs it holds.
+pub const RELAY_WORK: u32 = 2;
 
 /// The version that adds updates: [`HubRelayMsg::Command`], [`RelayMsg::Ack`] and
 /// [`HubRelayMsg::Recorded`] are sent only in a session at it or later.
@@ -73,6 +83,11 @@ pub const UPDATES: u32 = 3;
 /// The version that adds runners added on the hub: [`Operation::AddRunner`] and
 /// [`Operation::RemoveRunner`] are sent only in a session at it or later.
 pub const RUNNERS: u32 = 4;
+
+/// The version that puts a relay's session and its client API requests on one HTTP/2
+/// connection: [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`] are sent only in a session
+/// at it.
+pub const CONNECTION: u32 = 5;
 
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
@@ -132,6 +147,17 @@ pub enum HubRelayMsg {
     Command(Command),
     /// The hub has stored this outcome; the relay stops repeating it. Version [`UPDATES`].
     Recorded(CommandAck),
+    /// A ticket of the relay was granted or ended: the relay fetches it. Version
+    /// [`CONNECTION`].
+    Ticket { ticket: String },
+    /// An unsettled job of the relay has a new `revision` or more output: the relay fetches
+    /// its view past the revision it holds, and its output up to `output_len`. Version
+    /// [`CONNECTION`].
+    Job {
+        job: String,
+        revision: u64,
+        output_len: u64,
+    },
     /// The session is ended — the relay was removed, or a newer session took over — and the
     /// connection closes after this. Frozen as [`HubMsg::Refused`](crate::HubMsg::Refused)
     /// is, with the same JSON, so a relay reads it before or after the welcome.
@@ -728,6 +754,18 @@ mod tests {
             assert_eq!(serde_json::to_value(state).unwrap(), wire);
         }
         pinned(
+            &HubRelayMsg::Ticket { ticket: "t".into() },
+            r#"{"type":"ticket","ticket":"t"}"#,
+        );
+        pinned(
+            &HubRelayMsg::Job {
+                job: "j".into(),
+                revision: 3,
+                output_len: 10,
+            },
+            r#"{"type":"job","job":"j","revision":3,"output_len":10}"#,
+        );
+        pinned(
             &HubRelayMsg::Refused {
                 code: RefusalCode::Revoked,
                 reason: "r".into(),
@@ -740,6 +778,7 @@ mod tests {
             },
             r#"{"relay_id":"r"}"#,
         );
+        assert_eq!(ALPN, b"vk-relay/1");
         assert_eq!(
             (ENROLL_PATH, SESSION_PATH, RELEASE_PATH),
             (
@@ -1213,6 +1252,14 @@ mod tests {
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
         assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(RUNNERS));
+        assert_eq!(
+            PROTOCOL.negotiate(VersionRange {
+                min: CONNECTION,
+                max: CONNECTION
+            }),
+            Some(CONNECTION)
+        );
+        const { assert!(RELAY_PROTOCOL.min >= RELAY_WORK) };
         assert_eq!(
             VersionRange { min: 1, max: 1 }.negotiate(RELAY_PROTOCOL),
             None
