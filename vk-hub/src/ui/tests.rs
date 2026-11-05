@@ -9589,7 +9589,7 @@ async fn an_operator_adds_and_removes_gitlab_servers() {
 
     // Removed once asked, back to the tab; its page, open, says it is gone.
     let mut live_gl = Events::open(addr, "/events/gitlab/gl", &operator).await;
-    next_with(&mut live_gl, "<h2>Runners</h2>").await;
+    next_with(&mut live_gl, "<h2>Relays</h2>").await;
     let reply = post_action(addr, &origin, &operator, "/clients", &form, false).await;
     let answer = format!(
         "{form}&added={}&nonce={}&confirm=yes",
@@ -9778,11 +9778,22 @@ async fn relays_and_their_runners_follow_their_server() {
         "https://gitlab.example.com <span class=\"badge warn\">pending</span>",
         &format!("certificate key sha256 <code>{}</code>", "ab".repeat(32)),
         "<td>0.96.0</td><td class=\"num\">2</td><td class=\"num\">6</td>",
+        // Waiting for its server: the relay, then its runners.
+        &format!("<div class=\"relay-head\" id=\"relay-{relay}\"><h3>relay-1 <code class=\"sub\">"),
+        "<span class=\"sub\">0.96.0 · 2 runners</span><span class=\"badge bad\">unreachable</span></div>",
+        "<thead><tr><th>runner</th><th>source</th><th>lane</th><th>placement</th>\
+         <th>state</th><th class=\"num\">jobs</th><th>last GitLab answer</th></tr></thead>",
         // Its server not approved: neither mapped nor unmapped.
-        "<td>relay-1</td><td>ci</td><td>42</td><td>config</td><td>-</td><td>-</td><td>pool ci · large · 4096 MiB",
-        "<td class=\"num\">4</td><td><span class=\"badge warn\">server not approved</span>",
-        "<td class=\"num\">1</td><td class=\"num\">3</td><td><time",
+        "<tr class=\"runner\"><td><strong>ci</strong><br><span class=\"sub\">GitLab ID 42</span>\
+         </td><td>config</td><td>-</td><td>pool ci · large · 4096 MiB",
+        "<td><span class=\"badge warn\">server not approved</span></td><td class=\"num\">3 / 4</td><td><time",
         " · HTTP 204</td>",
+        // The scheduler's view, folded.
+        &format!(
+            "<details class=\"more\" data-keep=\"runner/{relay}/ci\"><summary>Details</summary>\
+          <dl class=\"facts\"><dt>class</dt><dd>-</dd><dt>requests</dt><dd>1</dd>"
+        ),
+        "<td class=\"num\">- / -</td>",
         "<span class=\"badge bad\">token not verified</span> \
          <span class=\"badge bad\">token refused</span>",
         "&lt;script&gt;x&lt;/script&gt;",
@@ -9800,22 +9811,38 @@ async fn relays_and_their_runners_follow_their_server() {
     let waiting = next_with(&mut live, "event: gitlab-waiting\n").await;
     assert!(!waiting.contains("Runners waiting"), "{waiting}");
     let mut live_server = Events::open(addr, "/events/gitlab/gl", &viewer).await;
-    let event = next_with(&mut live_server, "<td>42</td>").await;
-    // Its server approved: no lane, and no Map link for a viewer.
+    let event = next_with(&mut live_server, "GitLab ID 42").await;
+    // Its server approved: no lane, and no link adding one for a viewer.
     assert!(
         event.contains(
-            "<td>42</td><td>config</td><td><span class=\"badge warn\">unmapped</span></td><td>-</td>"
+            "GitLab ID 42</span></td><td>config</td><td><span class=\"badge warn\">No lane: \
+             its jobs are refused</span></td><td>pool"
         ),
         "{event}"
     );
+    // Overview's relay leads to it on its server's page.
+    let overview = get(addr, "/gitlab", Some(&viewer)).await.body;
+    assert!(
+        overview.contains(&format!(
+            "<td><a href=\"/gitlab/gl#relay-{relay}\"><strong>relay-1</strong></a>"
+        )),
+        "{overview}"
+    );
+    assert!(!overview.contains("<tr class=\"runner\">"), "{overview}");
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let lane = "/lanes?edit=runner%2Fgl%2F42";
     let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
     assert!(
         page.contains(&format!(
-            "<span class=\"badge warn\">unmapped</span> <a href=\"{lane}\">Map</a></td>"
+            "<span class=\"badge warn\">No lane: its jobs are refused</span> \
+             <a href=\"{lane}\">Add a lane</a></td>"
         )),
         "{page}"
+    );
+    let lanes = get(addr, "/lanes", Some(&operator)).await.body;
+    assert!(
+        lanes.contains(&format!(" <a href=\"{lane}\">Add a lane</a></li>")),
+        "{lanes}"
     );
     assert!(
         get(addr, lane, Some(&operator))
@@ -9837,11 +9864,11 @@ async fn relays_and_their_runners_follow_their_server() {
     });
     hub.db.set_capacity_policy(&policy, "u", now).unwrap();
     hub.clients_changed();
-    let event = next_with(&mut live_server, "production</td>").await;
+    let event = next_with(&mut live_server, "<dd>production</dd>").await;
     assert!(
         event.contains(
-            "<td>42</td><td>config</td><td><a href=\"/lanes\">weight 2</a></td>\
-             <td>production</td><td>pool ci"
+            "GitLab ID 42</span></td><td>config</td><td><a href=\"/lanes\">weight 2</a></td>\
+             <td>pool ci"
         ),
         "{event}"
     );
@@ -9854,7 +9881,10 @@ async fn relays_and_their_runners_follow_their_server() {
     );
     // No request of it is queued: nothing waits.
     assert!(
-        event.contains("<td class=\"num\">0</td><td>-</td><td>-</td><td>-</td></tr>"),
+        event.contains(
+            "<dt>waiting</dt><dd>0</dd><dt>offered / held / jobs</dt><dd>-</dd>\
+             <dt>demand</dt><dd>-</dd><dt>waits for</dt><dd>-</dd></dl></details></td></tr>"
+        ),
         "{event}"
     );
     // A session of protocol 1 gets no new jobs: the relay is marked for upgrade.
@@ -9950,23 +9980,18 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
             .record_relay_session(&relay, "i", 3, now, || true)
             .unwrap()
     );
-    assert!(
-        !get(addr, "/gitlab", Some(&operator))
-            .await
-            .body
-            .contains(&link)
-    );
+    let update = "<p class=\"sub\">Update this relay to add runners here.</p>";
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(!page.contains(&link) && page.contains(update), "{page}");
+    let page = get(addr, "/gitlab", Some(&viewer)).await.body;
+    assert!(!page.contains(update), "{page}");
     assert!(
         hub.db
             .record_relay_session(&relay, "i", 4, now, || true)
             .unwrap()
     );
-    assert!(
-        get(addr, "/gitlab", Some(&operator))
-            .await
-            .body
-            .contains(&link)
-    );
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(page.contains(&link) && !page.contains(update), "{page}");
 
     // A viewer has no link, and is refused the form and its post.
     assert!(
@@ -10198,21 +10223,38 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     // The server's page: where each runner comes from; Remove for the one added on the hub.
     let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
     for want in [
-        "<td>7</td><td>config</td><td><span class=\"badge warn\">unmapped</span>",
+        "<summary>Details</summary>",
+        &format!("<div class=\"relay-head\" id=\"relay-{relay}\"><h3>relay-1 "),
+        "<span class=\"sub\">0.96.0 · 2 runners</span>",
+        &format!("unreachable</span>{link}<div class=\"sub\">Add runner <strong>ci-1</strong>: "),
+        &want,
         &format!(
-            "<td>42</td><td>added on the hub</td><td>{notice} <a href=\"{lane}\">Add a lane</a>"
+            "GitLab ID 7</span></td><td>config</td><td>{notice} <a href=\"/lanes?edit=runner%2Fgl%2F7\">Add a lane</a>"
         ),
+        &format!("</td><td>added on the hub</td><td>{notice} <a href=\"{lane}\">Add a lane</a>"),
+        // Remove on the runner's row, under its name.
+        "GitLab ID 42</span><form method=\"post\"",
         "<input type=\"hidden\" name=\"op\" value=\"remove-runner\"><input type=\"hidden\" \
-         name=\"name\" value=\"ci-1\"><button class=\"danger\">Remove</button>",
+         name=\"name\" value=\"ci-1\"><button class=\"danger\">Remove</button></form></td>\
+         <td>added on the hub</td>",
     ] {
         assert!(page.contains(want), "{want}: {page}");
     }
     assert!(!page.contains("name=\"name\" value=\"cfg\""), "{page}");
+    // The Overview's Add runner leads there.
+    let overview = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(
+        overview.contains(&format!(
+            "<a href=\"/gitlab/gl#relay-{relay}\">Add runner</a>"
+        )),
+        "{overview}"
+    );
     let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
     assert!(
-        !page.contains("remove-runner") && !page.contains(lane),
+        !page.contains("remove-runner") && !page.contains(lane) && !page.contains(&href),
         "{page}"
     );
+    assert!(page.contains("<summary>Details</summary>"), "{page}");
     let form = format!("_csrf={viewer_csrf}&op=remove-runner&name=ci-1");
     let reply = post_action(addr, &origin, &viewer, &action, &form, true).await;
     assert_eq!(reply.status, 403, "{}", reply.body);
@@ -10273,8 +10315,17 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     );
     audited(&hub, "remove runner ci-1").await;
     let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
-    assert!(page.contains("<td>42</td><td>being removed</td>"), "{page}");
+    assert!(
+        page.contains("GitLab ID 42</span></td><td>being removed</td>"),
+        "{page}"
+    );
     assert!(!page.contains("remove-runner"), "{page}");
+    assert!(
+        page.contains(
+            "Remove runner <strong>ci-1</strong>: <span class=\"badge busy\">pending</span>"
+        ),
+        "{page}"
+    );
     let page = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
         page.contains(
@@ -10282,6 +10333,18 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         ),
         "{page}"
     );
+
+    // A relay no longer taking runners: no Add runner; an operator is told what lets it.
+    inventory.allow = vec![];
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory), now)
+        .unwrap();
+    let hint = "<p class=\"sub\">Add <code>runners</code> to this relay's \
+                <code>[hub] allow</code> to add runners here.</p>";
+    let page = get(addr, "/gitlab/gl", Some(&operator)).await.body;
+    assert!(page.contains(hint) && !page.contains(&href), "{page}");
+    let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
+    assert!(!page.contains("[hub] allow"), "{page}");
 }
 
 /// What waits for approval is on top of the GitLab pages, counted on the GitLab link and its
@@ -10495,7 +10558,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     );
     assert!(!rejected.contains("reject-projects"), "{rejected}");
     let approved = event.split("<h2>Approved projects</h2>").nth(1).unwrap();
-    let approved = approved.split("<h2>Runners</h2>").next().unwrap();
+    let approved = approved.split("<h2>Relays</h2>").next().unwrap();
     for want in [
         "<td><input id=\"pick-approved-gl-42\"",
         "<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td><td class=\"num\">42</td>\
@@ -10510,7 +10573,7 @@ async fn an_operator_decides_on_pending_gitlab_servers_and_projects() {
     // A viewer sees them listed and linked, with nothing to decide.
     let page = get(addr, "/gitlab/gl", Some(&viewer)).await.body;
     let listed = page.split("<h2>Approved projects</h2>").nth(1).unwrap();
-    let listed = listed.split("<h2>Runners</h2>").next().unwrap();
+    let listed = listed.split("<h2>Relays</h2>").next().unwrap();
     assert!(
         listed.contains("<td><a href=\"/gitlab/gl/projects/42\">acme/web</a></td>"),
         "{listed}"

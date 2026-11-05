@@ -65,7 +65,7 @@ use crate::store::{
     KeyRow, KeysChanged, PendingGitlab, ProjectRef, ProjectRow, ProjectState, ProjectView,
     RejectedGitlab, RelayCommandRow, Role,
 };
-use vk_hub_proto::gitlab::{Operation, RunnerState, ServerState, ServerStatus};
+use vk_hub_proto::gitlab::{ALLOW_RUNNERS, Operation, RunnerState, ServerState, ServerStatus};
 
 /// The GitLab and API keys forms' POST endpoint. Before navigation sections, it served
 /// Connections' two tabs; GET requests now redirect to the corresponding page.
@@ -236,7 +236,7 @@ impl Shown {
         (key, lane)
     }
 
-    /// The URL for mapping runner `runner_id` of relay `r`, if the hub can establish
+    /// The URL adding a lane for runner `runner_id` of relay `r`, if the hub can establish
     /// that it has no lane.
     fn unmapped(&self, r: &RelayView, runner_id: Option<u64>) -> Option<String> {
         let (key, lane) = self.lane_of(r, runner_id);
@@ -468,17 +468,20 @@ fn servers_fragment(shown: &Shown, steer: bool) -> Html {
 }
 
 /// Server `name`'s page: its projects waiting for approval, rejected and approved, then the
-/// runners of the relays bound to it. None when the hub has no such server.
+/// relays bound to it, each with its runners. None when the hub has no such server.
 fn server_fragment(shown: &Shown, name: &str, now: u64, steer: bool) -> Option<Html> {
     let url = shown.url(name)?;
     let mut h = Html::new();
     pending_section(&mut h, shown, Some(name), steer);
     approved_section(&mut h, shown, name, steer);
-    h.raw("<section><h2>Runners</h2>");
+    h.raw("<section><h2>Relays</h2>");
     let relays: Vec<&RelayView> = (shown.relays.iter())
         .filter(|r| r.row.server_url.as_deref() == Some(url))
         .collect();
-    runners_table(&mut h, shown, &relays, now, steer);
+    if relays.is_empty() {
+        h.raw("<p class=\"empty\">None yet.</p>");
+    }
+    relay_blocks(&mut h, shown, &relays, now, steer);
     h.raw("</section>");
     Some(h)
 }
@@ -529,7 +532,7 @@ fn waiting_fragment(shown: &Shown, now: u64, steer: bool) -> Html {
         h.raw("<section><h2>Runners waiting for their server</h2><p class=\"sub\">Their ")
             .raw("relays are bound to a server the hub does not have. Once the hub has that ")
             .raw("server, these runners show on its page.</p>");
-        runners_table(&mut h, shown, &unbound, now, steer);
+        relay_blocks(&mut h, shown, &unbound, now, steer);
         h.raw("</section>");
     }
     h
@@ -877,9 +880,10 @@ fn bound(relays: &[RelayView], url: &str) -> bool {
         .any(|r| r.row.server_url.as_deref() == Some(url))
 }
 
-/// Each relay: its reach, the GitLab server it is bound to and what the hub makes of it, what it
-/// reports of that server, its version and runners, and how its last runner command went. With
-/// `steer`, the link adding a runner to one that takes them, and the button removing it.
+/// Each relay, linking to it on its server's page: its reach, the GitLab server it is bound to
+/// and what the hub makes of it, what it reports of that server, its version and runners, and
+/// how its last runner command went. With `steer`, Add runner on one that takes them, leading
+/// to its server's page when it has one, and the button removing it.
 fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
     let relays = &shown.relays;
     h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>state</th><th>last heard</th>")
@@ -891,9 +895,21 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
     h.raw("</tr></thead><tbody>");
     for r in relays {
         let inventory = r.row.inventory.as_ref();
-        h.raw("<tr><td><strong>")
-            .node(&r.row.hostname)
-            .raw("</strong> <code class=\"sub\">")
+        let page = relay_page(r);
+        h.raw("<tr><td>");
+        match &page {
+            Some(href) => {
+                h.raw("<a href=\"")
+                    .text(href)
+                    .raw("\"><strong>")
+                    .node(&r.row.hostname)
+                    .raw("</strong></a>");
+            }
+            None => {
+                h.raw("<strong>").node(&r.row.hostname).raw("</strong>");
+            }
+        }
+        h.raw(" <code class=\"sub\">")
             .text(crate::rollout::short_id(&r.id))
             .raw("</code></td><td>")
             .raw(if r.connected {
@@ -952,7 +968,7 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
             h.raw("<td class=\"actions\">");
             if crate::relays::runners_refusal(&r.row).is_none() {
                 h.raw("<a href=\"")
-                    .text(super::relays::add_runner_href(&r.id))
+                    .text(page.unwrap_or_else(|| super::relays::add_runner_href(&r.id)))
                     .raw("\">Add runner</a> ");
             }
             h.raw("<form method=\"post\" action=\"")
@@ -971,7 +987,7 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
 }
 
 /// How runner command `c` of relay `r` went, or that it is under way. An added runner
-/// that maps to no lane says so, linking to mapping it for an operator.
+/// that maps to no lane says so, linking to adding one for an operator.
 fn runner_command(
     h: &mut Html,
     shown: &Shown,
@@ -1008,8 +1024,7 @@ fn runner_command(
     h.raw("</div>");
 }
 
-/// A runner added on the hub that maps to no lane: its jobs are refused, until an operator
-/// maps it at `href`.
+/// A runner that maps to no lane: its jobs are refused, until an operator adds one at `href`.
 fn lane_notice(h: &mut Html, href: Option<&str>) {
     h.raw("<span class=\"badge warn\">No lane: its jobs are refused</span>");
     if let Some(href) = href {
@@ -1037,33 +1052,88 @@ fn server_status(h: &mut Html, s: &ServerStatus) {
     }
 }
 
-/// The runners of `relays`: GitLab's ID for each, where it comes from, where its jobs go, how
-/// many at once, whether GitLab took its token, what it is doing and its load, as the relay
-/// last said. With `steer`, each runner the hub schedules links to its lane's form, or to
-/// mapping it, and one added on the hub has the button removing it.
-fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, steer: bool) {
-    let runners = || {
-        relays.iter().flat_map(|r| {
-            (r.row.inventory.iter())
-                .flat_map(|i| &i.runners)
-                .map(move |runner| (r, runner))
-        })
+/// Each of `relays` with its runners: a heading with the relay's name, version, connection,
+/// runner count and last runner command, then its runners.
+/// With `steer`, the link adding a runner to a relay that takes them, or what lets it.
+fn relay_blocks(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, steer: bool) {
+    for r in relays {
+        let inventory = r.row.inventory.as_ref();
+        h.raw("<div class=\"relay-head\" id=\"")
+            .text(relay_anchor(&r.id))
+            .raw("\"><h3>")
+            .node(&r.row.hostname)
+            .raw(" <code class=\"sub\">")
+            .text(crate::rollout::short_id(&r.id))
+            .raw("</code></h3><span class=\"sub\">");
+        if let Some(i) = inventory {
+            h.node(&i.version).raw(" · ");
+        }
+        let count = inventory.map_or(0, |i| i.runners.len());
+        h.text(count)
+            .raw(if count == 1 { " runner" } else { " runners" })
+            .raw("</span>")
+            .raw(if r.connected {
+                "<span class=\"badge ok\">connected</span>"
+            } else {
+                "<span class=\"badge bad\">unreachable</span>"
+            });
+        if r.row
+            .protocol
+            .is_some_and(|v| v < vk_hub_proto::gitlab::RELAY_PROTOCOL.min)
+        {
+            h.raw("<span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span>");
+        }
+        if steer && crate::relays::runners_refusal(&r.row).is_none() {
+            h.raw("<a href=\"")
+                .text(super::relays::add_runner_href(&r.id))
+                .raw("\">Add runner</a>");
+        }
+        if let Some(c) = crate::relays::last_runner_command(shown.commands(&r.id)) {
+            runner_command(h, shown, r, c, now, steer);
+        }
+        h.raw("</div>");
+        if steer && let Some(i) = inventory {
+            if !i.allow.iter().any(|a| a == ALLOW_RUNNERS) {
+                h.raw("<p class=\"sub\">Add <code>").raw(ALLOW_RUNNERS).raw(
+                    "</code> to this relay's <code>[hub] allow</code> to add runners here.</p>",
+                );
+            } else if r.row.protocol.unwrap_or(0) < vk_hub_proto::gitlab::RUNNERS {
+                h.raw("<p class=\"sub\">Update this relay to add runners here.</p>");
+            }
+        }
+        runners_table(h, shown, r, now, steer);
+    }
+}
+
+/// The ID of relay `id`'s block on its server's page.
+fn relay_anchor(id: &str) -> String {
+    format!("relay-{id}")
+}
+
+/// Relay `r` on its server's page, if the hub has its server.
+pub(super) fn relay_page(r: &RelayView) -> Option<String> {
+    let name = r.server.as_ref()?.name.as_deref()?;
+    Some(format!("{}#{}", server_path(name), relay_anchor(&r.id)))
+}
+
+/// The runners of relay `r`: each one's name and GitLab ID, where it comes from, where its jobs
+/// go, its state, its jobs against its limit and its last answer from GitLab, as the relay last
+/// said; what the hub's scheduler makes of it folded under each. With `steer`, each runner the
+/// hub schedules links to its lane's form, or to adding one, and one added on the hub has the
+/// button removing it.
+fn runners_table(h: &mut Html, shown: &Shown, r: &RelayView, now: u64, steer: bool) {
+    let Some(inventory) = &r.row.inventory else {
+        h.raw("<p class=\"empty\">Not reported yet.</p>");
+        return;
     };
-    if runners().next().is_none() {
-        h.raw("<p class=\"empty\">none: no relay has reported a runner yet</p>");
+    if inventory.runners.is_empty() {
+        h.raw("<p class=\"empty\">No runners.</p>");
         return;
     }
-    h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>runner</th>")
-        .raw("<th>GitLab ID</th><th>source</th><th>lane</th><th>class</th><th>placement</th>")
-        .raw("<th class=\"num\">limit</th><th>state</th>")
-        .raw("<th class=\"num\">requests</th><th class=\"num\">jobs</th>")
-        .raw("<th>last GitLab answer</th><th class=\"num\">waiting</th>")
-        .raw("<th>offered / held / jobs</th><th>demand</th><th>waits for</th>");
-    if steer {
-        h.raw("<th>change</th>");
-    }
-    h.raw("</tr></thead><tbody>");
-    for (r, runner) in runners() {
+    h.raw("<table class=\"grid runners\"><thead><tr><th>runner</th><th>source</th>")
+        .raw("<th>lane</th><th>placement</th><th>state</th><th class=\"num\">jobs</th>")
+        .raw("<th>last GitLab answer</th></tr></thead><tbody>");
+    for runner in &inventory.runners {
         let report = (r.row.report.iter())
             .flat_map(|rep| &rep.runners)
             .find(|rep| rep.name == runner.name);
@@ -1071,16 +1141,27 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, s
             .flat_map(|hb| &hb.runners)
             .find(|l| l.name == runner.name);
         let p = &runner.placement;
-        h.raw("<tr><td>")
-            .node(&r.row.hostname)
-            .raw("</td><td>")
+        h.raw("<tr class=\"runner\"><td><strong>")
             .node(&runner.name)
-            .raw("</td><td>");
-        match runner.runner_id {
-            Some(id) => h.text(id),
-            None => h.raw("-"),
-        };
+            .raw("</strong>");
+        if let Some(id) = runner.runner_id {
+            h.raw("<br><span class=\"sub\">GitLab ID ")
+                .text(id)
+                .raw("</span>");
+        }
         let origin = crate::relays::runner_origin(runner, shown.commands(&r.id), now);
+        if steer
+            && matches!(
+                origin,
+                RunnerOrigin::Hub {
+                    added_by: Some(_),
+                    removing: false
+                }
+            )
+            && runner.runner_id.is_some()
+        {
+            super::relays::remove_runner_button(h, &r.id, &runner.name);
+        }
         h.raw("</td><td>").raw(super::relays::origin_text(origin));
         let (key, mapping) = shown.lane_of(r, runner.runner_id);
         let lane = (key.as_ref().filter(|_| steer)).map(|(gitlab, id)| {
@@ -1103,25 +1184,11 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, s
                 if let Some(href) = &lane {
                     h.raw(" <a href=\"").text(href).raw("\">Edit lane</a>");
                 }
-                h.raw("</td><td>").text(m.class);
             }
             // Its server approved, its GitLab ID known and the policy read: it maps to none.
-            None if key.is_some() && shown.policy.is_ok() => {
-                match (&lane, origin) {
-                    (_, RunnerOrigin::Hub { .. }) => lane_notice(h, lane.as_deref()),
-                    (Some(href), _) => {
-                        h.raw("<span class=\"badge warn\">unmapped</span> <a href=\"")
-                            .text(href)
-                            .raw("\">Map</a>");
-                    }
-                    (None, _) => {
-                        h.raw("<span class=\"badge warn\">unmapped</span>");
-                    }
-                }
-                h.raw("</td><td>-");
-            }
+            None if key.is_some() && shown.policy.is_ok() => lane_notice(h, lane.as_deref()),
             None => {
-                h.raw("-</td><td>-");
+                h.raw("-");
             }
         }
         h.raw("</td><td>pool ").node(&p.pool);
@@ -1133,11 +1200,6 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, s
             h.raw(" · only ")
                 .text(super::lanes::may_use_text(m, &shown.nodes));
         }
-        h.raw("</td><td class=\"num\">");
-        match runner.limit {
-            Some(n) => h.text(n),
-            None => h.raw("-"),
-        };
         h.raw("</td><td>");
         if !runner.verified {
             h.raw("<span class=\"badge bad\">token not verified</span> ");
@@ -1153,74 +1215,73 @@ fn runners_table(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, s
                 h.raw("-");
             }
         }
-        h.raw("</td>");
+        h.raw("</td><td class=\"num\">");
         match load {
-            Some(l) => {
-                h.raw("<td class=\"num\">")
-                    .text(l.requests)
-                    .raw("</td><td class=\"num\">")
-                    .text(l.jobs)
-                    .raw("</td><td>");
-                if let Some(t) = l.last_answer_at {
-                    super::fleet::time_ago(h, now, t);
-                    if let Some(status) = l.last_status {
-                        h.raw(" · HTTP ").text(status);
-                    }
-                } else {
-                    h.raw("-");
+            Some(l) => h.text(l.jobs),
+            None => h.raw("-"),
+        };
+        h.raw(" / ");
+        match runner.limit {
+            Some(n) => h.text(n),
+            None => h.raw("-"),
+        };
+        h.raw("</td><td>");
+        match load.and_then(|l| l.last_answer_at.map(|t| (t, l.last_status))) {
+            Some((t, status)) => {
+                super::fleet::time_ago(h, now, t);
+                if let Some(status) = status {
+                    h.raw(" · HTTP ").text(status);
                 }
-                h.raw("</td>");
             }
             None => {
-                h.raw("<td class=\"num\">-</td><td class=\"num\">-</td><td>-</td>");
+                h.raw("-");
             }
         }
+        h.raw("</td></tr><tr class=\"more\"><td colspan=\"7\"><details class=\"more\" data-keep=\"runner/")
+            .text(&r.id)
+            .raw("/")
+            .text(&runner.name)
+            .raw("\"><summary>Details</summary><dl class=\"facts\"><dt>class</dt><dd>")
+            .text(mapping.map_or("-".to_string(), |m| m.class.to_string()))
+            .raw("</dd><dt>requests</dt><dd>");
+        match load {
+            Some(l) => h.text(l.requests),
+            None => h.raw("-"),
+        };
+        h.raw("</dd>");
         match key.as_ref().and_then(|key| shown.arbitration.get(key)) {
-            Some(view) => arbitration_cells(h, view),
+            Some(view) => arbitration_facts(h, view),
             None => {
-                h.raw("<td class=\"num\">0</td><td>-</td><td>-</td><td>-</td>");
+                h.raw("<dt>waiting</dt><dd>0</dd><dt>offered / held / jobs</dt><dd>-</dd>")
+                    .raw("<dt>demand</dt><dd>-</dd><dt>waits for</dt><dd>-</dd>");
             }
         }
-        if steer {
-            h.raw("<td class=\"actions\">");
-            if matches!(
-                origin,
-                RunnerOrigin::Hub {
-                    added_by: Some(_),
-                    removing: false
-                }
-            ) && runner.runner_id.is_some()
-            {
-                super::relays::remove_runner_button(h, &r.id, &runner.name);
-            }
-            h.raw("</td>");
-        }
-        h.raw("</tr>");
+        h.raw("</dl></details></td></tr>");
     }
     h.raw("</tbody></table>");
 }
 
 /// The runner's waiting, offered and held request counts, job count, oldest request's wait,
 /// recent admission outcomes, backoff, and reason its oldest request or a queued job waits.
-fn arbitration_cells(h: &mut Html, view: &crate::jobs::ArbitrationView) {
-    h.raw("<td class=\"num\">").text(view.waiting);
+fn arbitration_facts(h: &mut Html, view: &crate::jobs::ArbitrationView) {
+    h.raw("<dt>waiting</dt><dd>").text(view.waiting);
     if let Some(secs) = view.wait_secs {
         h.raw(" <span class=\"sub\">").text(secs).raw("s</span>");
     }
-    h.raw("</td><td>")
+    h.raw("</dd><dt>offered / held / jobs</dt><dd>")
         .text(view.offers)
         .raw(" / ")
         .text(view.holds)
         .raw(" / ")
         .text(view.jobs)
-        .raw("</td><td>")
+        .raw("</dd><dt>demand</dt><dd>")
         .text(view.demand);
     if let Some(secs) = view.backoff_secs {
         h.raw(" · backoff ").text(secs).raw("s");
     }
-    h.raw("</td><td>")
+    h.raw("</dd><dt>waits for</dt><dd>")
         .text(view.reason.unwrap_or("-"))
-        .raw("</td>");
+        .raw("</dd>");
 }
 
 /// A runner's state as a badge.
@@ -2696,11 +2757,12 @@ mod tests {
             oldest: Some("a".into()),
         };
         let mut h = Html::new();
-        arbitration_cells(&mut h, &view);
+        arbitration_facts(&mut h, &view);
         assert_eq!(
             h.into_string(),
-            "<td class=\"num\">2 <span class=\"sub\">12s</span></td><td>1 / 3 / 4</td>\
-             <td>recently empty · backoff 5s</td><td>tenant cap</td>"
+            "<dt>waiting</dt><dd>2 <span class=\"sub\">12s</span></dd>\
+             <dt>offered / held / jobs</dt><dd>1 / 3 / 4</dd>\
+             <dt>demand</dt><dd>recently empty · backoff 5s</dd><dt>waits for</dt><dd>tenant cap</dd>"
         );
     }
 }

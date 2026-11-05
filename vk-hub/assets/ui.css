@@ -220,6 +220,18 @@ table.grid tbody tr:last-child td { border-bottom: 0; }
 table.grid tbody tr:hover td { background: var(--raised); }
 table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
 table.grid tr.down td, .rollout tr.failed td { color: var(--bad); }
+/* A relay's runners on its server's page: cells wrap to fit the page, each runner's
+   scheduler details folded in a row of their own under it. */
+.relay-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s3); margin: var(--s4) 0 var(--s2); }
+.relay-head h3 { margin: 0; }
+table.grid.runners td { white-space: normal; overflow-wrap: anywhere; }
+table.grid.runners td form { margin-top: var(--s1); }
+table.grid.runners tr.runner td { border-bottom: 0; }
+table.grid.runners tr.more td { padding-top: 0; }
+table.grid.runners tr.more:hover td { background: none; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: var(--s1) var(--s4); margin: var(--s2) 0 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; }
 /* The jobs table keeps its columns where they are across live updates: fixed widths, sized for
    the longest values the other columns show, the job and its branch sharing what is left, and
    text cut short (whole on hover) rather than widening a column. The minimum leaves the job and

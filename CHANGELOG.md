@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **vk-hub's GitLab server pages show each relay with its runners.** Runner tables fit the
+  page, with scheduling details folded under each runner. A runner without a lane says its
+  jobs are refused. Operators add and remove runners there; the Overview's relays link there.
+
 ### Fixed
 
 - **Faster small reads from vk-registry.** Clients reading many small objects over one

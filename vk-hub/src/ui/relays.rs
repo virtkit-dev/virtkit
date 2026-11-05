@@ -325,7 +325,7 @@ fn runner_form(
             .raw("\">Lanes</a>.</p></section>");
     }
     h.raw("<p><a href=\"")
-        .raw(super::clients::GITLAB_PATH)
+        .text(back(relay))
         .raw("\">Back to GitLab</a></p>");
     let mut resp = page(fleet::layout(
         "Add a runner",
@@ -354,6 +354,12 @@ fn input(h: &mut Html, label: &'static str, name: &'static str, value: &str, hin
         .raw("\">");
 }
 
+/// Where a page about `relay`'s runners leads back to: the relay on its server's page, else
+/// GitLab's Overview.
+fn back(relay: &RelayView) -> String {
+    super::clients::relay_page(relay).unwrap_or_else(|| super::clients::GITLAB_PATH.to_string())
+}
+
 /// `s` with its first letter capitalized.
 fn capitalized(s: &str) -> String {
     let mut chars = s.chars();
@@ -363,8 +369,8 @@ fn capitalized(s: &str) -> String {
 }
 
 /// Add the runner `form` asks for to relay `id`, as `vk-hub relays runners add` does, then back
-/// to GitLab, where the relay's row shows how it ends. A refusal shows the form again, but not
-/// the token.
+/// to the relay on its server's page, which shows how it ends. A refusal shows the form again,
+/// but not the token.
 async fn add_runner(
     ui: &Ui,
     auth: &Auth,
@@ -412,7 +418,7 @@ async fn add_runner(
                 fields.name,
                 command.id
             );
-            Ok(super::clients::see_other(super::clients::GITLAB_PATH))
+            Ok(super::clients::see_other(&back(&relay)))
         }
         Err(e) if e.is::<NotEnrolled>() => Ok(super::message(
             StatusCode::NOT_FOUND,
@@ -474,7 +480,7 @@ async fn remove_runner(
         .raw("</strong></p>");
     let ask = actions::Ask {
         path: format!("{PREFIX}{id}/action"),
-        back: super::clients::GITLAB_PATH.to_string(),
+        back: back(&relay),
         op: REMOVE_RUNNER.to_string(),
         what: "Remove this runner? It stops taking new jobs and is removed after its running \
                jobs end. It stays in GitLab; delete it there.",
@@ -513,11 +519,10 @@ async fn remove_runner(
                 command.id
             );
             if !htmx {
-                return Ok(super::clients::see_other(super::clients::GITLAB_PATH));
+                return Ok(super::clients::see_other(&back(&relay)));
             }
             Ok(fleet::said_so(&format!(
-                "Removing runner {} from {}. It goes once its running jobs end; the relay's \
-                 row on GitLab's Overview shows how it ends.",
+                "Removing runner {} from {}. It goes once its running jobs end.",
                 vk_hub_proto::display_safe(&name),
                 vk_hub_proto::display_safe(&relay.row.hostname),
             )))

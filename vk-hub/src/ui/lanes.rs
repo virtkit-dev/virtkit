@@ -423,13 +423,13 @@ fn lanes_table(h: &mut Html, shown: &Shown, policy: &Policy, steer: bool) {
     h.raw("</tbody></table>");
 }
 
-/// The runners seen without a lane, each to map, and the API keys without one, to add.
+/// The runners seen without a lane, each to add one for, and the API keys without one, to add.
 fn add_section(h: &mut Html, policy: &Policy, known: &Known) {
     let unmapped: Vec<_> = (known.runners.iter())
         .filter(|r| policy.runner(&r.gitlab, r.id).is_none())
         .collect();
     if !unmapped.is_empty() {
-        h.raw("<h3>Runners without a lane</h3><p class=\"sub\">They get no work until mapped.")
+        h.raw("<h3>Runners without a lane</h3><p class=\"sub\">Their jobs are refused.")
             .raw("</p><ul>");
         for r in unmapped {
             let id = LaneId::Runner {
@@ -440,7 +440,7 @@ fn add_section(h: &mut Html, policy: &Policy, known: &Known) {
                 .text(known.label(&id))
                 .raw(" <a href=\"")
                 .text(edit_href(&id))
-                .raw("\">Map</a></li>");
+                .raw("\">Add a lane</a></li>");
         }
         h.raw("</ul>");
     }
