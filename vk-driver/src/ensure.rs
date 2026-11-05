@@ -68,6 +68,9 @@ pub struct BuildRecipe {
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
     pub cache: crate::build::CacheDest,
+    /// The local scope the build tier keeps this build under ([`build_tier_dir`]); `None` for
+    /// the unscoped tier, which builds outside placed jobs share.
+    pub local_scope: Option<String>,
     /// Egress policy for the build's RUN guests (`[egress.build]` and the job's own).
     /// `BuildNet::All` = unrestricted (the docker-build-like default when unconfigured).
     pub net: crate::build::BuildNet,
@@ -141,18 +144,26 @@ pub fn ensure_unit_build(
     Ok(())
 }
 
-/// The shared build-cache tier directory for a `build:` stage: `<state_dir>/build/<uuid>/`,
-/// keyed by the stage's content fingerprint (the same value stamped into the ext4). An
-/// identical stage — same base, instructions, copied files — maps to the same dir, so it is
-/// built once and shared across services, runs, and runners. Slots into the generic
-/// idle-eviction GC (`image::gc_idle`/`base_dirs`) like the pulled `registry/`/`docker/`
-/// tiers.
 /// Build-tier qcow2 image holding the unit's ext4, beside its `.json` config sidecar.
 /// Idle GC also recognizes legacy `runner.ext4` entries.
 pub const UNIT_IMAGE: &str = "runner.qcow2";
 
-pub fn build_tier_dir(state_dir: &Path, stage_key: &str) -> PathBuf {
-    state_dir.join("build").join(fingerprint(&[stage_key]))
+/// The build-tier directory for a `build:` stage: `<state_dir>/build/<uuid>/`, named by the
+/// stage's content fingerprint (the same value stamped into the ext4), so an identical stage —
+/// same base, instructions, copied files — maps to the same dir and is built once. It slots
+/// into the generic idle-eviction GC (`image::gc_idle`/`base_dirs`) like the pulled
+/// `registry/`/`docker/` tiers.
+///
+/// A placed job's builds go under their local `scope`: the entry is then named for the scope
+/// and the stage key together, so a job of another scope never finds it, while the image's
+/// stamped UUID stays the stage's own fingerprint. The entries share the one `build/` level,
+/// so the idle GC, the use locks and the staging sweep treat them alike.
+pub fn build_tier_dir(state_dir: &Path, scope: Option<&str>, stage_key: &str) -> PathBuf {
+    let name = match scope {
+        None => fingerprint(&[stage_key]),
+        Some(scope) => fingerprint(&[&format!("scope:{scope}"), stage_key]),
+    };
+    state_dir.join("build").join(name)
 }
 
 /// A held reference on `dir` iff it is already fresh, `None` when it must be (re)built.
@@ -190,9 +201,9 @@ fn reference_if_fresh(
     }
 }
 
-/// Ensure a `build:` stage is materialized in the shared build tier, returning its cache dir
-/// (holding [`UNIT_IMAGE`] + its config sidecar) together with a held reference on it. On a
-/// fingerprint miss it builds under a pull lock into a tmp sibling, stamps the UUID, and
+/// Materialize a `build:` stage under the recipe's local scope. Return its cache dir
+/// ([`UNIT_IMAGE`] and its config sidecar) and a held reference. On a fingerprint miss,
+/// it builds under a pull lock into a tmp sibling, stamps the UUID, and
 /// promotes atomically — so a killed build never leaves a half-image a freshness check would
 /// trust, and concurrent identical builds serialize (the loser then finds it fresh). Runs idle
 /// GC on the tier. `label` names the stage (its compose service / git-defined image name) in
@@ -212,7 +223,7 @@ pub fn ensure_build_tier(
     label: &str,
     sink: Option<crate::build::ProgressSink>,
 ) -> Result<(PathBuf, crate::cachelock::Guard)> {
-    let dir = build_tier_dir(state_dir, stage_key);
+    let dir = build_tier_dir(state_dir, recipe.local_scope.as_deref(), stage_key);
     let expected = fingerprint(&[stage_key]);
     if let Some(guard) = reference_if_fresh(state_dir, &dir, &expected)? {
         return Ok((dir, guard));
@@ -264,6 +275,21 @@ pub fn ensure_build_tier(
 mod tests {
     use super::*;
 
+    /// A scoped entry is apart from the unscoped one and from another scope's, for the same
+    /// stage; the image it holds is still stamped with the stage's own fingerprint.
+    #[test]
+    fn a_scope_keeps_its_own_build_tier_entries() {
+        let state = Path::new("/state");
+        let shared = build_tier_dir(state, None, "k");
+        let a = build_tier_dir(state, Some("a"), "k");
+        assert_eq!(shared, state.join("build").join(fingerprint(&["k"])));
+        assert_ne!(a, shared);
+        assert_ne!(a, build_tier_dir(state, Some("b"), "k"));
+        assert_ne!(a, build_tier_dir(state, Some("a"), "k2"));
+        assert_eq!(a, build_tier_dir(state, Some("a"), "k"));
+        assert_eq!(a.parent(), shared.parent());
+    }
+
     #[test]
     fn fingerprint_parses_back_into_uuid_bytes() {
         let fp = fingerprint(&["stage-key"]);
@@ -297,6 +323,7 @@ mod tests {
                 insecure: false,
                 auth: Default::default(),
             }),
+            local_scope: None,
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
@@ -336,6 +363,7 @@ mod tests {
                 insecure: false,
                 auth: Default::default(),
             }),
+            local_scope: None,
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
@@ -354,7 +382,7 @@ mod tests {
             result.is_err(),
             "test setup: the build must fail (missing Dockerfile)"
         );
-        let tmp = build_tier_dir(&state_dir, key).with_extension("tmp");
+        let tmp = build_tier_dir(&state_dir, None, key).with_extension("tmp");
         assert!(
             !tmp.exists(),
             "a failed build must not leave its .tmp scratch behind"
@@ -372,7 +400,7 @@ mod tests {
             std::env::temp_dir().join(format!("vk-ensure-tier-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_dir);
         let key = "already-fresh";
-        let dir = build_tier_dir(&state_dir, key);
+        let dir = build_tier_dir(&state_dir, None, key);
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join(UNIT_IMAGE);
         let tree = state_dir.join("tree");
@@ -396,6 +424,7 @@ mod tests {
                 insecure: false,
                 auth: Default::default(),
             }),
+            local_scope: None,
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
@@ -441,7 +470,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let key = "reference-if-fresh";
         let expected = fingerprint(&[key]);
-        let dir = build_tier_dir(&state_dir, key);
+        let dir = build_tier_dir(&state_dir, None, key);
 
         // Nothing on disk at all: not fresh, and no error for the absent sidecar.
         assert!(

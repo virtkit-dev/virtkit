@@ -168,8 +168,8 @@ A cold node with the cache off still fetches its media: step 7 tests it.
 ## The local tier
 
 A node keeps built images and layers locally, keyed by content. A job build stores and looks
-them up under its **local scope**: the SHA-256 of the length-prefixed registry ID and
-`build_prefix`, the prefix naming the GitLab instance, project, protection and `{scope}`.
+them up under its **local scope**: the SHA-256 of a tag and the length-prefixed registry ID
+and `build_prefix`, the prefix naming the GitLab instance, project, protection and `{scope}`.
 The node takes both from the hub-authorized `JobStart`. The local scope selects an entry's
 location and grants nothing. It changes the entry's name, not its content key: stage keys,
 their fingerprints and the builder's stamps stay unchanged, and builds of the same content

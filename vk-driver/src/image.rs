@@ -655,6 +655,21 @@ pub(crate) fn collect_idle(root: &Path, idle: std::time::Duration, dry_run: bool
     evicted
 }
 
+/// Evict `base` with [`gc_idle`]'s locking and removal rules but no idle delay.
+/// Only unused entries are removed. Best-effort; removal failures are reported.
+pub(crate) fn evict_unused(base: &Path) {
+    let mut evicted = Evicted::default();
+    crate::cachelock::try_reclaim(
+        &base.join(".inuse"),
+        &base.join(".used"),
+        std::time::Duration::ZERO,
+        std::time::SystemTime::now(),
+        || {
+            remove_counted(base, &mut evicted);
+        },
+    );
+}
+
 /// Remove `base` under the caller's exclusive lock and add its space to `evicted`.
 /// Return whether removal succeeded.
 fn remove_counted(base: &Path, evicted: &mut Evicted) -> bool {

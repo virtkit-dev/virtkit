@@ -869,8 +869,8 @@ fn git_image_sources(ctx: &JobCtx, spec: &str, service: Option<&str>) -> Result<
     })
 }
 
-/// Build `sources` into the shared build tier using the job's build-phase egress,
-/// `[build] cache_registry`, and build record. Return the rootfs, captured runtime config,
+/// Build `sources` into the build tier using the job's build-phase egress, cache destination
+/// and local scope, and build record. Return the rootfs, captured runtime config,
 /// and a held reference on the entry (see [`crate::ensure::ensure_build_tier`]).
 /// The caller has confined every path in `sources`: the build reads them on the host,
 /// outside the microVM boundary.
@@ -900,7 +900,7 @@ pub(crate) fn build_image_sources(
     )
     .context("computing the image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
-    let cache = job_cache_dest(ctx);
+    let job_cache = job_cache_dest(ctx);
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,
         contexts,
@@ -908,7 +908,8 @@ pub(crate) fn build_image_sources(
         build_args,
         kernel: cfg.build.kernel.clone(),
         agent: cfg.build.agent.clone(),
-        cache,
+        cache: job_cache.dest,
+        local_scope: job_cache.local.key().map(str::to_string),
         net,
         audit,
         record: build_record(ctx, service.as_deref())?,
@@ -923,6 +924,9 @@ pub(crate) fn build_image_sources(
         None,
     )
     .with_context(|| format!("building the image {label:?}"))?;
+    if matches!(job_cache.local, crate::jobctx::LocalScope::Private(_)) {
+        note_private_build(&ctx.job_dir, &dir)?;
+    }
     let rootfs = dir.join(crate::ensure::UNIT_IMAGE);
     // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
     let config = crate::build::read_config_sidecar(&rootfs)?;
@@ -1450,27 +1454,33 @@ fn build_compose_unit(
     // A compose `build:` service's RUN egress is the build phase — same `[egress.build]`
     // policy and audit as the git-defined primary.
     let (net, audit) = effective_build_egress(cfg, ctx)?;
-    let cache = job_cache_dest(ctx);
+    let job_cache = job_cache_dest(ctx);
+    let private = matches!(job_cache.local, crate::jobctx::LocalScope::Private(_));
     let build = crate::units::BuildOpts {
         // A compose unit's build args are its own (compose file / `.env`); there is no
         // executor-global build-arg channel.
         build_args: vec![],
         kernel: kernel.path.clone(),
         agent: agent.path.clone(),
-        cache,
+        cache: job_cache.dest,
+        local_scope: job_cache.local.key().map(str::to_string),
         net,
         audit,
         record: build_record(ctx, Some(&unit.name))?,
     };
     // The build reports the entry it materialized; addressing it separately would pin the
     // fingerprint computed here rather than the one the build settled on.
-    crate::units::ensure_unit_build_sync(
+    let built = crate::units::ensure_unit_build_sync(
         unit,
         cfg.state_dir(),
         cfg.image_cache_idle(),
         &build,
         None,
-    )
+    )?;
+    if private && let Some(dir) = built.0.parent() {
+        note_private_build(&ctx.job_dir, dir)?;
+    }
+    Ok(built)
 }
 
 /// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by
@@ -3105,14 +3115,14 @@ fn build_record(ctx: &JobCtx, service: Option<&str>) -> Result<Option<crate::bui
 
 /// Where this job's builds cache ([`JobCtx::cache_dest`]). When the cache is off, the job's
 /// trace says why, once ([`first_cache_off`]).
-fn job_cache_dest(ctx: &JobCtx) -> crate::build::CacheDest {
-    let (dest, why) = ctx.cache_dest();
-    if let Some(why) = why
+fn job_cache_dest(ctx: &JobCtx) -> crate::jobctx::JobCacheDest {
+    let cache = ctx.cache_dest();
+    if let Some(why) = &cache.why_off
         && first_cache_off(&ctx.job_dir)
     {
         println!("virtkit: building with no build cache: {why}");
     }
-    dest
+    cache
 }
 
 /// Whether to report why build caching is off for `job_dir`. A marker suppresses repeats
@@ -3130,6 +3140,49 @@ fn first_cache_off(job_dir: &Path) -> bool {
 
 /// In a job dir: [`job_cache_dest`] has said why the job's build cache is off.
 const BUILD_CACHE_OFF: &str = "build-cache-off";
+
+/// In a job dir: the build-tier entries a job built in its private scope, one name a line,
+/// which its cleanup removes ([`remove_private_builds`]).
+const PRIVATE_BUILDS: &str = "private-builds";
+
+/// Record the private build `dir` in `job_dir` for cleanup, skipping duplicate names.
+fn note_private_build(job_dir: &Path, dir: &Path) -> Result<()> {
+    use std::io::Write;
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("a build-tier entry has a name")?;
+    let list = job_dir.join(PRIVATE_BUILDS);
+    match std::fs::read_to_string(&list) {
+        Ok(noted) if noted.lines().any(|n| n == name) => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", list.display())),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&list)
+        .context("noting a private build")?;
+    writeln!(f, "{name}").context("noting a private build")
+}
+
+/// Remove the job's private build-tier entries through descriptors, under each entry's
+/// lock, and only while unused ([`crate::image::evict_unused`]), as the idle GC does.
+/// Accept only fingerprint names to confine the list to `<state_dir>/build`.
+/// Best-effort; idle GC handles leftovers.
+fn remove_private_builds(state_dir: &Path, job_dir: &Path) {
+    let Ok(list) = std::fs::read_to_string(job_dir.join(PRIVATE_BUILDS)) else {
+        return;
+    };
+    let root = state_dir.join("build");
+    for name in list.lines() {
+        if crate::ensure::parse_uuid(name).is_none() || name.len() != 36 {
+            continue;
+        }
+        crate::image::evict_unused(&root.join(name));
+    }
+}
 
 /// This job's build-phase egress ([`crate::build::BuildNet`]) plus its build-audit flag: the
 /// `[egress.build]` cap and the job's own `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME`, each
@@ -4272,6 +4325,8 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     if let Some(record) = &ctx.egress_record {
         crate::egress_report::keep_run_channels(&ctx.job_dir, record);
     }
+    // Before the job dir goes: the list of what it built in its private scope is in it.
+    remove_private_builds(ctx.cfg.state_dir(), &ctx.job_dir);
     let removed = match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -4892,6 +4947,37 @@ mod tests {
         // No job dir to mark: said each time rather than never.
         assert!(first_cache_off(&dir.join("absent")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's cleanup removes what it built in its private scope, and only build-tier
+    /// entries: a name in the list that is not a fingerprint reaches nothing.
+    #[test]
+    fn a_jobs_private_builds_go_with_it() {
+        let tmp = std::env::temp_dir().join(format!("vk-private-builds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (state, job) = (tmp.join("state"), tmp.join("job"));
+        let mine = crate::ensure::build_tier_dir(&state, Some("mine"), "k");
+        let shared = crate::ensure::build_tier_dir(&state, None, "k");
+        for d in [&mine, &shared, &job, &tmp.join("outside")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // As a build leaves an entry: dated by its use.
+        std::fs::write(mine.join(".used"), b"").unwrap();
+        note_private_build(&job, &mine).unwrap();
+        note_private_build(&job, &mine).unwrap();
+        let noted = std::fs::read_to_string(job.join(PRIVATE_BUILDS)).unwrap();
+        assert_eq!(noted.lines().count(), 1, "noted once: {noted}");
+        let mut list = std::fs::OpenOptions::new()
+            .append(true)
+            .open(job.join(PRIVATE_BUILDS))
+            .unwrap();
+        std::io::Write::write_all(&mut list, b"../../outside\n\n").unwrap();
+        remove_private_builds(&state, &job);
+        assert!(!mine.exists());
+        assert!(shared.exists() && tmp.join("outside").exists());
+        // Nothing listed, nothing to do.
+        remove_private_builds(&state, &tmp.join("none"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     use crate::config::Config;

@@ -116,6 +116,9 @@ pub struct BuildOpts {
     pub kernel: PathBuf,
     pub agent: PathBuf,
     pub cache: crate::build::CacheDest,
+    /// The local scope the build tier keeps these builds under
+    /// ([`crate::ensure::BuildRecipe::local_scope`]).
+    pub local_scope: Option<String>,
     /// Egress policy for the unit build's RUN guests (`[egress.build]` and the job's own);
     /// `BuildNet::All` = unrestricted default.
     pub net: crate::build::BuildNet,
@@ -163,6 +166,7 @@ fn build_recipe(
         agent: build.map(|b| b.agent.clone()),
         // `build = None` never builds, so it reaches no cache.
         cache: build.map_or(crate::build::CacheDest::Off, |b| b.cache.clone()),
+        local_scope: build.and_then(|b| b.local_scope.clone()),
         // `build = None` is the ext4-path/fingerprint call that never builds, so the egress
         // default is irrelevant there; the real build passes the job's `[egress.build]` policy.
         net: build
@@ -184,7 +188,8 @@ pub fn build_unit_ext4(
     unit: &crate::compose::Unit,
 ) -> Result<PathBuf> {
     let (_recipe, _target, key) = build_recipe(unit, global_build_args, None)?;
-    Ok(crate::ensure::build_tier_dir(state_dir, &key).join(crate::ensure::UNIT_IMAGE))
+    // `vk run --compose`'s own units: no placed job, so the unscoped tier.
+    Ok(crate::ensure::build_tier_dir(state_dir, None, &key).join(crate::ensure::UNIT_IMAGE))
 }
 
 /// The content identity of a unit's clean image: the content-addressed cache path it resolves
@@ -907,6 +912,7 @@ mod tests {
                 insecure: false,
                 auth: Default::default(),
             }),
+            local_scope: None,
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,

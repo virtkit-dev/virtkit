@@ -350,16 +350,26 @@ impl JobCtx {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    /// This job's build-cache destination and reason when disabled, under the node's config
-    /// ([`cache_dest`]).
-    pub fn cache_dest(&self) -> (crate::build::CacheDest, Option<String>) {
+    /// Where this job's builds cache ([`cache_dest`]) under this node's config.
+    pub fn cache_dest(&self) -> JobCacheDest {
         cache_dest(
             &self.cfg,
             self.hub_placed,
             self.job_registry.as_ref(),
             crate::node::caches_jobs_by_scope(&self.cfg),
             vk_peer::now_secs(),
+            &self.private_scope(),
         )
+    }
+
+    /// The local scope of this job alone: no other job on this node has it.
+    fn private_scope(&self) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        scope_hash(&[
+            b"job",
+            self.job_id.as_bytes(),
+            self.job_dir.as_os_str().as_bytes(),
+        ])
     }
 
     /// The root every `[executor] host_checkout` tree on this host lives under — the unit the idle
@@ -822,11 +832,56 @@ pub(crate) fn pipeline_identity() -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// The job's cache destination at `now`, and the reason when disabled:
+/// Where a job's builds cache, in the registry and on the node.
+#[derive(Debug)]
+pub struct JobCacheDest {
+    pub dest: crate::build::CacheDest,
+    /// Where the node's build tier keeps the job's builds ([`crate::ensure::build_tier_dir`]).
+    pub local: LocalScope,
+    /// Why the cache is off, when it is.
+    pub why_off: Option<String>,
+}
+
+/// The local scope a job's builds are kept under on the node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalScope {
+    /// The unscoped tier, which builds outside placed jobs share.
+    Unscoped,
+    /// The scope of a cache destination, which every job building there shares.
+    Shared(String),
+    /// The job's own: its cleanup removes its entries, and the idle GC any it misses.
+    Private(String),
+}
+
+impl LocalScope {
+    /// The scope's key, `None` for the unscoped tier.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            LocalScope::Unscoped => None,
+            LocalScope::Shared(k) | LocalScope::Private(k) => Some(k),
+        }
+    }
+}
+
+/// The SHA-256 of `parts`, each length-prefixed so no two lists encode alike, in hex. The
+/// first part tags what the scope is of, so a job's scope and a cache destination's differ.
+fn scope_hash(parts: &[&[u8]]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_be_bytes());
+        h.update(p);
+    }
+    vk_hub_proto::to_hex(&h.finalize())
+}
+
+/// The job's cache destination and local scope at `now`:
 /// - jobs not placed by a hub, or on nodes without scoped caching (`by_scope`), use
-///   `[build] cache_registry`;
+///   `[build] cache_registry` and the node's unscoped tier;
 /// - placed jobs on nodes with scoped caching use their build prefix and token on the
-///   node's registry, or no cache. Missing inputs never fall back to the shared cache.
+///   node's registry. Jobs sharing that registry and prefix share a local scope.
+///   Missing inputs disable caching and select the job's `private` scope, never the
+///   node's shared cache or unscoped tier.
 ///
 /// The token is checked once, here: the hub has it live for the job's timeout and 15 minutes
 /// more, so it outlasts the job's builds unless `max_job_token_secs` cuts it shorter; a build
@@ -837,15 +892,21 @@ fn cache_dest(
     registry: Option<&vk_hub_proto::dispatch::JobRegistry>,
     by_scope: bool,
     now: u64,
-) -> (crate::build::CacheDest, Option<String>) {
+    private: &str,
+) -> JobCacheDest {
     use crate::build::CacheDest;
     if !hub_placed || !by_scope {
-        return (
-            CacheDest::Configured(crate::build::CacheOpts::from_config(&cfg.build)),
-            None,
-        );
+        return JobCacheDest {
+            dest: CacheDest::Configured(crate::build::CacheOpts::from_config(&cfg.build)),
+            local: LocalScope::Unscoped,
+            why_off: None,
+        };
     }
-    let off = |why: &str| (CacheDest::Off, Some(why.to_string()));
+    let off = |why: &str| JobCacheDest {
+        dest: CacheDest::Off,
+        local: LocalScope::Private(private.to_string()),
+        why_off: Some(why.to_string()),
+    };
     let Some(registry) = registry else {
         return off("the hub gave this job no registry token");
     };
@@ -864,7 +925,15 @@ fn cache_dest(
         return off("this node has no [registry]");
     };
     match crate::registry::at_path(rg, prefix, Some(&registry.token)) {
-        Some(rg) => (CacheDest::Scoped(rg), None),
+        Some(rg) => JobCacheDest {
+            dest: CacheDest::Scoped(rg),
+            local: LocalScope::Shared(scope_hash(&[
+                b"build",
+                registry.registry_id.as_bytes(),
+                prefix.as_bytes(),
+            ])),
+            why_off: None,
+        },
         None => off("this node's [registry] is not a remote registry"),
     }
 }
@@ -1175,20 +1244,30 @@ mod tests {
             CacheDest::Configured(c) => c.registry.clone(),
             other => panic!("{other:?}"),
         };
-        // Not placed, or not caching by scope: the shared cache.
+        // Not placed, or not caching by scope: the shared cache and the unscoped tier.
         for (placed, by_scope) in [(false, true), (true, false), (false, false)] {
-            let (dest, why) = cache_dest(&cfg, placed, Some(&job), by_scope, 1);
-            assert_eq!(configured(&dest).as_deref(), Some("cache.example/shared"));
-            assert_eq!(why, None);
+            let c = cache_dest(&cfg, placed, Some(&job), by_scope, 1, "mine");
+            assert_eq!(configured(&c.dest).as_deref(), Some("cache.example/shared"));
+            assert_eq!((c.local, c.why_off), (LocalScope::Unscoped, None));
         }
-        // Placed, by scope: the job's prefix, with its token.
-        let (dest, why) = cache_dest(&cfg, true, Some(&job), true, 1);
-        let CacheDest::Scoped(rg) = dest else {
-            panic!("{dest:?}")
+        // Placed, by scope: the job's prefix and token, with a local scope shared only
+        // by jobs of the same prefix.
+        let c = cache_dest(&cfg, true, Some(&job), true, 1, "mine");
+        let CacheDest::Scoped(rg) = &c.dest else {
+            panic!("{:?}", c.dest)
         };
         assert_eq!(rg.repo, "reg.example/ci-build/gl/42/protected/all");
         assert_eq!(rg.job_token.as_ref().map(|t| t.0.as_str()), Some("vkt_x.y"));
-        assert_eq!(why, None);
+        assert_eq!(c.why_off, None);
+        assert!(matches!(c.local, LocalScope::Shared(_)), "{:?}", c.local);
+        let other_job = cache_dest(&cfg, true, Some(&job), true, 1, "theirs");
+        assert_eq!(other_job.local, c.local);
+        let branch = JobRegistry {
+            build_prefix: Some("ci-build/gl/42/protected/ref-x-0".into()),
+            ..job.clone()
+        };
+        let other = cache_dest(&cfg, true, Some(&branch), true, 1, "mine");
+        assert!(matches!(other.local, LocalScope::Shared(_)) && other.local != c.local);
         // Anything missing turns the cache off, saying why.
         let bad_prefix = JobRegistry {
             build_prefix: Some("../x".into()),
@@ -1209,9 +1288,13 @@ mod tests {
             (&none, Some(&job), 1, "no [registry]"),
             (&local, Some(&job), 1, "not a remote registry"),
         ] {
-            let (dest, why) = cache_dest(cfg, true, registry, true, now);
-            assert!(matches!(dest, CacheDest::Off), "{want}: {dest:?}");
-            assert!(why.as_deref().is_some_and(|w| w.contains(want)), "{why:?}");
+            let c = cache_dest(cfg, true, registry, true, now, "mine");
+            assert!(matches!(c.dest, CacheDest::Off), "{want}: {:?}", c.dest);
+            assert!(
+                c.why_off.as_deref().is_some_and(|w| w.contains(want)),
+                "{c:?}"
+            );
+            assert_eq!(c.local, LocalScope::Private("mine".into()));
         }
     }
 

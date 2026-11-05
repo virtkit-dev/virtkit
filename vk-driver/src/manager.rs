@@ -1118,6 +1118,7 @@ mod tests {
                     insecure: false,
                     auth: Default::default(),
                 }),
+                local_scope: None,
                 net: crate::build::BuildNet::All,
                 audit: false,
                 record: None,

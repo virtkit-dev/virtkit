@@ -3941,6 +3941,7 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         agent: agent.to_path_buf(),
         cache: crate::build::CacheDest::Configured(args.cache.clone()),
         // Dev `vk run --compose` service builds share the run's `--build-net` / build-audit.
+        local_scope: None,
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
         record: None,
@@ -6535,6 +6536,7 @@ mod tests {
                     insecure: false,
                     auth: Default::default(),
                 }),
+                local_scope: None,
                 net: crate::build::BuildNet::All,
                 audit: false,
                 record: None,
