@@ -3,8 +3,8 @@
 //! single-layer raw-file manifest, as written by `/upload`, whose layer holds the file bytes.
 //! A write streams to `uploads/` while hashing ([`stage`]), then promotes the blob and writes
 //! the manifest and tag under the namespace lock ([`commit`]). Each wire protocol over this
-//! layer keeps its own status codes and bodies: WebDAV under `/dav/files/` (`crate::dav`)
-//! today, an S3 view in later work. Entries expire under gc's tag retention and blob grace
+//! layer keeps its own status codes and bodies: WebDAV under `/dav/files/` (`crate::dav`) and
+//! S3 under `/s3/` (`crate::s3`). Entries expire under gc's tag retention and blob grace
 //! windows.
 
 use std::collections::BTreeMap;
@@ -75,6 +75,8 @@ pub(crate) struct Object {
     pub(crate) size: u64,
     /// the tag's mtime
     pub(crate) modified: SystemTime,
+    /// the manifest's annotations: what a front stored beside the bytes
+    pub(crate) annotations: BTreeMap<String, String>,
 }
 
 impl Node {
@@ -118,16 +120,17 @@ pub(crate) fn resolve(store: &Store, segs: &[String]) -> Result<Option<Node>> {
         return Ok(None);
     };
     let layer = match store.get_blob(&manifest_hex)? {
-        Some(manifest) => crate::raw_file_layer(&manifest),
+        Some(manifest) => crate::raw_file_parts(&manifest),
         None => None,
     };
     Ok(Some(match layer {
-        Some((layer, size)) => Node::Object(Object {
+        Some((layer, size, annotations)) => Node::Object(Object {
             repo,
             tag: tag.to_string(),
             layer,
             size,
             modified,
+            annotations,
         }),
         None => Node::Foreign(repo),
     }))

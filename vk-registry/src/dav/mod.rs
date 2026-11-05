@@ -228,7 +228,7 @@ pub(crate) fn href(segments: &[&str], collection: bool) -> String {
 
 /// Root enumeration requires configured credentials. Accounts-mode listings also filter by
 /// scope.
-fn may_enumerate(state: &ServerState) -> bool {
+pub(crate) fn may_enumerate(state: &ServerState) -> bool {
     match &state.auth {
         Authenticator::Accounts { .. } => true,
         Authenticator::Shared(auth) => auth.enabled(),
