@@ -362,6 +362,29 @@ fn hmac(key: &[u8], data: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
     Some(out)
 }
 
+/// The key a scope's signatures are made with, derived from a secret and wiped when dropped.
+/// A request's own signature needs it only for the call that checks it ([`signature`]); the
+/// chunk signatures of an `aws-chunked` body need it for as long as the body streams.
+pub(crate) struct SigningKey(Zeroizing<[u8; 32]>);
+
+impl SigningKey {
+    /// The key `secret` gives the scope `date/region/service/aws4_request`; the keys derived
+    /// on the way are wiped as they are dropped.
+    pub(crate) fn derive(secret: &str, date: &str, region: &str, service: &str) -> Option<Self> {
+        let seed = Zeroizing::new(format!("AWS4{secret}").into_bytes());
+        let k_date = hmac(&seed, date.as_bytes())?;
+        let k_region = hmac(&*k_date, region.as_bytes())?;
+        let k_service = hmac(&*k_region, service.as_bytes())?;
+        Some(SigningKey(hmac(&*k_service, TERMINATOR.as_bytes())?))
+    }
+
+    /// The hex signature of `string_to_sign` under this key.
+    pub(crate) fn sign(&self, string_to_sign: &str) -> Option<String> {
+        let signed = hmac(&*self.0, string_to_sign.as_bytes())?;
+        Some(crate::hex_of(&*signed))
+    }
+}
+
 /// The hex signature of `string_to_sign` under the key derived from `secret` for the scope
 /// `date/region/service/aws4_request`. The derived keys live in this call only, each wiped
 /// when dropped; nothing but the signature leaves it.
@@ -372,13 +395,7 @@ pub(crate) fn signature(
     service: &str,
     string_to_sign: &str,
 ) -> Option<String> {
-    let seed = Zeroizing::new(format!("AWS4{secret}").into_bytes());
-    let k_date = hmac(&seed, date.as_bytes())?;
-    let k_region = hmac(&*k_date, region.as_bytes())?;
-    let k_service = hmac(&*k_region, service.as_bytes())?;
-    let k_signing = hmac(&*k_service, TERMINATOR.as_bytes())?;
-    let signed = hmac(&*k_signing, string_to_sign.as_bytes())?;
-    Some(crate::hex_of(&*signed))
+    SigningKey::derive(secret, date, region, service)?.sign(string_to_sign)
 }
 
 /// Whether `credential`'s signature is the one `secret` gives `canonical_request` made at

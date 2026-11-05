@@ -21,7 +21,7 @@ use hyper::{Request, Response, StatusCode};
 use sha1::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
-use super::{Ctx, drain, meta, refuse, xml};
+use super::{Ctx, chunked, drain, meta, refuse, xml};
 use crate::dav::http_date;
 use crate::files::{
     self, Commit, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed, object_of,
@@ -236,13 +236,18 @@ pub(super) async fn attributes(
     .await
 }
 
-/// How a PutObject's body is bound to its signature, by `x-amz-content-sha256`.
-enum Payload {
-    /// `UNSIGNED-PAYLOAD`, or no header (an unsigned request)
-    Unsigned,
-    /// the body's SHA-256, lowercase hex
-    Sha256(String),
+/// How a PutObject's body is bound to its signature, by `x-amz-content-sha256`, and how it is
+/// framed.
+struct Payload {
+    /// the (decoded) body's SHA-256, lowercase hex, when the header names one rather than
+    /// `UNSIGNED-PAYLOAD` or a streaming mode
+    sha256: Option<String>,
+    /// how the body is framed when it is `aws-chunked`
+    framing: Option<chunked::Framing>,
 }
+
+/// The header naming how long an `aws-chunked` body is once decoded.
+const DECODED_LENGTH: &str = "x-amz-decoded-content-length";
 
 /// The digests a PutObject asks to be checked against what arrives, each as bytes.
 #[derive(Default)]
@@ -259,39 +264,110 @@ struct Expected {
 /// and a message.
 type Refused = (StatusCode, &'static str, &'static str);
 
+/// What `x-amz-content-sha256`, `Content-Encoding`, `x-amz-decoded-content-length` and
+/// `x-amz-trailer` say of a PutObject's body. A streaming mode, or `aws-chunked` named among
+/// the encodings, makes it an `aws-chunked` body; no other encoding is decoded, so none is
+/// taken beside it.
 fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
-    let chunked = headers.get_all(CONTENT_ENCODING).iter().any(|v| {
-        v.to_str().is_ok_and(|v| {
-            v.split(',')
-                .any(|e| e.trim().eq_ignore_ascii_case("aws-chunked"))
-        })
-    });
-    let streaming = (
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "aws-chunked uploads are not served yet: send UNSIGNED-PAYLOAD or the body's SHA-256",
-    );
-    if chunked {
-        return Err(streaming);
+    let invalid = |message| (StatusCode::BAD_REQUEST, "InvalidRequest", message);
+    let mut sent = headers.get_all("x-amz-content-sha256").iter();
+    let value = sent.next().map(|v| v.to_str().unwrap_or_default());
+    if sent.next().is_some() {
+        return Err(invalid("x-amz-content-sha256 is sent once"));
     }
-    let Some(value) = headers.get("x-amz-content-sha256") else {
-        return Ok(Payload::Unsigned);
+    let (sha256, streaming) = match value {
+        None | Some("UNSIGNED-PAYLOAD") => (None, None),
+        Some(v) if v.starts_with("STREAMING-") => match chunked::Mode::of(v) {
+            Some(mode) => (None, Some(mode)),
+            None => {
+                return Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "the streaming payloads taken are STREAMING-AWS4-HMAC-SHA256-PAYLOAD, its \
+                     -TRAILER form and STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                ));
+            }
+        },
+        Some(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            (Some(v.to_ascii_lowercase()), None)
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "x-amz-content-sha256 is UNSIGNED-PAYLOAD, the body's SHA-256 in hex, or a \
+                 streaming mode",
+            ));
+        }
     };
-    let value = value.to_str().unwrap_or_default();
-    if value == "UNSIGNED-PAYLOAD" {
-        return Ok(Payload::Unsigned);
+    let (mut chunked, mut other) = (false, false);
+    for encoding in headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .flat_map(|v| v.to_str().unwrap_or("?").split(','))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        if encoding.eq_ignore_ascii_case("aws-chunked") {
+            chunked = true;
+        } else if !encoding.eq_ignore_ascii_case("identity") {
+            other = true;
+        }
     }
-    if value.starts_with("STREAMING-") {
-        return Err(streaming);
+    let Some(mode) = streaming.or(chunked.then_some(chunked::Mode::Unsigned)) else {
+        if headers.contains_key("x-amz-trailer") {
+            return Err(invalid("x-amz-trailer is for a -TRAILER streaming payload"));
+        }
+        return Ok(Payload {
+            sha256,
+            framing: None,
+        });
+    };
+    if other {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "an aws-chunked body is decoded, and no other content encoding with it",
+        ));
     }
-    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Ok(Payload::Sha256(value.to_ascii_lowercase()));
+    let declared = headers
+        .get(DECODED_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or(invalid(
+            "an aws-chunked body needs x-amz-decoded-content-length, its decoded length",
+        ))?;
+    let trailer = match headers.get("x-amz-trailer") {
+        None => None,
+        Some(_) if !mode.trailer() => {
+            return Err(invalid("x-amz-trailer is for a -TRAILER streaming payload"));
+        }
+        Some(v) => {
+            let name = v.to_str().unwrap_or_default().trim();
+            let known = chunked::CHECKSUMS
+                .into_iter()
+                .find(|c| c.eq_ignore_ascii_case(name));
+            Some(known.ok_or(invalid("x-amz-trailer names one x-amz-checksum header"))?)
+        }
+    };
+    Ok(Payload {
+        sha256,
+        framing: Some(chunked::Framing {
+            mode,
+            declared,
+            trailer,
+        }),
+    })
+}
+
+/// How many bytes the checksum a header or trailer `name`s is.
+fn checksum_len(name: &str) -> usize {
+    match name {
+        "x-amz-checksum-sha256" => 32,
+        "x-amz-checksum-sha1" => 20,
+        "x-amz-checksum-crc64nvme" => 8,
+        _ => 4,
     }
-    Err((
-        StatusCode::BAD_REQUEST,
-        "InvalidArgument",
-        "x-amz-content-sha256 is UNSIGNED-PAYLOAD or the body's SHA-256 in hex",
-    ))
 }
 
 fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
@@ -330,15 +406,38 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
             )
         })?;
         if let Some((text, value)) = value {
-            out.echo.push((name, text));
-            match name {
-                "x-amz-checksum-sha256" => out.sha256 = Some(value),
-                "x-amz-checksum-sha1" => out.sha1 = Some(value),
-                _ => out.crc32 = Some(value),
-            }
+            out.expect(name, text, value);
         }
     }
     Ok(out)
+}
+
+impl Expected {
+    /// Check the body against `value`, the checksum `name`s, and echo its `text` once it
+    /// held: for the checksums this registry computes; any other is taken unchecked.
+    fn expect(&mut self, name: &'static str, text: String, value: Vec<u8>) {
+        let slot = match name {
+            "x-amz-checksum-sha256" => &mut self.sha256,
+            "x-amz-checksum-sha1" => &mut self.sha1,
+            "x-amz-checksum-crc32" => &mut self.crc32,
+            _ => return,
+        };
+        *slot = Some(value);
+        self.echo.push((name, text));
+    }
+
+    /// The trailer's checksum `name`d, as sent: base64 of the checksum's length.
+    fn trailer(&mut self, name: &'static str, text: &str) -> std::result::Result<(), Refused> {
+        let value = crate::auth::base64_decode(text)
+            .filter(|b| b.len() == checksum_len(name))
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "the trailer's x-amz-checksum is the checksum of the body in base64",
+            ))?;
+        self.expect(name, text.to_string(), value);
+        Ok(())
+    }
 }
 
 /// The digests computed while a body streams: MD5 always (the ETag), SHA-1 and CRC32 only
@@ -350,11 +449,14 @@ struct Digests {
 }
 
 impl Digests {
-    fn for_(expected: &Expected) -> Self {
+    /// The digests `expected` asks for, and the one a trailer announced as `trailer`.
+    fn for_(expected: &Expected, trailer: Option<&str>) -> Self {
+        let wanted = |set: bool, name| set || trailer == Some(name);
         Digests {
             md5: md5::Context::new(),
-            sha1: expected.sha1.is_some().then(sha1::Sha1::new),
-            crc32: expected.crc32.is_some().then(crc32fast::Hasher::new),
+            sha1: wanted(expected.sha1.is_some(), "x-amz-checksum-sha1").then(sha1::Sha1::new),
+            crc32: wanted(expected.crc32.is_some(), "x-amz-checksum-crc32")
+                .then(crc32fast::Hasher::new),
         }
     }
 
@@ -383,11 +485,14 @@ fn unwritable(why: Unwritable, ctx: &Ctx) -> Response<Body> {
 /// `PUT /s3/<bucket>/<key>`: stream the body into staging while hashing it, check it against
 /// what the request said of it, then tag it under the namespace lock, with its MD5 and user
 /// metadata on the manifest and the request's `If-None-Match: *`/`If-Match` checked there.
-/// Its `Content-Type` is not kept: every object is served as bytes.
+/// Its `Content-Type` is not kept: every object is served as bytes. An `aws-chunked` body is
+/// decoded on the way, its chunk signatures checked against `seed` when there is one, and
+/// its trailer's checksum checked as a header's would be.
 pub(super) async fn put(
     state: &ServerState,
     authz: &Authz<'_>,
     segs: Vec<String>,
+    seed: Option<chunked::Seed>,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -397,19 +502,31 @@ pub(super) async fn put(
     }
     let headers = req.headers();
     // A declared length over the cap is refused unread; the connection then closes.
-    if headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_OBJECT)
-    {
+    let over = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > MAX_OBJECT)
+    };
+    if over(CONTENT_LENGTH.as_str()) || over(DECODED_LENGTH) {
         return Ok(ctx.too_large());
     }
     if headers.contains_key("x-amz-copy-source") {
         return refuse(req, ctx.not_implemented(), ctx).await;
     }
-    let checked = payload(headers).and_then(|p| Ok((p, expected(headers)?)));
-    let (payload, expected) = match checked {
+    let checked = payload(headers).and_then(|p| {
+        let trailer = p.framing.and_then(|f| f.trailer);
+        if trailer.is_some_and(|name| headers.contains_key(name)) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "a checksum is sent as a header or in the trailer, not both",
+            ));
+        }
+        Ok((p, expected(headers)?))
+    });
+    let (payload, mut expected) = match checked {
         Ok(checked) => checked,
         Err((status, code, message)) => {
             return refuse(req, ctx.error(status, code, message), ctx).await;
@@ -442,15 +559,41 @@ pub(super) async fn put(
         return refuse(req, unwritable(why, ctx), ctx).await;
     }
 
-    let mut digests = Digests::for_(&expected);
-    let staged = match files::stage(&state.store, req.into_body(), &mut |d| digests.update(d)).await
-    {
+    let mut digests = Digests::for_(&expected, payload.framing.and_then(|f| f.trailer));
+    let mut tap = |d: &[u8]| digests.update(d);
+    let (staged, trailer) = match payload.framing {
+        None => (
+            files::stage(&state.store, req.into_body(), &mut tap).await,
+            None,
+        ),
+        Some(framing) => {
+            let mut body = chunked::Decoder::new(req.into_body(), framing, seed);
+            let staged = files::stage(&state.store, &mut body, &mut tap).await;
+            let trailer = body
+                .trailer()
+                .map(|(name, value)| (name, value.to_string()));
+            (staged, trailer)
+        }
+    };
+    let staged = match staged {
         Ok(staged) => staged,
         Err(PutError::TooLarge) => return Ok(ctx.too_large()),
-        Err(PutError::Failed(e)) => return Err(e),
+        // A body whose framing was refused is answered, unread past where it went wrong; the
+        // answer closes the connection.
+        Err(PutError::Failed(e)) => match e.downcast_ref::<chunked::Error>() {
+            Some(chunked::Error::Refused(why)) => {
+                return Ok(ctx.error(why.status, why.code, why.message));
+            }
+            _ => return Err(e),
+        },
     };
     // A refusal from here on drops `staged`, which unlinks it: nothing is tagged.
-    if let Payload::Sha256(signed) = &payload
+    if let Some((name, value)) = trailer
+        && let Err((status, code, message)) = expected.trailer(name, &value)
+    {
+        return Ok(ctx.error(status, code, message));
+    }
+    if let Some(signed) = &payload.sha256
         && *signed != staged.hex
     {
         return Ok(ctx.error(
@@ -582,35 +725,125 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_is_unsigned_or_its_sha256_and_streaming_waits() {
+    fn a_payload_is_unsigned_its_sha256_or_chunked() {
         let code = |pairs: &[(&str, &str)]| payload(&headers(pairs)).err().map(|e| e.1);
-        assert!(matches!(payload(&headers(&[])), Ok(Payload::Unsigned)));
-        assert!(matches!(
-            payload(&headers(&[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")])),
-            Ok(Payload::Unsigned)
-        ));
+        let plain = |pairs: &[(&str, &str)]| {
+            let p = payload(&headers(pairs)).ok().unwrap();
+            assert!(p.framing.is_none());
+            p.sha256
+        };
+        assert_eq!(plain(&[]), None);
+        assert_eq!(plain(&[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")]), None);
         let hex = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
-        assert!(matches!(
-            payload(&headers(&[("x-amz-content-sha256", hex)])),
-            Ok(Payload::Sha256(h)) if h == hex.to_ascii_lowercase()
-        ));
-        for streaming in [
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-        ] {
-            assert_eq!(
-                code(&[("x-amz-content-sha256", streaming)]),
-                Some("NotImplemented")
-            );
-        }
-        assert_eq!(
-            code(&[("content-encoding", "gzip, aws-chunked")]),
-            Some("NotImplemented")
-        );
+        let lower = Some(hex.to_ascii_lowercase());
+        assert_eq!(plain(&[("x-amz-content-sha256", hex)]), lower);
+        // Another encoding alone is not ours to decode, and is kept as it was sent.
+        assert_eq!(plain(&[("content-encoding", "gzip")]), None);
         assert_eq!(
             code(&[("x-amz-content-sha256", "abc")]),
             Some("InvalidArgument")
         );
+        assert_eq!(
+            code(&[
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-content-sha256", hex)
+            ]),
+            Some("InvalidRequest")
+        );
+
+        let length = ("x-amz-decoded-content-length", "13");
+        let framing = |pairs: &[(&str, &str)]| {
+            let p = payload(&headers(pairs)).ok().unwrap();
+            (p.sha256, p.framing.unwrap())
+        };
+        for (value, mode) in [
+            ("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", chunked::Mode::Signed),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                chunked::Mode::SignedTrailer,
+            ),
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                chunked::Mode::UnsignedTrailer,
+            ),
+        ] {
+            let (sha256, f) = framing(&[("x-amz-content-sha256", value), length]);
+            assert_eq!(
+                (sha256, f.mode, f.declared, f.trailer),
+                (None, mode, 13, None)
+            );
+            assert_eq!(
+                code(&[("x-amz-content-sha256", value)]),
+                Some("InvalidRequest"),
+                "{value} without its decoded length"
+            );
+        }
+        // aws-chunked named among the encodings, with any other payload hash.
+        let (sha256, f) = framing(&[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", hex),
+            length,
+        ]);
+        assert_eq!((sha256, f.mode), (lower, chunked::Mode::Unsigned));
+        let (_, f) = framing(&[("content-encoding", "identity, AWS-Chunked"), length]);
+        assert_eq!(f.mode, chunked::Mode::Unsigned);
+        assert_eq!(
+            code(&[("content-encoding", "aws-chunked,gzip"), length]),
+            Some("NotImplemented")
+        );
+        assert_eq!(
+            code(&[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "-1")
+            ]),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            code(&[(
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"
+            )]),
+            Some("NotImplemented")
+        );
+
+        // The trailer's checksum, in the trailer modes only.
+        let trailer = ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        let (_, f) = framing(&[trailer, length, ("x-amz-trailer", "X-Amz-Checksum-CRC32")]);
+        assert_eq!(f.trailer, Some("x-amz-checksum-crc32"));
+        for bad in [
+            "x-amz-checksum-md5",
+            "x-amz-checksum-crc32,x-amz-checksum-sha1",
+            "",
+        ] {
+            assert_eq!(
+                code(&[trailer, length, ("x-amz-trailer", bad)]),
+                Some("InvalidRequest"),
+                "{bad}"
+            );
+        }
+        let signed = ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+        let crc = ("x-amz-trailer", "x-amz-checksum-crc32");
+        assert_eq!(code(&[signed, length, crc]), Some("InvalidRequest"));
+        assert_eq!(code(&[crc]), Some("InvalidRequest"));
+    }
+
+    #[test]
+    fn a_trailer_checksum_is_checked_as_a_header_is() {
+        let mut e = Expected::default();
+        let crc = vk_hub_proto::to_base64(&[1, 2, 3, 4]);
+        e.trailer("x-amz-checksum-crc32", &crc).ok().unwrap();
+        assert_eq!(e.crc32, Some(vec![1, 2, 3, 4]));
+        assert_eq!(e.echo, [("x-amz-checksum-crc32", crc.clone())]);
+        // Taken unchecked, and not echoed.
+        e.trailer(
+            "x-amz-checksum-crc64nvme",
+            &vk_hub_proto::to_base64(&[0; 8]),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(e.echo.len(), 1);
+        assert!(e.trailer("x-amz-checksum-sha256", &crc).is_err());
+        assert!(e.trailer("x-amz-checksum-crc32c", "!!").is_err());
     }
 
     #[test]
