@@ -309,6 +309,201 @@ runner_system_failure` does not retry this reason, so a pending project does not
 rejected project's jobs fail the same way, with `project_rejected` and a message saying so.
 A refused submission retried under the same request ID counts once.
 
+## One connection to the hub
+
+Status: **design**, relay protocol version 5.
+
+A relay holds **one HTTP/2 connection** to the hub. Its session is a stream of it, and its
+client API requests are the others. The hub **pushes** small notices over the session when a ticket
+or a job of the relay changes, and the relay **fetches** what changed with plain requests on the same
+connection. Nothing long-polls. Nodes and registries keep their HTTP/1.1 WebSocket sessions.
+
+**HTTP/2 for relays only.** The hub's listener offers ALPN `vk-relay/1` and `http/1.1`,
+never `h2`. `vk-relay/1` is a private protocol ID the hub serves as HTTP/2. Only vk-gitlab
+offers it, so curl and other API-key clients stay on HTTP/1.1, as today.
+
+**The session.** The relay dials the hub's listener over TLS 1.3, offering ALPN `vk-relay/1`
+and `http/1.1`, and opens `/v1/gitlab/session` as a WebSocket over HTTP/2 (RFC 8441): `CONNECT` with
+`:protocol` `websocket` and `sec-websocket-version: 13`, answered 200. The hub's HTTP/2
+server enables the extended CONNECT (hyper's `enable_connect_protocol`); the stream is then
+the `Upgraded` an HTTP/1.1 upgrade gives today, so `vk-peer`'s handshake (hello, challenge,
+auth signed over the connection's TLS exporter, welcome) and `relays::run` stay as they are.
+On a plain-HTTP loopback listener, which has no ALPN, the hub tells HTTP/2 from HTTP/1.1
+by the client's connection preface (h2c with prior knowledge). There the auth is
+`Channel::Plaintext`, as today.
+
+**The session authenticates the connection.** Before the welcome, the hub marks the
+connection as the relay's, under the relay's ID and the session's number. From then on it
+serves the client API on that connection as that relay, while the session is current
+(`Hub::is_current`). A request **carries no signature**: no `vk-relay`, `vk-time` or
+`vk-signature`, no body digest. The per-request signature bound a request to the relay key and
+the TLS connection; the session's auth binds the same key to the same exporter once, and TLS
+1.3 lets only the holder of that connection's traffic keys send on it. A TLS-terminating
+proxy breaks the auth exactly as it broke the signatures, and a hub with a stolen certificate
+key gets neither: the exporters on its two sides differ. Signing each request again adds
+nothing against the [trust model](trust-model.md)'s attackers, and costs a body hash, a
+signature, and a dependency on the relay's clock (`DOWNLOAD_SKEW_SECS`). The connection lives
+as long as its session. When the session ends (lost, superseded, removed or handed over),
+the hub stops new requests on the connection with 503 `unavailable` and sends GOAWAY. Requests
+already accepted still finish. The relay dials a new connection and session, then sends
+any unanswered request again, as it does today. Every client API request is idempotent.
+
+**What the hub pushes.** Version 5 adds two `HubRelayMsg`s. Each names an object and
+carries no data:
+
+- `ticket {ticket}`: a ticket of the relay was granted or ended (refused, cancelled, its grant
+  unclaimed past the lease). It replaces the ticket's long poll
+  (`GET /v1/reservations/tickets/<id>?wait=`).
+- `job {job, revision, output_len}`: an unsettled job of the relay has a new `revision`
+  (state, node, stage, cancel, result) or more output. It replaces the job view's and output's
+  long polls, and covers what the relay waits for on a job: its placement, a cancel
+  issued on the hub, its end, which a settle refused 409 waits for, and its output up to
+  `output_len`.
+
+The other long polls have no notice. Capacity (`POST /v1/capacity`) is not asked by vk-gitlab;
+a claimed reservation that is lost is still found by its renewal's 410, within `lease_secs /
+3`. The relay fetches over the connection with the same requests as before, without
+`wait`: a ticket's `GET` (201 grant, 202 queued, 410 gone), the job's `GET` and its output
+from an offset. On a session connection the hub refuses a request carrying `wait` (or a
+capacity request's `wait_secs`) with 400 `invalid`, the client API's code for a bad request.
+So each stream is short, and a relay bug shows at once instead of holding streams. A grant is fetched rather than pushed so that the relay still counts its
+lease from when it sent the request that brought it ([Admission and
+reservations](gitlab-dispatch.md#admission-and-reservations)). The poll loop counts from
+before its call today (`sent`), which would charge the wait for the notice against the lease.
+So the `Reservation` a fetch returns carries the instant that fetch was sent, and the loop
+counts from that.
+
+The hub builds notices by diffing, not by queueing events. Its source is a **notice
+record** per principal: for each live ticket its phase, and for each unsettled job its
+`(revision, output_len)`. Every place that changes a ticket's phase, a job's revision or its
+output's length updates the record, including the write that persists a finished job and
+drops it from the dispatch state's memory. A record is dropped when its job is settled or
+expires (`JOB_KEEP`), and when its ticket ends and has been told. At start, the hub rebuilds
+the records from the store's unsettled jobs, finished ones included. Each session keeps what
+it last told per object. On a change to its relay's record, coalesced over 50 ms, it sends
+one notice per object that moved, and it forgets any entry whose object left the record.
+Several changes made while a send is pending collapse into one notice, so the notices
+outstanding never exceed the record: the relay's live tickets (at most 256) and its
+unsettled jobs. A send is bounded by the heartbeat, as the ping is. A relay that does not
+read ends its session.
+
+**Ordering, duplicates, misses.** The hub reads a notice's values from the dispatch state
+before sending it. A fetch issued after the relay receives the notice is served from that
+state or a later one, so it sees at least the revision and output length the notice named. A
+notice can come before the answer that tells the relay about its object: a grant before
+`POST /v1/reservations` has answered with the ticket, or a revision before `POST /v1/jobs`
+has answered. So the relay keeps the latest notice per ID in a table, as a `watch` keeps its
+value, and a waiter compares against the table rather than waiting for the next notice. An
+entry goes when its ticket ends or its job is settled. An entry for an ID nothing claims
+within two minutes goes too. A duplicate notice costs at most one fetch: the relay fetches
+only past the revision and offset it holds. Notices are lost only with the session. The
+relay therefore takes a new session as one notice about everything it follows. Each
+waiter fetches once on the new connection: a job's view and its output from its offset, and a
+ticket, which answers 410 because its session ended (below). The new session's first diff
+starts from nothing, so it tells every object anew, harmlessly. As a backstop against a bug in the notices,
+a waiter that hears nothing for `MAX_WAIT_SECS` (60 s) fetches anyway, which is today's
+long-poll timeout without its held stream.
+
+**Tickets end with their session.** A ticket belongs to the session of the connection
+that queued it, not to whichever session is current when the request runs, as
+`current_session` gives it today. A request accepted just before a reconnect could otherwise
+bind its ticket to the new session. The queue and the claim take the connection's session
+number. Under the dispatch lock, which `relay_disconnected` also takes, they refuse with 503
+`unavailable` a session that is no longer current. So a ticket either exists before
+`relay_disconnected` ends its session's tickets or is never created. A waiting, offered or
+granted ticket of a version-5 session is not polled, so `TICKET_IDLE` does not expire it: it
+ends with its session or by its own lease. Ended tickets are still collected as today: idle
+expiry and eviction past `MAX_RETAINED_TICKETS` apply to them. Claimed admissions outlive
+the session, as today, and the next session's first heartbeat reconciles them.
+
+**Restarts.** *Hub handover*: when the gate closes, the hub closes every relay session with
+a WebSocket close, so that the connections drain: an HTTP/2 connection lives as long as its
+streams, and the session's stream would otherwise hold it for the whole `GRACE`. Fetches are
+short, so the connections end well within it. The relay redials into the listener's backlog,
+and the release accepts it. Its first heartbeat reconciles claims. Tickets granted but not
+claimed were in memory only and are lost, as they are today. The relay queues again on its
+fetch's 410. *Hub restart*: the same, after the relay's session backoff. *Relay restart*:
+unchanged. The state files list the relay's jobs, and each resumes with a fetch once the
+session is up. The new incarnation's session gets the notices for every unsettled job of the
+relay ID, including those the old incarnation submitted.
+
+**Flow control.** The session must not starve behind bulk bodies, in either direction. The
+relay bounds both directions: at most 4 output reads in flight, and at most 4 submissions,
+the only large request bodies (a spec of up to 512 KiB). Small requests are not bounded. From
+hub to relay, only output reads are large: at most `MAX_OUTPUT_READ` (1 MiB). The relay reads
+every answer whole as it arrives, already bounded by `MAX_ANSWER`, before writing anything to
+GitLab. So a slow trace patch never holds the window, and 4 MiB in flight stays within
+hyper's client connection window (5 MiB). From relay to hub, the hub reads each request body
+whole before handling it, and its connection window is raised from hyper's 1 MiB to 4 MiB,
+enough for the 4 submissions. Both windows therefore keep room for the session's stream
+whatever the bulk traffic does. The stream still shares the link's bandwidth: on a slow link
+a notice or heartbeat may wait behind up to 4 MiB in flight. The heartbeat's silence limit
+(`MISSED_HEARTBEATS`) must absorb that, which a saturation test on a throttled link checks
+(below). Streams are capped per connection (`MAX_CLIENT_STREAMS`, 512). Without long polls, a
+relay keeps far fewer requests in flight than that.
+
+**Before the session: limits.** An HTTP/2 connection whose session is not up yet is
+unauthenticated. It holds one of `MAX_PRE_AUTH` connection permits, and it must be
+authenticated within `3 * PRE_AUTH_TIMEOUT`, as an HTTP/1.1 one must be, or it is closed. It
+serves the session's `CONNECT`, which takes a handshake permit with each step bounded by
+`HANDSHAKE_STEP` as today, and nothing else: any other request is refused 403 `forbidden`.
+A second `CONNECT` on a connection that has had one is refused too: one session per
+connection. Once its session is up, a connection serves that relay's requests alone.
+Anything else, such as a bearer key or a signature, is refused 403 `forbidden`. hyper bounds
+header lists (`MAX_H2_HEADER_LIST`) and reset streams (rapid reset).
+
+**Off the connection.** Enrollment and release downloads stay on HTTP/1.1 connections of their own: `join` is one call, and a release
+would compete with the session for the window. `vk-peer` keeps HTTP/1.1-only TLS for them.
+
+**Compatibility.** The hub speaks `PROTOCOL` 1 to 5, and the transport decides which of these
+a relay's session gets. On HTTP/1.1 the hub's challenge offers 1 to 4. The relay's signed
+client API on HTTP/1.1, with its long polls and `TICKET_IDLE`, is unchanged for relays at 2
+to 4. On HTTP/2 the challenge offers 5 only, so the hub never pushes notices to a relay that
+cannot read them and never serves unsigned requests to one that did not authenticate the
+connection. The relay speaks `RELAY_PROTOCOL` 5 only and **refuses an older hub** instead of
+falling back. Falling back would keep the signed client, its HTTP/1.1 connections and every
+long poll alive in the relay for a configuration the upgrade order already excludes: hub
+first, then relays. A hub that negotiates `http/1.1` (every hub before this one), or whose SETTINGS do not enable the
+extended CONNECT, is treated as a `VersionRefused` hub. The relay logs that the hub must be
+upgraded, asks GitLab for no jobs, and redials at the longest backoff. Its held jobs wait.
+An update that an older hub pushes to such a release never reaches the session, so its trial
+rolls back to the previous binary. The DNS cache in `vk_peer::session::dial` is unchanged;
+the relay now dials once per session, not per request.
+
+**What changes in [the client API](gitlab-dispatch.md#daemon--hub-the-client-api).**
+Its first paragraph covers transports: one HTTP/2 connection (ALPN `vk-relay/1`) per relay
+at version 5, carrying its session and requests only, and HTTP/1.1 for relays at 2 to 4 and
+for API keys. *Authentication*: for a relay at 5 the
+connection's session authenticates; signatures remain for 2 to 4. *Session*: version 5, its
+transport, and the two notices. *Long polls*: a relay at 5
+does not use them, and `wait` is refused 400 `invalid` on its connection. *Reservations* and [Admission
+and reservations](gitlab-dispatch.md#admission-and-reservations): a version-5 ticket ends
+with its session, with no idle expiry. The error table: 400 `invalid` for `wait` on a
+relay's connection, 403 `forbidden` for a request before the session or of another
+principal, and 503 `unavailable` once the connection's session has ended. 401
+`unauthorized` stays for a relay's signature (2 to 4) and a bearer key. [Job
+flow](gitlab-dispatch.md#job-flow) steps 1 and 7: notified, then fetched. In this document,
+[Jobs](#jobs)' paragraph on signatures and [Protocol](#protocol) take version 5.
+
+**Implementation order.** Each step builds and runs alone. (1) Proto, additive: `PROTOCOL`
+raised to 5, `HubRelayMsg::Ticket` and `HubRelayMsg::Job`, with JSON pinned, and arms in
+vk-gitlab's exhaustive match on `HubRelayMsg` that refuse them. A new `RELAY_WORK` (2) names
+the version the hub takes new work from, which the hub's admission check and the UI read
+today as `RELAY_PROTOCOL.min`. `RELAY_PROTOCOL` stays as it is. (2) Hub: HTTP/2 under
+`vk-relay/1` alone, with the extended CONNECT, h2c detection on plain listeners, and the
+relay's session over it at version 5 only. The connection is marked at the welcome, serves that relay's
+unsigned requests (with `wait` refused), and closes with its session. Also the pre-session
+limits, the notice records, tickets and claims bound to their connection's session, and
+sessions closed on handover. Released relays (2 to 4) are unaffected. (3) vk-peer: a dial offering `vk-relay/1` that
+opens the session over the extended CONNECT and hands back the connection's request sender
+beside the `Ws`. A hub that answers `http/1.1` is refused. (4) vk-gitlab: `RELAY_PROTOCOL` 5,
+one connection shared by the session and the hub client, and the notice table. The
+`Dispatcher`'s waits become "notice, or `MAX_WAIT_SECS`, then fetch", so the poll loop and
+`FakeDispatcher` keep their contract, with the grant's send instant. Also the caps on output
+reads and submissions in flight, and removal of the request signatures and the per-request
+HTTP/1.1 connections. A test drives a relay over a throttled link, with outputs and
+submissions saturating it, and checks that its session survives. (5) Docs and CHANGELOG.
+
 ## Approval on the hub
 
 | Item | Becomes pending when | Approve | Effect |
