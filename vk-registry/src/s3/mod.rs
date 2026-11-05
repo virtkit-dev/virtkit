@@ -5,7 +5,17 @@
 //! nothing new is stored; or by the bearer, Basic or session credential the other routes
 //! take. Every answer carries an `x-amz-request-id`, and refusals are S3's XML `Error`.
 //! Presigned URLs and temporary credentials are refused.
+//!
+//! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
+//! one, served over the object layer the WebDAV view shares ([`crate::files`]): [`bucket`]
+//! answers the service and its buckets, [`object`] the objects. Operations not served yet
+//! answer `NotImplemented`.
 
+mod bucket;
+mod conditional;
+mod meta;
+mod object;
+mod path;
 mod sigv4;
 mod xml;
 
@@ -17,6 +27,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode};
 use vk_hub_proto::token::Claims;
 
+use crate::files::{MAX_OBJECT, PutError};
 use crate::{Authenticator, Authz, Body, ServerState, accounts, hubtoken};
 
 /// Whether `path` is one this module answers.
@@ -35,12 +46,11 @@ const REQUEST_ID: &str = "x-amz-request-id";
 /// Serve one `/s3/…` request, from its credentials on: [`crate::route`] hands every such
 /// request here before its own gate when S3 is on.
 pub(crate) async fn route(state: &ServerState, req: Request<Incoming>) -> Result<Response<Body>> {
-    let id = accounts::random_token(8);
-    let path = req.uri().path().to_string();
     let ctx = Ctx {
-        id: &id,
-        path: &path,
+        id: accounts::random_token(8),
+        path: req.uri().path().to_string(),
     };
+    let id = &ctx.id;
     let mut resp = match serve(state, req, &ctx).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -49,24 +59,49 @@ pub(crate) async fn route(state: &ServerState, req: Request<Incoming>) -> Result
         }
     };
     let headers = resp.headers_mut();
-    headers.insert(REQUEST_ID, HeaderValue::from_str(&id)?);
+    headers.insert(REQUEST_ID, HeaderValue::from_str(id)?);
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     Ok(resp)
 }
 
 /// What every answer to a request names: its id and the path it asked for.
-struct Ctx<'a> {
-    id: &'a str,
-    path: &'a str,
+#[derive(Clone)]
+struct Ctx {
+    id: String,
+    path: String,
 }
 
-impl Ctx<'_> {
+impl Ctx {
     fn error(&self, status: StatusCode, code: &str, message: &str) -> Response<Body> {
-        xml::error(status, code, message, &[], self.path, self.id)
+        xml::error(status, code, message, &[], &self.path, &self.id)
+    }
+
+    fn not_implemented(&self) -> Response<Body> {
+        self.error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "this registry does not serve that operation",
+        )
+    }
+
+    fn access_denied(&self) -> Response<Body> {
+        self.error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the credential grants nothing for this bucket or key",
+        )
+    }
+
+    fn too_large(&self) -> Response<Body> {
+        self.error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "EntityTooLarge",
+            "an object is at most 4 GiB",
+        )
     }
 }
 
-fn internal_error(ctx: &Ctx<'_>) -> Response<Body> {
+fn internal_error(ctx: &Ctx) -> Response<Body> {
     ctx.error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "InternalError",
@@ -92,11 +127,7 @@ impl Who {
     }
 }
 
-async fn serve(
-    state: &ServerState,
-    req: Request<Incoming>,
-    ctx: &Ctx<'_>,
-) -> Result<Response<Body>> {
+async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result<Response<Body>> {
     let headers = req.headers();
     // Browsers attach cookies or Basic credentials to cross-site requests, as on every
     // other machine route.
@@ -139,7 +170,7 @@ async fn serve(
     };
 
     // A hub managing the registry may make it refuse writes for a while.
-    if state.store.read_only() && crate::is_store_write(req.method(), ctx.path) {
+    if state.store.read_only() && crate::is_store_write(req.method(), &ctx.path) {
         let mut resp = ctx.error(
             StatusCode::SERVICE_UNAVAILABLE,
             "ServiceUnavailable",
@@ -147,40 +178,88 @@ async fn serve(
         );
         resp.headers_mut()
             .insert(RETRY_AFTER, HeaderValue::from_static("60"));
-        return crate::dav::refuse(req, resp, ctx.path).await;
+        return refuse(req, resp, ctx).await;
     }
-    unserved(&who.authz(), req, ctx).await
+    operate(state, &who.authz(), req, ctx).await
 }
 
-/// The answer to an authenticated request while no S3 operation is served: a read of an
-/// object or a bucket finds nothing, whoever `_authz` names, and anything else is not
-/// implemented. The body is read through first, as after any authenticated refusal.
-async fn unserved(
-    _authz: &Authz<'_>,
+/// The query parameter an AWS SDK adds to name the operation it calls, which says nothing
+/// the method and path do not.
+const OPERATION_HINT: &str = "x-id";
+
+/// The subresource a query names (`location`, `attributes`, `uploads`…): `None` for a query
+/// of [`OPERATION_HINT`] at most, `Some("")` when it names more than one parameter or names
+/// one with a value — which nothing served here takes.
+fn subresource(query: &str) -> Option<&str> {
+    let mut names = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| p.split_once('=').map_or(*p, |(n, _)| n) != OPERATION_HINT);
+    let first = names.next()?;
+    Some(match (first.split_once('='), names.next()) {
+        (None | Some((_, "")), None) => first.trim_end_matches('='),
+        _ => "",
+    })
+}
+
+/// An authenticated request, to the operation its method, path and query name. What is not
+/// served answers `NotImplemented` once the body is read, as every refusal past the gate does.
+async fn operate(
+    state: &ServerState,
+    authz: &Authz<'_>,
     req: Request<Incoming>,
-    ctx: &Ctx<'_>,
+    ctx: &Ctx,
 ) -> Result<Response<Body>> {
-    let rest = ctx.path.strip_prefix("/s3").unwrap_or_default();
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
-    let read = matches!(req.method(), &Method::GET | &Method::HEAD);
-    let resp = match rest.split_once('/') {
-        _ if !read || rest.is_empty() => ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "this registry does not serve that operation",
-        ),
-        None | Some((_, "")) => ctx.error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        ),
-        Some(_) => ctx.error(
-            StatusCode::NOT_FOUND,
-            "NoSuchKey",
-            "the specified key does not exist",
-        ),
+    let target = match path::parse(&ctx.path) {
+        Ok(target) => target,
+        Err(why) => {
+            let resp = ctx.error(StatusCode::BAD_REQUEST, why.code, why.message);
+            return refuse(req, resp, ctx).await;
+        }
     };
-    crate::dav::refuse(req, resp, ctx.path).await
+    let query = req.uri().query().unwrap_or("").to_string();
+    let sub = subresource(&query);
+    let method = req.method().clone();
+    match (target, &method, sub) {
+        (path::Target::Service, &Method::GET, None) => bucket::list(state, authz, req, ctx).await,
+        (path::Target::Bucket(b), &Method::HEAD, None) => {
+            bucket::head(state, authz, b, req, ctx).await
+        }
+        (path::Target::Bucket(b), &Method::GET, Some("location")) => {
+            bucket::location(state, authz, b, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::GET | &Method::HEAD, None) => {
+            object::get(state, authz, segs, method == Method::HEAD, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::GET, Some("attributes")) => {
+            object::attributes(state, authz, segs, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::PUT, None) => {
+            object::put(state, authz, segs, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::DELETE, None) => {
+            object::delete(state, authz, segs, req, ctx).await
+        }
+        _ => refuse(req, ctx.not_implemented(), ctx).await,
+    }
+}
+
+/// Answer `resp` once the request body has been read through, as after every refusal of an
+/// authenticated request: a status sent with request bytes unread resets the connection,
+/// which a client sees instead of the answer. A body past the object cap is refused with 413
+/// instead.
+async fn refuse(req: Request<Incoming>, resp: Response<Body>, ctx: &Ctx) -> Result<Response<Body>> {
+    Ok(drain(req, ctx).await?.unwrap_or(resp))
+}
+
+/// Read a request's body through and discard it: `Some(413)` if it crosses the object cap.
+async fn drain(req: Request<Incoming>, ctx: &Ctx) -> Result<Option<Response<Body>>> {
+    let sink = &mut tokio::io::sink();
+    match crate::files::drain_into(sink, req.into_body(), MAX_OBJECT, &mut |_| {}).await {
+        Ok(_) => Ok(None),
+        Err(PutError::TooLarge) => Ok(Some(ctx.too_large())),
+        Err(PutError::Failed(e)) => Err(e),
+    }
 }
 
 /// Answer `resp` to a request refused before it was authenticated, having read at most
@@ -207,7 +286,7 @@ fn is_presigned(query: &str) -> bool {
 fn presented(
     state: &ServerState,
     req: &Request<Incoming>,
-    ctx: &Ctx<'_>,
+    ctx: &Ctx,
 ) -> std::result::Result<Who, Box<Response<Body>>> {
     let denied = || {
         let message = if req.headers().contains_key(AUTHORIZATION) {
@@ -255,7 +334,7 @@ fn token(
 
 /// The answer when the accounts database could not be read: the release taking over is
 /// asked again, anything else is logged under the request's id.
-fn resolve_failed(e: anyhow::Error, ctx: &Ctx<'_>) -> Box<Response<Body>> {
+fn resolve_failed(e: anyhow::Error, ctx: &Ctx) -> Box<Response<Body>> {
     if accounts::is_handed_over_error(&e) {
         return Box::new(crate::ask_again(ctx.error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -279,7 +358,7 @@ fn resolve_failed(e: anyhow::Error, ctx: &Ctx<'_>) -> Box<Response<Body>> {
 fn signed_by(
     state: &ServerState,
     req: &Request<Incoming>,
-    ctx: &Ctx<'_>,
+    ctx: &Ctx,
 ) -> std::result::Result<Who, Box<Response<Body>>> {
     let headers = req.headers();
     let malformed = |why: &str| {
@@ -326,8 +405,8 @@ fn signed_by(
                     ("ServerTime", &server_time),
                     ("MaxAllowedSkewMilliseconds", &skew),
                 ],
-                ctx.path,
-                ctx.id,
+                &ctx.path,
+                &ctx.id,
             )));
         }
     }
@@ -390,8 +469,8 @@ fn signed_by(
             "SignatureDoesNotMatch",
             "the request signature does not match the one computed with the key's secret",
             &[("StringToSign", &sts), ("CanonicalRequest", &canonical)],
-            ctx.path,
-            ctx.id,
+            &ctx.path,
+            &ctx.id,
         )));
     }
     Ok(who)
@@ -431,6 +510,23 @@ mod tests {
         assert!(!is_presigned("list-type=2&prefix=X-Amz-Algorithm"));
         assert!(!is_presigned("x-amz-algorithm=1"));
         assert!(!is_presigned(""));
+    }
+
+    #[test]
+    fn a_query_names_one_subresource_or_none() {
+        assert_eq!(subresource(""), None);
+        assert_eq!(subresource("x-id=GetObject"), None);
+        assert_eq!(subresource("location"), Some("location"));
+        assert_eq!(subresource("location="), Some("location"));
+        assert_eq!(
+            subresource("attributes&x-id=GetObjectAttributes"),
+            Some("attributes")
+        );
+        assert_eq!(subresource("x-id=PutObject&tagging"), Some("tagging"));
+        assert_eq!(subresource("list-type=2"), Some(""));
+        assert_eq!(subresource("partNumber=1&uploadId=a"), Some(""));
+        assert_eq!(subresource("location&acl"), Some(""));
+        assert_eq!(subresource("versionId=null"), Some(""));
     }
 
     #[test]

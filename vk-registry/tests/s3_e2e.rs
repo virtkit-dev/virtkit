@@ -1,7 +1,8 @@
 //! S3 over real HTTP: the gate `/s3/` requests pass, under every authentication mode the
-//! server has. SigV4 requests are signed here by a signer of the tests' own, checked against
-//! AWS's published example; responses are read off a raw socket, so a test sees exactly what
-//! a connection carries and can send a second request on it.
+//! server has, and the operations on buckets and objects behind it. SigV4 requests are signed
+//! here by a signer of the tests' own, checked against AWS's published example; responses are
+//! read off a raw socket, so a test sees exactly what a connection carries and can send a
+//! second request on it.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -251,6 +252,11 @@ impl Req {
 
     /// Signed for `host` by `key` (id, secret), `skew` seconds off now (UNSIGNED-PAYLOAD).
     fn signed(self, host: &str, key: (&str, &str), skew: i64) -> Self {
+        self.signed_payload(host, key, skew, UNSIGNED)
+    }
+
+    /// [`Req::signed`] with `payload` as the `x-amz-content-sha256` the signature binds.
+    fn signed_payload(self, host: &str, key: (&str, &str), skew: i64, payload: &str) -> Self {
         let at = stamp(vk_peer::now_secs().saturating_add_signed(skew));
         let auth = authorization(
             self.method,
@@ -258,14 +264,14 @@ impl Req {
             &self.query,
             &[
                 ("host", host),
-                ("x-amz-content-sha256", UNSIGNED),
+                ("x-amz-content-sha256", payload),
                 ("x-amz-date", &at),
             ],
-            UNSIGNED,
+            payload,
             key,
             &at,
         );
-        self.header("x-amz-content-sha256", UNSIGNED)
+        self.header("x-amz-content-sha256", payload)
             .header("x-amz-date", &at)
             .header("Authorization", &auth)
     }
@@ -285,12 +291,13 @@ impl Req {
     }
 }
 
-/// A response: its status, headers (names lowercase) and body.
+/// A response: its status, headers (names lowercase) and body, also as text.
 #[derive(Debug)]
 struct Resp {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    bytes: Vec<u8>,
 }
 
 impl Resp {
@@ -301,10 +308,9 @@ impl Resp {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The status, the S3 headers every `/s3/` answer carries, and for an error its XML
-    /// `Code` and the request id the header names.
+    /// The status and the S3 headers every `/s3/` answer carries.
     #[track_caller]
-    fn is(&self, status: u16, code: &str) -> &Self {
+    fn ok(&self, status: u16) -> &Self {
         assert_eq!(self.status, status, "{self:?}");
         let id = self.header("x-amz-request-id").expect("a request id");
         assert!(
@@ -312,6 +318,14 @@ impl Resp {
             "{id}"
         );
         assert_eq!(self.header("x-content-type-options"), Some("nosniff"));
+        self
+    }
+
+    /// [`Resp::ok`], and for an error its XML `Code` and the request id the header names.
+    #[track_caller]
+    fn is(&self, status: u16, code: &str) -> &Self {
+        self.ok(status);
+        let id = self.header("x-amz-request-id").expect("a request id");
         assert_eq!(self.header("content-type"), Some("application/xml"));
         assert!(
             self.body
@@ -359,10 +373,16 @@ impl Conn {
             .await
             .unwrap();
         write.write_all(&req.body).await.unwrap();
-        self.response().await
+        self.response_to(req.method == "HEAD").await
     }
 
     async fn response(&mut self) -> Resp {
+        self.response_to(false).await
+    }
+
+    /// The next response; `head` when it answers a HEAD, which has no body whatever its
+    /// `Content-Length` says.
+    async fn response_to(&mut self, head: bool) -> Resp {
         let mut line = String::new();
         self.read.read_line(&mut line).await.unwrap();
         let status = line
@@ -384,13 +404,15 @@ impl Conn {
         let len: usize = headers
             .iter()
             .find(|(n, _)| n == "content-length")
+            .filter(|_| !head)
             .map_or(0, |(_, v)| v.parse().unwrap());
-        let mut body = vec![0; len];
-        self.read.read_exact(&mut body).await.unwrap();
+        let mut bytes = vec![0; len];
+        self.read.read_exact(&mut bytes).await.unwrap();
         Resp {
             status,
             headers,
-            body: String::from_utf8(body).unwrap(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
         }
     }
 
@@ -486,20 +508,24 @@ async fn an_open_server_checks_no_signature_but_refuses_presigned_and_tokens() {
     send(&host, get("/s3/b/k/deeper"))
         .await
         .is(404, "NoSuchKey");
-    send(&host, get("/s3/b")).await.is(404, "NoSuchBucket");
-    send(&host, get("/s3/b/")).await.is(404, "NoSuchBucket");
-    send(&host, get("/s3/")).await.is(501, "NotImplemented");
-    send(&host, get("/s3")).await.is(501, "NotImplemented");
+    // Listing a bucket is not served yet; listing the buckets is not on an open server.
+    send(&host, get("/s3/b")).await.is(501, "NotImplemented");
+    send(&host, get("/s3/b/")).await.is(501, "NotImplemented");
+    send(&host, get("/s3/")).await.is(403, "AccessDenied");
+    send(&host, get("/s3")).await.is(403, "AccessDenied");
     send(
         &host,
         Req::new("PUT", "/s3/b/k").body(b"Hello, World!".to_vec()),
     )
     .await
-    .is(501, "NotImplemented");
+    .ok(200);
+    let resp = send(&host, get("/s3/b/k")).await;
+    resp.ok(200);
+    assert_eq!(resp.body, "Hello, World!");
     // Any key will do, its signature unchecked.
     send(
         &host,
-        get("/s3/b/k").signed(&host, ("anyone", "anything"), 0),
+        get("/s3/b/absent").signed(&host, ("anyone", "anything"), 0),
     )
     .await
     .is(404, "NoSuchKey");
@@ -546,20 +572,24 @@ async fn a_shared_bearer_is_the_access_key_and_its_secret() {
         .is(404, "NoSuchKey");
     sigv4_refusals(&host, ("s3cret", "s3cret")).await;
 
-    // A hub token is a key too, signed or as a bearer; an expired one, or one for another
-    // registry, is not.
+    // A hub token is a key too, signed or as a bearer, for what its grants cover; an expired
+    // one, or one for another registry, is not.
     let now = vk_peer::now_secs();
     let token = signer.sign(hub_claims(AUD, now - 1, now + 600)).unwrap();
-    send(&host, get().signed(&host, (&token, &token), 0))
+    let granted = || Req::new("GET", "/s3/p/gl/42/k");
+    send(&host, granted().signed(&host, (&token, &token), 0))
         .await
         .is(404, "NoSuchKey");
     send(
         &host,
-        get().header("Authorization", &format!("Bearer {token}")),
+        granted().header("Authorization", &format!("Bearer {token}")),
     )
     .await
     .is(404, "NoSuchKey");
-    send(&host, get().signed(&host, (&token, "other"), 0))
+    send(&host, get().signed(&host, (&token, &token), 0))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, granted().signed(&host, (&token, "other"), 0))
         .await
         .is(403, "SignatureDoesNotMatch");
     for bad in [
@@ -804,6 +834,739 @@ async fn a_read_only_registry_refuses_writes_with_retry_after() {
         assert_eq!(resp.header("retry-after"), Some("60"));
     }
     send(&host, Req::new("GET", "/s3/b/k"))
+        .await
+        .is(404, "NoSuchKey");
+}
+
+// ---- objects and buckets ----
+
+const HELLO: &[u8] = b"Hello, World!";
+const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+fn md5_hex(b: &[u8]) -> String {
+    hex(&md5::compute(b).0)
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    hex(&sha2::Sha256::digest(b))
+}
+
+fn b64(b: &[u8]) -> String {
+    vk_hub_proto::to_base64(b)
+}
+
+/// Files in `uploads/`, where a PUT stages its object.
+fn staging_left(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("store/uploads")).map_or(0, |d| {
+        d.filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .count()
+    })
+}
+
+/// How a test's requests are authenticated: a function from a request to the signed one.
+type Sign<'a> = &'a dyn Fn(Req) -> Req;
+
+/// What every served object carries, beside its bytes.
+#[track_caller]
+fn is_object(resp: &Resp, body: &[u8]) {
+    resp.ok(200);
+    assert_eq!(resp.bytes, body);
+    assert_eq!(
+        resp.header("content-length"),
+        Some(&*body.len().to_string())
+    );
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(resp.header("content-disposition"), Some("attachment"));
+    assert!(resp.header("last-modified").is_some(), "{resp:?}");
+    assert_eq!(resp.header("accept-ranges"), None);
+    assert_eq!(resp.header("docker-content-digest"), None);
+}
+
+/// What `sccache` does with its S3 backend, OpenDAL's requests: its startup probe of
+/// `.sccache_check`, the probe written, a cache entry written and read back, and the HEAD
+/// OpenDAL's `stat` sends.
+async fn sccache_sequence(host: &str, sign: Sign<'_>, prefix: &str) {
+    let check = format!("/s3/sccache/{prefix}.sccache_check");
+    send(host, sign(Req::new("GET", &check)))
+        .await
+        .is(404, "NoSuchKey");
+    let resp = send(host, sign(Req::new("PUT", &check).body(HELLO.to_vec()))).await;
+    resp.ok(200);
+    let etag = format!("\"{}\"", md5_hex(HELLO));
+    assert_eq!(resp.header("etag"), Some(&*etag));
+    let resp = send(host, sign(Req::new("GET", &check))).await;
+    is_object(&resp, HELLO);
+    assert_eq!(resp.header("etag"), Some(&*etag));
+
+    let entry: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let key = format!(
+        "/s3/sccache/{prefix}a/b/c/{}",
+        sha256_hex(b"an entry's key")
+    );
+    send(host, sign(Req::new("PUT", &key).body(entry.clone())))
+        .await
+        .ok(200);
+    let resp = send(host, sign(Req::new("GET", &key))).await;
+    is_object(&resp, &entry);
+    assert_eq!(
+        resp.header("etag"),
+        Some(&*format!("\"{}\"", md5_hex(&entry)))
+    );
+    let resp = send(host, sign(Req::new("HEAD", &key))).await;
+    resp.ok(200);
+    assert!(resp.bytes.is_empty());
+    assert_eq!(
+        resp.header("content-length"),
+        Some(&*entry.len().to_string())
+    );
+    assert_eq!(resp.header("content-disposition"), Some("attachment"));
+}
+
+#[tokio::test]
+async fn the_sccache_sequence_round_trips_on_an_open_server() {
+    let dir = tmp("sccache-open");
+    let host = spawn(open_state(&dir, true));
+    sccache_sequence(&host, &|r| r, "").await;
+    let signed = |r: Req| r.signed(&host, ("anyone", "anything"), 0);
+    sccache_sequence(&host, &signed, "ci/").await;
+    assert_eq!(staging_left(&dir), 0);
+}
+
+#[tokio::test]
+async fn the_sccache_sequence_round_trips_with_an_api_key() {
+    let dir = tmp("sccache-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let scopes = [Scope {
+        action: Action::Write,
+        repo_pattern: "files/*".to_string(),
+    }];
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "s3", &scopes, None)
+        .unwrap();
+    let host = spawn(state.clone());
+    let signed = |r: Req| r.signed(&host, (&key, &key), 0);
+    sccache_sequence(&host, &signed, "ci/").await;
+    // The bearer on the same paths still works.
+    let bearer = |r: Req| r.header("Authorization", &format!("Bearer {key}"));
+    sccache_sequence(&host, &bearer, "other/").await;
+}
+
+/// The payload modes: unsigned, or the body's SHA-256, which the body must then have. A
+/// streamed `aws-chunked` body is not decoded yet, so it is refused and its framing never
+/// becomes an object.
+#[tokio::test]
+async fn a_put_body_is_unsigned_or_its_signed_sha256_and_streaming_waits() {
+    let dir = tmp("payload");
+    let (state, _) = shared(
+        &dir,
+        Auth::Bearer {
+            token: "s3cret".into(),
+        },
+        true,
+    );
+    let host = spawn(state);
+    let key = ("s3cret", "s3cret");
+    let put = |path: &str, body: &[u8]| Req::new("PUT", path).body(body.to_vec());
+    let get = |path: &str| Req::new("GET", path).signed(&host, key, 0);
+
+    send(&host, put("/s3/b/unsigned", HELLO).signed(&host, key, 0))
+        .await
+        .ok(200);
+    is_object(&send(&host, get("/s3/b/unsigned")).await, HELLO);
+
+    // The body's own digest, any case.
+    let hex = sha256_hex(HELLO);
+    for (path, digest) in [
+        ("/s3/b/hex", hex.clone()),
+        ("/s3/b/HEX", hex.to_uppercase()),
+    ] {
+        let req = put(path, HELLO).signed_payload(&host, key, 0, &digest);
+        send(&host, req).await.ok(200);
+        is_object(&send(&host, get(path)).await, HELLO);
+    }
+    // Another body's: refused, and nothing tagged.
+    let req = put("/s3/b/mismatch", b"Hello, World?").signed_payload(&host, key, 0, &hex);
+    send(&host, req).await.is(400, "XAmzContentSHA256Mismatch");
+    send(&host, get("/s3/b/mismatch"))
+        .await
+        .is(404, "NoSuchKey");
+    let req = put("/s3/b/garbage", HELLO).signed_payload(&host, key, 0, "not-a-digest");
+    send(&host, req).await.is(400, "InvalidArgument");
+
+    // AWS's chunked framing, signed or announced: not stored as the object it would become.
+    let framed = b"d;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n\
+Hello, World!\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n";
+    for (path, req) in [
+        (
+            "/s3/b/streaming",
+            put("/s3/b/streaming", framed).signed_payload(
+                &host,
+                key,
+                0,
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            ),
+        ),
+        (
+            "/s3/b/trailer",
+            put("/s3/b/trailer", framed).signed_payload(
+                &host,
+                key,
+                0,
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            ),
+        ),
+        (
+            "/s3/b/chunked",
+            put("/s3/b/chunked", framed)
+                .header("Content-Encoding", "aws-chunked")
+                .header("x-amz-decoded-content-length", "13")
+                .signed(&host, key, 0),
+        ),
+    ] {
+        send(&host, req).await.is(501, "NotImplemented");
+        send(&host, get(path)).await.is(404, "NoSuchKey");
+    }
+    assert!(
+        !dir.join("store/repos/files/b/tags/streaming").exists()
+            && !dir.join("store/repos/files/b/tags/chunked").exists()
+    );
+    assert_eq!(staging_left(&dir), 0);
+
+    // A declared length past 4 GiB is refused before a byte is read.
+    let req = put("/s3/b/big", b"").signed(&host, key, 0);
+    let head = req.head(&host).replace(
+        "Content-Length: 0",
+        &format!("Content-Length: {}", (4u64 << 30) + 1),
+    );
+    let mut conn = Conn::open(&host).await;
+    conn.write
+        .as_mut()
+        .unwrap()
+        .write_all(head.as_bytes())
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
+        .await
+        .expect("answered unread");
+    resp.is(413, "EntityTooLarge");
+    assert_eq!(staging_left(&dir), 0);
+}
+
+#[tokio::test]
+async fn a_put_checks_the_digests_it_is_sent() {
+    let dir = tmp("digests");
+    let host = spawn(open_state(&dir, true));
+    let put = |path: &str, (name, value): (&str, &str)| {
+        Req::new("PUT", path)
+            .header(name, value)
+            .body(HELLO.to_vec())
+    };
+    let get = |path: &str| Req::new("GET", path);
+    let other = b"Hello, World?";
+    let sha1 = |b: &[u8]| {
+        use sha1::Digest as _;
+        sha1::Sha1::digest(b).to_vec()
+    };
+    let crc = |b: &[u8]| crc32fast::hash(b).to_be_bytes().to_vec();
+    let good: Vec<(&str, String)> = vec![
+        ("Content-MD5", b64(&md5::compute(HELLO).0)),
+        ("x-amz-checksum-sha256", b64(&sha2::Sha256::digest(HELLO))),
+        ("x-amz-checksum-sha1", b64(&sha1(HELLO))),
+        ("x-amz-checksum-crc32", b64(&crc(HELLO))),
+    ];
+    let bad: Vec<(&str, String)> = vec![
+        ("Content-MD5", b64(&md5::compute(other).0)),
+        ("x-amz-checksum-sha256", b64(&sha2::Sha256::digest(other))),
+        ("x-amz-checksum-sha1", b64(&sha1(other))),
+        ("x-amz-checksum-crc32", b64(&crc(other))),
+    ];
+    for (i, (name, value)) in good.iter().enumerate() {
+        let path = format!("/s3/b/good{i}");
+        let resp = send(&host, put(&path, (name, value))).await;
+        resp.ok(200);
+        if name.starts_with("x-amz-checksum") {
+            assert_eq!(resp.header(name), Some(value.as_str()), "{name}");
+        }
+        is_object(&send(&host, get(&path)).await, HELLO);
+    }
+    for (i, (name, value)) in bad.iter().enumerate() {
+        let path = format!("/s3/b/bad{i}");
+        send(&host, put(&path, (name, value)))
+            .await
+            .is(400, "BadDigest");
+        send(&host, get(&path)).await.is(404, "NoSuchKey");
+    }
+    send(&host, put("/s3/b/x", ("Content-MD5", "AAAA")))
+        .await
+        .is(400, "InvalidDigest");
+    send(&host, put("/s3/b/x", ("x-amz-checksum-sha256", "AAAA")))
+        .await
+        .is(400, "InvalidRequest");
+    // Not checked, so taken.
+    send(&host, put("/s3/b/c", ("x-amz-checksum-crc32c", "AAAAAA==")))
+        .await
+        .ok(200);
+    assert_eq!(staging_left(&dir), 0);
+
+    // On a read, the SHA-256 the store has, when asked.
+    let resp = send(&host, get("/s3/b/good0")).await;
+    assert_eq!(resp.header("x-amz-checksum-sha256"), None);
+    let asked = get("/s3/b/good0").header("x-amz-checksum-mode", "ENABLED");
+    let resp = send(&host, asked).await;
+    is_object(&resp, HELLO);
+    assert_eq!(
+        resp.header("x-amz-checksum-sha256"),
+        Some(&*b64(&sha2::Sha256::digest(HELLO)))
+    );
+    let asked = Req::new("HEAD", "/s3/b/good0").header("x-amz-checksum-mode", "enabled");
+    let resp = send(&host, asked).await;
+    resp.ok(200);
+    assert_eq!(
+        resp.header("x-amz-checksum-sha256"),
+        Some(&*b64(&sha2::Sha256::digest(HELLO)))
+    );
+}
+
+#[tokio::test]
+async fn user_metadata_round_trips_and_no_content_type_is_kept() {
+    let dir = tmp("meta");
+    let host = spawn(open_state(&dir, true));
+    let resp = send(
+        &host,
+        Req::new("PUT", "/s3/b/m")
+            .header("Content-Type", "text/html")
+            .header("x-amz-meta-mtime", "1700000000")
+            .header("X-Amz-Meta-Foo-Bar", "baz qux")
+            .body(b"<script>".to_vec()),
+    )
+    .await;
+    resp.ok(200);
+    for method in ["GET", "HEAD"] {
+        let resp = send(&host, Req::new(method, "/s3/b/m")).await;
+        resp.ok(200);
+        assert_eq!(resp.header("x-amz-meta-mtime"), Some("1700000000"));
+        assert_eq!(resp.header("x-amz-meta-foo-bar"), Some("baz qux"));
+        assert_eq!(
+            resp.header("content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(resp.header("content-disposition"), Some("attachment"));
+    }
+    // Replaced whole: metadata not sent again is gone.
+    send(&host, Req::new("PUT", "/s3/b/m").body(HELLO.to_vec()))
+        .await
+        .ok(200);
+    let resp = send(&host, Req::new("GET", "/s3/b/m")).await;
+    assert_eq!(resp.header("x-amz-meta-mtime"), None);
+
+    let put = |name: &str, value: &str| {
+        Req::new("PUT", "/s3/b/refused")
+            .header(name, value)
+            .body(HELLO.to_vec())
+    };
+    send(&host, put("x-amz-meta-big", &"v".repeat(2048)))
+        .await
+        .is(400, "MetadataTooLarge");
+    send(&host, put("x-amz-meta-a_b", "v"))
+        .await
+        .is(400, "InvalidArgument");
+    send(&host, Req::new("GET", "/s3/b/refused"))
+        .await
+        .is(404, "NoSuchKey");
+}
+
+#[tokio::test]
+async fn conditional_headers_decide_reads_and_writes() {
+    let dir = tmp("conditional");
+    let host = spawn(open_state(&dir, true));
+    let put = |path: &str, body: &[u8]| Req::new("PUT", path).body(body.to_vec());
+    // Create only.
+    let create = |path: &str, body: &[u8]| put(path, body).header("If-None-Match", "*");
+    send(&host, create("/s3/b/k", HELLO)).await.ok(200);
+    send(&host, create("/s3/b/k", b"again"))
+        .await
+        .is(412, "PreconditionFailed");
+    let etag = format!("\"{}\"", md5_hex(HELLO));
+    // Compare and swap.
+    send(
+        &host,
+        put("/s3/b/k", b"swapped").header("If-Match", "\"0000\""),
+    )
+    .await
+    .is(412, "PreconditionFailed");
+    send(&host, put("/s3/b/absent", HELLO).header("If-Match", &etag))
+        .await
+        .is(412, "PreconditionFailed");
+    let resp = send(&host, put("/s3/b/k", b"swapped").header("If-Match", &etag)).await;
+    resp.ok(200);
+    let etag = format!("\"{}\"", md5_hex(b"swapped"));
+    assert_eq!(resp.header("etag"), Some(&*etag));
+    send(&host, put("/s3/b/k", HELLO).header("If-None-Match", &etag))
+        .await
+        .is(501, "NotImplemented");
+    assert_eq!(staging_left(&dir), 0);
+
+    let modified = send(&host, Req::new("GET", "/s3/b/k"))
+        .await
+        .header("last-modified")
+        .unwrap()
+        .to_string();
+    let past = "Mon, 01 Jan 2001 00:00:00 GMT";
+    let future = "Fri, 01 Jan 2100 00:00:00 GMT";
+    for method in ["GET", "HEAD"] {
+        let read = |name: &str, value: &str| Req::new(method, "/s3/b/k").header(name, value);
+        let served = |r: &Resp| {
+            r.ok(200);
+            assert_eq!(r.header("etag"), Some(&*etag));
+        };
+        let not_modified = |r: &Resp| {
+            r.ok(304);
+            assert_eq!(r.header("etag"), Some(&*etag));
+            assert!(r.bytes.is_empty());
+        };
+        let failed = |r: &Resp| {
+            r.ok(412);
+            if method == "GET" {
+                r.is(412, "PreconditionFailed");
+            }
+        };
+        served(&send(&host, read("If-Match", &etag)).await);
+        failed(&send(&host, read("If-Match", "\"other\"")).await);
+        not_modified(&send(&host, read("If-None-Match", &etag)).await);
+        served(&send(&host, read("If-None-Match", "\"other\"")).await);
+        not_modified(&send(&host, read("If-Modified-Since", &modified)).await);
+        not_modified(&send(&host, read("If-Modified-Since", future)).await);
+        served(&send(&host, read("If-Modified-Since", past)).await);
+        served(&send(&host, read("If-Unmodified-Since", &modified)).await);
+        failed(&send(&host, read("If-Unmodified-Since", past)).await);
+        // If-Match outranks a failing If-Unmodified-Since.
+        let both = read("If-Match", &etag).header("If-Unmodified-Since", past);
+        served(&send(&host, both).await);
+    }
+}
+
+#[tokio::test]
+async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
+    let dir = tmp("objects");
+    let state = open_state(&dir, true);
+    let store = state.store.clone();
+    let host = spawn(state);
+    let put = |path: &str| Req::new("PUT", path).body(HELLO.to_vec());
+    send(&host, put("/s3/b/k")).await.ok(200);
+    send(&host, put("/s3/b/d/x")).await.ok(200);
+
+    // GetObjectAttributes.
+    let attrs = |which: &str| {
+        Req::new("GET", "/s3/b/k")
+            .query("attributes")
+            .header("x-amz-object-attributes", which)
+    };
+    let resp = send(&host, attrs("ETag,ObjectSize, Checksum")).await;
+    resp.ok(200);
+    assert!(resp.header("last-modified").is_some());
+    assert_eq!(
+        resp.body,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetObjectAttributesResponse \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>{}</ETag><Checksum>\
+             <ChecksumSHA256>{}</ChecksumSHA256></Checksum><ObjectSize>13</ObjectSize>\
+             </GetObjectAttributesResponse>",
+            md5_hex(HELLO),
+            b64(&sha2::Sha256::digest(HELLO))
+        )
+    );
+    send(&host, attrs("Nonsense"))
+        .await
+        .is(400, "InvalidArgument");
+    send(&host, Req::new("GET", "/s3/b/k").query("attributes"))
+        .await
+        .is(400, "InvalidArgument");
+    send(&host, attrs("ETag").path_of("/s3/b/absent"))
+        .await
+        .is(404, "NoSuchKey");
+
+    // Not served yet: other subresources, other verbs, copies.
+    for req in [
+        Req::new("GET", "/s3/b/k").query("tagging"),
+        Req::new("GET", "/s3/b/k").query("partNumber=1"),
+        Req::new("POST", "/s3/b/k").query("uploads"),
+        Req::new("GET", "/s3/b").query("list-type=2"),
+        put("/s3/b/copy").header("x-amz-copy-source", "/b/k"),
+    ] {
+        send(&host, req).await.is(501, "NotImplemented");
+    }
+    send(&host, Req::new("GET", "/s3/b/copy"))
+        .await
+        .is(404, "NoSuchKey");
+    // The SDK's operation hint is no subresource.
+    let resp = send(&host, Req::new("GET", "/s3/b/k").query("x-id=GetObject")).await;
+    is_object(&resp, HELLO);
+
+    // Keys the store cannot name.
+    for (path, code) in [
+        ("/s3/b/a%2Fb", "InvalidArgument"),
+        ("/s3/b/a%20b", "InvalidArgument"),
+        ("/s3/b/k/", "InvalidArgument"),
+        ("/s3/b/tags/x", "InvalidArgument"),
+        ("/s3/b/%2E%2E/x", "InvalidArgument"),
+        ("/s3/b/a+b", "InvalidArgument"),
+        ("/s3/tags/x", "InvalidBucketName"),
+    ] {
+        send(&host, put(path)).await.is(400, code);
+    }
+    let long = format!("/s3/b/{}", "x".repeat(256));
+    send(&host, put(&long)).await.is(400, "KeyTooLongError");
+
+    // Where an object cannot go: a directory, below an object, over a foreign tag.
+    store
+        .put_manifest(
+            "files/b/img",
+            "v1",
+            MANIFEST_TYPE,
+            br#"{"schemaVersion":2}"#,
+        )
+        .unwrap();
+    for path in ["/s3/b/d", "/s3/b/k/below", "/s3/b/img/v1"] {
+        let resp = send(&host, put(path)).await;
+        resp.is(409, "OperationAborted");
+    }
+    send(&host, Req::new("GET", "/s3/b/img/v1"))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, Req::new("GET", "/s3/b/d"))
+        .await
+        .is(404, "NoSuchKey");
+
+    // DeleteObject: 204 there or not; a directory has no object to delete; a foreign tag is
+    // not this view's.
+    send(&host, Req::new("DELETE", "/s3/b/k")).await.ok(204);
+    send(&host, Req::new("GET", "/s3/b/k"))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, Req::new("DELETE", "/s3/b/k")).await.ok(204);
+    send(&host, Req::new("DELETE", "/s3/nobucket/k"))
+        .await
+        .ok(204);
+    send(&host, Req::new("DELETE", "/s3/b/d")).await.ok(204);
+    is_object(&send(&host, Req::new("GET", "/s3/b/d/x")).await, HELLO);
+    send(&host, Req::new("DELETE", "/s3/b/img/v1"))
+        .await
+        .is(409, "OperationAborted");
+    assert!(dir.join("store/repos/files/b/img/tags/v1").is_file());
+    assert_eq!(staging_left(&dir), 0);
+}
+
+impl Req {
+    /// The same request at another path.
+    fn path_of(mut self, path: &str) -> Self {
+        self.path = path.to_string();
+        self
+    }
+}
+
+#[tokio::test]
+async fn buckets_are_the_top_level_directories() {
+    let dir = tmp("buckets");
+    let host = spawn(open_state(&dir, true));
+    send(&host, Req::new("PUT", "/s3/b/k").body(HELLO.to_vec()))
+        .await
+        .ok(200);
+    send(&host, Req::new("HEAD", "/s3/b")).await.ok(200);
+    send(&host, Req::new("HEAD", "/s3/b/")).await.ok(200);
+    send(&host, Req::new("HEAD", "/s3/none")).await.ok(404);
+    let location = |path: &str| Req::new("GET", path).query("location");
+    let resp = send(&host, location("/s3/b")).await;
+    resp.ok(200);
+    assert_eq!(
+        resp.body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+    );
+    let resp = send(&host, location("/s3/b").signed(&host, ("any", "any"), 0)).await;
+    assert!(
+        resp.body.ends_with(">us-east-1</LocationConstraint>"),
+        "{}",
+        resp.body
+    );
+    send(&host, location("/s3/none"))
+        .await
+        .is(404, "NoSuchBucket");
+}
+
+/// Accounts mode: what each key may do follows its scopes, as on `/dav/files/`.
+#[tokio::test]
+async fn api_keys_reach_what_their_scopes_cover() {
+    let dir = tmp("scopes");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let key = |action, pattern: &str| {
+        let scopes = [Scope {
+            action,
+            repo_pattern: pattern.to_string(),
+        }];
+        db.create_api_key(Some(&user.id), pattern, &scopes, None)
+            .unwrap()
+            .1
+    };
+    let writer = key(Action::Write, "files/*");
+    let reader = key(Action::Read, "files/*");
+    let prefix = key(Action::Read, "files/b/p/*");
+    let on_key = key(Action::Read, "files/b/k/*");
+    let bucket_b = key(Action::Read, "files/b/*");
+    let host = spawn(state.clone());
+    let as_ = |k: &str, r: Req| r.signed(&host, (k, k), 0);
+    let put = |path: &str| Req::new("PUT", path).body(HELLO.to_vec());
+    let get = |path: &str| Req::new("GET", path);
+    for path in ["/s3/b/p/x", "/s3/b/q/y", "/s3/b/k", "/s3/c/z"] {
+        send(&host, as_(&writer, put(path))).await.ok(200);
+    }
+
+    // A read-only key's write is refused, its body read through first.
+    let resp = send(
+        &host,
+        as_(&reader, put("/s3/b/p/new").body(vec![7; 1 << 20])),
+    )
+    .await;
+    resp.is(403, "AccessDenied");
+    send(&host, as_(&reader, Req::new("DELETE", "/s3/b/k")))
+        .await
+        .is(403, "AccessDenied");
+    is_object(&send(&host, as_(&reader, get("/s3/b/k"))).await, HELLO);
+
+    // A prefix-scoped key reads its prefix and nothing beside it.
+    is_object(&send(&host, as_(&prefix, get("/s3/b/p/x"))).await, HELLO);
+    send(&host, as_(&prefix, get("/s3/b/p/absent")))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, as_(&prefix, get("/s3/b/q/y")))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, as_(&prefix, Req::new("HEAD", "/s3/b")))
+        .await
+        .ok(403);
+    // Holding the key's own path but not the bucket it is in: absent, not refused.
+    send(&host, as_(&on_key, get("/s3/b/k")))
+        .await
+        .is(404, "NoSuchKey");
+
+    // The buckets listed are those the key may read.
+    let buckets = |k: &str| {
+        let k = k.to_string();
+        let host = host.clone();
+        async move {
+            let resp = send(&host, get("/s3/").signed(&host, (&k, &k), 0)).await;
+            resp.ok(200);
+            assert!(
+                resp.body.contains(
+                    "<Owner><ID>vk-registry</ID><DisplayName>vk-registry</DisplayName></Owner>"
+                ),
+                "{}",
+                resp.body
+            );
+            resp.body
+                .split("<Name>")
+                .skip(1)
+                .map(|s| s.split('<').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(buckets(&writer).await, ["b", "c"]);
+    assert_eq!(buckets(&bucket_b).await, ["b"]);
+    assert!(buckets(&prefix).await.is_empty());
+    let resp = send(&host, as_(&writer, get("/s3/"))).await;
+    assert!(resp.body.contains("<CreationDate>"), "{}", resp.body);
+}
+
+/// A hub token's grants cover `files/<prefix>`.
+#[tokio::test]
+async fn a_hub_token_writes_and_reads_below_its_grant() {
+    let dir = tmp("hub");
+    let (state, signer) = shared(
+        &dir,
+        Auth::Bearer {
+            token: "s3cret".into(),
+        },
+        true,
+    );
+    let host = spawn(state);
+    let now = vk_peer::now_secs();
+    let token = signer.sign(hub_claims(AUD, now - 1, now + 600)).unwrap();
+    let as_token = |r: Req| r.signed(&host, (&token, &token), 0);
+    send(
+        &host,
+        as_token(Req::new("PUT", "/s3/p/gl/42/k").body(HELLO.to_vec())),
+    )
+    .await
+    .ok(200);
+    is_object(
+        &send(&host, as_token(Req::new("GET", "/s3/p/gl/42/k"))).await,
+        HELLO,
+    );
+    send(
+        &host,
+        as_token(Req::new("PUT", "/s3/p/gl/43/k").body(HELLO.to_vec())),
+    )
+    .await
+    .is(403, "AccessDenied");
+}
+
+/// One object, three views: what S3 writes WebDAV and `/v2/` read, and the other way round.
+#[tokio::test]
+async fn s3_dav_and_v2_see_the_same_objects() {
+    let dir = tmp("views");
+    let host = spawn(open_state(&dir, true));
+    send(&host, Req::new("PUT", "/s3/b/d/k").body(HELLO.to_vec()))
+        .await
+        .ok(200);
+    let resp = send(
+        &host,
+        Req::new("PROPFIND", "/dav/files/b/d/").header("Depth", "1"),
+    )
+    .await;
+    assert_eq!(resp.status, 207);
+    assert!(
+        resp.body.contains("<D:href>/dav/files/b/d/k</D:href>"),
+        "{}",
+        resp.body
+    );
+    let resp = send(&host, Req::new("GET", "/dav/files/b/d/k")).await;
+    assert_eq!((resp.status, resp.bytes.as_slice()), (200, HELLO));
+    let resp = send(&host, Req::new("GET", "/v2/files/b/d/manifests/k")).await;
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.body
+            .contains(&format!("\"org.virtkit.md5\":\"{}\"", md5_hex(HELLO))),
+        "{}",
+        resp.body
+    );
+
+    // Written over WebDAV: the SHA-256 is its ETag.
+    let resp = send(
+        &host,
+        Req::new("PUT", "/dav/files/b/dav").body(HELLO.to_vec()),
+    )
+    .await;
+    assert_eq!(resp.status, 201);
+    let resp = send(&host, Req::new("GET", "/s3/b/dav")).await;
+    is_object(&resp, HELLO);
+    assert_eq!(
+        resp.header("etag"),
+        Some(&*format!("\"{}\"", sha256_hex(HELLO)))
+    );
+    let resp = send(&host, Req::new("DELETE", "/dav/files/b/dav")).await;
+    assert_eq!(resp.status, 204);
+    send(&host, Req::new("GET", "/s3/b/dav"))
         .await
         .is(404, "NoSuchKey");
 }

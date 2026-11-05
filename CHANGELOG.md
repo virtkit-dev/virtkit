@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The registry's plain-file area is also served as S3.** Under `/s3/` on `vk-registry`,
+  each top-level directory of the WebDAV `files/` area is a bucket, so `sccache`'s S3 backend
+  and other S3 clients can share a compiler cache or files with it: point them at
+  `https://<registry>/s3` with any region, and use the registry credential (an API key, a hub
+  token or the shared bearer) as both the access key and the secret access key, or the shared
+  Basic user and its password. Objects can be written, read with conditional headers and
+  checksums, given metadata and deleted, and are the same files WebDAV and `vk registry get`
+  see. Listing objects, multipart and chunked uploads, ranges and copies are not served yet.
+  Set `s3 = false` in the server config to turn it off.
+
 ## [0.106.0] - 2026-11-05
 
 ### Added

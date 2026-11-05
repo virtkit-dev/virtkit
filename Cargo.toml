@@ -128,9 +128,14 @@ oci-client = { version = "0.18", default-features = false }
 flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
 sha2 = "0.11"
-# vk-tpm's SHA-1 PCR bank (TPM 2.0 keeps one for compatibility). RustCrypto, like sha2; already
-# in the tree via russh.
+# vk-tpm's SHA-1 PCR bank (TPM 2.0 keeps one for compatibility), and vk-registry's check of an
+# S3 upload's x-amz-checksum-sha1. RustCrypto, like sha2; already in the tree via russh.
 sha1 = "0.11"
+# vk-registry: the MD5 an S3 object's ETag is, and the check of a Content-MD5. Already in the
+# tree via russh.
+md5 = "0.8"
+# vk-registry: the check of an S3 upload's x-amz-checksum-crc32. Already in the tree via flate2.
+crc32fast = "1.5"
 # vk-tpm: the TPM's entropy (TPM2_GetRandom, its seeds) from the OS. Already in the tree via rand.
 getrandom = "0.4"
 # vk-tpm: constant-time comparison of authorization values. Already in the tree via the

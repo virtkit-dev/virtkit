@@ -558,6 +558,112 @@ an entry alive as a writer's do. There is no per-directory policy and no size ca
 replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
 left in `uploads/` goes with the idle uploads.
 
+## S3 view (`/s3/`)
+
+The `files/` area is also served as S3, path-style, under `/s3/`, through the same listener,
+TLS and credentials: a bucket is a top-level `files/` directory and an object key the path
+below it, so `PUT /s3/sccache/a/b/abcdef` writes the same tag `/dav/files/sccache/a/b/abcdef`
+names. Nothing new is stored, and the WebDAV view, `/v2/`, `/browse`, `vk registry get` and
+the gc see the same entries. S3 is enabled by default. Set `s3 = false` to disable it: `/s3/`
+requests then return the 404 any unknown path returns, after the usual authentication, and
+the server logs this setting at startup.
+
+```text
+/s3/                          the buckets: top-level directories of files/
+/s3/<bucket>                  files/<bucket>
+/s3/<bucket>/<key…>           the object files/<bucket>/<key…> names, as in /dav/files/
+```
+
+Clients take `endpoint = https://<registry>/s3` and any region: `sccache` with
+`SCCACHE_BUCKET=<bucket> SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto`
+(`SCCACHE_S3_KEY_PREFIX` names a directory inside the bucket). Virtual-hosted style, which
+needs wildcard DNS, is not served.
+
+**Credentials.** SigV4 needs the server to hold the signing secret, and this registry stores
+API keys only as hashes and never mints hub tokens, so no new secret is introduced: the
+access key id is a credential the registry already takes, and the secret access key is the
+same string. In accounts mode `AWS_ACCESS_KEY_ID=vkr_…` and `AWS_SECRET_ACCESS_KEY=vkr_…`,
+the same value; a hub token likewise, in either mode, when the registry takes them; the
+shared bearer likewise. With a shared Basic user, the access key id is the user name and the
+secret its password, which then never crosses the wire; a user name holding `/` cannot be an
+access key id, since the credential scope is split from the right. The access key id is
+authenticated first, exactly as the bearer it would be, so revocation, expiry and scopes
+apply unchanged, and only then is its secret used to check the signature; an unknown id is
+403 `InvalidAccessKeyId`, a wrong signature 403 `SignatureDoesNotMatch` (with the string to
+sign and canonical request, as AWS answers). The request's time must be on the scope's day
+and within 15 minutes of the server's (403 `RequestTimeTooSkewed`, naming the server's
+time). The usual `Authorization: Bearer|Basic` and the session cookie keep working on `/s3/`;
+a request with no credential on a server that requires one is S3's 403 `AccessDenied`, not
+the 401 challenge. On a server with no credential configured, signatures are not checked, as
+nothing else is. Presigned (query-string) URLs are refused with 400
+`AuthorizationQueryParametersError`, since they put a credential in a URL and so in logs, and
+temporary credentials (`x-amz-security-token`) with 400 `InvalidToken`.
+
+The exposure is today's: a bearer travels in clear under TLS and so does an access key id,
+while the signature also binds the method, path, query, signed headers and a timestamp. With
+`UNSIGNED-PAYLOAD`, which OpenDAL and most SDKs send, a captured `Authorization` header can be
+replayed with another body to the same key for those 15 minutes, as a captured bearer can be
+for as long as it is good.
+
+**Keys** follow the store's name rules as they are; there is no escaping scheme. A bucket is
+one component; a key is 1 to 14 components (16 counting `files` and the bucket), each a run of
+`[A-Za-z0-9._-]` of at most 255 bytes, not `.`, `..`, `tags`, `manifests` or `blobs`, the whole
+key at most 1024 bytes, no empty component and no trailing slash, so there are no "directory
+marker" objects. Paths are split before they are percent-decoded, as WebDAV's are, so `%2F`
+cannot smuggle a separator. Anything else is 400 `InvalidArgument`, `KeyTooLongError` or
+`InvalidBucketName`, with a message naming the rule. `sccache`'s keys (`a/b/c/<hex>`,
+`.sccache_check`) pass.
+
+**Authorization** is the WebDAV view's: a `PUT` needs `Write` on the key's parent repository,
+a read `Read` on the repository the key resolves to, and a `DELETE` `Write` there; a caller
+holding the action on neither the key's own name nor its parent's is 403 `AccessDenied` before
+anything is looked up, and what it may not read is otherwise absent (`NoSuchKey`). A write
+refused over a clash answers 409 and so reveals that the name exists, as WebDAV's does. A
+bucket authorizes as `files/<bucket>`. Listing the buckets needs a configured credential, as
+`/dav/`'s root listing does, and shows only those the caller may read.
+
+**Objects are bytes.** Every object is served `application/octet-stream`,
+`Content-Disposition: attachment` and `nosniff`, whatever its writer sent: a `Content-Type`
+is not stored, for the reason manifest media types are restricted (this origin also serves
+`/browse` and holds the session cookie). An object's ETag is the MD5 of its bytes, quoted,
+which a `PutObject` computes in the same pass as the SHA-256 and records on the manifest as
+`org.virtkit.md5`; an object written otherwise (WebDAV, `vk registry put`, `/upload`) has no
+MD5 and its ETag is its SHA-256, quoted — 64 hex digits, which a client checking an ETag as
+an MD5 sees is not one. User metadata (`x-amz-meta-<name>`, names `[a-z0-9-]`, at most 2 KiB
+of names and values) is kept on the manifest as `org.virtkit.s3-meta.<name>` and sent back on
+reads; a replaced object keeps only what its own write sent.
+
+| Request | Answer |
+|---|---|
+| `PUT /s3/<b>/<k>` PutObject | 200 with `ETag`; streamed to `uploads/` while hashed (SHA-256, MD5, and the SHA-1 or CRC32 when asked), then tagged under the namespace lock as a WebDAV `PUT` is. `x-amz-content-sha256` is `UNSIGNED-PAYLOAD` or the body's SHA-256, else 400 `XAmzContentSHA256Mismatch` and nothing is tagged. `Content-MD5` and `x-amz-checksum-{sha256,sha1,crc32}` are checked (400 `BadDigest`; 400 `InvalidDigest`/`InvalidRequest` when malformed) and the checksums echoed; `crc32c` and `crc64nvme` are taken unchecked. `If-None-Match: *` (create only) and `If-Match: <etag>` (replace only that object; an absent one fails too) are checked under the lock the tag is written under: 412 `PreconditionFailed`. 409 `OperationAborted` onto a directory, below an object, or over a foreign tag; 413 `EntityTooLarge` past 4 GiB, declared or streamed; 400 `MetadataTooLarge` |
+| `GET`, `HEAD /s3/<b>/<k>` GetObject, HeadObject | 200 with the bytes, `ETag`, `Last-Modified` from the tag, `Content-Length` and the metadata; `x-amz-checksum-sha256` (the store's digest, base64) with `x-amz-checksum-mode: ENABLED`. `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since` in RFC 9110's order: 412 `PreconditionFailed`, or 304 with the `ETag`. `Range` is ignored and no `Accept-Ranges` is sent: a whole 200 is a legal answer. A directory, a foreign tag or a missing key is 404 `NoSuchKey`. A `GET` refreshes an idle tag as WebDAV's does; a `HEAD` touches nothing |
+| `GET /s3/<b>/<k>?attributes` GetObjectAttributes | 200 `GetObjectAttributesResponse` with what `x-amz-object-attributes` names of `ETag`, `Checksum` (SHA-256), `StorageClass` (`STANDARD`) and `ObjectSize`, and `Last-Modified`; 400 `InvalidArgument` without the header; touches nothing |
+| `DELETE /s3/<b>/<k>` DeleteObject | 204 whether or not the key held an object, as S3 answers, and for a key that is a directory, which holds no object to delete; 409 `OperationAborted` for a foreign tag; 403 when the caller may read the object but not write it |
+| `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 without `Read` on `files/<b>` |
+| `GET /s3/<b>?location` GetBucketLocation | the region the request was signed for, which is any the client chose, or an empty `LocationConstraint` for an unsigned request; after HeadBucket's checks |
+| `GET /s3/` ListBuckets | `ListAllMyBucketsResult`: the readable top-level directories, each dated by its directory's mtime, and the owner `vk-registry`; 403 `AccessDenied` on a server with no credential |
+| anything else | 501 `NotImplemented`: listing a bucket's objects, creating and deleting buckets, copies, batch deletes, multipart uploads, `aws-chunked` bodies (`STREAMING-*` payloads, `Content-Encoding: aws-chunked`), tagging, ACLs, versioning and every other subresource; an SDK's `x-id` operation hint is ignored |
+
+**`LastModified` moves on reads**, as `getlastmodified` does over WebDAV: a `GET` refreshes
+the tag's mtime once it is an hour old, which is what keeps a hot cache entry from the gc's
+retention. Sync tools that compare modification times (`aws s3 sync`, rclone `--update`) see
+it; they keep the source file's own time in user metadata.
+
+**Errors** are S3's XML `Error` documents (`Code`, `Message`, `Resource`, `RequestId`, and
+the extra elements AWS sends, such as `ServerTime` or `Condition`), so a client shows a code
+rather than a bare status. Every `/s3/` response carries an `x-amz-request-id` of 16 hex
+digits and `nosniff`; an internal error logs its request id, so a client's report can be
+matched to the server's line. A refusal decided before the caller is authenticated reads at
+most 64 KiB of the body first, enough for `sccache`'s 13-byte probe to see its answer rather
+than a reset; every refusal after it reads the body through, up to the 4 GiB cap, as
+WebDAV's do. A refusal of a request with a body then closes the connection. A registry its
+hub made read-only answers writes 503 `ServiceUnavailable` with `Retry-After`.
+
+S3 writes into `files/` take the WebDAV view's namespace lock, run their store work on the
+blocking pool and stream their bodies on the runtime. Objects expire under the gc's tag
+retention like every `files/` entry ("Lifecycle" above): a PutObject writes no retention
+annotation.
+
 ## Accounts administration
 
 `vk-registry accounts` manages users, sessions, administrators, and API keys. The command
@@ -813,7 +919,9 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   `/browse`, `status` and `gc`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
-  "WebDAV view").
+  "WebDAV view"). A key reaches exactly the same content over `/v2/`, `/dav/` and `/s3/`.
+- SigV4 needs the server's clock within 15 minutes of its clients'. A reverse proxy in front
+  of `/s3/` must pass `Host` and the path unchanged, since the signature covers both.
 - The store directory must be writable only by trusted local users. Requests can follow
   symlinks in parent directories under `repos/files/`; checks reject only a symlink at the
   final path component. Preventing this requires descriptor-relative path resolution.
@@ -825,6 +933,6 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
 - The server has no durable request audit log. Administrative changes are logged to stderr:
   `accounts admin: <peer>:` identifies the admin socket peer; `accounts web: <identity>:`
   identifies the session for browse and settings changes (tag deletion, API key minting and
-  revocation, captions, uploads). Writes through `/v2/` and WebDAV, including tag removal
+  revocation, captions, uploads). Writes through `/v2/`, WebDAV and S3, including tag removal
   and replacement, are not audited.
 - OIDC trusts platform roots only and caches discovery until restart.

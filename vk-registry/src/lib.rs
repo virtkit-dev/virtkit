@@ -2935,7 +2935,27 @@ pub fn raw_file_title(manifest: &[u8]) -> Option<String> {
 /// any other shape: an image pushed over `/v2/` into a `files/` repository is not a file
 /// the WebDAV view serves.
 pub fn raw_file_layer(manifest: &[u8]) -> Option<(String, u64)> {
+    raw_file_layer_of(&serde_json::from_slice(manifest).ok()?)
+}
+
+/// [`raw_file_layer`] and the manifest's string annotations, from one parse; an annotation
+/// whose value is not a string is left out.
+pub(crate) fn raw_file_parts(manifest: &[u8]) -> Option<(String, u64, BTreeMap<String, String>)> {
     let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    let (hex, size) = raw_file_layer_of(&v)?;
+    let annotations = v
+        .pointer("/annotations")
+        .and_then(|a| a.as_object())
+        .map(|a| {
+            a.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((hex, size, annotations))
+}
+
+fn raw_file_layer_of(v: &serde_json::Value) -> Option<(String, u64)> {
     let [layer] = v.pointer("/layers")?.as_array()?.as_slice() else {
         return None;
     };
