@@ -1454,6 +1454,165 @@ async fn a_put_checks_the_digests_it_is_sent() {
     assert_eq!(resp.header("x-amz-checksum-type"), None);
 }
 
+/// An object uploaded in parts is read back a part at a time, as the AWS CLI and SDKs
+/// download it: each part as it was sent, with the count of them; an object written whole
+/// is its one part; a part there is not is refused as a range past the end is.
+#[tokio::test]
+async fn an_object_made_of_parts_is_read_a_part_at_a_time() {
+    let dir = tmp("parts");
+    let host = spawn(open_state(&dir, true));
+    let sign = |r: Req| r;
+    let path = "/s3/b/parts";
+    let id = create_upload(&host, &sign, path).await;
+    let parts: Vec<Vec<u8>> = vec![bytes_of_len(70_000), bytes_of_len(500), b"end".to_vec()];
+    let mut etags = Vec::new();
+    for (i, data) in parts.iter().enumerate() {
+        etags.push(upload_part(&host, &sign, path, &id, i as u32 + 1, data).await);
+    }
+    let named: Vec<(u32, &str)> = etags
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i as u32 + 1, e.as_str()))
+        .collect();
+    send(&host, complete(path, &id, &named)).await.ok(200);
+    let whole = parts.concat();
+    let etag = multipart_etag(&[&parts[0], &parts[1], &parts[2]]);
+    let mut start = 0;
+    for (i, data) in parts.iter().enumerate() {
+        let query = format!("partNumber={}", i + 1);
+        for method in ["GET", "HEAD"] {
+            let resp = send(&host, Req::new(method, path).query(&query)).await;
+            resp.ok(206);
+            assert_eq!(resp.header("x-amz-mp-parts-count"), Some("3"));
+            assert_eq!(resp.header("etag"), Some(&*etag));
+            assert_eq!(
+                resp.header("content-range"),
+                Some(&*format!(
+                    "bytes {start}-{}/{}",
+                    start + data.len() - 1,
+                    whole.len()
+                ))
+            );
+            assert_eq!(
+                resp.header("content-length"),
+                Some(&*data.len().to_string())
+            );
+            assert_eq!(resp.header("accept-ranges"), Some("bytes"));
+            if method == "GET" {
+                assert_eq!(resp.bytes, *data);
+            }
+        }
+        start += data.len();
+    }
+    let resp = send(&host, Req::new("GET", path).query("partNumber=4")).await;
+    resp.is(416, "InvalidPartNumber");
+    assert_eq!(element(&resp.body, "ActualPartCount"), "3");
+    assert_eq!(element(&resp.body, "PartNumberRequested"), "4");
+    for bad in [
+        "partNumber=0",
+        "partNumber=-3",
+        "partNumber=10001",
+        "partNumber=x",
+    ] {
+        send(&host, Req::new("GET", path).query(bad))
+            .await
+            .is(400, "InvalidArgument");
+    }
+    let both = Req::new("GET", path)
+        .query("partNumber=1")
+        .header("Range", "bytes=0-9");
+    send(&host, both).await.is(400, "InvalidRequest");
+    // The SDK's hint and the null version name nothing more.
+    let resp = send(
+        &host,
+        Req::new("GET", path).query("partNumber=3&versionId=null&x-id=GetObject"),
+    )
+    .await;
+    resp.ok(206);
+    assert_eq!(resp.bytes, b"end");
+    // The whole object, and a range of it, as before.
+    is_object(&send(&host, Req::new("GET", path)).await, &whole);
+    let resp = send(
+        &host,
+        Req::new("GET", path).header("Range", "bytes=70000-70499"),
+    )
+    .await;
+    resp.ok(206);
+    assert_eq!(resp.bytes, parts[1]);
+    assert_eq!(resp.header("x-amz-mp-parts-count"), None);
+
+    // Its parts among its attributes, paged.
+    let attrs = |which: &str| {
+        Req::new("GET", path)
+            .query("attributes")
+            .header("x-amz-object-attributes", which)
+    };
+    let resp = send(&host, attrs("ObjectParts,ObjectSize")).await;
+    resp.ok(200);
+    assert_eq!(
+        element(&resp.body, "ObjectParts"),
+        "<IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts><PartNumberMarker>0\
+         </PartNumberMarker><Part><PartNumber>1</PartNumber><Size>70000</Size></Part><Part>\
+         <PartNumber>2</PartNumber><Size>500</Size></Part><Part><PartNumber>3</PartNumber>\
+         <Size>3</Size></Part><PartsCount>3</PartsCount>"
+    );
+    assert_eq!(element(&resp.body, "ObjectSize"), "70503");
+    let resp = send(
+        &host,
+        attrs("ObjectParts")
+            .header("x-amz-max-parts", "1")
+            .header("x-amz-part-number-marker", "1"),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(elements(&resp.body, "PartNumber"), ["2"]);
+    assert_eq!(element(&resp.body, "IsTruncated"), "true");
+    assert_eq!(element(&resp.body, "NextPartNumberMarker"), "2");
+    send(&host, attrs("ObjectParts").header("x-amz-max-parts", "-1"))
+        .await
+        .is(400, "InvalidArgument");
+
+    // A copy is made of the same parts.
+    let copy = Req::new("PUT", "/s3/b/copy").header("x-amz-copy-source", "/b/parts");
+    send(&host, copy).await.ok(200);
+    let resp = send(&host, Req::new("GET", "/s3/b/copy").query("partNumber=2")).await;
+    resp.ok(206);
+    assert_eq!(resp.bytes, parts[1]);
+    assert_eq!(resp.header("x-amz-mp-parts-count"), Some("3"));
+
+    // An object written whole is its one part, with no count; one of no bytes is whole.
+    send(&host, Req::new("PUT", "/s3/b/one").body(HELLO.to_vec()))
+        .await
+        .ok(200);
+    for method in ["GET", "HEAD"] {
+        let resp = send(&host, Req::new(method, "/s3/b/one").query("partNumber=1")).await;
+        resp.ok(206);
+        assert_eq!(resp.header("content-range"), Some("bytes 0-12/13"));
+        assert_eq!(resp.header("content-length"), Some("13"));
+        assert_eq!(resp.header("x-amz-mp-parts-count"), None);
+    }
+    let resp = send(&host, Req::new("GET", "/s3/b/one").query("partNumber=2")).await;
+    resp.is(416, "InvalidPartNumber");
+    assert_eq!(element(&resp.body, "ActualPartCount"), "1");
+    let resp = send(&host, attrs("ObjectParts,ETag").path_of("/s3/b/one")).await;
+    resp.ok(200);
+    assert!(!resp.body.contains("ObjectParts"), "{}", resp.body);
+    let sha = b64(&sha2::Sha256::digest(b""));
+    let empty = Req::new("PUT", "/s3/b/empty").header("x-amz-checksum-sha256", &sha);
+    send(&host, empty).await.ok(200);
+    let resp = send(
+        &host,
+        Req::new("HEAD", "/s3/b/empty")
+            .query("partNumber=1")
+            .header("x-amz-checksum-mode", "ENABLED"),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(resp.header("content-range"), None);
+    assert_eq!(resp.header("content-length"), Some("0"));
+    assert_eq!(resp.header("x-amz-checksum-sha256"), Some(sha.as_str()));
+}
+
 /// The checksum a write carried, once it held, is the object's: sent back on a read asking
 /// for it, listed with the object, reported among its attributes, carried by a copy, and
 /// the one a completed upload's whole-object checksum becomes.
@@ -2167,7 +2326,7 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
 
     // Not served: other subresources and verbs, and parameters an operation does not take.
     for req in [
-        Req::new("GET", "/s3/b/k").query("partNumber=1"),
+        Req::new("GET", "/s3/b/k").query("partNumber=1&retention"),
         Req::new("GET", "/s3/b/k").query("retention"),
         Req::new("POST", "/s3/b/k").query("uploads&acl"),
         put("/s3/b/k").query("tagging"),

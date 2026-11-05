@@ -289,6 +289,16 @@ fn parse_query(raw: &str) -> Option<Vec<(String, String)>> {
         .collect()
 }
 
+/// The part a query asks of an object (`?partNumber=<n>`), as sent, when it names nothing
+/// else but [`implicit`] parameters.
+fn part_asked(params: &Params) -> Option<&str> {
+    let mut named = params.iter().filter(|p| !implicit(p));
+    match (named.next(), named.next()) {
+        (Some((name, value)), None) if name == "partNumber" => Some(value),
+        _ => None,
+    }
+}
+
 /// The subresource a query names (`location`, `attributes`, `uploads`…): `None` for a query
 /// of [`implicit`] parameters at most, `Some("")` when it names more than one other
 /// parameter or names one with a value — which nothing served here takes.
@@ -331,6 +341,20 @@ async fn operate(
     if let Some((status, code, message)) = canned::asked(req.headers()) {
         return refuse(req, ctx.error(status, code, message), ctx).await;
     }
+    let part = match part_asked(&query) {
+        None => None,
+        Some(value) => match multipart::part_number(value) {
+            Some(n) => Some(n),
+            None => {
+                let resp = ctx.error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Part number must be an integer between 1 and 10000, inclusive.",
+                );
+                return refuse(req, resp, ctx).await;
+            }
+        },
+    };
     let sub = subresource(&query);
     let method = req.method().clone();
     match (target, &method, sub) {
@@ -370,8 +394,10 @@ async fn operate(
         (path::Target::Bucket(b), &Method::POST, Some("delete")) => {
             batch::delete(state, authz, b, req, ctx).await
         }
-        (path::Target::Object { segs, .. }, &Method::GET | &Method::HEAD, None) => {
-            object::get(state, authz, segs, method == Method::HEAD, req, ctx).await
+        (path::Target::Object { segs, .. }, &Method::GET | &Method::HEAD, _)
+            if part.is_some() || sub.is_none() =>
+        {
+            object::get(state, authz, segs, method == Method::HEAD, part, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::GET, Some("attributes")) => {
             object::attributes(state, authz, segs, req, ctx).await
@@ -804,6 +830,15 @@ mod tests {
         assert_eq!(sub("x-id=PutObject&tagging"), Some("tagging".to_string()));
         assert_eq!(sub("list-type=2"), Some("".to_string()));
         assert_eq!(sub("partNumber=1&uploadId=a"), Some("".to_string()));
+        // A part of an object, and nothing else with it.
+        let part = |q: &str| part_asked(&parse_query(q).unwrap()).map(str::to_string);
+        assert_eq!(part("partNumber=3"), Some("3".to_string()));
+        assert_eq!(part("partNumber=x&x-id=GetObject"), Some("x".to_string()));
+        assert_eq!(part("partNumber=1&versionId=null"), Some("1".to_string()));
+        assert_eq!(part("partNumber=1&uploadId=a"), None);
+        assert_eq!(part("partNumber=1&versionId=2"), None);
+        assert_eq!(part("x-id=GetObject"), None);
+        assert_eq!(part(""), None);
         assert_eq!(sub("location&acl"), Some("".to_string()));
         // The null version is the object; any other is nothing served.
         assert_eq!(sub("versionId=null"), None);
