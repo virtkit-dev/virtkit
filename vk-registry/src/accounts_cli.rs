@@ -20,6 +20,7 @@
 //! person already holds working until they expire — `revoke-sessions` is what ends those.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
@@ -336,7 +337,21 @@ pub fn create_key(
     }
     eprintln!("Copy this token now — it is not stored and will not be shown again.");
     println!("{token}");
+    // Only where the token was just shown: a redirected stdout is the operator capturing
+    // it, and stderr may then be a log the token must not reach.
+    let shown = std::io::stdout().is_terminal().then_some(token.as_str());
+    eprint!("{}", s3_pair(shown));
     Ok(())
+}
+
+/// The key in the form S3 clients take it, for stderr after the token: the same string is
+/// both halves of the pair. `None` names the pair without the token in it.
+fn s3_pair(token: Option<&str>) -> String {
+    let token = token.unwrap_or("<token>");
+    format!(
+        "For S3 clients (endpoint https://<registry>/s3), the token is both the access key \
+         id and the secret:\nAWS_ACCESS_KEY_ID={token} AWS_SECRET_ACCESS_KEY={token}\n"
+    )
 }
 
 /// `ACTION:repo_pattern`, e.g. `write:team-a/*` or `read:*`.
@@ -658,6 +673,23 @@ mod tests {
         assert!(line.contains("owner=(unknown user)"), "{line}");
         assert!(!line.contains('\u{1f}'), "{line}");
         Ok(())
+    }
+
+    /// The S3 lines carry the token only when asked to, and as both halves of the pair.
+    #[test]
+    fn a_minted_key_is_also_shown_as_an_s3_pair() {
+        let shown = s3_pair(Some("vkr_abc"));
+        assert_eq!(
+            shown,
+            "For S3 clients (endpoint https://<registry>/s3), the token is both the access \
+             key id and the secret:\nAWS_ACCESS_KEY_ID=vkr_abc AWS_SECRET_ACCESS_KEY=vkr_abc\n"
+        );
+        let hidden = s3_pair(None);
+        assert!(!hidden.contains("vkr_"), "{hidden}");
+        assert!(
+            hidden.ends_with("AWS_ACCESS_KEY_ID=<token> AWS_SECRET_ACCESS_KEY=<token>\n"),
+            "{hidden}"
+        );
     }
 
     /// Drives every `accounts_cli` function in sequence against a real `Db` — the

@@ -179,15 +179,24 @@ async fn create(
             Some(Section::Keys),
             &Principal::Session(user.clone()),
             csrf_of(db, session_id.as_deref()).as_deref(),
-            &format!(
-                "<h1>New API key</h1>\n\
-                 <p>Copy this token now — it is not stored and will not be shown again:</p>\n\
-                 <pre>{}</pre>\n\
-                 <p><a href=\"/settings/keys\">&larr; back to keys</a></p>",
-                html_escape(&token)
-            ),
+            &minted(&token),
         ),
     ))
+}
+
+/// The one page a new key's token is ever shown on: as the bearer string, then as the pair
+/// S3 clients take, which is the same string twice.
+fn minted(token: &str) -> String {
+    let token = html_escape(token);
+    format!(
+        "<h1>New API key</h1>\n\
+         <p>Copy this token now — it is not stored and will not be shown again:</p>\n\
+         <pre>{token}</pre>\n\
+         <p>For S3 clients (endpoint <code>https://&lt;registry&gt;/s3</code>), the token is \
+         both the access key id and the secret:</p>\n\
+         <pre>AWS_ACCESS_KEY_ID={token} AWS_SECRET_ACCESS_KEY={token}</pre>\n\
+         <p><a href=\"/settings/keys\">&larr; back to keys</a></p>"
+    )
 }
 
 async fn revoke(
@@ -429,6 +438,21 @@ mod tests {
             ),
             "{plain}"
         );
+    }
+
+    /// The token is shown as the bearer and as both halves of the S3 pair, escaped each time.
+    #[test]
+    fn a_new_key_is_shown_as_a_bearer_and_as_an_s3_pair() {
+        let page = minted("vkr_<a&b>");
+        assert!(page.contains("<pre>vkr_&lt;a&amp;b&gt;</pre>"), "{page}");
+        assert!(
+            page.contains(
+                "<pre>AWS_ACCESS_KEY_ID=vkr_&lt;a&amp;b&gt; \
+                 AWS_SECRET_ACCESS_KEY=vkr_&lt;a&amp;b&gt;</pre>"
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("<a&b>"), "{page}");
     }
 
     #[test]
