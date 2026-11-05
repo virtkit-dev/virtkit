@@ -18,7 +18,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::path::MAX_KEY;
-use super::{Ctx, NULL_VERSION, Params, bucket, conditional, refuse, sigv4, xml};
+use super::{Ctx, NULL_VERSION, Params, bucket, checksum, conditional, refuse, sigv4, xml};
 use crate::files::{self, FILES_REPO, Node, Object, allowed, repo_name};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
@@ -449,8 +449,9 @@ impl Query {
 }
 
 /// The `ListBucketResult` or `ListVersionsResult` of a page: its parameters, then the
-/// objects (each a `Version` of id `null` in the latter), then the common prefixes, every
-/// caller string escaped and, under `encoding-type=url`, encoded.
+/// objects (each a `Version` of id `null` in the latter, each with the algorithm of the
+/// checksum its write kept, when one did), then the common prefixes, every caller string
+/// escaped and, under `encoding-type=url`, encoded.
 fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
     let enc = |s: &str| if q.url { url_encode(s) } else { s.to_string() };
     let mut out = xml::element("Name", bucket);
@@ -514,6 +515,9 @@ fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
             out.push_str(&version);
             out.push_str(&xml::element("LastModified", &iso8601(obj.modified)));
             out.push_str(&xml::element("ETag", &conditional::etag_of(obj)));
+            if let Some(kept) = checksum::stored(&obj.annotations) {
+                out.push_str(&kept.listed());
+            }
             out.push_str(&xml::element("Size", &obj.size.to_string()));
             if q.owner {
                 out.push_str(&bucket::owner());

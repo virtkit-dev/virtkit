@@ -3,8 +3,9 @@
 //! manifest whatever the size and the pool still holds the bytes once. The source is read
 //! as GetObject reads it and its conditions are its `x-amz-copy-source-if-*` headers; the
 //! destination is written as PutObject writes, its `If-None-Match: *`/`If-Match` checked
-//! where the tag is written. The source's MD5, and so its ETag, comes along; its user
-//! metadata too, unless `x-amz-metadata-directive: REPLACE` gives the request's instead.
+//! where the tag is written. The source's MD5, and so its ETag, comes along, and the checksum
+//! its write kept; its user metadata too, unless `x-amz-metadata-directive: REPLACE` gives
+//! the request's instead.
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -12,7 +13,7 @@ use hyper::{Request, Response, StatusCode};
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::object::{admitted, no_such_key, readable, unwritable};
-use super::{Ctx, NULL_VERSION, drain, list, meta, path, refuse, xml};
+use super::{Ctx, NULL_VERSION, checksum, drain, list, meta, path, refuse, xml};
 use crate::files::{self, Commit, FILES_REPO, Written, allowed, object_of};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
@@ -206,8 +207,11 @@ pub(super) async fn copy(
             return Ok(no_such_key(&ctx));
         }
         let mut annotations = replaced.unwrap_or_else(|| meta::carried(&obj.annotations));
-        if let Some(md5) = obj.annotations.get(MD5_ANNOTATION) {
-            annotations.insert(MD5_ANNOTATION.to_string(), md5.clone());
+        // Of the bytes, which are the same: the ETag and the checksum.
+        for name in [MD5_ANNOTATION, checksum::ANNOTATION] {
+            if let Some(value) = obj.annotations.get(name) {
+                annotations.insert(name.to_string(), value.clone());
+            }
         }
         let etag = conditional::etag(&obj.layer, &annotations);
         let how = Commit {
