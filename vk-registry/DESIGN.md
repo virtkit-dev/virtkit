@@ -605,7 +605,10 @@ access key id, since the credential scope is split from the right. The access ke
 authenticated first, exactly as the bearer it would be, so revocation, expiry and scopes
 apply unchanged, and only then is its secret used to check the signature; an unknown id is
 403 `InvalidAccessKeyId`, a wrong signature 403 `SignatureDoesNotMatch` (with the string to
-sign and canonical request, as AWS answers). The request's time must be on the scope's day
+sign and canonical request, as AWS answers). The signature must cover `host`, `x-amz-content-sha256`
+and, as S3 requires, every `x-amz-*` header the request carries: one left out is 403
+`AccessDenied` naming it in `HeadersNotSigned`, since anything on the way could have added
+it. The request's time must be on the scope's day
 and within 15 minutes of the server's (403 `RequestTimeTooSkewed`, naming the server's
 time). The usual `Authorization: Bearer|Basic` and the session cookie keep working on `/s3/`;
 a request with no credential on a server that requires one is S3's 403 `AccessDenied`, not

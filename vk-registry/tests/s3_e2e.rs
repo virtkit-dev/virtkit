@@ -361,22 +361,37 @@ impl Req {
     /// [`Req::signed`] with `payload` as the `x-amz-content-sha256` the signature binds.
     fn signed_payload(self, host: &str, key: (&str, &str), skew: i64, payload: &str) -> Self {
         let at = stamp(vk_peer::now_secs().saturating_add_signed(skew));
-        let auth = authorization(
+        let req = self
+            .header("x-amz-content-sha256", payload)
+            .header("x-amz-date", &at);
+        let auth = req.authorization(host, payload, key, &at);
+        req.header("Authorization", &auth)
+    }
+
+    /// The `Authorization` for this request as it is, signing `host` and every `x-amz-*`
+    /// header it carries, as S3 requires and SDKs do.
+    fn authorization(&self, host: &str, payload: &str, key: (&str, &str), at: &str) -> String {
+        let mut signed: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .map(|(n, v)| (n.to_ascii_lowercase(), v.clone()))
+            .filter(|(n, _)| n.starts_with("x-amz-"))
+            .chain([("host".to_string(), host.to_string())])
+            .collect();
+        signed.sort();
+        let signed: Vec<(&str, &str)> = signed
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        authorization(
             self.method,
             &self.path,
             &self.query,
-            &[
-                ("host", host),
-                ("x-amz-content-sha256", payload),
-                ("x-amz-date", &at),
-            ],
+            &signed,
             payload,
             key,
-            &at,
-        );
-        self.header("x-amz-content-sha256", payload)
-            .header("x-amz-date", &at)
-            .header("Authorization", &auth)
+            at,
+        )
     }
 
     /// `data` sent as an `aws-chunked` body framed by `mode` in 64 KiB chunks, signed for
@@ -389,34 +404,36 @@ impl Req {
         data: &[u8],
         trailer: Option<(&str, &str)>,
     ) -> Self {
+        self.chunked_declaring(host, key, mode, data, trailer, Some(data.len()))
+    }
+
+    /// [`Req::chunked`] declaring `decoded` as its `x-amz-decoded-content-length`, or none.
+    fn chunked_declaring(
+        self,
+        host: &str,
+        key: (&str, &str),
+        mode: Chunked,
+        data: &[u8],
+        trailer: Option<(&str, &str)>,
+        decoded: Option<usize>,
+    ) -> Self {
         let at = stamp(vk_peer::now_secs());
         let payload = mode.content_sha256();
-        let auth = authorization(
-            self.method,
-            &self.path,
-            &self.query,
-            &[
-                ("host", host),
-                ("x-amz-content-sha256", payload),
-                ("x-amz-date", &at),
-            ],
-            payload,
-            key,
-            &at,
-        );
-        let seed = auth.rsplit("Signature=").next().unwrap().to_string();
-        let signing = signing_key(key.1, &at[..8]);
-        let body = aws_chunked(mode, data, 64 * 1024, (&signing, &at, &seed), trailer);
         let mut req = self
             .header("x-amz-content-sha256", payload)
             .header("x-amz-date", &at)
-            .header("Authorization", &auth)
-            .header("Content-Encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string());
+            .header("Content-Encoding", "aws-chunked");
+        if let Some(decoded) = decoded {
+            req = req.header("x-amz-decoded-content-length", &decoded.to_string());
+        }
         if let Some((name, _)) = trailer {
             req = req.header("x-amz-trailer", name);
         }
-        req.body(body)
+        let auth = req.authorization(host, payload, key, &at);
+        let seed = auth.rsplit("Signature=").next().unwrap().to_string();
+        let signing = signing_key(key.1, &at[..8]);
+        let body = aws_chunked(mode, data, 64 * 1024, (&signing, &at, &seed), trailer);
+        req.header("Authorization", &auth).body(body)
     }
 
     /// This request with `name` sent as `value` instead of as it was.
@@ -647,6 +664,25 @@ async fn sigv4_refusals(host: &str, good: (&str, &str)) {
     )
     .await
     .is(400, "AuthorizationHeaderMalformed");
+    // An x-amz-* header the signature does not cover; signed, it passes.
+    let resp = send(
+        host,
+        get().signed(host, good, 0).header("X-Amz-Meta-X", "1"),
+    )
+    .await;
+    resp.is(403, "AccessDenied");
+    assert!(
+        resp.body
+            .contains("<HeadersNotSigned>x-amz-meta-x</HeadersNotSigned>"),
+        "{}",
+        resp.body
+    );
+    send(
+        host,
+        get().header("X-Amz-Meta-X", "1").signed(host, good, 0),
+    )
+    .await
+    .is(404, "NoSuchKey");
     // And the good key passes the gate, to find nothing yet.
     send(host, get().signed(host, good, 0))
         .await
@@ -1506,12 +1542,13 @@ async fn a_chunked_body_that_does_not_hold_leaves_nothing() {
     flip_after_last(&mut req.body, b"x-amz-trailer-signature:");
     cases.push(("/s3/b/trailer-sig", req, 403, "SignatureDoesNotMatch"));
     // The length the chunks hold, and what follows their end.
-    let short = (data.len() - 1).to_string();
-    let req = put("/s3/b/short", Chunked::Signed).replace("x-amz-decoded-content-length", &short);
+    let declaring = |path: &str, mode: Chunked, decoded: Option<usize>| {
+        let trailer = (mode != Chunked::Signed).then_some(("x-amz-checksum-crc32", crc.as_str()));
+        Req::new("PUT", path).chunked_declaring(&host, BEARER, mode, &data, trailer, decoded)
+    };
+    let req = declaring("/s3/b/short", Chunked::Signed, Some(data.len() - 1));
     cases.push(("/s3/b/short", req, 400, "InvalidChunkSizeError"));
-    let long = (data.len() + 1).to_string();
-    let req =
-        put("/s3/b/long", Chunked::UnsignedTrailer).replace("x-amz-decoded-content-length", &long);
+    let req = declaring("/s3/b/long", Chunked::UnsignedTrailer, Some(data.len() + 1));
     cases.push(("/s3/b/long", req, 400, "IncompleteBody"));
     let mut req = put("/s3/b/garbage", Chunked::Signed);
     req.body.extend_from_slice(b"\r\n");
@@ -1523,9 +1560,7 @@ async fn a_chunked_body_that_does_not_hold_leaves_nothing() {
     req.body.truncate(req.body.len() - 50);
     cases.push(("/s3/b/truncated", req, 400, "IncompleteBody"));
     // No decoded length at all.
-    let mut req = put("/s3/b/no-length", Chunked::Signed);
-    req.headers
-        .retain(|(n, _)| n != "x-amz-decoded-content-length");
+    let req = declaring("/s3/b/no-length", Chunked::Signed, None);
     cases.push(("/s3/b/no-length", req, 400, "InvalidRequest"));
 
     for (path, req, status, code) in cases {
@@ -1624,19 +1659,19 @@ async fn a_trailer_checksum_must_be_the_body_s() {
         let req = Req::new("PUT", "/s3/b/x").chunked(&host, BEARER, mode, &data, Some(crc));
         send(&host, req).await.is(400, "InvalidRequest");
         let req = Req::new("PUT", "/s3/b/x")
-            .chunked(&host, BEARER, mode, &data, None)
-            .header("x-amz-trailer", "x-amz-checksum-crc32");
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .chunked(&host, BEARER, mode, &data, None);
         send(&host, req).await.is(400, "MalformedTrailerError");
         let crc = crc32_b64(&data);
         let req = Req::new("PUT", "/s3/b/x")
+            .header("x-amz-checksum-crc32", &crc)
             .chunked(
                 &host,
                 BEARER,
                 mode,
                 &data,
                 Some(("x-amz-checksum-crc32", crc.as_str())),
-            )
-            .header("x-amz-checksum-crc32", &crc);
+            );
         send(&host, req).await.is(400, "InvalidRequest");
         send(&host, get("/s3/b/x")).await.is(404, "NoSuchKey");
     }
