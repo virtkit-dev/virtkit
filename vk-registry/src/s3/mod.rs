@@ -223,13 +223,14 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
         );
         return before_auth(req, resp).await;
     }
-    let signed = headers
-        .get(AUTHORIZATION)
-        .is_some_and(|v| v.as_bytes().starts_with(b"AWS4-HMAC-SHA256 "));
-    let who = if signed {
-        signed_by(state, &req, ctx)
-    } else {
-        presented(state, &req, ctx).map(|who| (who, None))
+    let who = match scheme(headers) {
+        Ok(true) => signed_by(state, &req, ctx),
+        Ok(false) => presented(state, &req, ctx).map(|who| (who, None)),
+        Err(why) => Err(Box::new(ctx.error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            why,
+        ))),
     };
     let (who, seed) = match who {
         Ok(who) => who,
@@ -385,6 +386,32 @@ async fn operate(
             object::delete(state, authz, segs, req, ctx).await
         }
         _ => refuse(req, ctx.not_implemented(), ctx).await,
+    }
+}
+
+/// Whether the `Authorization` header is SigV4's: `false` for none (the session cookie may
+/// stand in) or one of the schemes the other routes take, Basic and Bearer, which
+/// [`presented`] resolves; an error for any other scheme, or a value with no scheme, which
+/// S3 answers 400 as a signature version it does not take rather than 403 as a credential
+/// it refused.
+fn scheme(headers: &HeaderMap) -> std::result::Result<bool, &'static str> {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Ok(false);
+    };
+    let Ok(value) = value.to_str() else {
+        return Err("the Authorization header is not text");
+    };
+    let Some((scheme, _)) = value.split_once(' ') else {
+        return Err("the Authorization header names no scheme: a space follows the scheme");
+    };
+    if scheme == sigv4::ALGORITHM {
+        Ok(true)
+    } else if scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("bearer") {
+        Ok(false)
+    } else {
+        Err(
+            "the Authorization scheme is not one this registry takes: AWS4-HMAC-SHA256, Bearer or Basic",
+        )
     }
 }
 
@@ -680,6 +707,32 @@ fn bearer_of(id: &str) -> Option<HeaderMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_authorization_scheme_is_sigv4_one_of_ours_or_refused() {
+        let of = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(v) = value {
+                headers.insert(AUTHORIZATION, HeaderValue::from_str(v).unwrap());
+            }
+            scheme(&headers)
+        };
+        assert_eq!(of(None), Ok(false));
+        assert_eq!(of(Some("Basic dXNlcjpwYXNz")), Ok(false));
+        assert_eq!(of(Some("bearer vkr_x")), Ok(false));
+        assert_eq!(of(Some("AWS4-HMAC-SHA256 Credential=x")), Ok(true));
+        for bad in [
+            "",
+            "invalid_header",
+            "Basic",
+            "aws4-hmac-sha256 Credential=x",
+            "AWS2-HMAC-SHA1 Credential=x",
+            "AWS AKID:sig",
+            "Digest username=x",
+        ] {
+            assert!(of(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn only_s3_paths_are_s3() {
