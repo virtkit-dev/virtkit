@@ -332,7 +332,7 @@ async fn put(
     }
 
     // Stream uploads to bound memory use; the digest falls out of the same pass.
-    let staged = match crate::files::stage(&state.store, req.into_body()).await {
+    let staged = match crate::files::stage(&state.store, req.into_body(), &mut |_| {}).await {
         Ok(staged) => staged,
         Err(PutError::TooLarge) => {
             return Ok(error_response(
@@ -344,10 +344,14 @@ async fn put(
         Err(PutError::Failed(e)) => return Err(e),
     };
     Ok(
-        match crate::files::commit(Arc::clone(&state.store), segs, staged).await? {
+        match crate::files::commit(Arc::clone(&state.store), segs, staged, Default::default())
+            .await?
+        {
             Written::Created => created(),
             Written::Replaced => no_content(),
             Written::Refused(why) => put_refusal(why, href),
+            // Unreachable: no precondition was asked for.
+            Written::PreconditionFailed => no_content(),
         },
     )
 }
@@ -355,7 +359,14 @@ async fn put(
 /// Read a request's body through and discard it: a status sent with request bytes unread
 /// resets the connection. `Some(413)` if the body crosses the object cap on the way.
 pub(super) async fn drain(req: Request<Incoming>, href: &str) -> Result<Option<Response<Body>>> {
-    match drain_into(&mut tokio::io::sink(), req.into_body(), MAX_OBJECT).await {
+    match drain_into(
+        &mut tokio::io::sink(),
+        req.into_body(),
+        MAX_OBJECT,
+        &mut |_| {},
+    )
+    .await
+    {
         Ok(_) => Ok(None),
         Err(PutError::TooLarge) => Ok(Some(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
