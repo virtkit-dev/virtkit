@@ -105,7 +105,7 @@ fn delete_key(
 }
 
 /// `POST /s3/<bucket>?delete`: each key of the document deleted, or the reason it was not,
-/// in the order asked. A bucket that does not exist holds none of the keys, which all count
+/// in the order asked, a key the store fails on included. A bucket that does not exist holds none of the keys, which all count
 /// as deleted, as DeleteObject answers for each.
 pub(super) async fn delete(
     state: &ServerState,
@@ -131,6 +131,7 @@ pub(super) async fn delete(
         Ok(asked) => asked,
         Err(Malformed(why)) => return Ok(ctx.error(StatusCode::BAD_REQUEST, "MalformedXML", why)),
     };
+    let id = ctx.id.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         let namespace = files::namespace(store)?;
         let mut out = String::new();
@@ -141,7 +142,17 @@ pub(super) async fn delete(
                     "this registry keeps no versions: a key is deleted without a VersionId",
                 ))
             } else {
-                delete_key(store, &namespace, authz, &bucket, &entry.key)?
+                // A key the store fails on is that key's error; the batch goes on.
+                delete_key(store, &namespace, authz, &bucket, &entry.key).unwrap_or_else(|e| {
+                    eprintln!(
+                        "vk-registry: S3 request {id} could not delete {:?}: {e:#}",
+                        entry.key
+                    );
+                    Err((
+                        "InternalError",
+                        "the server could not delete this key; its log names this request id",
+                    ))
+                })
             };
             match outcome {
                 Ok(()) if asked.quiet => {}
