@@ -991,9 +991,25 @@ layers. The feature is opt-in and requires guest networking.
 The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
 `[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose
 grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/` and
-`/dav/files/` too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and
-OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`. A job without a token,
-a gitlab-runner job included, gets a proxy that refuses everything.
+`/dav/files/` and the S3 view (`/s3`) too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT,
+MKCOL, DELETE and OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`, and
+under `/s3` GET, HEAD, PUT, POST, DELETE and OPTIONS. A job without a token, a gitlab-runner
+job included, gets a proxy that refuses everything.
+
+On `/s3/`, the proxy replaces the guest's `Authorization` — SigV4 with dummy keys, or none —
+with the job's token, so the guest holds no key, and drops `x-amz-security-token`. An
+`aws-chunked` body passes as sent: authenticated by a bearer, its framing is decoded and its
+chunk signatures are not checked (see `aws-chunked` bodies above). The job's areas map as on
+`/dav/files/`: `/s3/job/<alias>/<key…>` is the key below the area's prefix, so for the prefix
+`a/b/c`, bucket `a` and key `b/c/<key…>`, and a copy's `x-amz-copy-source: /job/<alias>/<key>`
+likewise. `/s3/job/<alias>` alone is the area as a bucket: the real bucket `a`, whose listings
+(`ListObjects`, `ListObjectsV2`, `ListMultipartUploads`) are given the key prefix `b/c/`
+before their `prefix`, `start-after`, `marker` and `key-marker` and inside their
+`continuation-token`, a `prefix` when they name none; an area below its bucket takes only
+reads there, since creating, deleting or batch-deleting its bucket would act on all of `a`.
+The documents answering a request through an area name it back: the bucket as `<alias>`, keys,
+prefixes, markers and continuation tokens without `b/c/` (a key outside the area as it is),
+and the paths in `Location` and `Resource` as `/s3/job/<alias>/…`.
 
 ## Connection limits
 

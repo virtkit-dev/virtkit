@@ -23,7 +23,10 @@ All notable changes to virtkit will be documented in this file.
   and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts
   them. Set `s3 = false` in the server config to turn it off. A newly created API key is also
   shown as the S3 key pair, ready to paste. With wildcard DNS, setting `s3_host` also serves
-  each bucket at its own host name, as clients using virtual-hosted style address it.
+  each bucket at its own host name, as clients using virtual-hosted style address it. Jobs a
+  fleet hub places with their own registry token reach it too through the guest registry
+  proxy, holding no credential: `sccache` there takes bucket `job` with its area's alias as the
+  key prefix.
 
 ## [0.106.0] - 2026-11-05
 

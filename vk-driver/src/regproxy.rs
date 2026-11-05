@@ -25,9 +25,9 @@
 //! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
 //! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
 //! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
-//! lock API (`/lock/`) and plain files (`/dav/files/`): the registry enforces the token's
-//! grants on each. A job meant to have a token and given none gets a proxy that forwards
-//! nothing.
+//! lock API (`/lock/`), plain files (`/dav/files/`) and their S3 view (`/s3`): the registry
+//! enforces the token's grants on each. A job meant to have a token and given none gets a proxy
+//! that forwards nothing.
 //!
 //! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI or plain-file path, or
 //! before the `:` of a lock name, stands for the area's prefix, so a guest names a fixed path
@@ -36,6 +36,13 @@
 //! (an upload's `Location`, a lock's holders), which the proxy forwards too. A `PROPFIND`'s
 //! hrefs are the exception, mapped back to the alias, since a WebDAV client resolves a listing
 //! against the root it asked for.
+//!
+//! Under `/s3/`, `job/<alias>/<key…>` names a key below the area's prefix, and `job/<alias>` alone
+//! names the area as a bucket of its own ([`map_s3`]): the prefix's first component is the real
+//! bucket, the rest a key prefix the proxy adds to a listing's query and takes off the names in
+//! the documents it answers ([`S3Names`]). The guest's own `Authorization`, SigV4 with whatever
+//! keys or none, is replaced by the token, so the registry decodes an `aws-chunked` body without
+//! checking chunk signatures made with keys it does not know.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -71,12 +78,17 @@ const DAV_FILES_METHODS: &[&str] = &[
     "GET", "HEAD", "PROPFIND", "PUT", "MKCOL", "DELETE", "OPTIONS",
 ];
 
+/// The S3 view's path, and the methods forwarded under it: vk-registry's for `/s3`.
+const S3: &str = "/s3";
+const S3_METHODS: &[&str] = &["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"];
+
 /// Which of the registry's paths the proxy forwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// The OCI API only, `/v2/`: what an unscoped credential may be lent for.
     Oci,
-    /// `/v2/`, `/lock/` and `/dav/files/`: a job token's, whose grants the registry enforces.
+    /// `/v2/`, `/lock/`, `/dav/files/` and `/s3`: a job token's, whose grants the registry
+    /// enforces.
     Job,
     /// Nothing: a job that should have had a token and has none.
     Deny,
@@ -87,7 +99,7 @@ impl Scope {
     fn paths(self) -> &'static [&'static str] {
         match self {
             Scope::Oci => &["/v2/"],
-            Scope::Job => &["/v2/", "/lock/", DAV_FILES],
+            Scope::Job => &["/v2/", "/lock/", DAV_FILES, S3],
             Scope::Deny => &[],
         }
     }
@@ -304,19 +316,23 @@ async fn handle(
     }))
 }
 
+/// Whether `path` lies under the forwarded path `scoped`: below it when it ends in `/`, else
+/// also the path itself, as [`S3`] alone names the service, with or without a query.
+fn within(path: &str, scoped: &str) -> bool {
+    match path.strip_prefix(scoped) {
+        Some(_) if scoped.ends_with('/') => true,
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '?']),
+        None => false,
+    }
+}
+
 /// The upstream URL a guest's request target names, or `None` when, once resolved, it is not
 /// under one of the scope's paths below the upstream's own. Checked after resolving, not on
 /// the text: the URL parser resolves `..` and its percent-encoded spellings (`%2e%2e`), so
 /// `/v2/../lock/acquire` starts with `/v2/` and still reaches `/lock/acquire`, carrying the
 /// credential.
 fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
-    let scoped = |p: &str| {
-        cfg.scope
-            .paths()
-            .iter()
-            .find(|s| p.starts_with(*s))
-            .copied()
-    };
+    let scoped = |p: &str| cfg.scope.paths().iter().find(|s| within(p, s)).copied();
     let prefix = scoped(path_and_query)?;
     // An encoded separator stays encoded through the parser, so `/v2/..%2Flock` passes the
     // check below — and reaches `/lock` through a front proxy that decodes `%2F`/`%5C` once
@@ -332,7 +348,7 @@ fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
     }
     let url = reqwest::Url::parse(&format!("{}{path_and_query}", cfg.upstream)).ok()?;
     let resolved = url.path().strip_prefix(cfg.root.as_str())?;
-    (url.origin() == cfg.base.origin() && resolved.starts_with(prefix)).then_some(url)
+    (url.origin() == cfg.base.origin() && within(resolved, prefix)).then_some(url)
 }
 
 /// What a request becomes under the job's areas.
@@ -344,11 +360,13 @@ enum Mapped<'a> {
     To(String, &'a Area),
     /// `job/…` naming no area of this job.
     Unknown,
+    /// An area named in a way the request cannot take, refused with this message.
+    Refused(&'static [u8]),
 }
 
 /// `url` (an accepted upstream URL) under `cfg`'s areas: `job/<alias>` at the start of an
-/// OCI or plain-file path, or of a lock name's path part, becomes the area's prefix.
-fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
+/// OCI, plain-file or S3 path, or of a lock name's path part, becomes the area's prefix.
+fn map_aliases<'a>(cfg: &'a ProxyCfg, method: &Method, url: &reqwest::Url) -> Mapped<'a> {
     if cfg.scope != Scope::Job {
         return Mapped::Unchanged;
     }
@@ -362,6 +380,9 @@ fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
             Ok(Some((q, area))) => Mapped::To(format!("{path}?{q}"), area),
             Err(()) => Mapped::Unknown,
         };
+    }
+    if let Some(rest) = path.strip_prefix(S3).and_then(|p| p.strip_prefix('/')) {
+        return map_s3(&cfg.areas, method, rest, url.query());
     }
     for base in ["/v2/", DAV_FILES] {
         let Some(rest) = path.strip_prefix(base) else {
@@ -398,6 +419,189 @@ fn map_name<'a>(
     Ok(Some((format!("{}{tail}", area.prefix), area)))
 }
 
+/// `/s3/<rest>` under the job's areas. `job/<alias>/<key…>` is the key below the area's
+/// prefix, as on `/dav/files/`. `job/<alias>` alone, with or without a `/`, is the area as a
+/// bucket: the real bucket, with a listing's query given the key prefix ([`listing_query`]).
+/// When the area lies below its bucket, only reads pass there: creating or deleting the bucket
+/// would act on the whole real bucket, and a batch delete's keys sit in a body the proxy does
+/// not rewrite, under checksums it could not keep.
+fn map_s3<'a>(areas: &'a [Area], method: &Method, rest: &str, query: Option<&str>) -> Mapped<'a> {
+    let (name, area) = match map_name(areas, rest, '/') {
+        Ok(None) => return Mapped::Unchanged,
+        Ok(Some(mapped)) => mapped,
+        Err(()) => return Mapped::Unknown,
+    };
+    let tail = name.strip_prefix(area.prefix.as_str()).unwrap_or_default();
+    if !matches!(tail, "" | "/") {
+        let query = query.map(|q| format!("?{q}")).unwrap_or_default();
+        return Mapped::To(format!("{S3}/{name}{query}"), area);
+    }
+    let names = S3Names::new(area);
+    let query = match query {
+        _ if names.keys.is_empty() => query.map(str::to_string),
+        _ if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") => {
+            return Mapped::Refused(
+                b"registry proxy: an area below its bucket takes reads only, not bucket writes",
+            );
+        }
+        _ if *method == Method::GET => Some(listing_query(&names, query.unwrap_or_default())),
+        _ => query.map(str::to_string),
+    };
+    let query = query
+        .filter(|q| !q.is_empty())
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    Mapped::To(format!("{S3}/{}{query}", names.bucket), area)
+}
+
+/// The parameters a bucket listing takes, of either version, and a listing of its multipart
+/// uploads; an SDK's `x-id` hint too. A query naming another is not a listing.
+const LISTING_PARAMS: &[&str] = &[
+    "list-type",
+    "prefix",
+    "delimiter",
+    "max-keys",
+    "continuation-token",
+    "start-after",
+    "marker",
+    "encoding-type",
+    "fetch-owner",
+    "x-id",
+];
+const UPLOADS_PARAMS: &[&str] = &[
+    "uploads",
+    "prefix",
+    "delimiter",
+    "key-marker",
+    "upload-id-marker",
+    "max-uploads",
+    "encoding-type",
+    "x-id",
+];
+
+/// A bucket `GET`'s query through an area below its bucket: a listing's keys are the area's,
+/// so the key prefix goes before each `prefix`, `start-after`, `marker` and `key-marker`, and
+/// into the key a `continuation-token` names; a `prefix` is added when none is given, so the
+/// listing stays in the area. Any other query, a configuration's, is kept as sent.
+fn listing_query(names: &S3Names, query: &str) -> String {
+    let name = |p: &str| p.split_once('=').map_or(p, |(n, _)| n).to_string();
+    let pairs: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    let known = match pairs.iter().any(|p| name(p) == "uploads") {
+        true => UPLOADS_PARAMS,
+        false => LISTING_PARAMS,
+    };
+    if !pairs.iter().all(|p| known.contains(&name(p).as_str())) {
+        return query.to_string();
+    }
+    // A prefix is lowercase alphanumerics and `._-/`, so encoding escapes the `/` alone.
+    let keys = vk_registry::percent_encode(&names.keys);
+    let value = |p: &str| p.split_once('=').map_or("", |(_, v)| v).to_string();
+    let mut out: Vec<String> = pairs
+        .iter()
+        .map(|p| match name(p).as_str() {
+            n @ ("prefix" | "start-after" | "marker" | "key-marker") => {
+                format!("{n}={keys}{}", value(p))
+            }
+            "continuation-token" => format!("continuation-token={}", names.token_in(&value(p))),
+            _ => p.to_string(),
+        })
+        .collect();
+    if !pairs.iter().any(|p| name(p) == "prefix") {
+        out.push(format!("prefix={keys}"));
+    }
+    out.join("&")
+}
+
+/// An `x-amz-copy-source` under the job's areas: `[/]job/<alias>/<key…>`, escaped as a whole
+/// or not, becomes `/<prefix>/<key…>`, unescaped as the registry also takes it. `Ok(None)` for
+/// a source not under [`ALIAS_ROOT`], forwarded as sent; `Err` for no such alias.
+fn map_copy_source(areas: &[Area], source: &str) -> Result<Option<String>, ()> {
+    let decoded = vk_registry::percent_decode(source);
+    let name = decoded.strip_prefix('/').unwrap_or(&decoded);
+    Ok(map_name(areas, name, '/')?.map(|(name, _)| format!("/{name}")))
+}
+
+/// An area as the S3 view sees it, and its names mapped back from the registry's.
+#[derive(Clone)]
+struct S3Names {
+    /// The prefix's first component, the real bucket
+    bucket: String,
+    /// The rest of the prefix with a `/`, or nothing when the prefix is the bucket alone
+    keys: String,
+    /// `/s3/<prefix>` and `/s3/<bucket>`, as the registry names a request's path
+    real: String,
+    real_bucket: String,
+    alias: String,
+    /// `/s3/job/<alias>`, which a guest names the area by
+    aliased: String,
+}
+
+impl S3Names {
+    fn new(area: &Area) -> Self {
+        let (bucket, keys) = match area.prefix.split_once('/') {
+            Some((bucket, rest)) => (bucket, format!("{rest}/")),
+            None => (area.prefix.as_str(), String::new()),
+        };
+        S3Names {
+            bucket: bucket.to_string(),
+            keys,
+            real: format!("{S3}/{}", area.prefix),
+            real_bucket: format!("{S3}/{bucket}"),
+            alias: area.alias.clone(),
+            aliased: format!("{S3}/{ALIAS_ROOT}/{}", area.alias),
+        }
+    }
+
+    /// A guest's continuation token, the key it names put below the key prefix; one that does
+    /// not decode is kept for the registry to refuse.
+    fn token_in(&self, token: &str) -> String {
+        use vk_hub_proto::token::{from_base64url, to_base64url};
+        match from_base64url(&vk_registry::percent_decode(token)) {
+            Some(key) if !token.is_empty() => to_base64url(&[self.keys.as_bytes(), &key].concat()),
+            _ => token.to_string(),
+        }
+    }
+
+    /// The registry's continuation token, the key it names taken from below the key prefix.
+    fn token_out(&self, token: &[u8]) -> Option<Vec<u8>> {
+        use vk_hub_proto::token::{from_base64url, to_base64url};
+        let key = from_base64url(std::str::from_utf8(token).ok()?)?;
+        let key = key.strip_prefix(self.keys.as_bytes())?;
+        Some(to_base64url(key).into_bytes())
+    }
+
+    /// A path the registry names, `/s3/<prefix>[/…]` or the bucket `/s3/<bucket>[/]`, as the
+    /// guest names it, `/s3/job/<alias>[/…]`.
+    fn path_out(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let tail = path
+            .strip_prefix(self.real.as_bytes())
+            .filter(|r| r.is_empty() || r.starts_with(b"/"))
+            .or_else(|| {
+                path.strip_prefix(self.real_bucket.as_bytes())
+                    .filter(|r| matches!(r, [] | [b'/']))
+            })?;
+        Some([self.aliased.as_bytes(), tail].concat())
+    }
+
+    /// The text of the element `name` as the guest names it, or `None` to keep it: a bucket
+    /// becomes the alias, a key or key prefix loses the area's key prefix, a continuation
+    /// token the same in the key it names, and a path the alias form. A name outside the area
+    /// is kept. Every one of these is the registry's escaped XML text, which the prefix's
+    /// characters pass through unchanged, under `encoding-type=url` too.
+    fn text(&self, name: &[u8], text: &[u8]) -> Option<Vec<u8>> {
+        match name {
+            b"Name" | b"Bucket" => {
+                (text == self.bucket.as_bytes()).then(|| self.alias.clone().into_bytes())
+            }
+            b"Prefix" | b"StartAfter" | b"Marker" | b"NextMarker" | b"Key" | b"KeyMarker"
+            | b"NextKeyMarker" => text.strip_prefix(self.keys.as_bytes()).map(<[u8]>::to_vec),
+            b"ContinuationToken" | b"NextContinuationToken" => self.token_out(text),
+            b"Location" | b"Resource" => self.path_out(text),
+            _ => None,
+        }
+    }
+}
+
 /// A lock request's query with each `name=` under [`ALIAS_ROOT`] mapped, decoded as the
 /// registry decodes it and encoded again; every other pair is kept as it came, in order.
 /// `Ok(None)` when no name was mapped. The area returned is the first mapped name's. One
@@ -421,10 +625,18 @@ fn map_lock_names<'a>(areas: &'a [Area], query: &str) -> Result<Option<(String, 
     Ok(first.map(|area| (pairs.join("&"), area)))
 }
 
+/// The refusal of a `job/…` naming no area of this job.
+const NO_SUCH_AREA: &[u8] = b"registry proxy: this job has no area of that alias";
+
 /// A 403 with `msg`.
 fn forbidden(msg: &'static [u8]) -> Response<ProxyBody> {
+    refusal(StatusCode::FORBIDDEN, msg)
+}
+
+/// A `status` answer with `msg`, never forwarded.
+fn refusal(status: StatusCode, msg: &'static [u8]) -> Response<ProxyBody> {
     Response::builder()
-        .status(StatusCode::FORBIDDEN)
+        .status(status)
         .body(
             Full::new(Bytes::from_static(msg))
                 .map_err(|never| match never {})
@@ -445,6 +657,14 @@ struct HrefMap {
     carry: Vec<u8>,
 }
 
+/// A rewrite of a response body as it streams, holding back at most a bounded tail.
+trait BodyMap {
+    /// The bytes that can be sent now, mapped, once `chunk` has arrived.
+    fn push(&mut self, chunk: &[u8]) -> Bytes;
+    /// The rest, mapped, once the body has ended.
+    fn finish(&mut self) -> Bytes;
+}
+
 impl HrefMap {
     fn new(area: &Area) -> Self {
         let href = |p: &str| format!("<D:href>{DAV_FILES}{p}").into_bytes();
@@ -453,18 +673,6 @@ impl HrefMap {
             to: href(&format!("{ALIAS_ROOT}/{}", area.alias)),
             carry: Vec::new(),
         }
-    }
-
-    /// The bytes of `chunk` that can be sent now, mapped; a tail as long as the pattern waits
-    /// for the next chunk, which holds the byte after a match.
-    fn push(&mut self, chunk: &[u8]) -> Bytes {
-        self.carry.extend_from_slice(chunk);
-        self.emit(self.carry.len().saturating_sub(self.from.len()))
-    }
-
-    /// The rest, mapped, once the body has ended.
-    fn finish(&mut self) -> Bytes {
-        self.emit(self.carry.len())
     }
 
     /// The carry up to `upto`, mapped; a match starting before `upto` is taken whole.
@@ -486,32 +694,166 @@ impl HrefMap {
         self.carry.drain(..i.min(self.carry.len()));
         Bytes::from(out)
     }
+}
 
-    /// `body` with its hrefs mapped; a chunk that leaves nothing to send yet yields no frame.
-    fn over<S>(self, body: S) -> impl futures::Stream<Item = reqwest::Result<Bytes>>
-    where
-        S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-    {
-        use futures::StreamExt;
-        futures::stream::unfold((Box::pin(body), Some(self)), |(mut body, map)| async move {
-            let mut map = map?;
-            loop {
-                match body.next().await {
-                    Some(Ok(chunk)) => {
-                        let out = map.push(&chunk);
-                        if !out.is_empty() {
-                            return Some((Ok(out), (body, Some(map))));
-                        }
-                    }
-                    Some(Err(e)) => return Some((Err(e), (body, None))),
-                    None => {
-                        let out = map.finish();
-                        return (!out.is_empty()).then_some((Ok(out), (body, None)));
-                    }
+impl BodyMap for HrefMap {
+    /// A tail as long as the pattern waits for the next chunk, which holds the byte after a
+    /// match.
+    fn push(&mut self, chunk: &[u8]) -> Bytes {
+        self.carry.extend_from_slice(chunk);
+        self.emit(self.carry.len().saturating_sub(self.from.len()))
+    }
+
+    fn finish(&mut self) -> Bytes {
+        self.emit(self.carry.len())
+    }
+}
+
+/// The longest element [`S3Map`] waits for whole: past it, the element streams on unmapped.
+/// A key is at most 1024 bytes, 3 KiB once URL-encoded, and a token or path not much more.
+const MAX_ELEMENT: usize = 8 << 10;
+
+/// The elements of an S3 document [`S3Names::text`] maps.
+const S3_ELEMENTS: &[&[u8]] = &[
+    b"Name",
+    b"Bucket",
+    b"Prefix",
+    b"StartAfter",
+    b"Marker",
+    b"NextMarker",
+    b"Key",
+    b"KeyMarker",
+    b"NextKeyMarker",
+    b"ContinuationToken",
+    b"NextContinuationToken",
+    b"Location",
+    b"Resource",
+];
+
+/// Maps an S3 document answering a request through an area back to the area's names, as the
+/// body streams: each `<E>text</E>` of [`S3_ELEMENTS`] has its text mapped by [`S3Names::text`],
+/// whatever element holds it (a common prefix's `Prefix` as the listing's). vk-registry writes
+/// these elements with no attribute and their text escaped, so no `<` is in it. At most
+/// [`MAX_ELEMENT`] bytes wait for the next chunk.
+struct S3Map {
+    names: S3Names,
+    /// Bytes not sent yet: an element, or the start of a tag, still arriving.
+    carry: Vec<u8>,
+}
+
+/// What the carry holds from a `<` on.
+enum Scan {
+    /// One of [`S3_ELEMENTS`], whole: its bytes mapped, and how many it took.
+    Mapped(Vec<u8>, usize),
+    /// Something else, sent as it is.
+    Other,
+    /// Too little to tell yet.
+    Short,
+}
+
+impl S3Map {
+    fn new(names: S3Names) -> Self {
+        S3Map {
+            names,
+            carry: Vec::new(),
+        }
+    }
+
+    /// `at`, which starts with `<`, read as one of [`S3_ELEMENTS`].
+    fn scan(&self, at: &[u8]) -> Scan {
+        let Some(gt) = at.iter().position(|&b| b == b'>') else {
+            return Scan::Short;
+        };
+        let name = at.get(1..gt).unwrap_or_default();
+        if !S3_ELEMENTS.contains(&name) {
+            return Scan::Other;
+        }
+        let rest = at.get(gt + 1..).unwrap_or_default();
+        let Some(lt) = rest.iter().position(|&b| b == b'<') else {
+            return Scan::Short;
+        };
+        let (text, after) = rest.split_at(lt);
+        let close = [b"</", name, b">"].concat();
+        if !after.starts_with(&close) {
+            return match close.starts_with(after) {
+                true => Scan::Short,
+                false => Scan::Other,
+            };
+        }
+        let text = self.names.text(name, text).unwrap_or_else(|| text.to_vec());
+        let open = at.get(..=gt).unwrap_or_default();
+        let used = gt + 1 + lt + close.len();
+        Scan::Mapped([open, &text, &close].concat(), used)
+    }
+
+    /// The carry, mapped, up to an element still arriving unless the body has `ended`.
+    fn emit(&mut self, ended: bool) -> Bytes {
+        let mut out = Vec::with_capacity(self.carry.len());
+        let mut i = 0;
+        while let Some(rest) = self.carry.get(i..).filter(|r| !r.is_empty()) {
+            let Some(lt) = rest.iter().position(|&b| b == b'<') else {
+                out.extend_from_slice(rest);
+                i = self.carry.len();
+                break;
+            };
+            out.extend_from_slice(rest.get(..lt).unwrap_or_default());
+            i += lt;
+            let at = self.carry.get(i..).unwrap_or_default();
+            match self.scan(at) {
+                Scan::Mapped(bytes, used) => {
+                    out.extend_from_slice(&bytes);
+                    i += used;
+                }
+                Scan::Short if !ended && at.len() <= MAX_ELEMENT => break,
+                Scan::Short | Scan::Other => {
+                    out.push(b'<');
+                    i += 1;
                 }
             }
-        })
+        }
+        self.carry.drain(..i.min(self.carry.len()));
+        Bytes::from(out)
     }
+}
+
+impl BodyMap for S3Map {
+    fn push(&mut self, chunk: &[u8]) -> Bytes {
+        self.carry.extend_from_slice(chunk);
+        self.emit(false)
+    }
+
+    fn finish(&mut self) -> Bytes {
+        self.emit(true)
+    }
+}
+
+/// `body` with `map` applied; a chunk that leaves nothing to send yet yields no frame.
+fn mapped<S>(
+    map: Box<dyn BodyMap + Send>,
+    body: S,
+) -> impl futures::Stream<Item = reqwest::Result<Bytes>>
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
+    use futures::StreamExt;
+    futures::stream::unfold((Box::pin(body), Some(map)), |(mut body, map)| async move {
+        let mut map = map?;
+        loop {
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    let out = map.push(&chunk);
+                    if !out.is_empty() {
+                        return Some((Ok(out), (body, Some(map))));
+                    }
+                }
+                Some(Err(e)) => return Some((Err(e), (body, None))),
+                None => {
+                    let out = map.finish();
+                    return (!out.is_empty()).then_some((Ok(out), (body, None)));
+                }
+            }
+        }
+    })
 }
 
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
@@ -526,6 +868,8 @@ fn is_skipped(name: &str) -> bool {
             | "content-length"
             | "connection"
             | "transfer-encoding"
+            // a SigV4 session token, meaningless once the guest's signature is replaced
+            | "x-amz-security-token"
     )
 }
 
@@ -538,13 +882,13 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         .to_string();
     // The proxy signs requests with a credential, so confine it to the paths its scope lends
     // that credential for: the OCI distribution API surface (`/v2/…`) for the host's own,
-    // the lock API and plain files too for a job's token. A guest-chosen path outside them —
+    // the lock API, plain files and their S3 view too for a job's token. A guest-chosen path outside them —
     // a foreign authority smuggled via `//host`, or the `/lock/` control plane under the
     // host's credential — is refused rather than authenticated on the guest's behalf.
     let Some(url) = upstream_url(cfg, &path_and_query) else {
         return Ok(forbidden(match cfg.scope {
             Scope::Oci => b"registry proxy: only /v2/ registry paths are proxied",
-            Scope::Job => b"registry proxy: only /v2/, /lock/ and /dav/files/ are proxied",
+            Scope::Job => b"registry proxy: only /v2/, /lock/, /dav/files/ and /s3/ are proxied",
             Scope::Deny => b"registry proxy: this job has no registry credential",
         }));
     };
@@ -552,33 +896,35 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     // Plain files take the verbs vk-registry serves there, and no MOVE or COPY, whose
     // `Destination` names the proxy rather than the registry.
     if path_and_query.starts_with(DAV_FILES) && !DAV_FILES_METHODS.contains(&method.as_str()) {
-        let body = Full::new(Bytes::from_static(
+        return Ok(refusal(
+            StatusCode::METHOD_NOT_ALLOWED,
             b"registry proxy: this method is not proxied under /dav/files/",
-        ))
-        .map_err(|never| match never {})
-        .boxed_unsync();
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(body)?);
+        ));
+    }
+    if within(&path_and_query, S3) && !S3_METHODS.contains(&method.as_str()) {
+        return Ok(refusal(
+            StatusCode::METHOD_NOT_ALLOWED,
+            b"registry proxy: this method is not proxied under /s3/",
+        ));
     }
     // The job's aliases, mapped on the resolved URL, which then goes through the same checks
     // again: the prefix is the hub's, but the rest of the path is still the guest's.
-    let (url, area) = match map_aliases(cfg, &url) {
+    let (url, area) = match map_aliases(cfg, &method, &url) {
         Mapped::Unchanged => (url, None),
         Mapped::To(target, area) => match upstream_url(cfg, &target) {
             Some(url) => (url, Some(area)),
             None => return Ok(forbidden(b"registry proxy: an area's path is refused")),
         },
-        Mapped::Unknown => {
-            return Ok(forbidden(
-                b"registry proxy: this job has no area of that alias",
-            ));
-        }
+        Mapped::Unknown => return Ok(forbidden(NO_SUCH_AREA)),
+        Mapped::Refused(msg) => return Ok(forbidden(msg)),
     };
     let path = url.path().strip_prefix(cfg.root.as_str()).unwrap_or("");
     // A listing's hrefs go back to the alias the guest asked for (see the module's doc).
     let listing = method.as_str() == "PROPFIND" && path.starts_with(DAV_FILES);
     let hrefs = area.filter(|_| listing).map(HrefMap::new);
+    let s3 = cfg.scope == Scope::Job && within(path, S3);
+    // An S3 answer through an area names the area back (see [`S3Map`]).
+    let s3_names = area.filter(|_| s3).map(S3Names::new);
     // OCI writes and WebDAV PROPFIND always stream a body upstream, even when empty.
     // Forward other bodies for the registry to validate: dropping a MKCOL body
     // would create the collection instead of rejecting the request (RFC 4918 §9.3).
@@ -586,12 +932,28 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
         || method.as_str() == "PROPFIND"
         || !hyper::body::Body::is_end_stream(&incoming);
-    let headers: Vec<_> = parts
+    let mut headers: Vec<_> = parts
         .headers
         .iter()
         .filter(|(k, _)| !is_skipped(&k.as_str().to_ascii_lowercase()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // A copy's source names its area as a path does. One that is not text is forwarded for
+    // the registry to refuse.
+    for (_, v) in headers
+        .iter_mut()
+        .filter(|(k, _)| s3 && k.as_str() == "x-amz-copy-source")
+    {
+        let Ok(source) = v.to_str() else { continue };
+        match map_copy_source(&cfg.areas, source) {
+            Ok(None) => {}
+            Ok(Some(mapped)) => match hyper::header::HeaderValue::from_str(&mapped) {
+                Ok(mapped) => *v = mapped,
+                Err(_) => return Ok(forbidden(b"registry proxy: an area's path is refused")),
+            },
+            Err(()) => return Ok(forbidden(NO_SUCH_AREA)),
+        }
+    }
     let sent = match (repeatable(&method, path), bodyful) {
         (true, false) => Outgoing::Whole(Bytes::new()),
         (true, true) => held(incoming, MAX_HELD).await?,
@@ -632,11 +994,19 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         && !headers_out.contains_key(hyper::header::CONTENT_ENCODING))
     .then(|| resp.content_length())
     .flatten();
+    let xml = headers_out
+        .get(hyper::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/xml"));
+    let body_map: Option<Box<dyn BodyMap + Send>> = match (hrefs, &s3_names) {
+        (Some(map), _) => Some(Box::new(map)),
+        (None, Some(names)) if xml => Some(Box::new(S3Map::new(names.clone()))),
+        _ => None,
+    };
     // stream the upstream response back without buffering (blob pulls).
     let stream = resp.bytes_stream();
-    let body = match (hrefs, resume) {
+    let body = match (body_map, resume) {
         (Some(map), _) => StreamBody::new(
-            map.over(stream)
+            mapped(map, stream)
                 .map_ok(Frame::data)
                 .map_err(|e| std::io::Error::other(e.to_string())),
         )
@@ -683,9 +1053,16 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
 
     let mut out = Response::builder().status(status);
     for (k, v) in headers_out.iter() {
-        if !is_skipped(&k.as_str().to_ascii_lowercase()) {
-            out = out.header(k, v);
+        if is_skipped(&k.as_str().to_ascii_lowercase()) {
+            continue;
         }
+        // A bucket created through an area is located at the alias.
+        let aliased = s3_names
+            .as_ref()
+            .filter(|_| k == hyper::header::LOCATION)
+            .and_then(|names| names.path_out(v.as_bytes()))
+            .and_then(|p| hyper::header::HeaderValue::from_bytes(&p).ok());
+        out = out.header(k, aliased.as_ref().unwrap_or(v));
     }
     out.body(body).map_err(Into::into)
 }
@@ -704,8 +1081,8 @@ enum Outgoing {
 /// Whether a request to `path`, relative to the upstream root, can be repeated after
 /// a refused connection, a connection cut before the response, or a 503/429.
 /// Repeating it must have the same effect even if the first request reached the registry:
-/// reads, manifest PUTs by tag or digest, whole-file PUTs, and upload starts (which leave
-/// the first upload unused). Excludes upload chunks (`PATCH`), upload completion (`PUT`
+/// reads, manifest PUTs by tag or digest, whole-file PUTs, S3 PUTs of an object, a part or a
+/// copy, and upload starts (which leave the first upload unused). Excludes upload chunks (`PATCH`), upload completion (`PUT`
 /// under `blobs/uploads/`, whose upload is then gone), deletions, collection creation,
 /// and all `/lock/` requests regardless of method. A retried PUT lands last, like a
 /// later PUT from another writer.
@@ -719,6 +1096,9 @@ fn repeatable(method: &Method, path: &str) -> bool {
         "PUT" => {
             oci.is_some_and(|p| p.rsplit('/').nth(1) == Some("manifests"))
                 || path.starts_with(DAV_FILES)
+                || path
+                    .strip_prefix("/s3/")
+                    .is_some_and(|p| p.trim_end_matches('/').contains('/'))
         }
         "POST" => oci.is_some_and(|p| p.ends_with("/blobs/uploads/")),
         _ => false,
@@ -934,20 +1314,30 @@ fn resumed_at(
 mod tests {
     use super::*;
 
-    // A fake upstream that records the Authorization header + path and query of the last
-    // request and replies 200 with a marker body. It runs on its own dedicated thread + runtime
+    /// What [`fake_upstream`] saw of the last request: its `Authorization`, its path and
+    /// query, and every header forwarded.
+    type Seen = (String, String, hyper::HeaderMap);
+
+    // A fake upstream that records the Authorization header, path and query, and headers of
+    // the last request and replies 200 with a marker body. It runs on its own dedicated thread + runtime
     // (like the proxy's `spawn_blocking` and the vk-registry e2e servers) so its accept
     // loop never competes with the test's runtime threads — which caused acceptance stalls
     // and flakes when many of these servers ran concurrently under `cargo test`.
-    fn fake_upstream() -> (SocketAddr, Arc<std::sync::Mutex<(String, String)>>) {
+    fn fake_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Seen>>) {
         fake_upstream_replying(b"ok")
     }
 
     /// [`fake_upstream`], replying `body` to every request.
-    fn fake_upstream_replying(
+    fn fake_upstream_replying(body: &'static [u8]) -> (SocketAddr, Arc<std::sync::Mutex<Seen>>) {
+        fake_upstream_answering(body, &[])
+    }
+
+    /// [`fake_upstream_replying`], with these headers.
+    fn fake_upstream_answering(
         body: &'static [u8],
-    ) -> (SocketAddr, Arc<std::sync::Mutex<(String, String)>>) {
-        let seen = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        headers: &'static [(&'static str, &'static str)],
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Seen>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -976,10 +1366,12 @@ mod tests {
                                     .unwrap_or("")
                                     .to_string();
                                 let path = req.uri().path_and_query().unwrap().to_string();
-                                *s.lock().unwrap() = (auth, path);
-                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
-                                    body,
-                                ))))
+                                *s.lock().unwrap() = (auth, path, req.headers().clone());
+                                let mut resp = Response::new(Full::new(Bytes::from_static(body)));
+                                for (k, v) in headers {
+                                    resp.headers_mut().insert(*k, v.parse().unwrap());
+                                }
+                                Ok::<_, Infallible>(resp)
                             }
                         });
                         let _ = http1::Builder::new().serve_connection(io, svc).await;
@@ -1019,7 +1411,7 @@ mod tests {
         assert!(r.status().is_success());
         assert_eq!(r.text().await.unwrap(), "ok");
 
-        let (auth, path) = seen.lock().unwrap().clone();
+        let (auth, path, _) = seen.lock().unwrap().clone();
         assert_eq!(
             path, "/v2/app/manifests/latest",
             "path must be forwarded as resolved"
@@ -1124,7 +1516,7 @@ mod tests {
             .unwrap();
         assert!(r.status().is_success());
 
-        let (auth, _) = seen.lock().unwrap().clone();
+        let (auth, ..) = seen.lock().unwrap().clone();
         assert_eq!(
             auth, "Bearer vkr_x",
             "the proxy must inject the bearer token"
@@ -1174,9 +1566,9 @@ mod tests {
         proxy: SocketAddr,
         method: &str,
         target: &str,
-        seen: &std::sync::Mutex<(String, String)>,
+        seen: &std::sync::Mutex<Seen>,
     ) -> (u16, String, String) {
-        *seen.lock().unwrap() = (String::new(), String::new());
+        *seen.lock().unwrap() = Seen::default();
         let r = reqwest::Client::new()
             .request(
                 reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
@@ -1186,7 +1578,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let (auth, path) = seen.lock().unwrap().clone();
+        let (auth, path, _) = seen.lock().unwrap().clone();
         (r.status().as_u16(), auth, path)
     }
 
@@ -1372,7 +1764,7 @@ mod tests {
         let status = raw_status(proxy, "GET", "/dav/files/job/task-cache/../../other").await;
         assert_eq!(status, 200);
         assert_eq!(seen.lock().unwrap().1, "/dav/files/other");
-        *seen.lock().unwrap() = (String::new(), String::new());
+        *seen.lock().unwrap() = Seen::default();
         let status = raw_status(proxy, "GET", "/v2/job/task-cache/..%2F..%2Flock/x").await;
         assert_eq!(status, 403);
         assert_eq!(seen.lock().unwrap().1, "", "nothing forwarded");
@@ -1436,6 +1828,352 @@ mod tests {
         }
     }
 
+    /// The areas the S3 tests map: a prefix of one, two and three components.
+    fn s3_areas() -> [Area; 3] {
+        [
+            area("one", "solo"),
+            area("two", "duo/b"),
+            area("three", "tri/b/c"),
+        ]
+    }
+
+    /// A job's token reaches the S3 view, every method it serves, injected in place of the
+    /// guest's own `Authorization`, SigV4 included; the node's credential does not, nor a job
+    /// without a token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_token_reaches_s3_too() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let proxy = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap())
+            .unwrap();
+        for (method, target) in [
+            ("GET", "/s3"),
+            ("GET", "/s3/"),
+            ("HEAD", "/s3/b"),
+            ("GET", "/s3/b?list-type=2&prefix=x/"),
+            ("PUT", "/s3/b/k"),
+            ("POST", "/s3/b/k?uploads"),
+            ("DELETE", "/s3/b/k"),
+            ("OPTIONS", "/s3/b/k"),
+        ] {
+            let (status, auth, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 200, "{method} {target}");
+            assert_eq!(auth, "Bearer vkt_job", "{method} {target}");
+            assert_eq!(path, target, "{method} {target}");
+        }
+        *seen.lock().unwrap() = Seen::default();
+        let r = reqwest::Client::new()
+            .put(format!("http://{proxy}/s3/b/k"))
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=dummy/20261105/auto/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=00",
+            )
+            .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .header("x-amz-security-token", "dummy")
+            .body("0;chunk-signature=00\r\n\r\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let (auth, _, headers) = seen.lock().unwrap().clone();
+        assert_eq!(auth, "Bearer vkt_job");
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert!(!headers.contains_key("x-amz-security-token"));
+        assert_eq!(
+            headers["x-amz-content-sha256"],
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        );
+        for (method, target) in [("PROPFIND", "/s3/b/k"), ("PATCH", "/s3/b"), ("COPY", "/s3")] {
+            let (status, _, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 405, "{method} {target}");
+            assert_eq!(path, "", "{method} {target} must not be forwarded");
+        }
+        let node = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let deny = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), None).unwrap()).unwrap();
+        for proxy in [node, deny] {
+            for target in ["/s3", "/s3/b/k"] {
+                let (status, _, path) = status_and_auth(proxy, "GET", target, &seen).await;
+                assert_eq!(status, 403, "{target}");
+                assert_eq!(path, "", "{target} must not be forwarded");
+            }
+        }
+    }
+
+    /// `/s3/job/<alias>/<key…>` is the key below the area's prefix; `/s3/job/<alias>` alone is
+    /// the area as a bucket, its listings kept to the area by their query; anything else
+    /// under `job/` is refused unforwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_reaches_s3_areas_by_alias() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
+            .unwrap()
+            .with_areas(&s3_areas());
+        let proxy = spawn_blocking(cfg).unwrap();
+        for (method, target, want) in [
+            ("GET", "/s3/job/one/a/b", "/s3/solo/a/b"),
+            (
+                "PUT",
+                "/s3/job/two/.sccache_check",
+                "/s3/duo/b/.sccache_check",
+            ),
+            (
+                "PUT",
+                "/s3/job/three/k?partNumber=1&uploadId=u",
+                "/s3/tri/b/c/k?partNumber=1&uploadId=u",
+            ),
+            ("GET", "/s3/job/one", "/s3/solo"),
+            (
+                "GET",
+                "/s3/job/one/?list-type=2&prefix=a",
+                "/s3/solo?list-type=2&prefix=a",
+            ),
+            ("PUT", "/s3/job/one", "/s3/solo"),
+            ("DELETE", "/s3/job/one/", "/s3/solo"),
+            ("POST", "/s3/job/one?delete", "/s3/solo?delete"),
+            ("GET", "/s3/job/two", "/s3/duo?prefix=b%2F"),
+            ("GET", "/s3/job/three", "/s3/tri?prefix=b%2Fc%2F"),
+            ("GET", "/s3/job/three/", "/s3/tri?prefix=b%2Fc%2F"),
+            (
+                "GET",
+                "/s3/job/three?list-type=2&prefix=d/&delimiter=/&start-after=d/a",
+                "/s3/tri?list-type=2&prefix=b%2Fc%2Fd/&delimiter=/&start-after=b%2Fc%2Fd/a",
+            ),
+            (
+                "GET",
+                "/s3/job/three?marker=k",
+                "/s3/tri?marker=b%2Fc%2Fk&prefix=b%2Fc%2F",
+            ),
+            (
+                "GET",
+                "/s3/job/three?uploads&key-marker=k",
+                "/s3/tri?uploads&key-marker=b%2Fc%2Fk&prefix=b%2Fc%2F",
+            ),
+            ("GET", "/s3/job/three?location", "/s3/tri?location"),
+            ("HEAD", "/s3/job/three", "/s3/tri"),
+            ("GET", "/s3/jobs/k", "/s3/jobs/k"),
+            ("GET", "/s3/tri/b/c/k", "/s3/tri/b/c/k"),
+        ] {
+            let (status, auth, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 200, "{method} {target}");
+            assert_eq!(auth, "Bearer vkt_job", "{method} {target}");
+            assert_eq!(path, want, "{method} {target}");
+        }
+        for (method, target) in [
+            ("GET", "/s3/job"),
+            ("GET", "/s3/job/"),
+            ("GET", "/s3/job?list-type=2&prefix=one/"),
+            ("GET", "/s3/job/other/k"),
+            ("PUT", "/s3/job/other"),
+            ("PUT", "/s3/job/three"),
+            ("DELETE", "/s3/job/two/"),
+            ("POST", "/s3/job/three?delete"),
+        ] {
+            let (status, _, path) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(status, 403, "{method} {target}");
+            assert_eq!(path, "", "{method} {target} must not be forwarded");
+        }
+    }
+
+    /// An S3 alias opens no way out either: `..` resolves before mapping and an encoded
+    /// separator is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_s3_alias_does_not_escape_its_scope() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
+            .unwrap()
+            .with_areas(&s3_areas());
+        let proxy = spawn_blocking(cfg).unwrap();
+        for (target, status, want) in [
+            ("/s3/job/three/../../other", 200, "/s3/other"),
+            ("/s3/job/../", 200, "/s3/"),
+            ("/s3/job/three/../../../settings/keys", 403, ""),
+            ("/s3/job/three/%2e%2e/%2e%2e/%2e%2e/browse", 403, ""),
+            ("/s3/job/three/..%2F..%2F..%2Fv2", 403, ""),
+            ("/s3/job/three/..%5Cx", 403, ""),
+        ] {
+            *seen.lock().unwrap() = Seen::default();
+            assert_eq!(raw_status(proxy, "GET", target).await, status, "{target}");
+            assert_eq!(seen.lock().unwrap().1, want, "{target}");
+        }
+    }
+
+    /// A listing's keys and markers get the key prefix, a continuation token in the key it
+    /// names, and back again; a query that is not a listing's is kept.
+    #[test]
+    fn listing_queries_take_the_key_prefix() {
+        use vk_hub_proto::token::to_base64url;
+        let [_, _, three] = s3_areas();
+        let names = S3Names::new(&three);
+        assert_eq!(names.bucket, "tri");
+        assert_eq!(names.keys, "b/c/");
+        let token = to_base64url(b"d/k");
+        let real = to_base64url(b"b/c/d/k");
+        assert_eq!(
+            listing_query(
+                &names,
+                &format!("list-type=2&continuation-token={token}&max-keys=2")
+            ),
+            format!("list-type=2&continuation-token={real}&max-keys=2&prefix=b%2Fc%2F")
+        );
+        assert_eq!(
+            names.token_out(real.as_bytes()),
+            Some(token.clone().into_bytes())
+        );
+        assert_eq!(names.token_in(&token), real);
+        // One the registry did not give, or naming a key outside the area, is kept.
+        assert_eq!(names.token_in("!!"), "!!");
+        assert_eq!(names.token_in(""), "");
+        assert_eq!(names.token_out(to_base64url(b"x/k").as_bytes()), None);
+        assert_eq!(names.token_out(b"!!"), None);
+        assert_eq!(
+            listing_query(&names, "prefix&start-after"),
+            "prefix=b%2Fc%2F&start-after=b%2Fc%2F"
+        );
+        for kept in [
+            "versioning",
+            "acl",
+            "list-type=2&tagging",
+            "uploads&list-type=2",
+        ] {
+            assert_eq!(listing_query(&names, kept), kept);
+        }
+        // A one-component prefix is the bucket alone.
+        let one = S3Names::new(&area("one", "solo"));
+        assert_eq!((one.bucket.as_str(), one.keys.as_str()), ("solo", ""));
+    }
+
+    /// A copy's source names its area as a path does, escaped or not.
+    #[test]
+    fn copy_sources_map_their_alias() {
+        let areas = s3_areas();
+        for (source, want) in [
+            ("/job/three/k", "/tri/b/c/k"),
+            ("job/two/a/k", "/duo/b/a/k"),
+            ("job%2Fone%2Fk", "/solo/k"),
+            ("%2Fjob%2Fthree%2Fk", "/tri/b/c/k"),
+        ] {
+            assert_eq!(
+                map_copy_source(&areas, source),
+                Ok(Some(want.to_string())),
+                "{source}"
+            );
+        }
+        assert_eq!(map_copy_source(&areas, "/b/k"), Ok(None));
+        assert_eq!(map_copy_source(&areas, "jobs/k"), Ok(None));
+        assert_eq!(map_copy_source(&areas, "/job/other/k"), Err(()));
+        assert_eq!(map_copy_source(&areas, "job"), Err(()));
+    }
+
+    /// An S3 document's names in the area go back to the alias, wherever the chunks split; a
+    /// key outside the area, and other elements, are left alone.
+    #[test]
+    fn s3_documents_map_back_to_the_alias() {
+        use vk_hub_proto::token::to_base64url;
+        let (tok_in, tok_out) = (to_base64url(b"b/c/d/"), to_base64url(b"d/"));
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"x\">\
+             <Name>tri</Name><Prefix>b/c/</Prefix><MaxKeys>2</MaxKeys><Delimiter>/</Delimiter>\
+             <IsTruncated>true</IsTruncated><ContinuationToken>{tok_in}</ContinuationToken>\
+             <NextContinuationToken>{tok_in}</NextContinuationToken>\
+             <StartAfter>b/c/a</StartAfter>\
+             <Contents><Key>b/c/a&amp;b</Key><Size>1</Size></Contents>\
+             <Contents><Key>b/cd/x</Key><Size>2</Size></Contents>\
+             <CommonPrefixes><Prefix>b/c/d/</Prefix></CommonPrefixes>\
+             <Key></Key><Marker>b/c/</Marker><Bucket>tri</Bucket><Bucket>trio</Bucket>\
+             <Resource>/s3/tri/b/c/k</Resource><Location>/s3/tri</Location>\
+             <Location>/s3/trio</Location><Contents ><Key/></ListBucketResult>"
+        );
+        let want = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"x\">\
+             <Name>three</Name><Prefix></Prefix><MaxKeys>2</MaxKeys><Delimiter>/</Delimiter>\
+             <IsTruncated>true</IsTruncated><ContinuationToken>{tok_out}</ContinuationToken>\
+             <NextContinuationToken>{tok_out}</NextContinuationToken>\
+             <StartAfter>a</StartAfter>\
+             <Contents><Key>a&amp;b</Key><Size>1</Size></Contents>\
+             <Contents><Key>b/cd/x</Key><Size>2</Size></Contents>\
+             <CommonPrefixes><Prefix>d/</Prefix></CommonPrefixes>\
+             <Key></Key><Marker></Marker><Bucket>three</Bucket><Bucket>trio</Bucket>\
+             <Resource>/s3/job/three/k</Resource><Location>/s3/job/three</Location>\
+             <Location>/s3/trio</Location><Contents ><Key/></ListBucketResult>"
+        );
+        let names = S3Names::new(&area("three", "tri/b/c"));
+        for size in [1, 2, 3, 7, 25, body.len()] {
+            let mut map = S3Map::new(names.clone());
+            let mut out = Vec::new();
+            for chunk in body.as_bytes().chunks(size) {
+                out.extend_from_slice(&map.push(chunk));
+                assert!(map.carry.len() <= MAX_ELEMENT + size, "chunks of {size}");
+            }
+            out.extend_from_slice(&map.finish());
+            assert_eq!(String::from_utf8(out).unwrap(), want, "chunks of {size}");
+        }
+        // An element past the bound streams on unmapped rather than waiting.
+        let long = format!("<Key>b/c/{}", "x".repeat(MAX_ELEMENT));
+        let mut map = S3Map::new(names);
+        let mut out = map.push(long.as_bytes()).to_vec();
+        assert!(map.carry.is_empty());
+        out.extend_from_slice(&map.push(b"</Key>"));
+        out.extend_from_slice(&map.finish());
+        assert_eq!(out, format!("{long}</Key>").into_bytes());
+    }
+
+    /// An S3 document reached through an area, and a bucket's `Location`, come back under the
+    /// alias; an object's bytes, and an answer reached by the real path, are left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_s3_document_through_the_alias_is_mapped_back() {
+        const LISTING: &str = "<ListBucketResult><Name>tri</Name><Prefix>b/c/</Prefix>\
+                               <Contents><Key>b/c/k</Key></Contents></ListBucketResult>";
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let start = |content_type: &'static str| {
+            let (up_addr, _) = fake_upstream_answering(
+                LISTING.as_bytes(),
+                if content_type == "application/xml" {
+                    &[("content-type", "application/xml"), ("location", "/s3/tri")]
+                } else {
+                    &[
+                        ("content-type", "application/octet-stream"),
+                        ("location", "/s3/tri"),
+                    ]
+                },
+            );
+            let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
+                .unwrap()
+                .with_areas(&s3_areas());
+            spawn_blocking(cfg).unwrap()
+        };
+        let get = |proxy: SocketAddr, target: &'static str| async move {
+            let r = reqwest::Client::new()
+                .get(format!("http://{proxy}{target}"))
+                .send()
+                .await
+                .unwrap();
+            let location = r.headers()["location"].to_str().unwrap().to_string();
+            (location, r.text().await.unwrap())
+        };
+        let xml = start("application/xml");
+        assert_eq!(
+            get(xml, "/s3/job/three?list-type=2").await,
+            (
+                "/s3/job/three".to_string(),
+                "<ListBucketResult><Name>three</Name><Prefix></Prefix>\
+                 <Contents><Key>k</Key></Contents></ListBucketResult>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            get(xml, "/s3/tri?list-type=2").await,
+            ("/s3/tri".to_string(), LISTING.to_string())
+        );
+        let bytes = start("application/octet-stream");
+        assert_eq!(
+            get(bytes, "/s3/job/three/k").await,
+            ("/s3/job/three".to_string(), LISTING.to_string())
+        );
+    }
+
     /// A job meant to have a token and given none gets a proxy that lends nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_job_without_a_token_gets_nothing() {
@@ -1489,6 +2227,11 @@ mod tests {
             "/lock/acquire?name=p:k",
             "/dav/files/p/x",
             "/v2/p/tags/list",
+            "/s3",
+            "/s3?x-id=ListBuckets",
+            "/s3/",
+            "/s3/b/k",
+            "/s3/job/../b",
         ] {
             assert!(ok(fine).is_some(), "{fine}");
         }
@@ -1499,9 +2242,17 @@ mod tests {
             "/dav/files/../../x",
             "/dav/files/../repos/x",
             "/lock/%2e%2e/browse",
+            "/s3x",
+            "/s3../x",
+            "/s3/../settings/keys",
+            "/s3/%2e%2e/browse",
+            "/s3/b/..%2f..%2fv2",
+            "/s3/job/%2e%2e/%2e%2e/dav/repos",
         ] {
             assert_eq!(ok(escape), None, "{escape}");
         }
+        // Nor the node's credential the S3 view.
+        assert_eq!(upstream_url(&up, "/s3/b/k"), None);
     }
 
     #[test]
@@ -1832,6 +2583,12 @@ mod tests {
         assert!(repeatable(&put, "/v2/app/manifests/latest"));
         assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab"));
         assert!(repeatable(&put, "/dav/files/p/x"));
+        assert!(repeatable(&put, "/s3/b/k"));
+        assert!(repeatable(&get, "/s3/b"));
+        assert!(!repeatable(&put, "/s3/b"));
+        assert!(!repeatable(&put, "/s3/b/"));
+        assert!(!repeatable(&post, "/s3/b/k?uploadId=u"));
+        assert!(!repeatable(&Method::DELETE, "/s3/b/k"));
         assert!(repeatable(&post, "/v2/app/blobs/uploads/"));
         assert!(!repeatable(&put, "/v2/app/blobs/uploads/u1"));
         assert!(!repeatable(&Method::PATCH, "/v2/app/blobs/uploads/u1"));
