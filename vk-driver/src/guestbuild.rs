@@ -1196,6 +1196,7 @@ mod tests {
             cache_repo: None,
             pipeline_prefix: Some(prefix.to_string()),
             areas: vec![],
+            build_prefix: None,
         }
     }
 

@@ -4876,6 +4876,7 @@ mod tests {
             cache_repo: None,
             pipeline_prefix: None,
             areas: vec![],
+            build_prefix: None,
         };
         let remote_job =
             rg("repo = \"reg.example/t\"\nguest_credential = \"job\"\nproxy_guests = true\n");
@@ -5036,6 +5037,7 @@ mod tests {
                 cache_repo: None,
                 pipeline_prefix: prefix.map(str::to_string),
                 areas: vec![],
+                build_prefix: None,
             });
             ctx
         };

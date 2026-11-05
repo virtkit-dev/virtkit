@@ -5,7 +5,7 @@
 use vk_hub_proto::token::Grant;
 
 use crate::egress::blocked::{Instances, instance_tag};
-use crate::store::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS};
+use crate::store::{CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS};
 use crate::subject::{Projects, Subject};
 
 /// Rights in plain words: `Read, Publish, Coordinate builds`, or `No access`.
@@ -71,7 +71,7 @@ pub(super) struct Area {
     /// Who may publish, one line per access rule, saying when they also coordinate builds;
     /// rules that only coordinate builds say so.
     pub publishers: Vec<String>,
-    /// One of the areas the hub keeps for CI: caches and per-pipeline storage.
+    /// One of the areas the hub keeps for CI: CI caches, per-pipeline storage and build caches.
     pub managed: bool,
 }
 
@@ -80,6 +80,7 @@ pub(super) fn label(name: &str) -> String {
     match name {
         CI_CACHE => "CI caches".to_string(),
         CI_PIPELINE => "Pipeline storage".to_string(),
+        CI_BUILD => "Build caches".to_string(),
         other => other.to_string(),
     }
 }
@@ -104,7 +105,7 @@ pub(super) fn area(ns: &NamespaceRow, instances: Instances<&str>) -> Area {
                 _ => format!("{} · coordinate builds only", line(g)),
             })
             .collect(),
-        managed: ns.name == CI_CACHE || ns.name == CI_PIPELINE,
+        managed: [CI_CACHE, CI_PIPELINE, CI_BUILD].contains(&ns.name.as_str()),
     }
 }
 

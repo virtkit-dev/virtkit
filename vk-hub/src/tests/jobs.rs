@@ -5715,8 +5715,12 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
     assert_eq!(
         rights,
         [
+            (
+                "ci-build/gl/42/unprotected/all".to_string(),
+                "rwl".to_string()
+            ),
             ("ci-cache/gl/42/unprotected".to_string(), "rw".to_string()),
-            ("ci-pipeline/gl/42/902".to_string(), "rwl".to_string())
+            ("ci-pipeline/gl/42/902".to_string(), "rwl".to_string()),
         ]
     );
     assert!(format!("{access:?}").contains("[redacted]"));
@@ -5777,9 +5781,11 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         alias: "task-cache".into(),
         prefix: "task-cache/gl/42/unprotected".into(),
     };
-    for (n, maps, want) in [(40, false, vec![]), (41, true, vec![area])] {
+    // The build prefix requires build-cache support, independently of registry-area support.
+    for (n, maps, caches, want) in [(40, false, true, vec![]), (41, true, false, vec![area])] {
         let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
         inventory.registry_areas = maps;
+        inventory.job_build_cache = caches;
         hub.db
             .record_inventory(&node_id, inventory, true, now_secs())
             .unwrap();
@@ -5788,7 +5794,12 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         let HubJobMsg::Start(start) = node.job().await else {
             panic!("expected a start");
         };
-        assert_eq!(start.registry.expect("a registry token").areas, want);
+        let access = start.registry.expect("a registry token");
+        assert_eq!(access.areas, want);
+        assert_eq!(
+            access.build_prefix.as_deref(),
+            caches.then_some("ci-build/gl/42/unprotected/all")
+        );
     }
     // Jobs go without when anything a token needs is missing: a node that uses none or names
     // no registry the hub binds.

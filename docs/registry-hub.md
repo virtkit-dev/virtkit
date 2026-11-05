@@ -473,6 +473,8 @@ namespace ci-cache     path = "ci-cache/{gitlab}/{project_id}/{protection}"
   read write           own project
 namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}"  retention = 2d
   read write lock      own project, own pipeline
+namespace ci-build     path = "ci-build/{gitlab}/{project_id}/{protection}/{scope}"  retention = 14d
+  read write lock      own project
 ```
 
 - **What a prefix covers.** A namespace's path covers every kind of reference beneath it,
@@ -536,9 +538,11 @@ namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}" 
   ignored and an `org.virtkit.expires` later than the window is cut to it, since any job with
   write access chooses those annotations. Under a window the hub sets, both hold, so a hub
   cannot drop pinned tags.
-- **The default set.** The hub starts with `ci-cache` and `ci-pipeline` as above; the
-  operator may change both paths and grants, and declares the rest. These two names are
-  roles: the node stores a job's caches in the repositories they resolve to (see 4a).
+- **The default set.** The hub starts with `ci-cache`, `ci-pipeline` and `ci-build` as above;
+  the operator may change their paths and grants, within `ci-build`'s checks, and declares the
+  rest. These three names are roles: the node stores a job's caches, pipeline content and
+  build caches in the repositories they resolve to (see 4a, 4c and
+  [build caches](build-cache-design.md)).
 
 **Trust.** A job's claims (project ID and path, ref, protection, pipeline) are vk-gitlab's,
 submitted by the relay it enrolled as ([design](gitlab-relay-enrollment.md)), and the hub does
@@ -853,10 +857,16 @@ A retention (1 to 3650 days) covers the path's leading fixed components, so the 
 fixed component after a placeholder, and it is refused where it would reach into another
 namespace asking for another window. A registry that first takes tokens gets `ci-cache`
 (`ci-cache/{gitlab}/{project_id}/{protection}`, `rw:own project`) and `ci-pipeline`
-(`ci-pipeline/{gitlab}/{project_id}/{pipeline_id}`, `rwl:own project, own pipeline`, 2 days),
-once; their names are the roles that name a job's cache repository and pipeline prefix. The
-2-day window takes effect only on a registry whose `[[gc.prefix]]` allows it: the hub may only
-lengthen a registry's own window, and stays within `min_retention_days` elsewhere.
+(`ci-pipeline/{gitlab}/{project_id}/{pipeline_id}`, `rwl:own project, own pipeline`, 2 days)
+and `ci-build` (`ci-build/{gitlab}/{project_id}/{protection}/{scope}`, `rwl:own project`, 14
+days), once; their names are the roles that name a job's cache repository, pipeline prefix and
+build prefix. A registry seeded before `ci-build` was a default gets it once on its own,
+unless a namespace holds its name or root. A `ci-build` path must hold `{gitlab}`,
+`{project_id}`, `{protection}` and `{scope}`, and its grants select only `own project`; its
+prefix reaches a job as `build_prefix` only on a node announcing `job_build_cache`
+([build caches](build-cache-design.md)). A window below the registry's `min_retention_days`,
+such as `ci-pipeline`'s 2 days, takes effect only on a registry whose `[[gc.prefix]]` allows
+it: the hub may only lengthen a registry's own window.
 
 **Registry URLs.** `vk-hub token create --kind registry --url <url>` binds the enrolling
 registry to the URL its clients reach it at; `vk-hub registries set-url <id> <url>|--none`

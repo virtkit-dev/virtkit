@@ -344,6 +344,7 @@ mod tests {
             cache_repo: None,
             pipeline_prefix: prefix.map(str::to_string),
             areas: vec![],
+            build_prefix: None,
         }
     }
 

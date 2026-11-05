@@ -264,6 +264,7 @@ mod tests {
                 cache_repo: None,
                 pipeline_prefix: None,
                 areas: vec![],
+                build_prefix: None,
             }),
             egress: None,
         };

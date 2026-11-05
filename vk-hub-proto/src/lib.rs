@@ -743,6 +743,12 @@ pub struct Inventory {
     /// paths reach the registry unmapped, which refuses them unless a grant covers them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registry_areas: bool,
+    /// Whether the node builds a placed job with its cache at
+    /// [`dispatch::JobRegistry::build_prefix`] under the job's token, or with no cache, never
+    /// its own shared cache, and never lends a guest its own registry credential. A node
+    /// without it gets no `build_prefix`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job_build_cache: bool,
     /// Whether the node sends each placed job's egress report ([`job::JobResult::egress`]): a job
     /// placed on one that does not has no report to show.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1481,6 +1487,7 @@ mod tests {
             registry: None,
             job_tokens: false,
             registry_areas: false,
+            job_build_cache: false,
             egress_reports: false,
             egress_rules: false,
             egress_fallback: false,
@@ -2240,6 +2247,7 @@ mod tests {
         tokens["registry"] = json!("https://reg.example.com");
         tokens["job_tokens"] = json!(true);
         tokens["registry_areas"] = json!(true);
+        tokens["job_build_cache"] = json!(true);
         tokens["egress_reports"] = json!(true);
         tokens["egress_rules"] = json!(true);
         tokens["egress_fallback"] = json!(true);
@@ -2248,6 +2256,7 @@ mod tests {
                 registry: Some("https://reg.example.com".into()),
                 job_tokens: true,
                 registry_areas: true,
+                job_build_cache: true,
                 egress_reports: true,
                 egress_rules: true,
                 egress_fallback: true,

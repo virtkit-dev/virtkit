@@ -9095,7 +9095,7 @@ async fn the_registries_list_says_whether_jobs_get_access() {
         "https://off.example.com",
         "<span class=\"sub\">off</span>",
         "https://ok.example.com",
-        "<span class=\"badge ok\">Configured</span><div class=\"sub\">2 storage areas</div>",
+        "<span class=\"badge ok\">Configured</span><div class=\"sub\">3 storage areas</div>",
         "no address",
         "Setup needed</span><div class=\"sub\">no address bound",
     ] {

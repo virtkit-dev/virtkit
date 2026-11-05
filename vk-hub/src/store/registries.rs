@@ -65,6 +65,11 @@ pub struct RegistryRow {
     /// Whether it got the default namespaces, which it does once, when it first takes tokens.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub namespaces_seeded: bool,
+    /// Whether the hub has tried to give it [`super::namespaces::CI_BUILD`] by default, with
+    /// the others or once on its own for a registry seeded before it was a default; set even
+    /// when that namespace was skipped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub build_cache_seeded: bool,
 }
 
 impl RegistryRow {

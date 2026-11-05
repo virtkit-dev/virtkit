@@ -870,6 +870,7 @@ mod tests {
             cache_repo: Some("ci-cache/gl/42/protected".into()),
             pipeline_prefix: None,
             areas: vec![],
+            build_prefix: None,
         };
         let job = JobStart {
             job: "j".into(),

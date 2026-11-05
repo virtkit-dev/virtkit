@@ -123,6 +123,12 @@ pub struct JobRegistry {
     /// [`Inventory::registry_areas`](crate::Inventory::registry_areas).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub areas: Vec<Area>,
+    /// The prefix the job's builds cache under, the `ci-build` namespace's for it: layers at
+    /// `<prefix>/build-cache`, with the job's token. Sent only to a node announcing
+    /// [`Inventory::job_build_cache`](crate::Inventory::job_build_cache); `None` when no such
+    /// namespace gives the job one, and the node then builds with the cache off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_prefix: Option<String>,
 }
 
 /// An alias a job reaches one of its prefixes by, whatever its project or protection.
@@ -144,6 +150,7 @@ impl std::fmt::Debug for JobRegistry {
             .field("cache_repo", &self.cache_repo)
             .field("pipeline_prefix", &self.pipeline_prefix)
             .field("areas", &self.areas)
+            .field("build_prefix", &self.build_prefix)
             .finish()
     }
 }
@@ -566,6 +573,7 @@ mod tests {
             cache_repo: Some("ci-cache/gl/42/protected".into()),
             pipeline_prefix: Some("ci-pipeline/gl/42/7".into()),
             areas: vec![],
+            build_prefix: Some("ci-build/gl/42/protected/all".into()),
         };
         let wire = json!({
             "registry_id": id("r"),
@@ -574,6 +582,7 @@ mod tests {
             "grants": [{"prefix": "ci-cache/gl/42/protected", "read": true, "write": true}],
             "cache_repo": "ci-cache/gl/42/protected",
             "pipeline_prefix": "ci-pipeline/gl/42/7",
+            "build_prefix": "ci-build/gl/42/protected/all",
         });
         assert_eq!(serde_json::to_value(&access).unwrap(), wire);
         assert_eq!(serde_json::from_value::<JobRegistry>(wire).unwrap(), access);

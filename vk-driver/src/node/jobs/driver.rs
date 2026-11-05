@@ -1174,6 +1174,7 @@ mod tests {
             cache_repo: None,
             pipeline_prefix: None,
             areas: vec![],
+            build_prefix: None,
         };
         let job = CiJob::default();
         let phrases = masked_phrases(&Vars::default(), &job, Some(&registry));

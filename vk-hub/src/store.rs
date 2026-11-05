@@ -83,7 +83,7 @@ pub use keys::{
     MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
 pub use namespaces::{
-    CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS, prefix_retention, resolve,
+    CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS, prefix_retention, resolve,
 };
 pub use observed::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,

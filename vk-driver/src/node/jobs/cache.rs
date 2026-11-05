@@ -918,6 +918,7 @@ mod tests {
             cache_repo: cache_repo.map(str::to_string),
             pipeline_prefix: None,
             areas: vec![],
+            build_prefix: None,
         }
     }
 

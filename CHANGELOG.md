@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   and protection; `vk-hub namespaces add … --isolate <glob>` gives the refs it matches a scope
   each, which no other ref's job reaches. The path's leading fixed part is reserved: no other
   namespace may reach it, so grants cannot add up across scopes.
+- **vk-hub adds a `ci-build` namespace for build caches,** one per project, protection and
+  isolated ref, kept 14 days, to every registry taking tokens, existing ones included unless a
+  namespace already uses that name or root. Nodes do not use it yet.
 
 ### Changed
 

@@ -368,6 +368,7 @@ pub fn for_job(
         key,
         gitlab,
         areas: inventory.is_some_and(|i| i.registry_areas),
+        build_cache: inventory.is_some_and(|i| i.job_build_cache),
     };
     match mint_for_job(hub, ctx, &target, (node.0, job), spec) {
         Ok((access, audit, jti)) => {
@@ -397,6 +398,9 @@ struct MintTarget<'a> {
     gitlab: &'a str,
     /// Whether the node maps a job's aliases ([`vk_hub_proto::Inventory::registry_areas`]).
     areas: bool,
+    /// Whether the node caches a job's builds at its build prefix
+    /// ([`vk_hub_proto::Inventory::job_build_cache`]).
+    build_cache: bool,
 }
 
 fn mint_for_job(
@@ -412,6 +416,7 @@ fn mint_for_job(
         key,
         gitlab,
         areas,
+        build_cache,
     } = *target;
     let Some(signer) = ctx.signers.get(&key.public.kid) else {
         bail!("token-signing key {} is not loaded", key.public.kid);
@@ -452,6 +457,8 @@ fn mint_for_job(
         pipeline_prefix: resolved.pipeline_prefix,
         // An older node would leave `job/…` paths unmapped.
         areas: if areas { resolved.areas } else { Vec::new() },
+        // An older node would cache the job's builds in its shared cache all the same.
+        build_prefix: resolved.build_prefix.filter(|_| build_cache),
         token: signer.sign(claims)?,
     };
     Ok((access, (Some(registry), event), jti))

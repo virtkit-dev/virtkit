@@ -120,10 +120,16 @@ fn a_registry_taking_tokens_gets_keys_namespaces_and_retention() {
     assert_eq!(keys.len(), 1);
     assert_eq!(
         desired.prefix_retention.unwrap(),
-        vec![vk_hub_proto::registry::PrefixRetention {
-            prefix: "ci-pipeline".into(),
-            retention_days: 2
-        }]
+        vec![
+            vk_hub_proto::registry::PrefixRetention {
+                prefix: "ci-build".into(),
+                retention_days: 14
+            },
+            vk_hub_proto::registry::PrefixRetention {
+                prefix: "ci-pipeline".into(),
+                retention_days: 2
+            }
+        ]
     );
     let names: Vec<String> = hub
         .db
@@ -132,13 +138,13 @@ fn a_registry_taking_tokens_gets_keys_namespaces_and_retention() {
         .into_iter()
         .map(|n| n.name)
         .collect();
-    assert_eq!(names, ["ci-cache", "ci-pipeline"]);
+    assert_eq!(names, ["ci-build", "ci-cache", "ci-pipeline"]);
     // Removing the defaults does not bring them back.
     hub.db
         .remove_namespace(&id, "ci-cache", "uid 0", 1)
         .unwrap();
     crate::tokens::sync_registry(&hub, &id).unwrap();
-    assert_eq!(hub.db.namespaces(&id).unwrap().len(), 1);
+    assert_eq!(hub.db.namespaces(&id).unwrap().len(), 2);
 }
 
 #[test]
@@ -474,7 +480,7 @@ fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
         )
         .unwrap();
     crate::tokens::sync_registry(&hub, &id).unwrap();
-    assert_eq!(desired().prefix_retention.unwrap().len(), 1);
+    assert_eq!(desired().prefix_retention.unwrap().len(), 2);
     let images = crate::store::NamespaceRow {
         name: "images".into(),
         path: "images".into(),
@@ -492,7 +498,7 @@ fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
         .into_iter()
         .map(|r| format!("{}={}", r.prefix, r.retention_days))
         .collect();
-    assert_eq!(windows, ["ci-pipeline=2", "images=30"]);
+    assert_eq!(windows, ["ci-build=14", "ci-pipeline=2", "images=30"]);
 }
 
 /// A CLI that knows no isolated refs leaves out `isolate` when it replaces a namespace: the

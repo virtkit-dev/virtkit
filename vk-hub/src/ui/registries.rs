@@ -343,8 +343,8 @@ fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances
         areas_table(h, &own);
     }
     if !managed.is_empty() {
-        h.raw("<details class=\"fold\"><summary>Managed by CI <span class=\"sub\">· caches and ")
-            .raw("per-pipeline storage</span></summary>");
+        h.raw("<details class=\"fold\"><summary>Managed by CI <span class=\"sub\">· CI caches, ")
+            .raw("per-pipeline storage and build caches</span></summary>");
         areas_table(h, &managed);
         h.raw("</details>");
     }

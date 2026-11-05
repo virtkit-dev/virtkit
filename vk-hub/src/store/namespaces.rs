@@ -30,6 +30,14 @@ pub(super) const NAMESPACES: TableDefinition<&str, &[u8]> = TableDefinition::new
 pub const CI_CACHE: &str = "ci-cache";
 /// The namespace a pipeline's jobs share: its path is the job's pipeline prefix.
 pub const CI_PIPELINE: &str = "ci-pipeline";
+/// The job's build-cache namespace: its path is the build prefix, with layers under
+/// [`BUILD_CACHE_REPO`].
+pub const CI_BUILD: &str = "ci-build";
+/// The repository under a job's build prefix that holds its build cache.
+pub const BUILD_CACHE_REPO: &str = "build-cache";
+/// The placeholders a [`CI_BUILD`] path must hold, so a job's build cache is its project's,
+/// protection's and scope's alone.
+const CI_BUILD_PLACEHOLDERS: [&str; 4] = ["{gitlab}", "{project_id}", "{protection}", "{scope}"];
 
 /// The most namespaces a registry has: a job's token carries at most one grant per
 /// namespace, and a token holds [`vk_hub_proto::token::MAX_GRANTS`].
@@ -138,6 +146,10 @@ impl NamespaceRow {
                 PLACEHOLDERS.join(", ")
             )
         })?;
+        let longest = match self.name.as_str() {
+            CI_BUILD => format!("{longest}/{BUILD_CACHE_REPO}"),
+            _ => longest,
+        };
         if !servable_prefix(&longest) {
             return Err(format!(
                 "{:?} is not a repository name for every job: at its longest, {longest:?}, it \
@@ -197,6 +209,9 @@ impl NamespaceRow {
         if self.grants.is_empty() || self.grants.len() > MAX_GRANTS {
             return Err(format!("a namespace has 1 to {MAX_GRANTS} grant lines"));
         }
+        if self.name == CI_BUILD {
+            self.check_ci_build()?;
+        }
         for g in &self.grants {
             g.subject.check_grant(g.write || g.lock)?;
             let has = |p: &str| self.path.split('/').any(|c| c == p);
@@ -208,6 +223,34 @@ impl NamespaceRow {
                     "`own pipeline` needs {gitlab} and {pipeline_id} in the path".to_string(),
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Why this [`CI_BUILD`] namespace may not be stored, if it may not: its path must name
+    /// the job's instance, project, protection and scope, and its grants select only by `own
+    /// project`, so no job reaches another's build cache through it.
+    fn check_ci_build(&self) -> Result<(), String> {
+        let components: Vec<&str> = self.path.split('/').collect();
+        if let Some(missing) = CI_BUILD_PLACEHOLDERS
+            .iter()
+            .find(|p| !components.contains(p))
+        {
+            return Err(format!(
+                "{:?}: a {CI_BUILD} path must hold {}; it lacks {missing}",
+                self.path,
+                CI_BUILD_PLACEHOLDERS.join(", ")
+            ));
+        }
+        let own = Subject {
+            projects: Projects::Own,
+            ..Subject::default()
+        };
+        if let Some(g) = self.grants.iter().find(|g| g.subject != own) {
+            return Err(format!(
+                "{g}: {CI_BUILD} grants only to `own project`, so no job reaches another's \
+                 build cache"
+            ));
         }
         Ok(())
     }
@@ -440,6 +483,8 @@ pub struct Resolved {
     pub pipeline_prefix: Option<String>,
     /// The aliases of the namespaces selecting the job, with the prefix each stands for.
     pub areas: Vec<Area>,
+    /// [`CI_BUILD`]'s path for the job, when it selects the job.
+    pub build_prefix: Option<String>,
 }
 
 /// The grants the namespaces `ns` give the job claiming `c`: per namespace whose path fills,
@@ -465,6 +510,9 @@ pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
         match n.name.as_str() {
             CI_CACHE => out.cache_repo = Some(prefix.clone()),
             CI_PIPELINE => out.pipeline_prefix = Some(prefix.clone()),
+            // Legacy namespaces keep their grants but supply a build prefix only if they pass
+            // the checks, so no job's builds land where another project's may.
+            CI_BUILD if n.check_ci_build().is_ok() => out.build_prefix = Some(prefix.clone()),
             _ => {}
         }
         if let Some(alias) = &n.alias {
@@ -511,7 +559,8 @@ pub fn prefix_retention(ns: &[NamespaceRow]) -> Vec<PrefixRetention> {
     out
 }
 
-/// The namespaces a registry starts with when it first takes tokens.
+/// The namespaces a registry starts with when it first takes tokens; a registry that took
+/// them before [`CI_BUILD`] was one gets that one later, once.
 pub fn defaults(now: u64) -> Vec<NamespaceRow> {
     let grant = |line: &str| NsGrant::parse(line).unwrap_or_else(|e| unreachable!("{e}"));
     vec![
@@ -532,6 +581,16 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             alias: None,
             isolate: Vec::new(),
             grants: vec![grant("rwl:own project, own pipeline")],
+            created_at: now,
+            created_by: "hub".into(),
+        },
+        NamespaceRow {
+            name: CI_BUILD.into(),
+            path: "ci-build/{gitlab}/{project_id}/{protection}/{scope}".into(),
+            retention_days: Some(14),
+            alias: None,
+            isolate: Vec::new(),
+            grants: vec![grant("rwl:own project")],
             created_at: now,
             created_by: "hub".into(),
         },
@@ -679,8 +738,9 @@ impl Db {
     }
 
     /// Give registry `registry` the [`defaults`] it lacks, once, each held to the checks
-    /// [`Db::put_namespace`] makes: one refused is skipped, and the audit log says why.
-    /// Whether it got them now.
+    /// [`Db::put_namespace`] makes: one refused is skipped, and the audit log says why. A
+    /// registry seeded before [`CI_BUILD`] was a default gets that one alone, once. Whether it
+    /// ran now.
     pub fn seed_namespaces(&self, registry: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let mut events = Vec::new();
@@ -693,13 +753,18 @@ impl Db {
             else {
                 return Err(NotEnrolled(registry.to_string()).into());
             };
-            if row.namespaces_seeded {
+            if row.namespaces_seeded && row.build_cache_seeded {
                 false
             } else {
+                let only_build = row.namespaces_seeded;
                 row.namespaces_seeded = true;
+                row.build_cache_seeded = true;
                 registries.insert(registry, encode(&row)?.as_slice())?;
                 let mut table = txn.open_table(NAMESPACES)?;
                 for ns in defaults(now) {
+                    if only_build && ns.name != CI_BUILD {
+                        continue;
+                    }
                     let key = format!("{registry}/{}", ns.name);
                     if table.get(key.as_str())?.is_some() {
                         continue;
@@ -903,16 +968,21 @@ mod tests {
     }
 
     #[test]
-    fn defaults_resolve_to_the_cache_and_pipeline() {
+    fn defaults_resolve_to_the_cache_pipeline_and_build_cache() {
         let r = resolve(&defaults(0), &claims(false, 7));
         assert_eq!(r.cache_repo.as_deref(), Some("ci-cache/gl/42/unprotected"));
         assert_eq!(r.pipeline_prefix.as_deref(), Some("ci-pipeline/gl/42/7"));
-        assert_eq!(r.grants.len(), 2);
+        assert_eq!(
+            r.build_prefix.as_deref(),
+            Some("ci-build/gl/42/unprotected/all")
+        );
+        assert_eq!(r.grants.len(), 3);
         assert_eq!(r.grants[0].rights(), "rw");
         assert_eq!(r.grants[1].rights(), "rwl");
+        assert_eq!(r.grants[2].rights(), "rwl");
         let no_pipeline = resolve(&defaults(0), &claims(true, 0));
         assert_eq!(no_pipeline.pipeline_prefix, None);
-        assert_eq!(no_pipeline.grants.len(), 1);
+        assert_eq!(no_pipeline.grants.len(), 2);
         for d in defaults(0) {
             d.check().unwrap();
         }
@@ -1027,7 +1097,7 @@ mod tests {
             .into_iter()
             .map(|n| n.name)
             .collect();
-        assert_eq!(names, [CI_CACHE, "wider"]);
+        assert_eq!(names, [CI_BUILD, CI_CACHE, "wider"]);
         let events: Vec<String> = db
             .audit_search(&AuditFilter::default(), None, 100)
             .unwrap()
@@ -1042,6 +1112,126 @@ mod tests {
             "{events:?}"
         );
         assert!(!db.seed_namespaces(&overlapping, 3).unwrap());
+    }
+
+    #[test]
+    fn a_registry_seeded_before_gets_the_build_cache_once() {
+        use crate::store::{RegistryEnrollment, TokenKind};
+        let db = Db::open_memory().unwrap();
+        let ttl = std::time::Duration::from_secs(60);
+        let enroll = |key: &str| {
+            let (token, _) = db
+                .create_token_for(TokenKind::Registry, ttl, None, "u", 1)
+                .unwrap();
+            let RegistryEnrollment::Enrolled { id } =
+                db.enroll_registry(&token, key, "reg", "p", 1).unwrap()
+            else {
+                panic!("not enrolled");
+            };
+            id
+        };
+        let (old, held) = (enroll("aa"), enroll("bb"));
+        // As an older hub left them: seeded, without ci-build, ci-cache removed since.
+        for id in [&old, &held] {
+            let txn = db.db.begin_write().unwrap();
+            {
+                let mut registries = txn.open_table(REGISTRIES).unwrap();
+                let mut row: super::super::RegistryRow =
+                    decode(registries.get(id.as_str()).unwrap().unwrap().value()).unwrap();
+                row.namespaces_seeded = true;
+                registries
+                    .insert(id.as_str(), encode(&row).unwrap().as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        // A namespace on ci-build's root keeps it from being added.
+        let mine = ns("mine", "ci-build/{gitlab}", &["r:*"], None);
+        db.put_namespace(&held, &mine, "u", 1).unwrap();
+        let names = |id: &str| -> Vec<String> {
+            db.namespaces(id)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.name)
+                .collect()
+        };
+        assert!(db.seed_namespaces(&old, 2).unwrap());
+        assert_eq!(names(&old), [CI_BUILD]);
+        assert!(db.seed_namespaces(&held, 2).unwrap());
+        assert_eq!(names(&held), ["mine"]);
+        // Once: removed, it does not come back.
+        assert!(db.remove_namespace(&old, CI_BUILD, "u", 3).unwrap());
+        assert!(!db.seed_namespaces(&old, 4).unwrap());
+        assert!(names(&old).is_empty());
+    }
+
+    /// A ci-build stored before its checks, too wide, keeps its grant but gives no job a build
+    /// prefix.
+    #[test]
+    fn a_ci_build_failing_its_checks_gives_no_build_prefix() {
+        let wide = ns(CI_BUILD, "ci-build/{gitlab}", &["r:*"], None);
+        let r = resolve(std::slice::from_ref(&wide), &claims(false, 7));
+        assert_eq!(r.build_prefix, None);
+        assert_eq!(r.grants.len(), 1);
+        let ok = defaults(0)
+            .into_iter()
+            .find(|n| n.name == CI_BUILD)
+            .unwrap();
+        let r = resolve(std::slice::from_ref(&ok), &claims(false, 7));
+        assert_eq!(
+            r.build_prefix.as_deref(),
+            Some("ci-build/gl/42/unprotected/all")
+        );
+    }
+
+    #[test]
+    fn ci_build_is_its_projects_protections_and_scopes_alone() {
+        let ci_build = defaults(0)
+            .into_iter()
+            .find(|n| n.name == CI_BUILD)
+            .unwrap();
+        ci_build.check().unwrap();
+        NamespaceRow {
+            isolate: vec!["main".into()],
+            ..ci_build.clone()
+        }
+        .check()
+        .unwrap();
+        for path in [
+            "ci-build/{gitlab}/{project_id}/{protection}",
+            "ci-build/{gitlab}/{project_id}/{scope}",
+            "ci-build/{gitlab}/{protection}/{scope}",
+            "ci-build/{project_id}/{protection}/{scope}",
+        ] {
+            let bad = NamespaceRow {
+                path: path.into(),
+                ..ci_build.clone()
+            };
+            assert!(bad.check().unwrap_err().contains("lacks {"), "{path}");
+        }
+        for grant in [
+            "r:*",
+            "rwl:own project, protected",
+            "r:gitlab gl",
+            "rwl:own project, own pipeline",
+        ] {
+            let bad = NamespaceRow {
+                grants: vec![NsGrant::parse(grant).unwrap()],
+                ..ci_build.clone()
+            };
+            assert!(bad.check().is_err(), "{grant}");
+        }
+        // Room for /build-cache is part of the length checked.
+        // Slashes, {gitlab}, {project_id}, {protection} and {scope} at their longest.
+        let fixed =
+            "a".repeat(MAX_PREFIX_LEN - 4 - super::super::gitlabs::MAX_GITLAB_NAME - 20 - 11 - 69);
+        let path = format!("{fixed}/{{gitlab}}/{{project_id}}/{{protection}}/{{scope}}");
+        ns("x", &path, &["rwl:own project"], None).check().unwrap();
+        let as_build = NamespaceRow {
+            path,
+            ..ci_build.clone()
+        };
+        assert!(as_build.check().unwrap_err().contains("at its longest"));
     }
 
     #[test]
