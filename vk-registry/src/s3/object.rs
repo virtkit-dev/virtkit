@@ -911,19 +911,22 @@ pub(super) enum Deleted {
 }
 
 /// Delete the object at `segs` for this caller, the namespace held (`_namespace`): a key
-/// that is a directory holds no object to delete, and one the caller may not read is absent.
+/// that is a directory holds no object to delete. Writing the repository it is in is what
+/// deletes it, reading it or not; one the caller may neither read nor write is absent.
 pub(super) fn delete_one(
     store: &Store,
     _namespace: &files::Namespace,
     authz: &Authz<'_>,
     segs: &[String],
 ) -> Result<Deleted> {
-    let node = match files::resolve(store, segs)? {
-        Some(node) if allowed(authz, accounts::Action::Read, node.repo()) => node,
-        _ => return Ok(Deleted::Gone),
+    let Some(node) = files::resolve(store, segs)? else {
+        return Ok(Deleted::Gone);
     };
     if !allowed(authz, accounts::Action::Write, node.repo()) {
-        return Ok(Deleted::Denied);
+        return Ok(match allowed(authz, accounts::Action::Read, node.repo()) {
+            true => Deleted::Denied,
+            false => Deleted::Gone,
+        });
     }
     match node {
         Node::Object(obj) => {

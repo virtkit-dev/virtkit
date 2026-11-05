@@ -2390,6 +2390,44 @@ async fn a_hub_token_writes_and_reads_below_its_grant() {
     )
     .await
     .is(403, "AccessDenied");
+    // A grant to write and not read deletes, one key or a batch; nothing beyond it.
+    let mut claims = hub_claims(AUD, now - 1, now + 600);
+    claims.grants[0].read = false;
+    let writer = signer.sign(claims).unwrap();
+    let as_writer = |r: Req| r.signed(&host, (&writer, &writer), 0);
+    send(&host, as_writer(Req::new("GET", "/s3/p/gl/42/k")))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, as_writer(Req::new("DELETE", "/s3/p/gl/42/k")))
+        .await
+        .ok(204);
+    send(&host, as_token(Req::new("GET", "/s3/p/gl/42/k")))
+        .await
+        .is(404, "NoSuchKey");
+    send(
+        &host,
+        as_token(Req::new("PUT", "/s3/p/gl/42/b").body(HELLO.to_vec())),
+    )
+    .await
+    .ok(200);
+    let (deleted, errors) = delete_result(
+        &send(
+            &host,
+            as_writer(delete_objects(
+                "p",
+                delete_doc(&[&key_of("gl/42/b"), &key_of("gl/43/k")], false),
+            )),
+        )
+        .await,
+    );
+    assert_eq!(deleted, ["gl/42/b"]);
+    assert_eq!(
+        errors,
+        [("gl/43/k".to_string(), "AccessDenied".to_string())]
+    );
+    send(&host, as_token(Req::new("GET", "/s3/p/gl/42/b")))
+        .await
+        .is(404, "NoSuchKey");
 }
 
 /// One object, three views: what S3 writes WebDAV and `/v2/` read, and the other way round.
