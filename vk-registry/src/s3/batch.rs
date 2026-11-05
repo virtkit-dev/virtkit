@@ -229,6 +229,10 @@ mod tests {
             body("<Object><Key>a</Key></Object><Quiet>yes</Quiet>"),
             body("<Object><Key>a</Key></Object><Quiet>true</Quiet><Quiet>true</Quiet>"),
             body("<Object><Key>&ent;</Key></Object>"),
+            // What an answer echoing the key could not write.
+            body("<Object><Key>a&#1;</Key></Object>"),
+            body("<Object><Key>a\u{1}</Key></Object>"),
+            body("<Object><Key><![CDATA[a\u{1}]]></Key></Object>"),
             b"<Other><Object><Key>a</Key></Object></Other>".to_vec(),
             b"".to_vec(),
         ] {

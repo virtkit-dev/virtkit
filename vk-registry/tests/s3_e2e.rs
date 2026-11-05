@@ -1970,6 +1970,41 @@ async fn a_key_that_fails_to_delete_is_reported_and_the_batch_goes_on() {
     is_object(&send(&host, Req::new("GET", "/s3/b/d/x")).await, HELLO);
 }
 
+/// What an answer echoes holds no character XML cannot write: an uploads listing's prefix and
+/// markers, and a batch delete's keys.
+#[tokio::test]
+async fn echoed_text_holds_no_control_character() {
+    let dir = tmp("echoed");
+    let host = spawn(open_state(&dir, true));
+    send(&host, Req::new("PUT", "/s3/b/k").body(HELLO.to_vec()))
+        .await
+        .ok(200);
+    for bad in [
+        "uploads&prefix=%0A",
+        "uploads&key-marker=a%01",
+        "uploads&upload-id-marker=%1B",
+    ] {
+        send(&host, Req::new("GET", "/s3/b").query(bad))
+            .await
+            .is(400, "InvalidArgument");
+    }
+    send(
+        &host,
+        Req::new("GET", "/s3/b").query("uploads&prefix=a&key-marker=k&upload-id-marker=u"),
+    )
+    .await
+    .ok(200);
+    for key in ["a&#1;", "a\u{1}"] {
+        send(
+            &host,
+            delete_objects("b", delete_doc(&[&key_of(key)], false)),
+        )
+        .await
+        .is(400, "MalformedXML");
+    }
+    is_object(&send(&host, Req::new("GET", "/s3/b/k")).await, HELLO);
+}
+
 /// A query's names are taken decoded, as the signature takes them, wherever they dispatch;
 /// a malformed escape is refused.
 #[tokio::test]
