@@ -17,8 +17,8 @@ use super::{
     method_not_allowed, multistatus, no_content, not_found, options, propfind_depth, refuse,
 };
 use crate::files::{
-    FILES_REPO, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed, drain_into,
-    namespace, object_of, repo_name, resolve, under_object,
+    DELETE_LOCK_WAIT, FILES_REPO, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed,
+    drain_into, namespace, object_of, repo_name, resolve, under_object,
 };
 use crate::{Authz, Body, RepoRemoval, ServerState, Store, accounts, error_response};
 
@@ -406,9 +406,6 @@ fn mkcol(store: &Store, segs: &[String], href: &str) -> Result<Response<Body>> {
         }
     }
 }
-
-/// Longest a directory `DELETE` waits for the exclusive store lock before answering 503.
-const DELETE_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Delete an object, or a directory with nothing in it (204); 403 for a directory with
 /// members or for a caller that may read the resource but not write it, 409 for a directory

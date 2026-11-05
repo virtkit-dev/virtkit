@@ -667,6 +667,12 @@ impl Store {
                 .is_ok_and(|m| m.is_dir())
     }
 
+    /// Whether anything is at `repos/<name>`, a directory or not: what keeps a name from
+    /// becoming a repository.
+    pub(crate) fn repo_path_taken(&self, name: &str) -> bool {
+        valid_name(name) && std::fs::symlink_metadata(self.root.join("repos").join(name)).is_ok()
+    }
+
     /// Create an empty `tags/` directory and any missing ancestors for WebDAV `MKCOL`.
     /// [`Store::has_repo`] then recognizes the repository before it holds any content.
     /// Hold the shared lock so [`Store::remove_empty_repo`] cannot remove an ancestor

@@ -1725,13 +1725,15 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         .await
         .is(404, "NoSuchKey");
 
-    // Not served yet: other subresources, other verbs, copies.
+    // Not served yet: other subresources, other verbs, part copies.
     for req in [
-        Req::new("GET", "/s3/b/k").query("tagging"),
         Req::new("GET", "/s3/b/k").query("partNumber=1"),
+        Req::new("GET", "/s3/b/k").query("retention"),
         Req::new("POST", "/s3/b/k").query("uploads"),
-        Req::new("GET", "/s3/b").query("versioning"),
-        put("/s3/b/copy").header("x-amz-copy-source", "/b/k"),
+        put("/s3/b/k").query("tagging"),
+        put("/s3/b/copy")
+            .query("partNumber=1&uploadId=0")
+            .header("x-amz-copy-source", "/b/k"),
     ] {
         send(&host, req).await.is(501, "NotImplemented");
     }
@@ -2197,7 +2199,13 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
         .await
         .is(404, "NoSuchBucket");
     // A query naming something else is not a listing.
-    send(host, list("acl=")).await.is(501, "NotImplemented");
+    let resp = send(host, list("acl=")).await;
+    resp.ok(200);
+    assert!(
+        resp.body.contains("<Permission>FULL_CONTROL</Permission>"),
+        "{}",
+        resp.body
+    );
     send(host, list("acl=&list-type=2"))
         .await
         .is(501, "NotImplemented");
@@ -2532,4 +2540,752 @@ async fn a_dav_written_object_is_served_in_ranges_and_a_ranged_get_refreshes_it(
     let resp = send(&host, ranged("HEAD", "headed")).await;
     is_part(&resp, &data, data.len() - 1000, 1000, &etag);
     assert_eq!(mtime("headed"), long_ago);
+}
+
+// ---- buckets made and removed, copies, batch deletes, configurations ----
+
+/// A key of `db`'s user `ci` holding `scopes`, each an action on a pattern.
+fn api_key(db: &Db, name: &str, scopes: &[(Action, &str)]) -> String {
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let scopes: Vec<Scope> = scopes
+        .iter()
+        .map(|(action, pattern)| Scope {
+            action: *action,
+            repo_pattern: pattern.to_string(),
+        })
+        .collect();
+    db.create_api_key(Some(&user.id), name, &scopes, None)
+        .unwrap()
+        .1
+}
+
+/// A request signed by `key` as its access key and secret.
+fn as_key<'a>(host: &'a str, key: &'a str) -> impl Fn(Req) -> Req + 'a {
+    move |r: Req| r.signed(host, (key, key), 0)
+}
+
+/// CreateBucket and DeleteBucket, as `aws s3 mb` and `rb` send them: a bucket is made,
+/// refused twice, and removed once its keys are deleted, however deep they were.
+async fn buckets_are_made_and_removed(host: &str, sign: Sign<'_>) {
+    let req = |method, path: &str| sign(Req::new(method, path));
+    let resp = send(host, req("PUT", "/s3/made")).await;
+    resp.ok(200);
+    assert_eq!(resp.header("location"), Some("/s3/made"));
+    send(host, req("HEAD", "/s3/made")).await.ok(200);
+    send(host, req("PUT", "/s3/made"))
+        .await
+        .is(409, "BucketAlreadyOwnedByYou");
+
+    // A configuration and a canned ACL are taken and ignored; object lock is not served.
+    let config = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                  <LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>";
+    let configured = Req::new("PUT", "/s3/configured")
+        .header("x-amz-acl", "private")
+        .body(config.as_bytes().to_vec());
+    send(host, sign(configured)).await.ok(200);
+    for (path, body) in [
+        ("/s3/large", vec![b' '; 1025]),
+        ("/s3/garbled", b"<CreateBucketConfiguration>".to_vec()),
+        ("/s3/other", b"<Delete/>".to_vec()),
+    ] {
+        let resp = send(host, sign(Req::new("PUT", path).body(body))).await;
+        resp.is(400, "MalformedXML");
+    }
+    let locked = Req::new("PUT", "/s3/locked").header("x-amz-bucket-object-lock-enabled", "true");
+    send(host, sign(locked)).await.is(501, "NotImplemented");
+    for absent in ["/s3/large", "/s3/garbled", "/s3/other", "/s3/locked"] {
+        send(host, req("HEAD", absent)).await.ok(404);
+    }
+
+    // Not empty while it holds a key; empty once they are deleted, the directories they were
+    // in going with it.
+    for path in ["/s3/made/a/b/k", "/s3/made/top"] {
+        let put = Req::new("PUT", path).body(HELLO.to_vec());
+        send(host, sign(put)).await.ok(200);
+    }
+    send(host, req("DELETE", "/s3/made"))
+        .await
+        .is(409, "BucketNotEmpty");
+    send(host, req("DELETE", "/s3/made/top")).await.ok(204);
+    send(host, req("DELETE", "/s3/made"))
+        .await
+        .is(409, "BucketNotEmpty");
+    is_object(&send(host, req("GET", "/s3/made/a/b/k")).await, HELLO);
+    send(host, req("DELETE", "/s3/made/a/b/k")).await.ok(204);
+    send(host, req("DELETE", "/s3/made")).await.ok(204);
+    send(host, req("HEAD", "/s3/made")).await.ok(404);
+    send(host, req("DELETE", "/s3/made"))
+        .await
+        .is(404, "NoSuchBucket");
+    send(host, req("DELETE", "/s3/configured")).await.ok(204);
+    let resp = send(host, req("GET", "/s3/made/a/b/k")).await;
+    resp.is(404, "NoSuchKey");
+}
+
+#[tokio::test]
+async fn buckets_are_made_and_removed_on_an_open_server() {
+    let dir = tmp("mb-open");
+    let state = open_state(&dir, true);
+    let store = state.store.clone();
+    let host = spawn(state);
+    buckets_are_made_and_removed(&host, &|r| r).await;
+
+    // A bucket holding records a deleted object does not account for: an image's manifest
+    // pushed over /v2/, its tag since deleted.
+    store
+        .put_manifest("files/rec", "v1", MANIFEST_TYPE, br#"{"schemaVersion":2}"#)
+        .unwrap();
+    send(&host, Req::new("DELETE", "/s3/rec"))
+        .await
+        .is(409, "BucketNotEmpty");
+    store.delete_tag("files/rec", "v1").unwrap();
+    let resp = send(&host, Req::new("DELETE", "/s3/rec")).await;
+    resp.is(409, "BucketNotEmpty");
+    assert!(resp.body.contains("/v2/"), "{}", resp.body);
+    // The name taken in the store by something that is not a directory.
+    std::fs::write(dir.join("store/repos/files/plain"), b"").unwrap();
+    send(&host, Req::new("PUT", "/s3/plain"))
+        .await
+        .is(409, "OperationAborted");
+    assert_eq!(staging_left(&dir), 0);
+}
+
+#[tokio::test]
+async fn buckets_are_made_and_removed_with_an_api_key() {
+    let dir = tmp("mb-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let writer = api_key(db, "writer", &[(Action::Write, "files/*")]);
+    let reader = api_key(db, "reader", &[(Action::Read, "files/*")]);
+    let inside = api_key(db, "inside", &[(Action::Write, "files/made/sub/*")]);
+    let host = spawn(state.clone());
+    buckets_are_made_and_removed(&host, &as_key(&host, &writer)).await;
+
+    // A bucket is made and removed by a key that may write the bucket itself.
+    let (reader, inside) = (as_key(&host, &reader), as_key(&host, &inside));
+    let body = vec![b'x'; 1 << 20];
+    let resp = send(&host, reader(Req::new("PUT", "/s3/new").body(body))).await;
+    resp.is(403, "AccessDenied");
+    send(&host, inside(Req::new("PUT", "/s3/made")))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, as_key(&host, &writer)(Req::new("PUT", "/s3/made")))
+        .await
+        .ok(200);
+    send(&host, reader(Req::new("DELETE", "/s3/made")))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, inside(Req::new("DELETE", "/s3/made")))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, reader(Req::new("HEAD", "/s3/made")))
+        .await
+        .ok(200);
+}
+
+/// A copy's `CopyObjectResult`: its `ETag` element, unescaped.
+#[track_caller]
+fn copied(resp: &Resp) -> String {
+    resp.ok(200);
+    assert!(
+        resp.body.starts_with(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>"
+        ),
+        "{}",
+        resp.body
+    );
+    assert!(element(&resp.body, "LastModified").ends_with(".000Z"));
+    element(&resp.body, "ETag").replace("&quot;", "\"")
+}
+
+/// CopyObject within and across buckets: the bytes, ETag and metadata carried or replaced,
+/// the source's four conditions and the destination's two, and what cannot be copied.
+async fn objects_are_copied(host: &str, sign: Sign<'_>) -> Vec<u8> {
+    let data = bytes_of_len(70_000);
+    let etag = format!("\"{}\"", md5_hex(&data));
+    let put = Req::new("PUT", "/s3/src/d/k")
+        .header("x-amz-meta-mtime", "1700000000")
+        .body(data.clone());
+    send(host, sign(put)).await.ok(200);
+    let copy = |to: &str, from: &str| Req::new("PUT", to).header("x-amz-copy-source", from);
+    let got = async |path: &str| {
+        let resp = send(host, sign(Req::new("GET", path))).await;
+        is_object(&resp, &data);
+        assert_eq!(resp.header("etag"), Some(&*etag));
+        resp
+    };
+
+    // Within the bucket, then across buckets in the spellings clients send.
+    let resp = send(host, sign(copy("/s3/src/e/copy", "/src/d/k"))).await;
+    assert_eq!(copied(&resp), etag);
+    let resp = got("/s3/src/e/copy").await;
+    assert_eq!(resp.header("x-amz-meta-mtime"), Some("1700000000"));
+    for (to, from) in [
+        ("/s3/dst/copy", "src/d/k"),
+        ("/s3/dst/escaped", "%2Fsrc%2Fd%2Fk"),
+    ] {
+        assert_eq!(copied(&send(host, sign(copy(to, from))).await), etag);
+        let resp = got(to).await;
+        assert_eq!(resp.header("x-amz-meta-mtime"), Some("1700000000"));
+    }
+
+    // REPLACE takes the request's metadata and keeps the bytes' MD5; onto itself, only so.
+    let replace = |to: &str| {
+        copy(to, "/src/d/k")
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("x-amz-meta-other", "x")
+    };
+    assert_eq!(
+        copied(&send(host, sign(replace("/s3/dst/replaced"))).await),
+        etag
+    );
+    let resp = got("/s3/dst/replaced").await;
+    assert_eq!(resp.header("x-amz-meta-other"), Some("x"));
+    assert_eq!(resp.header("x-amz-meta-mtime"), None);
+    send(host, sign(copy("/s3/src/d/k", "/src/d/k")))
+        .await
+        .is(400, "InvalidRequest");
+    let directive = copy("/s3/src/d/k", "/src/d/k").header("x-amz-metadata-directive", "COPY");
+    send(host, sign(directive)).await.is(400, "InvalidRequest");
+    assert_eq!(
+        copied(&send(host, sign(replace("/s3/src/d/k"))).await),
+        etag
+    );
+    let resp = got("/s3/src/d/k").await;
+    assert_eq!(resp.header("x-amz-meta-other"), Some("x"));
+    assert_eq!(resp.header("x-amz-meta-mtime"), None);
+    let bad = copy("/s3/dst/x", "/src/d/k").header("x-amz-metadata-directive", "MOVE");
+    send(host, sign(bad)).await.is(400, "InvalidArgument");
+
+    // The source's conditions, each met and failed.
+    let past = "Mon, 01 Jan 2001 00:00:00 GMT";
+    let future = "Fri, 01 Jan 2100 00:00:00 GMT";
+    for (name, met, failed) in [
+        ("x-amz-copy-source-if-match", etag.as_str(), "\"other\""),
+        (
+            "x-amz-copy-source-if-none-match",
+            "\"other\"",
+            etag.as_str(),
+        ),
+        ("x-amz-copy-source-if-modified-since", past, future),
+        ("x-amz-copy-source-if-unmodified-since", future, past),
+    ] {
+        let req = copy("/s3/dst/conditional", "/src/d/k").header(name, met);
+        assert_eq!(copied(&send(host, sign(req)).await), etag, "{name}");
+        let req = copy("/s3/dst/conditional", "/src/d/k").header(name, failed);
+        send(host, sign(req)).await.is(412, "PreconditionFailed");
+    }
+    // The destination's: create only, or replace only what it names.
+    let req = copy("/s3/dst/copy", "/src/d/k").header("If-None-Match", "*");
+    send(host, sign(req)).await.is(412, "PreconditionFailed");
+    let req = copy("/s3/dst/copy", "/src/d/k").header("If-Match", "\"other\"");
+    send(host, sign(req)).await.is(412, "PreconditionFailed");
+    let req = copy("/s3/dst/copy", "/src/d/k").header("If-Match", &etag);
+    assert_eq!(copied(&send(host, sign(req)).await), etag);
+    let req = copy("/s3/dst/fresh", "/src/d/k").header("If-None-Match", "*");
+    assert_eq!(copied(&send(host, sign(req)).await), etag);
+
+    // What names no object, or no place for one.
+    for (to, from, status, code) in [
+        ("/s3/dst/x", "/src/absent", 404, "NoSuchKey"),
+        ("/s3/dst/x", "/src/d", 404, "NoSuchKey"),
+        ("/s3/dst/x", "/nobucket/k", 404, "NoSuchBucket"),
+        (
+            "/s3/dst/x",
+            "/src/d/k?versionId=null",
+            501,
+            "NotImplemented",
+        ),
+        ("/s3/dst/x", "/src", 400, "InvalidArgument"),
+        ("/s3/dst/x", "/src/a%20b", 400, "InvalidArgument"),
+        ("/s3/src/d", "/src/d/k", 409, "OperationAborted"),
+        ("/s3/src/d/k/below", "/src/e/copy", 409, "OperationAborted"),
+    ] {
+        let resp = send(host, sign(copy(to, from))).await;
+        resp.is(status, code);
+    }
+    send(host, sign(Req::new("GET", "/s3/dst/x")))
+        .await
+        .is(404, "NoSuchKey");
+    data
+}
+
+/// A copy is a second tag on the same layer: `/v2/` names one digest for both.
+async fn one_layer_two_tags(host: &str, data: &[u8], bearer: Option<&str>) {
+    let layer = format!("sha256:{}", sha256_hex(data));
+    for path in [
+        "/v2/files/src/d/manifests/k",
+        "/v2/files/dst/manifests/copy",
+    ] {
+        let mut req = Req::new("GET", path).header("Accept", MANIFEST_TYPE);
+        if let Some(key) = bearer {
+            req = req.header("Authorization", &format!("Bearer {key}"));
+        }
+        let resp = send(host, req).await;
+        assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+        let manifest: serde_json::Value = serde_json::from_slice(&resp.bytes).unwrap();
+        assert_eq!(manifest["layers"][0]["digest"], layer.as_str(), "{path}");
+        assert_eq!(
+            manifest["annotations"]["org.virtkit.md5"],
+            md5_hex(data).as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn objects_are_copied_on_an_open_server() {
+    let dir = tmp("copy-open");
+    let host = spawn(open_state(&dir, true));
+    let data = objects_are_copied(&host, &|r| r).await;
+    one_layer_two_tags(&host, &data, None).await;
+    let blobs = std::fs::read_dir(dir.join("store/repos/files/dst/blobs"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        blobs, 2,
+        "the destination holds the layer and the empty config"
+    );
+    assert_eq!(staging_left(&dir), 0);
+}
+
+#[tokio::test]
+async fn objects_are_copied_with_an_api_key() {
+    let dir = tmp("copy-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let writer = api_key(db, "writer", &[(Action::Write, "files/*")]);
+    let reader = api_key(db, "reader", &[(Action::Read, "files/*")]);
+    let dst_reader = api_key(db, "dst-reader", &[(Action::Read, "files/dst/*")]);
+    let blind = api_key(
+        db,
+        "blind",
+        &[
+            (Action::Write, "files/dst/*"),
+            (Action::Read, "files/src/d/k/*"),
+        ],
+    );
+    let host = spawn(state.clone());
+    let data = objects_are_copied(&host, &as_key(&host, &writer)).await;
+    one_layer_two_tags(&host, &data, Some(&writer)).await;
+
+    let copy = |to: &str, from: &str| Req::new("PUT", to).header("x-amz-copy-source", from);
+    // A key that may read the copy only, reads its bytes through the copy.
+    let resp = send(
+        &host,
+        as_key(&host, &dst_reader)(Req::new("GET", "/s3/dst/copy")),
+    )
+    .await;
+    is_object(&resp, &data);
+    send(
+        &host,
+        as_key(&host, &dst_reader)(Req::new("GET", "/s3/src/d/k")),
+    )
+    .await
+    .is(403, "AccessDenied");
+    // A read-only key may not write the destination; a source the key may not read is absent.
+    let resp = send(
+        &host,
+        as_key(&host, &reader)(copy("/s3/dst/new", "/src/d/k")),
+    )
+    .await;
+    resp.is(403, "AccessDenied");
+    let resp = send(
+        &host,
+        as_key(&host, &blind)(copy("/s3/dst/new", "/src/d/k")),
+    )
+    .await;
+    resp.is(404, "NoSuchKey");
+    let resp = send(
+        &host,
+        as_key(&host, &blind)(copy("/s3/dst/new", "/src/e/copy")),
+    )
+    .await;
+    resp.is(403, "AccessDenied");
+    send(
+        &host,
+        as_key(&host, &writer)(Req::new("GET", "/s3/dst/new")),
+    )
+    .await
+    .is(404, "NoSuchKey");
+}
+
+/// A `Delete` document of `objects` (each an `<Object>`'s content), quiet when asked.
+fn delete_doc(objects: &[&str], quiet: bool) -> Vec<u8> {
+    let mut doc = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    for o in objects {
+        doc.push_str(&format!("<Object>{o}</Object>"));
+    }
+    if quiet {
+        doc.push_str("<Quiet>true</Quiet>");
+    }
+    doc.push_str("</Delete>");
+    doc.into_bytes()
+}
+
+fn key_of(k: &str) -> String {
+    format!("<Key>{k}</Key>")
+}
+
+/// A `DeleteResult`: the keys deleted, and each error's key and code.
+#[track_caller]
+fn delete_result(resp: &Resp) -> (Vec<String>, Vec<(String, String)>) {
+    resp.ok(200);
+    assert!(
+        resp.body.starts_with(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""
+        ),
+        "{}",
+        resp.body
+    );
+    let deleted = elements(&resp.body, "Deleted")
+        .iter()
+        .map(|d| element(d, "Key"))
+        .collect();
+    let errors = elements(&resp.body, "Error")
+        .iter()
+        .map(|e| {
+            assert_eq!(elements(e, "Message").len(), 1, "{e}");
+            (element(e, "Key"), element(e, "Code"))
+        })
+        .collect();
+    (deleted, errors)
+}
+
+/// The request deleting `doc` from `bucket`, with its `Content-MD5`.
+fn delete_objects(bucket: &str, doc: Vec<u8>) -> Req {
+    Req::new("POST", &format!("/s3/{bucket}"))
+        .query("delete=")
+        .header("Content-MD5", &b64(&md5::compute(&doc).0))
+        .body(doc)
+}
+
+/// DeleteObjects with every outcome a key can have, verbose and quiet, and the documents and
+/// digests that are refused whole.
+async fn objects_are_deleted_in_batches(host: &str, sign: Sign<'_>, store: &Store) {
+    for path in [
+        "/s3/batch/a",
+        "/s3/batch/d/b",
+        "/s3/batch/c",
+        "/s3/batch/kept",
+    ] {
+        let put = Req::new("PUT", path).body(HELLO.to_vec());
+        send(host, sign(put)).await.ok(200);
+    }
+    store
+        .put_manifest(
+            "files/batch/img",
+            "v1",
+            MANIFEST_TYPE,
+            br#"{"schemaVersion":2}"#,
+        )
+        .unwrap();
+    let pair = |k: &str, code: &str| (k.to_string(), code.to_string());
+
+    // A digest that does not hold, or a document that is none, deletes nothing.
+    let doc = delete_doc(&[&key_of("kept")], false);
+    let wrong = delete_objects("batch", doc.clone()).replace("Content-MD5", &b64(&[0; 16]));
+    send(host, sign(wrong)).await.is(400, "BadDigest");
+    let crc = Req::new("POST", "/s3/batch")
+        .query("delete=")
+        .header("x-amz-checksum-crc32", &b64(&[0; 4]))
+        .body(doc.clone());
+    send(host, sign(crc)).await.is(400, "BadDigest");
+    let too_many: Vec<String> = (0..1001).map(|i| key_of(&format!("k{i}"))).collect();
+    let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    let mut over = delete_doc(&[&key_of("kept")], false);
+    over.extend(std::iter::repeat_n(b' ', 1 << 20));
+    for bad in [
+        delete_doc(&too_many, false),
+        delete_doc(&["<Key>&ent;</Key>"], false),
+        delete_doc(&[], false),
+        b"<?xml version=\"1.0\"?><!DOCTYPE d><Delete/>".to_vec(),
+        over,
+    ] {
+        let resp = send_refused(host, sign(delete_objects("batch", bad))).await;
+        resp.is(400, "MalformedXML");
+    }
+    is_object(
+        &send(host, sign(Req::new("GET", "/s3/batch/kept"))).await,
+        HELLO,
+    );
+
+    // Every outcome, in the order asked.
+    let doc = delete_doc(
+        &[
+            &key_of("a"),
+            &key_of("absent"),
+            &key_of("a&amp;b"),
+            &key_of("d"),
+            &key_of("img/v1"),
+            "<Key>c</Key><VersionId>null</VersionId>",
+            &key_of("d/b"),
+            &key_of("x/../y"),
+        ],
+        false,
+    );
+    let (deleted, errors) = delete_result(&send(host, sign(delete_objects("batch", doc))).await);
+    assert_eq!(deleted, ["a", "absent", "d", "d/b"]);
+    assert_eq!(
+        errors,
+        [
+            pair("a&amp;b", "InvalidArgument"),
+            pair("img/v1", "OperationAborted"),
+            pair("c", "NotImplemented"),
+            pair("x/../y", "InvalidArgument"),
+        ]
+    );
+    for gone in ["/s3/batch/a", "/s3/batch/d/b"] {
+        send(host, sign(Req::new("GET", gone)))
+            .await
+            .is(404, "NoSuchKey");
+    }
+    is_object(
+        &send(host, sign(Req::new("GET", "/s3/batch/c"))).await,
+        HELLO,
+    );
+    assert_eq!(
+        store.has_manifests("files/batch/img", &["v1"]).unwrap(),
+        [true]
+    );
+
+    // Quiet: only the errors.
+    let doc = delete_doc(&[&key_of("c"), &key_of("img/v1")], true);
+    let resp = send(host, sign(delete_objects("batch", doc))).await;
+    let (deleted, errors) = delete_result(&resp);
+    assert!(deleted.is_empty(), "{}", resp.body);
+    assert_eq!(errors, [pair("img/v1", "OperationAborted")]);
+    let doc = delete_doc(&[&key_of("kept")], true);
+    let resp = send(host, sign(delete_objects("batch", doc))).await;
+    assert!(
+        resp.body.ends_with(
+            "<DeleteResult \
+         xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+        ),
+        "{}",
+        resp.body
+    );
+    // A correct checksum header, and none at all.
+    send(
+        host,
+        sign(Req::new("PUT", "/s3/batch/c").body(HELLO.to_vec())),
+    )
+    .await
+    .ok(200);
+    let doc = delete_doc(&[&key_of("c")], false);
+    let crc = Req::new("POST", "/s3/batch")
+        .query("delete=")
+        .header("x-amz-checksum-crc32", &crc32_b64(&doc))
+        .body(doc.clone());
+    assert_eq!(delete_result(&send(host, sign(crc)).await).0, ["c"]);
+    let plain = Req::new("POST", "/s3/batch").query("delete=").body(doc);
+    assert_eq!(delete_result(&send(host, sign(plain)).await).0, ["c"]);
+    // A bucket that is not there holds none of the keys.
+    let doc = delete_doc(&[&key_of("k")], false);
+    let resp = send(host, sign(delete_objects("nobucket", doc))).await;
+    assert_eq!(delete_result(&resp).0, ["k"]);
+}
+
+#[tokio::test]
+async fn objects_are_deleted_in_batches_on_an_open_server() {
+    let dir = tmp("batch-open");
+    let state = open_state(&dir, true);
+    let store = state.store.clone();
+    let host = spawn(state);
+    objects_are_deleted_in_batches(&host, &|r| r, &store).await;
+    // The signed payload hash binds the document.
+    let doc = delete_doc(&[&key_of("k")], false);
+    let signed = |payload: &str| {
+        delete_objects("batch", doc.clone()).signed_payload(&host, ("any", "any"), 0, payload)
+    };
+    assert_eq!(
+        delete_result(&send(&host, signed(&sha256_hex(&doc))).await).0,
+        ["k"]
+    );
+    send(&host, signed(&sha256_hex(b"another")))
+        .await
+        .is(400, "XAmzContentSHA256Mismatch");
+    // The subresource as SDKs write it, with no `=`.
+    let bare = Req::new("POST", "/s3/batch").query("delete").body(doc);
+    assert_eq!(delete_result(&send(&host, bare).await).0, ["k"]);
+    let resp = send(&host, Req::new("GET", "/s3/batch").query("versioning")).await;
+    resp.ok(200);
+}
+
+#[tokio::test]
+async fn objects_are_deleted_in_batches_with_an_api_key() {
+    let dir = tmp("batch-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let writer = api_key(db, "writer", &[(Action::Write, "files/*")]);
+    let reader = api_key(db, "reader", &[(Action::Read, "files/*")]);
+    let inside = api_key(db, "inside", &[(Action::Write, "files/batch/w/*")]);
+    let host = spawn(state.clone());
+    objects_are_deleted_in_batches(&host, &as_key(&host, &writer), &state.store).await;
+
+    for path in ["/s3/batch/w/x", "/s3/batch/y"] {
+        let put = Req::new("PUT", path).body(HELLO.to_vec());
+        send(&host, as_key(&host, &writer)(put)).await.ok(200);
+    }
+    let doc = || delete_doc(&[&key_of("w/x"), &key_of("y")], false);
+    // The keys a credential may not delete are reported, the others deleted.
+    let resp = send(
+        &host,
+        as_key(&host, &reader)(delete_objects("batch", doc())),
+    )
+    .await;
+    let (deleted, errors) = delete_result(&resp);
+    assert!(deleted.is_empty());
+    let codes: Vec<&str> = errors.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(codes, ["AccessDenied", "AccessDenied"]);
+    let resp = send(
+        &host,
+        as_key(&host, &inside)(delete_objects("batch", doc())),
+    )
+    .await;
+    let (deleted, errors) = delete_result(&resp);
+    assert_eq!(deleted, ["w/x"]);
+    assert_eq!(errors, [("y".to_string(), "AccessDenied".to_string())]);
+    let get = |path: &str| as_key(&host, &writer)(Req::new("GET", path));
+    send(&host, get("/s3/batch/w/x")).await.is(404, "NoSuchKey");
+    is_object(&send(&host, get("/s3/batch/y")).await, HELLO);
+}
+
+/// The configurations tools probe, on a bucket and an object that exist and on ones that do
+/// not, and their writes refused.
+async fn configurations_are_canned(host: &str, sign: Sign<'_>) {
+    send(
+        host,
+        sign(Req::new("PUT", "/s3/conf/k").body(HELLO.to_vec())),
+    )
+    .await
+    .ok(200);
+    let get = |path: &str, q: &str| sign(Req::new("GET", path).query(&format!("{q}=")));
+    let doc = |root: &str, inner: &str| {
+        let open = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><{root} \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""
+        );
+        if inner.is_empty() {
+            format!("{open}/>")
+        } else {
+            format!("{open}>{inner}</{root}>")
+        }
+    };
+    for (q, root, inner) in [
+        ("versioning", "VersioningConfiguration", ""),
+        ("tagging", "Tagging", "<TagSet/>"),
+        ("logging", "BucketLoggingStatus", ""),
+        ("notification", "NotificationConfiguration", ""),
+        (
+            "requestPayment",
+            "RequestPaymentConfiguration",
+            "<Payer>BucketOwner</Payer>",
+        ),
+        ("accelerate", "AccelerateConfiguration", ""),
+    ] {
+        let resp = send(host, get("/s3/conf", q)).await;
+        resp.ok(200);
+        assert_eq!(resp.body, doc(root, inner), "{q}");
+        send(host, get("/s3/none", q)).await.is(404, "NoSuchBucket");
+    }
+    for path in ["/s3/conf", "/s3/conf/k"] {
+        let resp = send(host, get(path, "acl")).await;
+        resp.ok(200);
+        assert!(
+            resp.body.contains(
+                "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+             xsi:type=\"CanonicalUser\"><ID>vk-registry</ID><DisplayName>vk-registry\
+             </DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant>"
+            ),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains(
+                "<Owner><ID>vk-registry</ID><DisplayName>vk-registry</DisplayName></Owner>"
+            )
+        );
+    }
+    let resp = send(host, get("/s3/conf/k", "tagging")).await;
+    resp.ok(200);
+    assert_eq!(resp.body, doc("Tagging", "<TagSet/>"));
+    for q in ["tagging", "acl"] {
+        send(host, get("/s3/conf/absent", q))
+            .await
+            .is(404, "NoSuchKey");
+    }
+    for (q, code) in [
+        ("lifecycle", "NoSuchLifecycleConfiguration"),
+        ("policy", "NoSuchBucketPolicy"),
+        ("policyStatus", "NoSuchBucketPolicy"),
+        ("cors", "NoSuchCORSConfiguration"),
+        (
+            "encryption",
+            "ServerSideEncryptionConfigurationNotFoundError",
+        ),
+        ("object-lock", "ObjectLockConfigurationNotFoundError"),
+        ("replication", "ReplicationConfigurationNotFoundError"),
+        ("website", "NoSuchWebsiteConfiguration"),
+        ("publicAccessBlock", "NoSuchPublicAccessBlockConfiguration"),
+        ("ownershipControls", "OwnershipControlsNotFoundError"),
+    ] {
+        send(host, get("/s3/conf", q)).await.is(404, code);
+        send(host, get("/s3/none", q)).await.is(404, "NoSuchBucket");
+    }
+    // Nothing of it is written.
+    for (method, path, q) in [
+        ("PUT", "/s3/conf", "versioning"),
+        ("PUT", "/s3/conf", "policy"),
+        ("PUT", "/s3/conf", "acl"),
+        ("DELETE", "/s3/conf", "tagging"),
+        ("DELETE", "/s3/conf", "lifecycle"),
+        ("PUT", "/s3/conf/k", "acl"),
+        ("PUT", "/s3/conf/k", "tagging"),
+        ("DELETE", "/s3/conf/k", "tagging"),
+    ] {
+        let req = Req::new(method, path)
+            .query(&format!("{q}="))
+            .body(b"<Tagging/>".to_vec());
+        send(host, sign(req)).await.is(501, "NotImplemented");
+    }
+    is_object(
+        &send(host, sign(Req::new("GET", "/s3/conf/k"))).await,
+        HELLO,
+    );
+}
+
+#[tokio::test]
+async fn configurations_are_canned_on_an_open_server() {
+    let dir = tmp("canned-open");
+    let host = spawn(open_state(&dir, true));
+    configurations_are_canned(&host, &|r| r).await;
+}
+
+#[tokio::test]
+async fn configurations_are_canned_with_an_api_key() {
+    let dir = tmp("canned-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let writer = api_key(db, "writer", &[(Action::Write, "files/*")]);
+    let other = api_key(db, "other", &[(Action::Read, "files/other/*")]);
+    let host = spawn(state.clone());
+    configurations_are_canned(&host, &as_key(&host, &writer)).await;
+    // Read on neither the bucket nor anything in it: refused, as HeadBucket is.
+    let other = as_key(&host, &other);
+    send(
+        &host,
+        other(Req::new("GET", "/s3/conf").query("versioning=")),
+    )
+    .await
+    .is(403, "AccessDenied");
+    send(&host, other(Req::new("GET", "/s3/conf/k").query("acl=")))
+        .await
+        .is(403, "AccessDenied");
 }

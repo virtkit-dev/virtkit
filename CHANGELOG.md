@@ -15,9 +15,11 @@ All notable changes to virtkit will be documented in this file.
   checksums, given metadata and deleted, and listed page by page, and are the same files WebDAV
   and `vk registry get` see; a key limited to a directory of a bucket can list that directory.
   The chunked uploads AWS SDKs and the CLI send are taken, their signatures and checksums
-  checked, and objects can be read in byte ranges, as the AWS CLI downloads large files;
-  multipart uploads and copies are not served yet. Set `s3 = false` in the server config to
-  turn it off.
+  checked, and objects can be read in byte ranges, as the AWS CLI downloads large files.
+  Buckets can be created and removed, objects copied without their bytes being stored twice
+  and deleted in batches, and the configuration probes tools send before using a bucket
+  (versioning, ACLs, tagging and the like) are answered as for a bucket with none set;
+  multipart uploads are not served yet. Set `s3 = false` in the server config to turn it off.
 
 ## [0.106.0] - 2026-11-05
 

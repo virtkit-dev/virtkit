@@ -67,7 +67,41 @@ pub(crate) enum Outcome {
 
 impl Conditions {
     pub(crate) fn of(headers: &HeaderMap) -> Self {
-        let text = |name| {
+        Self::named(
+            headers,
+            [
+                IF_MATCH.as_str(),
+                IF_NONE_MATCH.as_str(),
+                IF_MODIFIED_SINCE.as_str(),
+                IF_UNMODIFIED_SINCE.as_str(),
+            ],
+        )
+    }
+
+    /// A CopyObject's conditions on its source: the same four, each `x-amz-copy-source-`
+    /// prefixed, weighed in the same order. What a read would answer 304 fails the copy.
+    pub(crate) fn of_copy_source(headers: &HeaderMap) -> Self {
+        Self::named(
+            headers,
+            [
+                "x-amz-copy-source-if-match",
+                "x-amz-copy-source-if-none-match",
+                "x-amz-copy-source-if-modified-since",
+                "x-amz-copy-source-if-unmodified-since",
+            ],
+        )
+    }
+
+    /// The conditions the headers `names` (`If-Match`, `If-None-Match`, `If-Modified-Since`
+    /// and `If-Unmodified-Since`, or what stands for them) carry.
+    fn named(headers: &HeaderMap, names: [&str; 4]) -> Self {
+        let [
+            if_match,
+            if_none_match,
+            if_modified_since,
+            if_unmodified_since,
+        ] = names;
+        let text = |name: &str| {
             let values: Vec<&str> = headers
                 .get_all(name)
                 .iter()
@@ -75,17 +109,17 @@ impl Conditions {
                 .collect();
             (!values.is_empty()).then(|| values.join(","))
         };
-        let date = |name| {
+        let date = |name: &str| {
             headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
         };
         Conditions {
-            if_match: text(IF_MATCH),
-            if_none_match: text(IF_NONE_MATCH),
-            if_modified_since: date(IF_MODIFIED_SINCE),
-            if_unmodified_since: date(IF_UNMODIFIED_SINCE),
+            if_match: text(if_match),
+            if_none_match: text(if_none_match),
+            if_modified_since: date(if_modified_since),
+            if_unmodified_since: date(if_unmodified_since),
         }
     }
 
@@ -285,6 +319,44 @@ mod tests {
         assert_eq!(
             decide(&[(IF_UNMODIFIED_SINCE, "yesterday")]),
             Outcome::Serve
+        );
+    }
+
+    /// A copy's conditions on its source are the same four under their own names, and the
+    /// read's own headers say nothing to them.
+    #[test]
+    fn a_copy_source_s_conditions_are_its_own_headers() {
+        let e = format!("\"{MD5}\"");
+        let modified = at(1_000_000);
+        let before = httpdate::fmt_http_date(at(999_999));
+        let named = |n: &'static str| hyper::header::HeaderName::from_static(n);
+        let decide = |pairs: &[(hyper::header::HeaderName, &str)]| {
+            Conditions::of_copy_source(&headers(pairs)).evaluate(&e, modified)
+        };
+        assert_eq!(decide(&[(IF_MATCH, "\"x\"")]), Outcome::Serve);
+        let if_match = named("x-amz-copy-source-if-match");
+        let unmodified = named("x-amz-copy-source-if-unmodified-since");
+        assert_eq!(
+            decide(&[(if_match.clone(), "\"x\"")]),
+            Outcome::Failed("If-Match")
+        );
+        // S3's rule for the copy: a matching If-Match carries a failing If-Unmodified-Since.
+        assert_eq!(
+            decide(&[(if_match, &e), (unmodified.clone(), &before)]),
+            Outcome::Serve
+        );
+        assert_eq!(
+            decide(&[(unmodified, &before)]),
+            Outcome::Failed("If-Unmodified-Since")
+        );
+        assert_eq!(
+            decide(&[(named("x-amz-copy-source-if-none-match"), &e)]),
+            Outcome::NotModified
+        );
+        let since = httpdate::fmt_http_date(at(1_000_000));
+        assert_eq!(
+            decide(&[(named("x-amz-copy-source-if-modified-since"), &since)]),
+            Outcome::NotModified
         );
     }
 
