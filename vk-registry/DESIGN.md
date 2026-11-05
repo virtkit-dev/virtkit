@@ -592,7 +592,12 @@ path included, so nothing about credentials changes. It needs a wildcard DNS rec
 wildcard (one label deep: a bucket name with a dot is not covered). A host whose label cannot
 be a bucket, `s3_host` itself, and every other host are served as before, and path-style
 `/s3/` keeps working on any of them. The setting is a lowercase host name with no port; the
-server refuses anything else at startup.
+server refuses anything else at startup. The registry's own host name must not be below
+`s3_host`, since every `<label>.<s3_host>` is taken for a bucket, `/v2/`, `/login` and
+`/browse` included: `s3_host = "example.com"` would serve `reg.example.com` as bucket `reg`.
+The server refuses at startup an `[oidc] public_url` whose host is below `s3_host`, and
+`s3_host` with `s3 = false`; `s3_host` may be the registry's own name, which is not a
+bucket's.
 
 **Credentials.** SigV4 needs the server to hold the signing secret, and this registry stores
 API keys only as hashes and never mints hub tokens, so no new secret is introduced: the

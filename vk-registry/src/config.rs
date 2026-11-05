@@ -712,6 +712,8 @@ impl ServerConfig {
         cfg.check_connection_limits()?;
         if let Some(host) = &cfg.s3_host {
             check_s3_host(host)?;
+            let public_url = cfg.oidc.as_ref().map(|o| o.public_url.as_str());
+            check_s3_host_apart(host, cfg.s3, public_url)?;
         }
         cfg.check_hub()?;
         check_gc_prefixes(&cfg.gc_prefixes)?;
@@ -1032,7 +1034,6 @@ fn parse_addr(addr: Option<String>) -> Result<Option<SocketAddr>> {
         .transpose()
 }
 
-/// Each `[[gc.prefix]]` names a repository prefix, once, with a window of a day or more.
 /// `s3_host` is a host name its buckets are subdomains of: lowercase DNS labels, as a
 /// wildcard certificate and record name them, and no port, which a request's own `Host`
 /// carries and the match ignores.
@@ -1053,6 +1054,42 @@ fn check_s3_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// `s3_host` serves only S3, and the registry's own name, `public_url`'s host, is not below
+/// it: every request to `<label>.<s3_host>` is served as that bucket, so a registry named
+/// there would have its `/v2/`, `/login` and `/browse` taken for objects. The name itself is
+/// not a bucket's, and stays the registry's.
+fn check_s3_host_apart(host: &str, s3: bool, public_url: Option<&str>) -> Result<()> {
+    if !s3 {
+        bail!("s3_host = {host:?} needs S3 on: drop it, or s3 = false");
+    }
+    let Some(url) = public_url else {
+        return Ok(());
+    };
+    // `scheme://[userinfo@]host[:port][/…]`, as `[oidc] public_url` is checked to be.
+    let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // A port goes; an IPv6 literal, which holds colons of its own, is no name below a host.
+    let own = match authority.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => authority,
+    };
+    let below = own.len() > host.len()
+        && own
+            .get(own.len() - host.len() - 1..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&format!(".{host}")));
+    if below {
+        bail!(
+            "s3_host = {host:?} would take the registry's own name {own:?} ([oidc] public_url) \
+             for a bucket: the registry must not be named below s3_host"
+        );
+    }
+    Ok(())
+}
+
+/// Each `[[gc.prefix]]` names a repository prefix, once, with a window of a day or more.
 fn check_gc_prefixes(prefixes: &[GcPrefix]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for p in prefixes {
@@ -1999,6 +2036,39 @@ mod tests {
                 panic!("{bad:?} was accepted");
             };
             assert!(format!("{err:#}").contains("s3_host"), "{bad:?}: {err:#}");
+        }
+        // With S3 off it would serve nothing, and the registry's own name is not below it.
+        let Err(err) = load("s3 = false\ns3_host = \"s3.example.com\"\n") else {
+            panic!("s3_host was taken with S3 off");
+        };
+        assert!(format!("{err:#}").contains("s3_host"), "{err:#}");
+        let accounts = |s3_host: &str, public_url: &str| {
+            load(&format!(
+                "mode = \"accounts\"\ns3_host = {s3_host:?}\n[oidc]\n\
+                 issuer = \"https://login.example.com\"\nclient_id = \"r\"\n\
+                 client_secret_file = \"/s\"\npublic_url = {public_url:?}\n"
+            ))
+        };
+        for (s3_host, own) in [
+            ("example.com", "https://reg.example.com"),
+            ("example.com", "https://a.b.example.com:8443/"),
+            ("example.com", "https://REG.Example.com/base"),
+            ("s3.example.com", "https://reg.s3.example.com"),
+        ] {
+            let Err(err) = accounts(s3_host, own) else {
+                panic!("{s3_host} was taken over {own}");
+            };
+            assert!(format!("{err:#}").contains("public_url"), "{own}: {err:#}");
+        }
+        for (s3_host, own) in [
+            ("s3.example.com", "https://reg.example.com"),
+            ("reg.example.com", "https://reg.example.com"),
+            ("example.com", "https://example.com:443"),
+            ("example.com", "https://regexample.com"),
+            ("example.com", "https://[::1]:5000"),
+        ] {
+            let cfg = accounts(s3_host, own).unwrap();
+            assert_eq!(cfg.s3_host.as_deref(), Some(s3_host), "{own}");
         }
         let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
