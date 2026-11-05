@@ -558,7 +558,7 @@ and nothing else.
 | Principal | Credential | Client side |
 |---|---|---|
 | a person | OIDC login on the hub, exchanged for a short-lived hub session token | `vk hub login https://hub` — the OAuth device flow, so it works over SSH; the token is kept `0600` under `~/.config/virtkit/` |
-| `vk-gitlab`, a GitLab relay | its ed25519 key, pinned by an enrollment token as a node's is; each request signed and bound to its TLS connection | `vk-gitlab join`, which keeps the key under its state directory |
+| `vk-gitlab`, a GitLab relay | its ed25519 key, pinned by an enrollment token as a node's is; its session authenticates the one HTTP/2 connection its requests share | `vk-gitlab join`, which keeps the key under its state directory |
 | other automation | a scoped API key: hashed at rest, expiring, revocable | `token_file` in the config, as the registry client does |
 
 The hub and `vk-registry` are to share one identity layer — the registry's accounts

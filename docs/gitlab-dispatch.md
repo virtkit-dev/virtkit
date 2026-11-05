@@ -20,7 +20,7 @@ Three parties take part:
 | Credential | Held by | Used for |
 |---|---|---|
 | runner authentication token (`glrt-…`) | `vk-gitlab` alone | `POST /api/v4/jobs/request`, `/runners/verify` |
-| relay key (ed25519, `<state_dir>/hub/key.pk8`) | `vk-gitlab` alone | signing every [client API](#daemon--hub-the-client-api) request; its session with the hub |
+| relay key (ed25519, `<state_dir>/hub/key.pk8`) | `vk-gitlab` alone | its session with the hub, which authenticates its [client API](#daemon--hub-the-client-api) requests |
 | `CI_JOB_TOKEN` (the job response's `token`) | `vk-gitlab`; the job's node, in the spec | the daemon: trace, state; the node: clone, artifact upload |
 | dependency tokens (`dependencies[].token`) | the job's node | downloading that dependency's artifacts |
 | registry credentials (`credentials`) | the job's node | pulling the job's images |
@@ -35,7 +35,8 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 ## Job flow
 
 1. `vk-gitlab` queues a reservation request for the runner's [placement](#placement)
-   (`POST /v1/reservations`, `queue: true`) and long-polls its ticket until the hub grants it:
+   (`POST /v1/reservations`, `queue: true`) and fetches its ticket each time the hub tells it the
+   ticket changed, until the hub grants it:
    the hub has offered one envelope to a node and the node accepted.
 2. It takes a slot under `concurrent` and the runner's `limit`, and claims the grant
    (`POST /v1/reservations/<id>/claim`).
@@ -49,7 +50,7 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 6. Seeing the job accepted, `vk-gitlab` sends GitLab `PUT /jobs/:id` `state=running` — the
    commit of a job taken under `two_phase_job_commit`.
 7. The node runs the stages, streaming masked output to the hub, which stores it and acks.
-   `vk-gitlab` reads it from its GitLab offset and patches the trace.
+   Told of more output, `vk-gitlab` reads it from its GitLab offset and patches the trace.
 8. The node uploads the artifacts to GitLab itself, then sends its result once its output
    is all acked.
 9. `vk-gitlab` patches the rest of the trace, sends the final `PUT /jobs/:id`, settles the
@@ -64,10 +65,10 @@ capacity policy. See [capacity arbitration](capacity-arbitration.md) for configu
 monitoring:
 
 - **Queued, not held.** Each of a runner's `request_concurrency` request loops queues a
-  reservation request and polls its ticket without holding a slot under `concurrent` or
-  `limit`. Unclaimed tickets expire after 120 seconds without a poll and end with the relay's
-  session. Only claimed tickets survive a hub restart. Polling a lost ticket returns 410,
-  and the loop queues again.
+  reservation request and follows its ticket without holding a slot under `concurrent` or
+  `limit`. Unclaimed tickets end with the session of the connection that queued them (a relay
+  at protocol 2 to 4: with its session, or after 120 seconds without a poll). Only claimed
+  tickets survive a hub restart. Fetching a lost ticket returns 410, and the loop queues again.
 - **Arbitrated.** The hub offers room to the waiting tickets and the queued jobs of each
   placement together: a job at its `place_within_secs` deadline first, then a job holding its
   reservation, then production work other than probes, then production probes, then normal
@@ -214,22 +215,36 @@ recorded by a hub from before capacity arbitration, without a scheduling identit
 
 ## Daemon ↔ hub: the client API
 
-HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Bodies are
+JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. A relay at protocol 5,
+such as `vk-gitlab` of this release, holds **one HTTP/2 connection** to the hub, under the
+private ALPN ID `vk-relay/1`: its session (below) is a WebSocket stream of it (RFC 8441's
+extended `CONNECT`), and its requests are the others. Relays at 2 to 4, API keys, enrollments,
+release downloads, nodes and registries use HTTP/1.1; the hub never offers `h2`. On a
+plaintext loopback listener, a relay's connection opens with HTTP/2's preface instead. Past
+4096 client requests in flight on the hub, a request is answered `unavailable`. Bodies are
 `vk_hub_proto::client`'s. `vk-gitlab` is an enrolled relay ([GitLab relay
-enrollment](gitlab-relay-enrollment.md)): `vk-hub token create --kind gitlab | vk-gitlab join
-<hub-url> --token - [--ca FILE]` pins its key on the hub and keeps it, the hub's URL, its CA and
-the relay's ID under `<state_dir>/hub/` (`0700`); `vk-gitlab leave` deletes them. Both are
-refused while a state file holds a job.
+enrollment](gitlab-relay-enrollment.md)):
+`vk-hub token create --kind gitlab | vk-gitlab join <hub-url> --token - [--ca FILE]` pins its
+key on the hub and keeps it, the hub's URL, its CA and the relay's ID under `<state_dir>/hub/`
+(`0700`); `vk-gitlab leave` deletes them. Both are refused while a state file holds a job.
 
-**Authentication.** Each request is signed by the relay's key, as a node signs a release
-download: `vk-relay` carries the relay's ID, `vk-time` the time, and `vk-signature` its
-ed25519 signature over `client_request_message` — the relay ID, method, path and query, the
-body's SHA-256, the time, and the TLS connection's exporter. The hub checks that the relay is
-enrolled and not removed, the time within `DOWNLOAD_SKEW_SECS`, and the signature. A signature
-is good on its own connection only, so the daemon opens one connection per request and signs
-a retry again; a TLS-terminating proxy in front of the hub breaks the binding. A relay is
-held to no pool or envelope ceiling: it already holds the runner tokens and sees every job's
-secrets.
+**Authentication.** A relay's session authenticates its connection: its handshake signs the
+connection's TLS exporter with the relay's key, and the hub then serves the client API on that
+connection as that relay, **unsigned**, while the session is current. Before the session is up,
+the connection serves the session's `CONNECT` alone, and must reach it within the time an
+HTTP/1.1 handshake has; a second `CONNECT`, any other request, or one on an established
+connection carrying an `authorization`, `vk-relay`, `vk-time` or `vk-signature` header, is
+refused 403 `forbidden`. Once the session ends (lost, superseded, removed, or the hub handing
+over), the connection takes no new request (503 `unavailable`), finishes those it serves and
+closes. `vk-gitlab` sends a request made while it has no session once the next is up, and one
+left unanswered on a lost connection once more on the new one: every request is idempotent. A
+relay at 2 to 4 instead signs each request, on its own HTTP/1.1 connection: `vk-relay` carries
+its ID, `vk-time` the time, and `vk-signature` an ed25519 signature over
+`client_request_message` — the relay ID, method, path and query, the body's SHA-256, the time,
+and the TLS connection's exporter; the hub checks that the relay is enrolled and not removed,
+the time within `DOWNLOAD_SKEW_SECS`, and the signature. Either way, a TLS-terminating proxy in
+front of the hub breaks the binding. A relay is held to no pool or envelope ceiling: it already
+holds the runner tokens and sees every job's secrets.
 
 **Session.** Besides the client API, `vk-gitlab run` holds a session with the hub at
 `/v1/gitlab/session`, as a node does, redialing it when lost: it reports its version, host,
@@ -244,39 +259,52 @@ asks GitLab for jobs only while that status is `approved`: not before the first 
 while the server is pending, rejected or the relay `rebound`, nor once the hub refused the
 relay for good. Jobs it already holds run either way.
 
-The session is at protocol version 2, which adds `request_concurrency` and the admission lists,
-or 3, which adds updates; the hub speaks 1 to 3, vk-gitlab 2 and 3. The hub takes new work only
-from a relay whose session is at version 2 or later: a version-1 relay keeps its session, and
-replays its submissions, follows, cancels and settles the jobs it holds, but its capacity and
-reservation requests and its new jobs are refused 403 `forbidden`. A hub that speaks only
-version 1 refuses a relay's session for its version: the relay logs that the hub must be
-upgraded, asks GitLab for no jobs, and dials again every minute or so. Upgrade the hub first,
-then the relays: a relay whose `[hub] allow` lists `update` is updated from the hub's Updates
-page or `vk-hub relays update`, its running jobs resumed by the release
+The hub speaks protocol versions 1 to 5: 1 to 4 on HTTP/1.1, 5 alone on a relay's HTTP/2
+connection. Version 2 adds `request_concurrency` and the admission lists, 3 updates, 4 runners
+added on the hub, and 5 the one connection and its **notices**: the hub tells the relay, over
+the session, when one of its tickets is granted or ends (`ticket {ticket}`), and when one of
+its jobs not settled reaches a new `revision` or more output (`job {job, revision,
+output_len}`). A notice carries no data: the relay fetches what changed with the requests
+below. `vk-gitlab` speaks 5 only. The hub takes new work only from a relay whose session is at
+version 2 or later: a version-1 relay keeps its session, and replays its submissions, follows,
+cancels and settles the jobs it holds, but its capacity and reservation requests and its new
+jobs are refused 403 `forbidden`. A hub older than `vk-gitlab` — one that negotiates HTTP/1.1,
+or refuses version 5 — is refused: the relay logs that the hub must be upgraded, asks GitLab
+for no jobs, and dials again every minute or so. Upgrade the hub first, then the relays: a
+relay whose `[hub] allow` lists `update` is updated from the hub's Updates page or `vk-hub
+relays update`, its running jobs resumed by the release
 (`docs/gitlab-relay-enrollment.md`, "Updates").
 
 | Request | Body | Answer |
 |---|---|---|
 | `POST /v1/capacity` | `CapacityRequest` | 200 `Capacity` |
 | `POST /v1/reservations` | `ReservationRequest` | 201 `ReservationGrant`, or 202 `ReservationTicket` when queued |
-| `GET /v1/reservations/tickets/<ticket>?wait=<secs>` | — | 201 `ReservationGrant`, or 202 `ReservationTicket` while queued |
+| `GET /v1/reservations/tickets/<ticket>[?wait=<secs>]` | — | 201 `ReservationGrant`, or 202 `ReservationTicket` while queued |
 | `DELETE /v1/reservations/tickets/<ticket>` | — | 204 |
 | `POST /v1/reservations/<id>/claim` | — | 204 |
 | `POST /v1/reservations/<admission>/outcome` | `OutcomeRequest` | 204 |
 | `POST /v1/reservations/<id>/renew` | `RenewRequest` | 200 `ReservationGrant` |
 | `DELETE /v1/reservations/<id>` | — | 204 |
 | `POST /v1/jobs` | `JobSubmission` | 201 `JobView` |
-| `GET /v1/jobs/<id>?after=<revision>&wait=<secs>` | — | 200 `JobView` |
-| `GET /v1/jobs/<id>/output?offset=<n>&wait=<secs>` | — | 200 bytes |
+| `GET /v1/jobs/<id>?after=<revision>[&wait=<secs>]` | — | 200 `JobView` |
+| `GET /v1/jobs/<id>/output?offset=<n>[&wait=<secs>]` | — | 200 bytes |
 | `POST /v1/jobs/<id>/cancel` | `CancelRequest` | 202 `JobView` |
 | `POST /v1/jobs/<id>/settle` | — | 204 |
 | `POST /v1/clients` | `ClientHello` | 204 (API keys of other clients; a relay is refused) |
 
-**Long polls.** `wait` on the `GET`s, and `wait_secs` in a capacity request, hold a request for
-at most 60 seconds: a ticket until it is granted, a capacity answer until its `revision` passes
-`after`, a job view until its `revision` passes `after`, an output read until there are bytes
-past `offset` or the output is complete. A long poll that times out answers as a plain request
-would.
+**Notices, not long polls.** A relay at 5 follows a ticket or a job by fetching it when a
+notice names it, once when it starts following it, once on each new session (which may have
+missed a notice), and after 60 seconds without one. It keeps the latest notice per ticket and
+job, since one can arrive before the answer that names its object. The hub refuses `wait`, and
+a capacity request's `wait_secs`, on a relay's connection with 400 `invalid`. `vk-gitlab`
+keeps at most 4 output reads and 4 job submissions in flight on its connection, so its session
+never waits behind more bulk than the connection's flow-control windows hold.
+
+**Long polls**, for API keys and relays at 2 to 4. `wait` on the `GET`s, and `wait_secs` in a
+capacity request, hold a request for at most 60 seconds: a ticket until it is granted, a
+capacity answer until its `revision` passes `after`, a job view until its `revision` passes
+`after`, an output read until there are bytes past `offset` or the output is complete. A long
+poll that times out answers as a plain request would.
 
 **Capacity.** `{runner, placement, after, wait_secs}` → `{revision, fits}`. `fits` counts
 envelopes, not nodes: a node with room for two counts two. Advisory — the hub's count, from
@@ -296,9 +324,10 @@ what its outcome reports on and its job's submission names.
 
 `GET` on a ticket answers 202 while it waits and 201 with the grant, its `lease_secs` what is
 left of the lease, once a node accepted; 410 `reservation_gone` for a ticket that ended —
-cancelled, unpolled, refused, or granted and not claimed in time — or that the hub does not
-know. `DELETE` cancels it, releasing an offered or granted reservation; it answers 204 for a
-ticket the hub does not know, and 409 once claimed. Both answer 404 for another principal's.
+cancelled, refused, ended with its session, unpolled (any but a relay at 5's), or granted and
+not claimed in time — or that the hub does not know. `DELETE` cancels it, releasing an offered
+or granted reservation; it answers 204 for a ticket the hub does not know, and 409 once
+claimed. Both answer 404 for another principal's.
 
 `claim` takes a grant for a GitLab request: 204, again for one already claimed; 410 for no such
 grant, or once its reservation or lease is gone. `outcome` takes `{admission, outcome}`,
@@ -358,9 +387,9 @@ cancels and settles reported jobs and resumes running ones.
 
 | Status | `code` | Meaning | Retry |
 |---|---|---|---|
-| 400 | `invalid` | unparseable body, malformed ID, a job without a project, an outcome naming another admission than its path | no |
-| 401 | `unauthorized` | no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
-| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job; a relay below protocol 2 asking for new work; a runner without a lane, or a project or branch its lane does not allow; a job that does not match its admission | no |
+| 400 | `invalid` | unparseable body, malformed ID, a job without a project, an outcome naming another admission than its path; `wait` or `wait_secs` on a relay's HTTP/2 connection | no |
+| 401 | `unauthorized` | a bearer key missing or bad; for a relay at 2 to 4, no signature, a bad one or its time too far off, or a relay the hub does not know or removed | no |
+| 403 | `forbidden` | a job of another GitLab server than the relay's, of a relay told `rebound`, or an API key's GitLab job; a relay below protocol 2 asking for new work; a runner without a lane, or a project or branch its lane does not allow; a job that does not match its admission; on a relay's HTTP/2 connection, a request before its session, a second session, or a request carrying a key or signature | no |
 | 403 | `approval_pending` | a job of a project, or of a server, an operator has yet to approve on the hub | no: the job fails |
 | 403 | `project_rejected` | a job of a project, or of a server, an operator rejected | no: the job fails |
 | 404 | `not_found` | no such job, reservation, grant or admission of this relay's; another principal's ticket | no |
@@ -370,7 +399,7 @@ cancels and settles reported jobs and resumes running ones.
 | 413 | `too_large` | spec over 512 KiB | no |
 | 500 | `internal` | — | yes |
 | 503 | `no_capacity` | no node accepted in time | yes, after `retry_after_secs` |
-| 503 | `unavailable` | hub busy or starting; the reservation queue full; the relay's session not connected; an admission being updated | yes, after `retry_after_secs` |
+| 503 | `unavailable` | hub busy or starting; the reservation queue full; the relay's session not connected, or the session of the connection a request came on ended; an admission being updated | yes, after `retry_after_secs` |
 
 An error body is `{error, code, retry_after_secs?, approval_url?}`. Unknown codes read as `other`;
 unknown fields are ignored. When the hub serves a web UI, `approval_pending` and

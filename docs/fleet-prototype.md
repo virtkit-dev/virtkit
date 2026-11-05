@@ -1145,12 +1145,21 @@ Every rejection, approval and forget is audited. `vk-hub
 relays` lists the relays — reach, version, server, runners, last seen — `relays show <id>` adds
 its server and runners, and `relays remove <id>` unpins its key and ends its session, audited.
 
-**A relay on the client API.** A relay signs each client API request with its pinned key instead
-of carrying an API key: `vk-relay` names it, `vk-time` the time and `vk-signature` an ed25519
-signature over `vk_hub_proto::client::client_request_message` — its ID, the method, path and
-query, the body's SHA-256, the time and the TLS connection's exporter. The hub checks the relay
-is enrolled and the time within 5 minutes of its clock before reading the body, and the
-signature once it has; anything wrong is 401 `unauthorized`. A relay has the whole client API
+**A relay on the client API.** A relay carries no API key. At protocol 5 it holds one HTTP/2
+connection to the hub, under the private ALPN ID `vk-relay/1` (a plaintext listener tells it
+by HTTP/2's preface): its session is a WebSocket over the extended `CONNECT` on it, and the
+session's handshake, signed over the connection's TLS exporter with the pinned key,
+authenticates the relay's requests on it, which are unsigned. Before the session the
+connection serves that `CONNECT` alone, bounded as an HTTP/1.1 handshake is; after it, that
+relay's client API requests alone, while the session is current, refusing `wait` with 400
+`invalid` and anything else with 403 `forbidden`; once the session ends, nothing (503
+`unavailable`), and it closes. The session tells the relay when its tickets and jobs change,
+and the relay fetches them. A relay at 2 to 4 signs each request on HTTP/1.1 instead:
+`vk-relay` names it, `vk-time` the time and `vk-signature` an ed25519 signature over
+`vk_hub_proto::client::client_request_message` — its ID, the method, path and query, the
+body's SHA-256, the time and the TLS connection's exporter. The hub checks the relay is
+enrolled and the time within 5 minutes of its clock before reading the body, and the signature
+once it has; anything wrong is 401 `unauthorized`. A relay has the whole client API
 but hellos, holds no pool or envelope ceiling, and owns its jobs and reservations, audited as
 `relay <id>`. Only a relay submits GitLab jobs; an API key's are 403 `forbidden`. **The approval
 gate** lets a relay's new job through only when the job's `server_url` is its bound server's,
@@ -1168,17 +1177,21 @@ web page, sets the pools a node is in, at most 256, audited. Labels come from th
 inventory. `vk-hub nodes` lists each node's pools and labels under the table.
 
 **The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
-`/v1/jobs`. The key, or the relay and its signed time, is checked before the body is read. A body is at most 64 KiB, a job
-submission 576 KiB, its spec 512 KiB (413 `too_large`), and has 30 seconds to arrive. A
-connection counts among the 256 unauthenticated ones until a key checks; then it counts among
-1024 client connections shared by every key, past which a request is answered 503
-`unavailable`. A running job keeps two of them, its view's long poll and its output's. The hub
-raises its soft descriptor limit to the hard limit, at most 1M, at startup to hold them, and
-warns when that stays below what its connection caps add up to. A client connection
-closes when idle for 10 seconds between requests, and after 10 minutes finishes the request it
-serves, within 2 more, then closes. Long polls hold at most 60 seconds. A `request_id` makes a
-create idempotent for a day, kept in the database: for a reservation, the grant only, so a
-request that got no reservation is tried afresh; for a job, the job or the gate's refusal.
+`/v1/jobs`, over HTTP/1.1, and over a relay's HTTP/2 connection. The key, a relay's signed
+time, or its connection's session is checked before the body is read. A body is at most
+64 KiB, a job submission 576 KiB, its spec 512 KiB (413 `too_large`), and has 30 seconds to
+arrive. A connection counts among the 256 unauthenticated ones until a key checks, or a relay's
+session is up on it. Then an HTTP/1.1 one counts among 1024 client connections shared by every
+key, and the hub serves at most 4096 client requests at once; past either a request is answered
+503 `unavailable`. A relay's HTTP/2 connection carries up to 512 requests at once. A running
+job of a relay at 2 to 4 keeps two requests, its view's long poll and its output's: two
+connections. The hub raises its soft descriptor limit to the hard limit, at most 1M, at startup
+to hold them, and warns when that stays below what its connection caps add up to. An HTTP/1.1
+client connection closes when idle for 10 seconds between requests, and after 10 minutes
+finishes the requests it serves, within 2 more, then closes; a relay's HTTP/2 connection lasts
+as long as its session. Long polls hold at most 60 seconds. A `request_id` makes a create idempotent for a day, kept in the
+database: for a reservation, the grant only, so a request that got no reservation is tried
+afresh; for a job, the job or the gate's refusal.
 
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
 `held`, it is connected, in the pool, carries every label, reports itself ready and has at least
