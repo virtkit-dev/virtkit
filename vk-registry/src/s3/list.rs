@@ -336,7 +336,7 @@ impl Walker<'_, '_> {
 
 /// `key` for a document asking `encoding-type=url`: each component percent-encoded, the
 /// slashes kept.
-fn url_encode(key: &str) -> String {
+pub(super) fn url_encode(key: &str) -> String {
     key.split('/')
         .map(crate::percent_encode)
         .collect::<Vec<_>>()
@@ -409,7 +409,7 @@ fn page(store: &Store, authz: &Authz<'_>, bucket: &str, q: &Query) -> Result<(Ve
 
 /// Whether this caller may list `bucket` with `prefix`: it may read the bucket, or the
 /// directory the prefix's whole components name; the walk then shows what it may read.
-fn admitted(authz: &Authz<'_>, bucket: &str, prefix: &str) -> bool {
+pub(super) fn admitted(authz: &Authz<'_>, bucket: &str, prefix: &str) -> bool {
     let read = |repo: &str| allowed(authz, accounts::Action::Read, repo);
     let bucket = format!("{FILES_REPO}/{bucket}");
     read(&bucket)

@@ -22,7 +22,7 @@ use sha1::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::range::{self, Range};
-use super::{Ctx, chunked, drain, meta, refuse, xml};
+use super::{Ctx, UNCOMPRESSED_FROM, chunked, drain, meta, refuse, xml};
 use crate::dav::http_date;
 use crate::files::{
     self, Commit, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed, object_of,
@@ -321,13 +321,6 @@ struct Payload {
     framing: Option<chunked::Framing>,
 }
 
-/// The size from which a written object is stored uncompressed. The AWS CLI and SDK transfer
-/// managers download an object past 8 MiB as parallel 8 MiB ranges, and a range of a
-/// zstd-stored blob is decoded from the blob's start ([`Store::serve_blob_range`]): stored
-/// compressed, an object of N bytes would cost about N²/16 MiB of decoding to download, where
-/// stored plain each range is a seek. Below it, a range costs at most this much decoding.
-const UNCOMPRESSED_FROM: u64 = 8 << 20;
-
 /// The header naming how long an `aws-chunked` body is once decoded.
 const DECODED_LENGTH: &str = "x-amz-decoded-content-length";
 
@@ -452,27 +445,38 @@ fn checksum_len(name: &str) -> usize {
     }
 }
 
-fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
-    // The header's text and the bytes it decodes to, `len` of them.
-    let decoded = |name: &str, len: usize| -> std::result::Result<Option<(String, Vec<u8>)>, ()> {
-        let Some(v) = headers.get(name) else {
-            return Ok(None);
-        };
-        let text = v.to_str().map_err(|_| ())?.trim();
-        let bytes = crate::auth::base64_decode(text)
-            .filter(|b| b.len() == len)
-            .ok_or(())?;
-        Ok(Some((text.to_string(), bytes)))
+/// Header `name`'s text and the bytes it decodes to from base64, `len` of them: `Ok(None)`
+/// when it is not sent, `Err` when it is not that.
+pub(super) fn base64_header(
+    headers: &HeaderMap,
+    name: &str,
+    len: usize,
+) -> std::result::Result<Option<(String, Vec<u8>)>, ()> {
+    let Some(v) = headers.get(name) else {
+        return Ok(None);
     };
-    let md5 = decoded("content-md5", 16).map_err(|()| {
+    let text = v.to_str().map_err(|_| ())?.trim();
+    let bytes = crate::auth::base64_decode(text)
+        .filter(|b| b.len() == len)
+        .ok_or(())?;
+    Ok(Some((text.to_string(), bytes)))
+}
+
+/// The `Content-MD5` a request sends, as bytes.
+fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refused> {
+    let md5 = base64_header(headers, "content-md5", 16).map_err(|()| {
         (
             StatusCode::BAD_REQUEST,
             "InvalidDigest",
             "Content-MD5 is the body's MD5 in base64",
         )
     })?;
+    Ok(md5.map(|(_, b)| b))
+}
+
+fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
     let mut out = Expected {
-        md5: md5.map(|(_, b)| b),
+        md5: content_md5(headers)?,
         ..Expected::default()
     };
     for (name, len) in [
@@ -480,7 +484,7 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
         ("x-amz-checksum-sha1", 20),
         ("x-amz-checksum-crc32", 4),
     ] {
-        let value = decoded(name, len).map_err(|()| {
+        let value = base64_header(headers, name, len).map_err(|()| {
             (
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -589,26 +593,9 @@ fn verify(
 /// PutObject's body is checked: the signed `x-amz-content-sha256`, `Content-MD5` and the
 /// `x-amz-checksum-*` headers. A document is sent whole, not `aws-chunked`.
 pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
-    let payload = payload(headers)?;
-    if payload.framing.is_some() {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "a request document is sent whole, not aws-chunked",
-        ));
-    }
+    check_document(headers, body)?;
     let expected = expected(headers)?;
     let sha256 = sha2::Sha256::digest(body).to_vec();
-    if payload
-        .sha256
-        .is_some_and(|signed| signed != crate::hex_of(&sha256))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
-        ));
-    }
     let sha1 = sha1::Sha1::digest(body).to_vec();
     let crc32 = crc32fast::hash(body).to_be_bytes().to_vec();
     verify(
@@ -618,6 +605,35 @@ pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Resul
         &Some(sha1),
         &Some(crc32),
     )
+}
+
+/// [`check_body`] for a document whose `x-amz-checksum-*` headers are not its own (a
+/// `CompleteMultipartUpload`'s are the object's): the signed `x-amz-content-sha256` and
+/// `Content-MD5` only.
+pub(super) fn check_document(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
+    let payload = payload(headers)?;
+    if payload.framing.is_some() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "a request document is sent whole, not aws-chunked",
+        ));
+    }
+    if payload
+        .sha256
+        .is_some_and(|signed| signed != crate::hex_of(&sha2::Sha256::digest(body)))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
+        ));
+    }
+    let expected = Expected {
+        md5: content_md5(headers)?,
+        ..Expected::default()
+    };
+    verify(&expected, &md5::compute(body).0, &None, &None, &None)
 }
 
 /// Why a write at a path that takes no object is refused: what is in the way.
@@ -639,12 +655,143 @@ pub(super) fn unwritable(why: Unwritable, ctx: &Ctx) -> Response<Body> {
     )
 }
 
+/// Whether a write's declared length, `Content-Length` or `x-amz-decoded-content-length`, is
+/// past the object cap: refused unread, and the connection then closes.
+pub(super) fn declared_too_large(headers: &HeaderMap) -> bool {
+    let over = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > MAX_OBJECT)
+    };
+    over(CONTENT_LENGTH.as_str()) || over(DECODED_LENGTH)
+}
+
+/// What a write's headers say of its body, checked before it is read: how it is framed and
+/// bound to the signature, and the digests it is to be checked against.
+pub(super) struct Plan {
+    payload: Payload,
+    expected: Expected,
+}
+
+/// The [`Plan`] of a write's body, or why its headers are refused.
+pub(super) fn plan(headers: &HeaderMap) -> std::result::Result<Plan, Refused> {
+    let payload = payload(headers)?;
+    let trailer = payload.framing.and_then(|f| f.trailer);
+    if trailer.is_some_and(|name| headers.contains_key(name)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "a checksum is sent as a header or in the trailer, not both",
+        ));
+    }
+    Ok(Plan {
+        payload,
+        expected: expected(headers)?,
+    })
+}
+
+/// A write's body, received whole and checked against what its request said of it.
+pub(super) struct Received {
+    /// the bytes, staged
+    pub(super) staged: files::Staged,
+    pub(super) md5: [u8; 16],
+    /// the `x-amz-checksum-*` that held, to echo
+    pub(super) echo: Vec<(&'static str, String)>,
+}
+
+/// Stream `body` into `staging` (a private file just created, and its path) while hashing it,
+/// as `plan` says it is framed, then check it against what `plan` says of it. An
+/// `aws-chunked` body is decoded on the way, its chunk signatures checked against `seed` when
+/// there is one, and its trailer's checksum checked as a header's would be. `Ok(Err(answer))`
+/// for a body refused, whose staging file is then gone; a body refused part way is not read
+/// past where it went wrong, and the answer closes the connection.
+pub(super) async fn receive(
+    plan: Plan,
+    body: Incoming,
+    seed: Option<chunked::Seed>,
+    (path, file): (std::path::PathBuf, std::fs::File),
+    ctx: &Ctx,
+) -> Result<std::result::Result<Received, Response<Body>>> {
+    let Plan {
+        payload,
+        mut expected,
+    } = plan;
+    let mut digests = Digests::for_(&expected, payload.framing.and_then(|f| f.trailer));
+    let mut tap = |d: &[u8]| digests.update(d);
+    let (staged, trailer) = match payload.framing {
+        None => (files::stage_into(path, file, body, &mut tap).await, None),
+        Some(framing) => {
+            let mut body = chunked::Decoder::new(body, framing, seed);
+            let staged = files::stage_into(path, file, &mut body, &mut tap).await;
+            let trailer = body
+                .trailer()
+                .map(|(name, value)| (name, value.to_string()));
+            (staged, trailer)
+        }
+    };
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(PutError::TooLarge) => return Ok(Err(ctx.too_large())),
+        Err(PutError::Failed(e)) => match e.downcast_ref::<chunked::Error>() {
+            Some(chunked::Error::Refused(why)) => {
+                return Ok(Err(ctx.error(why.status, why.code, why.message)));
+            }
+            _ => return Err(e),
+        },
+    };
+    // A refusal from here on drops `staged`, which unlinks it.
+    if let Some((name, value)) = trailer
+        && let Err((status, code, message)) = expected.trailer(name, &value)
+    {
+        return Ok(Err(ctx.error(status, code, message)));
+    }
+    if let Some(signed) = &payload.sha256
+        && *signed != staged.hex
+    {
+        return Ok(Err(ctx.error(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
+        )));
+    }
+    let md5 = digests.md5.finalize().0;
+    let sha1 = digests.sha1.map(|h| h.finalize().to_vec());
+    let crc32 = digests.crc32.map(|h| h.finalize().to_be_bytes().to_vec());
+    let sha256 = hex_bytes(&staged.hex);
+    if let Err((status, code, message)) = verify(&expected, &md5, &sha256, &sha1, &crc32) {
+        return Ok(Err(ctx.error(status, code, message)));
+    }
+    Ok(Ok(Received {
+        staged,
+        md5,
+        echo: expected.echo,
+    }))
+}
+
+/// The 200 a write answers: its `etag` (quoted) and the checksums that held.
+pub(super) fn written(etag: &str, echo: Vec<(&'static str, String)>) -> Result<Response<Body>> {
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, "0")
+        .body(body_of(bytes::Bytes::new()))?;
+    let headers = resp.headers_mut();
+    insert(headers, ETAG, etag);
+    for (name, value) in echo {
+        insert(
+            headers,
+            hyper::header::HeaderName::from_static(name),
+            &value,
+        );
+    }
+    Ok(resp)
+}
+
 /// `PUT /s3/<bucket>/<key>`: stream the body into staging while hashing it, check it against
-/// what the request said of it, then tag it under the namespace lock, with its MD5 and user
-/// metadata on the manifest and the request's `If-None-Match: *`/`If-Match` checked there.
-/// Its `Content-Type` is not kept: every object is served as bytes. An `aws-chunked` body is
-/// decoded on the way, its chunk signatures checked against `seed` when there is one, and
-/// its trailer's checksum checked as a header's would be.
+/// what the request said of it ([`receive`]), then tag it under the namespace lock, with its
+/// MD5 and user metadata on the manifest and the request's `If-None-Match: *`/`If-Match`
+/// checked there. Its `Content-Type` is not kept: every object is served as bytes.
 pub(super) async fn put(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -658,30 +805,11 @@ pub(super) async fn put(
         return refuse(req, ctx.access_denied(), ctx).await;
     }
     let headers = req.headers();
-    // A declared length over the cap is refused unread; the connection then closes.
-    let over = |name| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|n| n > MAX_OBJECT)
-    };
-    if over(CONTENT_LENGTH.as_str()) || over(DECODED_LENGTH) {
+    if declared_too_large(headers) {
         return Ok(ctx.too_large());
     }
-    let checked = payload(headers).and_then(|p| {
-        let trailer = p.framing.and_then(|f| f.trailer);
-        if trailer.is_some_and(|name| headers.contains_key(name)) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "a checksum is sent as a header or in the trailer, not both",
-            ));
-        }
-        Ok((p, expected(headers)?))
-    });
-    let (payload, mut expected) = match checked {
-        Ok(checked) => checked,
+    let plan = match plan(headers) {
+        Ok(plan) => plan,
         Err((status, code, message)) => {
             return refuse(req, ctx.error(status, code, message), ctx).await;
         }
@@ -713,64 +841,19 @@ pub(super) async fn put(
         return refuse(req, unwritable(why, ctx), ctx).await;
     }
 
-    let mut digests = Digests::for_(&expected, payload.framing.and_then(|f| f.trailer));
-    let mut tap = |d: &[u8]| digests.update(d);
-    let (staged, trailer) = match payload.framing {
-        None => (
-            files::stage(&state.store, req.into_body(), &mut tap).await,
-            None,
-        ),
-        Some(framing) => {
-            let mut body = chunked::Decoder::new(req.into_body(), framing, seed);
-            let staged = files::stage(&state.store, &mut body, &mut tap).await;
-            let trailer = body
-                .trailer()
-                .map(|(name, value)| (name, value.to_string()));
-            (staged, trailer)
-        }
+    let staging = state.store.stage_file()?;
+    let received = match receive(plan, req.into_body(), seed, staging, ctx).await? {
+        Ok(received) => received,
+        Err(resp) => return Ok(resp),
     };
-    let staged = match staged {
-        Ok(staged) => staged,
-        Err(PutError::TooLarge) => return Ok(ctx.too_large()),
-        // A body whose framing was refused is answered, unread past where it went wrong; the
-        // answer closes the connection.
-        Err(PutError::Failed(e)) => match e.downcast_ref::<chunked::Error>() {
-            Some(chunked::Error::Refused(why)) => {
-                return Ok(ctx.error(why.status, why.code, why.message));
-            }
-            _ => return Err(e),
-        },
-    };
-    // A refusal from here on drops `staged`, which unlinks it: nothing is tagged.
-    if let Some((name, value)) = trailer
-        && let Err((status, code, message)) = expected.trailer(name, &value)
-    {
-        return Ok(ctx.error(status, code, message));
-    }
-    if let Some(signed) = &payload.sha256
-        && *signed != staged.hex
-    {
-        return Ok(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
-        ));
-    }
-    let md5 = digests.md5.finalize().0;
-    let sha1 = digests.sha1.map(|h| h.finalize().to_vec());
-    let crc32 = digests.crc32.map(|h| h.finalize().to_be_bytes().to_vec());
-    let sha256 = hex_bytes(&staged.hex);
-    if let Err((status, code, message)) = verify(&expected, &md5, &sha256, &sha1, &crc32) {
-        return Ok(ctx.error(status, code, message));
-    }
-    let md5_hex = crate::hex_of(&md5);
+    let md5_hex = crate::hex_of(&received.md5);
     annotations.insert(MD5_ANNOTATION.to_string(), md5_hex.clone());
     let how = Commit {
         annotations,
         precondition: conditions.precondition(),
-        uncompressed: staged.size >= UNCOMPRESSED_FROM,
+        uncompressed: received.staged.size >= UNCOMPRESSED_FROM,
     };
-    let written = files::commit(Arc::clone(&state.store), segs, staged, how).await?;
+    let written = files::commit(Arc::clone(&state.store), segs, received.staged, how).await?;
     match written {
         Written::Created | Written::Replaced => {}
         Written::Refused(why) => return Ok(unwritable(why, ctx)),
@@ -782,20 +865,7 @@ pub(super) async fn put(
             ));
         }
     }
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, "0")
-        .body(body_of(bytes::Bytes::new()))?;
-    let headers = resp.headers_mut();
-    insert(headers, ETAG, &format!("\"{md5_hex}\""));
-    for (name, value) in expected.echo {
-        insert(
-            headers,
-            hyper::header::HeaderName::from_static(name),
-            &value,
-        );
-    }
-    Ok(resp)
+    self::written(&format!("\"{md5_hex}\""), received.echo)
 }
 
 /// `DELETE /s3/<bucket>/<key>`: 204 whether or not the key held an object, as S3 answers;

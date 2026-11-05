@@ -10,9 +10,9 @@
 //! one, served over the object layer the WebDAV view shares ([`crate::files`]): [`bucket`]
 //! answers the service and its buckets, [`list`] a bucket's listings, [`object`] the
 //! objects, with [`chunked`] decoding the `aws-chunked` bodies SDKs upload them in, [`copy`]
-//! their copies and [`batch`] their deletion in batches; [`canned`] answers the
-//! configurations a bucket or an object has none of. Operations not served yet answer
-//! `NotImplemented`.
+//! their copies, [`multipart`] their uploads in parts and [`batch`] their deletion in
+//! batches; [`canned`] answers the configurations a bucket or an object has none of.
+//! Operations not served answer `NotImplemented`.
 
 mod batch;
 mod bucket;
@@ -22,6 +22,7 @@ mod conditional;
 mod copy;
 mod list;
 mod meta;
+mod multipart;
 mod object;
 mod path;
 mod range;
@@ -52,12 +53,28 @@ const PRE_AUTH_DRAIN: u64 = 64 * 1024;
 /// The header naming each request, for a client's report to be matched to a server line.
 const REQUEST_ID: &str = "x-amz-request-id";
 
+/// The size from which a written object is stored uncompressed. The AWS CLI and SDK transfer
+/// managers download an object past 8 MiB as parallel 8 MiB ranges, and a range of a
+/// zstd-stored blob is decoded from the blob's start ([`crate::Store::serve_blob_range`]):
+/// stored compressed, an object of N bytes would cost about N²/16 MiB of decoding to download,
+/// where stored plain each range is a seek. Below it, a range costs at most this much decoding.
+pub(super) const UNCOMPRESSED_FROM: u64 = 8 << 20;
+
 /// Serve one `/s3/…` request, from its credentials on: [`crate::route`] hands every such
 /// request here before its own gate when S3 is on.
 pub(crate) async fn route(state: &ServerState, req: Request<Incoming>) -> Result<Response<Body>> {
     let ctx = Ctx {
         id: accounts::random_token(8),
         path: req.uri().path().to_string(),
+        url: match req.headers().get(hyper::header::HOST) {
+            Some(host) => format!(
+                "{}://{}{}",
+                crate::scheme(state.tls.is_some()),
+                String::from_utf8_lossy(host.as_bytes()),
+                req.uri().path()
+            ),
+            None => req.uri().path().to_string(),
+        },
     };
     let id = &ctx.id;
     let mut resp = match serve(state, req, &ctx).await {
@@ -78,6 +95,9 @@ pub(crate) async fn route(state: &ServerState, req: Request<Incoming>) -> Result
 struct Ctx {
     id: String,
     path: String,
+    /// the URL the request was sent to, as S3 names a resource it made: the scheme this
+    /// listener serves, the `Host` and the path, as sent
+    url: String,
 }
 
 impl Ctx {
@@ -232,6 +252,19 @@ async fn operate(
     let sub = subresource(&query);
     let method = req.method().clone();
     match (target, &method, sub) {
+        // Before the arms below: `?uploads` and `?uploadId` name no canned configuration, no
+        // listing, and a part's copy is no CopyObject.
+        (path::Target::Bucket(b), &Method::GET, _) if multipart::names(&query, "uploads") => {
+            multipart::list_uploads(state, authz, b, &query, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, &Method::POST, _)
+            if multipart::names(&query, "uploads") =>
+        {
+            multipart::create(state, authz, segs, &query, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, _, _) if multipart::names(&query, "uploadId") => {
+            multipart::upload(state, authz, segs, seed, &query, req, ctx).await
+        }
         (path::Target::Service, &Method::GET, None) => bucket::list(state, authz, req, ctx).await,
         (path::Target::Bucket(b), &Method::HEAD, None) => {
             bucket::head(state, authz, b, req, ctx).await

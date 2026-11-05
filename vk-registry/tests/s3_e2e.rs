@@ -1725,14 +1725,14 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         .await
         .is(404, "NoSuchKey");
 
-    // Not served yet: other subresources, other verbs, part copies.
+    // Not served: other subresources and verbs, and parameters an operation does not take.
     for req in [
         Req::new("GET", "/s3/b/k").query("partNumber=1"),
         Req::new("GET", "/s3/b/k").query("retention"),
-        Req::new("POST", "/s3/b/k").query("uploads"),
+        Req::new("POST", "/s3/b/k").query("uploads&acl"),
         put("/s3/b/k").query("tagging"),
         put("/s3/b/copy")
-            .query("partNumber=1&uploadId=0")
+            .query("partNumber=1&uploadId=0&acl")
             .header("x-amz-copy-source", "/b/k"),
     ] {
         send(&host, req).await.is(501, "NotImplemented");
@@ -3288,4 +3288,432 @@ async fn configurations_are_canned_with_an_api_key() {
     send(&host, other(Req::new("GET", "/s3/conf/k").query("acl=")))
         .await
         .is(403, "AccessDenied");
+}
+
+// ---- multipart uploads ----
+
+/// `?uploadId=<id>` and, for a part, `partNumber=<n>` before it, as SigV4 sorts them.
+fn part_query(id: &str, n: u32) -> String {
+    format!("partNumber={n}&uploadId={id}")
+}
+
+/// A `CompleteMultipartUpload` document naming `parts` (number, ETag as sent).
+fn complete_doc(parts: &[(u32, &str)]) -> Vec<u8> {
+    let mut doc = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    for (n, etag) in parts {
+        doc.push_str(&format!(
+            "<Part><ETag>{etag}</ETag><PartNumber>{n}</PartNumber></Part>"
+        ));
+    }
+    doc.push_str("</CompleteMultipartUpload>");
+    doc.into_bytes()
+}
+
+/// The ETag S3 gives an object made of `parts`: the MD5 of their MD5s, and their count.
+fn multipart_etag(parts: &[&[u8]]) -> String {
+    let md5s: Vec<u8> = parts.iter().flat_map(|p| md5::compute(p).0).collect();
+    format!("\"{}-{}\"", md5_hex(&md5s), parts.len())
+}
+
+/// Start an upload of the object at `path`: its id.
+async fn create_upload(host: &str, sign: Sign<'_>, path: &str) -> String {
+    let resp = send(host, sign(Req::new("POST", path).query("uploads="))).await;
+    resp.ok(200);
+    element(&resp.body, "UploadId")
+}
+
+/// Send part `n` of upload `id` of `path`: its ETag.
+async fn upload_part(
+    host: &str,
+    sign: Sign<'_>,
+    path: &str,
+    id: &str,
+    n: u32,
+    data: &[u8],
+) -> String {
+    let req = Req::new("PUT", path)
+        .query(&part_query(id, n))
+        .body(data.to_vec());
+    let resp = send(host, sign(req)).await;
+    resp.ok(200);
+    let etag = format!("\"{}\"", md5_hex(data));
+    assert_eq!(resp.header("etag"), Some(&*etag));
+    etag
+}
+
+/// Complete upload `id` of `path` with `parts`.
+fn complete(path: &str, id: &str, parts: &[(u32, &str)]) -> Req {
+    Req::new("POST", path)
+        .query(&format!("uploadId={id}"))
+        .body(complete_doc(parts))
+}
+
+/// The S3 multipart uploads left in the store, by id.
+fn multipart_left(dir: &std::path::Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(dir.join("store/uploads/s3"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// An upload in three parts, as the AWS CLI sends a large file (the first part SigV4-signed
+/// `aws-chunked`, the second with its `Content-MD5`, the last with its SHA-256 signed and an
+/// `x-amz-checksum-sha256`), one part replaced, listed, refused when completed wrong, then
+/// completed and read back as the object the parts make, under the multipart ETag; and what
+/// becomes of the upload.
+#[tokio::test]
+async fn a_multipart_upload_is_assembled_from_its_parts() {
+    let (dir, host) = bearer_server("multipart");
+    let sign = |r: Req| r.signed(&host, BEARER, 0);
+    send(&host, sign(Req::new("PUT", "/s3/b"))).await.ok(200);
+    let path = "/s3/b/big/obj";
+    let create = Req::new("POST", path)
+        .query("uploads=")
+        .header("x-amz-meta-mtime", "1700000000")
+        .header("x-amz-checksum-algorithm", "sha256");
+    let resp = send(&host, sign(create)).await;
+    resp.ok(200);
+    assert_eq!(element(&resp.body, "Bucket"), "b");
+    assert_eq!(element(&resp.body, "Key"), "big/obj");
+    assert_eq!(resp.header("x-amz-checksum-algorithm"), Some("SHA256"));
+    let id = element(&resp.body, "UploadId");
+    assert!(
+        id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "{id}"
+    );
+    assert_eq!(multipart_left(&dir), std::slice::from_ref(&id));
+
+    let listed = send(&host, sign(Req::new("GET", "/s3/b").query("uploads="))).await;
+    listed.ok(200);
+    assert_eq!(
+        elements(&listed.body, "UploadId"),
+        std::slice::from_ref(&id)
+    );
+    assert_eq!(keys(&listed.body), ["big/obj"]);
+    assert!(element(&listed.body, "Initiated").ends_with(".000Z"));
+
+    let one = bytes_of_len(5 << 20);
+    let two: Vec<u8> = (0..5usize << 20).map(|i| (i * 13 % 241) as u8).collect();
+    let three = bytes_of_len(1024);
+    let query = part_query(&id, 1);
+    let req =
+        Req::new("PUT", path)
+            .query(&query)
+            .chunked(&host, BEARER, Chunked::Signed, &one, None);
+    let resp = send(&host, req).await;
+    resp.ok(200);
+    let etag1 = format!("\"{}\"", md5_hex(&one));
+    assert_eq!(resp.header("etag"), Some(&*etag1));
+    // Part 2 sent wrong first, then replaced.
+    let wrong = upload_part(&host, &sign, path, &id, 2, b"not this").await;
+    let req = Req::new("PUT", path)
+        .query(&part_query(&id, 2))
+        .header("content-md5", &b64(&md5::compute(&two).0))
+        .body(two.clone());
+    let resp = send(&host, sign(req)).await;
+    resp.ok(200);
+    let etag2 = format!("\"{}\"", md5_hex(&two));
+    assert_eq!(resp.header("etag"), Some(&*etag2));
+    let sha = b64(&sha2::Sha256::digest(&three));
+    let req = Req::new("PUT", path)
+        .query(&part_query(&id, 3))
+        .header("x-amz-checksum-sha256", &sha)
+        .body(three.clone())
+        .signed_payload(&host, BEARER, 0, &sha256_hex(&three));
+    let resp = send(&host, req).await;
+    resp.ok(200);
+    assert_eq!(resp.header("x-amz-checksum-sha256"), Some(&*sha));
+    let etag3 = format!("\"{}\"", md5_hex(&three));
+    // A part whose digest does not hold is refused, and the part it would replace kept.
+    let req = Req::new("PUT", path)
+        .query(&part_query(&id, 3))
+        .header("content-md5", &b64(&md5::compute(b"other").0))
+        .body(three.clone());
+    send(&host, sign(req)).await.is(400, "BadDigest");
+
+    // The parts, two to a page.
+    let page = |q: &str| sign(Req::new("GET", path).query(q));
+    let resp = send(&host, page(&format!("max-parts=2&uploadId={id}"))).await;
+    resp.ok(200);
+    assert_eq!(elements(&resp.body, "PartNumber"), ["1", "2"]);
+    assert_eq!(
+        elements(&resp.body, "ETag"),
+        [etag1.replace('"', "&quot;"), etag2.replace('"', "&quot;")]
+    );
+    assert_eq!(
+        elements(&resp.body, "Size"),
+        [(5 << 20).to_string(), (5 << 20).to_string()]
+    );
+    assert_eq!(element(&resp.body, "IsTruncated"), "true");
+    assert_eq!(element(&resp.body, "NextPartNumberMarker"), "2");
+    assert_eq!(element(&resp.body, "UploadId"), id);
+    let resp = send(&host, page(&format!("part-number-marker=2&uploadId={id}"))).await;
+    resp.ok(200);
+    assert_eq!(elements(&resp.body, "PartNumber"), ["3"]);
+    assert_eq!(element(&resp.body, "IsTruncated"), "false");
+
+    // Completions that name the parts wrong leave the upload as it was.
+    let (e1, e2, e3) = (etag1.as_str(), etag2.as_str(), etag3.as_str());
+    for (parts, status, code) in [
+        (vec![(2, e2), (1, e1), (3, e3)], 400, "InvalidPartOrder"),
+        (vec![(1, e1), (1, e1)], 400, "InvalidPartOrder"),
+        (
+            vec![(1, e1), (2, wrong.as_str()), (3, e3)],
+            400,
+            "InvalidPart",
+        ),
+        (vec![(1, e1), (2, e2), (4, e3)], 400, "InvalidPart"),
+        (vec![], 400, "MalformedXML"),
+    ] {
+        let resp = send(&host, sign(complete(path, &id, &parts))).await;
+        resp.is(status, code);
+    }
+    let resp = send(
+        &host,
+        sign(complete(path, &id, &[(1, e1), (2, e2), (3, e3)])),
+    )
+    .await;
+    resp.ok(200);
+    let etag = multipart_etag(&[&one, &two, &three]);
+    assert!(etag.ends_with("-3\""), "{etag}");
+    assert_eq!(element(&resp.body, "ETag"), etag.replace('"', "&quot;"));
+    assert_eq!(element(&resp.body, "Key"), "big/obj");
+    // An absolute URL, as S3 answers: the scheme and host the request was sent to.
+    assert_eq!(
+        element(&resp.body, "Location"),
+        format!("http://{host}{path}")
+    );
+
+    let whole = [one.as_slice(), &two, &three].concat();
+    let resp = send(&host, sign(Req::new("GET", path))).await;
+    is_object(&resp, &whole);
+    assert_eq!(resp.header("etag"), Some(&*etag));
+    assert_eq!(resp.header("x-amz-meta-mtime"), Some("1700000000"));
+    let resp = send(&host, sign(Req::new("HEAD", path))).await;
+    resp.ok(200);
+    assert_eq!(resp.header("etag"), Some(&*etag));
+    let resp = send(&host, sign(Req::new("GET", "/s3/b").query("list-type=2"))).await;
+    resp.ok(200);
+    assert_eq!(keys(&resp.body), ["big/obj"]);
+    assert_eq!(element(&resp.body, "ETag"), etag.replace('"', "&quot;"));
+    // Past 8 MiB, stored plain, as a PutObject of that size is.
+    assert!(
+        dir.join("store/blobs/sha256")
+            .join(sha256_hex(&whole))
+            .is_file()
+    );
+
+    // The upload is gone with its parts, and nothing is left staged.
+    assert!(multipart_left(&dir).is_empty());
+    assert_eq!(staging_left(&dir), 0);
+    let listed = send(&host, sign(Req::new("GET", "/s3/b").query("uploads="))).await;
+    listed.ok(200);
+    assert!(
+        elements(&listed.body, "Upload").is_empty(),
+        "{}",
+        listed.body
+    );
+    let req = Req::new("PUT", path)
+        .query(&part_query(&id, 1))
+        .body(b"late".to_vec());
+    send(&host, sign(req)).await.is(404, "NoSuchUpload");
+    send(&host, sign(complete(path, &id, &[(1, e1)])))
+        .await
+        .is(404, "NoSuchUpload");
+}
+
+/// A one-part upload, an aborted one, part copies, an upload's id used for another key, a
+/// total past the object cap, and the gc's sweep of the uploads left idle.
+#[tokio::test]
+async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
+    let (dir, host) = bearer_server("multipart-more");
+    let sign = |r: Req| r.signed(&host, BEARER, 0);
+    let path = "/s3/b/k";
+
+    // One part.
+    let id = create_upload(&host, &sign, path).await;
+    let data = bytes_of_len(1024);
+    let etag = upload_part(&host, &sign, path, &id, 1, &data).await;
+    let resp = send(&host, sign(complete(path, &id, &[(1, &etag)]))).await;
+    resp.ok(200);
+    let whole = multipart_etag(&[&data]);
+    assert!(whole.ends_with("-1\""), "{whole}");
+    assert_eq!(element(&resp.body, "ETag"), whole.replace('"', "&quot;"));
+    is_object(&send(&host, sign(Req::new("GET", path))).await, &data);
+
+    // Aborted: gone, and gone again.
+    let id = create_upload(&host, &sign, path).await;
+    upload_part(&host, &sign, path, &id, 1, &data).await;
+    let abort = || sign(Req::new("DELETE", path).query(&format!("uploadId={id}")));
+    send(&host, abort()).await.ok(204);
+    let list = Req::new("GET", path).query(&format!("uploadId={id}"));
+    send(&host, sign(list)).await.is(404, "NoSuchUpload");
+    send(&host, abort()).await.is(404, "NoSuchUpload");
+
+    // An id names its own key's upload only, and an id this server cannot mint nothing.
+    let id = create_upload(&host, &sign, path).await;
+    for other in ["/s3/b/other", "/s3/c/k"] {
+        let req = Req::new("PUT", other)
+            .query(&part_query(&id, 1))
+            .body(data.clone());
+        send(&host, sign(req)).await.is(404, "NoSuchUpload");
+    }
+    for bad in ["..", "0-0-zz", "s3"] {
+        let req = Req::new("PUT", path)
+            .query(&part_query(bad, 1))
+            .body(data.clone());
+        send(&host, sign(req)).await.is(404, "NoSuchUpload");
+    }
+    for n in ["0", "10001", "x"] {
+        let req = Req::new("PUT", path)
+            .query(&format!("partNumber={n}&uploadId={id}"))
+            .body(data.clone());
+        send(&host, sign(req)).await.is(400, "InvalidArgument");
+    }
+    // A copy source on a creation is no part copy.
+    let req = Req::new("POST", "/s3/b/x")
+        .query("uploads=")
+        .header("x-amz-copy-source", "/b/k");
+    send(&host, sign(req)).await.is(400, "InvalidArgument");
+    // Nor can an upload be made where no object can be.
+    let req = Req::new("POST", "/s3/b/k/below").query("uploads=");
+    send(&host, sign(req)).await.is(409, "OperationAborted");
+
+    // Parts copied from an object: whole, then a range of it.
+    let src = bytes_of_len(70_000);
+    send(&host, sign(Req::new("PUT", "/s3/b/src").body(src.clone())))
+        .await
+        .ok(200);
+    let copied = "/s3/b/copied";
+    let id = create_upload(&host, &sign, copied).await;
+    let copy = |n: u32| {
+        Req::new("PUT", copied)
+            .query(&part_query(&id, n))
+            .header("x-amz-copy-source", "/b/src")
+    };
+    let resp = send(&host, sign(copy(1))).await;
+    resp.ok(200);
+    assert!(resp.body.contains("<CopyPartResult"), "{}", resp.body);
+    let e1 = element(&resp.body, "ETag").replace("&quot;", "\"");
+    assert_eq!(e1, format!("\"{}\"", md5_hex(&src)));
+    let resp = send(
+        &host,
+        sign(copy(2).header("x-amz-copy-source-range", "bytes=100-1099")),
+    )
+    .await;
+    resp.ok(200);
+    let e2 = element(&resp.body, "ETag").replace("&quot;", "\"");
+    assert_eq!(e2, format!("\"{}\"", md5_hex(&src[100..1100])));
+    let past = copy(3).header("x-amz-copy-source-range", "bytes=69000-70000");
+    send(&host, sign(past)).await.is(416, "InvalidRange");
+    let backwards = copy(3).header("x-amz-copy-source-range", "bytes=5-2");
+    send(&host, sign(backwards))
+        .await
+        .is(400, "InvalidArgument");
+    let failed = copy(3).header("x-amz-copy-source-if-match", "\"other\"");
+    send(&host, sign(failed))
+        .await
+        .is(412, "PreconditionFailed");
+    let absent = Req::new("PUT", copied)
+        .query(&part_query(&id, 3))
+        .header("x-amz-copy-source", "/b/absent");
+    send(&host, sign(absent)).await.is(404, "NoSuchKey");
+    let resp = send(&host, sign(complete(copied, &id, &[(1, &e1), (2, &e2)]))).await;
+    resp.ok(200);
+    let both = [src.as_slice(), &src[100..1100]].concat();
+    is_object(&send(&host, sign(Req::new("GET", copied))).await, &both);
+
+    // A total past the object cap is refused, as the parts' records say before any is read.
+    let id = create_upload(&host, &sign, "/s3/b/huge").await;
+    let e1 = upload_part(&host, &sign, "/s3/b/huge", &id, 1, &data).await;
+    let e2 = upload_part(&host, &sign, "/s3/b/huge", &id, 2, &data).await;
+    let record = dir.join(format!("store/uploads/s3/{id}/part-1.json"));
+    let swollen = format!("{{\"size\":{},\"md5\":\"{}\"}}", 4u64 << 30, md5_hex(&data));
+    std::fs::write(&record, swollen).unwrap();
+    let resp = send(
+        &host,
+        sign(complete("/s3/b/huge", &id, &[(1, &e1), (2, &e2)])),
+    )
+    .await;
+    resp.is(413, "EntityTooLarge");
+    send(&host, sign(Req::new("GET", "/s3/b/huge")))
+        .await
+        .is(404, "NoSuchKey");
+
+    // The gc sweeps an upload nothing was written into for its grace window, and keeps one
+    // a part was written into lately.
+    let fresh = create_upload(&host, &sign, "/s3/b/fresh").await;
+    let old = SystemTime::now() - Duration::from_secs(3 * 86_400);
+    for id in multipart_left(&dir).iter().filter(|id| **id != fresh) {
+        let up = dir.join(format!("store/uploads/s3/{id}"));
+        for e in std::fs::read_dir(&up).unwrap() {
+            std::fs::File::open(e.unwrap().path())
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        std::fs::File::open(&up).unwrap().set_modified(old).unwrap();
+    }
+    assert_eq!(multipart_left(&dir).len(), 3);
+    let store = Store::new(dir.join("store")).unwrap();
+    let day = Duration::from_secs(86_400);
+    let report = store.gc(day * 30, day, false).unwrap();
+    assert_eq!(report.uploads_dropped, 2);
+    assert_eq!(multipart_left(&dir), std::slice::from_ref(&fresh));
+    upload_part(&host, &sign, "/s3/b/fresh", &fresh, 1, &data).await;
+    assert_eq!(staging_left(&dir), 0);
+}
+
+/// A key that may only read a directory can list its uploads and parts, and can neither
+/// start an upload there nor send a part to one.
+#[tokio::test]
+async fn a_read_only_key_cannot_upload_parts() {
+    let dir = tmp("multipart-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let writer = api_key(db, "writer", &[(Action::Write, "files/*")]);
+    let reader = api_key(db, "reader", &[(Action::Read, "files/*")]);
+    let host = spawn(state.clone());
+    let (writer, reader) = (as_key(&host, &writer), as_key(&host, &reader));
+    send(&host, writer(Req::new("PUT", "/s3/b"))).await.ok(200);
+    let path = "/s3/b/d/k";
+    let id = create_upload(&host, &writer, path).await;
+    let data = bytes_of_len(1024);
+    let etag = upload_part(&host, &writer, path, &id, 1, &data).await;
+
+    let body = vec![b'x'; 1 << 20];
+    let req = Req::new("PUT", path).query(&part_query(&id, 2)).body(body);
+    send(&host, reader(req)).await.is(403, "AccessDenied");
+    let req = Req::new("POST", "/s3/b/d/other").query("uploads=");
+    send(&host, reader(req)).await.is(403, "AccessDenied");
+    send(&host, reader(complete(path, &id, &[(1, &etag)])))
+        .await
+        .is(403, "AccessDenied");
+    let abort = Req::new("DELETE", path).query(&format!("uploadId={id}"));
+    send(&host, reader(abort)).await.is(403, "AccessDenied");
+    let resp = send(
+        &host,
+        reader(Req::new("GET", path).query(&format!("uploadId={id}"))),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(elements(&resp.body, "PartNumber"), ["1"]);
+    let resp = send(&host, reader(Req::new("GET", "/s3/b").query("uploads="))).await;
+    resp.ok(200);
+    assert_eq!(elements(&resp.body, "UploadId"), std::slice::from_ref(&id));
+
+    send(&host, writer(complete(path, &id, &[(1, &etag)])))
+        .await
+        .ok(200);
+    is_object(&send(&host, reader(Req::new("GET", path))).await, &data);
+    assert!(multipart_left(&dir).is_empty());
+    assert_eq!(staging_left(&dir), 0);
 }
