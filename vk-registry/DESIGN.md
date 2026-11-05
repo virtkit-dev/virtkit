@@ -656,6 +656,12 @@ caller may not read is passed over with everything below it, as `PROPFIND` passe
 and neither a foreign tag nor an object whose bytes the caller may not read through it is
 listed.
 
+**A write makes its bucket.** PutObject, CopyObject and CompleteMultipartUpload into a bucket
+that does not exist create it, with every directory above the key, as WebDAV's `PUT` creates
+missing directories, rather than answering S3's `NoSuchBucket`; the write is authorized as
+any other, on the key's parent. This is deliberate: a job behind the guest proxy may not
+create the bucket its area lies in (see below), and can write there all the same.
+
 **Objects are bytes.** Every object is served `application/octet-stream`,
 `Content-Disposition: attachment` and `nosniff`, whatever its writer sent: a `Content-Type`
 is not stored, for the reason manifest media types are restricted (this origin also serves
