@@ -67,6 +67,14 @@ async fn wait_out(resp: &reqwest::Response, start: tokio::time::Instant, window:
     true
 }
 
+/// `req` with `X-Vk-Lock-Pipeline: pipeline`, or without the header for `None`.
+fn with_pipeline(req: reqwest::RequestBuilder, pipeline: Option<&str>) -> reqwest::RequestBuilder {
+    match pipeline {
+        Some(p) => req.header("x-vk-lock-pipeline", p),
+        None => req,
+    }
+}
+
 impl LockClient {
     pub fn new(base: impl Into<String>, auth: ClientAuth, client: reqwest::Client) -> Self {
         LockClient {
@@ -280,17 +288,25 @@ impl LockClient {
     /// via [`Self::recent_failure`] and fails fast instead of repeating the same doomed
     /// build. Best-effort: a transport error is swallowed — a missed record only costs a
     /// future re-attempt, never a correctness issue. Retry 503s within [`BUSY_WINDOW`].
-    pub async fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
+    /// `None` sends no pipeline, for a registry token: the registry takes the token's.
+    pub async fn record_failure(
+        &self,
+        name: &str,
+        pipeline: Option<&str>,
+        reason: &str,
+        ttl: Duration,
+    ) {
         let ttl_s = ttl.as_secs().to_string();
         let start = tokio::time::Instant::now();
         loop {
-            let sent = self
-                .auth(self.client.post(self.url("fail")))
-                .query(&[("name", name), ("ttl", ttl_s.as_str())])
-                .header("x-vk-lock-pipeline", pipeline)
-                .body(reason.to_string())
-                .send()
-                .await;
+            let sent = with_pipeline(
+                self.auth(self.client.post(self.url("fail")))
+                    .query(&[("name", name), ("ttl", ttl_s.as_str())]),
+                pipeline,
+            )
+            .body(reason.to_string())
+            .send()
+            .await;
             match sent {
                 Ok(resp) if wait_out(&resp, start, BUSY_WINDOW).await => {}
                 _ => return,
@@ -301,15 +317,16 @@ impl LockClient {
     /// A still-live failure record for `name` under `pipeline`. `None` for no record, a
     /// record under a different pipeline, a lapsed ttl, or any transport/parse error —
     /// treated alike so a registry hiccup never blocks a build that would otherwise
-    /// proceed.
-    pub async fn recent_failure(&self, name: &str, pipeline: &str) -> Option<FailInfo> {
-        let resp = self
-            .auth(self.client.post(self.url("fail-status")))
-            .query(&[("name", name)])
-            .header("x-vk-lock-pipeline", pipeline)
-            .send()
-            .await
-            .ok()?;
+    /// proceed. `pipeline` is `None` for a registry token, as for [`Self::record_failure`].
+    pub async fn recent_failure(&self, name: &str, pipeline: Option<&str>) -> Option<FailInfo> {
+        let resp = with_pipeline(
+            self.auth(self.client.post(self.url("fail-status")))
+                .query(&[("name", name)]),
+            pipeline,
+        )
+        .send()
+        .await
+        .ok()?;
         if !resp.status().is_success() {
             return None;
         }

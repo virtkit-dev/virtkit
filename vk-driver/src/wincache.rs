@@ -107,7 +107,7 @@ pub(crate) fn lock(rg: &Registry, key: &str, what: &str) -> Option<crate::regist
     let mut waited = false;
     let lock = crate::registry::build_lock_waiting(
         rg,
-        &format!("{CACHE_REPO}/{}", tag(key)),
+        &crate::registry::lock_name(rg, CACHE_REPO, &tag(key)),
         LOCK_WAIT,
         &mut |holder| {
             waited = true;

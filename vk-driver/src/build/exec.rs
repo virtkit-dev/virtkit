@@ -2712,19 +2712,21 @@ impl Executor for MicroVm {
         key: &str,
         on_wait: &mut dyn FnMut(&str),
     ) -> Option<crate::registry::BuildLock> {
-        // Namespace the lock key by the cache repo so unrelated stores don't collide.
+        let rg = self.cache.as_ref()?;
         crate::registry::build_lock(
-            self.cache.as_ref()?,
-            &format!("{CACHE_REPO}/{key}"),
+            rg,
+            &crate::registry::lock_name(rg, CACHE_REPO, key),
             on_wait,
         )
     }
     fn check_build_failure(&mut self, key: &str) -> Option<vk_registry::FailInfo> {
-        crate::registry::check_build_failure(self.cache.as_ref()?, &format!("{CACHE_REPO}/{key}"))
+        let rg = self.cache.as_ref()?;
+        crate::registry::check_build_failure(rg, &crate::registry::lock_name(rg, CACHE_REPO, key))
     }
     fn report_build_failure(&mut self, key: &str, reason: &str) {
         if let Some(rg) = self.cache.as_ref() {
-            crate::registry::report_build_failure(rg, &format!("{CACHE_REPO}/{key}"), reason);
+            let name = crate::registry::lock_name(rg, CACHE_REPO, key);
+            crate::registry::report_build_failure(rg, &name, reason);
         }
     }
     fn cache_restore(&mut self, fs: &Rootfs, key: &str) -> Result<()> {

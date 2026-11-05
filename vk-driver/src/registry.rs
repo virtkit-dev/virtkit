@@ -3501,12 +3501,31 @@ impl Drop for BuildLock {
 /// pipeline id always bypasses it regardless.
 const BUILD_FAIL_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// Failure-memo pipeline for the lock API: `Some(None)` uses the job token's pipeline.
+/// Without a job token, use the CI pipeline or return `None` to disable memos.
+fn memo_pipeline(rg: &Registry) -> Option<Option<String>> {
+    if rg.job_token.is_some() {
+        Some(None)
+    } else {
+        crate::jobctx::pipeline_identity().map(Some)
+    }
+}
+
+/// The lock and failure-memo name of `repo:tag` in `rg`: `<rg's prefix>/<repo>:<tag>`, so a
+/// job token granted on that prefix covers it. Linux and Windows layers name theirs alike.
+pub(crate) fn lock_name(rg: &Registry, repo: &str, tag: &str) -> String {
+    match rg.base_url().map_or("", |(_, prefix)| prefix) {
+        "" => format!("{repo}:{tag}"),
+        prefix => format!("{prefix}/{repo}:{tag}"),
+    }
+}
+
 /// A lock client for `rg`'s failure-memo endpoints, or `None` when there is nothing to talk
-/// to: a local filesystem store (no lock server), or outside CI (no pipeline id — a local
-/// `vk build`/`vk run` always retries, never memoized). Shared setup for
+/// to: a local filesystem store (no lock server), or outside CI without a job token (no
+/// pipeline id — a local `vk build`/`vk run` always retries, never memoized). Shared setup for
 /// [`check_build_failure`]/[`report_build_failure`].
-fn fail_client(rg: &Registry) -> Option<(vk_registry::LockClient, String)> {
-    let pipeline = crate::jobctx::pipeline_identity()?;
+fn fail_client(rg: &Registry) -> Option<(vk_registry::LockClient, Option<String>)> {
+    let pipeline = memo_pipeline(rg)?;
     let base = lock_base(rg)?;
     let http = http_client(rg).ok()?;
     let auth = cred(rg).map(|c| c.client_auth()).unwrap_or_default();
@@ -3515,23 +3534,23 @@ fn fail_client(rg: &Registry) -> Option<(vk_registry::LockClient, String)> {
 
 /// Did `key` (a stage's final content hash) already fail to build earlier in this same
 /// pipeline? `None` (the common case) means proceed with the build as usual — including
-/// when there's nothing to ask (local store, or outside CI).
+/// when there's nothing to ask (local store, or outside CI without a job token).
 pub fn check_build_failure(rg: &Registry, key: &str) -> Option<vk_registry::FailInfo> {
     let (client, pipeline) = fail_client(rg)?;
-    block_on(async move { client.recent_failure(key, &pipeline).await })
+    block_on(async move { client.recent_failure(key, pipeline.as_deref()).await })
 }
 
 /// Record that `key` just failed to build, so a peer in this same pipeline — another job
 /// needing the same content-key, or this job's own runner-level retry — fails fast instead
 /// of repeating the same doomed build. Best-effort no-op when there's nothing to tell (local
-/// store, or outside CI).
+/// store, or outside CI without a job token).
 pub fn report_build_failure(rg: &Registry, key: &str, reason: &str) {
     let Some((client, pipeline)) = fail_client(rg) else {
         return;
     };
     block_on(async move {
         client
-            .record_failure(key, &pipeline, reason, BUILD_FAIL_TTL)
+            .record_failure(key, pipeline.as_deref(), reason, BUILD_FAIL_TTL)
             .await
     });
 }
@@ -4595,6 +4614,46 @@ mod local {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A layer's lock and memo name is its repository path under the cache's prefix, so a
+    /// job's token on that prefix covers it.
+    #[test]
+    fn locks_and_memos_are_named_under_the_caches_prefix() {
+        let at = |repo: &str| {
+            Registry::for_share(repo.into(), false, None, String::new(), None, None, None)
+        };
+        let node = at("reg.example");
+        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some("vkt_x.y")).unwrap();
+        assert_eq!(
+            lock_name(&scoped, "build-cache", "win-abc"),
+            "ci-build/gl/42/protected/all/build-cache:win-abc"
+        );
+        assert_eq!(
+            lock_name(&at("https://Reg.example/shared/"), "build-cache", "k"),
+            "shared/build-cache:k"
+        );
+        assert_eq!(lock_name(&node, "build-cache", "k"), "build-cache:k");
+        assert_eq!(
+            lock_name(&at("/srv/store"), "build-cache", "k"),
+            "build-cache:k"
+        );
+    }
+
+    /// A memo through a job's token names no pipeline: the registry takes the token's.
+    #[test]
+    fn a_job_tokens_memo_names_no_pipeline() {
+        let node = Registry::for_share(
+            "reg.example".into(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some("vkt_x.y")).unwrap();
+        assert_eq!(memo_pipeline(&scoped), Some(None));
+    }
 
     /// One request as the fake registry saw it.
     #[derive(Clone, Debug)]

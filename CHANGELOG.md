@@ -27,6 +27,8 @@ All notable changes to virtkit will be documented in this file.
   are rejected when stored or minted if they exceed 16 components or contain `tags`,
   `manifests` or `blobs` as a component. GitLab instances cannot use those names either.
   These paths were already refused by the registry.
+- **While a fleet is upgraded, hosts of this release and earlier ones may each build the same
+  cached layer once** instead of waiting for each other's build.
 
 ## [0.106.1] - 2026-11-06
 

@@ -423,6 +423,33 @@ async fn a_tokens_locks_and_memos_stay_within_its_grants_and_pipeline() {
     assert_eq!(r.status(), 200);
     assert!(status("gl/7").await);
 
+    // The client names no pipeline for a token: the registry takes the token's.
+    let client = vk_registry::LockClient::new(
+        url.clone(),
+        vk_registry::ClientAuth::Bearer {
+            token: token.clone(),
+        },
+        http.clone(),
+    );
+    client
+        .record_failure(
+            "p/gl/42:c",
+            None,
+            "broke",
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+    let seen = client.recent_failure("p/gl/42:c", None).await;
+    assert_eq!(seen.map(|f| f.reason).as_deref(), Some("broke"));
+    // Refused (403) rather than not found, as the raw requests above show: the client reads
+    // both as no record.
+    assert!(
+        client
+            .recent_failure("p/gl/42:c", Some("gl/8"))
+            .await
+            .is_none()
+    );
+
     // A token naming no pipeline takes locks but records no memo.
     let anonymous = signer.sign(claims(AUD, 600, None)).unwrap();
     let r = post("/lock/fail?name=p%2Fgl%2F42%3Ak", &anonymous, Some("gl/7"))
