@@ -50,6 +50,16 @@ const TRUNCATED: Malformed = Malformed("the document ends inside an element");
 /// The document element of `input`, of at most `max_elements` elements in all.
 pub(crate) fn parse(input: &[u8], max_elements: usize) -> Result<Element, Malformed> {
     let text = std::str::from_utf8(input).map_err(|_| Malformed("the document is not UTF-8"))?;
+    // What XML 1.0 has no character for, a reference excepted ([`character`]), so that no
+    // text taken from a document holds what an answer echoing it could not write.
+    if text
+        .chars()
+        .any(|c| (c < ' ' && !is_space(c)) || matches!(c, '\u{fffe}' | '\u{ffff}'))
+    {
+        return Err(Malformed(
+            "the document holds a character XML does not allow",
+        ));
+    }
     let rest = misc(text.strip_prefix('\u{feff}').unwrap_or(text))?;
     if rest.is_empty() {
         return Err(Malformed("the document has no element"));
@@ -235,7 +245,8 @@ fn character(name: &str) -> Option<char> {
         return None;
     }
     let c = char::from_u32(u32::from_str_radix(digits, radix).ok()?)?;
-    (matches!(c, '\t' | '\n' | '\r') || c >= ' ').then_some(c)
+    (matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && !matches!(c, '\u{fffe}' | '\u{ffff}')))
+        .then_some(c)
 }
 
 #[cfg(test)]
@@ -313,6 +324,9 @@ mod tests {
             "<K>&#0;</K>",
             "<K>&#xD800;</K>",
             "<K>&#x110000;</K>",
+            "<K>&#1;</K>",
+            "<K>&#x1B;</K>",
+            "<K>&#xFFFE;</K>",
             "<K>&#12a;</K>",
             "<K>&averyverylongname;</K>",
             "<K a=\"&nbsp;\"/>",
@@ -344,7 +358,11 @@ mod tests {
             ("<a x=\"1\"y=\"2\"></a>", "white space"),
             ("< a/>", "name"),
             ("<:/>", "name"),
-            ("<a>\u{0}", "ends inside"),
+            ("<a>\u{0}", "does not allow"),
+            ("<a>x\u{1}</a>", "does not allow"),
+            ("<a><![CDATA[\u{1b}]]></a>", "does not allow"),
+            ("<a>\u{ffff}</a>", "does not allow"),
+            ("<a x=\"\u{8}\"/>", "does not allow"),
         ] {
             assert!(malformed(bad).contains(why), "{bad}: {}", malformed(bad));
         }

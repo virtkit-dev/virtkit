@@ -114,7 +114,7 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
 
 /// A prefix, delimiter or start key, which a listing echoes in XML: no control character,
 /// which XML 1.0 cannot carry, and no longer than a key.
-fn text(v: String) -> std::result::Result<String, &'static str> {
+pub(super) fn text(v: String) -> std::result::Result<String, &'static str> {
     if v.chars().any(char::is_control) {
         Err("a prefix, delimiter or start key holds no control character")
     } else if v.len() > MAX_KEY {

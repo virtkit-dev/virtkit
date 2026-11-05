@@ -1044,11 +1044,18 @@ pub(super) async fn list_uploads(
     let Some(max) = page_size(param(&params, "max-uploads")) else {
         return refuse(req, invalid(ctx, "max-uploads is a count of uploads"), ctx).await;
     };
-    let prefix = param(&params, "prefix").unwrap_or_default().to_string();
-    let key_marker = param(&params, "key-marker").unwrap_or_default().to_string();
-    let id_marker = param(&params, "upload-id-marker")
-        .unwrap_or_default()
-        .to_string();
+    // Each is echoed in the listing, so held to what a bucket listing's prefix is.
+    let echoed = |name| list::text(param(&params, name).unwrap_or_default().to_string());
+    let (prefix, key_marker, id_marker) = match (
+        echoed("prefix"),
+        echoed("key-marker"),
+        echoed("upload-id-marker"),
+    ) {
+        (Ok(prefix), Ok(key), Ok(id)) => (prefix, key, id),
+        (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => {
+            return refuse(req, invalid(ctx, why), ctx).await;
+        }
+    };
     if !list::admitted(authz, &bucket, &prefix) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
