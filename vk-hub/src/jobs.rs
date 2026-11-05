@@ -270,6 +270,68 @@ struct State {
     /// The last [`step`]'s [`ArbitrationView`]s after [`ArbitrationView::settled`].
     /// Changes wake the live updates of a GitLab server's page, where runners show.
     arbitration_shown: HashMap<(String, u64), ArbitrationView>,
+    /// Finished jobs not settled whose final row the database holds and memory no longer does,
+    /// by ID: what [`notices`] tells of them until they are settled or expire.
+    stored: HashMap<String, StoredJob>,
+}
+
+/// A finished job not settled, as [`State::stored`] keeps it.
+struct StoredJob {
+    key: String,
+    revision: u64,
+    output_len: u64,
+}
+
+/// What a relay at version [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION) is told of: the
+/// answer each of its tickets would get, and the revision and output length of each of its
+/// jobs not settled, as the dispatch state holds them. Its session tells it of each one that
+/// moved since it last did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Notices {
+    pub(crate) tickets: HashMap<String, TicketNotice>,
+    /// Revision and output length.
+    pub(crate) jobs: HashMap<String, (u64, u64)>,
+}
+
+/// What a ticket's fetch would answer, as far as a relay waits on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TicketNotice {
+    /// Waiting for room, or offered: 202.
+    Queued,
+    /// 201 with its grant.
+    Granted,
+    /// Claimed by the relay, which no longer waits on it.
+    Claimed,
+    /// 410.
+    Ended,
+}
+
+/// Principal `principal`'s [`Notices`] now.
+pub(crate) fn notices(hub: &Hub, principal: &str) -> Notices {
+    let state = hub.dispatch.lock();
+    let tickets = (state.tickets.iter())
+        .filter(|(_, t)| t.key == principal)
+        .map(|(id, t)| {
+            let notice = match t.phase {
+                TicketPhase::Waiting | TicketPhase::Offering { .. } => TicketNotice::Queued,
+                TicketPhase::Granted { .. } => TicketNotice::Granted,
+                TicketPhase::Claimed { .. } | TicketPhase::Job => TicketNotice::Claimed,
+                TicketPhase::Finished(_) => TicketNotice::Ended,
+            };
+            (id.clone(), notice)
+        })
+        .collect();
+    let live = (state.jobs.iter().map(|(id, j)| (id, &j.row)))
+        .chain(state.finished.iter())
+        .filter(|(_, row)| row.key == principal && row.settled_at.is_none())
+        .map(|(id, row)| (id.clone(), (row.revision, row.output_len)));
+    let stored = (state.stored.iter())
+        .filter(|(_, j)| j.key == principal)
+        .map(|(id, j)| (id.clone(), (j.revision, j.output_len)));
+    Notices {
+        tickets,
+        jobs: stored.chain(live).collect(),
+    }
 }
 
 #[derive(Default)]
@@ -910,13 +972,29 @@ async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) -> Result
     .await?;
     {
         let mut state = hub.dispatch.lock();
-        if row.state == JobState::Finished
+        let dropped = row.state == JobState::Finished
             && state
                 .finished
                 .get(&id)
-                .is_some_and(|r| r.revision <= row.revision)
-        {
+                .is_some_and(|r| r.revision <= row.revision);
+        if dropped {
             state.finished.remove(&id);
+        }
+        // Told of until settled: recorded by the write that drops it from memory, which a
+        // write of an older row, finishing after a newer one dropped it, is not.
+        if row.state == JobState::Finished {
+            if row.settled_at.is_some() || row.expired_at.is_some() {
+                state.stored.remove(&id);
+            } else if dropped && written {
+                state.stored.insert(
+                    id.clone(),
+                    StoredJob {
+                        key: row.key.clone(),
+                        revision: row.revision,
+                        output_len: row.output_len,
+                    },
+                );
+            }
         }
         // Written with this report: [`write_egress`] leaves it, not one newer that came since.
         if let (true, Some(report), Some(job)) = (written, &row.egress, state.jobs.get_mut(&id))
@@ -3998,7 +4076,11 @@ async fn prune(hub: &Hub) -> bool {
     {
         let mut state = hub.dispatch.lock();
         for (job, principal, admission) in pruned.retired {
+            state.stored.remove(&job);
             state.retired_jobs.insert(job, (principal, admission));
+        }
+        for job in &pruned.outputs {
+            state.stored.remove(job);
         }
         retire_finished_jobs(&mut state);
     }

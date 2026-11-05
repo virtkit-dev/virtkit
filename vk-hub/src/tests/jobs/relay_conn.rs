@@ -448,3 +448,103 @@ async fn a_hand_over_closes_relay_sessions() {
     assert!(hub.handover.gate.drained(Duration::from_secs(5)).await);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The next notice on `session`.
+async fn notice(session: &mut mpsc::UnboundedReceiver<Message>) -> HubRelayMsg {
+    let msg = tokio::time::timeout(Duration::from_secs(5), session.recv())
+        .await
+        .expect("no notice came");
+    let Some(Message::Text(text)) = msg else {
+        panic!("not a notice: {msg:?}");
+    };
+    serde_json::from_str(text.as_str()).unwrap()
+}
+
+/// A relay's session tells it when its ticket ends and its job moves, not when it queues a
+/// ticket; a finished, written job is told of again to the next session until it is settled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_is_told_when_its_tickets_and_jobs_change() {
+    let (dir, addr, _hub, key) = hub_and_relay("relay-conn-notices", false).await;
+    let (h2, mut session) = session_up(addr, &key, false).await;
+
+    let mut queued = relay_reservation_body(1, 0);
+    queued["queue"] = json!(true);
+    let (status, body) = h2
+        .send("POST", "/v1/reservations", &[], Some(queued))
+        .await
+        .unwrap();
+    assert_eq!(status, 202, "{}", String::from_utf8_lossy(&body));
+    let ticket = serde_json::from_slice::<ReservationTicket>(&body)
+        .unwrap()
+        .ticket;
+    let path = format!("/v1/reservations/tickets/{ticket}");
+    let (status, _) = h2.send("DELETE", &path, &[], None).await.unwrap();
+    assert_eq!(status, 204);
+    assert_eq!(
+        notice(&mut session).await,
+        HubRelayMsg::Ticket {
+            ticket: ticket.clone()
+        }
+    );
+
+    let (status, body) = h2
+        .send("POST", "/v1/jobs", &[], Some(job_body(2, None, 30)))
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let view = serde_json::from_slice::<JobView>(&body).unwrap();
+    assert_eq!(
+        notice(&mut session).await,
+        HubRelayMsg::Job {
+            job: view.id.clone(),
+            revision: view.revision,
+            output_len: 0,
+        }
+    );
+    let cancel = format!("/v1/jobs/{}/cancel", view.id);
+    let (status, body) = h2
+        .send("POST", &cancel, &[], Some(json!({"mode": "graceful"})))
+        .await
+        .unwrap();
+    assert_eq!(status, 202, "{}", String::from_utf8_lossy(&body));
+    let HubRelayMsg::Job { revision, .. } = notice(&mut session).await else {
+        panic!("not a job notice");
+    };
+    let (status, body) = h2
+        .send("GET", &format!("/v1/jobs/{}", view.id), &[], None)
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    let ended = serde_json::from_slice::<JobView>(&body).unwrap();
+    assert_eq!(ended.state, JobState::Finished);
+    assert_eq!(revision, ended.revision);
+
+    // A new session is told of the job anew, from its stored row, and of the ended ticket.
+    let (h2, mut session) = session_up(addr, &key, false).await;
+    let mut heard = vec![notice(&mut session).await, notice(&mut session).await];
+    heard.sort_by_key(|n| matches!(n, HubRelayMsg::Job { .. }));
+    assert_eq!(
+        heard,
+        [
+            HubRelayMsg::Ticket { ticket },
+            HubRelayMsg::Job {
+                job: view.id.clone(),
+                revision: ended.revision,
+                output_len: 0,
+            }
+        ]
+    );
+    let settle = format!("/v1/jobs/{}/settle", view.id);
+    let (status, _) = h2.send("POST", &settle, &[], None).await.unwrap();
+    assert_eq!(status, 204);
+
+    // Settled, it is told of no more.
+    let (_h2, mut session) = session_up(addr, &key, false).await;
+    assert!(matches!(
+        notice(&mut session).await,
+        HubRelayMsg::Ticket { .. }
+    ));
+    let more = tokio::time::timeout(Duration::from_millis(500), session.recv()).await;
+    assert!(more.is_err(), "{more:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

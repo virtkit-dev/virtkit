@@ -373,17 +373,21 @@ before its call today (`sent`), which would charge the wait for the notice again
 So the `Reservation` a fetch returns carries the instant that fetch was sent, and the loop
 counts from that.
 
-The hub builds notices by diffing, not by queueing events. Its source is a **notice
-record** per principal: for each live ticket its phase, and for each unsettled job its
-`(revision, output_len)`. Every place that changes a ticket's phase, a job's revision or its
-output's length updates the record, including the write that persists a finished job and
-drops it from the dispatch state's memory. A record is dropped when its job is settled or
-expires (`JOB_KEEP`), and when its ticket ends and has been told. At start, the hub rebuilds
-the records from the store's unsettled jobs, finished ones included. Each session keeps what
-it last told per object. On a change to its relay's record, coalesced over 50 ms, it sends
-one notice per object that moved, and it forgets any entry whose object left the record.
-Several changes made while a send is pending collapse into one notice, so the notices
-outstanding never exceed the record: the relay's live tickets (at most 256) and its
+The hub builds notices by diffing, not by queueing events. Its source is the dispatch
+state the long polls follow, which already signals each change: the principal's
+tickets with their phase, and its unsettled jobs with their `(revision, output_len)`, from
+the live jobs, the finished ones not yet written, and a **record** of the finished ones whose
+final row is written and which memory no longer holds. The write that drops a finished job
+from memory adds it to the record; its settlement, expiry (`JOB_KEEP`) or trim from the
+history removes it. Tickets leave the state as they do today. A job finished and written
+before the hub started needs no entry: nothing changes it until its relay, which fetches it
+on its new session, settles it.
+Each session keeps what it last told per object. On a change of the dispatch state,
+coalesced over 50 ms, it sends one notice per object that moved: a ticket granted or ended
+(one gone from the state ended too; one the relay claimed is not told), a job at a new
+revision or output length. It forgets any entry whose object left the state. Several changes
+made while a send is pending collapse into one notice, so the notices outstanding never
+exceed the relay's tickets (at most 256 live, and those ended still retained) and its
 unsettled jobs. A send is bounded by the heartbeat, as the ping is. A relay that does not
 read ends its session.
 

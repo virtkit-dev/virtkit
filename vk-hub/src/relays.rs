@@ -18,7 +18,11 @@
 //! A relay at version [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION) holds its session on
 //! its HTTP/2 connection, which the session authenticates for the relay's client API requests
 //! and which ends with it. Every relay session is closed when the hub hands over to a release,
-//! so that such a connection drains rather than holds the hand-over.
+//! so that such a connection drains rather than holds the hand-over. Such a session tells its
+//! relay when one of its tickets is granted or ends, and when one of its jobs not settled has a
+//! new revision or more output ([`HubRelayMsg::Ticket`], [`HubRelayMsg::Job`]): it diffs the
+//! dispatch state against what it last told, [`NOTICE_COALESCE`] after a change, so notices
+//! never queue up beyond one per object.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -39,6 +43,7 @@ use vk_hub_proto::gitlab::{
 };
 use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
+use crate::jobs::TicketNotice;
 use crate::server::{
     Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach, RelayConn,
 };
@@ -57,6 +62,10 @@ const REMOVED: &str = "this relay was removed from the hub";
 
 /// What a relay superseded by a newer session of its own is told.
 const SUPERSEDED: &str = "superseded by a newer session of this relay";
+
+/// How long a session waits after a change of the dispatch state before it tells its relay what
+/// moved, so that a burst of changes, such as a job's output arriving, makes one notice.
+const NOTICE_COALESCE: Duration = Duration::from_millis(50);
 
 /// Run a relay's session on `ws` to its end, logging why it ended. `conn` is the relay's
 /// HTTP/2 connection the session's stream belongs to, which the session marks as the relay's
@@ -166,8 +175,23 @@ async fn serve(
     };
     let handover = hub.handover.gate.closing();
     tokio::pin!(handover);
+    // Notices, at version 5: the first diff at once, from nothing, then one after each change.
+    let notices = relay.version >= vk_hub_proto::gitlab::CONNECTION;
+    let mut changes = hub.dispatch.subscribe();
+    let mut noticed = Told::default();
+    let mut due = notices.then(tokio::time::Instant::now);
     loop {
         tokio::select! {
+            changed = changes.changed(), if notices && due.is_none() => {
+                // The sender lives as long as the hub.
+                if changed.is_ok() {
+                    due = Some(tokio::time::Instant::now() + NOTICE_COALESCE);
+                }
+            }
+            () = sleep_until_due(due) => {
+                due = None;
+                tell_notices(ws, hub, relay, &mut noticed).await?;
+            }
             () = &mut handover => {
                 // The relay redials into the listener's backlog, which the release accepts.
                 // Best effort, bounded: a relay that does not read the close is cut with the
@@ -275,6 +299,80 @@ async fn serve(
             }
         }
     }
+}
+
+/// Once `due`, never if `None`.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What a session last told its relay of each of its tickets and jobs.
+#[derive(Default)]
+struct Told {
+    tickets: HashMap<String, TicketNotice>,
+    jobs: HashMap<String, (u64, u64)>,
+}
+
+/// Tell the relay of each ticket and job that moved since `told`, read from the dispatch state
+/// before sending: a ticket granted or ended (gone from the state, it ended too), unless the
+/// relay claimed it; a job at a new revision or output length. Forget what left the state.
+async fn tell_notices(ws: &mut Ws, hub: &Hub, relay: &Peer, told: &mut Told) -> Result<()> {
+    let now = crate::jobs::notices(hub, &relay.id);
+    let mut out = Vec::new();
+    for (ticket, notice) in &now.tickets {
+        let before = told.tickets.get(ticket);
+        if before != Some(notice)
+            && before != Some(&TicketNotice::Claimed)
+            && matches!(notice, TicketNotice::Granted | TicketNotice::Ended)
+        {
+            out.push(HubRelayMsg::Ticket {
+                ticket: ticket.clone(),
+            });
+        }
+    }
+    for (ticket, before) in &told.tickets {
+        if !now.tickets.contains_key(ticket)
+            && matches!(before, TicketNotice::Queued | TicketNotice::Granted)
+        {
+            out.push(HubRelayMsg::Ticket {
+                ticket: ticket.clone(),
+            });
+        }
+    }
+    for (job, &(revision, output_len)) in &now.jobs {
+        if told.jobs.get(job) != Some(&(revision, output_len)) {
+            out.push(HubRelayMsg::Job {
+                job: job.clone(),
+                revision,
+                output_len,
+            });
+        }
+    }
+    *told = Told {
+        tickets: now.tickets,
+        jobs: now.jobs,
+    };
+    if out.is_empty() {
+        return Ok(());
+    }
+    // One batch, bounded by the heartbeat as one send is: a relay reading slowly cannot hold
+    // the session's loop for longer by having it send many.
+    let texts = (out.iter())
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .context("encoding a notice")?;
+    tokio::time::timeout(HEARTBEAT, async {
+        for text in texts {
+            ws.feed(Message::text(text)).await?;
+        }
+        ws.flush().await
+    })
+    .await
+    .map_err(|_| anyhow!("the relay is not reading"))?
+    .map_err(|e| anyhow!("sending: {e}"))
 }
 
 /// Send the relay its server's status if it is bound to one and `told` is not it already.
