@@ -300,8 +300,10 @@ fn subresource(params: &Params) -> Option<&str> {
 }
 
 /// An authenticated request, to the operation its method, path and query name. What is not
-/// served answers `NotImplemented` once the body is read, as every refusal past the gate does.
-/// `seed` is what a signed `aws-chunked` body's signatures are checked against.
+/// served answers `NotImplemented` once the body is read, as every refusal past the gate does;
+/// so does a request whose headers ask for a configuration this registry keeps nothing of
+/// ([`canned::asked`]), whatever its operation. `seed` is what a signed `aws-chunked` body's
+/// signatures are checked against.
 async fn operate(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -324,6 +326,9 @@ async fn operate(
         );
         return refuse(req, resp, ctx).await;
     };
+    if let Some((status, code, message)) = canned::asked(req.headers()) {
+        return refuse(req, ctx.error(status, code, message), ctx).await;
+    }
     let sub = subresource(&query);
     let method = req.method().clone();
     match (target, &method, sub) {

@@ -157,7 +157,8 @@ const MAX_CONFIGURATION: usize = 1024;
 /// `PUT /s3/<bucket>`: the directory `files/<bucket>`, made as WebDAV's `MKCOL` makes it,
 /// under the namespace lock. 200 with its `Location`; 409 `BucketAlreadyOwnedByYou` when it
 /// is a directory already, which every bucket's owner is. A `CreateBucketConfiguration` body
-/// and `x-amz-acl` are taken and ignored; asking for object lock is `NotImplemented`.
+/// is taken and ignored; asking for object lock is `NotImplemented`, as asking for an ACL
+/// is ([`super::canned::asked`]).
 pub(super) async fn create(
     state: &ServerState,
     authz: &Authz<'_>,
