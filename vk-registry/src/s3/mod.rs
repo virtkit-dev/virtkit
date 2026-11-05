@@ -479,8 +479,8 @@ fn resolve_failed(e: anyhow::Error, ctx: &Ctx) -> Box<Response<Body>> {
     Box::new(internal_error(ctx))
 }
 
-/// A request with a SigV4 header. In order: the header parses and names S3's scope; the
-/// request's time is on the scope's day and within [`sigv4::MAX_SKEW_SECS`] of the server's;
+/// A request with a SigV4 header. In order: the header parses, names S3's scope and signs
+/// every `x-amz-*` header the request carries; the request's time is on the scope's day and within [`sigv4::MAX_SKEW_SECS`] of the server's;
 /// the access key id is authenticated exactly as a bearer would be, by the resolvers the
 /// other routes use; only then is the secret it maps to used as a key, to check the
 /// signature. On a server with no credential configured, an id that is not a hub token is
@@ -503,6 +503,16 @@ fn signed_by(
     let credential = sigv4::parse_authorization(value).map_err(malformed)?;
     if let Some(why) = sigv4::s3_refusal(&credential) {
         return Err(malformed(why));
+    }
+    if let Some(name) = sigv4::unsigned_amz_header(&credential, headers) {
+        return Err(Box::new(xml::error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "There were headers present in the request which were not signed",
+            &[("HeadersNotSigned", name)],
+            &ctx.path,
+            &ctx.id,
+        )));
     }
 
     let now = vk_peer::now_secs();

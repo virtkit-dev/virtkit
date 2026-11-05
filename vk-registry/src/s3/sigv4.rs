@@ -146,6 +146,18 @@ pub(crate) fn s3_refusal(credential: &Credential<'_>) -> Option<&'static str> {
     None
 }
 
+/// The first `x-amz-*` header of `headers` the signature does not cover: S3 refuses a request
+/// carrying one, as anything on its way could have added it.
+pub(crate) fn unsigned_amz_header<'h>(
+    credential: &Credential<'_>,
+    headers: &'h HeaderMap,
+) -> Option<&'h str> {
+    headers
+        .keys()
+        .map(|name| name.as_str())
+        .find(|name| name.starts_with("x-amz-") && !credential.signed_headers.contains(name))
+}
+
 /// Why a request's time is refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Clock {
@@ -807,6 +819,33 @@ mod tests {
         ] {
             assert!(parse_authorization(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn every_x_amz_header_is_signed() {
+        let header = authorization(
+            "id/20130524/us-east-1/s3/aws4_request",
+            "host;x-amz-content-sha256;x-amz-date;x-amz-meta-x",
+        );
+        let cred = parse_authorization(&header).unwrap();
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-meta-x",
+            "range",
+        ] {
+            headers.insert(
+                hyper::header::HeaderName::from_static(name),
+                hyper::header::HeaderValue::from_static("v"),
+            );
+        }
+        assert_eq!(unsigned_amz_header(&cred, &headers), None);
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-amz-meta-y"),
+            hyper::header::HeaderValue::from_static("v"),
+        );
+        assert_eq!(unsigned_amz_header(&cred, &headers), Some("x-amz-meta-y"));
     }
 
     #[test]
