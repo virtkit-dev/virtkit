@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.105.0] - 2026-11-05
+
 ### Added
 
 - **Boot a pipeline's own images.** On a fleet, a job or service image
@@ -5149,7 +5151,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.104.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.105.0...HEAD
+[0.105.0]: https://github.com/virtkit-dev/virtkit/compare/v0.104.0...v0.105.0
 [0.104.0]: https://github.com/virtkit-dev/virtkit/compare/v0.103.0...v0.104.0
 [0.103.0]: https://github.com/virtkit-dev/virtkit/compare/v0.102.4...v0.103.0
 [0.102.4]: https://github.com/virtkit-dev/virtkit/compare/v0.102.3...v0.102.4
