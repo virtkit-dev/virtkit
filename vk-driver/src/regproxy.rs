@@ -968,7 +968,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             Err(()) => return Ok(forbidden(NO_SUCH_AREA)),
         }
     }
-    let sent = match (repeatable(&method, path), bodyful) {
+    let sent = match (repeatable(&method, path, &parts.headers), bodyful) {
         (true, false) => Outgoing::Whole(Bytes::new()),
         (true, true) => held(incoming, MAX_HELD).await?,
         (false, false) => Outgoing::Once(None),
@@ -1102,12 +1102,23 @@ enum Outgoing {
 /// a refused connection, a connection cut before the response, or a 503/429.
 /// Repeating it must have the same effect even if the first request reached the registry:
 /// reads, manifest PUTs by tag or digest, whole-file PUTs, S3 PUTs of an object, a part or a
-/// copy, and upload starts (which leave the first upload unused). Excludes upload chunks (`PATCH`), upload completion (`PUT`
-/// under `blobs/uploads/`, whose upload is then gone), deletions, collection creation,
-/// and all `/lock/` requests regardless of method. A retried PUT lands last, like a
-/// later PUT from another writer.
-fn repeatable(method: &Method, path: &str) -> bool {
+/// copy, and upload starts (which leave the first upload unused). A retried PUT lands last,
+/// like a later PUT from another writer. Excludes upload chunks (`PATCH`), upload completion
+/// (`PUT` under `blobs/uploads/`, whose upload is then gone), deletions, collection
+/// creation, a PUT under a precondition (`If-Match`, `If-None-Match`, `If-Unmodified-Since`
+/// or a copy source's `x-amz-copy-source-if-*`), which its own first write would fail
+/// again, and all `/lock/` requests regardless of method.
+fn repeatable(method: &Method, path: &str, headers: &hyper::HeaderMap) -> bool {
     if path.starts_with("/lock/") {
+        return false;
+    }
+    let conditional = headers.keys().any(|k| {
+        matches!(
+            k.as_str(),
+            "if-match" | "if-none-match" | "if-unmodified-since"
+        ) || k.as_str().starts_with("x-amz-copy-source-if-")
+    });
+    if *method == Method::PUT && conditional {
         return false;
     }
     let oci = path.strip_prefix("/v2/");
@@ -2668,27 +2679,56 @@ mod tests {
         let get = Method::GET;
         let put = Method::PUT;
         let post = Method::POST;
-        assert!(repeatable(&get, "/v2/app/blobs/sha256:ab"));
-        assert!(repeatable(&Method::HEAD, "/v2/app/manifests/latest"));
-        assert!(repeatable(&put, "/v2/app/manifests/latest"));
-        assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab"));
-        assert!(repeatable(&put, "/dav/files/p/x"));
-        assert!(repeatable(&put, "/s3/b/k"));
-        assert!(repeatable(&get, "/s3/b"));
-        assert!(!repeatable(&put, "/s3/b"));
-        assert!(!repeatable(&put, "/s3/b/"));
-        assert!(!repeatable(&post, "/s3/b/k?uploadId=u"));
-        assert!(!repeatable(&Method::DELETE, "/s3/b/k"));
-        assert!(repeatable(&post, "/v2/app/blobs/uploads/"));
-        assert!(!repeatable(&put, "/v2/app/blobs/uploads/u1"));
-        assert!(!repeatable(&Method::PATCH, "/v2/app/blobs/uploads/u1"));
-        assert!(!repeatable(&Method::DELETE, "/v2/app/manifests/sha256:ab"));
-        assert!(!repeatable(&post, "/lock/acquire"));
-        assert!(!repeatable(&get, "/lock/acquire"));
+        let none = hyper::HeaderMap::new();
+        assert!(repeatable(&get, "/v2/app/blobs/sha256:ab", &none));
+        assert!(repeatable(&Method::HEAD, "/v2/app/manifests/latest", &none));
+        assert!(repeatable(&put, "/v2/app/manifests/latest", &none));
+        assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab", &none));
+        assert!(repeatable(&put, "/dav/files/p/x", &none));
+        assert!(repeatable(&put, "/s3/b/k", &none));
+        assert!(repeatable(&get, "/s3/b", &none));
+        assert!(!repeatable(&put, "/s3/b", &none));
+        assert!(!repeatable(&put, "/s3/b/", &none));
+        assert!(!repeatable(&post, "/s3/b/k?uploadId=u", &none));
+        assert!(!repeatable(&Method::DELETE, "/s3/b/k", &none));
+        assert!(repeatable(&post, "/v2/app/blobs/uploads/", &none));
+        assert!(!repeatable(&put, "/v2/app/blobs/uploads/u1", &none));
+        assert!(!repeatable(
+            &Method::PATCH,
+            "/v2/app/blobs/uploads/u1",
+            &none
+        ));
+        assert!(!repeatable(
+            &Method::DELETE,
+            "/v2/app/manifests/sha256:ab",
+            &none
+        ));
+        assert!(!repeatable(&post, "/lock/acquire", &none));
+        assert!(!repeatable(&get, "/lock/acquire", &none));
         assert!(!repeatable(
             &Method::from_bytes(b"MKCOL").unwrap(),
-            "/dav/files/p/x"
+            "/dav/files/p/x",
+            &none
         ));
+        // A write under a precondition its first attempt may have spent is sent once.
+        for name in [
+            "if-none-match",
+            "if-match",
+            "if-unmodified-since",
+            "x-amz-copy-source-if-match",
+            "x-amz-copy-source-if-none-match",
+            "x-amz-copy-source-if-modified-since",
+            "x-amz-copy-source-if-unmodified-since",
+        ] {
+            let mut conditional = hyper::HeaderMap::new();
+            conditional.insert(
+                hyper::header::HeaderName::from_static(name),
+                hyper::header::HeaderValue::from_static("*"),
+            );
+            assert!(!repeatable(&put, "/s3/b/k", &conditional), "{name}");
+            assert!(!repeatable(&put, "/dav/files/p/x", &conditional), "{name}");
+            assert!(repeatable(&get, "/s3/b/k", &conditional), "{name}");
+        }
         assert!(digest_addressed("/v2/app/blobs/sha256:ab"));
         assert!(digest_addressed("/v2/team/app/manifests/sha256:ab"));
         assert!(!digest_addressed("/v2/app/manifests/latest"));
