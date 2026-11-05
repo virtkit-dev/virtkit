@@ -697,10 +697,21 @@ names to nodes taking tokens of their own, placed jobs are treated as under `"jo
 local gitlab-runner's job gets the node's guest token instead
 ([registry hub, 4d](registry-hub.md#4d-node-tokens)).
 
-With a token, the proxy forwards the lock API (`/lock/`) and plain files (`/dav/files/`) as
-well as `/v2/`; the registry enforces the token's grants. Under `/dav/files/` only GET,
-HEAD, PROPFIND, PUT, MKCOL, DELETE and OPTIONS pass: MOVE and COPY would name the proxy in
-their `Destination`. The job's steps find the proxy in `VK_REGISTRY` (`http://registry.vk`)
+With a token, the proxy forwards the lock API (`/lock/`), plain files (`/dav/files/`) and their
+S3 view (`/s3`) as well as `/v2/`; the registry enforces the token's grants. Under
+`/dav/files/` only GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and OPTIONS pass: MOVE and COPY
+would name the proxy in their `Destination`. On `/s3`, the guest's own signature is replaced by
+the token, so a job points `sccache` at its area with no key at all:
+
+```sh
+export SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>/ SCCACHE_ENDPOINT=$VK_REGISTRY/s3
+export SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true
+```
+
+`job/<alias>` there stands for the area's prefix, as on `/dav/files/job/<alias>`
+([4b](registry-hub.md#4b-registry-access-from-inside-a-job)); `SCCACHE_S3_NO_CREDENTIALS`
+sends the requests unsigned, and dummy `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` work as
+well. The job's steps find the proxy in `VK_REGISTRY` (`http://registry.vk`)
 and their grants in `VK_REGISTRY_NAMESPACES`, space-separated `<prefix>=<rights>` with `r`,
 `w` and `l` for read, write and lock. The proxy needs `net.mode = "switch"`, the only network
 that serves `registry.vk`; under any other, a job gets neither the proxy nor these variables.
