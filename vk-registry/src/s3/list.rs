@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::path::MAX_KEY;
-use super::{Ctx, bucket, conditional, refuse, sigv4, xml};
+use super::{Ctx, Params, bucket, conditional, refuse, sigv4, xml};
 use crate::files::{self, FILES_REPO, Node, Object, allowed, repo_name};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
@@ -38,11 +38,8 @@ const PARAMS: &[&str] = &[
 ];
 
 /// Whether a bucket `GET` with this query is a listing: one that names only [`PARAMS`].
-pub(super) fn is_listing(query: &str) -> bool {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .all(|p| PARAMS.contains(&p.split_once('=').map_or(p, |(n, _)| n)))
+pub(super) fn is_listing(params: &Params) -> bool {
+    params.iter().all(|(n, _)| PARAMS.contains(&n.as_str()))
 }
 
 /// What a listing asks for.
@@ -66,22 +63,20 @@ struct Query {
 }
 
 /// The listing a query asks for, or why it is refused (400 `InvalidArgument`).
-fn parse(query: &str) -> std::result::Result<Query, &'static str> {
+fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
     let mut q = Query {
         max_keys: MAX_KEYS,
         ..Query::default()
     };
     let (mut start_after, mut marker) = (None, None);
     let mut seen: Vec<&str> = Vec::new();
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (name, raw) = pair.split_once('=').unwrap_or((pair, ""));
+    for (name, value) in params {
+        let (name, value) = (name.as_str(), value.clone());
         // The first of a repeated parameter is the one taken.
         if seen.contains(&name) {
             continue;
         }
         seen.push(name);
-        let value = crate::dav::decode_segment(raw)
-            .ok_or("a query parameter has a malformed percent escape or is not UTF-8")?;
         match name {
             "list-type" if value == "2" => q.v2 = true,
             "list-type" => return Err("list-type is 2, or absent for the first version"),
@@ -357,11 +352,11 @@ pub(super) async fn list(
     state: &ServerState,
     authz: &Authz<'_>,
     bucket: String,
-    query: &str,
+    params: &Params,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
-    let q = match parse(query) {
+    let q = match parse(params) {
         Ok(q) => q,
         Err(message) => {
             let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
@@ -823,7 +818,13 @@ mod tests {
 
     #[test]
     fn a_query_names_a_listing_of_either_version() {
+        let is_listing = |q: &str| super::is_listing(&crate::s3::parse_query(q).unwrap());
+        let parse = |q: &str| match crate::s3::parse_query(q) {
+            Some(params) => super::parse(&params),
+            None => Err("malformed"),
+        };
         assert!(is_listing(""));
+        assert!(is_listing("list-%74ype=2"));
         assert!(is_listing("list-type=2&prefix=a%2F&delimiter=%2F"));
         assert!(is_listing("marker=a&max-keys=2&x-id=ListObjects"));
         assert!(!is_listing("location"));

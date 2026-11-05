@@ -630,7 +630,9 @@ key at most 1024 bytes, no empty component and no trailing slash, so there are n
 marker" objects. Paths are split before they are percent-decoded, as WebDAV's are, so `%2F`
 cannot smuggle a separator. Anything else is 400 `InvalidArgument`, `KeyTooLongError` or
 `InvalidBucketName`, with a message naming the rule. `sccache`'s keys (`a/b/c/<hex>`,
-`.sccache_check`) pass.
+`.sccache_check`) pass. A query's parameters, names and values alike, are percent-decoded
+once, as the signature decodes them, before the request is dispatched on them; a malformed
+escape is 400 `InvalidArgument`.
 
 **Authorization** is the WebDAV view's: a `PUT` needs `Write` on the key's parent repository,
 a read `Read` on the repository the key resolves to, and a `DELETE` `Write` there; a caller

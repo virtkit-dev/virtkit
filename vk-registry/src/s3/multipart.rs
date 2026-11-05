@@ -34,8 +34,8 @@ use super::copy::{self, COPY_SOURCE, Source};
 use super::object::{self, Refused, admitted, no_such_key, readable, unwritable};
 use super::xml::scan::{self, Malformed};
 use super::{
-    Ctx, OPERATION_HINT, UNCOMPRESSED_FROM, bucket, chunked, drain, list, meta, read_small, refuse,
-    xml,
+    Ctx, OPERATION_HINT, Params, UNCOMPRESSED_FROM, bucket, chunked, drain, list, meta, read_small,
+    refuse, xml,
 };
 use crate::files::{self, Commit, FILES_REPO, MAX_OBJECT, Staged, Written, allowed, object_of};
 use crate::{Authz, Body, STREAM_CHUNK, ServerState, Store, accounts, body_of};
@@ -97,35 +97,28 @@ fn bucket_of(segs: &[String]) -> &str {
     segs.first().map_or("", String::as_str)
 }
 
-/// `query`'s parameters with their values percent-decoded, in order, the SDK's operation
-/// hint left out.
-fn params(query: &str) -> Vec<(&str, String)> {
+/// A query's parameters, already decoded ([`super::parse_query`]), the SDK's operation hint
+/// left out.
+fn params(query: &Params) -> Vec<(&str, &str)> {
     query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let (n, v) = p.split_once('=').unwrap_or((p, ""));
-            (n, crate::percent_decode(v))
-        })
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
         .filter(|(n, _)| *n != OPERATION_HINT)
         .collect()
 }
 
 /// The value of the first parameter named `name`.
-fn param<'a>(params: &'a [(&str, String)], name: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| v.as_str())
+fn param<'a>(params: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
+    params.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
 
 /// Whether `query` names a parameter `name`: what dispatches a request here.
-pub(super) fn names(query: &str, name: &str) -> bool {
-    params(query).iter().any(|(n, _)| *n == name)
+pub(super) fn names(query: &Params, name: &str) -> bool {
+    query.iter().any(|(n, _)| n == name)
 }
 
 /// Whether every parameter is one of `taken`.
-fn only(params: &[(&str, String)], taken: &[&str]) -> bool {
+fn only(params: &[(&str, &str)], taken: &[&str]) -> bool {
     params.iter().all(|(n, _)| taken.contains(n))
 }
 
@@ -228,7 +221,7 @@ pub(super) async fn create(
     state: &ServerState,
     authz: &Authz<'_>,
     segs: Vec<String>,
-    query: &str,
+    query: &Params,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -323,7 +316,7 @@ pub(super) async fn upload(
     authz: &Authz<'_>,
     segs: Vec<String>,
     seed: Option<chunked::Seed>,
-    query: &str,
+    query: &Params,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -940,7 +933,7 @@ async fn list_parts(
     authz: &Authz<'_>,
     segs: Vec<String>,
     id: String,
-    params: &[(&str, String)],
+    params: &[(&str, &str)],
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -1027,7 +1020,7 @@ pub(super) async fn list_uploads(
     state: &ServerState,
     authz: &Authz<'_>,
     bucket: String,
-    query: &str,
+    query: &Params,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -1268,15 +1261,19 @@ mod tests {
 
     #[test]
     fn queries_name_their_parameters_decoded() {
-        let p = params("uploadId=1-2-ab&partNumber=3&x-id=UploadPart");
+        let query = |q: &str| crate::s3::parse_query(q).unwrap();
+        let q = query("uploadId=1-2-ab&partNumber=3&x-id=UploadPart");
+        let p = params(&q);
         assert_eq!(param(&p, "uploadId"), Some("1-2-ab"));
         assert_eq!(param(&p, "partNumber"), Some("3"));
         assert!(only(&p, &["uploadId", "partNumber"]));
         assert!(!only(&p, &["uploadId"]));
-        assert!(names("uploads", "uploads"));
-        assert!(names("uploads=&prefix=a%2Fb", "uploads"));
-        assert_eq!(param(&params("prefix=a%2Fb"), "prefix"), Some("a/b"));
-        assert!(!names("uploadIds=1", "uploadId"));
+        assert!(names(&query("uploads"), "uploads"));
+        assert!(names(&query("uploads=&prefix=a%2Fb"), "uploads"));
+        assert!(names(&query("upload%49d=u"), "uploadId"));
+        let q = query("prefix=a%2Fb+c");
+        assert_eq!(param(&params(&q), "prefix"), Some("a/b+c"));
+        assert!(!names(&query("uploadIds=1"), "uploadId"));
         assert_eq!(page_size(None), Some(MAX_LISTED));
         assert_eq!(page_size(Some("5")), Some(5));
         assert_eq!(
