@@ -7,6 +7,7 @@
 //! today, an S3 view in later work. Entries expire under gc's tag retention and blob grace
 //! windows.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -227,8 +228,13 @@ pub(crate) struct Staged {
 }
 
 /// Stream `body` into a staging file under `uploads/`, hashing it on the way, up to
-/// [`MAX_OBJECT`]. Memory use is bounded by the coalescing buffer whatever the size.
-pub(crate) async fn stage<B>(store: &Store, body: B) -> std::result::Result<Staged, PutError>
+/// [`MAX_OBJECT`]; `tap` sees every byte as it goes, for a front's own digests. Memory use is
+/// bounded by the coalescing buffer whatever the size.
+pub(crate) async fn stage<B>(
+    store: &Store,
+    body: B,
+    tap: &mut impl FnMut(&[u8]),
+) -> std::result::Result<Staged, PutError>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -236,7 +242,7 @@ where
     let (path, file) = store.stage_file().map_err(PutError::Failed)?;
     let staging = Staging { path, armed: true };
     let mut file = tokio::fs::File::from_std(file);
-    let written = drain_into(&mut file, body, MAX_OBJECT).await;
+    let written = drain_into(&mut file, body, MAX_OBJECT, tap).await;
     let flushed = file
         .flush()
         .await
@@ -255,16 +261,34 @@ pub(crate) enum Written {
     /// the path changed while the body streamed and no longer takes an object; nothing was
     /// written
     Refused(Unwritable),
+    /// [`Commit::precondition`] refused the object found there, or its absence; nothing was
+    /// written
+    PreconditionFailed,
+}
+
+/// Whether a [`commit`] goes ahead, given the object at its path or `None`.
+pub(crate) type Precondition = Box<dyn FnOnce(Option<&Object>) -> bool + Send>;
+
+/// What a front asks of a [`commit`] beyond the bytes.
+#[derive(Default)]
+pub(crate) struct Commit {
+    /// written on the object's manifest
+    pub(crate) annotations: BTreeMap<String, String>,
+    /// checked under the locks the tag is written under, so no other write of this server
+    /// comes between the check and the write
+    pub(crate) precondition: Option<Precondition>,
 }
 
 /// Promote a [`stage`]d body into the pool and tag it at `segs` as a raw file, re-checking
-/// [`unwritable`] under [`NAMESPACE`] and the shared store lock first. Off the runtime:
-/// staging compresses, and a large object would otherwise block a tokio worker for seconds.
-/// The locks are taken inside, after that pass — the store lock as the relay takes it.
+/// [`unwritable`], then `how`'s precondition, under [`NAMESPACE`] and the shared store lock
+/// first. Off the runtime: staging compresses, and a large object would otherwise block a
+/// tokio worker for seconds. The locks are taken inside, after that pass — the store lock as
+/// the relay takes it.
 pub(crate) async fn commit(
     store: Arc<Store>,
     segs: Vec<String>,
     staged: Staged,
+    how: Commit,
 ) -> Result<Written> {
     tokio::task::spawn_blocking(move || -> Result<Written> {
         let Staged {
@@ -278,11 +302,14 @@ pub(crate) async fn commit(
         // references it; see Store::lock_shared. Another write may have changed the path
         // while the body streamed, so it is checked again.
         let checked = store.lock_shared().and_then(|lock| {
-            let existed = matches!(resolve(&store, &segs)?, Some(Node::Object(_)));
-            Ok((lock, unwritable(&store, &segs)?, existed))
+            let existing = match resolve(&store, &segs)? {
+                Some(Node::Object(obj)) => Some(obj),
+                _ => None,
+            };
+            Ok((lock, unwritable(&store, &segs)?, existing))
         });
-        let (_lock, existed) = match checked {
-            Ok((lock, None, existed)) => (lock, existed),
+        let (_lock, existing) = match checked {
+            Ok((lock, None, existing)) => (lock, existing),
             Ok((_, Some(why), _)) => {
                 promotion.discard();
                 return Ok(Written::Refused(why));
@@ -292,10 +319,17 @@ pub(crate) async fn commit(
                 return Err(e);
             }
         };
+        if let Some(precondition) = how.precondition
+            && !precondition(existing.as_ref())
+        {
+            promotion.discard();
+            return Ok(Written::PreconditionFailed);
+        }
+        let existed = existing.is_some();
         store.promote_staged(&hex, promotion)?;
         staging.armed = false;
         let (repo, tag) = object_of(&segs).context("a write past its checks names an object")?;
-        store.put_raw_file(&repo, tag, &hex, size, None)?;
+        store.put_raw_file_annotated(&repo, tag, &hex, size, None, &how.annotations)?;
         Ok(if existed {
             Written::Replaced
         } else {
@@ -307,12 +341,14 @@ pub(crate) async fn commit(
 }
 
 /// Stream `body` to `out`, coalescing small frames and enforcing `cap`, including for chunked
-/// bodies; `(bytes written, sha256 hex)` on success. `out` may be a sink when draining a
-/// refused request. The generic body allows tests with a small cap.
+/// bodies; `(bytes written, sha256 hex)` on success. `tap` sees each frame's bytes as they are
+/// hashed, before they are written. `out` may be a sink when draining a refused request. The
+/// generic body allows tests with a small cap.
 pub(crate) async fn drain_into<B>(
     out: &mut (impl AsyncWrite + Unpin),
     mut body: B,
     cap: u64,
+    tap: &mut impl FnMut(&[u8]),
 ) -> std::result::Result<(u64, String), PutError>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
@@ -334,6 +370,7 @@ where
             return Err(PutError::TooLarge);
         }
         hasher.update(&data);
+        tap(&data);
         // A frame already worth a write goes straight out rather than through the
         // coalescing buffer, which is there for the small ones.
         if buf.is_empty() && data.len() >= STREAM_CHUNK {
@@ -363,7 +400,7 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     // Past `cap`, or unreadable: either way there is nothing more to read.
-    let _ = drain_into(&mut tokio::io::sink(), body, cap).await;
+    let _ = drain_into(&mut tokio::io::sink(), body, cap, &mut |_| {}).await;
 }
 
 #[cfg(test)]
@@ -410,7 +447,7 @@ mod tests {
 
         let mut file = tokio::fs::File::create(&path).await.unwrap();
         assert!(matches!(
-            drain_into(&mut file, frames(), 250).await,
+            drain_into(&mut file, frames(), 250, &mut |_| {}).await,
             Err(PutError::TooLarge)
         ));
         drop(file);
@@ -421,13 +458,78 @@ mod tests {
 
         // Exactly at the cap is not over it, and the digest is the body's.
         let mut file = tokio::fs::File::create(&path).await.unwrap();
-        let (n, hex) = drain_into(&mut file, frames(), 400).await.ok().unwrap();
+        let mut tapped = 0;
+        let (n, hex) = drain_into(&mut file, frames(), 400, &mut |b| tapped += b.len())
+            .await
+            .ok()
+            .unwrap();
         file.flush().await.unwrap();
         drop(file);
-        assert_eq!(n, 400);
+        assert_eq!((n, tapped), (400, 400));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 400);
         assert_eq!(hex, crate::sha256_hex_raw(&vec![1u8; 400]));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit writes the annotations it is given on the manifest, and its precondition sees
+    /// what is at the path, under the locks: refused, nothing is tagged and the staging file
+    /// goes.
+    #[tokio::test]
+    async fn a_commit_carries_annotations_and_honours_its_precondition() {
+        let dir = std::env::temp_dir().join(format!("vk-reg-files-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.clone()).unwrap());
+        let body = |b: &'static [u8]| {
+            let frame: std::result::Result<_, std::io::Error> =
+                Ok(hyper::body::Frame::data(Bytes::from_static(b)));
+            http_body_util::StreamBody::new(futures::stream::iter([frame]))
+        };
+        let segs = vec!["b".to_string(), "k".to_string()];
+        let write = async |b: &'static [u8], how: Commit| {
+            let staged = stage(&store, body(b), &mut |_| {}).await.ok().unwrap();
+            commit(Arc::clone(&store), segs.clone(), staged, how)
+                .await
+                .unwrap()
+        };
+        let absent =
+            || -> Option<Precondition> { Some(Box::new(|o: Option<&Object>| o.is_none())) };
+        let annotations = BTreeMap::from([("org.example.k".to_string(), "v".to_string())]);
+
+        let how = Commit {
+            annotations: annotations.clone(),
+            precondition: absent(),
+        };
+        assert!(matches!(write(b"one", how).await, Written::Created));
+        let (hex, _) = store.tag_target("files/b", "k").unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&store.get_blob(&hex).unwrap().unwrap()).unwrap();
+        assert_eq!(manifest["annotations"]["org.example.k"], "v");
+        assert!(crate::raw_file_layer(&serde_json::to_vec(&manifest).unwrap()).is_some());
+
+        let how = Commit {
+            precondition: absent(),
+            ..Commit::default()
+        };
+        assert!(matches!(
+            write(b"two", how).await,
+            Written::PreconditionFailed
+        ));
+        assert_eq!(store.tag_target("files/b", "k").unwrap().0, hex);
+        let staged = std::fs::read_dir(dir.join("uploads"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_file())
+            .count();
+        assert_eq!(staged, 0, "the refused body's staging file is gone");
+
+        let layer = crate::sha256_hex_raw(b"one");
+        let how = Commit {
+            precondition: Some(Box::new(move |o: Option<&Object>| {
+                o.is_some_and(|o| o.layer == layer && o.size == 3)
+            })),
+            ..Commit::default()
+        };
+        assert!(matches!(write(b"three", how).await, Written::Replaced));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

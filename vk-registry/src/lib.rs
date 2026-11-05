@@ -746,8 +746,9 @@ impl Store {
         self.put_raw_file_annotated(name, tag, layer_hex, size, title, &BTreeMap::new())
     }
 
-    /// [`Store::put_raw_file`] with `annotations` on the manifest: a [`Retention`].
-    fn put_raw_file_annotated(
+    /// [`Store::put_raw_file`] with `annotations` on the manifest: a [`Retention`], or what
+    /// a `files/` front keeps beside an object.
+    pub(crate) fn put_raw_file_annotated(
         &self,
         name: &str,
         tag: &str,
