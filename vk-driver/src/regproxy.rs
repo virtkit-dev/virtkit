@@ -273,6 +273,10 @@ async fn serve_on(listener: TcpListener, cfg: Arc<ProxyCfg>) {
         let Ok((stream, _)) = listener.accept().await else {
             break;
         };
+        // A streamed response's head is written before its body exists; with Nagle on, a
+        // small body then waits for the guest's delayed ACK, about 40 ms on Linux. Best
+        // effort: without it the connection is only slower.
+        let _ = stream.set_nodelay(true);
         let cfg = cfg.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -1025,6 +1029,72 @@ mod tests {
             auth, "Basic cm9ib3Q6czNjcmV0",
             "the proxy must inject Basic auth"
         );
+    }
+
+    /// The proxy turns Nagle off on each connection it accepts: it writes a response's head as
+    /// soon as the upstream's arrives and its body when that follows, which Nagle would hold
+    /// for the guest's delayed ACK (about 40 ms on Linux) on every small read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_connections_have_nagle_off() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, _) = fake_upstream();
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let me = client.local_addr().unwrap();
+        // Until the accept loop reaches the connection; the deadline only bounds a failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while server_nodelay(proxy, me) != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proxy's end of the connection has Nagle on"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether `TCP_NODELAY` is set on the server's end of the connection from `client` to
+    /// `server`, found among this process's descriptors; `None` until the server accepts it.
+    fn server_nodelay(server: std::net::SocketAddr, client: std::net::SocketAddr) -> Option<bool> {
+        type Name = unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::sockaddr,
+            *mut libc::socklen_t,
+        ) -> libc::c_int;
+        // The IPv4 port `name` gives `fd`, if `fd` is an IPv4 socket that has one.
+        fn port(fd: libc::c_int, name: Name) -> Option<u16> {
+            // SAFETY: all-zero is a valid `sockaddr_in`.
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            // SAFETY: `addr` and `len` are valid for writes and `len` is `addr`'s size; a stale or
+            // non-socket `fd` only makes the call fail.
+            let r = unsafe { name(fd, (&raw mut addr).cast(), &mut len) };
+            (r == 0 && i32::from(addr.sin_family) == libc::AF_INET)
+                .then(|| u16::from_be(addr.sin_port))
+        }
+        for entry in std::fs::read_dir("/proc/self/fd").ok()?.flatten() {
+            let Ok(fd) = entry.file_name().to_string_lossy().parse::<libc::c_int>() else {
+                continue;
+            };
+            if port(fd, libc::getsockname) != Some(server.port())
+                || port(fd, libc::getpeername) != Some(client.port())
+            {
+                continue;
+            }
+            let mut on: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: `on` and `len` are valid for writes and `len` is `on`'s size.
+            let r = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NODELAY,
+                    (&raw mut on).cast(),
+                    &mut len,
+                )
+            };
+            return (r == 0).then_some(on != 0);
+        }
+        None
     }
 
     /// A `[registry]` gated by a bearer token — a vk-registry in `mode = "accounts"`, whose

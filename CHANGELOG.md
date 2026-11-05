@@ -9,6 +9,8 @@ All notable changes to virtkit will be documented in this file.
 - **Faster small reads from vk-registry.** Clients reading many small objects over one
   connection, such as a build cache fetching entries, no longer wait about 40 ms extra
   per read.
+- **Faster small reads through a node's registry proxy.** A job reading many small objects
+  from the registry, such as a build cache, no longer waits about 40 ms extra per read.
 
 ## [0.105.1] - 2026-11-05
 
