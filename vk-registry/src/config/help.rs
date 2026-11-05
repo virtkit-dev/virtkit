@@ -106,7 +106,9 @@ const KEYS: &[Key] = &[
         name: "s3_host",
         help: "host name whose subdomains are S3 buckets: <bucket>.<s3_host>\n\
                is served as /s3/<bucket>/, for virtual-hosted clients;\n\
-               needs wildcard DNS and certificate [default: unset]",
+               needs wildcard DNS and certificate, and s3 on; the\n\
+               registry's own host name must not be below it\n\
+               [default: unset]",
     },
     Key {
         table: Table::Top,
