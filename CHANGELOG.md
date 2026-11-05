@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-11-05
+
 ### Added
 
 - **A GitLab relay holds one HTTP/2 connection to vk-hub.** The relay's session and its requests
@@ -5186,7 +5188,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.105.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.106.0...HEAD
+[0.106.0]: https://github.com/virtkit-dev/virtkit/compare/v0.105.1...v0.106.0
 [0.105.1]: https://github.com/virtkit-dev/virtkit/compare/v0.105.0...v0.105.1
 [0.105.0]: https://github.com/virtkit-dev/virtkit/compare/v0.104.0...v0.105.0
 [0.104.0]: https://github.com/virtkit-dev/virtkit/compare/v0.103.0...v0.104.0
