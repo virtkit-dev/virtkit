@@ -3,9 +3,9 @@
 //! manifest whatever the size and the pool still holds the bytes once. The source is read
 //! as GetObject reads it and its conditions are its `x-amz-copy-source-if-*` headers; the
 //! destination is written as PutObject writes, its `If-None-Match: *`/`If-Match` checked
-//! where the tag is written. The source's MD5, and so its ETag, comes along, and the checksum
-//! its write kept; its user metadata too, unless `x-amz-metadata-directive: REPLACE` gives
-//! the request's instead.
+//! where the tag is written. The source's MD5, and so its ETag, comes along, with the
+//! checksum its write kept and its parts; its user metadata too, unless
+//! `x-amz-metadata-directive: REPLACE` gives the request's instead.
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -207,8 +207,12 @@ pub(super) async fn copy(
             return Ok(no_such_key(&ctx));
         }
         let mut annotations = replaced.unwrap_or_else(|| meta::carried(&obj.annotations));
-        // Of the bytes, which are the same: the ETag and the checksum.
-        for name in [MD5_ANNOTATION, checksum::ANNOTATION] {
+        // Of the bytes, which are the same: the ETag, the checksum and the parts.
+        for name in [
+            MD5_ANNOTATION,
+            checksum::ANNOTATION,
+            super::multipart::PARTS_ANNOTATION,
+        ] {
             if let Some(value) = obj.annotations.get(name) {
                 annotations.insert(name.to_string(), value.clone());
             }

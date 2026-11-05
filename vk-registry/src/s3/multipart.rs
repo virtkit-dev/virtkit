@@ -8,8 +8,10 @@
 //! again replaces the earlier one whole. Completing an upload concatenates the parts it names
 //! into one staging file in a single pass off the runtime, hashing on the way, then promotes
 //! and tags it as a PutObject's body is, its ETag `"<MD5 of the parts' MD5s>-<parts>"`; the
-//! directory then goes. The gc sweeps an upload nothing has been written into for its grace
-//! window, as it sweeps an idle OCI upload.
+//! directory then goes, and the parts' sizes stay on the manifest ([`PARTS_ANNOTATION`]),
+//! so a read may ask for one part of the object as it was uploaded (`?partNumber=<n>`) and
+//! GetObjectAttributes may list them. The gc sweeps an upload nothing has been written into
+//! for its grace window, as it sweeps an idle OCI upload.
 //!
 //! Authorized as a PutObject is: `Write` on the key's parent repository, `Read` there for
 //! ListParts, and ListMultipartUploads as a listing of the bucket. The upload id must name an
@@ -55,6 +57,109 @@ const MAX_LISTED: usize = 1000;
 
 /// What an upload records of itself, in its directory.
 const META: &str = "meta.json";
+
+/// The manifest annotation holding the sizes of the parts an object was completed from, in
+/// order: each in decimal, a run of equal sizes as `<size>x<count>`, joined by commas, so an
+/// upload in equal parts is one run whatever their number.
+pub(crate) const PARTS_ANNOTATION: &str = "org.virtkit.s3-parts";
+
+/// The [`PARTS_ANNOTATION`] for parts of `sizes`.
+fn parts_annotation(sizes: &[u64]) -> String {
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    for size in sizes {
+        match runs.last_mut() {
+            Some((s, n)) if s == size => *n = n.saturating_add(1),
+            _ => runs.push((*size, 1)),
+        }
+    }
+    runs.iter()
+        .map(|(size, n)| {
+            if *n == 1 {
+                size.to_string()
+            } else {
+                format!("{size}x{n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The sizes of the parts `annotations` say an object was completed from, in order: 1 to
+/// [`MAX_PARTS`] of them, summing to at most the object cap. `None` for an object not made
+/// of parts, or an annotation this registry did not write.
+pub(super) fn part_sizes(annotations: &BTreeMap<String, String>) -> Option<Vec<u64>> {
+    let text = annotations.get(PARTS_ANNOTATION)?;
+    let mut sizes = Vec::new();
+    let mut total: u64 = 0;
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.len() <= 20)
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    for run in text.split(',') {
+        let (size, count) = match run.split_once('x') {
+            Some((size, count)) => (number(size)?, number(count)?),
+            None => (number(run)?, 1),
+        };
+        let count = usize::try_from(count).ok()?;
+        if count == 0 || sizes.len().saturating_add(count) > MAX_PARTS as usize {
+            return None;
+        }
+        total = total.checked_add(size.checked_mul(count as u64)?)?;
+        if total > MAX_OBJECT {
+            return None;
+        }
+        sizes.extend(std::iter::repeat_n(size, count));
+    }
+    (!sizes.is_empty()).then_some(sizes)
+}
+
+/// Where part `n` (from 1) of an object of parts `sizes` lies: its first byte and its
+/// length; `None` past the last part.
+pub(super) fn part_range(sizes: &[u64], n: u32) -> Option<(u64, u64)> {
+    let at = usize::try_from(n).ok()?.checked_sub(1)?;
+    let len = *sizes.get(at)?;
+    let start = sizes
+        .get(..at)?
+        .iter()
+        .try_fold(0u64, |a, s| a.checked_add(*s))?;
+    Some((start, len))
+}
+
+/// The `ObjectParts` of GetObjectAttributes for an object of parts `sizes`: `max` of them
+/// from after part `marker`, each with its number and size (no checksum: none is kept per
+/// part), with the paging S3 writes around them and the count of them all.
+pub(super) fn object_parts(sizes: &[u64], max: usize, marker: u32) -> String {
+    let after: Vec<(usize, &u64)> = sizes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i.saturating_add(1) > marker as usize)
+        .collect();
+    let truncated = after.len() > max;
+    let page = after.get(..max).unwrap_or(&after);
+    let mut out = format!(
+        "<ObjectParts>{}{}",
+        xml::element("IsTruncated", if truncated { "true" } else { "false" }),
+        xml::element("MaxParts", &max.to_string())
+    );
+    if let (true, Some((last, _))) = (truncated, page.last()) {
+        out.push_str(&xml::element(
+            "NextPartNumberMarker",
+            &last.saturating_add(1).to_string(),
+        ));
+    }
+    out.push_str(&xml::element("PartNumberMarker", &marker.to_string()));
+    for (i, size) in page {
+        out.push_str(&format!(
+            "<Part>{}{}</Part>",
+            xml::element("PartNumber", &i.saturating_add(1).to_string()),
+            xml::element("Size", &size.to_string())
+        ));
+    }
+    out.push_str(&xml::element("PartsCount", &sizes.len().to_string()));
+    out.push_str("</ObjectParts>");
+    out
+}
 
 /// Longest `meta.json` or part record read: far above what one can hold (a key, and at most
 /// 2 KiB of user metadata).
@@ -123,7 +228,7 @@ fn only(params: &[(&str, &str)], taken: &[&str]) -> bool {
 }
 
 /// A part number as a query or a document gives it: 1 to [`MAX_PARTS`], in decimal.
-fn part_number(s: &str) -> Option<u32> {
+pub(super) fn part_number(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || s.len() > 5 {
         return None;
     }
@@ -673,12 +778,13 @@ impl Whole {
     }
 }
 
-/// What [`assemble`] made: the object staged, its ETag, unquoted, and the whole-object
-/// checksum that held, its header and text, to keep.
+/// What [`assemble`] made: the object staged, its ETag, unquoted, the whole-object checksum
+/// that held, its header and text, to keep, and the sizes of its parts in order.
 struct Assembled {
     staged: Staged,
     etag: String,
     checksum: Option<(&'static str, String)>,
+    sizes: Vec<u64>,
 }
 
 /// Concatenate the `parts` of `up`, in order, into a staging file, in one pass, hashing on
@@ -726,6 +832,7 @@ fn assemble(
     let mut sha256 = sha2::Sha256::new();
     let mut hasher = whole.and_then(|w| checksum::Hasher::for_(w.header));
     let mut md5s = Vec::with_capacity(parts.len());
+    let mut sizes = Vec::with_capacity(parts.len());
     let mut buf = vec![0u8; STREAM_CHUNK];
     for (n, etag) in parts {
         let mut file = match std::fs::File::open(part_path(&up.dir, *n)) {
@@ -734,6 +841,7 @@ fn assemble(
             Err(e) => return Err(anyhow::Error::from(e).context("opening a part")),
         };
         let mut md5 = md5::Context::new();
+        let before = staged.size;
         loop {
             let got = match file.read(&mut buf) {
                 Ok(0) => break,
@@ -758,6 +866,7 @@ fn assemble(
             return Ok(Err(invalid_part));
         }
         md5s.push(md5);
+        sizes.push(staged.size.saturating_sub(before));
     }
     drop(out);
     let sha256 = sha256.finalize().to_vec();
@@ -775,15 +884,16 @@ fn assemble(
         staged,
         etag: multipart_etag(&md5s),
         checksum: whole.map(|w| (w.header, w.text.clone())),
+        sizes,
     }))
 }
 
 /// `POST /s3/<bucket>/<key>?uploadId=<id>`: the object the `CompleteMultipartUpload`
 /// document's parts make, in the order given, tagged at the key as a PutObject's body is
 /// (the key checked again, `If-None-Match: *`/`If-Match` checked where the tag is written),
-/// with the user metadata recorded at the upload's creation, the multipart ETag and the
-/// whole-object checksum that held; the upload then goes. A refusal leaves the upload as it
-/// was, to be completed again.
+/// with the user metadata recorded at the upload's creation, the multipart ETag, the
+/// whole-object checksum that held and the parts' sizes; the upload then goes. A refusal
+/// leaves the upload as it was, to be completed again.
 async fn complete(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -856,9 +966,11 @@ async fn complete(
         staged,
         etag,
         checksum,
+        sizes,
     } = assembled;
     let mut annotations = up.meta.annotations;
     annotations.insert(MD5_ANNOTATION.to_string(), etag.clone());
+    annotations.insert(PARTS_ANNOTATION.to_string(), parts_annotation(&sizes));
     if let Some((name, value)) =
         checksum.and_then(|(header, text)| checksum::annotation(header, &text))
     {
@@ -1280,6 +1392,84 @@ mod tests {
         ] {
             assert_eq!(recorded_part(name), None, "{name}");
         }
+    }
+
+    #[test]
+    fn part_sizes_round_trip_through_their_annotation() {
+        let of = |text: &str| {
+            part_sizes(&BTreeMap::from([(
+                PARTS_ANNOTATION.to_string(),
+                text.to_string(),
+            )]))
+        };
+        for sizes in [
+            vec![5],
+            vec![8 << 20, 8 << 20, 8 << 20, 1024],
+            vec![1, 2, 2, 3, 3, 3, 1],
+            vec![0, 0],
+            vec![7; 10_000],
+        ] {
+            let text = parts_annotation(&sizes);
+            assert_eq!(of(&text), Some(sizes.clone()), "{text}");
+        }
+        assert_eq!(
+            parts_annotation(&[8 << 20, 8 << 20, 8 << 20, 1024]),
+            "8388608x3,1024"
+        );
+        assert_eq!(parts_annotation(&[1, 2, 2, 3, 3, 3, 1]), "1,2x2,3x3,1");
+        assert_eq!(of("3x2"), Some(vec![3, 3]));
+        for bad in [
+            "",
+            "x",
+            "3x",
+            "x3",
+            "3x0",
+            "-1",
+            "1,,2",
+            "1x10001",
+            "4294967296x1024",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(of(bad), None, "{bad:?}");
+        }
+        assert_eq!(part_sizes(&BTreeMap::new()), None);
+
+        let sizes = [5, 7, 0, 3];
+        assert_eq!(part_range(&sizes, 1), Some((0, 5)));
+        assert_eq!(part_range(&sizes, 2), Some((5, 7)));
+        assert_eq!(part_range(&sizes, 3), Some((12, 0)));
+        assert_eq!(part_range(&sizes, 4), Some((12, 3)));
+        assert_eq!(part_range(&sizes, 5), None);
+        assert_eq!(part_range(&sizes, 0), None);
+    }
+
+    #[test]
+    fn object_parts_are_paged_as_s3_pages_them() {
+        let sizes = [5, 7, 3];
+        assert_eq!(
+            object_parts(&sizes, 1000, 0),
+            "<ObjectParts><IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts>\
+             <PartNumberMarker>0</PartNumberMarker><Part><PartNumber>1</PartNumber><Size>5</Size>\
+             </Part><Part><PartNumber>2</PartNumber><Size>7</Size></Part><Part><PartNumber>3\
+             </PartNumber><Size>3</Size></Part><PartsCount>3</PartsCount></ObjectParts>"
+        );
+        assert_eq!(
+            object_parts(&sizes, 2, 0),
+            "<ObjectParts><IsTruncated>true</IsTruncated><MaxParts>2</MaxParts>\
+             <NextPartNumberMarker>2</NextPartNumberMarker><PartNumberMarker>0</PartNumberMarker>\
+             <Part><PartNumber>1</PartNumber><Size>5</Size></Part><Part><PartNumber>2</PartNumber>\
+             <Size>7</Size></Part><PartsCount>3</PartsCount></ObjectParts>"
+        );
+        assert_eq!(
+            object_parts(&sizes, 2, 2),
+            "<ObjectParts><IsTruncated>false</IsTruncated><MaxParts>2</MaxParts>\
+             <PartNumberMarker>2</PartNumberMarker><Part><PartNumber>3</PartNumber><Size>3</Size>\
+             </Part><PartsCount>3</PartsCount></ObjectParts>"
+        );
+        let none = object_parts(&sizes, 0, 0);
+        assert!(none.contains("<IsTruncated>true</IsTruncated><MaxParts>0</MaxParts>"));
+        assert!(!none.contains("<Part>") && !none.contains("NextPartNumberMarker"));
+        assert!(!object_parts(&sizes, 5, 3).contains("<Part>"));
     }
 
     #[test]

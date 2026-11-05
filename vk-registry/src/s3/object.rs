@@ -22,7 +22,7 @@ use sha2::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::range::{self, Range};
-use super::{Ctx, UNCOMPRESSED_FROM, checksum, chunked, drain, meta, refuse, xml};
+use super::{Ctx, UNCOMPRESSED_FROM, checksum, chunked, drain, meta, multipart, refuse, xml};
 use crate::dav::http_date;
 use crate::files::{
     self, Commit, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed, object_of,
@@ -32,6 +32,9 @@ use crate::{Authz, Body, ServerState, Store, accounts, body_of};
 
 /// The header asking a read for the object's checksum.
 const CHECKSUM_MODE: &str = "x-amz-checksum-mode";
+
+/// The header a read of one part carries: how many parts the object was uploaded in.
+const PARTS_COUNT: &str = "x-amz-mp-parts-count";
 
 /// The checksum a read answers with, when asked, for an object whose write kept none: the
 /// SHA-256 the store names the bytes by.
@@ -103,7 +106,10 @@ fn content_range(start: u64, len: u64, total: u64) -> String {
 }
 
 /// `GET`/`HEAD /s3/<bucket>/<key>`: the object's bytes, after its conditional headers, or
-/// the one byte range `Range` asks for (206) when `If-Range`, if sent, still holds; a HEAD
+/// the one byte range `Range` asks for (206) when `If-Range`, if sent, still holds, or
+/// `?partNumber=<part>`: the bytes of that part of the object as it was uploaded (206 with
+/// its `Content-Range`, and `x-amz-mp-parts-count` for an object made of parts; an object
+/// written whole is its one part, and a part of no bytes is the whole object, 200); a HEAD
 /// answers what the GET would. A GET served, whole or in part, refreshes an idle object's tag
 /// as a WebDAV GET does; a HEAD touches nothing.
 pub(super) async fn get(
@@ -111,6 +117,7 @@ pub(super) async fn get(
     authz: &Authz<'_>,
     segs: Vec<String>,
     head: bool,
+    part: Option<u32>,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -119,6 +126,14 @@ pub(super) async fn get(
     }
     let conditions = Conditions::of(req.headers());
     let asked = range::Asked::of(req.headers());
+    if part.is_some() && req.headers().contains_key(hyper::header::RANGE) {
+        let resp = ctx.error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Cannot specify both Range header and partNumber query parameter",
+        );
+        return refuse(req, resp, ctx).await;
+    }
     let checksum = req
         .headers()
         .get(CHECKSUM_MODE)
@@ -151,7 +166,36 @@ pub(super) async fn get(
                 ));
             }
         }
-        let mut resp = match asked.resolve(&etag, obj.modified, obj.size) {
+        let sizes = multipart::part_sizes(&obj.annotations);
+        let range = match part {
+            None => asked.resolve(&etag, obj.modified, obj.size),
+            Some(n) => {
+                let lies = match &sizes {
+                    Some(sizes) => multipart::part_range(sizes, n),
+                    None => (n == 1).then_some((0, obj.size)),
+                };
+                let Some((start, len)) = lies else {
+                    let count = sizes.as_ref().map_or(1, Vec::len).to_string();
+                    return Ok(xml::error(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "InvalidPartNumber",
+                        "The requested partnumber is not satisfiable.",
+                        &[
+                            ("ActualPartCount", &count),
+                            ("PartNumberRequested", &n.to_string()),
+                        ],
+                        &ctx.path,
+                        &ctx.id,
+                    ));
+                };
+                if len == 0 {
+                    Range::Whole
+                } else {
+                    Range::Part { start, len }
+                }
+            }
+        };
+        let mut resp = match range {
             Range::Whole => {
                 let digest = format!("sha256:{}", obj.layer);
                 let mut resp = crate::serve_blob(store, &digest, head, false, false)?;
@@ -205,6 +249,13 @@ pub(super) async fn get(
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
         insert(headers, ETAG, &etag);
         insert(headers, LAST_MODIFIED, &modified);
+        if let (Some(_), Some(sizes)) = (part, &sizes) {
+            insert(
+                headers,
+                hyper::header::HeaderName::from_static(PARTS_COUNT),
+                &sizes.len().to_string(),
+            );
+        }
         // The whole object's checksum, on the whole object only: S3 sends none with a part,
         // and the AWS CLI checks what it is sent against the bytes of each part it fetches.
         if checksum && !partial {
@@ -226,8 +277,10 @@ pub(super) async fn get(
 }
 
 /// `GET /s3/<bucket>/<key>?attributes`: what `x-amz-object-attributes` asks of `ETag`,
-/// `Checksum`, `ObjectSize` and `StorageClass` (`ObjectParts` has nothing to say of an object
-/// written whole), with `Last-Modified`. A metadata read, so it touches nothing.
+/// `Checksum`, `ObjectParts` (the parts an object was uploaded in, `x-amz-max-parts` of
+/// them from after `x-amz-part-number-marker`; an object written whole has none),
+/// `ObjectSize` and `StorageClass`, with `Last-Modified`. A metadata read, so it touches
+/// nothing.
 pub(super) async fn attributes(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -238,6 +291,28 @@ pub(super) async fn attributes(
     if !admitted(authz, accounts::Action::Read, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
+    let count = |name: &str, default: u64, most: u64| -> Option<u64> {
+        match req.headers().get(name) {
+            None => Some(default),
+            Some(v) => v
+                .to_str()
+                .ok()
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|n| n.min(most)),
+        }
+    };
+    let (Some(max_parts), Some(marker)) = (
+        count("x-amz-max-parts", 1000, 1000),
+        count("x-amz-part-number-marker", 0, u64::from(u32::MAX)),
+    ) else {
+        let resp = ctx.error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-max-parts and x-amz-part-number-marker are whole numbers",
+        );
+        return refuse(req, resp, ctx).await;
+    };
     let mut asked = Vec::new();
     for value in req.headers().get_all("x-amz-object-attributes") {
         let Ok(value) = value.to_str() else {
@@ -282,6 +357,13 @@ pub(super) async fn attributes(
                 None => xml::element("ChecksumSHA256", &sha256_base64(&obj.layer)),
             };
             inner.push_str(&format!("<Checksum>{kept}</Checksum>"));
+        }
+        if has("ObjectParts")
+            && let Some(sizes) = multipart::part_sizes(&obj.annotations)
+        {
+            let max = usize::try_from(max_parts).unwrap_or(1000);
+            let marker = u32::try_from(marker).unwrap_or(u32::MAX);
+            inner.push_str(&multipart::object_parts(&sizes, max, marker));
         }
         if has("StorageClass") {
             inner.push_str(&xml::element("StorageClass", "STANDARD"));
