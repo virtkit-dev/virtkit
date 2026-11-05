@@ -9,7 +9,7 @@ use hyper::{Request, Response, StatusCode};
 
 use super::object::{Deleted, admitted, check_body, delete_one, unwritable_message};
 use super::xml::scan::{self, Malformed};
-use super::{Ctx, path, read_small, xml};
+use super::{Ctx, NULL_VERSION, path, read_small, xml};
 use crate::files::{self, Unwritable};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
@@ -27,7 +27,8 @@ const MAX_ELEMENTS: usize = 6 * MAX_KEYS + 16;
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     key: String,
-    /// whether it names a version, which this registry does not keep
+    /// whether it names a version other than the object's one, [`NULL_VERSION`], which
+    /// this registry does not keep
     versioned: bool,
 }
 
@@ -57,7 +58,7 @@ fn document(body: &[u8]) -> Result<Asked, Malformed> {
             .ok_or(Malformed("each Object names its Key"))?;
         entries.push(Entry {
             key: key.text.clone(),
-            versioned: o.one("VersionId")?.is_some(),
+            versioned: o.one("VersionId")?.is_some_and(|v| v.text != NULL_VERSION),
         });
     }
     if entries.is_empty() {
@@ -139,7 +140,7 @@ pub(super) async fn delete(
             let outcome = if entry.versioned {
                 Err((
                     "NotImplemented",
-                    "this registry keeps no versions: a key is deleted without a VersionId",
+                    "this registry keeps no versions: a key's one VersionId is null",
                 ))
             } else {
                 // A key the store fails on is that key's error; the batch goes on.
@@ -196,14 +197,15 @@ mod tests {
     fn a_delete_names_its_keys_versions_and_quietness() {
         let asked = document(&body(
             "<Quiet>true</Quiet><Object><Key>a/b</Key></Object>\
-             <Object><VersionId>v</VersionId><Key>c</Key><ETag>\"x\"</ETag></Object>",
+             <Object><VersionId>v</VersionId><Key>c</Key><ETag>\"x\"</ETag></Object>\
+             <Object><Key>d</Key><VersionId>null</VersionId></Object>",
         ))
         .unwrap();
         assert_eq!(
             asked,
             Asked {
                 quiet: true,
-                entries: vec![entry("a/b", false), entry("c", true)],
+                entries: vec![entry("a/b", false), entry("c", true), entry("d", false)],
             }
         );
         let asked = document(&body("<Object><Key>k</Key></Object><Quiet>False</Quiet>")).unwrap();

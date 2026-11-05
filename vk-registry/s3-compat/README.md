@@ -113,7 +113,9 @@ Found while bringing the harness up against a build in progress (November 2026):
   teardown empty every test bucket with `list_object_versions`, so a 501 there makes every
   test error before it starts. An unversioned bucket's answer (each key once, `VersionId`
   `null`, `IsLatest` true, no delete markers) is what AWS gives for a bucket that was never
-  versioned.
+  versioned. The teardown then deletes each key with the `VersionId` it was listed with, so
+  `null` has to name the object on DeleteObjects (and DeleteObject) too, or the bucket stays
+  non-empty and every test errors in setup on its `delete_bucket`.
 - **A ranged GET that carries the whole object's `x-amz-checksum-sha256` fails the AWS
   CLI's downloads.** The CLI fetches anything past 8 MiB as parallel ranges, validates each
   206 response's body against the checksum header it carries, and the whole object's does

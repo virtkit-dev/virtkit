@@ -248,6 +248,19 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
 /// the method and path do not.
 const OPERATION_HINT: &str = "x-id";
 
+/// The one version every object has, S3's id for an object written while versioning was
+/// off: what ListObjectVersions names each object, and what a request that names it back
+/// (`?versionId=null`, a `VersionId` in a `Delete` document, a copy source's query) asks
+/// for, which is the object itself.
+pub(super) const NULL_VERSION: &str = "null";
+
+/// Whether a query parameter names nothing the path does not: [`OPERATION_HINT`], or the
+/// [`NULL_VERSION`] of the object, which a tool emptying a bucket through
+/// ListObjectVersions sends back with each key.
+fn implicit((name, value): &(String, String)) -> bool {
+    name == OPERATION_HINT || (name == "versionId" && value == NULL_VERSION)
+}
+
 /// A request's query parameters, name and value, in order.
 type Params = [(String, String)];
 
@@ -268,10 +281,10 @@ fn parse_query(raw: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// The subresource a query names (`location`, `attributes`, `uploads`…): `None` for a query
-/// of [`OPERATION_HINT`] at most, `Some("")` when it names more than one parameter or names
-/// one with a value — which nothing served here takes.
+/// of [`implicit`] parameters at most, `Some("")` when it names more than one other
+/// parameter or names one with a value — which nothing served here takes.
 fn subresource(params: &Params) -> Option<&str> {
-    let mut named = params.iter().filter(|(n, _)| n != OPERATION_HINT);
+    let mut named = params.iter().filter(|p| !implicit(p));
     let (name, value) = named.next()?;
     Some(match (value.is_empty(), named.next()) {
         (true, None) => name,
@@ -726,7 +739,13 @@ mod tests {
         assert_eq!(sub("list-type=2"), Some("".to_string()));
         assert_eq!(sub("partNumber=1&uploadId=a"), Some("".to_string()));
         assert_eq!(sub("location&acl"), Some("".to_string()));
-        assert_eq!(sub("versionId=null"), Some("".to_string()));
+        // The null version is the object; any other is nothing served.
+        assert_eq!(sub("versionId=null"), None);
+        assert_eq!(sub("versionId=null&x-id=DeleteObject"), None);
+        assert_eq!(sub("versionId=null&tagging"), Some("tagging".to_string()));
+        assert_eq!(sub("versionId=1"), Some("".to_string()));
+        assert_eq!(sub("versionId="), Some("versionId".to_string()));
+        assert_eq!(sub("versionId=NULL"), Some("".to_string()));
         // Names are decoded as the signature decodes them.
         assert_eq!(sub("upload%73"), Some("uploads".to_string()));
         assert_eq!(sub("x%2Did=GetObject"), None);

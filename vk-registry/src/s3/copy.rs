@@ -12,7 +12,7 @@ use hyper::{Request, Response, StatusCode};
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::object::{admitted, no_such_key, readable, unwritable};
-use super::{Ctx, drain, list, meta, path, refuse, xml};
+use super::{Ctx, NULL_VERSION, drain, list, meta, path, refuse, xml};
 use crate::files::{self, Commit, FILES_REPO, Written, allowed, object_of};
 use crate::{Authz, Body, ServerState, Store, accounts};
 
@@ -24,7 +24,8 @@ pub(super) const COPY_SOURCE: &str = "x-amz-copy-source";
 pub(super) enum Source {
     /// an object: the bucket then the key's components, as [`path::Target::Object`]'s
     Object(Vec<String>),
-    /// one version of an object, which this registry does not keep
+    /// one version of an object other than its [`NULL_VERSION`], which this registry does
+    /// not keep
     Versioned,
     /// nothing this view serves: an S3 error code and the rule
     Invalid(&'static str, &'static str),
@@ -40,7 +41,8 @@ pub(super) fn source(value: &str) -> Source {
         Some((raw, query)) => (raw, Some(query)),
         None => (value, None),
     };
-    if let Some(query) = query {
+    // The null version is the object; the query names nothing else.
+    if let Some(query) = query.filter(|q| q.strip_prefix("versionId=") != Some(NULL_VERSION)) {
         let versioned = query
             .split('&')
             .any(|p| p.split_once('=').map_or(p, |(n, _)| n) == "versionId");
@@ -250,6 +252,7 @@ mod tests {
             "b%2Fa/k",
             "%2Fb/a/k",
             "/b/a/%6B",
+            "/b/a/k?versionId=null",
         ] {
             assert_eq!(source(spelling), object(&["b", "a", "k"]), "{spelling}");
         }
@@ -257,7 +260,12 @@ mod tests {
             source("/b/.sccache_check"),
             object(&["b", ".sccache_check"])
         );
-        for versioned in ["/b/k?versionId=null", "b/k?versionId=3&x=1"] {
+        for versioned in [
+            "/b/k?versionId=1",
+            "b/k?versionId=3&x=1",
+            "b/k?versionId=null&x=1",
+            "b/k?versionId=NULL",
+        ] {
             assert_eq!(source(versioned), Source::Versioned, "{versioned}");
         }
     }

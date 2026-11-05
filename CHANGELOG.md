@@ -12,8 +12,9 @@ All notable changes to virtkit will be documented in this file.
   `https://<registry>/s3` with any region, and use the registry credential (an API key, a hub
   token or the shared bearer) as both the access key and the secret access key, or the shared
   Basic user and its password. Objects can be written, read with conditional headers and
-  checksums, given metadata and deleted, and listed page by page, and are the same files WebDAV
-  and `vk registry get` see; a key limited to a directory of a bucket can list that directory.
+  checksums, given metadata and deleted, and listed page by page (as object versions too, for
+  tools that empty a bucket that way), and are the same files WebDAV and `vk registry get`
+  see; a key limited to a directory of a bucket can list that directory.
   The chunked uploads AWS SDKs and the CLI send are taken, their signatures and checksums
   checked, and objects can be read in byte ranges, as the AWS CLI downloads large files.
   Buckets can be created and removed, objects copied without their bytes being stored twice
