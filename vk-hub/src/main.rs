@@ -2782,6 +2782,12 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
                 },
             )?;
             print!("{}", show(&ns));
+            if ns.has_scope() {
+                eprintln!(
+                    "vk-hub: tokens minted before this keep their grants until they expire \
+                     (max_job_token_secs, plus clock skew); scopes are isolated once they have"
+                );
+            }
         }
         NamespacesCmd::Remove { registry, name } => {
             if !client.remove_namespace(&registry, &name)? {

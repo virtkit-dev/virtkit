@@ -265,6 +265,61 @@ fn check_retention_overlap(ns: &NamespaceRow, others: &[NamespaceRow]) -> Result
     Ok(())
 }
 
+/// A namespace whose path holds `{scope}` reserves its root, its path's leading fixed
+/// components, and no other namespace's path may, at any filling, lie above, at or under it.
+/// Grants add up across namespaces and a prefix covers what is beneath it, so another
+/// namespace reaching there could hand a job every protection and scope of it.
+fn check_reserved_root(ns: &NamespaceRow, others: &[NamespaceRow]) -> Option<String> {
+    for other in others {
+        for (scoped, beside) in [(ns, other), (other, ns)] {
+            if !scoped.has_scope() {
+                continue;
+            }
+            // A path starting with a placeholder has no root to reserve; one is refused when
+            // stored, and a legacy row keeps its place.
+            let Some(root) = scoped.static_prefix() else {
+                continue;
+            };
+            if may_meet(&root, &beside.path) {
+                return Some(format!(
+                    "namespace {}'s path {} could reach {root}, which namespace {} reserves for \
+                     its scopes: grants add up, so it would reach scopes there",
+                    beside.name, beside.path, scoped.name
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether some filling of the templates `a` and `b` makes one at or under the other: every
+/// component they both have may fill alike ([`may_fill`]).
+fn may_meet(a: &str, b: &str) -> bool {
+    a.split('/')
+        .zip(b.split('/'))
+        .all(|(x, y)| match (x.starts_with('{'), y.starts_with('{')) {
+            (false, false) => x == y,
+            (true, false) => may_fill(x, y),
+            (false, true) => may_fill(y, x),
+            // Two placeholders may fill alike: an instance name may be all digits, say.
+            (true, true) => true,
+        })
+}
+
+/// Whether `placeholder` may fill as the fixed component `fixed` for some job; it errs toward
+/// yes: any value of the placeholder's shape counts.
+fn may_fill(placeholder: &str, fixed: &str) -> bool {
+    match placeholder {
+        "{gitlab}" => super::gitlabs::valid_gitlab_name(fixed),
+        "{project_id}" | "{pipeline_id}" => {
+            fixed.bytes().all(|b| b.is_ascii_digit()) && fixed.parse::<u64>().is_ok()
+        }
+        "{protection}" => fixed == "protected" || fixed == "unprotected",
+        "{scope}" => fixed == SHARED_SCOPE || fixed.starts_with("ref-"),
+        _ => true,
+    }
+}
+
 /// Refuse `ns`'s alias if another namespace has it or a legacy path under [`ALIAS_ROOT`]
 /// could be hidden by it.
 fn check_alias(ns: &NamespaceRow, others: &[NamespaceRow]) -> Option<String> {
@@ -490,7 +545,8 @@ fn ns_range(registry: &str) -> (String, String) {
 /// Why `ns` may not be stored on registry `registry` beside the namespaces in `table`, if it
 /// may not: the registry has [`MAX_NAMESPACES`] already, unless `ns` `replaces` one; another
 /// namespace has `ns`'s alias, or `ns` has one while another's path lies under [`ALIAS_ROOT`]
-/// ([`check_alias`]); or a retention would reach into another namespace.
+/// ([`check_alias`]); a path would reach a root another reserves for its scopes
+/// ([`check_reserved_root`]); or a retention would reach into another namespace.
 fn refusal(
     table: &redb::Table<&str, &[u8]>,
     registry: &str,
@@ -511,6 +567,9 @@ fn refusal(
         }
     }
     if let Some(why) = check_alias(ns, &others) {
+        return Ok(Some(why));
+    }
+    if let Some(why) = check_reserved_root(ns, &others) {
         return Ok(Some(why));
     }
     Ok(check_retention_overlap(ns, &others).err())
@@ -997,6 +1056,100 @@ mod tests {
         assert!(check_retention_overlap(&pipelines, std::slice::from_ref(&apart)).is_ok());
         let narrower = ns("deep", "p/x", &["r:*"], Some(9));
         assert!(check_retention_overlap(&pipelines, std::slice::from_ref(&narrower)).is_err());
+    }
+
+    #[test]
+    fn a_scoped_namespace_reserves_its_root() {
+        let tc = ns(
+            "tc",
+            "task-cache/{gitlab}/{project_id}/{protection}/{scope}",
+            &["rwl:own project"],
+            None,
+        );
+        for (path, refused) in [
+            ("task-cache/{gitlab}/{project_id}", true),
+            ("task-cache", true),
+            ("task-cache/x/y/z/w/v", true),
+            ("task-cache2/{gitlab}", false),
+            ("images", false),
+            ("p/task-cache", false),
+        ] {
+            let other = ns("o", path, &["r:*"], None);
+            for (a, b) in [(&tc, &other), (&other, &tc)] {
+                let got = check_reserved_root(a, std::slice::from_ref(b));
+                assert_eq!(got.is_some(), refused, "{path}: {got:?}");
+            }
+        }
+        // A root deeper than a placeholder elsewhere is reached through it.
+        let deep = ns("d", "a/b/{gitlab}/{scope}", &["r:*"], None);
+        let wide = ns("w", "a/{gitlab}", &["r:*"], None);
+        assert!(check_reserved_root(&wide, std::slice::from_ref(&deep)).is_some());
+        let apart = ns("w", "a/c/{gitlab}", &["r:*"], None);
+        assert!(check_reserved_root(&apart, std::slice::from_ref(&deep)).is_none());
+        // Two unscoped namespaces may nest.
+        let unscoped = ns("u", "task-cache/{gitlab}/{project_id}", &["r:*"], None);
+        let nested = ns("n", "task-cache/{gitlab}", &["r:*"], None);
+        assert!(check_reserved_root(&unscoped, std::slice::from_ref(&nested)).is_none());
+        // A placeholder reaches a fixed component only where a job could fill it so.
+        for (root, path, meets) in [
+            ("a/b", "a/{protection}", false),
+            ("a/protected", "a/{protection}", true),
+            ("a/x", "a/{project_id}", false),
+            ("a/42", "a/{pipeline_id}", true),
+            ("a/Upper", "a/{gitlab}", false),
+            ("a/gl", "a/{gitlab}", true),
+            ("a/b", "a/{scope}", false),
+            ("a/all", "a/{scope}", true),
+        ] {
+            assert_eq!(may_meet(root, path), meets, "{root} {path}");
+        }
+    }
+
+    /// A namespace may add `{scope}` under its own name. A legacy namespace reaching the root
+    /// stays listed, but neither it nor a new conflicting namespace can be stored.
+    #[test]
+    fn a_reserved_root_is_held_when_namespaces_are_stored() {
+        use crate::store::{RegistryEnrollment, TokenKind};
+        let db = Db::open_memory().unwrap();
+        let ttl = std::time::Duration::from_secs(60);
+        let (token, _) = db
+            .create_token_for(TokenKind::Registry, ttl, None, "u", 1)
+            .unwrap();
+        let RegistryEnrollment::Enrolled { id } =
+            db.enroll_registry(&token, "aa", "reg", "p", 1).unwrap()
+        else {
+            panic!("not enrolled");
+        };
+        let tc = |path: &str| ns("tc", path, &["rwl:own project"], None);
+        db.put_namespace(&id, &tc("tc/{gitlab}/{project_id}"), "u", 1)
+            .unwrap();
+        db.put_namespace(&id, &tc("tc/{gitlab}/{project_id}/{scope}"), "u", 2)
+            .unwrap();
+        // As an older hub stored it, beside the scoped one.
+        let legacy = ns("wide", "tc/{gitlab}", &["r:*"], None);
+        let txn = db.db.begin_write().unwrap();
+        txn.open_table(NAMESPACES)
+            .unwrap()
+            .insert(
+                format!("{id}/wide").as_str(),
+                encode(&legacy).unwrap().as_slice(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let names: Vec<String> = db
+            .namespaces(&id)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(names, ["tc", "wide"]);
+        for again in [legacy, ns("new", "tc/x", &["r:*"], None)] {
+            let err = db
+                .put_namespace(&id, &again, "u", 3)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("which namespace tc reserves"), "{err}");
+        }
     }
 
     #[test]

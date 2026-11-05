@@ -9,7 +9,8 @@ All notable changes to virtkit will be documented in this file.
 - **vk-hub namespaces can keep chosen branches' and tags' caches apart.** A namespace path may
   hold the new `{scope}`, which is `all` for most jobs, so the namespace stays per project
   and protection; `vk-hub namespaces add … --isolate <glob>` gives the refs it matches a scope
-  each, which no other ref's job reaches.
+  each, which no other ref's job reaches. The path's leading fixed part is reserved: no other
+  namespace may reach it, so grants cannot add up across scopes.
 
 ### Changed
 

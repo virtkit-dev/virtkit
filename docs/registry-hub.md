@@ -832,8 +832,13 @@ projects ([Placed jobs](fleet-prototype.md#placed-jobs)).
 token's grants. A path is a repository name whose components may be `{gitlab}`,
 `{project_id}`, `{pipeline_id}`, `{protection}` or `{scope}` whole; it starts with a fixed
 component. `--isolate` needs `{scope}` in the path, and a namespace takes at most 32 of them;
-an older CLI replacing a namespace keeps its isolated refs. Rights are some of `r`, `w`, `l`.
-A subject is comma-separated terms that must all hold:
+an older CLI replacing a namespace keeps its isolated refs. A namespace whose path holds
+`{scope}` reserves its root, its path's leading fixed components: the hub refuses any other
+namespace whose path could, at some filling, lie above, at or under it, since grants add up
+and would reach the scopes there. A namespace stored before keeps its place; only a new or
+changed one is refused, naming the conflict. Tokens are not revoked, so one minted before the
+change keeps its grants until it expires; `namespaces add` says so. Rights are some of `r`,
+`w`, `l`. A subject is comma-separated terms that must all hold:
 
 | Term | Selects |
 |---|---|
