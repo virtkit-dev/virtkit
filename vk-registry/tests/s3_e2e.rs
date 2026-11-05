@@ -1937,6 +1937,39 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     assert_eq!(staging_left(&dir), 0);
 }
 
+/// A key the store fails to delete is reported on its own, and the batch goes on past it.
+#[tokio::test]
+async fn a_key_that_fails_to_delete_is_reported_and_the_batch_goes_on() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tmp("batch-io");
+    let host = spawn(open_state(&dir, true));
+    for key in ["a", "d/x", "c"] {
+        send(
+            &host,
+            Req::new("PUT", &format!("/s3/b/{key}")).body(HELLO.to_vec()),
+        )
+        .await
+        .ok(200);
+    }
+    let tags = dir.join("store/repos/files/b/d/tags");
+    std::fs::set_permissions(&tags, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Whoever may write a read-only directory (root) cannot make the store fail this way.
+    let probe = tags.join("probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        std::fs::set_permissions(&tags, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: a read-only directory does not stop this user");
+        return;
+    }
+    let doc = delete_doc(&[&key_of("a"), &key_of("d/x"), &key_of("c")], false);
+    let resp = send(&host, delete_objects("b", doc)).await;
+    std::fs::set_permissions(&tags, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (deleted, errors) = delete_result(&resp);
+    assert_eq!(deleted, ["a", "c"]);
+    assert_eq!(errors, [("d/x".to_string(), "InternalError".to_string())]);
+    is_object(&send(&host, Req::new("GET", "/s3/b/d/x")).await, HELLO);
+}
+
 /// A query's names are taken decoded, as the signature takes them, wherever they dispatch;
 /// a malformed escape is refused.
 #[tokio::test]
