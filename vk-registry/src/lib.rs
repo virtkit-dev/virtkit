@@ -4078,6 +4078,11 @@ async fn serve_refusing(
                 continue;
             }
         };
+        // Small responses go out as a header write then a body write; with Nagle on, the
+        // second waits for the client's delayed ACK, about 40 ms on Linux. Best effort: a
+        // socket that refuses the option is still served correctly, only slower, and one
+        // the client already reset fails on its first read anyway.
+        let _ = stream.set_nodelay(true);
         let Some(peer_slot) = PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) else {
             drop(slot);
             let key = peer_key(peer.ip());
