@@ -154,6 +154,13 @@ job's plain GitLab `image:` is read the same way):
 - unset → `local/default` (the baked default bundle);
 - `local/<name>` — a bundle directory under `[local] dir`;
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo;
+- `pipeline/build/<name>[:job-<id>][@sha256:…]` — a bundle in the job's pipeline namespace
+  (`<prefix>/builds/<name>`), for a job the hub placed with one: tag `job-<id>` when given,
+  else `current`, the last one published. A digest given beside it must be the tag's. A
+  reference written straight into the pipeline namespace is refused: anything under
+  `[registry] pipeline_root` (default `ci-pipeline`, set it to the root of the namespace's
+  path when the hub's config moves it) or under the first component of the job's prefix.
+  Other `pipeline/` names are reserved;
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, booted
   directly (embedded kernel + agent). A reference `[docker]` does not route — and every
   one of them when that section is absent — is offered first to the vk-registry this

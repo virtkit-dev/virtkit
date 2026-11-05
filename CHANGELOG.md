@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Boot a pipeline's own images.** On a fleet, a job or service image
+  `pipeline/build/<name>[:job-<id>][@sha256:…]` boots the image published under that name in
+  the job's pipeline: `job-<id>`'s, or the latest. A missing image fails naming the producer
+  job to rerun. Naming the pipeline namespace's images directly is refused for every job;
+  `[registry] pipeline_root` (default `ci-pipeline`) says where that namespace lives.
+
 ## [0.104.0] - 2026-11-04
 
 ### Added

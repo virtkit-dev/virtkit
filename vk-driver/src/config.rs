@@ -991,6 +991,28 @@ pub struct Registry {
     /// only network that serves `registry.vk`.
     #[serde(default)]
     pub guest_credential: GuestCredential,
+    /// The root of the `ci-pipeline` namespace's path on this registry, as the hub's config
+    /// gives that path: one or more leading components, `"ci-pipeline"` by default. A job's
+    /// image naming a repository under it directly is refused, whatever the job, so a job
+    /// reaches pipeline images through `pipeline/build/` alone.
+    #[serde(default)]
+    pub pipeline_root: Option<String>,
+    /// A runtime bearer token for storing on a job's behalf, overriding the configured
+    /// credential. Never read from a config. Only [`crate::registry::at_path`] sets it, on a
+    /// copy used for publication; the node's own `[registry]` is unchanged.
+    /// [`crate::registry::cred`] supplies it to every request through that copy.
+    #[serde(skip)]
+    pub(crate) job_token: Option<JobToken>,
+}
+
+/// A job's registry token, kept out of `Debug`.
+#[derive(Clone)]
+pub(crate) struct JobToken(pub(crate) String);
+
+impl std::fmt::Debug for JobToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 /// `[registry] guest_credential`.
@@ -1035,6 +1057,11 @@ impl Registry {
         ))
     }
 
+    /// [`Registry::pipeline_root`], defaulted.
+    pub fn pipeline_root(&self) -> &str {
+        self.pipeline_root.as_deref().unwrap_or("ci-pipeline")
+    }
+
     /// Whether the guest's proxy lends a job's token rather than this section's credential:
     /// `guest_credential = "job"` on a remote registry.
     pub fn lends_job_token(&self) -> bool {
@@ -1073,6 +1100,8 @@ impl Registry {
             transparent_zstd,
             proxy_guests: false,
             guest_credential: GuestCredential::Node,
+            pipeline_root: None,
+            job_token: None,
         }
     }
 }
@@ -1175,6 +1204,7 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
     let mut cfg: Config = table
         .try_into()
         .with_context(|| format!("parsing {}", path.display()))?;
+    refuse_conflicts(&cfg).with_context(|| format!("parsing {}", path.display()))?;
     for warning in ineffective_settings(&cfg) {
         eprintln!("virtkit: warning: {}: {warning}", path.display());
     }
@@ -1223,6 +1253,22 @@ fn strip_removed_keys(table: &mut toml::Table) -> Vec<&'static str> {
         removed.push("build.cloud_hypervisor");
     }
     removed
+}
+
+/// Refuse what `cfg` sets that it cannot keep.
+fn refuse_conflicts(cfg: &Config) -> Result<()> {
+    if let Some(root) = cfg
+        .registry
+        .as_ref()
+        .and_then(|r| r.pipeline_root.as_deref())
+        && !vk_hub_proto::token::valid_prefix(root)
+    {
+        anyhow::bail!(
+            "`[registry] pipeline_root = {root:?}` is not a repository path: lowercase \
+             components separated by `/`"
+        );
+    }
+    Ok(())
 }
 
 /// What `cfg` sets that has no effect, for the caller to warn about.
@@ -1452,6 +1498,24 @@ mod tests {
         let stale = dir.file("stale.toml", "[vm]\ncpus = 1\n");
         let err = format!("{:#}", load_resolved(Some(stale), &[]).unwrap_err());
         assert!(err.contains("[executor.vm]"), "{err}");
+    }
+
+    /// `pipeline_root` defaults to the namespace's default path root and must be a path.
+    #[test]
+    fn pipeline_root_is_a_repository_path() {
+        let dir = Dir::new("pipeline-root");
+        let load = |name: &str, root: &str| {
+            let text = format!("[registry]\nrepo = \"reg.example/x\"\n{root}");
+            load_resolved(Some(dir.file(name, &text)), &[])
+        };
+        let root = |cfg: Config| cfg.registry.unwrap().pipeline_root().to_string();
+        assert_eq!(root(load("default.toml", "").unwrap()), "ci-pipeline");
+        let custom = load("custom.toml", "pipeline_root = \"org/pipelines\"\n").unwrap();
+        assert_eq!(root(custom), "org/pipelines");
+        for bad in ["", "/x", "x/", "X", "a//b", "a b"] {
+            let line = format!("pipeline_root = {bad:?}\n");
+            assert!(load("bad.toml", &line).is_err(), "{bad:?}");
+        }
     }
 
     /// File loading strips `virtiofsd` rather than rejecting it under `deny_unknown_fields`.

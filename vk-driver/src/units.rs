@@ -258,16 +258,15 @@ pub fn ensure_unit_build_sync(
     Ok((image, config, guard))
 }
 
-/// Provision one service unit at address `slot`: resolve its clean image to a cache path and
-/// merge its runtime config. Shared by `vk run --compose` and the CI executor, so both address
-/// services identically. An `image:` unit resolves through the shared image cache
-/// (`image::resolve_ref` — a services image must be generic-disk) and carries its real config.
-/// A `build:` unit addresses its shared build-tier ext4 (a pure function of the stage
-/// fingerprint) but is not built here — it gets the compose overrides alone as a placeholder
-/// until the service manager materializes it on demand and adopts the entry it built, with
-/// that image's config. Only that owner provisions a `build:` unit, though: the CI executor
-/// asks its build for the address instead, because addressing it would have to reach a stage
-/// key another process computed (see `vm::plan_services`).
+/// Provision one service unit of `vk run --compose` at address `slot`: resolve its clean
+/// image to a cache path and merge its runtime config. An `image:` unit resolves through the
+/// shared image cache (`image::resolve_ref` — a services image must be generic-disk) and
+/// carries its real config. A `build:` unit addresses its shared build-tier ext4 (a pure
+/// function of the stage fingerprint) but is not built here — it gets the compose overrides
+/// alone as a placeholder until the service manager materializes it on demand and adopts the
+/// entry it built, with that image's config. The CI executor resolves each of its services
+/// itself, under the job's pipeline scope, and addresses it through [`provisioned`] (see
+/// `vm::plan_services`).
 pub fn provision(
     cfg: &Config,
     state_dir: &Path,
@@ -303,8 +302,8 @@ pub fn provision(
 
 /// Assemble a [`Provisioned`] from an already-resolved image + merged config: assign the
 /// static address (`slot`), and carry the unit's volumes + init/kernel axes. Shared by
-/// `provision` and the CI executor's git-defined-service path (which resolves its image its own
-/// way but addresses it identically).
+/// `provision` and the CI executor's services (which resolve their images their own way but
+/// are addressed identically).
 pub fn provisioned(
     unit: &crate::compose::Unit,
     ext4: PathBuf,

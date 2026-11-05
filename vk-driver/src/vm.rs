@@ -473,7 +473,8 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
     }
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
-    // the supervisor re-resolves from the same env (a fingerprint hit for a build).
+    // the supervisor re-resolves from the same env (a fingerprint hit for a build). A ref by
+    // tag alone, such as a bare `pipeline/build/<name>` (`current`), may move in between.
     let mut plan = resolve_media(ctx)?;
     // The bases this job boots, for its next admission to keep (see `admit`); supervise notes
     // them again with the services only it resolves.
@@ -749,7 +750,8 @@ async fn wait_for_windows(
 /// `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds a **git-defined** image from the
 /// host-side checkout into the shared build tier and boots that; `compose:<file>#<primary>`
 /// takes the primary out of the fleet and resolves that unit; any other form resolves
-/// through the shared image cache (`resolve_ref`).
+/// through the shared image cache under the job's pipeline scope
+/// (`pipeline::resolve_ref`).
 fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     if let Some(spec) = image_ref.strip_prefix("dockerfile:") {
@@ -759,7 +761,8 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
         let fleet = load_compose_fleet(ctx, spec)?;
         return compose_unit_media(ctx, &fleet.units[fleet.primary]);
     }
-    match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
+    let job = ctx.job_registry.as_ref();
+    match crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image_ref)? {
         ResolvedImage::Disk { rootfs, config } => Ok(BootPlan {
             media: Media {
                 rootfs,
@@ -1364,8 +1367,9 @@ fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootP
             })
         }
         crate::compose::Source::Image(image) => {
+            let job = ctx.job_registry.as_ref();
             let crate::image::ResolvedImage::Disk { rootfs, config } =
-                crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image)?;
+                crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image)?;
             let config = Some(crate::compose::merged_config(
                 &config.unwrap_or_default(),
                 unit,
@@ -2486,7 +2490,7 @@ fn tools_problem(out: &[u8]) -> Option<String> {
 enum ServiceMedia<'a> {
     Git(&'a str),
     Build,
-    Image,
+    Image(&'a str),
     /// a Windows bundle, which a CI job does not boot
     Bundle,
 }
@@ -2498,7 +2502,7 @@ fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
     match source {
         crate::compose::Source::Image(image) => match image.strip_prefix("dockerfile:") {
             Some(spec) => ServiceMedia::Git(spec),
-            None => ServiceMedia::Image,
+            None => ServiceMedia::Image(image),
         },
         crate::compose::Source::Build { .. } => ServiceMedia::Build,
         crate::compose::Source::Bundle { .. } => ServiceMedia::Bundle,
@@ -2589,14 +2593,14 @@ fn plan_services(
                 guards.push(guard);
                 crate::units::provisioned(&unit, ext4, config, siting(slot, extra_ips))?
             }
-            ServiceMedia::Image => {
-                let prov = crate::units::provision(
-                    &ctx.cfg,
-                    ctx.cfg.state_dir(),
-                    &[],
-                    &unit,
-                    siting(slot, extra_ips),
-                )?;
+            ServiceMedia::Image(image) => {
+                let job = ctx.job_registry.as_ref();
+                let crate::image::ResolvedImage::Disk { rootfs, config } =
+                    crate::pipeline::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), job, image)
+                        .with_context(|| format!("service {}", unit.name))?;
+                let config = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
+                let prov =
+                    crate::units::provisioned(&unit, rootfs, config, siting(slot, extra_ips))?;
                 if let Some(g) =
                     crate::image::acquire_use_lock_for(ctx.cfg.state_dir(), &prov.ext4)?
                 {
@@ -6860,7 +6864,7 @@ mod tests {
         );
         assert_eq!(
             service_media(&Source::Image("alpine:3.21".into())),
-            ServiceMedia::Image
+            ServiceMedia::Image("alpine:3.21")
         );
         // A Windows bundle is a media of its own, which `plan_services` refuses.
         assert_eq!(

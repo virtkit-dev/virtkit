@@ -67,6 +67,7 @@ mod oci;
 mod oomkills;
 mod outrelay;
 mod ova;
+mod pipeline;
 mod prio;
 mod publish;
 mod qcow2;

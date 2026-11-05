@@ -229,6 +229,9 @@
 # token_file = "/etc/virtkit/registry-token"   # static bearer token instead of Basic
 #                                  # (for an Auth::Bearer registry); wins over username
 # insecure = false                 # plain HTTP (a local/insecure registry)
+# pipeline_root = "ci-pipeline"    # the root of the hub's ci-pipeline namespace path on this
+#                                  # registry: a job image naming a repository under it is
+#                                  # refused, pipeline/build/ being the way in
 
 # [docker]               # OCI images booted directly on demand (native OCI client, no
 #                        # docker daemon). MICROVM_IMAGE is `docker/<name>[:tag|@digest]`;
