@@ -508,9 +508,9 @@ async fn an_open_server_checks_no_signature_but_refuses_presigned_and_tokens() {
     send(&host, get("/s3/b/k/deeper"))
         .await
         .is(404, "NoSuchKey");
-    // Listing a bucket is not served yet; listing the buckets is not on an open server.
-    send(&host, get("/s3/b")).await.is(501, "NotImplemented");
-    send(&host, get("/s3/b/")).await.is(501, "NotImplemented");
+    // A bucket that is not there; listing the buckets is not on an open server.
+    send(&host, get("/s3/b")).await.is(404, "NoSuchBucket");
+    send(&host, get("/s3/b/")).await.is(404, "NoSuchBucket");
     send(&host, get("/s3/")).await.is(403, "AccessDenied");
     send(&host, get("/s3")).await.is(403, "AccessDenied");
     send(
@@ -800,6 +800,8 @@ async fn s3_off_is_the_catch_all_404_after_authentication() {
     assert_eq!(off.header("x-amz-request-id"), None);
     assert_eq!(off.body, unknown.body);
     assert_eq!(off.header("content-type"), unknown.header("content-type"));
+    let list = send(&host, Req::new("GET", "/s3/b").query("list-type=2")).await;
+    assert_eq!((list.status, list.body), (404, unknown.body.clone()));
 
     let dir = tmp("off-bearer");
     let (state, _) = shared(
@@ -1298,7 +1300,7 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         Req::new("GET", "/s3/b/k").query("tagging"),
         Req::new("GET", "/s3/b/k").query("partNumber=1"),
         Req::new("POST", "/s3/b/k").query("uploads"),
-        Req::new("GET", "/s3/b").query("list-type=2"),
+        Req::new("GET", "/s3/b").query("versioning"),
         put("/s3/b/copy").header("x-amz-copy-source", "/b/k"),
     ] {
         send(&host, req).await.is(501, "NotImplemented");
@@ -1452,9 +1454,16 @@ async fn api_keys_reach_what_their_scopes_cover() {
     send(&host, as_(&prefix, get("/s3/b/q/y")))
         .await
         .is(403, "AccessDenied");
+    // It may probe the bucket its prefix is in, as clients do before listing, and no other.
     send(&host, as_(&prefix, Req::new("HEAD", "/s3/b")))
         .await
+        .ok(200);
+    send(&host, as_(&prefix, Req::new("HEAD", "/s3/c")))
+        .await
         .ok(403);
+    send(&host, as_(&prefix, get("/s3/b").query("location=")))
+        .await
+        .ok(200);
     // Holding the key's own path but not the bucket it is in: absent, not refused.
     send(&host, as_(&on_key, get("/s3/b/k")))
         .await
@@ -1486,6 +1495,309 @@ async fn api_keys_reach_what_their_scopes_cover() {
     assert!(buckets(&prefix).await.is_empty());
     let resp = send(&host, as_(&writer, get("/s3/"))).await;
     assert!(resp.body.contains("<CreationDate>"), "{}", resp.body);
+
+    // Listings: admitted on the bucket or on the directory the prefix names, and showing
+    // what the key may read.
+    let list = |k: &str, q: &str| {
+        let (k, q, host) = (k.to_string(), q.to_string(), host.clone());
+        async move { send(&host, get("/s3/b").query(&q).signed(&host, (&k, &k), 0)).await }
+    };
+    let resp = list(&prefix, "list-type=2&prefix=p%2F").await;
+    resp.ok(200);
+    assert_eq!(keys(&resp.body), ["p/x"]);
+    assert_eq!(keys(&list(&prefix, "prefix=p%2F").await.body), ["p/x"]);
+    assert_eq!(
+        keys(&list(&prefix, "list-type=2&prefix=p%2Fx").await.body),
+        ["p/x"]
+    );
+    for refused in [
+        "list-type=2",
+        "list-type=2&prefix=p",
+        "list-type=2&prefix=q%2F",
+    ] {
+        list(&prefix, refused).await.is(403, "AccessDenied");
+    }
+    assert_eq!(
+        keys(&list(&bucket_b, "list-type=2").await.body),
+        ["k", "p/x", "q/y"]
+    );
+    let resp = list(&writer, "delimiter=%2F&list-type=2").await;
+    assert_eq!(keys(&resp.body), ["k"]);
+    assert_eq!(prefixes(&resp.body), ["p/", "q/"]);
+    send(&host, as_(&writer, get("/s3/none").query("list-type=2")))
+        .await
+        .is(404, "NoSuchBucket");
+
+    // A tag in the prefix whose bytes only bucket `c` holds: listed to a key that may read
+    // them there, absent to the others, as a read of it is.
+    send(
+        &host,
+        as_(&writer, put("/s3/c/secret").body(b"only in c".to_vec())),
+    )
+    .await
+    .ok(200);
+    let resp = send(
+        &host,
+        get("/v2/files/c/manifests/secret").header("Authorization", &format!("Bearer {writer}")),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    state
+        .store
+        .put_manifest("files/b/p", "stolen", MANIFEST_TYPE, &resp.bytes)
+        .unwrap();
+    assert_eq!(
+        keys(&list(&writer, "list-type=2&prefix=p%2F").await.body),
+        ["p/stolen", "p/x"]
+    );
+    assert_eq!(
+        keys(&list(&prefix, "list-type=2&prefix=p%2F").await.body),
+        ["p/x"]
+    );
+    assert_eq!(
+        keys(&list(&bucket_b, "list-type=2").await.body),
+        ["k", "p/x", "q/y"]
+    );
+    send(&host, as_(&prefix, get("/s3/b/p/stolen")))
+        .await
+        .is(404, "NoSuchKey");
+}
+
+/// The text of each `<name>` element of a document, in order.
+fn elements(body: &str, name: &str) -> Vec<String> {
+    let open = format!("<{name}>");
+    body.split(&open)
+        .skip(1)
+        .map(|s| s.split(&format!("</{name}>")).next().unwrap().to_string())
+        .collect()
+}
+
+/// A listing's keys.
+fn keys(body: &str) -> Vec<String> {
+    elements(body, "Key")
+}
+
+/// A listing's common prefixes.
+fn prefixes(body: &str) -> Vec<String> {
+    elements(body, "CommonPrefixes")
+        .iter()
+        .flat_map(|p| elements(p, "Prefix"))
+        .collect()
+}
+
+/// The text of a document's one `<name>` element.
+#[track_caller]
+fn element(body: &str, name: &str) -> String {
+    let all = elements(body, name);
+    assert_eq!(all.len(), 1, "{name} in {body}");
+    all.into_iter().next().unwrap()
+}
+
+/// What `sccache` leaves in its bucket, sharded `a/b/c/<key>`, listed the ways the AWS CLI
+/// and rclone list it: whole, by directory, by pages of two, and by the first version's
+/// markers.
+async fn sharded_listing(host: &str, sign: Sign<'_>) {
+    let mut written: Vec<String> = [".sccache_check"].map(String::from).to_vec();
+    for i in 0..6u8 {
+        let hex = sha256_hex(&[i]);
+        let (a, b, c) = (&hex[..1], &hex[1..2], &hex[2..3]);
+        written.push(format!("ci/{a}/{b}/{c}/{hex}"));
+    }
+    for key in &written {
+        let put = Req::new("PUT", &format!("/s3/sccache/{key}")).body(key.as_bytes().to_vec());
+        send(host, sign(put)).await.ok(200);
+    }
+    written.sort();
+    let list = |q: &str| sign(Req::new("GET", "/s3/sccache").query(q));
+
+    let resp = send(host, list("list-type=2")).await;
+    resp.ok(200);
+    assert_eq!(resp.header("content-type"), Some("application/xml"));
+    assert!(
+        resp.body.starts_with(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>sccache</Name><Prefix></Prefix><MaxKeys>1000</MaxKeys><KeyCount>7</KeyCount>\
+             <IsTruncated>false</IsTruncated><Contents>"
+        ),
+        "{}",
+        resp.body
+    );
+    assert_eq!(keys(&resp.body), written);
+    assert_eq!(
+        elements(&resp.body, "ETag").first().unwrap(),
+        &format!("&quot;{}&quot;", md5_hex(b".sccache_check"))
+    );
+    assert_eq!(elements(&resp.body, "Size").first().unwrap(), "14");
+    let modified = elements(&resp.body, "LastModified");
+    assert!(
+        modified
+            .iter()
+            .all(|m| m.len() == 24 && m.ends_with(".000Z")),
+        "{modified:?}"
+    );
+    assert_eq!(elements(&resp.body, "StorageClass").len(), 7);
+    assert!(!resp.body.contains("<Owner>"));
+
+    // By directory, as `aws s3 ls` and rclone walk it.
+    let resp = send(host, list("delimiter=%2F&list-type=2")).await;
+    assert_eq!(keys(&resp.body), [".sccache_check"]);
+    assert_eq!(prefixes(&resp.body), ["ci/"]);
+    assert_eq!(element(&resp.body, "KeyCount"), "2");
+    let first = &written[1];
+    let shard = format!("ci/{}/", &first[3..4]);
+    let resp = send(
+        host,
+        list(&format!(
+            "delimiter=%2F&list-type=2&prefix={}",
+            shard.replace('/', "%2F")
+        )),
+    )
+    .await;
+    assert!(keys(&resp.body).is_empty());
+    assert!(
+        prefixes(&resp.body)
+            .iter()
+            .all(|p| p.starts_with(&shard) && p.len() == shard.len() + 2),
+        "{}",
+        resp.body
+    );
+    assert_eq!(element(&resp.body, "Delimiter"), "/");
+
+    // By pages of two: each token resumes where the last page ended.
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let q = match &token {
+            Some(t) => format!("continuation-token={t}&list-type=2&max-keys=2"),
+            None => "list-type=2&max-keys=2".to_string(),
+        };
+        let resp = send(host, list(&q)).await;
+        resp.ok(200);
+        pages += 1;
+        let page = keys(&resp.body);
+        assert_eq!(element(&resp.body, "KeyCount"), page.len().to_string());
+        assert_eq!(element(&resp.body, "MaxKeys"), "2");
+        if let Some(t) = &token {
+            assert_eq!(&element(&resp.body, "ContinuationToken"), t);
+        }
+        seen.extend(page);
+        if element(&resp.body, "IsTruncated") == "false" {
+            assert!(!resp.body.contains("NextContinuationToken"));
+            break;
+        }
+        token = Some(element(&resp.body, "NextContinuationToken"));
+    }
+    assert_eq!((pages, seen.as_slice()), (4, written.as_slice()));
+
+    // The first version: markers, and every object's owner.
+    let mut seen = Vec::new();
+    let mut marker = String::new();
+    loop {
+        let q = if marker.is_empty() {
+            "max-keys=3".to_string()
+        } else {
+            format!("marker={}&max-keys=3", marker.replace('/', "%2F"))
+        };
+        let resp = send(host, list(&q)).await;
+        resp.ok(200);
+        assert_eq!(element(&resp.body, "Marker"), marker);
+        assert!(!resp.body.contains("KeyCount"));
+        let page = keys(&resp.body);
+        assert_eq!(elements(&resp.body, "Owner").len(), page.len());
+        seen.extend(page);
+        if element(&resp.body, "IsTruncated") == "false" {
+            break;
+        }
+        marker = element(&resp.body, "NextMarker");
+        assert_eq!(&marker, seen.last().unwrap());
+    }
+    assert_eq!(seen, written);
+
+    // The other parameters.
+    let start = &written[3];
+    let resp = send(
+        host,
+        list(&format!(
+            "list-type=2&start-after={}",
+            start.replace('/', "%2F")
+        )),
+    )
+    .await;
+    assert_eq!(keys(&resp.body), &written[4..]);
+    assert_eq!(&element(&resp.body, "StartAfter"), start);
+    let resp = send(host, list("fetch-owner=true&list-type=2&max-keys=1")).await;
+    assert!(
+        resp.body.contains(
+            "<Size>14</Size><Owner><ID>vk-registry</ID><DisplayName>vk-registry</DisplayName>\
+             </Owner><StorageClass>STANDARD</StorageClass>"
+        ),
+        "{}",
+        resp.body
+    );
+    let resp = send(host, list("list-type=2&max-keys=0")).await;
+    assert!(keys(&resp.body).is_empty());
+    assert_eq!(element(&resp.body, "IsTruncated"), "false");
+    assert_eq!(element(&resp.body, "KeyCount"), "0");
+    let resp = send(host, list("list-type=2&max-keys=5000")).await;
+    assert_eq!(element(&resp.body, "MaxKeys"), "1000");
+    let resp = send(
+        host,
+        list("delimiter=%2F&encoding-type=url&list-type=2&prefix=x%20y"),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(element(&resp.body, "Prefix"), "x%20y");
+    assert_eq!(element(&resp.body, "EncodingType"), "url");
+    let resp = send(host, list("encoding-type=url&list-type=2&max-keys=1")).await;
+    assert_eq!(keys(&resp.body), [".sccache_check"]);
+
+    // Refused: a token this registry did not give, a malformed parameter.
+    for bad in [
+        "continuation-token=bm90IGEga2V5&list-type=2",
+        "continuation-token=%21%21&list-type=2",
+        "list-type=2&max-keys=-1",
+        "encoding-type=base64&list-type=2",
+        "list-type=3",
+    ] {
+        send(host, list(bad)).await.is(400, "InvalidArgument");
+    }
+    send(host, sign(Req::new("GET", "/s3/none").query("list-type=2")))
+        .await
+        .is(404, "NoSuchBucket");
+    // A query naming something else is not a listing.
+    send(host, list("acl=")).await.is(501, "NotImplemented");
+    send(host, list("acl=&list-type=2"))
+        .await
+        .is(501, "NotImplemented");
+}
+
+#[tokio::test]
+async fn a_sharded_bucket_lists_on_an_open_server() {
+    let dir = tmp("list-open");
+    let host = spawn(open_state(&dir, true));
+    sharded_listing(&host, &|r| r).await;
+}
+
+#[tokio::test]
+async fn a_sharded_bucket_lists_with_an_api_key() {
+    let dir = tmp("list-accounts");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let scopes = [Scope {
+        action: Action::Write,
+        repo_pattern: "files/*".to_string(),
+    }];
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "s3", &scopes, None)
+        .unwrap();
+    let host = spawn(state.clone());
+    let signed = |r: Req| r.signed(&host, (&key, &key), 0);
+    sharded_listing(&host, &signed).await;
 }
 
 /// A hub token's grants cover `files/<prefix>`.
@@ -1513,6 +1825,23 @@ async fn a_hub_token_writes_and_reads_below_its_grant() {
         &send(&host, as_token(Req::new("GET", "/s3/p/gl/42/k"))).await,
         HELLO,
     );
+    // The bucket its grant is in, probed and listed down its grant.
+    send(&host, as_token(Req::new("HEAD", "/s3/p")))
+        .await
+        .ok(200);
+    let resp = send(
+        &host,
+        as_token(Req::new("GET", "/s3/p").query("list-type=2&prefix=gl%2F42%2F")),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(keys(&resp.body), ["gl/42/k"]);
+    send(
+        &host,
+        as_token(Req::new("GET", "/s3/p").query("list-type=2")),
+    )
+    .await
+    .is(403, "AccessDenied");
     send(
         &host,
         as_token(Req::new("PUT", "/s3/p/gl/43/k").body(HELLO.to_vec())),

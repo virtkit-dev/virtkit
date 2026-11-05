@@ -619,8 +619,16 @@ a read `Read` on the repository the key resolves to, and a `DELETE` `Write` ther
 holding the action on neither the key's own name nor its parent's is 403 `AccessDenied` before
 anything is looked up, and what it may not read is otherwise absent (`NoSuchKey`). A write
 refused over a clash answers 409 and so reveals that the name exists, as WebDAV's does. A
-bucket authorizes as `files/<bucket>`. Listing the buckets needs a configured credential, as
-`/dav/`'s root listing does, and shows only those the caller may read.
+bucket authorizes as `files/<bucket>`, except that HeadBucket and GetBucketLocation also
+admit a caller that may read only a directory inside it, which clients probe before listing
+the prefix they were given. Listing the buckets needs a configured credential, as `/dav/`'s
+root listing does, and shows only those the caller may read. Listing a bucket's objects is
+admitted when the caller may read the bucket or the directory the prefix's whole components
+name (`prefix=proj/` for a `read:files/team/proj/*` key over bucket `team`; `prefix=proj`
+names no directory and is refused), and shows only what a read would serve: a directory the
+caller may not read is passed over with everything below it, as `PROPFIND` passes it over,
+and neither a foreign tag nor an object whose bytes the caller may not read through it is
+listed.
 
 **Objects are bytes.** Every object is served `application/octet-stream`,
 `Content-Disposition: attachment` and `nosniff`, whatever its writer sent: a `Content-Type`
@@ -639,10 +647,23 @@ reads; a replaced object keeps only what its own write sent.
 | `GET`, `HEAD /s3/<b>/<k>` GetObject, HeadObject | 200 with the bytes, `ETag`, `Last-Modified` from the tag, `Content-Length` and the metadata; `x-amz-checksum-sha256` (the store's digest, base64) with `x-amz-checksum-mode: ENABLED`. `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since` in RFC 9110's order: 412 `PreconditionFailed`, or 304 with the `ETag`. `Range` is ignored and no `Accept-Ranges` is sent: a whole 200 is a legal answer. A directory, a foreign tag or a missing key is 404 `NoSuchKey`. A `GET` refreshes an idle tag as WebDAV's does; a `HEAD` touches nothing |
 | `GET /s3/<b>/<k>?attributes` GetObjectAttributes | 200 `GetObjectAttributesResponse` with what `x-amz-object-attributes` names of `ETag`, `Checksum` (SHA-256), `StorageClass` (`STANDARD`) and `ObjectSize`, and `Last-Modified`; 400 `InvalidArgument` without the header; touches nothing |
 | `DELETE /s3/<b>/<k>` DeleteObject | 204 whether or not the key held an object, as S3 answers, and for a key that is a directory, which holds no object to delete; 409 `OperationAborted` for a foreign tag; 403 when the caller may read the object but not write it |
-| `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 without `Read` on `files/<b>` |
+| `GET /s3/<b>?list-type=2` ListObjectsV2 | `ListBucketResult` with `KeyCount`, the keys starting with `prefix` (any text, which may end inside a component), each with `Key`, `LastModified`, `ETag` (as HeadObject's), `Size` and `StorageClass` `STANDARD`, and `Owner` `vk-registry` with `fetch-owner=true`. Keys come in byte order of the whole key, the order S3 lists in: a directory's keys all start with `<name>/`, so tag `a-b` and `a.b` come before the keys below directory `a`, and those before tag `a_b`. `delimiter` (any text) folds every key past the prefix holding it into a `CommonPrefixes` entry ending at its first occurrence; a directory folded so is not walked, and an empty one is listed as a prefix, as WebDAV shows it. `max-keys` defaults to 1000 and is clamped to it; `0` is an empty, complete page. `NextContinuationToken` names the page's last entry; a `continuation-token` or `start-after` resumes after it, a common prefix included (a start key inside a folded prefix passes over it). `encoding-type=url` percent-encodes keys, prefixes, the delimiter and `StartAfter`. 400 `InvalidArgument` for a token this registry did not give or a malformed parameter; 404 `NoSuchBucket`; 403 `AccessDenied` past the admission rule above. Touches nothing |
+| `GET /s3/<b>` ListObjects | the first version of the same listing: `marker` for `start-after`, `Marker` and, on a truncated page, `NextMarker` in the answer, no `KeyCount`, and every object's `Owner` |
+| `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 when the caller may read neither `files/<b>` nor anything below it |
 | `GET /s3/<b>?location` GetBucketLocation | the region the request was signed for, which is any the client chose, or an empty `LocationConstraint` for an unsigned request; after HeadBucket's checks |
 | `GET /s3/` ListBuckets | `ListAllMyBucketsResult`: the readable top-level directories, each dated by its directory's mtime, and the owner `vk-registry`; 403 `AccessDenied` on a server with no credential |
-| anything else | 501 `NotImplemented`: listing a bucket's objects, creating and deleting buckets, copies, batch deletes, multipart uploads, `aws-chunked` bodies (`STREAMING-*` payloads, `Content-Encoding: aws-chunked`), tagging, ACLs, versioning and every other subresource; an SDK's `x-id` operation hint is ignored |
+| anything else | 501 `NotImplemented`: creating and deleting buckets, copies, batch deletes, multipart uploads, `aws-chunked` bodies (`STREAMING-*` payloads, `Content-Encoding: aws-chunked`), tagging, ACLs, versioning and every other subresource; an SDK's `x-id` operation hint is ignored |
+
+**A listing's cost** is bounded by its page. The walk runs on the blocking pool, starts at the
+directory the prefix's whole components name, lists each directory it enters once (its
+subdirectories and tags), and stops one entry past `max-keys`, to know whether the page is
+truncated; memory is the page and a directory listing per level. A resumed page passes over
+every subtree that sorts before its resume point unread, so it costs the directories on the
+way down to that point plus the page, however deep into the bucket it is. Each key listed
+costs a manifest read and a membership `stat`, as a `PROPFIND` entry does: about a thousand
+small reads for a full page. A listing with `delimiter=/` never walks below the level it
+lists; one without a delimiter over a sharded `sccache` directory walks its thousands of
+repositories across its pages (see "Operational constraints and deferred work").
 
 **`LastModified` moves on reads**, as `getlastmodified` does over WebDAV: a `GET` refreshes
 the tag's mtime once it is an hour old, which is what keeps a hot cache entry from the gc's
@@ -916,7 +937,7 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   marker and the pool's manifest and layer blobs, the last two shared with identical
   entries. Everything that walks every repository name pays for those directories: a
   membership miss on `/v2/` (`readable_through`), a `/dav/repos/` prefix lookup or listing,
-  `/browse`, `status` and `gc`.
+  an S3 listing of such a directory without a delimiter, `/browse`, `status` and `gc`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
   "WebDAV view"). A key reaches exactly the same content over `/v2/`, `/dav/` and `/s3/`.

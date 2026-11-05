@@ -1,14 +1,14 @@
 //! The service and its buckets: ListBuckets, HeadBucket and GetBucketLocation. A bucket is a
 //! top-level directory of `files/`, authorized as the repository `files/<bucket>`; one the
-//! caller may not read is absent to it, as in the WebDAV view.
+//! caller may read nothing in is absent to it, as in the WebDAV view.
 
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH};
 use hyper::{Request, Response, StatusCode};
 
 use super::{Ctx, refuse, sigv4, xml};
-use crate::files::{FILES_REPO, allowed};
-use crate::{Authz, Body, ServerState, accounts, body_of};
+use crate::files::FILES_REPO;
+use crate::{Authz, Body, ServerState, body_of};
 
 /// The owner every listing names: the registry, whoever wrote what it holds.
 pub(super) const OWNER: &str = "vk-registry";
@@ -64,8 +64,9 @@ pub(super) async fn list(
 }
 
 /// Whether `bucket` is there for this caller: `Err` with the answer when it is not — 403 when
-/// the caller may not read the bucket at all, 404 `NoSuchBucket` when it may but no such
-/// directory exists.
+/// the caller may read nothing in the bucket, 404 `NoSuchBucket` when it may but no such
+/// directory exists. A caller that may read only a directory inside the bucket passes, since
+/// clients probe the bucket before they list the prefix they were given.
 async fn check(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -73,7 +74,7 @@ async fn check(
     ctx: &Ctx,
 ) -> anyhow::Result<Option<Response<Body>>> {
     let repo = format!("{FILES_REPO}/{bucket}");
-    if !allowed(authz, accounts::Action::Read, &repo) {
+    if !authz.may_read_below(&repo) {
         return Ok(Some(ctx.access_denied()));
     }
     let store = std::sync::Arc::clone(&state.store);

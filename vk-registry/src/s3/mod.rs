@@ -8,11 +8,12 @@
 //!
 //! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
 //! one, served over the object layer the WebDAV view shares ([`crate::files`]): [`bucket`]
-//! answers the service and its buckets, [`object`] the objects. Operations not served yet
-//! answer `NotImplemented`.
+//! answers the service and its buckets, [`list`] a bucket's listings, [`object`] the
+//! objects. Operations not served yet answer `NotImplemented`.
 
 mod bucket;
 mod conditional;
+mod list;
 mod meta;
 mod object;
 mod path;
@@ -227,6 +228,9 @@ async fn operate(
         }
         (path::Target::Bucket(b), &Method::GET, Some("location")) => {
             bucket::location(state, authz, b, req, ctx).await
+        }
+        (path::Target::Bucket(b), &Method::GET, _) if list::is_listing(&query) => {
+            list::list(state, authz, b, &query, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::GET | &Method::HEAD, None) => {
             object::get(state, authz, segs, method == Method::HEAD, req, ctx).await

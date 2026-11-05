@@ -5331,6 +5331,34 @@ impl Authz<'_> {
         self.may(accounts::Action::Read, repo)
     }
 
+    /// Whether this caller may read `repo` or a repository below it: what a probe of a
+    /// directory needs, whose contents the caller may see only part of. A scope or grant
+    /// reaches below `repo` when what it covers starts there.
+    fn may_read_below(&self, repo: &str) -> bool {
+        use vk_hub_proto::token::under;
+        if self.may_read(repo) {
+            return true;
+        }
+        match self {
+            Authz::NoScopes => true,
+            Authz::Accounts(accounts::Principal::Session(_)) => false,
+            // Either action reads; `*` and every pattern above `repo` passed `may_read`.
+            Authz::Accounts(accounts::Principal::ApiKey(key)) => key.scopes.iter().any(|s| {
+                let root = s.repo_pattern.strip_suffix("/*").unwrap_or(&s.repo_pattern);
+                under(repo, root)
+            }),
+            // A grant covers `<prefix>` and `files/<prefix>`, as `Claims::allows_repo` reads it.
+            Authz::Token(claims) => claims.grants.iter().any(|g| {
+                g.read
+                    && (under(repo, &g.prefix)
+                        || repo
+                            .strip_prefix(files::FILES_REPO)
+                            .and_then(|r| r.strip_prefix('/'))
+                            .is_some_and(|r| under(r, &g.prefix)))
+            }),
+        }
+    }
+
     /// Whether this caller may do `action` on `repo`.
     fn may(&self, action: accounts::Action, repo: &str) -> bool {
         match self {
@@ -10009,6 +10037,60 @@ mod tests {
         assert!(store.repo_has_blob("p/gl/42/app", &hex));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller may read below a repository when it may read the repository, or when a
+    /// scope or grant covers something that starts below it, cut at a component.
+    #[test]
+    fn reading_below_a_repository_follows_what_scopes_and_grants_cover() {
+        let key = |scopes: &[(accounts::Action, &str)]| {
+            accounts::Principal::ApiKey(accounts::ApiKey {
+                id: "hash".to_string(),
+                owner_user_id: None,
+                name: "k".to_string(),
+                token_prefix: "0123abcd".to_string(),
+                scopes: scopes
+                    .iter()
+                    .map(|(action, pattern)| accounts::Scope {
+                        action: *action,
+                        repo_pattern: pattern.to_string(),
+                    })
+                    .collect(),
+                created_at: SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+            })
+        };
+        let read = accounts::Action::Read;
+        let prefix = key(&[(read, "files/b/p/*")]);
+        let authz = Authz::Accounts(&prefix);
+        assert!(authz.may_read_below("files/b"));
+        assert!(authz.may_read_below("files"));
+        assert!(authz.may_read_below("files/b/p"));
+        assert!(authz.may_read_below("files/b/p/q"));
+        assert!(!authz.may_read("files/b"));
+        assert!(!authz.may_read_below("files/c"));
+        assert!(!authz.may_read_below("files/bb"));
+        assert!(!authz.may_read_below("files/b/pp"));
+        let exact = key(&[(accounts::Action::Write, "files/b/p")]);
+        assert!(Authz::Accounts(&exact).may_read_below("files/b"));
+        assert!(!Authz::Accounts(&exact).may_read_below("files/b/p/q"));
+        let any = key(&[(read, "*")]);
+        assert!(Authz::Accounts(&any).may_read_below("files/x"));
+        let none = key(&[]);
+        assert!(!Authz::Accounts(&none).may_read_below("files/b"));
+        assert!(Authz::NoScopes.may_read_below("files/b"));
+
+        let c = claims(&[("b/p", "r"), ("w/only", "w"), ("images", "r")]);
+        let authz = Authz::Token(&c);
+        assert!(authz.may_read_below("files/b"));
+        assert!(authz.may_read_below("files/b/p/q"));
+        assert!(authz.may_read_below("b"));
+        assert!(authz.may_read_below("files/images"));
+        assert!(!authz.may_read_below("files/w"));
+        assert!(!authz.may_read_below("files/bp"));
+        assert!(!authz.may_read_below("files/c"));
     }
 
     /// A prefix's window drops its idle tags well inside the store-wide one, and holds a far
