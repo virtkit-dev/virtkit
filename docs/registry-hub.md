@@ -695,6 +695,9 @@ though within them it can claim protection.
   entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
   `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
   in `key_prefix`, so it never creates `/dav/files/job/` itself). Neither holds a credential.
+- **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
+  a namespace may give chosen refs a scope of their own: see the
+  [build caches design](build-cache-design.md).
 
 ### 4c: pipeline caches and captures
 
