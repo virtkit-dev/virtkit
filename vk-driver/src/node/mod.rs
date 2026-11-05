@@ -805,6 +805,17 @@ pub fn claim_tuning(cfg: &Config) -> Result<Option<TuneClaim>> {
     Err(e).with_context(|| format!("probing {}", path.display()))
 }
 
+/// Whether this node caches placed jobs' builds by scope: at the build prefix the hub gives
+/// each job, with the job's token, or not at all, and never in `[build] cache_registry`. It
+/// announces so (`job_build_cache`) and the hub then sends the prefix.
+///
+/// Not yet: build-once locks and failure memos, the local tier and Windows builds still use
+/// names and storage shared across scopes. Once they do, this holds when the guest's proxy
+/// never lends the node's own credential, which would reach every scope.
+pub fn caches_jobs_by_scope(_cfg: &Config) -> bool {
+    false
+}
+
 /// Last persisted hub concurrency ceiling, or `None` without a fleet enrollment or when the
 /// state belongs to another enrollment. The next `vk node run` forgets that old ceiling.
 pub fn hub_ceiling(cfg: &Config) -> Result<Option<u32>> {

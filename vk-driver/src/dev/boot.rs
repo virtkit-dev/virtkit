@@ -1463,8 +1463,11 @@ mod tests {
         )
         .unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));
-        assert_eq!(opts.cache_registry.as_deref(), Some("127.0.0.1:5000/cache"));
-        assert!(opts.cache_insecure);
+        assert_eq!(
+            opts.cache.configured().registry.as_deref(),
+            Some("127.0.0.1:5000/cache")
+        );
+        assert!(opts.cache.configured().insecure);
 
         // Saying nothing falls through to `[build]`, the same answer `vk run` gets, with the
         // credentials that destination needs — not the local store nothing else reads.
@@ -1482,10 +1485,10 @@ mod tests {
         .unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));
         assert_eq!(
-            opts.cache_registry.as_deref(),
+            opts.cache.configured().registry.as_deref(),
             Some("registry.example/cache")
         );
-        assert_eq!(opts.cache_auth.username, "ci");
+        assert_eq!(opts.cache.configured().auth.username, "ci");
     }
 
     #[test]
@@ -1743,8 +1746,11 @@ mod tests {
         )
         .unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));
-        assert_eq!(opts.cache_registry.as_deref(), Some("127.0.0.1:5000/cache"));
-        assert!(opts.cache_insecure);
+        assert_eq!(
+            opts.cache.configured().registry.as_deref(),
+            Some("127.0.0.1:5000/cache")
+        );
+        assert!(opts.cache.configured().insecure);
 
         // The command line is the last word, over what the config says.
         let over = Overrides {
@@ -1754,9 +1760,12 @@ mod tests {
         };
         let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));
-        assert_eq!(opts.cache_registry.as_deref(), Some("/var/cache/vk"));
+        assert_eq!(
+            opts.cache.configured().registry.as_deref(),
+            Some("/var/cache/vk")
+        );
         // …and only over what it speaks about: the config still asked for plain HTTP.
-        assert!(opts.cache_insecure);
+        assert!(opts.cache.configured().insecure);
     }
 
     #[test]

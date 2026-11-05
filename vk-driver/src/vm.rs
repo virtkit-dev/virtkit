@@ -900,7 +900,7 @@ pub(crate) fn build_image_sources(
     )
     .context("computing the image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
-    let cache = crate::build::CacheOpts::from_config(&cfg.build);
+    let cache = job_cache_dest(ctx);
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,
         contexts,
@@ -908,9 +908,7 @@ pub(crate) fn build_image_sources(
         build_args,
         kernel: cfg.build.kernel.clone(),
         agent: cfg.build.agent.clone(),
-        cache_registry: cache.registry,
-        cache_insecure: cache.insecure,
-        cache_auth: cache.auth,
+        cache,
         net,
         audit,
         record: build_record(ctx, service.as_deref())?,
@@ -1452,16 +1450,14 @@ fn build_compose_unit(
     // A compose `build:` service's RUN egress is the build phase — same `[egress.build]`
     // policy and audit as the git-defined primary.
     let (net, audit) = effective_build_egress(cfg, ctx)?;
-    let cache = crate::build::CacheOpts::from_config(&cfg.build);
+    let cache = job_cache_dest(ctx);
     let build = crate::units::BuildOpts {
         // A compose unit's build args are its own (compose file / `.env`); there is no
         // executor-global build-arg channel.
         build_args: vec![],
         kernel: kernel.path.clone(),
         agent: agent.path.clone(),
-        cache_registry: cache.registry,
-        cache_insecure: cache.insecure,
-        cache_auth: cache.auth,
+        cache,
         net,
         audit,
         record: build_record(ctx, Some(&unit.name))?,
@@ -3106,6 +3102,34 @@ fn build_record(ctx: &JobCtx, service: Option<&str>) -> Result<Option<crate::bui
         hub,
     }))
 }
+
+/// Where this job's builds cache ([`JobCtx::cache_dest`]). When the cache is off, the job's
+/// trace says why, once ([`first_cache_off`]).
+fn job_cache_dest(ctx: &JobCtx) -> crate::build::CacheDest {
+    let (dest, why) = ctx.cache_dest();
+    if let Some(why) = why
+        && first_cache_off(&ctx.job_dir)
+    {
+        println!("virtkit: building with no build cache: {why}");
+    }
+    dest
+}
+
+/// Whether to report why build caching is off for `job_dir`. A marker suppresses repeats
+/// across builds and commands; failure to create it reports each time.
+fn first_cache_off(job_dir: &Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(job_dir.join(BUILD_CACHE_OFF))
+    {
+        Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
+        Ok(_) => true,
+    }
+}
+
+/// In a job dir: [`job_cache_dest`] has said why the job's build cache is off.
+const BUILD_CACHE_OFF: &str = "build-cache-off";
 
 /// This job's build-phase egress ([`crate::build::BuildNet`]) plus its build-audit flag: the
 /// `[egress.build]` cap and the job's own `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME`, each
@@ -4856,6 +4880,19 @@ fn log_tail(path: &Path, lines: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job says why its build cache is off once, whatever builds follow.
+    #[test]
+    fn a_job_says_once_why_its_build_cache_is_off() {
+        let dir = std::env::temp_dir().join(format!("vk-cache-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(first_cache_off(&dir));
+        assert!(!first_cache_off(&dir));
+        // No job dir to mark: said each time rather than never.
+        assert!(first_cache_off(&dir.join("absent")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     use crate::config::Config;
     use crate::jobctx::JobCtx;

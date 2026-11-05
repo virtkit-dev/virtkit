@@ -254,6 +254,11 @@ isolation does not hold, as for builds. sccache takes an area the same way.
 - **Merge-request pipelines.** What `git_info.ref` holds there (the source branch, or
   `refs/merge-requests/<iid>/head`) decides whether an MR pipeline of an isolated branch
   shares its cache. To check against GitLab in step 7.
+- **Pulled images through the relay.** A job's `docker:` image pulls still relay through
+  `[build] cache_registry` with `[build]`'s credentials (`dockerimg.rs` `relay_target`). The
+  relay caches upstream images by their reference, with the registry's own upstream
+  credentials where it has any, so a job can pull through it what those reach. That is not a
+  project's builds and is left out of the scope here; it needs its own change.
 - **Pulled images by digest.** A node reuses a pulled bundle found by digest without asking
   the registry (`registry.rs`), whatever repository the reference names: a job could boot an
   image another project pulled on the same node. This predates build caches and is not

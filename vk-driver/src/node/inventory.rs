@@ -92,8 +92,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
         job_tokens: true,
         // Its guest registry proxy maps `job/<alias>` to the job's areas.
         registry_areas: true,
-        // Its builds still use its own shared cache for placed jobs.
-        job_build_cache: false,
+        job_build_cache: super::caches_jobs_by_scope(cfg),
         // Each placed job's result carries its egress report.
         egress_reports: true,
         // A placed job's start may carry the hub's egress layer, which its switches enforce in

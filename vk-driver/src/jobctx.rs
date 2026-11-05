@@ -350,6 +350,18 @@ impl JobCtx {
             .with_context(|| format!("writing {}", path.display()))
     }
 
+    /// This job's build-cache destination and reason when disabled, under the node's config
+    /// ([`cache_dest`]).
+    pub fn cache_dest(&self) -> (crate::build::CacheDest, Option<String>) {
+        cache_dest(
+            &self.cfg,
+            self.hub_placed,
+            self.job_registry.as_ref(),
+            crate::node::caches_jobs_by_scope(&self.cfg),
+            vk_peer::now_secs(),
+        )
+    }
+
     /// The root every `[executor] host_checkout` tree on this host lives under — the unit the idle
     /// checkout sweep walks. `[executor] checkout_dir` (e.g. the RAM-backed /builds tmpfs) puts it
     /// in a private subtree there, so the clone and the job's writes stay in host RAM without
@@ -810,6 +822,53 @@ pub(crate) fn pipeline_identity() -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+/// The job's cache destination at `now`, and the reason when disabled:
+/// - jobs not placed by a hub, or on nodes without scoped caching (`by_scope`), use
+///   `[build] cache_registry`;
+/// - placed jobs on nodes with scoped caching use their build prefix and token on the
+///   node's registry, or no cache. Missing inputs never fall back to the shared cache.
+///
+/// The token is checked once, here: the hub has it live for the job's timeout and 15 minutes
+/// more, so it outlasts the job's builds unless `max_job_token_secs` cuts it shorter; a build
+/// past its expiry, and the registry's 60 s of skew, then fails its cache requests.
+fn cache_dest(
+    cfg: &Config,
+    hub_placed: bool,
+    registry: Option<&vk_hub_proto::dispatch::JobRegistry>,
+    by_scope: bool,
+    now: u64,
+) -> (crate::build::CacheDest, Option<String>) {
+    use crate::build::CacheDest;
+    if !hub_placed || !by_scope {
+        return (
+            CacheDest::Configured(crate::build::CacheOpts::from_config(&cfg.build)),
+            None,
+        );
+    }
+    let off = |why: &str| (CacheDest::Off, Some(why.to_string()));
+    let Some(registry) = registry else {
+        return off("the hub gave this job no registry token");
+    };
+    let Some(prefix) = registry.build_prefix.as_deref() else {
+        return off(
+            "the hub gave this job no build cache: its registry has no ci-build namespace for it",
+        );
+    };
+    if !vk_hub_proto::token::valid_prefix(prefix) {
+        return off("the hub named a build cache that is not a repository name");
+    }
+    if now >= registry.expires_at {
+        return off("the job's registry token has expired");
+    }
+    let Some(rg) = cfg.registry.as_ref() else {
+        return off("this node has no [registry]");
+    };
+    match crate::registry::at_path(rg, prefix, Some(&registry.token)) {
+        Some(rg) => (CacheDest::Scoped(rg), None),
+        None => off("this node's [registry] is not a remote registry"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,6 +1148,71 @@ mod tests {
         }
         // Two names that reduce alike keep distinct components, which is what the digest is for.
         assert_ne!(job_component("deploy:prod"), job_component("deploy prod"));
+    }
+
+    /// A placed job on a node caching by scope builds at its prefix with its token, or with no
+    /// cache, never in `[build] cache_registry`; any other job takes `[build] cache_registry`.
+    #[test]
+    fn a_placed_jobs_builds_cache_at_its_prefix_or_nowhere() {
+        use crate::build::CacheDest;
+        use vk_hub_proto::dispatch::JobRegistry;
+        let cfg: Config = toml::from_str(
+            "state_dir = \"/s\"\n[build]\ncache_registry = \"cache.example/shared\"\n\
+             [registry]\nrepo = \"reg.example/node\"\n",
+        )
+        .unwrap();
+        let job = JobRegistry {
+            registry_id: "r".into(),
+            token: "vkt_x.y".into(),
+            expires_at: 100,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+            areas: vec![],
+            build_prefix: Some("ci-build/gl/42/protected/all".into()),
+        };
+        let configured = |d: &CacheDest| match d {
+            CacheDest::Configured(c) => c.registry.clone(),
+            other => panic!("{other:?}"),
+        };
+        // Not placed, or not caching by scope: the shared cache.
+        for (placed, by_scope) in [(false, true), (true, false), (false, false)] {
+            let (dest, why) = cache_dest(&cfg, placed, Some(&job), by_scope, 1);
+            assert_eq!(configured(&dest).as_deref(), Some("cache.example/shared"));
+            assert_eq!(why, None);
+        }
+        // Placed, by scope: the job's prefix, with its token.
+        let (dest, why) = cache_dest(&cfg, true, Some(&job), true, 1);
+        let CacheDest::Scoped(rg) = dest else {
+            panic!("{dest:?}")
+        };
+        assert_eq!(rg.repo, "reg.example/ci-build/gl/42/protected/all");
+        assert_eq!(rg.job_token.as_ref().map(|t| t.0.as_str()), Some("vkt_x.y"));
+        assert_eq!(why, None);
+        // Anything missing turns the cache off, saying why.
+        let bad_prefix = JobRegistry {
+            build_prefix: Some("../x".into()),
+            ..job.clone()
+        };
+        let no_prefix = JobRegistry {
+            build_prefix: None,
+            ..job.clone()
+        };
+        let local: Config =
+            toml::from_str("state_dir = \"/s\"\n[registry]\nrepo = \"/srv/store\"\n").unwrap();
+        let none: Config = toml::from_str("state_dir = \"/s\"\n").unwrap();
+        for (cfg, registry, now, want) in [
+            (&cfg, None, 1, "no registry token"),
+            (&cfg, Some(&no_prefix), 1, "no ci-build namespace"),
+            (&cfg, Some(&bad_prefix), 1, "not a repository name"),
+            (&cfg, Some(&job), 100, "expired"),
+            (&none, Some(&job), 1, "no [registry]"),
+            (&local, Some(&job), 1, "not a remote registry"),
+        ] {
+            let (dest, why) = cache_dest(cfg, true, registry, true, now);
+            assert!(matches!(dest, CacheDest::Off), "{want}: {dest:?}");
+            assert!(why.as_deref().is_some_and(|w| w.contains(want)), "{why:?}");
+        }
     }
 
     // A JobCtx with a fixed slot/project key, built directly so `host_checkout_dir` is

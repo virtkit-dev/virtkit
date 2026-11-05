@@ -115,9 +115,7 @@ pub struct BuildOpts {
     pub build_args: Vec<(String, String)>,
     pub kernel: PathBuf,
     pub agent: PathBuf,
-    pub cache_registry: Option<String>,
-    pub cache_insecure: bool,
-    pub cache_auth: crate::build::CacheAuth,
+    pub cache: crate::build::CacheDest,
     /// Egress policy for the unit build's RUN guests (`[egress.build]` and the job's own);
     /// `BuildNet::All` = unrestricted default.
     pub net: crate::build::BuildNet,
@@ -163,9 +161,8 @@ fn build_recipe(
         build_args,
         kernel: build.map(|b| b.kernel.clone()),
         agent: build.map(|b| b.agent.clone()),
-        cache_registry: build.and_then(|b| b.cache_registry.clone()),
-        cache_insecure: build.is_some_and(|b| b.cache_insecure),
-        cache_auth: build.map(|b| b.cache_auth.clone()).unwrap_or_default(),
+        // `build = None` never builds, so it reaches no cache.
+        cache: build.map_or(crate::build::CacheDest::Off, |b| b.cache.clone()),
         // `build = None` is the ext4-path/fingerprint call that never builds, so the egress
         // default is irrelevant there; the real build passes the job's `[egress.build]` policy.
         net: build
@@ -905,9 +902,11 @@ mod tests {
             build_args: vec![],
             kernel: "/nonexistent".into(),
             agent: "/nonexistent".into(),
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,

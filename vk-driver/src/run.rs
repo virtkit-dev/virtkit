@@ -3939,9 +3939,7 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         build_args: args.build_args.clone(),
         kernel: kernel.to_path_buf(),
         agent: agent.to_path_buf(),
-        cache_registry: args.cache.registry.clone(),
-        cache_insecure: args.cache.insecure,
-        cache_auth: args.cache.auth.clone(),
+        cache: crate::build::CacheDest::Configured(args.cache.clone()),
         // Dev `vk run --compose` service builds share the run's `--build-net` / build-audit.
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
@@ -3969,9 +3967,7 @@ pub(crate) fn service_build_options(
         print_plan: false,
         kernel: Some(kernel.to_path_buf()),
         agent: Some(agent.to_path_buf()),
-        cache_registry: args.cache.registry.clone(),
-        cache_insecure: args.cache.insecure,
-        cache_auth: args.cache.auth.clone(),
+        cache: crate::build::CacheDest::Configured(args.cache.clone()),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
         // Run roots boot read-only under an overlay; qcow2 keeps the backing file compact.
@@ -6534,9 +6530,11 @@ mod tests {
                 build_args: vec![],
                 kernel: "/nonexistent".into(),
                 agent: "/nonexistent".into(),
-                cache_registry: None,
-                cache_insecure: false,
-                cache_auth: Default::default(),
+                cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                    registry: None,
+                    insecure: false,
+                    auth: Default::default(),
+                }),
                 net: crate::build::BuildNet::All,
                 audit: false,
                 record: None,
@@ -6892,11 +6890,23 @@ mod tests {
             );
         };
         let o = dockerfile_build_options(&args, kernel, agent, PathBuf::from("/root.ext4"), None);
-        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+        carried(
+            o.cache.configured().registry.as_deref(),
+            o.cache.configured().insecure,
+            &o.cache.configured().auth,
+        );
         let o = manager_build_opts(&args, kernel, agent);
-        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+        carried(
+            o.cache.configured().registry.as_deref(),
+            o.cache.configured().insecure,
+            &o.cache.configured().auth,
+        );
         let o = service_build_options(&args, kernel, agent);
-        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+        carried(
+            o.cache.configured().registry.as_deref(),
+            o.cache.configured().insecure,
+            &o.cache.configured().auth,
+        );
     }
 
     // Exercise the real raw_connect path through a Unix socket. `serve` controls split

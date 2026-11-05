@@ -249,6 +249,43 @@ impl CacheOpts {
     }
 }
 
+/// The caller chooses the instruction and base-image cache destination once. Every cache
+/// access uses it; no part of the build falls back to `[build] cache_registry` on its own.
+#[derive(Debug, Clone)]
+pub enum CacheDest {
+    /// `--cache-registry` or `[build] cache_registry`, with `[build]`'s credentials: a
+    /// registry repo (e.g. a `vk-registry` at `127.0.0.1:5000`), an absolute store directory
+    /// path (accessed in-process), or `none` for no cache; no destination is the builtin
+    /// local store (`vk_registry::default_root`). Builds outside placed jobs, and every build
+    /// of a node that does not cache placed jobs' builds by scope.
+    Configured(CacheOpts),
+    /// A placed job's build prefix on the node's registry, reached with the job's token:
+    /// layers at `<prefix>/build-cache`.
+    Scoped(crate::config::Registry),
+    /// No cache.
+    Off,
+}
+
+impl CacheDest {
+    /// The registry or store the build caches in; `None` when it caches nowhere.
+    pub(crate) fn registry(&self) -> Result<Option<crate::config::Registry>> {
+        match self {
+            CacheDest::Configured(cache) => cache_registry(cache),
+            CacheDest::Scoped(rg) => Ok(Some(rg.clone())),
+            CacheDest::Off => Ok(None),
+        }
+    }
+
+    /// The configured destination, for a test that knows the build took it.
+    #[cfg(test)]
+    pub(crate) fn configured(&self) -> &CacheOpts {
+        match self {
+            CacheDest::Configured(cache) => cache,
+            other => panic!("not the configured cache: {other:?}"),
+        }
+    }
+}
+
 /// The server or on-disk store for cached builds and plain files, with its credentials.
 /// `None` when caching is off.
 pub(crate) fn cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::Registry>> {
@@ -301,16 +338,8 @@ pub struct Options {
     pub print_plan: bool,
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
-    /// instruction-cache destination: a registry repo (e.g. a `vk-registry` at
-    /// `127.0.0.1:5000`), an absolute store directory path (accessed in-process), or
-    /// `none` to disable caching. `None` = the builtin local store
-    /// (`vk_registry::default_root`).
-    pub cache_registry: Option<String>,
-    /// the cache registry speaks plain HTTP (a loopback vk-registry).
-    pub cache_insecure: bool,
-    /// CA + Basic auth for the cache registry when it is a remote, TLS-and-auth-gated
-    /// vk-registry. `Default` (empty) for a loopback/open cache or the local store.
-    pub cache_auth: CacheAuth,
+    /// Where the instruction cache lives ([`CacheDest`]).
+    pub cache: CacheDest,
     /// how aggressively the instruction cache is populated (see [`BuildCache`]).
     pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
@@ -836,17 +865,7 @@ fn make_microvm(
 ) -> Result<MicroVm> {
     // Sweep dead builds' stage session dirs under $TMPDIR before booting new guests.
     sweep_stale_sessions(&std::env::temp_dir());
-    let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
-        crate::config::Registry::for_share(
-            repo,
-            opts.cache_insecure,
-            opts.cache_auth.ca_file.clone(),
-            opts.cache_auth.username.clone(),
-            opts.cache_auth.password_file.clone(),
-            opts.cache_auth.token_file.clone(),
-            None,
-        )
-    });
+    let cache = opts.cache.registry()?;
     let cpus = exec::resolve_build_cpus(configured_build_cpus(), exec::host_cpus());
     let mem = exec::resolve_build_mem(configured_build_mem().as_deref());
     // A placed job records its build's denials, attributed, and its contacts whatever audit
@@ -6845,9 +6864,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -6918,9 +6939,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -6968,9 +6991,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7025,9 +7050,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7074,9 +7101,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7130,9 +7159,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,
@@ -7203,9 +7234,11 @@ ENTRYPOINT run me
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: Some("none".into()),
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: true,
             out_format: ImageFormat::Raw,
@@ -8378,9 +8411,11 @@ RUN ship
             print_plan: false,
             kernel: None,
             agent: None,
-            cache_registry: None,
-            cache_insecure: false,
-            cache_auth: Default::default(),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: None,
+                insecure: false,
+                auth: Default::default(),
+            }),
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,

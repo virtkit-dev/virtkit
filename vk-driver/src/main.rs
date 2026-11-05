@@ -4293,9 +4293,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             print_plan: *print_plan,
             kernel: kernel.clone().or_else(|| b.kernel.clone()),
             agent: agent.clone().or_else(|| b.agent.clone()),
-            cache_registry: cache.registry,
-            cache_insecure: cache.insecure,
-            cache_auth: cache.auth,
+            cache: crate::build::CacheDest::Configured(cache),
             build_cache,
             journal: journal_enabled(*no_journal, b.no_journal),
             // A `vk build --out` artifact stays a raw ext4: it is what gets mounted, packaged
