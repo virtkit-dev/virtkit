@@ -175,7 +175,7 @@ pub(crate) fn parse(rest: &str) -> Option<(Vec<String>, bool)> {
 
 /// Percent-decode one path component: `%XX` escapes only, `+` being itself in a path, and
 /// the decoded bytes must be UTF-8. `None` for a malformed escape or invalid UTF-8.
-fn decode_segment(raw: &str) -> Option<String> {
+pub(crate) fn decode_segment(raw: &str) -> Option<String> {
     fn hex(c: u8) -> Option<u8> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),

@@ -74,6 +74,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+vk-registry's SigV4 tests use AWS's signing test suite, as vendored in awslabs/aws-c-auth
+(tests/aws-signing-test-suite/v4), copied under vk-registry/src/s3/testdata/sigv4/:
+https://github.com/awslabs/aws-c-auth/tree/3281f8692e6fd10562c4585a4dded5c16b322698/tests/aws-signing-test-suite/v4
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Apache License 2.0; see vk-registry/src/s3/testdata/sigv4/LICENSE.
+
 The variable expansion in vk-gitlab/src/spec.rs (`expand`) and vk-driver/src/node/jobs/vars.rs
 is adapted from Go's os.Expand (src/os/env.go) and its tests, as gitlab-runner uses it:
 https://github.com/golang/go/blob/go1.24.0/src/os/env.go
