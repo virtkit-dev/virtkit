@@ -483,6 +483,7 @@ impl Resp {
             id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()),
             "{id}"
         );
+        assert_eq!(self.header("x-amz-id-2"), Some(id));
         assert_eq!(self.header("x-content-type-options"), Some("nosniff"));
         self
     }
