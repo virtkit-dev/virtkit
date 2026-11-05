@@ -27,8 +27,10 @@ pub(super) fn owner() -> String {
     )
 }
 
-/// `GET /s3/`: the top-level directories the caller may read. Refused, as `/dav/`'s root
-/// listing is, on a server without a credential, where it would list for anyone.
+/// `GET /s3/`: the top-level directories the caller may read, or read a directory inside, as
+/// HeadBucket admits it: a client given a prefix finds its bucket listed. Refused, as
+/// `/dav/`'s root listing is, on a server without a credential, where it would list for
+/// anyone.
 pub(super) async fn list(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -47,7 +49,7 @@ pub(super) async fn list(
         let mut buckets = String::new();
         for name in store.repo_children(FILES_REPO)? {
             let repo = format!("{FILES_REPO}/{name}");
-            if !authz.may_read(&repo) {
+            if !authz.may_read_below(&repo) {
                 continue;
             }
             let created = store

@@ -2149,7 +2149,7 @@ async fn api_keys_reach_what_their_scopes_cover() {
         .await
         .is(404, "NoSuchKey");
 
-    // The buckets listed are those the key may read.
+    // The buckets listed are those the key may read, or read a directory inside.
     let buckets = |k: &str| {
         let k = k.to_string();
         let host = host.clone();
@@ -2172,7 +2172,7 @@ async fn api_keys_reach_what_their_scopes_cover() {
     };
     assert_eq!(buckets(&writer).await, ["b", "c"]);
     assert_eq!(buckets(&bucket_b).await, ["b"]);
-    assert!(buckets(&prefix).await.is_empty());
+    assert_eq!(buckets(&prefix).await, ["b"]);
     let resp = send(&host, as_(&writer, get("/s3/"))).await;
     assert!(resp.body.contains("<CreationDate>"), "{}", resp.body);
 
