@@ -9,9 +9,11 @@
 //! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
 //! one, served over the object layer the WebDAV view shares ([`crate::files`]): [`bucket`]
 //! answers the service and its buckets, [`list`] a bucket's listings, [`object`] the
-//! objects. Operations not served yet answer `NotImplemented`.
+//! objects, with [`chunked`] decoding the `aws-chunked` bodies SDKs upload them in.
+//! Operations not served yet answer `NotImplemented`.
 
 mod bucket;
+mod chunked;
 mod conditional;
 mod list;
 mod meta;
@@ -163,9 +165,9 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
     let who = if signed {
         signed_by(state, &req, ctx)
     } else {
-        presented(state, &req, ctx)
+        presented(state, &req, ctx).map(|who| (who, None))
     };
-    let who = match who {
+    let (who, seed) = match who {
         Ok(who) => who,
         Err(resp) => return before_auth(req, *resp).await,
     };
@@ -181,7 +183,7 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
             .insert(RETRY_AFTER, HeaderValue::from_static("60"));
         return refuse(req, resp, ctx).await;
     }
-    operate(state, &who.authz(), req, ctx).await
+    operate(state, &who.authz(), seed, req, ctx).await
 }
 
 /// The query parameter an AWS SDK adds to name the operation it calls, which says nothing
@@ -205,9 +207,11 @@ fn subresource(query: &str) -> Option<&str> {
 
 /// An authenticated request, to the operation its method, path and query name. What is not
 /// served answers `NotImplemented` once the body is read, as every refusal past the gate does.
+/// `seed` is what a signed `aws-chunked` body's signatures are checked against.
 async fn operate(
     state: &ServerState,
     authz: &Authz<'_>,
+    seed: Option<chunked::Seed>,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
@@ -239,7 +243,7 @@ async fn operate(
             object::attributes(state, authz, segs, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::PUT, None) => {
-            object::put(state, authz, segs, req, ctx).await
+            object::put(state, authz, segs, seed, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::DELETE, None) => {
             object::delete(state, authz, segs, req, ctx).await
@@ -358,12 +362,14 @@ fn resolve_failed(e: anyhow::Error, ctx: &Ctx) -> Box<Response<Body>> {
 /// the access key id is authenticated exactly as a bearer would be, by the resolvers the
 /// other routes use; only then is the secret it maps to used as a key, to check the
 /// signature. On a server with no credential configured, an id that is not a hub token is
-/// taken with its signature unchecked, as nothing else is checked there.
+/// taken with its signature unchecked, as nothing else is checked there. A request whose
+/// body is a signed `aws-chunked` stream also gets the seed its chunks' signatures chain
+/// from, which holds the signing key until the body has been read.
 fn signed_by(
     state: &ServerState,
     req: &Request<Incoming>,
     ctx: &Ctx,
-) -> std::result::Result<Who, Box<Response<Body>>> {
+) -> std::result::Result<(Who, Option<chunked::Seed>), Box<Response<Body>>> {
     let headers = req.headers();
     let malformed = |why: &str| {
         Box::new(ctx.error(StatusCode::BAD_REQUEST, "AuthorizationHeaderMalformed", why))
@@ -442,7 +448,7 @@ fn signed_by(
         },
     };
     let Some(secret) = secret else {
-        return Ok(who);
+        return Ok((who, None));
     };
 
     let payload_hash = headers
@@ -477,7 +483,14 @@ fn signed_by(
             &ctx.id,
         )));
     }
-    Ok(who)
+    if !chunked::Mode::of(payload_hash).is_some_and(chunked::Mode::signed) {
+        return Ok((who, None));
+    }
+    // Never a signed body whose signatures go unchecked for want of a key.
+    match chunked::Seed::of(secret, &credential, stamp) {
+        Some(seed) => Ok((who, Some(seed))),
+        None => Err(Box::new(internal_error(ctx))),
+    }
 }
 
 /// `Authorization: Bearer <id>`, alone; `None` when `id` cannot be a header value.

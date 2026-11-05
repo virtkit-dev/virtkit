@@ -14,7 +14,8 @@ All notable changes to virtkit will be documented in this file.
   Basic user and its password. Objects can be written, read with conditional headers and
   checksums, given metadata and deleted, and listed page by page, and are the same files WebDAV
   and `vk registry get` see; a key limited to a directory of a bucket can list that directory.
-  Multipart and chunked uploads, ranges and copies are not served yet. Set `s3 = false` in the
+  The chunked uploads AWS SDKs and the CLI send are taken, their signatures and checksums
+  checked; multipart uploads, ranges and copies are not served yet. Set `s3 = false` in the
   server config to turn it off.
 
 ## [0.106.0] - 2026-11-05

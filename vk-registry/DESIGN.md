@@ -643,7 +643,7 @@ reads; a replaced object keeps only what its own write sent.
 
 | Request | Answer |
 |---|---|
-| `PUT /s3/<b>/<k>` PutObject | 200 with `ETag`; streamed to `uploads/` while hashed (SHA-256, MD5, and the SHA-1 or CRC32 when asked), then tagged under the namespace lock as a WebDAV `PUT` is. `x-amz-content-sha256` is `UNSIGNED-PAYLOAD` or the body's SHA-256, else 400 `XAmzContentSHA256Mismatch` and nothing is tagged. `Content-MD5` and `x-amz-checksum-{sha256,sha1,crc32}` are checked (400 `BadDigest`; 400 `InvalidDigest`/`InvalidRequest` when malformed) and the checksums echoed; `crc32c` and `crc64nvme` are taken unchecked. `If-None-Match: *` (create only) and `If-Match: <etag>` (replace only that object; an absent one fails too) are checked under the lock the tag is written under: 412 `PreconditionFailed`. 409 `OperationAborted` onto a directory, below an object, or over a foreign tag; 413 `EntityTooLarge` past 4 GiB, declared or streamed; 400 `MetadataTooLarge` |
+| `PUT /s3/<b>/<k>` PutObject | 200 with `ETag`; streamed to `uploads/` while hashed (SHA-256, MD5, and the SHA-1 or CRC32 when asked), then tagged under the namespace lock as a WebDAV `PUT` is. `x-amz-content-sha256` is `UNSIGNED-PAYLOAD`, the body's SHA-256 (else 400 `XAmzContentSHA256Mismatch` and nothing is tagged), or a streaming mode whose `aws-chunked` body is decoded on the way in (below). `Content-MD5` and `x-amz-checksum-{sha256,sha1,crc32}`, as headers or in a chunked body's trailer, are checked (400 `BadDigest`; 400 `InvalidDigest`/`InvalidRequest` when malformed) and the checksums echoed; `crc32c` and `crc64nvme` are taken unchecked. `If-None-Match: *` (create only) and `If-Match: <etag>` (replace only that object; an absent one fails too) are checked under the lock the tag is written under: 412 `PreconditionFailed`. 409 `OperationAborted` onto a directory, below an object, or over a foreign tag; 413 `EntityTooLarge` past 4 GiB, declared or streamed; 400 `MetadataTooLarge` |
 | `GET`, `HEAD /s3/<b>/<k>` GetObject, HeadObject | 200 with the bytes, `ETag`, `Last-Modified` from the tag, `Content-Length` and the metadata; `x-amz-checksum-sha256` (the store's digest, base64) with `x-amz-checksum-mode: ENABLED`. `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since` in RFC 9110's order: 412 `PreconditionFailed`, or 304 with the `ETag`. `Range` is ignored and no `Accept-Ranges` is sent: a whole 200 is a legal answer. A directory, a foreign tag or a missing key is 404 `NoSuchKey`. A `GET` refreshes an idle tag as WebDAV's does; a `HEAD` touches nothing |
 | `GET /s3/<b>/<k>?attributes` GetObjectAttributes | 200 `GetObjectAttributesResponse` with what `x-amz-object-attributes` names of `ETag`, `Checksum` (SHA-256), `StorageClass` (`STANDARD`) and `ObjectSize`, and `Last-Modified`; 400 `InvalidArgument` without the header; touches nothing |
 | `DELETE /s3/<b>/<k>` DeleteObject | 204 whether or not the key held an object, as S3 answers, and for a key that is a directory, which holds no object to delete; 409 `OperationAborted` for a foreign tag; 403 when the caller may read the object but not write it |
@@ -652,7 +652,34 @@ reads; a replaced object keeps only what its own write sent.
 | `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 when the caller may read neither `files/<b>` nor anything below it |
 | `GET /s3/<b>?location` GetBucketLocation | the region the request was signed for, which is any the client chose, or an empty `LocationConstraint` for an unsigned request; after HeadBucket's checks |
 | `GET /s3/` ListBuckets | `ListAllMyBucketsResult`: the readable top-level directories, each dated by its directory's mtime, and the owner `vk-registry`; 403 `AccessDenied` on a server with no credential |
-| anything else | 501 `NotImplemented`: creating and deleting buckets, copies, batch deletes, multipart uploads, `aws-chunked` bodies (`STREAMING-*` payloads, `Content-Encoding: aws-chunked`), tagging, ACLs, versioning and every other subresource; an SDK's `x-id` operation hint is ignored |
+| anything else | 501 `NotImplemented`: creating and deleting buckets, copies, batch deletes, multipart uploads, tagging, ACLs, versioning and every other subresource; an SDK's `x-id` operation hint is ignored |
+
+**`aws-chunked` bodies**, which AWS's SDKs and CLI send by default, are decoded as they
+stream, in one pass: a run of `<hex size>[;chunk-signature=<sig>]\r\n<data>\r\n` chunks ended
+by an empty one, then, in the `-TRAILER` modes, the checksum `x-amz-trailer` announced and,
+when signed, `x-amz-trailer-signature`. `x-amz-content-sha256` names the mode:
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` signs every chunk, its `-TRAILER` form the trailer too,
+`STREAMING-UNSIGNED-PAYLOAD-TRAILER` signs nothing and carries the checksum, and
+`Content-Encoding: aws-chunked` beside `UNSIGNED-PAYLOAD` or a SHA-256 is framing alone (the
+SHA-256 then being the decoded bytes'). Chunk signatures chain from the request's own as AWS
+defines them, the trailer's signing its `name:value\n` lines after the last chunk's; they are
+checked with the signing key the request's signature was, which is kept while the body
+streams and wiped after. **A request authenticated by a bearer, Basic or session credential
+rather than SigV4** — the way a proxy that authenticates a guest's requests itself forwards
+them — and any request to a server with no credential has no secret to check them with: its
+framing is decoded and its signatures are read, not checked. `x-amz-decoded-content-length`
+is required (400 `InvalidRequest`), past 4 GiB is 413 before the body is read, and the chunks
+must hold exactly that many bytes. The trailer's `x-amz-checksum-{crc32,sha1,sha256}` is
+checked against the decoded bytes and echoed, as a header's is; `crc32c` and `crc64nvme` are
+taken unchecked; a checksum sent both as a header and in the trailer is 400. Reading is
+bounded as it goes: a chunk header of at most 256 bytes, a chunk no longer than what is left
+of the declared length, a trailer of at most 8 KiB, nothing after its end, and memory of one
+frame and a line. A body that breaks any of this is refused where it goes wrong — 400
+`InvalidChunkSizeError`, `IncompleteBody` or `MalformedTrailerError`, 403
+`SignatureDoesNotMatch` — and its staging file is dropped, so nothing it held is tagged. No
+other content encoding is decoded: one named beside `aws-chunked` is 501 `NotImplemented`, as
+is another streaming mode (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`); another encoding
+alone is stored as sent, its name not kept.
 
 **A listing's cost** is bounded by its page. The walk runs on the blocking pool, starts at the
 directory the prefix's whole components name, lists each directory it enters once (its

@@ -171,15 +171,108 @@ fn authorization(
         "AWS4-HMAC-SHA256\n{at}\n{scope}\n{}",
         hex(&sha2::Sha256::digest(canonical.as_bytes()))
     );
+    format!(
+        "AWS4-HMAC-SHA256 Credential={id}/{scope}, SignedHeaders={}, Signature={}",
+        names.join(";"),
+        hex(&hmac(&signing_key(secret, date), &sts))
+    )
+}
+
+/// The key `secret` signs with on `date`, in the tests' region.
+fn signing_key(secret: &str, date: &str) -> Vec<u8> {
     let mut key = hmac(format!("AWS4{secret}").as_bytes(), date);
     for part in ["us-east-1", "s3", "aws4_request"] {
         key = hmac(&key, part);
     }
-    format!(
-        "AWS4-HMAC-SHA256 Credential={id}/{scope}, SignedHeaders={}, Signature={}",
-        names.join(";"),
-        hex(&hmac(&key, &sts))
-    )
+    key
+}
+
+/// How a test's `aws-chunked` body is signed and ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Chunked {
+    Signed,
+    SignedTrailer,
+    UnsignedTrailer,
+}
+
+impl Chunked {
+    fn content_sha256(self) -> &'static str {
+        match self {
+            Chunked::Signed => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            Chunked::SignedTrailer => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            Chunked::UnsignedTrailer => "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        }
+    }
+}
+
+/// `data` framed as `aws-chunked` in chunks of `chunk` bytes, as AWS's SDKs frame it: each
+/// chunk signed from `seed` (the request's signature) with `key` at `at` in a signed mode,
+/// then the `trailer` line and, in the signed trailer mode, its signature.
+fn aws_chunked(
+    mode: Chunked,
+    data: &[u8],
+    chunk: usize,
+    (key, at, seed): (&[u8], &str, &str),
+    trailer: Option<(&str, &str)>,
+) -> Vec<u8> {
+    let scope = format!("{}/us-east-1/s3/aws4_request", &at[..8]);
+    let empty = sha256_hex(b"");
+    let mut previous = seed.to_string();
+    let mut out = Vec::new();
+    for piece in data.chunks(chunk).chain([&b""[..]]) {
+        out.extend_from_slice(format!("{:x}", piece.len()).as_bytes());
+        if mode != Chunked::UnsignedTrailer {
+            let sts = format!(
+                "AWS4-HMAC-SHA256-PAYLOAD\n{at}\n{scope}\n{previous}\n{empty}\n{}",
+                sha256_hex(piece)
+            );
+            previous = hex(&hmac(key, &sts));
+            out.extend_from_slice(format!(";chunk-signature={previous}").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(piece);
+        if !piece.is_empty() {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    if mode != Chunked::Signed {
+        let lines = trailer.map_or(String::new(), |(n, v)| format!("{n}:{v}\n"));
+        out.extend_from_slice(lines.replace('\n', "\r\n").as_bytes());
+        if mode == Chunked::SignedTrailer {
+            let sts = format!(
+                "AWS4-HMAC-SHA256-TRAILER\n{at}\n{scope}\n{previous}\n{}",
+                sha256_hex(lines.as_bytes())
+            );
+            let signature = hex(&hmac(key, &sts));
+            out.extend_from_slice(format!("x-amz-trailer-signature:{signature}\r\n").as_bytes());
+        }
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The encoder frames AWS's chunked PutObject example as AWS does, signatures and all.
+#[test]
+fn the_test_encoder_reproduces_the_aws_chunked_example() {
+    let key = signing_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "20130524");
+    let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
+    let body = aws_chunked(
+        Chunked::Signed,
+        &[b'a'; 66_560],
+        65_536,
+        (&key, "20130524T000000Z", seed),
+        None,
+    );
+    assert_eq!(body.len(), 66_824);
+    let text = String::from_utf8(body).unwrap();
+    for signature in [
+        "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648",
+        "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497",
+        "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9",
+    ] {
+        assert!(text.contains(&format!(";chunk-signature={signature}\r\n")));
+    }
+    assert!(text.ends_with("\r\n\r\n"));
 }
 
 /// The signer reproduces AWS's GET Object example, signature and all.
@@ -274,6 +367,52 @@ impl Req {
         self.header("x-amz-content-sha256", payload)
             .header("x-amz-date", &at)
             .header("Authorization", &auth)
+    }
+
+    /// `data` sent as an `aws-chunked` body framed by `mode` in 64 KiB chunks, signed for
+    /// `host` by `key` now, with `trailer` as the trailer's checksum when given.
+    fn chunked(
+        self,
+        host: &str,
+        key: (&str, &str),
+        mode: Chunked,
+        data: &[u8],
+        trailer: Option<(&str, &str)>,
+    ) -> Self {
+        let at = stamp(vk_peer::now_secs());
+        let payload = mode.content_sha256();
+        let auth = authorization(
+            self.method,
+            &self.path,
+            &self.query,
+            &[
+                ("host", host),
+                ("x-amz-content-sha256", payload),
+                ("x-amz-date", &at),
+            ],
+            payload,
+            key,
+            &at,
+        );
+        let seed = auth.rsplit("Signature=").next().unwrap().to_string();
+        let signing = signing_key(key.1, &at[..8]);
+        let body = aws_chunked(mode, data, 64 * 1024, (&signing, &at, &seed), trailer);
+        let mut req = self
+            .header("x-amz-content-sha256", payload)
+            .header("x-amz-date", &at)
+            .header("Authorization", &auth)
+            .header("Content-Encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string());
+        if let Some((name, _)) = trailer {
+            req = req.header("x-amz-trailer", name);
+        }
+        req.body(body)
+    }
+
+    /// This request with `name` sent as `value` instead of as it was.
+    fn replace(mut self, name: &str, value: &str) -> Self {
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.header(name, value)
     }
 
     fn head(&self, host: &str) -> String {
@@ -962,10 +1101,10 @@ async fn the_sccache_sequence_round_trips_with_an_api_key() {
 }
 
 /// The payload modes: unsigned, or the body's SHA-256, which the body must then have. A
-/// streamed `aws-chunked` body is not decoded yet, so it is refused and its framing never
-/// becomes an object.
+/// streaming mode this registry does not decode is refused, so its framing never becomes an
+/// object.
 #[tokio::test]
-async fn a_put_body_is_unsigned_or_its_signed_sha256_and_streaming_waits() {
+async fn a_put_body_is_unsigned_or_its_signed_sha256() {
     let dir = tmp("payload");
     let (state, _) = shared(
         &dir,
@@ -1003,43 +1142,21 @@ async fn a_put_body_is_unsigned_or_its_signed_sha256_and_streaming_waits() {
     let req = put("/s3/b/garbage", HELLO).signed_payload(&host, key, 0, "not-a-digest");
     send(&host, req).await.is(400, "InvalidArgument");
 
-    // AWS's chunked framing, signed or announced: not stored as the object it would become.
-    let framed = b"d;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n\
-Hello, World!\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n";
-    for (path, req) in [
-        (
-            "/s3/b/streaming",
-            put("/s3/b/streaming", framed).signed_payload(
-                &host,
-                key,
-                0,
-                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-            ),
-        ),
-        (
-            "/s3/b/trailer",
-            put("/s3/b/trailer", framed).signed_payload(
-                &host,
-                key,
-                0,
-                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-            ),
-        ),
-        (
-            "/s3/b/chunked",
-            put("/s3/b/chunked", framed)
-                .header("Content-Encoding", "aws-chunked")
-                .header("x-amz-decoded-content-length", "13")
-                .signed(&host, key, 0),
-        ),
-    ] {
-        send(&host, req).await.is(501, "NotImplemented");
+    // A streaming mode not decoded here, or an encoding beside aws-chunked.
+    let framed = b"d\r\nHello, World!\r\n0\r\n\r\n";
+    let ecdsa = put("/s3/b/ecdsa", framed)
+        .header("Content-Encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", "13")
+        .signed_payload(&host, key, 0, "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD");
+    send(&host, ecdsa).await.is(501, "NotImplemented");
+    let gzip = put("/s3/b/gzip", framed)
+        .header("Content-Encoding", "aws-chunked, gzip")
+        .header("x-amz-decoded-content-length", "13")
+        .signed(&host, key, 0);
+    send(&host, gzip).await.is(501, "NotImplemented");
+    for path in ["/s3/b/ecdsa", "/s3/b/gzip"] {
         send(&host, get(path)).await.is(404, "NoSuchKey");
     }
-    assert!(
-        !dir.join("store/repos/files/b/tags/streaming").exists()
-            && !dir.join("store/repos/files/b/tags/chunked").exists()
-    );
     assert_eq!(staging_left(&dir), 0);
 
     // A declared length past 4 GiB is refused before a byte is read.
@@ -1135,6 +1252,319 @@ async fn a_put_checks_the_digests_it_is_sent() {
         resp.header("x-amz-checksum-sha256"),
         Some(&*b64(&sha2::Sha256::digest(HELLO)))
     );
+}
+
+/// The shared bearer of [`bearer_server`], which is also its access key and secret.
+const BEARER: (&str, &str) = ("s3cret", "s3cret");
+
+/// A shared-bearer server: its directory and address.
+fn bearer_server(tag: &str) -> (std::path::PathBuf, String) {
+    let dir = tmp(tag);
+    let auth = Auth::Bearer {
+        token: BEARER.0.into(),
+    };
+    let (state, _) = shared(&dir, auth, true);
+    (dir, spawn(state))
+}
+
+fn bytes_of_len(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+fn sha1_b64(b: &[u8]) -> String {
+    use sha1::Digest as _;
+    b64(&sha1::Sha1::digest(b))
+}
+
+fn crc32_b64(b: &[u8]) -> String {
+    b64(&crc32fast::hash(b).to_be_bytes())
+}
+
+/// One request whose body the server may stop reading, refusing it: the body is written
+/// beside the wait for the answer, and a write failing once the server closes is expected.
+async fn send_refused(host: &str, req: Req) -> Resp {
+    let mut conn = Conn::open(host).await;
+    let mut write = conn.write.take().unwrap();
+    let head = req.head(host);
+    let writer = tokio::spawn(async move {
+        let _ = write.write_all(head.as_bytes()).await;
+        let _ = write.write_all(&req.body).await;
+        write
+    });
+    let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
+        .await
+        .expect("answered");
+    drop(writer.await.unwrap());
+    resp
+}
+
+/// Change the byte after the last `marker` in `body`, a hex digit, to another one.
+fn flip_after_last(body: &mut [u8], marker: &[u8]) {
+    let at = body
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .unwrap()
+        + marker.len();
+    body[at] = if body[at] == b'0' { b'1' } else { b'0' };
+}
+
+/// `aws-chunked` bodies in the three streaming modes, from one byte to many chunks, decoded on
+/// the way in: read back, each is the bytes sent, its ETag their MD5, and the trailer's
+/// checksum is echoed as a header's would be.
+#[tokio::test]
+async fn aws_chunked_uploads_are_decoded_in_every_mode() {
+    let (dir, host) = bearer_server("chunked");
+    let get = |path: &str| Req::new("GET", path).signed(&host, BEARER, 0);
+    for size in [1, 1024, 64 * 1024 + 1, 1 << 20] {
+        let data = bytes_of_len(size);
+        let (crc, sha) = (crc32_b64(&data), b64(&sha2::Sha256::digest(&data)));
+        for (mode, trailer) in [
+            (Chunked::Signed, None),
+            (
+                Chunked::SignedTrailer,
+                Some(("x-amz-checksum-sha256", sha.as_str())),
+            ),
+            (
+                Chunked::UnsignedTrailer,
+                Some(("x-amz-checksum-crc32", crc.as_str())),
+            ),
+        ] {
+            let path = format!("/s3/b/{mode:?}-{size}");
+            let req = Req::new("PUT", &path).chunked(&host, BEARER, mode, &data, trailer);
+            let resp = send(&host, req).await;
+            resp.ok(200);
+            let etag = format!("\"{}\"", md5_hex(&data));
+            assert_eq!(resp.header("etag"), Some(&*etag), "{path}");
+            if let Some((name, value)) = trailer {
+                assert_eq!(resp.header(name), Some(value), "{path}");
+            }
+            is_object(&send(&host, get(&path)).await, &data);
+        }
+    }
+    // A checksum not computed here is taken unchecked, and not echoed.
+    let crc32c = Some(("x-amz-checksum-crc32c", "AAAAAA=="));
+    let req = Req::new("PUT", "/s3/b/crc32c").chunked(
+        &host,
+        BEARER,
+        Chunked::UnsignedTrailer,
+        HELLO,
+        crc32c,
+    );
+    let resp = send(&host, req).await;
+    resp.ok(200);
+    assert_eq!(resp.header("x-amz-checksum-crc32c"), None);
+    is_object(&send(&host, get("/s3/b/crc32c")).await, HELLO);
+
+    // An aws-chunked body under its own SHA-256: the decoded bytes must have it.
+    let framed = b"d\r\nHello, World!\r\n0\r\n\r\n".to_vec();
+    let chunked = |path: &str, digest: &str| {
+        Req::new("PUT", path)
+            .header("Content-Encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "13")
+            .body(framed.clone())
+            .signed_payload(&host, BEARER, 0, digest)
+    };
+    send(&host, chunked("/s3/b/hex", &sha256_hex(HELLO)))
+        .await
+        .ok(200);
+    is_object(&send(&host, get("/s3/b/hex")).await, HELLO);
+    let other = sha256_hex(b"Hello, World?");
+    send(&host, chunked("/s3/b/hex-other", &other))
+        .await
+        .is(400, "XAmzContentSHA256Mismatch");
+    send(&host, get("/s3/b/hex-other"))
+        .await
+        .is(404, "NoSuchKey");
+    assert_eq!(staging_left(&dir), 0);
+}
+
+/// A chunked body whose signatures or framing do not hold is refused, wherever in the body it
+/// goes wrong, and leaves neither an object nor a staging file behind.
+#[tokio::test]
+async fn a_chunked_body_that_does_not_hold_leaves_nothing() {
+    let (dir, host) = bearer_server("chunked-refused");
+    let data = bytes_of_len(200_000);
+    let crc = crc32_b64(&data);
+    let put = |path: &str, mode| {
+        let trailer = (mode != Chunked::Signed).then_some(("x-amz-checksum-crc32", crc.as_str()));
+        Req::new("PUT", path).chunked(&host, BEARER, mode, &data, trailer)
+    };
+    let mut cases = Vec::new();
+    // The last chunk's signature, read once every byte of data has been staged.
+    let mut req = put("/s3/b/last-chunk", Chunked::Signed);
+    flip_after_last(&mut req.body, b";chunk-signature=");
+    cases.push(("/s3/b/last-chunk", req, 403, "SignatureDoesNotMatch"));
+    // The first chunk's data.
+    let mut req = put("/s3/b/data", Chunked::Signed);
+    req.body[1000] ^= 1;
+    cases.push(("/s3/b/data", req, 403, "SignatureDoesNotMatch"));
+    let mut req = put("/s3/b/trailer-sig", Chunked::SignedTrailer);
+    flip_after_last(&mut req.body, b"x-amz-trailer-signature:");
+    cases.push(("/s3/b/trailer-sig", req, 403, "SignatureDoesNotMatch"));
+    // The length the chunks hold, and what follows their end.
+    let short = (data.len() - 1).to_string();
+    let req = put("/s3/b/short", Chunked::Signed).replace("x-amz-decoded-content-length", &short);
+    cases.push(("/s3/b/short", req, 400, "InvalidChunkSizeError"));
+    let long = (data.len() + 1).to_string();
+    let req =
+        put("/s3/b/long", Chunked::UnsignedTrailer).replace("x-amz-decoded-content-length", &long);
+    cases.push(("/s3/b/long", req, 400, "IncompleteBody"));
+    let mut req = put("/s3/b/garbage", Chunked::Signed);
+    req.body.extend_from_slice(b"\r\n");
+    cases.push(("/s3/b/garbage", req, 400, "MalformedTrailerError"));
+    let mut req = put("/s3/b/header", Chunked::UnsignedTrailer);
+    req.body.splice(0..0, std::iter::repeat_n(b'0', 300));
+    cases.push(("/s3/b/header", req, 400, "InvalidChunkSizeError"));
+    let mut req = put("/s3/b/truncated", Chunked::Signed);
+    req.body.truncate(req.body.len() - 50);
+    cases.push(("/s3/b/truncated", req, 400, "IncompleteBody"));
+    // No decoded length at all.
+    let mut req = put("/s3/b/no-length", Chunked::Signed);
+    req.headers
+        .retain(|(n, _)| n != "x-amz-decoded-content-length");
+    cases.push(("/s3/b/no-length", req, 400, "InvalidRequest"));
+
+    for (path, req, status, code) in cases {
+        send_refused(&host, req).await.is(status, code);
+        let get = Req::new("GET", path).signed(&host, BEARER, 0);
+        send(&host, get).await.is(404, "NoSuchKey");
+    }
+    assert!(!dir.join("store/repos/files/b/tags").exists());
+    assert_eq!(staging_left(&dir), 0);
+}
+
+/// Under the bearer rather than SigV4, as the guest proxy will send it, a signed chunked body
+/// has no seed to check its signatures against: its framing is decoded, its signatures not
+/// checked.
+#[tokio::test]
+async fn a_bearer_chunked_put_is_decoded_with_its_signatures_unchecked() {
+    let (dir, host) = bearer_server("chunked-bearer");
+    let data = bytes_of_len(100_000);
+    let crc = crc32_b64(&data);
+    let bearer = format!("Bearer {}", BEARER.0);
+    let stranger = ("anyone", "not-this-registry's-secret");
+    for mode in [
+        Chunked::Signed,
+        Chunked::SignedTrailer,
+        Chunked::UnsignedTrailer,
+    ] {
+        let path = format!("/s3/b/{mode:?}");
+        let trailer = (mode != Chunked::Signed).then_some(("x-amz-checksum-crc32", crc.as_str()));
+        let req = Req::new("PUT", &path)
+            .chunked(&host, stranger, mode, &data, trailer)
+            .replace("Authorization", &bearer);
+        send(&host, req).await.ok(200);
+        let get = Req::new("GET", &path).header("Authorization", &bearer);
+        is_object(&send(&host, get).await, &data);
+    }
+    // Its framing and its trailer's checksum still are.
+    let mut req = Req::new("PUT", "/s3/b/garbage")
+        .chunked(&host, stranger, Chunked::Signed, &data, None)
+        .replace("Authorization", &bearer);
+    req.body.push(b'x');
+    send(&host, req).await.is(400, "MalformedTrailerError");
+    let wrong = crc32_b64(b"other");
+    let req = Req::new("PUT", "/s3/b/crc")
+        .chunked(
+            &host,
+            stranger,
+            Chunked::SignedTrailer,
+            &data,
+            Some(("x-amz-checksum-crc32", wrong.as_str())),
+        )
+        .replace("Authorization", &bearer);
+    send(&host, req).await.is(400, "BadDigest");
+    assert_eq!(staging_left(&dir), 0);
+}
+
+/// A trailer's checksum is checked against the decoded bytes, as the header's would be.
+#[tokio::test]
+async fn a_trailer_checksum_must_be_the_body_s() {
+    let (dir, host) = bearer_server("chunked-trailer");
+    let data = bytes_of_len(70_000);
+    let other = b"other";
+    let get = |path: &str| Req::new("GET", path).signed(&host, BEARER, 0);
+    let mut n = 0;
+    for mode in [Chunked::SignedTrailer, Chunked::UnsignedTrailer] {
+        for (name, value) in [
+            ("x-amz-checksum-crc32", crc32_b64(other)),
+            ("x-amz-checksum-sha1", sha1_b64(other)),
+            ("x-amz-checksum-sha256", b64(&sha2::Sha256::digest(other))),
+        ] {
+            n += 1;
+            let path = format!("/s3/b/bad{n}");
+            let req = Req::new("PUT", &path).chunked(
+                &host,
+                BEARER,
+                mode,
+                &data,
+                Some((name, value.as_str())),
+            );
+            send(&host, req).await.is(400, "BadDigest");
+            send(&host, get(&path)).await.is(404, "NoSuchKey");
+        }
+        let sha1 = sha1_b64(&data);
+        let req = Req::new("PUT", "/s3/b/sha1").chunked(
+            &host,
+            BEARER,
+            mode,
+            &data,
+            Some(("x-amz-checksum-sha1", sha1.as_str())),
+        );
+        let resp = send(&host, req).await;
+        resp.ok(200);
+        assert_eq!(resp.header("x-amz-checksum-sha1"), Some(sha1.as_str()));
+
+        // Not base64 of its length; announced and not sent; sent as a header too.
+        let crc = ("x-amz-checksum-crc32", "!!");
+        let req = Req::new("PUT", "/s3/b/x").chunked(&host, BEARER, mode, &data, Some(crc));
+        send(&host, req).await.is(400, "InvalidRequest");
+        let req = Req::new("PUT", "/s3/b/x")
+            .chunked(&host, BEARER, mode, &data, None)
+            .header("x-amz-trailer", "x-amz-checksum-crc32");
+        send(&host, req).await.is(400, "MalformedTrailerError");
+        let crc = crc32_b64(&data);
+        let req = Req::new("PUT", "/s3/b/x")
+            .chunked(
+                &host,
+                BEARER,
+                mode,
+                &data,
+                Some(("x-amz-checksum-crc32", crc.as_str())),
+            )
+            .header("x-amz-checksum-crc32", &crc);
+        send(&host, req).await.is(400, "InvalidRequest");
+        send(&host, get("/s3/b/x")).await.is(404, "NoSuchKey");
+    }
+    assert_eq!(staging_left(&dir), 0);
+}
+
+/// A decoded length past 4 GiB is refused before a byte of the body is read.
+#[tokio::test]
+async fn a_decoded_length_past_the_cap_is_refused_unread() {
+    let (dir, host) = bearer_server("chunked-big");
+    let req = Req::new("PUT", "/s3/b/big")
+        .header("Content-Encoding", "aws-chunked")
+        .header(
+            "x-amz-decoded-content-length",
+            &((4u64 << 30) + 1).to_string(),
+        )
+        .signed_payload(&host, BEARER, 0, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+    let head = req
+        .head(&host)
+        .replace("Content-Length: 0", "Content-Length: 1000000");
+    let mut conn = Conn::open(&host).await;
+    conn.write
+        .as_mut()
+        .unwrap()
+        .write_all(head.as_bytes())
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
+        .await
+        .expect("answered unread");
+    resp.is(413, "EntityTooLarge");
+    assert_eq!(staging_left(&dir), 0);
 }
 
 #[tokio::test]
