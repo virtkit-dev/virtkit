@@ -14,13 +14,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use hyper::body::Incoming;
 use hyper::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, HeaderMap, HeaderValue,
-    LAST_MODIFIED,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED,
 };
 use hyper::{Request, Response, StatusCode};
 use sha1::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
+use super::range::{self, Range};
 use super::{Ctx, chunked, drain, meta, refuse, xml};
 use crate::dav::http_date;
 use crate::files::{
@@ -90,9 +91,16 @@ fn insert(headers: &mut HeaderMap, name: hyper::header::HeaderName, value: &str)
     }
 }
 
-/// `GET`/`HEAD /s3/<bucket>/<key>`: the object's bytes, after its conditional headers. A GET
-/// served refreshes an idle object's tag, as a WebDAV GET does; a HEAD touches nothing.
-/// `Range` is ignored: a whole 200 is a legal answer to it.
+/// The `Content-Range` of `len` bytes from `start` of an object `total` bytes long.
+fn content_range(start: u64, len: u64, total: u64) -> String {
+    let last = start.saturating_add(len).saturating_sub(1);
+    format!("bytes {start}-{last}/{total}")
+}
+
+/// `GET`/`HEAD /s3/<bucket>/<key>`: the object's bytes, after its conditional headers, or
+/// the one byte range `Range` asks for (206) when `If-Range`, if sent, still holds; a HEAD
+/// answers what the GET would. A GET served, whole or in part, refreshes an idle object's tag
+/// as a WebDAV GET does; a HEAD touches nothing.
 pub(super) async fn get(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -105,6 +113,7 @@ pub(super) async fn get(
         return refuse(req, ctx.access_denied(), ctx).await;
     }
     let conditions = Conditions::of(req.headers());
+    let asked = range::Asked::of(req.headers());
     let checksum = req
         .headers()
         .get(CHECKSUM_MODE)
@@ -137,17 +146,56 @@ pub(super) async fn get(
                 ));
             }
         }
-        let mut resp =
-            crate::serve_blob(store, &format!("sha256:{}", obj.layer), head, false, false)?;
-        // The layer gone under the tag (a gc between the two reads) is no object either.
-        if resp.status() != StatusCode::OK {
-            return Ok(no_such_key(&ctx));
-        }
+        let mut resp = match asked.resolve(&etag, obj.modified, obj.size) {
+            Range::Whole => {
+                let digest = format!("sha256:{}", obj.layer);
+                let mut resp = crate::serve_blob(store, &digest, head, false, false)?;
+                // The layer gone under the tag (a gc between the two reads) is no object
+                // either.
+                if resp.status() != StatusCode::OK {
+                    return Ok(no_such_key(&ctx));
+                }
+                resp.headers_mut().remove("docker-content-digest");
+                resp
+            }
+            Range::Part { start, len } => {
+                let Some(part) = store.serve_blob_range(&obj.layer, start, len, head)? else {
+                    return Ok(no_such_key(&ctx));
+                };
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_LENGTH, len.to_string())
+                    .header(CONTENT_RANGE, content_range(start, len, part.total))
+                    .body(part.body)?
+            }
+            Range::Unsatisfiable => {
+                let total = obj.size.to_string();
+                let mut resp = xml::error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "InvalidRange",
+                    "the requested range is not satisfiable",
+                    &[
+                        ("RangeRequested", asked.range()),
+                        ("ActualObjectSize", &total),
+                    ],
+                    &ctx.path,
+                    &ctx.id,
+                );
+                insert(
+                    resp.headers_mut(),
+                    CONTENT_RANGE,
+                    &format!("bytes */{total}"),
+                );
+                insert(resp.headers_mut(), ACCEPT_RANGES, "bytes");
+                return Ok(resp);
+            }
+        };
         if !head {
             files::touch_if_idle(store, &obj);
         }
         let headers = resp.headers_mut();
-        headers.remove("docker-content-digest");
+        headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
         insert(headers, ETAG, &etag);
         insert(headers, LAST_MODIFIED, &modified);
@@ -245,6 +293,13 @@ struct Payload {
     /// how the body is framed when it is `aws-chunked`
     framing: Option<chunked::Framing>,
 }
+
+/// The size from which a written object is stored uncompressed. The AWS CLI and SDK transfer
+/// managers download an object past 8 MiB as parallel 8 MiB ranges, and a range of a
+/// zstd-stored blob is decoded from the blob's start ([`Store::serve_blob_range`]): stored
+/// compressed, an object of N bytes would cost about N²/16 MiB of decoding to download, where
+/// stored plain each range is a seek. Below it, a range costs at most this much decoding.
+const UNCOMPRESSED_FROM: u64 = 8 << 20;
 
 /// The header naming how long an `aws-chunked` body is once decoded.
 const DECODED_LENGTH: &str = "x-amz-decoded-content-length";
@@ -631,6 +686,7 @@ pub(super) async fn put(
     let how = Commit {
         annotations,
         precondition: conditions.precondition(),
+        uncompressed: staged.size >= UNCOMPRESSED_FROM,
     };
     let written = files::commit(Arc::clone(&state.store), segs, staged, how).await?;
     match written {
