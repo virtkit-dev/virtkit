@@ -610,6 +610,18 @@ async fn send(host: &str, req: Req) -> Resp {
 /// the key it takes as `good`: each one's answer, over a mode's `host`.
 async fn sigv4_refusals(host: &str, good: (&str, &str)) {
     let get = || Req::new("GET", "/s3/b/k");
+    // A header with no scheme, or of a scheme this registry does not take.
+    for value in [
+        "invalid_header",
+        "AWS2-HMAC-SHA1 Credential=x/20260101/us-east-1/s3/aws4_request, \
+         SignedHeaders=host, Signature=00",
+        "AWS AKIDNOTAKEY:c2ln",
+        "Digest username=x",
+    ] {
+        send(host, get().header("Authorization", value))
+            .await
+            .is(400, "InvalidArgument");
+    }
     // An id it does not know, whose signature is consistent with it.
     send(host, get().signed(host, ("AKIDNOTAKEY", "AKIDNOTAKEY"), 0))
         .await
@@ -754,9 +766,10 @@ async fn a_shared_bearer_is_the_access_key_and_its_secret() {
     send(&host, get().header("Authorization", "Bearer nope"))
         .await
         .is(403, "AccessDenied");
+    // A scheme this registry does not take is malformed, not refused.
     send(&host, get().header("Authorization", "AWS AKID:sig"))
         .await
-        .is(403, "AccessDenied");
+        .is(400, "InvalidArgument");
     // The bearer itself still works, as on `/dav/`.
     send(&host, get().header("Authorization", "Bearer s3cret"))
         .await

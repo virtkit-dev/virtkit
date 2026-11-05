@@ -616,8 +616,9 @@ and, as S3 requires, every `x-amz-*` header the request carries: one left out is
 it. The request's time must be on the scope's day
 and within 15 minutes of the server's (403 `RequestTimeTooSkewed`, naming the server's
 time). The usual `Authorization: Bearer|Basic` and the session cookie keep working on `/s3/`;
-a request with no credential on a server that requires one is S3's 403 `AccessDenied`, not
-the 401 challenge. On a server with no credential configured, signatures are not checked, as
+an `Authorization` of any other scheme (SigV2, say), or with no scheme at all, is 400
+`InvalidArgument`, as S3 answers a signature version it does not take; a request with no
+credential on a server that requires one is S3's 403 `AccessDenied`, not the 401 challenge. On a server with no credential configured, signatures are not checked, as
 nothing else is. Presigned (query-string) URLs are refused with 400
 `AuthorizationQueryParametersError`, since they put a credential in a URL and so in logs, and
 temporary credentials (`x-amz-security-token`) with 400 `InvalidToken`.
