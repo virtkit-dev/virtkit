@@ -1366,6 +1366,7 @@ async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1471,6 +1472,7 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1691,6 +1693,7 @@ async fn deleting_a_manifest_on_an_open_server() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -2185,6 +2188,7 @@ async fn a_cross_site_write_is_refused_on_an_open_server() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     }));
