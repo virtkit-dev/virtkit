@@ -73,6 +73,7 @@ fn shared(dir: &std::path::Path, auth: Auth, s3: bool) -> (Arc<ServerState>, Sig
         tls: None,
         webdav: true,
         s3,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -82,6 +83,15 @@ fn shared(dir: &std::path::Path, auth: Auth, s3: bool) -> (Arc<ServerState>, Sig
 
 /// Accounts-mode state built the way `serve` builds it, as in `dav_e2e.rs`.
 fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
+    Arc::new(
+        accounts_config(dir)
+            .into_state()
+            .expect("a valid accounts config starts"),
+    )
+}
+
+/// The accounts-mode config [`accounts_state`] starts.
+fn accounts_config(dir: &std::path::Path) -> ServerConfig {
     let secret = dir.join("oidc-secret");
     std::fs::write(&secret, "s3cr3t\n").unwrap();
     let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
@@ -92,7 +102,7 @@ fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
         client_secret_file: secret,
         public_url: "https://registry.internal".to_string(),
     });
-    Arc::new(cfg.into_state().expect("a valid accounts config starts"))
+    cfg
 }
 
 fn accounts_db(state: &ServerState) -> &Db {
@@ -496,7 +506,12 @@ struct Conn {
 
 impl Conn {
     async fn open(host: &str) -> Self {
-        let sock = tokio::net::TcpStream::connect(host).await.unwrap();
+        Conn::open_as(host, host).await
+    }
+
+    /// A connection to `addr` whose requests say they are for `host`.
+    async fn open_as(addr: &str, host: &str) -> Self {
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (read, write) = sock.into_split();
         Conn {
             host: host.to_string(),
@@ -1098,6 +1113,95 @@ async fn the_sccache_sequence_round_trips_with_an_api_key() {
     // The bearer on the same paths still works.
     let bearer = |r: Req| r.header("Authorization", &format!("Bearer {key}"));
     sccache_sequence(&host, &bearer, "other/").await;
+}
+
+/// With `s3_host` set, a host `<bucket>.<s3_host>` names the bucket and the whole path the
+/// key, signed over the host and path as sent; path-style goes on working beside it, and a
+/// host that names no bucket is left to the other routes.
+#[tokio::test]
+async fn a_bucket_is_named_by_its_host_under_s3_host() {
+    let dir = tmp("virtual-host");
+    let mut cfg = accounts_config(&dir);
+    cfg.s3_host = Some("s3.example.com".to_string());
+    let state = Arc::new(cfg.into_state().unwrap());
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let scopes = [Scope {
+        action: Action::Write,
+        repo_pattern: "files/*".to_string(),
+    }];
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "s3", &scopes, None)
+        .unwrap();
+    let addr = spawn(state.clone());
+    let port = addr.rsplit(':').next().unwrap();
+    let send_to = |host: String, req: Req| {
+        let addr = addr.clone();
+        async move { Conn::open_as(&addr, &host).await.send(&req).await }
+    };
+    let signed = |host: &str, req: Req| req.signed(host, (&key, &key), 0);
+    // the port a client sends is ignored, and the signature covers the host with it
+    for vhost in [
+        "b.s3.example.com".to_string(),
+        format!("b.s3.example.com:{port}"),
+    ] {
+        let put = signed(&vhost, Req::new("PUT", "/dir/k").body(HELLO.to_vec()));
+        send_to(vhost.clone(), put).await.ok(200);
+        let get = signed(&vhost, Req::new("GET", "/dir/k"));
+        is_object(&send_to(vhost.clone(), get).await, HELLO);
+    }
+    // the same object, path-style, on the registry's own host
+    let get = signed(&addr, Req::new("GET", "/s3/b/dir/k"));
+    is_object(&send_to(addr.clone(), get).await, HELLO);
+    // and on `s3_host` itself, where only `/s3/` is S3
+    let get = signed("s3.example.com", Req::new("GET", "/s3/b/dir/k"));
+    is_object(&send_to("s3.example.com".into(), get).await, HELLO);
+
+    let vhost = "b.s3.example.com".to_string();
+    // `/` is the bucket: its listing
+    let list = signed(&vhost, Req::new("GET", "/").query("list-type=2"));
+    let resp = send_to(vhost.clone(), list).await;
+    resp.ok(200);
+    assert!(resp.body.contains("<Name>b</Name>"), "{}", resp.body);
+    assert!(resp.body.contains("<Key>dir/k</Key>"), "{}", resp.body);
+    // the whole path is the key, even one another route would take
+    for path in ["/login", "/s3/k", "/v2/k"] {
+        let put = signed(&vhost, Req::new("PUT", path).body(HELLO.to_vec()));
+        send_to(vhost.clone(), put).await.ok(200);
+    }
+    let get = signed(&addr, Req::new("GET", "/s3/b/s3/k"));
+    is_object(&send_to(addr.clone(), get).await, HELLO);
+    let del = signed(&vhost, Req::new("DELETE", "/dir/k"));
+    send_to(vhost.clone(), del).await.ok(204);
+    let get = signed(&vhost, Req::new("GET", "/dir/k"));
+    send_to(vhost.clone(), get).await.is(404, "NoSuchKey");
+
+    // A label that cannot be a bucket, `s3_host` itself and another domain are the
+    // registry's other routes, as for any host.
+    let bearer = format!("Bearer {key}");
+    let unknown = send_to(
+        addr.clone(),
+        Req::new("GET", "/nowhere").header("Authorization", &bearer),
+    )
+    .await;
+    assert_eq!(unknown.status, 404);
+    for host in [
+        "tags.s3.example.com",
+        "s3.example.com",
+        "b.s3.example.org",
+        "b.s4.example.com",
+    ] {
+        let resp = send_to(
+            host.to_string(),
+            Req::new("GET", "/nowhere").header("Authorization", &bearer),
+        )
+        .await;
+        assert_eq!(resp.status, 404, "{host}: {resp:?}");
+        assert_eq!(resp.header("x-amz-request-id"), None, "{host}");
+        assert_eq!(resp.body, unknown.body, "{host}");
+    }
 }
 
 /// The payload modes: unsigned, or the body's SHA-256, which the body must then have. A

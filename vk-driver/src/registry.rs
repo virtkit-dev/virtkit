@@ -5944,6 +5944,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }))
@@ -5992,6 +5993,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6028,6 +6030,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6142,6 +6145,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6399,6 +6403,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6702,6 +6707,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6744,6 +6750,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6781,6 +6788,7 @@ pub(crate) mod tests {
             tls: None,
             webdav: true,
             s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));

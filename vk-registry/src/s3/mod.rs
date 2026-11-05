@@ -13,6 +13,11 @@
 //! their copies, [`multipart`] their uploads in parts and [`batch`] their deletion in
 //! batches; [`canned`] answers the configurations a bucket or an object has none of.
 //! Operations not served answer `NotImplemented`.
+//!
+//! With `s3_host` set, a request sent to `<bucket>.<s3_host>` names its bucket by its host,
+//! virtual-hosted style, and its key by its whole path ([`virtual_bucket`]). It is served
+//! as the path-style request for the same bucket and key; its signature is checked against
+//! the request as sent, host and path included, as the client signed it.
 
 mod batch;
 mod bucket;
@@ -45,6 +50,28 @@ pub(crate) fn is_path(path: &str) -> bool {
     path == "/s3" || path.starts_with("/s3/")
 }
 
+/// The bucket a request sent to `host` names, virtual-hosted style: `<bucket>.<s3_host>`,
+/// with any `:port` ignored and the domain compared without regard to case. `None` for any
+/// other host, and for a label that cannot name a bucket, so the other routes answer it.
+pub(crate) fn virtual_bucket<'h>(s3_host: &str, host: &'h str) -> Option<&'h str> {
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    let at = name.len().checked_sub(s3_host.len())?;
+    let (label, domain) = (name.get(..at)?, name.get(at..)?);
+    let bucket = label.strip_suffix('.')?;
+    (domain.eq_ignore_ascii_case(s3_host) && path::is_bucket(bucket)).then_some(bucket)
+}
+
+/// The host a request was sent to: its `Host` header, or the authority of an HTTP/2 one.
+pub(crate) fn host_of(req: &Request<Incoming>) -> Option<&str> {
+    match req.headers().get(hyper::header::HOST) {
+        Some(host) => host.to_str().ok(),
+        None => req.uri().authority().map(|a| a.as_str()),
+    }
+}
+
 /// How much of a request body is read before answering a refusal decided before the caller
 /// is known: enough for a small write to see its answer rather than a reset, not so much
 /// that anyone who can reach the port can make the server read a large upload for nothing.
@@ -61,19 +88,24 @@ const REQUEST_ID: &str = "x-amz-request-id";
 pub(super) const UNCOMPRESSED_FROM: u64 = 8 << 20;
 
 /// Serve one `/s3/…` request, from its credentials on: [`crate::route`] hands every such
-/// request here before its own gate when S3 is on.
-pub(crate) async fn route(state: &ServerState, req: Request<Incoming>) -> Result<Response<Body>> {
+/// request here before its own gate when S3 is on, and every request whose host names a
+/// `bucket` ([`virtual_bucket`]), which is then served as the `/s3/<bucket>/…` path naming
+/// the same key.
+pub(crate) async fn route(
+    state: &ServerState,
+    bucket: Option<&str>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>> {
+    let path = req.uri().path();
     let ctx = Ctx {
         id: accounts::random_token(8),
-        path: req.uri().path().to_string(),
-        url: match req.headers().get(hyper::header::HOST) {
-            Some(host) => format!(
-                "{}://{}{}",
-                crate::scheme(state.tls.is_some()),
-                String::from_utf8_lossy(host.as_bytes()),
-                req.uri().path()
-            ),
-            None => req.uri().path().to_string(),
+        path: match bucket {
+            Some(bucket) => format!("/s3/{bucket}{path}"),
+            None => path.to_string(),
+        },
+        url: match host_of(&req) {
+            Some(host) => format!("{}://{host}{path}", crate::scheme(state.tls.is_some())),
+            None => path.to_string(),
         },
     };
     let id = &ctx.id;
@@ -604,6 +636,33 @@ mod tests {
         }
         for p in ["/s3x", "/s", "/dav/s3", "/S3/"] {
             assert!(!is_path(p), "{p}");
+        }
+    }
+
+    /// The bucket is the host's first labels before `s3_host`, whatever the port; any other
+    /// host, and a label that cannot be a bucket, names none.
+    #[test]
+    fn a_host_names_a_bucket_only_below_s3_host() {
+        let of = |host| virtual_bucket("s3.example.com", host);
+        assert_eq!(of("b.s3.example.com"), Some("b"));
+        assert_eq!(of("b.s3.example.com:8443"), Some("b"));
+        assert_eq!(of("b.S3.Example.COM"), Some("b"));
+        assert_eq!(of("my.cache.s3.example.com"), Some("my.cache"));
+        for host in [
+            "s3.example.com",
+            "s3.example.com:443",
+            ".s3.example.com",
+            "bs3.example.com",
+            "b.s3.example.org",
+            "b.s3.example.com.",
+            "b.s3.example.com:",
+            "b.s3.example.com:x",
+            "tags.s3.example.com",
+            "a%2fb.s3.example.com",
+            "example.com",
+            "",
+        ] {
+            assert_eq!(of(host), None, "{host:?}");
         }
     }
 
