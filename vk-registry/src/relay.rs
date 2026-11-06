@@ -280,7 +280,11 @@ pub async fn get_manifest(
         // the sidecar that makes them readable here, and an exclusive `gc` in between
         // would leave the one without the other.
         let _lock = state.store.lock_shared()?;
-        let got = state.store.put_manifest(name, reference, &ctype, &body)?;
+        // Kept as the upstream wrote it, other digest algorithms included: see
+        // `Store::put_relayed_manifest` for why that is safe and why refusing is not.
+        let got = state
+            .store
+            .put_relayed_manifest(name, reference, &ctype, &body)?;
         if got != reference {
             bail!("upstream manifest digest mismatch for {name}: got {got}, want {reference}");
         }

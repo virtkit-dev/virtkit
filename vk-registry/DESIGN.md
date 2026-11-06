@@ -158,7 +158,10 @@ Relayed blobs stream into a temporary file with bounded memory. The server hashe
 as they arrive, verifies the requested digest, and promotes the file only after successful
 verification. Promotion applies the same adaptive choice as an upload — compressed when that
 shrinks the bytes, identity otherwise — decided before the store lock is taken.
-Digest-addressed manifests follow the normal manifest write path without creating a tag.
+Digest-addressed manifests follow the normal manifest write path without creating a tag,
+except that they are kept as the upstream wrote them even when a descriptor names a digest
+that is not `sha256:<64 lowercase hex>` (OCI allows other algorithms). Nothing in the store
+reads through such a digest, and `vk` refuses it before using it.
 
 Blob `HEAD` deliberately describes local storage rather than upstream availability. This
 supports the push deduplication protocol: `vk push` skips an upload after a successful
@@ -193,8 +196,10 @@ The second rule preserves cross-repository deduplication without disclosing byte
 principal could not already fetch. The common pull path is one membership lookup; only a
 miss searches the repositories the principal may read.
 
-A manifest `PUT` succeeds only if every referenced digest is already readable by the
-caller. Accepted references receive membership in the target repository. Validation and
+A manifest `PUT` naming a digest that is not `sha256:<64 lowercase hex>` — config, layer,
+index child or subject — is refused with `DIGEST_INVALID`, in every mode, rather than having
+that digest skipped by the check. Otherwise it succeeds only if every referenced digest is
+already readable by the caller. Accepted references receive membership in the target repository. Validation and
 write run under the same store lock, preventing `gc` from removing a referenced blob
 between them. Image indexes are traversed when establishing membership, including their
 child manifest digests.

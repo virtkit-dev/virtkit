@@ -180,7 +180,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-a/app/manifests/v1"))
         .header("Cookie", format!("__Host-vk_session={plain_session}"))
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -190,7 +190,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-a/app/manifests/v1"))
         .header("Cookie", format!("__Host-vk_session={admin_session}"))
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -200,7 +200,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-a/other/manifests/v1"))
         .bearer_auth(&team_a_key)
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -210,7 +210,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-b/app/manifests/v1"))
         .bearer_auth(&team_a_key)
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -236,7 +236,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-a/app/manifests/v2"))
         .bearer_auth(&read_only_key)
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -368,7 +368,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let resp = client
         .put(format!("{url}/v2/team-b/app/manifests/v1"))
         .header("Cookie", format!("__Host-vk_session={admin_session}"))
-        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .body(r#"{"schemaVersion":2,"layers":[]}"#)
         .send()
         .await
         .unwrap();
@@ -1775,7 +1775,7 @@ async fn admin_socket_changes_decide_the_next_request() {
     let socket = spawn_admin_socket(&state, &dir);
     let url = spawn(state.clone());
     let http = no_redirect_client();
-    let manifest = r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#;
+    let manifest = r#"{"schemaVersion":2,"layers":[]}"#;
 
     // A second process cannot open the db: without the socket, this is where an operator
     // would have had to stop the server.

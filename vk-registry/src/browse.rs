@@ -680,8 +680,9 @@ mod tests {
                 "mediaType": "text/plain",
             }],
         });
+        // A pusher's manifest is refused for such digests; an upstream's is kept as it came.
         store
-            .put_manifest(
+            .put_relayed_manifest(
                 "team-a/app",
                 "v1",
                 "application/vnd.oci.image.manifest.v1+json",
@@ -716,7 +717,7 @@ mod tests {
             ],
         });
         store
-            .put_manifest(
+            .put_relayed_manifest(
                 "team-a/multi",
                 "v1",
                 "application/vnd.oci.image.index.v1+json",

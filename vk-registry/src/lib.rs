@@ -521,6 +521,11 @@ impl Store {
     /// Locate a blob by digest hex: `(path, stored_as_zstd)`. Checks the zstd store
     /// then the identity store.
     fn find_blob(&self, hex: &str) -> Option<(PathBuf, bool)> {
+        // The public readers (`get_blob`, `has_blob`) take a hex their caller may have read
+        // out of a manifest: anything else is no blob, rather than a path to follow.
+        if !is_blob_hex(hex) {
+            return None;
+        }
         let z = self.zstd_blob_path(hex);
         if z.is_file() {
             return Some((z, true));
@@ -900,8 +905,7 @@ impl Store {
         let path = self.tag_path(name, tag);
         let modified = std::fs::symlink_metadata(&path).ok()?.modified().ok()?;
         let digest = std::fs::read_to_string(&path).ok()?;
-        let hex = digest.trim().trim_start_matches("sha256:").to_string();
-        is_blob_hex(&hex).then_some((hex, modified))
+        Some((tag_hex(&digest)?.to_string(), modified))
     }
 
     /// Manifest length, media type and membership mtime, using the same media-type fallbacks as
@@ -1160,13 +1164,42 @@ impl Store {
 
     /// Store manifest bytes (content-addressed) + the Content-Type sidecar, and point
     /// the tag at it (a digest reference is already self-describing). Returns the
-    /// manifest digest.
+    /// manifest digest. Refuses a manifest naming any digest that is not
+    /// `sha256:<64 lowercase hex>` ([`non_canonical_descriptor`]).
     pub fn put_manifest(
         &self,
         name: &str,
         reference: &str,
         ctype: &str,
         body: &[u8],
+    ) -> Result<String> {
+        self.write_manifest(name, reference, ctype, body, true)
+    }
+
+    /// [`Store::put_manifest`] for a manifest the relay fetched by digest from an upstream,
+    /// which is kept byte for byte even when it names a digest in another algorithm (OCI
+    /// allows `sha512:`) or in a spelling this store would refuse from a pusher. Refusing it
+    /// would break pulling a real upstream image through the relay for no gain: no membership
+    /// is recorded from it (the relay records only the blobs it fetched and hashed itself),
+    /// the gc mark skips such a digest, and every blob request is held to [`valid_digest`],
+    /// so nothing here reads through it; `vk` refuses it on its side before using it.
+    pub(crate) fn put_relayed_manifest(
+        &self,
+        name: &str,
+        reference: &str,
+        ctype: &str,
+        body: &[u8],
+    ) -> Result<String> {
+        self.write_manifest(name, reference, ctype, body, false)
+    }
+
+    fn write_manifest(
+        &self,
+        name: &str,
+        reference: &str,
+        ctype: &str,
+        body: &[u8],
+        canonical_only: bool,
     ) -> Result<String> {
         if !valid_name(name) || !valid_reference(reference) {
             bail!("invalid manifest reference {name}:{reference}");
@@ -1184,6 +1217,9 @@ impl Store {
         // storing such bytes would stall collection for as long as their tag is read.
         if !is_json_object(body) {
             bail!("manifest body is not a JSON object");
+        }
+        if canonical_only && let Some(why) = non_canonical_descriptor(body) {
+            bail!("refusing the manifest {name}:{reference}: {why}");
         }
         let hex = &digest[7..];
         let dest = self.blob_path(hex);
@@ -1243,7 +1279,10 @@ impl Store {
                 Err(_) => return Ok(None),
             }
         };
-        let hex = digest.trim_start_matches("sha256:");
+        // A tag whose contents are not a digest resolves to nothing: they are joined to paths.
+        let Some(hex) = digest_hex(&digest) else {
+            return Ok(None);
+        };
         let Ok(data) = std::fs::read(self.blob_path(hex)) else {
             return Ok(None);
         };
@@ -1285,10 +1324,10 @@ impl Store {
                 let Ok(digest) = std::fs::read_to_string(&path) else {
                     return false;
                 };
-                let hex = digest.trim().trim_start_matches("sha256:");
-                // The same check `get_manifest` makes: a manifest is stored uncompressed, so
-                // read the identity blob rather than the zstd form `find_blob` also accepts.
-                let present = self.blob_path(hex).is_file();
+                // The same checks `get_manifest` makes: a digest, not a path, and a manifest is
+                // stored uncompressed, so read the identity blob rather than the zstd form
+                // `find_blob` also accepts.
+                let present = tag_hex(&digest).is_some_and(|hex| self.blob_path(hex).is_file());
                 if present {
                     touch(&path);
                 }
@@ -1468,10 +1507,7 @@ impl Store {
             .iter()
             .map(|tag| {
                 let digest = std::fs::read_to_string(self.tag_path(name, tag)).ok()?;
-                let hex = digest.trim().trim_start_matches("sha256:");
-                if !is_blob_hex(hex) {
-                    return None;
-                }
+                let hex = tag_hex(&digest)?;
                 let mut per_tag = 0u64;
                 for (h, size) in self.manifest_ondisk_blobs(hex)? {
                     per_tag += size;
@@ -2127,8 +2163,7 @@ impl Store {
                 // kept, and a kept tag left unrooted would have its blobs swept.
                 let seen = SeenTag::read(tag)?;
                 let d = &seen.bytes;
-                let hex =
-                    std::str::from_utf8(d).map_or("", |d| d.trim().trim_start_matches("sha256:"));
+                let hex = std::str::from_utf8(d).ok().and_then(tag_hex).unwrap_or("");
                 let protected = !scoped
                     || seen
                         .path
@@ -2348,7 +2383,9 @@ impl Store {
                     }
                 };
                 let hex = std::str::from_utf8(&bytes)
-                    .map_or("", |d| d.trim().trim_start_matches("sha256:"));
+                    .ok()
+                    .and_then(tag_hex)
+                    .unwrap_or("");
                 if is_blob_hex(hex) && !plan.walked.contains(hex) {
                     roots.insert(hex.to_string());
                 }
@@ -2719,14 +2756,13 @@ impl Store {
                 if stage {
                     s.completed_stages += 1;
                 }
-                if let Ok(digest) = std::fs::read_to_string(&tag) {
-                    let hex = digest.trim().trim_start_matches("sha256:").to_string();
-                    if is_blob_hex(&hex) {
-                        if stage {
-                            stage_hexes.push(hex.clone());
-                        }
-                        manifest_hexes.insert(hex);
+                if let Ok(digest) = std::fs::read_to_string(&tag)
+                    && let Some(hex) = tag_hex(&digest).map(str::to_string)
+                {
+                    if stage {
+                        stage_hexes.push(hex.clone());
                     }
+                    manifest_hexes.insert(hex);
                 }
                 if let Some(n) = tag.file_name().and_then(|n| n.to_str()) {
                     let m = std::fs::metadata(&tag)
@@ -3487,42 +3523,64 @@ fn is_blob_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Every descriptor a manifest names, labeled for an error: its config and layers, an image
+/// index's child manifests, and its `subject`. A JSON `null` in place of one names nothing.
+fn referenced_descriptors(v: &serde_json::Value) -> Vec<(&'static str, &serde_json::Value)> {
+    let mut out = manifest_descriptors(v);
+    if let Some(children) = v.pointer("/manifests").and_then(|m| m.as_array()) {
+        out.extend(children.iter().map(|m| ("manifest", m)));
+    }
+    // `subject` is a reference like any other: a referrers manifest that named one and did
+    // not mount it would push fine and then 404 on the subject it points at.
+    if let Some(subject) = v.pointer("/subject") {
+        out.push(("subject", subject));
+    }
+    out.retain(|(_, d)| !d.is_null());
+    out
+}
+
+/// Why `manifest` cannot be stored as a pushed manifest: the first descriptor whose digest is
+/// not `sha256:<64 lowercase hex>` ([`digest_hex`]), described for the refusal. `None` for a
+/// manifest whose every descriptor is canonical, and for bytes that are not JSON, which the
+/// caller refuses on their own.
+///
+/// Refused rather than skipped: a skipped digest is one the membership check never saw, and a
+/// client that reads it less strictly than this store does (stripping a repeated `sha256:`,
+/// say) would then fetch content from its own cache that the pusher had no claim to.
+fn non_canonical_descriptor(manifest: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    referenced_descriptors(&v)
+        .into_iter()
+        .find_map(
+            |(label, d)| match d.pointer("/digest").and_then(|d| d.as_str()) {
+                Some(digest) if digest_hex(digest).is_some() => None,
+                Some(digest) => Some(format!(
+                    "the {label} digest {digest:?} is not sha256:<64 lowercase hex>"
+                )),
+                None => Some(format!("a {label} descriptor has no digest")),
+            },
+        )
+}
+
 /// Every digest a manifest references, tolerantly: its config and layers, *and* an image
-/// index's child manifests. Unlike [`manifest_references`], which fails on bytes that are
-/// not JSON so that the gc mark can refuse such a root, this is for recording membership,
-/// where an unparseable or unfamiliar manifest should contribute what it can rather than
-/// fail a push.
+/// index's child manifests and its subject. Unlike [`manifest_references`], which fails on
+/// bytes that are not JSON so that the gc mark can refuse such a root, this is for recording
+/// membership, where an unfamiliar manifest should contribute what it can rather than fail a
+/// push.
 ///
 /// Failing open (an empty result for bytes that are not JSON) is deliberate and grants
 /// nothing: contributing no digests records no membership, so the only thing readable
 /// through the repository afterwards is the manifest's own bytes, which the caller
-/// supplied. A digest in an algorithm this store does not use, or in uppercase hex, is
-/// dropped for the same reason — nothing here can serve it either.
+/// supplied. A digest that is not `sha256:<64 lowercase hex>` never gets here: every
+/// manifest write refuses it first ([`non_canonical_descriptor`]), because skipping it would
+/// leave it unchecked for clients that read it less strictly than this store does.
 fn manifest_child_hexes(manifest: &[u8]) -> Vec<String> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest) else {
         return Vec::new();
     };
-    let children = v
-        .pointer("/manifests")
-        .and_then(|m| m.as_array())
+    referenced_descriptors(&v)
         .into_iter()
-        .flatten()
-        .map(|m| m.pointer("/digest"));
-    // `subject` is a reference like any other: a referrers manifest that named one and did
-    // not mount it would push fine and then 404 on the subject it points at.
-    manifest_descriptors(&v)
-        .into_iter()
-        .map(|(_, d)| d.pointer("/digest"))
-        .chain(children)
-        .chain(std::iter::once(v.pointer("/subject/digest")))
-        .filter_map(|d| d?.as_str())
-        // `strip_prefix`, not `trim_start_matches`: exactly one `sha256:`, and a digest in
-        // another algorithm — or with no algorithm at all — is dropped rather than
-        // half-parsed. Dropping one means it is not checked, which grants nothing: this
-        // store names blobs by `sha256:<lowercase hex>` and `valid_digest` refuses any
-        // other spelling, so there is no way to read back what was skipped.
-        .filter_map(|d| d.strip_prefix("sha256:"))
-        .filter(|h| is_blob_hex(h))
+        .filter_map(|(_, d)| digest_hex(d.pointer("/digest")?.as_str()?))
         .map(str::to_string)
         .collect()
 }
@@ -3546,8 +3604,7 @@ fn manifest_references(manifest: &[u8]) -> Result<ManifestReferences> {
     // Only `sha256:<lowercase hex>`, as [`manifest_child_hexes`] reads them: anything else
     // names nothing this store holds, and as a path component it could name anything at all.
     fn hex(d: &serde_json::Value) -> Option<String> {
-        let h = d.pointer("/digest")?.as_str()?.strip_prefix("sha256:")?;
-        is_blob_hex(h).then(|| h.to_string())
+        digest_hex(d.pointer("/digest")?.as_str()?).map(str::to_string)
     }
     let size = |d: &serde_json::Value| d.pointer("/size").and_then(|s| s.as_u64()).unwrap_or(0);
     let children = v.pointer("/manifests").and_then(|m| m.as_array());
@@ -5149,6 +5206,15 @@ fn put_manifest(
             "the manifest body is not a JSON object",
         ));
     }
+    // In every mode, before the membership check, which reads canonical digests only: one
+    // it skipped would go unchecked to a client that reads it less strictly.
+    if let Some(why) = non_canonical_descriptor(body) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &why,
+        ));
+    }
     // shared store lock for the write (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
     match authorize_and_mount_manifest_blobs(authz, store, name, body)? {
@@ -5802,10 +5868,23 @@ pub fn valid_name(name: &str) -> bool {
 /// [`sha256_hex_raw`] produces, so a digest that passes here is one the store can
 /// actually compare against and find.
 fn valid_digest(d: &str) -> bool {
-    // Lowercase only, matching [`is_blob_hex`]: blobs are named by lowercase hex on disk,
-    // so accepting uppercase here would let the read predicate and the write predicate
-    // disagree about the same digest.
-    d.strip_prefix("sha256:").is_some_and(is_blob_hex)
+    digest_hex(d).is_some()
+}
+
+/// The hex of `digest` when it is exactly `sha256:` and 64 lowercase hex digits, the only
+/// spelling under which a digest may name a file. One `sha256:`, not as many as
+/// `trim_start_matches` strips, and no other algorithm: whatever passes is a bare file name,
+/// so a digest read from a manifest or a peer can be joined onto a directory. Lowercase only,
+/// matching [`is_blob_hex`]: blobs are named by lowercase hex on disk, so accepting uppercase
+/// would let the read predicate and the write predicate disagree about the same digest.
+pub fn digest_hex(digest: &str) -> Option<&str> {
+    digest.strip_prefix("sha256:").filter(|h| is_blob_hex(h))
+}
+
+/// The manifest hex a tag file's `contents` point at: [`digest_hex`] of them, trimmed, so a
+/// repeated `sha256:`, a bare hex or a path names no manifest rather than a file to open.
+fn tag_hex(contents: &str) -> Option<&str> {
+    digest_hex(contents.trim())
 }
 
 /// A manifest reference: a digest, or a single safe tag component. Shared with
@@ -7510,6 +7589,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A manifest naming a digest that is not `sha256:<64 lowercase hex>` — config, layer,
+    /// index child or subject — is refused, scoped or not, rather than having that digest
+    /// skipped by the membership check. Only the relay keeps such a manifest, as the upstream
+    /// wrote it.
+    #[tokio::test]
+    async fn a_manifest_naming_a_non_canonical_digest_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-noncanon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        // Another project's layer: what a doubled prefix would otherwise smuggle past.
+        let secret = store.put_blob(b"another project's layer").unwrap();
+        let secret_hex = hex(&secret);
+        store.record_blob("p/gl/43/app", &secret_hex).unwrap();
+        let ok = store.put_blob(b"own config").unwrap();
+        store.record_blob("p/gl/42/app", &hex(&ok)).unwrap();
+
+        let layer = |d: &str| serde_json::json!({"mediaType": "x", "digest": d, "size": 1});
+        let bad = [
+            format!("sha256:{secret}"),
+            secret_hex.clone(),
+            format!("sha256:{}", secret_hex.to_uppercase()),
+            format!("sha256:{}", &secret_hex[..63]),
+            "sha256:../../blobs/sha256/x".to_string(),
+            format!("sha512:{}", "a".repeat(128)),
+            String::new(),
+        ];
+        let mut bodies: Vec<Vec<u8>> = bad
+            .iter()
+            .flat_map(|d| {
+                [
+                    serde_json::json!({"schemaVersion": 2, "config": layer(&ok), "layers": [layer(d)]}),
+                    serde_json::json!({"schemaVersion": 2, "config": layer(d), "layers": []}),
+                    serde_json::json!({"schemaVersion": 2, "manifests": [layer(d)]}),
+                    serde_json::json!({"schemaVersion": 2, "config": layer(&ok), "subject": layer(d)}),
+                ]
+            })
+            .map(|v| serde_json::to_vec(&v).unwrap())
+            .collect();
+        bodies.push(br#"{"schemaVersion":2,"layers":[{"mediaType":"x","size":1}]}"#.to_vec());
+
+        let c = claims(&[("p/gl/42", "rw")]);
+        for body in &bodies {
+            for authz in [Authz::NoScopes, Authz::Token(&c)] {
+                let res = put_manifest(
+                    &authz,
+                    &store,
+                    "p/gl/42/app",
+                    "v1",
+                    DEFAULT_MANIFEST_TYPE,
+                    body,
+                )
+                .unwrap();
+                assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+                let err: serde_json::Value =
+                    serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                        .unwrap();
+                assert_eq!(err["errors"][0]["code"], "DIGEST_INVALID");
+            }
+            assert!(
+                store
+                    .put_manifest("p/gl/42/app", "v1", DEFAULT_MANIFEST_TYPE, body)
+                    .is_err()
+            );
+        }
+        assert!(store.get_manifest("p/gl/42/app", "v1").unwrap().is_none());
+        assert!(!store.repo_has_blob("p/gl/42/app", &secret_hex));
+
+        // A canonical manifest pushes fine, and the relay keeps an upstream's manifest
+        // whatever its digests say.
+        let good = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "config": layer(&ok), "layers": [], "subject": null,
+        }))
+        .unwrap();
+        let res = put_manifest(
+            &Authz::Token(&c),
+            &store,
+            "p/gl/42/app",
+            "v1",
+            DEFAULT_MANIFEST_TYPE,
+            &good,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let pinned = format!("sha256:{}", sha256_hex_raw(&bodies[0]));
+        assert_eq!(
+            store
+                .put_relayed_manifest("mirror/app", &pinned, DEFAULT_MANIFEST_TYPE, &bodies[0])
+                .unwrap(),
+            pinned
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tag file's contents name a manifest only when they are a canonical digest: a repeated
+    /// `sha256:`, a bare hex, a traversal or an absolute path resolves to nothing through
+    /// either public reader, even when a manifest sits where the path would lead.
+    #[test]
+    fn a_tag_naming_anything_but_a_digest_resolves_to_nothing() {
+        let base = std::env::temp_dir().join(format!("vk-regserve-tagfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Store::new(base.join("store")).unwrap();
+        let body = br#"{"schemaVersion":2,"layers":[]}"#;
+        let digest = store
+            .put_manifest("img", "good", DEFAULT_MANIFEST_TYPE, body)
+            .unwrap();
+        let hex = hex(&digest);
+        let outside = base.join("outside");
+        std::fs::write(&outside, body).unwrap();
+        for (tag, contents) in [
+            ("doubled", format!("sha256:{digest}")),
+            ("bare", hex.clone()),
+            ("traversal", "sha256:../../../outside".to_string()),
+            ("absolute", format!("sha256:{}", outside.display())),
+            ("bare-absolute", outside.display().to_string()),
+        ] {
+            std::fs::write(store.tag_path("img", tag), &contents).unwrap();
+            assert!(
+                store.get_manifest("img", tag).unwrap().is_none(),
+                "{contents}"
+            );
+            assert_eq!(
+                store.has_manifests("img", &[tag]).unwrap(),
+                [false],
+                "{contents}"
+            );
+            assert!(store.tag_target("img", tag).is_none(), "{contents}");
+        }
+        assert!(store.get_manifest("img", "good").unwrap().is_some());
+        assert_eq!(store.has_manifests("img", &["good"]).unwrap(), [true]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// DELETE by tag drops that tag only; by digest, every tag of the repository on it and
     /// its membership, leaving other repositories' tags on the same bytes alone. Nothing to
     /// drop is a 404.
@@ -8944,8 +9155,9 @@ mod tests {
         })
         .to_string()
         .into_bytes();
+        // Kept only from an upstream: a pusher's manifest is refused for such a digest.
         store
-            .put_manifest(
+            .put_relayed_manifest(
                 "repo",
                 "odd",
                 "application/vnd.oci.image.index.v1+json",
@@ -10324,10 +10536,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.clone()).unwrap();
 
-        let manifest =
-            br#"{"schemaVersion":2,"config":{"digest":"sha256:x","size":0},"layers":[]}"#;
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"sha256:{}","size":0}},"layers":[]}}"#,
+            "0".repeat(64)
+        );
         store
-            .put_manifest("team-a/app", "v1", DEFAULT_MANIFEST_TYPE, manifest)
+            .put_manifest(
+                "team-a/app",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                manifest.as_bytes(),
+            )
             .unwrap();
         for i in 0..40u32 {
             store
@@ -10828,8 +11047,9 @@ mod tests {
         })
         .to_string()
         .into_bytes();
+        // Kept only from an upstream: a pusher's manifest is refused for such digests.
         store
-            .put_manifest("repo", "odd", DEFAULT_MANIFEST_TYPE, &manifest)
+            .put_relayed_manifest("repo", "odd", DEFAULT_MANIFEST_TYPE, &manifest)
             .unwrap();
 
         let s = store.stats().unwrap();

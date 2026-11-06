@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security: vk-registry refuses a pushed manifest that names anything but a lowercase sha256
+  digest.** A manifest or index whose config, layers, child manifests or subject name another
+  digest, `sha512:` included, is refused with `DIGEST_INVALID` instead of being stored.
+  Manifests the pull-through relay fetches from an upstream are kept as they come.
+
 ## [0.106.0] - 2026-11-05
 
 ### Added
