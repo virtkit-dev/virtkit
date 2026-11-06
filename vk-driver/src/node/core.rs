@@ -61,7 +61,8 @@ pub struct Core {
     /// Whether an update may install an older version than this one (`[node]
     /// allow_downgrade`).
     allow_downgrade: AtomicBool,
-    /// What an update's release must be signed with (`[node] release_keys`).
+    /// What an update's release must be signed with (`[node] release_keys`, or the keys
+    /// pinned at enrollment).
     release_policy: Mutex<crate::release_key::Policy>,
     /// The node's configured intake of hub-placed jobs.
     placed: Mutex<PlacedIntake>,
@@ -293,8 +294,8 @@ impl Core {
         self.allow_downgrade.load(Ordering::Relaxed)
     }
 
-    /// Require what `policy` says of every update's release, as `[node] release_keys` and
-    /// `require_signed` say.
+    /// Require what `policy` says of every update's release, as `[node] release_keys` (or the
+    /// keys pinned at enrollment) and `require_signed` say.
     pub fn set_release_policy(&self, policy: crate::release_key::Policy) {
         *lock(&self.release_policy) = policy;
     }
@@ -401,6 +402,7 @@ impl Core {
             tools: persisted.tools_progress.clone(),
             placed: Some(placed),
             settings: lock(&self.settings).as_ref().map(|h| h.report().clone()),
+            release_keys: Some(lock(&self.release_policy).shown()),
             ..Report::default()
         }
     }

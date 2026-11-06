@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A fleet node checks update signatures with no config of its own.** The release keys in the
+  hub's `[nodes] release_keys` are pinned on each node when it joins, and from then on it
+  requires updates signed by one of them, as it would with the keys in its own config, which
+  still win; `[node] require_signed = false` in its config makes a signature optional, as it
+  does for those keys. Nothing the hub says later changes them. The node reports which keys it
+  trusts, where they come from and whether it requires a signature.
 - **A fleet node can use the registry its hub names.** With no `[registry]` in its config, the
   node takes the hub's, CA included, and holds no registry credential of its own: its jobs'
   guests reach the registry with the token the hub gives each job, and so do the node's own

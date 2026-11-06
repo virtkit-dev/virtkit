@@ -546,10 +546,11 @@ pub struct Node {
     /// on, nothing older than the first release that takes part in a trial is installed.
     pub allow_downgrade: bool,
     /// The ed25519 public keys, base64, whose signature an update's release must carry —
-    /// `vk release-key generate` prints one. Unset: releases are not checked.
+    /// `vk release-key generate` prints one. Unset: the keys the hub gave when the node
+    /// enrolled, pinned in its enrollment; with none, releases are not checked.
     pub release_keys: Vec<String>,
-    /// Whether an update needs a signature by one of `release_keys`. Unset: when any key is
-    /// set. A release that carries a signature is checked whenever there are keys.
+    /// Whether an update needs a signature by a configured or pinned release key. Defaults
+    /// to true when any key exists. With keys, a supplied signature is always checked.
     pub require_signed: Option<bool>,
     /// Labels for job placement: a `vk-gitlab` runner requires nodes with all its labels.
     /// At most 32 labels, each 1–64 ASCII letters, digits or `-_.:/=` characters.

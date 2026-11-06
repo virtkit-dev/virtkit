@@ -1354,6 +1354,7 @@ mod tests {
                 hub: hub.clone(),
                 node_id: "ab".repeat(16),
                 ca: false,
+                release_keys: Vec::new(),
             },
             identity: crate::node::identity::Identity::load_or_create(dir).unwrap(),
             incarnation: "cd".repeat(16),

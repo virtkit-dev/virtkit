@@ -9,8 +9,8 @@ The long-term goal is a fleet administered from the hub alone. The hub holds eve
 every registry's configuration, and a host needs almost no administration of its own. Today
 a node's own config is authoritative: the hub only narrows it, or, as proposed, fills in an
 allowlist of capacity settings the config leaves unset (`fleet-design.md`, *Configuration*),
-and trust anchors such as release keys are pinned on each host, from its config or, as
-proposed, at enrollment. This design keeps what that buys, a hub compromise that cannot take over the
+and trust anchors such as release keys are pinned on each host, from its config or at
+enrollment. This design keeps what that buys, a hub compromise that cannot take over the
 fleet, and drops the per-host administration. The hub holds and distributes everything, but
 an offline **fleet root** signs the few powers the hub may not grant itself.
 

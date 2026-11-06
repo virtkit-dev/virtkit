@@ -114,6 +114,10 @@ pub struct Enrollment {
     /// Whether the hub is verified against `ca.pem` alone rather than the system's roots.
     #[serde(default)]
     pub ca: bool,
+    /// The ed25519 public keys, base64, the hub gave to check `vk` releases against: pinned
+    /// here, since no session changes them. `[node] release_keys` replaces them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_keys: Vec<String>,
 }
 
 /// `<state_dir>/node`.
@@ -340,7 +344,7 @@ async fn enroll_here(
             signature: identity.sign(&vk_hub_proto::enroll_message(token, public_key)),
             hostname: inventory::hostname(),
         };
-        let node_id = enroll(hub, ca_pem.as_deref(), &ask).await?;
+        let (node_id, release_keys) = enroll(hub, ca_pem.as_deref(), &ask).await?;
         if let Some(pem) = &ca_pem {
             let path = dir.join(CA_FILE);
             vk_fs::write_atomic(&path, pem, 0o600)
@@ -352,6 +356,7 @@ async fn enroll_here(
             hub: hub.to_string(),
             node_id: node_id.clone(),
             ca: ca_pem.is_some(),
+            release_keys,
         };
         let json = serde_json::to_vec_pretty(&enrollment).context("encoding the enrollment")?;
         let path = dir.join(ENROLLMENT_FILE);
@@ -498,8 +503,12 @@ pub async fn run(cfg: Config) -> Result<()> {
         node_id: enrollment.node_id.clone(),
     };
     let (runner_tx, runner_state) = tokio::sync::watch::channel(vk_hub_proto::RunnerState::Stopped);
-    let policy =
-        crate::release_key::Policy::from_config(&cfg.node.release_keys, cfg.node.require_signed)?;
+    let policy = crate::release_key::Policy::for_node(
+        &cfg.node.release_keys,
+        &enrollment.release_keys,
+        cfg.node.require_signed,
+    )
+    .context("checking [node] release_keys, or those pinned at enrollment")?;
     let runner = match mode {
         vk_hub_proto::RunnerMode::Managed => core::Runner::Managed(runner_state),
         vk_hub_proto::RunnerMode::External => core::Runner::External,
@@ -970,8 +979,13 @@ fn lock_tries(dir: &Path, tries: u32) -> Result<std::fs::File> {
     vk_peer::net::lock_tries(dir, LOCK_FILE, tries, "vk node")
 }
 
-/// `POST /v1/enroll`, answering with the node ID the hub assigned.
-async fn enroll(hub: &str, ca_pem: Option<&[u8]>, ask: &EnrollRequest) -> Result<String> {
+/// `POST /v1/enroll`, answering with the node ID the hub assigned and the release keys it
+/// gave.
+async fn enroll(
+    hub: &str,
+    ca_pem: Option<&[u8]>,
+    ask: &EnrollRequest,
+) -> Result<(String, Vec<String>)> {
     let answer: EnrollResponse =
         vk_peer::net::enroll(hub, vk_hub_proto::ENROLL_PATH, ca_pem, ask).await?;
     if !vk_hub_proto::valid_id(&answer.node_id) {
@@ -980,7 +994,10 @@ async fn enroll(hub: &str, ca_pem: Option<&[u8]>, ask: &EnrollRequest) -> Result
             vk_hub_proto::display_safe(&answer.node_id)
         );
     }
-    Ok(answer.node_id)
+    // Held to what `run` will take, so a join never leaves an enrollment that cannot start.
+    crate::release_key::Policy::for_node(&[], &answer.release_keys, None)
+        .context("the hub's enrollment answer")?;
+    Ok((answer.node_id, answer.release_keys))
 }
 
 /// `enrollment.json`, held to what `join` writes: the file is the node's own, but a hand
@@ -1076,6 +1093,7 @@ concurrent = 4
             hub: "https://old".into(),
             node_id: "cd".repeat(16),
             ca: false,
+            release_keys: Vec::new(),
         };
         std::fs::write(dir.join(ENROLLMENT_FILE), serde_json::to_vec(&e).unwrap()).unwrap();
         let refused = make_room(&dir, false).unwrap_err().to_string();
@@ -1164,9 +1182,14 @@ concurrent = 4
             hub: "https://hub".into(),
             node_id: "ab".repeat(16),
             ca: true,
+            release_keys: vec!["k".into()],
         };
         std::fs::write(dir.join(ENROLLMENT_FILE), serde_json::to_vec(&e).unwrap()).unwrap();
         assert_eq!(read_enrollment(&dir).unwrap(), e);
+        // One an older `vk` wrote pins no keys.
+        let older = serde_json::json!({"hub": "https://hub", "node_id": "ab".repeat(16)});
+        std::fs::write(dir.join(ENROLLMENT_FILE), older.to_string()).unwrap();
+        assert!(read_enrollment(&dir).unwrap().release_keys.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1211,6 +1234,7 @@ concurrent = 4
             hub: "https://hub".into(),
             node_id: "ab".repeat(16),
             ca: false,
+            release_keys: Vec::new(),
         };
         std::fs::write(
             node.join(ENROLLMENT_FILE),
@@ -1291,6 +1315,7 @@ concurrent = 4
             hub: "https://hub".into(),
             node_id: "ab".repeat(16),
             ca: false,
+            release_keys: Vec::new(),
         };
         std::fs::write(
             node.join(ENROLLMENT_FILE),

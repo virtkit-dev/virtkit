@@ -68,7 +68,9 @@ vk-hub token create | ssh ci-7 vk node join https://hub.example.com --token -
 `vk-hub token create [--ttl 1h]` issues a single-use token, valid for at most 30 days, through
 the hub's admin socket rather than over the network, and prints it alone on stdout. `vk node
 join <hub> --token TOKEN|-|--token-file FILE [--ca FILE]` generates the node's ed25519
-identity and signs the token with it, so the hub pins only a key the caller holds. The hub URL
+identity and signs the token with it, so the hub pins only a key the caller holds. The hub
+answers with the node's ID and its release keys, which `join` keeps in
+`<state_dir>/node/enrollment.json` ([Release signing](#release-signing)). The hub URL
 is `https`, or `http` only to a loopback hub. `--ca` verifies the hub against that bundle
 alone, not the system's roots. Enrollment speaks TLS 1.3 only, ignores `HTTP(S)_PROXY` and
 follows no redirect. `join` refuses while `vk check` fails on KVM, the VMM or the guest
@@ -619,11 +621,18 @@ under `vk-fleet gitlab-release v1`, and with `--program vk-hub`, the hub's own u
 node and workstation has and which already links ring, rather than in `vk-hub`: keep the key
 off the hub so a compromised hub cannot sign releases.
 
-A node's `[node] release_keys` lists its trusted keys. `require_signed` defaults to true when
-any key is set, requiring a signature by one of them. The node checks it on receipt, before
-any drain, and again before the release first runs, using its current keys. With keys
-configured, the node rejects invalid signatures even when signatures are optional. The keys
-are pinned in the node's configuration, not in the `vk` binary. Official releases are not
+A node trusts the keys pinned when it enrolled: `[nodes] release_keys` in the hub's `hub.toml`
+(at most 16, checked when the hub starts) come with the enrollment answer, and `vk node join`
+keeps them in `enrollment.json`. A node's own `[node] release_keys`, when it lists any,
+replaces them. Changing the
+hub's keys reaches only nodes that enroll afterwards; a node enrolled before keeps its keys
+until it enrolls again. `require_signed` defaults to true when there is any key, pinned or
+set, requiring a signature by one of them. The node checks it on receipt, before any drain,
+and again before the release first runs, using the keys `vk node run` started with. With keys,
+the node rejects invalid signatures even when signatures are optional. Its report carries the
+keys in force, whether they were pinned at enrollment or set locally, and whether a signature
+is required. The keys are pinned in the node's state or configuration, not in the `vk`
+binary. Official releases are not
 signed this way yet: that is a step for the release workflow, with the key in CI's secrets.
 
 ## Updating the hub
@@ -789,8 +798,9 @@ and extract caches and artifacts in `vk-agent` and have the node transfer them, 
 node whose `vk node` manages a gitlab-runner (`[node] runner = "managed"`) still needs one in its
 definition, or `vk check --feature gitlab` fails. The tools are run on the host — `--version`, an
 empty environment, ten seconds, the first line kept — only on a node that takes unsigned releases
-(no `[node] release_keys`, or `require_signed = false`), whose hub can run anything there already; a
-node that requires signed releases runs them nowhere but in job VMs, and reports no versions.
+(no release keys, pinned or set, or `require_signed = false`), whose hub can run anything
+there already; a node that requires signed releases runs them nowhere but in job VMs, and
+reports no versions.
 
 The tools are installed as `<state_dir>/tools/<sha256>/`, `0755` with their files `0755`, with
 `<sha256>.json` beside it naming the label and versions, and `<state_dir>/tools/current` is

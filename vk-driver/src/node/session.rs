@@ -641,6 +641,7 @@ mod tests {
                     hub: format!("http://{addr}"),
                     node_id: "ab".repeat(16),
                     ca: false,
+                    release_keys: Vec::new(),
                 },
                 identity: Identity::load_or_create(&dir).unwrap(),
                 incarnation: "cd".repeat(16),

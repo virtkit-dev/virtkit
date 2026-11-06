@@ -977,6 +977,36 @@ pub struct Report {
     /// `None` from a node that does not announce [`Inventory::hub_settings`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsReport>,
+    /// The keys the node checks a `vk` release's signature against, and whether it requires
+    /// one. Absent from an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_keys: Option<ReleaseKeys>,
+}
+
+/// The keys a node checks a `vk` release's signature against.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseKeys {
+    /// The ed25519 public keys, base64; none when releases are not checked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Where `keys` come from; `None` with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ReleaseKeySource>,
+    /// Whether every release must carry a signature by one of `keys`.
+    pub required: bool,
+}
+
+/// Where a node's release keys come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseKeySource {
+    /// Pinned when the node enrolled, from the hub's answer.
+    Enrollment,
+    /// The node's own configuration, `[node] release_keys`, which replaces pinned keys.
+    Local,
+    /// A source from a later `vk`.
+    #[serde(other)]
+    Other,
 }
 
 /// Effective values on a node for keys the hub may set ([`DesiredState::settings`]).
@@ -2136,7 +2166,32 @@ mod tests {
             tools: None,
             placed: None,
             settings: None,
+            release_keys: None,
         }
+    }
+
+    /// A node's release keys are optional in its report: absent from an older node's, and an
+    /// unknown source reads as one this peer does not know.
+    #[test]
+    fn release_keys_keep_their_wire_shape() {
+        let report = Report {
+            release_keys: Some(ReleaseKeys {
+                keys: vec!["k".into()],
+                source: Some(ReleaseKeySource::Enrollment),
+                required: true,
+            }),
+            ..Report::default()
+        };
+        let mut wire = serde_json::to_value(Report::default()).unwrap();
+        assert!(wire.get("release_keys").is_none());
+        wire["release_keys"] = json!({"keys": ["k"], "source": "enrollment", "required": true});
+        pinned(&report, wire);
+        pinned(&ReleaseKeys::default(), json!({"required": false}));
+        assert_eq!(report.without_steering().release_keys, None);
+        assert_eq!(
+            serde_json::from_value::<ReleaseKeySource>(json!("fleet_root")).unwrap(),
+            ReleaseKeySource::Other
+        );
     }
 
     /// Hub settings and what a node reports of them are optional within version 2: absent from

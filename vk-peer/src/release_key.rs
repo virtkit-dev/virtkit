@@ -1,5 +1,6 @@
-//! Ed25519 release keys for the hub's peers (`[node] release_keys` for `vk node`, `[hub]
-//! release_keys` for `vk-registry` and `vk-gitlab`). `vk release-key generate`
+//! Ed25519 release keys for the hub's peers (`[node] release_keys` for `vk node`, or those it
+//! pinned when it enrolled; `[hub] release_keys` for `vk-registry` and `vk-gitlab`). `vk
+//! release-key generate`
 //! creates a key; `vk release-key sign` signs a binary on the machine holding it. Keep the
 //! key off the hub so a compromised hub can send arbitrary bytes but cannot sign them.
 //!
@@ -125,15 +126,17 @@ fn sha256_of(path: &Path) -> Result<[u8; 32]> {
 }
 
 /// A peer's signature policy, read once from its config's `release_keys` and
-/// `require_signed`.
+/// `require_signed`, or from the keys it pinned at enrollment.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     keys: Vec<Vec<u8>>,
     required: bool,
-    /// The config table the keys come from, `[node]` or `[hub]`, to say so.
+    /// Where the keys come from, `[node]`, `[hub]` or `pinned`, to say so.
     section: &'static str,
     /// The program of the releases it checks.
     program: Program,
+    /// Whether the keys are the ones pinned at enrollment rather than configured.
+    pinned: bool,
 }
 
 impl Policy {
@@ -142,6 +145,24 @@ impl Policy {
     /// against is an error, as is a key that is not 32 bytes of base64.
     pub fn from_config(keys: &[String], require_signed: Option<bool>) -> Result<Self> {
         Self::from_config_in("[node]", Program::Vk, keys, require_signed)
+    }
+
+    /// Check `vk` releases with the node's nonempty `[node] release_keys`, otherwise its
+    /// enrollment keys. `require_signed` applies to either, defaulting to true when keys exist.
+    pub fn for_node(
+        configured: &[String],
+        pinned: &[String],
+        require_signed: Option<bool>,
+    ) -> Result<Self> {
+        if configured.is_empty() && !pinned.is_empty() {
+            let policy = Self::from_config_in("pinned", Program::Vk, pinned, require_signed)?;
+            Ok(Policy {
+                pinned: true,
+                ..policy
+            })
+        } else {
+            Self::from_config(configured, require_signed)
+        }
     }
 
     /// [`Policy::from_config`] for the keys of the config table `section`, checking releases
@@ -174,7 +195,27 @@ impl Policy {
             required,
             section,
             program,
+            pinned: false,
         })
+    }
+
+    /// The keys in force, where they come from and whether a signature is required, as a
+    /// node reports them.
+    pub fn shown(&self) -> vk_hub_proto::ReleaseKeys {
+        use vk_hub_proto::ReleaseKeySource;
+        vk_hub_proto::ReleaseKeys {
+            keys: self
+                .keys
+                .iter()
+                .map(|k| vk_hub_proto::to_base64(k))
+                .collect(),
+            source: match (self.keys.is_empty(), self.pinned) {
+                (true, _) => None,
+                (false, true) => Some(ReleaseKeySource::Enrollment),
+                (false, false) => Some(ReleaseKeySource::Local),
+            },
+            required: self.required,
+        }
     }
 
     /// Whether every release must carry a signature by one of the peer's keys: the peer does
@@ -301,6 +342,44 @@ mod tests {
         let err = sign(&fifo, &binary, "0.84.0", Program::Vk).unwrap_err();
         assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A node's own keys replace those pinned at enrollment; either way a signature is
+    /// required by default, and `require_signed` decides.
+    #[test]
+    fn a_nodes_configured_keys_replace_its_pinned_ones() {
+        use vk_hub_proto::ReleaseKeySource;
+        let pinned = vk_hub_proto::to_base64(&[1; vk_hub_proto::PUBLIC_KEY_LEN]);
+        let local = vk_hub_proto::to_base64(&[2; vk_hub_proto::PUBLIC_KEY_LEN]);
+        let pinned = std::slice::from_ref(&pinned);
+        let local = std::slice::from_ref(&local);
+
+        let p = Policy::for_node(&[], pinned, None).unwrap();
+        assert!(p.required());
+        let shown = p.shown();
+        assert_eq!(
+            (shown.keys.as_slice(), shown.source),
+            (pinned, Some(ReleaseKeySource::Enrollment))
+        );
+        let err = p.check(&"00".repeat(32), "0.1.0", None).unwrap_err();
+        assert!(err.contains("pinned release_keys"), "{err}");
+        assert!(
+            !Policy::for_node(&[], pinned, Some(false))
+                .unwrap()
+                .required()
+        );
+
+        let p = Policy::for_node(local, pinned, None).unwrap();
+        let shown = p.shown();
+        assert_eq!(
+            (shown.keys.as_slice(), shown.source, shown.required),
+            (local, Some(ReleaseKeySource::Local), true)
+        );
+
+        let none = Policy::for_node(&[], &[], None).unwrap().shown();
+        assert_eq!(none, vk_hub_proto::ReleaseKeys::default());
+        assert!(Policy::for_node(&[], &[], Some(true)).is_err());
+        assert!(Policy::for_node(&[], &["x".into()], None).is_err());
     }
 
     #[test]

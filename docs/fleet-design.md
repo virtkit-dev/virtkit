@@ -128,8 +128,8 @@ built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
 Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet, an enrolled node's memory and vCPU defaults, and the
-registry the hub names.
+which the hub has no way to set yet, an enrolled node's memory and vCPU defaults, the
+registry the hub names, and the release keys pinned at enrollment ([Updates](#updates)).
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
@@ -387,17 +387,19 @@ the trial's deadline hand the node back to the previous binary. See
 [update trial and rollback](fleet-prototype.md#update-trial-and-rollback) for the binary
 switch, restart deadlines, installed-path checks and the external-runner exception.
 
-Built release trust: a node with signing keys in its own configuration requires a signature
-by one of them, checked when the update arrives and again before the release first runs; the
-key signs offline, never on the hub ([Release signing](fleet-prototype.md#release-signing)).
-Proposed: the keys are pinned at enrollment. A hub with `[nodes] release_keys` in `hub.toml`
-returns them in the enrollment answer, and `vk node join` keeps them in
-`<state_dir>/node/enrollment.json` beside the node ID; nothing a session carries changes them.
-A node whose configuration sets `[node] release_keys` uses those instead. They are taken on
-first use from the hub enrollment authenticates — its TLS certificate and a single-use token —
-so a hub compromised after a node joined can neither add nor replace one; rotating them takes
-a new enrollment, the local setting, or the fleet root
-([the trust model](trust-model.md#releases)).
+Built release trust: a node with signing keys requires a signature by one of them, checked
+when the update arrives and again before the release first runs; the key signs offline, never
+on the hub ([Release signing](fleet-prototype.md#release-signing)). The keys are pinned at
+enrollment: a hub with `[nodes] release_keys` in `hub.toml` returns them in the enrollment
+answer, and `vk node join` keeps them in `<state_dir>/node/enrollment.json` beside the node ID;
+nothing a session carries changes them. A node whose configuration sets `[node] release_keys`
+uses those instead, and `[node] require_signed` applies to either. The node reports the keys in
+force, where they come from (`enrollment` or `local`) and whether a signature is required. They
+are taken on first use from the hub enrollment authenticates — its TLS certificate and a
+single-use token — so a hub compromised after a node joined can neither add nor replace one;
+rotating them takes a new enrollment, the local setting, or the fleet root
+([the trust model](trust-model.md#releases)). Keys changed in `hub.toml` reach only the nodes
+that enroll afterwards.
 Proposed: remote updates require at least one pinned signing key and a valid
 signature by default, where a node with no keys takes unsigned releases today. A node may opt
 out explicitly for development; the hub cannot grant that exception, and the node's report
@@ -567,8 +569,8 @@ model, commands and process handling.
   since an override the hub carried would be worth nothing against a compromised hub — which
   could otherwise take the fleet back to a release with a known flaw, signed or not.
 - A release's signature is checked by the node against keys in its own configuration
-  (`[node] release_keys`) or, proposed, pinned when it enrolled, made by a key kept off the
-  hub: a compromised hub can hand a node any bytes, but not a signature it has no key for.
+  (`[node] release_keys`) or pinned when it enrolled, made by a key kept off the hub: a
+  compromised hub can hand a node any bytes, but not a signature it has no key for.
 - Proposed: hub settings are an allowlist of capacity and sizing keys the node's own file has
   not set ([Configuration](#configuration)); a compromised hub can misuse those, not reach
   anything else.

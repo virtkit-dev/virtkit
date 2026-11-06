@@ -3334,6 +3334,12 @@ fn display_safe_report(mut report: Report) -> Report {
         *s = vk_hub_proto::display_safe(s);
     }
     report.settings = report.settings.map(display_safe_settings);
+    if let Some(r) = report.release_keys.as_mut() {
+        r.keys.truncate(MAX_INVENTORY_ITEMS);
+        for k in &mut r.keys {
+            *k = vk_hub_proto::display_safe(k);
+        }
+    }
     report
 }
 
@@ -5011,6 +5017,31 @@ mod tests {
             "{text}"
         );
         assert_eq!(shown.effective["registry"].source, SettingSource::Local);
+    }
+
+    /// The release keys a node reports are kept, made safe to show.
+    #[test]
+    fn a_nodes_release_keys_are_kept_and_shown_safely() {
+        use vk_hub_proto::{ReleaseKeySource, ReleaseKeys};
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let report = Report {
+            release_keys: Some(ReleaseKeys {
+                keys: vec!["k\x1b[2J".into(); MAX_INVENTORY_ITEMS + 1],
+                source: Some(ReleaseKeySource::Local),
+                required: true,
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, report, 2).unwrap();
+        let shown = db.node(&id).unwrap().unwrap().report.unwrap();
+        let shown = shown.release_keys.unwrap();
+        assert_eq!(shown.keys.len(), MAX_INVENTORY_ITEMS);
+        assert!(shown.keys.iter().all(|k| !k.contains('\x1b')), "{shown:?}");
+        assert_eq!(
+            (shown.source, shown.required),
+            (Some(ReleaseKeySource::Local), true)
+        );
     }
 
     /// A hub of protocol version 1 rewrites a node's row without its desired state or what the
