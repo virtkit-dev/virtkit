@@ -568,6 +568,7 @@ mod tests {
             cpus: None,
             mem: None,
             nested: crate::dev::config::Nested::Off,
+            vga: false,
             egress: None,
             mounts: vec![mount(
                 "vscode-server",

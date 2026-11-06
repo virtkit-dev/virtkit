@@ -247,6 +247,10 @@ pub struct Plan {
     pub cpus: Option<Cpus>,
     pub mem: Option<String>,
     pub nested: Nested,
+    /// a VGA text console for the primary (`vga = true`); left out of the record when off, so
+    /// an environment that never asked for one keeps the identity it booted with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vga: bool,
     /// the allowlist the guest's egress is held to; `None` = it reaches what the host reaches.
     /// Left out of the record when `None`, so an environment that never asked for one keeps
     /// the identity it booted with.
@@ -485,6 +489,7 @@ pub fn resolve(loaded: &Loaded, name: &str) -> Result<Plan> {
         cpus: env.cpus,
         mem: env.mem.clone(),
         nested: env.nested,
+        vga: env.vga,
         egress: (env.network.egress == Some(crate::dev::config::Egress::Restricted)).then(|| {
             EgressPlan {
                 mode: crate::dev::config::Egress::Restricted,
@@ -1447,6 +1452,9 @@ impl Plan {
         }
         if self.nests_here() {
             out.push_str("  --nested \\\n");
+        }
+        if self.vga {
+            out.push_str("  --vga=detached \\\n");
         }
         if self.cached_only {
             out.push_str("  --require-cached \\\n");

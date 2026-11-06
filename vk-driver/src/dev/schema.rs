@@ -381,6 +381,7 @@ profiles = ["tools"]
 cpus = "host"
 mem = "8G"
 nested = "auto"
+vga = false
 
 [dev.exec-env]
 GITLAB_TOKEN = "x"

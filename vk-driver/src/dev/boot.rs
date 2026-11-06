@@ -257,6 +257,11 @@ fn run_args(
             .map(|h| h.env.clone())
             .unwrap_or_default(),
         nested: plan.nests_here(),
+        // A detached run has no terminal to show it on: `vk vga` attaches to it.
+        vga: plan.vga.then(|| crate::vga::Options {
+            mode: crate::vga::Mode::Detached,
+            ..crate::vga::Options::default()
+        }),
         // The managed client is how `vk dev shell`, `vk dev code` and the editor reach it.
         ssh: true,
         ssh_client: true,

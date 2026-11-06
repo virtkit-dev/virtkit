@@ -111,6 +111,10 @@
           "description": "nested virtualization for the primary, so it can boot microVMs of its own: `true` requires it and a host that does not allow it refuses to boot, `\"auto\"` takes it where the host allows it. Unset or `false` never asks for it.",
           "$ref": "#/$defs/nested"
         },
+        "vga": {
+          "description": "a VGA text console as the primary's tty0, with a PS/2 keyboard, for `vk vga` to attach to; needs a kernel with VT and VGA console support. Compose services other than the primary ask with `x-virtkit.vga`.",
+          "type": "boolean"
+        },
         "exec-env": {
           "description": "environment for development sessions: exec, shell, SSH and editor processes",
           "$ref": "#/$defs/string-map"

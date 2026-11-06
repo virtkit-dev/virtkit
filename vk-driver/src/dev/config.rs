@@ -143,6 +143,11 @@ pub struct Environment {
     /// where the host allows it. Unset or `false` never asks for it.
     #[serde(default)]
     pub nested: Nested,
+    /// a VGA text console as the primary's tty0, with a PS/2 keyboard, for `vk vga` to attach
+    /// to; needs a kernel with VT and VGA console support. Compose services other than the
+    /// primary ask with `x-virtkit.vga`.
+    #[serde(default)]
+    pub vga: bool,
     /// environment for development sessions: exec, shell, SSH and editor processes
     #[serde(default)]
     pub exec_env: BTreeMap<String, String>,

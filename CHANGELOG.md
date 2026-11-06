@@ -14,6 +14,8 @@ All notable changes to virtkit will be documented in this file.
   distribution's kernel booted with `--kernel image`; UEFI guests cannot use it.
 - **Compose services can have the VGA console too: `x-virtkit: vga: true`.** `vk vga --service
   NAME` shows a service's console; on the service booted as the primary, `--vga` says how.
+- **`vk dev` environments can have the VGA console: `vga = true` in `[dev]`.** `vk vga` run in
+  the workspace attaches to it.
 
 ## [0.106.0] - 2026-11-05
 
