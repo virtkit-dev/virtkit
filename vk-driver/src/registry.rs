@@ -4776,9 +4776,22 @@ pub(crate) mod tests {
     /// A request to a port nothing listens on: refused, so lost in transit. The port is the
     /// local end of a live connection, which no listener can bind while it lasts.
     async fn refused() -> reqwest::Error {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let held = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Each held end uses its own address in 127.0.0.0/8 (Linux routes all of it to lo).
+        // The down state is process-wide and keyed by authority: reusing an ephemeral port
+        // another test marked down would stop retries at the first attempt.
+        static NEXT: AtomicU32 = AtomicU32::new(0x1_0000);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let ip = std::net::Ipv4Addr::from(0x7f00_0000 | (n & 0x00ff_ffff));
+        let listener = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((ip, 0).into()).unwrap();
+        let held = socket
+            .connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let addr = held.local_addr().unwrap();
+        assert_eq!(addr.ip(), ip, "the held end has its own address");
         let err = reqwest::get(format!("http://{addr}/v2/"))
             .await
             .unwrap_err();
@@ -4979,6 +4992,24 @@ pub(crate) mod tests {
         budget: Duration::from_millis(500),
     };
 
+    /// [`TEST_BACKOFF`] for a case that runs out of budget and checks it retried meanwhile:
+    /// long enough that a loaded host makes more than one attempt, delays capped so it makes
+    /// dozens rather than hundreds.
+    const SPENT_BACKOFF: Backoff = Backoff {
+        transport_budget: Duration::from_secs(3),
+        budget: Duration::from_secs(3),
+        cap: Duration::from_millis(100),
+        ..TEST_BACKOFF
+    };
+
+    /// [`TEST_BACKOFF`] for a case that succeeds after a few failures: a budget no loaded host
+    /// spends on them, since the case is about the retries, not about running out of time.
+    const ROOMY_BACKOFF: Backoff = Backoff {
+        transport_budget: Duration::from_secs(60),
+        budget: Duration::from_secs(60),
+        ..TEST_BACKOFF
+    };
+
     /// Retry transport failures for their budget; registry errors are final.
     #[test]
     fn transfer_retry_repeats_transport_failures_only() {
@@ -4988,7 +5019,7 @@ pub(crate) mod tests {
         block_on(async {
             // Two transport failures, then the answer.
             let calls = AtomicU32::new(0);
-            let got = retry_transfer("probe", &TEST_BACKOFF, || {
+            let got = retry_transfer("probe", &ROOMY_BACKOFF, || {
                 let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
                 async move {
                     if n < 3 {
@@ -5004,19 +5035,16 @@ pub(crate) mod tests {
             // Return the last error once the budget is spent.
             calls.store(0, Ordering::Relaxed);
             let start = std::time::Instant::now();
-            let err = retry_transfer("probe", &TEST_BACKOFF, || {
+            let err = retry_transfer("probe", &SPENT_BACKOFF, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async { Err::<(), _>(lost().await) }
             })
             .await
             .unwrap_err();
             assert_eq!(err.retry(), Retry::Transport);
-            // Clear the down state so a concurrent test's `refused()` can reuse this
-            // ephemeral port without failing at once.
-            mark_up(&err.authority().unwrap());
             assert!(calls.load(Ordering::Relaxed) > 1);
             assert!(
-                start.elapsed() > TEST_BACKOFF.transport_budget - TEST_BACKOFF.cap,
+                start.elapsed() > SPENT_BACKOFF.transport_budget - SPENT_BACKOFF.cap,
                 "{:?}",
                 start.elapsed()
             );
@@ -5074,14 +5102,14 @@ pub(crate) mod tests {
         block_on(async {
             let client = reqwest::Client::new();
             let (url, served) = serve(3);
-            let resp = request_retry("probe", &TEST_BACKOFF, || client.get(&url).send())
+            let resp = request_retry("probe", &ROOMY_BACKOFF, || client.get(&url).send())
                 .await
                 .unwrap();
             assert_eq!(resp.status().as_u16(), 200);
             assert_eq!(served.load(Ordering::Relaxed), 3);
 
             let (url, served) = serve(u32::MAX);
-            let resp = request_retry("probe", &TEST_BACKOFF, || client.get(&url).send())
+            let resp = request_retry("probe", &SPENT_BACKOFF, || client.get(&url).send())
                 .await
                 .unwrap();
             assert_eq!(resp.status().as_u16(), 503);
@@ -5107,7 +5135,7 @@ pub(crate) mod tests {
                 let url = &url;
                 async move { Err::<(), _>(reqwest::get(url).await.unwrap_err()) }
             };
-            let err = retry_transfer("probe", &TEST_BACKOFF, fail)
+            let err = retry_transfer("probe", &SPENT_BACKOFF, fail)
                 .await
                 .unwrap_err();
             assert!(!err.connected(), "{err:#}");
@@ -5131,14 +5159,13 @@ pub(crate) mod tests {
 
             // Another registry is retried still.
             calls.store(0, Ordering::Relaxed);
-            let other = retry_transfer("probe", &TEST_BACKOFF, || {
+            retry_transfer("probe", &SPENT_BACKOFF, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async { Err::<(), _>(refused().await) }
             })
             .await
             .unwrap_err();
             assert!(calls.load(Ordering::Relaxed) > 1);
-            mark_up(&other.authority().unwrap());
 
             // A connection made to it again forgets it was down.
             let authority = err.authority().unwrap();
