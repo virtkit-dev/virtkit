@@ -57,14 +57,15 @@ struct Query {
     /// `version-id-marker`, as sent, to echo: with one version a key, `key-marker` alone
     /// says where to resume
     version_marker: Option<String>,
-    prefix: String,
+    /// `prefix`, as sent: echoed only when it was, as S3 echoes it
+    prefix: Option<String>,
     delimiter: Option<String>,
     max_keys: usize,
-    /// the continuation token as sent, to echo
+    /// the continuation token as sent, to echo (v2 only)
     token: Option<String>,
     /// `start-after` (v2) or `marker` (v1), as sent
     start: Option<String>,
-    /// the key the page starts after: the token's, else `start`
+    /// the key the page starts after: the later of the token's and `start`
     after: Option<String>,
     /// `encoding-type=url`
     url: bool,
@@ -90,7 +91,7 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
         match name {
             "list-type" if value == "2" => q.v2 = true,
             "list-type" => return Err("list-type is 2, or absent for the first version"),
-            "prefix" => q.prefix = text(value)?,
+            "prefix" => q.prefix = Some(text(value)?),
             "delimiter" => q.delimiter = Some(text(value)?).filter(|d| !d.is_empty()),
             "max-keys" => {
                 let n: usize = value
@@ -123,15 +124,23 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
         (q.start, q.token, q.owner) = (key_marker, None, true);
     } else if q.v2 {
         q.start = start_after;
+    } else if start_after.is_some() {
+        return Err("start-after is ListObjectsV2's: send list-type=2, or marker");
+    } else if q.token.is_some() {
+        return Err("continuation-token is ListObjectsV2's: send list-type=2, or marker");
     } else {
-        (q.start, q.token, q.owner) = (marker, None, true);
+        (q.start, q.owner) = (marker, true);
     }
-    q.after = match &q.token {
+    // Sent both, a page starts after the later: a paginator that keeps its first
+    // `start-after` beside the token it was given sees no key twice. An empty token is
+    // none, echoed as sent.
+    let resumed = match q.token.as_deref() {
+        Some("") | None => None,
         Some(token) => Some(
             resume_point(token).ok_or("the continuation token is not one this registry gave")?,
         ),
-        None => q.start.clone(),
     };
+    q.after = resumed.max(q.start.clone());
     Ok(q)
 }
 
@@ -386,7 +395,7 @@ pub(super) async fn list(
             return refuse(req, resp, ctx).await;
         }
     };
-    if !admitted(authz, &bucket, &q.prefix) {
+    if !admitted(authz, &bucket, q.prefix()) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
     let ctx = ctx.clone();
@@ -414,7 +423,7 @@ fn page(store: &Store, authz: &Authz<'_>, bucket: &str, q: &Query) -> Result<(Ve
         return Ok((Vec::new(), false));
     }
     let how = Walk {
-        prefix: &q.prefix,
+        prefix: q.prefix(),
         delimiter: q.delimiter.as_deref(),
         after: q.after.as_deref(),
         limit: q.max_keys.saturating_add(1),
@@ -438,6 +447,11 @@ pub(super) fn admitted(authz: &Authz<'_>, bucket: &str, prefix: &str) -> bool {
 }
 
 impl Query {
+    /// The keys listed start with this: `prefix`, or anything.
+    fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("")
+    }
+
     /// The root element of the document this listing answers with.
     fn root(&self) -> &'static str {
         if self.versions {
@@ -455,7 +469,9 @@ impl Query {
 fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
     let enc = |s: &str| if q.url { url_encode(s) } else { s.to_string() };
     let mut out = xml::element("Name", bucket);
-    out.push_str(&xml::element("Prefix", &enc(&q.prefix)));
+    if let Some(prefix) = &q.prefix {
+        out.push_str(&xml::element("Prefix", &enc(prefix)));
+    }
     let next = truncated.then(|| items.last().map(Item::key)).flatten();
     let start = enc(q.start.as_deref().unwrap_or(""));
     if q.versions {
@@ -470,7 +486,9 @@ fn render(bucket: &str, q: &Query, items: &[Item], truncated: bool) -> String {
         }
     } else if !q.v2 {
         out.push_str(&xml::element("Marker", &start));
-        if let Some(next) = next {
+        // S3 names the next marker only beside a delimiter; without one, the page's last
+        // key is where the next page starts.
+        if let Some(next) = next.filter(|_| q.delimiter.is_some()) {
             out.push_str(&xml::element("NextMarker", &enc(next)));
         }
     }
@@ -744,7 +762,7 @@ mod tests {
                 let mut after: Option<String> = None;
                 loop {
                     let q = Query {
-                        prefix: prefix.to_string(),
+                        prefix: Some(prefix.to_string()),
                         delimiter: delimiter.map(str::to_string),
                         max_keys: size,
                         after: after.clone(),
@@ -895,7 +913,7 @@ mod tests {
             parse("list-type=2&prefix=a%2F&delimiter=%2F&max-keys=5000&fetch-owner=true").unwrap();
         assert!(q.v2 && q.owner);
         assert_eq!(
-            (q.prefix.as_str(), q.delimiter.as_deref(), q.max_keys),
+            (q.prefix(), q.delimiter.as_deref(), q.max_keys),
             ("a/", Some("/"), 1000)
         );
         let q = parse("list-type=2&start-after=a&marker=b").unwrap();
@@ -910,9 +928,22 @@ mod tests {
         .unwrap();
         assert_eq!(q.after.as_deref(), Some("s/1/"));
         assert_eq!(q.token.as_deref(), Some(token.as_str()));
-        let q = parse("marker=b&start-after=a&delimiter=").unwrap();
-        assert!(!q.v2 && q.owner);
+        // Sent both, the later of the token and `start-after` is where the page starts.
+        let q = parse(&format!(
+            "list-type=2&start-after=t&continuation-token={token}"
+        ))
+        .unwrap();
+        assert_eq!(q.after.as_deref(), Some("t"));
+        // An empty token is none, and is echoed.
+        let q = parse("list-type=2&continuation-token=&start-after=a").unwrap();
+        assert_eq!(
+            (q.token.as_deref(), q.after.as_deref()),
+            (Some(""), Some("a"))
+        );
+        let q = parse("marker=b&delimiter=").unwrap();
+        assert!(!q.v2 && q.owner && q.prefix.is_none());
         assert_eq!((q.after.as_deref(), q.delimiter), (Some("b"), None));
+        assert_eq!(parse("prefix=").unwrap().prefix.as_deref(), Some(""));
         assert_eq!(parse("").unwrap().max_keys, 1000);
         assert_eq!(parse("max-keys=0").unwrap().max_keys, 0);
         assert!(parse("encoding-type=url").unwrap().url);
@@ -937,13 +968,17 @@ mod tests {
             parse(&format!("list-type=2&continuation-token={token}")).is_err()
         };
         assert!(bad_token(b"a b"));
-        assert!(bad_token(b""));
+        assert!(!bad_token(b""));
         assert!(bad_token(&[0xff]));
         assert!(bad_token(&[b'a'; 1025]));
         assert!(!bad_token(&[b'a'; 1024]));
         for bad in [
             "list-type=2&continuation-token=!!",
             "list-type=2&continuation-token=YQ==",
+            // ListObjectsV2's own parameters, sent to the first version.
+            "start-after=a",
+            "start-after",
+            "marker=a&continuation-token=",
             "list-type=1",
             "max-keys=-1",
             "max-keys=x",
@@ -965,7 +1000,7 @@ mod tests {
         let t = tree("render", &["d/k"]);
         let q = Query {
             v2: true,
-            prefix: "d/".to_string(),
+            prefix: Some("d/".to_string()),
             max_keys: 1000,
             ..Query::default()
         };
@@ -990,10 +1025,14 @@ mod tests {
             "{xml}"
         );
         assert!(!xml.contains("<Owner>"));
+        // A prefix is echoed only when one was sent.
+        let q = Query { prefix: None, ..q };
+        let xml = render("b", &q, &items, false);
+        assert!(xml.starts_with("<Name>b</Name><MaxKeys>"), "{xml}");
 
         let q = Query {
             v2: true,
-            prefix: "<a b>/".to_string(),
+            prefix: Some("<a b>/".to_string()),
             delimiter: Some("&".to_string()),
             start: Some("\"x".to_string()),
             max_keys: 2,
@@ -1019,10 +1058,11 @@ mod tests {
         assert!(xml.contains("<StartAfter>%22x</StartAfter>"), "{xml}");
         assert!(xml.contains("<Prefix>%3Ca%20b%3E/c%26</Prefix></CommonPrefixes>"));
 
-        // The first version: a marker, the next one, and every object's owner.
+        // The first version: a marker, the next one beside a delimiter only, and every
+        // object's owner.
         put(&t.store, "b/d/m");
         let q = Query {
-            prefix: "d/".to_string(),
+            prefix: Some("d/".to_string()),
             start: Some("d/a".to_string()),
             after: Some("d/a".to_string()),
             max_keys: 1,
@@ -1034,7 +1074,25 @@ mod tests {
         assert!(
             xml.starts_with(
                 "<Name>b</Name><Prefix>d/</Prefix><Marker>d/a</Marker>\
-                 <NextMarker>d/k</NextMarker><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated>"
+                 <MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated>"
+            ),
+            "{xml}"
+        );
+        let delimited = Query {
+            prefix: Some("d/".to_string()),
+            delimiter: Some("/".to_string()),
+            start: Some("d/a".to_string()),
+            after: Some("d/a".to_string()),
+            max_keys: 1,
+            owner: true,
+            ..Query::default()
+        };
+        let xml = render("b", &delimited, &items, truncated);
+        assert!(
+            xml.starts_with(
+                "<Name>b</Name><Prefix>d/</Prefix><Marker>d/a</Marker>\
+                 <NextMarker>d/k</NextMarker><MaxKeys>1</MaxKeys><Delimiter>/</Delimiter>\
+                 <IsTruncated>true</IsTruncated>"
             ),
             "{xml}"
         );
@@ -1077,7 +1135,7 @@ mod tests {
         assert!(!xml.contains("Marker>d/a</Marker") && !xml.contains("Contents"));
         let q = Query {
             versions: true,
-            prefix: "d/".to_string(),
+            prefix: Some("d/".to_string()),
             max_keys: 2,
             ..Query::default()
         };

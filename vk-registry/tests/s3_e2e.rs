@@ -3053,7 +3053,7 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
         resp.body.starts_with(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Name>sccache</Name><Prefix></Prefix><MaxKeys>1000</MaxKeys><KeyCount>7</KeyCount>\
+             <Name>sccache</Name><MaxKeys>1000</MaxKeys><KeyCount>7</KeyCount>\
              <IsTruncated>false</IsTruncated><Contents>"
         ),
         "{}",
@@ -3127,7 +3127,8 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
     }
     assert_eq!((pages, seen.as_slice()), (4, written.as_slice()));
 
-    // The first version: markers, and every object's owner.
+    // The first version: markers, and every object's owner. With no delimiter there is no
+    // next marker: the page's last key is where the next one starts, as SDKs page it.
     let mut seen = Vec::new();
     let mut marker = String::new();
     loop {
@@ -3146,10 +3147,12 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
         if element(&resp.body, "IsTruncated") == "false" {
             break;
         }
-        marker = element(&resp.body, "NextMarker");
-        assert_eq!(&marker, seen.last().unwrap());
+        assert!(!resp.body.contains("NextMarker"));
+        marker = seen.last().unwrap().clone();
     }
     assert_eq!(seen, written);
+    let resp = send(host, list("delimiter=%2F&max-keys=1")).await;
+    assert_eq!(element(&resp.body, "NextMarker"), ".sccache_check");
 
     // The versions: each object the one, `null`, version of its key, paged by key marker
     // as boto3's paginator pages it, sending back the version id marker it was given.
@@ -3169,7 +3172,7 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
             resp.body.starts_with(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                  <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-                 <Name>sccache</Name><Prefix></Prefix><KeyMarker>"
+                 <Name>sccache</Name><KeyMarker>"
             ),
             "{}",
             resp.body
@@ -3222,6 +3225,33 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
     .await;
     assert_eq!(keys(&resp.body), &written[4..]);
     assert_eq!(&element(&resp.body, "StartAfter"), start);
+    // A token and `start-after` both: the page starts after the later of the two, and
+    // both are echoed; an empty token is none.
+    let first = send(host, list("list-type=2&max-keys=1")).await;
+    let token = element(&first.body, "NextContinuationToken");
+    for (start, from) in [(&written[0], 1), (&written[3], 4)] {
+        let resp = send(
+            host,
+            list(&format!(
+                "continuation-token={token}&list-type=2&start-after={}",
+                start.replace('/', "%2F")
+            )),
+        )
+        .await;
+        assert_eq!(keys(&resp.body), &written[from..], "{start}");
+        assert_eq!(element(&resp.body, "ContinuationToken"), token);
+        assert_eq!(&element(&resp.body, "StartAfter"), start);
+    }
+    let resp = send(host, list("continuation-token=&list-type=2")).await;
+    resp.ok(200);
+    assert_eq!(keys(&resp.body), written);
+    assert!(
+        resp.body
+            .contains("<ContinuationToken></ContinuationToken>")
+    );
+    assert!(!resp.body.contains("<Prefix>"));
+    let resp = send(host, list("list-type=2&prefix=")).await;
+    assert!(resp.body.contains("<Prefix></Prefix>"), "{}", resp.body);
     let resp = send(host, list("fetch-owner=true&list-type=2&max-keys=1")).await;
     assert!(
         resp.body.contains(
@@ -3255,6 +3285,8 @@ async fn sharded_listing(host: &str, sign: Sign<'_>) {
         "list-type=2&max-keys=-1",
         "encoding-type=base64&list-type=2",
         "list-type=3",
+        "start-after=a",
+        "continuation-token=",
     ] {
         send(host, list(bad)).await.is(400, "InvalidArgument");
     }
