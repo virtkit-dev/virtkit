@@ -15,8 +15,9 @@
 
 use anyhow::Result;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
+use super::error::{Code, Refusal};
 use super::path::MAX_KEY;
 use super::{Ctx, NULL_VERSION, Params, bucket, checksum, conditional, refuse, sigv4, xml};
 use crate::files::{self, FILES_REPO, Node, Object, allowed, repo_name};
@@ -73,8 +74,34 @@ struct Query {
     owner: bool,
 }
 
+/// A count a query parameter `name` gives (`max-keys`, `max-uploads`, `max-parts`, a part
+/// number marker): a whole number from 0 to 2147483647, as S3 takes it, or `InvalidArgument`
+/// in S3's words for one that is negative or is no such number.
+pub(super) fn count(name: &'static str, value: &str) -> std::result::Result<u32, Refusal> {
+    match value.parse::<i64>() {
+        Ok(n) if n < 0 => Err(Refusal::argument(
+            format!("Argument {value} must be an integer between 0 and 2147483647"),
+            name,
+            value,
+        )),
+        Ok(n) => i32::try_from(n)
+            .ok()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| not_a_count(name, value)),
+        Err(_) => Err(not_a_count(name, value)),
+    }
+}
+
+fn not_a_count(name: &'static str, value: &str) -> Refusal {
+    Refusal::argument(
+        format!("Provided {value} not an integer or within integer range"),
+        name,
+        value,
+    )
+}
+
 /// The listing a query asks for, or why it is refused (400 `InvalidArgument`).
-fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
+fn parse(params: &Params) -> std::result::Result<Query, Refusal> {
     let mut q = Query {
         max_keys: MAX_KEYS,
         ..Query::default()
@@ -88,26 +115,44 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
             continue;
         }
         seen.push(name);
+        let text = |value| text(name, value);
         match name {
             "list-type" if value == "2" => q.v2 = true,
-            "list-type" => return Err("list-type is 2, or absent for the first version"),
+            "list-type" => {
+                return Err(Refusal::argument(
+                    "list-type is 2, or absent for the first version",
+                    "list-type",
+                    value,
+                ));
+            }
             "prefix" => q.prefix = Some(text(value)?),
             "delimiter" => q.delimiter = Some(text(value)?).filter(|d| !d.is_empty()),
             "max-keys" => {
-                let n: usize = value
-                    .parse()
-                    .map_err(|_| "max-keys is a whole number from 0")?;
-                q.max_keys = n.min(MAX_KEYS);
+                q.max_keys = usize::try_from(count("max-keys", &value)?)
+                    .unwrap_or(MAX_KEYS)
+                    .min(MAX_KEYS);
             }
             "continuation-token" => q.token = Some(value),
             "start-after" => start_after = Some(text(value)?),
             "marker" => marker = Some(text(value)?),
             "versions" if value.is_empty() => q.versions = true,
-            "versions" => return Err("versions takes no value"),
+            "versions" => {
+                return Err(Refusal::argument(
+                    "versions takes no value",
+                    "versions",
+                    value,
+                ));
+            }
             "key-marker" => key_marker = Some(text(value)?),
             "version-id-marker" => q.version_marker = Some(text(value)?),
             "encoding-type" if value == "url" => q.url = true,
-            "encoding-type" => return Err("encoding-type is url, or absent"),
+            "encoding-type" => {
+                return Err(Refusal::argument(
+                    "Invalid Encoding Method specified in Request",
+                    "encoding-type",
+                    value,
+                ));
+            }
             "fetch-owner" => q.owner = value == "true",
             _ => {}
         }
@@ -116,18 +161,34 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
     // the owner.
     if q.versions {
         if q.v2 {
-            return Err("list-type names ListObjectsV2, which a versions listing is not");
+            return Err(Refusal::argument(
+                "list-type names ListObjectsV2, which a versions listing is not",
+                "list-type",
+                "2",
+            ));
         }
-        if q.version_marker.is_some() && key_marker.is_none() {
-            return Err("a version-id-marker needs the key-marker it is a version of");
+        if let (Some(marker), None) = (&q.version_marker, &key_marker) {
+            return Err(Refusal::argument(
+                "A version-id marker cannot be specified without a key marker.",
+                "version-id-marker",
+                marker.as_str(),
+            ));
         }
         (q.start, q.token, q.owner) = (key_marker, None, true);
     } else if q.v2 {
         q.start = start_after;
-    } else if start_after.is_some() {
-        return Err("start-after is ListObjectsV2's: send list-type=2, or marker");
-    } else if q.token.is_some() {
-        return Err("continuation-token is ListObjectsV2's: send list-type=2, or marker");
+    } else if let Some(start_after) = start_after {
+        return Err(Refusal::argument(
+            "startAfter only supported in REST.GET.BUCKET with list-type=2",
+            "start-after",
+            start_after,
+        ));
+    } else if let Some(token) = &q.token {
+        return Err(Refusal::argument(
+            "continuation-token only supported in REST.GET.BUCKET with list-type=2",
+            "continuation-token",
+            token.as_str(),
+        ));
     } else {
         (q.start, q.owner) = (marker, true);
     }
@@ -136,21 +197,30 @@ fn parse(params: &Params) -> std::result::Result<Query, &'static str> {
     // none, echoed as sent.
     let resumed = match q.token.as_deref() {
         Some("") | None => None,
-        Some(token) => Some(
-            resume_point(token).ok_or("the continuation token is not one this registry gave")?,
-        ),
+        Some(token) => Some(resume_point(token).ok_or_else(|| {
+            Refusal::argument(
+                "The continuation token provided is incorrect",
+                "continuation-token",
+                token,
+            )
+        })?),
     };
     q.after = resumed.max(q.start.clone());
     Ok(q)
 }
 
-/// A prefix, delimiter or start key, which a listing echoes in XML: no control character,
-/// which XML 1.0 cannot carry, and no longer than a key.
-pub(super) fn text(v: String) -> std::result::Result<String, &'static str> {
+/// A prefix, delimiter or start key, which a listing echoes in XML, sent as parameter
+/// `name`: no control character, which XML 1.0 cannot carry, and no longer than a key.
+pub(super) fn text(name: &str, v: String) -> std::result::Result<String, Refusal> {
+    let refused = |rule| Refusal::said(Code::InvalidArgument, rule).with("ArgumentName", name);
     if v.chars().any(char::is_control) {
-        Err("a prefix, delimiter or start key holds no control character")
+        Err(refused(
+            "a prefix, delimiter or start key holds no control character",
+        ))
     } else if v.len() > MAX_KEY {
-        Err("a prefix, delimiter or start key is at most 1024 bytes")
+        Err(refused(
+            "a prefix, delimiter or start key is at most 1024 bytes",
+        ))
     } else {
         Ok(v)
     }
@@ -390,10 +460,7 @@ pub(super) async fn list(
 ) -> Result<Response<Body>> {
     let q = match parse(params) {
         Ok(q) => q,
-        Err(message) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
-            return refuse(req, resp, ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if !admitted(authz, &bucket, q.prefix()) {
         return refuse(req, ctx.access_denied(), ctx).await;
@@ -401,11 +468,7 @@ pub(super) async fn list(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         if !store.repo_dir_exists(&format!("{FILES_REPO}/{bucket}")) {
-            return Ok(ctx.error(
-                StatusCode::NOT_FOUND,
-                "NoSuchBucket",
-                "the specified bucket does not exist",
-            ));
+            return Ok(ctx.error(bucket::no_such_bucket(&bucket)));
         }
         let (items, truncated) = page(store, authz, &bucket, &q)?;
         Ok(xml::document(
@@ -894,8 +957,8 @@ mod tests {
     fn a_query_names_a_listing_of_either_version() {
         let is_listing = |q: &str| super::is_listing(&crate::s3::parse_query(q).unwrap());
         let parse = |q: &str| match crate::s3::parse_query(q) {
-            Some(params) => super::parse(&params),
-            None => Err("malformed"),
+            Some(params) => super::parse(&params).map_err(|r| r.message().to_string()),
+            None => Err("malformed".to_string()),
         };
         assert!(is_listing(""));
         assert!(is_listing("list-%74ype=2"));
@@ -993,6 +1056,25 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+        // In S3's words where S3 has them.
+        assert_eq!(
+            parse("max-keys=-5").unwrap_err(),
+            "Argument -5 must be an integer between 0 and 2147483647"
+        );
+        assert_eq!(
+            parse("max-keys=x").unwrap_err(),
+            "Provided x not an integer or within integer range"
+        );
+        assert!(parse("max-keys=2147483647").is_ok());
+        assert!(parse("max-keys=2147483648").is_err());
+        assert_eq!(
+            parse("start-after=a").unwrap_err(),
+            "startAfter only supported in REST.GET.BUCKET with list-type=2"
+        );
+        assert_eq!(
+            parse("continuation-token=").unwrap_err(),
+            "continuation-token only supported in REST.GET.BUCKET with list-type=2"
+        );
     }
 
     #[test]

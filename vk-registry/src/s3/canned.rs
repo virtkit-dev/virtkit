@@ -4,11 +4,11 @@
 //! set here: a `PUT` or `DELETE` of any of them is `NotImplemented`, and so is a request
 //! whose headers ask for one on the object or bucket it writes ([`asked`]).
 
+use hyper::Response;
 use hyper::header::HeaderMap;
-use hyper::{Response, StatusCode};
 
 use super::bucket::{OWNER, owner};
-use super::object::Refused;
+use super::error::{Code, Refusal};
 use super::xml;
 
 /// What a configuration read answers.
@@ -16,19 +16,15 @@ pub(super) enum Canned {
     /// a 200 document: its root element and what it holds
     Document(&'static str, String),
     /// a 404: S3's code for "none configured"
-    Missing(&'static str),
+    Missing(Code),
 }
 
 impl Canned {
-    /// The answer, at `ctx`'s path.
-    pub(super) fn answer(self, ctx: &super::Ctx) -> Response<crate::Body> {
+    /// The answer, at `ctx`'s path, for `bucket`.
+    pub(super) fn answer(self, bucket: &str, ctx: &super::Ctx) -> Response<crate::Body> {
         match self {
             Canned::Document(root, inner) => xml::document(root, &inner),
-            Canned::Missing(code) => ctx.error(
-                StatusCode::NOT_FOUND,
-                code,
-                "this registry keeps no such configuration",
-            ),
+            Canned::Missing(code) => ctx.error(Refusal::new(code).with("BucketName", bucket)),
         }
     }
 }
@@ -68,15 +64,15 @@ pub(super) fn bucket(sub: &str) -> Option<Canned> {
             xml::element("Payer", "BucketOwner"),
         ),
         "accelerate" => empty("AccelerateConfiguration"),
-        "lifecycle" => Canned::Missing("NoSuchLifecycleConfiguration"),
-        "policy" | "policyStatus" => Canned::Missing("NoSuchBucketPolicy"),
-        "cors" => Canned::Missing("NoSuchCORSConfiguration"),
-        "encryption" => Canned::Missing("ServerSideEncryptionConfigurationNotFoundError"),
-        "object-lock" => Canned::Missing("ObjectLockConfigurationNotFoundError"),
-        "replication" => Canned::Missing("ReplicationConfigurationNotFoundError"),
-        "website" => Canned::Missing("NoSuchWebsiteConfiguration"),
-        "publicAccessBlock" => Canned::Missing("NoSuchPublicAccessBlockConfiguration"),
-        "ownershipControls" => Canned::Missing("OwnershipControlsNotFoundError"),
+        "lifecycle" => Canned::Missing(Code::NoSuchLifecycleConfiguration),
+        "policy" | "policyStatus" => Canned::Missing(Code::NoSuchBucketPolicy),
+        "cors" => Canned::Missing(Code::NoSuchCORSConfiguration),
+        "encryption" => Canned::Missing(Code::ServerSideEncryptionConfigurationNotFoundError),
+        "object-lock" => Canned::Missing(Code::ObjectLockConfigurationNotFoundError),
+        "replication" => Canned::Missing(Code::ReplicationConfigurationNotFoundError),
+        "website" => Canned::Missing(Code::NoSuchWebsiteConfiguration),
+        "publicAccessBlock" => Canned::Missing(Code::NoSuchPublicAccessBlockConfiguration),
+        "ownershipControls" => Canned::Missing(Code::OwnershipControlsNotFoundError),
         _ => return None,
     })
 }
@@ -112,32 +108,19 @@ const STORAGE_CLASSES: [&str; 10] = [
 /// copy's source too), object tags, an ACL other than the one every object has, a grant, a
 /// storage class other than `STANDARD`, a website redirect and object lock are
 /// `NotImplemented`; a storage class S3 does not have is `InvalidStorageClass`.
-pub(super) fn asked(headers: &HeaderMap) -> Option<Refused> {
-    let not_implemented = |message| (StatusCode::NOT_IMPLEMENTED, "NotImplemented", message);
+pub(super) fn asked(headers: &HeaderMap) -> Option<Refusal> {
+    // AWS names the header a NotImplemented is about.
+    let not_implemented = |header: &str| Refusal::new(Code::NotImplemented).with("Header", header);
     for name in headers.keys() {
         let name = name.as_str();
-        if name.contains("server-side-encryption") {
-            return Some(not_implemented(
-                "this registry stores objects unencrypted and takes no encryption key: send \
-                 no x-amz-server-side-encryption header",
-            ));
-        }
         // No tags at all is what every object has.
-        if name == "x-amz-tagging" && headers.get_all(name).iter().any(|v| !v.is_empty()) {
-            return Some(not_implemented("this registry keeps no object tags"));
-        }
-        if name.starts_with("x-amz-grant-") {
-            return Some(not_implemented(
-                "this registry keeps no ACL but the owner's: send no x-amz-grant header",
-            ));
-        }
-        if name.starts_with("x-amz-object-lock-") {
-            return Some(not_implemented("this registry keeps no object lock"));
-        }
-        if name == "x-amz-website-redirect-location" {
-            return Some(not_implemented(
-                "this registry keeps no website configuration",
-            ));
+        if name.contains("server-side-encryption")
+            || (name == "x-amz-tagging" && headers.get_all(name).iter().any(|v| !v.is_empty()))
+            || name.starts_with("x-amz-grant-")
+            || name.starts_with("x-amz-object-lock-")
+            || name == "x-amz-website-redirect-location"
+        {
+            return Some(not_implemented(name));
         }
     }
     // The ACL every object and bucket has, by either of its names, asks for nothing new.
@@ -146,10 +129,7 @@ pub(super) fn asked(headers: &HeaderMap) -> Option<Refused> {
         .iter()
         .any(|v| !matches!(v.as_bytes(), b"private" | b"bucket-owner-full-control"))
     {
-        return Some(not_implemented(
-            "this registry keeps no ACL but the owner's: x-amz-acl is private, \
-             bucket-owner-full-control or absent",
-        ));
+        return Some(not_implemented("x-amz-acl"));
     }
     for value in headers.get_all("x-amz-storage-class") {
         let class = value.to_str().unwrap_or_default();
@@ -157,15 +137,9 @@ pub(super) fn asked(headers: &HeaderMap) -> Option<Refused> {
             continue;
         }
         if STORAGE_CLASSES.contains(&class) {
-            return Some(not_implemented(
-                "this registry stores every object as STANDARD",
-            ));
+            return Some(not_implemented("x-amz-storage-class"));
         }
-        return Some((
-            StatusCode::BAD_REQUEST,
-            "InvalidStorageClass",
-            "the storage class you specified is not valid",
-        ));
+        return Some(Refusal::new(Code::InvalidStorageClass).with("StorageClassRequested", class));
     }
     None
 }
@@ -221,7 +195,7 @@ mod tests {
                     hyper::header::HeaderValue::from_str(v).unwrap(),
                 );
             }
-            asked(&h).map(|(status, code, _)| (status.as_u16(), code))
+            asked(&h).map(|r| (r.code.status().as_u16(), r.code.name()))
         };
         assert_eq!(of(&[]), None);
         assert_eq!(
@@ -273,6 +247,18 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // A refusal names the header, and says what AWS says.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-amz-grant-read",
+            hyper::header::HeaderValue::from_static("id=x"),
+        );
+        let r = asked(&h).unwrap();
+        assert_eq!(r.element("Header"), Some("x-amz-grant-read"));
+        assert_eq!(
+            r.message(),
+            "A header you provided implies functionality that is not implemented"
+        );
         // Checked in that order: a refusal names the first thing asked for.
         assert_eq!(
             of(&[("x-amz-acl", "public-read"), ("x-amz-storage-class", "x")]),

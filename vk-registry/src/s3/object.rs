@@ -21,6 +21,7 @@ use hyper::{Request, Response, StatusCode};
 use sha2::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
+use super::error::{Code, Refusal};
 use super::range::{self, Range};
 use super::{Ctx, UNCOMPRESSED_FROM, checksum, chunked, drain, meta, multipart, refuse, xml};
 use crate::dav::http_date;
@@ -47,12 +48,10 @@ pub(super) fn admitted(authz: &Authz<'_>, action: accounts::Action, segs: &[Stri
         || object_of(segs).is_some_and(|(parent, _)| allowed(authz, action, &parent))
 }
 
-pub(super) fn no_such_key(ctx: &Ctx) -> Response<Body> {
-    ctx.error(
-        StatusCode::NOT_FOUND,
-        "NoSuchKey",
-        "the specified key does not exist",
-    )
+/// `NoSuchKey`, naming the key at `segs`.
+pub(super) fn no_such_key(ctx: &Ctx, segs: &[String]) -> Response<Body> {
+    let key = segs.get(1..).unwrap_or_default().join("/");
+    ctx.error(Refusal::new(Code::NoSuchKey).with("Key", key))
 }
 
 /// The object at `segs` as this caller may read it: `None` when nothing is there, when a
@@ -127,11 +126,10 @@ pub(super) async fn get(
     let conditions = Conditions::of(req.headers());
     let asked = range::Asked::of(req.headers());
     if part.is_some() && req.headers().contains_key(hyper::header::RANGE) {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidRequest,
             "Cannot specify both Range header and partNumber query parameter",
-        );
+        ));
         return refuse(req, resp, ctx).await;
     }
     let checksum = req
@@ -141,7 +139,7 @@ pub(super) async fn get(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         let Some(obj) = readable(store, authz, &segs)? else {
-            return Ok(no_such_key(&ctx));
+            return Ok(no_such_key(&ctx, &segs));
         };
         let etag = conditional::etag_of(&obj);
         let modified = http_date(obj.modified);
@@ -156,14 +154,9 @@ pub(super) async fn get(
                 return Ok(resp);
             }
             Outcome::Failed(condition) => {
-                return Ok(xml::error(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    "at least one of the preconditions you specified did not hold",
-                    &[("Condition", condition)],
-                    &ctx.path,
-                    &ctx.id,
-                ));
+                return Ok(
+                    ctx.error(Refusal::new(Code::PreconditionFailed).with("Condition", condition))
+                );
             }
         }
         let sizes = multipart::part_sizes(&obj.annotations);
@@ -176,16 +169,10 @@ pub(super) async fn get(
                 };
                 let Some((start, len)) = lies else {
                     let count = sizes.as_ref().map_or(1, Vec::len).to_string();
-                    return Ok(xml::error(
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "InvalidPartNumber",
-                        "The requested partnumber is not satisfiable.",
-                        &[
-                            ("ActualPartCount", &count),
-                            ("PartNumberRequested", &n.to_string()),
-                        ],
-                        &ctx.path,
-                        &ctx.id,
+                    return Ok(ctx.error(
+                        Refusal::new(Code::InvalidPartNumber)
+                            .with("ActualPartCount", count)
+                            .with("PartNumberRequested", n.to_string()),
                     ));
                 };
                 if len == 0 {
@@ -202,14 +189,14 @@ pub(super) async fn get(
                 // The layer gone under the tag (a gc between the two reads) is no object
                 // either.
                 if resp.status() != StatusCode::OK {
-                    return Ok(no_such_key(&ctx));
+                    return Ok(no_such_key(&ctx, &segs));
                 }
                 resp.headers_mut().remove("docker-content-digest");
                 resp
             }
             Range::Part { start, len } => {
                 let Some(part) = store.serve_blob_range(&obj.layer, start, len, head)? else {
-                    return Ok(no_such_key(&ctx));
+                    return Ok(no_such_key(&ctx, &segs));
                 };
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -220,16 +207,10 @@ pub(super) async fn get(
             }
             Range::Unsatisfiable => {
                 let total = obj.size.to_string();
-                let mut resp = xml::error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "InvalidRange",
-                    "the requested range is not satisfiable",
-                    &[
-                        ("RangeRequested", asked.range()),
-                        ("ActualObjectSize", &total),
-                    ],
-                    &ctx.path,
-                    &ctx.id,
+                let mut resp = ctx.error(
+                    Refusal::new(Code::InvalidRange)
+                        .with("RangeRequested", asked.range())
+                        .with("ActualObjectSize", total.as_str()),
                 );
                 insert(
                     resp.headers_mut(),
@@ -306,11 +287,10 @@ pub(super) async fn attributes(
         count("x-amz-max-parts", 1000, 1000),
         count("x-amz-part-number-marker", 0, u64::from(u32::MAX)),
     ) else {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidArgument,
             "x-amz-max-parts and x-amz-part-number-marker are whole numbers",
-        );
+        ));
         return refuse(req, resp, ctx).await;
     };
     let mut asked = Vec::new();
@@ -329,18 +309,17 @@ pub(super) async fn attributes(
         "ObjectSize",
     ];
     if asked.is_empty() || asked.iter().any(|a| !known.contains(&a.as_str())) {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
-            "x-amz-object-attributes names some of ETag, Checksum, ObjectParts, StorageClass \
-             and ObjectSize",
-        );
+        let resp = ctx.error(Refusal::argument(
+            "Invalid attribute name specified.",
+            "x-amz-object-attributes",
+            asked.join(","),
+        ));
         return refuse(req, resp, ctx).await;
     }
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         let Some(obj) = readable(store, authz, &segs)? else {
-            return Ok(no_such_key(&ctx));
+            return Ok(no_such_key(&ctx, &segs));
         };
         let has = |a: &str| asked.iter().any(|x| x == a);
         let mut inner = String::new();
@@ -394,8 +373,8 @@ pub(super) async fn configuration(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         Ok(match readable(store, authz, &segs)? {
-            Some(_) => canned.answer(&ctx),
-            None => no_such_key(&ctx),
+            Some(_) => canned.answer(&segs[0], &ctx),
+            None => no_such_key(&ctx, &segs),
         })
     })
     .await
@@ -431,22 +410,17 @@ struct Claim {
 }
 
 /// The refusal of a second `x-amz-checksum-*`, as S3 words it.
-const ONE_CHECKSUM: Refused = (
-    StatusCode::BAD_REQUEST,
-    "InvalidRequest",
+const ONE_CHECKSUM: Refusal = Refusal::said(
+    Code::InvalidRequest,
     "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
 );
-
-/// What a PutObject's headers ask that cannot be served, or are malformed: a status, a code
-/// and a message.
-pub(super) type Refused = (StatusCode, &'static str, &'static str);
 
 /// What `x-amz-content-sha256`, `Content-Encoding`, `x-amz-decoded-content-length` and
 /// `x-amz-trailer` say of a PutObject's body. A streaming mode, or `aws-chunked` named among
 /// the encodings, makes it an `aws-chunked` body; no other encoding is decoded, so none is
 /// taken beside it.
-fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
-    let invalid = |message| (StatusCode::BAD_REQUEST, "InvalidRequest", message);
+fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
+    let invalid = |message| Refusal::said(Code::InvalidRequest, message);
     let mut sent = headers.get_all("x-amz-content-sha256").iter();
     let value = sent.next().map(|v| v.to_str().unwrap_or_default());
     if sent.next().is_some() {
@@ -457,23 +431,23 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
         Some(v) if v.starts_with("STREAMING-") => match chunked::Mode::of(v) {
             Some(mode) => (None, Some(mode)),
             None => {
-                return Err((
-                    StatusCode::NOT_IMPLEMENTED,
-                    "NotImplemented",
-                    "the streaming payloads taken are STREAMING-AWS4-HMAC-SHA256-PAYLOAD, its \
-                     -TRAILER form and STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-                ));
+                return Err(
+                    Refusal::new(Code::NotImplemented).with("Header", "x-amz-content-sha256")
+                );
             }
         },
         Some(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => {
             (Some(v.to_ascii_lowercase()), None)
         }
-        Some(_) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "x-amz-content-sha256 is UNSIGNED-PAYLOAD, the body's SHA-256 in hex, or a \
-                 streaming mode",
+        Some(v) => {
+            return Err(Refusal::argument(
+                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
+                 STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
+                 STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, \
+                 STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
+                 STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.",
+                "x-amz-content-sha256",
+                v,
             ));
         }
     };
@@ -501,11 +475,7 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refused> {
         });
     };
     if other {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "an aws-chunked body is decoded, and no other content encoding with it",
-        ));
+        return Err(Refusal::new(Code::NotImplemented).with("Header", "Content-Encoding"));
     }
     let declared = headers
         .get(DECODED_LENGTH)
@@ -566,13 +536,10 @@ pub(super) fn base64_header(
 }
 
 /// The `Content-MD5` a request sends, as bytes.
-fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refused> {
+fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refusal> {
     let md5 = base64_header(headers, "content-md5", 16).map_err(|()| {
-        (
-            StatusCode::BAD_REQUEST,
-            "InvalidDigest",
-            "Content-MD5 is the body's MD5 in base64",
-        )
+        let sent = headers.get("content-md5").and_then(|v| v.to_str().ok());
+        Refusal::new(Code::InvalidDigest).with("Content-MD5", sent.unwrap_or_default())
     })?;
     Ok(md5.map(|(_, b)| b))
 }
@@ -580,7 +547,7 @@ fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refu
 /// What a request's headers ask to be checked: its `Content-MD5` and the one
 /// `x-amz-checksum-*` it carries, in an algorithm computed here; a second one is refused as
 /// S3 refuses it, and one in another algorithm as not implemented.
-fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
+fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refusal> {
     if checksum::not_computed(headers) {
         return Err(checksum::NOT_COMPUTED);
     }
@@ -589,13 +556,7 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
         ..Expected::default()
     };
     for (name, _, len) in checksum::ALGORITHMS {
-        let value = base64_header(headers, name, len).map_err(|()| {
-            (
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "an x-amz-checksum header is the checksum of the body in base64",
-            )
-        })?;
+        let value = base64_header(headers, name, len).map_err(|()| checksum::invalid(name))?;
         if let Some((text, bytes)) = value {
             if out.checksum.is_some() {
                 return Err(ONE_CHECKSUM);
@@ -620,14 +581,10 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refused> {
 
 impl Expected {
     /// The trailer's checksum `name`d, as sent: base64 of the checksum's length.
-    fn trailer(&mut self, name: &'static str, text: &str) -> std::result::Result<(), Refused> {
+    fn trailer(&mut self, name: &'static str, text: &str) -> std::result::Result<(), Refusal> {
         let bytes = crate::auth::base64_decode(text)
             .filter(|b| Some(b.len()) == checksum::len(name))
-            .ok_or((
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "the trailer's x-amz-checksum is the checksum of the body in base64",
-            ))?;
+            .ok_or_else(|| checksum::invalid_trailing(name))?;
         self.checksum = Some(Claim {
             header: name,
             text: text.to_string(),
@@ -670,13 +627,9 @@ fn verify(
     md5: &[u8],
     sha256: Option<&[u8]>,
     computed: Option<Vec<u8>>,
-) -> std::result::Result<(), Refused> {
+) -> std::result::Result<(), Refusal> {
     if expected.md5.as_deref().is_some_and(|m| m != md5) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the Content-MD5 you specified did not match what was received",
-        ));
+        return Err(Refusal::new(Code::BadDigest));
     }
     if let Some(claim) = &expected.checksum {
         let got = if claim.header == CHECKSUM_SHA256 {
@@ -694,7 +647,7 @@ fn verify(
 /// Check a request document read whole (a `Delete`) against what its headers say of it, as a
 /// PutObject's body is checked: the signed `x-amz-content-sha256`, `Content-MD5` and the
 /// `x-amz-checksum-*` header. A document is sent whole, not `aws-chunked`.
-pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
+pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refusal> {
     check_document(headers, body)?;
     let expected = expected(headers)?;
     let computed = expected
@@ -712,24 +665,16 @@ pub(super) fn check_body(headers: &HeaderMap, body: &[u8]) -> std::result::Resul
 /// [`check_body`] for a document whose `x-amz-checksum-*` headers are not its own (a
 /// `CompleteMultipartUpload`'s are the object's): the signed `x-amz-content-sha256` and
 /// `Content-MD5` only.
-pub(super) fn check_document(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refused> {
+pub(super) fn check_document(headers: &HeaderMap, body: &[u8]) -> std::result::Result<(), Refusal> {
     let payload = payload(headers)?;
     if payload.framing.is_some() {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "a request document is sent whole, not aws-chunked",
-        ));
+        return Err(Refusal::new(Code::NotImplemented).with("Header", "Content-Encoding"));
     }
     if payload
         .sha256
         .is_some_and(|signed| signed != crate::hex_of(&sha2::Sha256::digest(body)))
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
-        ));
+        return Err(Refusal::new(Code::XAmzContentSHA256Mismatch));
     }
     let expected = Expected {
         md5: content_md5(headers)?,
@@ -750,11 +695,10 @@ pub(super) fn unwritable_message(why: Unwritable) -> &'static str {
 
 /// The answer to a write at a path that takes no object, with what is in the way.
 pub(super) fn unwritable(why: Unwritable, ctx: &Ctx) -> Response<Body> {
-    ctx.error(
-        StatusCode::CONFLICT,
-        "OperationAborted",
+    ctx.error(Refusal::said(
+        Code::OperationAborted,
         unwritable_message(why),
-    )
+    ))
 }
 
 /// Whether a write's declared length, `Content-Length` or `x-amz-decoded-content-length`, is
@@ -778,15 +722,11 @@ pub(super) struct Plan {
 }
 
 /// The [`Plan`] of a write's body, or why its headers are refused.
-pub(super) fn plan(headers: &HeaderMap) -> std::result::Result<Plan, Refused> {
+pub(super) fn plan(headers: &HeaderMap) -> std::result::Result<Plan, Refusal> {
     let payload = payload(headers)?;
     let expected = expected(headers)?;
     if payload.framing.is_some_and(|f| f.trailer.is_some()) && expected.checksum.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "a checksum is sent as a header or in the trailer, not both",
-        ));
+        return Err(ONE_CHECKSUM);
     }
     // As beside a checksum header: the trailer's checksum is in the algorithm the SDK names.
     if let (Some(named), Some(trailer)) = (
@@ -843,32 +783,26 @@ pub(super) async fn receive(
         Ok(staged) => staged,
         Err(PutError::TooLarge) => return Ok(Err(ctx.too_large())),
         Err(PutError::Failed(e)) => match e.downcast_ref::<chunked::Error>() {
-            Some(chunked::Error::Refused(why)) => {
-                return Ok(Err(ctx.error(why.status, why.code, why.message)));
-            }
+            Some(chunked::Error::Refused(why)) => return Ok(Err(ctx.error(*why))),
             _ => return Err(e),
         },
     };
     // A refusal from here on drops `staged`, which unlinks it.
     if let Some((name, value)) = trailer
-        && let Err((status, code, message)) = expected.trailer(name, &value)
+        && let Err(why) = expected.trailer(name, &value)
     {
-        return Ok(Err(ctx.error(status, code, message)));
+        return Ok(Err(ctx.error(why)));
     }
     if let Some(signed) = &payload.sha256
         && *signed != staged.hex
     {
-        return Ok(Err(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the body's SHA-256 is not the x-amz-content-sha256 the request was signed with",
-        )));
+        return Ok(Err(ctx.error(Code::XAmzContentSHA256Mismatch)));
     }
     let md5 = digests.md5.finalize().0;
     let computed = digests.checksum.map(checksum::Hasher::finalize);
     let sha256 = hex_bytes(&staged.hex);
-    if let Err((status, code, message)) = verify(&expected, &md5, sha256.as_deref(), computed) {
-        return Ok(Err(ctx.error(status, code, message)));
+    if let Err(why) = verify(&expected, &md5, sha256.as_deref(), computed) {
+        return Ok(Err(ctx.error(why)));
     }
     Ok(Ok(Received {
         staged,
@@ -938,24 +872,15 @@ pub(super) async fn put(
     }
     let plan = match plan(headers) {
         Ok(plan) => plan,
-        Err((status, code, message)) => {
-            return refuse(req, ctx.error(status, code, message), ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let mut annotations = match meta::annotations(headers) {
         Ok(a) => a,
-        Err(why) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, why.code, why.message);
-            return refuse(req, resp, ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
-    let Ok(conditions) = WriteConditions::of(headers) else {
-        let resp = ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "a write's If-None-Match is * or nothing",
-        );
-        return refuse(req, resp, ctx).await;
+    let conditions = match WriteConditions::of(headers) {
+        Ok(conditions) => conditions,
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     // Refused before the body is staged when the answer is already known; checked again
     // once it is, under the namespace lock.
@@ -993,13 +918,7 @@ pub(super) async fn put(
     match written {
         Written::Created | Written::Replaced => {}
         Written::Refused(why) => return Ok(unwritable(why, ctx)),
-        Written::PreconditionFailed => {
-            return Ok(ctx.error(
-                StatusCode::PRECONDITION_FAILED,
-                "PreconditionFailed",
-                "at least one of the preconditions you specified did not hold",
-            ));
-        }
+        Written::PreconditionFailed => return Ok(ctx.error(Code::PreconditionFailed)),
     }
     let mut resp = written_of(&format!("\"{md5_hex}\""), received.echo, Some(size))?;
     if kept.is_some() {
@@ -1034,18 +953,10 @@ pub(super) async fn delete(
     }
     let conditions = match conditional::DeleteConditions::of(req.headers()) {
         Ok(c) => c,
-        Err(why) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidArgument", why);
-            return refuse(req, resp, ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if versioned && !conditions.is_empty() {
-        let resp = ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "A header you provided implies functionality that is not implemented",
-        );
-        return refuse(req, resp, ctx).await;
+        return refuse(req, ctx.error(conditions.versioned()), ctx).await;
     }
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
@@ -1058,12 +969,8 @@ pub(super) async fn delete(
                 Deleted::Gone => no_content(),
                 Deleted::Denied => ctx.access_denied(),
                 Deleted::Foreign => unwritable(Unwritable::Foreign, &ctx),
-                Deleted::Absent => no_such_key(&ctx),
-                Deleted::Failed => ctx.error(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    conditional::PRECONDITION_FAILED,
-                ),
+                Deleted::Absent => no_such_key(&ctx, &segs),
+                Deleted::Failed => ctx.error(Code::PreconditionFailed),
             },
         )
     })
@@ -1145,7 +1052,7 @@ mod tests {
 
     #[test]
     fn a_payload_is_unsigned_its_sha256_or_chunked() {
-        let code = |pairs: &[(&str, &str)]| payload(&headers(pairs)).err().map(|e| e.1);
+        let code = |pairs: &[(&str, &str)]| payload(&headers(pairs)).err().map(|e| e.code.name());
         let plain = |pairs: &[(&str, &str)]| {
             let p = payload(&headers(pairs)).ok().unwrap();
             assert!(p.framing.is_none());
@@ -1296,7 +1203,7 @@ mod tests {
             let e = expected(&headers(&[(name, &value)])).ok().unwrap();
             assert_eq!(e.checksum.unwrap().header, name);
         }
-        let code = |pairs: &[(&str, &str)]| expected(&headers(pairs)).err().map(|e| e.1);
+        let code = |pairs: &[(&str, &str)]| expected(&headers(pairs)).err().map(|e| e.code.name());
         assert_eq!(code(&[("content-md5", "AAAA")]), Some("InvalidDigest"));
         assert_eq!(code(&[("content-md5", "!!")]), Some("InvalidDigest"));
         assert_eq!(
@@ -1352,7 +1259,7 @@ mod tests {
                 ("x-amz-checksum-sha256", &sha)
             ]))
             .err()
-            .map(|e| e.1),
+            .map(|e| e.code.name()),
             Some("InvalidRequest")
         );
         assert!(plan(&headers(&[streaming, length, crc])).is_ok());

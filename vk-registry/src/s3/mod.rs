@@ -4,7 +4,7 @@
 //! user) and whose signing secret is that same string (the Basic password for the user), so
 //! nothing new is stored; or by the bearer, Basic or session credential the other routes
 //! take. Every answer carries an `x-amz-request-id` (and the same id as `x-amz-id-2`), and
-//! refusals are S3's XML `Error`.
+//! refusals are S3's XML `Error`, in S3's codes and words ([`error`]).
 //! Presigned URLs and temporary credentials are refused.
 //!
 //! Past the gate, a bucket is a top-level directory of `files/` and an object a key below
@@ -28,6 +28,7 @@ mod checksum;
 mod chunked;
 mod conditional;
 mod copy;
+mod error;
 mod list;
 mod meta;
 mod multipart;
@@ -42,9 +43,10 @@ use hyper::body::Incoming;
 use hyper::header::{
     AUTHORIZATION, DATE, EXPECT, HeaderMap, HeaderValue, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
 };
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response};
 use vk_hub_proto::token::Claims;
 
+use self::error::{Code, Refusal};
 use crate::files::{MAX_OBJECT, PutError};
 use crate::{Authenticator, Authz, Body, ServerState, accounts, hubtoken};
 
@@ -122,12 +124,10 @@ pub(crate) async fn route(
     };
     let id = &ctx.id;
     // S3 parses the URI before it looks at the credential.
-    let served = match unparsable {
-        Some(why) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidURI", why);
-            before_auth(req, resp).await
-        }
-        None => serve(state, req, &ctx).await,
+    let served = if unparsable {
+        before_auth(req, ctx.error(Code::InvalidURI)).await
+    } else {
+        serve(state, req, &ctx).await
     };
     let mut resp = match served {
         Ok(resp) => resp,
@@ -154,41 +154,28 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn error(&self, status: StatusCode, code: &str, message: &str) -> Response<Body> {
-        xml::error(status, code, message, &[], &self.path, &self.id)
+    /// The `Error` document of `refusal`, naming this request.
+    fn error(&self, refusal: impl Into<Refusal>) -> Response<Body> {
+        refusal.into().answer(&self.path, &self.id)
     }
 
     fn not_implemented(&self) -> Response<Body> {
-        self.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "this registry does not serve that operation",
-        )
+        self.error(Code::NotImplemented)
     }
 
     fn access_denied(&self) -> Response<Body> {
-        self.error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            "the credential grants nothing for this bucket or key",
-        )
+        self.error(Code::AccessDenied)
     }
 
     fn too_large(&self) -> Response<Body> {
         self.error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "EntityTooLarge",
-            "an object is at most 4 GiB",
+            Refusal::new(Code::EntityTooLarge).with("MaxSizeAllowed", MAX_OBJECT.to_string()),
         )
     }
 }
 
 fn internal_error(ctx: &Ctx) -> Response<Body> {
-    ctx.error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "InternalError",
-        "the server could not answer; its log names this request id",
-    )
+    ctx.error(Code::InternalError)
 }
 
 /// Who a request was authenticated as: what [`Authz`] borrows from.
@@ -214,38 +201,31 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
     // Browsers attach cookies or Basic credentials to cross-site requests, as on every
     // other machine route.
     if !matches!(req.method(), &Method::GET | &Method::HEAD) && crate::cross_site(headers) {
-        let resp = ctx.error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
+        let resp = ctx.error(Refusal::said(
+            Code::AccessDenied,
             "a write to this registry cannot come from another site's page",
-        );
+        ));
         return before_auth(req, resp).await;
     }
     // A credential in a URL ends up in logs, proxies' included.
     if is_presigned(req.uri().query().unwrap_or("")) {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "AuthorizationQueryParametersError",
+        let resp = ctx.error(Refusal::said(
+            Code::AuthorizationQueryParametersError,
             "presigned URLs are not accepted: sign the Authorization header",
-        );
+        ));
         return before_auth(req, resp).await;
     }
     if headers.contains_key("x-amz-security-token") {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidToken,
             "temporary credentials are not accepted: sign with a key of this registry",
-        );
+        ));
         return before_auth(req, resp).await;
     }
     let who = match scheme(headers) {
         Ok(true) => signed_by(state, &req, ctx),
         Ok(false) => presented(state, &req, ctx).map(|who| (who, None)),
-        Err(why) => Err(Box::new(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
-            why,
-        ))),
+        Err(why) => Err(Box::new(ctx.error(why))),
     };
     let (who, seed) = match who {
         Ok(who) => who,
@@ -254,11 +234,10 @@ async fn serve(state: &ServerState, req: Request<Incoming>, ctx: &Ctx) -> Result
 
     // A hub managing the registry may make it refuse writes for a while.
     if state.store.read_only() && crate::is_store_write(req.method(), &ctx.path) {
-        let mut resp = ctx.error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ServiceUnavailable",
+        let mut resp = ctx.error(Refusal::said(
+            Code::ServiceUnavailable,
             "the registry is read-only for now",
-        );
+        ));
         resp.headers_mut()
             .insert(RETRY_AFTER, HeaderValue::from_static("60"));
         return refuse(req, resp, ctx).await;
@@ -338,32 +317,28 @@ async fn operate(
 ) -> Result<Response<Body>> {
     let target = match path::parse(&ctx.path) {
         Ok(target) => target,
-        Err(why) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, why.code, why.message);
-            return refuse(req, resp, ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let Some(query) = parse_query(req.uri().query().unwrap_or("")) else {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidArgument,
             "a query parameter has a malformed percent escape or is not UTF-8",
-        );
+        ));
         return refuse(req, resp, ctx).await;
     };
-    if let Some((status, code, message)) = canned::asked(req.headers()) {
-        return refuse(req, ctx.error(status, code, message), ctx).await;
+    if let Some(why) = canned::asked(req.headers()) {
+        return refuse(req, ctx.error(why), ctx).await;
     }
     let part = match part_asked(&query) {
         None => None,
         Some(value) => match multipart::part_number(value) {
             Some(n) => Some(n),
             None => {
-                let resp = ctx.error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidArgument",
-                    "Part number must be an integer between 1 and 10000, inclusive.",
-                );
+                let resp = ctx.error(Refusal::argument(
+                    multipart::PART_NUMBER,
+                    "partNumber",
+                    value,
+                ));
                 return refuse(req, resp, ctx).await;
             }
         },
@@ -438,34 +413,36 @@ async fn operate(
 
 /// Whether the `Authorization` header is SigV4's: `false` for none (the session cookie may
 /// stand in) or one of the schemes the other routes take, Basic and Bearer, which
-/// [`presented`] resolves; an error for any other scheme, or a value with no scheme, which
-/// S3 answers 400 as a signature version it does not take rather than 403 as a credential
-/// it refused.
-fn scheme(headers: &HeaderMap) -> std::result::Result<bool, &'static str> {
+/// [`presented`] resolves; refused otherwise: a value with no scheme or of any other scheme
+/// is 400 `InvalidArgument`, as S3 answers a signature version it does not take rather than
+/// 403 as a credential it refused.
+fn scheme(headers: &HeaderMap) -> std::result::Result<bool, Refusal> {
+    let invalid =
+        |why| Refusal::said(Code::InvalidArgument, why).with("ArgumentName", "Authorization");
     let Some(value) = headers.get(AUTHORIZATION) else {
         return Ok(false);
     };
     let Ok(value) = value.to_str() else {
-        return Err("the Authorization header is not text");
+        return Err(invalid("the Authorization header is not text"));
     };
     let Some((scheme, _)) = value.split_once(' ') else {
-        return Err("the Authorization header names no scheme: a space follows the scheme");
+        return Err(invalid(
+            "Authorization header is invalid -- one and only one ' ' (space) required",
+        ));
     };
     if scheme == sigv4::ALGORITHM {
         Ok(true)
     } else if scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("bearer") {
         Ok(false)
     } else {
-        Err(
-            "the Authorization scheme is not one this registry takes: AWS4-HMAC-SHA256, Bearer or Basic",
-        )
+        Err(invalid("Unsupported Authorization Type"))
     }
 }
 
 /// Answer `resp` once the request body has been read through, as after every refusal of an
 /// authenticated request: a status sent with request bytes unread resets the connection,
-/// which a client sees instead of the answer. A body past the object cap is refused with 413
-/// instead. A client waiting on `Expect: 100-continue` has sent no body yet: it is answered
+/// which a client sees instead of the answer. A body past the object cap is refused with
+/// `EntityTooLarge` instead. A client waiting on `Expect: 100-continue` has sent no body yet: it is answered
 /// at once, and the `100` it would have sent the body on never goes out.
 async fn refuse(req: Request<Incoming>, resp: Response<Body>, ctx: &Ctx) -> Result<Response<Body>> {
     if expects_continue(req.headers()) {
@@ -483,7 +460,8 @@ fn expects_continue(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
-/// Read a request's body through and discard it: `Some(413)` if it crosses the object cap.
+/// Read a request's body through and discard it: `Some(EntityTooLarge)` if it crosses the
+/// object cap.
 async fn drain(req: Request<Incoming>, ctx: &Ctx) -> Result<Option<Response<Body>>> {
     let sink = &mut tokio::io::sink();
     match crate::files::drain_into(sink, req.into_body(), MAX_OBJECT, &mut |_| {}).await {
@@ -494,7 +472,8 @@ async fn drain(req: Request<Incoming>, ctx: &Ctx) -> Result<Option<Response<Body
 }
 
 /// A request document read whole, up to `cap` bytes: `Err(too_long)` when it is longer,
-/// once the rest has been read through as a refusal's is (or 413 past the object cap).
+/// once the rest has been read through as a refusal's is (or `EntityTooLarge` past the object
+/// cap).
 async fn read_small(
     mut body: Incoming,
     cap: usize,
@@ -550,14 +529,7 @@ fn presented(
     req: &Request<Incoming>,
     ctx: &Ctx,
 ) -> std::result::Result<Who, Box<Response<Body>>> {
-    let denied = || {
-        let message = if req.headers().contains_key(AUTHORIZATION) {
-            "the credential was refused"
-        } else {
-            "this registry needs a credential: sign the request with a key of this registry"
-        };
-        Box::new(ctx.error(StatusCode::FORBIDDEN, "AccessDenied", message))
-    };
+    let denied = || Box::new(ctx.access_denied());
     if let Some(claims) = token(state, req.headers(), denied)? {
         return Ok(Who::Token(claims));
     }
@@ -598,11 +570,10 @@ fn token(
 /// asked again, anything else is logged under the request's id.
 fn resolve_failed(e: anyhow::Error, ctx: &Ctx) -> Box<Response<Body>> {
     if accounts::is_handed_over_error(&e) {
-        return Box::new(crate::ask_again(ctx.error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ServiceUnavailable",
+        return Box::new(crate::ask_again(ctx.error(Refusal::said(
+            Code::ServiceUnavailable,
             "this registry is updating; retry",
-        )));
+        ))));
     }
     eprintln!(
         "vk-registry: S3 request {}: resolving a credential: {e:#}",
@@ -625,26 +596,31 @@ fn signed_by(
     ctx: &Ctx,
 ) -> std::result::Result<(Who, Option<chunked::Seed>), Box<Response<Body>>> {
     let headers = req.headers();
+    // What AWS says after this of every malformed header.
     let malformed = |why: &str| {
-        Box::new(ctx.error(StatusCode::BAD_REQUEST, "AuthorizationHeaderMalformed", why))
+        Box::new(ctx.error(Refusal::saying(
+            Code::AuthorizationHeaderMalformed,
+            format!("The authorization header is malformed; {why}"),
+        )))
     };
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| malformed("the Authorization header is not text"))?;
-    let credential = sigv4::parse_authorization(value).map_err(malformed)?;
+        .ok_or_else(|| malformed("the Authorization header is not text."))?;
+    let credential = sigv4::parse_authorization(value, "s3").map_err(|why| malformed(&why))?;
     if let Some(why) = sigv4::s3_refusal(&credential) {
         return Err(malformed(why));
     }
-    if let Some(name) = sigv4::unsigned_amz_header(&credential, headers) {
-        return Err(Box::new(xml::error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            "There were headers present in the request which were not signed",
-            &[("HeadersNotSigned", name)],
-            &ctx.path,
-            &ctx.id,
-        )));
+    if let Some(names) = sigv4::unsigned_amz_headers(&credential, headers) {
+        return Err(Box::new(
+            ctx.error(
+                Refusal::said(
+                    Code::AccessDenied,
+                    "There were headers present in the request which were not signed",
+                )
+                .with("HeadersNotSigned", names),
+            ),
+        ));
     }
 
     let now = vk_peer::now_secs();
@@ -656,43 +632,37 @@ fn signed_by(
     match sigv4::check_clock(stamp, credential.date, now) {
         Ok(()) => {}
         Err(sigv4::Clock::Unreadable) => {
-            return Err(Box::new(ctx.error(
-                StatusCode::FORBIDDEN,
-                "AccessDenied",
-                "a signed request needs an x-amz-date header as YYYYMMDDTHHMMSSZ",
-            )));
+            return Err(Box::new(ctx.error(Refusal::said(
+                Code::AccessDenied,
+                "AWS authentication requires a valid Date or x-amz-date header.",
+            ))));
         }
         Err(sigv4::Clock::OtherDay) => {
             return Err(malformed(
-                "the credential's date is not the day of x-amz-date",
+                "Invalid credential date. Date is not the same as X-Amz-Date.",
             ));
         }
         Err(sigv4::Clock::Skewed) => {
-            let server_time = sigv4::format_time(now);
-            let skew = (sigv4::MAX_SKEW_SECS * 1000).to_string();
-            return Err(Box::new(xml::error(
-                StatusCode::FORBIDDEN,
-                "RequestTimeTooSkewed",
-                "the difference between the request time and the server's time is too large",
-                &[
-                    ("RequestTime", stamp),
-                    ("ServerTime", &server_time),
-                    ("MaxAllowedSkewMilliseconds", &skew),
-                ],
-                &ctx.path,
-                &ctx.id,
-            )));
+            return Err(Box::new(
+                ctx.error(
+                    Refusal::new(Code::RequestTimeTooSkewed)
+                        .with("RequestTime", stamp)
+                        .with("ServerTime", sigv4::format_time(now))
+                        .with(
+                            "MaxAllowedSkewMilliseconds",
+                            (sigv4::MAX_SKEW_SECS * 1000).to_string(),
+                        ),
+                ),
+            ));
         }
     }
 
     // The id, authenticated as the bearer it would be: the one header map built here holds
     // nothing else, so no resolver can accept through it what it would not accept as sent.
     let unknown = || {
-        Box::new(ctx.error(
-            StatusCode::FORBIDDEN,
-            "InvalidAccessKeyId",
-            "the access key id is not a credential of this registry",
-        ))
+        Box::new(
+            ctx.error(Refusal::new(Code::InvalidAccessKeyId).with("AWSAccessKeyId", credential.id)),
+        )
     };
     let as_bearer = bearer_of(credential.id).ok_or_else(unknown)?;
     let (who, secret) = match (token(state, &as_bearer, unknown)?, &state.auth) {
@@ -718,7 +688,12 @@ fn signed_by(
     let payload_hash = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| malformed("the signed x-amz-content-sha256 header is missing"))?;
+        .ok_or_else(|| {
+            Box::new(ctx.error(Refusal::said(
+                Code::InvalidRequest,
+                "Missing required header for this request: x-amz-content-sha256",
+            )))
+        })?;
     let canonical = sigv4::canonical_request(
         req.method().as_str(),
         req.uri().path(),
@@ -728,24 +703,21 @@ fn signed_by(
         payload_hash,
     )
     .map_err(|why| match why {
-        sigv4::Canon::Path | sigv4::Canon::Query => Box::new(ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidURI",
-            "the request's URI has a malformed escape or is not UTF-8",
-        )),
+        sigv4::Canon::Path | sigv4::Canon::Query => Box::new(ctx.error(Code::InvalidURI)),
         sigv4::Canon::Missing(name) => malformed(&format!("the signed header {name} is missing")),
         sigv4::Canon::NotText(name) => malformed(&format!("the signed header {name} is not text")),
     })?;
     if !sigv4::signature_matches(secret, &credential, stamp, &canonical) {
         let sts = sigv4::string_to_sign(stamp, &credential.scope(), &canonical);
-        return Err(Box::new(xml::error(
-            StatusCode::FORBIDDEN,
-            "SignatureDoesNotMatch",
-            "the request signature does not match the one computed with the key's secret",
-            &[("StringToSign", &sts), ("CanonicalRequest", &canonical)],
-            &ctx.path,
-            &ctx.id,
-        )));
+        return Err(Box::new(
+            ctx.error(
+                Refusal::new(Code::SignatureDoesNotMatch)
+                    .with("AWSAccessKeyId", credential.id)
+                    .with("StringToSign", sts)
+                    .with("SignatureProvided", credential.signature)
+                    .with("CanonicalRequest", canonical),
+            ),
+        ));
     }
     if !chunked::Mode::of(payload_hash).is_some_and(chunked::Mode::signed) {
         return Ok((who, None));

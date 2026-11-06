@@ -10,6 +10,7 @@ use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, HeaderValue, LOCATION, RETRY_
 use hyper::{Request, Response, StatusCode};
 
 use super::canned::Canned;
+use super::error::{Code, Refusal};
 use super::xml::scan;
 use super::{Ctx, drain, read_small, refuse, sigv4, xml};
 use crate::files::{self, DELETE_LOCK_WAIT, FILES_REPO, allowed};
@@ -38,11 +39,10 @@ pub(super) async fn list(
     ctx: &Ctx,
 ) -> anyhow::Result<Response<Body>> {
     if !crate::dav::may_enumerate(state) {
-        let resp = ctx.error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
+        let resp = ctx.error(Refusal::said(
+            Code::AccessDenied,
             "listing the buckets needs a configured credential",
-        );
+        ));
         return refuse(req, resp, ctx).await;
     }
     crate::dav::blocking(state, authz, move |store, authz| {
@@ -70,6 +70,11 @@ pub(super) async fn list(
     .await
 }
 
+/// `NoSuchBucket`, naming `bucket`.
+pub(super) fn no_such_bucket(bucket: &str) -> Refusal {
+    Refusal::new(Code::NoSuchBucket).with("BucketName", bucket)
+}
+
 /// Whether `bucket` is there for this caller: `Err` with the answer when it is not — 403 when
 /// the caller may read nothing in the bucket, 404 `NoSuchBucket` when it may but no such
 /// directory exists. A caller that may read only a directory inside the bucket passes, since
@@ -86,13 +91,7 @@ async fn check(
     }
     let store = std::sync::Arc::clone(&state.store);
     let exists = tokio::task::spawn_blocking(move || store.repo_dir_exists(&repo)).await?;
-    Ok((!exists).then(|| {
-        ctx.error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        )
-    }))
+    Ok((!exists).then(|| ctx.error(no_such_bucket(bucket))))
 }
 
 /// `HEAD /s3/<bucket>`.
@@ -130,7 +129,7 @@ pub(super) async fn location(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| sigv4::parse_authorization(v).ok())
+        .and_then(|v| sigv4::parse_authorization(v, "s3").ok())
         .map_or(String::new(), |c| xml::escape(c.region));
     Ok(xml::document("LocationConstraint", &region))
 }
@@ -148,7 +147,7 @@ pub(super) async fn configuration(
     if let Some(resp) = check(state, authz, &bucket, ctx).await? {
         return refuse(req, resp, ctx).await;
     }
-    refuse(req, canned.answer(ctx), ctx).await
+    refuse(req, canned.answer(&bucket, ctx), ctx).await
 }
 
 /// Longest `CreateBucketConfiguration` body taken: it names a region, which is ignored.
@@ -176,14 +175,12 @@ pub(super) async fn create(
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
     {
         let resp = ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "this registry keeps no object lock",
+            Refusal::new(Code::NotImplemented).with("Header", "x-amz-bucket-object-lock-enabled"),
         );
         return refuse(req, resp, ctx).await;
     }
-    let malformed = |message| ctx.error(StatusCode::BAD_REQUEST, "MalformedXML", message);
-    let too_long = malformed("a CreateBucketConfiguration is at most 1 KiB");
+    let malformed = || ctx.error(Code::MalformedXML);
+    let too_long = malformed();
     let body = match read_small(req.into_body(), MAX_CONFIGURATION, too_long, ctx).await? {
         Ok(body) => body,
         Err(resp) => return Ok(resp),
@@ -191,24 +188,21 @@ pub(super) async fn create(
     if !body.iter().all(u8::is_ascii_whitespace)
         && !scan::parse(&body, 16).is_ok_and(|el| el.name == "CreateBucketConfiguration")
     {
-        return Ok(malformed("the body is not a CreateBucketConfiguration"));
+        return Ok(malformed());
     }
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, _| {
         let _namespace = files::namespace(store)?;
         if store.repo_dir_exists(&repo) {
-            return Ok(ctx.error(
-                StatusCode::CONFLICT,
-                "BucketAlreadyOwnedByYou",
-                "the bucket you tried to create exists, and is yours",
-            ));
+            return Ok(
+                ctx.error(Refusal::new(Code::BucketAlreadyOwnedByYou).with("BucketName", bucket))
+            );
         }
         if store.repo_path_taken(&repo) {
-            return Ok(ctx.error(
-                StatusCode::CONFLICT,
-                "OperationAborted",
+            return Ok(ctx.error(Refusal::said(
+                Code::OperationAborted,
                 "something that is not a directory has the bucket's name in the store",
-            ));
+            )));
         }
         store.create_repo(&repo)?;
         Ok(Response::builder()
@@ -260,28 +254,24 @@ pub(super) async fn delete(
         loop {
             let namespace = files::namespace(store)?;
             if !store.repo_dir_exists(&repo) {
-                return Ok(ctx.error(
-                    StatusCode::NOT_FOUND,
-                    "NoSuchBucket",
-                    "the specified bucket does not exist",
-                ));
+                return Ok(ctx.error(no_such_bucket(&bucket)));
             }
-            let not_empty = |message| ctx.error(StatusCode::CONFLICT, "BucketNotEmpty", message);
+            let not_empty = |r: Refusal| ctx.error(r.with("BucketName", bucket.as_str()));
             return Ok(match remove_tree(store, &repo)? {
                 RepoRemoval::Removed => Response::builder()
                     .status(StatusCode::NO_CONTENT)
                     .body(body_of(bytes::Bytes::new()))?,
-                RepoRemoval::HasMembers => not_empty("the bucket you tried to delete is not empty"),
-                RepoRemoval::HasRecords => not_empty(
+                RepoRemoval::HasMembers => not_empty(Refusal::new(Code::BucketNotEmpty)),
+                RepoRemoval::HasRecords => not_empty(Refusal::said(
+                    Code::BucketNotEmpty,
                     "the bucket holds content written lately that is not a deleted object's, \
                      such as an image pushed over /v2/; it can go once the gc's grace has passed",
-                ),
+                )),
                 RepoRemoval::Busy if Instant::now() >= deadline => {
-                    let mut resp = ctx.error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ServiceUnavailable",
+                    let mut resp = ctx.error(Refusal::said(
+                        Code::ServiceUnavailable,
                         "the store stayed locked; retry the DeleteBucket",
-                    );
+                    ));
                     resp.headers_mut()
                         .insert(RETRY_AFTER, HeaderValue::from_static("5"));
                     resp

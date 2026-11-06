@@ -37,7 +37,8 @@ use sha1::Digest as _;
 
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
 use super::copy::{self, COPY_SOURCE, Source};
-use super::object::{self, Refused, admitted, no_such_key, readable, unwritable};
+use super::error::{Code, Refusal};
+use super::object::{self, admitted, no_such_key, readable, unwritable};
 use super::xml::scan::{self, Malformed};
 use super::{
     Ctx, OPERATION_HINT, Params, UNCOMPRESSED_FROM, bucket, checksum, chunked, drain, list, meta,
@@ -231,6 +232,10 @@ fn only(params: &[(&str, &str)], taken: &[&str]) -> bool {
     params.iter().all(|(n, _)| taken.contains(n))
 }
 
+/// What S3 says of a `partNumber` that is not one.
+pub(super) const PART_NUMBER: &str =
+    "Part number must be an integer between 1 and 10000, inclusive.";
+
 /// A part number as a query or a document gives it: 1 to [`MAX_PARTS`], in decimal.
 pub(super) fn part_number(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || s.len() > 5 {
@@ -320,17 +325,9 @@ async fn open_held_async(state: &ServerState, id: &str, segs: &[String]) -> Resu
         .context("holding an upload panicked")?
 }
 
-fn no_such_upload(ctx: &Ctx) -> Response<Body> {
-    ctx.error(
-        StatusCode::NOT_FOUND,
-        "NoSuchUpload",
-        "the specified multipart upload does not exist: its id may be wrong, or it was \
-         completed or aborted",
-    )
-}
-
-fn invalid(ctx: &Ctx, message: &str) -> Response<Body> {
-    ctx.error(StatusCode::BAD_REQUEST, "InvalidArgument", message)
+/// `NoSuchUpload`, naming upload `id`.
+fn no_such_upload(ctx: &Ctx, id: &str) -> Response<Body> {
+    ctx.error(Refusal::new(Code::NoSuchUpload).with("UploadId", id))
 }
 
 /// Whether this caller may `action` on the repository the object at `segs` would be in.
@@ -385,24 +382,20 @@ pub(super) async fn create(
     }
     let headers = req.headers();
     if headers.contains_key(COPY_SOURCE) {
-        let resp = invalid(
-            ctx,
-            "a multipart upload's parts are copied by UploadPartCopy, not named at its creation",
-        );
+        let resp = ctx.error(Refusal::argument(
+            "You can only specify a copy source header for copy requests.",
+            "x-amz-copy-source",
+            String::from_utf8_lossy(headers[COPY_SOURCE].as_bytes()),
+        ));
         return refuse(req, resp, ctx).await;
     }
     let annotations = match meta::annotations(headers) {
         Ok(a) => a,
-        Err(why) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, why.code, why.message);
-            return refuse(req, resp, ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let algorithm = match checksum_algorithm(headers) {
         Ok(a) => a,
-        Err((status, code, message)) => {
-            return refuse(req, ctx.error(status, code, message), ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
@@ -449,7 +442,7 @@ pub(super) async fn create(
 /// The `x-amz-checksum-algorithm` a creation names, as S3 spells it: the algorithm the
 /// parts' checksums will be in, which each part's request then carries and is checked by;
 /// one not computed here is refused as a part carrying it would be.
-fn checksum_algorithm(headers: &HeaderMap) -> std::result::Result<Option<&'static str>, Refused> {
+fn checksum_algorithm(headers: &HeaderMap) -> std::result::Result<Option<&'static str>, Refusal> {
     let Some(v) = headers.get("x-amz-checksum-algorithm") else {
         return Ok(None);
     };
@@ -459,10 +452,11 @@ fn checksum_algorithm(headers: &HeaderMap) -> std::result::Result<Option<&'stati
         .find(|a| v.as_bytes().eq_ignore_ascii_case(a.as_bytes()));
     match known {
         Some(name) => Ok(Some(name)),
-        None if v.as_bytes().is_empty() || v.to_str().is_err() => Err((
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "x-amz-checksum-algorithm names one of S3's checksum algorithms",
+        None if v.as_bytes().is_empty() || v.to_str().is_err() => Err(Refusal::said(
+            Code::InvalidRequest,
+            "Checksum algorithm provided is unsupported. Please try again with any of the \
+             valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, \
+             XXHASH3, XXHASH64]",
         )),
         None => Err(checksum::NOT_COMPUTED),
     }
@@ -497,7 +491,11 @@ pub(super) async fn upload(
     match method {
         Method::PUT => {
             let Some(n) = param(&params, "partNumber").and_then(part_number) else {
-                let resp = invalid(ctx, "partNumber is a part's number, 1 to 10000");
+                let resp = ctx.error(Refusal::argument(
+                    PART_NUMBER,
+                    "partNumber",
+                    param(&params, "partNumber").unwrap_or_default(),
+                ));
                 return refuse(req, resp, ctx).await;
             };
             if req.headers().contains_key(COPY_SOURCE) {
@@ -545,17 +543,15 @@ async fn upload_part(
     }
     let plan = match object::plan(headers) {
         Ok(plan) => plan,
-        Err((status, code, message)) => {
-            return refuse(req, ctx.error(status, code, message), ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let Some(up) = open_async(state, &id, &segs).await? else {
-        return refuse(req, no_such_upload(ctx), ctx).await;
+        return refuse(req, no_such_upload(ctx, &id), ctx).await;
     };
     let staging = match temp_in(&up.dir, &format!("part-{n}")) {
         Ok(staging) => staging,
         // Completed or aborted since it was looked up.
-        Err(_) if !up.dir.is_dir() => return refuse(req, no_such_upload(ctx), ctx).await,
+        Err(_) if !up.dir.is_dir() => return refuse(req, no_such_upload(ctx, &id), ctx).await,
         Err(e) => return Err(e),
     };
     let received = match object::receive(plan, req.into_body(), seed, staging, ctx).await? {
@@ -571,7 +567,7 @@ async fn upload_part(
     };
     match installed {
         Ok(()) => {}
-        Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(ctx)),
+        Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(ctx, &id)),
         Err(e) => return Err(e),
     }
     object::written(&format!("\"{md5}\""), received.echo)
@@ -617,17 +613,10 @@ async fn copy_part(
     let src = match copy::source(value) {
         Source::Object(src) => src,
         Source::Versioned => {
-            let resp = ctx.error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "this registry keeps no versions to copy from",
-            );
+            let resp = ctx.error(Refusal::new(Code::NotImplemented).with("Header", COPY_SOURCE));
             return refuse(req, resp, ctx).await;
         }
-        Source::Invalid(code, message) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, code, message);
-            return refuse(req, resp, ctx).await;
-        }
+        Source::Invalid(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if !admitted(authz, accounts::Action::Read, &src) {
         return refuse(req, ctx.access_denied(), ctx).await;
@@ -637,11 +626,13 @@ async fn copy_part(
         Some(v) => match v.to_str().ok().and_then(copy_range) {
             Some(range) => Some(range),
             None => {
-                let resp = invalid(
-                    ctx,
-                    "x-amz-copy-source-range is bytes=<first>-<last>, the zero-based offsets \
-                     of the first and last bytes to copy",
-                );
+                let resp = ctx.error(Refusal::argument(
+                    "The x-amz-copy-source-range value must be of the form bytes=first-last \
+                     where first and last are the zero-based offsets of the first and last \
+                     bytes to copy",
+                    COPY_SOURCE_RANGE,
+                    String::from_utf8_lossy(v.as_bytes()),
+                ));
                 return refuse(req, resp, ctx).await;
             }
         },
@@ -654,7 +645,7 @@ async fn copy_part(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         let Some(up) = open(store, &id, &segs) else {
-            return Ok(no_such_upload(&ctx));
+            return Ok(no_such_upload(&ctx, &id));
         };
         let Some(obj) = readable(store, authz, &src)? else {
             return Ok(copy::absent(store, authz, &src, &ctx));
@@ -666,23 +657,17 @@ async fn copy_part(
             None => (0, obj.size),
             Some((first, last)) if last < obj.size => (first, last - first + 1),
             Some(_) => {
-                let size = obj.size.to_string();
-                return Ok(xml::error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "InvalidRange",
-                    "x-amz-copy-source-range reaches past the source object's end",
-                    &[("ActualObjectSize", &size)],
-                    &ctx.path,
-                    &ctx.id,
+                return Ok(ctx.error(
+                    Refusal::new(Code::InvalidRange).with("ActualObjectSize", obj.size.to_string()),
                 ));
             }
         };
         let Some((_, mut reader)) = store.read_blob_range(&obj.layer, start, len)? else {
-            return Ok(no_such_key(&ctx));
+            return Ok(no_such_key(&ctx, &src));
         };
         let (path, mut file) = match temp_in(&up.dir, &format!("part-{n}")) {
             Ok(staging) => staging,
-            Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx)),
+            Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx, &id)),
             Err(e) => return Err(e),
         };
         let mut staged = Staged::written(path, 0, String::new());
@@ -704,7 +689,7 @@ async fn copy_part(
         let md5 = crate::hex_of(&md5.finalize().0);
         match install_part(&up.dir, n, staged, &md5) {
             Ok(()) => {}
-            Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx)),
+            Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx, &id)),
             Err(e) => return Err(e),
         }
         Ok(xml::document(
@@ -721,7 +706,7 @@ async fn copy_part(
 
 /// Why a `CompleteMultipartUpload` document is refused.
 #[derive(Debug, PartialEq, Eq)]
-enum Refusal {
+enum Unfit {
     /// 400 `MalformedXML`
     Malformed(&'static str),
     /// 400 `InvalidPartOrder`: the part numbers do not ascend
@@ -731,10 +716,10 @@ enum Refusal {
 /// The parts a `CompleteMultipartUpload` document names, in order: each part's number and
 /// the ETag it is expected to have, unquoted and lowercase. Fields beside `PartNumber` and
 /// `ETag` (the parts' checksums) are passed over.
-fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Refusal> {
-    let root = scan::parse(body, MAX_ELEMENTS).map_err(|Malformed(why)| Refusal::Malformed(why))?;
+fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Unfit> {
+    let root = scan::parse(body, MAX_ELEMENTS).map_err(|Malformed(why)| Unfit::Malformed(why))?;
     if root.name != "CompleteMultipartUpload" {
-        return Err(Refusal::Malformed(
+        return Err(Unfit::Malformed(
             "the document is not a CompleteMultipartUpload",
         ));
     }
@@ -742,14 +727,12 @@ fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Refusal> {
     for p in root.all("Part") {
         let field = |name| {
             p.one(name)
-                .map_err(|Malformed(why)| Refusal::Malformed(why))?
+                .map_err(|Malformed(why)| Unfit::Malformed(why))?
                 .map(|e| e.text.trim().to_string())
-                .ok_or(Refusal::Malformed(
-                    "each Part names its PartNumber and ETag",
-                ))
+                .ok_or(Unfit::Malformed("each Part names its PartNumber and ETag"))
         };
         let n = part_number(&field("PartNumber")?)
-            .ok_or(Refusal::Malformed("a PartNumber is 1 to 10000"))?;
+            .ok_or(Unfit::Malformed("a PartNumber is 1 to 10000"))?;
         let etag = field("ETag")?;
         let etag = etag
             .strip_prefix('"')
@@ -757,12 +740,12 @@ fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Refusal> {
             .unwrap_or(&etag)
             .to_ascii_lowercase();
         if parts.last().is_some_and(|(last, _)| *last >= n) {
-            return Err(Refusal::Order);
+            return Err(Unfit::Order);
         }
         parts.push((n, etag));
     }
     if parts.is_empty() {
-        return Err(Refusal::Malformed(
+        return Err(Unfit::Malformed(
             "a CompleteMultipartUpload names at least one Part",
         ));
     }
@@ -791,7 +774,7 @@ struct Whole {
 }
 
 impl Whole {
-    fn of(headers: &HeaderMap) -> std::result::Result<Option<Self>, Refused> {
+    fn of(headers: &HeaderMap) -> std::result::Result<Option<Self>, Refusal> {
         if checksum::not_computed(headers) {
             return Err(checksum::NOT_COMPUTED);
         }
@@ -813,12 +796,7 @@ impl Whole {
                     && part_number(parts).is_some()
             });
             if !composite {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRequest",
-                    "an x-amz-checksum header is the checksum of the object in base64, or a \
-                     composite one, <base64>-<parts>",
-                ));
+                return Err(checksum::invalid(header));
             }
         }
         Ok(None)
@@ -843,13 +821,13 @@ fn assemble(
     up: &Upload,
     parts: &[(u32, String)],
     whole: Option<&Whole>,
-) -> Result<std::result::Result<Assembled, Refused>> {
-    let invalid_part: Refused = (
-        StatusCode::BAD_REQUEST,
-        "InvalidPart",
-        "one or more of the specified parts could not be found, or its ETag is not the one \
-         given",
-    );
+) -> Result<std::result::Result<Assembled, Refusal>> {
+    let invalid_part = |n: &u32, etag: &str| {
+        Refusal::new(Code::InvalidPart)
+            .with("UploadId", up.id.as_str())
+            .with("PartNumber", n.to_string())
+            .with("ETag", etag)
+    };
     // Written into, so the gc takes the upload as in use while it is read.
     if let Ok(meta) = std::fs::File::open(up.dir.join(META)) {
         // A failure only leaves the upload as fresh as its last write.
@@ -858,20 +836,20 @@ fn assemble(
     let mut total: u64 = 0;
     for (n, etag) in parts {
         let Some(part) = read_record::<Part>(&record_path(&up.dir, *n)) else {
-            return Ok(Err(invalid_part));
+            return Ok(Err(invalid_part(n, etag)));
         };
         if part.md5 != *etag {
-            return Ok(Err(invalid_part));
+            return Ok(Err(invalid_part(n, etag)));
         }
         total = total.saturating_add(part.size);
     }
-    let too_large: Refused = (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "EntityTooLarge",
-        "an object is at most 4 GiB, its parts together",
-    );
+    let too_large = |size: u64| {
+        Refusal::new(Code::EntityTooLarge)
+            .with("ProposedSize", size.to_string())
+            .with("MaxSizeAllowed", MAX_OBJECT.to_string())
+    };
     if total > MAX_OBJECT {
-        return Ok(Err(too_large));
+        return Ok(Err(too_large(total)));
     }
 
     let (path, mut out) = store.stage_file()?;
@@ -884,7 +862,9 @@ fn assemble(
     for (n, etag) in parts {
         let mut file = match std::fs::File::open(part_path(&up.dir, *n)) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Err(invalid_part)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Err(invalid_part(n, etag)));
+            }
             Err(e) => return Err(anyhow::Error::from(e).context("opening a part")),
         };
         let mut md5 = md5::Context::new();
@@ -898,7 +878,7 @@ fn assemble(
             };
             staged.size = staged.size.saturating_add(got as u64);
             if staged.size > MAX_OBJECT {
-                return Ok(Err(too_large));
+                return Ok(Err(too_large(staged.size)));
             }
             let data = buf.get(..got).unwrap_or_default();
             md5.consume(data);
@@ -910,7 +890,7 @@ fn assemble(
         }
         let md5 = md5.finalize().0;
         if crate::hex_of(&md5) != *etag {
-            return Ok(Err(invalid_part));
+            return Ok(Err(invalid_part(n, etag)));
         }
         md5s.push(md5);
         sizes.push(staged.size.saturating_sub(before));
@@ -954,48 +934,33 @@ async fn complete(
     if !on_parent(authz, accounts::Action::Write, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
-    let Ok(conditions) = WriteConditions::of(req.headers()) else {
-        let resp = ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "a write's If-None-Match is * or nothing",
-        );
-        return refuse(req, resp, ctx).await;
+    let conditions = match WriteConditions::of(req.headers()) {
+        Ok(conditions) => conditions,
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let whole = match Whole::of(req.headers()) {
         Ok(whole) => whole,
-        Err((status, code, message)) => {
-            return refuse(req, ctx.error(status, code, message), ctx).await;
-        }
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let (head, body) = req.into_parts();
-    let too_long = ctx.error(
-        StatusCode::BAD_REQUEST,
-        "MalformedXML",
-        "a CompleteMultipartUpload document is at most 1 MiB",
-    );
+    let too_long = ctx.error(Code::MalformedXML);
     let body = match read_small(body, MAX_DOCUMENT, too_long, ctx).await? {
         Ok(body) => body,
         Err(resp) => return Ok(resp),
     };
-    if let Err((status, code, message)) = object::check_document(&head.headers, &body) {
-        return Ok(ctx.error(status, code, message));
+    if let Err(why) = object::check_document(&head.headers, &body) {
+        return Ok(ctx.error(why));
     }
     let parts = match document(&body) {
         Ok(parts) => parts,
-        Err(Refusal::Malformed(why)) => {
-            return Ok(ctx.error(StatusCode::BAD_REQUEST, "MalformedXML", why));
-        }
-        Err(Refusal::Order) => {
-            return Ok(ctx.error(
-                StatusCode::BAD_REQUEST,
-                "InvalidPartOrder",
-                "the list of parts was not in ascending order of part number",
-            ));
+        // What is wrong with it is S3's to say in its own words.
+        Err(Unfit::Malformed(_)) => return Ok(ctx.error(Code::MalformedXML)),
+        Err(Unfit::Order) => {
+            return Ok(ctx.error(Refusal::new(Code::InvalidPartOrder).with("UploadId", id)));
         }
     };
     let found = {
-        let (store, segs) = (Arc::clone(&state.store), segs.clone());
+        let (store, segs, id) = (Arc::clone(&state.store), segs.clone(), id.clone());
         tokio::task::spawn_blocking(move || -> Result<_> {
             let Some((lock, dir)) = hold(&store, &id)? else {
                 return Ok(Found::Gone);
@@ -1015,11 +980,9 @@ async fn complete(
     // Held until the upload is completed, so a completion racing this one waits, then finds
     // it completed rather than its parts going from under it.
     let (Held { _lock, up }, parts, assembled) = match found {
-        Found::Gone => return Ok(no_such_upload(ctx)),
+        Found::Gone => return Ok(no_such_upload(ctx, &id)),
         Found::Completed(done) => return Ok(done.result(ctx)),
-        Found::Assembled(_, _, Err((status, code, message))) => {
-            return Ok(ctx.error(status, code, message));
-        }
+        Found::Assembled(_, _, Err(why)) => return Ok(ctx.error(why)),
         Found::Assembled(held, parts, Ok(assembled)) => (held, parts, assembled),
     };
     let Assembled {
@@ -1081,7 +1044,7 @@ enum Found {
     Assembled(
         Held,
         Vec<(u32, String)>,
-        std::result::Result<Assembled, Refused>,
+        std::result::Result<Assembled, Refusal>,
     ),
 }
 
@@ -1203,8 +1166,12 @@ async fn abort(
             Some(t) if t > SystemTime::now() => None,
             Some(t) => Some(conditional::whole_seconds(t)),
             None => {
-                let why = "x-amz-if-match-initiated-time is an HTTP date";
-                return refuse(req, invalid(ctx, why), ctx).await;
+                let resp = ctx.error(Refusal::argument(
+                    "x-amz-if-match-initiated-time is an HTTP date",
+                    conditional::IF_MATCH_INITIATED,
+                    String::from_utf8_lossy(v.as_bytes()),
+                ));
+                return refuse(req, resp, ctx).await;
             }
         },
     };
@@ -1213,13 +1180,11 @@ async fn abort(
     }
     // Held until the upload is gone: an abort racing a completion waits for it to end.
     let Some(Held { _lock, up }) = open_held_async(state, &id, &segs).await? else {
-        return Ok(no_such_upload(ctx));
+        return Ok(no_such_upload(ctx, &id));
     };
     if initiated.is_some_and(|t| t != up.meta.created) {
         return Ok(ctx.error(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            conditional::PRECONDITION_FAILED,
+            Refusal::new(Code::PreconditionFailed).with("Condition", "If-Match-Initiated-Time"),
         ));
     }
     remove(up.dir).await?;
@@ -1228,14 +1193,14 @@ async fn abort(
         .body(body_of(bytes::Bytes::new()))?)
 }
 
-/// A page size as a query gives it: a count, clamped to [`MAX_LISTED`]; absent, the bound.
-fn page_size(value: Option<&str>) -> Option<usize> {
+/// A page size as query parameter `name` gives it ([`list::count`]), clamped to
+/// [`MAX_LISTED`]; absent, the bound.
+fn page_size(name: &'static str, value: Option<&str>) -> std::result::Result<usize, Refusal> {
     match value {
-        None => Some(MAX_LISTED),
-        Some(v) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
-            Some(v.parse::<usize>().map_or(MAX_LISTED, |n| n.min(MAX_LISTED)))
-        }
-        Some(_) => None,
+        None => Ok(MAX_LISTED),
+        Some(v) => Ok(usize::try_from(list::count(name, v)?)
+            .unwrap_or(MAX_LISTED)
+            .min(MAX_LISTED)),
     }
 }
 
@@ -1277,23 +1242,21 @@ async fn list_parts(
     if !on_parent(authz, accounts::Action::Read, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
-    let Some(max) = page_size(param(params, "max-parts")) else {
-        return refuse(req, invalid(ctx, "max-parts is a count of parts"), ctx).await;
+    let max = match page_size("max-parts", param(params, "max-parts")) {
+        Ok(max) => max,
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let marker = match param(params, "part-number-marker") {
         None => 0,
-        Some(m) => match m.parse::<u32>() {
+        Some(m) => match list::count("part-number-marker", m) {
             Ok(m) => m,
-            Err(_) => {
-                let resp = invalid(ctx, "part-number-marker is a part's number");
-                return refuse(req, resp, ctx).await;
-            }
+            Err(why) => return refuse(req, ctx.error(why), ctx).await,
         },
     };
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, _| {
         let Some(up) = open(store, &id, &segs) else {
-            return Ok(no_such_upload(&ctx));
+            return Ok(no_such_upload(&ctx, &id));
         };
         let mut numbers = if max == 0 {
             Vec::new()
@@ -1392,13 +1355,21 @@ pub(super) async fn list_uploads(
     let url = match param(&params, "encoding-type") {
         None => false,
         Some("url") => true,
-        Some(_) => return refuse(req, invalid(ctx, "encoding-type is url"), ctx).await,
+        Some(v) => {
+            let resp = ctx.error(Refusal::argument(
+                "Invalid Encoding Method specified in Request",
+                "encoding-type",
+                v,
+            ));
+            return refuse(req, resp, ctx).await;
+        }
     };
-    let Some(max) = page_size(param(&params, "max-uploads")) else {
-        return refuse(req, invalid(ctx, "max-uploads is a count of uploads"), ctx).await;
+    let max = match page_size("max-uploads", param(&params, "max-uploads")) {
+        Ok(max) => max,
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     // Each is echoed in the listing, so held to what a bucket listing's prefix is.
-    let echoed = |name| list::text(param(&params, name).unwrap_or_default().to_string());
+    let echoed = |name| list::text(name, param(&params, name).unwrap_or_default().to_string());
     let (prefix, key_marker, mut id_marker) = match (
         echoed("prefix"),
         echoed("key-marker"),
@@ -1406,7 +1377,7 @@ pub(super) async fn list_uploads(
     ) {
         (Ok(prefix), Ok(key), Ok(id)) => (prefix, key, id),
         (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => {
-            return refuse(req, invalid(ctx, why), ctx).await;
+            return refuse(req, ctx.error(why), ctx).await;
         }
     };
     if key_marker.is_empty() {
@@ -1419,11 +1390,7 @@ pub(super) async fn list_uploads(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         if !store.repo_dir_exists(&format!("{FILES_REPO}/{bucket}")) {
-            return Ok(ctx.error(
-                StatusCode::NOT_FOUND,
-                "NoSuchBucket",
-                "the specified bucket does not exist",
-            ));
+            return Ok(ctx.error(bucket::no_such_bucket(&bucket)));
         }
         let mut uploads: Vec<Listed> = Vec::new();
         for (id, dir) in store.multipart_uploads() {
@@ -1455,11 +1422,11 @@ pub(super) async fn list_uploads(
                 .take_while(|u| Some(&u.key) == first.as_ref())
                 .position(|u| u.id == id_marker)
             else {
-                return Ok(ctx.error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidArgument",
-                    "upload-id-marker names none of the uploads of the first key from key-marker",
-                ));
+                return Ok(ctx.error(Refusal::argument(
+                    "Invalid uploadId marker",
+                    "upload-id-marker",
+                    id_marker,
+                )));
             };
             uploads.drain(..=at);
         }
@@ -1550,7 +1517,7 @@ mod tests {
             format!("{}{}", part("2", MD5), part("1", MD5)),
             format!("{}{}", part("2", MD5), part("2", MD5)),
         ] {
-            assert_eq!(document(&body(&unordered)), Err(Refusal::Order));
+            assert_eq!(document(&body(&unordered)), Err(Unfit::Order));
         }
     }
 
@@ -1571,7 +1538,7 @@ mod tests {
             b"".to_vec(),
         ] {
             assert!(
-                matches!(document(&bad), Err(Refusal::Malformed(_))),
+                matches!(document(&bad), Err(Unfit::Malformed(_))),
                 "{}",
                 String::from_utf8_lossy(&bad)
             );
@@ -1584,7 +1551,7 @@ mod tests {
         let elements = (0..MAX_ELEMENTS).map(|_| "<x/>").collect::<String>();
         assert!(matches!(
             document(&body(&elements)),
-            Err(Refusal::Malformed(_))
+            Err(Unfit::Malformed(_))
         ));
         let big = vec![b' '; MAX_DOCUMENT + 1];
         assert!(document(&big).is_err());
@@ -1734,13 +1701,22 @@ mod tests {
         let q = query("prefix=a%2Fb+c");
         assert_eq!(param(&params(&q), "prefix"), Some("a/b+c"));
         assert!(!names(&query("uploadIds=1"), "uploadId"));
-        assert_eq!(page_size(None), Some(MAX_LISTED));
-        assert_eq!(page_size(Some("5")), Some(5));
+        assert_eq!(page_size("max-parts", None), Ok(MAX_LISTED));
+        assert_eq!(page_size("max-parts", Some("5")), Ok(5));
+        assert_eq!(page_size("max-parts", Some("2147483647")), Ok(MAX_LISTED));
+        // Past what S3 takes, in its words.
+        let refused = |v| page_size("max-parts", Some(v)).unwrap_err();
         assert_eq!(
-            page_size(Some("100000000000000000000000")),
-            Some(MAX_LISTED)
+            refused("100000000000000000000000").message(),
+            "Provided 100000000000000000000000 not an integer or within integer range"
         );
-        assert_eq!(page_size(Some("-1")), None);
+        let r = refused("-1");
+        assert_eq!(
+            r.message(),
+            "Argument -1 must be an integer between 0 and 2147483647"
+        );
+        assert_eq!(r.element("ArgumentName"), Some("max-parts"));
+        assert_eq!(r.element("ArgumentValue"), Some("-1"));
     }
 
     /// An upload is found only for the bucket and key it was created for, and never through an

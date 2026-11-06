@@ -9,9 +9,11 @@
 
 use anyhow::Result;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
+use super::bucket::no_such_bucket;
 use super::conditional::{self, Conditions, MD5_ANNOTATION, Outcome, WriteConditions};
+use super::error::{Code, Refusal};
 use super::object::{admitted, no_such_key, readable, unwritable};
 use super::{Ctx, NULL_VERSION, checksum, drain, list, meta, path, refuse, xml};
 use crate::files::{self, Commit, FILES_REPO, Written, allowed, object_of};
@@ -28,8 +30,8 @@ pub(super) enum Source {
     /// one version of an object other than its [`NULL_VERSION`], which this registry does
     /// not keep
     Versioned,
-    /// nothing this view serves: an S3 error code and the rule
-    Invalid(&'static str, &'static str),
+    /// nothing this view serves, and why
+    Invalid(Refusal),
 }
 
 /// What a copy source `value` names: `<bucket>/<key>`, with or without a leading slash, its
@@ -50,41 +52,39 @@ pub(super) fn source(value: &str) -> Source {
         return if versioned {
             Source::Versioned
         } else {
-            Source::Invalid(
-                "InvalidArgument",
+            invalid(
                 "x-amz-copy-source is <bucket>/<key>, with no query but a versionId",
+                value,
             )
         };
     }
     let Some(decoded) = crate::dav::decode_segment(raw) else {
-        return Source::Invalid(
-            "InvalidArgument",
-            "x-amz-copy-source has a malformed percent escape or is not UTF-8",
-        );
+        return invalid("Invalid copy source encoding", value);
     };
     if decoded.contains('%') {
-        return Source::Invalid(
-            "InvalidArgument",
+        return invalid(
             "a key's components are runs of A-Z a-z 0-9 . _ - only",
+            value,
         );
     }
     let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
     match path::parse(&format!("/s3/{decoded}")) {
         Ok(path::Target::Object { segs, .. }) => Source::Object(segs),
-        Ok(_) => Source::Invalid(
-            "InvalidArgument",
-            "x-amz-copy-source names a bucket and a key",
-        ),
-        Err(why) => Source::Invalid(why.code, why.message),
+        Ok(_) => invalid("Invalid copy source object key", value),
+        Err(why) if why.code == Code::InvalidBucketName => {
+            invalid("Invalid copy source bucket name", value)
+        }
+        Err(why) => Source::Invalid(why),
     }
 }
 
+/// A copy source refused as S3 refuses one: `InvalidArgument` on `x-amz-copy-source`.
+fn invalid(message: &'static str, value: &str) -> Source {
+    Source::Invalid(Refusal::argument(message, COPY_SOURCE, value))
+}
+
 pub(super) fn failed(ctx: &Ctx) -> Response<Body> {
-    ctx.error(
-        StatusCode::PRECONDITION_FAILED,
-        "PreconditionFailed",
-        "at least one of the preconditions you specified did not hold",
-    )
+    ctx.error(Code::PreconditionFailed)
 }
 
 /// The answer for a source the caller cannot read: `NoSuchBucket` when its bucket is no
@@ -97,13 +97,9 @@ pub(super) fn absent(
 ) -> Response<Body> {
     let bucket = format!("{FILES_REPO}/{}", src.first().map_or("", String::as_str));
     if authz.may_read_below(&bucket) && !store.repo_dir_exists(&bucket) {
-        return ctx.error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        );
+        return ctx.error(no_such_bucket(src.first().map_or("", String::as_str)));
     }
-    no_such_key(ctx)
+    no_such_key(ctx, src)
 }
 
 /// `PUT /s3/<bucket>/<key>` with `x-amz-copy-source`: the source object tagged again at the
@@ -128,17 +124,10 @@ pub(super) async fn copy(
     let src = match source(value) {
         Source::Object(src) => src,
         Source::Versioned => {
-            let resp = ctx.error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "this registry keeps no versions to copy from",
-            );
+            let resp = ctx.error(Refusal::new(Code::NotImplemented).with("Header", COPY_SOURCE));
             return refuse(req, resp, ctx).await;
         }
-        Source::Invalid(code, message) => {
-            let resp = ctx.error(StatusCode::BAD_REQUEST, code, message);
-            return refuse(req, resp, ctx).await;
-        }
+        Source::Invalid(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if !admitted(authz, accounts::Action::Read, &src) {
         return refuse(req, ctx.access_denied(), ctx).await;
@@ -149,43 +138,36 @@ pub(super) async fn copy(
     {
         None | Some(b"COPY") => false,
         Some(b"REPLACE") => true,
-        Some(_) => {
-            let resp = ctx.error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "x-amz-metadata-directive is COPY or REPLACE",
-            );
+        Some(v) => {
+            let resp = ctx.error(Refusal::argument(
+                "Unknown metadata directive.",
+                "x-amz-metadata-directive",
+                String::from_utf8_lossy(v),
+            ));
             return refuse(req, resp, ctx).await;
         }
     };
     if src == segs && !replace {
-        let resp = ctx.error(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "this copy request is illegal because it is trying to copy an object to itself \
-             without changing the object's metadata",
-        );
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidRequest,
+            "This copy request is illegal because it is trying to copy an object to itself \
+             without changing the object's metadata, storage class, website redirect location \
+             or encryption attributes.",
+        ));
         return refuse(req, resp, ctx).await;
     }
     let replaced = if replace {
         match meta::annotations(headers) {
             Ok(a) => Some(a),
-            Err(why) => {
-                let resp = ctx.error(StatusCode::BAD_REQUEST, why.code, why.message);
-                return refuse(req, resp, ctx).await;
-            }
+            Err(why) => return refuse(req, ctx.error(why), ctx).await,
         }
     } else {
         None
     };
     let conditions = Conditions::of_copy_source(headers);
-    let Ok(written) = WriteConditions::of(headers) else {
-        let resp = ctx.error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "a write's If-None-Match is * or nothing",
-        );
-        return refuse(req, resp, ctx).await;
+    let written = match WriteConditions::of(headers) {
+        Ok(written) => written,
+        Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let precondition = written.precondition();
     // A copy has no body of its own; whatever came is read through first.
@@ -204,7 +186,7 @@ pub(super) async fn copy(
         // The layer gone under the tag (pruned by hand) is no object either; present, it is
         // now referenced again, which keeps it from the gc's grace window.
         if !store.has_blob(&obj.layer) {
-            return Ok(no_such_key(&ctx));
+            return Ok(no_such_key(&ctx, &src));
         }
         let mut annotations = replaced.unwrap_or_else(|| meta::carried(&obj.annotations));
         // Of the bytes, which are the same: the ETag, the checksum and the parts.
@@ -280,8 +262,8 @@ mod tests {
 
     #[test]
     fn a_copy_source_that_names_no_object_is_refused_with_the_rule() {
-        let code = |value: &str| match source(value) {
-            Source::Invalid(code, _) => code,
+        let refusal = |value: &str| match source(value) {
+            Source::Invalid(why) => why,
             other => panic!("{value}: {other:?}"),
         };
         for bad in [
@@ -300,12 +282,21 @@ mod tests {
             "/b/tags/k",
             "//b/k",
         ] {
-            assert!(
-                ["InvalidArgument", "InvalidBucketName"].contains(&code(bad)),
-                "{bad}: {}",
-                code(bad)
-            );
+            assert_eq!(refusal(bad).code, Code::InvalidArgument, "{bad}");
         }
-        assert_eq!(code(&format!("/b/{}", "x".repeat(256))), "KeyTooLongError");
+        // In S3's words, naming the header and its value.
+        let r = refusal("/b/a%2");
+        assert_eq!(r.message(), "Invalid copy source encoding");
+        assert_eq!(r.element("ArgumentName"), Some(COPY_SOURCE));
+        assert_eq!(r.element("ArgumentValue"), Some("/b/a%2"));
+        assert_eq!(refusal("/b").message(), "Invalid copy source object key");
+        assert_eq!(
+            refusal("//b/k").message(),
+            "Invalid copy source bucket name"
+        );
+        assert_eq!(
+            refusal(&format!("/b/{}", "x".repeat(256))).code,
+            Code::KeyTooLongError
+        );
     }
 }
