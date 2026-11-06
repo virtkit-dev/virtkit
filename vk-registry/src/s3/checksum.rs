@@ -362,12 +362,13 @@ pub(super) fn of_blob(
     Ok(Some(vk_hub_proto::to_base64(&hasher.finalize())))
 }
 
-/// What an object's annotation keeps: the algorithm, by S3's name, and the checksum in
-/// base64.
+/// What an object's annotation keeps: the algorithm, by S3's name, the checksum in base64
+/// (then `-<parts>` for a composite one), and its kind.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Stored {
     pub(super) algorithm: &'static str,
     pub(super) value: String,
+    pub(super) kind: Kind,
 }
 
 /// The annotation keeping `value`, the checksum `header` carried once it held.
@@ -377,15 +378,38 @@ pub(super) fn annotation(header: &str, value: &str) -> Option<(String, String)> 
 }
 
 /// The checksum `annotations` keep, when they keep one this registry wrote: an algorithm it
-/// has, and base64 of that algorithm's length.
+/// has, and base64 of that algorithm's length, alone (a full object's) or followed by
+/// `-<parts>` (a composite one, from 1 to 10000 parts).
 pub(super) fn stored(annotations: &BTreeMap<String, String>) -> Option<Stored> {
     let (algorithm, value) = annotations.get(ANNOTATION)?.split_once(':')?;
     let header = header(algorithm)?;
-    let decoded = crate::auth::base64_decode(value)?;
+    let (sum, kind) = match value.rsplit_once('-') {
+        None => (value, Kind::FullObject),
+        Some((sum, parts)) => {
+            let count = parts.parse::<u32>().ok()?;
+            let fits = (1..=10_000).contains(&count)
+                && !parts.starts_with(['+', '0'])
+                && Kind::Composite.fits(algorithm);
+            fits.then_some((sum, Kind::Composite))?
+        }
+    };
+    let decoded = crate::auth::base64_decode(sum)?;
     (Some(decoded.len()) == len(header)).then(|| Stored {
         algorithm: algorithm_static(algorithm),
         value: value.to_string(),
+        kind,
     })
+}
+
+/// The composite checksum of parts whose checksums, in the algorithm `header` names, are
+/// `parts`: that algorithm's checksum of their concatenation, as S3 makes it (which it
+/// writes in base64, then `-` and how many parts there are).
+pub(super) fn composite(header: &str, parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut hasher = Hasher::any(header)?;
+    for part in parts {
+        hasher.update(part);
+    }
+    Some(hasher.finalize())
 }
 
 /// `name` as the static S3 name it is, once [`header`] found it.
@@ -404,21 +428,21 @@ impl Stored {
         let value = HeaderValue::from_str(&self.value).ok();
         name.zip(value).into_iter().chain([(
             HeaderName::from_static(TYPE_HEADER),
-            HeaderValue::from_static(FULL_OBJECT),
+            HeaderValue::from_static(self.kind.name()),
         )])
     }
 
     /// The elements a listing adds to an object: its algorithm and the checksum's type.
     pub(super) fn listed(&self) -> String {
         xml::element("ChecksumAlgorithm", self.algorithm)
-            + &xml::element("ChecksumType", FULL_OBJECT)
+            + &xml::element("ChecksumType", self.kind.name())
     }
 
     /// The elements a `Checksum` attribute or a completed upload's result holds: the
     /// checksum itself, named by its algorithm, and its type.
     pub(super) fn elements(&self) -> String {
         xml::element(&format!("Checksum{}", self.algorithm), &self.value)
-            + &xml::element("ChecksumType", FULL_OBJECT)
+            + &xml::element("ChecksumType", self.kind.name())
     }
 }
 
@@ -556,6 +580,28 @@ mod tests {
             )]))
         };
         assert_eq!(of("CRC32C:AQID"), None);
+        // A composite one: the parts' count after it.
+        let composite = of("SHA1:2jmj7l5rSw0yVb/vlWAYkK/YBwk=-12").unwrap();
+        assert_eq!(composite.kind, Kind::Composite);
+        assert_eq!(composite.value, "2jmj7l5rSw0yVb/vlWAYkK/YBwk=-12");
+        assert_eq!(
+            composite.listed(),
+            "<ChecksumAlgorithm>SHA1</ChecksumAlgorithm><ChecksumType>COMPOSITE</ChecksumType>"
+        );
+        for bad in ["-0", "-10001", "-x", "-", "-+1", "-01"] {
+            assert_eq!(
+                of(&format!("SHA1:2jmj7l5rSw0yVb/vlWAYkK/YBwk={bad}")),
+                None,
+                "{bad}"
+            );
+        }
+        assert_eq!(of("CRC64NVME:AAAAAAAAAAA=-2"), None);
+        // Made as S3 makes it: the checksum of the parts' checksums, and their count.
+        let parts = [vec![1u8; 32], vec![2u8; 32]];
+        assert_eq!(
+            super::composite("x-amz-checksum-sha256", &parts).unwrap(),
+            sha2::Sha256::digest(parts.concat()).to_vec()
+        );
         assert_eq!(of("XXHASH64:AQIDBA=="), None);
         assert_eq!(of("XXHASH:AQIDBA=="), None);
         assert_eq!(of("MD5:AQIDBA=="), None);

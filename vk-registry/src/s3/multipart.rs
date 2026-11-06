@@ -68,6 +68,32 @@ const META: &str = crate::MULTIPART_RECORD;
 /// upload in equal parts is one run whatever their number.
 pub(crate) const PARTS_ANNOTATION: &str = "org.virtkit.s3-parts";
 
+/// The manifest annotation holding the checksums of the parts an object was completed from,
+/// in order, for an upload created with a checksum: each in base64, in the algorithm of the
+/// object's own checksum, joined by commas.
+pub(crate) const PART_CHECKSUMS_ANNOTATION: &str = "org.virtkit.s3-part-checksums";
+
+/// The checksums of its `count` parts `annotations` keep, and their algorithm, by S3's name:
+/// `None` unless there is one for each, in base64 of the length of the algorithm of the
+/// object's checksum.
+pub(super) fn part_checksums(
+    annotations: &BTreeMap<String, String>,
+    count: usize,
+) -> Option<(&'static str, Vec<String>)> {
+    let algorithm = checksum::stored(annotations)?.algorithm;
+    let len = checksum::header(algorithm).and_then(checksum::len)?;
+    let values: Vec<String> = annotations
+        .get(PART_CHECKSUMS_ANNOTATION)?
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let fit = values.len() == count
+        && values
+            .iter()
+            .all(|v| crate::auth::base64_decode(v).is_some_and(|b| b.len() == len));
+    fit.then_some((algorithm, values))
+}
+
 /// The [`PARTS_ANNOTATION`] for parts of `sizes`.
 fn parts_annotation(sizes: &[u64]) -> String {
     let mut runs: Vec<(u64, usize)> = Vec::new();
@@ -132,9 +158,15 @@ pub(super) fn part_range(sizes: &[u64], n: u32) -> Option<(u64, u64)> {
 }
 
 /// The `ObjectParts` of GetObjectAttributes for an object of parts `sizes`: `max` of them
-/// from after part `marker`, each with its number and size (no checksum: none is kept per
-/// part), with the paging S3 writes around them and the count of them all.
-pub(super) fn object_parts(sizes: &[u64], max: usize, marker: u32) -> String {
+/// from after part `marker`, each with its number and size, and its checksum when the
+/// object keeps them (`checksums`, by algorithm), with the paging S3 writes around them and
+/// the count of them all.
+pub(super) fn object_parts(
+    sizes: &[u64],
+    checksums: Option<&(&'static str, Vec<String>)>,
+    max: usize,
+    marker: u32,
+) -> String {
     let after: Vec<(usize, &u64)> = sizes
         .iter()
         .enumerate()
@@ -155,8 +187,14 @@ pub(super) fn object_parts(sizes: &[u64], max: usize, marker: u32) -> String {
     }
     out.push_str(&xml::element("PartNumberMarker", &marker.to_string()));
     for (i, size) in page {
+        let checksum = checksums
+            .and_then(|(algorithm, values)| {
+                let value = values.get(*i)?;
+                Some(xml::element(&format!("Checksum{algorithm}"), value))
+            })
+            .unwrap_or_default();
         out.push_str(&format!(
-            "<Part>{}{}</Part>",
+            "<Part>{checksum}{}{}</Part>",
             xml::element("PartNumber", &i.saturating_add(1).to_string()),
             xml::element("Size", &size.to_string())
         ));
@@ -197,6 +235,12 @@ impl Asked {
     /// The checksum header of its algorithm; `None` for a record this server did not write.
     fn header(&self) -> Option<&'static str> {
         checksum::header(&self.algorithm)
+    }
+
+    /// The elements ListParts and ListMultipartUploads name it with.
+    fn listed(&self) -> String {
+        xml::element("ChecksumAlgorithm", &self.algorithm)
+            + &xml::element("ChecksumType", self.kind.name())
     }
 }
 
@@ -1028,6 +1072,8 @@ struct Assembled {
     etag: String,
     checksum: Option<(&'static str, String)>,
     sizes: Vec<u64>,
+    /// the parts' checksums in the upload's algorithm, base64, for an upload created with one
+    part_checksums: Option<Vec<String>>,
 }
 
 /// Concatenate the `parts` of `up`, in order, into a staging file, in one pass, hashing on
@@ -1035,8 +1081,10 @@ struct Assembled {
 /// part replaced while this reads it is noticed rather than built in; the whole object's
 /// SHA-256; and its checksum: the full object's of an upload created with one, checked
 /// against what `whole` names in its algorithm, or for an upload created with none, S3's
-/// default CRC64NVME. First, the completion's `kind` must be the upload's, and the checksums
-/// `sent` for each part what [`check_part`] takes. A composite checksum is passed over.
+/// default CRC64NVME; or the composite one, made of the parts' checksums, of an upload
+/// created with one, checked against what `whole` names in its algorithm, with or without
+/// its count of parts. First, the completion's `kind` must be the upload's, and the
+/// checksums `sent` for each part what [`check_part`] takes.
 fn assemble(
     store: &Store,
     up: &Upload,
@@ -1085,6 +1133,8 @@ fn assemble(
         let _ = meta.set_modified(SystemTime::now());
     }
     let mut total: u64 = 0;
+    // The parts' checksums in the upload's algorithm, which every part of it has.
+    let mut part_checksums = asked.map(|_| Vec::with_capacity(parts.len()));
     for ((n, etag), sent) in parts.iter().zip(sent) {
         let Some(part) = read_record::<Part>(&record_path(&up.dir, *n)) else {
             return Ok(Err(invalid_part(n, etag)));
@@ -1101,6 +1151,17 @@ fn assemble(
         );
         if let Err(why) = checked {
             return Ok(Err(why));
+        }
+        let own = asked.and_then(|a| {
+            let (algorithm, value) = part.checksum.as_deref()?.split_once(':')?;
+            (algorithm == a.algorithm).then(|| value.to_string())
+        });
+        match own {
+            Some(value) => part_checksums
+                .iter_mut()
+                .for_each(|c| c.push(value.clone())),
+            // A part recorded before its upload's checksum was: none made of them.
+            None => part_checksums = None,
         }
         total = total.saturating_add(part.size);
     }
@@ -1169,12 +1230,31 @@ fn assemble(
         }
         kept = Some((header, vk_hub_proto::to_base64(&got)));
     }
+    if let Some(a) = asked.filter(|a| a.kind == checksum::Kind::Composite)
+        && let (Some(header), Some(values)) = (a.header(), &part_checksums)
+    {
+        let decoded: Option<Vec<Vec<u8>>> = values
+            .iter()
+            .map(|v| crate::auth::base64_decode(v))
+            .collect();
+        if let Some(digest) = decoded.and_then(|d| checksum::composite(header, &d)) {
+            // Sent with its count of parts or without, as S3 takes it.
+            if let Some(w) = whole.filter(|w| w.header == header)
+                && (w.bytes != digest || w.composite.is_some_and(|n| n as usize != parts.len()))
+            {
+                return Ok(Err(checksum::mismatch(header)));
+            }
+            let made = format!("{}-{}", vk_hub_proto::to_base64(&digest), parts.len());
+            kept = Some((header, made));
+        }
+    }
     staged.hex = crate::hex_of(&sha256);
     Ok(Ok(Assembled {
         staged,
         etag: multipart_etag(&md5s),
         checksum: kept,
         sizes,
+        part_checksums,
     }))
 }
 
@@ -1254,7 +1334,8 @@ async fn complete(
             };
             let (whole, kind) = &whole;
             let assembled = assemble(&store, &up, &parts, &sent, (whole.as_ref(), *kind))?;
-            Ok(Found::Assembled(Held { _lock: lock, up }, parts, assembled))
+            let held = Held { _lock: lock, up };
+            Ok(Found::Assembled(held, parts, Box::new(assembled)))
         })
         .await
         .context("assembling an upload panicked")??
@@ -1264,18 +1345,24 @@ async fn complete(
     let (Held { _lock, up }, parts, assembled) = match found {
         Found::Gone => return Ok(no_such_upload(ctx, &id)),
         Found::Completed(done) => return Ok(done.result(ctx)),
-        Found::Assembled(_, _, Err(why)) => return Ok(ctx.error(why)),
-        Found::Assembled(held, parts, Ok(assembled)) => (held, parts, assembled),
+        Found::Assembled(held, parts, assembled) => match *assembled {
+            Err(why) => return Ok(ctx.error(why)),
+            Ok(assembled) => (held, parts, assembled),
+        },
     };
     let Assembled {
         staged,
         etag,
         checksum,
         sizes,
+        part_checksums,
     } = assembled;
     let mut annotations = up.meta.annotations;
     annotations.insert(MD5_ANNOTATION.to_string(), etag.clone());
     annotations.insert(PARTS_ANNOTATION.to_string(), parts_annotation(&sizes));
+    if let Some(values) = part_checksums {
+        annotations.insert(PART_CHECKSUMS_ANNOTATION.to_string(), values.join(","));
+    }
     if let Some((name, value)) =
         checksum.and_then(|(header, text)| checksum::annotation(header, &text))
     {
@@ -1326,7 +1413,7 @@ enum Found {
     Assembled(
         Held,
         Vec<(u32, String)>,
-        std::result::Result<Assembled, Refusal>,
+        Box<std::result::Result<Assembled, Refusal>>,
     ),
 }
 
@@ -1558,12 +1645,16 @@ async fn list_parts(
         let truncated = numbers.len() > max;
         numbers.truncate(max);
         let mut out = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             xml::element("Bucket", &up.meta.bucket),
             xml::element("Key", &up.meta.key),
             xml::element("UploadId", &up.id),
             initiator_and_owner(),
             xml::element("StorageClass", "STANDARD"),
+            up.meta
+                .checksum
+                .as_ref()
+                .map_or(String::new(), Asked::listed),
             xml::element("PartNumberMarker", &marker.to_string()),
         );
         if let Some(last) = numbers.last() {
@@ -1583,8 +1674,15 @@ async fn list_parts(
             let written = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .unwrap_or_else(|_| SystemTime::now());
+            let checksum = part
+                .checksum
+                .as_deref()
+                .and_then(|kept| kept.split_once(':'))
+                .map_or(String::new(), |(algorithm, value)| {
+                    xml::element(&format!("Checksum{algorithm}"), value)
+                });
             out.push_str(&format!(
-                "<Part>{}{}{}{}</Part>",
+                "<Part>{}{}{}{}{checksum}</Part>",
                 xml::element("PartNumber", &n.to_string()),
                 xml::element("LastModified", &list::iso8601(written)),
                 xml::element("ETag", &format!("\"{}\"", part.md5)),
@@ -1601,6 +1699,7 @@ struct Listed {
     key: String,
     id: String,
     created: u64,
+    checksum: Option<Asked>,
 }
 
 impl Listed {
@@ -1703,6 +1802,7 @@ pub(super) async fn list_uploads(
                     key: meta.key,
                     id,
                     created: meta.created,
+                    checksum: meta.checksum,
                 });
             }
         }
@@ -1756,12 +1856,13 @@ pub(super) async fn list_uploads(
         for u in &uploads {
             let created = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u.created);
             out.push_str(&format!(
-                "<Upload>{}{}{}{}{}</Upload>",
+                "<Upload>{}{}{}{}{}{}</Upload>",
                 xml::element("Key", &enc(&u.key)),
                 xml::element("UploadId", &u.id),
                 initiator_and_owner(),
                 xml::element("StorageClass", "STANDARD"),
-                xml::element("Initiated", &list::iso8601(created))
+                xml::element("Initiated", &list::iso8601(created)),
+                u.checksum.as_ref().map_or(String::new(), Asked::listed),
             ));
         }
         Ok(xml::document("ListMultipartUploadsResult", &out))
@@ -1942,29 +2043,29 @@ mod tests {
     fn object_parts_are_paged_as_s3_pages_them() {
         let sizes = [5, 7, 3];
         assert_eq!(
-            object_parts(&sizes, 1000, 0),
+            object_parts(&sizes, None, 1000, 0),
             "<ObjectParts><IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts>\
              <PartNumberMarker>0</PartNumberMarker><Part><PartNumber>1</PartNumber><Size>5</Size>\
              </Part><Part><PartNumber>2</PartNumber><Size>7</Size></Part><Part><PartNumber>3\
              </PartNumber><Size>3</Size></Part><PartsCount>3</PartsCount></ObjectParts>"
         );
         assert_eq!(
-            object_parts(&sizes, 2, 0),
+            object_parts(&sizes, None, 2, 0),
             "<ObjectParts><IsTruncated>true</IsTruncated><MaxParts>2</MaxParts>\
              <NextPartNumberMarker>2</NextPartNumberMarker><PartNumberMarker>0</PartNumberMarker>\
              <Part><PartNumber>1</PartNumber><Size>5</Size></Part><Part><PartNumber>2</PartNumber>\
              <Size>7</Size></Part><PartsCount>3</PartsCount></ObjectParts>"
         );
         assert_eq!(
-            object_parts(&sizes, 2, 2),
+            object_parts(&sizes, None, 2, 2),
             "<ObjectParts><IsTruncated>false</IsTruncated><MaxParts>2</MaxParts>\
              <PartNumberMarker>2</PartNumberMarker><Part><PartNumber>3</PartNumber><Size>3</Size>\
              </Part><PartsCount>3</PartsCount></ObjectParts>"
         );
-        let none = object_parts(&sizes, 0, 0);
+        let none = object_parts(&sizes, None, 0, 0);
         assert!(none.contains("<IsTruncated>true</IsTruncated><MaxParts>0</MaxParts>"));
         assert!(!none.contains("<Part>") && !none.contains("NextPartNumberMarker"));
-        assert!(!object_parts(&sizes, 5, 3).contains("<Part>"));
+        assert!(!object_parts(&sizes, None, 5, 3).contains("<Part>"));
     }
 
     #[test]

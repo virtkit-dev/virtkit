@@ -249,6 +249,7 @@ pub(super) async fn copy(
             MD5_ANNOTATION,
             checksum::ANNOTATION,
             super::multipart::PARTS_ANNOTATION,
+            super::multipart::PART_CHECKSUMS_ANNOTATION,
         ] {
             if let Some(value) = obj.annotations.get(name) {
                 annotations.insert(name.to_string(), value.clone());
@@ -265,6 +266,8 @@ pub(super) async fn copy(
             if let Some((name, value)) = checksum::annotation(header, &value) {
                 annotations.insert(name, value);
             }
+            // The parts' are in the algorithm it replaces.
+            annotations.remove(super::multipart::PART_CHECKSUMS_ANNOTATION);
         }
         let checksum = checksum::stored(&annotations).map_or(String::new(), |k| k.elements());
         let etag = conditional::etag(&obj.layer, &annotations);

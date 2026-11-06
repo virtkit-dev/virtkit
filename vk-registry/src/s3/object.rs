@@ -237,10 +237,12 @@ pub(super) async fn get(
                 &sizes.len().to_string(),
             );
         }
-        // The whole object's checksum, on the whole object only: S3 sends none with a part,
-        // and the AWS CLI checks what it is sent against the bytes of each part it fetches.
+        // The whole object's checksum, on the whole object only: S3 sends none with a range,
+        // and the AWS CLI checks what it is sent against the bytes of each part it fetches. A
+        // part of an upload that kept its parts' checksums is sent its own, as S3 sends it.
+        let kept = checksum::stored(&obj.annotations);
         if checksum && !partial {
-            match checksum::stored(&obj.annotations) {
+            match &kept {
                 Some(kept) => headers.extend(kept.headers()),
                 None => insert(
                     headers,
@@ -248,6 +250,19 @@ pub(super) async fn get(
                     &sha256_base64(&obj.layer),
                 ),
             }
+        } else if checksum
+            && let (Some(n), Some(sizes), Some(kept)) = (part, &sizes, &kept)
+            && let Some((_, values)) = multipart::part_checksums(&obj.annotations, sizes.len())
+            && let Some(value) = usize::try_from(n)
+                .ok()
+                .and_then(|n| values.get(n.checked_sub(1)?))
+        {
+            let own = checksum::Stored {
+                algorithm: kept.algorithm,
+                value: value.clone(),
+                kind: kept.kind,
+            };
+            headers.extend(own.headers());
         }
         for (name, value) in meta::headers(&obj.annotations) {
             headers.append(name, value);
@@ -350,7 +365,13 @@ pub(super) async fn attributes(
         {
             let max = usize::try_from(max_parts).unwrap_or(1000);
             let marker = u32::try_from(marker).unwrap_or(u32::MAX);
-            inner.push_str(&multipart::object_parts(&sizes, max, marker));
+            let checksums = multipart::part_checksums(&obj.annotations, sizes.len());
+            inner.push_str(&multipart::object_parts(
+                &sizes,
+                checksums.as_ref(),
+                max,
+                marker,
+            ));
         }
         if has("StorageClass") {
             inner.push_str(&xml::element("StorageClass", "STANDARD"));
