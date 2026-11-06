@@ -173,6 +173,27 @@ KVM nesting enabled (`kvm_intel.nested=1` or `kvm_amd.nested=1`), which the flag
 before pulling or building anything. Treat this as a grant for trusted guests: nested
 virtualization reaches the host kernel's KVM paths.
 
+`--vga` gives the guest a VGA text console as its `tty0`, with a PS/2 keyboard: the guest's
+kernel draws an 80x25 text screen, and vk shows it as text, never pixels. Kernel messages go
+there too, and a systemd image (`--kernel image --init image`) starts a login on it. A bare
+`--vga` (`auto`) shows it full screen on this terminal when the guest command leaves the
+terminal alone (Ctrl-] leaves the view), else in a new terminal window in a graphical session
+(`$TERMINAL`, `xdg-terminal-exec`, `x-terminal-emulator` or a known terminal), else nowhere
+until `vk vga` attaches. With stdin and stdout not a terminal, they serve as files: keys read
+from stdin, and a text snapshot of the screen written to stdout at each change, each ended by a
+form feed line. `--vga=tty|stdio|window|detached` picks one, and `--vga-input FILE` and
+`--vga-output FILE` read keys from and write snapshots to named files instead, which a script
+can type through and read back:
+
+```sh
+vk run --kernel image --init image --vga-output screen.txt local/appliance
+vk vga ./run --input keys.txt          # or attach later, from another terminal
+```
+
+The console needs a kernel booted directly, with VT, VGA console and AT keyboard support —
+vk's own kernel or a distribution's — and not a UEFI bundle, whose loader declares no text
+screen. Keys follow the US layout; characters it has no key for are dropped.
+
 ### Build a Dockerfile
 
 `vk build` evaluates Dockerfiles directly; it does not call Docker. Each `RUN` executes
@@ -321,6 +342,8 @@ services:
 kernel), `image` (the image's own kernel and modules) or a kernel file path. Together they
 boot a systemd or otherwise self-booting image as a service. `persist_root` keeps the root
 filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
+`vga: true` gives the service a VGA text console (see [Run an OCI image](#run-an-oci-image)),
+which `vk vga --service NAME` shows.
 
 Guests give idle memory back. Pages one frees return to the host through the balloon, and a
 guest not under memory pressure also evicts the file cache it has not touched for a minute or
@@ -916,6 +939,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
 | `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
+| `vk vga` | Show the VGA text console of a VM booted with `--vga` (or a service with `x-virtkit.vga`) on this terminal, in a new window or as files, and type on its keyboard. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, the images of long-unused dev environments and run state dirs, and scratch left by killed builds and runs, then summarize what went and what stayed; `--dry-run` only reports. `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a booting `vk dev` start a pass in the background once a day, and sooner when the disk runs low. |
