@@ -728,6 +728,7 @@ async fn an_open_server_checks_no_signature_but_refuses_presigned_and_tokens() {
     let dir = tmp("open");
     let host = spawn(open_state(&dir, true));
     let get = |path: &str| Req::new("GET", path);
+    // A read of a key in a bucket not made yet is a miss, as in an empty bucket.
     send(&host, get("/s3/b/k"))
         .await
         .is(404, "NoSuchKey")
@@ -735,6 +736,13 @@ async fn an_open_server_checks_no_signature_but_refuses_presigned_and_tokens() {
     send(&host, get("/s3/b/k/deeper"))
         .await
         .is(404, "NoSuchKey");
+    send(&host, get("/s3/b/k").query("partNumber=1"))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, Req::new("HEAD", "/s3/b/k")).await.ok(404);
+    send(&host, get("/s3/b/k").query("attributes="))
+        .await
+        .is(404, "NoSuchBucket");
     // A bucket that is not there; listing the buckets is not on an open server.
     send(&host, get("/s3/b"))
         .await
@@ -817,6 +825,7 @@ async fn a_shared_bearer_is_the_access_key_and_its_secret() {
     )
     .await
     .is(404, "NoSuchKey");
+    // Outside its grants, nothing is said of what is there.
     send(&host, get().signed(&host, (&token, &token), 0))
         .await
         .is(403, "AccessDenied");
@@ -1191,6 +1200,7 @@ fn is_object(resp: &Resp, body: &[u8]) {
 /// OpenDAL's `stat` sends.
 async fn sccache_sequence(host: &str, sign: Sign<'_>, prefix: &str) {
     let check = format!("/s3/sccache/{prefix}.sccache_check");
+    // Before the bucket is made too: OpenDAL takes `NoSuchBucket` for a broken configuration.
     send(host, sign(Req::new("GET", &check)))
         .await
         .is(404, "NoSuchKey");
@@ -2664,7 +2674,7 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     send(&host, Req::new("DELETE", "/s3/b/k")).await.ok(204);
     send(&host, Req::new("DELETE", "/s3/nobucket/k"))
         .await
-        .ok(204);
+        .is(404, "NoSuchBucket");
     send(&host, Req::new("DELETE", "/s3/b/d")).await.ok(204);
     is_object(&send(&host, Req::new("GET", "/s3/b/d/x")).await, HELLO);
     send(&host, Req::new("DELETE", "/s3/b/img/v1"))
@@ -4395,10 +4405,11 @@ async fn objects_are_deleted_in_batches(host: &str, sign: Sign<'_>, store: &Stor
     assert_eq!(delete_result(&send(host, sign(crc)).await).0, ["c"]);
     let plain = Req::new("POST", "/s3/batch").query("delete=").body(doc);
     assert_eq!(delete_result(&send(host, sign(plain)).await).0, ["c"]);
-    // A bucket that is not there holds none of the keys.
+    // A bucket that is not there is said first.
     let doc = delete_doc(&[&key_of("k")], false);
-    let resp = send(host, sign(delete_objects("nobucket", doc))).await;
-    assert_eq!(delete_result(&resp).0, ["k"]);
+    send(host, sign(delete_objects("nobucket", doc)))
+        .await
+        .is(404, "NoSuchBucket");
 }
 
 #[tokio::test]
@@ -4564,6 +4575,19 @@ async fn configurations_are_canned(host: &str, sign: Sign<'_>) {
             .body(b"<Tagging/>".to_vec());
         send(host, sign(req)).await.is(501, "NotImplemented");
     }
+    // A bucket or a key that is not there is said first, as S3 looks it up first.
+    for (method, path, q, code) in [
+        ("PUT", "/s3/none", "policy", "NoSuchBucket"),
+        ("DELETE", "/s3/none", "cors", "NoSuchBucket"),
+        ("PUT", "/s3/none/k", "tagging", "NoSuchBucket"),
+        ("GET", "/s3/none/k", "attributes", "NoSuchBucket"),
+        ("GET", "/s3/none/k", "retention", "NoSuchBucket"),
+        ("PUT", "/s3/conf/absent", "tagging", "NoSuchKey"),
+        ("GET", "/s3/conf/absent", "legal-hold", "NoSuchKey"),
+    ] {
+        let req = Req::new(method, path).query(&format!("{q}="));
+        send(host, sign(req)).await.is(404, code);
+    }
     is_object(
         &send(host, sign(Req::new("GET", "/s3/conf/k"))).await,
         HELLO,
@@ -4597,6 +4621,16 @@ async fn configurations_are_canned_with_an_api_key() {
     send(&host, other(Req::new("GET", "/s3/conf/k").query("acl=")))
         .await
         .is(403, "AccessDenied");
+    // Nor is it told a bucket or a key is not there.
+    send(&host, other(Req::new("PUT", "/s3/none").query("policy=")))
+        .await
+        .is(501, "NotImplemented");
+    send(
+        &host,
+        other(Req::new("PUT", "/s3/conf/absent").query("tagging=")),
+    )
+    .await
+    .is(501, "NotImplemented");
 }
 
 // ---- multipart uploads ----
@@ -4967,7 +5001,12 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
         let req = Req::new("PUT", other)
             .query(&part_query(&id, 1))
             .body(data.clone());
-        send(&host, sign(req)).await.is(404, "NoSuchUpload");
+        let code = if other == "/s3/c/k" {
+            "NoSuchBucket"
+        } else {
+            "NoSuchUpload"
+        };
+        send(&host, sign(req)).await.is(404, code);
     }
     for bad in ["..", "0-0-zz", "s3"] {
         let req = Req::new("PUT", path)

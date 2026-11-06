@@ -303,8 +303,9 @@ fn subresource(params: &Params) -> Option<&str> {
     })
 }
 
-/// An authenticated request, to the operation its method, path and query name. What is not
-/// served answers `NotImplemented` once the body is read, as every refusal past the gate does;
+/// An authenticated request, to the operation its method, path and query name, once a bucket
+/// that is not there has been said to be ([`bucket::missing`]). What is not served answers
+/// `NotImplemented` once the body is read, as every refusal past the gate does;
 /// so does a request whose headers ask for a configuration this registry keeps nothing of
 /// ([`canned::asked`]), whatever its operation. `seed` is what a signed `aws-chunked` body's
 /// signatures are checked against.
@@ -328,6 +329,30 @@ async fn operate(
     };
     if let Some(why) = canned::asked(req.headers()) {
         return refuse(req, ctx.error(why), ctx).await;
+    }
+    // Before anything else is said of a bucket that is not there, to one who may know: but
+    // not of a write, which makes its bucket, nor of a request naming an upload, which is
+    // looked up first, nor of a read of an object, which is a miss as it is in an empty
+    // bucket: OpenDAL takes a `NoSuchBucket` for a broken configuration, not for a miss, so
+    // sccache would not start on a bucket its first write was to make.
+    let bucket_first = match (&target, req.method()) {
+        _ if multipart::names(&query, "uploadId") => None,
+        (path::Target::Object { .. }, &Method::GET | &Method::HEAD)
+            if subresource(&query).is_none() || part_asked(&query).is_some() =>
+        {
+            None
+        }
+        (path::Target::Bucket(_), &Method::PUT) if subresource(&query).is_none() => None,
+        (path::Target::Object { .. }, &Method::PUT) if subresource(&query).is_none() => None,
+        (path::Target::Object { .. }, &Method::POST) if multipart::names(&query, "uploads") => None,
+        (path::Target::Bucket(b), _) => Some(b.as_str()),
+        (path::Target::Object { segs, .. }, _) => segs.first().map(String::as_str),
+        (path::Target::Service, _) => None,
+    };
+    if let Some(b) = bucket_first
+        && let Some(resp) = bucket::missing(state, authz, b, ctx).await?
+    {
+        return refuse(req, resp, ctx).await;
     }
     let part = match part_asked(&query) {
         None => None,
@@ -392,7 +417,7 @@ async fn operate(
         }
         (path::Target::Object { segs, .. }, &Method::GET, Some(sub)) => match canned::object(sub) {
             Some(canned) => object::configuration(state, authz, segs, canned, req, ctx).await,
-            None => refuse(req, ctx.not_implemented(), ctx).await,
+            None => object::unserved(state, authz, segs, req, ctx).await,
         },
         // A copy names its source in a header, and its body is not the object.
         (path::Target::Object { segs, .. }, &Method::PUT, None)
@@ -406,6 +431,9 @@ async fn operate(
         (path::Target::Object { segs, .. }, &Method::DELETE, None) => {
             let versioned = query.iter().any(|(name, _)| name == "versionId");
             object::delete(state, authz, segs, versioned, req, ctx).await
+        }
+        (path::Target::Object { segs, .. }, _, _) => {
+            object::unserved(state, authz, segs, req, ctx).await
         }
         _ => refuse(req, ctx.not_implemented(), ctx).await,
     }

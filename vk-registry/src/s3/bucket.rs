@@ -94,6 +94,25 @@ async fn check(
     Ok((!exists).then(|| ctx.error(no_such_bucket(bucket))))
 }
 
+/// `NoSuchBucket` for a request about `bucket`, answered before anything else of it, when no
+/// such directory exists and the caller may read in it, as HeadBucket admits: `None` when the
+/// bucket is there, and for a caller that may not, which learns nothing and is answered as the
+/// request would be otherwise.
+pub(super) async fn missing(
+    state: &ServerState,
+    authz: &Authz<'_>,
+    bucket: &str,
+    ctx: &Ctx,
+) -> anyhow::Result<Option<Response<Body>>> {
+    let repo = format!("{FILES_REPO}/{bucket}");
+    if !authz.may_read_below(&repo) {
+        return Ok(None);
+    }
+    let store = std::sync::Arc::clone(&state.store);
+    let exists = tokio::task::spawn_blocking(move || store.repo_dir_exists(&repo)).await?;
+    Ok((!exists).then(|| ctx.error(no_such_bucket(bucket))))
+}
+
 /// `HEAD /s3/<bucket>`.
 pub(super) async fn head(
     state: &ServerState,
