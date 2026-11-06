@@ -65,6 +65,35 @@ const COMPONENT_TOO_LONG: Refusal =
     refusal("KeyTooLongError", "a key component is at most 255 bytes");
 const KEY_TOO_LONG: Refusal = refusal("KeyTooLongError", "a key is at most 1024 bytes");
 
+/// Why S3 could not parse a request's path at all, which it answers 400 `InvalidURI` before
+/// looking at the credential: a component with a malformed percent escape, not UTF-8 once
+/// decoded or holding a control character (as ceph's suite has S3 refuse `\u{8a}`), or `..`
+/// components that climb above the root, `\` separating them as `/` does.
+/// `rel` is the path below the S3 root: what follows `/s3` path-style, the whole path of a
+/// request whose host names the bucket. A `.` or `..` that stays below the root is a key's
+/// component, which [`parse`] refuses as such.
+pub(crate) fn unparsable(rel: &str) -> Option<&'static str> {
+    let mut depth = 0usize;
+    for raw in rel.split('/') {
+        let Some(seg) = decode_segment(raw).filter(|s| !s.chars().any(char::is_control)) else {
+            return Some(
+                "the request's path has a malformed percent escape, is not UTF-8 or holds a control character",
+            );
+        };
+        for part in seg.split('\\') {
+            match part {
+                "" | "." => {}
+                ".." => match depth.checked_sub(1) {
+                    Some(up) => depth = up,
+                    None => return Some("the request's path climbs above its root"),
+                },
+                _ => depth += 1,
+            }
+        }
+    }
+    None
+}
+
 /// What the path of a request under `/s3` names; the caller dispatches only `/s3` paths here.
 pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
     let rest = path.strip_prefix("/s3").unwrap_or(path);
@@ -146,6 +175,41 @@ mod tests {
                 r.message
             }
             Ok(t) => panic!("accepted {key:?} as {t:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_is_unparsable_with_a_bad_escape_or_climbing_above_its_root() {
+        for bad in [
+            "/b/(*&^%&())",
+            "/b/a%zz",
+            "/b/a%",
+            "/b/%FF",
+            "/b/%C2%AE%C2%8A-",
+            "/b/a%0Ab",
+            "/b%2",
+            "/b/../../x",
+            "/b/a/a/../../../../x",
+            "/b//a/../../b/../../c",
+            "/b/x//../../../y",
+            "/b/x%5C..%5C..%5C..%5Cy",
+            "/../x",
+            "/..",
+        ] {
+            assert!(unparsable(bad).is_some(), "{bad}");
+        }
+        for good in [
+            "",
+            "/",
+            "/b",
+            "/b/k",
+            "/b/..",
+            "/b/a/../b",
+            "/b/x/y/../..",
+            "/b/./k",
+            "/b/a%2F..%2F..%2F..",
+        ] {
+            assert_eq!(unparsable(good), None, "{good}");
         }
     }
 
