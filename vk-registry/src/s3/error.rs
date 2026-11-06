@@ -29,6 +29,7 @@ pub(crate) enum Code {
     InvalidAccessKeyId,
     InvalidArgument,
     InvalidBucketName,
+    InvalidChunkSizeError,
     InvalidDigest,
     InvalidPart,
     InvalidPartNumber,
@@ -131,6 +132,11 @@ impl Code {
                 "InvalidBucketName",
                 BAD,
                 "The specified bucket is not valid.",
+            ),
+            InvalidChunkSizeError => (
+                "InvalidChunkSizeError",
+                BAD,
+                "Only the last chunk is allowed to have a size less than 8192 bytes",
             ),
             InvalidDigest => (
                 "InvalidDigest",

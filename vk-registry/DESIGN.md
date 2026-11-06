@@ -765,7 +765,9 @@ rather than SigV4** — the way a proxy that authenticates a guest's requests it
 them — and any request to a server with no credential has no secret to check them with: its
 framing is decoded and its signatures are read, not checked. `x-amz-decoded-content-length`
 is required (411 `MissingContentLength`), past 4 GiB is 400 `EntityTooLarge` before the body is read, and the chunks
-must hold exactly that many bytes. The trailer's `x-amz-checksum-*`, in any of S3's algorithms, is
+must hold exactly that many bytes; every chunk holding data but the last holds at least 8192
+bytes, as S3 requires (400 `InvalidChunkSizeError`, naming the `Chunk` and its
+`BadChunkSize`). The trailer's `x-amz-checksum-*`, in any of S3's algorithms, is
 checked against the decoded bytes, echoed and kept, as a header's is; a checksum sent both as
 a header and in the trailer is 400. Reading is
 bounded as it goes: a chunk header of at most 256 bytes, a chunk no longer than what is left

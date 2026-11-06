@@ -11,7 +11,8 @@
 //! decoded and its signatures read but not checked, as no seed is known.
 //!
 //! What is read is bounded as it is read: a chunk header of at most [`MAX_HEADER`] bytes, a
-//! chunk no longer than what is left of `x-amz-decoded-content-length`, a trailer section of
+//! chunk no longer than what is left of `x-amz-decoded-content-length` and, but for the last
+//! one holding data, no shorter than [`MIN_CHUNK`], as S3 holds it, a trailer section of
 //! at most [`MAX_TRAILER`], and nothing after its end. Memory is one frame of the inner body
 //! and a line. Anything else stops the body with a [`Refusal`]; the data already passed on
 //! is then in a staging file its caller drops, so nothing it decoded is ever tagged.
@@ -30,6 +31,9 @@ use super::sigv4::{self, SigningKey};
 
 /// The longest chunk header taken, its CRLF included: a size and a signature need 91.
 pub(crate) const MAX_HEADER: usize = 256;
+
+/// The fewest bytes a chunk holds when another chunk of data follows it: S3's minimum.
+pub(crate) const MIN_CHUNK: u64 = 8192;
 
 /// The longest trailer section taken, every line's CRLF included.
 pub(crate) const MAX_TRAILER: usize = 8 * 1024;
@@ -149,6 +153,8 @@ pub(crate) struct Refusal {
     pub(crate) code: Code,
     pub(crate) said: &'static str,
     pub(crate) message: &'static str,
+    /// the chunk too short to have another follow it: its number, from 1, and its size
+    short: Option<(u64, u64)>,
 }
 
 impl Refusal {
@@ -160,6 +166,7 @@ impl Refusal {
             code: Code::IncompleteBody,
             said: "The request body terminated unexpectedly",
             message,
+            short: None,
         }
     }
 
@@ -169,6 +176,7 @@ impl Refusal {
             code: Code::IncompleteBody,
             said: Code::IncompleteBody.message(),
             message,
+            short: None,
         }
     }
 
@@ -178,6 +186,7 @@ impl Refusal {
             code: Code::MalformedTrailerError,
             said: Code::MalformedTrailerError.message(),
             message,
+            short: None,
         }
     }
 
@@ -187,13 +196,33 @@ impl Refusal {
             code: Code::SignatureDoesNotMatch,
             said: Code::SignatureDoesNotMatch.message(),
             message,
+            short: None,
+        }
+    }
+}
+
+impl Refusal {
+    /// Chunk number `chunk`, of `size` bytes, followed by another holding data, though it is
+    /// shorter than [`MIN_CHUNK`].
+    fn short(chunk: u64, size: u64) -> Self {
+        Refusal {
+            code: Code::InvalidChunkSizeError,
+            said: Code::InvalidChunkSizeError.message(),
+            message: "only the last chunk may hold fewer than 8192 bytes",
+            short: Some((chunk, size)),
         }
     }
 }
 
 impl From<Refusal> for super::error::Refusal {
     fn from(r: Refusal) -> Self {
-        super::error::Refusal::said(r.code, r.said)
+        let refusal = super::error::Refusal::said(r.code, r.said);
+        match r.short {
+            Some((chunk, size)) => refusal
+                .with("Chunk", chunk.to_string())
+                .with("BadChunkSize", size.to_string()),
+            None => refusal,
+        }
     }
 }
 
@@ -275,6 +304,8 @@ pub(crate) struct Decoder<B> {
     /// the line being read, its CRLF not yet seen
     line: Vec<u8>,
     decoded: u64,
+    /// how many chunks holding data were read, and the size of the last of them
+    chunks: (u64, u64),
     /// the signature of the chunk being read and the hash of its data, when checked
     chunk: Option<(String, Sha256)>,
     trailer: Trailer,
@@ -298,6 +329,7 @@ impl<B> Decoder<B> {
             pending: Bytes::new(),
             line: Vec::new(),
             decoded: 0,
+            chunks: (0, 0),
             chunk: None,
             trailer: Trailer::default(),
         }
@@ -368,6 +400,10 @@ impl<B> Decoder<B> {
                 ));
             }
         };
+        let (count, last) = self.chunks;
+        if size > 0 && count > 0 && last < MIN_CHUNK {
+            return Err(Refusal::short(count, last));
+        }
         let left = self.framing.declared.saturating_sub(self.decoded);
         if size > left {
             return Err(Refusal::mismatch(
@@ -386,6 +422,7 @@ impl<B> Decoder<B> {
             self.chunk_done()?;
             self.state = State::Trailer;
         } else {
+            self.chunks = (count.saturating_add(1), size);
             self.state = State::Data(size);
         }
         Ok(())
@@ -802,7 +839,7 @@ mod tests {
     #[test]
     fn an_unsigned_trailer_carries_its_checksum() {
         let crc = vk_hub_proto::to_base64(&crc32fast::hash(b"hello world").to_be_bytes());
-        let body = format!("5\r\nhello\r\n6\r\n world\r\n0\r\nx-amz-checksum-crc32:{crc}\r\n\r\n");
+        let body = format!("b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:{crc}\r\n\r\n");
         for frame in [1, 3, body.len()] {
             // A seed changes nothing for a body that is not signed.
             let (out, trailer) = decode(
@@ -857,6 +894,43 @@ mod tests {
             code("1\r\na\r\n0\r\nx-amz-checksum-crc32:a\r\n\r\n", plain),
             Code::MalformedTrailerError
         );
+    }
+
+    #[test]
+    fn only_the_last_chunk_of_data_may_be_short() {
+        let plain = |declared| Framing {
+            mode: Mode::Unsigned,
+            declared,
+            trailer: None,
+        };
+        let body = |sizes: &[usize]| {
+            let mut out = Vec::new();
+            for &n in sizes.iter().chain([&0]) {
+                out.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                out.extend(std::iter::repeat_n(b'a', n));
+                if n > 0 {
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            out.extend_from_slice(b"\r\n");
+            (out, sizes.iter().sum::<usize>() as u64)
+        };
+        for sizes in [&[100][..], &[8192, 8192, 100], &[10_000, 9500, 20]] {
+            let (b, n) = body(sizes);
+            assert_eq!(decode(&b, 4096, plain(n), None).unwrap().0.len() as u64, n);
+        }
+        for (sizes, chunk, size) in [
+            (&[100, 8192, 100][..], 1, 100),
+            (&[8192, 10, 100], 2, 10),
+            (&[10_000, 10, 8192, 8192], 2, 10),
+        ] {
+            let (b, n) = body(sizes);
+            let r = decode(&b, 4096, plain(n), None).unwrap_err();
+            assert_eq!(r.code, Code::InvalidChunkSizeError, "{sizes:?}");
+            let r = super::super::error::Refusal::from(r);
+            assert_eq!(r.element("Chunk"), Some(&*chunk.to_string()));
+            assert_eq!(r.element("BadChunkSize"), Some(&*size.to_string()));
+        }
     }
 
     #[test]
