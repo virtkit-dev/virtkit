@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A fleet node's jobs have a network with no config of its own.** Unless its config file
+  sets `[net] mode`, a node enrolled with a hub gives its jobs the per-job switch, held to its
+  own `[egress]` and the hub's egress rules, so they can reach the registry proxy and run
+  services. The hub cannot change this; a node that wants its jobs offline sets `mode = "none"`.
 - **A fleet node checks update signatures with no config of its own.** The release keys in the
   hub's `[nodes] release_keys` are pinned on each node when it joins, and from then on it
   requires updates signed by one of them, as it would with the keys in its own config, which

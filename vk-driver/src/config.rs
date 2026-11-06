@@ -1378,8 +1378,13 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
 /// memory budget of [`enrolled_budget_gib`], a per-job vCPU ceiling of the host's `cpus`
 /// online, a vCPU overcommit of [`ENROLLED_CPU_OVERCOMMIT`], and the base VM held to them, so
 /// a job that asks for nothing fits. A figure this host cannot read leaves its default as it
-/// is.
+/// is. Its jobs get the per-job switch's network unless the local file says otherwise: the
+/// hub's egress layer narrows it, and only the switch serves `registry.vk`. The hub never sets
+/// the mode, so it takes only the file's.
 fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>) {
+    if !crate::node::hub_settings::is_set(&cfg.layers.local, "net.mode") {
+        cfg.net.mode = "switch".into();
+    }
     let schedule = &mut cfg.executor.schedule;
     if schedule.mem_budget.is_none() {
         schedule.mem_budget = total_mib
@@ -1822,6 +1827,24 @@ mod tests {
         let hub = ["executor.vm.cpus", "executor.vm.mem"];
         let (_, _, cpus, mem) = defaults("", &hub, Some(4_551), Some(2));
         assert_eq!((cpus, mem.as_str()), (4, "4G"), "set by the hub");
+    }
+
+    /// An enrolled host's jobs get the switch's network unless its file sets a mode, even
+    /// the old default.
+    #[test]
+    fn an_enrolled_host_networks_its_jobs_through_the_switch() {
+        let mode = |text: &str| {
+            let local: toml::Table = toml::from_str(text).unwrap();
+            let mut cfg = from_table(local.clone()).unwrap();
+            cfg.layers.local = local;
+            enrolled_defaults(&mut cfg, Some(257_000), Some(64));
+            cfg.net.mode
+        };
+        assert_eq!(mode(""), "switch");
+        assert_eq!(mode("[net]\nsubnet = \"10.9.8.0/24\"\n"), "switch");
+        assert_eq!(mode("[net]\nmode = \"none\"\n"), "none");
+        assert_eq!(mode("[net]\nmode = \"pool\"\n"), "pool");
+        assert_eq!(Config::default().net.mode, "none", "not enrolled");
     }
 
     /// An enrolled host overcommits its CPUs twice unless told otherwise, and holds the base

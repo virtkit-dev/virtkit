@@ -128,7 +128,7 @@ built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
 Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet, an enrolled node's memory and vCPU defaults, the
+which the hub has no way to set yet, an enrolled node's memory, vCPU and network defaults, the
 registry the hub names, and the release keys pinned at enrollment ([Updates](#updates)).
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
@@ -177,6 +177,12 @@ with the source `default`.
   `cpus` too. The heartbeat reports vCPUs committed and the budget, `vk tune` counts only the
   jobs both budgets have room for, and the hub places on a node no more vCPUs than its budget
   has left, less those it has asked of the node since.
+- **Job network.** An unset `[net] mode` is `switch`, where on a host that is not enrolled it is
+  `none`: jobs reach out through the per-job switch, held to the node's `[egress]` and the
+  hub's [egress layer](#job-egress-from-the-hub), and their guests reach the registry proxy
+  `registry.vk` and can have `services:`. The node reports its run-phase egress cap as its
+  `[egress]` says, unrestricted when it says nothing. The hub cannot set the mode; a node that
+  wants no network sets `mode = "none"` in its file.
 
 ### Hub settings
 
@@ -207,8 +213,7 @@ with the source `default`.
 - **A registry.** With no `[registry]` in the local file, the node uses the one the hub names —
   a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
   guests get the job's token (`guest_credential = "job"`, the only value the hub may send),
-  so only jobs the hub places reach it, and only on `[net] mode = "switch"`, which the hub
-  cannot set. The hub sends the CA as PEM, `ca_pem`; the node checks it holds certificates
+  so only jobs the hub places reach it, and only on `[net] mode = "switch"`, the default. The hub sends the CA as PEM, `ca_pem`; the node checks it holds certificates
   and pins it by content as `<state_dir>/node/registry-ca-<hash>.pem`, written whole by rename
   before the settings that name it. A CA the hub no longer names is kept a week, the longest
   a job's registry token lives, for the jobs that started with it. A local `[registry]` is

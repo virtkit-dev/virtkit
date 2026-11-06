@@ -9,6 +9,7 @@
 
 [net]
 # mode = "none"                # none | tap (single, dev) | pool (production)
+#                              # | switch; unset: none, but switch on a fleet node
 #
 # mode = "tap": one pre-created tap, one VM at a time
 # tap = "tap0"                 # pre-create the tap on a bridge yourself

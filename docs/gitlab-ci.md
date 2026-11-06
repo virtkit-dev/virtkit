@@ -1671,8 +1671,9 @@ caps it was held to, by their fingerprint, and the hub counts the phase toward t
 ## Services
 
 CI `services:` run as **sibling microVMs** on the per-job switch, each resolvable
-by its `alias` over the switch's DNS. They need the per-job LAN, so the job must
-set `[net] mode = "switch"`; vk pulls each service image host-side (registry
+by its `alias` over the switch's DNS. They need the per-job LAN, so the node must
+set `[net] mode = "switch"`, a [fleet node](fleet-design.md#defaults-on-an-enrolled-node)'s
+default; vk pulls each service image host-side (registry
 credentials never enter a guest) into the same digest-keyed cache the job's
 `image:` uses — an OCI ref (`mysql:8`, `redis:7`) under `<state_dir>/docker`, a
 `virtkit/` bundle under `<state_dir>/registry`.
