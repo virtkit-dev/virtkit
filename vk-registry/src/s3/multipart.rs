@@ -474,6 +474,13 @@ pub(super) async fn upload(
 ) -> Result<Response<Body>> {
     let params = params(query);
     let id = param(&params, "uploadId").unwrap_or_default().to_string();
+    // A bucket that is not there is said first, when the upload is not there either: an
+    // upload is made before its bucket is, at its completion.
+    if let Some(resp) = bucket::missing(state, authz, bucket_of(&segs), ctx).await?
+        && open_async(state, &id, &segs).await?.is_none()
+    {
+        return refuse(req, resp, ctx).await;
+    }
     let method = req.method().clone();
     let taken: &[&str] = match method {
         Method::PUT => &["uploadId", "partNumber"],

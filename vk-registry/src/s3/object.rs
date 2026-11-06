@@ -357,6 +357,32 @@ pub(super) async fn attributes(
     .await
 }
 
+/// An operation on the object at `segs` that is not served: `NoSuchKey` first when no object
+/// is there for a caller that may read it, as S3 looks the object up before what it is asked
+/// of it, and `NotImplemented` otherwise.
+pub(super) async fn unserved(
+    state: &ServerState,
+    authz: &Authz<'_>,
+    segs: Vec<String>,
+    req: Request<Incoming>,
+    ctx: &Ctx,
+) -> Result<Response<Body>> {
+    if !admitted(authz, accounts::Action::Read, &segs) {
+        return refuse(req, ctx.not_implemented(), ctx).await;
+    }
+    let resp = {
+        let ctx = ctx.clone();
+        crate::dav::blocking(state, authz, move |store, authz| {
+            Ok(match readable(store, authz, &segs)? {
+                Some(_) => ctx.not_implemented(),
+                None => no_such_key(&ctx, &segs),
+            })
+        })
+        .await?
+    };
+    refuse(req, resp, ctx).await
+}
+
 /// `GET /s3/<bucket>/<key>?tagging|acl`: the configuration `canned` says an object has, once
 /// the object is one the caller may read.
 pub(super) async fn configuration(

@@ -196,8 +196,8 @@ fn refused(entry: &Entry) -> Option<Refusal> {
 }
 
 /// `POST /s3/<bucket>?delete`: each key of the document deleted, or the reason it was not,
-/// in the order asked, a key the store fails on included. A bucket that does not exist holds none of the keys, which all count
-/// as deleted, as DeleteObject answers for each.
+/// in the order asked, a key the store fails on included. A bucket that does not exist is
+/// `NoSuchBucket`, said before ([`super::bucket::missing`]).
 pub(super) async fn delete(
     state: &ServerState,
     authz: &Authz<'_>,
