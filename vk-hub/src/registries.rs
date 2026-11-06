@@ -648,9 +648,28 @@ fn issue(hub: &Hub, actor: &str, id: &str, op: Operation) -> Result<Command> {
     Ok(command)
 }
 
-/// Bind registry `id` to `url`, or unbind it, as `actor`; whether it changed.
-pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bool> {
-    let changed = hub.db.set_registry_url(id, url, actor, crate::now_secs())?;
+/// The most a registry's CA may hold: a few certificates, well within what the admin socket
+/// carries in one request and what a node takes.
+pub const MAX_CA_PEM: usize = 32 * 1024;
+
+/// Bind registry `id` to `url` and the CA `ca_pem` its certificate chains to there, or unbind
+/// it, as `actor`; whether it changed. The CA must hold certificates, as a node checks it.
+pub fn set_url(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    url: Option<&str>,
+    ca_pem: Option<&str>,
+) -> Result<bool> {
+    if let Some(pem) = ca_pem {
+        if pem.len() > MAX_CA_PEM {
+            bail!("the CA is over {MAX_CA_PEM} bytes");
+        }
+        vk_peer::net::roots_from_pem(pem.as_bytes(), std::path::Path::new("the CA"))?;
+    }
+    let changed = hub
+        .db
+        .set_registry_url(id, url, ca_pem, actor, crate::now_secs())?;
     if changed {
         hub.changed(id);
         crate::settings::steer(hub);

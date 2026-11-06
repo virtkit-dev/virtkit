@@ -9,6 +9,9 @@ All notable changes to virtkit will be documented in this file.
 - **vk-hub sets its nodes' settings.** `vk-hub settings set` and `unset` give every node, or
   one, capacity and VM sizing settings and a registry the hub manages to use, one node's own
   winning over the fleet's; a value a node would refuse is refused at once.
+- **A registry's CA reaches the nodes it is named to.** `vk-hub registries set-url --ca`
+  takes the CA a registry's certificate chains to, and nodes the hub names the registry to
+  trust it with no config of their own.
 - **vk-hub keeps its nodes on a target release.** `vk-hub release target` sets the `vk` the
   fleet should run: setting it rolls it out to the nodes running an older version, and from then
   on a node that falls behind, such as one that just joined, is updated on its own once it is

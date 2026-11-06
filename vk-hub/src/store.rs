@@ -97,7 +97,9 @@ pub use registries::{
 };
 pub use relay_commands::{RelayCommandRow, relay_operation_name};
 pub use relays::{PendingGitlab, RelayEnrollment, RelayRow, RelayWrite};
-pub use settings::{Layer as SettingsLayer, Layers as SettingsLayers, shown as setting_shown};
+pub use settings::{
+    Layer as SettingsLayer, Layers as SettingsLayers, registry_table, shown as setting_shown,
+};
 pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
 

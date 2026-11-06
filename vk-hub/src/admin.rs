@@ -70,6 +70,26 @@ const FETCH_WAIT: Duration = Duration::from_secs(35 * 60);
 /// twice over, as it may be waiting on a check the pages started.
 const CHECK_WAIT: Duration = Duration::from_secs(2 * crate::fetch::CHECK_TIMEOUT.as_secs() + 30);
 
+/// Bind registry `id` to `url` and `ca_pem`, as `actor`: whether it changed.
+fn bind_registry(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    url: Option<String>,
+    ca_pem: Option<String>,
+) -> Result<serde_json::Value> {
+    let changed = crate::registries::set_url(hub, actor, id, url.as_deref(), ca_pem.as_deref())?;
+    if changed {
+        eprintln!(
+            "vk-hub: admin: {actor} bound registry {} to {}",
+            vk_hub_proto::display_safe(id),
+            url.as_deref()
+                .map_or("no URL".to_string(), vk_hub_proto::display_safe)
+        );
+    }
+    Ok(serde_json::to_value(changed)?)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 enum Call {
@@ -159,6 +179,13 @@ enum Call {
     SetRegistryUrl {
         id: String,
         url: Option<String>,
+    },
+    /// [`Call::SetRegistryUrl`] with the CA the registry's certificate chains to: an operation
+    /// of its own, which an older hub refuses rather than binding the URL without the CA.
+    BindRegistry {
+        id: String,
+        url: Option<String>,
+        ca_pem: Option<String>,
     },
     /// A token for a registry, for automation or a test.
     MintRegistryToken {
@@ -745,18 +772,8 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::UpdateRegistry { id, release } => {
             serde_json::to_value(crate::registries::update(hub, &actor, &id, &release)?)?
         }
-        Call::SetRegistryUrl { id, url } => {
-            let changed = crate::registries::set_url(hub, &actor, &id, url.as_deref())?;
-            if changed {
-                eprintln!(
-                    "vk-hub: admin: {actor} bound registry {} to {}",
-                    vk_hub_proto::display_safe(&id),
-                    url.as_deref()
-                        .map_or("no URL".to_string(), vk_hub_proto::display_safe)
-                );
-            }
-            serde_json::to_value(changed)?
-        }
+        Call::SetRegistryUrl { id, url } => bind_registry(hub, &actor, &id, url, None)?,
+        Call::BindRegistry { id, url, ca_pem } => bind_registry(hub, &actor, &id, url, ca_pem)?,
         Call::MintRegistryToken {
             id,
             grants,
@@ -1213,11 +1230,24 @@ impl Client {
     }
 
     /// Whether it changed.
-    pub fn set_registry_url(&self, id: &str, url: Option<String>) -> Result<bool> {
-        self.call(Call::SetRegistryUrl {
-            id: id.to_string(),
-            url,
-        })
+    /// Bind registry `id` to `url` and, when given, the CA `ca_pem`.
+    pub fn set_registry_url(
+        &self,
+        id: &str,
+        url: Option<String>,
+        ca_pem: Option<String>,
+    ) -> Result<bool> {
+        match ca_pem {
+            None => self.call(Call::SetRegistryUrl {
+                id: id.to_string(),
+                url,
+            }),
+            ca_pem => self.call(Call::BindRegistry {
+                id: id.to_string(),
+                url,
+                ca_pem,
+            }),
+        }
     }
 
     pub fn mint_registry_token(

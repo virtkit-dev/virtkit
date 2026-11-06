@@ -247,25 +247,38 @@ fn a_registry_url_is_bound_once() {
     let b = url_registry(&hub, "https://reg-2.example.com", "bb");
     for taken in [REGISTRY_URL, "http://reg.example.com:443"] {
         assert!(
-            hub.db.set_registry_url(&b, Some(taken), "u", 1).is_err(),
+            hub.db
+                .set_registry_url(&b, Some(taken), None, "u", 1)
+                .is_err(),
             "{taken}"
         );
     }
     assert!(
         hub.db
-            .set_registry_url(&b, Some("https://x/path"), "u", 1)
+            .set_registry_url(&b, Some("https://x/path"), None, "u", 1)
             .is_err()
     );
     assert!(
         hub.db
-            .set_registry_url(&b, Some("https://reg-3.example.com/"), "u", 1)
+            .set_registry_url(&b, Some("https://reg-3.example.com/"), None, "u", 1)
             .unwrap()
     );
     assert_eq!(
         hub.db.registry(&b).unwrap().unwrap().url.as_deref(),
         Some("https://reg-3.example.com")
     );
-    assert!(hub.db.set_registry_url(&a, None, "u", 1).unwrap());
+    // A CA is taken with its URL, holding certificates, and goes when it is unbound.
+    let ca = std::str::from_utf8(include_bytes!("../testdata/tls-ca.pem")).unwrap();
+    let url = Some("https://reg-3.example.com");
+    assert!(crate::registries::set_url(&hub, "u", &b, url, Some("not a CA")).is_err());
+    assert!(crate::registries::set_url(&hub, "u", &b, url, Some(ca)).unwrap());
+    assert_eq!(
+        hub.db.registry(&b).unwrap().unwrap().ca_pem.as_deref(),
+        Some(ca)
+    );
+    assert!(crate::registries::set_url(&hub, "u", &b, None, Some(ca)).unwrap());
+    assert_eq!(hub.db.registry(&b).unwrap().unwrap().ca_pem, None);
+    assert!(hub.db.set_registry_url(&a, None, None, "u", 1).unwrap());
 }
 
 #[test]
@@ -563,7 +576,7 @@ fn a_url_taken_since_the_token_was_issued_is_not_bound() {
         .unwrap();
     let b = url_registry(&hub, "https://reg-3.example.com", "bb");
     hub.db
-        .set_registry_url(&b, Some("http://reg-2.example.com:443"), "u", 1)
+        .set_registry_url(&b, Some("http://reg-2.example.com:443"), None, "u", 1)
         .unwrap();
     let RegistryEnrollment::Reenrolled { id } = hub
         .db

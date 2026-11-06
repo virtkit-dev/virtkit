@@ -9244,6 +9244,16 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
     ] {
         assert!(settings.contains(want), "{want}: {settings}");
     }
+    assert!(!settings.contains("not sent to nodes"), "{settings}");
+    // A CA nodes would refuse: the registry is not sent, and its tab says why.
+    hub.db
+        .set_registry_url(&id, Some("https://ok.example.com"), Some("PEM"), "u", 1)
+        .unwrap();
+    let settings = page(format!("/registry/{id}?tab=settings")).await;
+    assert!(
+        settings.contains("not sent to nodes, which would refuse it: "),
+        "{settings}"
+    );
     // A registry that takes no tokens says so on both.
     let off = url_registry(&hub, "https://off.example.com", "b2");
     let access = page(format!("/registry/{off}?tab=access")).await;

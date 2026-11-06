@@ -62,6 +62,9 @@ pub const MAX_SECS: u64 = 10 * 365 * 24 * 3600;
 /// The largest ratio a setting may name.
 pub const MAX_RATIO: f64 = 64.0;
 
+/// The most a registry's `ca_pem` may hold.
+pub const MAX_CA_PEM: usize = 256 * 1024;
+
 /// The only `guest_credential` a registry the hub names may have: the job's token.
 pub const GUEST_CREDENTIAL: &str = "job";
 
@@ -152,7 +155,9 @@ fn is_gib(s: &str) -> bool {
 }
 
 /// That `value` is a `[registry]` the hub may send: a table of [`REGISTRY_KEYS`] naming a
-/// `repo`, whose guests get the job's token alone.
+/// remote registry in `repo`, whose guests get the job's token alone, with a `pipeline_root` in
+/// the repository grammar. That `ca_pem` holds certificates is left to the caller, which can
+/// parse them.
 fn check_registry(value: &Value) -> Result<(), String> {
     let Value::Object(table) = value else {
         return Err("expected a table".to_string());
@@ -163,8 +168,18 @@ fn check_registry(value: &Value) -> Result<(), String> {
             REGISTRY_KEYS.join(", ")
         ));
     }
-    if !table.get("repo").is_some_and(Value::is_string) {
+    let Some(repo) = table.get("repo").and_then(Value::as_str) else {
         return Err("`repo` must name the registry".to_string());
+    };
+    if repo.starts_with('/') || repo.starts_with("file://") {
+        return Err("`repo` names a store on the host, not a registry".to_string());
+    }
+    let authority = repo
+        .strip_prefix("https://")
+        .or_else(|| repo.strip_prefix("http://"))
+        .unwrap_or(repo);
+    if authority.split('/').next().is_none_or(str::is_empty) {
+        return Err("`repo` names no registry host".to_string());
     }
     if table
         .get("guest_credential")
@@ -178,6 +193,21 @@ fn check_registry(value: &Value) -> Result<(), String> {
         if table.get(key).is_some_and(|v| !v.is_string()) {
             return Err(format!("`{key}` must be a string"));
         }
+    }
+    if table
+        .get("ca_pem")
+        .and_then(Value::as_str)
+        .is_some_and(|pem| pem.len() > MAX_CA_PEM)
+    {
+        return Err(format!("`ca_pem` is over {MAX_CA_PEM} bytes"));
+    }
+    if let Some(root) = table.get("pipeline_root").and_then(Value::as_str)
+        && !crate::token::valid_prefix(root)
+    {
+        return Err(format!(
+            "`pipeline_root` {root:?} is not a repository path: lowercase components \
+             separated by `/`"
+        ));
     }
     for key in ["insecure", "transparent_zstd", "proxy_guests"] {
         if table.get(key).is_some_and(|v| !v.is_boolean()) {
@@ -264,5 +294,20 @@ mod tests {
         assert!(check(json!({"repo": "r", "guest_credential": "node"})).is_err());
         assert!(check(json!({"repo": "r", "insecure": "yes"})).is_err());
         assert!(check(json!("r")).is_err());
+        for (registry, why) in [
+            (json!({"repo": "/srv/store"}), "store on the host"),
+            (json!({"repo": "file:///srv/store"}), "store on the host"),
+            (json!({"repo": ""}), "no registry host"),
+            (json!({"repo": "https:///ci"}), "no registry host"),
+            (json!({"repo": "r", "pipeline_root": "A"}), "pipeline_root"),
+            (json!({"repo": "r", "pipeline_root": ""}), "pipeline_root"),
+            (
+                json!({"repo": "r", "ca_pem": "x".repeat(MAX_CA_PEM + 1)}),
+                "over",
+            ),
+        ] {
+            let err = check(registry).unwrap_err();
+            assert!(err.contains(why), "{err}");
+        }
     }
 }

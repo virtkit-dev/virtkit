@@ -286,7 +286,7 @@ pub(super) async fn detail(
             commands_table(&mut main, &view, &commands, now);
         }
         Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref()),
-        Tab::Settings => settings(&mut main, &view, &keys, now),
+        Tab::Settings => settings(&mut main, &view, &namespaces, &keys, now),
     }
     let here = format!("{DETAIL_PREFIX}{id}");
     Ok(page(super::fleet::layout(
@@ -390,7 +390,13 @@ fn lines(h: &mut Html, lines: &[String]) {
 }
 
 /// The Settings tab: the address the registry is bound to, and the signing keys it holds.
-fn settings(h: &mut Html, v: &RegistryView, keys: &[TokenKeyRow], now: u64) {
+fn settings(
+    h: &mut Html,
+    v: &RegistryView,
+    namespaces: &[NamespaceRow],
+    keys: &[TokenKeyRow],
+    now: u64,
+) {
     section(h, "Address");
     match &v.row.url {
         Some(url) => kv(h, "Bound to", url),
@@ -399,6 +405,13 @@ fn settings(h: &mut Html, v: &RegistryView, keys: &[TokenKeyRow], now: u64) {
             "Bound to",
             "none, so nodes cannot name it and their jobs get no access",
         ),
+    }
+    if let Some(Err(why)) = crate::store::registry_table(&v.row, namespaces) {
+        kv(
+            h,
+            "Nodes",
+            &format!("not sent to nodes, which would refuse it: {why}"),
+        );
     }
     end_section(h);
     h.raw("<section><h2>Signing keys</h2>");

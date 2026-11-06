@@ -873,7 +873,10 @@ it: the hub may only lengthen a registry's own window.
 
 **Registry URLs.** `vk-hub token create --kind registry --url <url>` binds the enrolling
 registry to the URL its clients reach it at; `vk-hub registries set-url <id> <url>|--none`
-changes it, and `registries show` prints it with whether the registry takes tokens. A URL is
+changes it, with `--ca <file>` the PEM CA its certificate chains to there, which the hub gives
+the nodes its `registry` setting names the registry to (without, they check it against their
+system roots; unbinding drops it), and `registries show` prints it with whether the registry
+takes tokens. A URL is
 `http(s)://host[:port]`, and one host and port belong to one registry whatever the scheme. A
 URL another registry took before the token was spent is not bound, and the audit log says so.
 

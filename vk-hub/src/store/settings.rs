@@ -4,6 +4,7 @@
 //! the hub manages, by ID, which a node is sent as the `[registry]` table that reaches it.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
@@ -65,15 +66,23 @@ fn layers_in(table: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<
     Ok(layers)
 }
 
-/// The `[registry]` table a node is sent for registry `row`: its bound URL and the root of its `ci-pipeline` namespace's path, guests lent the job's
-/// token. `None` while no URL is bound.
-fn registry_table(row: &RegistryRow, namespaces: &[NamespaceRow]) -> Option<Value> {
+/// The `[registry]` table a node is sent for registry `row`, whose namespaces are `namespaces`:
+/// its bound URL, the CA the operator gave with it, and the root of its `ci-pipeline`
+/// namespace's path, guests lent the job's token. `None` while no URL is bound; why a node
+/// would refuse the table, which is then not sent.
+pub fn registry_table(
+    row: &RegistryRow,
+    namespaces: &[NamespaceRow],
+) -> Option<Result<Value, String>> {
     let url = row.url.as_deref()?;
     let (scheme, authority) = url.split_once("://")?;
     let mut table = serde_json::Map::new();
     table.insert("repo".into(), Value::from(authority));
     if scheme == "http" {
         table.insert("insecure".into(), Value::Bool(true));
+    }
+    if let Some(pem) = &row.ca_pem {
+        table.insert("ca_pem".into(), Value::from(pem.as_str()));
     }
     if let Some(root) = namespaces
         .iter()
@@ -83,7 +92,33 @@ fn registry_table(row: &RegistryRow, namespaces: &[NamespaceRow]) -> Option<Valu
         table.insert("pipeline_root".into(), Value::from(root));
     }
     table.insert("guest_credential".into(), Value::from(GUEST_CREDENTIAL));
-    Some(Value::Object(table))
+    let table = Value::Object(table);
+    Some(node_takes(&table).map(|()| table))
+}
+
+/// That a node takes `table` as its `[registry]`, as it checks one: by the shared check, and
+/// its CA's certificates parsed.
+fn node_takes(table: &Value) -> Result<(), String> {
+    Kind::Registry.check(table)?;
+    match table.get("ca_pem").and_then(Value::as_str) {
+        Some(pem) => vk_peer::net::roots_from_pem(pem.as_bytes(), Path::new("the CA"))
+            .map(drop)
+            .map_err(|e| format!("{e:#}")),
+        None => Ok(()),
+    }
+}
+
+/// The namespaces of registry `id` in `namespaces`.
+fn namespaces_of(
+    namespaces: &impl ReadableTable<&'static str, &'static [u8]>,
+    id: &str,
+) -> Result<Vec<NamespaceRow>> {
+    let (start, end) = ns_range(id);
+    let mut ns = Vec::new();
+    for entry in namespaces.range(start.as_str()..end.as_str())? {
+        ns.push(decode::<NamespaceRow>(entry?.1.value())?);
+    }
+    Ok(ns)
 }
 
 /// The hub's settings as they are sent: every layer, and each registry's table by ID.
@@ -113,12 +148,8 @@ impl Expanded {
             let (id, row) = entry?;
             let id = id.value().to_string();
             let row = decode::<RegistryRow>(row.value())?;
-            let (start, end) = ns_range(&id);
-            let mut ns = Vec::new();
-            for entry in namespaces.range(start.as_str()..end.as_str())? {
-                ns.push(decode::<NamespaceRow>(entry?.1.value())?);
-            }
-            tables.insert(id, registry_table(&row, &ns));
+            let table = registry_table(&row, &namespaces_of(namespaces, &id)?);
+            tables.insert(id, table.and_then(Result::ok));
         }
         Ok(Expanded {
             layers,
@@ -127,7 +158,8 @@ impl Expanded {
     }
 
     /// What node `id`, whose row is `row`, is sent: nothing unless it takes the hub's settings,
-    /// and no registry while the one named has no URL bound or is gone.
+    /// and no registry while the one named has no URL bound, a node would refuse its table, or
+    /// it is gone.
     fn wanted(&self, id: &str, row: &NodeRow) -> BTreeMap<String, Value> {
         if !takes(row) {
             return BTreeMap::new();
@@ -181,11 +213,12 @@ pub fn shown(value: &Value) -> String {
 }
 
 /// Check that the node accepts `key` and `value`; for `registry`, require a registry the hub
-/// manages with a bound URL.
+/// manages with a bound URL, whose table a node would take.
 fn check(
     key: &str,
     value: &Value,
     registries: &impl ReadableTable<&'static str, &'static [u8]>,
+    namespaces: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<()> {
     let Some(kind) = vk_hub_proto::settings::kind(key) else {
         bail!(
@@ -208,13 +241,14 @@ fn check(
         .map(|g| decode::<RegistryRow>(g.value()))
         .transpose()?
         .with_context(|| format!("there is no registry {id}"))?;
-    if row.url.is_none() {
-        bail!(
+    match registry_table(&row, &namespaces_of(namespaces, id)?) {
+        None => bail!(
             "registry {id} has no URL bound; bind one first (vk-hub registries set-url {id} \
              <url> [--ca <file>])"
-        );
+        ),
+        Some(Err(why)) => bail!("nodes would refuse registry {id}: {why}"),
+        Some(Ok(_)) => Ok(()),
     }
-    Ok(())
 }
 
 impl Db {
@@ -237,7 +271,12 @@ impl Db {
     ) -> Result<(bool, Vec<String>)> {
         let txn = self.db.begin_write().context("starting a write")?;
         if let Some(value) = &value {
-            check(key, value, &txn.open_table(REGISTRIES)?)?;
+            check(
+                key,
+                value,
+                &txn.open_table(REGISTRIES)?,
+                &txn.open_table(NAMESPACES)?,
+            )?;
         } else if vk_hub_proto::settings::kind(key).is_none() {
             bail!("{key} is not a setting the hub may set");
         }
@@ -466,7 +505,7 @@ mod tests {
         };
         let named = |now| db.set_setting(None, "registry", Some(json!(reg)), "u", now);
         assert!(format!("{:#}", named(2).unwrap_err()).contains("no URL bound"));
-        db.set_registry_url(&reg, Some("http://Reg.example:5000"), "u", 3)
+        db.set_registry_url(&reg, Some("http://Reg.example:5000"), None, "u", 3)
             .unwrap();
         named(4).unwrap();
         assert_eq!(
@@ -484,15 +523,27 @@ mod tests {
             created_by: "u".into(),
         };
         db.put_namespace(&reg, &pipeline, "u", 5).unwrap();
-        db.set_registry_url(&reg, Some("https://reg.example"), "u", 6)
+        // A table a node would refuse is not sent, nor can it be named.
+        db.set_registry_url(&reg, Some("https://reg.example"), Some("PEM"), "u", 6)
             .unwrap();
         assert_eq!(db.steer_settings(7).unwrap(), std::slice::from_ref(&id));
+        assert!(desired(&db, &id).settings.is_empty());
+        let refused = db.set_setting(Some(&id), "registry", Some(json!(reg)), "u", 7);
+        assert!(
+            format!("{:#}", refused.unwrap_err()).contains("nodes would refuse"),
+            "named"
+        );
+        let ca = include_str!("../testdata/tls-ca.pem");
+        db.set_registry_url(&reg, Some("https://reg.example"), Some(ca), "u", 8)
+            .unwrap();
+        assert_eq!(db.steer_settings(8).unwrap(), std::slice::from_ref(&id));
         assert_eq!(
             desired(&db, &id).settings["registry"],
-            json!({"repo": "reg.example", "pipeline_root": "pipes", "guest_credential": "job"})
+            json!({"repo": "reg.example", "ca_pem": ca, "pipeline_root": "pipes",
+                   "guest_credential": "job"})
         );
         // Unbound or gone, the registry is no longer sent; the setting stays.
-        db.set_registry_url(&reg, None, "u", 8).unwrap();
+        db.set_registry_url(&reg, None, None, "u", 8).unwrap();
         db.steer_settings(9).unwrap();
         assert!(desired(&db, &id).settings.is_empty());
         assert_eq!(db.settings_layers().unwrap().fleet["registry"], json!(reg));

@@ -27,8 +27,6 @@ const REGISTRY_CA: &str = "registry-ca-";
 /// Retain retired CAs for the maximum job-token lifetime (`max_job_token_secs` at most),
 /// so jobs that started with them keep registry access until their tokens expire.
 const RETIRED_CA_KEPT: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-/// The most a `ca_pem` may hold.
-const MAX_CA_PEM: usize = 256 * 1024;
 
 /// Reads a key's effective value off a loaded config.
 type Read = fn(&Config) -> Option<Value>;
@@ -376,42 +374,14 @@ fn check_value(key: &str, cfg: &Config) -> Result<()> {
     }
 }
 
-/// That a `[registry]` from the hub names a remote registry, and nothing of the node's: no
-/// path, no credential; its guests reach it with the job's token alone, and `ca_pem` holds
-/// certificates.
+/// That a `[registry]` from the hub, which the hub's own check of it passed, has a `ca_pem`
+/// that holds certificates.
 fn check_registry(value: &toml::Value) -> Result<(), String> {
-    let toml::Value::Table(table) = value else {
-        return Err("not a table".to_string());
-    };
-    if let Some(key) = table.keys().find(|k| !REGISTRY_KEYS.contains(&k.as_str())) {
-        return Err(format!(
-            "`{key}` is the node's own to set: the hub may name only {}",
-            REGISTRY_KEYS.join(", ")
-        ));
-    }
-    if table
-        .get("guest_credential")
-        .is_some_and(|v| v.as_str() != Some("job"))
-    {
-        return Err(
-            "`guest_credential` may only be \"job\": a registry the hub names lends guests the \
-             job's token, never a credential of the node's"
-                .to_string(),
-        );
-    }
-    if let Some(pem) = table.get("ca_pem") {
-        let pem = pem.as_str().ok_or("`ca_pem` is not a string")?;
-        if pem.len() > MAX_CA_PEM {
-            return Err(format!("`ca_pem` is over {MAX_CA_PEM} bytes"));
-        }
-        super::roots_from_pem(pem.as_bytes(), Path::new("`ca_pem`"))
-            .map_err(|e| format!("{e:#}"))?;
-    }
-    match table.get("repo").and_then(toml::Value::as_str) {
-        Some(repo) if crate::config::Registry::local_root_of(repo).is_some() => {
-            Err("`repo` names a store on the host, not a registry".to_string())
-        }
-        _ => Ok(()),
+    match value.get("ca_pem").and_then(toml::Value::as_str) {
+        Some(pem) => super::roots_from_pem(pem.as_bytes(), Path::new("`ca_pem`"))
+            .map(drop)
+            .map_err(|e| format!("{e:#}")),
+        None => Ok(()),
     }
 }
 
@@ -721,7 +691,7 @@ mod tests {
             ),
             (json!({"repo": "r/ci", "ca_pem": 1}), "a string"),
             (
-                json!({"repo": "r/ci", "ca_pem": "x".repeat(MAX_CA_PEM + 1)}),
+                json!({"repo": "r/ci", "ca_pem": "x".repeat(vk_hub_proto::settings::MAX_CA_PEM + 1)}),
                 "over",
             ),
         ] {

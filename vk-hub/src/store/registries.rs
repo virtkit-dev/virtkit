@@ -58,6 +58,10 @@ pub struct RegistryRow {
     /// `[registry]` is this URL get tokens for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The CA, PEM, its TLS certificate chains to at `url`, as the operator gave it: nodes the
+    /// hub names the registry to pin it. `None`: the system's roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
     /// The generation of the desired state each token-signing key was first sent in: the hub
     /// signs its tokens with a key only once it reports applying that generation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -456,12 +460,14 @@ impl Db {
         })
     }
 
-    /// Bind registry `id` to `url` ([`normalize_registry_url`]), or unbind it (`None`),
-    /// audited as `actor`'s; refused when another registry holds the URL. Whether it changed.
+    /// Bind registry `id` to `url` ([`normalize_registry_url`]) and the CA `ca_pem` its
+    /// certificate chains to there, or unbind it (`None`, which drops the CA too), audited as
+    /// `actor`'s; refused when another registry holds the URL. Whether it changed.
     pub fn set_registry_url(
         &self,
         id: &str,
         url: Option<&str>,
+        ca_pem: Option<&str>,
         actor: &str,
         now: u64,
     ) -> Result<bool> {
@@ -472,6 +478,7 @@ impl Db {
             ),
             None => None,
         };
+        let ca_pem = url.as_ref().and(ca_pem).map(str::to_string);
         let txn = self.db.begin_write().context("starting a write")?;
         let changed = {
             let mut table = txn.open_table(REGISTRIES)?;
@@ -488,13 +495,19 @@ impl Db {
                 }
             }
             let mut row = row.ok_or_else(|| NotEnrolled(id.to_string()))?;
-            if row.url == url {
+            if (&row.url, &row.ca_pem) == (&url, &ca_pem) {
                 false
             } else {
                 row.url.clone_from(&url);
+                row.ca_pem.clone_from(&ca_pem);
                 table.insert(id, encode(&row)?.as_slice())?;
+                let ca = if ca_pem.is_some() {
+                    " with a CA of its own"
+                } else {
+                    ""
+                };
                 let event = match &url {
-                    Some(u) => format!("{actor} bound registry {id} to {u}"),
+                    Some(u) => format!("{actor} bound registry {id} to {u}{ca}"),
                     None => format!("{actor} unbound registry {id} from its URL"),
                 };
                 append_audit(&txn, Some(id), actor, &event, now)?;

@@ -224,9 +224,12 @@ with the source `default`.
 
   The hub's `registry` setting names a registry it manages by ID, and the hub sends each node
   the table that reaches it: `repo` the host and port of its bound URL, `insecure` for an
-  `http` URL, and `pipeline_root` the leading fixed components of its `ci-pipeline` namespace's
-  path. A registry with no URL bound cannot be named, and one unbound or removed since is not
-  sent, the setting kept; a change to its URL or namespaces moves the nodes on.
+  `http` URL, `ca_pem` the CA the operator gave with the URL, which the hub cannot learn from
+  the registry, and `pipeline_root` the leading fixed components of its `ci-pipeline` namespace's
+  path. The hub checks that table as a node does: a registry with no URL bound, or whose table
+  a node would refuse, cannot be named, and one unbound, removed or refused since is not sent,
+  the setting kept — the registry's page says why it is refused; a change to its URL, CA or
+  namespaces moves the nodes on.
 
   Holding no credential, the node pulls a placed job's images from the registry — `virtkit/`
   bundles, `pipeline/build/` images, and Docker images it offers the registry's relay first —

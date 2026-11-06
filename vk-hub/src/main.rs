@@ -1221,6 +1221,10 @@ enum RegistriesCmd {
         /// Unbind it: nodes get no tokens for it
         #[arg(long, conflicts_with = "url")]
         none: bool,
+        /// The CA its TLS certificate chains to at the URL, PEM: given to the nodes the hub's
+        /// `registry` setting names it to. Without, nodes check it against their system roots
+        #[arg(long, value_name = "FILE", conflicts_with = "none")]
+        ca: Option<std::path::PathBuf>,
     },
     /// Mint a token for the registry, printed once: for automation or a test
     Token {
@@ -3750,9 +3754,29 @@ fn registries_blocking(client: &admin::Client, cmd: Option<RegistriesCmd>) -> Re
             let command = client.update_registry(&id, &release)?;
             eprintln!("vk-hub: registry {id}: issued command {}", command.id);
         }
-        Some(RegistriesCmd::SetUrl { id, url, none: _ }) => {
+        Some(RegistriesCmd::SetUrl {
+            id,
+            url,
+            none: _,
+            ca,
+        }) => {
+            let ca_pem = match ca {
+                Some(path) => {
+                    let pem = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    if pem.len() > registries::MAX_CA_PEM {
+                        bail!(
+                            "{} is over {} bytes: give the registry's CA alone",
+                            path.display(),
+                            registries::MAX_CA_PEM
+                        );
+                    }
+                    Some(pem)
+                }
+                None => None,
+            };
             // `--none` conflicts with a URL, so it leaves `url` unset.
-            if client.set_registry_url(&id, url)? {
+            if client.set_registry_url(&id, url, ca_pem)? {
                 eprintln!("vk-hub: registry {id}: URL changed");
             } else {
                 eprintln!("vk-hub: already so; nothing changed");
@@ -3853,6 +3877,16 @@ fn render_registry(
             .clone()
             .unwrap_or_else(|| "none bound (vk-hub registries set-url)".to_string()),
     );
+    if r.row.url.is_some() {
+        field(
+            "ca",
+            if r.row.ca_pem.is_some() {
+                "its own, given to the nodes it is named to".to_string()
+            } else {
+                "the system's roots".to_string()
+            },
+        );
+    }
     if let Some(u) = &r.row.usage {
         field(
             "usage",
