@@ -151,8 +151,18 @@ impl Creds {
     }
 
     /// What `[registry]` names — the same credential `registry::cred` resolves for the
-    /// bundle paths, in the shape the OCI client here takes.
+    /// bundle paths, a job's token first, in the shape the OCI client here takes.
     pub fn from_registry(rg: &Registry) -> Result<Creds> {
+        if let Some(token) = rg.live_job_token() {
+            return Creds {
+                username: None,
+                password: None,
+                token: Some(token.to_string()),
+                ca_pem: None,
+                insecure: rg.insecure,
+            }
+            .with_ca_file(rg.ca_file.as_deref());
+        }
         Creds::from_files(CredFiles {
             section: "[registry]",
             ca_file: rg.ca_file.as_deref(),

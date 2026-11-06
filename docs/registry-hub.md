@@ -641,7 +641,10 @@ though within them it can claim protection.
   trace.
 - **Unchanged in this step.** These keep the node's credential: image pulls and relays,
   `vk build`'s build cache, and the build-once locks and failure memos `vk` takes around a
-  build. Pulling a job's image with a read token for its namespace (`images` for most) is
+  build. Under `"job"`, a node without its own credential uses the placed job's token for image
+  pulls, relays and locks; this includes nodes using the registry their hub names
+  ([fleet design](fleet-design.md#hub-settings)). Pulling a job's image with a read token for
+  its namespace (`images` for most) is
   the next step, as `fleet-design.md` intends.
 
 ### 4b: registry access from inside a job

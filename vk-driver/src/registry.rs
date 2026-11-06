@@ -311,14 +311,20 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
 }
 
 /// `rg` with its repository prefix replaced by `path`, an absolute path on the same registry,
-/// and `token`, when given, in place of its credential. `None` for a local store or a `repo`
-/// naming no host.
-pub(crate) fn at_path(rg: &Registry, path: &str, token: Option<&str>) -> Option<Registry> {
+/// and `token`, when given, in place of its credential; without one, it keeps `rg`'s. `None`
+/// for a local store or a `repo` naming no host.
+pub(crate) fn at_path(
+    rg: &Registry,
+    path: &str,
+    token: Option<crate::config::JobToken>,
+) -> Option<Registry> {
     let (base, _) = rg.base_url()?;
     let authority = base.split_once("://").map_or(base.as_str(), |(_, a)| a);
     let mut out = rg.clone();
     out.repo = format!("{authority}/{path}");
-    out.job_token = token.map(|t| crate::config::JobToken(t.to_string()));
+    if token.is_some() {
+        out.job_token = token;
+    }
     Some(out)
 }
 
@@ -3504,7 +3510,7 @@ const BUILD_FAIL_TTL: Duration = Duration::from_secs(6 * 3600);
 /// Failure-memo pipeline for the lock API: `Some(None)` uses the job token's pipeline.
 /// Without a job token, use the CI pipeline or return `None` to disable memos.
 fn memo_pipeline(rg: &Registry) -> Option<Option<String>> {
-    if rg.job_token.is_some() {
+    if rg.live_job_token().is_some() {
         Some(None)
     } else {
         crate::jobctx::pipeline_identity().map(Some)
@@ -3566,8 +3572,10 @@ pub(crate) enum Cred {
 }
 
 pub(crate) fn cred(rg: &Registry) -> Result<Cred> {
-    if let Some(t) = &rg.job_token {
-        return Ok(Cred::Bearer { token: t.0.clone() });
+    if let Some(token) = rg.live_job_token() {
+        return Ok(Cred::Bearer {
+            token: token.to_string(),
+        });
     }
     if let Some(tf) = &rg.token_file {
         // A bearer token carries no meaningful surrounding whitespace, so trim both ends
@@ -4615,6 +4623,10 @@ mod local {
 pub(crate) mod tests {
     use super::*;
 
+    fn live_token() -> crate::config::JobToken {
+        crate::config::JobToken::new("vkt_x.y", u64::MAX)
+    }
+
     /// A layer's lock and memo name is its repository path under the cache's prefix, so a
     /// job's token on that prefix covers it.
     #[test]
@@ -4623,7 +4635,7 @@ pub(crate) mod tests {
             Registry::for_share(repo.into(), false, None, String::new(), None, None, None)
         };
         let node = at("reg.example");
-        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some("vkt_x.y")).unwrap();
+        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some(live_token())).unwrap();
         assert_eq!(
             lock_name(&scoped, "build-cache", "win-abc"),
             "ci-build/gl/42/protected/all/build-cache:win-abc"
@@ -4651,7 +4663,7 @@ pub(crate) mod tests {
             None,
             None,
         );
-        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some("vkt_x.y")).unwrap();
+        let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some(live_token())).unwrap();
         assert_eq!(memo_pipeline(&scoped), Some(None));
     }
 

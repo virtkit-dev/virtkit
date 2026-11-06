@@ -115,7 +115,11 @@ fn checked(prefix: &str) -> Result<&str> {
 
 /// The node's `[registry]` at `<prefix>/builds`, with `token` in place of its credential when
 /// given.
-fn builds(cfg: &Config, prefix: &str, token: Option<&str>) -> Result<crate::config::Registry> {
+fn builds(
+    cfg: &Config,
+    prefix: &str,
+    token: Option<crate::config::JobToken>,
+) -> Result<crate::config::Registry> {
     let rg = cfg
         .registry
         .as_ref()
@@ -147,7 +151,8 @@ pub fn resolve_ref(
     crate::image::resolve_ref(cfg, state_dir, image)
 }
 
-/// `pipeline/build/<spec>`, pulled with the node's credential, always by tag.
+/// `pipeline/build/<spec>`, pulled with the node's credential (the job's token on a node with
+/// none, see [`crate::jobctx::JobCtx`]), always by tag.
 fn resolve_build(
     cfg: &Config,
     state_dir: &Path,
@@ -326,7 +331,7 @@ fn publication(
     let prefix = prefix(job)?;
     let token = job
         .filter(|j| vk_peer::now_secs() < j.expires_at)
-        .map(|j| j.token.as_str())
+        .map(crate::config::JobToken::of)
         .context("the job's registry token has expired")?;
     builds(cfg, prefix, Some(token))
 }

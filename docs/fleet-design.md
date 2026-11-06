@@ -214,6 +214,18 @@ with the source `default`.
   a job's registry token lives, for the jobs that started with it. A local `[registry]` is
   taken whole; the two never merge.
 
+  Holding no credential, the node pulls a placed job's images from the registry — `virtkit/`
+  bundles, `pipeline/build/` images, and Docker images it offers the registry's relay first —
+  with the job's token, as it does on any node lending guests the job's token with no
+  credential of its own; so the hub's namespaces must grant jobs read where their images live,
+  and a relay the token cannot read falls back to a direct pull. Past the token's expiry the
+  node sends it no more and pulls as nobody. Limits: outside a placed job (`vk build`,
+  `vk registry pull`, a job gitlab-runner gives the node) the node reaches the registry as nobody,
+  which a registry that takes no anonymous requests refuses, until nodes get tokens of their
+  own; Windows install media and layers go through `[build]`'s cache settings, not this
+  registry; and an image already in the node's cache by digest is served to any job without
+  asking the registry, as it is under a node credential.
+
 The node reports a hash of its effective configuration, hub settings included, and its node
 page shows it, so drift between nodes that should match is visible.
 

@@ -1072,17 +1072,48 @@ pub struct Registry {
     /// reaches pipeline images through `pipeline/build/` alone.
     #[serde(default)]
     pub pipeline_root: Option<String>,
-    /// A runtime bearer token for storing on a job's behalf, overriding the configured
-    /// credential. Never read from a config. Only [`crate::registry::at_path`] sets it, on a
-    /// copy used for publication; the node's own `[registry]` is unchanged.
+    /// A runtime bearer token for reaching the registry on a job's behalf, overriding the
+    /// configured credential. Never read from a config. [`crate::registry::at_path`] sets it on
+    /// a copy used for publication, and a placed job's context on its own config when the node
+    /// has no credential of its own; the node's `[registry]` is unchanged.
     /// [`crate::registry::cred`] supplies it to every request through that copy.
     #[serde(skip)]
     pub(crate) job_token: Option<JobToken>,
 }
 
-/// A job's registry token, kept out of `Debug`.
+/// A job's registry token, kept out of `Debug`, and when it expires.
 #[derive(Clone)]
-pub(crate) struct JobToken(pub(crate) String);
+pub(crate) struct JobToken {
+    token: String,
+    /// Seconds since the epoch.
+    expires_at: u64,
+}
+
+impl JobToken {
+    pub(crate) fn new(token: &str, expires_at: u64) -> JobToken {
+        JobToken {
+            token: token.to_string(),
+            expires_at,
+        }
+    }
+
+    /// The token the hub gave a job for `registry`.
+    pub(crate) fn of(registry: &vk_hub_proto::dispatch::JobRegistry) -> JobToken {
+        JobToken::new(&registry.token, registry.expires_at)
+    }
+
+    /// The token while it is live. From its expiry on, a registry refuses it, so a request
+    /// goes without it rather than fail on it.
+    pub(crate) fn live(&self) -> Option<&str> {
+        (vk_peer::now_secs() < self.expires_at).then_some(self.token.as_str())
+    }
+
+    /// The token, live or not.
+    #[cfg(test)]
+    pub(crate) fn secret(&self) -> &str {
+        &self.token
+    }
+}
 
 impl std::fmt::Debug for JobToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1147,6 +1178,17 @@ impl Registry {
     /// `guest_credential = "job"` on a remote registry.
     pub fn lends_job_token(&self) -> bool {
         self.guest_credential == GuestCredential::Job && self.local_root().is_none()
+    }
+
+    /// Whether this section names a credential of the node's own: a `token_file`, or a
+    /// `username`.
+    pub fn has_credential(&self) -> bool {
+        self.token_file.is_some() || !self.username.is_empty()
+    }
+
+    /// [`Registry::job_token`] while it is live ([`JobToken::live`]).
+    pub(crate) fn live_job_token(&self) -> Option<&str> {
+        self.job_token.as_ref().and_then(JobToken::live)
     }
 
     /// [`Registry::local_root`]'s test applied to a repo string that is not (yet) a

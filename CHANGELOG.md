@@ -8,8 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **A fleet node can use the registry its hub names.** With no `[registry]` in its config, the
   node takes the hub's, CA included, and holds no registry credential of its own: its jobs'
-  guests reach the registry with the token the hub gives each job. The hub cannot name one
-  yet.
+  guests reach the registry with the token the hub gives each job, and so do the node's own
+  pulls of the job's images. The hub cannot name one yet.
 - **CI jobs can wait for vCPUs as they wait for memory.** With `[executor.schedule]
   cpu_overcommit` set, a job waits while the guests' vCPUs would pass that many per CPU of the
   host, and `vk tune` asks the runner for no more jobs than that leaves room for. A fleet node
@@ -33,6 +33,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **Nodes that lend guests the job's registry token and have no registry credential
+  now use that token to pull placed jobs' images,** replacing anonymous pulls; once the token
+  has expired, they pull anonymously again.
 - **vk-hub places jobs only where a node's memory is free now as well as within its budget,**
   keeping 15 % of the node's RAM spare, as `vk tune` does.
 - **A fleet node needs no memory budget or vCPU ceiling in its config.** Unless its config or

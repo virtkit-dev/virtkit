@@ -139,6 +139,23 @@ fn read_job_start(path: &Path) -> Result<vk_hub_proto::dispatch::JobStart> {
         .with_context(|| format!("reading the job's start {}", path.display()))
 }
 
+/// Use the hub-provided job token for registry access, including image pulls, when `[registry]`
+/// lends it to guests and has no node credential. The token's grants govern which images the
+/// job may pull; past its expiry, requests go anonymously. A node with its own credential keeps
+/// using it.
+fn with_job_token(
+    mut cfg: Config,
+    registry: Option<&vk_hub_proto::dispatch::JobRegistry>,
+) -> Config {
+    if let (Some(rg), Some(job)) = (cfg.registry.as_mut(), registry)
+        && rg.lends_job_token()
+        && !rg.has_credential()
+    {
+        rg.job_token = Some(crate::config::JobToken::of(job));
+    }
+    cfg
+}
+
 /// [`JobCtx::images_dir`] of any job run with `cfg`.
 pub fn images_dir(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("job-images")
@@ -240,6 +257,7 @@ impl JobCtx {
             }
             None => (None, None),
         };
+        let cfg = with_job_token(cfg, job_registry.as_ref());
         let egress_record = env(JOB_EGRESS)
             .filter(|_| hub_placed)
             .filter(|p| !p.is_empty())
@@ -925,7 +943,7 @@ fn cache_dest(
     let Some(rg) = cfg.registry.as_ref() else {
         return off("this node has no [registry]");
     };
-    match crate::registry::at_path(rg, prefix, Some(&registry.token)) {
+    match crate::registry::at_path(rg, prefix, Some(crate::config::JobToken::of(registry))) {
         Some(rg) => JobCacheDest {
             dest: CacheDest::Scoped(rg),
             local: LocalScope::Shared(scope_hash(&[
@@ -980,6 +998,65 @@ mod tests {
         assert_eq!(ctx.user_req.as_deref(), Some("1000"), "the last one wins");
         assert_eq!(ctx.build_failure, 5);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with no registry credential of its own pulls a placed job's images with the
+    /// job's token, under `guest_credential = "job"` alone; a node with one keeps it.
+    #[test]
+    fn a_node_without_a_credential_pulls_with_the_jobs_token() {
+        let job = vk_hub_proto::dispatch::JobRegistry {
+            registry_id: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+            token: "vkt_x.y".into(),
+            expires_at: u64::MAX,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+            areas: vec![],
+            build_prefix: None,
+        };
+        let token = |registry: &str, job: Option<&vk_hub_proto::dispatch::JobRegistry>| {
+            let cfg = crate::config::from_table(toml::from_str(registry).unwrap()).unwrap();
+            with_job_token(cfg, job)
+                .registry
+                .and_then(|rg| rg.live_job_token().map(str::to_string))
+        };
+        let lends = "[registry]\nrepo = \"reg.example.com/ci\"\nguest_credential = \"job\"\n";
+        assert_eq!(token(lends, Some(&job)).as_deref(), Some("vkt_x.y"));
+        assert_eq!(token(lends, None), None);
+        let own = format!("{lends}token_file = \"/t\"\n");
+        assert_eq!(token(&own, Some(&job)), None);
+        let node = "[registry]\nrepo = \"reg.example.com/ci\"\n";
+        assert_eq!(token(node, Some(&job)), None);
+        let rg = with_job_token(
+            crate::config::from_table(toml::from_str(lends).unwrap()).unwrap(),
+            Some(&job),
+        )
+        .registry
+        .unwrap();
+        // Every client of the section sends it: a repository on the same registry, and the
+        // relay.
+        let at = crate::registry::at_path(&rg, "ci-pipeline/gl/1/2/builds", None).unwrap();
+        assert_eq!(at.live_job_token(), Some("vkt_x.y"));
+        let creds = crate::oci::Creds::from_registry(&rg).unwrap();
+        assert_eq!(creds.token.as_deref(), Some("vkt_x.y"));
+        // Expired, it is no longer sent: the node pulls as nobody.
+        let expired = vk_hub_proto::dispatch::JobRegistry {
+            expires_at: vk_peer::now_secs(),
+            ..job
+        };
+        assert_eq!(token(lends, Some(&expired)), None);
+        let rg = with_job_token(
+            crate::config::from_table(toml::from_str(lends).unwrap()).unwrap(),
+            Some(&expired),
+        )
+        .registry
+        .unwrap();
+        let creds = crate::oci::Creds::from_registry(&rg).unwrap();
+        assert_eq!(creds.token, None);
+        assert!(matches!(
+            crate::registry::cred(&rg).unwrap(),
+            crate::registry::Cred::None
+        ));
     }
 
     /// A placed job's registry access and egress layer come from the start its driver names,
@@ -1258,7 +1335,7 @@ mod tests {
             panic!("{:?}", c.dest)
         };
         assert_eq!(rg.repo, "reg.example/ci-build/gl/42/protected/all");
-        assert_eq!(rg.job_token.as_ref().map(|t| t.0.as_str()), Some("vkt_x.y"));
+        assert_eq!(rg.job_token.as_ref().map(|t| t.secret()), Some("vkt_x.y"));
         assert_eq!(c.why_off, None);
         assert!(matches!(c.local, LocalScope::Shared(_)), "{:?}", c.local);
         let other_job = cache_dest(&cfg, true, Some(&job), true, 1, "theirs");
