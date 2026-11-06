@@ -901,12 +901,12 @@ async fn an_api_key_is_the_access_key_and_its_secret_until_revoked_or_expired() 
     }
 }
 
-/// A refusal before authentication reads up to 64 KiB of the body, so a write sees its answer
+/// A refusal before authentication reads up to 8 MiB of the body, so a write sees its answer
 /// rather than a reset, a large one while it is still sending; the connection then closes,
 /// as after any refusal of a request with a body, rather than the server reading the rest.
 /// Without a body, the connection goes on.
 #[tokio::test]
-async fn a_refused_body_is_read_up_to_64_kib() {
+async fn a_refused_body_is_read_up_to_8_mib() {
     let dir = tmp("drain");
     let (state, _) = shared(
         &dir,
@@ -967,12 +967,12 @@ async fn a_refused_body_is_read_up_to_64_kib() {
         assert_eq!(resp.header("connection"), Some("close"), "{code}");
         assert!(conn.closed().await, "{code}");
 
-        // A MiB of a body declared 64 MiB long, the rest never sent: the answer comes all
+        // 9 MiB of a body declared 64 MiB long, the rest never sent: the answer comes all
         // the same, so the server did not wait for the body's end.
-        let req = req(vec![b'x'; 1 << 20]);
+        let req = req(vec![b'x'; 9 << 20]);
         let mut conn = Conn::open(&host).await;
         let head = req.head(&host).replace(
-            &format!("Content-Length: {}", 1 << 20),
+            &format!("Content-Length: {}", 9 << 20),
             &format!("Content-Length: {}", 64 << 20),
         );
         let mut write = conn.write.take().unwrap();
@@ -991,6 +991,73 @@ async fn a_refused_body_is_read_up_to_64_kib() {
         assert!(conn.closed().await, "{code}");
         drop(writer.await.unwrap());
     }
+}
+
+/// A client holding its body back on `Expect: 100-continue` gets a refusal as its first
+/// answer, before any `100`, and never sends the body; one admitted gets the `100`, sends
+/// the body and is answered as usual.
+#[tokio::test]
+async fn a_refusal_comes_before_any_100_continue() {
+    let dir = tmp("expect");
+    let (state, _) = shared(
+        &dir,
+        Auth::Bearer {
+            token: "s3cret".into(),
+        },
+        true,
+    );
+    let host = spawn(state);
+    /// The head of `req` with a 123-byte body announced and held back.
+    fn held(req: &Req, host: &str) -> String {
+        req.head(host).replace(
+            "Content-Length: 0",
+            "Content-Length: 123\r\nExpect: 100-continue",
+        )
+    }
+    let put = || Req::new("PUT", "/s3/b/k");
+    // Before authentication, and after it.
+    for (req, status) in [
+        (put(), 403),
+        (put().header("Authorization", "Bearer nope"), 403),
+        (
+            put()
+                .header("x-amz-tagging", "a=b")
+                .signed(&host, ("s3cret", "s3cret"), 0),
+            501,
+        ),
+    ] {
+        let mut conn = Conn::open(&host).await;
+        let write = conn.write.as_mut().unwrap();
+        write.write_all(held(&req, &host).as_bytes()).await.unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
+            .await
+            .expect("answered without the body");
+        assert_eq!(resp.status, status, "{resp:?}");
+        assert_eq!(resp.header("connection"), Some("close"));
+        assert!(conn.closed().await);
+    }
+    // Admitted: the 100, then the body, then the answer.
+    let body = vec![b'x'; 123];
+    let req = put().signed(&host, ("s3cret", "s3cret"), 0);
+    let mut conn = Conn::open(&host).await;
+    let write = conn.write.as_mut().unwrap();
+    write.write_all(held(&req, &host).as_bytes()).await.unwrap();
+    let mut line = String::new();
+    conn.read.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+    line.clear();
+    conn.read.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "\r\n");
+    conn.write.as_mut().unwrap().write_all(&body).await.unwrap();
+    conn.response().await.ok(200);
+    is_object(
+        &send(
+            &host,
+            Req::new("GET", "/s3/b/k").signed(&host, ("s3cret", "s3cret"), 0),
+        )
+        .await,
+        &body,
+    );
 }
 
 /// `s3 = false`: `/s3/` is the 404 any unknown path is, after the usual gate.

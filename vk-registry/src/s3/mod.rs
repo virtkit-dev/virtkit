@@ -40,7 +40,7 @@ mod xml;
 use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::header::{
-    AUTHORIZATION, DATE, HeaderMap, HeaderValue, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
+    AUTHORIZATION, DATE, EXPECT, HeaderMap, HeaderValue, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use vk_hub_proto::token::Claims;
@@ -76,9 +76,10 @@ pub(crate) fn host_of(req: &Request<Incoming>) -> Option<&str> {
 }
 
 /// How much of a request body is read before answering a refusal decided before the caller
-/// is known: enough for a small write to see its answer rather than a reset, not so much
-/// that anyone who can reach the port can make the server read a large upload for nothing.
-const PRE_AUTH_DRAIN: u64 = 64 * 1024;
+/// is known: enough for a write of a part's size (the AWS CLI's 8 MiB) to see its answer
+/// rather than a reset, not so much that anyone who can reach the port can make the server
+/// read a large upload for nothing.
+const PRE_AUTH_DRAIN: u64 = 8 << 20;
 
 /// The header naming each request, for a client's report to be matched to a server line.
 const REQUEST_ID: &str = "x-amz-request-id";
@@ -451,9 +452,22 @@ fn scheme(headers: &HeaderMap) -> std::result::Result<bool, &'static str> {
 /// Answer `resp` once the request body has been read through, as after every refusal of an
 /// authenticated request: a status sent with request bytes unread resets the connection,
 /// which a client sees instead of the answer. A body past the object cap is refused with 413
-/// instead.
+/// instead. A client waiting on `Expect: 100-continue` has sent no body yet: it is answered
+/// at once, and the `100` it would have sent the body on never goes out.
 async fn refuse(req: Request<Incoming>, resp: Response<Body>, ctx: &Ctx) -> Result<Response<Body>> {
+    if expects_continue(req.headers()) {
+        return Ok(resp);
+    }
     Ok(drain(req, ctx).await?.unwrap_or(resp))
+}
+
+/// Whether the client holds its body back until a `100 Continue`, which hyper sends only once
+/// the body is first read: an answer given before that is the final one, and the body never
+/// comes.
+fn expects_continue(headers: &HeaderMap) -> bool {
+    headers
+        .get(EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
 /// Read a request's body through and discard it: `Some(413)` if it crosses the object cap.
@@ -495,9 +509,12 @@ async fn read_small(
 }
 
 /// Answer `resp` to a request refused before it was authenticated, having read at most
-/// [`PRE_AUTH_DRAIN`] of its body (and the frame that crossed it).
+/// [`PRE_AUTH_DRAIN`] of its body (and the frame that crossed it); none of a body held back
+/// for a `100 Continue`, as [`refuse`] reads none.
 async fn before_auth(req: Request<Incoming>, resp: Response<Body>) -> Result<Response<Body>> {
-    crate::files::drain_up_to(req.into_body(), PRE_AUTH_DRAIN).await;
+    if !expects_continue(req.headers()) {
+        crate::files::drain_up_to(req.into_body(), PRE_AUTH_DRAIN).await;
+    }
     Ok(resp)
 }
 
