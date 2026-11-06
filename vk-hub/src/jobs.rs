@@ -14,8 +14,8 @@
 //! while it is connected, in the placement's pool, carries its labels and reports itself
 //! ready. Its room is what its last heartbeat left — the admission ledger's budget less what
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
-//! what the hub has asked of it since: reservations and jobs accepted after that heartbeat,
-//! offers and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
+//! what the hub has asked of it since: reservations and jobs accepted after the ledger was
+//! read for that heartbeat, offers and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
 //! then the roomiest, then by ID.
 //!
 //! **Image affinity.** A job whose image a node builds from the job's checkout (`dockerfile:`
@@ -1948,7 +1948,9 @@ fn room(
         None => MAX_FITS,
     };
     let heartbeat = row.heartbeat.as_ref()?;
-    let since = row.heartbeat_at.unwrap_or(0);
+    // When its admission was read: as old as the node says, rounded up, before it arrived.
+    let read_secs = heartbeat.admission_age_ms.map_or(0, |ms| ms.div_ceil(1000));
+    let since = row.heartbeat_at.unwrap_or(0).saturating_sub(read_secs);
     // What the hub asked of it that its heartbeat does not show yet.
     let mut pending = Envelope::default();
     let mut add = |e: Envelope| {

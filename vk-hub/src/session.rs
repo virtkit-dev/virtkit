@@ -415,7 +415,7 @@ async fn serve(
                 let now = Instant::now();
                 let held = [
                     pace.held_report(now).map(Write::Report),
-                    pace.held(now).map(Write::Heartbeat),
+                    pace.held(now).map(|(h, arrived)| Write::Heartbeat(h, arrived)),
                 ];
                 for write in held.into_iter().flatten() {
                     let report = matches!(write, Write::Report(_));
@@ -460,7 +460,7 @@ async fn serve(
                         report = true;
                         Some(Write::Inventory(inventory, pace.inventory_durable(now)))
                     }
-                    NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(Write::Heartbeat),
+                    NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(|h| Write::Heartbeat(h, now)),
                     NodeMsg::Report(r) if node.version < STEERING => {
                         pace.report(r.without_steering(), now).map(Write::Report)
                     }
@@ -615,7 +615,8 @@ struct Pace {
 /// One kind of message stored at most once per half heartbeat.
 struct Paced<T> {
     stored_at: Option<Instant>,
-    held: Option<T>,
+    /// The one held back, and when it arrived.
+    held: Option<(T, Instant)>,
 }
 
 impl<T> Default for Paced<T> {
@@ -634,7 +635,7 @@ impl<T> Paced<T> {
             .stored_at
             .is_some_and(|t| now.duration_since(t) < HEARTBEAT / 2)
         {
-            self.held = Some(msg);
+            self.held = Some((msg, now));
             return None;
         }
         self.held = None;
@@ -642,11 +643,11 @@ impl<T> Paced<T> {
         Some(msg)
     }
 
-    /// The one held back, to store at `now`.
-    fn held(&mut self, now: Instant) -> Option<T> {
-        let msg = self.held.take()?;
+    /// The one held back, to store at `now`, and when it arrived.
+    fn held(&mut self, now: Instant) -> Option<(T, Instant)> {
+        let held = self.held.take()?;
         self.stored_at = Some(now);
-        Some(msg)
+        Some(held)
     }
 }
 
@@ -656,8 +657,8 @@ impl Pace {
         self.heartbeat.offer(heartbeat, now)
     }
 
-    /// The heartbeat held back, to store at `now`.
-    fn held(&mut self, now: Instant) -> Option<Heartbeat> {
+    /// The heartbeat held back, to store at `now`, and when it arrived.
+    fn held(&mut self, now: Instant) -> Option<(Heartbeat, Instant)> {
         self.heartbeat.held(now)
     }
 
@@ -668,7 +669,7 @@ impl Pace {
 
     /// The report held back, to store at `now`.
     fn held_report(&mut self, now: Instant) -> Option<Report> {
-        self.report.held(now)
+        self.report.held(now).map(|(report, _)| report)
     }
 
     /// Whether an inventory arriving at `now` is written durably.
@@ -687,8 +688,19 @@ impl Pace {
 enum Write {
     /// An inventory, and whether to write it durably.
     Inventory(Inventory, bool),
-    Heartbeat(Heartbeat),
+    /// A heartbeat, and when it arrived.
+    Heartbeat(Heartbeat, Instant),
     Report(Report),
+}
+
+/// Add `waited` since arrival to the admission age: the hub timestamps heartbeats at storage.
+/// Leave older nodes' heartbeats unchanged when they omit the age.
+fn aged(mut heartbeat: Heartbeat, waited: Duration) -> Heartbeat {
+    if let Some(age) = heartbeat.admission_age_ms.as_mut() {
+        let waited = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        *age = age.saturating_add(waited);
+    }
+    heartbeat
 }
 
 /// Write `write` for `node`. `Some` carries why the session ends: the node was removed since
@@ -702,7 +714,9 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Peer, write: Write) -> Result<Opti
     let inventory = matches!(write, Write::Inventory(..));
     let written = tokio::task::spawn_blocking(move || match write {
         Write::Inventory(inventory, durable) => db.record_inventory(&id, inventory, durable, now),
-        Write::Heartbeat(heartbeat) => db.record_heartbeat(&id, heartbeat, now).map(|()| false),
+        Write::Heartbeat(heartbeat, arrived) => db
+            .record_heartbeat(&id, aged(heartbeat, arrived.elapsed()), now)
+            .map(|()| false),
         Write::Report(report) => db.record_report(&id, report, now).map(|()| false),
     })
     .await?;
@@ -771,13 +785,35 @@ mod tests {
         assert_eq!(pace.heartbeat(beat(1), t), Some(beat(1)));
         assert_eq!(pace.heartbeat(beat(2), t + HEARTBEAT / 4), None);
         assert_eq!(pace.heartbeat(beat(3), t + HEARTBEAT / 3), None);
-        assert_eq!(pace.held(t + HEARTBEAT), Some(beat(3)));
+        assert_eq!(pace.held(t + HEARTBEAT), Some((beat(3), t + HEARTBEAT / 3)));
         assert_eq!(pace.held(t + HEARTBEAT), None);
         // Storing the held one counts as a store.
         assert_eq!(pace.heartbeat(beat(4), t + HEARTBEAT * 5 / 4), None);
         // One on time is stored, and replaces any held back.
         assert_eq!(pace.heartbeat(beat(5), t + HEARTBEAT * 2), Some(beat(5)));
         assert_eq!(pace.held(t + HEARTBEAT * 3), None);
+    }
+
+    /// Admission age includes storage delays, including time held back by pacing.
+    #[test]
+    fn a_heartbeat_stored_late_ages_its_admission() {
+        let mut pace = Pace::default();
+        let t = Instant::now();
+        let read = |age_ms| Heartbeat {
+            admission: Some(vk_hub_proto::Admission::default()),
+            admission_age_ms: age_ms,
+            ..Heartbeat::default()
+        };
+        assert_eq!(pace.heartbeat(read(Some(100)), t), Some(read(Some(100))));
+        assert_eq!(pace.heartbeat(read(Some(200)), t + HEARTBEAT / 4), None);
+        assert_eq!(
+            pace.held(t + HEARTBEAT),
+            Some((read(Some(200)), t + HEARTBEAT / 4))
+        );
+        let waited = Duration::from_millis(750);
+        assert_eq!(aged(read(Some(200)), waited), read(Some(950)));
+        // An older node's, as it came.
+        assert_eq!(aged(read(None), waited), read(None));
     }
 
     #[test]

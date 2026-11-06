@@ -8,6 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use vk_hub_proto::egress::{EgressCaps, HubPhase, NodeEgressCaps};
@@ -192,6 +193,8 @@ pub fn labels(cfg: &Config) -> anyhow::Result<Vec<String>> {
 pub struct Readings {
     /// The admission as last read, standing in while an admission holds the ledger.
     admission: Option<Admission>,
+    /// When `admission` was read.
+    admission_read: Option<Instant>,
     /// The VM registry the workloads are read from; `None` for the user's own.
     registry: Option<PathBuf>,
     /// The workloads' lister, for its measuring cadence and last figures; made on the first
@@ -207,6 +210,11 @@ impl Readings {
             ..Readings::default()
         }
     }
+
+    /// When the admission the heartbeat carries was read; `None` without one.
+    pub fn admission_read(&self) -> Option<Instant> {
+        self.admission_read
+    }
 }
 
 /// The heartbeat, and the workloads its memory readings are for: both read off one look at
@@ -217,8 +225,10 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
     });
     // Do not wait for the admission's ledger lock: that would delay the heartbeat.
     // Reuse the last admission reading until the lock is free.
+    let read = Instant::now();
     match lister.read_ledger(cfg) {
         Ledger::Read(held) => {
+            readings.admission_read = Some(read);
             readings.admission = Some(Admission {
                 committed_mib: held.granted_mib,
                 // An unresolvable budget (a percentage on a host whose memory cannot be
@@ -232,7 +242,7 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
             });
         }
         Ledger::Busy => {}
-        Ledger::Unreadable => readings.admission = None,
+        Ledger::Unreadable => (readings.admission, readings.admission_read) = (None, None),
     }
     let (workloads, workload_mem_bytes) = lister.look(cfg);
     let heartbeat = Heartbeat {
@@ -258,6 +268,8 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
         load1_hundredths: std::fs::read_to_string("/proc/loadavg")
             .ok()
             .and_then(|t| load1_hundredths(&t)),
+        // Set at send time from [`Readings::admission_read`].
+        admission_age_ms: None,
     };
     (heartbeat, workloads)
 }

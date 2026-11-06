@@ -898,6 +898,10 @@ pub struct Heartbeat {
     /// `None` when unreadable or omitted by an older node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load1_hundredths: Option<u32>,
+    /// How old `admission` was when the heartbeat was sent, in milliseconds: a node reuses its
+    /// last reading while the ledger is busy. `None` without a reading or from an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1674,6 +1678,7 @@ mod tests {
             }],
             workload_mem_bytes: BTreeMap::from([("ab".repeat(8), 1 << 30)]),
             load1_hundredths: Some(250),
+            admission_age_ms: Some(1500),
         }
     }
 
@@ -2008,6 +2013,7 @@ mod tests {
                 }],
                 "workload_mem_bytes": {"abababababababab": 1_u64 << 30},
                 "load1_hundredths": 250,
+                "admission_age_ms": 1500,
             }),
         );
         pinned(

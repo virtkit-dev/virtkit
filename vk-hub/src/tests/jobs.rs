@@ -4277,6 +4277,47 @@ async fn a_node_is_placed_no_more_vcpus_than_its_budget_has_left() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_counts_against_room_until_an_admission_reading_from_after_it_arrives() {
+    let dir = scratch("room-reading");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let node_key = keypair();
+    let id = new_node(addr, &hub, &node_key).await;
+    // Room for two envelopes, and no heartbeat but those sent here.
+    let mut node = connect_beating(
+        addr,
+        &id,
+        &node_key,
+        V3,
+        heartbeat(8192, None),
+        Some(Held::default()),
+        Duration::from_secs(3600),
+    )
+    .await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    running_job(addr, &key, &mut node, 1).await;
+    assert_eq!(fits().await, 1);
+    let accepted = now_secs();
+    while now_secs() <= accepted {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A heartbeat from a later second whose reading, reused, is older than the job.
+    let at = now_secs();
+    let mut beat = heartbeat(8192, None);
+    beat.admission_age_ms = Some(5_000);
+    node.outbox.send(NodeMsg::Heartbeat(beat)).unwrap();
+    wait_until(|| (hub.db.node(&id).unwrap()).is_some_and(|r| r.heartbeat_at >= Some(at))).await;
+    assert_eq!(fits().await, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The next start the hub sends `node`, past the other job messages.
 async fn next_start(node: &mut FakeNode) -> Box<vk_hub_proto::dispatch::JobStart> {
     loop {

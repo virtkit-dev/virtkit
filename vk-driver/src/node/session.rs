@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -88,8 +88,9 @@ enum Ask {
 /// What it answers with.
 pub enum Gathered {
     Inventory(Box<Inventory>),
-    /// The heartbeat, and the workloads its memory readings are for.
-    Heartbeat(Heartbeat, Listed),
+    /// The heartbeat, the workloads its memory readings are for, and when its admission was
+    /// read.
+    Heartbeat(Heartbeat, Listed, Option<Instant>),
 }
 
 /// What is asked and not yet taken up: one flag per kind, so asking again while the gatherer
@@ -148,7 +149,7 @@ impl Gatherer {
                         Ask::Heartbeat => {
                             let (heartbeat, workloads) =
                                 super::inventory::heartbeat(&cfg, &mut readings);
-                            Gathered::Heartbeat(heartbeat, workloads)
+                            Gathered::Heartbeat(heartbeat, workloads, readings.admission_read())
                         }
                     };
                     (g, readings)
@@ -282,8 +283,10 @@ pub async fn run(
             }
             Some(gathered) = gatherer.answers.recv() => {
                 let mut msgs = Vec::with_capacity(2);
+                let mut admission_read = None;
                 match gathered {
-                    Gathered::Heartbeat(hb, listed) => {
+                    Gathered::Heartbeat(hb, listed, read) => {
+                        admission_read = read;
                         // The report first, so the heartbeat's readings land on the list
                         // they are for.
                         workloads = Some(listed);
@@ -297,8 +300,14 @@ pub async fn run(
                         msgs.push(NodeMsg::Inventory(*inventory));
                     }
                 }
-                for msg in &msgs {
-                    if !send_unless_stopped(&mut ws, msg, heartbeat, stop).await? {
+                for mut msg in msgs {
+                    // Send the admission age so the hub can subtract work requested since
+                    // the reading from the node's room.
+                    if let NodeMsg::Heartbeat(hb) = &mut msg {
+                        hb.admission_age_ms = admission_read
+                            .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    }
+                    if !send_unless_stopped(&mut ws, &msg, heartbeat, stop).await? {
                         return Ok(());
                     }
                 }
@@ -884,7 +893,7 @@ mod tests {
                 (&same, false),
                 (&changed, true),
             ] {
-                let beat = Gathered::Heartbeat(Heartbeat::default(), workloads.clone());
+                let beat = Gathered::Heartbeat(Heartbeat::default(), workloads.clone(), None);
                 feed.send(beat).await.unwrap();
                 // Reports may also carry the node's runner state; count only those with workloads.
                 let mut with_workloads = Vec::new();

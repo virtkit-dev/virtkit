@@ -1274,7 +1274,8 @@ only one, memory available whole with no `MemTotal` — its vCPU budget less the
 where it reports a budget, and the job filesystem's most free space, less what
 the hub asked of it since: unanswered offers, unanswered starts without reservations, and
 reservations and jobs accepted after that heartbeat. Jobs on reservations use the reservation's
-acceptance time. `fits` is the sum of each node's room
+acceptance time. Nodes reuse the last admission reading while the ledger is busy. Heartbeats
+report its age so the hub can date the reading back by that much. `fits` is the sum of each node's room
 in envelopes, at most 1024 a node, and at most what its cap leaves.
 
 **The ceiling.** The hub counts offered reservations that have not been refused, unfinished jobs
