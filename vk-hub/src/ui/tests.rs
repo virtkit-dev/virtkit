@@ -1552,10 +1552,15 @@ async fn ask_with(
     )
 }
 
+/// How long a test waits for a background task's outcome: long enough that only a hang, not a
+/// loaded host, runs it out.
+const OUTCOME_WAIT: Duration = Duration::from_secs(60);
+
 /// Wait for the audit log to hold a line containing `want`.
 async fn audited(hub: &Hub, want: &str) -> Vec<String> {
     let mut events = Vec::new();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + OUTCOME_WAIT;
+    while std::time::Instant::now() < deadline {
         events = hub
             .db
             .audits(None, 50)
@@ -1575,7 +1580,8 @@ async fn audited(hub: &Hub, want: &str) -> Vec<String> {
 /// before the page shows it.
 async fn page_with(addr: SocketAddr, path: &str, cookie: &str, want: &str) -> String {
     let mut body = String::new();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + OUTCOME_WAIT;
+    while std::time::Instant::now() < deadline {
         body = get(addr, path, Some(cookie)).await.body;
         if body.contains(want) {
             return body;

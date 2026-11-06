@@ -41,10 +41,7 @@ pub const DEFAULT_SOURCE: &str = "https://github.com/virtkit-dev/virtkit";
 /// seconds, not a download that trickles. Checking what arrived is not counted: it is the
 /// hub's own disk, and a release half adopted when the time ran out would be held all the
 /// same.
-#[cfg(not(test))]
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-#[cfg(test)]
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long asking for the latest release may take.
 pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,6 +56,8 @@ pub struct Source {
     /// As configured, normalized: `https://host/owner/repo`.
     url: String,
     repo: vk_selfupdate::Repository,
+    /// Total time allowed for a fetch's requests: [`FETCH_TIMEOUT`] unless a test shortens it.
+    timeout: Duration,
 }
 
 impl Source {
@@ -98,6 +97,7 @@ impl Source {
         Ok(Source {
             url: format!("https://{host}/{owner}/{name}"),
             repo,
+            timeout: FETCH_TIMEOUT,
         })
     }
 
@@ -106,6 +106,7 @@ impl Source {
         Source {
             url: DEFAULT_SOURCE.to_string(),
             repo: vk_selfupdate::Repository::virtkit(),
+            timeout: FETCH_TIMEOUT,
         }
     }
 
@@ -115,7 +116,14 @@ impl Source {
         Source {
             url: format!("{api}/virtkit-dev/virtkit"),
             repo: vk_selfupdate::Repository::new(api, "virtkit-dev/virtkit").unwrap(),
+            timeout: FETCH_TIMEOUT,
         }
+    }
+
+    /// This source, its fetches given up after `timeout`.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(self, timeout: Duration) -> Source {
+        Source { timeout, ..self }
     }
 
     pub fn url(&self) -> &str {
@@ -373,11 +381,12 @@ async fn fetch(
     version: Option<&str>,
 ) -> Result<Release> {
     set_phase(hub, index, Phase::Resolving);
-    let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + source.timeout;
     let client = vk_selfupdate::client(concat!("vk-hub/", env!("CARGO_PKG_VERSION")))?;
     let asset = program.name();
     let resolved = within(
         deadline,
+        source.timeout,
         vk_selfupdate::artifacts_in(&client, &source.repo, version, &[asset]),
     )
     .await?;
@@ -414,6 +423,7 @@ async fn fetch(
     };
     within(
         deadline,
+        source.timeout,
         vk_selfupdate::fetch(
             &client,
             &artifact.url,
@@ -453,9 +463,10 @@ fn holding(hub: &Hub, sha256: String, program: Program, version: &str) -> Result
     Ok(Holding::Staged(releases::Staged::name(hub, "fetch")?))
 }
 
-/// `request`'s outcome, or an error once `deadline` has passed.
+/// `request`'s outcome, or an error after `deadline` (`timeout` from the fetch's start).
 async fn within<T>(
     deadline: tokio::time::Instant,
+    timeout: Duration,
     request: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::time::timeout_at(deadline, request)
@@ -463,7 +474,7 @@ async fn within<T>(
         .unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
                 "it took longer than {}",
-                crate::human_duration(FETCH_TIMEOUT)
+                crate::human_duration(timeout)
             ))
         })
 }
@@ -664,6 +675,11 @@ pub mod tests {
 
     /// A hub keeping releases in a scratch directory and fetching from `api`.
     pub fn hub_fetching_from(api: &str, tag: &str) -> (Arc<Hub>, std::path::PathBuf) {
+        hub_fetching_with(Source::at(api), tag)
+    }
+
+    /// [`hub_fetching_from`] with `source`.
+    pub fn hub_fetching_with(source: Source, tag: &str) -> (Arc<Hub>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "vk-hub-fetch-{tag}-{}-{}",
             std::process::id(),
@@ -672,7 +688,7 @@ pub mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
             .with_releases(dir.join("releases"))
-            .with_release_source(Some(Source::at(api)));
+            .with_release_source(Some(source));
         (Arc::new(hub), dir)
     }
 
@@ -914,7 +930,9 @@ pub mod tests {
         let mut stalled = FakeRelease::new("v0.85.0", fake_vk("0.85.0"));
         stalled.stall = true;
         let api = fake_github(stalled).await;
-        let (hub, dir) = hub_fetching_from(&api, "stall");
+        // Stalls for good: give up after 5 s, not FETCH_TIMEOUT.
+        let source = Source::at(&api).with_timeout(Duration::from_secs(5));
+        let (hub, dir) = hub_fetching_with(source, "stall");
         let err = one(&hub, Program::Vk, None).await.unwrap_err();
         assert!(format!("{err:#}").contains("took longer than"), "{err:#}");
         assert!(hub.db.releases().unwrap().is_empty());
