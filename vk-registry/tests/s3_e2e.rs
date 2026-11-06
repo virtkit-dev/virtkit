@@ -4818,6 +4818,53 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
     assert_eq!(staging_left(&dir), 0);
 }
 
+/// The same upload completed by several requests at once, as an SDK retrying a completion
+/// that timed out does: one makes the object and the others find the upload completed,
+/// never a part of it missing; the object is the parts', whole.
+#[tokio::test]
+async fn concurrent_completions_of_one_upload_make_one_object() {
+    let (dir, host) = bearer_server("multipart-racey");
+    let sign = |r: Req| r.signed(&host, BEARER, 0);
+    let path = "/s3/b/racey";
+    let parts: Vec<Vec<u8>> = (0..3u8)
+        .map(|p| {
+            (0..5usize << 20)
+                .map(|i| (i * 7 + p as usize) as u8)
+                .collect()
+        })
+        .collect();
+    for round in 0..4 {
+        let id = create_upload(&host, &sign, path).await;
+        let mut etags = Vec::new();
+        for (n, data) in (1..).zip(&parts) {
+            etags.push(upload_part(&host, &sign, path, &id, n, data).await);
+        }
+        let named: Vec<(u32, &str)> = (1..).zip(etags.iter().map(String::as_str)).collect();
+        let mut racing = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let (host, req) = (host.clone(), sign(complete(path, &id, &named)));
+            racing.spawn(async move { send(&host, req).await });
+        }
+        let mut made = 0;
+        while let Some(resp) = racing.join_next().await {
+            let resp = resp.unwrap();
+            if resp.status == 200 {
+                made += 1;
+            } else {
+                resp.is(404, "NoSuchUpload");
+            }
+        }
+        assert_eq!(made, 1, "round {round}");
+        let whole = parts.concat();
+        let resp = send(&host, sign(Req::new("GET", path))).await;
+        is_object(&resp, &whole);
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        assert_eq!(resp.header("etag"), Some(&*multipart_etag(&refs)));
+    }
+    assert!(multipart_left(&dir).is_empty());
+    assert_eq!(staging_left(&dir), 0);
+}
+
 /// A key that may only read a directory can list its uploads and parts, and can neither
 /// start an upload there nor send a part to one.
 #[tokio::test]
