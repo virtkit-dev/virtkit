@@ -227,6 +227,8 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
                 budget_mib: crate::vm::budget_mib(cfg).and_then(Result::ok),
                 running: u32::try_from(held.granted).unwrap_or(u32::MAX),
                 waiting: u32::try_from(held.ahead).unwrap_or(u32::MAX),
+                committed_cpus: Some(u32::try_from(held.granted_cpus).unwrap_or(u32::MAX)),
+                cpu_budget: crate::vm::cpu_budget(cfg),
             });
         }
         Ledger::Busy => {}

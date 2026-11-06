@@ -1187,7 +1187,8 @@ cpu_overcommit = 2        # vCPUs per online CPU, rounded down; 1.5 works too
 ```
 
 It shares the oldest-first queue and `wait_timeout_secs` with memory and disk admission, and
-needs neither. A `MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is
+needs neither. With a memory budget too, `vk tune` asks the runner for no more jobs of
+`[executor.vm] cpus` than the vCPUs left have room for. A `MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is
 to the memory budget; an `[executor.vm] cpus` above it fails every job. Only the job's own
 guest counts, not its services, and a job prepared by an older `vk` counts none. Unset there is
 no vCPU gate — except on a [fleet node](fleet-design.md#defaults-on-an-enrolled-node), where it

@@ -64,6 +64,8 @@ struct Basis {
     running: usize,
     typical_mib: u64,
     host: Option<(u64, u64)>,
+    /// vCPUs committed and their budget, with a vCPU budget.
+    cpus: Option<(u64, u32)>,
 }
 
 /// The smallest of the terms that apply, never below one: `concurrent = 0` is not a throttle
@@ -118,12 +120,22 @@ pub(crate) fn decide_with(
             let typical = typical_job_mib(cfg, declared_mib);
             // Read once: the figures the decision rests on are the ones reported below it.
             let host = host_memory();
+            let cpu_budget = crate::vm::cpu_budget(cfg);
             let want = concurrency(Inputs {
                 budget_mib,
                 granted_mib: held.granted_mib,
                 running: held.granted as u64,
                 typical_mib: typical,
                 host,
+                cpus: cpu_budget.map(|budget| CpuRoom {
+                    free: u64::from(budget).saturating_sub(held.granted_cpus),
+                    // A job's default size, held to the ceiling as it is when one boots.
+                    typical: cfg
+                        .executor
+                        .vm
+                        .max_cpus
+                        .map_or(cfg.executor.vm.cpus, |max| cfg.executor.vm.cpus.min(max)),
+                }),
                 previous,
             });
             let basis = Basis {
@@ -132,6 +144,7 @@ pub(crate) fn decide_with(
                 running: held.granted,
                 typical_mib: typical,
                 host: host.map(|h| (h.available_mib, h.total_mib)),
+                cpus: cpu_budget.map(|budget| (held.granted_cpus, budget)),
             };
             (Some(want), Some(basis))
         }
@@ -239,6 +252,9 @@ pub(crate) fn describe(d: &Decision) -> String {
                 None => "host memory unreadable".to_string(),
             },
         ));
+        if let Some((committed, budget)) = b.cpus {
+            line.push_str(&format!(", {committed} of {budget} vCPUs committed"));
+        }
     }
     line
 }
@@ -482,7 +498,16 @@ pub struct Inputs {
     /// `None` when `/proc/meminfo` cannot be read: the host brake is then off and the ledger
     /// is the only gate, which is what it was before this brake existed.
     pub host: Option<HostMemory>,
+    /// `None` without a vCPU budget.
+    pub cpus: Option<CpuRoom>,
     pub previous: Option<u32>,
+}
+
+/// The vCPUs left under the host's vCPU budget, and what a typical job has.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuRoom {
+    pub free: u64,
+    pub typical: u32,
 }
 
 /// How many jobs the runner should be accepting: the ones already running, plus as many
@@ -507,7 +532,11 @@ pub fn concurrency(i: Inputs) -> u32 {
         }
         None => budget_headroom,
     };
-    let want = i.running + headroom / i.typical_mib.max(1);
+    let mut more = headroom / i.typical_mib.max(1);
+    if let Some(cpus) = i.cpus {
+        more = more.min(cpus.free / u64::from(cpus.typical.max(1)));
+    }
+    let want = i.running + more;
     // Never below one, even then: `concurrent = 0` is not a throttle gitlab-runner has, and a
     // runner that stops taking work entirely never recovers on its own. An idle host under
     // memory pressure therefore still offers the one slot.
@@ -601,6 +630,7 @@ mod tests {
                 total_mib: 65536,
                 shmem_mib: 0,
             }),
+            cpus: None,
             previous: None,
         }
     }
@@ -945,6 +975,35 @@ mod tests {
                 ..inputs()
             }),
             1
+        );
+    }
+
+    #[test]
+    fn the_vcpu_budget_holds_the_estimate_back_too() {
+        let cpus = |free| Some(CpuRoom { free, typical: 4 });
+        // Room for eight by memory, three by vCPUs.
+        assert_eq!(
+            concurrency(Inputs {
+                cpus: cpus(14),
+                ..inputs()
+            }),
+            3
+        );
+        // Room for more vCPUs than memory: memory decides.
+        assert_eq!(
+            concurrency(Inputs {
+                cpus: cpus(64),
+                ..inputs()
+            }),
+            8
+        );
+        assert_eq!(
+            concurrency(Inputs {
+                running: 2,
+                cpus: cpus(0),
+                ..inputs()
+            }),
+            2
         );
     }
 

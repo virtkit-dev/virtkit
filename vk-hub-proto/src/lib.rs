@@ -903,6 +903,12 @@ pub struct Admission {
     pub running: u32,
     /// Jobs waiting for one.
     pub waiting: u32,
+    /// vCPUs held by jobs with reservations; `None` from nodes predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_cpus: Option<u32>,
+    /// Total vCPU limit across jobs; `None` without a budget or from nodes predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_budget: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1616,6 +1622,8 @@ mod tests {
                 budget_mib: Some(400_000),
                 running: 1,
                 waiting: 2,
+                committed_cpus: None,
+                cpu_budget: None,
             }),
             desired_concurrency: Some(9),
             mem_available_mib: Some(300_000),
@@ -1813,6 +1821,21 @@ mod tests {
         );
     }
 
+    /// Admission's two vCPU fields are ignored by older hubs and optional in older heartbeats.
+    #[test]
+    fn admission_vcpus_are_optional_on_the_wire() {
+        let admission = Admission {
+            committed_cpus: Some(6),
+            cpu_budget: Some(32),
+            ..Admission::default()
+        };
+        pinned(
+            &admission,
+            json!({"committed_mib": 0, "budget_mib": null, "running": 0, "waiting": 0,
+                   "committed_cpus": 6, "cpu_budget": 32}),
+        );
+    }
+
     fn pinned<T>(value: &T, wire: serde_json::Value)
     where
         T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -1983,6 +2006,8 @@ mod tests {
                     budget_mib: None,
                     running: 0,
                     waiting: 0,
+                    committed_cpus: None,
+                    cpu_budget: None,
                 }),
                 ..Heartbeat::default()
             }),

@@ -172,12 +172,12 @@ with the source `default`.
   means no vCPU gate: the admission ledger counts each job guest's vCPUs, against the online
   CPUs times the ratio, rounded down. A job waits for vCPUs as it waits for memory, and a
   node refuses an offer past them; a `MICROVM_CPUS` is held to the budget, and an unset
-  `cpus` too.
+  `cpus` too. The heartbeat reports vCPUs committed and the budget, and `vk tune` counts
+  only the jobs both budgets have room for.
 
 Proposed:
 
-- **vCPUs reported.** The heartbeat reports vCPUs committed and the budget, and the hub stops
-  placing on a node past it.
+- **vCPUs placed.** The hub stops placing on a node past its vCPU budget.
 - **Registry.** With no `[registry]` in the local file, the node uses the one the hub names —
   a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
   guests get the job's token (`guest_credential = "job"`), so only jobs the hub places reach
@@ -228,8 +228,7 @@ Every node reports, keeping hard facts, measured load and operator policy apart:
 - **pressure** — memory available, CPU, memory and I/O PSI, disk latency;
 - **runner** — the gitlab-runner configuration, its `concurrent` and runner names, its
   version, and its jobs preparing, waiting on admission, running and cleaning up;
-- **admission** — memory reserved and budget, disk claimed; proposed, vCPUs committed and
-  their budget;
+- **admission** — memory reserved and budget, vCPUs committed and their budget, disk claimed;
 - **versions** — `vk`, the guest kernel, the effective configuration hash.
 
 A transient reading never changes a node's declared capabilities. The facts — hardware,

@@ -614,6 +614,8 @@ fn heartbeat(mem_mib: u64, load1_hundredths: Option<u32>) -> Heartbeat {
             budget_mib: Some(mem_mib),
             running: 0,
             waiting: 0,
+            committed_cpus: None,
+            cpu_budget: None,
         }),
         storage: vec![FsUsage {
             role: StorageRole::Jobs,

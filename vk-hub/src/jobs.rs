@@ -5697,6 +5697,8 @@ mod tests {
                 budget_mib: budget,
                 running: 1,
                 waiting: 0,
+                committed_cpus: None,
+                cpu_budget: None,
             }),
             mem_available_mib: available,
             ..Default::default()
