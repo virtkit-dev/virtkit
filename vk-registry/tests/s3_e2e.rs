@@ -4839,6 +4839,7 @@ fn multipart_left(dir: &std::path::Path) -> Vec<String> {
 async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
     let dir = tmp("mp-checksums");
     let host = spawn(open_state(&dir, true));
+    send(&host, Req::new("PUT", "/s3/b")).await.ok(200);
     let path = "/s3/b/k";
     let create = |pairs: &[(&str, &str)]| {
         let mut req = Req::new("POST", path).query("uploads=");
@@ -5027,16 +5028,97 @@ async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
         .says(
             "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
         );
+    // Listed with the parts' checksums and the upload's.
     let resp = send(
         &host,
+        Req::new("GET", path).query(&format!("uploadId={id}")),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(
+        elements(&resp.body, "ChecksumSHA256"),
+        [sha1.clone(), sha2.clone()]
+    );
+    assert_eq!(element(&resp.body, "ChecksumAlgorithm"), "SHA256");
+    assert_eq!(element(&resp.body, "ChecksumType"), "COMPOSITE");
+    let resp = send(&host, Req::new("GET", "/s3/b").query("uploads=")).await;
+    let upload = elements(&resp.body, "Upload")
+        .into_iter()
+        .find(|u| u.contains(&id))
+        .unwrap();
+    assert!(
+        upload.contains(
+            "<ChecksumAlgorithm>SHA256</ChecksumAlgorithm><ChecksumType>COMPOSITE</ChecksumType>"
+        ),
+        "{upload}"
+    );
+    // The composite checksum: the SHA256 of the parts' SHA256s, and their count; one sent is
+    // checked, with its count or without.
+    let digest = |b: &[u8]| sha2::Sha256::digest(b).to_vec();
+    let composite = b64(&digest(&[digest(&one), digest(&two)].concat()));
+    let both = || {
         completion(&[
             (1, e1.as_str(), &[("ChecksumSHA256", sha1.as_str())]),
             (2, e2.as_str(), &[("ChecksumSHA256", sha2.as_str())]),
         ])
-        .header(kind, "composite"),
+    };
+    for wrong in [format!("{composite}-3"), format!("{sha1}-2"), sha1.clone()] {
+        send(&host, both().header("x-amz-checksum-sha256", &wrong))
+            .await
+            .is(400, "BadDigest")
+            .says("The SHA256 you specified did not match the calculated checksum.");
+    }
+    let resp = send(
+        &host,
+        both()
+            .header(kind, "composite")
+            .header("x-amz-checksum-sha256", &composite),
     )
     .await;
     resp.ok(200);
+    let composite = format!("{composite}-2");
+    assert_eq!(element(&resp.body, "ChecksumSHA256"), composite);
+    assert_eq!(element(&resp.body, "ChecksumType"), "COMPOSITE");
+    let asked = |r: Req| r.header("x-amz-checksum-mode", "ENABLED");
+    let resp = send(&host, asked(Req::new("HEAD", path))).await;
+    assert_eq!(
+        resp.header("x-amz-checksum-sha256"),
+        Some(composite.as_str())
+    );
+    assert_eq!(resp.header("x-amz-checksum-type"), Some("COMPOSITE"));
+    // A part read is sent its own.
+    let resp = send(&host, asked(Req::new("GET", path).query("partNumber=2"))).await;
+    resp.ok(206);
+    assert_eq!(resp.header("x-amz-checksum-sha256"), Some(sha2.as_str()));
+    assert_eq!(resp.header("x-amz-checksum-type"), Some("COMPOSITE"));
+    let attrs = Req::new("GET", path)
+        .query("attributes")
+        .header("x-amz-object-attributes", "Checksum,ObjectParts");
+    let resp = send(&host, attrs).await;
+    resp.ok(200);
+    assert_eq!(
+        element(&resp.body, "Checksum"),
+        format!(
+            "<ChecksumSHA256>{composite}</ChecksumSHA256><ChecksumType>COMPOSITE</ChecksumType>"
+        )
+    );
+    assert_eq!(
+        elements(&resp.body, "Part"),
+        [
+            format!(
+                "<ChecksumSHA256>{sha1}</ChecksumSHA256><PartNumber>1</PartNumber><Size>1000</Size>"
+            ),
+            format!(
+                "<ChecksumSHA256>{sha2}</ChecksumSHA256><PartNumber>2</PartNumber><Size>300</Size>"
+            ),
+        ]
+    );
+    let resp = send(
+        &host,
+        Req::new("GET", "/s3/b").query("list-type=2&prefix=k"),
+    )
+    .await;
+    assert_eq!(element(&resp.body, "ChecksumType"), "COMPOSITE");
 
     // A full object's CRC32C upload: a part with none has it computed, the object's is
     // computed as it is assembled, checked against the one sent, and kept.
@@ -5090,6 +5172,13 @@ async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
         resp.header("x-amz-checksum-crc32c"),
         Some(&*crc32c_b64(&whole))
     );
+    let part = Req::new("HEAD", path)
+        .query("partNumber=1")
+        .header("x-amz-checksum-mode", "ENABLED");
+    let resp = send(&host, part).await;
+    resp.ok(206);
+    assert_eq!(resp.header("x-amz-checksum-crc32c"), Some(c1.as_str()));
+    assert_eq!(resp.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
 }
 
 /// A copy asking for a checksum algorithm has the object's checksum in it, computed from the
