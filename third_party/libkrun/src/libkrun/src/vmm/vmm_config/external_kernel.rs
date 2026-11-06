@@ -32,4 +32,7 @@ pub struct ExternalKernel {
     pub initramfs_path: Option<PathBuf>,
     pub initramfs_size: u64,
     pub cmdline: Option<String>,
+    /// Boot through the 64-bit boot protocol even when the kernel has a PVH entry point (local
+    /// patch, see VENDOR.md): only its zero page can declare a VGA text screen.
+    pub boot_64bit: bool,
 }

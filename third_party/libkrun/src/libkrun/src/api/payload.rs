@@ -126,6 +126,7 @@ impl Payload {
             initramfs_path,
             initramfs_size,
             cmdline: Some(cmdline.to_string()),
+            boot_64bit: false,
         };
 
         Ok(Payload {

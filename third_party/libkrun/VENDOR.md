@@ -873,3 +873,17 @@ a command of its own. Writes for the AUX port (`0xD3`, `0xD4`) are dropped: ther
 room for, and drops them while the guest has the keyboard disabled. The upstream device acked
 every keyboard byte and answered nothing else, so atkbd waited out its identify timeouts and
 fell back to a dumb keyboard. Covered by the i8042 tests.
+
+`src/devices/src/legacy/x86_64/vga.rs` + `src/arch/src/x86_64/mod.rs` +
+`src/libkrun/src/{api/{payload.rs,vmm_builder.rs},vmm/{builder.rs,resources.rs,vmm_config/external_kernel.rs}}`
+— `VmmBuilder::vga_console`: a VGA text console for Linux's vgacon. The colour VGA register file
+on ports 0x3c0-0x3df (CRTC, sequencer, graphics and attribute controllers, DAC, the input status
+flip-flop), starting in BIOS mode 3; the text window at 0xb8000 stays guest RAM, reserved in the
+e820 map, which vgacon writes directly. An 80x25 colour text screen is declared in the zero page
+(`declare_vga_text_screen`), so a kernel payload boots through the 64-bit boot protocol instead
+of PVH (`ExternalKernel::boot_64bit`): a PVH kernel builds its own zero page with no screen, and
+vgacon then gives up. The caller's `VgaConsole` is attached to the VM's memory and i8042 at
+build, and reads the visible page back as character/attribute cells with the cursor, following
+the CRTC's start address, cursor and geometry, and types set-2 scancodes on the keyboard. A VM
+rebuilt in place starts the registers in mode 3 again; a snapshot does not keep them. Covered by
+the VGA register and read-back tests and the zero page test.

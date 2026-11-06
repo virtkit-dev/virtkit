@@ -137,6 +137,9 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// A VGA text console and its keyboard, if any (local patch, see VENDOR.md).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub vga_console: Option<std::sync::Arc<devices::legacy::VgaConsole>>,
 }
 
 impl VmResources {
@@ -293,6 +296,8 @@ mod tests {
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            vga_console: None,
         }
     }
 

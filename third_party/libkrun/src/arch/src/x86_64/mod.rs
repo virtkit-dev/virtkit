@@ -574,6 +574,33 @@ fn configure_64bit_boot(
     Ok(())
 }
 
+/// Declare an 80x25 colour VGA text screen in the zero page [`configure_system`] wrote for the
+/// 64-bit boot protocol (local patch, see VENDOR.md): Linux's vgacon then drives tty0 on the
+/// text window at 0xb8000. PVH leaves the screen to the kernel, which declares none.
+pub fn declare_vga_text_screen(guest_mem: &GuestMemoryMmap) -> super::Result<()> {
+    use arch_gen::x86::bootparam::screen_info;
+    let zero_page = layout::ZERO_PAGE_START;
+    let fields: [(usize, &[u8]); 5] = [
+        // BIOS mode 3: 80x25 colour text.
+        (std::mem::offset_of!(screen_info, orig_video_mode), &[3]),
+        (std::mem::offset_of!(screen_info, orig_video_cols), &[80]),
+        (std::mem::offset_of!(screen_info, orig_video_lines), &[25]),
+        // A VGA (vgacon's VIDEO_TYPE_VGAC), not an EGA: `orig_video_ega_bx` stays 0.
+        (std::mem::offset_of!(screen_info, orig_video_isVGA), &[1]),
+        // 16-scanline character cells.
+        (
+            std::mem::offset_of!(screen_info, orig_video_points),
+            &16u16.to_le_bytes(),
+        ),
+    ];
+    for (offset, bytes) in fields {
+        guest_mem
+            .write_slice(bytes, GuestAddress(zero_page + offset as u64))
+            .map_err(|_| Error::ZeroPageSetup)?;
+    }
+    Ok(())
+}
+
 /// Add an e820 region to the e820 map.
 /// Returns Ok(()) if successful, or an error if there is no space left in the map.
 fn add_e820_entry(
@@ -846,6 +873,25 @@ mod tests {
             .iter()
             .any(|&(addr, size)| addr.0 == fw_start && size == fw_size);
         assert!(has_fw_region, "firmware region not found in memory regions");
+    }
+
+    #[test]
+    fn declares_an_80x25_vga_text_screen_in_the_zero_page() {
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        declare_vga_text_screen(&gm).unwrap();
+        let params: BootParamsWrapper = gm.read_obj(GuestAddress(layout::ZERO_PAGE_START)).unwrap();
+        let si = params.0.screen_info;
+        assert_eq!(
+            (
+                si.orig_video_mode,
+                si.orig_video_cols,
+                si.orig_video_lines,
+                si.orig_video_isVGA,
+                { si.orig_video_points },
+                { si.orig_video_ega_bx },
+            ),
+            (3, 80, 25, 1, 16, 0)
+        );
     }
 
     #[test]

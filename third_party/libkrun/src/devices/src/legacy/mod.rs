@@ -99,6 +99,10 @@ pub use self::x86_64::pvpanic::PvPanic;
 pub use self::x86_64::tpm::{TPM_CRB_SIZE, TpmCrb, TpmState};
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "uefi-vars"))]
 pub use self::x86_64::uefi_vars::{UEFI_VARS_SIZE, UefiVars, UefiVarsState};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use self::x86_64::vga::{
+    KeyboardError as VgaKeyboardError, VGA_PORT_BASE, VGA_PORT_LEN, VgaConsole, VgaPorts, VgaScreen,
+};
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.

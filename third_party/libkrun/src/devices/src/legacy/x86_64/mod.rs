@@ -10,3 +10,5 @@ pub mod serial;
 pub mod tpm;
 #[cfg(all(target_os = "linux", feature = "uefi-vars"))]
 pub mod uefi_vars;
+#[cfg(target_os = "linux")]
+pub mod vga;

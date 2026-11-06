@@ -1203,6 +1203,9 @@ pub fn build_microvm(
             &mut mmio_device_manager,
             Some(intc.clone()),
         )?;
+        if let Some(console) = &vm_resources.vga_console {
+            attach_vga_console(console, &mut pio_device_manager, &guest_memory)?;
+        }
         // The ACPI PM device waits on the host power-button eventfd.
         event_manager
             .add_subscriber(pio_device_manager.acpi_pm.clone())
@@ -1494,6 +1497,17 @@ pub fn build_microvm(
         vm_resources.tpm_state.is_some(),
     )
     .map_err(StartMicrovmError::Internal)?;
+    // The 64-bit boot protocol's zero page declares the VGA text screen (local patch).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if vm_resources
+        .external_kernel
+        .as_ref()
+        .is_some_and(|k| k.boot_64bit)
+        && !payload_config.pvh
+    {
+        arch::x86_64::declare_vga_text_screen(vmm.guest_memory())
+            .map_err(|e| StartMicrovmError::Internal(Error::ConfigureSystem(e)))?;
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1587,7 +1601,9 @@ fn load_external_kernel(
             let load_result = loader::Elf::load(guest_mem, None, &mut file, None)
                 .map_err(StartMicrovmError::ElfLoadKernel)?;
             match load_result.pvh_boot_cap {
-                loader::PvhBootCapability::PvhEntryPresent(guest_address) => {
+                loader::PvhBootCapability::PvhEntryPresent(guest_address)
+                    if !external_kernel.boot_64bit =>
+                {
                     pvh = true;
                     guest_address
                 }
@@ -2472,6 +2488,27 @@ fn attach_uefi_vars_flash(
         )
         .map_err(|e| StartMicrovmError::UefiVars(io::Error::other(format!("{e:?}"))))?;
     Ok(Some(flash))
+}
+
+/// Put `console`'s VGA registers on the I/O bus and point it at this VM's memory and keyboard
+/// (local patch, see VENDOR.md).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn attach_vga_console(
+    console: &Arc<devices::legacy::VgaConsole>,
+    pio_device_manager: &mut PortIODeviceManager,
+    guest_memory: &GuestMemoryMmap,
+) -> std::result::Result<(), StartMicrovmError> {
+    pio_device_manager
+        .io_bus
+        .insert(
+            Arc::new(Mutex::new(console.ports())),
+            u64::from(devices::legacy::VGA_PORT_BASE),
+            devices::legacy::VGA_PORT_LEN,
+        )
+        .map_err(|e| Error::LegacyIOBus(device_manager::legacy::Error::BusError(e)))
+        .map_err(StartMicrovmError::Internal)?;
+    console.attach(guest_memory.clone(), pio_device_manager.i8042.clone());
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

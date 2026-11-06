@@ -53,6 +53,9 @@ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
+/// The VGA text console (local patch, see VENDOR.md): see [`VmmBuilder::vga_console`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use devices::legacy::{VgaConsole, VgaKeyboardError, VgaScreen};
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;

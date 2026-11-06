@@ -45,6 +45,8 @@ pub struct VmmBuilder<'a> {
     acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    vga_console: Option<std::sync::Arc<devices::legacy::VgaConsole>>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -189,6 +191,18 @@ impl<'a> VmmBuilder<'a> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
     pub fn restore_from(mut self, dir: std::path::PathBuf) -> Self {
         self.restore_from = Some(dir);
+        self
+    }
+
+    /// Give the guest a VGA text console (local patch, see VENDOR.md): the colour VGA registers
+    /// on ports 0x3c0-0x3df over the text window at 0xb8000, and an 80x25 text screen declared
+    /// in the zero page, so Linux's vgacon drives tty0 on it. A kernel payload then boots
+    /// through the 64-bit boot protocol rather than PVH, whose zero page the kernel fills
+    /// itself. The caller reads the screen and types on the i8042 keyboard through `console`,
+    /// which the builder attaches to the VM's memory and keyboard. x86_64 Linux hosts only.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn vga_console(mut self, console: std::sync::Arc<devices::legacy::VgaConsole>) -> Self {
+        self.vga_console = Some(console);
         self
     }
 
@@ -525,7 +539,11 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         PayloadKind::Kernel { bundle } => {
             vm_resources.kernel_bundle = Some(bundle);
         }
-        PayloadKind::External { kernel } => {
+        PayloadKind::External { mut kernel } => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                kernel.boot_64bit = builder_cfg.vga_console.is_some();
+            }
             vm_resources.external_kernel = Some(kernel);
         }
         PayloadKind::Firmware { path } => {
@@ -579,6 +597,10 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.restore_from = builder_cfg.restore_from;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        vm_resources.vga_console = builder_cfg.vga_console.clone();
+    }
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
     }
