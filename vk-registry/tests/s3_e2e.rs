@@ -1440,6 +1440,7 @@ async fn a_put_checks_the_digests_it_is_sent() {
         let path = format!("/s3/b/good{i}");
         let resp = send(&host, put(&path, (name, value))).await;
         resp.ok(200);
+        assert_eq!(resp.header("x-amz-object-size"), Some("13"));
         if name.starts_with("x-amz-checksum") {
             assert_eq!(resp.header(name), Some(value.as_str()), "{name}");
             assert_eq!(resp.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
