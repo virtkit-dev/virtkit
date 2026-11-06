@@ -441,24 +441,13 @@ pub(super) async fn create(
 
 /// The `x-amz-checksum-algorithm` a creation names, as S3 spells it: the algorithm the
 /// parts' checksums will be in, which each part's request then carries and is checked by;
-/// one not computed here is refused as a part carrying it would be.
+/// one S3 does not have is refused as S3 refuses it.
 fn checksum_algorithm(headers: &HeaderMap) -> std::result::Result<Option<&'static str>, Refusal> {
-    let Some(v) = headers.get("x-amz-checksum-algorithm") else {
-        return Ok(None);
-    };
-    let known = checksum::ALGORITHMS
-        .into_iter()
-        .map(|(_, name, _)| name)
-        .find(|a| v.as_bytes().eq_ignore_ascii_case(a.as_bytes()));
-    match known {
-        Some(name) => Ok(Some(name)),
-        None if v.as_bytes().is_empty() || v.to_str().is_err() => Err(Refusal::said(
-            Code::InvalidRequest,
-            "Checksum algorithm provided is unsupported. Please try again with any of the \
-             valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, \
-             XXHASH3, XXHASH64]",
-        )),
-        None => Err(checksum::NOT_COMPUTED),
+    match headers.get("x-amz-checksum-algorithm") {
+        None => Ok(None),
+        Some(v) => checksum::named(v.as_bytes())
+            .map(Some)
+            .ok_or(checksum::UNKNOWN_ALGORITHM),
     }
 }
 
@@ -791,10 +780,10 @@ fn multipart_etag(md5s: &[[u8; 16]]) -> String {
 }
 
 /// The whole-object checksum a completion's headers name: the first `x-amz-checksum-*` of
-/// the algorithms computed here sent as a full object's (base64 of the algorithm's length),
+/// S3's algorithms sent as a full object's (base64 of the algorithm's length),
 /// its header, text and bytes. A composite checksum (a checksum of the parts' checksums,
 /// `<base64>-<parts>`) is passed over, since the parts were checked as they came; anything
-/// else is refused, as is an algorithm not computed here.
+/// else is refused, as is an algorithm S3 does not have.
 struct Whole {
     header: &'static str,
     text: String,
@@ -803,8 +792,8 @@ struct Whole {
 
 impl Whole {
     fn of(headers: &HeaderMap) -> std::result::Result<Option<Self>, Refusal> {
-        if checksum::not_computed(headers) {
-            return Err(checksum::NOT_COMPUTED);
+        if let Some(why) = checksum::unknown(headers) {
+            return Err(why);
         }
         for (header, _, len) in checksum::ALGORITHMS {
             let Some(value) = headers.get(header) else {

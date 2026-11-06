@@ -1,7 +1,7 @@
 //! The checksum a write may carry of its body, `x-amz-checksum-<algorithm>` as a header or
-//! as an `aws-chunked` body's trailer, in the algorithms S3 has that this registry computes
-//! (CRC32, CRC32C, SHA1, SHA256, CRC64NVME, SHA512, MD5; the XXHASH family is refused rather
-//! than taken unchecked): one at most, checked against what arrived, echoed once it held,
+//! as an `aws-chunked` body's trailer, in any of S3's algorithms (CRC32, CRC32C, SHA1,
+//! SHA256, CRC64NVME, SHA512, MD5, XXHASH64, XXHASH3, XXHASH128): one at most, checked
+//! against what arrived, echoed once it held,
 //! kept on the manifest as `org.virtkit.s3-checksum` (`<ALGORITHM>:<base64>`) and from there
 //! sent back on reads asking for it, listed with the object and reported among its
 //! attributes, as the checksum of the whole object (`FULL_OBJECT`).
@@ -24,9 +24,9 @@ pub(super) const FULL_OBJECT: &str = "FULL_OBJECT";
 /// The header announcing or answering with that.
 pub(super) const TYPE_HEADER: &str = "x-amz-checksum-type";
 
-/// The algorithms computed here: the header carrying each, S3's name for it, and its length
+/// S3's algorithms, every one computed here: the header carrying each, S3's name for it, and its length
 /// in bytes.
-pub(super) const ALGORITHMS: [(&str, &str, usize); 7] = [
+pub(super) const ALGORITHMS: [(&str, &str, usize); 10] = [
     ("x-amz-checksum-crc32", "CRC32", 4),
     ("x-amz-checksum-crc32c", "CRC32C", 4),
     ("x-amz-checksum-sha1", "SHA1", 20),
@@ -34,6 +34,9 @@ pub(super) const ALGORITHMS: [(&str, &str, usize); 7] = [
     ("x-amz-checksum-crc64nvme", "CRC64NVME", 8),
     ("x-amz-checksum-sha512", "SHA512", 64),
     ("x-amz-checksum-md5", "MD5", 16),
+    ("x-amz-checksum-xxhash64", "XXHASH64", 8),
+    ("x-amz-checksum-xxhash3", "XXHASH3", 8),
+    ("x-amz-checksum-xxhash128", "XXHASH128", 16),
 ];
 
 /// The prefix of every checksum header, S3's and any it may add.
@@ -42,31 +45,43 @@ pub(super) const HEADER_PREFIX: &str = "x-amz-checksum-";
 /// The header an SDK names the algorithm of its checksum in, beside the checksum itself.
 pub(super) const SDK_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
 
-/// The refusal of a checksum in an algorithm not computed here (S3's XXHASH64, XXHASH3 and
-/// XXHASH128, or anything else), rather than the checksum taken unchecked and the object
-/// then listed without it.
-pub(super) const NOT_COMPUTED: Refusal = Refusal::new(Code::NotImplemented);
+/// The refusal of an `x-amz-checksum-*` header naming no algorithm S3 has, as S3 words it.
+pub(super) const UNKNOWN_HEADER: Refusal = Refusal::said(
+    Code::InvalidRequest,
+    "The algorithm type you specified in x-amz-checksum- header is invalid.",
+);
+
+/// The refusal of an algorithm, named by its own header (`x-amz-sdk-checksum-algorithm`,
+/// `x-amz-checksum-algorithm`), that S3 does not have, as S3 words it.
+pub(super) const UNKNOWN_ALGORITHM: Refusal = Refusal::said(
+    Code::InvalidRequest,
+    "Checksum algorithm provided is unsupported. Please try again with any of the valid types: \
+     [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]",
+);
+
+/// The refusal of an `x-amz-trailer` naming no checksum S3 has, as S3 words it.
+pub(super) const UNKNOWN_TRAILER: Refusal = Refusal::said(
+    Code::InvalidRequest,
+    "The value specified in the x-amz-trailer header is not supported",
+);
+
+/// The headers beginning with [`HEADER_PREFIX`] that carry no checksum: they name an
+/// algorithm, a type or a mode.
+const NOT_CHECKSUMS: [&str; 3] = [
+    "x-amz-checksum-algorithm",
+    "x-amz-checksum-type",
+    "x-amz-checksum-mode",
+];
 
 /// The refusal of a checksum that did not hold, as S3 words it, naming the algorithm.
 pub(super) fn mismatch(header: &str) -> Refusal {
-    let message = match header {
-        "x-amz-checksum-crc32" => "The CRC32 you specified did not match the calculated checksum.",
-        "x-amz-checksum-crc32c" => {
-            "The CRC32C you specified did not match the calculated checksum."
-        }
-        "x-amz-checksum-sha1" => "The SHA1 you specified did not match the calculated checksum.",
-        "x-amz-checksum-sha256" => {
-            "The SHA256 you specified did not match the calculated checksum."
-        }
-        "x-amz-checksum-crc64nvme" => {
-            "The CRC64NVME you specified did not match the calculated checksum."
-        }
-        "x-amz-checksum-sha512" => {
-            "The SHA512 you specified did not match the calculated checksum."
-        }
-        _ => "The MD5 you specified did not match the calculated checksum.",
-    };
-    Refusal::said(Code::BadDigest, message)
+    Refusal::saying(
+        Code::BadDigest,
+        format!(
+            "The {} you specified did not match the calculated checksum.",
+            algorithm(header).unwrap_or("MD5")
+        ),
+    )
 }
 
 /// The refusal of a [`SDK_ALGORITHM`] naming an algorithm other than the checksum header's.
@@ -91,18 +106,30 @@ pub(super) fn invalid_trailing(name: &str) -> Refusal {
     )
 }
 
-/// Whether `headers` name a checksum, by header or by [`SDK_ALGORITHM`], in an algorithm
-/// not computed here.
-pub(super) fn not_computed(headers: &hyper::header::HeaderMap) -> bool {
-    let known = |name: &str| ALGORITHMS.iter().any(|(h, _, _)| *h == name);
-    headers
+/// Why `headers` are refused when they name a checksum, by header or by [`SDK_ALGORITHM`],
+/// in an algorithm S3 does not have.
+pub(super) fn unknown(headers: &hyper::header::HeaderMap) -> Option<Refusal> {
+    let known =
+        |name: &str| ALGORITHMS.iter().any(|(h, _, _)| *h == name) || NOT_CHECKSUMS.contains(&name);
+    if headers
         .keys()
         .any(|k| k.as_str().starts_with(HEADER_PREFIX) && !known(k.as_str()))
-        || headers.get_all(SDK_ALGORITHM).iter().any(|v| {
-            !ALGORITHMS
-                .iter()
-                .any(|(_, name, _)| v.as_bytes().eq_ignore_ascii_case(name.as_bytes()))
-        })
+    {
+        return Some(UNKNOWN_HEADER);
+    }
+    headers
+        .get_all(SDK_ALGORITHM)
+        .iter()
+        .any(|v| named(v.as_bytes()).is_none())
+        .then_some(UNKNOWN_ALGORITHM)
+}
+
+/// S3's name of the algorithm `value` names, in any case.
+pub(super) fn named(value: &[u8]) -> Option<&'static str> {
+    ALGORITHMS
+        .iter()
+        .find(|(_, name, _)| value.eq_ignore_ascii_case(name.as_bytes()))
+        .map(|(_, name, _)| *name)
 }
 
 /// CRC-32C (Castagnoli), as S3's `CRC32C`.
@@ -144,6 +171,10 @@ pub(super) enum Hasher {
     Crc64nvme(crc::Digest<'static, u64>),
     Sha512(sha2::Sha512),
     Md5(md5::Context),
+    Xxhash64(xxhash_rust::xxh64::Xxh64),
+    // XXH3's state holds a 256-byte buffer: boxed, so every other hasher stays small.
+    Xxhash3(Box<xxhash_rust::xxh3::Xxh3Default>),
+    Xxhash128(Box<xxhash_rust::xxh3::Xxh3Default>),
 }
 
 impl Hasher {
@@ -156,6 +187,14 @@ impl Hasher {
             "x-amz-checksum-crc64nvme" => Hasher::Crc64nvme(CRC64NVME.digest()),
             "x-amz-checksum-sha512" => Hasher::Sha512(sha2::Sha512::new()),
             "x-amz-checksum-md5" => Hasher::Md5(md5::Context::new()),
+            // S3's XXHASH checksums are unseeded.
+            "x-amz-checksum-xxhash64" => Hasher::Xxhash64(xxhash_rust::xxh64::Xxh64::new(0)),
+            "x-amz-checksum-xxhash3" => {
+                Hasher::Xxhash3(Box::new(xxhash_rust::xxh3::Xxh3Default::new()))
+            }
+            "x-amz-checksum-xxhash128" => {
+                Hasher::Xxhash128(Box::new(xxhash_rust::xxh3::Xxh3Default::new()))
+            }
             _ => return None,
         })
     }
@@ -168,10 +207,13 @@ impl Hasher {
             Hasher::Crc64nvme(h) => h.update(data),
             Hasher::Sha512(h) => h.update(data),
             Hasher::Md5(h) => h.consume(data),
+            Hasher::Xxhash64(h) => h.update(data),
+            Hasher::Xxhash3(h) | Hasher::Xxhash128(h) => h.update(data),
         }
     }
 
-    /// The checksum, as the bytes S3 encodes in base64: big-endian for the CRCs.
+    /// The checksum, as the bytes S3 encodes in base64: big-endian for the CRCs and the
+    /// XXHASHes (XXH128's high half first), as xxHash's canonical form is.
     pub(super) fn finalize(self) -> Vec<u8> {
         match self {
             Hasher::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
@@ -180,6 +222,9 @@ impl Hasher {
             Hasher::Crc64nvme(h) => h.finalize().to_be_bytes().to_vec(),
             Hasher::Sha512(h) => h.finalize().to_vec(),
             Hasher::Md5(h) => h.finalize().0.to_vec(),
+            Hasher::Xxhash64(h) => h.digest().to_be_bytes().to_vec(),
+            Hasher::Xxhash3(h) => h.digest().to_be_bytes().to_vec(),
+            Hasher::Xxhash128(h) => h.digest128().to_be_bytes().to_vec(),
         }
     }
 }
@@ -289,7 +334,21 @@ mod tests {
             b64(&sha2::Sha512::digest(b"123456789"))
         );
         assert_eq!(of("x-amz-checksum-md5"), b64(&md5::compute(b"123456789").0));
-        assert_eq!(super::of("x-amz-checksum-xxhash64", b""), None);
+        // xxHash's own values for no input, unseeded.
+        let empty = |header| b64(&super::of(header, b"").unwrap());
+        assert_eq!(
+            empty("x-amz-checksum-xxhash64"),
+            b64(&0xEF46_DB37_51D8_E999u64.to_be_bytes())
+        );
+        assert_eq!(
+            empty("x-amz-checksum-xxhash3"),
+            b64(&0x2D06_8005_38D3_94C2u64.to_be_bytes())
+        );
+        assert_eq!(
+            empty("x-amz-checksum-xxhash128"),
+            b64(&0x99AA_06D3_0147_98D8_6001_C324_468D_497Fu128.to_be_bytes())
+        );
+        assert_eq!(super::of("x-amz-checksum-xxhash", b""), None);
         // Streamed in pieces, the same.
         let mut h = Hasher::for_("x-amz-checksum-crc64nvme").unwrap();
         h.update(b"1234");
@@ -300,7 +359,7 @@ mod tests {
             assert_eq!(algorithm(header), Some(name));
             assert_eq!(super::header(name), Some(header));
         }
-        assert_eq!(super::len("x-amz-checksum-xxhash64"), None);
+        assert_eq!(super::len("x-amz-checksum-xxhash"), None);
         let of = |pairs: &[(&str, &str)]| {
             let mut h = hyper::header::HeaderMap::new();
             for (n, v) in pairs {
@@ -309,18 +368,23 @@ mod tests {
                     HeaderValue::from_str(v).unwrap(),
                 );
             }
-            not_computed(&h)
+            unknown(&h)
         };
-        assert!(!of(&[]));
-        assert!(!of(&[
-            ("x-amz-checksum-crc32c", "AAAAAA=="),
-            (SDK_ALGORITHM, "crc32c")
-        ]));
-        assert!(of(&[("x-amz-checksum-xxhash64", "AAAAAAAAAAA=")]));
-        assert!(of(&[("x-amz-checksum-xxhash128", "x")]));
-        assert!(of(&[("x-amz-checksum-", "x")]));
-        assert!(of(&[(SDK_ALGORITHM, "XXHASH3")]));
-        assert!(of(&[(SDK_ALGORITHM, "")]));
+        assert_eq!(of(&[]), None);
+        assert_eq!(
+            of(&[
+                ("x-amz-checksum-crc32c", "AAAAAA=="),
+                (SDK_ALGORITHM, "crc32c")
+            ]),
+            None
+        );
+        assert_eq!(of(&[("x-amz-checksum-xxhash128", "x")]), None);
+        assert_eq!(of(&[(SDK_ALGORITHM, "XXHASH3")]), None);
+        assert_eq!(of(&[("x-amz-checksum-type", "COMPOSITE")]), None);
+        assert_eq!(of(&[("x-amz-checksum-xxhash", "x")]), Some(UNKNOWN_HEADER));
+        assert_eq!(of(&[("x-amz-checksum-", "x")]), Some(UNKNOWN_HEADER));
+        assert_eq!(of(&[(SDK_ALGORITHM, "")]), Some(UNKNOWN_ALGORITHM));
+        assert_eq!(of(&[(SDK_ALGORITHM, "XXHASH")]), Some(UNKNOWN_ALGORITHM));
         for (header, name, _) in ALGORITHMS {
             assert!(
                 mismatch(header)
@@ -361,7 +425,7 @@ mod tests {
             kept.elements(),
             "<ChecksumCRC32C>AQIDBA==</ChecksumCRC32C><ChecksumType>FULL_OBJECT</ChecksumType>"
         );
-        assert_eq!(annotation("x-amz-checksum-xxhash64", &value), None);
+        assert_eq!(annotation("x-amz-checksum-xxhash", &value), None);
         // Nothing kept, or something this registry did not write.
         let of = |text: &str| {
             stored(&BTreeMap::from([(
@@ -371,6 +435,7 @@ mod tests {
         };
         assert_eq!(of("CRC32C:AQID"), None);
         assert_eq!(of("XXHASH64:AQIDBA=="), None);
+        assert_eq!(of("XXHASH:AQIDBA=="), None);
         assert_eq!(of("MD5:AQIDBA=="), None);
         assert_eq!(of("AQIDBA=="), None);
         assert_eq!(of("CRC32C:!!"), None);
