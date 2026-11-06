@@ -401,6 +401,27 @@ async fn enrolling_a_pinned_key_again_answers_with_its_node() {
     assert_eq!(hub.db.nodes().unwrap().len(), 1);
 }
 
+/// The hub's `[nodes] release_keys` come with every enrollment answer, a repeated one too.
+#[tokio::test(flavor = "multi_thread")]
+async fn enrollment_hands_the_node_the_release_keys() {
+    let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let keys = vec![vk_hub_proto::to_base64(
+        &[7u8; vk_hub_proto::PUBLIC_KEY_LEN],
+    )];
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_node_release_keys(keys.clone()),
+    );
+    tokio::spawn(server::serve(listener, None, hub.clone()));
+    let key = keypair();
+    for _ in 0..2 {
+        let (status, body) = enroll(addr, &token(&hub), &key).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let answer = serde_json::from_slice::<EnrollResponse>(&body).unwrap();
+        assert_eq!(answer.release_keys, keys);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_node_is_revoked_mid_session_and_refused_after() {
     let (addr, hub) = start().await;

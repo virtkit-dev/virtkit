@@ -46,6 +46,14 @@
 //! # of an older release still takes jobs and caches their builds in its shared cache.
 //! require_job_build_cache = true
 //!
+//! # What enrolling nodes are given.
+//! [nodes]
+//! # The keys a `vk` release must be signed by (`vk release-key sign`): each node pins them
+//! # when it enrolls and, with any, refuses an unsigned release unless its own config says
+//! # otherwise. A node's `[node] release_keys` replaces them. Changing them reaches only nodes
+//! # that enroll afterwards.
+//! release_keys = ["<base64 ed25519 public key>"]
+//!
 //! # Whether operators may update the hub to a vk-hub release it holds, from the web UI or
 //! # with `vk-hub update`; off unless set. The hub executes the release in its place, handing
 //! # it its listening sockets, and goes back to the binary it ran should the release not
@@ -107,6 +115,10 @@ const MAX_KEPT_OUTPUT: u64 = 4 << 20;
 /// The most `kept_output_total` may hold, compressed: the database holds it all.
 const MAX_KEPT_OUTPUT_TOTAL: u64 = 64 << 30;
 
+/// The most keys `[nodes] release_keys` may list: enough for a rotation's overlap, few enough
+/// that every enrollment answer stays small.
+const MAX_NODE_RELEASE_KEYS: usize = 16;
+
 /// The resolved configuration.
 #[derive(Debug)]
 pub struct HubConfig {
@@ -140,6 +152,9 @@ pub struct HubConfig {
     pub require_job_build_cache: bool,
     /// `[update]`: whether, and to which releases, the hub may update itself.
     pub update: UpdateConfig,
+    /// `[nodes] release_keys`: the keys, base64, nodes pin at enrollment to check `vk`
+    /// releases against.
+    pub node_release_keys: Vec<String>,
 }
 
 /// `[update]`, checked.
@@ -202,6 +217,7 @@ struct FileConfig {
     image_affinity_max_extra_load: Option<f64>,
     max_job_token_secs: Option<u64>,
     jobs: Option<FileJobs>,
+    nodes: Option<FileNodes>,
     update: Option<FileUpdate>,
     oidc: Option<FileOidc>,
 }
@@ -214,6 +230,13 @@ struct FileUpdate {
     release_keys: Option<Vec<String>>,
     require_signed: Option<bool>,
     allow_downgrade: Option<bool>,
+}
+
+/// `[nodes]` as written; `deny_unknown_fields` for the same reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileNodes {
+    release_keys: Option<Vec<String>>,
 }
 
 /// `[jobs]` as written; `deny_unknown_fields` for the same reason.
@@ -427,6 +450,17 @@ impl HubConfig {
             },
             None => UpdateConfig::default(),
         };
+        let node_release_keys = f.nodes.and_then(|n| n.release_keys).unwrap_or_default();
+        if node_release_keys.len() > MAX_NODE_RELEASE_KEYS {
+            bail!("[nodes] release_keys: at most {MAX_NODE_RELEASE_KEYS} keys");
+        }
+        // Checked as each node will check them, so a bad key fails here rather than every join.
+        vk_peer::release_key::Policy::from_config_in(
+            "[nodes]",
+            vk_peer::release_key::Program::Vk,
+            &node_release_keys,
+            None,
+        )?;
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -452,6 +486,7 @@ impl HubConfig {
                 .and_then(|j| j.require_job_build_cache)
                 .unwrap_or(false),
             update,
+            node_release_keys,
         })
     }
 
@@ -763,6 +798,20 @@ mod tests {
             assert!(format!("{e:#}").contains(want), "{bad}: {e:#}");
         }
         assert!(toml::from_str::<FileConfig>("[update]\nalow = true\n").is_err());
+    }
+
+    /// `[nodes] release_keys` are held to what a node takes, and none by default.
+    #[test]
+    fn node_release_keys_are_checked_at_load() {
+        assert!(parse("").unwrap().node_release_keys.is_empty());
+        let key = vk_hub_proto::to_base64(&[7u8; vk_hub_proto::PUBLIC_KEY_LEN]);
+        let cfg = parse(&format!("[nodes]\nrelease_keys = [\"{key}\"]\n")).unwrap();
+        assert_eq!(cfg.node_release_keys, [key.as_str()]);
+        let e = parse("[nodes]\nrelease_keys = [\"x\"]\n").unwrap_err();
+        assert!(format!("{e:#}").contains("[nodes] release_keys"), "{e:#}");
+        let many = vec![format!("\"{key}\""); MAX_NODE_RELEASE_KEYS + 1].join(", ");
+        assert!(parse(&format!("[nodes]\nrelease_keys = [{many}]\n")).is_err());
+        assert!(parse("[nodes]\nrelease_key = []\n").is_err());
     }
 
     #[test]

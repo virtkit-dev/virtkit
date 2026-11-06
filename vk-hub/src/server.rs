@@ -146,6 +146,8 @@ pub struct Hub {
     /// The enrollment and connection URL for `vk node join`, when known
     /// ([`crate::config::HubConfig::node_url`]).
     pub node_url: Option<String>,
+    /// `[nodes] release_keys`, which each node enrolling is given to pin.
+    node_release_keys: Vec<String>,
     /// Where release binaries are kept; `None` for a hub that holds none.
     releases: Option<std::path::PathBuf>,
     /// Held by a release's add or remove, from its file to its row.
@@ -255,6 +257,7 @@ impl Hub {
             ui_url,
             oidc: false,
             node_url: None,
+            node_release_keys: Vec::new(),
             releases: None,
             releases_lock: Mutex::new(()),
             tools: None,
@@ -483,6 +486,12 @@ impl Hub {
     /// This hub, advertising `url` as its node endpoint.
     pub fn with_node_url(mut self, url: Option<String>) -> Self {
         self.node_url = url;
+        self
+    }
+
+    /// This hub, giving each node that enrolls `keys` to check `vk` releases against.
+    pub fn with_node_release_keys(mut self, keys: Vec<String>) -> Self {
+        self.node_release_keys = keys;
         self
     }
 
@@ -1360,15 +1369,28 @@ async fn enroll(
     })
     .await
     .context("running an enrollment")??;
+    let release_keys = hub.node_release_keys.clone();
     Ok(match outcome {
         Enrollment::Enrolled { node_id } => {
             eprintln!("vk-hub: {peer}: enrolled node {node_id}");
             hub.touch();
-            json(StatusCode::OK, &EnrollResponse { node_id })
+            json(
+                StatusCode::OK,
+                &EnrollResponse {
+                    node_id,
+                    release_keys,
+                },
+            )
         }
         Enrollment::Reenrolled { node_id } => {
             eprintln!("vk-hub: {peer}: node {node_id} enrolled again with its pinned key");
-            json(StatusCode::OK, &EnrollResponse { node_id })
+            json(
+                StatusCode::OK,
+                &EnrollResponse {
+                    node_id,
+                    release_keys,
+                },
+            )
         }
         Enrollment::BadToken => error(
             StatusCode::FORBIDDEN,

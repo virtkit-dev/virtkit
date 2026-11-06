@@ -77,7 +77,8 @@ struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
     /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
     /// kept_output, kept_output_total, image_affinity_max_load, image_affinity_max_extra_load,
-    /// max_job_token_secs, [jobs] egress_rules, [jobs] require_job_build_cache, [oidc]
+    /// max_job_token_secs, [jobs] egress_rules, [jobs] require_job_build_cache,
+    /// [nodes] release_keys, [update], [oidc]
     /// [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
@@ -2015,6 +2016,7 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
     releases::sweep(&cfg.tools_dir());
     let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
         .with_node_url(cfg.node_url())
+        .with_node_release_keys(cfg.node_release_keys.clone())
         .with_releases(cfg.releases_dir())
         .with_tools(cfg.tools_dir())
         .with_release_source(cfg.release_source.clone())

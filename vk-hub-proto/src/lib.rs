@@ -12,7 +12,7 @@
 //! - **Enrollment**: `POST` [`ENROLL_PATH`] with an [`EnrollRequest`] — a single-use token and
 //!   the node's ed25519 public key, signed with the matching private key so the hub pins a
 //!   key the caller actually holds. The hub answers with an [`EnrollResponse`] naming the
-//!   node's ID, or an [`ErrorBody`].
+//!   node's ID and the release keys it is to pin, or an [`ErrorBody`].
 //! - **The session**: a WebSocket at [`NODE_PATH`], JSON in text frames, [`NodeMsg`] one way
 //!   and [`HubMsg`] the other. It opens with [`NodeMsg::Hello`] → [`HubMsg::Challenge`] →
 //!   [`NodeMsg::Auth`] → [`HubMsg::Welcome`]; after that the node sends its inventory,
@@ -609,6 +609,11 @@ pub struct EnrollRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub node_id: String,
+    /// The ed25519 public keys, base64, a `vk` release's signature is checked against: the
+    /// hub's `[nodes] release_keys`. The node pins them with its enrollment; no session
+    /// changes them. Absent from an older hub, and ignored by an older node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_keys: Vec<String>,
 }
 
 /// Any failed request's body.
@@ -2079,8 +2084,16 @@ mod tests {
         pinned(
             &EnrollResponse {
                 node_id: "n".into(),
+                release_keys: Vec::new(),
             },
             json!({"node_id": "n"}),
+        );
+        pinned(
+            &EnrollResponse {
+                node_id: "n".into(),
+                release_keys: vec!["k".into()],
+            },
+            json!({"node_id": "n", "release_keys": ["k"]}),
         );
         pinned(&ErrorBody { error: "e".into() }, json!({"error": "e"}));
     }
