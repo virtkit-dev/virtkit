@@ -693,37 +693,40 @@ mod tests {
         let mut leaving = vk_core::unixpath::connect(&sock).unwrap();
         let _idle = vk_core::unixpath::connect(&sock).unwrap();
         let mut client = vk_core::unixpath::connect(&sock).unwrap();
+        // The relay answers an invalid line itself: once it has, it polls `leaving`.
+        leaving.write_all(b"hello\n").unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&line(&leaving)).unwrap();
+        assert_eq!(error["error"]["class"], "GenericError");
         stuck.write_all(&request("a")).unwrap();
         assert_eq!(line(&port), request("a"));
+        // Written before the flood: a poll finding the flood readable finds `b` readable too, so
+        // the relay holds `b` by the end of the step that reads the flood's end, and sends it to
+        // the agent before it reads anything after the flood.
         leaving.write_all(&request("b")).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        // An answer `stuck` does not read holds the relay for CLIENT_WRITE_TIMEOUT.
-        let mut flood = port.try_clone().unwrap();
-        std::thread::spawn(move || {
-            flood.write_all(&[vec![b'x'; 4 << 20], b"\n".to_vec()].concat())
-        })
-        .join()
-        .unwrap()
-        .unwrap();
-        // The flood's tail may still sit in the port: an answer written now could be read with
-        // it and dropped as answering nothing, ahead of `b`'s request. The relay forwards whole
-        // lines, so a byte reaching `stuck` means it has read the flood and is blocked writing it.
+        // An answer `stuck` does not read holds the relay until `stuck` leaves, or for at most
+        // CLIENT_WRITE_TIMEOUT. A byte reaching `stuck` means the relay has read the whole flood,
+        // since it forwards whole lines, and is blocked writing it.
+        port.write_all(&[vec![b'x'; 4 << 20], b"\n".to_vec()].concat())
+            .unwrap();
         let mut byte = [0u8; 1];
+        // A bound on the relay's progress, not a wait for it.
         stuck
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         stuck.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"x");
-        // Meanwhile the answer to `leaving` comes early and `leaving` leaves: the relay finds
-        // both at once, and drops `leaving` as it answers it.
+        // Meanwhile the answer to `leaving` comes early and `leaving` leaves; `stuck` leaving
+        // then frees the relay, which finds both at once and drops `leaving` as it answers it.
+        // Should CLIENT_WRITE_TIMEOUT free it first, it finds them in turn: still in order,
+        // since `b` went to the agent ahead of its answer.
         port.write_all(b"answer b\n").unwrap();
         drop(leaving);
+        drop(stuck);
         assert_eq!(line(&port), request("b"));
 
         client.write_all(&request("c")).unwrap();
         assert_eq!(line(&port), request("c"));
         port.write_all(b"answer c\n").unwrap();
         assert_eq!(line(&client), b"answer c\n");
-        drop(stuck);
     }
 }
