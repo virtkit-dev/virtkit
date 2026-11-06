@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   A `MICROVM_IMAGE`, build-cache entry or Windows layer whose manifest names anything but a
   lowercase `sha256:` digest now fails to restore, with an error naming it, instead of being
   assembled from whatever the node's local cache holds under that name.
+- **Security: a blob stored by vk-registry always matches its digest.** A chunk sent to a blob
+  upload while the upload was being completed could change the stored blob after its digest
+  was checked. Such a chunk is now refused, and the upload completes with the bytes it
+  verified.
 
 ## [0.106.0] - 2026-11-05
 

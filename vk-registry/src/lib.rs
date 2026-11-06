@@ -4945,7 +4945,110 @@ fn upload_is_for(store: &Store, id: &str, name: &str) -> bool {
     std::fs::read(store.upload_owner_path(id)).is_ok_and(|recorded| recorded == name.as_bytes())
 }
 
-/// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file.
+/// What [`lock_upload`] found of an upload session.
+enum UploadSession {
+    /// The session's file, opened for appending and held under an exclusive `flock` until
+    /// it is dropped.
+    Held(std::fs::File),
+    /// Another request holds it: a PATCH appending, or a finalization verifying and
+    /// promoting it.
+    Busy,
+    /// Never opened, refused or finished.
+    Gone,
+}
+
+/// Lock upload session `id`, without waiting: what every write to a session and its
+/// finalization go through, so a PATCH cannot change the bytes [`finish_upload`] is
+/// verifying or has just promoted.
+///
+/// Never waits, because both callers run on the server's async workers: a request parked on
+/// the lock would hold a worker for as long as a finalization takes to hash a large blob,
+/// and a few of them would stall the server for everyone. Nothing is lost by refusing
+/// instead: a session's requests are sequential by protocol, so a second request finding
+/// it locked is a client bug, not a queue.
+///
+/// The lock is taken on the descriptor, and a descriptor outlives a rename: one opened
+/// before the session was promoted would point at the blob it became. So once the lock is
+/// held, the descriptor is still the session only if the inode at the session's path is the
+/// one it opened; a finished session's path is gone, or names another session.
+fn lock_upload(store: &Store, id: &str) -> Result<UploadSession> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    let path = store.upload_path(id);
+    let file = match std::fs::OpenOptions::new().append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(UploadSession::Gone),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    #[cfg(test)]
+    upload_hooks::opened(id);
+    // SAFETY: the fd is owned by `file`, which outlives the lock; flock returns 0 or
+    // -1/errno and, with `LOCK_NB`, fails with `EWOULDBLOCK` rather than waiting.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(UploadSession::Busy);
+        }
+        return Err(e).with_context(|| format!("locking {}", path.display()));
+    }
+    let held = file.metadata().context("reading the locked upload")?;
+    let live = match std::fs::metadata(&path) {
+        Ok(m) => m.dev() == held.dev() && m.ino() == held.ino(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(if live {
+        UploadSession::Held(file)
+    } else {
+        UploadSession::Gone
+    })
+}
+
+/// The refusal for a session [`lock_upload`] did not hand over. A busy session is
+/// `BLOB_UPLOAD_INVALID`, not `BLOB_UPLOAD_UNKNOWN`: the session exists, and saying it does
+/// not would send the client to a fresh one while its first may still be finalized; what it
+/// did wrong is overlap two requests on one upload, which the spec's sequential chunks forbid.
+fn upload_refused(session: UploadSession, id: &str) -> Response<Body> {
+    match session {
+        UploadSession::Busy => error_response(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            &format!("upload {id} is busy with another request"),
+        ),
+        _ => error_response(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", id),
+    }
+}
+
+/// A hook a test sets on an upload id: when [`lock_upload`] has opened that session, it says
+/// so and waits for the test's go before trying the lock, so the test can put a
+/// finalization in between.
+#[cfg(test)]
+mod upload_hooks {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    type Hook = (String, Sender<()>, Receiver<()>);
+    static OPENED: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+
+    pub(super) fn on_opened(id: &str, opened: Sender<()>, go: Receiver<()>) {
+        OPENED.lock().unwrap().push((id.to_string(), opened, go));
+    }
+
+    pub(super) fn opened(id: &str) {
+        let hook = {
+            let mut hooks = OPENED.lock().unwrap();
+            let i = hooks.iter().position(|(h, _, _)| h == id);
+            i.map(|i| hooks.swap_remove(i))
+        };
+        if let Some((_, opened, go)) = hook {
+            let _ = opened.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
+/// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file, under the
+/// session's lock ([`lock_upload`]).
 fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
     if !valid_upload_id(id) {
         return Ok(error_response(
@@ -4954,18 +5057,17 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
             id,
         ));
     }
-    let path = store.upload_path(id);
-    if !path.is_file() || !upload_is_for(store, id, name) {
+    if !upload_is_for(store, id, name) {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
             id,
         ));
     }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut f = match lock_upload(store, id)? {
+        UploadSession::Held(f) => f,
+        refused => return Ok(upload_refused(refused, id)),
+    };
     use std::io::Write;
     f.write_all(body).context("appending to the upload")?;
     let size = f.metadata()?.len();
@@ -5011,22 +5113,28 @@ fn finish_upload(
     }
     // shared store lock for the promotion (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
-    let hex = digest.trim_start_matches("sha256:").to_string();
-    let upload = store.upload_path(id);
-    if !upload.is_file() || !upload_is_for(store, id, name) {
+    if !upload_is_for(store, id, name) {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
             id,
         ));
     }
+    // Sealed from here: held until the session is promoted or dropped, so no PATCH writes
+    // between the hash and the rename, nor through a descriptor into the promoted blob.
+    // A busy session is refused, not waited for, as a PATCH is (see `lock_upload`): a second
+    // finalization of one session would otherwise park a worker for the whole of the first.
+    let mut session = match lock_upload(store, id)? {
+        UploadSession::Held(f) => f,
+        refused => return Ok(upload_refused(refused, id)),
+    };
+    let hex = digest.trim_start_matches("sha256:").to_string();
+    let upload = store.upload_path(id);
     if !body.is_empty() {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&upload)
-            .with_context(|| format!("opening {}", upload.display()))?;
-        f.write_all(body).context("appending the final chunk")?;
+        session
+            .write_all(body)
+            .context("appending the final chunk")?;
     }
 
     // Check the digest against the canonical bytes before anything is promoted: the store
@@ -5078,11 +5186,12 @@ fn finish_upload(
     // the promotion, so a membership record never names a blob that is not there.
     store.record_blob(name, &hex)?;
     let _ = std::fs::remove_file(store.upload_owner_path(id));
+    drop(session);
 
     Response::builder()
         .status(StatusCode::CREATED)
         .header("Location", format!("/v2/{name}/blobs/{digest}"))
-        .header("Docker-Content-Digest", &digest)
+        .header("Docker-Content-Digest", digest)
         .header(hyper::header::CONTENT_LENGTH, "0")
         .body(body_of(Bytes::new()))
         .map_err(Into::into)
@@ -7820,6 +7929,78 @@ mod tests {
         .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request overlapping another on one upload session is refused at once, PATCH and
+    /// finalization alike, before it writes a byte; and a PATCH that opened the session before
+    /// a finalization promoted it finds it gone, rather than appending to the blob it became
+    /// (a zstd session is renamed into the store) or to an unlinked file.
+    #[tokio::test]
+    async fn a_request_overlapping_another_on_an_upload_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        for (id, zstd) in [("aa-ace-1", false), ("aa-ace-2", true)] {
+            let raw = format!("the blob of {id}").into_bytes();
+            let digest = format!("sha256:{}", sha256_hex_raw(&raw));
+            let query = format!("digest={digest}");
+            let body = if zstd {
+                zstd_with_size(&raw).unwrap()
+            } else {
+                raw.clone()
+            };
+            // Most of it by PATCH, the rest with the finalization.
+            let (first, last) = body.split_at(body.len() - 4);
+            open_session(&store, "img", id);
+            assert_eq!(
+                patch_upload(&store, "img", id, first).unwrap().status(),
+                StatusCode::ACCEPTED
+            );
+            let upload = store.upload_path(id);
+            let len = std::fs::metadata(&upload).unwrap().len();
+
+            // Another request holds the session: both refused, nothing appended or stored.
+            let UploadSession::Held(holder) = lock_upload(&store, id).unwrap() else {
+                panic!("a live session");
+            };
+            for res in [
+                patch_upload(&store, "img", id, b"overlapping").unwrap(),
+                finish_upload(&store, "img", id, &query, last, zstd).unwrap(),
+            ] {
+                assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+                let err: serde_json::Value =
+                    serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                        .unwrap();
+                assert_eq!(err["errors"][0]["code"], "BLOB_UPLOAD_INVALID");
+            }
+            assert_eq!(std::fs::metadata(&upload).unwrap().len(), len);
+            assert!(!store.has_blob(&digest[7..]));
+            drop(holder);
+
+            // A PATCH that opened the session, then a finalization of it, then the PATCH's
+            // attempt at the lock.
+            let (opened, wait) = std::sync::mpsc::channel();
+            let (go, until) = std::sync::mpsc::channel();
+            upload_hooks::on_opened(id, opened, until);
+            std::thread::scope(|scope| {
+                let racer = scope.spawn(|| {
+                    patch_upload(&store, "img", id, b"appended late")
+                        .unwrap()
+                        .status()
+                });
+                wait.recv().unwrap();
+                let done = finish_upload(&store, "img", id, &query, last, zstd).unwrap();
+                assert_eq!(done.status(), StatusCode::CREATED);
+                go.send(()).unwrap();
+                assert_eq!(racer.join().unwrap(), StatusCode::NOT_FOUND);
+            });
+            let hex = &digest[7..];
+            assert_eq!(store.get_blob(hex).unwrap().unwrap(), raw);
+            if zstd {
+                assert_eq!(std::fs::read(store.zstd_blob_path(hex)).unwrap(), body);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
