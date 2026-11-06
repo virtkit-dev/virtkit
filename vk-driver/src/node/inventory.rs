@@ -114,6 +114,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
             }
             caps => caps,
         }),
+        hub_settings: false,
     }
 }
 

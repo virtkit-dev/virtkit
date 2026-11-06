@@ -768,6 +768,10 @@ pub struct Inventory {
     /// fingerprint; `None` from an older node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_caps: Option<egress::NodeEgressCaps>,
+    /// Whether the node accepts the hub's settings ([`DesiredState::settings`]) and reports
+    /// their effective values ([`Report::settings`]): an older node would ignore them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hub_settings: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -958,6 +962,45 @@ pub struct Report {
     /// The node's placed-job intake. Older nodes omit this field and declare no policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placed: Option<PlacedIntake>,
+    /// Effective values of keys the hub may set, and the hub settings the node refused.
+    /// `None` from a node that does not announce [`Inventory::hub_settings`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsReport>,
+}
+
+/// Effective values on a node for keys the hub may set ([`DesiredState::settings`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsReport {
+    /// Every key the hub may set, by dotted key: its effective value and where it comes from.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effective: BTreeMap<String, Setting>,
+    /// The hub's entries the node refused, by key: why. The other entries still apply.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refused: BTreeMap<String, String>,
+}
+
+/// A key's effective value on a node, and where it comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setting {
+    /// The value, of the key's TOML type; `None` when unset, as an unset `mem_budget` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    pub source: SettingSource,
+}
+
+/// Where a node's setting comes from: the later layer wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingSource {
+    /// Built in, or autodetected on the host.
+    Default,
+    /// The hub's settings.
+    Hub,
+    /// The node's own configuration file.
+    Local,
+    /// A source from a later `vk`.
+    #[serde(other)]
+    Other,
 }
 
 /// A node's configured intake of hub-placed jobs.
@@ -1106,6 +1149,13 @@ pub struct DesiredState {
     /// [`Inventory::egress_fallback`]: an older one would ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<egress::HubEgress>,
+    /// The hub's settings for the node, by dotted key (`executor.vm.max_cpus`), each a value of
+    /// that key's TOML type, `registry` a table. They fill in what the node's configuration file
+    /// leaves unset; the node refuses a key the hub may not set, or a value that does not fit,
+    /// and reports it ([`Report::settings`]). Sent only to a node announcing
+    /// [`Inventory::hub_settings`]: an older one would ignore them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, serde_json::Value>,
 }
 
 /// A node's own state, persisted on the node: losing the hub changes none of it.
@@ -1492,6 +1542,7 @@ mod tests {
             egress_rules: false,
             egress_fallback: false,
             egress_caps: None,
+            hub_settings: false,
         }
     }
 
@@ -1643,12 +1694,14 @@ mod tests {
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             HubMsg::Desired(DesiredState {
                 generation: 1,
                 ceiling: None,
                 acquisition: Acquisition::Run,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             HubMsg::Command(Command {
                 id: id.clone(),
@@ -2016,6 +2069,7 @@ mod tests {
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             unsupported: vec!["stop acquisition".into()],
             state: Some(NodeState::Draining),
@@ -2043,7 +2097,100 @@ mod tests {
             }),
             tools: None,
             placed: None,
+            settings: None,
         }
+    }
+
+    /// Hub settings and what a node reports of them are optional within version 2: absent from
+    /// the wire when empty, so older peers' bytes are unchanged, and read back as such.
+    #[test]
+    fn hub_settings_keep_their_wire_shape() {
+        let desired = DesiredState {
+            generation: 5,
+            ceiling: None,
+            acquisition: Acquisition::Run,
+            egress: None,
+            settings: BTreeMap::from([
+                ("executor.vm.max_cpus".to_string(), json!(16)),
+                (
+                    "registry".to_string(),
+                    json!({"repo": "reg.example.com/ci"}),
+                ),
+            ]),
+        };
+        pinned(
+            &HubMsg::Desired(desired.clone()),
+            json!({"type": "desired", "generation": 5, "ceiling": null, "acquisition": "run",
+                   "settings": {"executor.vm.max_cpus": 16,
+                                "registry": {"repo": "reg.example.com/ci"}}}),
+        );
+        let old =
+            json!({"type": "desired", "generation": 5, "ceiling": null, "acquisition": "run"});
+        let HubMsg::Desired(read) = serde_json::from_value(old).unwrap() else {
+            panic!("not a desired state");
+        };
+        assert!(read.settings.is_empty());
+        let mut flagged = serde_json::to_value(inventory()).unwrap();
+        assert!(flagged.get("hub_settings").is_none());
+        flagged["hub_settings"] = json!(true);
+        pinned(
+            &Inventory {
+                hub_settings: true,
+                ..inventory()
+            },
+            flagged,
+        );
+        let report = Report {
+            applied: Some(desired),
+            settings: Some(SettingsReport {
+                effective: BTreeMap::from([
+                    (
+                        "executor.vm.max_cpus".to_string(),
+                        Setting {
+                            value: Some(json!(16)),
+                            source: SettingSource::Hub,
+                        },
+                    ),
+                    (
+                        "executor.schedule.mem_budget".to_string(),
+                        Setting {
+                            value: None,
+                            source: SettingSource::Default,
+                        },
+                    ),
+                    (
+                        "executor.vm.cpus".to_string(),
+                        Setting {
+                            value: Some(json!(8)),
+                            source: SettingSource::Local,
+                        },
+                    ),
+                ]),
+                refused: BTreeMap::from([("state_dir".to_string(), "not settable".to_string())]),
+            }),
+            ..Report::default()
+        };
+        let mut wire = serde_json::to_value(Report {
+            settings: None,
+            ..report.clone()
+        })
+        .unwrap();
+        assert!(wire.get("settings").is_none());
+        wire["settings"] = json!({
+            "effective": {
+                "executor.schedule.mem_budget": {"source": "default"},
+                "executor.vm.cpus": {"value": 8, "source": "local"},
+                "executor.vm.max_cpus": {"value": 16, "source": "hub"},
+            },
+            "refused": {"state_dir": "not settable"},
+        });
+        pinned(&report, wire);
+        assert_eq!(report.clone().without_steering().settings, None);
+        // A source from a later node reads as one this peer does not know.
+        assert_eq!(
+            serde_json::from_value::<SettingSource>(json!("fleet")).unwrap(),
+            SettingSource::Other
+        );
     }
 
     fn update() -> Operation {
@@ -2069,6 +2216,7 @@ mod tests {
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             json!({"type": "desired", "generation": 3, "ceiling": 4, "acquisition": "stop"}),
         );
@@ -2078,6 +2226,7 @@ mod tests {
                 ceiling: None,
                 acquisition: Acquisition::Run,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             json!({"type": "desired", "generation": 1, "ceiling": null, "acquisition": "run"}),
         );
@@ -2096,6 +2245,7 @@ mod tests {
                     build: egress::HubPhase::Unrestricted,
                     dry_run: Vec::new(),
                 }),
+                settings: BTreeMap::new(),
             }),
             json!({"type": "desired", "generation": 2, "ceiling": null, "acquisition": "run",
                    "egress": {"rules": ["default"], "run": {"kind": "allow", "names": [], "ips": []},

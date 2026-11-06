@@ -1303,6 +1303,7 @@ mod tests {
             ceiling: Some(2),
             acquisition: vk_hub_proto::Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         })
     }
 

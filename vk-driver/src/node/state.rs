@@ -817,6 +817,7 @@ mod tests {
             ceiling,
             acquisition,
             egress: None,
+            settings: Default::default(),
         }
     }
 

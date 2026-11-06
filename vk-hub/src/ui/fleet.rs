@@ -2824,6 +2824,7 @@ mod tests {
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         };
         assert_eq!(
             ops(&view(Ready, Managed, Some(paused.clone()))),
@@ -2850,6 +2851,7 @@ mod tests {
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         };
         let mut v = view(NodeState::Ready, RunnerMode::Managed, Some(paused));
         let p = Panel::of(&v);
@@ -2903,6 +2905,7 @@ mod tests {
             ceiling: None,
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         });
         assert_eq!(
             Panel::of(&v).intake,
@@ -2949,6 +2952,7 @@ mod tests {
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         });
         assert_eq!(
             Panel::of(&v).placed.as_deref(),

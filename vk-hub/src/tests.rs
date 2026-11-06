@@ -632,6 +632,7 @@ fn applied(applied: Option<u64>) -> NodeMsg {
             ceiling: None,
             acquisition: vk_hub_proto::Acquisition::Run,
             egress: None,
+            settings: Default::default(),
         }),
         state: Some(vk_hub_proto::NodeState::Ready),
         ..vk_hub_proto::Report::default()
@@ -853,6 +854,7 @@ async fn a_hub_without_desired_state_keeps_the_nodes() {
         ceiling: Some(2),
         acquisition: Acquisition::Stop,
         egress: None,
+        settings: Default::default(),
     };
     send(
         &mut ws,
@@ -883,6 +885,7 @@ async fn a_hub_without_desired_state_keeps_the_nodes() {
             ceiling: Some(3),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: Default::default(),
         }
     );
 }
@@ -2430,6 +2433,7 @@ fn sync_compares_the_applied_state_not_only_its_generation() {
         ceiling: Some(4),
         acquisition: Acquisition::Run,
         egress: None,
+        settings: Default::default(),
     };
     let view = |applied: DesiredState| ops::NodeView {
         protocol: Some(vk_hub_proto::STEERING),
@@ -2520,6 +2524,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: Default::default(),
             }),
             report: Some(Report {
                 applied: Some(DesiredState {
@@ -2527,6 +2532,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                     ceiling: Some(6),
                     acquisition: Acquisition::Run,
                     egress: None,
+                    settings: Default::default(),
                 }),
                 state: Some(NodeState::Draining),
                 acquisition: Some(Acquisition::Run),
@@ -2559,6 +2565,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 ceiling: Some(2),
                 acquisition: Acquisition::Run,
                 egress: None,
+                settings: Default::default(),
             }),
             report: Some(Report::default()),
             ..ops::NodeView::default()

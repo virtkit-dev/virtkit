@@ -1142,6 +1142,7 @@ concurrent = 4
                 ceiling: None,
                 acquisition: vk_hub_proto::Acquisition::Run,
                 egress,
+                settings: Default::default(),
             });
             persisted.save(&node).unwrap();
         };
@@ -1212,6 +1213,7 @@ concurrent = 4
                 ceiling: Some(3),
                 acquisition: vk_hub_proto::Acquisition::Run,
                 egress: None,
+                settings: Default::default(),
             });
             persisted.save(&node).unwrap();
             hub_ceiling(&cfg).unwrap()

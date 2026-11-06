@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use vk_hub_proto::egress::NodeEgressCaps;
 use vk_hub_proto::{
     Acquisition, Command, CommandAck, DesiredState, Heartbeat, Inventory, NodeState, Operation,
-    Outcome, Report, STEERING, Workload,
+    Outcome, Report, STEERING, SettingsReport, Workload,
 };
 
 use crate::rollout::{
@@ -1487,8 +1487,17 @@ impl Db {
                         },
                         // The hub's alone to set: the Fallback, steered below.
                         egress: ours.egress.clone(),
+                        // Nothing on the hub sets them yet: the node's stand.
+                        settings: theirs.settings.clone(),
                     };
-                    let same = |s: &DesiredState| (s.ceiling, s.acquisition, s.egress.clone());
+                    let same = |s: &DesiredState| {
+                        (
+                            s.ceiling,
+                            s.acquisition,
+                            s.egress.clone(),
+                            s.settings.clone(),
+                        )
+                    };
                     if ours.generation > theirs.generation && same(&merged) == same(ours) {
                         // Ours already carries the change past the node's generation, and may
                         // be in flight: it stands, as the generation must never go back.
@@ -1528,6 +1537,8 @@ impl Db {
                 (Some(ours), Some(theirs), None) if theirs.generation > ours.generation => {
                     let desired = DesiredState {
                         generation: theirs.generation.saturating_add(1),
+                        // Nothing on the hub sets them yet: the node's stand.
+                        settings: theirs.settings.clone(),
                         ..ours.clone()
                     };
                     events.push((
@@ -2735,6 +2746,7 @@ const DEFAULT_DESIRED: DesiredState = DesiredState {
     ceiling: None,
     acquisition: Acquisition::Run,
     egress: None,
+    settings: BTreeMap::new(),
 };
 
 /// Issue `op` to node `id` inside `txn`, valid for `ttl`, audited as `actor`'s; see
@@ -3321,7 +3333,55 @@ fn display_safe_report(mut report: Report) -> Report {
     {
         *s = vk_hub_proto::display_safe(s);
     }
+    report.settings = report.settings.map(display_safe_settings);
     report
+}
+
+/// `settings` cut to [`MAX_INVENTORY_ITEMS`] keys and refusals, with every key, reason and
+/// string in a value made safe to display.
+fn display_safe_settings(settings: SettingsReport) -> SettingsReport {
+    fn safe(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => *s = vk_hub_proto::display_safe(s),
+            serde_json::Value::Array(items) => {
+                items.truncate(MAX_INVENTORY_ITEMS);
+                items.iter_mut().for_each(safe);
+            }
+            serde_json::Value::Object(fields) => {
+                *fields = std::mem::take(fields)
+                    .into_iter()
+                    .take(MAX_INVENTORY_ITEMS)
+                    .map(|(k, mut v)| {
+                        safe(&mut v);
+                        (vk_hub_proto::display_safe(&k), v)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    SettingsReport {
+        effective: settings
+            .effective
+            .into_iter()
+            .take(MAX_INVENTORY_ITEMS)
+            .map(|(key, mut setting)| {
+                setting.value.iter_mut().for_each(safe);
+                (vk_hub_proto::display_safe(&key), setting)
+            })
+            .collect(),
+        refused: settings
+            .refused
+            .into_iter()
+            .take(MAX_INVENTORY_ITEMS)
+            .map(|(key, why)| {
+                (
+                    vk_hub_proto::display_safe(&key),
+                    vk_hub_proto::display_safe(&why),
+                )
+            })
+            .collect(),
+    }
 }
 
 /// `heartbeat` cut to what an inventory may hold: [`MAX_INVENTORY_ITEMS`] filesystems, and
@@ -4578,6 +4638,7 @@ mod tests {
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: BTreeMap::new(),
         };
         let report = Report {
             applied: Some(applied.clone()),
@@ -4621,6 +4682,7 @@ mod tests {
                 ceiling: None,
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }
         );
         // A node that applied nothing gives the hub nothing to adopt.
@@ -4673,6 +4735,7 @@ mod tests {
             ceiling: Some(2),
             acquisition: Acquisition::Run,
             egress: None,
+            settings: BTreeMap::new(),
         };
         let report = Report {
             applied: Some(applied.clone()),
@@ -4735,6 +4798,7 @@ mod tests {
             ceiling: Some(2),
             acquisition: Acquisition::Stop,
             egress: None,
+            settings: BTreeMap::new(),
         };
         let report = Report {
             applied: Some(applied.clone()),
@@ -4762,6 +4826,7 @@ mod tests {
             ceiling,
             acquisition,
             egress: None,
+            settings: BTreeMap::new(),
         };
         let (desired, events) = outcome(&[DesiredChange::Ceiling(Some(5))]);
         assert_eq!(desired, state(Some(5), Acquisition::Stop));
@@ -4811,6 +4876,7 @@ mod tests {
                 ceiling: Some(4),
                 acquisition: Acquisition::Run,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             ..Report::default()
         };
@@ -4820,6 +4886,7 @@ mod tests {
             ceiling: Some(4),
             acquisition: Acquisition::Run,
             egress: None,
+            settings: BTreeMap::new(),
         };
         assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(ours.clone()));
         let caught_up = Report {
@@ -4856,6 +4923,7 @@ mod tests {
                 ceiling: Some(4),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             ..Report::default()
         };
@@ -4868,6 +4936,7 @@ mod tests {
                 ceiling: Some(5),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             }
         );
 
@@ -4881,6 +4950,67 @@ mod tests {
             .unwrap();
         assert_eq!(next, state(Some(5), Acquisition::Stop));
         assert_eq!(db.node(&id).unwrap().unwrap().set_on_defaults, None);
+    }
+
+    /// The hub sets no settings of its own yet: it keeps a node's, through an operator's change
+    /// made before the node reported, and keeps what the node said of them, made safe to show.
+    #[test]
+    fn a_nodes_settings_are_kept_and_shown_safely() {
+        use vk_hub_proto::{Setting, SettingSource};
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.set_desired(&id, DesiredChange::Ceiling(Some(5)), "uid 0", "changed", 1)
+            .unwrap();
+        let settings =
+            BTreeMap::from([("executor.vm.max_cpus".to_string(), serde_json::json!(16))]);
+        let report = Report {
+            applied: Some(DesiredState {
+                generation: 7,
+                ceiling: None,
+                acquisition: Acquisition::Run,
+                egress: None,
+                settings: settings.clone(),
+            }),
+            settings: Some(SettingsReport {
+                effective: BTreeMap::from([(
+                    "registry".to_string(),
+                    Setting {
+                        value: Some(serde_json::json!({"repo": "reg\x1b[2Jistry", "n": ["a\x07"]})),
+                        source: SettingSource::Local,
+                    },
+                )]),
+                refused: BTreeMap::from([("state\x1b_dir".to_string(), "no\x1b".to_string())]),
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, report, 2).unwrap();
+        let row = db.node(&id).unwrap().unwrap();
+        let desired = row.desired.unwrap();
+        assert_eq!((desired.generation, desired.ceiling), (8, Some(5)));
+        assert_eq!(desired.settings, settings);
+        let shown = row.report.unwrap().settings.unwrap();
+        // A hub restored from before the node's generation re-issues its own state, with the
+        // node's settings.
+        let ahead = Report {
+            applied: Some(DesiredState {
+                generation: 20,
+                ceiling: None,
+                acquisition: Acquisition::Run,
+                egress: None,
+                settings: settings.clone(),
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, ahead, 3).unwrap();
+        let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
+        assert_eq!((desired.generation, desired.ceiling), (21, Some(5)));
+        assert_eq!(desired.settings, settings);
+        let text = serde_json::to_string(&shown).unwrap();
+        assert!(
+            !text.contains("\\u001b") && !text.contains("\\u0007"),
+            "{text}"
+        );
+        assert_eq!(shown.effective["registry"].source, SettingSource::Local);
     }
 
     /// A hub of protocol version 1 rewrites a node's row without its desired state or what the
@@ -4908,6 +5038,7 @@ mod tests {
                 ceiling: Some(2),
                 acquisition: Acquisition::Run,
                 egress: None,
+                settings: BTreeMap::new(),
             }),
             ..Report::default()
         };
@@ -4919,6 +5050,7 @@ mod tests {
                 ceiling: Some(2),
                 acquisition: Acquisition::Stop,
                 egress: None,
+                settings: BTreeMap::new(),
             })
         );
     }
