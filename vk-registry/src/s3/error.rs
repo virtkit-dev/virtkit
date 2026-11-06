@@ -24,6 +24,7 @@ pub(crate) enum Code {
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     EntityTooLarge,
+    EntityTooSmall,
     IncompleteBody,
     InternalError,
     InvalidAccessKeyId,
@@ -110,6 +111,11 @@ impl Code {
                 "EntityTooLarge",
                 BAD,
                 "Your proposed upload exceeds the maximum allowed object size.",
+            ),
+            EntityTooSmall => (
+                "EntityTooSmall",
+                BAD,
+                "Your proposed upload is smaller than the minimum allowed size",
             ),
             IncompleteBody => (
                 "IncompleteBody",
