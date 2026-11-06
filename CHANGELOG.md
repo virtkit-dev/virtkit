@@ -13,7 +13,8 @@ All notable changes to virtkit will be documented in this file.
   `sccache` needs none made beforehand), and use the registry credential (an API key, a hub
   token or the shared bearer) as both the access key and the secret access key, or the shared
   Basic user and its password. Objects can be written, read with conditional headers and
-  checksums (in every algorithm S3 has, checked on upload and kept with the object), given
+  checksums (in every algorithm S3 has, checked on upload and kept with the object, and a
+  CRC64NVME computed for an upload that sends none, as S3 does), given
   metadata and deleted, and listed page by page (as object versions too, for
   tools that empty a bucket that way), and are the same files WebDAV and `vk registry get`
   see; a key limited to a directory of a bucket can list that directory.

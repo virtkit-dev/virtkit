@@ -1034,8 +1034,8 @@ struct Assembled {
 /// the way: each part's MD5, checked against both the ETag asked and the part's record, so a
 /// part replaced while this reads it is noticed rather than built in; the whole object's
 /// SHA-256; and its checksum: the full object's of an upload created with one, checked
-/// against what `whole` names in its algorithm, or for an upload created with none, the
-/// one `whole` names. First, the completion's `kind` must be the upload's, and the checksums
+/// against what `whole` names in its algorithm, or for an upload created with none, S3's
+/// default CRC64NVME. First, the completion's `kind` must be the upload's, and the checksums
 /// `sent` for each part what [`check_part`] takes. A composite checksum is passed over.
 fn assemble(
     store: &Store,
@@ -1063,12 +1063,11 @@ fn assemble(
             ),
         )));
     }
-    // The checksum the object will have, and the one sent to check it against.
+    // The checksum the object will have, and the one sent to check it against. An upload
+    // created with none has S3's default, of the whole object; what it is sent is passed
+    // over, as S3 passes it over.
     let (target, check) = match asked {
-        None => {
-            let full = whole.filter(|w| w.composite.is_none());
-            (full.map(|w| w.header), full)
-        }
+        None => (Some(checksum::DEFAULT), None),
         Some(a) if a.kind == checksum::Kind::FullObject => {
             let named = whole.filter(|w| Some(w.header) == a.header());
             if let Some(w) = named

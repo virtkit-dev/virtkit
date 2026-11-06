@@ -113,6 +113,9 @@ pub(super) const ALGORITHMS: [(&str, &str, usize); 10] = [
     ("x-amz-checksum-xxhash128", "XXHASH128", 16),
 ];
 
+/// The header of the checksum every write is given when it carries none, as S3 gives it.
+pub(super) const DEFAULT: &str = "x-amz-checksum-crc64nvme";
+
 /// The prefix of every checksum header, S3's and any it may add.
 pub(super) const HEADER_PREFIX: &str = "x-amz-checksum-";
 
@@ -207,10 +210,15 @@ pub(super) fn named(value: &[u8]) -> Option<&'static str> {
 }
 
 /// CRC-32C (Castagnoli), as S3's `CRC32C`.
-static CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+/// Sixteen lanes of tables (16 KiB, built at compile time) rather than the default one: every
+/// write computes a CRC, CRC64NVME by default, as it streams.
+static CRC32C: crc::Crc<u32, crc::Table<16>> =
+    crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISCSI);
 
 /// CRC-64/NVME, as S3's `CRC64NVME`.
-static CRC64NVME: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_NVME);
+/// As [`CRC32C`], with 32 KiB of tables.
+static CRC64NVME: crc::Crc<u64, crc::Table<16>> =
+    crc::Crc::<u64, crc::Table<16>>::new(&crc::CRC_64_NVME);
 
 /// How many bytes the checksum `header` carries is, for one of [`ALGORITHMS`].
 pub(super) fn len(header: &str) -> Option<usize> {
@@ -241,9 +249,9 @@ pub(super) fn header(algorithm: &str) -> Option<&'static str> {
 pub(super) enum Hasher {
     Sha256(sha2::Sha256),
     Crc32(crc32fast::Hasher),
-    Crc32c(crc::Digest<'static, u32>),
+    Crc32c(crc::Digest<'static, u32, crc::Table<16>>),
     Sha1(sha1::Sha1),
-    Crc64nvme(crc::Digest<'static, u64>),
+    Crc64nvme(crc::Digest<'static, u64, crc::Table<16>>),
     Sha512(sha2::Sha512),
     Md5(md5::Context),
     Xxhash64(xxhash_rust::xxh64::Xxh64),
