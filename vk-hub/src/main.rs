@@ -45,6 +45,7 @@ mod server;
 mod session;
 mod store;
 mod subject;
+mod target;
 mod tokens;
 mod tools;
 mod ui;
@@ -343,10 +344,33 @@ enum ReleaseCmd {
     },
     /// List the releases the hub holds
     List,
-    /// Delete a release, unless a node is still updating to it or a rollout of it is not over
+    /// Delete a release, unless a node is still updating to it, a rollout of it is not over or
+    /// it is the target
     Remove {
         /// Its sha256, or at least the first 8 hex digits
         release: String,
+    },
+    /// Show the vk release nodes are kept updated to, or set or clear it
+    ///
+    /// Setting it starts a rollout of it, with `rollout create`'s defaults, over the nodes
+    /// running an older version. Afterwards a node reporting an older version is updated alone
+    /// once it is ready and no rollout runs. A node running a newer version, one whose runner
+    /// is external, and one whose release keys would refuse the target's signature are left
+    /// alone; one whose update to the target failed is not tried again until --retry, nor is
+    /// any node after the rollout is aborted. With [nodes] release_keys, the target must be
+    /// signed by one of them.
+    Target {
+        /// The release's sha256, or at least its first 8 hex digits
+        #[arg(conflicts_with_all = ["clear", "retry"])]
+        release: Option<String>,
+        /// Clear the target: no more automatic updates
+        #[arg(long, conflicts_with = "retry")]
+        clear: bool,
+        /// Try the update to the target again on a node whose update failed: its ID (at least
+        /// the first 8 hex digits), or `all`; either resumes updates held after the target's
+        /// rollout was aborted
+        #[arg(long, value_name = "NODE|all")]
+        retry: Option<String>,
     },
 }
 
@@ -1416,6 +1440,52 @@ async fn run(cli: Cli) -> Result<()> {
                         );
                     }
                 }
+                ReleaseCmd::Target {
+                    release: Some(release),
+                    ..
+                } => {
+                    let set =
+                        tokio::task::spawn_blocking(move || client.set_target(&release)).await??;
+                    eprintln!(
+                        "vk-hub: the target is vk {} ({})",
+                        set.target.version, set.target.release
+                    );
+                    match set.rollout {
+                        Some(r) => eprint!("{}", render_rollout(&r, now_secs())),
+                        None => eprintln!("vk-hub: no node to roll it out to now"),
+                    }
+                }
+                ReleaseCmd::Target { clear: true, .. } => {
+                    match tokio::task::spawn_blocking(move || client.clear_target()).await?? {
+                        Some(t) => eprintln!(
+                            "vk-hub: cleared the target, vk {}; a rollout it started goes on",
+                            t.version
+                        ),
+                        None => eprintln!("vk-hub: no target was set"),
+                    }
+                }
+                ReleaseCmd::Target {
+                    retry: Some(node), ..
+                } => {
+                    let node = (node != "all").then_some(node);
+                    let (retried, lifted) =
+                        tokio::task::spawn_blocking(move || client.retry_target(node.as_deref()))
+                            .await??;
+                    if lifted {
+                        eprintln!("vk-hub: the automatic updates to the target resume");
+                    } else if retried.is_empty() {
+                        bail!("no such node's update to the target failed");
+                    }
+                    for id in retried {
+                        eprintln!("vk-hub: node {id} will be updated to the target again");
+                    }
+                }
+                ReleaseCmd::Target { .. } => {
+                    match tokio::task::spawn_blocking(move || client.target()).await?? {
+                        Some(view) => print!("{}", render_target(&view)),
+                        None => eprintln!("vk-hub: no target is set"),
+                    }
+                }
                 ReleaseCmd::Remove { release } => {
                     let what = release.clone();
                     match tokio::task::spawn_blocking(move || client.remove_release(&release))
@@ -1744,6 +1814,53 @@ async fn steer_rollout(
         rollout_state(&r.row.state)
     );
     Ok(())
+}
+
+/// `vk-hub release target`: the target, then each node and where it stands against it.
+fn render_target(view: &ops::TargetView) -> String {
+    use target::Standing;
+    let t = &view.target;
+    let mut out = format!(
+        "target: vk {} ({}), set {} by {}\n",
+        t.version,
+        t.release,
+        utc(t.set_at),
+        t.set_by
+    );
+    if let Some(r) = &t.rollout {
+        out.push_str(&format!("rollout: {}\n", rollout::short_id(r)));
+    }
+    if let Some(why) = &t.held {
+        out.push_str(&format!(
+            "held: {why}; `vk-hub release target --retry all` resumes\n"
+        ));
+    }
+    let rows: Vec<[String; 3]> = view
+        .nodes
+        .iter()
+        .map(|(id, hostname, standing)| {
+            let (name, detail) = match standing {
+                Standing::Current => ("current", String::new()),
+                Standing::Newer { vk } => ("newer", format!("runs vk {vk}")),
+                Standing::Updating { command } => ("updating", format!("command {command}")),
+                Standing::Failed { reason } => ("failed", reason.clone()),
+                Standing::Flagged { reason } => ("flagged", reason.clone()),
+                Standing::Held { reason } => ("held", reason.clone()),
+                Standing::Unorderable { vk } => (
+                    "manual",
+                    format!("runs vk {vk}, not MAJOR.MINOR.PATCH: install a release by hand"),
+                ),
+                Standing::Due => ("behind", "updated once ready and no rollout runs".into()),
+            };
+            [
+                format!("{hostname} ({})", rollout::short_id(id)),
+                name.to_string(),
+                detail,
+            ]
+        })
+        .collect();
+    out.push_str(&table(&["NODE", "STANDING", "DETAIL"], &rows));
+    out
 }
 
 /// One line of `vk-hub rollout status`: what it is and how far it has got.
@@ -3427,6 +3544,9 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
             "{}: no gitlab-runner, placed jobs only",
             n.hostname
         ));
+    }
+    if let Some(note) = &n.auto_update {
+        placement.push(format!("{}: {note}", n.hostname));
     }
     let Some(report) = &n.report else {
         return placement;

@@ -15,6 +15,7 @@ use crate::store::{
     AccountChange, DesiredChange, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, Tools,
     ToolsUnsupported,
 };
+use crate::target::{Standing, TargetRow};
 
 /// Command delivery window. One day allows for a node reboot or hub outage without applying
 /// a stale request, such as a week-old drain.
@@ -74,6 +75,10 @@ pub struct NodeView {
     /// announce `job_build_cache`.
     #[serde(default)]
     pub without_job_build_cache: bool,
+    /// Where it stands against the hub's target release, in words, when there is anything to
+    /// say: behind it, being updated, failed, or left alone and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<String>,
 }
 
 impl NodeView {
@@ -85,18 +90,19 @@ impl NodeView {
 
 /// Every enrolled node, as `vk-hub nodes` shows it, ordered by hostname.
 pub fn node_views(hub: &Hub) -> Result<Vec<NodeView>> {
+    let target = hub.db.target()?;
     let mut views: Vec<NodeView> = hub
         .db
         .nodes()?
         .into_iter()
-        .map(|(id, row)| node_view(hub, id, &row))
+        .map(|(id, row)| node_view(hub, id, &row, target.as_ref()))
         .collect();
     views.sort_by(|a, b| (&a.hostname, &a.id).cmp(&(&b.hostname, &b.id)));
     Ok(views)
 }
 
-/// Node `id`'s row as `vk-hub nodes` shows it.
-pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
+/// Node `id`'s row as `vk-hub nodes` shows it, against the hub's `target` release if one is set.
+pub fn node_view(hub: &Hub, id: String, row: &NodeRow, target: Option<&TargetRow>) -> NodeView {
     let inventory = row.inventory.as_ref();
     let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
     NodeView {
@@ -128,6 +134,7 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
             && !crate::jobs::enforces_rules(hub, row),
         without_job_build_cache: crate::jobs::accepting(hub).is_ok()
             && !crate::jobs::caches_builds_as_required(hub, row),
+        auto_update: target.and_then(|t| crate::target::standing(t, &id, row).note(t)),
         id,
     }
 }
@@ -464,16 +471,15 @@ pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<Rollo
     Ok((release, nodes))
 }
 
-/// Start the rollout [`plan_rollout`] planned, as `actor`.
-pub fn start_rollout(
-    hub: &Hub,
+/// The rollout [`plan_rollout`] planned, started by `actor` at `now`.
+fn rollout_row(
     actor: &str,
     plan: &RolloutPlan,
     release: &Release,
     nodes: Vec<RolloutNode>,
-) -> Result<Rollout> {
-    let now = crate::now_secs();
-    let row = RolloutRow {
+    now: u64,
+) -> RolloutRow {
+    RolloutRow {
         release: release.sha256.clone(),
         version: release.row.version.clone(),
         created_at: now,
@@ -487,7 +493,18 @@ pub fn start_rollout(
         state: RolloutState::Running,
         failures: 0,
         nodes,
-    };
+    }
+}
+
+/// Start the rollout [`plan_rollout`] planned, as `actor`.
+pub fn start_rollout(
+    hub: &Hub,
+    actor: &str,
+    plan: &RolloutPlan,
+    release: &Release,
+    nodes: Vec<RolloutNode>,
+) -> Result<Rollout> {
+    let row = rollout_row(actor, plan, release, nodes, crate::now_secs());
     let id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
     hub.db.create_rollout(&id, &row, actor)?;
     eprintln!(
@@ -497,6 +514,158 @@ pub fn start_rollout(
     );
     hub.touch();
     Ok(Rollout { id, row })
+}
+
+/// The target, as `vk-hub release target` shows it: where each node stands against it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetView {
+    pub target: TargetRow,
+    /// Each node's ID, hostname and standing, by hostname.
+    pub nodes: Vec<(String, String, Standing)>,
+}
+
+/// The target and any rollout it started over nodes running an older version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetSet {
+    pub target: TargetRow,
+    pub rollout: Option<Rollout>,
+}
+
+/// The target and where each node stands against it, or `None` when none is set.
+pub fn target_view(hub: &Hub) -> Result<Option<TargetView>> {
+    let Some(target) = hub.db.target()? else {
+        return Ok(None);
+    };
+    let mut nodes: Vec<(String, String, Standing)> = hub
+        .db
+        .nodes()?
+        .into_iter()
+        .map(|(id, row)| {
+            let standing = crate::target::standing(&target, &id, &row);
+            (id, row.hostname, standing)
+        })
+        .collect();
+    nodes.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+    Ok(Some(TargetView { target, nodes }))
+}
+
+/// Make the release whose sha256 starts with `release` the target, as `actor`, and start a
+/// rollout of it, with `vk-hub rollout create`'s defaults, over the nodes behind it. The
+/// release must be a `vk` of `MAJOR.MINOR.PATCH`, signed by one of `[nodes] release_keys`
+/// when any is set.
+pub fn set_target(hub: &Hub, actor: &str, release: &str) -> Result<TargetSet> {
+    // Held from the lookup to the write, so the release cannot be removed between them.
+    let _held = hub.releases_lock();
+    let release = hub.db.resolve_release(release)?;
+    nodes_release(&release)?;
+    if !crate::target::orderable(&release.row.version) {
+        bail!(
+            "vk {} is not MAJOR.MINOR.PATCH, which nodes are ordered against",
+            release.row.version
+        );
+    }
+    if !hub.node_release_keys().is_empty() {
+        vk_peer::release_key::Policy::from_config_in(
+            "[nodes]",
+            vk_peer::release_key::Program::Vk,
+            hub.node_release_keys(),
+            None,
+        )?
+        .check(
+            &release.sha256,
+            &release.row.version,
+            release.row.signature.as_deref(),
+        )
+        .map_err(|e| anyhow!("{e}; a target must be signed by one of them"))?;
+    }
+    let now = crate::now_secs();
+    let mut target = TargetRow {
+        release: release.sha256.clone(),
+        version: release.row.version.clone(),
+        signature: release.row.signature.clone(),
+        set_at: now,
+        set_by: actor.to_string(),
+        rollout: None,
+        held: None,
+        nodes: Default::default(),
+    };
+    let behind: Vec<String> = hub
+        .db
+        .nodes()?
+        .into_iter()
+        .filter(|(id, row)| crate::target::standing(&target, id, row) == Standing::Due)
+        .map(|(id, _)| id)
+        .collect();
+    let mut rollout = None;
+    if !behind.is_empty() {
+        let plan = RolloutPlan {
+            release: release.sha256.clone(),
+            nodes: Selection::Nodes(behind),
+            batch: 1,
+            canary_per_profile: false,
+            max_failures: 0,
+            node_timeout_secs: crate::rollout::NODE_TIMEOUT_SECS,
+            drain_timeout_secs: crate::rollout::DRAIN_TIMEOUT_SECS,
+            force: false,
+        };
+        let (release, nodes) = plan_rollout(hub, &plan)?;
+        if nodes.iter().any(|n| n.status == NodeStatus::Pending) {
+            let id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
+            target.rollout = Some(id.clone());
+            rollout = Some(Rollout {
+                id,
+                row: rollout_row(actor, &plan, &release, nodes, now),
+            });
+        }
+    }
+    hub.db.set_target(
+        &target,
+        rollout.as_ref().map(|r| (r.id.as_str(), &r.row)),
+        actor,
+    )?;
+    eprintln!(
+        "vk-hub: {actor} set the target to vk {}{}",
+        target.version,
+        match &rollout {
+            Some(r) => format!(", rollout {}", crate::rollout::short_id(&r.id)),
+            None => String::new(),
+        }
+    );
+    hub.touch();
+    Ok(TargetSet { target, rollout })
+}
+
+/// Clear the target, as `actor`; the target it was, or `None` when none was set.
+pub fn clear_target(hub: &Hub, actor: &str) -> Result<Option<TargetRow>> {
+    let cleared = hub.db.clear_target(actor, crate::now_secs())?;
+    if let Some(t) = &cleared {
+        eprintln!("vk-hub: {actor} cleared the target, vk {}", t.version);
+        hub.touch();
+    }
+    Ok(cleared)
+}
+
+/// Allow failed target updates to be retried for IDs starting with `node`, or all with
+/// `None`, and lift any automatic-update hold, as `actor`. Return the nodes allowed to retry
+/// and whether a hold was lifted.
+pub fn retry_target(hub: &Hub, actor: &str, node: Option<&str>) -> Result<(Vec<String>, bool)> {
+    if let Some(node) = node
+        && node.len() < 8
+    {
+        bail!(
+            "{}: name a node by its ID, or at least its first 8 hex digits",
+            vk_hub_proto::display_safe(node)
+        );
+    }
+    let (retried, lifted) = hub.db.retry_target(node, actor, crate::now_secs())?;
+    if !retried.is_empty() || lifted {
+        eprintln!(
+            "vk-hub: {actor} let {} node(s) be updated to the target again",
+            retried.len()
+        );
+        hub.touch();
+    }
+    Ok((retried, lifted))
 }
 
 /// Every rollout, newest first.

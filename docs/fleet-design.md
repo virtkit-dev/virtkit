@@ -431,13 +431,16 @@ for material configuration differences, such as VMM version, kernel and executor
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
 not built: a canary is promoted as soon as its own update has passed.
 
-Proposed automatic updates: the hub keeps a target `vk` release, which must be signed by one of
+Built automatic updates: the hub keeps a target `vk` release, which must be signed by one of
 `[nodes] release_keys` when any is set. Setting it starts a rollout of it over the nodes running
 an older version; afterwards a node reporting an older version — newly joined, or taken back by
 hand — is updated alone once it is ready and no rollout runs. Each is an ordinary update
 command, held to the node's signature, downgrade and trial checks. A node running a newer
-version is left alone, a node with an external runner is skipped rather than forced, and a node
-whose automatic update failed is not tried again for that target until an operator says so.
+version is left alone, one whose version is not `MAJOR.MINOR.PATCH` is never updated
+automatically and shown as such, a node with an external runner is skipped rather than forced, a node
+whose reported release keys would refuse the target's signature is skipped and flagged, and a
+node whose automatic update failed is not tried again for that target until an operator says
+so; nor is any node once the rollout the target started is aborted. See [Rollouts](fleet-prototype.md#rollouts).
 
 Release downloads are authenticated and scoped to a pending update; their bytes do not ride on
 the control session. The hub stores and serves releases this way

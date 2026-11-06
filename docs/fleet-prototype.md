@@ -732,13 +732,49 @@ update an operator issued it before the rollout reached it is still under way.
 `rollout status [<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues
 nothing more, and updates under way finish and are still recorded. `rollout delete <id>`
 forgets an ended rollout, done or aborted, once no update it issued is under way; its audit
-lines stay. One rollout runs at a time, a release is kept while a rollout of it is not over,
-and `vk-hub nodes update` refuses a node a running or paused rollout has still to update. The
+lines stay. One rollout runs at a time. A release is kept while its rollout is unfinished or
+it is the target. `vk-hub nodes update` refuses a node a running or paused rollout has yet to
+update. The
 rollout and its nodes' states are one row in the hub's database, written in one transaction
 with the commands it issues and the audit lines that describe each step; a pass that changes
 nothing writes nothing; the hub task advances every rollout from the database at start,
 whenever a node reports, and every five seconds, so a restarted hub carries on where it
 stopped. A rollout that cannot advance holds none of the others back.
+
+### Automatic updates
+
+`vk-hub release target <sha256>` makes a `vk` release the hub's target: its version must be
+`MAJOR.MINOR.PATCH`, and with `[nodes] release_keys` in `hub.toml` it must carry a signature by
+one of them. Setting it starts a rollout of it, with `rollout create`'s defaults — batches of
+one, no canaries, no failure absorbed, 30 minutes per node and four hours to drain — over the
+nodes running an older version, in the same write as the target. Setting a target is refused
+while a rollout is running or paused, and while an automatic update to the target it would
+replace is under way. To shape that rollout, run `rollout create` first and set the
+target once it is over: nodes on the target are not behind it. Versions are ordered as
+`MAJOR.MINOR.PATCH`, as a node orders them before it updates.
+
+Afterwards the hub's rollout task, on each pass, updates one node behind the target at a time:
+one that reports an older version — joined since, skipped by the rollout, or taken back by hand
+— and is ready, connected and has no update under way, once no rollout is running, paused or
+still finishing an update it issued; the first by hostname goes first. The update is an ordinary
+one, issued as `auto-update` with the same windows and judged as a rollout judges its nodes:
+done once the node runs the release and is back. A node running a newer version is left alone;
+one running a version that is not `MAJOR.MINOR.PATCH`, such as a pre-release or a development
+build, which it would not order against the target either, is never updated automatically and
+is shown as such until a release is installed on it by hand; one whose runner is external is skipped, never
+forced; one only monitored is skipped; and one whose reported release keys would refuse the
+target's signature is skipped and flagged. A node whose update to the target failed — on its
+own or in the rollout the target started, refused or expired included — is not tried again
+until `vk-hub release target --retry <node>|all`. Once the rollout the target started is
+aborted — past its one failure or by an operator — no node is updated automatically until a
+`--retry` resumes them; that rollout cannot be deleted until the hub has taken in how it ended,
+a few seconds later. Each step is audited.
+
+`vk-hub release target` alone prints the target and where each node stands against it
+(`current`, `newer`, `behind`, `updating`, `failed`, `flagged`, `manual` or `held`, with why),
+and `vk-hub nodes` notes each node that is not current. `--clear` ends the automatic updates; an
+update under way finishes, and a rollout the target started goes on until aborted. The target
+lives in the hub's database, so a restarted hub carries on.
 
 ## CI tools
 

@@ -495,6 +495,11 @@ impl Hub {
         self
     }
 
+    /// `[nodes] release_keys`: what a target release must be signed by, when any.
+    pub fn node_release_keys(&self) -> &[String] {
+        &self.node_release_keys
+    }
+
     /// This hub, keeping release binaries in `dir`.
     pub fn with_releases(mut self, dir: std::path::PathBuf) -> Self {
         self.releases = Some(dir);

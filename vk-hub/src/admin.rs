@@ -34,6 +34,7 @@ use crate::store::{
     AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Program, Release, Role, TokenKind, Tools,
     UiSession,
 };
+use crate::target::TargetRow;
 use vk_hub_proto::registry::{
     Command as RegistryCommand, DesiredState as RegistryDesired, GcPolicy,
 };
@@ -279,6 +280,17 @@ enum Call {
     ListReleases,
     RemoveRelease {
         release: String,
+    },
+    /// The target release, and where each node stands against it.
+    ShowTarget,
+    /// Make a release, named by its sha256 or a prefix of it, the target.
+    SetTarget {
+        release: String,
+    },
+    ClearTarget,
+    /// Let a node, by an ID prefix, or every node with `None`, be updated to the target again.
+    RetryTarget {
+        node: Option<String>,
     },
     /// Pack the build context at `path`, which the hub's user must be able to read, into a
     /// tools definition.
@@ -962,6 +974,14 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             let removed = crate::releases::remove(hub, &actor, &release.sha256)?;
             serde_json::to_value(removed.then_some(release))?
         }
+        Call::ShowTarget => serde_json::to_value(ops::target_view(hub)?)?,
+        Call::SetTarget { release } => {
+            serde_json::to_value(ops::set_target(hub, &actor, &release)?)?
+        }
+        Call::ClearTarget => serde_json::to_value(ops::clear_target(hub, &actor)?)?,
+        Call::RetryTarget { node } => {
+            serde_json::to_value(ops::retry_target(hub, &actor, node.as_deref())?)?
+        }
         Call::AddTools { path, version } => {
             serde_json::to_value(crate::tools::add(hub, &actor, &path, &version)?)?
         }
@@ -1557,6 +1577,29 @@ impl Client {
     pub fn remove_release(&self, release: &str) -> Result<Option<Release>> {
         self.call(Call::RemoveRelease {
             release: release.to_string(),
+        })
+    }
+
+    /// The target and where each node stands against it; `None` when none is set.
+    pub fn target(&self) -> Result<Option<ops::TargetView>> {
+        self.call(Call::ShowTarget)
+    }
+
+    pub fn set_target(&self, release: &str) -> Result<ops::TargetSet> {
+        self.call(Call::SetTarget {
+            release: release.to_string(),
+        })
+    }
+
+    /// The target cleared, or `None` when none was set.
+    pub fn clear_target(&self) -> Result<Option<TargetRow>> {
+        self.call(Call::ClearTarget)
+    }
+
+    /// The nodes let be tried again, and whether a hold was lifted.
+    pub fn retry_target(&self, node: Option<&str>) -> Result<(Vec<String>, bool)> {
+        self.call(Call::RetryTarget {
+            node: node.map(str::to_string),
         })
     }
 

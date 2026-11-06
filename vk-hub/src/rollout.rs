@@ -99,6 +99,9 @@ impl RolloutRow {
 /// How long a drain may take unless a rollout says otherwise: a long CI job's worth.
 pub const DRAIN_TIMEOUT_SECS: u64 = 4 * 3600;
 
+/// How long a node's update may take once drained unless a rollout says otherwise.
+pub const NODE_TIMEOUT_SECS: u64 = 30 * 60;
+
 fn default_drain_timeout() -> u64 {
     DRAIN_TIMEOUT_SECS
 }
@@ -688,18 +691,21 @@ pub fn short_id(id: &str) -> &str {
 /// How often the driver looks at its rollouts when nothing else wakes it.
 const TICK: Duration = Duration::from_secs(5);
 
-/// Drive every active rollout for as long as the hub runs: at start — so a restarted hub
-/// carries on — whenever a node reports or an operator acts, and every [`TICK`] regardless,
-/// for the timeouts. Its nodes get [`GIVE_UP_GRACE_SECS`] from the start to reconnect before
+/// Drive every active rollout, then the target's automatic updates
+/// ([`crate::target`]), for as long as the hub runs: at start — so a restarted hub carries on —
+/// whenever a node reports or an operator acts, and every [`TICK`] regardless, for the
+/// timeouts. Its nodes get [`GIVE_UP_GRACE_SECS`] from the start to reconnect before
 /// any window is judged.
 pub async fn drive(hub: Arc<Hub>) {
     let mut changes = hub.subscribe();
     let not_before = crate::now_secs().saturating_add(GIVE_UP_GRACE_SECS);
     loop {
         let db = hub.db.clone();
+        let hub_for_target = hub.clone();
         let advanced = tokio::task::spawn_blocking(move || {
             let mut issued = Vec::new();
             let mut any = false;
+            let hub = hub_for_target;
             for (id, row) in db.rollouts()? {
                 if row.state != RolloutState::Running
                     && !row
@@ -717,6 +723,15 @@ pub async fn drive(hub: Arc<Hub>) {
                     }
                     Err(e) => eprintln!("vk-hub: advancing rollout {}: {e:#}", short_id(&id)),
                 }
+            }
+            // After the rollouts, so a rollout that has just ended no longer holds it back.
+            let connected = |id: &str| hub.reach(id) == crate::server::Reach::Connected;
+            match db.advance_target(crate::now_secs(), not_before, &connected) {
+                Ok((changed, node)) => {
+                    any |= changed;
+                    issued.extend(node);
+                }
+                Err(e) => eprintln!("vk-hub: advancing the target's updates: {e:#}"),
             }
             anyhow::Ok((any, issued))
         })

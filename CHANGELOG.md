@@ -6,6 +6,14 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **vk-hub keeps its nodes on a target release.** `vk-hub release target` sets the `vk` the
+  fleet should run: setting it rolls it out to the nodes running an older version, and from then
+  on a node that falls behind, such as one that just joined, is updated on its own once it is
+  ready. Nodes on a newer version, with their own gitlab-runner, or whose keys would refuse the
+  release are left alone, a node running a pre-release or development build is shown as not
+  updated automatically, and a node whose update failed waits for an operator's `--retry`. The
+  target must be signed by one of `[nodes] release_keys` when the hub sets any, and cannot be
+  deleted while it is the target.
 - **A fleet node's jobs have a network with no config of its own.** Unless its config file
   sets `[net] mode`, a node enrolled with a hub gives its jobs the per-job switch, held to its
   own `[egress]` and the hub's egress rules, so they can reach the registry proxy and run

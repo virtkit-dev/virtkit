@@ -545,7 +545,7 @@ fn read_node(hub: &Hub, id: &str) -> Result<Option<NodeDetail>> {
     commands.reverse();
     commands.truncate(NODE_COMMANDS);
     Ok(Some(NodeDetail {
-        view: crate::ops::node_view(hub, id.to_string(), &row),
+        view: crate::ops::node_view(hub, id.to_string(), &row, hub.db.target()?.as_ref()),
         workloads,
         commands,
         row,

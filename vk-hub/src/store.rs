@@ -57,6 +57,7 @@ mod policy;
 mod registries;
 mod relay_commands;
 mod relays;
+mod target;
 mod token_keys;
 mod tools;
 
@@ -1015,6 +1016,8 @@ impl Db {
             .context("opening the releases table")?;
         txn.open_table(ROLLOUTS)
             .context("opening the rollouts table")?;
+        txn.open_table(target::TARGET)
+            .context("opening the target table")?;
         txn.open_table(ACCOUNTS)
             .context("opening the accounts table")?;
         txn.open_table(keys::API_KEYS)
@@ -1838,6 +1841,9 @@ impl Db {
                     );
                 }
             }
+            if let Some(why) = target::keeps(&txn, sha256)? {
+                bail!("{why}");
+            }
             for entry in txn.open_table(ROLLOUTS)?.iter()? {
                 let (id, value) = entry?;
                 let row = decode::<RolloutRow>(value.value())?;
@@ -2060,6 +2066,13 @@ impl Db {
             };
             if let Some(kept) = RolloutUndeletable::of(id, &row, rule) {
                 return Err(kept.into());
+            }
+            if target::awaits(&txn, id)? {
+                bail!(
+                    "rollout {} has not been taken in by the target it was started for yet; \
+                     try again in a few seconds",
+                    crate::rollout::short_id(id)
+                );
             }
             table.remove(id)?;
             let event = format!(
@@ -2771,6 +2784,22 @@ fn insert_command(
     Ok(command)
 }
 
+/// Refuse, inside `txn`, while a rollout is running or paused.
+fn refuse_active_rollout(txn: &redb::WriteTransaction) -> Result<()> {
+    for entry in txn.open_table(ROLLOUTS)?.iter()? {
+        let (other, value) = entry?;
+        let other_row = decode::<RolloutRow>(value.value())?;
+        if other_row.state.active() {
+            bail!(
+                "rollout {} is still {}; abort it, or let it finish, first",
+                crate::rollout::short_id(other.value()),
+                other_row.state.name()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// [`Db::create_rollout`] inside `txn`.
 fn insert_rollout(
     txn: &redb::WriteTransaction,
@@ -2786,19 +2815,9 @@ fn insert_rollout(
     {
         bail!("there is no release {}", row.release);
     }
-    let mut table = txn.open_table(ROLLOUTS)?;
-    for entry in table.iter()? {
-        let (other, value) = entry?;
-        let other_row = decode::<RolloutRow>(value.value())?;
-        if other_row.state.active() {
-            bail!(
-                "rollout {} is still {}; abort it, or let it finish, first",
-                crate::rollout::short_id(other.value()),
-                other_row.state.name()
-            );
-        }
-    }
-    table.insert(id, encode(row)?.as_slice())?;
+    refuse_active_rollout(txn)?;
+    txn.open_table(ROLLOUTS)?
+        .insert(id, encode(row)?.as_slice())?;
     let event = format!(
         "{actor} started rollout {} of vk {} ({}) to {} node(s), {} skipped from the \
          start, batches of {}{}, at most {} failure(s)",

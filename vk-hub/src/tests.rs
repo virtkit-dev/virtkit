@@ -2183,6 +2183,178 @@ async fn a_rollout_survives_a_hub_restart() {
 }
 
 /// `vk-hub rollout status` names each node's wave and how its update went.
+/// Say on behalf of node `id` that it is ready and runs `vk` of `sha256`, with `runner`.
+fn ready_at(hub: &Hub, id: &str, vk: &str, sha256: &str, runner: vk_hub_proto::RunnerMode) {
+    let mut inventory = Inventory {
+        hostname: hub.db.node(id).unwrap().unwrap().hostname,
+        ..Inventory::default()
+    };
+    inventory.versions.vk = vk.into();
+    inventory.versions.vk_sha256 = Some(sha256.into());
+    hub.db
+        .record_inventory(id, inventory, true, now_secs())
+        .unwrap();
+    hub.db
+        .record_report(
+            id,
+            vk_hub_proto::Report {
+                state: Some(vk_hub_proto::NodeState::Ready),
+                runner: Some(runner),
+                ..vk_hub_proto::Report::default()
+            },
+            now_secs(),
+        )
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_rolls_out_then_updates_each_node_behind_it_alone() {
+    use vk_hub_proto::RunnerMode::{External, Managed};
+    let (dir, _, hub) = start_releases("target", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.90.0"), "0.90.0").unwrap();
+    let other = "00".repeat(32);
+    let [a, b, newer, external] = ["a", "b", "newer", "external"].map(|n| enroll_as(&hub, n));
+    ready_at(&hub, &a, "0.89.0", &other, Managed);
+    ready_at(&hub, &b, "0.89.0", &other, Managed);
+    ready_at(&hub, &newer, "0.91.0", &other, Managed);
+    ready_at(&hub, &external, "0.89.0", &other, External);
+    let set = ops::set_target(&hub, "uid 0", &release.sha256[..8]).unwrap();
+    // Only the nodes behind it that can be updated are in its rollout.
+    let rollout = set.rollout.unwrap();
+    let mut in_rollout: Vec<&str> = rollout.row.nodes.iter().map(|n| n.id.as_str()).collect();
+    in_rollout.sort();
+    let mut want = vec![a.as_str(), b.as_str()];
+    want.sort();
+    assert_eq!(in_rollout, want);
+    // The target is kept.
+    let err = releases::remove(&hub, "uid 0", &release.sha256).unwrap_err();
+    assert!(format!("{err:#}").contains("target"), "{err:#}");
+    let connected = |_: &str| true;
+    let advance_target = || hub.db.advance_target(now_secs(), 0, &connected).unwrap();
+    let advance = || hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    let (_, issued) = advance();
+    let first = issued[0].clone();
+    let second = if first == a { b.clone() } else { a.clone() };
+    // A rollout running holds the automatic updates back.
+    assert_eq!(advance_target().1, None);
+    ack_only(&hub, &first, vk_hub_proto::Outcome::Done);
+    ready_at(&hub, &first, "0.90.0", &release.sha256, Managed);
+    assert_eq!(advance().1, std::slice::from_ref(&second));
+    ack_only(
+        &hub,
+        &second,
+        vk_hub_proto::Outcome::Failed {
+            message: "rolled back: validation failed".into(),
+        },
+    );
+    // No failure absorbed: the rollout aborts.
+    advance();
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert!(
+        matches!(row.state, rollout::RolloutState::Aborted { .. }),
+        "{row:?}"
+    );
+    // Kept until the target has taken in how it ended.
+    let delete = || {
+        hub.db
+            .delete_rollout(&rollout.id, rollout::DeleteRule::Ended, "uid 0", now_secs())
+    };
+    assert!(format!("{:#}", delete().unwrap_err()).contains("taken in"));
+    // The rollout aborted, the node it failed on is not tried again, and every automatic
+    // update is held.
+    let (changed, issued) = advance_target();
+    assert!(changed);
+    assert_eq!(issued, None);
+    assert!(delete().unwrap().is_some());
+    let view = ops::target_view(&hub).unwrap().unwrap();
+    assert!(view.target.held.is_some());
+    let standing = |id: &str| view.nodes.iter().find(|n| n.0 == id).unwrap().2.clone();
+    assert!(matches!(standing(&second), target::Standing::Failed { .. }));
+    assert_eq!(standing(&first), target::Standing::Current);
+    assert!(matches!(standing(&newer), target::Standing::Newer { .. }));
+    assert!(matches!(standing(&external), target::Standing::Held { .. }));
+    let late = enroll_as(&hub, "late");
+    ready_at(&hub, &late, "0.88.0", &other, Managed);
+    assert_eq!(advance_target().1, None);
+    // An operator lets the updates resume: one node at a time, the first by hostname.
+    assert_eq!(
+        ops::retry_target(&hub, "uid 0", None).unwrap(),
+        (vec![second.clone()], true)
+    );
+    assert_eq!(advance_target().1.as_deref(), Some(second.as_str()));
+    let command = hub
+        .db
+        .pending_commands(&second, now_secs())
+        .unwrap()
+        .remove(0);
+    assert!(matches!(
+        command.op,
+        vk_hub_proto::Operation::Update {
+            within_secs: Some(rollout::NODE_TIMEOUT_SECS),
+            force: false,
+            ..
+        }
+    ));
+    assert_eq!(advance_target().1, None);
+    // A target cannot be replaced under an automatic update.
+    let err = ops::set_target(&hub, "uid 0", &release.sha256).unwrap_err();
+    assert!(format!("{err:#}").contains("let it finish"), "{err:#}");
+    ack_only(&hub, &second, vk_hub_proto::Outcome::Done);
+    ready_at(&hub, &second, "0.90.0", &release.sha256, Managed);
+    // Done, the node joined behind it is next.
+    let (changed, issued) = advance_target();
+    assert!(changed);
+    assert_eq!(issued.as_deref(), Some(late.as_str()));
+    let events: Vec<String> = hub
+        .db
+        .audits(None, 200)
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{}: {}", r.actor, r.event))
+        .collect();
+    for want in [
+        "uid 0: uid 0 set the target to vk 0.90.0",
+        "auto-update: updated to the target vk 0.90.0",
+        "uid 0: uid 0 let the update to the target vk 0.90.0 be tried again",
+        "auto-update: held the automatic updates to the target vk 0.90.0",
+        "uid 0: uid 0 resumed the automatic updates",
+    ] {
+        assert!(
+            events.iter().any(|e| e.contains(want)),
+            "{want}: {events:?}"
+        );
+    }
+    // Cleared: no more automatic updates, and the release can go once nothing updates to it.
+    assert!(ops::clear_target(&hub, "uid 0").unwrap().is_some());
+    ack_only(&hub, &late, vk_hub_proto::Outcome::Expired);
+    assert_eq!(advance_target(), (false, None));
+    assert!(releases::remove(&hub, "uid 0", &release.sha256).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_is_held_to_the_nodes_release_keys_and_ordered() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-target-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+        .with_releases(dir.join("releases"))
+        .with_node_release_keys(vec![vk_hub_proto::to_base64(
+            &[7; vk_hub_proto::PUBLIC_KEY_LEN],
+        )]);
+    let unsigned = add_release(&hub, &dir, &fake_vk("0.90.0"), "0.90.0").unwrap();
+    let err = ops::set_target(&hub, "uid 0", &unsigned.sha256).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("[nodes] release_keys"),
+        "{err:#}"
+    );
+    let nightly = add_release(&hub, &dir, &fake_vk("nightly"), "nightly").unwrap();
+    let err = ops::set_target(&hub, "uid 0", &nightly.sha256).unwrap_err();
+    assert!(format!("{err:#}").contains("MAJOR.MINOR.PATCH"), "{err:#}");
+    assert!(ops::target_view(&hub).unwrap().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_rollout_status_shows_each_node_by_wave() {
     let row = rollout::RolloutRow {
