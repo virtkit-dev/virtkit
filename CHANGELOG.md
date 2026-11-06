@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **vk-hub sets its nodes' settings.** `vk-hub settings set` and `unset` give every node, or
+  one, capacity and VM sizing settings and a registry the hub manages to use, one node's own
+  winning over the fleet's; a value a node would refuse is refused at once.
 - **vk-hub keeps its nodes on a target release.** `vk-hub release target` sets the `vk` the
   fleet should run: setting it rolls it out to the nodes running an older version, and from then
   on a node that falls behind, such as one that just joined, is updated on its own once it is
@@ -27,7 +30,7 @@ All notable changes to virtkit will be documented in this file.
 - **A fleet node can use the registry its hub names.** With no `[registry]` in its config, the
   node takes the hub's, CA included, and holds no registry credential of its own: its jobs'
   guests reach the registry with the token the hub gives each job, and so do the node's own
-  pulls of the job's images. The hub cannot name one yet.
+  pulls of the job's images.
 - **CI jobs can wait for vCPUs as they wait for memory.** With `[executor.schedule]
   cpu_overcommit` set, a job waits while the guests' vCPUs would pass that many per CPU of the
   host, and `vk tune` asks the runner for no more jobs than that leaves room for. A fleet node
@@ -37,7 +40,7 @@ All notable changes to virtkit will be documented in this file.
   registry may come from the hub; anything the node's own config file sets still wins, and
   every `vk` on the node uses the result. The node refuses anything else the hub sends and
   reports each setting's value and where it comes from. `vk node run` restarts itself in
-  place when they change. The hub cannot set them yet.
+  place when they change.
 - **vk-hub namespaces can keep chosen branches' and tags' caches apart.** A namespace path may
   hold the new `{scope}`, which is `all` for most jobs, so the namespace stays per project
   and protection; `vk-hub namespaces add … --isolate <glob>` gives the refs it matches a scope

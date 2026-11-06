@@ -83,6 +83,14 @@ enum Call {
         url: Option<String>,
     },
     ListNodes,
+    /// The hub's settings for its nodes, every layer.
+    ShowSettings,
+    /// Set a hub setting, or unset it with no `value`, fleet-wide or for `node` alone.
+    SetSetting {
+        node: Option<String>,
+        key: String,
+        value: Option<serde_json::Value>,
+    },
     /// Every node's workloads, or one node's: by ID, or by a hostname only it has.
     Workloads {
         node: Option<String>,
@@ -664,6 +672,14 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(CreatedToken { token, expires_at })?
         }
         Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
+        Call::ShowSettings => serde_json::to_value(hub.db.settings_layers()?)?,
+        Call::SetSetting { node, key, value } => serde_json::to_value(crate::settings::set(
+            hub,
+            &actor,
+            node.as_deref(),
+            &key,
+            value,
+        )?)?,
         Call::Workloads { node } => {
             serde_json::to_value(ops::workloads(hub, node.as_deref(), MAX_REPLY_VALUE)?)?
         }
@@ -1495,6 +1511,24 @@ impl Client {
     pub fn workloads(&self, node: Option<&str>) -> Result<Vec<ops::NodeWorkloads>> {
         self.call(Call::Workloads {
             node: node.map(str::to_string),
+        })
+    }
+
+    pub fn settings(&self) -> Result<crate::store::SettingsLayers> {
+        self.call(Call::ShowSettings)
+    }
+
+    /// Whether it changed.
+    pub fn set_setting(
+        &self,
+        node: Option<&str>,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> Result<bool> {
+        self.call(Call::SetSetting {
+            node: node.map(str::to_string),
+            key: key.to_string(),
+            value,
         })
     }
 

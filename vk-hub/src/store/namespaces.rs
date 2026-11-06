@@ -597,7 +597,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
     ]
 }
 
-fn ns_range(registry: &str) -> (String, String) {
+pub(super) fn ns_range(registry: &str) -> (String, String) {
     (format!("{registry}/"), format!("{registry}0"))
 }
 

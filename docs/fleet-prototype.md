@@ -345,6 +345,16 @@ a command, saying to update its `vk`, and `vk-hub nodes` shows it as `monitor on
 node that has not connected yet is steered on trust; if it then connects at version 1, it is
 sent nothing, and its commands expire unanswered.
 
+`vk-hub settings set <key> <value> [--node ID]` and `vk-hub settings unset <key> [--node ID]`
+set the [hub settings](fleet-design.md#hub-settings) a node takes where its config file leaves a
+key unset, fleet-wide or for one node, whose own wins key by key; `vk-hub settings` lists both
+layers and the keys the hub may set. A value is checked as the node checks it — `executor.vm.mem
+8G`, `executor.vm.cpus 4`, `executor.schedule.mem_budget 50%`, `executor.schedule.from_history
+true` — and refused if it would be. `registry` takes the ID of a registry the hub manages, as
+`vk-hub registries` lists it, once it has a URL bound (`vk-hub registries set-url`). Each change is audited, and moves the generation of every
+node it changes, sent to the nodes that announce `hub_settings` only; a node's layer goes when
+it is removed.
+
 `vk-hub nodes` shows what the hub asked beside what the node reports. STATE is the node's own,
 with how many commands are pending. ACQUIRE and CEILING are the hub's, with the node's in
 brackets where they differ, and `quitting` while a stopped runner finishes its jobs. CONC is

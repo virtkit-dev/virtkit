@@ -653,6 +653,7 @@ pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bo
     let changed = hub.db.set_registry_url(id, url, actor, crate::now_secs())?;
     if changed {
         hub.changed(id);
+        crate::settings::steer(hub);
     }
     Ok(changed)
 }
@@ -682,6 +683,7 @@ pub fn put_namespace_with(
         .put_namespace_with(id, ns, keep_isolate, actor, crate::now_secs())?;
     sync_after_namespaces(hub, id);
     hub.changed(id);
+    crate::settings::steer(hub);
     Ok(ns)
 }
 
@@ -693,6 +695,7 @@ pub fn remove_namespace(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<
     if removed {
         sync_after_namespaces(hub, id);
         hub.changed(id);
+        crate::settings::steer(hub);
     }
     Ok(removed)
 }
@@ -711,6 +714,7 @@ pub fn remove(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
     if removed {
         hub.revoke(id);
         hub.touch();
+        crate::settings::steer(hub);
     }
     Ok(removed)
 }

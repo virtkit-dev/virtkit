@@ -57,6 +57,7 @@ mod policy;
 mod registries;
 mod relay_commands;
 mod relays;
+mod settings;
 mod target;
 mod token_keys;
 mod tools;
@@ -96,6 +97,7 @@ pub use registries::{
 };
 pub use relay_commands::{RelayCommandRow, relay_operation_name};
 pub use relays::{PendingGitlab, RelayEnrollment, RelayRow, RelayWrite};
+pub use settings::{Layer as SettingsLayer, Layers as SettingsLayers, shown as setting_shown};
 pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
 
@@ -1018,6 +1020,8 @@ impl Db {
             .context("opening the rollouts table")?;
         txn.open_table(target::TARGET)
             .context("opening the target table")?;
+        txn.open_table(settings::SETTINGS)
+            .context("opening the settings table")?;
         txn.open_table(ACCOUNTS)
             .context("opening the accounts table")?;
         txn.open_table(keys::API_KEYS)
@@ -1306,6 +1310,7 @@ impl Db {
             )?;
             txn.open_table(WORKLOADS)?.remove(id)?;
             txn.open_table(WORKLOAD_MEM)?.remove(id)?;
+            settings::remove_node_in(&txn, id)?;
             let (start, end) = command_range(id);
             txn.open_table(COMMANDS)?
                 .retain_in(start.as_str()..end.as_str(), |_, _| false)?;
@@ -1334,10 +1339,15 @@ impl Db {
             row.inventory = Some(inventory);
             row.last_seen = Some(now);
             let mut events = Vec::new();
-            if changed
-                && let Some(generation) = steer_fallback(row, self.fallback_in(txn)?.as_ref())
-            {
-                events.push(("hub".to_string(), fallback_event(row, generation)));
+            if changed {
+                if let Some(generation) = steer_fallback(row, self.fallback_in(txn)?.as_ref()) {
+                    events.push(("hub".to_string(), fallback_event(row, generation)));
+                }
+                // Whether it takes them may have changed.
+                let wanted = settings::wanted_in(txn, id, row)?;
+                if let Some(generation) = settings::steer_settings(row, wanted) {
+                    events.push(("hub".to_string(), settings::settings_event(generation)));
+                }
             }
             let durability = if (changed && durable) || !events.is_empty() {
                 Durability::Immediate
@@ -1488,10 +1498,9 @@ impl Db {
                         } else {
                             theirs.acquisition
                         },
-                        // The hub's alone to set: the Fallback, steered below.
+                        // The hub's alone to set, steered below: the Fallback and the settings.
                         egress: ours.egress.clone(),
-                        // Nothing on the hub sets them yet: the node's stand.
-                        settings: theirs.settings.clone(),
+                        settings: ours.settings.clone(),
                     };
                     let same = |s: &DesiredState| {
                         (
@@ -1540,8 +1549,6 @@ impl Db {
                 (Some(ours), Some(theirs), None) if theirs.generation > ours.generation => {
                     let desired = DesiredState {
                         generation: theirs.generation.saturating_add(1),
-                        // Nothing on the hub sets them yet: the node's stand.
-                        settings: theirs.settings.clone(),
                         ..ours.clone()
                     };
                     events.push((
@@ -1559,6 +1566,12 @@ impl Db {
             row.report = Some(report);
             if let Some(generation) = steer_fallback(row, fallback.as_ref()) {
                 events.push(("hub".to_string(), fallback_event(row, generation)));
+            }
+            // The hub's settings stand over any the node applied: a hub restored from before
+            // they changed, or one that adopted the node's state, sends its own.
+            let wanted = settings::wanted_in(txn, id, row)?;
+            if let Some(generation) = settings::steer_settings(row, wanted) {
+                events.push(("hub".to_string(), settings::settings_event(generation)));
             }
             row.last_seen = Some(now);
             // Kept apart from the row, which carries their count.
@@ -2621,38 +2634,42 @@ impl Db {
     }
 }
 
-/// Give node `row` the Fallback egress layer `fallback` in its desired state when it enforces
-/// one, and none otherwise, as [`Db::set_desired`] makes a change: the next generation past both
-/// the hub's and the node's, and on the defaults recorded as such. `Some` with the new
-/// generation if that changed it. A node only monitored is left alone: it reads no desired
-/// state.
-fn steer_fallback(
-    row: &mut NodeRow,
-    fallback: Option<&vk_hub_proto::egress::HubEgress>,
-) -> Option<u64> {
+/// Change node `row`'s desired state by `change`, as [`Db::set_desired`] makes a change: the next
+/// generation past both the hub's and the node's, and on the defaults recorded as such. `Some`
+/// with the new generation if that changed it. A node only monitored is left alone: it reads no
+/// desired state.
+fn steer(row: &mut NodeRow, change: impl FnOnce(&mut DesiredState)) -> Option<u64> {
     if row.protocol.is_some_and(|v| v < STEERING) {
         return None;
     }
-    let enforces = row.inventory.as_ref().is_some_and(|i| i.egress_fallback);
-    let wanted = fallback.filter(|_| enforces).cloned();
     let before = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
-    if before.egress == wanted {
+    let mut next = before.clone();
+    change(&mut next);
+    if next == before {
         return None;
     }
     let applied = row.report.as_ref().and_then(Report::applied_generation);
     if row.desired.is_none() && applied.is_none() && row.set_on_defaults.is_none() {
         row.set_on_defaults = Some(SetFields::default());
     }
-    let generation = before
+    next.generation = before
         .generation
         .max(applied.unwrap_or(0))
         .saturating_add(1);
-    row.desired = Some(DesiredState {
-        generation,
-        egress: wanted,
-        ..before
-    });
+    let generation = next.generation;
+    row.desired = Some(next);
     Some(generation)
+}
+
+/// Give node `row` the Fallback egress layer `fallback` in its desired state when it enforces
+/// one, and none otherwise ([`steer`]).
+fn steer_fallback(
+    row: &mut NodeRow,
+    fallback: Option<&vk_hub_proto::egress::HubEgress>,
+) -> Option<u64> {
+    let enforces = row.inventory.as_ref().is_some_and(|i| i.egress_fallback);
+    let wanted = fallback.filter(|_| enforces).cloned();
+    steer(row, |d| d.egress = wanted)
 }
 
 /// The audit line for [`steer_fallback`] having moved `row` to `generation`.
@@ -4991,8 +5008,9 @@ mod tests {
         assert_eq!(db.node(&id).unwrap().unwrap().set_on_defaults, None);
     }
 
-    /// The hub sets no settings of its own yet: it keeps a node's, through an operator's change
-    /// made before the node reported, and keeps what the node said of them, made safe to show.
+    /// The hub's settings override the node's through operator changes made before its report
+    /// and reissues past its generation. Unsupported nodes receive none. The node's settings
+    /// report is kept with strings safe to display.
     #[test]
     fn a_nodes_settings_are_kept_and_shown_safely() {
         use vk_hub_proto::{Setting, SettingSource};
@@ -5026,10 +5044,9 @@ mod tests {
         let row = db.node(&id).unwrap().unwrap();
         let desired = row.desired.unwrap();
         assert_eq!((desired.generation, desired.ceiling), (8, Some(5)));
-        assert_eq!(desired.settings, settings);
+        assert!(desired.settings.is_empty());
         let shown = row.report.unwrap().settings.unwrap();
-        // A hub restored from before the node's generation re-issues its own state, with the
-        // node's settings.
+        // A hub restored from before the node's generation re-issues its own state.
         let ahead = Report {
             applied: Some(DesiredState {
                 generation: 20,
@@ -5043,7 +5060,7 @@ mod tests {
         db.record_report(&id, ahead, 3).unwrap();
         let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
         assert_eq!((desired.generation, desired.ceiling), (21, Some(5)));
-        assert_eq!(desired.settings, settings);
+        assert!(desired.settings.is_empty());
         let text = serde_json::to_string(&shown).unwrap();
         assert!(
             !text.contains("\\u001b") && !text.contains("\\u0007"),

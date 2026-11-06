@@ -127,9 +127,10 @@ setting resolves in three layers, a later one winning:
 built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
-Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet, an enrolled node's memory, vCPU and network defaults, the
-registry the hub names, and the release keys pinned at enrollment ([Updates](#updates)).
+Built today: the local file, over built-in defaults; the hub settings below, set with
+`vk-hub settings` ([Steering](fleet-prototype.md#steering)); an enrolled node's memory, vCPU and
+network defaults; the registry the hub names; and the release keys pinned at enrollment
+([Updates](#updates)).
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
@@ -187,7 +188,9 @@ with the source `default`.
 ### Hub settings
 
 - **On the hub.** A fleet-wide layer and one per node, in the database; the node's wins, key by
-  key. The hub expands them into each node's desired state as `settings`: a map from a dotted
+  key. The hub checks the allowlist, value type and `<n>G` size format so operators receive
+  errors immediately; the node checks again. The hub expands the layers into each node's
+  desired state as `settings`: a map from a dotted
   key (`executor.vm.max_cpus`) to a value of that key's TOML type, `registry` a table. A change
   is a new generation for every node it reaches, so settings are applied at most once, kept
   across a hub outage, and handled as the rest of desired state is after a
@@ -218,6 +221,12 @@ with the source `default`.
   before the settings that name it. A CA the hub no longer names is kept a week, the longest
   a job's registry token lives, for the jobs that started with it. A local `[registry]` is
   taken whole; the two never merge.
+
+  The hub's `registry` setting names a registry it manages by ID, and the hub sends each node
+  the table that reaches it: `repo` the host and port of its bound URL, `insecure` for an
+  `http` URL, and `pipeline_root` the leading fixed components of its `ci-pipeline` namespace's
+  path. A registry with no URL bound cannot be named, and one unbound or removed since is not
+  sent, the setting kept; a change to its URL or namespaces moves the nodes on.
 
   Holding no credential, the node pulls a placed job's images from the registry — `virtkit/`
   bundles, `pipeline/build/` images, and Docker images it offers the registry's relay first —

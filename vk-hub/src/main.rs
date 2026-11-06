@@ -43,6 +43,7 @@ mod releases;
 mod rollout;
 mod server;
 mod session;
+mod settings;
 mod store;
 mod subject;
 mod target;
@@ -199,6 +200,16 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
+    },
+    /// Show, set and unset the settings the hub gives its nodes, fleet-wide or for one node
+    ///
+    /// A node takes each setting its own config.toml leaves unset, from the node's own layer
+    /// before the fleet-wide one; `vk-hub nodes` and the node's page show what each came to.
+    Settings {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<SettingsCmd>,
     },
     /// Read or replace the capacity arbitration policy as JSON
     CapacityPolicy {
@@ -564,6 +575,30 @@ enum KeysCmd {
     /// Revoke the working key of that name; with none working, remove those that no longer
     /// work
     Revoke { name: String },
+}
+
+#[derive(Subcommand)]
+enum SettingsCmd {
+    /// Set a setting fleet-wide, or for one node with --node
+    ///
+    /// `registry` takes a registry's ID, as `vk-hub registries` lists it, once it has a URL
+    /// bound: nodes reach it with each job's token.
+    Set {
+        /// A key `vk-hub settings` lists, e.g. executor.vm.max_cpus
+        key: String,
+        /// Its value: a size such as 8G, a number, true or false, or a registry's ID
+        value: String,
+        /// Only this node: its ID, as `vk-hub nodes` lists it
+        #[arg(long, value_name = "ID")]
+        node: Option<String>,
+    },
+    /// Unset a setting fleet-wide, or for one node with --node
+    Unset {
+        key: String,
+        /// Only this node's: its ID, as `vk-hub nodes` lists it
+        #[arg(long, value_name = "ID")]
+        node: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1568,6 +1603,33 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Cmd::Settings { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let (node, key, value) = match cmd {
+                    None => {
+                        let layers = client.settings()?;
+                        let names = client
+                            .list_nodes()?
+                            .into_iter()
+                            .map(|n| (n.id, n.hostname))
+                            .collect();
+                        print!("{}", render_settings(&layers, &names));
+                        return Ok(());
+                    }
+                    Some(SettingsCmd::Set { key, value, node }) => {
+                        let value = settings::parse(&key, &value)?;
+                        (node, key, Some(value))
+                    }
+                    Some(SettingsCmd::Unset { key, node }) => (node, key, None),
+                };
+                if !client.set_setting(node.as_deref(), &key, value)? {
+                    eprintln!("vk-hub: already so; nothing changed");
+                }
+                Ok(())
+            })
+            .await?
+        }
         Cmd::CapacityPolicy { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -2098,6 +2160,15 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
         if let Some(warning) = rules.warning() {
             eprintln!("vk-hub: warning: {warning}");
         }
+    }
+    // A referenced registry may have changed while the hub was stopped, or a restored backup
+    // may hold different settings from those sent.
+    let sent = db.steer_settings(now_secs())?;
+    if !sent.is_empty() {
+        eprintln!(
+            "vk-hub: the hub's settings changed on {} node(s)",
+            sent.len()
+        );
     }
     let steered = db.steer_fallbacks(now_secs())?;
     if !steered.is_empty() {
@@ -3703,6 +3774,37 @@ fn registries_blocking(client: &admin::Client, cmd: Option<RegistriesCmd>) -> Re
         }
     }
     Ok(())
+}
+
+/// `vk-hub settings`: the fleet-wide layer, each node's, named by `names` (ID to hostname), and
+/// the keys the hub may set.
+fn render_settings(
+    layers: &store::SettingsLayers,
+    names: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    let mut layer = |title: String, layer: &store::SettingsLayer| {
+        out.push_str(&title);
+        out.push('\n');
+        if layer.is_empty() {
+            out.push_str("  none\n");
+        }
+        for (key, value) in layer {
+            out.push_str(&format!("  {key} = {}\n", store::setting_shown(value)));
+        }
+    };
+    layer("fleet-wide:".to_string(), &layers.fleet);
+    for (id, own) in &layers.nodes {
+        let name = names.get(id).map_or(String::new(), |n| {
+            format!(" ({})", vk_hub_proto::display_safe(n))
+        });
+        layer(format!("node {id}{name}:"), own);
+    }
+    out.push_str("\nthe hub may set:\n");
+    for (key, kind) in vk_hub_proto::settings::KEYS {
+        out.push_str(&format!("  {key}: {}\n", kind.describe()));
+    }
+    out
 }
 
 /// `vk-hub registries`' table, with each registry's notes under it.
