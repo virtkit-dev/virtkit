@@ -134,7 +134,7 @@ network defaults; the registry the hub names; and the release keys pinned at enr
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
-The rest of this section is proposed.
+Proposed: local configuration controlling which operations the hub may run.
 
 - **The local file wins.** A key `config.toml` sets, even to its default, is never overridden.
   This preserves host exceptions and tuning for hosts with much RAM and slow network disks
@@ -593,9 +593,10 @@ model, commands and process handling.
 - A release's signature is checked by the node against keys in its own configuration
   (`[node] release_keys`) or pinned when it enrolled, made by a key kept off the hub: a
   compromised hub can hand a node any bytes, but not a signature it has no key for.
-- Proposed: hub settings are an allowlist of capacity and sizing keys the node's own file has
-  not set ([Configuration](#configuration)); a compromised hub can misuse those, not reach
-  anything else.
+- Hub settings are an allowlist of keys the node's own file has not set: capacity and sizing,
+  the image cache's idle time, and the registry with its CA ([Configuration](#configuration)).
+  A compromised hub can misuse those — name a registry of its own, with a CA the node then
+  trusts for it — but not reach anything else.
 - CI tools definitions are not signed: a compromised hub can put binaries of its choosing into
   job VMs, which see the job's token, sources and secrets. It cannot have them run on a node's
   host where the node requires signed releases: such a node never runs them outside a VM.

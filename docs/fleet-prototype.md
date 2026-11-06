@@ -30,6 +30,9 @@ The prototype provides, all experimentally:
 - on the node, those builds, made with `vk build` apart from its build cache and installed as
   `<state_dir>/tools/current`, the directory `[executor] tools_dir` names;
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
+- on the hub, settings for its nodes, fleet-wide and per node (`vk-hub settings`, the web UI's
+  Settings tab), taken by each node where its own config file is silent, and a target release
+  nodes are kept on (`vk-hub release target`);
 - on the node, placed GitLab jobs (protocol version 3, [below](#placed-jobs-on-the-node)):
   reservations decided from the admission ledger, and jobs run stage by stage in microVMs,
   their masked output streamed to the hub;
