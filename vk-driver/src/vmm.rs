@@ -744,6 +744,11 @@ pub struct VmSpec {
     /// A Unix socket the boot child answers VM control requests on ([`crate::vmmctl`]).
     #[serde(default)]
     pub control: Option<PathBuf>,
+    /// A VGA text console as the guest's tty0, with a PS/2 keyboard, served on this Unix
+    /// socket ([`crate::vga`]). Only a kernel booted directly can use it: the boot declares
+    /// the text screen, which a UEFI guest's own loader does not.
+    #[serde(default)]
+    pub vga: Option<PathBuf>,
     /// A snapshot directory ([`crate::vmmctl`]) the VM starts from instead of booting.
     #[serde(default)]
     pub restore_from: Option<PathBuf>,

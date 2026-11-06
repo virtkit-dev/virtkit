@@ -101,6 +101,8 @@ mod toolchain;
 mod uefi;
 mod units;
 mod usage;
+mod vga;
+mod vgakeys;
 mod vm;
 mod vmdk;
 mod vmm;
@@ -1494,6 +1496,29 @@ enum Cmd {
         /// which VM: a directory (default: the current directory), as `vk exec` resolves it
         target: Option<String>,
     },
+    /// Show the VGA text console of a live VM booted with --vga, and type on its keyboard
+    ///
+    /// On this terminal, full screen (Ctrl-] leaves), or as files: keys read from stdin or
+    /// --input, a text snapshot of the screen appended to stdout or --output at each change,
+    /// each ended by a form feed line. It survives guest reboots. One view at a time: the newest
+    /// wins, and the one it replaces ends.
+    #[command(display_order = 3)]
+    Vga {
+        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        target: Option<String>,
+        /// the console's socket (`vga.sock` in the run directory), instead of finding the VM
+        #[arg(long, value_name = "PATH", conflicts_with = "target")]
+        socket: Option<PathBuf>,
+        /// where to show it (auto: this terminal, else stdin and stdout as files)
+        #[arg(long, value_enum, default_value_t = vga::Mode::Auto)]
+        mode: vga::Mode,
+        /// type the keys in this file
+        #[arg(long, value_name = "PATH")]
+        input: Option<PathBuf>,
+        /// append a text snapshot of the screen to this file at each change
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
     /// Copy a file into or out of a live Windows (UEFI) guest
     ///
     /// Goes through the guest's qemu-ga, as SYSTEM. The guest side is the path after a
@@ -1889,6 +1914,33 @@ enum Cmd {
         /// the legacy serial. Unneeded for the default or an image kernel.
         #[arg(long = "console-serial", help_heading = "Guest")]
         console_serial: bool,
+        /// a VGA text console as the guest's tty0, with a keyboard; MODE: where to show it
+        ///
+        /// The guest's kernel drives an 80x25 text screen that vk shows as text, and keys typed
+        /// go to its keyboard. `auto` (a bare `--vga`) takes this terminal when stdin and stdout
+        /// are one and the guest command leaves them be, else stdin and stdout as files (keys
+        /// in, a text snapshot of the screen out at each change, each ended by a form feed
+        /// line); when the command uses them, a new terminal window in a graphical session, else
+        /// no view. `tty` forces this terminal (Ctrl-] leaves the view), `stdio` the files,
+        /// `window` a new terminal window ($TERMINAL, else xdg-terminal-exec,
+        /// x-terminal-emulator or a known terminal), `detached` no view. `vk vga` attaches to
+        /// the console later. Needs a kernel booted directly with VT, VGA console, i8042 and
+        /// AT keyboard support — not a UEFI bundle.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "auto",
+            help_heading = "Guest"
+        )]
+        vga: Option<vga::Mode>,
+        /// type the keys in this file on the VGA console (implies --vga)
+        #[arg(long = "vga-input", value_name = "PATH", help_heading = "Guest")]
+        vga_input: Option<PathBuf>,
+        /// append a text snapshot of the VGA screen to this file at each change (implies --vga)
+        #[arg(long = "vga-output", value_name = "PATH", help_heading = "Guest")]
+        vga_output: Option<PathBuf>,
         /// expose the guest PMU for in-guest `perf` — trusted guests only
         ///
         /// Cycles, instructions and the rest, via KVM's vPMU. SECURITY: host performance
@@ -3582,6 +3634,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
         workdir_cache,
         kernel,
         console_serial,
+        vga,
+        vga_input,
+        vga_output,
         pmu,
         nested,
         source,
@@ -3803,6 +3858,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
             workdir_cache: *workdir_cache,
             kernel: kernel.clone(),
             console_serial: *console_serial,
+            vga: (vga.is_some() || vga_input.is_some() || vga_output.is_some()).then(|| {
+                vga::Options {
+                    mode: vga.unwrap_or_default(),
+                    input: vga_input.clone(),
+                    output: vga_output.clone(),
+                }
+            }),
             pmu: *pmu,
             nested: *nested,
             agent: agent.clone(),
@@ -5192,6 +5254,64 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 Err(e) => return fail(&e, 2),
             };
             match tokio::task::spawn_blocking(move || console::run(&entry)).await {
+                Ok(Ok(())) => ExitCode::SUCCESS,
+                Ok(Err(e)) => fail(&e, 1),
+                Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
+            }
+        }
+        Cmd::Vga {
+            target,
+            socket,
+            mode,
+            input,
+            output,
+        } => {
+            let (socket, alive): (PathBuf, vga::Alive) = match socket {
+                Some(s) => {
+                    let path = s.clone();
+                    // The run directory goes with an ephemeral run; a pinned one's socket
+                    // stays, and a reconnect that finds no VMM ends the view.
+                    (s.clone(), std::sync::Arc::new(move || path.exists()))
+                }
+                None => match vms::resolve_one(target.as_deref().map(Path::new)) {
+                    Ok(entry) => {
+                        let socket = entry.state_dir.join(vga::SOCKET);
+                        if !socket.exists() {
+                            return fail(
+                                &anyhow::anyhow!(
+                                    "{} has no VGA console: boot it with `vk run --vga`",
+                                    entry.state_dir.display()
+                                ),
+                                2,
+                            );
+                        }
+                        (socket, std::sync::Arc::new(move || vms::alive(&entry)))
+                    }
+                    Err(e) => return fail(&e, 2),
+                },
+            };
+            let opts = vga::Options {
+                mode,
+                input: input.clone(),
+                output: output.clone(),
+            };
+            let view = {
+                use std::io::IsTerminal;
+                if opts.mode == vga::Mode::Detached {
+                    return fail(&anyhow::anyhow!("vk vga --mode detached shows nothing"), 2);
+                }
+                match vga::resolve(
+                    &opts,
+                    false,
+                    std::io::stdin().is_terminal(),
+                    std::io::stdout().is_terminal(),
+                    vga::graphical_session(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return fail(&e, 2),
+                }
+            };
+            match tokio::task::spawn_blocking(move || vga::attach(&socket, &view, alive)).await {
                 Ok(Ok(())) => ExitCode::SUCCESS,
                 Ok(Err(e)) => fail(&e, 1),
                 Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
@@ -7730,7 +7850,8 @@ mod tests {
                 "status",
                 "stop",
                 "toolchain",
-                "update"
+                "update",
+                "vga"
             ]
         );
     }

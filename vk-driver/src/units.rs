@@ -811,6 +811,7 @@ pub fn boot_unit(
             tpm_state: None,
             serial_input: None,
             control: None,
+            vga: None,
             restore_from: None,
         };
         let vmm = crate::vmm::selected();

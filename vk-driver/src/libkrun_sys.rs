@@ -326,6 +326,12 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>, restore: bool) -> Result<()> {
             .split_whitespace()
             .any(|t| t == "VIRTKIT_KERNEL=image");
     let cmdline = console_cmdline(&spec.cmdline, keep_serial);
+    // The VGA console's kernel parameters go first, so the spec's own console stays
+    // `/dev/console`, the one given last.
+    let cmdline = match &spec.vga {
+        Some(_) => format!("{} {cmdline}", crate::vga::CMDLINE),
+        None => cmdline,
+    };
     let initramfs = spec.initramfs.as_deref().map(path_str).transpose()?;
     let payload = Payload::load_external(
         path_str(&spec.kernel)?,
@@ -374,6 +380,14 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>, restore: bool) -> Result<()> {
     };
     let builder = match &spec.tpm_state {
         Some(path) => builder.tpm_state(path.clone()),
+        None => builder,
+    };
+    let builder = match &spec.vga {
+        Some(socket) => {
+            let console = krun::VgaConsole::new();
+            crate::vga::serve(socket, console.clone())?;
+            builder.vga_console(console)
+        }
         None => builder,
     };
     let vmm = devices

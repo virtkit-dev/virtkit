@@ -288,6 +288,9 @@ pub struct RunArgs {
     /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
     /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
     pub console_serial: bool,
+    /// A VGA text console as the primary VM's tty0 (`vk run --vga`), and how to show it.
+    /// See [`crate::vga`].
+    pub vga: Option<crate::vga::Options>,
     /// Expose the guest PMU to the primary VM (`vk run --pmu`, trusted guests
     /// only). See [`crate::vmm::VmSpec::pmu`].
     pub pmu: bool,
@@ -494,6 +497,7 @@ impl Default for RunArgs {
             workdir_cache: crate::vmm::ShareCache::Auto,
             kernel: KernelSource::Default,
             console_serial: false,
+            vga: None,
             pmu: false,
             nested: false,
             agent: None,
@@ -2579,6 +2583,25 @@ async fn build_and_boot(
             .with_context(|| format!("--disk {}: cannot access", path.display()))?;
         disks.push(crate::vmm::Disk::raw(abs, *readonly));
     }
+    // The VGA console (`--vga`): its socket in the run directory, and the view resolved now,
+    // so a view that cannot work is refused before the boot.
+    let vga_view = match &args.vga {
+        Some(opts) => {
+            use std::io::IsTerminal;
+            // The command (or a shell) holds this process's stdio; a detached run lets go of it.
+            let command_uses_stdio =
+                args.shell || args.tty || !args.command.is_empty() || args.detach;
+            let view = crate::vga::resolve(
+                opts,
+                command_uses_stdio,
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                crate::vga::graphical_session(),
+            )?;
+            Some((work.join(crate::vga::SOCKET), view))
+        }
+        None => None,
+    };
     // Writable `disk` volumes and `--disk` images outlive the VM, so request guest poweroff
     // before killing it. Runs backed only by the throwaway overlay or host shares retain
     // immediate teardown; overlay writes are discarded and share writes are already host-owned.
@@ -2623,6 +2646,7 @@ async fn build_and_boot(
         tpm_state: None,
         serial_input: None,
         control: None,
+        vga: vga_view.as_ref().map(|(socket, _)| socket.clone()),
         restore_from: None,
     };
     // Control server on the primary's per-port control socket — only the
@@ -2664,6 +2688,9 @@ async fn build_and_boot(
     if spec.reboot {
         forward_hard_resets(&ch);
     }
+    // The VGA console's view runs beside the command; dropped at the end of the run, it
+    // gives the terminal back first.
+    let _vga_view = vga_view.map(|(socket, view)| crate::vga::RunView::start(socket, view));
 
     // Pre-declared so every post-VMM error site can route through teardown_run,
     // which needs these even when the ssh / host-exec steps have not run.
@@ -5781,6 +5808,7 @@ pub(crate) async fn boot_session(
         tpm_state: None,
         serial_input: None,
         control: None,
+        vga: None,
         restore_from: None,
     };
     let vmm = crate::vmm::selected();
@@ -8300,6 +8328,7 @@ mod tests {
             tpm_state: None,
             serial_input: None,
             control: None,
+            vga: None,
             restore_from: None,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();

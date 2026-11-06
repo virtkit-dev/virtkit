@@ -333,6 +333,9 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
         (!args.volumes.is_empty(), "--volume"),
         (!args.symlinks.is_empty(), "--symlink"),
         (!args.extra_disks.is_empty(), "--disk"),
+        // The VGA console needs the boot to declare its screen, which the guest's own loader
+        // does not.
+        (args.vga.is_some(), "--vga"),
         (!args.env.is_empty(), "--env/--env-file"),
         (args.shell, "--shell"),
         (args.tty, "--tty"),
@@ -639,6 +642,7 @@ pub(crate) fn guest_spec(
         tpm_state: None,
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
+        vga: None,
         restore_from: restore.map(Path::to_path_buf),
     })
 }

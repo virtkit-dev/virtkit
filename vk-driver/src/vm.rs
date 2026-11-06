@@ -2040,6 +2040,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         tpm_state: None,
         serial_input: None,
         control: None,
+        vga: None,
         restore_from: None,
     };
     // passive listeners the guest dials once up: safe (and simplest) to start before

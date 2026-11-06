@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A VGA text console for a guest's tty0, with a keyboard: `vk run --vga`.** The guest's
+  kernel shows an 80x25 text screen, and vk shows it as text: full screen on this terminal, in
+  a new terminal window, or as text snapshots written to stdout or a file at each change, with
+  the keys typed (or read from a file) going to the guest's keyboard. `vk vga` attaches to it
+  later. It needs a guest kernel with VT, VGA console and PS/2 keyboard support, such as a
+  distribution's kernel booted with `--kernel image`; UEFI guests cannot use it.
+
 ## [0.106.0] - 2026-11-05
 
 ### Added
