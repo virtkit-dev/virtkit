@@ -94,16 +94,28 @@ pub(crate) struct LazyChunk {
 
 /// Parse `"sha256:<hex>"` into raw digest bytes for a `.vk_ro_img` chunk record.
 fn digest_bytes(digest: &str) -> Result<[u8; 32]> {
-    let hex = digest.trim_start_matches("sha256:");
-    if hex.len() != 64 {
-        bail!("bad digest {digest}: expected 64 hex chars");
-    }
+    let hex = image::digest_hex(digest)?;
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
             .with_context(|| format!("bad digest {digest}"))?;
     }
     Ok(out)
+}
+
+/// Refuse `manifest` unless every descriptor it names (config, layers, subject) carries a
+/// digest [`image::digest_hex`] accepts, before any of them is fetched, looked up in a cache,
+/// leased or recorded. A bundle with one that does not is refused whole, naming it, rather
+/// than pulled without it.
+fn check_descriptors(manifest: &OciImageManifest) -> Result<()> {
+    let config = std::iter::once(("config".to_string(), &manifest.config));
+    let layers = (manifest.layers.iter().enumerate()).map(|(i, l)| (format!("layer {i}"), l));
+    let subject = manifest.subject.iter().map(|s| ("subject".to_string(), s));
+    for (what, d) in config.chain(layers).chain(subject) {
+        image::digest_hex(&d.digest)
+            .with_context(|| format!("the manifest's {what} ({})", d.media_type))?;
+    }
+    Ok(())
 }
 
 /// Write a `.vk_ro_img` manifest at `dest` (tmp-sibling + rename, so a failure never leaves
@@ -748,6 +760,7 @@ async fn try_pull_ext4_lazy_async(
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
+    check_descriptors(&manifest).with_context(|| format!("{name}@{digest}"))?;
     let config = pull_blob_bytes(&client, &dref, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
@@ -924,6 +937,7 @@ async fn fetch_bundle_async(rg: &Registry, name: &str, tag: &str) -> Result<Opti
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
+    check_descriptors(&manifest).with_context(|| format!("{name}@{digest}"))?;
     let config = pull_blob_bytes(&client, &dref, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
@@ -1821,6 +1835,8 @@ pub(crate) fn make_ref(rg: &Registry, name: &str, refr: &str) -> Result<OciRefer
 /// `<registry.repo>/<name>@<digest>` (digest keeps its `sha256:` prefix), so the
 /// manifest is fetched by digest — not as a tag named the bare hex.
 fn make_digest_ref(rg: &Registry, name: &str, digest: &str) -> Result<OciReference> {
+    // Every digest pulled by reaches here, a registry's answer to a resolve included.
+    image::digest_hex(digest).with_context(|| format!("pulling {name}@{digest}"))?;
     let whole = format!("{}/{name}@{digest}", rg.repo);
     whole
         .parse()
@@ -2030,10 +2046,8 @@ async fn ensure_bundle_pulled(
                 .with_context(|| format!("resolving {name}:{tag} against {}", rg.repo))?
         }
     };
-    let dir = state_dir
-        .join("registry")
-        .join(name)
-        .join(digest.trim_start_matches("sha256:"));
+    let hex = image::digest_hex(&digest).with_context(|| format!("resolving {name}"))?;
+    let dir = state_dir.join("registry").join(name).join(hex);
     let pulled = if bundle_present(&dir) {
         false
     } else {
@@ -2103,6 +2117,7 @@ async fn pull_into(
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
+    check_descriptors(&manifest).with_context(|| format!("{name}@{digest}"))?;
 
     let config = pull_blob_bytes(client, image, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
@@ -2156,10 +2171,10 @@ async fn pull_into(
     // pull as live and never reclaims a chunk it is still reassembling from. `runner.ext4`
     // already exists, so the staging dir is a `base_dirs` entry from here on. A later cache
     // GC uses the same list to drop chunk blobs no cached bundle references any more.
-    let chunk_hexes: Vec<String> = chunk_layers
+    let chunk_hexes = chunk_layers
         .iter()
-        .map(|l| l.digest.trim_start_matches("sha256:").to_string())
-        .collect();
+        .map(|l| image::digest_hex(&l.digest))
+        .collect::<Result<Vec<_>>>()?;
     std::fs::write(tmp.join("chunks.list"), chunk_hexes.join("\n"))
         .context("writing the chunk manifest")?;
     let chunks_cache = chunks_cache_dir(dir);
@@ -2260,7 +2275,7 @@ async fn pull_chunk(
     reused: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<u8>> {
     use std::sync::atomic::Ordering;
-    let hex = layer.digest.trim_start_matches("sha256:");
+    let hex = image::digest_hex(&layer.digest)?;
     let cached = cache.join(hex);
     // Hits are not re-dated: neither chunk sweep uses age alone. Windows sweeps only while no
     // pull holds the store (`wincache::sweep_chunks`); callers hold `wincache::hold_chunks` until
@@ -3709,10 +3724,12 @@ fn chunkmap_path(dir: &Path, raw_hex: &str) -> PathBuf {
     dir.join(shard).join(rest)
 }
 
-/// Look up a raw chunk's cached blob (digest, size); None on any miss/parse failure.
+/// Look up a raw chunk's cached blob (digest, size); None on any miss/parse failure, a
+/// digest that is not canonical ([`image::digest_hex`]) included: it names a pushed layer.
 fn chunkmap_get(dir: &Path, raw_hex: &str) -> Option<(String, i64)> {
     let text = std::fs::read_to_string(chunkmap_path(dir, raw_hex)).ok()?;
     let (digest, size) = text.trim().split_once(' ')?;
+    image::digest_hex(digest).ok()?;
     Some((digest.to_string(), size.parse().ok()?))
 }
 
@@ -3826,7 +3843,7 @@ mod local {
                 CHUNK_MEDIA_TYPE_RAW => false,
                 _ => return Ok(()),
             };
-            let hex = layer.digest.trim_start_matches("sha256:");
+            let hex = image::digest_hex(&layer.digest)?;
             let bytes = store.get_blob(hex)?.with_context(|| {
                 format!(
                     "cached chunk {} missing from {}",
@@ -3885,7 +3902,7 @@ mod local {
                 continue;
             }
             let (offset, length) = chunk_bounds(layer, config.total_size)?;
-            let hex = layer.digest.trim_start_matches("sha256:");
+            let hex = image::digest_hex(&layer.digest)?;
             // Presence + GC-retention mtime touch (this chunk is about to be read, like any
             // other cache hit) — `local_blob_codec` then determines which directory it lives
             // in, which `has_blob` alone can't tell us.
@@ -3907,7 +3924,8 @@ mod local {
         let hexes = manifest
             .layers
             .iter()
-            .map(|l| l.digest.trim_start_matches("sha256:"));
+            .map(|l| image::digest_hex(&l.digest))
+            .collect::<Result<Vec<_>>>()?;
         let protected = lease.is_some_and(|l| l.add(&store, &lock, hexes));
         write_vk_ro_img(
             dest,
@@ -4328,13 +4346,9 @@ mod local {
         };
         let manifest: OciImageManifest =
             serde_json::from_slice(&bytes).context("parsing the bundle manifest")?;
-        let hex = manifest
-            .config
-            .digest
-            .trim_start_matches("sha256:")
-            .to_string();
+        check_descriptors(&manifest).with_context(|| format!("{name}@{digest}"))?;
         let config = store
-            .get_blob(&hex)?
+            .get_blob(image::digest_hex(&manifest.config.digest)?)?
             .with_context(|| format!("bundle config blob {} missing", manifest.config.digest))?;
         let config: BundleConfig =
             serde_json::from_slice(&config).context("parsing the bundle config blob")?;
@@ -5968,11 +5982,18 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let hex = format!("ab{}", "c".repeat(62)); // 64 hex chars
         assert_eq!(chunkmap_get(&dir, &hex), None); // miss before any write
-        chunkmap_put(&dir, &hex, "sha256:deadbeef", 1234);
-        assert_eq!(
-            chunkmap_get(&dir, &hex),
-            Some(("sha256:deadbeef".to_string(), 1234))
-        );
+        let blob = format!("sha256:{}", "d".repeat(64));
+        chunkmap_put(&dir, &hex, &blob, 1234);
+        assert_eq!(chunkmap_get(&dir, &hex), Some((blob.clone(), 1234)));
+        // A recorded digest that is not canonical is a miss, not a layer to name.
+        for bad in [
+            format!("sha256:{blob}"),
+            "sha256:deadbeef".to_string(),
+            "d".repeat(64),
+        ] {
+            chunkmap_put(&dir, &hex, &bad, 1234);
+            assert_eq!(chunkmap_get(&dir, &hex), None, "{bad}");
+        }
         // sharded by the first two hex chars (no flat pile of entries)
         assert!(dir.join("ab").join(&hex[2..]).is_file());
         let _ = std::fs::remove_dir_all(&dir);
@@ -6134,6 +6155,250 @@ pub(crate) mod tests {
         assert!(!dest.exists());
         assert!(!staging_tmp(&dest).exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Store `body` as `<name>:<tag>` in `root`'s store the way the registry lays a manifest
+    /// out, past `Store::put_manifest`'s refusals: what the relay keeps of an upstream's
+    /// manifest, or a store written before them. Returns its digest.
+    fn plant_manifest(root: &Path, name: &str, tag: &str, body: &[u8]) -> String {
+        let digest = sha256_hex(body);
+        let blobs = root.join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(&digest[7..]), body).unwrap();
+        let tags = root.join("repos").join(name).join("tags");
+        std::fs::create_dir_all(&tags).unwrap();
+        std::fs::write(tags.join(tag), &digest).unwrap();
+        digest
+    }
+
+    /// A TCP proxy to `upstream` (`host:port`) logging the request line of each HTTP/1.1
+    /// request it forwards, before forwarding it: once a client call has returned, every
+    /// request it made is in the log. Forwards line by line, so it carries bodiless requests
+    /// only — the GETs and HEADs of a pull. Returns its `host:port` and the log.
+    fn recording_proxy(upstream: String) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, Write};
+        use std::net::Shutdown;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = log.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { return };
+                let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                    continue;
+                };
+                let (mut answers, mut to_client) =
+                    (server.try_clone().unwrap(), client.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut answers, &mut to_client);
+                    let _ = to_client.shutdown(Shutdown::Write);
+                });
+                let (recorder, mut to_server) = (recorder.clone(), server);
+                std::thread::spawn(move || {
+                    let mut requests = std::io::BufReader::new(client);
+                    let mut line = Vec::new();
+                    while matches!(requests.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.ends_with(" HTTP/1.1\r\n") {
+                            recorder.lock().unwrap().push(text.trim_end().to_string());
+                        }
+                        if to_server.write_all(&line).is_err() {
+                            break;
+                        }
+                        line.clear();
+                    }
+                    let _ = to_server.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        (addr, log)
+    }
+
+    /// A bundle whose chunk is not named by its canonical digest fails every restore, eager or
+    /// lazy, over HTTP or from a local store, naming the chunk, before any chunk is read and
+    /// before any blob is asked of the registry. The chunk such a digest would have named sits
+    /// where each restore reads chunks from — the node's shared chunk cache, the store's own
+    /// blobs — beside a file one step outside them, and the same bundle naming it canonically
+    /// restores from there.
+    #[test]
+    fn a_chunk_not_named_by_its_canonical_digest_fails_the_restore_unread() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("noncanonical-chunk");
+        let root = dir.join("store");
+        let store = std::sync::Arc::new(vk_registry::Store::new(root.clone()).unwrap());
+        let (proxy, requests) =
+            recording_proxy(serve_store(store.clone(), vk_registry::auth::Auth::None));
+        let remote = Registry::for_share(proxy, true, None, String::new(), None, None, None);
+        let local = local_registry(&root);
+
+        // Another image's chunk: in the store, and in the node's shared chunk cache, which
+        // every HTTP restore below stages beside (`state/registry/img/` puts it at
+        // `state/registry/chunks`); and its bytes one step outside either.
+        let state = dir.join("state/registry");
+        let img = state.join("img");
+        let secret = vec![0x5a; 4096];
+        let secret_digest = store.put_blob(&secret).unwrap();
+        let secret_hex = secret_digest[7..].to_string();
+        std::fs::create_dir_all(state.join("chunks")).unwrap();
+        std::fs::create_dir_all(&img).unwrap();
+        std::fs::write(state.join("chunks").join(&secret_hex), &secret).unwrap();
+        std::fs::write(state.join("outside"), &secret).unwrap();
+        std::fs::write(root.join("blobs/outside"), &secret).unwrap();
+        let config = BundleConfig {
+            total_size: secret.len() as u64,
+            chunk_count: 1,
+            boot_kind: "generic-disk".to_string(),
+            compression: "zstd".to_string(),
+            has_kernel: false,
+            has_initrd: false,
+            run_config: None,
+            meta: None,
+        };
+        let config = serde_json::to_vec(&config).unwrap();
+        let config_digest = store.put_blob(&config).unwrap();
+        let bundle = |chunk: &str| {
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_IMAGE_MEDIA_TYPE,
+                "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": config_digest, "size": config.len()},
+                "layers": [{
+                    "mediaType": CHUNK_MEDIA_TYPE_RAW,
+                    "digest": chunk,
+                    "size": secret.len(),
+                    "annotations": {ANN_OFFSET: "0", ANN_LENGTH: secret.len().to_string()},
+                }],
+            });
+            plant_manifest(&root, "img", "t", &serde_json::to_vec(&manifest).unwrap())
+        };
+        let (client, auth) = client(&remote).unwrap();
+        let pulled = img.join("pulled.ext4");
+        let view = img.join("view.vk_ro_img");
+
+        for bad in [
+            format!("sha256:{secret_digest}"),
+            "sha256:../outside".to_string(),
+        ] {
+            let digest = bundle(&bad);
+            requests.lock().unwrap().clear();
+            let refused = |err: anyhow::Error| {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("layer 0") && msg.contains(&format!("{bad:?}")),
+                    "{msg}"
+                );
+            };
+
+            let image = make_digest_ref(&remote, "img", &digest).unwrap();
+            let dest = img.join(&digest[7..]);
+            refused(
+                block_on(pull_into(
+                    &client, &auth, &image, "img", &digest, &dest, "img",
+                ))
+                .unwrap_err(),
+            );
+            assert!(!dest.exists() && !staging_tmp(&dest).exists());
+            for rg in [&remote, &local] {
+                refused(try_pull_ext4(rg, "img", "t", &pulled, "img").unwrap_err());
+                assert!(!pulled.exists());
+                refused(
+                    try_pull_ext4_lazy(rg, "img", "t", &view, "img", None, None)
+                        .err()
+                        .unwrap(),
+                );
+                assert!(!view.exists());
+                refused(fetch_bundle(rg, "img", "t").err().unwrap());
+            }
+            let asked = requests.lock().unwrap().clone();
+            assert!(!asked.is_empty());
+            assert!(!asked.iter().any(|r| r.contains("/blobs/")), "{asked:?}");
+        }
+
+        // The control: the same bundle naming the chunk canonically restores every way.
+        let digest = bundle(&secret_digest);
+        let image = make_digest_ref(&remote, "img", &digest).unwrap();
+        let dest = img.join(&digest[7..]);
+        block_on(pull_into(
+            &client, &auth, &image, "img", &digest, &dest, "img",
+        ))
+        .unwrap();
+        assert_eq!(std::fs::read(dest.join("runner.ext4")).unwrap(), secret);
+        for rg in [&remote, &local] {
+            assert_eq!(
+                try_pull_ext4(rg, "img", "t", &pulled, "img").unwrap(),
+                Some(digest.clone())
+            );
+            assert_eq!(std::fs::read(&pulled).unwrap(), secret);
+            let lazy = try_pull_ext4_lazy(rg, "img", "t", &view, "img", None, None)
+                .unwrap()
+                .expect("tag present");
+            assert_eq!(lazy.digest, digest);
+            assert!(view.is_file());
+            let fetched = fetch_bundle(rg, "img", "t").unwrap().expect("tag present");
+            assert_eq!(fetched.chunks[0].digest, secret_digest);
+            std::fs::remove_file(&pulled).unwrap();
+            std::fs::remove_file(&view).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A registry answering a tag's resolve with a digest that is not canonical gets no bundle
+    /// used: not even one already cached at the directory the digest's hex would name, which
+    /// a resolve answering that hex canonically does use, asking nothing more.
+    #[test]
+    fn a_resolve_answering_a_non_canonical_digest_uses_no_cached_bundle() {
+        install_crypto();
+        let dir = retry_tmpdir("noncanonical-resolve");
+        let hex = sha256_hex(b"another project's bundle")[7..].to_string();
+        let cached = dir.join("registry/img").join(&hex);
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(cached.join("runner.ext4"), b"another project's disk").unwrap();
+        std::fs::write(cached.join("boot.kind"), "generic-disk").unwrap();
+        assert!(bundle_present(&cached));
+
+        let canonical = format!("sha256:{hex}");
+        for (digest, used) in [(format!("sha256:{canonical}"), false), (canonical, true)] {
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nDocker-Content-Digest: {digest}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            // oci-client's two anonymous probes of `/v2/`, then the resolve.
+            let server = FakeServer::start(vec![answer; 3]);
+            let rg = fake_registry(&server);
+            let (client, auth) = client(&rg).unwrap();
+            let got = block_on(ensure_bundle_pulled(
+                &client,
+                &auth,
+                &rg,
+                &dir,
+                "img",
+                &Reference::Tag("t".into()),
+            ));
+            if used {
+                assert_eq!(got.unwrap(), (cached.clone(), digest.clone(), false));
+            } else {
+                let msg = format!("{:#}", got.unwrap_err());
+                assert!(
+                    msg.contains(&format!("{digest:?}"))
+                        && msg.contains("not sha256:<64 lowercase hex>"),
+                    "{msg}"
+                );
+            }
+            let seen = server.seen();
+            let asked: Vec<_> = seen
+                .iter()
+                .map(|r| (r.method.as_str(), r.path.as_str()))
+                .collect();
+            assert_eq!(
+                asked,
+                [
+                    ("GET", "/v2/"),
+                    ("GET", "/v2/"),
+                    ("HEAD", "/v2/repo/img/manifests/t")
+                ]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -10,6 +10,10 @@ All notable changes to virtkit will be documented in this file.
   digest.** A manifest or index whose config, layers, child manifests or subject name another
   digest, `sha512:` included, is refused with `DIGEST_INVALID` instead of being stored.
   Manifests the pull-through relay fetches from an upstream are kept as they come.
+- **Security: `vk` checks every digest a bundle pulled from a registry names before using it.**
+  A `MICROVM_IMAGE`, build-cache entry or Windows layer whose manifest names anything but a
+  lowercase `sha256:` digest now fails to restore, with an error naming it, instead of being
+  assembled from whatever the node's local cache holds under that name.
 
 ## [0.106.0] - 2026-11-05
 

@@ -38,9 +38,7 @@ impl BuildRef {
     pub fn parse(spec: &str) -> Result<BuildRef> {
         let (rest, digest) = match spec.split_once('@') {
             // Lowercase only, as OCI writes digests: the registry's is compared to it as a string.
-            Some((rest, d)) => match crate::image::parse_digest(d)
-                .filter(|d| !d.bytes().any(|b| b.is_ascii_uppercase()))
-            {
+            Some((rest, d)) => match crate::image::parse_digest(d) {
                 Some(d) => (rest, Some(d)),
                 None => {
                     bail!("invalid pipeline image digest {d:?} (want sha256:<64 lowercase hex>)")

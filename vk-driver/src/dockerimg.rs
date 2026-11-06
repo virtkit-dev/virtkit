@@ -86,13 +86,11 @@ fn resolve_unrouted(
 ) -> Result<ResolvedImage> {
     // A digest-pinned ref already names its content, so a warm cache settles it without
     // asking anyone — the no-network path pinning buys, which the relay must not cost.
-    // The digest is validated first: it comes from the job's own `image:`, and everything
-    // below joins it onto a path.
+    // `image_cache_dir` validates the digest: it comes from the job's own `image:`, and
+    // everything below joins it onto a path.
     if let Some((_, digest)) = image.rsplit_once('@')
-        && image::parse_digest(digest).is_some()
         && image_cache_dir(state_dir, name, digest)
-            .join("runner.ext4")
-            .is_file()
+            .is_ok_and(|dir| dir.join("runner.ext4").is_file())
     {
         return resolve_pinned(cfg, state_dir, name, image, &Creds::anonymous(), digest);
     }
@@ -235,12 +233,14 @@ fn registry_host_name(h: &str) -> bool {
 /// Version 2 excludes legacy env/user capture files from converted roots.
 const CONVERSION_VERSION: &str = "2";
 
-/// `<state_dir>/docker/<name>/<digest>-v<version>/`, including the config sidecar.
-fn image_cache_dir(state_dir: &Path, name: &str, digest: &str) -> PathBuf {
-    state_dir.join("docker").join(name).join(format!(
-        "{}-v{CONVERSION_VERSION}",
-        digest.trim_start_matches("sha256:")
-    ))
+/// `<state_dir>/docker/<name>/<digest>-v<version>/`, including the config sidecar. Refuses
+/// a `digest` that is not canonical ([`image::digest_hex`]): it becomes a path component.
+fn image_cache_dir(state_dir: &Path, name: &str, digest: &str) -> Result<PathBuf> {
+    let hex = image::digest_hex(digest)?;
+    Ok(state_dir
+        .join("docker")
+        .join(name)
+        .join(format!("{hex}-v{CONVERSION_VERSION}")))
 }
 
 /// Pull + cache + boot the OCI ref `full` with `creds` (cache-keyed by `name` + digest).
@@ -280,7 +280,7 @@ fn resolve_pinned(
     // — a vk update changes the boot agent, not the image.
     let pinned = pin_digest(full, digest);
 
-    let dir = image_cache_dir(state_dir, name, digest);
+    let dir = image_cache_dir(state_dir, name, digest)?;
     if !dir.join("runner.ext4").is_file() {
         let mut lock = image::acquire_pull_lock(&dir, "pull", name, digest)?;
         if !dir.join("runner.ext4").is_file() {
@@ -631,7 +631,7 @@ mod tests {
         let root = Path::new("/cache");
         let digest = format!("sha256:{}", "a".repeat(64));
         let old = root.join("docker/alpine").join("a".repeat(64));
-        let current = image_cache_dir(root, "alpine", &digest);
+        let current = image_cache_dir(root, "alpine", &digest).unwrap();
         assert_ne!(current, old);
         assert_eq!(
             current,

@@ -800,13 +800,7 @@ pub fn layer_of(manifest: &[u8]) -> Result<(String, u64)> {
     let [layer] = m.layers.as_slice() else {
         bail!("the cache's manifest does not have one layer");
     };
-    let hex = layer.digest.strip_prefix("sha256:").unwrap_or_default();
-    if layer.media_type != LAYER_MEDIA_TYPE
-        || hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if layer.media_type != LAYER_MEDIA_TYPE || crate::image::digest_hex(&layer.digest).is_err() {
         bail!("the cache's manifest names no cache layer");
     }
     Ok((layer.digest.clone(), layer.size))

@@ -132,7 +132,7 @@ pub(crate) fn parse_ref(s: &str) -> Result<(String, Reference)> {
     match &reference {
         Reference::Tag(t) if !component_ok(t) => bail!("invalid MICROVM_IMAGE tag {t:?}"),
         Reference::Digest(d) if parse_digest(d).is_none() => {
-            bail!("invalid MICROVM_IMAGE digest {d:?} (want sha256:<64 hex>)")
+            bail!("invalid MICROVM_IMAGE digest {d:?} (want sha256:<64 lowercase hex>)")
         }
         _ => {}
     }
@@ -140,8 +140,17 @@ pub(crate) fn parse_ref(s: &str) -> Result<(String, Reference)> {
 }
 
 pub(crate) fn parse_digest(s: &str) -> Option<String> {
-    let hex = s.strip_prefix("sha256:")?;
-    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| s.to_string())
+    vk_registry::digest_hex(s).map(|_| s.to_string())
+}
+
+/// The hex of `digest`, which must be exactly `sha256:` and 64 lowercase hex digits: what a
+/// digest read from a manifest, an index, a registry's answer or a file of our own must pass
+/// before it names a file, a cache entry, a lease or a `.vk_ro_img` record. Anything else
+/// fails, never stripped or skipped: `sha256:sha256:<hex>` would otherwise name another
+/// image's cached chunk, and a `/` or `..` a file outside the cache.
+pub(crate) fn digest_hex(digest: &str) -> Result<&str> {
+    vk_registry::digest_hex(digest)
+        .with_context(|| format!("digest {digest:?} is not sha256:<64 lowercase hex>"))
 }
 
 /// Pull-serialization lock: an abstract unix socket derived from the image
@@ -1562,6 +1571,34 @@ fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly `sha256:` and 64 lowercase hex digits names a file; every other spelling fails
+    /// rather than being stripped down to one that would.
+    #[test]
+    fn only_a_canonical_digest_yields_its_hex() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert_eq!(digest_hex(&format!("sha256:{hex}")).unwrap(), hex);
+        for bad in [
+            format!("sha256:sha256:{hex}"),
+            hex.clone(),
+            format!("sha256:{}", hex.to_uppercase()),
+            format!("SHA256:{hex}"),
+            format!("sha256:{}", &hex[..63]),
+            format!("sha256:{hex}0"),
+            format!("sha512:{hex}{hex}"),
+            format!("sha256:{}/{}", &hex[..31], &hex[32..]),
+            format!("sha256:../{}", &hex[..61]),
+            "sha256:..".to_string(),
+            format!("sha256:/{}", &hex[..63]),
+            "sha256:/etc/passwd".to_string(),
+            "sha256:".to_string(),
+            String::new(),
+        ] {
+            let err = digest_hex(&bad).unwrap_err();
+            assert!(err.to_string().contains(&format!("{bad:?}")), "{err}");
+            assert_eq!(parse_digest(&bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn boot_kind_marker_is_trimmed() {
