@@ -24,6 +24,80 @@ pub(super) const FULL_OBJECT: &str = "FULL_OBJECT";
 /// The header announcing or answering with that.
 pub(super) const TYPE_HEADER: &str = "x-amz-checksum-type";
 
+/// How a multipart upload's checksum is made, as `x-amz-checksum-type` names it: of the
+/// whole object, or of its parts' checksums (`<base64>-<parts>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum Kind {
+    FullObject,
+    Composite,
+}
+
+impl Kind {
+    /// The kind `value` names, in any case.
+    pub(super) fn of(value: &[u8]) -> Option<Self> {
+        [Kind::FullObject, Kind::Composite]
+            .into_iter()
+            .find(|k| value.eq_ignore_ascii_case(k.name().as_bytes()))
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Kind::FullObject => FULL_OBJECT,
+            Kind::Composite => "COMPOSITE",
+        }
+    }
+
+    /// Whether a checksum of this kind may be made with `algorithm`, as S3 has them: the
+    /// whole object's with a CRC only, the parts' with anything but CRC64NVME.
+    pub(super) fn fits(self, algorithm: &str) -> bool {
+        match self {
+            Kind::FullObject => matches!(algorithm, "CRC32" | "CRC32C" | "CRC64NVME"),
+            Kind::Composite => algorithm != "CRC64NVME",
+        }
+    }
+
+    /// The kind an upload created with `algorithm` and no `x-amz-checksum-type` has.
+    pub(super) fn default_for(algorithm: &str) -> Self {
+        if algorithm == "CRC64NVME" {
+            Kind::FullObject
+        } else {
+            Kind::Composite
+        }
+    }
+}
+
+/// The refusal of a checksum type `kind` that cannot be made with `algorithm`, as S3 words it.
+pub(super) fn unfit(kind: Kind, algorithm: &str) -> Refusal {
+    Refusal::saying(
+        Code::InvalidRequest,
+        format!(
+            "The {} checksum type cannot be used with the {} checksum algorithm.",
+            kind.name(),
+            algorithm.to_ascii_lowercase()
+        ),
+    )
+}
+
+/// The refusal of an `x-amz-checksum-type` sent without the algorithm, as S3 words it.
+pub(super) const TYPE_WITHOUT_ALGORITHM: Refusal = Refusal::said(
+    Code::InvalidRequest,
+    "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header.",
+);
+
+/// The refusal of a part whose checksum is in `actual`, or in none, when its upload was
+/// created with `expected`, as S3 words it.
+pub(super) fn part_mismatch(expected: &str, actual: Option<&str>) -> Refusal {
+    Refusal::saying(
+        Code::InvalidRequest,
+        format!(
+            "Checksum Type mismatch occurred, expected checksum Type: {expected}, actual \
+             checksum Type: {}",
+            actual.unwrap_or("null")
+        ),
+    )
+}
+
 /// S3's algorithms, every one computed here: the header carrying each, S3's name for it, and its length
 /// in bytes.
 pub(super) const ALGORITHMS: [(&str, &str, usize); 10] = [
@@ -155,7 +229,7 @@ pub(super) fn algorithm(header: &str) -> Option<&'static str> {
 }
 
 /// The header carrying `algorithm`'s checksum, by S3's name of it.
-fn header(algorithm: &str) -> Option<&'static str> {
+pub(super) fn header(algorithm: &str) -> Option<&'static str> {
     ALGORITHMS
         .iter()
         .find(|(_, name, _)| *name == algorithm)
